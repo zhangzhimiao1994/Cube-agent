@@ -146,7 +146,17 @@ LiteLLM Proxy 作为独立 `ModelGateway`。Agent 仅绑定逻辑模型名，例
 
 API Key 不允许通过飞书提交或回显。Web 管理台可通过 HTTPS 写入动态密钥；密钥使用环境中的主密钥进行信封加密。也可只使用环境变量或外部 Secret Manager。日志、异常、审计详情和 YAML 导出均不得包含明文密钥。
 
-### 8.1 多模态视觉模型
+### 8.1 API 凭证池与并发容量
+
+每个模型 Deployment 配置 `max_concurrency`、RPM、TPM、请求超时、优先级和费用信息。支持并发的一个 API Key 可以把 `max_concurrency` 设置为大于 `1`，由多个 Agent 共享；只能串行调用的 API Key 设置为 `1`。如果串行 API 需要并行执行，管理员为同一逻辑模型添加多个独立 API Key 或中转站账号，组成凭证池。
+
+每次模型调用必须先从 ModelGateway 获取有过期时间的容量租约，完成或失败后释放。网关使用 Redis 原子信号量和速率计数器，按健康状态、剩余并发槽、RPM/TPM、权重和费用选择最合适的 Deployment。多个 Agent 不接触具体密钥，也不能绕过租约直接调用模型。
+
+所有槽位被占用时，请求默认进入有界等待队列；超过配置的等待时间后，才按回退链切换到备用 API 或模型。如果任务禁止模型切换，则保持排队直到任务期限，并在飞书/Web 显示等待原因。用户取消、Worker 崩溃或租约过期时必须回收容量。
+
+系统使用不可逆密钥指纹识别重复凭证；同一 API Key 被重复添加时不会被计算为额外容量。Web 管理台提供受控并发探测，结果只作为配置建议，因为供应商和中转站限制可能动态变化。运行期遇到 `429`、超时或服务端限流时自动降低有效并发并进入冷却，稳定后逐步恢复到管理员上限。
+
+### 8.2 多模态视觉模型
 
 模型 Deployment 必须声明能力元数据，包括 `text`、`vision`、`tool_calling`、`structured_output`、上下文上限和允许的媒体格式。Agent 绑定逻辑模型时可以声明 `requires: [vision]`，ModelGateway 只能从满足能力要求的 Deployment 中选择，避免把图片发送给纯文本模型。
 
@@ -271,7 +281,7 @@ PostgreSQL、Redis 可安装在本机或使用外部 DSN。Nginx/Caddy 为 Web �
 
 1. 单元测试：模式路由、双分类器分歧、状态机、配置 Schema、RBAC、预算和权限策略。
 2. 契约测试：CrewAI、AutoGen 与 LiteLLM 升级后仍满足统一 Runtime 接口。
-3. 集成测试：PostgreSQL、Redis、MCP、Skill Runner、配置发布和检查点恢复。
+3. 集成测试：PostgreSQL、Redis、模型容量租约/排队/降级、MCP、Skill Runner、配置发布和检查点恢复。
 4. 端到端测试：模拟飞书长连接/Webhook、卡片失败转文本询问、任务取消、进程崩溃和恢复。
 5. 安全测试：恶意 Skill 包、路径穿越、Prompt 注入、密钥泄露、越权配置和沙箱逃逸基线。
 6. 部署测试：Docker Compose，以及 Ubuntu、Debian、Rocky/AlmaLinux 原生安装 smoke test。
@@ -281,6 +291,7 @@ MVP 验收必须证明：
 
 - 同一 API/模型可供不同角色使用，角色上下文与权限互不混淆。
 - 同一任务可使用多个模型和中转站，并在故障时按策略降级。
+- 并发 API 可由多个 Agent 共享；串行 API 使用单槽，多凭证池可提供并行容量；满载时先排队、超时后才降级。
 - 飞书和 Web 图片能够按模型能力正确路由；纯文本模型不会收到图片，识别结果带来源和置信度。
 - Direct、Dispatch、Discuss、Hybrid 均可由命令指定并被自动路由。
 - 低置信度时飞书卡片询问，失败时文本询问，未确认不启动复杂任务。
