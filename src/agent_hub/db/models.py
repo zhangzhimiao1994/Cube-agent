@@ -1,7 +1,16 @@
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -34,7 +43,13 @@ class UserRow(Base):
 
 class ConfigRevisionRow(Base):
     __tablename__ = "agent_hub_config_revisions"
-    __table_args__ = (UniqueConstraint("tenant_id", "version"),)
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "version"),
+        CheckConstraint(
+            "status IN ('draft', 'published', 'superseded')",
+            name="ck_agent_hub_config_revisions_status",
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
     tenant_id: Mapped[UUID] = mapped_column(ForeignKey("agent_hub_tenants.id"))

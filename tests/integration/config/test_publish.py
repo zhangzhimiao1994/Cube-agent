@@ -2,14 +2,17 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from typing import Literal
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.config.repository import (
     ConfigNotFoundError,
     ConfigRepository,
+    ConfigStatus,
     ConfigStatusError,
 )
 from agent_hub.config.service import (
@@ -17,7 +20,7 @@ from agent_hub.config.service import (
     ConfigService,
     PostCommitNotificationError,
 )
-from agent_hub.db.models import TenantRow
+from agent_hub.db.models import ConfigRevisionRow, TenantRow
 from agent_hub.db.session import Database, build_database
 
 
@@ -62,6 +65,26 @@ class RecordingNotifier:
 class FailingNotifier:
     async def notify(self, event: ConfigPublishedEvent) -> None:
         raise RuntimeError(f"delivery failed for {event.version}")
+
+
+class CollectingNotifier:
+    def __init__(self) -> None:
+        self.events: list[ConfigPublishedEvent] = []
+
+    async def notify(self, event: ConfigPublishedEvent) -> None:
+        self.events.append(event)
+
+
+class InvalidPublishStatusRepository(ConfigRepository):
+    def set_status(
+        self,
+        row: ConfigRevisionRow,
+        status: Literal[ConfigStatus.PUBLISHED, ConfigStatus.SUPERSEDED],
+    ) -> None:
+        if status is ConfigStatus.PUBLISHED:
+            row.status = "archived"
+            return
+        super().set_status(row, status)
 
 
 @asynccontextmanager
@@ -262,3 +285,49 @@ async def test_notification_failure_is_reported_after_commit(
     assert current is not None
     assert current.version == draft.version
     assert current.status == "published"
+
+
+@pytest.mark.integration
+async def test_database_rejects_configuration_status_outside_state_machine(
+    db_session: AsyncSession,
+) -> None:
+    tenant_id = await create_tenant(db_session, "invalid-database-status")
+    db_session.add(
+        ConfigRevisionRow(
+            tenant_id=tenant_id,
+            version=1,
+            status="archived",
+            document={"models": {}, "agents": []},
+            created_by=uuid4(),
+        )
+    )
+
+    with pytest.raises(IntegrityError):
+        await db_session.flush()
+    await db_session.rollback()
+
+
+@pytest.mark.integration
+async def test_publish_flush_failure_rolls_back_and_does_not_notify(
+    db_session: AsyncSession, database_url: str
+) -> None:
+    tenant_id = await create_tenant(db_session, "publish-flush-failure")
+    actor_id = uuid4()
+    async with database_resource(database_url) as database:
+        async with database.session_factory() as session:
+            draft = await ConfigService().create_draft(
+                session, tenant_id, actor_id, document()
+            )
+            notifier = CollectingNotifier()
+            service = ConfigService(InvalidPublishStatusRepository(), notifier)
+
+            with pytest.raises(IntegrityError):
+                await service.publish(session, tenant_id, draft.version, actor_id)
+
+        async with database.session_factory() as observer:
+            stored = await ConfigService().get_version(observer, tenant_id, draft.version)
+            current = await ConfigService().get_current(observer, tenant_id)
+
+    assert stored.status == "draft"
+    assert current is None
+    assert notifier.events == []

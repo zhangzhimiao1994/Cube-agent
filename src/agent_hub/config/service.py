@@ -138,8 +138,15 @@ class ConfigService:
                 raise ConfigNotFoundError(
                     f"configuration version {source_version} was not found for tenant {tenant_id}"
                 )
-            if source.status == ConfigStatus.DRAFT.value:
-                raise ConfigStatusError("cannot roll back from a draft revision")
+            rollback_source_statuses = {
+                ConfigStatus.PUBLISHED.value,
+                ConfigStatus.SUPERSEDED.value,
+            }
+            if source.status not in rollback_source_statuses:
+                raise ConfigStatusError(
+                    "rollback source must be a published or superseded revision; "
+                    f"{source.status} revision is not eligible"
+                )
 
             current = await self._repository.get_current_row(
                 session, tenant_id, for_update=True
