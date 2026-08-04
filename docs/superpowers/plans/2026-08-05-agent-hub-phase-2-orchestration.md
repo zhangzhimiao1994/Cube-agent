@@ -76,7 +76,10 @@ class Deployment:
     provider_model: str = "openai/gpt-4o-mini"
     api_base: str = "http://litellm:4000/v1"
     secret_ref: str = "litellm-internal-key"
+    quota_scope_id: str = "default-account"
     max_concurrency: int = 1
+    target_utilization: float = 0.8
+    reserved_slots: int = 0
     rpm: int | None = None
     tpm: int | None = None
     weight: int = 100
@@ -155,7 +158,7 @@ Expected: FAIL because no lease pool exists.
 
 - [ ] **Step 3: Implement atomic Redis leases**
 
-Use a sorted set per deployment where score is lease expiry epoch and member is a UUID. The acquire Lua script removes expired leases, compares `ZCARD` to `max_concurrency`, inserts a new lease when a slot is free, and returns success atomically. Release removes only the exact lease ID. RPM/TPM counters use windowed Redis keys with TTL.
+Use a sorted set per `quota_scope_id` where score is lease expiry epoch and member is a UUID. The acquire Lua script removes expired leases, calculates a safe operational limit from configured concurrency, target utilization, and reserved slots, compares `ZCARD` to that limit, inserts a new lease when a slot is free, and returns success atomically. Multiple keys in the same quota scope share this signal. Release removes only the exact lease ID. RPM/TPM token buckets are quota-scoped Redis keys with TTL.
 
 ```python
 @dataclass(frozen=True)
@@ -180,13 +183,13 @@ class CapacityPool:
 
 - [ ] **Step 4: Add gateway fallback and lease recovery**
 
-`ModelGateway.complete()` must acquire from the primary logical model, resolve the secret only after lease acquisition, invoke the transport, and release in `finally`. A capacity wait timeout may traverse the configured fallback chain only when `allow_fallback=True`. A worker heartbeat renews long calls; expired leases are naturally reclaimed. `429` reduces a deployment's dynamic concurrency and starts cooldown; successful probes restore one slot at a time up to the configured maximum.
+`ModelGateway.complete()` must acquire from the primary logical model, resolve the secret only after lease acquisition, invoke the transport, and release in `finally` only after the response/stream completes. A capacity wait timeout may traverse the configured fallback chain only when `allow_fallback=True`. A worker heartbeat renews long calls; expired leases are naturally reclaimed. `429`, `503`, or elevated P95 latency reduce quota-scope concurrency and start cooldown; successful probes restore one slot at a time only up to the safe utilization limit.
 
 - [ ] **Step 5: Verify concurrency behavior**
 
 Run: `uv run pytest tests/unit/models/test_gateway.py tests/integration/models/test_capacity.py -q`
 
-Expected: one-key concurrency, multi-key pooling, bounded queue, timeout fallback, cancellation release, expired lease reclamation, and duplicate fingerprint tests pass.
+Expected: one-key concurrency, independent-quota pooling, same-account keys sharing one limit, safety headroom, RPM/TPM token buckets, bounded queue, timeout fallback, cancellation release, expired lease reclamation, and duplicate fingerprint tests pass.
 
 - [ ] **Step 6: Commit the capacity pool**
 

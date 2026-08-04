@@ -195,12 +195,30 @@ class Base(DeclarativeBase):
 
 ```python
 # src/agent_hub/db/session.py
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from dataclasses import dataclass
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 
-def build_session_factory(database_url: str) -> async_sessionmaker[AsyncSession]:
-    engine = create_async_engine(database_url, pool_pre_ping=True)
+def build_engine(database_url: str) -> AsyncEngine:
+    return create_async_engine(database_url, pool_pre_ping=True)
+
+
+def build_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(engine, expire_on_commit=False)
+
+
+@dataclass
+class Database:
+    engine: AsyncEngine
+    sessions: async_sessionmaker[AsyncSession]
+
+    async def dispose(self) -> None:
+        await self.engine.dispose()
+
+
+def build_database(database_url: str) -> Database:
+    engine = build_engine(database_url)
+    return Database(engine=engine, sessions=build_session_factory(engine))
 ```
 
 ```python
@@ -407,7 +425,10 @@ class DeploymentDefinition(BaseModel):
     model: str
     api_base: str | None = None
     secret_ref: str
+    quota_scope_id: str
     max_concurrency: int = Field(default=1, ge=1, le=1000)
+    target_utilization: float = Field(default=0.8, ge=0.5, le=0.9)
+    reserved_slots: int = Field(default=0, ge=0)
     rpm: int | None = Field(default=None, ge=1)
     tpm: int | None = Field(default=None, ge=1)
     capabilities: set[Literal["text", "vision", "tool_calling", "structured_output"]] = Field(default_factory=lambda: {"text"})

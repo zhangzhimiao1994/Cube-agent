@@ -325,7 +325,7 @@ Add models/deployments, credential create/rotate, concurrency probe, agents, wor
 
 - [ ] **Step 3: Implement Web forms and immutable publish flow**
 
-Model form edits provider, base URL, logical model, capabilities, max concurrency, RPM/TPM, queue timeout, fallback, weight, and secret reference. Show probe output as a recommendation requiring explicit save. Configuration pages edit a draft and require Diff confirmation before publish.
+Model form edits provider, base URL, logical model, capabilities, credential, quota scope, max concurrency, target utilization, reserved capacity, RPM/TPM, queue timeout, fallback, weight, and secret reference. Warn that keys in the same provider account may share quota and cannot be counted twice. Show a progressive non-saturating probe as a recommendation requiring explicit save. Configuration pages edit a draft and require Diff confirmation before publish.
 
 - [ ] **Step 4: Test and commit**
 
