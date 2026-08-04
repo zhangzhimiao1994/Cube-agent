@@ -369,7 +369,7 @@ Quality runs Python lint/type/test, Web lint/test/build, ShellCheck/Bats, depend
 
 - [ ] **Step 2: Implement smoke verification**
 
-`smoke.sh` installs unattended, consumes the setup code, logs in, publishes a minimal config with fake LiteLLM, submits Direct/Dispatch/Discuss/Hybrid tasks, tests a serial model queue plus two-key pool, submits a sample image, exercises Skill approval/MCP, restarts Worker, runs backup/restore verification, and checks redacted audit output.
+`smoke.sh` installs unattended, consumes the setup code, logs in, publishes a minimal config with fake LiteLLM, submits Direct/Dispatch/Discuss/Hybrid tasks, tests a serial queue, same-account keys sharing one quota scope, and two independent quota scopes adding capacity; verifies safety headroom and queue-before-fallback; submits a sample image, exercises Skill approval/MCP, restarts Worker, runs backup/restore verification, and checks redacted audit output.
 
 - [ ] **Step 3: Run available local jobs and commit**
 
@@ -400,7 +400,7 @@ README starts with verified release download, checksum verification, `sudo bash 
 
 - [ ] **Step 2: Add executable documentation checks**
 
-Extract shell blocks marked `testable` and run them in CI. Validate internal Markdown links and assert that examples contain no real-looking secrets. Include these exact model-pool examples: one key with concurrency 8; one serial key with concurrency 1; four independent serial keys providing four slots; queue timeout then fallback.
+Extract shell blocks marked `testable` and run them in CI. Validate internal Markdown links and assert that examples contain no real-looking secrets. Include these exact model-pool examples: one account quota with configured concurrency 8 and safe utilization below 100%; one serial quota with concurrency 1; multiple keys in one account sharing capacity; four independent quota scopes providing four serial slots; queue timeout then fallback.
 
 - [ ] **Step 3: Run the global verification gate**
 

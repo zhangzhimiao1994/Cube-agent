@@ -407,7 +407,10 @@ class DeploymentDefinition(BaseModel):
     model: str
     api_base: str | None = None
     secret_ref: str
+    quota_scope_id: str
     max_concurrency: int = Field(default=1, ge=1, le=1000)
+    target_utilization: float = Field(default=0.8, ge=0.5, le=0.9)
+    reserved_slots: int = Field(default=0, ge=0)
     rpm: int | None = Field(default=None, ge=1)
     tpm: int | None = Field(default=None, ge=1)
     capabilities: set[Literal["text", "vision", "tool_calling", "structured_output"]] = Field(default_factory=lambda: {"text"})
