@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: agent_hub_test
+      POSTGRES_USER: agent_hub_test
+      POSTGRES_PASSWORD: agent_hub_test
+    ports:
+      - "127.0.0.1:54329:5432"
+    volumes:
+      - agent_hub_test_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_hub_test -d agent_hub_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  redis:
+    image: redis:7
+    ports:
+      - "127.0.0.1:56379:6379"
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+volumes:
+  agent_hub_test_postgres_data:
