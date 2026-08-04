@@ -1,7 +1,14 @@
-from sqlalchemy.ext.asyncio import AsyncEngine
+import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from time import monotonic
+from typing import cast
+
+import pytest
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from agent_hub.db.migrations import resolve_database_url
-from agent_hub.db.session import build_database
+from agent_hub.db.session import Database, build_database, build_session_factory
 from agent_hub.settings import Settings
 
 
@@ -12,6 +19,37 @@ async def test_database_exposes_and_disposes_its_owned_engine() -> None:
     assert database.session_factory.kw["bind"] is database.engine
 
     await database.dispose()
+
+
+async def test_session_factory_uses_caller_owned_engine() -> None:
+    database = build_database("postgresql+asyncpg://user:password@localhost:5432/database")
+    try:
+        session_factory = build_session_factory(database.engine)
+
+        assert session_factory.kw["bind"] is database.engine
+    finally:
+        await database.dispose()
+
+
+class HangingEngine:
+    @asynccontextmanager
+    async def connect(self) -> AsyncIterator[None]:
+        await asyncio.Event().wait()
+        yield None
+
+
+async def test_readiness_timeout_bounds_a_hanging_connection_attempt() -> None:
+    database = Database(
+        engine=cast(AsyncEngine, HangingEngine()),
+        session_factory=cast(async_sessionmaker[AsyncSession], None),
+    )
+    started_at = monotonic()
+
+    with pytest.raises(TimeoutError, match="Database did not become ready"):
+        async with asyncio.timeout(0.2):
+            await database.wait_until_ready(timeout_seconds=0.05, retry_interval_seconds=0.01)
+
+    assert monotonic() - started_at < 0.15
 
 
 def test_configured_migration_url_overrides_application_settings() -> None:

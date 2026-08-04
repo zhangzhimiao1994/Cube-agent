@@ -33,15 +33,19 @@ def alembic_config(database_url: str) -> Config:
 
 @pytest.fixture(scope="session", autouse=True)
 def migrated_database(database_url: str) -> Iterator[None]:
-    database = build_database(database_url)
-    try:
-        asyncio.run(database.wait_until_ready())
-    finally:
-        asyncio.run(database.dispose())
+    asyncio.run(_wait_for_database(database_url))
     config = Config(str(REPOSITORY_ROOT / "alembic.ini"))
     config.set_main_option("sqlalchemy.url", database_url)
     command.upgrade(config, "head")
     yield
+
+
+async def _wait_for_database(database_url: str) -> None:
+    database = build_database(database_url)
+    try:
+        await database.wait_until_ready()
+    finally:
+        await database.dispose()
 
 
 @pytest.fixture

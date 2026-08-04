@@ -21,6 +21,8 @@ def _session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
 
 @dataclass(slots=True)
 class Database:
+    """Application-lifespan database resource; dispose it during application shutdown."""
+
     engine: AsyncEngine
     session_factory: async_sessionmaker[AsyncSession]
 
@@ -32,14 +34,22 @@ class Database:
     ) -> None:
         deadline = monotonic() + timeout_seconds
         while True:
+            remaining_seconds = deadline - monotonic()
+            if remaining_seconds <= 0:
+                raise TimeoutError(f"Database did not become ready within {timeout_seconds} seconds")
             try:
-                async with self.engine.connect():
-                    return
+                async with asyncio.timeout(remaining_seconds):
+                    async with self.engine.connect():
+                        return
+            except TimeoutError as error:
+                message = f"Database did not become ready within {timeout_seconds} seconds"
+                raise TimeoutError(message) from error
             except (OSError, SQLAlchemyError) as error:
-                if monotonic() >= deadline:
+                remaining_seconds = deadline - monotonic()
+                if remaining_seconds <= 0:
                     message = f"Database did not become ready within {timeout_seconds} seconds"
                     raise TimeoutError(message) from error
-                await asyncio.sleep(retry_interval_seconds)
+                await asyncio.sleep(min(retry_interval_seconds, remaining_seconds))
 
 
 def build_database(database_url: str) -> Database:
@@ -47,5 +57,5 @@ def build_database(database_url: str) -> Database:
     return Database(engine=engine, session_factory=_session_factory(engine))
 
 
-def build_session_factory(database_url: str) -> async_sessionmaker[AsyncSession]:
-    return _session_factory(build_engine(database_url))
+def build_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
+    return _session_factory(engine)
