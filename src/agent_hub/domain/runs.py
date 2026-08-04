@@ -1,4 +1,6 @@
+from collections.abc import Mapping
 from enum import StrEnum
+from types import MappingProxyType
 
 
 class TaskMode(StrEnum):
@@ -27,7 +29,7 @@ class InvalidTransition(ValueError):
     pass
 
 
-_ALLOWED_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
+_ALLOWED_TRANSITIONS: Mapping[RunStatus, frozenset[RunStatus]] = MappingProxyType({
     RunStatus.QUEUED: frozenset({RunStatus.PLANNING, RunStatus.CANCELLED}),
     RunStatus.PLANNING: frozenset(
         {RunStatus.WAITING_USER_MODE, RunStatus.RUNNING, RunStatus.FAILED, RunStatus.CANCELLED}
@@ -54,7 +56,7 @@ _ALLOWED_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
     RunStatus.COMPLETED: frozenset(),
     RunStatus.FAILED: frozenset(),
     RunStatus.CANCELLED: frozenset(),
-}
+})
 
 
 def transition(current: RunStatus, target: RunStatus) -> RunStatus:
