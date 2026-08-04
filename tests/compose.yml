@@ -1,14 +1,17 @@
+# Set AGENT_HUB_TEST_COMPOSE_PROJECT and both host-port variables for parallel runs.
+name: ${AGENT_HUB_TEST_COMPOSE_PROJECT:-agent-hub-test}
+
 services:
   postgres:
-    image: postgres:16
+    image: postgres:16.11
     environment:
       POSTGRES_DB: agent_hub_test
       POSTGRES_USER: agent_hub_test
       POSTGRES_PASSWORD: agent_hub_test
     ports:
-      - "127.0.0.1:54329:5432"
-    volumes:
-      - agent_hub_test_postgres_data:/var/lib/postgresql/data
+      - "127.0.0.1:${AGENT_HUB_TEST_POSTGRES_PORT:-54329}:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U agent_hub_test -d agent_hub_test"]
       interval: 2s
@@ -16,9 +19,9 @@ services:
       retries: 15
 
   redis:
-    image: redis:7
+    image: redis:7.4
     ports:
-      - "127.0.0.1:56379:6379"
+      - "127.0.0.1:${AGENT_HUB_TEST_REDIS_PORT:-56379}:6379"
     tmpfs:
       - /data
     healthcheck:
@@ -26,6 +29,3 @@ services:
       interval: 2s
       timeout: 5s
       retries: 15
-
-volumes:
-  agent_hub_test_postgres_data:
