@@ -312,3 +312,4 @@ MVP 验收必须证明：
 - AutoGen AgentChat：https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/
 - LiteLLM：https://docs.litellm.ai/docs/
 - 飞书事件订阅：https://open.feishu.cn/document/server-docs/event-subscription-guide/overview
+- DeepSeek 并发与隔离：https://api-docs.deepseek.com/quick_start/rate_limit
