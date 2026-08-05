@@ -4,6 +4,7 @@ import asyncio
 import json
 import math
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping
+from decimal import Decimal
 from pathlib import Path
 from typing import cast
 from uuid import UUID, uuid4
@@ -42,6 +43,22 @@ def deeply_nested_json() -> dict[str, object]:
     for _ in range(40):
         value = [value]
     return {"value": value}
+
+
+def exception_graph_text(error: BaseException) -> str:
+    rendered: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        rendered.extend((str(current), repr(current)))
+        traceback = current.__traceback__
+        while traceback is not None:
+            if "agent_hub" in traceback.tb_frame.f_code.co_filename:
+                rendered.append(repr(traceback.tb_frame.f_locals))
+            traceback = traceback.tb_next
+        current = current.__cause__ or current.__context__
+    return " ".join(rendered)
 
 
 class FakeGateway:
@@ -114,6 +131,7 @@ def test_contract_validation_strings_and_safe_factory_hide_hostile_input() -> No
     assert sentinel not in str(safe.value)
     assert safe.value.__cause__ is None
     assert safe.value.__context__ is None
+    assert sentinel not in exception_graph_text(safe.value)
 
 
 def test_artifact_freezes_nested_json_and_computes_hash() -> None:
@@ -308,6 +326,85 @@ def test_event_contract_supports_bounded_framework_neutral_evolution() -> None:
             ),
             payload={"x": 1},
         )
+
+
+def test_known_future_events_enforce_kind_specific_semantics() -> None:
+    artifact = Artifact(id=uuid4(), type="text", producer="tool", content={"text": "result"})
+    events = (
+        RunEvent(
+            kind=EventKind.REVIEW_COMPLETED,
+            sequence=1,
+            run_id=RUN_ID,
+            actor="reviewer",
+            inputs=(artifact,),
+            payload={"verdict": "approve"},
+        ),
+        RunEvent(
+            kind=EventKind.DISCUSSION_STARTED,
+            sequence=2,
+            run_id=RUN_ID,
+            actor="moderator",
+            session_id="session-1",
+            participants=("moderator", "critic"),
+        ),
+        RunEvent(
+            kind=EventKind.TOOL_STARTED,
+            sequence=3,
+            run_id=RUN_ID,
+            actor="researcher",
+            tool_call_id="call-1",
+            tool_name="search",
+            payload={"query": "safe"},
+        ),
+        RunEvent(
+            kind=EventKind.TOOL_COMPLETED,
+            sequence=4,
+            run_id=RUN_ID,
+            actor="researcher",
+            tool_call_id="call-1",
+            tool_name="search",
+            artifact=artifact,
+        ),
+        RunEvent(
+            kind=EventKind.APPROVAL_REQUESTED,
+            sequence=5,
+            run_id=RUN_ID,
+            actor="main",
+            approval_id="approval-1",
+            action="publish",
+            reason="operator approval required",
+        ),
+        RunEvent(
+            kind=EventKind.APPROVAL_RESOLVED,
+            sequence=6,
+            run_id=RUN_ID,
+            actor="operator",
+            approval_id="approval-1",
+            decision="approved",
+        ),
+        RunEvent(
+            kind=EventKind.COST_RECORDED,
+            sequence=7,
+            run_id=RUN_ID,
+            actor="main",
+            provider_id="deepseek",
+            cost_usd=Decimal("0.01"),
+            currency="USD",
+        ),
+    )
+    assert len(events) == 7
+    with pytest.raises(ValidationError):
+        RunEvent(kind=EventKind.TOOL_STARTED, sequence=8, run_id=RUN_ID, actor="main")
+    with pytest.raises(ValidationError):
+        RunEvent(
+            kind=EventKind.COST_RECORDED,
+            sequence=9,
+            run_id=RUN_ID,
+            actor="main",
+            provider_id="deepseek",
+            cost_usd=Decimal("NaN"),
+            currency="USD",
+        )
     with pytest.raises(ValidationError):
         RunEvent(
             kind="step.completed",
@@ -377,6 +474,38 @@ def test_registry_redacts_hostile_runtime_property_failure() -> None:
     assert sentinel not in str(caught.value)
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+
+
+def test_registry_stops_consuming_at_duplicate_and_hard_limit() -> None:
+    first = DirectRuntime(FakeGateway(), logical_model="general")
+    consumed = 0
+
+    def duplicates() -> object:
+        nonlocal consumed
+        for item in (first, first):
+            consumed += 1
+            yield item
+        raise AssertionError("registry consumed beyond duplicate")
+
+    with pytest.raises(InvalidRuntimeRegistration, match="duplicate"):
+        RuntimeRegistry(duplicates())  # type: ignore[arg-type]
+    assert consumed == 2
+
+    class ModeRuntime:
+        def __init__(self, mode: TaskMode) -> None:
+            self.mode = mode
+
+    consumed = 0
+
+    def many() -> object:
+        nonlocal consumed
+        while True:
+            consumed += 1
+            yield ModeRuntime(TaskMode.DIRECT if consumed == 1 else TaskMode.DISPATCH)
+
+    with pytest.raises(InvalidRuntimeRegistration):
+        RuntimeRegistry(many())  # type: ignore[arg-type]
+    assert consumed <= 17
 
 
 def test_direct_runtime_rejects_unsafe_logical_model_identifier() -> None:
@@ -490,6 +619,7 @@ async def test_gateway_failure_is_redacted() -> None:
         await collect(runtime, context(request="safe request"))
     assert sentinel not in str(caught.value)
     assert sentinel not in repr(caught.value)
+    assert sentinel not in exception_graph_text(caught.value)
 
 
 async def test_invalid_model_text_is_redacted() -> None:
@@ -501,6 +631,7 @@ async def test_invalid_model_text_is_redacted() -> None:
     with pytest.raises(RuntimeExecutionError) as caught:
         await collect(runtime, context())
     assert sentinel not in str(caught.value)
+    assert sentinel not in exception_graph_text(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -614,6 +745,28 @@ async def test_concurrent_cancel_closes_completed_gateway_stream_once() -> None:
     await asyncio.gather(runtime.cancel(), runtime.cancel(), runtime.cancel())
     events = await collect(runtime, context(run_id=uuid4()))
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_cancel_retrieves_already_failed_gateway_task_without_loop_warning() -> None:
+    sentinel = "failed-task-api-key-sentinel"
+    gateway = FakeGateway(RuntimeError(sentinel))
+    runtime = DirectRuntime(gateway, logical_model="general")
+    loop = asyncio.get_running_loop()
+    observed: list[dict[str, object]] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: observed.append(dict(context)))
+    try:
+        stream = runtime.run(context())
+        assert (await anext(stream)).kind is EventKind.MODEL_STARTED
+        await asyncio.sleep(0)
+        await runtime.cancel()
+        gateway.response = ModelResponse(text="safe", usage=TokenUsage(1, 1, 2))
+        events = await collect(runtime, context(run_id=uuid4()))
+        assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+        await asyncio.sleep(0)
+        assert not observed
+    finally:
+        loop.set_exception_handler(previous)
 
 
 async def test_restore_rejects_wrong_version_run_tenant_and_mode() -> None:

@@ -8,9 +8,10 @@ import math
 import re
 import unicodedata
 from collections.abc import AsyncIterator, Mapping
+from decimal import Decimal
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Protocol, Self, cast
+from typing import Literal, Never, Protocol, Self, cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -159,6 +160,10 @@ class RuntimeContractError(ValueError):
     """A stable error that never exposes hostile contract input."""
 
 
+def _raise_contract_error() -> Never:
+    raise RuntimeContractError("invalid runtime contract") from None
+
+
 class _RuntimeContractModel(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
@@ -172,6 +177,7 @@ class _RuntimeContractModel(BaseModel):
     def from_payload(cls, payload: object) -> Self:
         failed = False
         validated: Self | None = None
+        encoded: str | None = None
         try:
             encoded = json.dumps(
                 payload,
@@ -187,8 +193,9 @@ class _RuntimeContractModel(BaseModel):
             error.__cause__ = None
             del error
             failed = True
+        del payload, encoded
         if failed or validated is None:
-            raise RuntimeContractError("invalid runtime contract") from None
+            _raise_contract_error()
         return validated
 
 
@@ -427,6 +434,16 @@ class RunEvent(_RuntimeContractModel):
     actor: str | None = None
     message: str | None = Field(default=None, repr=False)
     payload: Mapping[str, JsonValue] = Field(default_factory=dict, repr=False)
+    session_id: str | None = None
+    participants: tuple[str, ...] = Field(default=(), max_length=8)
+    tool_call_id: str | None = None
+    tool_name: str | None = None
+    approval_id: str | None = None
+    action: str | None = None
+    decision: Literal["approved", "rejected"] | None = None
+    provider_id: str | None = None
+    cost_usd: Decimal | None = Field(default=None, gt=0, allow_inf_nan=False)
+    currency: Literal["USD"] | None = None
 
     @field_validator("kind", mode="before")
     @classmethod
@@ -456,7 +473,16 @@ class RunEvent(_RuntimeContractModel):
             _safe_free_text(value, name="event reason", max_bytes=512)
         return value
 
-    @field_validator("step_id", "actor")
+    @field_validator(
+        "step_id",
+        "actor",
+        "session_id",
+        "tool_call_id",
+        "tool_name",
+        "approval_id",
+        "action",
+        "provider_id",
+    )
     @classmethod
     def safe_optional_identifier(cls, value: str | None) -> str | None:
         if value is not None:
@@ -474,6 +500,18 @@ class RunEvent(_RuntimeContractModel):
     @classmethod
     def validate_payload(cls, value: object) -> object:
         return _strict_json_input(_freeze_object(value, name="event payload"))
+
+    @field_validator("participants", mode="before")
+    @classmethod
+    def freeze_participants(cls, value: object) -> tuple[str, ...]:
+        if not isinstance(value, list | tuple):
+            raise TypeError("participants must be a list or tuple")
+        result = tuple(value)
+        if not all(type(item) is str and _SAFE_ID.fullmatch(item) is not None for item in result):
+            raise ValueError("participants must contain safe identifiers")
+        if len(set(result)) != len(result):
+            raise ValueError("participants must be unique")
+        return cast(tuple[str, ...], result)
 
     @field_validator("inputs", mode="before")
     @classmethod
@@ -527,6 +565,128 @@ class RunEvent(_RuntimeContractModel):
             self.actor is None or self.message is None
         ):
             raise ValueError("message.created requires actor and message")
+        if self.kind is EventKind.REVIEW_COMPLETED and (
+            self.actor is None
+            or not self.inputs
+            or self.payload.get("verdict") not in {"approve", "revise", "reject"}
+        ):
+            raise ValueError("review.completed requires actor, inputs, and verdict")
+        if self.kind is EventKind.DISCUSSION_STARTED and (
+            self.actor is None
+            or self.session_id is None
+            or not 2 <= len(self.participants) <= 8
+            or self.actor not in self.participants
+        ):
+            raise ValueError("discussion.started requires actor, session, and participants")
+        tool_kinds = {
+            EventKind.TOOL_STARTED,
+            EventKind.TOOL_COMPLETED,
+            EventKind.TOOL_FAILED,
+        }
+        if self.kind in tool_kinds and (
+            self.actor is None or self.tool_call_id is None or self.tool_name is None
+        ):
+            raise ValueError("tool events require actor, call id, and tool name")
+        if self.kind is EventKind.TOOL_COMPLETED and self.artifact is None and not self.payload:
+            raise ValueError("tool.completed requires an artifact or result payload")
+        if self.kind is EventKind.APPROVAL_REQUESTED and (
+            self.approval_id is None
+            or self.actor is None
+            or self.action is None
+            or self.reason is None
+            or self.decision is not None
+        ):
+            raise ValueError("approval.requested fields are inconsistent")
+        if self.kind is EventKind.APPROVAL_RESOLVED and (
+            self.approval_id is None
+            or self.actor is None
+            or self.decision is None
+            or self.action is not None
+            or self.reason is not None
+        ):
+            raise ValueError("approval.resolved fields are inconsistent")
+        if self.kind is EventKind.COST_RECORDED and (
+            self.actor is None
+            or self.provider_id is None
+            or self.cost_usd is None
+            or not self.cost_usd.is_finite()
+            or self.currency != "USD"
+        ):
+            raise ValueError("cost.recorded fields are inconsistent")
+        specialized_present = any(
+            (
+                self.session_id is not None,
+                bool(self.participants),
+                self.tool_call_id is not None,
+                self.tool_name is not None,
+                self.approval_id is not None,
+                self.action is not None,
+                self.decision is not None,
+                self.provider_id is not None,
+                self.cost_usd is not None,
+                self.currency is not None,
+            )
+        )
+        present: set[str] = set()
+        for name, is_present in (
+            ("artifact", self.artifact is not None),
+            ("checkpoint", self.checkpoint is not None),
+            ("reason", self.reason is not None),
+            ("inputs", bool(self.inputs)),
+            ("step_id", self.step_id is not None),
+            ("actor", self.actor is not None),
+            ("message", self.message is not None),
+            ("payload", bool(self.payload)),
+            ("session_id", self.session_id is not None),
+            ("participants", bool(self.participants)),
+            ("tool_call_id", self.tool_call_id is not None),
+            ("tool_name", self.tool_name is not None),
+            ("approval_id", self.approval_id is not None),
+            ("action", self.action is not None),
+            ("decision", self.decision is not None),
+            ("provider_id", self.provider_id is not None),
+            ("cost_usd", self.cost_usd is not None),
+            ("currency", self.currency is not None),
+        ):
+            if is_present:
+                present.add(name)
+        allowed_by_kind: dict[EventKind, frozenset[str]] = {
+            EventKind.STEP_STARTED: frozenset({"step_id", "actor", "payload", "inputs"}),
+            EventKind.STEP_COMPLETED: frozenset({"step_id", "actor", "payload", "inputs"}),
+            EventKind.STEP_FAILED: frozenset({"step_id", "actor", "reason", "payload"}),
+            EventKind.STEP_RETRYING: frozenset({"step_id", "actor", "reason", "payload"}),
+            EventKind.REVIEW_COMPLETED: frozenset({"actor", "inputs", "payload"}),
+            EventKind.DISCUSSION_STARTED: frozenset(
+                {"actor", "session_id", "participants", "inputs", "payload"}
+            ),
+            EventKind.MESSAGE_CREATED: frozenset(
+                {"actor", "session_id", "message", "inputs", "payload"}
+            ),
+            EventKind.TOOL_STARTED: frozenset(
+                {"actor", "tool_call_id", "tool_name", "payload"}
+            ),
+            EventKind.TOOL_COMPLETED: frozenset(
+                {"actor", "tool_call_id", "tool_name", "artifact", "payload"}
+            ),
+            EventKind.TOOL_FAILED: frozenset(
+                {"actor", "tool_call_id", "tool_name", "reason", "payload"}
+            ),
+            EventKind.APPROVAL_REQUESTED: frozenset(
+                {"actor", "approval_id", "action", "reason", "payload"}
+            ),
+            EventKind.APPROVAL_RESOLVED: frozenset(
+                {"actor", "approval_id", "decision", "payload"}
+            ),
+            EventKind.COST_RECORDED: frozenset(
+                {"actor", "provider_id", "cost_usd", "currency", "payload"}
+            ),
+        }
+        if (
+            isinstance(self.kind, EventKind)
+            and self.kind in allowed_by_kind
+            and present - allowed_by_kind[self.kind]
+        ):
+            raise ValueError("event carries fields unrelated to its kind")
         direct_kinds = {
             EventKind.MODEL_STARTED,
             EventKind.ARTIFACT_CREATED,
@@ -536,10 +696,17 @@ class RunEvent(_RuntimeContractModel):
             EventKind.RUNTIME_CANCELLED,
         }
         if self.kind in direct_kinds and (
-            self.step_id is not None or self.actor is not None or self.message is not None or self.payload
+            self.step_id is not None
+            or self.actor is not None
+            or self.message is not None
+            or self.payload
+            or specialized_present
         ):
             raise ValueError("direct runtime events forbid extension fields")
-        if self.artifact is not None and self.kind is not EventKind.ARTIFACT_CREATED:
+        if self.artifact is not None and self.kind not in {
+            EventKind.ARTIFACT_CREATED,
+            EventKind.TOOL_COMPLETED,
+        }:
             raise ValueError("only artifact.created may carry an artifact")
         if self.checkpoint is not None and self.kind is not EventKind.CHECKPOINT_SAVED:
             raise ValueError("only checkpoint.saved may carry a checkpoint")
@@ -548,7 +715,17 @@ class RunEvent(_RuntimeContractModel):
         if (
             isinstance(self.kind, str)
             and not isinstance(self.kind, EventKind)
-            and (not self.payload or self.artifact is not None or self.checkpoint is not None)
+            and (
+                not self.payload
+                or self.artifact is not None
+                or self.checkpoint is not None
+                or self.step_id is not None
+                or self.actor is not None
+                or self.message is not None
+                or self.inputs
+                or self.reason is not None
+                or specialized_present
+            )
         ):
             raise ValueError("extension events require payload and forbid direct objects")
         return self

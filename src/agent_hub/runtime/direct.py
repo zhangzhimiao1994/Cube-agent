@@ -6,7 +6,7 @@ import asyncio
 import json
 import re
 from collections.abc import AsyncIterator
-from typing import Protocol, cast
+from typing import Never, Protocol, cast
 from uuid import UUID, uuid4
 
 from agent_hub.domain.runs import TaskMode
@@ -55,6 +55,10 @@ class RuntimeExecutionError(RuntimeError):
 
 class RuntimeBusy(RuntimeExecutionError):
     """The registered runtime instance is already executing one run."""
+
+
+def _raise_execution_error(message: str) -> Never:
+    raise RuntimeExecutionError(message) from None
 
 
 class DirectRuntime:
@@ -132,15 +136,36 @@ class DirectRuntime:
                 del error
                 gateway_failed = True
             if gateway_failed or completion is None:
-                raise RuntimeExecutionError("model gateway failed") from None
+                await self._consume_task_terminal(gateway_task)
+                self._active_task = None
+                gateway_task = None
+                del completion, request, included_source_ids, context
+                _raise_execution_error("model gateway failed")
 
-            completion = self._strict_completion(completion)
+            validated_completion = self._strict_completion(completion)
+            del completion
+            if validated_completion is None:
+                await self._consume_task_terminal(gateway_task)
+                self._active_task = None
+                gateway_task = None
+                del request, included_source_ids, context
+                _raise_execution_error("model response is invalid")
+            completion = validated_completion
+            del validated_completion
             response = completion.response
             if response.tool_calls or response.text is None:
-                raise RuntimeExecutionError("model response is unsupported")
+                await self._consume_task_terminal(gateway_task)
+                self._active_task = None
+                gateway_task = None
+                del response, completion, request, included_source_ids, context
+                _raise_execution_error("model response is unsupported")
             text = response.text
             if not text.strip() or len(text.encode("utf-8")) > _MAX_OUTPUT_BYTES:
-                raise RuntimeExecutionError("model response is invalid")
+                await self._consume_task_terminal(gateway_task)
+                self._active_task = None
+                gateway_task = None
+                del text, response, completion, request, included_source_ids, context
+                _raise_execution_error("model response is invalid")
             usage = response.usage
             if (
                 usage is None
@@ -148,7 +173,11 @@ class DirectRuntime:
                 or usage.completion_tokens > request.max_output_tokens
                 or usage.total_tokens > context.token_budget
             ):
-                raise RuntimeExecutionError("model response budget is unverifiable")
+                await self._consume_task_terminal(gateway_task)
+                self._active_task = None
+                gateway_task = None
+                del usage, text, response, completion, request, included_source_ids, context
+                _raise_execution_error("model response budget is unverifiable")
 
             artifact_failed = False
             artifact: Artifact | None = None
@@ -174,7 +203,15 @@ class DirectRuntime:
                 del error
                 artifact_failed = True
             if artifact_failed or artifact is None:
-                raise RuntimeExecutionError("model response is invalid") from None
+                await self._consume_task_terminal(gateway_task)
+                self._active_task = None
+                gateway_task = None
+                del artifact, text, response, completion, request, included_source_ids, context
+                _raise_execution_error("model response is invalid")
+            await self._consume_task_terminal(gateway_task)
+            self._active_task = None
+            gateway_task = None
+            del text, response, completion, request
             yield RunEvent(
                 kind=EventKind.ARTIFACT_CREATED,
                 sequence=2,
@@ -209,9 +246,10 @@ class DirectRuntime:
                 inputs=(artifact,),
             )
         finally:
-            if gateway_task is not None and not gateway_task.done():
-                gateway_task.cancel()
-                await asyncio.gather(gateway_task, return_exceptions=True)
+            if gateway_task is not None:
+                if not gateway_task.done():
+                    gateway_task.cancel()
+                await self._consume_task_terminal(gateway_task)
             if self._active_token is token:
                 self._active_token = None
                 self._active_stream = None
@@ -313,12 +351,13 @@ class DirectRuntime:
             error.__cause__ = None
             del error
             failed = True
+        del context
         if failed or validated is None:
-            raise RuntimeExecutionError("invalid task context") from None
+            _raise_execution_error("invalid task context")
         return validated
 
     @staticmethod
-    def _strict_completion(completion: GatewayCompletion) -> GatewayCompletion:
+    def _strict_completion(completion: GatewayCompletion) -> GatewayCompletion | None:
         failed = False
         validated: GatewayCompletion | None = None
         try:
@@ -354,8 +393,9 @@ class DirectRuntime:
             error.__cause__ = None
             del error
             failed = True
+        del completion
         if failed or validated is None:
-            raise RuntimeExecutionError("model response is invalid") from None
+            return None
         return validated
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
@@ -396,9 +436,20 @@ class DirectRuntime:
             error.__cause__ = None
             del error
             failed = True
+        del checkpoint
         if failed or validated is None:
-            raise RuntimeExecutionError("invalid runtime checkpoint") from None
+            _raise_execution_error("invalid runtime checkpoint")
         return validated
+
+    @staticmethod
+    async def _consume_task_terminal(task: asyncio.Task[GatewayCompletion]) -> None:
+        outcomes = await asyncio.gather(task, return_exceptions=True)
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                outcome.__traceback__ = None
+                outcome.__context__ = None
+                outcome.__cause__ = None
+        del outcome, outcomes, task
 
     def _validate_checkpoint_for_context(
         self, checkpoint: RuntimeCheckpoint, context: TaskContext
