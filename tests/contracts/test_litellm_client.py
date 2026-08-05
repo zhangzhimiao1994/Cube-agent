@@ -22,6 +22,8 @@ from agent_hub.models.types import (
 API_KEY = "runtime-" + "sentinel-secret"
 PROMPT = "private-" + "prompt-sentinel"
 RAW_ERROR = "raw-" + "provider-body-sentinel"
+MULTIMODAL_TEXT = "multimodal-" + "text-sentinel"
+IMAGE_URL = "https://images.example.com/private-" + "image-sentinel"
 
 
 def sdk_response(
@@ -87,10 +89,25 @@ def request(**overrides: object) -> ModelRequest:
     return ModelRequest(**values)  # type: ignore[arg-type]
 
 
+def sensitive_request() -> ModelRequest:
+    return request(
+        messages=[
+            ModelMessage(role="user", content=PROMPT),
+            ModelMessage(
+                role="user",
+                content=[
+                    {"type": "text", "text": MULTIMODAL_TEXT},
+                    {"type": "image_url", "image_url": {"url": IMAGE_URL}},
+                ],  # type: ignore[arg-type]
+            ),
+        ]
+    )
+
+
 async def test_uses_exact_openai_compatible_chat_completions_surface() -> None:
     transport, factory, create, close = mock_transport()
 
-    result = await transport.invoke(deployment(), request(), api_key=API_KEY)
+    result = await transport.complete(deployment(), request(), API_KEY)
 
     factory.assert_called_once_with(
         api_key=API_KEY,
@@ -118,7 +135,7 @@ async def test_normalizes_multimodal_parts_without_mutating_caller_data() -> Non
     ]
     message = ModelMessage(role="user", content=caller_parts)  # type: ignore[arg-type]
 
-    await transport.invoke(deployment(), request(messages=[message]), api_key=API_KEY)
+    await transport.complete(deployment(), request(messages=[message]), API_KEY)
 
     assert caller_parts == [
         {"type": "text", "text": "inspect"},
@@ -144,14 +161,16 @@ async def test_sends_current_json_schema_response_format() -> None:
     }
     response_schema = StructuredResponseSchema(name="answer_contract", schema=caller_schema)
     caller_schema["properties"]["answer"]["type"] = "integer"
+    with pytest.raises(TypeError):
+        response_schema.schema["type"] = "array"  # type: ignore[index]
 
-    await transport.invoke(
+    await transport.complete(
         deployment(capabilities={ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT}),
         request(
             required_capabilities={ModelCapability.STRUCTURED_OUTPUT},
             response_schema=response_schema,
         ),
-        api_key=API_KEY,
+        API_KEY,
     )
 
     assert create.await_args is not None
@@ -202,7 +221,7 @@ async def test_parses_first_choice_tool_calls_usage_and_allowlisted_metadata() -
         )
     )
 
-    result = await transport.invoke(deployment(), request(), api_key=API_KEY)
+    result = await transport.complete(deployment(), request(), API_KEY)
 
     assert result.text is None
     assert result.tool_calls[0].id == "call_1"
@@ -224,6 +243,53 @@ async def test_parses_first_choice_tool_calls_usage_and_allowlisted_metadata() -
         result.tool_calls[0].arguments["query"] = "changed"
 
 
+async def test_drops_provider_metadata_containing_runtime_secrets_or_prompt_content() -> None:
+    poisoned = sdk_response()
+    poisoned._request_id = "req-" + API_KEY  # type: ignore[attr-defined]
+    poisoned.model = "model/" + PROMPT  # type: ignore[attr-defined]
+    poisoned.system_fingerprint = "fp-" + IMAGE_URL  # type: ignore[attr-defined]
+    poisoned.choices[0].finish_reason = "finish-" + MULTIMODAL_TEXT  # type: ignore[attr-defined]
+    transport, _, _, _ = mock_transport(result=poisoned)
+
+    result = await transport.complete(deployment(), sensitive_request(), API_KEY)
+
+    assert dict(result.provider_metadata) == {"created": 123456}
+    rendered = f"{result!s} {result!r} {result.provider_metadata!r}"
+    for sensitive in (API_KEY, PROMPT, MULTIMODAL_TEXT, IMAGE_URL):
+        assert sensitive not in rendered
+
+
+@pytest.mark.parametrize("leaked_value", [API_KEY, PROMPT, MULTIMODAL_TEXT, IMAGE_URL])
+async def test_drops_sensitive_provider_error_request_id_without_retaining_context(
+    leaked_value: str,
+) -> None:
+    class ProviderFailure(RuntimeError):
+        status_code = 429
+        request_id = "req-" + leaked_value
+
+    transport, _, _, close = mock_transport(error=ProviderFailure(RAW_ERROR + leaked_value))
+
+    with pytest.raises(ModelTransportError) as caught:
+        await transport.complete(deployment(), sensitive_request(), API_KEY)
+
+    close.assert_awaited_once_with()
+    rendered = " ".join(
+        (
+            str(caught.value),
+            repr(caught.value),
+            "".join(
+                traceback.format_exception(
+                    type(caught.value), caught.value, caught.value.__traceback__
+                )
+            ),
+        )
+    )
+    for sensitive in (API_KEY, PROMPT, MULTIMODAL_TEXT, IMAGE_URL, RAW_ERROR):
+        assert sensitive not in rendered
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
 @pytest.mark.parametrize(
     "response",
     [
@@ -235,7 +301,7 @@ async def test_rejects_empty_or_malformed_responses_safely(response: object) -> 
     transport, _, _, close = mock_transport(result=response)
 
     with pytest.raises(ModelResponseError, match="deployment 'primary-1'") as caught:
-        await transport.invoke(deployment(), request(), api_key=API_KEY)
+        await transport.complete(deployment(), request(), API_KEY)
 
     close.assert_awaited_once_with()
     rendered = repr(caught.value)
@@ -244,7 +310,7 @@ async def test_rejects_empty_or_malformed_responses_safely(response: object) -> 
 
 
 async def test_rejects_malformed_or_nonobject_tool_arguments_without_leaking_them() -> None:
-    bad_arguments = RAW_ERROR + " {not-json"
+    bad_arguments = RAW_ERROR + API_KEY + PROMPT + " {not-json"
     tool = SimpleNamespace(
         id="call_1",
         function=SimpleNamespace(name="lookup", arguments=bad_arguments),
@@ -252,9 +318,16 @@ async def test_rejects_malformed_or_nonobject_tool_arguments_without_leaking_the
     transport, _, _, _ = mock_transport(result=sdk_response(tool_calls=[tool]))
 
     with pytest.raises(ModelResponseError, match="malformed tool call") as caught:
-        await transport.invoke(deployment(), request(), api_key=API_KEY)
+        await transport.complete(deployment(), request(), API_KEY)
 
-    assert bad_arguments not in repr(caught.value)
+    rendered = "".join(
+        traceback.format_exception(type(caught.value), caught.value, caught.value.__traceback__)
+    )
+    for sensitive in (bad_arguments, API_KEY, PROMPT, RAW_ERROR):
+        assert sensitive not in rendered
+        assert sensitive not in repr(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 async def test_closes_on_provider_error_and_redacts_runtime_secrets() -> None:
@@ -265,7 +338,7 @@ async def test_closes_on_provider_error_and_redacts_runtime_secrets() -> None:
     transport, _, _, close = mock_transport(error=ProviderFailure(RAW_ERROR + API_KEY + PROMPT))
 
     with pytest.raises(ModelTransportError) as caught:
-        await transport.invoke(deployment(), request(), api_key=API_KEY)
+        await transport.complete(deployment(), request(), API_KEY)
 
     close.assert_awaited_once_with()
     rendered = "".join(
@@ -282,7 +355,7 @@ async def test_propagates_cancellation_and_still_closes() -> None:
     transport, _, _, close = mock_transport(error=asyncio.CancelledError())
 
     with pytest.raises(asyncio.CancelledError):
-        await transport.invoke(deployment(), request(), api_key=API_KEY)
+        await transport.complete(deployment(), request(), API_KEY)
 
     close.assert_awaited_once_with()
 
@@ -291,7 +364,7 @@ async def test_rejects_blank_runtime_key_before_constructing_sdk_client() -> Non
     transport, factory, _, _ = mock_transport()
 
     with pytest.raises(ValueError, match="API key must not be blank"):
-        await transport.invoke(deployment(), request(), api_key="   ")
+        await transport.complete(deployment(), request(), "   ")
 
     factory.assert_not_called()
     assert API_KEY not in repr(transport)

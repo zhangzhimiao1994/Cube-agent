@@ -96,6 +96,8 @@ def test_frozen_contracts_deeply_normalize_caller_collections() -> None:
         message.content[0]["text"] = "nope"  # type: ignore[index]
     with pytest.raises(FrozenInstanceError):
         deployment.weight = 1  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        request.messages = ()  # type: ignore[misc]
 
 
 @pytest.mark.parametrize(
@@ -183,6 +185,16 @@ def test_deployment_repr_omits_secret_reference() -> None:
     assert "secret-reference-sentinel" not in repr(deployment)
 
 
+def test_api_base_enforces_config_schema_length_boundary() -> None:
+    prefix = "https://proxy.example.com/"
+    maximum = prefix + "a" * (2048 - len(prefix))
+
+    assert len(maximum) == 2048
+    assert Deployment(id="maximum", logical_model="primary", api_base=maximum).api_base == maximum
+    with pytest.raises(ValueError, match="api_base"):
+        Deployment(id="too-long", logical_model="primary", api_base=maximum + "a")
+
+
 @pytest.mark.parametrize("logical_model", ["", "UPPER", " padded", "a" * 129])
 def test_request_rejects_invalid_logical_model(logical_model: str) -> None:
     with pytest.raises(ValueError):
@@ -200,6 +212,20 @@ def test_message_rejects_noncanonical_or_empty_multimodal_content() -> None:
         ModelMessage(role="user", content=())
     with pytest.raises(ValueError):
         ModelMessage(role="user", content=("not-an-object",))  # type: ignore[arg-type]
+
+
+def test_request_rejects_non_model_message_elements() -> None:
+    class MutableMessage:
+        def __init__(self) -> None:
+            self.role = "user"
+            self.content = "mutable"
+
+    for invalid in ({"role": "user", "content": "dictionary"}, MutableMessage()):
+        with pytest.raises(ValueError, match="messages must contain only ModelMessage"):
+            ModelRequest(
+                logical_model="primary",
+                messages=[invalid],  # type: ignore[arg-type]
+            )
 
 
 def test_models_package_exposes_the_public_contract() -> None:

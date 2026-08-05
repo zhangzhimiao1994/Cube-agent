@@ -107,7 +107,8 @@ class Deployment:
 
         parsed_base = urlsplit(self.api_base)
         if (
-            self.api_base != self.api_base.strip()
+            len(self.api_base) > 2048
+            or self.api_base != self.api_base.strip()
             or parsed_base.scheme not in {"http", "https"}
             or not parsed_base.netloc
             or parsed_base.username is not None
@@ -184,7 +185,10 @@ class ModelRequest:
         _require_safe_identifier("logical_model", self.logical_model)
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive and finite")
-        object.__setattr__(self, "messages", tuple(self.messages))
+        messages = tuple(self.messages)
+        if not all(isinstance(message, ModelMessage) for message in messages):
+            raise ValueError("messages must contain only ModelMessage values")
+        object.__setattr__(self, "messages", messages)
         object.__setattr__(
             self,
             "required_capabilities",
