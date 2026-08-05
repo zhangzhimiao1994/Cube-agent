@@ -21,11 +21,16 @@ class ErrorResponse(BaseModel):
     error: ErrorBody
 
 
-ERROR_STATUS_CODES = (400, 401, 403, 404, 409, 413, 422, 429, 500, 503)
-ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
-    status_code: {"model": ErrorResponse, "description": "Error response"}
-    for status_code in ERROR_STATUS_CODES
-}
+def error_responses(*status_codes: int) -> dict[int | str, dict[str, Any]]:
+    """Build explicit per-operation error response metadata."""
+
+    return {
+        status_code: {"model": ErrorResponse, "description": "Error response"}
+        for status_code in status_codes
+    }
+
+
+BASE_ERROR_RESPONSES = error_responses(405, 500)
 _SAFE_HTTP_HEADERS = frozenset({"allow", "www-authenticate", "retry-after"})
 
 
@@ -77,14 +82,4 @@ async def http_exception_handler(request: Request, error: Exception) -> JSONResp
         status_code=error.status_code,
         content=error_payload(code, message),
         headers=headers,
-    )
-
-
-async def unhandled_exception_handler(
-    request: Request, error: Exception
-) -> JSONResponse:
-    del request, error
-    return JSONResponse(
-        status_code=500,
-        content=error_payload("internal_error", "internal server error"),
     )

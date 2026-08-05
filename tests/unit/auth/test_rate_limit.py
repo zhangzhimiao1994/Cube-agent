@@ -64,3 +64,13 @@ async def test_equivalent_ipv6_clients_use_the_same_redis_key() -> None:
     await limiter.check("login", "2001:db8::1")
 
     assert redis.calls[0][2] == redis.calls[1][2]
+
+
+async def test_ipv4_and_ipv4_mapped_clients_use_the_same_redis_key() -> None:
+    redis = RedisStub((1, 60))
+    limiter = RedisAuthRateLimiter(redis, b"k" * 32)
+
+    await limiter.check("login", "192.0.2.10")
+    await limiter.check("login", "::ffff:192.0.2.10")
+
+    assert redis.calls[0][2] == redis.calls[1][2]

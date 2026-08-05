@@ -6,7 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request, status
 
 from agent_hub.api.dependencies import require_permission
-from agent_hub.api.errors import ERROR_RESPONSES, PublicAPIError
+from agent_hub.api.errors import PublicAPIError, error_responses
 from agent_hub.api.schemas import (
     ConfigDiffResponse,
     ConfigHistoryResponse,
@@ -27,7 +27,9 @@ from agent_hub.config.service import (
 )
 
 router = APIRouter(
-    prefix="/api/v1/config", tags=["config"], responses=ERROR_RESPONSES
+    prefix="/api/v1/config",
+    tags=["config"],
+    responses=error_responses(401, 403, 405, 500, 503),
 )
 
 
@@ -70,7 +72,11 @@ def _raise_config_error(error: Exception) -> None:
     raise error
 
 
-@router.post("/validate", response_model=ValidationResponse)
+@router.post(
+    "/validate",
+    response_model=ValidationResponse,
+    responses=error_responses(413, 422),
+)
 async def validate_config(
     body: PlatformConfig,
     principal: Annotated[
@@ -82,7 +88,10 @@ async def validate_config(
 
 
 @router.post(
-    "/drafts", response_model=ConfigRevisionResponse, status_code=status.HTTP_201_CREATED
+    "/drafts",
+    response_model=ConfigRevisionResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=error_responses(404, 409, 413, 422),
 )
 async def create_draft(
     body: PlatformConfig,
@@ -104,7 +113,9 @@ async def create_draft(
 
 
 @router.post(
-    "/drafts/{revision_id}/publish", response_model=PublishedRevisionResponse
+    "/drafts/{revision_id}/publish",
+    response_model=PublishedRevisionResponse,
+    responses=error_responses(404, 409, 413, 422),
 )
 async def publish_draft(
     revision_id: UUID,
@@ -126,7 +137,11 @@ async def publish_draft(
     return PublishedRevisionResponse.from_published(revision)
 
 
-@router.get("/current", response_model=ConfigRevisionResponse)
+@router.get(
+    "/current",
+    response_model=ConfigRevisionResponse,
+    responses=error_responses(404),
+)
 async def current_config(
     service: Annotated[ConfigurationService, Depends(_config_service)],
     principal: Annotated[
@@ -139,7 +154,11 @@ async def current_config(
     return ConfigRevisionResponse.from_revision(revision)
 
 
-@router.get("/history", response_model=ConfigHistoryResponse)
+@router.get(
+    "/history",
+    response_model=ConfigHistoryResponse,
+    responses=error_responses(422),
+)
 async def config_history(
     service: Annotated[ConfigurationService, Depends(_config_service)],
     principal: Annotated[
@@ -158,7 +177,11 @@ async def config_history(
     )
 
 
-@router.get("/history/{version}", response_model=ConfigRevisionResponse)
+@router.get(
+    "/history/{version}",
+    response_model=ConfigRevisionResponse,
+    responses=error_responses(404, 422),
+)
 async def config_version(
     version: int,
     service: Annotated[ConfigurationService, Depends(_config_service)],
@@ -174,7 +197,11 @@ async def config_version(
     return ConfigRevisionResponse.from_revision(revision)
 
 
-@router.get("/diff", response_model=ConfigDiffResponse)
+@router.get(
+    "/diff",
+    response_model=ConfigDiffResponse,
+    responses=error_responses(404, 422),
+)
 async def config_diff(
     service: Annotated[ConfigurationService, Depends(_config_service)],
     principal: Annotated[
@@ -195,7 +222,11 @@ async def config_diff(
     )
 
 
-@router.post("/history/{version}/rollback", response_model=PublishedRevisionResponse)
+@router.post(
+    "/history/{version}/rollback",
+    response_model=PublishedRevisionResponse,
+    responses=error_responses(404, 409, 413, 422),
+)
 async def rollback_config(
     version: int,
     service: Annotated[ConfigurationService, Depends(_config_service)],

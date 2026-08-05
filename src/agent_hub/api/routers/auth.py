@@ -1,12 +1,11 @@
 """Local bootstrap and login endpoints."""
 
-from ipaddress import ip_address
 from typing import Annotated, Protocol, cast
 
 from fastapi import APIRouter, Depends, Request, status
 
 from agent_hub.api.dependencies import current_principal
-from agent_hub.api.errors import ERROR_RESPONSES, PublicAPIError
+from agent_hub.api.errors import BASE_ERROR_RESPONSES, PublicAPIError, error_responses
 from agent_hub.api.schemas import (
     LoginRequest,
     PrincipalResponse,
@@ -26,8 +25,9 @@ from agent_hub.auth.models import (
 )
 from agent_hub.auth.passwords import PasswordValidationError
 from agent_hub.auth.rate_limit import AuthRateLimiter, RateLimitUnavailable
+from agent_hub.security.network import canonical_ip
 
-router = APIRouter(prefix="/api/v1", tags=["auth"], responses=ERROR_RESPONSES)
+router = APIRouter(prefix="/api/v1", tags=["auth"], responses=BASE_ERROR_RESPONSES)
 
 
 class AuthenticationService(Protocol):
@@ -47,7 +47,7 @@ def _auth_service(request: Request) -> AuthenticationService:
 
 def _client_ip(request: Request) -> str:
     socket_ip = request.client.host if request.client is not None else "unknown"
-    canonical_socket = _canonical_ip(socket_ip)
+    canonical_socket = canonical_ip(socket_ip)
     if canonical_socket is None:
         return socket_ip
     trusted: frozenset[str] = getattr(
@@ -70,7 +70,7 @@ def _client_ip(request: Request) -> str:
         return canonical_socket
     chain: list[str] = []
     for raw_hop in raw_hops:
-        hop = _canonical_ip(raw_hop.strip())
+        hop = canonical_ip(raw_hop.strip())
         if hop is None:
             return canonical_socket
         chain.append(hop)
@@ -79,15 +79,6 @@ def _client_ip(request: Request) -> str:
         if hop not in trusted:
             return hop
     return chain[0]
-
-
-def _canonical_ip(value: str) -> str | None:
-    if not value or "%" in value:
-        return None
-    try:
-        return str(ip_address(value))
-    except ValueError:
-        return None
 
 
 async def _enforce_rate_limit(request: Request, endpoint: str) -> None:
@@ -114,7 +105,12 @@ def _token_response(result: AuthResult) -> TokenResponse:
     )
 
 
-@router.post("/setup", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/setup",
+    response_model=TokenResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=error_responses(401, 409, 413, 422, 429, 503),
+)
 async def setup(
     body: SetupRequest,
     request: Request,
@@ -142,7 +138,11 @@ async def setup(
     return _token_response(result)
 
 
-@router.post("/auth/login", response_model=TokenResponse)
+@router.post(
+    "/auth/login",
+    response_model=TokenResponse,
+    responses=error_responses(401, 413, 422, 429, 503),
+)
 async def login(
     body: LoginRequest,
     request: Request,
@@ -171,7 +171,11 @@ async def login(
     return _token_response(result)
 
 
-@router.get("/auth/me", response_model=PrincipalResponse)
+@router.get(
+    "/auth/me",
+    response_model=PrincipalResponse,
+    responses=error_responses(401, 503),
+)
 async def me(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
 ) -> PrincipalResponse:

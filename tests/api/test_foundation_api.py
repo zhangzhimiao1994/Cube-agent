@@ -6,10 +6,13 @@ from datetime import UTC, datetime
 from typing import Self
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
+from starlette.types import Message, Receive, Scope, Send
 
+from agent_hub.api.middleware import SafeExceptionMiddleware
 from agent_hub.app import create_app
 from agent_hub.auth.models import (
     AuthenticatedPrincipal,
@@ -32,6 +35,26 @@ class Probe:
         self.calls += 1
         if self.outcome is not None:
             raise self.outcome
+
+
+class HangingProbe:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.task: asyncio.Task[object] | None = None
+
+    async def __call__(self) -> None:
+        self.task = asyncio.current_task()
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
+async def failing_probe() -> None:
+    raise RuntimeError("probe failed")
 
 
 async def never_returns() -> None:
@@ -85,6 +108,79 @@ def test_ready_reports_ok_when_dependencies_respond() -> None:
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
     assert database.calls == redis.calls == 1
+
+
+@pytest.mark.parametrize("hanging_side", ["database", "redis"])
+async def test_ready_fast_failure_cancels_and_reaps_hanging_sibling(
+    hanging_side: str,
+) -> None:
+    hanging = HangingProbe()
+    database_probe = hanging if hanging_side == "database" else failing_probe
+    redis_probe = hanging if hanging_side == "redis" else failing_probe
+    app = create_app(
+        database_probe=database_probe,
+        redis_probe=redis_probe,
+        readiness_timeout_seconds=5,
+        auth_service=object(),
+        config_service=object(),
+        rate_limiter=object(),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert hanging.cancelled.is_set()
+    assert hanging.task is not None and hanging.task.done()
+
+
+async def test_ready_timeout_cancels_and_reaps_both_probes() -> None:
+    database = HangingProbe()
+    redis = HangingProbe()
+    app = create_app(
+        database_probe=database,
+        redis_probe=redis,
+        readiness_timeout_seconds=0.01,
+        auth_service=object(),
+        config_service=object(),
+        rate_limiter=object(),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert database.cancelled.is_set() and redis.cancelled.is_set()
+    assert database.task is not None and database.task.done()
+    assert redis.task is not None and redis.task.done()
+
+
+async def test_cancelling_ready_request_cancels_and_reaps_both_probes() -> None:
+    database = HangingProbe()
+    redis = HangingProbe()
+    app = create_app(
+        database_probe=database,
+        redis_probe=redis,
+        readiness_timeout_seconds=5,
+        auth_service=object(),
+        config_service=object(),
+        rate_limiter=object(),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        request = asyncio.create_task(client.get("/health/ready"))
+        await database.started.wait()
+        await redis.started.wait()
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+
+    assert database.cancelled.is_set() and redis.cancelled.is_set()
+    assert database.task is not None and database.task.done()
+    assert redis.task is not None and redis.task.done()
 
 
 def test_default_placeholder_fails_closed_when_lifespan_starts() -> None:
@@ -592,6 +688,9 @@ def test_post_commit_notification_failure_returns_committed_revision() -> None:
 
 
 class FakeSession:
+    def __init__(self, execute_error: Exception | None = None) -> None:
+        self.execute_error = execute_error
+
     async def __aenter__(self) -> Self:
         return self
 
@@ -603,23 +702,48 @@ class FakeSession:
 
     async def execute(self, statement: object) -> None:
         del statement
+        if self.execute_error is not None:
+            raise self.execute_error
 
 
 class FakeDatabase:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        cleanup_error: BaseException | None = None,
+        execute_error: Exception | None = None,
+        events: list[str] | None = None,
+    ) -> None:
         self.disposed = False
-        self.session_factory = lambda: FakeSession()
+        self.cleanup_error = cleanup_error
+        self.events = events
+        self.session_factory = lambda: FakeSession(execute_error)
 
     async def dispose(self) -> None:
         self.disposed = True
+        if self.events is not None:
+            self.events.append("database.dispose")
+        if self.cleanup_error is not None:
+            raise self.cleanup_error
 
 
 class FakeRedis:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        cleanup_error: BaseException | None = None,
+        events: list[str] | None = None,
+    ) -> None:
         self.closed = False
+        self.cleanup_error = cleanup_error
+        self.events = events
 
     async def aclose(self) -> None:
         self.closed = True
+        if self.events is not None:
+            self.events.append("redis.aclose")
+        if self.cleanup_error is not None:
+            raise self.cleanup_error
 
     async def ping(self, **kwargs: object) -> bool:
         del kwargs
@@ -654,14 +778,24 @@ def test_injected_database_and_redis_are_not_closed() -> None:
     assert redis.closed is False
 
 
-def test_factory_created_database_and_redis_are_closed() -> None:
+def test_factory_created_database_and_redis_receive_unredacted_urls_and_are_closed() -> None:
     database = FakeDatabase()
     redis = FakeRedis()
+    database_url = "postgresql+asyncpg://user:SECRET_DB@localhost/application"
+    redis_url = "redis://:SECRET_REDIS@localhost:6379/0"
+    configured = Settings.model_validate(
+        {
+            "jwt_signing_key": valid_settings().jwt_signing_key_value(),
+            "database_url": database_url,
+            "redis_url": redis_url,
+        }
+    )
+    received: list[str] = []
     with TestClient(
         create_app(
-            settings=valid_settings(),
-            database_factory=lambda url: database,
-            redis_factory=lambda url: redis,
+            settings=configured,
+            database_factory=lambda url: (received.append(url) or database),
+            redis_factory=lambda url: (received.append(url) or redis),
             database_probe=Probe(),
             redis_probe=Probe(),
         )
@@ -670,6 +804,103 @@ def test_factory_created_database_and_redis_are_closed() -> None:
 
     assert database.disposed is True
     assert redis.closed is True
+    assert received == [database_url, redis_url]
+
+
+@pytest.mark.parametrize(
+    ("redis_fails", "database_fails"),
+    [(True, False), (False, True), (True, True)],
+)
+def test_all_owned_resource_cleanups_are_attempted_and_errors_are_safe(
+    redis_fails: bool, database_fails: bool
+) -> None:
+    events: list[str] = []
+    database = FakeDatabase(
+        cleanup_error=(RuntimeError("LEAK_DATABASE_URL") if database_fails else None),
+        events=events,
+    )
+    redis = FakeRedis(
+        cleanup_error=(RuntimeError("LEAK_REDIS_URL") if redis_fails else None),
+        events=events,
+    )
+    app = create_app(
+        settings=valid_settings(),
+        database_factory=lambda url: database,
+        redis_factory=lambda url: redis,
+        database_probe=Probe(),
+        redis_probe=Probe(),
+    )
+
+    with pytest.raises(Exception) as captured, TestClient(app):
+        pass
+
+    assert events == ["redis.aclose", "database.dispose"]
+    assert type(captured.value).__name__ == "ResourceCleanupError"
+    assert "LEAK_" not in str(captured.value)
+
+
+def test_base_exception_from_cleanup_does_not_skip_remaining_owned_cleanup() -> None:
+    class CleanupAbort(BaseException):
+        pass
+
+    events: list[str] = []
+    database = FakeDatabase(events=events)
+    redis = FakeRedis(cleanup_error=CleanupAbort("LEAK_ABORT"), events=events)
+    app = create_app(
+        settings=valid_settings(),
+        database_factory=lambda url: database,
+        redis_factory=lambda url: redis,
+        database_probe=Probe(),
+        redis_probe=Probe(),
+    )
+
+    with pytest.raises(Exception) as captured, TestClient(app):
+        pass
+
+    assert events == ["redis.aclose", "database.dispose"]
+    assert type(captured.value).__name__ == "ResourceCleanupError"
+    assert "LEAK_ABORT" not in str(captured.value)
+
+
+def test_startup_failure_cleans_every_resource_and_preserves_primary_error() -> None:
+    events: list[str] = []
+    database = FakeDatabase(
+        execute_error=RuntimeError("PRIMARY_TENANT_FAILURE"),
+        cleanup_error=RuntimeError("LEAK_DATABASE_URL"),
+        events=events,
+    )
+    redis = FakeRedis(
+        cleanup_error=RuntimeError("LEAK_REDIS_URL"),
+        events=events,
+    )
+    factories: list[str] = []
+    app = create_app(
+        settings=valid_settings(),
+        database_factory=lambda url: (factories.append("database") or database),
+        redis_factory=lambda url: (factories.append("redis") or redis),
+    )
+
+    with pytest.raises(RuntimeError, match="PRIMARY_TENANT_FAILURE"), TestClient(app):
+        pass
+
+    assert factories == ["database", "redis"]
+    assert events == ["redis.aclose", "database.dispose"]
+
+
+def test_invalid_jwt_key_is_rejected_before_resource_factories_run() -> None:
+    factories: list[str] = []
+    app = create_app(
+        settings=Settings.model_validate({}),
+        database_factory=lambda url: (
+            factories.append("database") or FakeDatabase()
+        ),
+        redis_factory=lambda url: factories.append("redis") or FakeRedis(),
+    )
+
+    with pytest.raises(ValueError), TestClient(app):
+        pass
+
+    assert factories == []
 
 
 def test_auth_request_body_size_is_bounded_before_validation() -> None:
@@ -744,7 +975,7 @@ def test_unhandled_exception_is_generic_and_does_not_leak_request_secrets(
         )
 
     app.add_api_route("/api/v1/fail", fail, methods=["POST"])
-    client = TestClient(app, raise_server_exceptions=False)
+    client = TestClient(app, raise_server_exceptions=True)
     response = client.post(
         "/api/v1/fail",
         headers={"Authorization": authorization},
@@ -755,25 +986,105 @@ def test_unhandled_exception_is_generic_and_does_not_leak_request_secrets(
     assert response.json() == {
         "error": {"code": "internal_error", "message": "internal server error"}
     }
+    error_id = response.headers["x-error-id"]
+    assert UUID(error_id)
+    assert f"error_id={error_id}" in caplog.text
+    assert "error_type=RuntimeError" in caplog.text
     captured = response.text + caplog.text
     assert "secret-dsn" not in captured
     assert authorization not in captured
     assert password not in captured
 
 
-def test_openapi_uses_error_response_for_all_documented_error_statuses() -> None:
+@pytest.mark.asyncio
+async def test_safe_exception_middleware_does_not_send_a_second_response_start() -> None:
+    async def started_then_failed(scope: Scope, receive: Receive, send: Send) -> None:
+        del scope, receive
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        raise RuntimeError("SECRET_AFTER_START")
+
+    messages: list[Message] = []
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: Message) -> None:
+        messages.append(message)
+
+    middleware = SafeExceptionMiddleware(started_then_failed)
+    await middleware({"type": "http", "method": "GET", "path": "/"}, receive, send)
+
+    assert [message["type"] for message in messages].count("http.response.start") == 1
+    assert messages[-1] == {
+        "type": "http.response.body",
+        "body": b"",
+        "more_body": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_safe_exception_middleware_propagates_request_cancellation() -> None:
+    async def cancelled(scope: Scope, receive: Receive, send: Send) -> None:
+        del scope, receive, send
+        raise asyncio.CancelledError
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: Message) -> None:
+        del message
+
+    with pytest.raises(asyncio.CancelledError):
+        await SafeExceptionMiddleware(cancelled)(
+            {"type": "http", "method": "GET", "path": "/"}, receive, send
+        )
+
+
+def test_openapi_describes_security_health_and_route_specific_errors() -> None:
     schema = auth_client().get("/openapi.json").json()
     assert "ErrorResponse" in schema["components"]["schemas"]
     assert "HTTPValidationError" not in schema["components"]["schemas"]
-    expected = {"400", "401", "403", "404", "409", "413", "422", "429", "500", "503"}
+    assert schema["components"]["securitySchemes"] == {
+        "BearerAuth": {"type": "http", "scheme": "bearer"}
+    }
+
+    assert "security" not in schema["paths"]["/health/live"]["get"]
+    assert "security" not in schema["paths"]["/api/v1/setup"]["post"]
+    assert "security" not in schema["paths"]["/api/v1/auth/login"]["post"]
+    assert schema["paths"]["/api/v1/auth/me"]["get"]["security"] == [
+        {"BearerAuth": []}
+    ]
+    assert schema["paths"]["/api/v1/config/current"]["get"]["security"] == [
+        {"BearerAuth": []}
+    ]
+
+    for path in ("/health/live", "/health/ready"):
+        assert schema["paths"][path]["get"]["responses"]["200"]["content"][
+            "application/json"
+        ]["schema"] == {"$ref": "#/components/schemas/HealthResponse"}
+
+    assert set(schema["paths"]["/health/live"]["get"]["responses"]) == {
+        "200",
+        "405",
+        "500",
+    }
+    assert set(schema["paths"]["/health/ready"]["get"]["responses"]) == {
+        "200",
+        "405",
+        "500",
+        "503",
+    }
+    setup_responses = set(schema["paths"]["/api/v1/setup"]["post"]["responses"])
+    assert setup_responses == {"201", "401", "405", "409", "413", "422", "429", "500", "503"}
+    assert "404" not in setup_responses
 
     for path, path_item in schema["paths"].items():
         for method, operation in path_item.items():
             if method not in {"get", "post", "put", "patch", "delete"}:
                 continue
             responses = operation["responses"]
-            assert expected <= set(responses), (path, method, responses)
-            for status_code in expected:
+            assert "405" in responses, (path, method, responses)
+            for status_code in set(responses) - {"200", "201"}:
                 content = responses[status_code]["content"]["application/json"]
                 assert content["schema"] == {
                     "$ref": "#/components/schemas/ErrorResponse"
@@ -812,6 +1123,13 @@ def test_trusted_proxy_single_hop_uses_canonical_forwarded_client() -> None:
     proxy_login(client, {"X-Forwarded-For": "2001:0db8:0:0:0:0:0:1"})
 
     assert limiter.calls == [("login", "2001:db8::1")]
+
+
+def test_ipv4_mapped_socket_matches_ipv4_trusted_proxy_configuration() -> None:
+    client, limiter = proxy_auth_client("::ffff:192.0.2.10", ["192.0.2.10"])
+    proxy_login(client, {"X-Forwarded-For": "::ffff:198.51.100.7"})
+
+    assert limiter.calls == [("login", "198.51.100.7")]
 
 
 def test_proxy_chain_strips_trusted_hops_from_the_right() -> None:

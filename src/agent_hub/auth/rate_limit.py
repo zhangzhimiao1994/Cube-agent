@@ -4,8 +4,9 @@ import hashlib
 import hmac
 import re
 from dataclasses import dataclass
-from ipaddress import ip_address
 from typing import ClassVar, Protocol, cast
+
+from agent_hub.security.network import canonical_ip
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,10 +62,7 @@ return {count, ttl}
         if endpoint not in self._LIMITS:
             raise ValueError("unsupported authentication endpoint")
         limit, window = self._LIMITS[endpoint]
-        try:
-            canonical_client = str(ip_address(client_ip))
-        except ValueError:
-            canonical_client = client_ip
+        canonical_client = canonical_ip(client_ip) or client_ip
         digest = hmac.new(
             self._hmac_key, canonical_client.encode("utf-8"), hashlib.sha256
         ).hexdigest()

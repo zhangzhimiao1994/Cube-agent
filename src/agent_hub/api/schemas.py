@@ -15,6 +15,10 @@ class APIModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class HealthResponse(APIModel):
+    status: Literal["ok"] = "ok"
+
+
 class SetupRequest(APIModel):
     code: SecretStr = Field(min_length=43, max_length=43, repr=False)
     username: str = Field(

@@ -1,6 +1,8 @@
 """FastAPI application factory and owned process resources."""
 
 import hashlib
+import logging
+import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any, Protocol
@@ -16,14 +18,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from agent_hub.api.errors import (
-    ERROR_RESPONSES,
     PublicAPIError,
     error_payload,
     http_exception_handler,
     public_error_handler,
-    unhandled_exception_handler,
 )
-from agent_hub.api.middleware import RequestBodyLimitMiddleware
+from agent_hub.api.middleware import RequestBodyLimitMiddleware, SafeExceptionMiddleware
 from agent_hub.api.routers import auth, config, system
 from agent_hub.auth.passwords import PasswordService
 from agent_hub.auth.rate_limit import RedisAuthRateLimiter
@@ -35,6 +35,15 @@ from agent_hub.db.session import build_database
 from agent_hub.settings import Settings, get_settings
 
 ReadinessProbe = Callable[[], Awaitable[None]]
+_LOGGER = logging.getLogger(__name__)
+
+
+class ResourceCleanupError(RuntimeError):
+    """Report cleanup failure types without exposing resource error details."""
+
+    def __init__(self, error_types: tuple[str, ...]) -> None:
+        self.error_types = error_types
+        super().__init__(f"resource cleanup failed: {', '.join(error_types)}")
 
 
 class DatabaseResource(Protocol):
@@ -88,25 +97,35 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
-        owned_database: DatabaseResource | None = None
-        owned_redis: RedisResource | None = None
         configured = settings or get_settings()
         active_database = database
         active_redis = redis_client
         active_sessions = session_factory
+        cleanup_callbacks: list[
+            tuple[str, Callable[[], Awaitable[None]]]
+        ] = []
+        token_service = (
+            AccessTokenService(configured.jwt_signing_key_value())
+            if auth_service is None
+            else None
+        )
         try:
             application.state.trusted_proxy_ips = configured.trusted_proxy_ips
             needs_sessions = auth_service is None or config_service is None
             if active_sessions is None and active_database is not None:
                 active_sessions = active_database.session_factory
             if active_sessions is None and needs_sessions:
-                owned_database = database_factory(configured.database_url)
-                active_database = owned_database
-                active_sessions = owned_database.session_factory
+                active_database = database_factory(configured.database_url_value())
+                cleanup_callbacks.append(("database", active_database.dispose))
+                active_sessions = active_database.session_factory
 
-            token_service: AccessTokenService | None = None
+            needs_redis = rate_limiter is None or redis_probe is None
+            if active_redis is None and needs_redis:
+                active_redis = redis_factory(configured.redis_url_value())
+                cleanup_callbacks.append(("redis", active_redis.aclose))
+
             if auth_service is None:
-                token_service = AccessTokenService(configured.jwt_signing_key_value())
+                assert token_service is not None
                 assert active_sessions is not None
                 await ensure_bootstrap_tenant(
                     active_sessions,
@@ -124,10 +143,6 @@ def create_app(
                 assert active_sessions is not None
                 application.state.config_service = ConfigService(active_sessions)
 
-            needs_redis = rate_limiter is None or redis_probe is None
-            if active_redis is None and needs_redis:
-                owned_redis = redis_factory(configured.redis_url)
-                active_redis = owned_redis
             if rate_limiter is None:
                 assert active_redis is not None
                 hmac_key = hashlib.sha256(
@@ -143,16 +158,26 @@ def create_app(
                 application.state.redis_probe = _redis_probe(active_redis)
             yield
         finally:
-            if owned_redis is not None:
-                await owned_redis.aclose()
-            if owned_database is not None:
-                await owned_database.dispose()
+            primary_error = sys.exception()
+            cleanup_error_types: list[str] = []
+            for resource_name, cleanup in reversed(cleanup_callbacks):
+                try:
+                    await cleanup()
+                except BaseException as error:  # noqa: BLE001 -- all cleanups must be attempted.
+                    error_type = type(error).__name__
+                    cleanup_error_types.append(error_type)
+                    _LOGGER.error(
+                        "resource_cleanup_failed resource=%s error_type=%s",
+                        resource_name,
+                        error_type,
+                    )
+            if cleanup_error_types and primary_error is None:
+                raise ResourceCleanupError(tuple(cleanup_error_types)) from None
 
     application = FastAPI(
         title="Agent Hub",
         version="0.1.0",
         lifespan=lifespan,
-        responses=ERROR_RESPONSES,
     )
     application.state.database_probe = database_probe
     application.state.redis_probe = redis_probe
@@ -164,7 +189,6 @@ def create_app(
     application.state.trusted_proxy_ips = configured_settings.trusted_proxy_ips
     application.add_exception_handler(PublicAPIError, public_error_handler)
     application.add_exception_handler(StarletteHTTPException, http_exception_handler)
-    application.add_exception_handler(Exception, unhandled_exception_handler)
 
     async def validation_error_handler(
         request: Request, error: Exception
@@ -178,6 +202,7 @@ def create_app(
 
     application.add_exception_handler(RequestValidationError, validation_error_handler)
     application.add_middleware(RequestBodyLimitMiddleware)
+    application.add_middleware(SafeExceptionMiddleware)
     application.router.routes.extend(system.router.routes)
     application.router.routes.extend(auth.router.routes)
     application.router.routes.extend(config.router.routes)

@@ -149,3 +149,23 @@ def test_settings_validation_does_not_echo_jwt_key() -> None:
 
     assert key not in str(captured.value)
     assert key not in repr(captured.value)
+
+
+def test_connection_urls_are_secret_but_accessors_preserve_original_values() -> None:
+    database_url = "postgresql+asyncpg://user:SECRET_DB@localhost/application"
+    redis_url = "redis://:SECRET_REDIS@localhost:6379/0"
+    settings = Settings(database_url=database_url, redis_url=redis_url)
+
+    assert settings.database_url_value() == database_url
+    assert settings.redis_url_value() == redis_url
+    rendered = repr(settings) + str(settings.model_dump()) + settings.model_dump_json()
+    assert "SECRET_DB" not in rendered
+    assert "SECRET_REDIS" not in rendered
+
+
+def test_ipv4_mapped_trusted_proxy_is_stored_as_ipv4() -> None:
+    settings = Settings.model_validate(
+        {"trusted_proxy_ips": ["::ffff:192.0.2.10", "192.0.2.10"]}
+    )
+
+    assert settings.trusted_proxy_ips == frozenset({"192.0.2.10"})

@@ -3,7 +3,8 @@
 from collections.abc import Callable
 from typing import Annotated, Protocol, cast
 
-from fastapi import Depends, Request
+from fastapi import Depends, Request, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from agent_hub.api.errors import PublicAPIError
 from agent_hub.auth.models import (
@@ -16,6 +17,7 @@ from agent_hub.auth.tokens import InvalidTokenError
 
 _MAX_TOKEN_CHARS = 8192
 _BEARER_HEADERS = {"WWW-Authenticate": "Bearer"}
+_BEARER_SCHEME = HTTPBearer(auto_error=False, scheme_name="BearerAuth")
 
 
 class TokenAuthenticator(Protocol):
@@ -40,7 +42,11 @@ def _authorization_values(request: Request) -> list[str]:
 def current_principal(
     request: Request,
     auth_service: Annotated[TokenAuthenticator, Depends(get_auth_service)],
+    documented_credentials: Annotated[
+        HTTPAuthorizationCredentials | None, Security(_BEARER_SCHEME)
+    ],
 ) -> AuthenticatedPrincipal:
+    del documented_credentials
     values = _authorization_values(request)
     if len(values) != 1:
         raise _invalid_token_error()

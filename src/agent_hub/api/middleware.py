@@ -1,5 +1,8 @@
 """Small security-focused ASGI middleware."""
 
+import logging
+from uuid import uuid4
+
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -7,6 +10,59 @@ from agent_hub.api.errors import error_payload
 
 _AUTH_BODY_LIMIT = 16 * 1024
 _CONFIG_BODY_LIMIT = 1024 * 1024
+_LOGGER = logging.getLogger(__name__)
+
+
+class SafeExceptionMiddleware:
+    """Turn unexpected request failures into a safe response inside Starlette's boundary."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        response_started = False
+        response_completed = False
+
+        async def tracked_send(message: Message) -> None:
+            nonlocal response_started, response_completed
+            if message["type"] == "http.response.start":
+                response_started = True
+            elif message["type"] == "http.response.body" and not message.get(
+                "more_body", False
+            ):
+                response_completed = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive, tracked_send)
+        except Exception as error:  # noqa: BLE001 -- this is the outer request safety boundary.
+            error_id = str(uuid4())
+            _LOGGER.error(
+                "unhandled_request_error error_id=%s error_type=%s response_started=%s",
+                error_id,
+                type(error).__name__,
+                response_started,
+            )
+            if response_started:
+                if not response_completed:
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": b"",
+                            "more_body": False,
+                        }
+                    )
+                return
+            response = JSONResponse(
+                status_code=500,
+                content=error_payload("internal_error", "internal server error"),
+                headers={"X-Error-ID": error_id},
+            )
+            await response(scope, receive, send)
 
 
 class RequestBodyLimitMiddleware:

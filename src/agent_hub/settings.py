@@ -1,12 +1,13 @@
 """Application settings."""
 
 from functools import lru_cache
-from ipaddress import ip_address
 from typing import ClassVar
 from uuid import UUID
 
 from pydantic import Field, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from agent_hub.security.network import canonical_ip
 
 
 class Settings(BaseSettings):
@@ -32,8 +33,10 @@ class Settings(BaseSettings):
     )
 
     environment: str = "development"
-    database_url: str = "postgresql+asyncpg://agent_hub:agent_hub@localhost/agent_hub"
-    redis_url: str = "redis://localhost:6379/0"
+    database_url: SecretStr = SecretStr(
+        "postgresql+asyncpg://agent_hub:agent_hub@localhost/agent_hub"
+    )
+    redis_url: SecretStr = SecretStr("redis://localhost:6379/0")
     jwt_signing_key: SecretStr = SecretStr("development-only-change-me")
     master_key: SecretStr = SecretStr("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
     trusted_proxy_ips: frozenset[str] = Field(default=frozenset(), max_length=32)
@@ -62,6 +65,16 @@ class Settings(BaseSettings):
 
         return self.jwt_signing_key.get_secret_value()
 
+    def database_url_value(self) -> str:
+        """Return the database URL only at the connection boundary."""
+
+        return self.database_url.get_secret_value()
+
+    def redis_url_value(self) -> str:
+        """Return the Redis URL only at the connection boundary."""
+
+        return self.redis_url.get_secret_value()
+
     @field_validator("trusted_proxy_ips", mode="before")
     @classmethod
     def validate_trusted_proxy_ips(cls, values: object) -> frozenset[str]:
@@ -75,7 +88,10 @@ class Settings(BaseSettings):
         for value in values:
             if not isinstance(value, str) or "%" in value:
                 raise ValueError("trusted proxy must be an IP address")
-            canonical.add(str(ip_address(value)))
+            normalized = canonical_ip(value)
+            if normalized is None:
+                raise ValueError("trusted proxy must be an IP address")
+            canonical.add(normalized)
         return frozenset(canonical)
 
     @field_validator("bootstrap_tenant_name", mode="after")
