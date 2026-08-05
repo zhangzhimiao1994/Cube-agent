@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 import re
 import secrets
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import StrEnum
 from typing import Literal, Protocol
@@ -63,10 +64,9 @@ class DecisionTokenStore(Protocol):
         self,
         subject: ConfirmationSubject,
         *,
-        version: int,
-        allowed_modes: tuple[TaskMode, ...],
+        snapshot: ConfirmationSnapshot,
         ttl_seconds: float,
-    ) -> str: ...
+    ) -> IssuedDecisionToken: ...
 
     async def consume(
         self,
@@ -75,15 +75,33 @@ class DecisionTokenStore(Protocol):
         *,
         version: int,
         selected_mode: TaskMode,
-    ) -> bool: ...
+    ) -> ConsumedDecisionToken | None: ...
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class IssuedDecisionToken:
+    token: str = field(repr=False)
+    version: int
+
+
+@dataclass(frozen=True, slots=True)
+class ConsumedDecisionToken:
+    snapshot: ConfirmationSnapshot
+    version: int
 
 
 @dataclass(frozen=True, slots=True)
 class _DecisionTokenRecord:
     subject: ConfirmationSubject
     version: int
-    allowed_modes: tuple[TaskMode, ...]
+    snapshot: ConfirmationSnapshot
     expires_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class _SubjectTokenState:
+    version: int
+    current_digest: str | None
 
 
 class InMemoryDecisionTokenStore:
@@ -94,31 +112,37 @@ class InMemoryDecisionTokenStore:
         *,
         monotonic: Callable[[], float] = time.monotonic,
         max_records: int = 10_000,
+        max_version: int = 2**31 - 2,
     ) -> None:
         if type(max_records) is not int or max_records <= 0:
             raise ValueError("max_records must be a strict positive integer")
         self._monotonic = monotonic
         self._max_records = max_records
+        if type(max_version) is not int or not 1 <= max_version <= 2**31 - 2:
+            raise ValueError("max_version must be a bounded positive integer")
+        self._max_version = max_version
         self._records: dict[str, _DecisionTokenRecord] = {}
+        self._subjects: dict[ConfirmationSubject, _SubjectTokenState] = {}
+        self._last_now: float | None = None
         self._lock = asyncio.Lock()
 
     async def issue(
         self,
         subject: ConfirmationSubject,
         *,
-        version: int,
-        allowed_modes: tuple[TaskMode, ...],
+        snapshot: ConfirmationSnapshot,
         ttl_seconds: float,
-    ) -> str:
+    ) -> IssuedDecisionToken:
         if not isinstance(subject, ConfirmationSubject):
             raise TypeError("confirmation subject is required")
         subject = ConfirmationSubject.model_validate(
             subject.model_dump(round_trip=True), strict=True
         )
-        if type(version) is not int or version <= 0:
-            raise ValueError("confirmation version must be positive")
-        if tuple(allowed_modes) != _EXECUTABLE_MODE_ORDER:
-            raise ValueError("confirmation modes must use the canonical order")
+        if not isinstance(snapshot, ConfirmationSnapshot):
+            raise TypeError("confirmation snapshot is required")
+        snapshot = ConfirmationSnapshot.model_validate(
+            snapshot.model_dump(round_trip=True), strict=True
+        )
         if (
             isinstance(ttl_seconds, bool)
             or not isinstance(ttl_seconds, int | float)
@@ -126,21 +150,32 @@ class InMemoryDecisionTokenStore:
             or ttl_seconds <= 0
         ):
             raise ValueError("confirmation TTL must be positive and finite")
-        now = self._monotonic()
         async with self._lock:
+            now = self._clock_now_locked()
             self._purge(now)
-            if len(self._records) >= self._max_records:
+            state = self._subjects.get(subject)
+            if state is None and len(self._subjects) >= self._max_records:
                 raise RuntimeError("confirmation token capacity unavailable")
+            current_version = 0 if state is None else state.version
+            if state is not None and state.current_digest is not None:
+                self._records.pop(state.current_digest, None)
+                self._subjects[subject] = _SubjectTokenState(state.version, None)
+            if current_version >= self._max_version:
+                raise RuntimeError("confirmation token version exhausted")
+            version = current_version + 1
             token = secrets.token_urlsafe(32)
-            while token in self._records:  # pragma: no cover - cryptographic collision guard
+            digest = self._token_digest(token)
+            while digest in self._records:  # pragma: no cover - cryptographic collision guard
                 token = secrets.token_urlsafe(32)
-            self._records[token] = _DecisionTokenRecord(
+                digest = self._token_digest(token)
+            self._records[digest] = _DecisionTokenRecord(
                 subject=subject,
                 version=version,
-                allowed_modes=allowed_modes,
+                snapshot=snapshot,
                 expires_at=now + float(ttl_seconds),
             )
-            return token
+            self._subjects[subject] = _SubjectTokenState(version, digest)
+            return IssuedDecisionToken(token=token, version=version)
 
     async def consume(
         self,
@@ -149,39 +184,72 @@ class InMemoryDecisionTokenStore:
         *,
         version: int,
         selected_mode: TaskMode,
-    ) -> bool:
+    ) -> ConsumedDecisionToken | None:
         if type(token) is not str or _TOKEN.fullmatch(token) is None:
-            return False
+            return None
         if type(version) is not int or version <= 0:
-            return False
+            return None
         if not isinstance(selected_mode, TaskMode) or selected_mode not in _EXECUTABLE_MODES:
-            return False
+            return None
         if not isinstance(subject, ConfirmationSubject):
-            return False
+            return None
         try:
             subject = ConfirmationSubject.model_validate(
                 subject.model_dump(round_trip=True), strict=True
             )
         except (TypeError, ValueError):
-            return False
-        now = self._monotonic()
+            return None
+        digest = self._token_digest(token)
         async with self._lock:
+            now = self._clock_now_locked()
             self._purge(now)
-            record = self._records.get(token)
+            record = self._records.get(digest)
+            state = self._subjects.get(subject)
             if (
                 record is None
+                or state is None
+                or state.current_digest != digest
                 or record.subject != subject
                 or record.version != version
-                or selected_mode not in record.allowed_modes
+                or state.version != version
+                or selected_mode not in record.snapshot.options
             ):
-                return False
-            del self._records[token]
-            return True
+                return None
+            del self._records[digest]
+            self._subjects[subject] = _SubjectTokenState(version, None)
+            return ConsumedDecisionToken(snapshot=record.snapshot, version=version)
 
     def _purge(self, now: float) -> None:
-        expired = [token for token, record in self._records.items() if record.expires_at <= now]
-        for token in expired:
-            del self._records[token]
+        expired = [digest for digest, record in self._records.items() if record.expires_at <= now]
+        for digest in expired:
+            record = self._records.pop(digest)
+            state = self._subjects.get(record.subject)
+            if state is not None and state.current_digest == digest:
+                self._subjects[record.subject] = _SubjectTokenState(state.version, None)
+
+    def _clock_now_locked(self) -> float:
+        try:
+            now = float(self._monotonic())
+        except Exception as error:  # noqa: BLE001 - clock is an injected trust boundary
+            error.__traceback__ = None
+            self._invalidate_current_tokens()
+            raise RuntimeError("confirmation clock unavailable") from None
+        if not math.isfinite(now) or (self._last_now is not None and now < self._last_now):
+            self._invalidate_current_tokens()
+            raise RuntimeError("confirmation clock unavailable")
+        self._last_now = now
+        return now
+
+    @staticmethod
+    def _token_digest(token: str) -> str:
+        return hashlib.sha256(token.encode("ascii")).hexdigest()
+
+    def _invalidate_current_tokens(self) -> None:
+        self._records.clear()
+        self._subjects = {
+            subject: _SubjectTokenState(state.version, None)
+            for subject, state in self._subjects.items()
+        }
 
 
 def _safe_text(value: str, *, name: str) -> str:
@@ -250,6 +318,35 @@ class RouteAssessment(BaseModel):
         return value
 
 
+class ConfirmationSnapshot(BaseModel):
+    """Server-authoritative immutable fields used to render and confirm a waiting route."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    assessments: tuple[RouteAssessment, ...] = Field(max_length=4)
+    clarification_reason: str = Field(pattern=r"^[a-z][a-z0-9_]{0,127}$")
+    options: tuple[TaskMode, ...]
+    risk: RiskLevel
+    requires_approval: bool
+
+    @model_validator(mode="after")
+    def snapshot_invariants(self) -> ConfirmationSnapshot:
+        if self.options != _EXECUTABLE_MODE_ORDER:
+            raise ValueError("confirmation options must use the canonical order")
+        aggregate_risk = (
+            max((item.risk for item in self.assessments), key=_risk_rank)
+            if self.assessments
+            else RiskLevel.LOW
+        )
+        if self.risk is not aggregate_risk:
+            raise ValueError("confirmation risk must match assessment risk")
+        if self.risk is RiskLevel.HIGH and not self.requires_approval:
+            raise ValueError("high risk confirmation must preserve approval")
+        if not self.assessments and self.requires_approval:
+            raise ValueError("empty confirmation assessments use the safe approval default")
+        return self
+
+
 class RouteDecision(BaseModel):
     """Pure routing result; it does not create or authorize a runtime job."""
 
@@ -299,7 +396,17 @@ class RouteDecision(BaseModel):
                 raise ValueError("ready decisions require one executable mode")
             if not self.assessments:
                 raise ValueError("ready decisions require an assessment")
-            if any(item.mode is not self.mode for item in self.assessments):
+            user_indexes = tuple(
+                index
+                for index, item in enumerate(self.assessments)
+                if item.source is RouteSource.USER
+            )
+            if user_indexes:
+                if user_indexes != (len(self.assessments) - 1,):
+                    raise ValueError("a user override must be the final unique assessment")
+                if self.assessments[-1].mode is not self.mode:
+                    raise ValueError("the user override must match the decision")
+            elif any(item.mode is not self.mode for item in self.assessments):
                 raise ValueError("ready assessment modes must match the decision")
             if self.clarification_reason is not None or self.options or self.decision_token is not None:
                 raise ValueError("ready decisions cannot carry an active clarification")

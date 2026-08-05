@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections.abc import Iterator, Mapping
 from decimal import Decimal
@@ -230,7 +231,7 @@ async def test_classifier_source_is_locally_overwritten() -> None:
     )
 
 
-async def test_router_revalidates_constructed_and_mapping_classifier_returns() -> None:
+async def test_router_revalidates_instances_and_rejects_mapping_contracts() -> None:
     invalid = assessment().model_copy(update={"confidence": float("nan")})
     rejected = await router(
         FakeClassifier(invalid),
@@ -245,13 +246,12 @@ async def test_router_revalidates_constructed_and_mapping_classifier_returns() -
             del task_text
             return mapping
 
-    accepted = await ModeRouter(
+    mapping_rejected = await ModeRouter(
         MappingClassifier(),
         FakeClassifier(assessment(source=RouteSource.VERIFIER)),
         token_store=InMemoryDecisionTokenStore(),
     ).route("ambiguous request")
-    assert accepted.status == "ready"
-    assert accepted.assessments[0].source is RouteSource.CLASSIFIER
+    assert mapping_rejected.status == "waiting_user_mode"
 
 
 async def test_hostile_mapping_from_classifier_fails_closed() -> None:
@@ -310,6 +310,18 @@ async def test_multilingual_explicit_risk_preserves_mode_and_approval(
         "发布到外部平台",
         "deploy_to_production",
         "执行不可逆操作",
+        "shutdown production server",
+        "disable security controls",
+        "send money to the supplier",
+        "rm -rf /",
+        "format production disk",
+        "delete all customer records",
+        "关闭生产服务器",
+        "禁用安全控制",
+        "给供应商打款",
+        "删除全部客户记录",
+        "Explain JSON, then delete production database",
+        "说明后删除生产数据库",
     ],
 )
 async def test_multilingual_high_risk_auto_routing_always_waits(text: str) -> None:
@@ -317,6 +329,15 @@ async def test_multilingual_high_risk_auto_routing_always_waits(text: str) -> No
     assert result.status == "waiting_user_mode"
     assert result.risk is RiskLevel.HIGH
     assert result.requires_approval is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Explain JSON payload validation", "What is deployment architecture?"],
+)
+async def test_read_only_payload_and_deployment_terms_are_not_high_risk(text: str) -> None:
+    result = await router().route(text)
+    assert result.risk is RiskLevel.LOW
 
 
 def test_router_requires_independent_classifier_instances_and_mandatory_verification() -> None:
@@ -334,7 +355,6 @@ async def test_user_confirmation_is_bound_to_decision_token_and_version() -> Non
     ).route("ambiguous architecture request", confirmation_subject=subject())
     with pytest.raises(ValueError, match="stale"):
         await router().confirm_mode(
-            waiting,
             TaskMode.DIRECT,
             decision_token="wrong",
             version=1,
@@ -348,7 +368,6 @@ async def test_user_confirmation_is_bound_to_decision_token_and_version() -> Non
         "ambiguous architecture request", confirmation_subject=subject()
     )
     ready = await selected_router.confirm_mode(
-        waiting,
         TaskMode.DIRECT,
         decision_token=waiting.decision_token,
         version=waiting.version,
@@ -366,7 +385,6 @@ async def test_confirmation_token_is_atomic_one_time_and_subject_bound() -> None
     waiting = await selected_router.route("ambiguous request", confirmation_subject=subject())
     with pytest.raises(ValueError, match="stale"):
         await selected_router.confirm_mode(
-            waiting,
             TaskMode.DIRECT,
             decision_token=waiting.decision_token,
             version=waiting.version,
@@ -374,7 +392,6 @@ async def test_confirmation_token_is_atomic_one_time_and_subject_bound() -> None
         )
     with pytest.raises(ValueError):
         await selected_router.confirm_mode(
-            waiting,
             "direct",  # type: ignore[arg-type]
             decision_token=waiting.decision_token,
             version=waiting.version,
@@ -382,14 +399,12 @@ async def test_confirmation_token_is_atomic_one_time_and_subject_bound() -> None
         )
     with pytest.raises(ValueError):
         await selected_router.confirm_mode(
-            waiting,
             TaskMode.DIRECT,
             decision_token=waiting.decision_token,
             version=True,
             confirmation_subject=subject(),
         )
     await selected_router.confirm_mode(
-        waiting,
         TaskMode.DIRECT,
         decision_token=waiting.decision_token,
         version=waiting.version,
@@ -397,7 +412,6 @@ async def test_confirmation_token_is_atomic_one_time_and_subject_bound() -> None
     )
     with pytest.raises(ValueError, match="stale"):
         await selected_router.confirm_mode(
-            waiting,
             TaskMode.DIRECT,
             decision_token=waiting.decision_token,
             version=waiting.version,
@@ -414,7 +428,6 @@ async def test_waiting_without_subject_is_not_confirmable() -> None:
     assert waiting.decision_token is None
     with pytest.raises(ValueError, match="stale"):
         await selected_router.confirm_mode(
-            waiting,
             TaskMode.DIRECT,
             decision_token=None,
             version=waiting.version,
@@ -435,12 +448,238 @@ async def test_confirmation_token_expires() -> None:
     now[0] = 11.0
     with pytest.raises(ValueError, match="stale"):
         await selected_router.confirm_mode(
-            waiting,
             TaskMode.DIRECT,
             decision_token=waiting.decision_token,
             version=waiting.version,
             confirmation_subject=subject(),
         )
+
+
+async def test_confirmation_uses_authoritative_snapshot_and_preserves_assessments() -> None:
+    selected_router = router(
+        FakeClassifier(
+            assessment(TaskMode.DISPATCH, risk=RiskLevel.HIGH, confidence=0.95)
+        ),
+        FakeClassifier(
+            assessment(
+                TaskMode.DISCUSS,
+                risk=RiskLevel.LOW,
+                confidence=0.95,
+                source=RouteSource.VERIFIER,
+            )
+        ),
+    )
+    waiting = await selected_router.route("ambiguous request", confirmation_subject=subject())
+    assert "decision" not in inspect.signature(selected_router.confirm_mode).parameters
+    ready = await selected_router.confirm_mode(
+        TaskMode.DIRECT,
+        decision_token=waiting.decision_token,
+        version=waiting.version,
+        confirmation_subject=subject(),
+    )
+    assert ready.risk is RiskLevel.HIGH
+    assert ready.requires_approval is True
+    assert tuple(item.source for item in ready.assessments) == (
+        RouteSource.CLASSIFIER,
+        RouteSource.VERIFIER,
+        RouteSource.USER,
+    )
+    assert ready.assessments[-1].mode is TaskMode.DIRECT
+    assert ready.assessments[0].deployment_id == "router-a"
+
+
+async def test_new_waiting_decision_revokes_old_card_and_increments_version() -> None:
+    selected_router = router(
+        FakeClassifier(assessment(TaskMode.DISPATCH)),
+        FakeClassifier(assessment(TaskMode.DISCUSS, source=RouteSource.VERIFIER)),
+    )
+    first = await selected_router.route("ambiguous request", confirmation_subject=subject())
+    second = await selected_router.route("ambiguous request", confirmation_subject=subject())
+    assert second.version == first.version + 1
+    with pytest.raises(ValueError, match="stale"):
+        await selected_router.confirm_mode(
+            TaskMode.DIRECT,
+            decision_token=first.decision_token,
+            version=first.version,
+            confirmation_subject=subject(),
+        )
+    ready = await selected_router.confirm_mode(
+        TaskMode.DIRECT,
+        decision_token=second.decision_token,
+        version=second.version,
+        confirmation_subject=subject(),
+    )
+    assert ready.status == "ready"
+
+
+async def test_concurrent_issue_and_confirm_leave_only_one_current_choice() -> None:
+    selected_router = router(
+        FakeClassifier(assessment(TaskMode.DISPATCH)),
+        FakeClassifier(assessment(TaskMode.DISCUSS, source=RouteSource.VERIFIER)),
+    )
+    issued = await asyncio.gather(
+        selected_router.route("ambiguous request", confirmation_subject=subject()),
+        selected_router.route("ambiguous request", confirmation_subject=subject()),
+    )
+    current = max(issued, key=lambda item: item.version)
+    old = min(issued, key=lambda item: item.version)
+    assert {item.version for item in issued} == {1, 2}
+    with pytest.raises(ValueError, match="stale"):
+        await selected_router.confirm_mode(
+            TaskMode.DIRECT,
+            decision_token=old.decision_token,
+            version=old.version,
+            confirmation_subject=subject(),
+        )
+    results = await asyncio.gather(
+        *(
+            selected_router.confirm_mode(
+                TaskMode.DIRECT,
+                decision_token=current.decision_token,
+                version=current.version,
+                confirmation_subject=subject(),
+            )
+            for _ in range(2)
+        ),
+        return_exceptions=True,
+    )
+    assert sum(isinstance(item, RouteDecision) for item in results) == 1
+    assert sum(isinstance(item, ValueError) for item in results) == 1
+
+
+async def test_confirmation_binds_task_and_generation_without_consuming_on_mismatch() -> None:
+    selected_router = router(
+        FakeClassifier(assessment(TaskMode.DISPATCH)),
+        FakeClassifier(assessment(TaskMode.DISCUSS, source=RouteSource.VERIFIER)),
+    )
+    waiting = await selected_router.route("ambiguous request", confirmation_subject=subject())
+    for wrong in (
+        subject(task_id="task-2"),
+        ConfirmationSubject(
+            tenant_id="tenant-1",
+            user_id="user-1",
+            task_id="task-1",
+            generation="generation-2",
+        ),
+    ):
+        with pytest.raises(ValueError, match="stale"):
+            await selected_router.confirm_mode(
+                TaskMode.DIRECT,
+                decision_token=waiting.decision_token,
+                version=waiting.version,
+                confirmation_subject=wrong,
+            )
+    ready = await selected_router.confirm_mode(
+        TaskMode.DIRECT,
+        decision_token=waiting.decision_token,
+        version=waiting.version,
+        confirmation_subject=subject(),
+    )
+    assert ready.status == "ready"
+
+
+async def test_consume_reads_clock_inside_lock_and_rejects_lock_wait_past_ttl() -> None:
+    now = [10.0]
+    store = InMemoryDecisionTokenStore(monotonic=lambda: now[0])
+    selected_router = ModeRouter(
+        FakeClassifier(assessment(TaskMode.DISPATCH)),
+        FakeClassifier(assessment(TaskMode.DISCUSS, source=RouteSource.VERIFIER)),
+        token_store=store,
+        policy=RoutingPolicy(confirmation_ttl_seconds=1),
+    )
+    waiting = await selected_router.route("ambiguous request", confirmation_subject=subject())
+    await store._lock.acquire()
+    confirmation = asyncio.create_task(
+        selected_router.confirm_mode(
+            TaskMode.DIRECT,
+            decision_token=waiting.decision_token,
+            version=waiting.version,
+            confirmation_subject=subject(),
+        )
+    )
+    await asyncio.sleep(0)
+    now[0] = 11.0
+    store._lock.release()
+    with pytest.raises(ValueError, match="stale"):
+        await confirmation
+
+
+async def test_token_store_never_keeps_plaintext_token() -> None:
+    store = InMemoryDecisionTokenStore()
+    selected_router = ModeRouter(
+        FakeClassifier(assessment(TaskMode.DISPATCH)),
+        FakeClassifier(assessment(TaskMode.DISCUSS, source=RouteSource.VERIFIER)),
+        token_store=store,
+    )
+    waiting = await selected_router.route("ambiguous request", confirmation_subject=subject())
+    assert waiting.decision_token is not None
+    assert waiting.decision_token not in repr(store.__dict__)
+
+
+async def test_version_exhaustion_revokes_old_token_and_fails_closed() -> None:
+    store = InMemoryDecisionTokenStore(max_version=1)
+    selected_router = ModeRouter(
+        FakeClassifier(assessment(TaskMode.DISPATCH)),
+        FakeClassifier(assessment(TaskMode.DISCUSS, source=RouteSource.VERIFIER)),
+        token_store=store,
+    )
+    first = await selected_router.route("ambiguous request", confirmation_subject=subject())
+    exhausted = await selected_router.route("ambiguous request", confirmation_subject=subject())
+    assert exhausted.decision_token is None
+    with pytest.raises(ValueError, match="stale"):
+        await selected_router.confirm_mode(
+            TaskMode.DIRECT,
+            decision_token=first.decision_token,
+            version=first.version,
+            confirmation_subject=subject(),
+        )
+
+
+async def test_token_subject_capacity_is_bounded_and_fails_closed() -> None:
+    store = InMemoryDecisionTokenStore(max_records=1)
+    selected_router = ModeRouter(
+        FakeClassifier(assessment(TaskMode.DISPATCH)),
+        FakeClassifier(assessment(TaskMode.DISCUSS, source=RouteSource.VERIFIER)),
+        token_store=store,
+    )
+    first = await selected_router.route("ambiguous request", confirmation_subject=subject())
+    blocked = await selected_router.route(
+        "ambiguous request", confirmation_subject=subject(task_id="task-2")
+    )
+    assert first.decision_token is not None
+    assert blocked.decision_token is None
+
+
+async def test_nonfinite_or_reversing_clock_invalidates_confirmation_tokens() -> None:
+    now = [10.0]
+    store = InMemoryDecisionTokenStore(monotonic=lambda: now[0])
+    selected_router = ModeRouter(
+        FakeClassifier(assessment(TaskMode.DISPATCH)),
+        FakeClassifier(assessment(TaskMode.DISCUSS, source=RouteSource.VERIFIER)),
+        token_store=store,
+    )
+    waiting = await selected_router.route("ambiguous request", confirmation_subject=subject())
+    now[0] = 9.0
+    with pytest.raises(ValueError, match="stale"):
+        await selected_router.confirm_mode(
+            TaskMode.DIRECT,
+            decision_token=waiting.decision_token,
+            version=waiting.version,
+            confirmation_subject=subject(),
+        )
+    now[0] = 10.0
+    with pytest.raises(ValueError, match="stale"):
+        await selected_router.confirm_mode(
+            TaskMode.DIRECT,
+            decision_token=waiting.decision_token,
+            version=waiting.version,
+            confirmation_subject=subject(),
+        )
+    now[0] = float("nan")
+    unavailable = await selected_router.route(
+        "ambiguous request", confirmation_subject=subject(task_id="task-2")
+    )
+    assert unavailable.decision_token is None
 
 
 def test_route_contracts_are_strict_frozen_and_enforce_invariants() -> None:

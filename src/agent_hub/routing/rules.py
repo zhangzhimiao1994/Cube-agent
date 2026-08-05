@@ -60,12 +60,9 @@ class RiskRulePolicy:
         "wipe",
         "erase",
         "remove",
-        "删除",
-        "清空",
-        "销毁",
-        "截断",
-        "擦除",
-        "移除",
+        "shutdown",
+        "disable",
+        "format",
     )
     destructive_targets: tuple[str, ...] = (
         "production",
@@ -75,24 +72,33 @@ class RiskRulePolicy:
         "data",
         "table",
         "file",
-        "生产",
-        "正式",
-        "数据库",
-        "数据",
-        "表",
-        "文件",
+        "disk",
+        "server",
+        "security",
+        "control",
+        "controls",
+        "record",
+        "records",
+        "customer",
+        "customers",
     )
     financial_actions: tuple[str, ...] = (
         "transfer",
-        "payment",
+        "send",
         "refund",
         "pay",
         "wire",
-        "转账",
-        "付款",
-        "支付",
-        "退款",
-        "汇款",
+    )
+    financial_targets: tuple[str, ...] = (
+        "money",
+        "fund",
+        "funds",
+        "payment",
+        "payments",
+        "customer",
+        "supplier",
+        "vendor",
+        "account",
     )
     sensitive_actions: tuple[str, ...] = (
         "change",
@@ -103,67 +109,136 @@ class RiskRulePolicy:
         "expose",
         "export",
         "delete",
-        "修改",
-        "重置",
-        "轮换",
-        "撤销",
-        "授予",
-        "泄露",
-        "导出",
-        "删除",
     )
     sensitive_targets: tuple[str, ...] = (
         "permission",
         "credential",
         "secret",
         "api key",
+        "api",
+        "key",
         "token",
         "password",
-        "权限",
-        "凭证",
-        "密钥",
-        "秘钥",
-        "令牌",
-        "密码",
-        "授权",
+        "admin",
     )
     external_actions: tuple[str, ...] = (
         "publish",
         "deploy",
-        "send external",
-        "发布",
-        "部署",
-        "上线",
-        "外发",
-        "推送到外部",
+    )
+    external_targets: tuple[str, ...] = (
+        "external",
+        "public",
+        "production",
+        "prod",
     )
     irreversible_markers: tuple[str, ...] = (
         "irreversible",
         "permanent",
         "cannot undo",
-        "不可逆",
-        "无法撤销",
-        "永久",
     )
 
     def is_high_risk(self, task_text: str) -> bool:
         normalized = unicodedata.normalize("NFKC", task_text).casefold()
-        separated = re.sub(r"[\s_\-./:]+", " ", normalized)
-        searchable = f" {separated} "
+        if re.search(r"\brm\s+-(?:[a-z]*r[a-z]*f|[a-z]*f[a-z]*r)\s+/(?:\s|$)", normalized):
+            return True
+
+        english_tokens = frozenset(re.findall(r"[a-z0-9]+", normalized))
+
+        def has(values: tuple[str, ...]) -> bool:
+            return not english_tokens.isdisjoint(values)
+
+        explicit_english_risk = (
+            (has(self.destructive_actions) and has(self.destructive_targets))
+            or (has(self.financial_actions) and has(self.financial_targets))
+            or (has(self.sensitive_actions) and has(self.sensitive_targets))
+            or (has(self.external_actions) and has(self.external_targets))
+            or any(marker in normalized for marker in self.irreversible_markers)
+        )
+        chinese_read_only = normalized.startswith(("解释", "什么是", "介绍", "说明"))
+        english_read_only = re.match(
+            r"^\s*(?:explain|what\s+is|what\s+are|describe|how\s+does)\b", normalized
+        ) is not None
+        english_read_only = english_read_only and re.search(
+            r"\b(?:then|and)\s+(?:delete|drop|truncate|shutdown|disable|format|"
+            r"transfer|send|refund|pay|wire|change|reset|rotate|revoke|grant|"
+            r"publish|deploy)\b",
+            normalized,
+        ) is None
+        chinese_read_only = chinese_read_only and not any(
+            marker in normalized for marker in ("然后", "随后", "并且", "说明后", "解释后")
+        )
+        if explicit_english_risk and not (english_read_only or chinese_read_only):
+            return True
+
+        chinese_destructive_actions = (
+            "删除",
+            "清空",
+            "销毁",
+            "截断",
+            "擦除",
+            "移除",
+            "关闭",
+            "停机",
+            "禁用",
+            "格式化",
+        )
+        chinese_destructive_targets = (
+            "生产",
+            "正式",
+            "数据库",
+            "数据",
+            "表",
+            "文件",
+            "磁盘",
+            "服务器",
+            "安全",
+            "控制",
+            "客户记录",
+            "全部客户",
+        )
+        chinese_sensitive_actions = (
+            "修改",
+            "重置",
+            "轮换",
+            "撤销",
+            "授予",
+            "泄露",
+            "导出",
+            "删除",
+        )
+        chinese_sensitive_targets = (
+            "权限",
+            "凭证",
+            "密钥",
+            "秘钥",
+            "令牌",
+            "密码",
+            "授权",
+        )
+        chinese_financial = ("转账", "付款", "支付", "退款", "汇款", "打款")
+        chinese_external_actions = ("发布", "部署", "上线", "外发", "推送")
+        chinese_external_targets = ("外部", "公开", "生产", "正式")
 
         def contains_any(values: tuple[str, ...]) -> bool:
-            return any(value in searchable or value in normalized for value in values)
+            return any(value in normalized for value in values)
 
-        return (
-            contains_any(self.financial_actions)
-            or contains_any(self.external_actions)
-            or contains_any(self.irreversible_markers)
+        explicit_chinese_risk = (
+            contains_any(chinese_financial)
+            or contains_any(("不可逆", "无法撤销", "永久"))
             or (
-                contains_any(self.destructive_actions)
-                and contains_any(self.destructive_targets)
+                contains_any(chinese_destructive_actions)
+                and contains_any(chinese_destructive_targets)
             )
-            or (contains_any(self.sensitive_actions) and contains_any(self.sensitive_targets))
+            or (
+                contains_any(chinese_sensitive_actions)
+                and contains_any(chinese_sensitive_targets)
+            )
+            or (
+                contains_any(chinese_external_actions)
+                and contains_any(chinese_external_targets)
+            )
         )
+        return explicit_chinese_risk and not chinese_read_only
 
 
 def validate_task_text(task_text: object) -> str:

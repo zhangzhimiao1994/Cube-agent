@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import math
-import secrets
-from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -19,6 +17,7 @@ from agent_hub.routing.rules import (
 )
 from agent_hub.routing.types import (
     EXECUTABLE_MODES,
+    ConfirmationSnapshot,
     ConfirmationSubject,
     DecisionTokenStore,
     RiskLevel,
@@ -236,14 +235,9 @@ class ModeRouter:
             "deployment_id",
             "provider_id",
         }
-        if isinstance(value, RouteAssessment):
-            raw: Mapping[str, object] = value.model_dump(round_trip=True)
-        elif isinstance(value, Mapping) and len(value) <= len(expected_keys):
-            if any(type(key) is not str for key in value):
-                return None
-            raw = value
-        else:
+        if not isinstance(value, RouteAssessment):
             return None
+        raw = value.model_dump(round_trip=True)
         if set(raw) != expected_keys:
             return None
         roles = raw.get("roles")
@@ -266,7 +260,6 @@ class ModeRouter:
 
     async def confirm_mode(
         self,
-        decision: RouteDecision,
         mode: TaskMode,
         *,
         decision_token: str | None,
@@ -274,9 +267,6 @@ class ModeRouter:
         confirmation_subject: ConfirmationSubject,
     ) -> RouteDecision:
         try:
-            decision = RouteDecision.model_validate(
-                decision.model_dump(round_trip=True), strict=True
-            )
             confirmation_subject = ConfirmationSubject.model_validate(
                 confirmation_subject.model_dump(round_trip=True), strict=True
             )
@@ -286,12 +276,9 @@ class ModeRouter:
             error.__cause__ = None
             raise ValueError("stale routing decision") from None
         if (
-            decision.status != "waiting_user_mode"
-            or decision_token is None
-            or decision.decision_token is None
-            or not secrets.compare_digest(decision_token, decision.decision_token)
+            decision_token is None
             or type(version) is not int
-            or version != decision.version
+            or version <= 0
         ):
             raise ValueError("stale routing decision")
         if not isinstance(mode, TaskMode) or mode not in EXECUTABLE_MODES:
@@ -309,18 +296,19 @@ class ModeRouter:
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None
-            consumed = False
-        if not consumed:
+            consumed = None
+        if consumed is None:
             raise ValueError("stale routing decision")
+        snapshot = consumed.snapshot
         user = self._local_assessment(
-            mode, "explicit_user_confirmation", RouteSource.USER, risk=decision.risk
+            mode, "explicit_user_confirmation", RouteSource.USER, risk=snapshot.risk
         )
         return self._ready(
             mode,
-            (user,),
-            risk=decision.risk,
-            requires_approval=decision.requires_approval,
-            version=decision.version + 1,
+            (*snapshot.assessments, user),
+            risk=snapshot.risk,
+            requires_approval=snapshot.requires_approval,
+            version=consumed.version + 1,
         )
 
     @staticmethod
@@ -387,14 +375,23 @@ class ModeRouter:
                 ),
             )
         token: str | None = None
+        version = 1
         if confirmation_subject is not None:
             try:
-                token = await self._token_store.issue(
+                snapshot = ConfirmationSnapshot(
+                    assessments=assessments,
+                    clarification_reason=reason,
+                    options=EXECUTABLE_MODES,
+                    risk=risk,
+                    requires_approval=requires_approval,
+                )
+                issued = await self._token_store.issue(
                     confirmation_subject,
-                    version=1,
-                    allowed_modes=EXECUTABLE_MODES,
+                    snapshot=snapshot,
                     ttl_seconds=self._policy.confirmation_ttl_seconds,
                 )
+                token = issued.token
+                version = issued.version
             except asyncio.CancelledError:
                 raise
             except Exception as error:  # noqa: BLE001 - fail closed without a token
@@ -409,7 +406,7 @@ class ModeRouter:
             clarification_reason=reason,
             options=EXECUTABLE_MODES,
             decision_token=token,
-            version=1,
+            version=version,
             risk=risk,
             requires_approval=requires_approval,
             permissions_still_apply=True,
