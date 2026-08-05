@@ -1,9 +1,10 @@
 import asyncio
+from io import StringIO
 from uuid import UUID, uuid4
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_hub.db.models import ConfigRevisionRow, TenantRow
@@ -37,6 +38,33 @@ async def test_database_readiness_confirms_postgres(database_url: str) -> None:
 def test_migrations_downgrade_to_base_and_upgrade_to_head(alembic_config: Config) -> None:
     command.downgrade(alembic_config, "base")
     command.upgrade(alembic_config, "head")
+
+
+@pytest.mark.integration
+def test_encrypted_secrets_migration_downgrades_and_reupgrades(
+    alembic_config: Config, database_url: str
+) -> None:
+    command.downgrade(alembic_config, "0003_one_published")
+    assert asyncio.run(_table_exists(database_url, "agent_hub_secrets")) is False
+
+    command.upgrade(alembic_config, "0004_encrypted_secrets")
+    assert asyncio.run(_table_exists(database_url, "agent_hub_secrets")) is True
+
+
+@pytest.mark.integration
+def test_encrypted_secrets_migration_generates_offline_sql(alembic_config: Config) -> None:
+    output = StringIO()
+    alembic_config.output_buffer = output
+
+    command.upgrade(
+        alembic_config,
+        "0003_one_published:0004_encrypted_secrets",
+        sql=True,
+    )
+
+    generated = output.getvalue()
+    assert "CREATE TABLE agent_hub_secrets" in generated
+    assert "uq_agent_hub_secrets_tenant_fingerprint" in generated
 
 
 @pytest.mark.integration
@@ -87,5 +115,18 @@ async def _delete_tenant(database_url: str, tenant_id: UUID) -> None:
             )
             await session.execute(delete(TenantRow).where(TenantRow.id == tenant_id))
             await session.commit()
+    finally:
+        await database.dispose()
+
+
+async def _table_exists(database_url: str, table_name: str) -> bool:
+    database = build_database(database_url)
+    try:
+        async with database.session_factory() as session:
+            relation = await session.scalar(
+                text("SELECT to_regclass(:table_name)"),
+                {"table_name": table_name},
+            )
+            return relation is not None
     finally:
         await database.dispose()

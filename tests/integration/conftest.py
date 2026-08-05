@@ -6,9 +6,9 @@ from pathlib import Path
 import pytest
 from alembic.config import Config
 from sqlalchemy import delete
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agent_hub.db.models import ConfigRevisionRow, TenantRow, UserRow
+from agent_hub.db.models import ConfigRevisionRow, SecretRow, TenantRow, UserRow
 from agent_hub.db.session import Database, build_database
 from alembic import command
 
@@ -54,6 +54,7 @@ async def db_session(database_url: str) -> AsyncIterator[AsyncSession]:
     try:
         async with database.session_factory() as session:
             await session.rollback()
+            await session.execute(delete(SecretRow))
             await session.execute(delete(ConfigRevisionRow))
             await session.execute(delete(UserRow))
             await session.execute(delete(TenantRow))
@@ -62,9 +63,33 @@ async def db_session(database_url: str) -> AsyncIterator[AsyncSession]:
                 yield session
             finally:
                 await session.rollback()
+                await session.execute(delete(SecretRow))
                 await session.execute(delete(ConfigRevisionRow))
                 await session.execute(delete(UserRow))
                 await session.execute(delete(TenantRow))
                 await session.commit()
     finally:
         await database.dispose()
+
+
+@pytest.fixture
+async def secret_session_factory(
+    database_url: str,
+) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    database = build_database(database_url)
+    try:
+        await _clean_database(database.session_factory)
+        yield database.session_factory
+    finally:
+        await _clean_database(database.session_factory)
+        await database.dispose()
+
+
+async def _clean_database(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session, session.begin():
+        await session.execute(delete(SecretRow))
+        await session.execute(delete(ConfigRevisionRow))
+        await session.execute(delete(UserRow))
+        await session.execute(delete(TenantRow))

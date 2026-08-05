@@ -43,6 +43,28 @@ class UserRow(Base):
     role: Mapped[str] = mapped_column(String(32))
 
 
+class SecretRow(Base):
+    __tablename__ = "agent_hub_secrets"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "fingerprint",
+            name="uq_agent_hub_secrets_tenant_fingerprint",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(ForeignKey("agent_hub_tenants.id"))
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    key_id: Mapped[str] = mapped_column(String(64))
+    nonce: Mapped[str] = mapped_column(String(16))
+    ciphertext: Mapped[str] = mapped_column(Text)
+    created_by: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class ConfigRevisionRow(Base):
     __tablename__ = "agent_hub_config_revisions"
     __table_args__ = (
