@@ -209,16 +209,20 @@ class CapacityPool:
             or refresh_interval >= float(metadata_ttl_seconds) / 3
         ):
             raise ValueError("metadata_refresh_interval must be positive and below TTL/3")
+        lease_ms = math.ceil(float(lease_seconds) * 1000)
+        metadata_ttl_ms = math.ceil(float(metadata_ttl_seconds) * 1000)
+        if metadata_ttl_ms < 3 * lease_ms:
+            raise ValueError("metadata_ttl_seconds must cover at least three lease horizons")
         self._redis = cast(RedisCapacityClient, redis_client)
         self._credentials = credentials
         self._key_prefix = key_prefix
-        self._lease_ms = math.ceil(lease_seconds * 1000)
+        self._lease_ms = lease_ms
         self._poll_interval = float(poll_interval)
         self._max_waiters = max_waiters
         self._cooldown_ms = math.ceil(cooldown_seconds * 1000)
         self._latency_threshold_ms = math.ceil(latency_threshold_seconds * 1000)
         self._health_window = health_window
-        self._metadata_ttl_ms = math.ceil(float(metadata_ttl_seconds) * 1000)
+        self._metadata_ttl_ms = metadata_ttl_ms
         self._metadata_refresh_interval = float(refresh_interval)
         self._monotonic = monotonic
         self._waiters = 0
@@ -267,16 +271,19 @@ class CapacityPool:
         Every worker must receive the same full catalog. Redis only converges values
         downward, so a permissive or stale worker can never raise a scope policy.
         """
+        await self._ensure_registration(force=False)
+
+    async def _ensure_registration(self, *, force: bool) -> None:
         if not self._catalog_by_id:
             raise CapacityConfigurationError("model capacity catalog is empty")
         if self._credentials is None:
             raise CapacityConfigurationError("credential fingerprints are required")
         now = self._clock_now()
-        if self._initialized and now < self._next_metadata_refresh:
+        if not force and self._initialized and now < self._next_metadata_refresh:
             return
         async with self._registration_lock:
             now = self._clock_now()
-            if self._initialized and now < self._next_metadata_refresh:
+            if not force and self._initialized and now < self._next_metadata_refresh:
                 return
             self._initialized = False
             await self._register_metadata()
@@ -489,6 +496,13 @@ class CapacityPool:
     async def renew(self, lease: CapacityLease) -> CapacityLease | None:
         if not isinstance(lease, CapacityLease):
             raise TypeError("lease must be a CapacityLease")
+        deployment = self._catalog_by_id.get(lease.deployment_id)
+        if deployment is None or deployment.quota_scope_id != lease.quota_scope_id:
+            raise CapacityConfigurationError("lease is outside initialized catalog")
+        # Fingerprint claims and leases occupy different Redis Cluster hash slots,
+        # so they cannot share one Lua transaction. Forced claim refresh plus the
+        # 3x metadata/lease TTL invariant fences natural expiry before ZADD.
+        await self._ensure_registration(force=True)
         key = self._keys(lease.quota_scope_id)["leases"]
         try:
             result = await self._redis.eval(

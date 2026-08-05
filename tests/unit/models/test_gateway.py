@@ -6,6 +6,7 @@ import pytest
 
 from agent_hub.models.capacity import (
     CapacityBackendError,
+    CapacityConfigurationError,
     CapacityLease,
     CapacityQueueFull,
     CapacityUnavailable,
@@ -69,6 +70,7 @@ class CapacityStub:
         self.release_started = asyncio.Event()
         self.initialize_calls = 0
         self.initialized = False
+        self.renew_error: Exception | None = None
 
     async def initialize(self) -> None:
         self.initialize_calls += 1
@@ -107,6 +109,8 @@ class CapacityStub:
     async def renew(self, lease: CapacityLease) -> CapacityLease | None:
         self.renews += 1
         self.events.append(("renew", lease.id))
+        if self.renew_error is not None:
+            raise self.renew_error
         return CapacityLease(
             lease.id,
             lease.deployment_id,
@@ -153,6 +157,7 @@ class TransportStub:
         self.failure = failure
         self.block = block
         self.calls: list[tuple[Deployment, ModelRequest, str]] = []
+        self.cancelled = asyncio.Event()
 
     async def complete(
         self, deployment: Deployment, model_request: ModelRequest, api_key: str
@@ -160,7 +165,11 @@ class TransportStub:
         self.events.append(("transport", deployment.id))
         self.calls.append((deployment, model_request, api_key))
         if self.block is not None:
-            await self.block.wait()
+            try:
+                await self.block.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
         if self.failure is not None:
             raise self.failure
         return ModelResponse(text="ok")
@@ -382,6 +391,28 @@ async def test_long_call_renews_lease_until_nonstream_response_finishes() -> Non
     block.set()
     assert (await task).text == "ok"
     assert len(capacity.releases) == 1
+
+
+async def test_heartbeat_ownership_conflict_cancels_transport_and_releases_once() -> None:
+    selected = deployment("selected")
+    capacity = CapacityStub([lease("selected")])
+    capacity.renew_error = CapacityConfigurationError("credential ownership conflict")
+    block = asyncio.Event()
+    transport = TransportStub(capacity.events, block=block)
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        SecretStub(capacity.events),
+        transport,
+        heartbeat_interval=0.005,
+    )
+
+    with pytest.raises(CapacityConfigurationError, match="ownership conflict"):
+        await gateway.complete(request())
+
+    assert transport.cancelled.is_set()
+    assert len(capacity.releases) == 1
+    assert capacity.events.count(("release", "lease-selected")) == 1
 
 
 async def test_capacity_timeout_traverses_fallback_only_when_allowed() -> None:

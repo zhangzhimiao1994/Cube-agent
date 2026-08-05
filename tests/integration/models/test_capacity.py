@@ -91,6 +91,15 @@ class RegistrationRedis:
         return await redis_eval(script, key_count, *args)
 
 
+async def redis_key(client: Redis, pattern: str, *, member: str | None = None) -> bytes:
+    async for key in client.scan_iter(match=pattern):
+        if not isinstance(key, bytes):
+            raise TypeError("test Redis keys must be bytes")
+        if member is None or await client.zscore(key, member) is not None:
+            return key
+    raise AssertionError("expected Redis key was not found")
+
+
 @pytest.mark.integration
 async def test_serial_scope_times_out_and_release_recovers(
     redis_client: Redis, prefix: str
@@ -270,6 +279,99 @@ async def test_expiry_and_exact_renew_semantics(redis_client: Redis, prefix: str
 
 
 @pytest.mark.integration
+async def test_renew_fails_without_extending_after_fingerprint_takeover(
+    redis_client: Redis, redis_url: str, prefix: str
+) -> None:
+    other_client = Redis.from_url(redis_url)
+    first = deployment("renew-a", "renew-scope-a")
+    second = deployment("renew-b", "renew-scope-b")
+    shared = fingerprint("renew-shared-credential")
+    first_pool = CapacityPool(
+        redis_client,
+        deployments=[first],
+        credentials=CredentialRegistry([CredentialDescriptor(first.secret_ref, shared)]),
+        key_prefix=prefix,
+        lease_seconds=0.5,
+        metadata_ttl_seconds=2,
+        metadata_refresh_interval=0.5,
+    )
+    second_pool = CapacityPool(
+        other_client,
+        deployments=[second],
+        credentials=CredentialRegistry([CredentialDescriptor(second.secret_ref, shared)]),
+        key_prefix=prefix,
+        lease_seconds=0.5,
+        metadata_ttl_seconds=2,
+        metadata_refresh_interval=0.5,
+    )
+    try:
+        await first_pool.initialize()
+        first_lease = await first_pool.acquire(
+            [first], wait_timeout=0.05, estimated_tokens=1
+        )
+        first_lease_key = await redis_key(
+            redis_client, f"{prefix}*:leases", member=first_lease.id
+        )
+        old_score = await redis_client.zscore(first_lease_key, first_lease.id)
+        claim_key = await redis_key(redis_client, f"{prefix}credential:*:scope")
+        await redis_client.delete(claim_key)
+        await second_pool.initialize()
+        second_lease = await second_pool.acquire(
+            [second], wait_timeout=0.05, estimated_tokens=1
+        )
+
+        with pytest.raises(CapacityConfigurationError, match="quota scope conflicts"):
+            await first_pool.renew(first_lease)
+        assert await redis_client.zscore(first_lease_key, first_lease.id) == old_score
+        assert await first_pool.release(first_lease) is True
+        assert await redis_client.zcard(first_lease_key) == 0
+        second_lease_key = await redis_key(
+            redis_client, f"{prefix}*:leases", member=second_lease.id
+        )
+        assert await redis_client.zcard(second_lease_key) == 1
+        await second_pool.release(second_lease)
+    finally:
+        await other_client.aclose()
+
+
+@pytest.mark.integration
+async def test_successful_renew_refreshes_fingerprint_claim(
+    redis_client: Redis, prefix: str
+) -> None:
+    serial = deployment("renew-normal", "renew-normal-scope")
+    pool = CapacityPool(
+        redis_client,
+        deployments=[serial],
+        credentials=credentials("renew-normal"),
+        key_prefix=prefix,
+        lease_seconds=0.5,
+        metadata_ttl_seconds=2,
+        metadata_refresh_interval=0.5,
+    )
+    await pool.initialize()
+    active = await pool.acquire([serial], wait_timeout=0.05, estimated_tokens=1)
+    claim_key = await redis_key(redis_client, f"{prefix}credential:*:scope")
+    await redis_client.pexpire(claim_key, 800)
+    before = await redis_client.pttl(claim_key)
+
+    renewed = await pool.renew(active)
+
+    assert renewed is not None
+    assert await redis_client.pttl(claim_key) > before + 500
+    await pool.release(active)
+
+
+def test_metadata_ttl_must_cover_three_lease_horizons() -> None:
+    with pytest.raises(ValueError, match="metadata_ttl_seconds"):
+        CapacityPool(
+            object(),
+            lease_seconds=1,
+            metadata_ttl_seconds=2.9,
+            metadata_refresh_interval=0.5,
+        )
+
+
+@pytest.mark.integration
 async def test_rpm_tpm_are_scope_shared_and_full_capacity_spends_nothing(
     redis_client: Redis, prefix: str
 ) -> None:
@@ -376,6 +478,7 @@ async def test_repeat_initialize_refreshes_active_metadata_ttls(
         deployments=[serial],
         credentials=credentials("refresh-active"),
         key_prefix=prefix,
+        lease_seconds=0.05,
         metadata_ttl_seconds=0.2,
         metadata_refresh_interval=0.05,
         monotonic=clock,
@@ -408,6 +511,7 @@ async def test_initialize_reconstructs_expired_metadata_before_acquire(
         deployments=[serial],
         credentials=credentials("refresh-expired"),
         key_prefix=prefix,
+        lease_seconds=0.02,
         metadata_ttl_seconds=0.08,
         metadata_refresh_interval=0.02,
         monotonic=clock,
@@ -439,6 +543,7 @@ async def test_expired_claim_conflict_blocks_original_worker(
         deployments=[first],
         credentials=CredentialRegistry([CredentialDescriptor(first.secret_ref, shared)]),
         key_prefix=prefix,
+        lease_seconds=0.02,
         metadata_ttl_seconds=0.08,
         metadata_refresh_interval=0.02,
         monotonic=first_clock,
@@ -448,6 +553,7 @@ async def test_expired_claim_conflict_blocks_original_worker(
         deployments=[second],
         credentials=CredentialRegistry([CredentialDescriptor(second.secret_ref, shared)]),
         key_prefix=prefix,
+        lease_seconds=0.05,
         metadata_ttl_seconds=0.2,
         metadata_refresh_interval=0.05,
         monotonic=second_clock,
@@ -482,6 +588,7 @@ async def test_concurrent_due_initialize_performs_one_registration_sequence(
         deployments=[serial],
         credentials=credentials("refresh-concurrent"),
         key_prefix=prefix,
+        lease_seconds=0.08,
         metadata_ttl_seconds=0.3,
         metadata_refresh_interval=0.05,
         monotonic=clock,
@@ -509,6 +616,7 @@ async def test_failed_or_cancelled_initialize_is_retryable(
         deployments=[serial],
         credentials=credentials("refresh-retry"),
         key_prefix=prefix,
+        lease_seconds=0.08,
         metadata_ttl_seconds=0.3,
         metadata_refresh_interval=0.05,
     )

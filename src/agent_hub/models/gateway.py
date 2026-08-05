@@ -9,6 +9,7 @@ from typing import Protocol
 
 from agent_hub.models.capacity import (
     CapacityBackendError,
+    CapacityConfigurationError,
     CapacityLease,
     CapacityPool,
     CapacityUnavailable,
@@ -222,7 +223,7 @@ class ModelGateway:
                     status_code = error.status_code
                     should_record = True
                     primary_error = error.with_traceback(None)
-                except CapacityBackendError as error:
+                except (CapacityBackendError, CapacityConfigurationError) as error:
                     primary_error = error
                 except Exception:  # noqa: BLE001 - redact arbitrary injected transport failures
                     should_record = True
