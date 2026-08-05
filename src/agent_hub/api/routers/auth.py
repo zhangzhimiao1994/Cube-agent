@@ -1,11 +1,12 @@
 """Local bootstrap and login endpoints."""
 
+from ipaddress import ip_address
 from typing import Annotated, Protocol, cast
 
 from fastapi import APIRouter, Depends, Request, status
 
 from agent_hub.api.dependencies import current_principal
-from agent_hub.api.errors import PublicAPIError
+from agent_hub.api.errors import ERROR_RESPONSES, PublicAPIError
 from agent_hub.api.schemas import (
     LoginRequest,
     PrincipalResponse,
@@ -26,7 +27,7 @@ from agent_hub.auth.models import (
 from agent_hub.auth.passwords import PasswordValidationError
 from agent_hub.auth.rate_limit import AuthRateLimiter, RateLimitUnavailable
 
-router = APIRouter(prefix="/api/v1", tags=["auth"])
+router = APIRouter(prefix="/api/v1", tags=["auth"], responses=ERROR_RESPONSES)
 
 
 class AuthenticationService(Protocol):
@@ -46,16 +47,47 @@ def _auth_service(request: Request) -> AuthenticationService:
 
 def _client_ip(request: Request) -> str:
     socket_ip = request.client.host if request.client is not None else "unknown"
+    canonical_socket = _canonical_ip(socket_ip)
+    if canonical_socket is None:
+        return socket_ip
     trusted: frozenset[str] = getattr(
         request.app.state, "trusted_proxy_ips", frozenset()
     )
-    if socket_ip not in trusted:
-        return socket_ip
-    forwarded_values = request.headers.getlist("x-forwarded-for")
+    if canonical_socket not in trusted:
+        return canonical_socket
+    forwarded_values = [
+        value.decode("latin-1")
+        for name, value in request.scope.get("headers", [])
+        if name.lower() == b"x-forwarded-for"
+    ]
     if len(forwarded_values) != 1:
-        return socket_ip
-    candidate = forwarded_values[0].split(",", 1)[0].strip()
-    return candidate or socket_ip
+        return canonical_socket
+    forwarded = forwarded_values[0]
+    if len(forwarded) > 2048:
+        return canonical_socket
+    raw_hops = forwarded.split(",")
+    if not 1 <= len(raw_hops) <= 32:
+        return canonical_socket
+    chain: list[str] = []
+    for raw_hop in raw_hops:
+        hop = _canonical_ip(raw_hop.strip())
+        if hop is None:
+            return canonical_socket
+        chain.append(hop)
+    chain.append(canonical_socket)
+    for hop in reversed(chain):
+        if hop not in trusted:
+            return hop
+    return chain[0]
+
+
+def _canonical_ip(value: str) -> str | None:
+    if not value or "%" in value:
+        return None
+    try:
+        return str(ip_address(value))
+    except ValueError:
+        return None
 
 
 async def _enforce_rate_limit(request: Request, endpoint: str) -> None:

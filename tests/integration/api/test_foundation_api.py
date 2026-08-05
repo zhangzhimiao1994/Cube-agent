@@ -159,6 +159,20 @@ async def test_real_foundation_api_workflow_and_tenant_authorization(
             )
         ).status_code == 403
 
+        real_draft = await client.post(
+            "/api/v1/config/drafts", headers=headers, json=document("Publish denied.")
+        )
+        operator_publish = await client.post(
+            f"/api/v1/config/drafts/{real_draft.json()['id']}/publish",
+            headers=operator_headers,
+        )
+        assert operator_publish.status_code == 403
+        admin_publish = await client.post(
+            f"/api/v1/config/drafts/{real_draft.json()['id']}/publish",
+            headers=headers,
+        )
+        assert admin_publish.status_code == 200
+
         other_tenant_token = tokens.encode(uuid4(), uuid4(), Role.ADMIN)
         other_headers = {"Authorization": f"Bearer {other_tenant_token}"}
         idor = await client.post(

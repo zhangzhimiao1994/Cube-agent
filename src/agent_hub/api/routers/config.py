@@ -6,7 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request, status
 
 from agent_hub.api.dependencies import require_permission
-from agent_hub.api.errors import PublicAPIError
+from agent_hub.api.errors import ERROR_RESPONSES, PublicAPIError
 from agent_hub.api.schemas import (
     ConfigDiffResponse,
     ConfigHistoryResponse,
@@ -26,7 +26,9 @@ from agent_hub.config.service import (
     PostCommitNotificationError,
 )
 
-router = APIRouter(prefix="/api/v1/config", tags=["config"])
+router = APIRouter(
+    prefix="/api/v1/config", tags=["config"], responses=ERROR_RESPONSES
+)
 
 
 class ConfigurationService(Protocol):

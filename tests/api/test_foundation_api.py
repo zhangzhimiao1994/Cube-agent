@@ -7,6 +7,7 @@ from typing import Self
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi import Request
 from fastapi.testclient import TestClient
 
 from agent_hub.app import create_app
@@ -620,7 +621,8 @@ class FakeRedis:
     async def aclose(self) -> None:
         self.closed = True
 
-    async def ping(self) -> bool:
+    async def ping(self, **kwargs: object) -> bool:
+        del kwargs
         return True
 
 
@@ -701,3 +703,205 @@ def test_openapi_does_not_expose_persistence_secret_fields() -> None:
         "nonce",
     ):
         assert forbidden not in serialized
+
+
+def test_framework_404_uses_safe_error_envelope() -> None:
+    response = auth_client().get("/missing/private-resource")
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "error": {"code": "not_found", "message": "resource not found"}
+    }
+    assert "detail" not in response.text
+
+
+def test_framework_405_uses_envelope_and_preserves_allow() -> None:
+    response = auth_client().post("/health/live")
+
+    assert response.status_code == 405
+    assert response.headers["allow"] == "GET"
+    assert response.json() == {
+        "error": {
+            "code": "method_not_allowed",
+            "message": "method not allowed",
+        }
+    }
+
+
+def test_unhandled_exception_is_generic_and_does_not_leak_request_secrets(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    app = create_app(
+        auth_service=StubAuthService(),
+        rate_limiter=StubRateLimiter(),
+    )
+    authorization = "Bearer SECRET_RUNTIME_TOKEN"
+    password = "SECRET_RUNTIME_PASSWORD"
+
+    async def fail(request: Request) -> None:
+        raise RuntimeError(
+            f"postgresql://secret-dsn {request.headers.get('authorization')} {password}"
+        )
+
+    app.add_api_route("/api/v1/fail", fail, methods=["POST"])
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.post(
+        "/api/v1/fail",
+        headers={"Authorization": authorization},
+        json={"password": password},
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "error": {"code": "internal_error", "message": "internal server error"}
+    }
+    captured = response.text + caplog.text
+    assert "secret-dsn" not in captured
+    assert authorization not in captured
+    assert password not in captured
+
+
+def test_openapi_uses_error_response_for_all_documented_error_statuses() -> None:
+    schema = auth_client().get("/openapi.json").json()
+    assert "ErrorResponse" in schema["components"]["schemas"]
+    assert "HTTPValidationError" not in schema["components"]["schemas"]
+    expected = {"400", "401", "403", "404", "409", "413", "422", "429", "500", "503"}
+
+    for path, path_item in schema["paths"].items():
+        for method, operation in path_item.items():
+            if method not in {"get", "post", "put", "patch", "delete"}:
+                continue
+            responses = operation["responses"]
+            assert expected <= set(responses), (path, method, responses)
+            for status_code in expected:
+                content = responses[status_code]["content"]["application/json"]
+                assert content["schema"] == {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                }
+
+
+def proxy_auth_client(
+    peer: str, trusted: list[str]
+) -> tuple[TestClient, StubRateLimiter]:
+    limiter = StubRateLimiter()
+    app = create_app(
+        settings=Settings.model_validate({"trusted_proxy_ips": trusted}),
+        auth_service=StubAuthService(),
+        rate_limiter=limiter,
+    )
+    return TestClient(app, client=(peer, 12345)), limiter
+
+
+def proxy_login(
+    client: TestClient, headers: dict[str, str] | list[tuple[str, str]]
+) -> None:
+    response = client.post(
+        "/api/v1/auth/login",
+        headers=headers,
+        json={
+            "tenant_id": str(uuid4()),
+            "username": "owner",
+            "password": "correct horse battery staple",
+        },
+    )
+    assert response.status_code == 200
+
+
+def test_trusted_proxy_single_hop_uses_canonical_forwarded_client() -> None:
+    client, limiter = proxy_auth_client("192.0.2.10", ["192.0.2.10"])
+    proxy_login(client, {"X-Forwarded-For": "2001:0db8:0:0:0:0:0:1"})
+
+    assert limiter.calls == [("login", "2001:db8::1")]
+
+
+def test_proxy_chain_strips_trusted_hops_from_the_right() -> None:
+    client, limiter = proxy_auth_client(
+        "192.0.2.10", ["192.0.2.10", "192.0.2.20"]
+    )
+    proxy_login(
+        client,
+        {"X-Forwarded-For": "198.51.100.7, 192.0.2.20"},
+    )
+
+    assert limiter.calls == [("login", "198.51.100.7")]
+
+
+def test_proxy_chain_ignores_attacker_prepended_spoof() -> None:
+    client, limiter = proxy_auth_client(
+        "192.0.2.10", ["192.0.2.10", "192.0.2.20"]
+    )
+    proxy_login(
+        client,
+        {"X-Forwarded-For": "203.0.113.99, 198.51.100.7, 192.0.2.20"},
+    )
+
+    assert limiter.calls == [("login", "198.51.100.7")]
+
+
+@pytest.mark.parametrize(
+    "forwarded",
+    [
+        "198.51.100.7,,192.0.2.20",
+        "not-an-ip",
+        "fe80::1%eth0",
+        ",198.51.100.7",
+        "1" * 2049,
+        ",".join(["198.51.100.7"] * 33),
+    ],
+)
+def test_invalid_or_oversized_forwarded_chain_falls_back_to_socket_peer(
+    forwarded: str,
+) -> None:
+    client, limiter = proxy_auth_client("192.0.2.10", ["192.0.2.10"])
+    proxy_login(client, {"X-Forwarded-For": forwarded})
+
+    assert limiter.calls == [("login", "192.0.2.10")]
+
+
+def test_multiple_forwarded_headers_fall_back_to_socket_peer() -> None:
+    client, limiter = proxy_auth_client("192.0.2.10", ["192.0.2.10"])
+    proxy_login(
+        client,
+        [("X-Forwarded-For", "198.51.100.7"), ("X-Forwarded-For", "203.0.113.8")],
+    )
+
+    assert limiter.calls == [("login", "192.0.2.10")]
+
+
+def test_all_trusted_proxy_chain_uses_leftmost_canonical_hop() -> None:
+    client, limiter = proxy_auth_client(
+        "192.0.2.10", ["192.0.2.10", "192.0.2.20", "2001:db8::1"]
+    )
+    proxy_login(
+        client,
+        {"X-Forwarded-For": "2001:0db8:0:0:0:0:0:1, 192.0.2.20"},
+    )
+
+    assert limiter.calls == [("login", "2001:db8::1")]
+
+
+def test_config_request_body_limit_accepts_boundary_and_rejects_overflow() -> None:
+    client, _, _ = config_client()
+    boundary = b"x" * (1024 * 1024)
+    marker = b"DO_NOT_ECHO_CONFIG_MARKER"
+
+    at_limit = client.post(
+        "/api/v1/config/validate",
+        headers={**bearer(), "Content-Type": "application/json"},
+        content=boundary,
+    )
+    too_large = client.post(
+        "/api/v1/config/validate",
+        headers={**bearer(), "Content-Type": "application/json"},
+        content=boundary + marker,
+    )
+
+    assert at_limit.status_code == 422
+    assert too_large.status_code == 413
+    assert too_large.json() == {
+        "error": {
+            "code": "request_too_large",
+            "message": "request body is too large",
+        }
+    }
+    assert marker.decode() not in too_large.text

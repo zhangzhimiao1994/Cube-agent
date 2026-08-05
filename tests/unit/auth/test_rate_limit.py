@@ -54,3 +54,13 @@ async def test_redis_limiter_fails_closed_without_backend_details() -> None:
         await limiter.check("login", "192.0.2.10")
 
     assert "secret-host" not in str(captured.value)
+
+
+async def test_equivalent_ipv6_clients_use_the_same_redis_key() -> None:
+    redis = RedisStub((1, 60))
+    limiter = RedisAuthRateLimiter(redis, b"k" * 32)
+
+    await limiter.check("login", "2001:0db8:0:0:0:0:0:1")
+    await limiter.check("login", "2001:db8::1")
+
+    assert redis.calls[0][2] == redis.calls[1][2]

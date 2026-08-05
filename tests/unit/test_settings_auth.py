@@ -102,6 +102,7 @@ def test_settings_preserve_whitespace_for_downstream_canonical_validation() -> N
         ("bootstrap_tenant_slug", "Bad Slug"),
         ("bootstrap_tenant_name", ""),
         ("trusted_proxy_ips", ["not-an-ip"]),
+        ("trusted_proxy_ips", "not-a-collection"),
     ],
 )
 def test_network_and_bootstrap_settings_reject_invalid_values(
@@ -109,3 +110,42 @@ def test_network_and_bootstrap_settings_reject_invalid_values(
 ) -> None:
     with pytest.raises(ValidationError):
         Settings.model_validate({field: value})
+
+
+def test_trusted_proxy_limit_accepts_32_and_rejects_33() -> None:
+    accepted = [f"192.0.2.{index}" for index in range(1, 33)]
+    settings = Settings.model_validate({"trusted_proxy_ips": accepted})
+
+    assert len(settings.trusted_proxy_ips) == 32
+    with pytest.raises(ValidationError):
+        Settings.model_validate(
+            {"trusted_proxy_ips": [*accepted, "198.51.100.1"]}
+        )
+
+
+@pytest.mark.parametrize(
+    "name", [" ", "\tName", "Name\n", "x" * 201]
+)
+def test_bootstrap_tenant_name_rejects_blank_padding_and_overflow(name: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings.model_validate({"bootstrap_tenant_name": name})
+
+
+@pytest.mark.parametrize("name", ["x", "x" * 200])
+def test_bootstrap_tenant_name_accepts_length_boundaries(name: str) -> None:
+    assert Settings.model_validate({"bootstrap_tenant_name": name}).bootstrap_tenant_name == name
+
+
+def test_settings_validation_does_not_echo_jwt_key() -> None:
+    key = "base64url:" + "SECRET_JWT_VALUE" * 4
+    with pytest.raises(ValidationError) as captured:
+        Settings.model_validate(
+            {
+                "environment": "production",
+                "jwt_signing_key": SecretStr(key),
+                "trusted_proxy_ips": ["invalid"],
+            }
+        )
+
+    assert key not in str(captured.value)
+    assert key not in repr(captured.value)

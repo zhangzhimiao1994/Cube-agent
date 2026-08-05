@@ -13,8 +13,16 @@ from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from agent_hub.api.errors import PublicAPIError, error_payload, public_error_handler
+from agent_hub.api.errors import (
+    ERROR_RESPONSES,
+    PublicAPIError,
+    error_payload,
+    http_exception_handler,
+    public_error_handler,
+    unhandled_exception_handler,
+)
 from agent_hub.api.middleware import RequestBodyLimitMiddleware
 from agent_hub.api.routers import auth, config, system
 from agent_hub.auth.passwords import PasswordService
@@ -38,7 +46,7 @@ class DatabaseResource(Protocol):
 class RedisResource(Protocol):
     async def aclose(self) -> None: ...
 
-    async def ping(self) -> object: ...
+    def ping(self, **kwargs: Any) -> Any: ...
 
 
 async def ensure_bootstrap_tenant(
@@ -140,7 +148,12 @@ def create_app(
             if owned_database is not None:
                 await owned_database.dispose()
 
-    application = FastAPI(title="Agent Hub", version="0.1.0", lifespan=lifespan)
+    application = FastAPI(
+        title="Agent Hub",
+        version="0.1.0",
+        lifespan=lifespan,
+        responses=ERROR_RESPONSES,
+    )
     application.state.database_probe = database_probe
     application.state.redis_probe = redis_probe
     application.state.readiness_timeout_seconds = readiness_timeout_seconds
@@ -150,6 +163,8 @@ def create_app(
     configured_settings = settings or Settings.model_construct()
     application.state.trusted_proxy_ips = configured_settings.trusted_proxy_ips
     application.add_exception_handler(PublicAPIError, public_error_handler)
+    application.add_exception_handler(StarletteHTTPException, http_exception_handler)
+    application.add_exception_handler(Exception, unhandled_exception_handler)
 
     async def validation_error_handler(
         request: Request, error: Exception

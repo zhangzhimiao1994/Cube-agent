@@ -2,7 +2,9 @@
 
 import hashlib
 import hmac
+import re
 from dataclasses import dataclass
+from ipaddress import ip_address
 from typing import ClassVar, Protocol, cast
 
 
@@ -36,20 +38,37 @@ return {count, ttl}
         "login": (10, 60),
     }
 
-    def __init__(self, redis_client: object, hmac_key: bytes) -> None:
+    def __init__(
+        self,
+        redis_client: object,
+        hmac_key: bytes,
+        *,
+        key_prefix: str = "agent-hub:auth:",
+    ) -> None:
         if len(hmac_key) < 32:
             raise ValueError("rate-limit HMAC key must be at least 32 bytes")
+        if (
+            not isinstance(key_prefix, str)
+            or not 1 <= len(key_prefix) <= 128
+            or re.fullmatch(r"[A-Za-z0-9:_-]+", key_prefix) is None
+        ):
+            raise ValueError("rate-limit key prefix is invalid")
         self._redis = cast(RedisEvalClient, redis_client)
         self._hmac_key = hmac_key
+        self._key_prefix = key_prefix
 
     async def check(self, endpoint: str, client_ip: str) -> RateLimitDecision:
         if endpoint not in self._LIMITS:
             raise ValueError("unsupported authentication endpoint")
         limit, window = self._LIMITS[endpoint]
+        try:
+            canonical_client = str(ip_address(client_ip))
+        except ValueError:
+            canonical_client = client_ip
         digest = hmac.new(
-            self._hmac_key, client_ip.encode("utf-8"), hashlib.sha256
+            self._hmac_key, canonical_client.encode("utf-8"), hashlib.sha256
         ).hexdigest()
-        key = f"agent-hub:auth:{endpoint}:{digest}"
+        key = f"{self._key_prefix}{endpoint}:{digest}"
         try:
             result = await self._redis.eval(self._SCRIPT, 1, key, window)
             if not isinstance(result, (list, tuple)) or len(result) != 2:

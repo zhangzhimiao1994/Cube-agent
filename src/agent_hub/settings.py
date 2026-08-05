@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     jwt_signing_key: SecretStr = SecretStr("development-only-change-me")
     master_key: SecretStr = SecretStr("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
-    trusted_proxy_ips: frozenset[str] = frozenset()
+    trusted_proxy_ips: frozenset[str] = Field(default=frozenset(), max_length=32)
     bootstrap_tenant_id: UUID = UUID("00000000-0000-4000-8000-000000000001")
     bootstrap_tenant_slug: str = Field(
         default="default", min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9-]*$"
@@ -62,10 +62,28 @@ class Settings(BaseSettings):
 
         return self.jwt_signing_key.get_secret_value()
 
-    @field_validator("trusted_proxy_ips", mode="after")
+    @field_validator("trusted_proxy_ips", mode="before")
     @classmethod
-    def validate_trusted_proxy_ips(cls, values: frozenset[str]) -> frozenset[str]:
-        return frozenset(str(ip_address(value)) for value in values)
+    def validate_trusted_proxy_ips(cls, values: object) -> frozenset[str]:
+        if not isinstance(values, (list, tuple, set, frozenset)):
+            raise ValueError(  # noqa: TRY004 -- Pydantic converts this to ValidationError.
+                "trusted proxies must be a collection of IP addresses"
+            )
+        if len(values) > 32:
+            raise ValueError("at most 32 trusted proxies may be configured")
+        canonical: set[str] = set()
+        for value in values:
+            if not isinstance(value, str) or "%" in value:
+                raise ValueError("trusted proxy must be an IP address")
+            canonical.add(str(ip_address(value)))
+        return frozenset(canonical)
+
+    @field_validator("bootstrap_tenant_name", mode="after")
+    @classmethod
+    def validate_bootstrap_tenant_name(cls, value: str) -> str:
+        if not value.strip() or value != value.strip():
+            raise ValueError("bootstrap tenant name must be unpadded and non-blank")
+        return value
 
 
 @lru_cache

@@ -24,6 +24,14 @@ def database_url() -> str:
     )
 
 
+@pytest.fixture(scope="session")
+def redis_url() -> str:
+    return os.environ.get(
+        "AGENT_HUB_TEST_REDIS_URL",
+        f"redis://127.0.0.1:{os.environ.get('AGENT_HUB_TEST_REDIS_PORT', '56379')}/15",
+    )
+
+
 @pytest.fixture
 def alembic_config(database_url: str) -> Config:
     config = Config(str(REPOSITORY_ROOT / "alembic.ini"))

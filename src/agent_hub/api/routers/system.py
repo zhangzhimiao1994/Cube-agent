@@ -5,9 +5,9 @@ import asyncio
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from agent_hub.api.errors import error_payload
+from agent_hub.api.errors import ERROR_RESPONSES, error_payload
 
-router = APIRouter(tags=["system"])
+router = APIRouter(tags=["system"], responses=ERROR_RESPONSES)
 
 
 @router.get("/health/live")
