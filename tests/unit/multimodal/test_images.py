@@ -18,9 +18,15 @@ import agent_hub.multimodal.images as image_module
 from agent_hub.multimodal.images import (
     FilesystemImageStore,
     ImageStoreCommitUncertain,
+    MemoryImageStore,
     sanitize_image,
 )
-from agent_hub.multimodal.types import ImageLimits, InvalidImage
+from agent_hub.multimodal.types import (
+    ImageCleanupRecoveryItem,
+    ImageLimits,
+    InvalidImage,
+    VisionCleanupError,
+)
 
 
 def encoded_image(
@@ -358,19 +364,19 @@ async def test_filesystem_store_writes_atomically_with_private_permissions(tmp_p
     if os.name == "posix":
         assert os.stat(target).st_mode & 0o777 == 0o600
 
-    await store.delete("tenant", key)
+    await store.delete_by_object_key(key)
     assert not target.exists()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX dirfd adapter")
-async def test_filesystem_store_delete_is_tenant_bound(tmp_path: Path) -> None:
+async def test_filesystem_store_delete_by_object_key_is_idempotent(tmp_path: Path) -> None:
     store = FilesystemImageStore(tmp_path)
     digest = hashlib.sha256(b"tenant").hexdigest()
     key = f"tenants/{digest}/123e4567-e89b-42d3-a456-426614174000.png"
     await store.put("tenant", key, b"canonical", "image/png")
-    with pytest.raises(OSError, match="cleanup failed"):
-        await store.delete("different-tenant", key)
-    assert tmp_path.joinpath(*key.split("/")).exists()
+    await store.delete_by_object_key(key)
+    await store.delete_by_object_key(key)
+    assert not tmp_path.joinpath(*key.split("/")).exists()
 
 
 @pytest.mark.parametrize(
@@ -421,6 +427,54 @@ async def test_filesystem_store_rejects_configured_symlink_root(tmp_path: Path) 
 def test_filesystem_store_fails_closed_off_posix(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="POSIX"):
         FilesystemImageStore(tmp_path)
+
+
+async def test_recovery_item_replays_idempotent_cleanup_without_tenant_identifier() -> None:
+    replay = getattr(image_module, "replay_image_cleanup", None)
+    assert callable(replay)
+    store = MemoryImageStore(store_id="memory-store", namespace="tenant-images")
+    sanitized = sanitize_image(encoded_image(), "image/png", "tenant")
+    await store.put(
+        "tenant",
+        sanitized.object_key,
+        sanitized.canonical_bytes,
+        sanitized.media_type,
+    )
+    item = ImageCleanupRecoveryItem(
+        store_id="memory-store",
+        namespace="tenant-images",
+        tenant_sha256=hashlib.sha256(b"tenant").hexdigest(),
+        object_key=sanitized.object_key,
+        canonical_sha256=sanitized.canonical_sha256,
+        reason="analysis_failed",
+    )
+    await replay(item, store)
+    await replay(item, store)
+    assert not store.contains("tenant", sanitized.object_key)
+
+
+async def test_recovery_replay_rejects_wrong_store_without_deleting() -> None:
+    replay = getattr(image_module, "replay_image_cleanup", None)
+    assert callable(replay)
+    wrong = MemoryImageStore(store_id="wrong-store", namespace="tenant-images")
+    sanitized = sanitize_image(encoded_image(), "image/png", "tenant")
+    await wrong.put(
+        "tenant",
+        sanitized.object_key,
+        sanitized.canonical_bytes,
+        sanitized.media_type,
+    )
+    item = ImageCleanupRecoveryItem(
+        store_id="source-store",
+        namespace="tenant-images",
+        tenant_sha256=hashlib.sha256(b"tenant").hexdigest(),
+        object_key=sanitized.object_key,
+        canonical_sha256=sanitized.canonical_sha256,
+        reason="analysis_failed",
+    )
+    with pytest.raises(VisionCleanupError, match="recovery item store mismatch"):
+        await replay(item, wrong)
+    assert wrong.contains("tenant", sanitized.object_key)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX dirfd adapter")
@@ -489,6 +543,6 @@ async def test_filesystem_store_reports_commit_uncertain_when_rollback_fails(
             await store.put("tenant", key, b"canonical", "image/png")
     assert captured.value.object_key == key
     assert "canonical" not in repr(captured.value)
-    await store.delete("tenant", key)
+    await store.delete_by_object_key(key)
     store.close()
     assert len(os.listdir("/proc/self/fd")) == baseline_descriptors

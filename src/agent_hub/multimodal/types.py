@@ -14,6 +14,7 @@ _OBJECT_KEY = re.compile(
     r"[89ab][0-9a-f]{3}-[0-9a-f]{12}\.png$"
 )
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
+_SAFE_STORE_NAMESPACE = re.compile(r"^[a-z0-9][a-z0-9_.:@-]{0,127}$")
 _MAX_SAFE_IMAGE_DIMENSION = 16_384
 _MAX_SAFE_IMAGE_PIXELS = 40_000_000
 
@@ -141,21 +142,30 @@ class StoredImageObject:
 class ImageObjectStore(Protocol):
     """Put must reach a terminal commit/failure state before returning or raising."""
 
+    store_id: str
+    namespace: str
+
     async def put(
         self, tenant_id: str, object_key: str, data: bytes, content_type: str
     ) -> StoredImageObject: ...
 
-    async def delete(self, tenant_id: str, object_key: str) -> None: ...
+    async def delete_by_object_key(self, object_key: str) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
 class ImageCleanupRecoveryItem:
+    store_id: str
+    namespace: str
     tenant_sha256: str
     object_key: str
     canonical_sha256: str
     reason: str
 
     def __post_init__(self) -> None:
+        if _SAFE_ID.fullmatch(self.store_id) is None:
+            raise ValueError("cleanup store_id must be a safe identifier")
+        if _SAFE_STORE_NAMESPACE.fullmatch(self.namespace) is None:
+            raise ValueError("cleanup namespace must be a safe identifier")
         if _SHA256.fullmatch(self.tenant_sha256) is None:
             raise ValueError("tenant_sha256 must be a SHA-256 digest")
         if _OBJECT_KEY.fullmatch(self.object_key) is None:

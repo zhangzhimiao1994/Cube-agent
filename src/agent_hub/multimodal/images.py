@@ -14,10 +14,13 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 
 from agent_hub.multimodal.types import (
     ContentTypeDetector,
+    ImageCleanupRecoveryItem,
     ImageLimits,
+    ImageObjectStore,
     InvalidImage,
     SanitizedImage,
     StoredImageObject,
+    VisionCleanupError,
 )
 
 _ALLOWED_MIME_TO_FORMAT = {
@@ -499,16 +502,24 @@ def _effective_uid() -> int:
 class MemoryImageStore:
     """Portable test/development adapter with the same tenant-bound key contract."""
 
-    def __init__(self, root: Path | str | None = None) -> None:
+    def __init__(
+        self,
+        root: Path | str | None = None,
+        *,
+        store_id: str = "memory-image-store",
+        namespace: str = "default",
+    ) -> None:
         del root
-        self._objects: dict[tuple[str, str], bytes] = {}
+        self.store_id = store_id
+        self.namespace = namespace
+        self._objects: dict[str, bytes] = {}
 
     async def put(
         self, tenant_id: str, object_key: str, data: bytes, content_type: str
     ) -> StoredImageObject:
         _validated_store_match(tenant_id, object_key, data, content_type)
         copied = bytes(data)
-        self._objects[(tenant_id, object_key)] = copied
+        self._objects[object_key] = copied
         return StoredImageObject(
             object_key=object_key,
             byte_length=len(copied),
@@ -516,17 +527,32 @@ class MemoryImageStore:
             sha256=hashlib.sha256(copied).hexdigest(),
         )
 
-    async def delete(self, tenant_id: str, object_key: str) -> None:
-        if type(tenant_id) is not str or _TENANT_ID.fullmatch(tenant_id) is None:
+    async def delete_by_object_key(self, object_key: str) -> None:
+        if type(object_key) is not str or _OBJECT_KEY.fullmatch(object_key) is None:
             raise OSError("image storage cleanup failed") from None
-        match = _OBJECT_KEY.fullmatch(object_key)
-        digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()
-        if match is None or match.group(1) != digest:
-            raise OSError("image storage cleanup failed") from None
-        self._objects.pop((tenant_id, object_key), None)
+        self._objects.pop(object_key, None)
 
     def contains(self, tenant_id: str, object_key: str) -> bool:
-        return (tenant_id, object_key) in self._objects
+        digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()
+        return object_key.startswith(f"tenants/{digest}/") and object_key in self._objects
+
+
+async def replay_image_cleanup(
+    item: ImageCleanupRecoveryItem, store: ImageObjectStore
+) -> None:
+    if item.store_id != store.store_id or item.namespace != store.namespace:
+        raise VisionCleanupError("recovery item store mismatch") from None
+    failed = False
+    try:
+        await store.delete_by_object_key(item.object_key)
+    except (Exception, asyncio.CancelledError) as error:  # noqa: BLE001 - adapter boundary
+        error.__traceback__ = None
+        error.__context__ = None
+        error.__cause__ = None
+        del error
+        failed = True
+    if failed:
+        raise VisionCleanupError("recovery cleanup failed") from None
 
 
 class ImageStoreCommitUncertain(OSError):
@@ -553,6 +579,8 @@ class FilesystemImageStore:
         if not configured_root.is_absolute():  # pragma: no cover - absolute() invariant
             raise ValueError("image store root must be absolute")
         self._fd_lock = threading.Lock()
+        self.store_id = "filesystem-image-store"
+        self.namespace = hashlib.sha256(os.fsencode(configured_root)).hexdigest()
         self._root_fd = self._open_secure_root(configured_root)
 
     @staticmethod
@@ -642,11 +670,9 @@ class FilesystemImageStore:
             raise result from None
         return result
 
-    async def delete(self, tenant_id: str, object_key: str) -> None:
-        worker = asyncio.create_task(
-            asyncio.to_thread(self._delete_sync_safe, tenant_id, object_key)
-        )
-        del tenant_id, object_key
+    async def delete_by_object_key(self, object_key: str) -> None:
+        worker = asyncio.create_task(asyncio.to_thread(self._delete_sync_safe, object_key))
+        del object_key
         try:
             deleted = await _await_task_uninterruptibly(worker)
         finally:
@@ -731,19 +757,13 @@ class FilesystemImageStore:
                 if descriptor >= 0:
                     os.close(descriptor)
 
-    def _delete_sync_safe(self, tenant_id: str, object_key: str) -> bool:
+    def _delete_sync_safe(self, object_key: str) -> bool:
         root_fd = tenants_fd = tenant_fd = target_fd = -1
         try:
             match = _OBJECT_KEY.fullmatch(object_key)
-            if (
-                type(tenant_id) is not str
-                or _TENANT_ID.fullmatch(tenant_id) is None
-                or match is None
-            ):
+            if match is None:
                 return False
-            tenant_digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()
-            if match.group(1) != tenant_digest:
-                return False
+            tenant_digest = match.group(1)
             root_fd = self._duplicate_root_fd()
             try:
                 tenants_fd = self._open_private_directory(root_fd, "tenants", create=False)

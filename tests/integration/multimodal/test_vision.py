@@ -20,6 +20,7 @@ from agent_hub.multimodal.images import (
     FilesystemImageStore as PosixFilesystemImageStore,
 )
 from agent_hub.multimodal.images import (
+    ImageStoreCommitUncertain,
     MemoryImageStore,
     sanitize_image,
 )
@@ -373,17 +374,17 @@ class BlockingFilesystemStore(PosixFilesystemImageStore):
 
     def _put_sync_safe(
         self, tenant_id: str, object_key: str, data: bytes, content_type: str
-    ) -> StoredImageObject | ValueError | None:
+    ) -> StoredImageObject | ValueError | ImageStoreCommitUncertain | None:
         self.put_started.set()
         self.put_release.wait()
         result = super()._put_sync_safe(tenant_id, object_key, data, content_type)
         self.put_finished.set()
         return result
 
-    def _delete_sync_safe(self, tenant_id: str, object_key: str) -> bool:
+    def _delete_sync_safe(self, object_key: str) -> bool:
         self.delete_started.set()
         self.delete_release.wait()
-        return super()._delete_sync_safe(tenant_id, object_key)
+        return super()._delete_sync_safe(object_key)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX filesystem race test")
@@ -865,6 +866,9 @@ async def test_image_admission_is_bounded_and_recovers_after_waiter_cancellation
 
 async def test_generic_store_put_reaches_terminal_commit_before_cancel_cleanup() -> None:
     class DelayedStore:
+        store_id = "delayed-store"
+        namespace = "test"
+
         def __init__(self) -> None:
             self.started = asyncio.Event()
             self.release = asyncio.Event()
@@ -885,9 +889,9 @@ async def test_generic_store_put_reaches_terminal_commit_before_cancel_cleanup()
                 sha256=hashlib.sha256(data).hexdigest(),
             )
 
-        async def delete(self, tenant_id: str, object_key: str) -> None:
+        async def delete_by_object_key(self, object_key: str) -> None:
             assert self.put_finished
-            self.committed.discard((tenant_id, object_key))
+            self.committed = {entry for entry in self.committed if entry[1] != object_key}
 
     store = DelayedStore()
     task = asyncio.create_task(
@@ -937,6 +941,9 @@ async def test_admission_counts_all_handoff_waiters_and_recovers_after_cancellat
 
 async def test_put_failure_retries_idempotent_cleanup_before_reporting_failure() -> None:
     class FailingStore:
+        store_id = "failing-store"
+        namespace = "test"
+
         def __init__(self) -> None:
             self.delete_calls = 0
 
@@ -946,8 +953,8 @@ async def test_put_failure_retries_idempotent_cleanup_before_reporting_failure()
             del tenant_id, object_key, data, content_type
             raise RuntimeError("private storage failure")
 
-        async def delete(self, tenant_id: str, object_key: str) -> None:
-            del tenant_id, object_key
+        async def delete_by_object_key(self, object_key: str) -> None:
+            del object_key
             self.delete_calls += 1
             if self.delete_calls < 3:
                 raise OSError("temporary cleanup failure")
@@ -976,14 +983,17 @@ async def test_put_failure_retries_idempotent_cleanup_before_reporting_failure()
 
 async def test_permanent_cleanup_failure_records_bounded_recovery_item() -> None:
     class FailingStore:
+        store_id = "failing-store"
+        namespace = "test"
+
         async def put(
             self, tenant_id: str, object_key: str, data: bytes, content_type: str
         ) -> StoredImageObject:
             del tenant_id, object_key, data, content_type
             raise RuntimeError("private put detail")
 
-        async def delete(self, tenant_id: str, object_key: str) -> None:
-            del tenant_id, object_key
+        async def delete_by_object_key(self, object_key: str) -> None:
+            del object_key
             raise OSError("private delete detail")
 
     class RecoverySink:
@@ -1014,14 +1024,17 @@ async def test_permanent_cleanup_failure_records_bounded_recovery_item() -> None
 
 async def test_recovery_sink_failure_is_fixed_and_observable() -> None:
     class FailingStore:
+        store_id = "failing-store"
+        namespace = "test"
+
         async def put(
             self, tenant_id: str, object_key: str, data: bytes, content_type: str
         ) -> StoredImageObject:
             del tenant_id, object_key, data, content_type
             raise RuntimeError("private put detail")
 
-        async def delete(self, tenant_id: str, object_key: str) -> None:
-            del tenant_id, object_key
+        async def delete_by_object_key(self, object_key: str) -> None:
+            del object_key
             raise OSError("private delete detail")
 
     class FailingRecoverySink:
@@ -1029,20 +1042,73 @@ async def test_recovery_sink_failure_is_fixed_and_observable() -> None:
             del item
             raise RuntimeError("private recovery detail")
 
+    raw = png_bytes()
+    canonical = sanitize_image(raw, "image/png", "tenant").canonical_bytes
     with pytest.raises(VisionAnalysisError, match="cleanup recovery recording failed") as captured:
         await VisionService(
             GatewayStub(response()),
             FailingStore(),
             cleanup_recovery_sink=FailingRecoverySink(),
             cleanup_backoff_seconds=0,
-        ).analyze(png_bytes(), "image/png", "tenant")
+        ).analyze(raw, "image/png", "tenant")
     assert type(captured.value).__name__ == "VisionCleanupError"
     assert "private" not in repr(captured.value)
+    assert captured.value.__cause__ is None and captured.value.__context__ is None
+    traceback = captured.value.__traceback__
+    while traceback is not None:
+        if traceback.tb_frame.f_globals.get("__name__", "").startswith("agent_hub"):
+            for value in traceback.tb_frame.f_locals.values():
+                assert not isinstance(value, SanitizedImage)
+                assert value != raw and value != canonical
+        traceback = traceback.tb_next
+
+
+@pytest.mark.parametrize("sink_cancellation", [False, True])
+async def test_original_model_cancellation_wins_over_recovery_sink_failure(
+    sink_cancellation: bool,
+) -> None:
+    original = asyncio.CancelledError("original-model-cancel")
+
+    class CancellingGateway(GatewayStub):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            raise original
+
+    class PermanentDeleteFailure(MemoryImageStore):
+        async def delete_by_object_key(self, object_key: str) -> None:
+            del object_key
+            raise OSError("private permanent delete failure")
+
+    class FailingRecoverySink:
+        async def enqueue(self, item: ImageCleanupRecoveryItem) -> None:
+            del item
+            if sink_cancellation:
+                raise asyncio.CancelledError("private sink cancellation")
+            raise RuntimeError("private sink failure")
+
+    task = asyncio.create_task(
+        VisionService(
+            CancellingGateway(response()),
+            PermanentDeleteFailure(),
+            cleanup_recovery_sink=FailingRecoverySink(),
+            cleanup_backoff_seconds=0,
+        ).analyze(png_bytes(), "image/png", "tenant")
+    )
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await task
+    assert captured.value is original
+    assert captured.value.args == ("original-model-cancel",)
+    assert captured.value.__notes__ == ["image cleanup recovery recording failed"]
+    assert captured.value.__cause__ is None and captured.value.__context__ is None
+    assert task.cancelled()
 
 
 async def test_cancelled_put_with_permanent_delete_failure_queues_recovery_and_preserves_identity(
 ) -> None:
     class DelayedCommittingStore:
+        store_id = "delayed-committing-store"
+        namespace = "test"
+
         def __init__(self) -> None:
             self.started = asyncio.Event()
             self.release = asyncio.Event()
@@ -1061,8 +1127,8 @@ async def test_cancelled_put_with_permanent_delete_failure_queues_recovery_and_p
                 sha256=hashlib.sha256(data).hexdigest(),
             )
 
-        async def delete(self, tenant_id: str, object_key: str) -> None:
-            del tenant_id, object_key
+        async def delete_by_object_key(self, object_key: str) -> None:
+            del object_key
             raise OSError("permanent private failure")
 
     store = DelayedCommittingStore()

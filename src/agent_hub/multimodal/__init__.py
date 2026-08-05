@@ -4,6 +4,7 @@ from agent_hub.multimodal.images import (
     FilesystemImageStore,
     ImageStoreCommitUncertain,
     MemoryImageStore,
+    replay_image_cleanup,
     sanitize_image,
 )
 from agent_hub.multimodal.service import VisionService
@@ -41,5 +42,6 @@ __all__ = [
     "VisionBusyError",
     "VisionCleanupError",
     "VisionService",
+    "replay_image_cleanup",
     "sanitize_image",
 ]
