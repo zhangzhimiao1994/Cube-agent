@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 from collections.abc import Mapping
@@ -134,13 +135,21 @@ class GatewayRouteClassifier:
         self._timeout_seconds = timeout_seconds
 
     async def classify(self, task_text: str) -> RouteAssessment:
-        outcome = await self._classify_safely(task_text)
-        del task_text
+        outcome: RouteAssessment | None = None
+        try:
+            outcome = await self._classify_safely(task_text)
+        finally:
+            task_text = ""
+            del task_text
         if outcome is None:
             raise RouteClassificationError("route classification failed") from None
         return outcome
 
     async def _classify_safely(self, task_text: str) -> RouteAssessment | None:
+        validated: str | None = None
+        request: ModelRequest | None = None
+        completion: GatewayCompletion | None = None
+        payload: _RoutePayload | None = None
         try:
             validated = validate_task_text(task_text)
             request = ModelRequest(
@@ -180,14 +189,19 @@ class GatewayRouteClassifier:
         except BaseException as error:
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 raise
-            import asyncio
-
             if isinstance(error, asyncio.CancelledError):
                 raise
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None
             return None
+        finally:
+            task_text = ""
+            validated = None
+            request = None
+            completion = None
+            payload = None
+            del task_text, validated, request, completion, payload
 
     @staticmethod
     def _parse(raw: str | None) -> _RoutePayload:

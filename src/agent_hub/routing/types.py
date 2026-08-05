@@ -200,6 +200,8 @@ class InMemoryDecisionTokenStore:
         except (TypeError, ValueError):
             return None
         digest = self._token_digest(token)
+        token = ""
+        del token
         async with self._lock:
             now = self._clock_now_locked()
             self._purge(now)
@@ -250,7 +252,9 @@ class InMemoryDecisionTokenStore:
 
 
 def _safe_text(value: str, *, name: str) -> str:
-    if value != value.strip() or any(ord(character) < 32 or ord(character) == 127 for character in value):
+    if value != value.strip() or any(
+        ord(character) < 32 or ord(character) == 127 for character in value
+    ):
         raise ValueError(f"{name} must be unpadded printable text")
     return value
 
@@ -405,7 +409,11 @@ class RouteDecision(BaseModel):
                     raise ValueError("the user override must match the decision")
             elif any(item.mode is not self.mode for item in self.assessments):
                 raise ValueError("ready assessment modes must match the decision")
-            if self.clarification_reason is not None or self.options or self.decision_token is not None:
+            if (
+                self.clarification_reason is not None
+                or self.options
+                or self.decision_token is not None
+            ):
                 raise ValueError("ready decisions cannot carry an active clarification")
         else:
             if self.mode is not None or not self.needs_user_choice:

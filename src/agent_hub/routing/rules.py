@@ -148,46 +148,54 @@ class RiskRulePolicy:
 
     def is_high_risk(self, task_text: str) -> bool:
         normalized = unicodedata.normalize("NFKC", task_text).casefold()
-        if self._has_recursive_force_remove(normalized):
+        return any(self._clause_is_high_risk(clause) for clause in self._clauses(normalized))
+
+    @staticmethod
+    def _clauses(normalized: str) -> tuple[str, ...]:
+        boundary = re.compile(
+            r"(?:[;\n!?。！？]+|\.(?=\s+|$)|,\s*(?=(?:and\s+)?then\b)|"
+            r"\b(?:and\s+then|and\s+afterwards|then|afterwards|after\s+that|next)\b|"
+            r"(?:然后|随后|接着|之后|并且|说明后|解释后))",
+            re.IGNORECASE,
+        )
+        return tuple(part.strip(" ,") for part in boundary.split(normalized) if part.strip(" ,"))
+
+    def _clause_is_high_risk(self, clause: str) -> bool:
+        if self._has_recursive_force_remove(clause):
             return True
 
-        english_tokens = frozenset(re.findall(r"[a-z0-9]+", normalized))
+        english_tokens = frozenset(re.findall(r"[a-z0-9]+", clause))
 
         def has(values: tuple[str, ...]) -> bool:
             return not english_tokens.isdisjoint(values)
 
+        english_read_only = (
+            re.match(r"^\s*(?:explain|what\s+is|what\s+are|describe|how\s+does)\b", clause)
+            is not None
+        )
+        chinese_read_only = clause.startswith(("解释", "什么是", "介绍", "说明"))
+        if english_read_only or chinese_read_only:
+            return False
+
         destructive_action = has(self.destructive_actions) or (
             "shut" in english_tokens and "down" in english_tokens
         )
-        currency_amount = re.search(
-            r"(?:[$€£¥]\s*\d+(?:[.,]\d+)?)|"
-            r"(?:\b\d+(?:[.,]\d+)?\s*(?:usd|eur|gbp|cny|rmb|jpy)\b)",
-            normalized,
-        ) is not None
-        explicit_english_risk = (
-            (destructive_action and has(self.destructive_targets))
-            or (
-                has(self.financial_actions)
-                and (has(self.financial_targets) or currency_amount)
+        currency_amount = (
+            re.search(
+                r"(?:[$€£¥]\s*\d+(?:[.,]\d+)?)|"
+                r"(?:\b\d+(?:[.,]\d+)?\s*(?:usd|eur|gbp|cny|rmb|jpy)\b)",
+                clause,
             )
-            or (has(self.sensitive_actions) and has(self.sensitive_targets))
+            is not None
+        )
+        sensitive_targets = tuple(target for target in self.sensitive_targets if target != "api")
+        if (
+            (destructive_action and has(self.destructive_targets))
+            or (has(self.financial_actions) and (has(self.financial_targets) or currency_amount))
+            or (has(self.sensitive_actions) and has(sensitive_targets))
             or (has(self.external_actions) and has(self.external_targets))
-            or any(marker in normalized for marker in self.irreversible_markers)
-        )
-        chinese_read_only = normalized.startswith(("解释", "什么是", "介绍", "说明"))
-        english_read_only = re.match(
-            r"^\s*(?:explain|what\s+is|what\s+are|describe|how\s+does)\b", normalized
-        ) is not None
-        english_read_only = english_read_only and re.search(
-            r"\b(?:then|and)\s+(?:delete|drop|truncate|shutdown|disable|format|"
-            r"transfer|send|refund|pay|wire|change|reset|rotate|revoke|grant|"
-            r"publish|deploy)\b",
-            normalized,
-        ) is None
-        chinese_read_only = chinese_read_only and not any(
-            marker in normalized for marker in ("然后", "随后", "并且", "说明后", "解释后")
-        )
-        if explicit_english_risk and not (english_read_only or chinese_read_only):
+            or any(marker in clause for marker in self.irreversible_markers)
+        ):
             return True
 
         chinese_destructive_actions = (
@@ -240,37 +248,34 @@ class RiskRulePolicy:
         chinese_external_targets = ("外部", "公开", "生产", "正式")
 
         def contains_any(values: tuple[str, ...]) -> bool:
-            return any(value in normalized for value in values)
+            return any(value in clause for value in values)
 
-        explicit_chinese_risk = (
+        return (
             contains_any(chinese_financial)
             or contains_any(("不可逆", "无法撤销", "永久"))
             or (
                 contains_any(chinese_destructive_actions)
                 and contains_any(chinese_destructive_targets)
             )
-            or (
-                contains_any(chinese_sensitive_actions)
-                and contains_any(chinese_sensitive_targets)
-            )
-            or (
-                contains_any(chinese_external_actions)
-                and contains_any(chinese_external_targets)
-            )
+            or (contains_any(chinese_sensitive_actions) and contains_any(chinese_sensitive_targets))
+            or (contains_any(chinese_external_actions) and contains_any(chinese_external_targets))
         )
-        return explicit_chinese_risk and not chinese_read_only
 
     @staticmethod
     def _has_recursive_force_remove(normalized: str) -> bool:
         """Detect a dangerous rm form as text only; this never parses or executes a shell."""
         command = re.compile(
-            r"(?:^|[\n;&|])\s*(?:sudo\s+)?rm\s+"
-            r"(?P<flags>(?:-[a-z]+\s+)+)(?:--\s+)?(?P<target>[^\s;&|]+)",
+            r"(?:^|[;&|])\s*(?:sudo\s+)?rm\s+"
+            r"(?P<flags>(?:(?:-[a-z]+|--[a-z][a-z-]*)\s+)+)"
+            r"(?:--\s+)?(?P<target>[^\s;&|]+)",
             re.IGNORECASE,
         )
         for match in command.finditer(normalized):
-            flag_letters = "".join(re.findall(r"[a-z]", match.group("flags")))
-            if "r" in flag_letters and "f" in flag_letters and match.group("target"):
+            flags = match.group("flags").split()
+            short_letters = "".join(flag[1:] for flag in flags if re.fullmatch(r"-[a-z]+", flag))
+            recursive = "r" in short_letters or "--recursive" in flags
+            force = "f" in short_letters or "--force" in flags
+            if recursive and force and match.group("target"):
                 return True
         return False
 
@@ -280,9 +285,20 @@ def validate_task_text(task_text: object) -> str:
         raise TypeError("task text must be a string")
     if not task_text or len(task_text) > MAX_TASK_TEXT:
         raise ValueError("task text must be nonempty and bounded")
-    if "\x00" in task_text:
-        raise ValueError("task text contains an invalid character")
+    for character in task_text:
+        if character in "\t\n\r":
+            continue
+        category = unicodedata.category(character)
+        if category.startswith("C"):
+            raise ValueError("task text contains an invalid character")
     return task_text
+
+
+def normalize_task_text(task_text: str) -> str:
+    """Normalize allowed whitespace after exact command parsing and before risk/model use."""
+    return (
+        task_text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", " ; ").replace("\t", " ")
+    )
 
 
 def parse_explicit_command(task_text: str) -> ExplicitCommand:
@@ -304,9 +320,7 @@ def parse_explicit_command(task_text: str) -> ExplicitCommand:
     return ExplicitCommand(mode=mode, task_text=body)
 
 
-def assess_rules(
-    task_text: str, *, risk_policy: RiskRulePolicy | None = None
-) -> RuleResult:
+def assess_rules(task_text: str, *, risk_policy: RiskRulePolicy | None = None) -> RuleResult:
     high_risk = (risk_policy or RiskRulePolicy()).is_high_risk(task_text)
     signals = {
         TaskMode.DIRECT: _DIRECT.search(task_text) is not None,

@@ -75,6 +75,24 @@ class BlockingClassifier(FakeClassifier):
         raise AssertionError("unreachable")
 
 
+class SwallowingCancellationClassifier(FakeClassifier):
+    def __init__(self, result: RouteAssessment) -> None:
+        super().__init__(result)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancellations = 0
+
+    async def classify(self, task_text: str) -> object:
+        self.calls.append(task_text)
+        self.started.set()
+        while not self.release.is_set():
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancellations += 1
+        return self.result
+
+
 def router(
     primary: FakeClassifier | None = None,
     verifier: FakeClassifier | None = None,
@@ -83,8 +101,7 @@ def router(
 ) -> ModeRouter:
     return ModeRouter(
         primary or FakeClassifier(assessment()),
-        verifier
-        or FakeClassifier(assessment(source=RouteSource.VERIFIER)),
+        verifier or FakeClassifier(assessment(source=RouteSource.VERIFIER)),
         token_store=InMemoryDecisionTokenStore(),
         policy=policy,
     )
@@ -97,6 +114,17 @@ def subject(*, task_id: str = "task-1", user_id: str = "user-1") -> Confirmation
         task_id=task_id,
         generation="generation-1",
     )
+
+
+def internal_traceback_locals(error: BaseException, filename: str) -> str:
+    values: list[str] = []
+    traceback = error.__traceback__
+    while traceback is not None:
+        normalized = traceback.tb_frame.f_code.co_filename.replace("\\", "/")
+        if normalized.endswith(filename):
+            values.append(repr(traceback.tb_frame.f_locals))
+        traceback = traceback.tb_next
+    return "".join(values)
 
 
 @pytest.mark.parametrize("mode", ["direct", "dispatch", "discuss", "hybrid"])
@@ -126,11 +154,29 @@ async def test_command_lookalikes_and_embedded_commands_are_not_explicit(text: s
     assert result.mode is not TaskMode.DIRECT
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "del\u200bete production database",
+        "delete\u202e production database",
+        "delete\x1b production database",
+    ],
+)
+async def test_unicode_controls_are_rejected_before_rules_or_classifiers(text: str) -> None:
+    primary = FakeClassifier(assessment())
+    verifier = FakeClassifier(assessment(source=RouteSource.VERIFIER))
+    result = await router(primary, verifier).route(text)
+    assert result.status == "waiting_user_mode"
+    assert result.clarification_reason == "invalid_input"
+    assert result.decision_token is None
+    assert primary.calls == []
+    assert verifier.calls == []
+    assert text not in repr(result)
+
+
 async def test_auto_restarts_normal_routing_on_bounded_body() -> None:
     primary = FakeClassifier(assessment(TaskMode.HYBRID))
-    verifier = FakeClassifier(
-        assessment(TaskMode.HYBRID, source=RouteSource.VERIFIER)
-    )
+    verifier = FakeClassifier(assessment(TaskMode.HYBRID, source=RouteSource.VERIFIER))
     result = await router(primary, verifier).route("/auto ambiguous architecture request")
     assert result.mode is TaskMode.HYBRID
     assert primary.calls == ["ambiguous architecture request"]
@@ -152,9 +198,7 @@ async def test_unambiguous_rules_do_not_call_models(text: str, mode: TaskMode) -
 
 
 async def test_conflicting_or_high_risk_rules_ask_user() -> None:
-    conflict = await router().route(
-        "Run the fixed workflow and have multiple agents debate it"
-    )
+    conflict = await router().route("Run the fixed workflow and have multiple agents debate it")
     risky = await router().route("Delete the production database")
     assert conflict.status == "waiting_user_mode"
     assert risky.status == "waiting_user_mode"
@@ -210,6 +254,90 @@ async def test_caller_cancellation_propagates_and_cleans_both_children() -> None
     with pytest.raises(asyncio.CancelledError):
         await task
     assert first.cancelled and second.cancelled
+
+
+async def test_uncooperative_classifiers_have_bounded_cleanup_and_registry_capacity() -> None:
+    first = SwallowingCancellationClassifier(assessment())
+    second = SwallowingCancellationClassifier(assessment(source=RouteSource.VERIFIER))
+    selected_router = ModeRouter(
+        first,
+        second,
+        token_store=InMemoryDecisionTokenStore(),
+        policy=RoutingPolicy(
+            classifier_timeout_seconds=0.02,
+            classifier_cleanup_grace_seconds=0.02,
+            max_detached_classifier_tasks=2,
+        ),
+    )
+    started = asyncio.get_running_loop().time()
+    result = await selected_router.route("ambiguous sk-sensitive request")
+    assert asyncio.get_running_loop().time() - started < 0.2
+    assert result.status == "waiting_user_mode"
+    assert len(selected_router._detached_classifier_tasks) == 2
+    calls = (len(first.calls), len(second.calls))
+    saturated = await selected_router.route("another ambiguous request")
+    assert saturated.status == "waiting_user_mode"
+    assert (len(first.calls), len(second.calls)) == calls
+    assert all(
+        "sk-sensitive" not in task.get_name() for task in selected_router._detached_classifier_tasks
+    )
+    first.release.set()
+    second.release.set()
+    await asyncio.sleep(0.05)
+    assert selected_router._detached_classifier_tasks == set()
+
+
+async def test_outer_cancel_of_uncooperative_classifiers_is_bounded_and_exact() -> None:
+    first = SwallowingCancellationClassifier(assessment())
+    second = SwallowingCancellationClassifier(assessment(source=RouteSource.VERIFIER))
+    selected_router = ModeRouter(
+        first,
+        second,
+        token_store=InMemoryDecisionTokenStore(),
+        policy=RoutingPolicy(
+            classifier_timeout_seconds=10,
+            classifier_cleanup_grace_seconds=0.02,
+            max_detached_classifier_tasks=2,
+        ),
+    )
+    route_task = asyncio.create_task(selected_router.route("ambiguous request"))
+    await asyncio.gather(first.started.wait(), second.started.wait())
+    started = asyncio.get_running_loop().time()
+    route_task.cancel("outer-token")
+    with pytest.raises(asyncio.CancelledError, match="outer-token"):
+        await route_task
+    assert asyncio.get_running_loop().time() - started < 0.2
+    assert len(selected_router._detached_classifier_tasks) == 2
+    first.release.set()
+    second.release.set()
+    await asyncio.sleep(0.05)
+
+
+async def test_classifier_capacity_includes_active_tasks_before_they_detach() -> None:
+    first = SwallowingCancellationClassifier(assessment())
+    second = SwallowingCancellationClassifier(assessment(source=RouteSource.VERIFIER))
+    selected_router = ModeRouter(
+        first,
+        second,
+        token_store=InMemoryDecisionTokenStore(),
+        policy=RoutingPolicy(
+            classifier_timeout_seconds=0.02,
+            classifier_cleanup_grace_seconds=0.02,
+            max_detached_classifier_tasks=2,
+        ),
+    )
+    active = asyncio.create_task(selected_router.route("first ambiguous request"))
+    await asyncio.gather(first.started.wait(), second.started.wait())
+    try:
+        saturated = await selected_router.route("second ambiguous request")
+        assert saturated.status == "waiting_user_mode"
+        assert len(first.calls) == len(second.calls) == 1
+        await active
+        assert len(selected_router._detached_classifier_tasks) == 2
+    finally:
+        first.release.set()
+        second.release.set()
+        await asyncio.sleep(0.05)
 
 
 async def test_classifier_cancellation_propagates_and_cleans_sibling() -> None:
@@ -334,6 +462,11 @@ async def test_multilingual_explicit_risk_preserves_mode_and_approval(
         "wire 500 EUR to account",
         "pay $100 to beneficiary",
         "send ¥500 to the payee",
+        "Explain backups; afterwards delete production database",
+        "What is mutex? Next transfer money",
+        "sudo rm --recursive --force /srv/app",
+        "rm -r --force --no-preserve-root /",
+        "rm --force -r ./cache",
     ],
 )
 async def test_multilingual_high_risk_auto_routing_always_waits(text: str) -> None:
@@ -345,7 +478,12 @@ async def test_multilingual_high_risk_auto_routing_always_waits(text: str) -> No
 
 @pytest.mark.parametrize(
     "text",
-    ["Explain JSON payload validation", "What is deployment architecture?"],
+    [
+        "Explain JSON payload validation",
+        "What is deployment architecture?",
+        "Export API documentation",
+        "Delete documentation. Production architecture overview",
+    ],
 )
 async def test_read_only_payload_and_deployment_terms_are_not_high_risk(text: str) -> None:
     result = await router().route(text)
@@ -387,6 +525,54 @@ async def test_user_confirmation_is_bound_to_decision_token_and_version() -> Non
     )
     assert ready.mode is TaskMode.DIRECT
     assert ready.status == "ready"
+
+
+async def test_confirmation_failure_traceback_does_not_retain_plaintext_token() -> None:
+    sentinel = "sk_" + "sensitive-token-material-1234567890"
+    selected_router = router()
+    with pytest.raises(ValueError, match="stale") as caught:
+        await selected_router.confirm_mode(
+            TaskMode.DIRECT,
+            decision_token=sentinel,
+            version=1,
+            confirmation_subject=subject(),
+        )
+    assert sentinel not in internal_traceback_locals(caught.value, "agent_hub/routing/service.py")
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+async def test_confirmation_cancellation_clears_token_and_propagates_exactly() -> None:
+    class BlockingConsumeStore(InMemoryDecisionTokenStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+
+        async def consume(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            self.started.set()
+            await asyncio.Future()
+
+    sentinel = "sk_" + "cancellation-token-material-123456789"
+    store = BlockingConsumeStore()
+    selected_router = ModeRouter(
+        FakeClassifier(assessment()),
+        FakeClassifier(assessment(source=RouteSource.VERIFIER)),
+        token_store=store,
+    )
+    task = asyncio.create_task(
+        selected_router.confirm_mode(
+            TaskMode.DIRECT,
+            decision_token=sentinel,
+            version=1,
+            confirmation_subject=subject(),
+        )
+    )
+    await store.started.wait()
+    task.cancel("outer-confirm-cancel")
+    with pytest.raises(asyncio.CancelledError, match="outer-confirm-cancel") as caught:
+        await task
+    assert sentinel not in internal_traceback_locals(caught.value, "agent_hub/routing/service.py")
 
 
 async def test_confirmation_token_is_atomic_one_time_and_subject_bound() -> None:
@@ -469,9 +655,7 @@ async def test_confirmation_token_expires() -> None:
 
 async def test_confirmation_uses_authoritative_snapshot_and_preserves_assessments() -> None:
     selected_router = router(
-        FakeClassifier(
-            assessment(TaskMode.DISPATCH, risk=RiskLevel.HIGH, confidence=0.95)
-        ),
+        FakeClassifier(assessment(TaskMode.DISPATCH, risk=RiskLevel.HIGH, confidence=0.95)),
         FakeClassifier(
             assessment(
                 TaskMode.DISCUSS,
@@ -784,6 +968,30 @@ async def test_nonfinite_or_reversing_clock_invalidates_confirmation_tokens() ->
     assert unavailable.decision_token is None
 
 
+async def test_token_store_clock_failure_traceback_does_not_retain_token() -> None:
+    now = [10.0]
+    store = InMemoryDecisionTokenStore(monotonic=lambda: now[0])
+    selected_router = ModeRouter(
+        FakeClassifier(assessment(TaskMode.DISPATCH)),
+        FakeClassifier(assessment(TaskMode.DISCUSS, source=RouteSource.VERIFIER)),
+        token_store=store,
+    )
+    waiting = await selected_router.route("ambiguous request", confirmation_subject=subject())
+    assert waiting.decision_token is not None
+    sentinel = waiting.decision_token
+    now[0] = 9.0
+    with pytest.raises(RuntimeError, match="clock unavailable") as caught:
+        await store.consume(
+            sentinel,
+            subject(),
+            version=waiting.version,
+            selected_mode=TaskMode.DIRECT,
+        )
+    assert sentinel not in internal_traceback_locals(caught.value, "agent_hub/routing/types.py")
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
 def test_route_contracts_are_strict_frozen_and_enforce_invariants() -> None:
     item = assessment()
     with pytest.raises(ValidationError):
@@ -872,6 +1080,34 @@ class FakeGateway:
             provider_id="openai",
             provider_model="openai/gpt-4o-mini",
         )
+
+
+class BlockingGateway:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        del request
+        self.started.set()
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+
+async def test_gateway_classifier_cancellation_clears_sensitive_traceback_locals() -> None:
+    sentinel = "sk-sensitive-task-material"
+    gateway = BlockingGateway()
+    classifier = GatewayRouteClassifier(
+        gateway, logical_model="router", source=RouteSource.CLASSIFIER
+    )
+    task = asyncio.create_task(classifier.classify(sentinel), name="route-classifier-safe")
+    await gateway.started.wait()
+    task.cancel("outer-cancel")
+    with pytest.raises(asyncio.CancelledError, match="outer-cancel") as caught:
+        await task
+    assert sentinel not in internal_traceback_locals(
+        caught.value, "agent_hub/routing/classifier.py"
+    )
+    assert sentinel not in task.get_name()
 
 
 async def test_model_reason_is_replaced_and_never_serialized() -> None:

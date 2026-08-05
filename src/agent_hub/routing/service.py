@@ -12,6 +12,7 @@ from agent_hub.routing.classifier import RouteClassifier
 from agent_hub.routing.rules import (
     RiskRulePolicy,
     assess_rules,
+    normalize_task_text,
     parse_explicit_command,
     validate_task_text,
 )
@@ -19,6 +20,7 @@ from agent_hub.routing.types import (
     EXECUTABLE_MODES,
     ConfirmationSnapshot,
     ConfirmationSubject,
+    ConsumedDecisionToken,
     DecisionTokenStore,
     RiskLevel,
     RouteAssessment,
@@ -33,6 +35,8 @@ class RoutingPolicy:
     max_single_cost_usd: Decimal = Decimal("0.50")
     max_total_cost_usd: Decimal = Decimal("0.75")
     classifier_timeout_seconds: float = 20
+    classifier_cleanup_grace_seconds: float = 0.1
+    max_detached_classifier_tasks: int = 32
     confirmation_ttl_seconds: float = 300
 
     def __post_init__(self) -> None:
@@ -56,6 +60,18 @@ class RoutingPolicy:
             or self.classifier_timeout_seconds <= 0
         ):
             raise ValueError("classifier timeout must be positive and finite")
+        if (
+            isinstance(self.classifier_cleanup_grace_seconds, bool)
+            or not isinstance(self.classifier_cleanup_grace_seconds, int | float)
+            or not math.isfinite(self.classifier_cleanup_grace_seconds)
+            or not 0 < self.classifier_cleanup_grace_seconds <= 1
+        ):
+            raise ValueError("classifier cleanup grace must be finite and at most one second")
+        if (
+            type(self.max_detached_classifier_tasks) is not int
+            or not 2 <= self.max_detached_classifier_tasks <= 256
+        ):
+            raise ValueError("detached classifier task capacity must be between 2 and 256")
         if (
             isinstance(self.confirmation_ttl_seconds, bool)
             or not isinstance(self.confirmation_ttl_seconds, int | float)
@@ -84,6 +100,8 @@ class ModeRouter:
         self._token_store = token_store
         self._policy = policy or RoutingPolicy()
         self._risk_policy = risk_policy or RiskRulePolicy()
+        self._active_classifier_tasks: set[asyncio.Task[object]] = set()
+        self._detached_classifier_tasks: set[asyncio.Task[object]] = set()
 
     async def route(
         self,
@@ -91,14 +109,18 @@ class ModeRouter:
         *,
         confirmation_subject: ConfirmationSubject | None = None,
     ) -> RouteDecision:
-        text = validate_task_text(task_text)
+        try:
+            text = validate_task_text(task_text)
+        except (TypeError, ValueError):
+            return await self._waiting("invalid_input")
         command = parse_explicit_command(text)
         if command.invalid:
             return await self._waiting(
                 "invalid_explicit_command", confirmation_subject=confirmation_subject
             )
         if command.mode is not None and command.mode is not TaskMode.AUTO:
-            rule = assess_rules(command.task_text, risk_policy=self._risk_policy)
+            normalized_body = normalize_task_text(command.task_text)
+            rule = assess_rules(normalized_body, risk_policy=self._risk_policy)
             risk = rule.risk
             return self._ready(
                 command.mode,
@@ -113,7 +135,9 @@ class ModeRouter:
                 risk=risk,
                 requires_approval=rule.requires_approval,
             )
-        effective_text = command.task_text if command.mode is TaskMode.AUTO else text
+        effective_text = normalize_task_text(
+            command.task_text if command.mode is TaskMode.AUTO else text
+        )
         rules = assess_rules(effective_text, risk_policy=self._risk_policy)
         if rules.reason is not None and rules.mode is None:
             return await self._waiting(
@@ -148,8 +172,7 @@ class ModeRouter:
             or any(item.mode is not assessments[0].mode for item in assessments[1:])
             or highest_risk is RiskLevel.HIGH
             or any(
-                item.estimated_cost_usd > self._policy.max_single_cost_usd
-                for item in assessments
+                item.estimated_cost_usd > self._policy.max_single_cost_usd for item in assessments
             )
             or sum((item.estimated_cost_usd for item in assessments), Decimal(0))
             > self._policy.max_total_cost_usd
@@ -169,8 +192,22 @@ class ModeRouter:
         )
 
     async def _classify(self, task_text: str) -> tuple[RouteAssessment, ...] | None:
+        if (
+            len(self._active_classifier_tasks) + len(self._detached_classifier_tasks) + 2
+            > self._policy.max_detached_classifier_tasks
+        ):
+            return None
         classifiers = (self._classifier, self._verifier)
-        tasks = tuple(asyncio.create_task(item.classify(task_text)) for item in classifiers)
+        tasks = tuple(
+            asyncio.create_task(
+                item.classify(task_text),
+                name=f"route-classifier-{index}",
+            )
+            for index, item in enumerate(classifiers)
+        )
+        self._active_classifier_tasks.update(tasks)
+        result: tuple[RouteAssessment, ...] | None = None
+        cancellation: asyncio.CancelledError | None = None
         try:
             try:
                 completed: dict[asyncio.Task[object], object] = {}
@@ -186,30 +223,83 @@ class ModeRouter:
                             except asyncio.CancelledError:
                                 raise
                             except Exception:  # noqa: BLE001 - classifier boundary is redacted
-                                return None
+                                pending = set()
+                                break
             except TimeoutError:
-                return None
-            validated = tuple(
-                self._validate_assessment(completed[task], source)
-                for task, source in zip(
-                    tasks,
-                    (RouteSource.CLASSIFIER, RouteSource.VERIFIER),
-                    strict=True,
+                completed = {}
+            if len(completed) == len(tasks):
+                validated = tuple(
+                    self._validate_assessment(completed[task], source)
+                    for task, source in zip(
+                        tasks,
+                        (RouteSource.CLASSIFIER, RouteSource.VERIFIER),
+                        strict=True,
+                    )
                 )
-            )
-            if any(item is None for item in validated):
-                return None
-            return tuple(item for item in validated if item is not None)
+                if not any(item is None for item in validated):
+                    result = tuple(item for item in validated if item is not None)
+        except asyncio.CancelledError as error:
+            cancellation = error
         finally:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                await self._bounded_classifier_cleanup(tasks)
+            except asyncio.CancelledError as error:
+                if cancellation is None:
+                    cancellation = error
+        if cancellation is not None:
+            raise cancellation
+        return result
+
+    async def _bounded_classifier_cleanup(self, tasks: tuple[asyncio.Task[object], ...]) -> None:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        interrupted: asyncio.CancelledError | None = None
+        done: set[asyncio.Task[object]] = {task for task in tasks if task.done()}
+        pending: set[asyncio.Task[object]] = set(tasks) - done
+        if pending:
+            try:
+                newly_done, pending = await asyncio.wait(
+                    pending,
+                    timeout=self._policy.classifier_cleanup_grace_seconds,
+                )
+                done.update(newly_done)
+            except asyncio.CancelledError as error:
+                interrupted = error
+                done = {task for task in tasks if task.done()}
+                pending = set(tasks) - done
+        for task in done:
+            self._active_classifier_tasks.discard(task)
+            self._consume_classifier_task(task)
+        for task in pending:
+            task.cancel()
+            self._active_classifier_tasks.discard(task)
+            self._register_detached_classifier_task(task)
+        if interrupted is not None:
+            raise interrupted
+
+    def _register_detached_classifier_task(self, task: asyncio.Task[object]) -> None:
+        if task.done():
+            self._consume_classifier_task(task)
+            return
+        self._detached_classifier_tasks.add(task)
+        task.add_done_callback(self._detached_classifier_done)
+
+    def _detached_classifier_done(self, task: asyncio.Task[object]) -> None:
+        self._detached_classifier_tasks.discard(task)
+        self._consume_classifier_task(task)
 
     @staticmethod
-    def _validate_assessment(
-        value: object, source: RouteSource
-    ) -> RouteAssessment | None:
+    def _consume_classifier_task(task: asyncio.Task[object]) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except BaseException:  # noqa: BLE001 - retrieve every terminal task failure
+            return
+
+    @staticmethod
+    def _validate_assessment(value: object, source: RouteSource) -> RouteAssessment | None:
         try:
             return ModeRouter._validate_assessment_unchecked(value, source)
         except Exception as error:  # noqa: BLE001 - untrusted classifier object boundary
@@ -266,39 +356,21 @@ class ModeRouter:
         version: int,
         confirmation_subject: ConfirmationSubject,
     ) -> RouteDecision:
+        plaintext_token = decision_token
+        decision_token = None
+        del decision_token
         try:
-            confirmation_subject = ConfirmationSubject.model_validate(
-                confirmation_subject.model_dump(round_trip=True), strict=True
-            )
-        except (AttributeError, TypeError, ValueError, ValidationError) as error:
-            error.__traceback__ = None
-            error.__context__ = None
-            error.__cause__ = None
-            raise ValueError("stale routing decision") from None
-        if (
-            decision_token is None
-            or type(version) is not int
-            or version <= 0
-        ):
-            raise ValueError("stale routing decision")
-        if not isinstance(mode, TaskMode) or mode not in EXECUTABLE_MODES:
-            raise ValueError("confirmed mode must be executable")
-        try:
-            consumed = await self._token_store.consume(
-                decision_token,
-                confirmation_subject,
+            consumed = await self._consume_confirmation(
+                mode,
+                plaintext_token=plaintext_token,
                 version=version,
-                selected_mode=mode,
+                confirmation_subject=confirmation_subject,
             )
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:  # noqa: BLE001 - stable confirmation boundary
-            error.__traceback__ = None
-            error.__context__ = None
-            error.__cause__ = None
-            consumed = None
+        finally:
+            plaintext_token = None
+            del plaintext_token
         if consumed is None:
-            raise ValueError("stale routing decision")
+            raise ValueError("stale routing decision") from None
         snapshot = consumed.snapshot
         user = self._local_assessment(
             mode, "explicit_user_confirmation", RouteSource.USER, risk=snapshot.risk
@@ -310,6 +382,46 @@ class ModeRouter:
             requires_approval=snapshot.requires_approval,
             version=consumed.version + 1,
         )
+
+    async def _consume_confirmation(
+        self,
+        mode: TaskMode,
+        *,
+        plaintext_token: str | None,
+        version: int,
+        confirmation_subject: ConfirmationSubject,
+    ) -> ConsumedDecisionToken | None:
+        try:
+            try:
+                confirmation_subject = ConfirmationSubject.model_validate(
+                    confirmation_subject.model_dump(round_trip=True), strict=True
+                )
+            except (AttributeError, TypeError, ValueError, ValidationError) as error:
+                error.__traceback__ = None
+                error.__context__ = None
+                error.__cause__ = None
+                return None
+            if plaintext_token is None or type(version) is not int or version <= 0:
+                return None
+            if not isinstance(mode, TaskMode) or mode not in EXECUTABLE_MODES:
+                raise ValueError("confirmed mode must be executable") from None
+            try:
+                return await self._token_store.consume(
+                    plaintext_token,
+                    confirmation_subject,
+                    version=version,
+                    selected_mode=mode,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - stable confirmation boundary
+                error.__traceback__ = None
+                error.__context__ = None
+                error.__cause__ = None
+                return None
+        finally:
+            plaintext_token = None
+            del plaintext_token
 
     @staticmethod
     def _local_assessment(
