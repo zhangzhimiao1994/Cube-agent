@@ -355,9 +355,11 @@ async def test_cancelled_background_hashing_error_is_observable_and_releases_cap
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[tuple[str, object]] = []
+    observed = threading.Event()
 
     def record_event(message: str, *, extra: object) -> None:
         events.append((message, extra))
+        observed.set()
 
     monkeypatch.setattr("agent_hub.auth.passwords._LOGGER.warning", record_event)
     password = "first sensitive password"
@@ -376,20 +378,7 @@ async def test_cancelled_background_hashing_error_is_observable_and_releases_cap
         await running
     hasher.release.set()
 
-    for _ in range(100):
-        try:
-            result = await service.hash_async("second valid password")
-        except AuthenticationBusy:
-            await asyncio.sleep(0.01)
-        else:
-            assert result.startswith("$argon2id$")
-            break
-    else:
-        pytest.fail("background hashing failure did not release capacity")
-    for _ in range(500):
-        if service.background_failure_count == 1:
-            break
-        await asyncio.sleep(0.01)
+    assert await asyncio.to_thread(observed.wait, 2)
     assert service.background_failure_count == 1
     assert events == [
         (
@@ -399,6 +388,7 @@ async def test_cancelled_background_hashing_error_is_observable_and_releases_cap
     ]
     assert password not in repr(events)
     assert TEST_DUMMY_HASH not in repr(events)
+    assert (await service.hash_async("second valid password")).startswith("$argon2id$")
 
 
 @pytest.mark.asyncio
@@ -406,9 +396,11 @@ async def test_cancelled_background_unknown_failure_logs_only_safe_category(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[tuple[str, object]] = []
+    observed = threading.Event()
 
     def record_event(message: str, *, extra: object) -> None:
         events.append((message, extra))
+        observed.set()
 
     monkeypatch.setattr("agent_hub.auth.passwords._LOGGER.warning", record_event)
     password = "first sensitive password"
@@ -426,10 +418,7 @@ async def test_cancelled_background_unknown_failure_logs_only_safe_category(
         await running
     hasher.release.set()
 
-    for _ in range(500):
-        if service.background_failure_count == 1:
-            break
-        await asyncio.sleep(0.01)
+    assert await asyncio.to_thread(observed.wait, 2)
     assert service.background_failure_count == 1
     assert events == [
         (
@@ -439,16 +428,7 @@ async def test_cancelled_background_unknown_failure_logs_only_safe_category(
     ]
     assert password not in repr(events)
     assert TEST_DUMMY_HASH not in repr(events)
-    for _ in range(100):
-        try:
-            result = await service.hash_async("second valid password")
-        except AuthenticationBusy:
-            await asyncio.sleep(0.01)
-        else:
-            assert result.startswith("$argon2id$")
-            break
-    else:
-        pytest.fail("background unknown failure did not release capacity")
+    assert (await service.hash_async("second valid password")).startswith("$argon2id$")
 
 
 def test_unknown_runtime_hash_failure_propagates_without_password_frames() -> None:

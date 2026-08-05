@@ -106,9 +106,7 @@ class Settings(BaseSettings):
     environment: str = "development"
     database_url: str = "postgresql+asyncpg://agent_hub:agent_hub@localhost/agent_hub"
     redis_url: str = "redis://localhost:6379/0"
-    jwt_signing_key: SecretStr = SecretStr(
-        "base64url:YWdlbnQtaHViLWRldmVsb3BtZW50LWtleS0wMDAwMDE"
-    )
+    jwt_signing_key: SecretStr = SecretStr("development-only-change-me")
     master_key: SecretStr = SecretStr("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 
 
