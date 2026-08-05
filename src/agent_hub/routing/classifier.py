@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
 from decimal import Decimal
 from typing import Protocol
@@ -28,7 +29,7 @@ class RouteClassificationError(RuntimeError):
 
 
 class RouteClassifier(Protocol):
-    async def classify(self, task_text: str) -> RouteAssessment: ...
+    async def classify(self, task_text: str) -> object: ...
 
 
 class RoutingGateway(Protocol):
@@ -120,33 +121,53 @@ class GatewayRouteClassifier:
             raise ValueError("gateway classifier source is invalid")
         if not logical_model:
             raise ValueError("logical model is required")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, int | float)
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("classifier timeout must be positive and finite")
         self._gateway = gateway
         self._logical_model = logical_model
         self._source = source
         self._timeout_seconds = timeout_seconds
 
     async def classify(self, task_text: str) -> RouteAssessment:
-        validated = validate_task_text(task_text)
-        request = ModelRequest(
-            logical_model=self._logical_model,
-            messages=(
-                ModelMessage(role="system", content=_SYSTEM_PROMPT),
-                ModelMessage(role="user", content=validated),
-            ),
-            required_capabilities=frozenset(
-                {ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT}
-            ),
-            timeout_seconds=self._timeout_seconds,
-            allow_fallback=True,
-            response_schema=StructuredResponseSchema(name="route_assessment", schema=_ROUTE_SCHEMA),
-        )
+        outcome = await self._classify_safely(task_text)
+        del task_text
+        if outcome is None:
+            raise RouteClassificationError("route classification failed") from None
+        return outcome
+
+    async def _classify_safely(self, task_text: str) -> RouteAssessment | None:
         try:
+            validated = validate_task_text(task_text)
+            request = ModelRequest(
+                logical_model=self._logical_model,
+                messages=(
+                    ModelMessage(role="system", content=_SYSTEM_PROMPT),
+                    ModelMessage(role="user", content=validated),
+                ),
+                required_capabilities=frozenset(
+                    {ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT}
+                ),
+                timeout_seconds=self._timeout_seconds,
+                allow_fallback=True,
+                response_schema=StructuredResponseSchema(
+                    name="route_assessment", schema=_ROUTE_SCHEMA
+                ),
+            )
             completion = await self._gateway.complete_with_context(request)
             payload = self._parse(completion.response.text)
             return RouteAssessment(
                 mode=payload.mode,
                 confidence=payload.confidence,
-                reason=payload.reason,
+                reason=(
+                    "classifier_recommendation"
+                    if self._source is RouteSource.CLASSIFIER
+                    else "verifier_recommendation"
+                ),
                 roles=tuple(payload.roles),
                 estimated_seconds=payload.estimated_seconds,
                 estimated_cost_usd=payload.estimated_cost_usd,
@@ -166,7 +187,7 @@ class GatewayRouteClassifier:
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None
-            raise RouteClassificationError("route classification failed") from None
+            return None
 
     @staticmethod
     def _parse(raw: str | None) -> _RoutePayload:
