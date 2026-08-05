@@ -69,6 +69,48 @@ def test_short_signing_key_is_rejected() -> None:
 
 
 @pytest.mark.parametrize(
+    "audience",
+    [["agent-hub"], ["other", "agent-hub"]],
+)
+def test_decode_rejects_audience_lists_with_one_safe_failure(
+    audience: list[str],
+) -> None:
+    payload = _valid_payload()
+    payload["aud"] = audience
+    token = _encode_payload(payload)
+
+    with pytest.raises(InvalidTokenError, match="invalid access token") as captured:
+        _service().decode(token)
+
+    assert token not in str(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    ("lifetime_seconds", "valid"),
+    [(59, False), (60, True), (3600, True), (3601, False), (365 * 24 * 60 * 60, False)],
+)
+def test_decode_enforces_the_same_lifetime_bounds_as_encode(
+    lifetime_seconds: int, valid: bool
+) -> None:
+    payload = _valid_payload()
+    payload["exp"] = int(NOW.timestamp()) + lifetime_seconds
+    token = _encode_payload(payload)
+
+    if valid:
+        assert _service().decode(token).expires_at == NOW + timedelta(
+            seconds=lifetime_seconds
+        )
+    else:
+        with pytest.raises(InvalidTokenError, match="invalid access token") as captured:
+            _service().decode(token)
+        assert token not in str(captured.value)
+        assert captured.value.__cause__ is None
+        assert captured.value.__context__ is None
+
+
+@pytest.mark.parametrize(
     "mutation",
     [
         lambda payload: payload.__setitem__("exp", int((NOW - timedelta(seconds=1)).timestamp())),

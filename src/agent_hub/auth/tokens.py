@@ -130,6 +130,7 @@ class AccessTokenService:
                 issuer=self._issuer,
                 options={
                     "require": list(_REQUIRED_CLAIMS),
+                    "strict_aud": True,
                     "verify_exp": False,
                     "verify_iat": False,
                 },
@@ -148,6 +149,12 @@ class AccessTokenService:
                 or not isinstance(expires_timestamp, int)
                 or isinstance(expires_timestamp, bool)
             ):
+                return None
+            audience = payload["aud"]
+            if not isinstance(audience, str) or audience != self._audience:
+                return None
+            lifetime_seconds = expires_timestamp - issued_timestamp
+            if not _MIN_TTL_SECONDS <= lifetime_seconds <= _MAX_TTL_SECONDS:
                 return None
             issued_at = datetime.fromtimestamp(issued_timestamp, UTC)
             expires_at = datetime.fromtimestamp(expires_timestamp, UTC)
