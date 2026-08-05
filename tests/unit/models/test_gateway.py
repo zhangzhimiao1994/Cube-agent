@@ -120,6 +120,7 @@ class CapacityStub:
             lease.deployment_id,
             lease.quota_scope_id,
             lease.expires_at + timedelta(seconds=30),
+            lease.renew_after_seconds,
         )
 
     async def record_outcome(
@@ -199,6 +200,17 @@ class RawFailingTransport:
         raise RuntimeError(f"raw-provider-detail:{api_key}")
 
 
+class TypedLeakingTransport:
+    def __init__(self) -> None:
+        self.task: asyncio.Task[object] | None = None
+
+    async def complete(
+        self, deployment: Deployment, request: ModelRequest, api_key: str
+    ) -> ModelResponse:
+        self.task = asyncio.current_task()
+        raise ModelTransportError(f"typed leaked {api_key}", status_code=429)
+
+
 class AdvancingSecretResolver:
     def __init__(self, clock: list[float]) -> None:
         self.clock = clock
@@ -227,6 +239,7 @@ def lease(identifier: str, scope: str | None = None) -> CapacityLease:
         deployment_id=identifier,
         quota_scope_id=scope or f"scope-{identifier}",
         expires_at=datetime.now(UTC) + timedelta(seconds=30),
+        renew_after_seconds=0.01,
     )
 
 
@@ -294,7 +307,7 @@ async def test_429_status_and_latency_are_recorded_and_release_occurs() -> None:
         monotonic=monotonic([2.0, 2.4]),
     )
 
-    with pytest.raises(ModelTransportError, match="safe transport failure"):
+    with pytest.raises(ModelTransportError, match="model transport failed"):
         await gateway.complete(request())
 
     assert len(capacity.records) == 1
@@ -348,6 +361,44 @@ async def test_typed_transport_error_traceback_drops_transport_key_locals() -> N
         frame_values.extend(repr(value) for value in traceback.tb_frame.f_locals.values())
         traceback = traceback.tb_next
     assert "key-for-secret://selected" not in " ".join(frame_values)
+
+
+async def test_typed_transport_error_message_and_captured_locals_are_redacted() -> None:
+    selected = Deployment(
+        id="selected",
+        logical_model="primary",
+        api_base="https://private-model.example/v1",
+        secret_ref="secret://selected",
+        quota_scope_id="private-scope",
+    )
+    capacity = CapacityStub([lease("selected", "private-scope")])
+    transport = TypedLeakingTransport()
+    gateway = ModelGateway(
+        ModelRegistry([selected]), capacity, SecretStub(capacity.events), transport
+    )
+
+    with pytest.raises(ModelTransportError) as captured:
+        await gateway.complete(request())
+
+    error = captured.value
+    assert str(error) == "model transport failed"
+    assert error.status_code == 429
+    assert error.__cause__ is None and error.__context__ is None
+    assert transport.task is not None and transport.task.exception() is None
+    locals_repr: list[str] = []
+    traceback = error.__traceback__
+    while traceback is not None:
+        locals_repr.extend(repr(value) for value in traceback.tb_frame.f_locals.values())
+        traceback = traceback.tb_next
+    exposed = " ".join(locals_repr)
+    for secret in (
+        "key-for-secret://selected",
+        "private-scope",
+        "private prompt",
+        "private-model.example",
+        "typed leaked",
+    ):
+        assert secret not in exposed
 
 
 async def test_raw_transport_failure_does_not_escape_task_or_public_traceback() -> None:
@@ -411,7 +462,7 @@ async def test_record_and_release_failures_do_not_replace_primary_transport_erro
         TransportStub(capacity.events, failure=primary),
     )
 
-    with pytest.raises(ModelTransportError, match="primary safe"):
+    with pytest.raises(ModelTransportError, match="model transport failed"):
         await gateway.complete(request())
     assert len(capacity.releases) == 1
 
@@ -511,6 +562,7 @@ async def test_short_lease_renews_before_expiry_with_large_heartbeat_cap() -> No
         deployment_id="selected",
         quota_scope_id="scope-selected",
         expires_at=datetime.now(UTC) + timedelta(seconds=0.08),
+        renew_after_seconds=0.02,
     )
     capacity = CapacityStub([short_lease])
     block = asyncio.Event()
@@ -715,18 +767,69 @@ def test_capacity_lease_repr_is_redacted_and_fields_are_validated() -> None:
     assert "sensitive" not in repr(active)
 
     with pytest.raises(ValueError, match="lease id"):
-        CapacityLease("not-a-uuid", "deployment", "scope", datetime.now(UTC))
+        CapacityLease("not-a-uuid", "deployment", "scope", datetime.now(UTC), 1)
     with pytest.raises(ValueError, match="deployment id"):
-        CapacityLease(str(uuid5(NAMESPACE_DNS, "x")), "Bad Deployment", "scope", datetime.now(UTC))
+        CapacityLease(
+            str(uuid5(NAMESPACE_DNS, "x")), "Bad Deployment", "scope", datetime.now(UTC), 1
+        )
+    for invalid_delay in (-1, float("inf"), float("nan"), True, "1"):
+        with pytest.raises(ValueError, match="renewal delay"):
+            CapacityLease(
+                str(uuid5(NAMESPACE_DNS, "delay")),
+                "deployment",
+                "scope",
+                datetime.now(UTC),
+                invalid_delay,  # type: ignore[arg-type]
+            )
+
+
+async def test_zero_relative_renewal_delay_fails_closed_without_spinning() -> None:
+    selected = deployment("selected")
+    immediate = CapacityLease(
+        str(uuid5(NAMESPACE_DNS, "immediate")),
+        "selected",
+        "scope-selected",
+        datetime.now(UTC) + timedelta(seconds=30),
+        0,
+    )
+    capacity = CapacityStub([immediate])
+    block = asyncio.Event()
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        SecretStub(capacity.events),
+        TransportStub(capacity.events, block=block),
+    )
+    with pytest.raises(CapacityBackendError, match="renewal timing"):
+        await gateway.complete(request())
+    assert capacity.renews == 3
     with pytest.raises(ValueError, match="quota_scope_id"):
-        CapacityLease(str(uuid5(NAMESPACE_DNS, "x")), "deployment", "bad scope", datetime.now(UTC))
+        CapacityLease(
+            str(uuid5(NAMESPACE_DNS, "x")), "deployment", "bad scope", datetime.now(UTC), 1
+        )
     with pytest.raises(ValueError, match="timezone-aware"):
         CapacityLease(
             str(uuid5(NAMESPACE_DNS, "x")),
             "deployment",
             "scope",
             datetime(2025, 1, 1),  # noqa: DTZ001 - intentionally exercises naive rejection
+            1,
         )
+
+
+def test_deployment_repr_omits_operational_and_credential_details() -> None:
+    configured = Deployment(
+        id="safe-id",
+        logical_model="safe-model",
+        api_base="https://private.example/v1",
+        secret_ref="secret://private-key",
+        quota_scope_id="private-scope",
+    )
+    exposed = repr(configured)
+    assert "safe-id" in exposed and "safe-model" in exposed
+    assert "private.example" not in exposed
+    assert "secret://private-key" not in exposed
+    assert "private-scope" not in exposed
 
 
 @pytest.mark.parametrize("status", [99, 600, True, "429"])

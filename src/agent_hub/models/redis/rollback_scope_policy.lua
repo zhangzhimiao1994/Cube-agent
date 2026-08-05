@@ -20,11 +20,10 @@ if #latest == 0 then
     return 1
 end
 
-local previous = tonumber(redis.call('HGET', KEYS[1], 'base'))
 local base = minimum(KEYS[3], false)
 redis.call('HSET', KEYS[1], 'base', base, 'rpm', minimum(KEYS[4], true), 'tpm', minimum(KEYS[5], true))
 local health = tonumber(redis.call('HGET', KEYS[7], 'effective'))
-if health == nil or previous == nil or health == previous then
+if health == nil then
     redis.call('HSET', KEYS[7], 'effective', base)
 elseif health > base then
     redis.call('HSET', KEYS[7], 'effective', base)

@@ -18,6 +18,7 @@ from agent_hub.models.types import Deployment, _require_safe_identifier
 _SAFE_PREFIX = re.compile(r"^[A-Za-z0-9:_-]{1,128}$")
 _SAFE_FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
 _STATE_TTL_MS = 3_600_000
+_MAX_OWNER_RECORDS = 4096
 
 
 class CapacityUnavailable(asyncio.TimeoutError):
@@ -50,6 +51,7 @@ class CapacityLease:
     deployment_id: str
     quota_scope_id: str
     expires_at: datetime
+    renew_after_seconds: float
 
     def __post_init__(self) -> None:
         try:
@@ -68,6 +70,13 @@ class CapacityLease:
             raise ValueError("lease expiry must be finite") from None
         if not math.isfinite(timestamp):
             raise ValueError("lease expiry must be finite")
+        if (
+            isinstance(self.renew_after_seconds, bool)
+            or not isinstance(self.renew_after_seconds, int | float)
+            or not math.isfinite(self.renew_after_seconds)
+            or self.renew_after_seconds < 0
+        ):
+            raise ValueError("lease renewal delay must be finite and nonnegative")
 
     def __repr__(self) -> str:
         return "CapacityLease(<redacted>)"
@@ -193,6 +202,7 @@ class CapacityPool:
         metadata_ttl_seconds: float = 3600,
         metadata_refresh_interval: float | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        owner_id: str | None = None,
     ) -> None:
         if _SAFE_PREFIX.fullmatch(key_prefix) is None:
             raise ValueError("capacity key prefix is invalid")
@@ -237,6 +247,13 @@ class CapacityPool:
         metadata_ttl_ms = math.ceil(float(metadata_ttl_seconds) * 1000)
         if metadata_ttl_ms < 3 * lease_ms:
             raise ValueError("metadata_ttl_seconds must cover at least three lease horizons")
+        configured_owner = str(uuid4()) if owner_id is None else owner_id
+        try:
+            parsed_owner = UUID(configured_owner)
+        except (ValueError, TypeError, AttributeError):
+            raise ValueError("capacity owner_id must be a canonical UUID") from None
+        if str(parsed_owner) != configured_owner:
+            raise ValueError("capacity owner_id must be a canonical UUID")
         self._redis = cast(RedisCapacityClient, redis_client)
         self._credentials = credentials
         self._key_prefix = key_prefix
@@ -249,6 +266,7 @@ class CapacityPool:
         self._metadata_ttl_ms = metadata_ttl_ms
         self._metadata_refresh_interval = float(refresh_interval)
         self._monotonic = monotonic
+        self._owner_id = configured_owner
         self._waiters = 0
         self._waiter_lock = asyncio.Lock()
         self._registration_lock = asyncio.Lock()
@@ -339,13 +357,12 @@ class CapacityPool:
                 raise CapacityConfigurationError("credential fingerprint quota scope conflicts")
             fingerprint_scopes[fingerprint] = deployment.quota_scope_id
             deployment_fingerprints.append((deployment, fingerprint))
-        owner = str(uuid4())
+        owner = self._owner_id
         fingerprint_keys: list[tuple[str, str]] = []
         policy_keys: list[Mapping[str, str]] = []
         try:
             for deployment, fingerprint in deployment_fingerprints:
                 claim_keys = self._fingerprint_keys(fingerprint)
-                fingerprint_keys.append(claim_keys)
                 claimed = await self._redis.eval(
                     _CLAIM_FINGERPRINT_SCRIPT,
                     2,
@@ -353,14 +370,25 @@ class CapacityPool:
                     owner,
                     self._scope_digest(deployment.quota_scope_id),
                     self._metadata_ttl_ms,
+                    _MAX_OWNER_RECORDS,
                 )
-                if self._strict_redis_int(claimed) != 1:
+                accepted, created, owner_count = self._integer_result(claimed, 3)
+                if not 0 <= owner_count <= _MAX_OWNER_RECORDS:
+                    raise CapacityBackendError(
+                        "model capacity backend returned invalid state"
+                    )
+                if accepted != 1:
                     raise CapacityConfigurationError(
                         "credential fingerprint quota scope conflicts"
                     )
+                if created not in {0, 1}:
+                    raise CapacityBackendError(
+                        "model capacity backend returned invalid state"
+                    )
+                if created:
+                    fingerprint_keys.append(claim_keys)
             for quota_scope_id, policy in self._scope_policies.items():
                 keys = self._keys(quota_scope_id)
-                policy_keys.append(keys)
                 result = await self._redis.eval(
                     _REGISTER_SCOPE_SCRIPT,
                     7,
@@ -370,8 +398,15 @@ class CapacityPool:
                     policy.rpm or 0,
                     policy.tpm or 0,
                     self._metadata_ttl_ms,
+                    _MAX_OWNER_RECORDS,
                 )
-                self._integer_result(result, 3)
+                _base, _rpm, _tpm, created, owner_count = self._integer_result(result, 5)
+                if created not in {0, 1} or not 0 <= owner_count <= _MAX_OWNER_RECORDS:
+                    raise CapacityBackendError(
+                        "model capacity backend returned invalid state"
+                    )
+                if created:
+                    policy_keys.append(keys)
         except BaseException as error:
             await self._rollback_registration(owner, fingerprint_keys, policy_keys)
             if isinstance(error, asyncio.CancelledError | CapacityConfigurationError):
@@ -497,6 +532,7 @@ class CapacityPool:
     ) -> CapacityLease | None:
         lease_id = str(uuid4())
         keys = self._keys(deployment.quota_scope_id)
+        started = self._clock_now()
         try:
             result = await self._redis.eval(
                 _ACQUIRE_SCRIPT,
@@ -530,11 +566,17 @@ class CapacityPool:
         except CapacityBackendError:
             await self._release_id_ignoring_errors(keys["leases"], lease_id)
             raise
+        try:
+            renewal_delay = self._safe_renewal_delay(started)
+        except CapacityConfigurationError:
+            await self._release_id_ignoring_errors(keys["leases"], lease_id)
+            raise
         return CapacityLease(
             id=lease_id,
             deployment_id=deployment.id,
             quota_scope_id=deployment.quota_scope_id,
             expires_at=datetime.fromtimestamp(final_value / 1000, tz=UTC),
+            renew_after_seconds=renewal_delay,
         )
 
     async def release(self, lease: CapacityLease) -> bool:
@@ -584,6 +626,7 @@ class CapacityPool:
         # 3x metadata/lease TTL invariant fences natural expiry before ZADD.
         await self._ensure_registration(force=True)
         key = self._keys(lease.quota_scope_id)["leases"]
+        started = self._clock_now()
         try:
             result = await self._redis.eval(
                 _RENEW_SCRIPT, 1, key, lease.id, self._lease_ms, _STATE_TTL_MS
@@ -602,7 +645,15 @@ class CapacityPool:
             deployment_id=lease.deployment_id,
             quota_scope_id=lease.quota_scope_id,
             expires_at=datetime.fromtimestamp(expires_ms / 1000, tz=UTC),
+            renew_after_seconds=self._safe_renewal_delay(started),
         )
+
+    def _safe_renewal_delay(self, started: float) -> float:
+        elapsed = self._clock_now() - started
+        if elapsed < 0:
+            raise CapacityConfigurationError("capacity monotonic clock moved backwards")
+        remaining = max(0.0, self._lease_ms / 1000 - elapsed)
+        return remaining / 2
 
     async def record_outcome(
         self,

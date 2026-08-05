@@ -99,7 +99,7 @@ def _normalize_content_part(value: Mapping[str, object]) -> ContentPart:
     return frozen
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class Deployment:
     id: str
     logical_model: str
@@ -168,6 +168,9 @@ class Deployment:
         if not capabilities:
             raise ValueError("capabilities must not be empty")
         object.__setattr__(self, "capabilities", capabilities)
+
+    def __repr__(self) -> str:
+        return f"Deployment(id={self.id!r}, logical_model={self.logical_model!r})"
 
 
 @dataclass(frozen=True, slots=True)

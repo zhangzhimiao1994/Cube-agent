@@ -163,10 +163,9 @@ class ModelGateway:
         self._fallbacks = MappingProxyType(configured_fallbacks)
         self._capacity_wait_timeout = float(capacity_wait_timeout)
         self._heartbeat_interval = float(heartbeat_interval)
-        self._heartbeat_safety_fraction = float(heartbeat_safety_fraction)
+        del heartbeat_safety_fraction, utc_now
         self._token_estimator = token_estimator or ConservativeTokenEstimator()
         self._monotonic = monotonic
-        self._utc_now = utc_now
 
     @staticmethod
     def _validate_fallbacks(registry: ModelRegistry, fallbacks: Mapping[str, str]) -> None:
@@ -353,7 +352,7 @@ class ModelGateway:
             raise
         except ModelTransportError as error:
             outcome = _SafeTransportFailure(
-                ModelTransportError(str(error), status_code=error.status_code)
+                ModelTransportError("model transport failed", status_code=error.status_code)
             )
             error.__traceback__ = None
             del error
@@ -366,24 +365,20 @@ class ModelGateway:
 
     async def _heartbeat(self, lease: CapacityLease) -> ModelResponse:
         current = lease
+        immediate_renewals = 0
         while True:
-            now = self._heartbeat_now()
-            remaining = (current.expires_at.astimezone(UTC) - now).total_seconds()
-            delay = max(
-                0.0,
-                min(self._heartbeat_interval, remaining * self._heartbeat_safety_fraction),
-            )
+            delay = min(self._heartbeat_interval, current.renew_after_seconds)
+            if delay == 0:
+                immediate_renewals += 1
+                if immediate_renewals > 3:
+                    raise CapacityBackendError("model capacity renewal timing unavailable")
+            else:
+                immediate_renewals = 0
             await asyncio.sleep(delay)
             renewed = await self._capacity.renew(current)
             if renewed is None:
                 raise CapacityBackendError("model capacity lease expired")
             current = renewed
-
-    def _heartbeat_now(self) -> datetime:
-        now = self._utc_now()
-        if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
-            raise ModelGatewayError("model heartbeat clock is invalid")
-        return now.astimezone(UTC)
 
     async def _release_cleanup(self, lease: CapacityLease) -> BaseException | None:
         release_task = asyncio.create_task(self._capacity.release(lease))

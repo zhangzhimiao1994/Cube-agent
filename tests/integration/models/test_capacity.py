@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from typing import cast
 from uuid import uuid4
 
@@ -120,6 +121,19 @@ class MalformedAcquireRedis:
         return result
 
 
+class DelayedAcquireRedis:
+    def __init__(self, client: Redis, delay: float) -> None:
+        self.client = client
+        self.delay = delay
+
+    async def eval(self, script: str, key_count: int, *args: object) -> object:
+        redis_eval = cast(Callable[..., Awaitable[object]], self.client.eval)
+        result = await redis_eval(script, key_count, *args)
+        if key_count == 5:
+            await asyncio.sleep(self.delay)
+        return result
+
+
 class SecretResolver:
     async def resolve(self, secret_ref: str) -> str:
         return "test-key"
@@ -136,6 +150,14 @@ class BlockingTransport:
         self.started.set()
         await self.finish.wait()
         return ModelResponse(text="ok")
+
+
+def test_capacity_owner_id_is_canonical_stable_and_repr_hidden() -> None:
+    owner = str(uuid4())
+    pool = CapacityPool(object(), owner_id=owner)
+    assert owner not in repr(pool)
+    with pytest.raises(ValueError, match="owner_id"):
+        CapacityPool(object(), owner_id="not-a-uuid")
 
 
 async def redis_key(client: Redis, pattern: str, *, member: str | None = None) -> bytes:
@@ -1088,7 +1110,111 @@ async def test_retired_strict_policy_expires_and_active_owner_can_relax_limit(
         await asyncio.sleep(0.07)
         relaxed_clock.advance(0.04)
         await relaxed_pool.initialize()
-        assert await relaxed_pool.effective_limit("retired") == 4
+        policy_key = await redis_key(redis_client, f"{prefix}*:policy")
+        policy_base = await cast(
+            Awaitable[bytes | None], redis_client.hget(policy_key.decode("ascii"), "base")
+        )
+        assert policy_base == b"4"
+        assert await relaxed_pool.effective_limit("retired") == 1
+        for expected in (2, 3, 4):
+            await relaxed_pool.record_outcome(
+                "retired", status_code=200, latency_seconds=0.001, succeeded=True
+            )
+            assert await relaxed_pool.effective_limit("retired") == expected
+    finally:
+        await other.aclose()
+
+
+@pytest.mark.integration
+async def test_repeated_renew_refreshes_one_stable_owner_record(
+    redis_client: Redis, prefix: str
+) -> None:
+    serial = deployment("stable-owner", "stable-owner-scope")
+    pool = CapacityPool(
+        redis_client,
+        deployments=[serial],
+        credentials=credentials("stable-owner"),
+        key_prefix=prefix,
+        lease_seconds=0.1,
+        metadata_ttl_seconds=1,
+        metadata_refresh_interval=0.2,
+    )
+    await pool.initialize()
+    lease = await pool.acquire([serial], wait_timeout=0.05, estimated_tokens=1)
+    for _ in range(20):
+        renewed = await pool.renew(lease)
+        assert renewed is not None
+        lease = renewed
+
+    owner_keys = [
+        key
+        async for key in redis_client.scan_iter(match=f"{prefix}*")
+        if key.decode("ascii").endswith((":expires", ":policy-expires"))
+    ]
+    assert len(owner_keys) == 2
+    assert [await redis_client.zcard(key) for key in owner_keys] == [1, 1]
+    await pool.release(lease)
+
+
+@pytest.mark.integration
+async def test_policy_owner_retirement_does_not_raise_degraded_health(
+    redis_client: Redis, redis_url: str, prefix: str
+) -> None:
+    other = Redis.from_url(redis_url)
+    relaxed = deployment("health-relaxed", "health-retirement", max_concurrency=5)
+    strict = deployment("health-strict", "health-retirement", max_concurrency=1)
+    relaxed_clock = ManualClock()
+    strict_clock = ManualClock()
+    relaxed_pool = CapacityPool(
+        redis_client,
+        deployments=[relaxed],
+        credentials=credentials("health-relaxed"),
+        key_prefix=prefix,
+        lease_seconds=0.02,
+        metadata_ttl_seconds=0.12,
+        metadata_refresh_interval=0.03,
+        cooldown_seconds=0.04,
+        monotonic=relaxed_clock,
+    )
+    strict_pool = CapacityPool(
+        other,
+        deployments=[strict],
+        credentials=credentials("health-strict"),
+        key_prefix=prefix,
+        lease_seconds=0.02,
+        metadata_ttl_seconds=0.12,
+        metadata_refresh_interval=0.03,
+        cooldown_seconds=0.04,
+        monotonic=strict_clock,
+    )
+    try:
+        await relaxed_pool.initialize()
+        await relaxed_pool.record_outcome(
+            "health-retirement", status_code=429, latency_seconds=0.001, succeeded=False
+        )
+        await relaxed_pool.record_outcome(
+            "health-retirement", status_code=429, latency_seconds=0.001, succeeded=False
+        )
+        assert await relaxed_pool.effective_limit("health-retirement") == 1
+        await strict_pool.initialize()
+        assert await relaxed_pool.effective_limit("health-retirement") == 1
+
+        await asyncio.sleep(0.07)
+        relaxed_clock.advance(0.04)
+        await relaxed_pool.initialize()
+        await asyncio.sleep(0.07)
+        relaxed_clock.advance(0.04)
+        await relaxed_pool.initialize()
+        assert await relaxed_pool.effective_limit("health-retirement") == 1
+
+        for expected in (2, 3, 4):
+            await relaxed_pool.record_outcome(
+                "health-retirement",
+                status_code=200,
+                latency_seconds=0.001,
+                succeeded=True,
+            )
+            assert await relaxed_pool.effective_limit("health-retirement") == expected
     finally:
         await other.aclose()
 
@@ -1130,6 +1256,41 @@ async def test_failed_refresh_blocks_admission_but_not_inflight_outcome(
 
 
 @pytest.mark.integration
+async def test_failed_refresh_retains_previous_stable_owner_registration(
+    redis_client: Redis, prefix: str
+) -> None:
+    serial = deployment("refresh-owner", "refresh-owner-scope")
+    clock = ManualClock()
+    wrapped = RegistrationRedis(redis_client)
+    pool = CapacityPool(
+        wrapped,
+        deployments=[serial],
+        credentials=credentials("refresh-owner"),
+        key_prefix=prefix,
+        lease_seconds=0.05,
+        metadata_ttl_seconds=0.3,
+        metadata_refresh_interval=0.05,
+        monotonic=clock,
+    )
+    await pool.initialize()
+    wrapped.calls = 0
+    wrapped.fail_on_call = 2
+    clock.advance(0.06)
+    with pytest.raises(CapacityBackendError):
+        await pool.initialize()
+
+    owner_keys = [
+        key
+        async for key in redis_client.scan_iter(match=f"{prefix}*")
+        if key.decode("ascii").endswith((":expires", ":policy-expires"))
+    ]
+    assert len(owner_keys) == 2
+    assert [await redis_client.zcard(key) for key in owner_keys] == [1, 1]
+    with pytest.raises(CapacityConfigurationError, match="not initialized"):
+        await pool.acquire([serial], wait_timeout=0.01, estimated_tokens=1)
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize("malformed", [True, 1.0, b"01", " 1"])
 async def test_malformed_acquire_result_cleans_exact_inserted_lease(
     redis_client: Redis, prefix: str, malformed: object
@@ -1152,13 +1313,15 @@ async def test_malformed_acquire_result_cleans_exact_inserted_lease(
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("skew_days", [-36500, 36500])
 async def test_gateway_renews_short_real_redis_lease_before_expiry(
-    redis_client: Redis, redis_url: str, prefix: str
+    redis_client: Redis, redis_url: str, prefix: str, skew_days: int
 ) -> None:
     other = Redis.from_url(redis_url)
     serial = deployment("heartbeat-real", "heartbeat-real-scope")
+    counted = RegistrationRedis(redis_client)
     primary = CapacityPool(
-        redis_client,
+        counted,
         deployments=[serial],
         credentials=credentials("heartbeat-real"),
         key_prefix=prefix,
@@ -1185,6 +1348,7 @@ async def test_gateway_renews_short_real_redis_lease_before_expiry(
         transport,
         heartbeat_interval=10,
         capacity_wait_timeout=0.05,
+        utc_now=lambda: datetime.now(UTC) + timedelta(days=skew_days),
     )
     request = ModelRequest(
         logical_model="chat", messages=(ModelMessage(role="user", content="hi"),)
@@ -1198,8 +1362,29 @@ async def test_gateway_renews_short_real_redis_lease_before_expiry(
             await challenger.acquire([serial], wait_timeout=0.025, estimated_tokens=1)
         transport.finish.set()
         assert (await task).text == "ok"
+        assert counted.calls < 30
     finally:
         await other.aclose()
+
+
+@pytest.mark.integration
+async def test_redis_round_trip_reduces_relative_renewal_delay(
+    redis_client: Redis, prefix: str
+) -> None:
+    serial = deployment("delayed-lease", "delayed-lease-scope")
+    pool = CapacityPool(
+        DelayedAcquireRedis(redis_client, 0.04),
+        deployments=[serial],
+        credentials=credentials("delayed-lease"),
+        key_prefix=prefix,
+        lease_seconds=0.1,
+        metadata_ttl_seconds=0.4,
+        metadata_refresh_interval=0.1,
+    )
+    await pool.initialize()
+    lease = await pool.acquire([serial], wait_timeout=0.1, estimated_tokens=1)
+    assert 0 < lease.renew_after_seconds < 0.04
+    await pool.release(lease)
 
 
 @pytest.mark.integration
