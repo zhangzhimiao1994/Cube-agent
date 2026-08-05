@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal
 from types import MappingProxyType
 from typing import Protocol
 
@@ -36,6 +37,7 @@ class GatewayCompletion:
     logical_model: str
     provider_id: str
     provider_model: str = field(repr=False)
+    cost_usd: Decimal = Decimal(0)
 
     def __post_init__(self) -> None:
         if not isinstance(self.response, ModelResponse):
@@ -43,6 +45,7 @@ class GatewayCompletion:
         _require_safe_identifier("deployment id", self.deployment_id)
         _require_safe_identifier("logical model", self.logical_model)
         _require_safe_identifier("provider id", self.provider_id)
+        cost_exponent = self.cost_usd.as_tuple().exponent
         if (
             not self.provider_model
             or self.provider_model != self.provider_model.strip()
@@ -51,6 +54,17 @@ class GatewayCompletion:
             raise ValueError("provider_model must be bounded and unpadded")
         if self.provider_model.split("/", 1)[0] != self.provider_id:
             raise ValueError("provider provenance is inconsistent")
+        if (
+            type(self.cost_usd) is not Decimal
+            or not self.cost_usd.is_finite()
+            or self.cost_usd < 0
+            or (
+                isinstance(cost_exponent, int)
+                and cost_exponent < -6
+            )
+            or self.cost_usd > Decimal(1000000)
+        ):
+            raise ValueError("gateway cost must be a bounded USD decimal")
 
 
 @dataclass(frozen=True, slots=True)

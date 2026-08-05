@@ -74,6 +74,19 @@ total_token_budget: 100
 
 
 @pytest.mark.parametrize(
+    "source",
+    (
+        "agents: []\nagents: []\nsteps: []",
+        "agents:\n  - id: writer\n    id: duplicate\nsteps: []",
+        "agents: []\nsteps: []\npolicy:\n  safe: true\n  safe: false",
+    ),
+)
+def test_yaml_rejects_duplicate_keys_at_every_depth(source: str) -> None:
+    with pytest.raises(InvalidDispatchPlan):
+        DispatchPlan.from_yaml(source)
+
+
+@pytest.mark.parametrize(
     ("steps", "message"),
     [
         (

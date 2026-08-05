@@ -12,6 +12,7 @@ from typing import Any, Self
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from yaml.nodes import MappingNode
 from yaml.tokens import AliasToken, AnchorToken, TagToken
 
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
@@ -20,6 +21,36 @@ _MAX_PLAN_BYTES = 262_144
 _DECIMAL = re.compile(r"(?:0|[1-9][0-9]{0,6})(?:\.[0-9]{1,6})?")
 _INTRINSICALLY_DANGEROUS = frozenset(
     {"shell.exec", "docker.socket", "host.write", "privilege.escalate"}
+)
+
+
+class _UniqueSafeLoader(yaml.SafeLoader):
+    """SafeLoader variant that rejects duplicate keys at every mapping depth."""
+
+
+def _construct_unique_mapping(
+    loader: _UniqueSafeLoader, node: MappingNode, deep: bool = False
+) -> dict[object, object]:
+    loader.flatten_mapping(node)
+    result: dict[object, object] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in result
+        except TypeError:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping", node.start_mark, "unhashable key", key_node.start_mark
+            ) from None
+        if duplicate:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping", node.start_mark, "duplicate key", key_node.start_mark
+            ) from None
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+
+_UniqueSafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping
 )
 
 
@@ -395,7 +426,7 @@ class DispatchPlan(_PlanModel):
             for index, token in enumerate(tokens):
                 if index >= 4096 or isinstance(token, AliasToken | AnchorToken | TagToken):
                     raise ValueError
-            payload = yaml.safe_load(source)
+            payload = yaml.load(source, Loader=_UniqueSafeLoader)
             if type(payload) is not dict:
                 raise ValueError
             validated = cls.from_payload(payload)

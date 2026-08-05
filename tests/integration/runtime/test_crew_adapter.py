@@ -1,15 +1,40 @@
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from typing import cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
 from agent_hub.domain.runs import TaskMode
+from agent_hub.models.capacity import CapacityLease
 from agent_hub.models.gateway import GatewayCompletion
-from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
+from agent_hub.models.gateway import ModelGateway as LeasedModelGateway
+from agent_hub.models.registry import ModelRegistry
+from agent_hub.models.types import (
+    Deployment,
+    ModelRequest,
+    ModelResponse,
+    TokenUsage,
+    ToolCall,
+)
 from agent_hub.runtime.contracts import EventKind, RunEvent, TaskContext
-from agent_hub.runtime.crew.adapter import CrewDispatchRuntime, RuntimeBusy, RuntimeExecutionError
+from agent_hub.runtime.crew.adapter import (
+    CapabilityGateway,
+    CapabilityOutcomeUncertain,
+    CrewAgentDefinition,
+    CrewAIObjectFactory,
+    CrewDispatchRuntime,
+    CrewLLMBridge,
+    CrewObjectFactory,
+    CrewRunStream,
+    CrewTaskDefinition,
+    RuntimeBusy,
+    RuntimeExecutionError,
+)
+from agent_hub.runtime.crew.adapter import (
+    ModelGateway as RuntimeModelGateway,
+)
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 
 RUN_ID = UUID("00000000-0000-4000-8000-000000000021")
@@ -37,8 +62,8 @@ class FakeGateway:
             self.release.set()
         try:
             await self.release.wait()
-            system = cast(str, request.messages[0].content)
-            if "REVIEWER" in system:
+            prompt = " ".join(cast(str, message.content) for message in request.messages)
+            if "REVIEWER" in prompt:
                 text = self.reviews.pop(0) if self.reviews else '{"verdict":"approve"}'
             else:
                 text = f"safe result {len(self.requests)}"
@@ -78,10 +103,43 @@ class FakeCapabilities:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
 
-    async def execute(self, *, tenant_id, run_id, actor, name, arguments):  # type: ignore[no-untyped-def]
-        del tenant_id, run_id, arguments
+    async def execute(  # type: ignore[no-untyped-def]
+        self, *, tenant_id, run_id, actor, name, arguments, idempotency_key
+    ):
+        del tenant_id, run_id, arguments, idempotency_key
         self.calls.append((actor, name))
         return {"items": ["safe result"]}
+
+    def is_replay_safe(self, name: str) -> bool:
+        return name == "web.search"
+
+
+class FastGeneration:
+    async def execute(
+        self,
+        step_id: str,
+        prompt: str,
+        bridge: CrewLLMBridge,
+        *,
+        agent_id: str | None = None,
+    ) -> str:
+        del step_id, agent_id
+        return await bridge.complete([{"role": "system", "content": prompt}])
+
+
+class FastFactory:
+    def build(
+        self,
+        agents: tuple[CrewAgentDefinition, ...],
+        tasks: tuple[CrewTaskDefinition, ...],
+        *,
+        share_crew: bool,
+        telemetry_disabled: bool,
+    ) -> FastGeneration:
+        del agents, tasks
+        assert share_crew is False
+        assert telemetry_disabled is True
+        return FastGeneration()
 
 
 def plan(*, review: bool = False, max_parallelism: int = 2) -> DispatchPlan:
@@ -132,9 +190,24 @@ async def collect(runtime: CrewDispatchRuntime, ctx: TaskContext) -> list[RunEve
     return [event async for event in runtime.run(ctx)]
 
 
+def make_runtime(
+    gateway: RuntimeModelGateway,
+    dispatch_plan: DispatchPlan | None = None,
+    *,
+    capability_gateway: CapabilityGateway | None = None,
+    crew_factory: CrewObjectFactory | None = None,
+) -> CrewDispatchRuntime:
+    return CrewDispatchRuntime(
+        gateway,
+        dispatch_plan or plan(),
+        capability_gateway=capability_gateway,
+        crew_factory=crew_factory or FastFactory(),
+    )
+
+
 async def test_ready_steps_execute_in_parallel_and_emit_framework_neutral_events() -> None:
     gateway = FakeGateway(barrier=2)
-    events = await collect(CrewDispatchRuntime(gateway, plan()), context())
+    events = await collect(make_runtime(gateway), context())
 
     assert gateway.maximum_observed_concurrency == 2
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
@@ -147,13 +220,100 @@ async def test_ready_steps_execute_in_parallel_and_emit_framework_neutral_events
 
 async def test_plan_parallelism_caps_fanout_even_when_gateway_has_capacity() -> None:
     gateway = FakeGateway()
-    await collect(CrewDispatchRuntime(gateway, plan(max_parallelism=1)), context())
+    await collect(make_runtime(gateway, plan(max_parallelism=1)), context())
     assert gateway.maximum_observed_concurrency == 1
+
+
+async def test_real_model_gateway_queues_agents_sharing_one_quota_scope() -> None:
+    class SharedCapacity:
+        def __init__(self) -> None:
+            self.semaphore = asyncio.Semaphore(1)
+            self.active = 0
+            self.maximum_active = 0
+            self.next_candidate = 0
+            self.scopes: list[str] = []
+
+        async def initialize(self) -> None:
+            return None
+
+        def validate_configuration(self, deployments):  # type: ignore[no-untyped-def]
+            assert {item.quota_scope_id for item in deployments} == {"shared-deepseek"}
+
+        async def acquire(  # type: ignore[no-untyped-def]
+            self, candidates, wait_timeout, *, estimated_tokens
+        ):
+            del wait_timeout, estimated_tokens
+            await self.semaphore.acquire()
+            selected = candidates[self.next_candidate % len(candidates)]
+            self.next_candidate += 1
+            self.active += 1
+            self.maximum_active = max(self.maximum_active, self.active)
+            self.scopes.append(selected.quota_scope_id)
+            return CapacityLease(
+                id=str(uuid4()),
+                deployment_id=selected.id,
+                quota_scope_id=selected.quota_scope_id,
+                expires_at=datetime.now(UTC) + timedelta(seconds=60),
+                renew_after_seconds=10,
+            )
+
+        async def release(self, lease: CapacityLease) -> bool:
+            del lease
+            self.active -= 1
+            self.semaphore.release()
+            return True
+
+        async def renew(self, lease: CapacityLease) -> CapacityLease:
+            return lease
+
+        async def record_outcome(self, quota_scope_id, **kwargs):  # type: ignore[no-untyped-def]
+            del quota_scope_id, kwargs
+
+    class Secrets:
+        async def resolve(self, secret_ref: str) -> str:
+            del secret_ref
+            return "test-key"
+
+    class Transport:
+        def __init__(self) -> None:
+            self.active = 0
+            self.maximum_active = 0
+
+        async def complete(self, deployment, request, api_key):  # type: ignore[no-untyped-def]
+            del deployment, request, api_key
+            self.active += 1
+            self.maximum_active = max(self.maximum_active, self.active)
+            await asyncio.sleep(0.01)
+            self.active -= 1
+            return ModelResponse(text="leased result", usage=TokenUsage(1, 1, 2))
+
+    deployments = tuple(
+        Deployment(
+            id=f"deepseek-{index}",
+            logical_model="general",
+            provider_model="deepseek/chat",
+            secret_ref=f"secret://deepseek-{index}",
+            quota_scope_id="shared-deepseek",
+        )
+        for index in range(2)
+    )
+    capacity = SharedCapacity()
+    transport = Transport()
+    gateway = LeasedModelGateway(
+        ModelRegistry(deployments), capacity, Secrets(), transport
+    )
+
+    events = await collect(make_runtime(gateway), context())
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert capacity.maximum_active == 1
+    assert transport.maximum_active == 1
+    assert set(capacity.scopes) == {"shared-deepseek"}
 
 
 async def test_reviewer_feedback_causes_only_bounded_retry() -> None:
     gateway = FakeGateway(reviews=['{"verdict":"revise","feedback":"fix it"}', '{"verdict":"approve"}'])
-    events = await collect(CrewDispatchRuntime(gateway, plan(review=True)), context())
+    events = await collect(make_runtime(gateway, plan(review=True)), context())
     assert len([event for event in events if event.kind is EventKind.STEP_RETRYING]) == 1
     assert any(event.kind is EventKind.REVIEW_COMPLETED for event in events)
     review_index = next(
@@ -171,7 +331,7 @@ async def test_review_retry_exhaustion_prevents_synthesis_and_redacts_output() -
             f'{{"verdict":"revise","feedback":"{sentinel}"}}',
         ]
     )
-    runtime = CrewDispatchRuntime(gateway, plan(review=True))
+    runtime = make_runtime(gateway, plan(review=True))
     with pytest.raises(RuntimeExecutionError) as caught:
         await collect(runtime, context())
     assert sentinel not in str(caught.value)
@@ -179,7 +339,7 @@ async def test_review_retry_exhaustion_prevents_synthesis_and_redacts_output() -
 
 
 async def test_checkpoint_can_resume_completed_run_without_model_calls() -> None:
-    first = CrewDispatchRuntime(FakeGateway(), plan())
+    first = make_runtime(FakeGateway())
     events = await collect(first, context())
     checkpoint = next(
         event.checkpoint
@@ -188,7 +348,7 @@ async def test_checkpoint_can_resume_completed_run_without_model_calls() -> None
     )
     assert checkpoint is not None
     second_gateway = FakeGateway()
-    second = CrewDispatchRuntime(second_gateway, plan())
+    second = make_runtime(second_gateway)
     await second.restore_checkpoint(checkpoint)
     stored_artifacts = tuple(
         event.artifact
@@ -202,9 +362,52 @@ async def test_checkpoint_can_resume_completed_run_without_model_calls() -> None
     assert not second_gateway.requests
 
 
+async def test_nonterminal_checkpoint_resumes_sequence_without_rerunning_sibling() -> None:
+    left_completed = asyncio.Event()
+
+    class PartialGateway(FakeGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            prompt = " ".join(cast(str, message.content) for message in request.messages)
+            if "Research left" in prompt:
+                left_completed.set()
+            elif "Research right" in prompt:
+                await left_completed.wait()
+                raise RuntimeError("provider detail must be redacted")
+            return await super().complete_with_context(request)
+
+    first = make_runtime(PartialGateway())
+    first_events: list[RunEvent] = []
+    with pytest.raises(RuntimeExecutionError):
+        async for event in first.run(context()):
+            first_events.append(event)
+    checkpoint = await first.save_checkpoint()
+    assert checkpoint.state["completed"] == ("left",)
+
+    stored_artifacts = tuple(
+        event.artifact
+        for event in first_events
+        if event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
+    )
+    gateway = FakeGateway()
+    resumed_runtime = make_runtime(gateway)
+    await resumed_runtime.restore_checkpoint(checkpoint)
+    resumed = await collect(
+        resumed_runtime,
+        context(checkpoint=checkpoint, artifacts=stored_artifacts),
+    )
+
+    prompts = [
+        " ".join(cast(str, message.content) for message in request.messages)
+        for request in gateway.requests
+    ]
+    assert not any("Research left" in prompt for prompt in prompts)
+    assert resumed[0].sequence == max(event.sequence for event in first_events) + 1
+    assert resumed[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
 async def test_cancel_and_early_close_clean_siblings_and_allow_reuse() -> None:
     gateway = FakeGateway(barrier=99)
-    runtime = CrewDispatchRuntime(gateway, plan())
+    runtime = make_runtime(gateway)
     task = asyncio.create_task(collect(runtime, context()))
     while len(gateway.requests) < 2:
         await asyncio.sleep(0)
@@ -218,19 +421,85 @@ async def test_cancel_and_early_close_clean_siblings_and_allow_reuse() -> None:
 
     gateway.barrier = 99
     gateway.release.clear()
-    stream: AsyncIterator[RunEvent] = runtime.run(context())
+    stream = cast(CrewRunStream, runtime.run(context()))
     await anext(stream)
-    await stream.aclose()  # type: ignore[attr-defined]
+    await stream.aclose()
     gateway.barrier = 1
     gateway.release.set()
     assert (await collect(runtime, context()))[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_noncooperative_generation_is_detached_and_runtime_cancelled_is_emitted() -> None:
+    class NoncooperativeGeneration(FastGeneration):
+        def __init__(self) -> None:
+            self.block = True
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def execute(
+            self,
+            step_id: str,
+            prompt: str,
+            bridge: CrewLLMBridge,
+            *,
+            agent_id: str | None = None,
+        ) -> str:
+            if self.block:
+                self.started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await self.release.wait()
+                return "detached result"
+            return await super().execute(
+                step_id, prompt, bridge, agent_id=agent_id
+            )
+
+    class Factory(FastFactory):
+        def __init__(self, generation: NoncooperativeGeneration) -> None:
+            self.generation = generation
+
+        def build(
+            self,
+            agents: tuple[CrewAgentDefinition, ...],
+            tasks: tuple[CrewTaskDefinition, ...],
+            *,
+            share_crew: bool,
+            telemetry_disabled: bool,
+        ) -> NoncooperativeGeneration:
+            del agents, tasks, share_crew, telemetry_disabled
+            return self.generation
+
+    generation = NoncooperativeGeneration()
+    runtime = make_runtime(
+        FakeGateway(), crew_factory=Factory(generation)
+    )
+    events: list[RunEvent] = []
+
+    async def consume() -> None:
+        async for event in runtime.run(context()):
+            events.append(event)
+
+    task = asyncio.create_task(consume())
+    await generation.started.wait()
+    await asyncio.wait_for(runtime.cancel(), timeout=2)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert EventKind.RUNTIME_CANCELLED in [event.kind for event in events]
+
+    generation.block = False
+    assert (await collect(runtime, context()))[-1].kind is EventKind.RUNTIME_COMPLETED
+    terminal_checkpoint = await runtime.save_checkpoint()
+    generation.release.set()
+    await asyncio.sleep(0)
+    assert (await runtime.save_checkpoint()).id == terminal_checkpoint.id
 
 
 async def test_runtime_revalidates_constructed_plan_before_gateway() -> None:
     unsafe = plan().model_copy()
     object.__setattr__(unsafe.steps[0], "id", "../secret")
     gateway = FakeGateway()
-    runtime = CrewDispatchRuntime(gateway, unsafe)
+    runtime = make_runtime(gateway, unsafe)
     with pytest.raises(RuntimeExecutionError):
         await collect(runtime, context())
     assert not gateway.requests
@@ -249,15 +518,15 @@ async def test_constructed_context_failure_has_no_secret_exception_chain() -> No
         token_budget=True,
     )
     with pytest.raises(RuntimeExecutionError) as caught:
-        CrewDispatchRuntime(FakeGateway(), plan()).run(unsafe)
+        make_runtime(FakeGateway()).run(unsafe)
     assert sentinel not in str(caught.value)
     assert caught.value.__context__ is None
     assert caught.value.__cause__ is None
 
 
 async def test_single_stream_consumer_and_mode_boundary() -> None:
-    runtime = CrewDispatchRuntime(FakeGateway(barrier=99), plan())
-    stream = runtime.run(context())
+    runtime = make_runtime(FakeGateway(barrier=99))
+    stream = cast(CrewRunStream, runtime.run(context()))
     await anext(stream)
 
     async def consume_other() -> RunEvent:
@@ -265,16 +534,16 @@ async def test_single_stream_consumer_and_mode_boundary() -> None:
 
     with pytest.raises(RuntimeBusy):
         await asyncio.create_task(consume_other())
-    await stream.aclose()  # type: ignore[attr-defined]
+    await stream.aclose()
     bad = context().model_copy(update={"mode": TaskMode.DIRECT})
     with pytest.raises(RuntimeExecutionError, match="mode"):
         runtime.run(bad)
 
 
 async def test_unstarted_stream_close_releases_runtime_reservation() -> None:
-    runtime = CrewDispatchRuntime(FakeGateway(), plan())
-    stream = runtime.run(context())
-    await stream.aclose()  # type: ignore[attr-defined]
+    runtime = make_runtime(FakeGateway())
+    stream = cast(CrewRunStream, runtime.run(context()))
+    await stream.aclose()
     assert (await collect(runtime, context()))[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
@@ -304,7 +573,7 @@ async def test_tool_calls_only_cross_the_capability_gateway() -> None:
     )
     capabilities = FakeCapabilities()
     events = await collect(
-        CrewDispatchRuntime(
+        make_runtime(
             ToolGateway(), tool_plan, capability_gateway=capabilities
         ),
         context(),
@@ -320,6 +589,214 @@ async def test_tool_calls_only_cross_the_capability_gateway() -> None:
     assert events[tool_completed_index + 1].kind is EventKind.CHECKPOINT_SAVED
 
 
+async def test_succeeded_tool_result_resumes_without_repeating_side_effect() -> None:
+    class FailingAfterToolGateway(ToolGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            if self.requests:
+                raise RuntimeError("provider detail")
+            return await super().complete_with_context(request)
+
+    tool_plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+                allowed_tools=("web.search",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                tools=("web.search",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=("web.search",),
+        total_token_budget=100,
+    )
+    first_capabilities = FakeCapabilities()
+    first = make_runtime(
+        FailingAfterToolGateway(), tool_plan, capability_gateway=first_capabilities
+    )
+    first_events: list[RunEvent] = []
+    with pytest.raises(RuntimeExecutionError):
+        async for event in first.run(context()):
+            first_events.append(event)
+    checkpoint = await first.save_checkpoint()
+    tool_artifacts = tuple(
+        event.artifact
+        for event in first_events
+        if event.kind is EventKind.TOOL_COMPLETED and event.artifact is not None
+    )
+    assert len(tool_artifacts) == 1
+
+    second_capabilities = FakeCapabilities()
+    resumed = make_runtime(
+        ToolGateway(), tool_plan, capability_gateway=second_capabilities
+    )
+    await resumed.restore_checkpoint(checkpoint)
+    events = await collect(
+        resumed,
+        context(checkpoint=checkpoint, artifacts=tool_artifacts),
+    )
+
+    assert second_capabilities.calls == []
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_replay_safe_running_tool_reuses_stable_idempotency_key() -> None:
+    class RecordingCapabilities(FakeCapabilities):
+        def __init__(self, *, block: bool) -> None:
+            super().__init__()
+            self.block = block
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.keys: list[str] = []
+
+        async def execute(  # type: ignore[no-untyped-def]
+            self, *, tenant_id, run_id, actor, name, arguments, idempotency_key
+        ):
+            del tenant_id, run_id, arguments
+            self.calls.append((actor, name))
+            self.keys.append(idempotency_key)
+            self.started.set()
+            if self.block:
+                await self.release.wait()
+            return {"items": ["safe result"]}
+
+    tool_plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+                allowed_tools=("web.search",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                tools=("web.search",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=("web.search",),
+        total_token_budget=100,
+    )
+    first_capabilities = RecordingCapabilities(block=True)
+    first = make_runtime(
+        ToolGateway(), tool_plan, capability_gateway=first_capabilities
+    )
+    task = asyncio.create_task(collect(first, context()))
+    await first_capabilities.started.wait()
+    checkpoint = await first.save_checkpoint()
+    tool_states = checkpoint.state["tools"]
+    assert isinstance(tool_states, Mapping)
+    tool_state = next(iter(tool_states.values()))
+    assert isinstance(tool_state, Mapping)
+    assert tool_state["status"] == "running"
+    await first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    second_capabilities = RecordingCapabilities(block=False)
+    resumed = make_runtime(
+        ToolGateway(), tool_plan, capability_gateway=second_capabilities
+    )
+    await resumed.restore_checkpoint(checkpoint)
+    events = await collect(resumed, context(checkpoint=checkpoint))
+
+    assert second_capabilities.keys == first_capabilities.keys
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_uncertain_tool_checkpoint_fails_closed_without_replay() -> None:
+    class UncertainCapabilities(FakeCapabilities):
+        async def execute(self, **kwargs):  # type: ignore[no-untyped-def]
+            del kwargs
+            raise RuntimeError("commit status unavailable")
+
+        def is_replay_safe(self, name: str) -> bool:
+            del name
+            return False
+
+    tool_plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+                allowed_tools=("account.update",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                tools=("account.update",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=("account.update",),
+        total_token_budget=100,
+    )
+
+    class RestrictedToolGateway(ToolGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            completion = await super().complete_with_context(request)
+            if completion.response.tool_calls:
+                response = ModelResponse(
+                    text=None,
+                    tool_calls=(
+                        ToolCall(
+                            id="provider-call",
+                            name="account.update",
+                            arguments={"value": "safe"},
+                        ),
+                    ),
+                    usage=completion.response.usage,
+                )
+                return GatewayCompletion(
+                    response=response,
+                    deployment_id=completion.deployment_id,
+                    logical_model=completion.logical_model,
+                    provider_id=completion.provider_id,
+                    provider_model=completion.provider_model,
+                )
+            return completion
+
+    first = make_runtime(
+        RestrictedToolGateway(),
+        tool_plan,
+        capability_gateway=UncertainCapabilities(),
+    )
+    with pytest.raises(CapabilityOutcomeUncertain):
+        await collect(first, context())
+    checkpoint = await first.save_checkpoint()
+    second_capabilities = UncertainCapabilities()
+    resumed = make_runtime(
+        RestrictedToolGateway(),
+        tool_plan,
+        capability_gateway=second_capabilities,
+    )
+    await resumed.restore_checkpoint(checkpoint)
+
+    with pytest.raises(CapabilityOutcomeUncertain):
+        await collect(resumed, context(checkpoint=checkpoint))
+
+
 async def test_private_factory_receives_locked_down_framework_generation() -> None:
     captured: dict[str, object] = {}
 
@@ -331,9 +808,9 @@ async def test_private_factory_receives_locked_down_framework_generation() -> No
                 share_crew=share_crew,
                 telemetry_disabled=telemetry_disabled,
             )
-            return object()
+            return FastGeneration()
 
-    runtime = CrewDispatchRuntime(FakeGateway(), plan(), crew_factory=Factory())
+    runtime = make_runtime(FakeGateway(), crew_factory=Factory())
     await collect(runtime, context())
     assert captured["share_crew"] is False
     assert captured["telemetry_disabled"] is True
@@ -343,3 +820,17 @@ async def test_private_factory_receives_locked_down_framework_generation() -> No
         not item.allow_delegation and not item.memory and not item.code_execution
         for item in agents
     )
+
+
+async def test_real_crewai_akickoff_uses_only_model_gateway(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    gateway = FakeGateway()
+    events = await collect(
+        make_runtime(
+            gateway,
+            crew_factory=CrewAIObjectFactory(storage_dir=tmp_path / "crewai"),
+        ),
+        context(),
+    )
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(gateway.requests) == 3
