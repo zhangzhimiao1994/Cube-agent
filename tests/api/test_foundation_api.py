@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -12,8 +13,8 @@ from fastapi import Request
 from fastapi.testclient import TestClient
 from starlette.types import Message, Receive, Scope, Send
 
-from agent_hub.api.middleware import SafeExceptionMiddleware
-from agent_hub.app import create_app
+from agent_hub.api.middleware import SafeExceptionMiddleware, StreamAbortedError
+from agent_hub.app import _cleanup_owned_resources, create_app
 from agent_hub.auth.models import (
     AuthenticatedPrincipal,
     AuthenticationPersistenceError,
@@ -791,11 +792,20 @@ def test_factory_created_database_and_redis_receive_unredacted_urls_and_are_clos
         }
     )
     received: list[str] = []
+
+    def database_factory(url: str) -> FakeDatabase:
+        received.append(url)
+        return database
+
+    def redis_factory(url: str) -> FakeRedis:
+        received.append(url)
+        return redis
+
     with TestClient(
         create_app(
             settings=configured,
-            database_factory=lambda url: (received.append(url) or database),
-            redis_factory=lambda url: (received.append(url) or redis),
+            database_factory=database_factory,
+            redis_factory=redis_factory,
             database_probe=Probe(),
             redis_probe=Probe(),
         )
@@ -839,27 +849,87 @@ def test_all_owned_resource_cleanups_are_attempted_and_errors_are_safe(
     assert "LEAK_" not in str(captured.value)
 
 
-def test_base_exception_from_cleanup_does_not_skip_remaining_owned_cleanup() -> None:
-    class CleanupAbort(BaseException):
-        pass
-
+@pytest.mark.parametrize("cancelled_resource", ["redis", "database"])
+async def test_cleanup_cancellation_is_rethrown_after_all_owned_resources(
+    cancelled_resource: str,
+) -> None:
     events: list[str] = []
-    database = FakeDatabase(events=events)
-    redis = FakeRedis(cleanup_error=CleanupAbort("LEAK_ABORT"), events=events)
+    database = FakeDatabase(
+        cleanup_error=(asyncio.CancelledError() if cancelled_resource == "database" else None),
+        events=events,
+    )
+    redis = FakeRedis(
+        cleanup_error=(asyncio.CancelledError() if cancelled_resource == "redis" else None),
+        events=events,
+    )
+    task = asyncio.create_task(
+        _cleanup_owned_resources(
+            [("database", database.dispose), ("redis", redis.aclose)],
+            primary_error=None,
+        )
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert events == ["redis.aclose", "database.dispose"]
+    assert task.cancelled()
+
+
+async def test_cleanup_cancellation_wins_over_ordinary_cleanup_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    events: list[str] = []
+    database = FakeDatabase(cleanup_error=RuntimeError("LEAK_DB"), events=events)
+    redis = FakeRedis(cleanup_error=asyncio.CancelledError(), events=events)
+    task = asyncio.create_task(
+        _cleanup_owned_resources(
+            [("database", database.dispose), ("redis", redis.aclose)],
+            primary_error=None,
+        )
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert events == ["redis.aclose", "database.dispose"]
+    assert task.cancelled()
+    assert "error_type=CancelledError" in caplog.text
+    assert "error_type=RuntimeError" in caplog.text
+    assert "LEAK_DB" not in caplog.text
+
+
+def test_primary_startup_error_is_preserved_over_cleanup_cancellation() -> None:
+    events: list[str] = []
+    database = FakeDatabase(
+        execute_error=RuntimeError("PRIMARY_TENANT_FAILURE"), events=events
+    )
+    redis = FakeRedis(cleanup_error=asyncio.CancelledError(), events=events)
     app = create_app(
         settings=valid_settings(),
         database_factory=lambda url: database,
         redis_factory=lambda url: redis,
-        database_probe=Probe(),
-        redis_probe=Probe(),
     )
 
-    with pytest.raises(Exception) as captured, TestClient(app):
+    with pytest.raises(RuntimeError, match="PRIMARY_TENANT_FAILURE"), TestClient(app):
         pass
 
     assert events == ["redis.aclose", "database.dispose"]
-    assert type(captured.value).__name__ == "ResourceCleanupError"
-    assert "LEAK_ABORT" not in str(captured.value)
+
+
+@pytest.mark.parametrize("fatal_error", [SystemExit(7), KeyboardInterrupt()])
+def test_fatal_base_exceptions_from_cleanup_are_not_swallowed(
+    fatal_error: BaseException,
+) -> None:
+    async def fatal_cleanup() -> None:
+        raise fatal_error
+
+    cleanup = _cleanup_owned_resources(
+        [("database", fatal_cleanup)], primary_error=None
+    )
+
+    with pytest.raises(type(fatal_error)):
+        cleanup.send(None)
 
 
 def test_startup_failure_cleans_every_resource_and_preserves_primary_error() -> None:
@@ -874,10 +944,21 @@ def test_startup_failure_cleans_every_resource_and_preserves_primary_error() -> 
         events=events,
     )
     factories: list[str] = []
+
+    def database_factory(url: str) -> FakeDatabase:
+        del url
+        factories.append("database")
+        return database
+
+    def redis_factory(url: str) -> FakeRedis:
+        del url
+        factories.append("redis")
+        return redis
+
     app = create_app(
         settings=valid_settings(),
-        database_factory=lambda url: (factories.append("database") or database),
-        redis_factory=lambda url: (factories.append("redis") or redis),
+        database_factory=database_factory,
+        redis_factory=redis_factory,
     )
 
     with pytest.raises(RuntimeError, match="PRIMARY_TENANT_FAILURE"), TestClient(app):
@@ -889,12 +970,21 @@ def test_startup_failure_cleans_every_resource_and_preserves_primary_error() -> 
 
 def test_invalid_jwt_key_is_rejected_before_resource_factories_run() -> None:
     factories: list[str] = []
+
+    def database_factory(url: str) -> FakeDatabase:
+        del url
+        factories.append("database")
+        return FakeDatabase()
+
+    def redis_factory(url: str) -> FakeRedis:
+        del url
+        factories.append("redis")
+        return FakeRedis()
+
     app = create_app(
         settings=Settings.model_validate({}),
-        database_factory=lambda url: (
-            factories.append("database") or FakeDatabase()
-        ),
-        redis_factory=lambda url: factories.append("redis") or FakeRedis(),
+        database_factory=database_factory,
+        redis_factory=redis_factory,
     )
 
     with pytest.raises(ValueError), TestClient(app):
@@ -997,7 +1087,9 @@ def test_unhandled_exception_is_generic_and_does_not_leak_request_secrets(
 
 
 @pytest.mark.asyncio
-async def test_safe_exception_middleware_does_not_send_a_second_response_start() -> None:
+async def test_safe_exception_middleware_aborts_started_stream_without_fake_eof(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     async def started_then_failed(scope: Scope, receive: Receive, send: Send) -> None:
         del scope, receive
         await send({"type": "http.response.start", "status": 200, "headers": []})
@@ -1012,14 +1104,18 @@ async def test_safe_exception_middleware_does_not_send_a_second_response_start()
         messages.append(message)
 
     middleware = SafeExceptionMiddleware(started_then_failed)
-    await middleware({"type": "http", "method": "GET", "path": "/"}, receive, send)
+    with pytest.raises(StreamAbortedError) as captured:
+        await middleware({"type": "http", "method": "GET", "path": "/"}, receive, send)
 
     assert [message["type"] for message in messages].count("http.response.start") == 1
-    assert messages[-1] == {
-        "type": "http.response.body",
-        "body": b"",
-        "more_body": False,
-    }
+    assert messages == [{"type": "http.response.start", "status": 200, "headers": []}]
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert "SECRET_AFTER_START" not in caplog.text
+    rendered_traceback = "".join(
+        traceback.format_exception(captured.type, captured.value, captured.tb)
+    )
+    assert "SECRET_AFTER_START" not in rendered_traceback
 
 
 @pytest.mark.asyncio
@@ -1057,6 +1153,19 @@ def test_openapi_describes_security_health_and_route_specific_errors() -> None:
     assert schema["paths"]["/api/v1/config/current"]["get"]["security"] == [
         {"BearerAuth": []}
     ]
+
+    config_403_matrix = {
+        ("/api/v1/config/validate", "post"): True,
+        ("/api/v1/config/drafts", "post"): True,
+        ("/api/v1/config/drafts/{revision_id}/publish", "post"): True,
+        ("/api/v1/config/history/{version}/rollback", "post"): True,
+        ("/api/v1/config/current", "get"): False,
+        ("/api/v1/config/history", "get"): False,
+        ("/api/v1/config/history/{version}", "get"): False,
+        ("/api/v1/config/diff", "get"): False,
+    }
+    for (path, method), expects_forbidden in config_403_matrix.items():
+        assert ("403" in schema["paths"][path][method]["responses"]) is expects_forbidden
 
     for path in ("/health/live", "/health/ready"):
         assert schema["paths"][path]["get"]["responses"]["200"]["content"][

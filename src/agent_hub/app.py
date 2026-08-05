@@ -1,5 +1,6 @@
 """FastAPI application factory and owned process resources."""
 
+import asyncio
 import hashlib
 import logging
 import sys
@@ -35,6 +36,7 @@ from agent_hub.db.session import build_database
 from agent_hub.settings import Settings, get_settings
 
 ReadinessProbe = Callable[[], Awaitable[None]]
+CleanupCallback = tuple[str, Callable[[], Awaitable[None]]]
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -56,6 +58,39 @@ class RedisResource(Protocol):
     async def aclose(self) -> None: ...
 
     def ping(self, **kwargs: Any) -> Any: ...
+
+
+async def _cleanup_owned_resources(
+    cleanup_callbacks: list[CleanupCallback],
+    *,
+    primary_error: BaseException | None,
+) -> None:
+    first_cancellation: asyncio.CancelledError | None = None
+    cleanup_error_types: list[str] = []
+    for resource_name, cleanup in reversed(cleanup_callbacks):
+        try:
+            await cleanup()
+        except asyncio.CancelledError as error:
+            if first_cancellation is None:
+                first_cancellation = error
+            _LOGGER.error(
+                "resource_cleanup_failed resource=%s error_type=CancelledError",
+                resource_name,
+            )
+        except Exception as error:  # noqa: BLE001 -- all ordinary cleanups are attempted.
+            error_type = type(error).__name__
+            cleanup_error_types.append(error_type)
+            _LOGGER.error(
+                "resource_cleanup_failed resource=%s error_type=%s",
+                resource_name,
+                error_type,
+            )
+    if primary_error is not None:
+        return
+    if first_cancellation is not None:
+        raise first_cancellation
+    if cleanup_error_types:
+        raise ResourceCleanupError(tuple(cleanup_error_types)) from None
 
 
 async def ensure_bootstrap_tenant(
@@ -101,9 +136,7 @@ def create_app(
         active_database = database
         active_redis = redis_client
         active_sessions = session_factory
-        cleanup_callbacks: list[
-            tuple[str, Callable[[], Awaitable[None]]]
-        ] = []
+        cleanup_callbacks: list[CleanupCallback] = []
         token_service = (
             AccessTokenService(configured.jwt_signing_key_value())
             if auth_service is None
@@ -158,21 +191,10 @@ def create_app(
                 application.state.redis_probe = _redis_probe(active_redis)
             yield
         finally:
-            primary_error = sys.exception()
-            cleanup_error_types: list[str] = []
-            for resource_name, cleanup in reversed(cleanup_callbacks):
-                try:
-                    await cleanup()
-                except BaseException as error:  # noqa: BLE001 -- all cleanups must be attempted.
-                    error_type = type(error).__name__
-                    cleanup_error_types.append(error_type)
-                    _LOGGER.error(
-                        "resource_cleanup_failed resource=%s error_type=%s",
-                        resource_name,
-                        error_type,
-                    )
-            if cleanup_error_types and primary_error is None:
-                raise ResourceCleanupError(tuple(cleanup_error_types)) from None
+            await _cleanup_owned_resources(
+                cleanup_callbacks,
+                primary_error=sys.exception(),
+            )
 
     application = FastAPI(
         title="Agent Hub",

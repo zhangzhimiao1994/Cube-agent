@@ -154,7 +154,9 @@ def test_settings_validation_does_not_echo_jwt_key() -> None:
 def test_connection_urls_are_secret_but_accessors_preserve_original_values() -> None:
     database_url = "postgresql+asyncpg://user:SECRET_DB@localhost/application"
     redis_url = "redis://:SECRET_REDIS@localhost:6379/0"
-    settings = Settings(database_url=database_url, redis_url=redis_url)
+    settings = Settings.model_validate(
+        {"database_url": database_url, "redis_url": redis_url}
+    )
 
     assert settings.database_url_value() == database_url
     assert settings.redis_url_value() == redis_url

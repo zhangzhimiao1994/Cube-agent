@@ -29,7 +29,7 @@ from agent_hub.config.service import (
 router = APIRouter(
     prefix="/api/v1/config",
     tags=["config"],
-    responses=error_responses(401, 403, 405, 500, 503),
+    responses=error_responses(401, 405, 500, 503),
 )
 
 
@@ -75,7 +75,7 @@ def _raise_config_error(error: Exception) -> None:
 @router.post(
     "/validate",
     response_model=ValidationResponse,
-    responses=error_responses(413, 422),
+    responses=error_responses(403, 413, 422),
 )
 async def validate_config(
     body: PlatformConfig,
@@ -91,7 +91,7 @@ async def validate_config(
     "/drafts",
     response_model=ConfigRevisionResponse,
     status_code=status.HTTP_201_CREATED,
-    responses=error_responses(404, 409, 413, 422),
+    responses=error_responses(403, 404, 409, 413, 422),
 )
 async def create_draft(
     body: PlatformConfig,
@@ -115,7 +115,7 @@ async def create_draft(
 @router.post(
     "/drafts/{revision_id}/publish",
     response_model=PublishedRevisionResponse,
-    responses=error_responses(404, 409, 413, 422),
+    responses=error_responses(403, 404, 409, 413, 422),
 )
 async def publish_draft(
     revision_id: UUID,
@@ -225,7 +225,7 @@ async def config_diff(
 @router.post(
     "/history/{version}/rollback",
     response_model=PublishedRevisionResponse,
-    responses=error_responses(404, 409, 413, 422),
+    responses=error_responses(403, 404, 409, 413, 422),
 )
 async def rollback_config(
     version: int,

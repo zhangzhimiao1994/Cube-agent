@@ -61,7 +61,9 @@ async def test_readiness_timeout_bounds_a_hanging_connection_attempt() -> None:
 
 
 def test_configured_migration_url_overrides_application_settings() -> None:
-    settings = Settings(database_url="postgresql+asyncpg://app:app@localhost/application")
+    settings = Settings.model_validate(
+        {"database_url": "postgresql+asyncpg://app:app@localhost/application"}
+    )
 
     assert (
         resolve_database_url("postgresql+asyncpg://test:test@localhost/test", settings)
@@ -70,6 +72,8 @@ def test_configured_migration_url_overrides_application_settings() -> None:
 
 
 def test_migration_url_uses_application_settings_when_not_explicitly_configured() -> None:
-    settings = Settings(database_url="postgresql+asyncpg://app:app@localhost/application")
+    settings = Settings.model_validate(
+        {"database_url": "postgresql+asyncpg://app:app@localhost/application"}
+    )
 
     assert resolve_database_url(None, settings) == "postgresql+asyncpg://app:app@localhost/application"

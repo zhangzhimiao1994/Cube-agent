@@ -13,6 +13,10 @@ _CONFIG_BODY_LIMIT = 1024 * 1024
 _LOGGER = logging.getLogger(__name__)
 
 
+class StreamAbortedError(RuntimeError):
+    """Safe signal to the server that a partially-started response must be aborted."""
+
+
 class SafeExceptionMiddleware:
     """Turn unexpected request failures into a safe response inside Starlette's boundary."""
 
@@ -26,6 +30,7 @@ class SafeExceptionMiddleware:
 
         response_started = False
         response_completed = False
+        abort_started_stream = False
 
         async def tracked_send(message: Message) -> None:
             nonlocal response_started, response_completed
@@ -49,20 +54,20 @@ class SafeExceptionMiddleware:
             )
             if response_started:
                 if not response_completed:
-                    await send(
-                        {
-                            "type": "http.response.body",
-                            "body": b"",
-                            "more_body": False,
-                        }
-                    )
-                return
-            response = JSONResponse(
-                status_code=500,
-                content=error_payload("internal_error", "internal server error"),
-                headers={"X-Error-ID": error_id},
-            )
-            await response(scope, receive, send)
+                    abort_started_stream = True
+            else:
+                response = JSONResponse(
+                    status_code=500,
+                    content=error_payload("internal_error", "internal server error"),
+                    headers={"X-Error-ID": error_id},
+                )
+                await response(scope, receive, send)
+        if abort_started_stream:
+            _abort_started_stream()
+
+
+def _abort_started_stream() -> None:
+    raise StreamAbortedError("response stream aborted") from None
 
 
 class RequestBodyLimitMiddleware:
