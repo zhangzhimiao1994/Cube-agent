@@ -5,7 +5,7 @@ import json
 import math
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Protocol
@@ -25,6 +25,19 @@ from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, _req
 
 class ModelGatewayError(RuntimeError):
     """Stable, redacted failure at the model gateway boundary."""
+
+
+@dataclass(frozen=True, slots=True)
+class GatewayCompletion:
+    """A response plus the gateway-trusted deployment that produced it."""
+
+    response: ModelResponse = field(repr=False)
+    deployment_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.response, ModelResponse):
+            raise TypeError("response must be ModelResponse")
+        _require_safe_identifier("deployment id", self.deployment_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +201,9 @@ class ModelGateway:
                 current = fallbacks[current]
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
+        return (await self.complete_with_context(request)).response
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
         estimated_tokens = self._token_estimator.estimate(request)
         if type(estimated_tokens) is not int or estimated_tokens <= 0:
             raise ValueError("token estimator must return a strict positive integer")
@@ -225,7 +241,8 @@ class ModelGateway:
             break
         if lease is None or selected is None:
             raise CapacityUnavailable("model capacity unavailable") from None
-        return await self._complete_leased(selected, lease, request)
+        response = await self._complete_leased(selected, lease, request)
+        return GatewayCompletion(response=response, deployment_id=selected.id)
 
     def _fallback_chain(self, primary: str, allow_fallback: bool) -> tuple[str, ...]:
         chain = [primary]
