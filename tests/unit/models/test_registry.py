@@ -351,7 +351,19 @@ def test_message_rejects_noncanonical_or_empty_multimodal_content() -> None:
     with pytest.raises(ValueError):
         ModelMessage(role="user", content=())
     with pytest.raises(ValueError):
+        ModelMessage(role="user", content=[])  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
         ModelMessage(role="user", content=("not-an-object",))  # type: ignore[arg-type]
+
+
+def test_message_rejects_empty_and_nonempty_one_shot_iterables() -> None:
+    empty = iter(())
+    populated = iter(({"type": "text", "text": "hello"},))
+
+    with pytest.raises(TypeError, match="list or tuple"):
+        ModelMessage(role="user", content=empty)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="list or tuple"):
+        ModelMessage(role="user", content=populated)  # type: ignore[arg-type]
 
 
 def test_request_rejects_non_model_message_elements() -> None:
@@ -366,6 +378,26 @@ def test_request_rejects_non_model_message_elements() -> None:
                 logical_model="primary",
                 messages=[invalid],  # type: ignore[arg-type]
             )
+
+
+@pytest.mark.parametrize("allow_fallback", ["false", 0, 1, None, [], {}])
+def test_request_requires_exact_boolean_allow_fallback(allow_fallback: object) -> None:
+    with pytest.raises(ValueError, match="allow_fallback must be a boolean"):
+        ModelRequest(
+            logical_model="primary",
+            messages=(),
+            allow_fallback=allow_fallback,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("response_schema", [object(), {}, "schema"])
+def test_request_rejects_invalid_response_schema(response_schema: object) -> None:
+    with pytest.raises(ValueError, match="response_schema"):
+        ModelRequest(
+            logical_model="primary",
+            messages=(),
+            response_schema=response_schema,  # type: ignore[arg-type]
+        )
 
 
 def test_models_package_exposes_the_public_contract() -> None:

@@ -179,14 +179,17 @@ class ModelMessage:
         _require_unpadded("role", self.role, max_length=64)
         if isinstance(self.content, str):
             return
-        if not self.content:
+        if not isinstance(self.content, list | tuple):
+            raise TypeError("multimodal content must be a list or tuple")
+        parts = tuple(self.content)
+        if not parts:
             raise ValueError("multimodal content must not be empty")
-        if not all(isinstance(part, Mapping) for part in self.content):
+        if not all(isinstance(part, Mapping) for part in parts):
             raise ValueError("multimodal content parts must be objects")
         object.__setattr__(
             self,
             "content",
-            tuple(_normalize_content_part(part) for part in self.content),
+            tuple(_normalize_content_part(part) for part in parts),
         )
 
 
@@ -222,6 +225,12 @@ class ModelRequest:
             or self.timeout_seconds <= 0
         ):
             raise ValueError("timeout_seconds must be positive and finite")
+        if type(self.allow_fallback) is not bool:
+            raise ValueError("allow_fallback must be a boolean")
+        if self.response_schema is not None and not isinstance(
+            self.response_schema, StructuredResponseSchema
+        ):
+            raise ValueError("response_schema must be StructuredResponseSchema or None")
         messages = tuple(self.messages)
         if not all(isinstance(message, ModelMessage) for message in messages):
             raise ValueError("messages must contain only ModelMessage values")

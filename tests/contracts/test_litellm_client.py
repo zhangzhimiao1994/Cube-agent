@@ -111,6 +111,17 @@ def sensitive_request() -> ModelRequest:
     )
 
 
+def malformed_sensitive_response() -> object:
+    tool = SimpleNamespace(
+        id="call_1",
+        function=SimpleNamespace(
+            name="lookup",
+            arguments=RAW_ERROR + API_KEY + PROMPT + " {not-json",
+        ),
+    )
+    return sdk_response(tool_calls=[tool])
+
+
 def captured_traceback(error: BaseException) -> str:
     return "".join(
         traceback.TracebackException.from_exception(error, capture_locals=True).format()
@@ -558,6 +569,39 @@ async def test_cancellation_close_failure_keeps_cancellation() -> None:
     with pytest.raises(asyncio.CancelledError) as caught:
         await transport.complete(deployment(), sensitive_request(), API_KEY)
 
+    close.assert_awaited_once_with()
+    rendered = captured_traceback(caught.value)
+    for sensitive in (RAW_ERROR, API_KEY, PROMPT, MULTIMODAL_TEXT, IMAGE_URL):
+        assert sensitive not in rendered
+
+
+@pytest.mark.parametrize("failure_kind", ["provider", "parse"])
+async def test_external_task_cancellation_during_error_cleanup_is_preserved(
+    failure_kind: str,
+) -> None:
+    close_started = asyncio.Event()
+    close_blocker = asyncio.Event()
+
+    async def blocking_close() -> None:
+        close_started.set()
+        await close_blocker.wait()
+
+    if failure_kind == "provider":
+        transport, _, _, close = mock_transport(
+            error=RuntimeError(RAW_ERROR + API_KEY + PROMPT)
+        )
+    else:
+        transport, _, _, close = mock_transport(result=malformed_sensitive_response())
+    close.side_effect = blocking_close
+
+    task = asyncio.create_task(transport.complete(deployment(), sensitive_request(), API_KEY))
+    await close_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await task
+
+    assert task.cancelled()
     close.assert_awaited_once_with()
     rendered = captured_traceback(caught.value)
     for sensitive in (RAW_ERROR, API_KEY, PROMPT, MULTIMODAL_TEXT, IMAGE_URL):

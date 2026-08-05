@@ -248,15 +248,17 @@ def _transport_error(
     return ModelTransportError(f"model transport failed for deployment {deployment_id!r}{suffix}")
 
 
-async def _close_ignoring_failures(client: _OpenAIClient | None) -> None:
+async def _close_ignoring_failures(client: _OpenAIClient | None) -> bool:
     if client is None:
-        return
+        return False
     try:
         await client.close()
     except asyncio.CancelledError:
-        return
+        task = asyncio.current_task()
+        return task is not None and task.cancelling() > 0
     except Exception:  # noqa: BLE001 - cleanup must not replace the primary safe error
-        return
+        return False
+    return False
 
 
 class LiteLLMClient:
@@ -330,7 +332,8 @@ class LiteLLMClient:
             safe_failure = _transport_error(deployment.id, error, sensitive_values)
 
         if safe_failure is not None:
-            await _close_ignoring_failures(client)
+            if await _close_ignoring_failures(client):
+                return _CANCELLED
             return safe_failure
         if client is None or parsed is None:  # pragma: no cover - defensive invariant
             return AssertionError("transport completed without a client response")
