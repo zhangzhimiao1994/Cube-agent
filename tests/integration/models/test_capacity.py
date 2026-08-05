@@ -1158,6 +1158,107 @@ async def test_failed_post_commit_refresh_preserves_valid_stable_owner(
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("failed_call", [3, 4])
+async def test_expired_registration_post_commit_failure_cleans_all_owner_state(
+    redis_client: Redis, prefix: str, failed_call: int
+) -> None:
+    serial = deployment("expired-error", "expired-error-scope")
+    shared = fingerprint("expired-error-shared")
+    clock = ManualClock()
+    wrapped = PostCommitRegistrationRedis(redis_client)
+    pool = CapacityPool(
+        wrapped,
+        deployments=[serial],
+        credentials=CredentialRegistry([CredentialDescriptor(serial.secret_ref, shared)]),
+        key_prefix=prefix,
+        lease_seconds=0.02,
+        metadata_ttl_seconds=0.08,
+        metadata_refresh_interval=0.02,
+        monotonic=clock,
+    )
+    await pool.initialize()
+    await asyncio.sleep(0.1)
+    clock.advance(0.1)
+    wrapped.raise_after_call = failed_call
+    with pytest.raises(CapacityBackendError):
+        await pool.initialize()
+    assert not [key async for key in redis_client.scan_iter(match=f"{prefix}*")]
+
+    replacement = deployment("expired-replacement", "replacement-scope")
+    replacement_pool = CapacityPool(
+        redis_client,
+        deployments=[replacement],
+        credentials=CredentialRegistry(
+            [CredentialDescriptor(replacement.secret_ref, shared)]
+        ),
+        key_prefix=prefix,
+    )
+    await replacement_pool.initialize()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("blocked_call", [3, 4])
+async def test_expired_registration_post_commit_cancellation_cleans_all_owner_state(
+    redis_client: Redis, prefix: str, blocked_call: int
+) -> None:
+    serial = deployment("expired-cancel", "expired-cancel-scope")
+    clock = ManualClock()
+    wrapped = PostCommitRegistrationRedis(redis_client)
+    pool = CapacityPool(
+        wrapped,
+        deployments=[serial],
+        credentials=credentials("expired-cancel"),
+        key_prefix=prefix,
+        lease_seconds=0.02,
+        metadata_ttl_seconds=0.08,
+        metadata_refresh_interval=0.02,
+        monotonic=clock,
+    )
+    await pool.initialize()
+    await asyncio.sleep(0.1)
+    clock.advance(0.1)
+    wrapped.block_after_call = blocked_call
+    refresh = asyncio.create_task(pool.initialize())
+    await wrapped.committed.wait()
+    refresh.cancel("expired registration cancelled")
+    wrapped.proceed.set()
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await refresh
+    assert captured.value.args == ("expired registration cancelled",)
+    assert refresh.cancelled()
+    assert not [key async for key in redis_client.scan_iter(match=f"{prefix}*")]
+
+
+@pytest.mark.integration
+async def test_successful_expired_registration_reconstruction_renews_local_deadline(
+    redis_client: Redis, prefix: str
+) -> None:
+    serial = deployment("deadline-rebuild", "deadline-rebuild-scope")
+    clock = ManualClock()
+    pool = CapacityPool(
+        redis_client,
+        deployments=[serial],
+        credentials=credentials("deadline-rebuild"),
+        key_prefix=prefix,
+        lease_seconds=0.02,
+        metadata_ttl_seconds=0.12,
+        metadata_refresh_interval=0.03,
+        monotonic=clock,
+    )
+    await pool.initialize()
+    await asyncio.sleep(0.14)
+    clock.advance(0.14)
+    await pool.initialize()
+
+    clock.advance(0.05)
+    lease = await pool.acquire([serial], wait_timeout=0.05, estimated_tokens=1)
+    await pool.release(lease)
+    clock.advance(0.07)
+    with pytest.raises(CapacityConfigurationError, match="not initialized"):
+        await pool.acquire([serial], wait_timeout=0.01, estimated_tokens=1)
+
+
+@pytest.mark.integration
 async def test_failed_registration_rollback_preserves_another_active_owner(
     redis_client: Redis, prefix: str
 ) -> None:

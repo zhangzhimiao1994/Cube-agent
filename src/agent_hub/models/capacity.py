@@ -273,7 +273,8 @@ class CapacityPool:
         self._scope_policies: dict[str, _ScopePolicy] = {}
         self._catalog_by_id: dict[str, Deployment] = {}
         self._initialized = False
-        self._has_valid_registration = False
+        self._catalog_frozen = False
+        self._registration_valid_until = 0.0
         self._refresh_in_progress = False
         self._next_metadata_refresh = 0.0
         self._observed_loads: dict[str, int] = {}
@@ -288,7 +289,7 @@ class CapacityPool:
             existing_deployment = self._catalog_by_id.get(deployment.id)
             if existing_deployment is not None and existing_deployment != deployment:
                 raise CapacityConfigurationError("deployment capacity configuration conflicts")
-            if self._has_valid_registration and existing_deployment is None:
+            if self._catalog_frozen and existing_deployment is None:
                 raise CapacityConfigurationError("capacity catalog is already initialized")
             self._catalog_by_id[deployment.id] = deployment
             policy = _ScopePolicy(
@@ -323,28 +324,47 @@ class CapacityPool:
         if self._credentials is None:
             raise CapacityConfigurationError("credential fingerprints are required")
         now = self._clock_now()
-        if not force and self._initialized and now < self._next_metadata_refresh:
+        if (
+            not force
+            and self._initialized
+            and now < self._next_metadata_refresh
+            and now < self._registration_valid_until
+        ):
             return
         async with self._registration_lock:
             now = self._clock_now()
-            if not force and self._initialized and now < self._next_metadata_refresh:
+            if (
+                not force
+                and self._initialized
+                and now < self._next_metadata_refresh
+                and now < self._registration_valid_until
+            ):
                 return
+            prior_registration_current = (
+                self._initialized and now < self._registration_valid_until
+            )
             self._refresh_in_progress = True
             try:
-                await self._register_metadata()
+                valid_until = await self._register_metadata(
+                    prior_registration_current=prior_registration_current
+                )
             except BaseException:
                 self._initialized = False
+                if not prior_registration_current:
+                    self._registration_valid_until = 0.0
                 raise
             else:
                 self._initialized = True
-                self._has_valid_registration = True
+                self._catalog_frozen = True
+                self._registration_valid_until = valid_until
                 self._next_metadata_refresh = (
                     self._clock_now() + self._metadata_refresh_interval
                 )
             finally:
                 self._refresh_in_progress = False
 
-    async def _register_metadata(self) -> None:
+    async def _register_metadata(self, *, prior_registration_current: bool) -> float:
+        registration_started = self._clock_now()
         credentials = self._credentials
         if credentials is None:  # pragma: no cover - initialize validates before entry
             raise CapacityConfigurationError("credential fingerprints are required")
@@ -360,7 +380,6 @@ class CapacityPool:
             fingerprint_scopes[fingerprint] = deployment.quota_scope_id
             deployment_fingerprints.append((deployment, fingerprint))
         owner = self._owner_id
-        had_valid_registration = self._has_valid_registration
         planned_fingerprint_keys = list(
             dict.fromkeys(
                 self._fingerprint_keys(fingerprint)
@@ -423,17 +442,27 @@ class CapacityPool:
                     policy_keys.append(keys)
                 if cancellation is not None:
                     raise cancellation
+            valid_until = self._registration_deadline(registration_started)
         except BaseException as error:
             await self._rollback_registration(
                 owner,
-                fingerprint_keys if had_valid_registration else planned_fingerprint_keys,
-                policy_keys if had_valid_registration else planned_policy_keys,
+                fingerprint_keys if prior_registration_current else planned_fingerprint_keys,
+                policy_keys if prior_registration_current else planned_policy_keys,
             )
             if isinstance(error, asyncio.CancelledError | CapacityConfigurationError):
                 raise
             if isinstance(error, CapacityBackendError):
                 raise
             raise CapacityBackendError("model capacity backend unavailable") from None
+        return valid_until
+
+    def _registration_deadline(self, started: float) -> float:
+        ttl_seconds = self._metadata_ttl_ms / 1000
+        safety_margin = max(0.001, ttl_seconds * 0.1)
+        deadline = started + max(0.0, ttl_seconds - safety_margin)
+        if not math.isfinite(deadline):
+            raise CapacityConfigurationError("capacity registration deadline is invalid")
+        return deadline
 
     async def _registration_eval(
         self, script: str, key_count: int, *args: object
@@ -490,7 +519,12 @@ class CapacityPool:
         return value
 
     def _require_initialized(self) -> None:
-        if not self._initialized or self._refresh_in_progress:
+        if (
+            not self._initialized
+            or self._refresh_in_progress
+            or self._clock_now() >= self._registration_valid_until
+        ):
+            self._initialized = False
             raise CapacityConfigurationError("model capacity pool is not initialized")
 
     async def acquire(
