@@ -5,9 +5,10 @@ from uuid import UUID, uuid4
 import pytest
 from alembic.config import Config
 from sqlalchemy import delete, select, text
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent_hub.db.models import ConfigRevisionRow, TenantRow
+from agent_hub.db.models import ConfigRevisionRow, TenantRow, UserRow
 from agent_hub.db.session import build_database
 from alembic import command
 
@@ -68,6 +69,48 @@ def test_encrypted_secrets_migration_generates_offline_sql(alembic_config: Confi
 
 
 @pytest.mark.integration
+def test_auth_migration_downgrades_reupgrades_and_generates_incremental_sql(
+    alembic_config: Config, database_url: str
+) -> None:
+    command.downgrade(alembic_config, "0004_encrypted_secrets")
+    assert asyncio.run(_table_exists(database_url, "agent_hub_bootstrap_codes")) is False
+
+    output = StringIO()
+    alembic_config.output_buffer = output
+    command.upgrade(alembic_config, "0004_encrypted_secrets:0005_auth", sql=True)
+    assert "CREATE TABLE agent_hub_bootstrap_codes" in output.getvalue()
+    assert "ck_agent_hub_users_role" in output.getvalue()
+
+    command.upgrade(alembic_config, "head")
+    assert asyncio.run(_table_exists(database_url, "agent_hub_bootstrap_codes")) is True
+
+
+@pytest.mark.integration
+async def test_user_role_check_rejects_unknown_role(db_session: AsyncSession) -> None:
+    tenant = TenantRow(slug="role-check", name="Role check")
+    db_session.add(tenant)
+    await db_session.flush()
+    db_session.add(UserRow(tenant_id=tenant.id, username="bad-role", role="owner"))
+
+    with pytest.raises(IntegrityError, match="ck_agent_hub_users_role"):
+        await db_session.commit()
+
+
+@pytest.mark.integration
+def test_auth_migration_rejects_preexisting_invalid_roles(
+    alembic_config: Config, database_url: str
+) -> None:
+    command.downgrade(alembic_config, "0004_encrypted_secrets")
+    tenant_id = asyncio.run(_seed_invalid_role(database_url))
+    try:
+        with pytest.raises(SQLAlchemyError, match="invalid roles"):
+            command.upgrade(alembic_config, "0005_auth")
+    finally:
+        asyncio.run(_delete_user_and_tenant(database_url, tenant_id))
+        command.upgrade(alembic_config, "head")
+
+
+@pytest.mark.integration
 def test_published_unique_index_migration_rejects_corrupt_history(
     alembic_config: Config, database_url: str
 ) -> None:
@@ -115,6 +158,30 @@ async def _delete_tenant(database_url: str, tenant_id: UUID) -> None:
             )
             await session.execute(delete(TenantRow).where(TenantRow.id == tenant_id))
             await session.commit()
+    finally:
+        await database.dispose()
+
+
+async def _seed_invalid_role(database_url: str) -> UUID:
+    database = build_database(database_url)
+    tenant_id = uuid4()
+    try:
+        async with database.session_factory() as session:
+            session.add(TenantRow(id=tenant_id, slug=f"invalid-role-{tenant_id}", name="Invalid"))
+            await session.flush()
+            session.add(UserRow(tenant_id=tenant_id, username="invalid", role="owner"))
+            await session.commit()
+    finally:
+        await database.dispose()
+    return tenant_id
+
+
+async def _delete_user_and_tenant(database_url: str, tenant_id: UUID) -> None:
+    database = build_database(database_url)
+    try:
+        async with database.session_factory() as session, session.begin():
+            await session.execute(delete(UserRow).where(UserRow.tenant_id == tenant_id))
+            await session.execute(delete(TenantRow).where(TenantRow.id == tenant_id))
     finally:
         await database.dispose()
 

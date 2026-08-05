@@ -33,7 +33,13 @@ class TenantRow(Base):
 
 class UserRow(Base):
     __tablename__ = "agent_hub_users"
-    __table_args__ = (UniqueConstraint("tenant_id", "username"),)
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "username"),
+        CheckConstraint(
+            "role IN ('super_admin', 'admin', 'operator', 'viewer')",
+            name="ck_agent_hub_users_role",
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
     tenant_id: Mapped[UUID] = mapped_column(ForeignKey("agent_hub_tenants.id"))
@@ -41,6 +47,26 @@ class UserRow(Base):
     password_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
     feishu_open_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     role: Mapped[str] = mapped_column(String(32))
+
+
+class BootstrapCodeRow(Base):
+    __tablename__ = "agent_hub_bootstrap_codes"
+    __table_args__ = (
+        UniqueConstraint("code_hash", name="uq_agent_hub_bootstrap_codes_code_hash"),
+        CheckConstraint(
+            "code_hash ~ '^[0-9a-f]{64}$'",
+            name="ck_agent_hub_bootstrap_codes_hash",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    code_hash: Mapped[str] = mapped_column(String(64))
+    tenant_id: Mapped[UUID] = mapped_column(ForeignKey("agent_hub_tenants.id"))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class SecretRow(Base):
