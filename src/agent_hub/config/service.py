@@ -130,6 +130,47 @@ class ConfigService:
         )
         return published
 
+    async def publish_revision(
+        self,
+        tenant_id: UUID,
+        revision_id: UUID,
+        actor_id: UUID,
+    ) -> ConfigRevision:
+        async with self._session_factory() as session, session.begin():
+            await self._repository.lock_tenant(session, tenant_id)
+            target = await self._repository.get_revision(
+                session, tenant_id, revision_id, for_update=True
+            )
+            if target is None:
+                raise ConfigNotFoundError("configuration revision was not found")
+            if target.status != ConfigStatus.DRAFT.value:
+                raise ConfigStatusError("only draft revisions can be published")
+            _validated_document(target.document)
+
+            current = await self._repository.get_current_row(
+                session, tenant_id, for_update=True
+            )
+            if current is not None and target.version <= current.version:
+                raise ConfigStatusError(
+                    "configuration revision is older than the current published version"
+                )
+            if current is not None:
+                self._repository.set_status(current, ConfigStatus.SUPERSEDED)
+                await session.flush([current])
+            self._repository.set_status(target, ConfigStatus.PUBLISHED)
+            await session.flush([target])
+            published = self._repository.materialize(target)
+
+        await self._notify_after_commit(
+            ConfigPublishedEvent(
+                tenant_id=tenant_id,
+                version=published.version,
+                actor_id=actor_id,
+                action="publish",
+            )
+        )
+        return published
+
     async def rollback(
         self,
         tenant_id: UUID,
@@ -197,10 +238,21 @@ class ConfigService:
         return revision
 
     async def list_versions(
-        self, tenant_id: UUID
+        self, tenant_id: UUID, *, limit: int = 20, offset: int = 0
     ) -> list[ConfigRevision]:
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 100
+            or not isinstance(offset, int)
+            or isinstance(offset, bool)
+            or not 0 <= offset <= 1_000_000
+        ):
+            raise ValueError("configuration history pagination is invalid")
         async with self._session_factory() as session:
-            return await self._repository.list_versions(session, tenant_id)
+            return await self._repository.list_versions(
+                session, tenant_id, limit=limit, offset=offset
+            )
 
     async def get_current(
         self, tenant_id: UUID

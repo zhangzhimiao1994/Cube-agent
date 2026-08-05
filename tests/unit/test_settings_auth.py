@@ -94,3 +94,18 @@ def test_settings_preserve_whitespace_for_downstream_canonical_validation() -> N
     assert settings.jwt_signing_key_value() == configured_key
     with pytest.raises(ValueError):
         AccessTokenService(settings.jwt_signing_key_value())
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("bootstrap_tenant_slug", "Bad Slug"),
+        ("bootstrap_tenant_name", ""),
+        ("trusted_proxy_ips", ["not-an-ip"]),
+    ],
+)
+def test_network_and_bootstrap_settings_reject_invalid_values(
+    field: str, value: object
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings.model_validate({field: value})

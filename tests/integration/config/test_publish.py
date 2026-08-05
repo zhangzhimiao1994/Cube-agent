@@ -556,3 +556,39 @@ async def test_concurrent_rollbacks_allocate_monotonic_versions_and_one_current(
     assert current is not None
     assert current.version == 4
     assert [event.action for event in notifier.events] == ["rollback", "rollback"]
+
+
+@pytest.mark.integration
+async def test_publish_revision_uses_tenant_scoped_uuid(
+    db_session: AsyncSession, database_url: str
+) -> None:
+    first_tenant = await create_tenant(db_session, "publish-by-id-first")
+    second_tenant = await create_tenant(db_session, "publish-by-id-second")
+    actor_id = uuid4()
+    async with database_resource(database_url) as database:
+        service = ConfigService(database.session_factory)
+        draft = await service.create_draft(first_tenant, actor_id, document())
+
+        with pytest.raises(ConfigNotFoundError):
+            await service.publish_revision(second_tenant, draft.id, actor_id)
+
+        published = await service.publish_revision(first_tenant, draft.id, actor_id)
+
+    assert published.id == draft.id
+    assert published.status == "published"
+
+
+@pytest.mark.integration
+async def test_list_versions_applies_limit_and_offset(
+    db_session: AsyncSession, database_url: str
+) -> None:
+    tenant_id = await create_tenant(db_session, "bounded-history")
+    actor_id = uuid4()
+    async with database_resource(database_url) as database:
+        service = ConfigService(database.session_factory)
+        for prompt in ("One.", "Two.", "Three."):
+            await service.create_draft(tenant_id, actor_id, document(prompt=prompt))
+
+        page = await service.list_versions(tenant_id, limit=1, offset=1)
+
+    assert [revision.version for revision in page] == [2]

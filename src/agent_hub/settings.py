@@ -1,9 +1,11 @@
 """Application settings."""
 
 from functools import lru_cache
+from ipaddress import ip_address
 from typing import ClassVar
+from uuid import UUID
 
-from pydantic import SecretStr, ValidationInfo, field_validator
+from pydantic import Field, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,6 +36,12 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     jwt_signing_key: SecretStr = SecretStr("development-only-change-me")
     master_key: SecretStr = SecretStr("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+    trusted_proxy_ips: frozenset[str] = frozenset()
+    bootstrap_tenant_id: UUID = UUID("00000000-0000-4000-8000-000000000001")
+    bootstrap_tenant_slug: str = Field(
+        default="default", min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9-]*$"
+    )
+    bootstrap_tenant_name: str = Field(default="Default", min_length=1, max_length=200)
 
     @field_validator("jwt_signing_key", mode="after")
     @classmethod
@@ -53,6 +61,11 @@ class Settings(BaseSettings):
         """Return the configured value for strict validation by AccessTokenService."""
 
         return self.jwt_signing_key.get_secret_value()
+
+    @field_validator("trusted_proxy_ips", mode="after")
+    @classmethod
+    def validate_trusted_proxy_ips(cls, values: frozenset[str]) -> frozenset[str]:
+        return frozenset(str(ip_address(value)) for value in values)
 
 
 @lru_cache

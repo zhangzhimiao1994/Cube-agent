@@ -112,6 +112,23 @@ class ConfigRepository:
         result = await session.execute(statement)
         return result.scalars().one_or_none()
 
+    async def get_revision(
+        self,
+        session: AsyncSession,
+        tenant_id: UUID,
+        revision_id: UUID,
+        *,
+        for_update: bool = False,
+    ) -> ConfigRevisionRow | None:
+        statement = select(ConfigRevisionRow).where(
+            ConfigRevisionRow.tenant_id == tenant_id,
+            ConfigRevisionRow.id == revision_id,
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        result = await session.execute(statement)
+        return result.scalars().one_or_none()
+
     async def get_current_row(
         self,
         session: AsyncSession,
@@ -141,12 +158,19 @@ class ConfigRepository:
         return None if row is None else _revision(row)
 
     async def list_versions(
-        self, session: AsyncSession, tenant_id: UUID
+        self,
+        session: AsyncSession,
+        tenant_id: UUID,
+        *,
+        limit: int,
+        offset: int,
     ) -> list[ConfigRevision]:
         rows = await session.scalars(
             select(ConfigRevisionRow)
             .where(ConfigRevisionRow.tenant_id == tenant_id)
             .order_by(ConfigRevisionRow.version)
+            .limit(limit)
+            .offset(offset)
         )
         return [_revision(row) for row in rows]
 

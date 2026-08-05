@@ -6,8 +6,9 @@ import pytest
 from alembic.config import Config
 from sqlalchemy import delete, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from agent_hub.app import ensure_bootstrap_tenant
 from agent_hub.db.models import ConfigRevisionRow, TenantRow, UserRow
 from agent_hub.db.session import build_database
 from alembic import command
@@ -33,6 +34,27 @@ async def test_database_readiness_confirms_postgres(database_url: str) -> None:
         await database.wait_until_ready(timeout_seconds=5)
     finally:
         await database.dispose()
+
+
+@pytest.mark.integration
+async def test_bootstrap_tenant_creation_is_idempotent(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+
+    await ensure_bootstrap_tenant(
+        auth_session_factory, tenant_id, "bootstrap-default", "Bootstrap Default"
+    )
+    await ensure_bootstrap_tenant(
+        auth_session_factory, tenant_id, "bootstrap-default", "Bootstrap Default"
+    )
+
+    async with auth_session_factory() as session:
+        tenants = list(
+            await session.scalars(select(TenantRow).where(TenantRow.id == tenant_id))
+        )
+    assert len(tenants) == 1
+    assert tenants[0].slug == "bootstrap-default"
 
 
 @pytest.mark.integration

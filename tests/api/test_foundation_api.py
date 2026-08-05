@@ -1,0 +1,703 @@
+import asyncio
+import base64
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+from typing import Self
+from uuid import UUID, uuid4
+
+import pytest
+from fastapi.testclient import TestClient
+
+from agent_hub.app import create_app
+from agent_hub.auth.models import (
+    AuthenticatedPrincipal,
+    AuthenticationPersistenceError,
+    AuthResult,
+    InvalidCredentials,
+    Role,
+)
+from agent_hub.config.repository import ConfigNotFoundError, ConfigRevision, ConfigStatus
+from agent_hub.config.service import ConfigPublishedEvent, PostCommitNotificationError
+from agent_hub.settings import Settings
+
+
+class Probe:
+    def __init__(self, outcome: Exception | None = None) -> None:
+        self.outcome = outcome
+        self.calls = 0
+
+    async def __call__(self) -> None:
+        self.calls += 1
+        if self.outcome is not None:
+            raise self.outcome
+
+
+async def never_returns() -> None:
+    await asyncio.Event().wait()
+
+
+@pytest.mark.parametrize("failed_probe", ["database", "redis"])
+def test_ready_is_generic_and_requires_both_dependencies(failed_probe: str) -> None:
+    probes: dict[str, Callable[[], Awaitable[None]]] = {
+        "database": Probe(),
+        "redis": Probe(),
+    }
+    probes[failed_probe] = Probe(RuntimeError("secret backend address"))
+    app = create_app(
+        database_probe=probes["database"],
+        redis_probe=probes["redis"],
+    )
+
+    response = TestClient(app).get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": {"code": "service_unavailable", "message": "service unavailable"}
+    }
+    assert "secret backend address" not in response.text
+
+
+def test_ready_times_out_and_live_stays_live() -> None:
+    app = create_app(
+        database_probe=never_returns,
+        redis_probe=Probe(),
+        readiness_timeout_seconds=0.01,
+    )
+    client = TestClient(app)
+
+    ready = client.get("/health/ready")
+    live = client.get("/health/live")
+
+    assert ready.status_code == 503
+    assert live.status_code == 200
+    assert live.json() == {"status": "ok"}
+
+
+def test_ready_reports_ok_when_dependencies_respond() -> None:
+    database = Probe()
+    redis = Probe()
+    app = create_app(database_probe=database, redis_probe=redis)
+
+    response = TestClient(app).get("/health/ready")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert database.calls == redis.calls == 1
+
+
+def test_default_placeholder_fails_closed_when_lifespan_starts() -> None:
+    app = create_app(settings=Settings.model_validate({}))
+
+    with pytest.raises(ValueError), TestClient(app):
+        pass
+
+
+class StubAuthService:
+    def __init__(self, principal: AuthenticatedPrincipal | None = None) -> None:
+        self.principal = principal or AuthenticatedPrincipal(uuid4(), uuid4(), Role.ADMIN)
+        self.login_error: Exception | None = None
+        self.seen_tokens: list[str] = []
+
+    async def consume_bootstrap_code(
+        self, code: str, username: str, password: str
+    ) -> AuthResult:
+        return AuthResult(self.principal, "setup-access-token")
+
+    async def login(self, tenant_id: UUID, username: str, password: str) -> AuthResult:
+        if self.login_error is not None:
+            raise self.login_error
+        return AuthResult(self.principal, "login-access-token")
+
+    def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
+        self.seen_tokens.append(token)
+        if token != "valid-token":
+            raise InvalidCredentials("internal token detail")
+        return self.principal
+
+
+@dataclass(frozen=True)
+class LimitDecision:
+    allowed: bool
+    retry_after: int = 0
+
+
+class StubRateLimiter:
+    def __init__(self, decision: LimitDecision | Exception | None = None) -> None:
+        self.decision = decision or LimitDecision(True)
+        self.calls: list[tuple[str, str]] = []
+
+    async def check(self, endpoint: str, client_ip: str) -> LimitDecision:
+        self.calls.append((endpoint, client_ip))
+        if isinstance(self.decision, Exception):
+            raise self.decision
+        return self.decision
+
+
+def auth_client(
+    auth: StubAuthService | None = None,
+    limiter: StubRateLimiter | None = None,
+) -> TestClient:
+    return TestClient(
+        create_app(
+            auth_service=auth or StubAuthService(),
+            rate_limiter=limiter or StubRateLimiter(),
+        )
+    )
+
+
+def test_setup_and_login_return_only_safe_principal_fields() -> None:
+    auth = StubAuthService()
+    client = auth_client(auth)
+
+    setup = client.post(
+        "/api/v1/setup",
+        json={
+            "code": "a" * 43,
+            "username": "owner",
+            "password": "correct horse battery staple",
+        },
+    )
+    login = client.post(
+        "/api/v1/auth/login",
+        json={
+            "tenant_id": str(auth.principal.tenant_id),
+            "username": "owner",
+            "password": "correct horse battery staple",
+        },
+    )
+
+    assert setup.status_code == 201
+    assert login.status_code == 200
+    assert setup.json() == {
+        "access_token": "setup-access-token",
+        "token_type": "bearer",
+        "principal": {
+            "user_id": str(auth.principal.user_id),
+            "tenant_id": str(auth.principal.tenant_id),
+            "role": "admin",
+        },
+    }
+    assert "password" not in setup.text
+    assert "code" not in setup.text
+
+
+def test_login_invalid_credentials_is_generic_401_with_challenge() -> None:
+    auth = StubAuthService()
+    auth.login_error = InvalidCredentials("database username leaked")
+    response = auth_client(auth).post(
+        "/api/v1/auth/login",
+        json={
+            "tenant_id": str(auth.principal.tenant_id),
+            "username": "owner",
+            "password": "correct horse battery staple",
+        },
+    )
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert response.json() == {
+        "error": {"code": "invalid_credentials", "message": "invalid credentials"}
+    }
+    assert "database username" not in response.text
+
+
+@pytest.mark.parametrize(
+    "authorization",
+    [None, "Basic abc", "Bearer", "Bearer a b", "Bearer " + "a" * 8193],
+)
+def test_bearer_dependency_rejects_missing_or_malformed_values(
+    authorization: str | None,
+) -> None:
+    headers = {} if authorization is None else {"Authorization": authorization}
+    response = auth_client().get("/api/v1/auth/me", headers=headers)
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert response.json() == {
+        "error": {"code": "invalid_token", "message": "invalid access token"}
+    }
+
+
+def test_bearer_dependency_rejects_duplicate_headers_without_authenticating() -> None:
+    auth = StubAuthService()
+    response = auth_client(auth).get(
+        "/api/v1/auth/me",
+        headers=[("Authorization", "Bearer valid-token"), ("Authorization", "Bearer other")],
+    )
+
+    assert response.status_code == 401
+    assert auth.seen_tokens == []
+    assert "valid-token" not in response.text
+
+
+def test_bearer_scheme_is_case_insensitive() -> None:
+    auth = StubAuthService()
+    response = auth_client(auth).get(
+        "/api/v1/auth/me", headers={"Authorization": "bEaReR valid-token"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["role"] == "admin"
+
+
+def test_auth_rate_limit_uses_socket_client_and_returns_retry_after() -> None:
+    limiter = StubRateLimiter(LimitDecision(False, retry_after=37))
+    response = auth_client(limiter=limiter).post(
+        "/api/v1/auth/login",
+        headers={"X-Forwarded-For": "203.0.113.9"},
+        json={
+            "tenant_id": str(uuid4()),
+            "username": "owner",
+            "password": "correct horse battery staple",
+        },
+    )
+
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "37"
+    assert limiter.calls == [("login", "testclient")]
+
+
+def test_rate_limiter_failure_is_fail_closed() -> None:
+    from agent_hub.auth.rate_limit import RateLimitUnavailable
+
+    limiter = StubRateLimiter(RateLimitUnavailable("redis host leaked"))
+    response = auth_client(limiter=limiter).post(
+        "/api/v1/setup",
+        json={
+            "code": "a" * 43,
+            "username": "owner",
+            "password": "correct horse battery staple",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["message"] == "service unavailable"
+    assert "redis host" not in response.text
+
+
+def test_request_validation_does_not_echo_sensitive_input() -> None:
+    code = "TOP_SECRET_CODE"
+    password = "TOP_SECRET_PASSWORD"
+    response = auth_client().post(
+        "/api/v1/setup",
+        json={"code": code, "username": "INVALID USER", "password": password},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "request_validation"
+    assert code not in response.text
+    assert password not in response.text
+
+
+def test_auth_persistence_failure_is_generic_503() -> None:
+    auth = StubAuthService()
+    auth.login_error = AuthenticationPersistenceError("postgres DSN leaked")
+    response = auth_client(auth).post(
+        "/api/v1/auth/login",
+        json={
+            "tenant_id": str(auth.principal.tenant_id),
+            "username": "owner",
+            "password": "correct horse battery staple",
+        },
+    )
+
+    assert response.status_code == 503
+    assert "postgres DSN" not in response.text
+
+
+def config_document(prompt: str = "Help.") -> dict[str, object]:
+    return {
+        "models": {
+            "main-model": {
+                "deployments": [
+                    {
+                        "provider": "openai",
+                        "model": "gpt-test",
+                        "secret_ref": "OPENAI_API_KEY",
+                        "quota_scope_id": "primary",
+                    }
+                ]
+            }
+        },
+        "agents": [
+            {
+                "id": "assistant",
+                "role": "assistant",
+                "prompt": prompt,
+                "model": "main-model",
+            }
+        ],
+    }
+
+
+class StubConfigService:
+    def __init__(self) -> None:
+        self.revisions: list[ConfigRevision] = []
+        self.publish_notification_failure = False
+        self.create_calls = 0
+
+    async def create_draft(
+        self, tenant_id: UUID, actor_id: UUID, document: object
+    ) -> ConfigRevision:
+        self.create_calls += 1
+        revision = ConfigRevision(
+            id=uuid4(),
+            tenant_id=tenant_id,
+            version=len(self.revisions) + 1,
+            status=ConfigStatus.DRAFT,
+            document=cast_dict(document),
+            created_by=actor_id,
+            created_at=datetime.now(UTC),
+        )
+        self.revisions.append(revision)
+        return revision
+
+    async def publish_revision(
+        self, tenant_id: UUID, revision_id: UUID, actor_id: UUID
+    ) -> ConfigRevision:
+        target = next(
+            (
+                revision
+                for revision in self.revisions
+                if revision.tenant_id == tenant_id and revision.id == revision_id
+            ),
+            None,
+        )
+        if target is None:
+            raise ConfigNotFoundError("other tenant detail")
+        published = replace(target, status=ConfigStatus.PUBLISHED)
+        self.revisions[self.revisions.index(target)] = published
+        if self.publish_notification_failure:
+            raise PostCommitNotificationError(
+                ConfigPublishedEvent(tenant_id, published.version, actor_id, "publish")
+            )
+        return published
+
+    async def rollback(
+        self, tenant_id: UUID, source_version: int, actor_id: UUID
+    ) -> ConfigRevision:
+        source = await self.get_version(tenant_id, source_version)
+        rolled_back = ConfigRevision(
+            id=uuid4(),
+            tenant_id=tenant_id,
+            version=len(self.revisions) + 1,
+            status=ConfigStatus.PUBLISHED,
+            document=source.document,
+            created_by=actor_id,
+            created_at=datetime.now(UTC),
+        )
+        self.revisions.append(rolled_back)
+        return rolled_back
+
+    async def get_version(self, tenant_id: UUID, version: int) -> ConfigRevision:
+        target = next(
+            (
+                revision
+                for revision in self.revisions
+                if revision.tenant_id == tenant_id and revision.version == version
+            ),
+            None,
+        )
+        if target is None:
+            raise ConfigNotFoundError("missing")
+        return target
+
+    async def get_current(self, tenant_id: UUID) -> ConfigRevision | None:
+        return next(
+            (
+                revision
+                for revision in reversed(self.revisions)
+                if revision.tenant_id == tenant_id
+                and revision.status is ConfigStatus.PUBLISHED
+            ),
+            None,
+        )
+
+    async def list_versions(
+        self, tenant_id: UUID, *, limit: int = 20, offset: int = 0
+    ) -> list[ConfigRevision]:
+        matches = [r for r in self.revisions if r.tenant_id == tenant_id]
+        return matches[offset : offset + limit]
+
+
+def cast_dict(value: object) -> dict[str, object]:
+    assert isinstance(value, dict)
+    return value
+
+
+def config_client(
+    role: Role = Role.ADMIN,
+    *,
+    service: StubConfigService | None = None,
+    tenant_id: UUID | None = None,
+) -> tuple[TestClient, StubConfigService, StubAuthService]:
+    principal = AuthenticatedPrincipal(uuid4(), tenant_id or uuid4(), role)
+    auth = StubAuthService(principal)
+    config = service or StubConfigService()
+    client = TestClient(
+        create_app(
+            auth_service=auth,
+            rate_limiter=StubRateLimiter(),
+            config_service=config,
+        )
+    )
+    return client, config, auth
+
+
+def bearer() -> dict[str, str]:
+    return {"Authorization": "Bearer valid-token"}
+
+
+def test_config_create_publish_current_history_and_rollback() -> None:
+    client, service, _ = config_client()
+
+    draft = client.post("/api/v1/config/drafts", headers=bearer(), json=config_document())
+    published = client.post(
+        f"/api/v1/config/drafts/{draft.json()['id']}/publish", headers=bearer()
+    )
+    current = client.get("/api/v1/config/current", headers=bearer())
+    history = client.get("/api/v1/config/history?limit=20&offset=0", headers=bearer())
+    rollback = client.post(
+        "/api/v1/config/history/1/rollback", headers=bearer()
+    )
+
+    assert draft.status_code == 201
+    assert published.status_code == 200
+    assert published.json()["status"] == "published"
+    assert current.json()["id"] == published.json()["id"]
+    assert history.json()["items"][0]["version"] == 1
+    assert rollback.status_code == 200
+    assert rollback.json()["version"] == 2
+    assert service.create_calls == 1
+
+
+def test_config_validate_does_not_persist_and_invalid_is_422() -> None:
+    client, service, _ = config_client()
+
+    valid = client.post("/api/v1/config/validate", headers=bearer(), json=config_document())
+    invalid = client.post(
+        "/api/v1/config/validate",
+        headers=bearer(),
+        json={"models": {}, "agents": [{"id": "a", "model": "missing"}]},
+    )
+
+    assert valid.status_code == 200
+    assert valid.json() == {"valid": True}
+    assert invalid.status_code == 422
+    assert service.create_calls == 0
+
+
+@pytest.mark.parametrize("role", [Role.OPERATOR, Role.VIEWER])
+def test_read_roles_cannot_create_or_publish(role: Role) -> None:
+    client, service, _ = config_client(role)
+    draft = asyncio.run(
+        service.create_draft(uuid4(), uuid4(), config_document())
+    )
+
+    create = client.post("/api/v1/config/drafts", headers=bearer(), json=config_document())
+    publish = client.post(
+        f"/api/v1/config/drafts/{draft.id}/publish", headers=bearer()
+    )
+    read = client.get("/api/v1/config/history", headers=bearer())
+
+    assert create.status_code == 403
+    assert publish.status_code == 403
+    assert read.status_code == 200
+
+
+def test_publish_revision_is_tenant_scoped_and_missing_is_generic_404() -> None:
+    service = StubConfigService()
+    other_tenant_draft = asyncio.run(
+        service.create_draft(uuid4(), uuid4(), config_document())
+    )
+    client, _, _ = config_client(service=service)
+
+    response = client.post(
+        f"/api/v1/config/drafts/{other_tenant_draft.id}/publish", headers=bearer()
+    )
+
+    assert response.status_code == 404
+    assert "other tenant" not in response.text
+
+
+@pytest.mark.parametrize("query", ["limit=0", "limit=101", "offset=-1"])
+def test_history_pagination_is_bounded(query: str) -> None:
+    client, _, _ = config_client()
+    response = client.get(f"/api/v1/config/history?{query}", headers=bearer())
+
+    assert response.status_code == 422
+
+
+def test_diff_is_deterministic_and_same_version_is_empty() -> None:
+    client, service, auth = config_client()
+    first = asyncio.run(
+        service.create_draft(auth.principal.tenant_id, auth.principal.user_id, config_document())
+    )
+    second = asyncio.run(
+        service.create_draft(
+            auth.principal.tenant_id,
+            auth.principal.user_id,
+            config_document(prompt="Changed."),
+        )
+    )
+
+    changed = client.get(
+        f"/api/v1/config/diff?from_version={first.version}&to_version={second.version}",
+        headers=bearer(),
+    )
+    same = client.get(
+        f"/api/v1/config/diff?from_version={first.version}&to_version={first.version}",
+        headers=bearer(),
+    )
+
+    assert changed.status_code == 200
+    assert changed.json() == {
+        "from_version": 1,
+        "to_version": 2,
+        "added": [],
+        "removed": [],
+        "changed": [
+            {
+                "path": "/agents",
+                "from": config_document()["agents"],
+                "to": config_document(prompt="Changed.")["agents"],
+            }
+        ],
+    }
+    assert same.json()["added"] == same.json()["removed"] == same.json()["changed"] == []
+
+
+def test_json_diff_escapes_pointer_segments() -> None:
+    from agent_hub.api.routers.config import structured_diff
+
+    assert structured_diff({"a/b~c": 1}, {"a/b~c": 2})["changed"] == [
+        {"path": "/a~1b~0c", "from": 1, "to": 2}
+    ]
+
+
+def test_post_commit_notification_failure_returns_committed_revision() -> None:
+    client, service, _ = config_client()
+    draft = client.post("/api/v1/config/drafts", headers=bearer(), json=config_document())
+    service.publish_notification_failure = True
+
+    response = client.post(
+        f"/api/v1/config/drafts/{draft.json()['id']}/publish", headers=bearer()
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "published"
+    assert response.json()["notification_status"] == "failed"
+
+
+class FakeSession:
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    def begin(self) -> "FakeSession":
+        return self
+
+    async def execute(self, statement: object) -> None:
+        del statement
+
+
+class FakeDatabase:
+    def __init__(self) -> None:
+        self.disposed = False
+        self.session_factory = lambda: FakeSession()
+
+    async def dispose(self) -> None:
+        self.disposed = True
+
+
+class FakeRedis:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+    async def ping(self) -> bool:
+        return True
+
+
+def valid_settings() -> Settings:
+    key = base64.urlsafe_b64encode(b"x" * 32).decode("ascii").rstrip("=")
+    return Settings.model_validate(
+        {"jwt_signing_key": "base64url:" + key}
+    )
+
+
+def test_injected_database_and_redis_are_not_closed() -> None:
+    database = FakeDatabase()
+    redis = FakeRedis()
+    with TestClient(
+        create_app(
+            settings=valid_settings(),
+            database=database,
+            redis_client=redis,
+            auth_service=StubAuthService(),
+            config_service=StubConfigService(),
+            rate_limiter=StubRateLimiter(),
+            database_probe=Probe(),
+            redis_probe=Probe(),
+        )
+    ):
+        pass
+
+    assert database.disposed is False
+    assert redis.closed is False
+
+
+def test_factory_created_database_and_redis_are_closed() -> None:
+    database = FakeDatabase()
+    redis = FakeRedis()
+    with TestClient(
+        create_app(
+            settings=valid_settings(),
+            database_factory=lambda url: database,
+            redis_factory=lambda url: redis,
+            database_probe=Probe(),
+            redis_probe=Probe(),
+        )
+    ):
+        pass
+
+    assert database.disposed is True
+    assert redis.closed is True
+
+
+def test_auth_request_body_size_is_bounded_before_validation() -> None:
+    secret = "S" * 20_000
+    response = auth_client().post(
+        "/api/v1/auth/login",
+        json={
+            "tenant_id": str(uuid4()),
+            "username": "owner",
+            "password": secret,
+        },
+    )
+
+    assert response.status_code == 413
+    assert response.json() == {
+        "error": {"code": "request_too_large", "message": "request body is too large"}
+    }
+    assert secret not in response.text
+
+
+def test_openapi_does_not_expose_persistence_secret_fields() -> None:
+    schema = auth_client().get("/openapi.json")
+
+    assert schema.status_code == 200
+    serialized = schema.text.lower()
+    for forbidden in (
+        "password_hash",
+        "code_hash",
+        "ciphertext",
+        "fingerprint",
+        "nonce",
+    ):
+        assert forbidden not in serialized
