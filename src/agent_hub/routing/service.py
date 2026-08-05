@@ -100,10 +100,29 @@ class ModeRouter:
         self._token_store = token_store
         self._policy = policy or RoutingPolicy()
         self._risk_policy = risk_policy or RiskRulePolicy()
+        self._classifier_task_slots = 0
         self._active_classifier_tasks: set[asyncio.Task[object]] = set()
         self._detached_classifier_tasks: set[asyncio.Task[object]] = set()
 
     async def route(
+        self,
+        task_text: object,
+        *,
+        confirmation_subject: ConfirmationSubject | None = None,
+    ) -> RouteDecision:
+        cancellation: asyncio.CancelledError | None = None
+        try:
+            return await self._route_with_text(task_text, confirmation_subject=confirmation_subject)
+        except asyncio.CancelledError as error:
+            cancellation = _clear_cancellation(error)
+        finally:
+            task_text = None
+            del task_text
+        if cancellation is None:  # pragma: no cover - defensive control-flow guard
+            raise RuntimeError("routing cancellation boundary failed")
+        raise cancellation from None
+
+    async def _route_with_text(
         self,
         task_text: object,
         *,
@@ -192,63 +211,101 @@ class ModeRouter:
         )
 
     async def _classify(self, task_text: str) -> tuple[RouteAssessment, ...] | None:
-        if (
-            len(self._active_classifier_tasks) + len(self._detached_classifier_tasks) + 2
-            > self._policy.max_detached_classifier_tasks
-        ):
-            return None
-        classifiers = (self._classifier, self._verifier)
-        tasks = tuple(
-            asyncio.create_task(
-                item.classify(task_text),
-                name=f"route-classifier-{index}",
-            )
-            for index, item in enumerate(classifiers)
-        )
-        self._active_classifier_tasks.update(tasks)
-        result: tuple[RouteAssessment, ...] | None = None
         cancellation: asyncio.CancelledError | None = None
         try:
-            try:
-                completed: dict[asyncio.Task[object], object] = {}
-                pending = set(tasks)
-                async with asyncio.timeout(self._policy.classifier_timeout_seconds):
-                    while pending:
-                        done, pending = await asyncio.wait(
-                            pending, return_when=asyncio.FIRST_COMPLETED
-                        )
-                        for task in done:
-                            try:
-                                completed[task] = task.result()
-                            except asyncio.CancelledError:
-                                raise
-                            except Exception:  # noqa: BLE001 - classifier boundary is redacted
-                                pending = set()
-                                break
-            except TimeoutError:
-                completed = {}
-            if len(completed) == len(tasks):
-                validated = tuple(
-                    self._validate_assessment(completed[task], source)
-                    for task, source in zip(
-                        tasks,
-                        (RouteSource.CLASSIFIER, RouteSource.VERIFIER),
-                        strict=True,
-                    )
-                )
-                if not any(item is None for item in validated):
-                    result = tuple(item for item in validated if item is not None)
+            return await self._classify_with_text(task_text)
         except asyncio.CancelledError as error:
-            cancellation = error
+            cancellation = _clear_cancellation(error)
+        finally:
+            task_text = ""
+            del task_text
+        if cancellation is None:  # pragma: no cover - defensive control-flow guard
+            raise RuntimeError("classifier cancellation boundary failed")
+        raise cancellation from None
+
+    async def _classify_with_text(self, task_text: str) -> tuple[RouteAssessment, ...] | None:
+        if self._classifier_task_slots + 2 > self._policy.max_detached_classifier_tasks:
+            return None
+        classifiers = (self._classifier, self._verifier)
+        sources = (RouteSource.CLASSIFIER, RouteSource.VERIFIER)
+        task_list: list[asyncio.Task[object]] = []
+        construction_error: BaseException | None = None
+        cancellation: asyncio.CancelledError | None = None
+        for index, (classifier, source) in enumerate(zip(classifiers, sources, strict=True)):
+            runner = self._classifier_runner(classifier, task_text, source)
+            task: asyncio.Task[object] | None = None
+            try:
+                task = asyncio.create_task(runner, name=f"route-classifier-{index}")
+                self._classifier_task_slots += 1
+                task_list.append(task)
+                self._active_classifier_tasks.add(task)
+            except BaseException as error:  # noqa: BLE001 - task construction boundary
+                if task is None:
+                    runner.close()
+                construction_error = _clear_exception(error)
+                if isinstance(error, asyncio.CancelledError):
+                    cancellation = error
+                break
+        tasks = tuple(task_list)
+        result: tuple[RouteAssessment, ...] | None = None
+        try:
+            if construction_error is None:
+                try:
+                    completed: dict[asyncio.Task[object], object] = {}
+                    pending = set(tasks)
+                    async with asyncio.timeout(self._policy.classifier_timeout_seconds):
+                        while pending:
+                            done, pending = await asyncio.wait(
+                                pending, return_when=asyncio.FIRST_COMPLETED
+                            )
+                            for task in done:
+                                try:
+                                    completed[task] = task.result()
+                                except asyncio.CancelledError as error:
+                                    cancellation = _clear_cancellation(error)
+                                    pending = set()
+                                    break
+                                except Exception as error:  # noqa: BLE001
+                                    _clear_exception(error)
+                                    pending = set()
+                                    break
+                except TimeoutError:
+                    completed = {}
+                if len(completed) == len(tasks):
+                    validated = tuple(
+                        self._validate_assessment(completed[task], source)
+                        for task, source in zip(tasks, sources, strict=True)
+                    )
+                    if not any(item is None for item in validated):
+                        result = tuple(item for item in validated if item is not None)
+        except asyncio.CancelledError as error:
+            cancellation = _clear_cancellation(error)
         finally:
             try:
                 await self._bounded_classifier_cleanup(tasks)
             except asyncio.CancelledError as error:
                 if cancellation is None:
-                    cancellation = error
+                    cancellation = _clear_cancellation(error)
+                else:
+                    _clear_cancellation(error)
         if cancellation is not None:
-            raise cancellation
+            raise cancellation from None
+        if isinstance(construction_error, (KeyboardInterrupt, SystemExit)):
+            raise construction_error from None
         return result
+
+    @staticmethod
+    async def _classifier_runner(
+        classifier: RouteClassifier,
+        task_text: str,
+        source: RouteSource,
+    ) -> object:
+        try:
+            del source
+            return await classifier.classify(task_text)
+        finally:
+            task_text = ""
+            del task_text
 
     async def _bounded_classifier_cleanup(self, tasks: tuple[asyncio.Task[object], ...]) -> None:
         for task in tasks:
@@ -270,24 +327,48 @@ class ModeRouter:
                 pending = set(tasks) - done
         for task in done:
             self._active_classifier_tasks.discard(task)
+            self._release_classifier_slot()
             self._consume_classifier_task(task)
         for task in pending:
             task.cancel()
-            self._active_classifier_tasks.discard(task)
-            self._register_detached_classifier_task(task)
+            if self._register_detached_classifier_task(task):
+                self._active_classifier_tasks.discard(task)
         if interrupted is not None:
             raise interrupted
 
-    def _register_detached_classifier_task(self, task: asyncio.Task[object]) -> None:
+    def _register_detached_classifier_task(self, task: asyncio.Task[object]) -> bool:
         if task.done():
+            self._release_classifier_slot()
             self._consume_classifier_task(task)
-            return
-        self._detached_classifier_tasks.add(task)
-        task.add_done_callback(self._detached_classifier_done)
+            return True
+        try:
+            self._detached_classifier_tasks.add(task)
+        except BaseException as error:  # noqa: BLE001 - retain active fallback capacity
+            _clear_exception(error)
+            try:
+                task.add_done_callback(self._active_classifier_done)
+            except BaseException as callback_error:  # noqa: BLE001 - fail closed in active set
+                _clear_exception(callback_error)
+            return False
+        try:
+            task.add_done_callback(self._detached_classifier_done)
+        except BaseException as error:  # noqa: BLE001 - detached set remains a bounded fallback
+            _clear_exception(error)
+        return True
+
+    def _active_classifier_done(self, task: asyncio.Task[object]) -> None:
+        self._active_classifier_tasks.discard(task)
+        self._release_classifier_slot()
+        self._consume_classifier_task(task)
 
     def _detached_classifier_done(self, task: asyncio.Task[object]) -> None:
         self._detached_classifier_tasks.discard(task)
+        self._release_classifier_slot()
         self._consume_classifier_task(task)
+
+    def _release_classifier_slot(self) -> None:
+        if self._classifier_task_slots > 0:
+            self._classifier_task_slots -= 1
 
     @staticmethod
     def _consume_classifier_task(task: asyncio.Task[object]) -> None:
@@ -359,6 +440,8 @@ class ModeRouter:
         plaintext_token = decision_token
         decision_token = None
         del decision_token
+        cancellation: asyncio.CancelledError | None = None
+        consumed: ConsumedDecisionToken | None = None
         try:
             consumed = await self._consume_confirmation(
                 mode,
@@ -366,9 +449,13 @@ class ModeRouter:
                 version=version,
                 confirmation_subject=confirmation_subject,
             )
+        except asyncio.CancelledError as error:
+            cancellation = _clear_cancellation(error)
         finally:
             plaintext_token = None
             del plaintext_token
+        if cancellation is not None:
+            raise cancellation from None
         if consumed is None:
             raise ValueError("stale routing decision") from None
         snapshot = consumed.snapshot
@@ -391,37 +478,37 @@ class ModeRouter:
         version: int,
         confirmation_subject: ConfirmationSubject,
     ) -> ConsumedDecisionToken | None:
+        cancellation: asyncio.CancelledError | None = None
+        consumed: ConsumedDecisionToken | None = None
         try:
             try:
                 confirmation_subject = ConfirmationSubject.model_validate(
                     confirmation_subject.model_dump(round_trip=True), strict=True
                 )
-            except (AttributeError, TypeError, ValueError, ValidationError) as error:
-                error.__traceback__ = None
-                error.__context__ = None
-                error.__cause__ = None
+            except Exception as error:  # noqa: BLE001 - hostile subject boundary
+                _clear_exception(error)
                 return None
             if plaintext_token is None or type(version) is not int or version <= 0:
                 return None
             if not isinstance(mode, TaskMode) or mode not in EXECUTABLE_MODES:
                 raise ValueError("confirmed mode must be executable") from None
             try:
-                return await self._token_store.consume(
+                consumed = await self._token_store.consume(
                     plaintext_token,
                     confirmation_subject,
                     version=version,
                     selected_mode=mode,
                 )
-            except asyncio.CancelledError:
-                raise
+            except asyncio.CancelledError as error:
+                cancellation = _clear_cancellation(error)
             except Exception as error:  # noqa: BLE001 - stable confirmation boundary
-                error.__traceback__ = None
-                error.__context__ = None
-                error.__cause__ = None
-                return None
+                _clear_exception(error)
         finally:
             plaintext_token = None
             del plaintext_token
+        if cancellation is not None:
+            raise cancellation from None
+        return consumed
 
     @staticmethod
     def _local_assessment(
@@ -527,3 +614,15 @@ class ModeRouter:
 
 def _risk_rank(value: RiskLevel) -> int:
     return {RiskLevel.LOW: 0, RiskLevel.MEDIUM: 1, RiskLevel.HIGH: 2}[value]
+
+
+def _clear_exception(error: BaseException) -> BaseException:
+    error.__traceback__ = None
+    error.__context__ = None
+    error.__cause__ = None
+    return error
+
+
+def _clear_cancellation(error: asyncio.CancelledError) -> asyncio.CancelledError:
+    _clear_exception(error)
+    return error

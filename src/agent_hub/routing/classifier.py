@@ -136,11 +136,16 @@ class GatewayRouteClassifier:
 
     async def classify(self, task_text: str) -> RouteAssessment:
         outcome: RouteAssessment | None = None
+        cancellation: asyncio.CancelledError | None = None
         try:
             outcome = await self._classify_safely(task_text)
+        except asyncio.CancelledError as error:
+            cancellation = _clear_cancellation(error)
         finally:
             task_text = ""
             del task_text
+        if cancellation is not None:
+            raise cancellation from None
         if outcome is None:
             raise RouteClassificationError("route classification failed") from None
         return outcome
@@ -150,6 +155,8 @@ class GatewayRouteClassifier:
         request: ModelRequest | None = None
         completion: GatewayCompletion | None = None
         payload: _RoutePayload | None = None
+        outcome: RouteAssessment | None = None
+        cancellation: asyncio.CancelledError | None = None
         try:
             validated = validate_task_text(task_text)
             request = ModelRequest(
@@ -169,7 +176,7 @@ class GatewayRouteClassifier:
             )
             completion = await self._gateway.complete_with_context(request)
             payload = self._parse(completion.response.text)
-            return RouteAssessment(
+            outcome = RouteAssessment(
                 mode=payload.mode,
                 confidence=payload.confidence,
                 reason=(
@@ -186,15 +193,12 @@ class GatewayRouteClassifier:
                 deployment_id=completion.deployment_id,
                 provider_id=completion.provider_id,
             )
-        except BaseException as error:
-            if isinstance(error, (KeyboardInterrupt, SystemExit)):
-                raise
-            if isinstance(error, asyncio.CancelledError):
-                raise
+        except asyncio.CancelledError as error:
+            cancellation = _clear_cancellation(error)
+        except Exception as error:  # noqa: BLE001 - stable redacted gateway boundary
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None
-            return None
         finally:
             task_text = ""
             validated = None
@@ -202,6 +206,9 @@ class GatewayRouteClassifier:
             completion = None
             payload = None
             del task_text, validated, request, completion, payload
+        if cancellation is not None:
+            raise cancellation from None
+        return outcome
 
     @staticmethod
     def _parse(raw: str | None) -> _RoutePayload:
@@ -220,3 +227,10 @@ class GatewayRouteClassifier:
             return _RoutePayload.model_validate_json(raw)
         except ValidationError:
             raise RouteClassificationError("route classification failed") from None
+
+
+def _clear_cancellation(error: asyncio.CancelledError) -> asyncio.CancelledError:
+    error.__traceback__ = None
+    error.__context__ = None
+    error.__cause__ = None
+    return error

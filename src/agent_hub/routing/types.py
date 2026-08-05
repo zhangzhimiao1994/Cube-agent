@@ -187,6 +187,9 @@ class InMemoryDecisionTokenStore:
     ) -> ConsumedDecisionToken | None:
         if type(token) is not str or _TOKEN.fullmatch(token) is None:
             return None
+        digest = self._token_digest(token)
+        token = ""
+        del token
         if type(version) is not int or version <= 0:
             return None
         if not isinstance(selected_mode, TaskMode) or selected_mode not in _EXECUTABLE_MODES:
@@ -197,11 +200,11 @@ class InMemoryDecisionTokenStore:
             subject = ConfirmationSubject.model_validate(
                 subject.model_dump(round_trip=True), strict=True
             )
-        except (TypeError, ValueError):
+        except Exception as error:  # noqa: BLE001 - hostile subject boundary
+            error.__traceback__ = None
+            error.__context__ = None
+            error.__cause__ = None
             return None
-        digest = self._token_digest(token)
-        token = ""
-        del token
         async with self._lock:
             now = self._clock_now_locked()
             self._purge(now)

@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Coroutine, Iterator, Mapping
 from decimal import Decimal
+from types import FrameType
+from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
@@ -93,6 +95,16 @@ class SwallowingCancellationClassifier(FakeClassifier):
         return self.result
 
 
+class ExactCancellationClassifier(FakeClassifier):
+    def __init__(self, error: asyncio.CancelledError) -> None:
+        super().__init__(error)
+        self.error = error
+
+    async def classify(self, task_text: str) -> object:
+        self.calls.append(task_text)
+        raise self.error
+
+
 def router(
     primary: FakeClassifier | None = None,
     verifier: FakeClassifier | None = None,
@@ -125,6 +137,34 @@ def internal_traceback_locals(error: BaseException, filename: str) -> str:
             values.append(repr(traceback.tb_frame.f_locals))
         traceback = traceback.tb_next
     return "".join(values)
+
+
+def traceback_frames(error: BaseException) -> list[FrameType]:
+    frames: list[FrameType] = []
+    seen: set[int] = set()
+    pending: list[BaseException] = [error]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        traceback = current.__traceback__
+        while traceback is not None:
+            frames.append(traceback.tb_frame)
+            traceback = traceback.tb_next
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return frames
+
+
+def package_traceback_locals(error: BaseException) -> str:
+    return "".join(
+        repr(frame.f_locals)
+        for frame in traceback_frames(error)
+        if "agent_hub" in frame.f_code.co_filename.replace("\\", "/")
+    )
 
 
 @pytest.mark.parametrize("mode", ["direct", "dispatch", "discuss", "hybrid"])
@@ -288,6 +328,7 @@ async def test_uncooperative_classifiers_have_bounded_cleanup_and_registry_capac
 
 
 async def test_outer_cancel_of_uncooperative_classifiers_is_bounded_and_exact() -> None:
+    sentinel = "sk-sensitive-outer-route-task"
     first = SwallowingCancellationClassifier(assessment())
     second = SwallowingCancellationClassifier(assessment(source=RouteSource.VERIFIER))
     selected_router = ModeRouter(
@@ -300,12 +341,16 @@ async def test_outer_cancel_of_uncooperative_classifiers_is_bounded_and_exact() 
             max_detached_classifier_tasks=2,
         ),
     )
-    route_task = asyncio.create_task(selected_router.route("ambiguous request"))
+    route_task = asyncio.create_task(selected_router.route(sentinel))
     await asyncio.gather(first.started.wait(), second.started.wait())
     started = asyncio.get_running_loop().time()
     route_task.cancel("outer-token")
-    with pytest.raises(asyncio.CancelledError, match="outer-token"):
+    with pytest.raises(asyncio.CancelledError, match="outer-token") as caught:
         await route_task
+    assert sentinel not in package_traceback_locals(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert route_task.cancelled() is True
     assert asyncio.get_running_loop().time() - started < 0.2
     assert len(selected_router._detached_classifier_tasks) == 2
     first.release.set()
@@ -340,11 +385,71 @@ async def test_classifier_capacity_includes_active_tasks_before_they_detach() ->
         await asyncio.sleep(0.05)
 
 
+async def test_detached_registry_failure_keeps_tasks_in_bounded_fallback_registry() -> None:
+    class RejectingTaskSet(set[asyncio.Task[object]]):
+        def add(self, element: asyncio.Task[object]) -> None:
+            del element
+            raise RuntimeError("registry unavailable")
+
+    first = SwallowingCancellationClassifier(assessment())
+    second = SwallowingCancellationClassifier(assessment(source=RouteSource.VERIFIER))
+    selected_router = ModeRouter(
+        first,
+        second,
+        token_store=InMemoryDecisionTokenStore(),
+        policy=RoutingPolicy(
+            classifier_timeout_seconds=0.02,
+            classifier_cleanup_grace_seconds=0.02,
+            max_detached_classifier_tasks=2,
+        ),
+    )
+    selected_router._detached_classifier_tasks = RejectingTaskSet()
+    try:
+        result = await selected_router.route("ambiguous registry failure request")
+        assert result.status == "waiting_user_mode"
+        assert len(selected_router._active_classifier_tasks) == 2
+        saturated = await selected_router.route("another request")
+        assert saturated.status == "waiting_user_mode"
+        assert len(first.calls) == len(second.calls) == 1
+    finally:
+        first.release.set()
+        second.release.set()
+        await asyncio.sleep(0.05)
+    assert selected_router._active_classifier_tasks == set()
+
+
 async def test_classifier_cancellation_propagates_and_cleans_sibling() -> None:
     blocker = BlockingClassifier()
     cancelled = FakeClassifier(asyncio.CancelledError("cancel-token"))
     with pytest.raises(asyncio.CancelledError, match="cancel-token"):
         await router(cancelled, blocker).route("ambiguous request")
+    assert blocker.cancelled is True
+
+
+async def test_route_cancellation_preserves_identity_without_task_text_traceback() -> None:
+    sentinel = "sk-sensitive-route-task"
+    cancellation = asyncio.CancelledError("exact-classifier-cancel")
+    blocker = BlockingClassifier()
+    selected_router = router(ExactCancellationClassifier(cancellation), blocker)
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await selected_router.route(sentinel)
+    assert caught.value is cancellation
+    assert caught.value.args == ("exact-classifier-cancel",)
+    assert sentinel not in package_traceback_locals(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert blocker.cancelled is True
+
+
+async def test_private_classify_cancellation_has_the_same_safe_boundary() -> None:
+    sentinel = "sk-sensitive-private-classify"
+    cancellation = asyncio.CancelledError("exact-private-cancel")
+    blocker = BlockingClassifier()
+    selected_router = router(ExactCancellationClassifier(cancellation), blocker)
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await selected_router._classify(sentinel)
+    assert caught.value is cancellation
+    assert sentinel not in package_traceback_locals(caught.value)
     assert blocker.cancelled is True
 
 
@@ -380,6 +485,63 @@ async def test_router_revalidates_instances_and_rejects_mapping_contracts() -> N
         token_store=InMemoryDecisionTokenStore(),
     ).route("ambiguous request")
     assert mapping_rejected.status == "waiting_user_mode"
+
+
+@pytest.mark.parametrize("kind", ["sync_raise", "non_awaitable"])
+async def test_sync_or_nonawaitable_classifier_failure_cleans_started_sibling(kind: str) -> None:
+    sentinel = "sk-sync-classifier-material"
+
+    class InvalidClassifier:
+        def classify(self, task_text: str) -> object:
+            if kind == "sync_raise":
+                raise RuntimeError(task_text)
+            return assessment(source=RouteSource.VERIFIER)
+
+    blocker = BlockingClassifier()
+    selected_router = ModeRouter(
+        blocker,
+        InvalidClassifier(),  # type: ignore[arg-type]
+        token_store=InMemoryDecisionTokenStore(),
+    )
+    result = await selected_router.route(sentinel)
+    assert result.status == "waiting_user_mode"
+    assert blocker.cancelled is True
+    assert selected_router._active_classifier_tasks == set()
+    assert selected_router._detached_classifier_tasks == set()
+    assert sentinel not in repr(result)
+
+
+async def test_partial_classifier_task_creation_failure_cleans_first_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blocker = BlockingClassifier()
+    selected_router = router(
+        blocker,
+        FakeClassifier(assessment(source=RouteSource.VERIFIER)),
+    )
+    real_create_task = asyncio.create_task
+    calls = 0
+    created_tasks: list[asyncio.Task[object]] = []
+
+    def fail_second_create(coroutine: object, **kwargs: object) -> asyncio.Task[object]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("task creation unavailable")
+        created: asyncio.Task[object] = real_create_task(
+            cast(Coroutine[Any, Any, object], coroutine),
+            name=cast(str | None, kwargs.get("name")),
+        )
+        created_tasks.append(created)
+        return created
+
+    monkeypatch.setattr(asyncio, "create_task", fail_second_create)
+    result = await selected_router._classify("sk-task-construction-material")
+    assert result is None
+    assert len(created_tasks) == 1
+    assert created_tasks[0].cancelled() is True
+    assert selected_router._active_classifier_tasks == set()
+    assert selected_router._detached_classifier_tasks == set()
 
 
 async def test_hostile_mapping_from_classifier_fails_closed() -> None:
@@ -467,6 +629,12 @@ async def test_multilingual_explicit_risk_preserves_mode_and_approval(
         "sudo rm --recursive --force /srv/app",
         "rm -r --force --no-preserve-root /",
         "rm --force -r ./cache",
+        "Explain how backups work while you delete production database",
+        "What is a mutex before you transfer money to the supplier",
+        "说明备份原理，同时删除生产数据库",
+        "Please execute rm -rf /var/lib/app now",
+        "The command is sudo rm --recursive --force /srv/app",
+        "Explain why rm -r --force ./cache is needed",
     ],
 )
 async def test_multilingual_high_risk_auto_routing_always_waits(text: str) -> None:
@@ -547,11 +715,16 @@ async def test_confirmation_cancellation_clears_token_and_propagates_exactly() -
         def __init__(self) -> None:
             super().__init__()
             self.started = asyncio.Event()
+            self.cancellation: asyncio.CancelledError | None = None
 
         async def consume(self, *args: object, **kwargs: object) -> None:
-            del args, kwargs
             self.started.set()
-            await asyncio.Future()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError as error:
+                self.cancellation = error
+                assert args and kwargs
+                raise
 
     sentinel = "sk_" + "cancellation-token-material-123456789"
     store = BlockingConsumeStore()
@@ -572,7 +745,11 @@ async def test_confirmation_cancellation_clears_token_and_propagates_exactly() -
     task.cancel("outer-confirm-cancel")
     with pytest.raises(asyncio.CancelledError, match="outer-confirm-cancel") as caught:
         await task
+    assert caught.value is store.cancellation
     assert sentinel not in internal_traceback_locals(caught.value, "agent_hub/routing/service.py")
+    assert all(frame.f_code.co_name != "consume" for frame in traceback_frames(caught.value))
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 async def test_confirmation_token_is_atomic_one_time_and_subject_bound() -> None:
@@ -992,6 +1169,53 @@ async def test_token_store_clock_failure_traceback_does_not_retain_token() -> No
     assert caught.value.__context__ is None
 
 
+async def test_hostile_subject_is_processed_only_after_plaintext_token_is_deleted() -> None:
+    token = "sk_" + "hostile-subject-token-material-123456789"
+    caller_locals: list[str] = []
+
+    class HostileSubject(ConfirmationSubject):
+        def model_dump(self, *args: object, **kwargs: object) -> dict[str, object]:
+            del args, kwargs
+            frame = inspect.currentframe()
+            assert frame is not None and frame.f_back is not None
+            caller_locals.append(repr(frame.f_back.f_locals))
+            raise RuntimeError("hostile-subject-error")
+
+    hostile = HostileSubject(
+        tenant_id="tenant-1",
+        user_id="user-1",
+        task_id="task-1",
+        generation="generation-1",
+    )
+    store = InMemoryDecisionTokenStore()
+    assert (
+        await store.consume(
+            token,
+            hostile,
+            version=1,
+            selected_mode=TaskMode.DIRECT,
+        )
+        is None
+    )
+    assert token not in "".join(caller_locals)
+
+    selected_router = ModeRouter(
+        FakeClassifier(assessment()),
+        FakeClassifier(assessment(source=RouteSource.VERIFIER)),
+        token_store=store,
+    )
+    with pytest.raises(ValueError, match="stale") as caught:
+        await selected_router.confirm_mode(
+            TaskMode.DIRECT,
+            decision_token=token,
+            version=1,
+            confirmation_subject=hostile,
+        )
+    assert token not in package_traceback_locals(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
 def test_route_contracts_are_strict_frozen_and_enforce_invariants() -> None:
     item = assessment()
     with pytest.raises(ValidationError):
@@ -1085,11 +1309,16 @@ class FakeGateway:
 class BlockingGateway:
     def __init__(self) -> None:
         self.started = asyncio.Event()
+        self.cancellation: asyncio.CancelledError | None = None
 
     async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
-        del request
         self.started.set()
-        await asyncio.Future()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError as error:
+            self.cancellation = error
+            assert request.messages
+            raise
         raise AssertionError("unreachable")
 
 
@@ -1104,9 +1333,16 @@ async def test_gateway_classifier_cancellation_clears_sensitive_traceback_locals
     task.cancel("outer-cancel")
     with pytest.raises(asyncio.CancelledError, match="outer-cancel") as caught:
         await task
+    assert caught.value is gateway.cancellation
     assert sentinel not in internal_traceback_locals(
         caught.value, "agent_hub/routing/classifier.py"
     )
+    assert all(
+        frame.f_code.co_name != "complete_with_context" for frame in traceback_frames(caught.value)
+    )
+    assert sentinel not in package_traceback_locals(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
     assert sentinel not in task.get_name()
 
 

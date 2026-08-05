@@ -148,14 +148,16 @@ class RiskRulePolicy:
 
     def is_high_risk(self, task_text: str) -> bool:
         normalized = unicodedata.normalize("NFKC", task_text).casefold()
-        return any(self._clause_is_high_risk(clause) for clause in self._clauses(normalized))
+        if self._has_recursive_force_remove(normalized):
+            return True
+        return any(
+            self._clause_is_high_risk(segment) for segment in self._safety_segments(normalized)
+        )
 
     @staticmethod
-    def _clauses(normalized: str) -> tuple[str, ...]:
+    def _safety_segments(normalized: str) -> tuple[str, ...]:
         boundary = re.compile(
-            r"(?:[;\n!?。！？]+|\.(?=\s+|$)|,\s*(?=(?:and\s+)?then\b)|"
-            r"\b(?:and\s+then|and\s+afterwards|then|afterwards|after\s+that|next)\b|"
-            r"(?:然后|随后|接着|之后|并且|说明后|解释后))",
+            r"(?:[;\n!?。！？]+|\.(?=\s+|$))",
             re.IGNORECASE,
         )
         return tuple(part.strip(" ,") for part in boundary.split(normalized) if part.strip(" ,"))
@@ -168,14 +170,6 @@ class RiskRulePolicy:
 
         def has(values: tuple[str, ...]) -> bool:
             return not english_tokens.isdisjoint(values)
-
-        english_read_only = (
-            re.match(r"^\s*(?:explain|what\s+is|what\s+are|describe|how\s+does)\b", clause)
-            is not None
-        )
-        chinese_read_only = clause.startswith(("解释", "什么是", "介绍", "说明"))
-        if english_read_only or chinese_read_only:
-            return False
 
         destructive_action = has(self.destructive_actions) or (
             "shut" in english_tokens and "down" in english_tokens
@@ -194,7 +188,6 @@ class RiskRulePolicy:
             or (has(self.financial_actions) and (has(self.financial_targets) or currency_amount))
             or (has(self.sensitive_actions) and has(sensitive_targets))
             or (has(self.external_actions) and has(self.external_targets))
-            or any(marker in clause for marker in self.irreversible_markers)
         ):
             return True
 
@@ -250,9 +243,8 @@ class RiskRulePolicy:
         def contains_any(values: tuple[str, ...]) -> bool:
             return any(value in clause for value in values)
 
-        return (
+        explicit_chinese_risk = (
             contains_any(chinese_financial)
-            or contains_any(("不可逆", "无法撤销", "永久"))
             or (
                 contains_any(chinese_destructive_actions)
                 and contains_any(chinese_destructive_targets)
@@ -260,12 +252,25 @@ class RiskRulePolicy:
             or (contains_any(chinese_sensitive_actions) and contains_any(chinese_sensitive_targets))
             or (contains_any(chinese_external_actions) and contains_any(chinese_external_targets))
         )
+        if explicit_chinese_risk:
+            return True
+
+        english_read_only = (
+            re.match(r"^\s*(?:explain|what\s+is|what\s+are|describe|how\s+does)\b", clause)
+            is not None
+        )
+        chinese_read_only = clause.startswith(("解释", "什么是", "介绍", "说明"))
+        if english_read_only or chinese_read_only:
+            return False
+        return any(marker in clause for marker in self.irreversible_markers) or contains_any(
+            ("不可逆", "无法撤销", "永久")
+        )
 
     @staticmethod
     def _has_recursive_force_remove(normalized: str) -> bool:
         """Detect a dangerous rm form as text only; this never parses or executes a shell."""
         command = re.compile(
-            r"(?:^|[;&|])\s*(?:sudo\s+)?rm\s+"
+            r"\brm\s+"
             r"(?P<flags>(?:(?:-[a-z]+|--[a-z][a-z-]*)\s+)+)"
             r"(?:--\s+)?(?P<target>[^\s;&|]+)",
             re.IGNORECASE,
