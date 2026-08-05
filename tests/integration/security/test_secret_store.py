@@ -65,7 +65,7 @@ async def test_key_rotation_deduplicates_with_old_row_and_resolves_keyring_versi
     tenant_id = await _create_tenant(secret_session_factory, slug="rotation")
     v1_service = SecretService(
         secret_session_factory,
-        SecretCipher(MASTER_KEY, key_id="v1", fingerprint_key=FINGERPRINT_KEY),
+        SecretCipher(MASTER_KEY, key_id="v1"),
     )
     old_reference = await v1_service.create_or_get(
         tenant_id, uuid4(), "stable across rotation"
@@ -74,7 +74,7 @@ async def test_key_rotation_deduplicates_with_old_row_and_resolves_keyring_versi
         ROTATED_KEY,
         key_id="v2",
         decryption_keys={"v1": MASTER_KEY},
-        fingerprint_key=FINGERPRINT_KEY,
+        fingerprint_key=MASTER_KEY,
     )
     v2_service = SecretService(secret_session_factory, v2_cipher)
 
@@ -239,6 +239,7 @@ async def test_create_or_get_rejects_unpaired_surrogate_without_writing_a_row(
 
     assert str(captured.value) == "secret could not be encoded"
     assert "private" not in str(captured.value)
+    _assert_production_frames_hide_markers(captured.value, ("private",))
     async with secret_session_factory() as session:
         assert await session.scalar(select(func.count()).select_from(SecretRow)) == 0
 
@@ -283,6 +284,7 @@ async def test_persistence_failure_is_sanitized_and_rolls_back(
         expected.ciphertext,
     )
     assert all(marker not in exposed for marker in sensitive_markers)
+    _assert_production_frames_hide_markers(captured.value, sensitive_markers)
     async with secret_session_factory() as session:
         assert await session.scalar(select(func.count()).select_from(SecretRow)) == 0
 
@@ -343,3 +345,21 @@ async def test_database_unique_constraint_is_final_deduplication_defense(
         )
         with pytest.raises(IntegrityError):
             await session.commit()
+
+
+def _assert_production_frames_hide_markers(
+    error: BaseException,
+    markers: tuple[str, ...],
+) -> None:
+    exposed: list[str] = []
+    current_traceback = error.__traceback__
+    while current_traceback is not None:
+        frame = current_traceback.tb_frame
+        module_name = str(frame.f_globals.get("__name__", ""))
+        if module_name.startswith("agent_hub"):
+            exposed.extend(
+                f"{name}={value!r}" for name, value in frame.f_locals.items()
+            )
+        current_traceback = current_traceback.tb_next
+    rendered = " ".join(exposed)
+    assert all(marker not in rendered for marker in markers)

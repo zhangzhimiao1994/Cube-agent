@@ -1,4 +1,5 @@
-from base64 import b64encode
+import traceback
+from base64 import b64decode, b64encode
 from collections.abc import Callable
 from dataclasses import replace
 from uuid import UUID, uuid4
@@ -83,10 +84,37 @@ def test_cipher_rotation_uses_keyring_and_stable_independent_fingerprint_key() -
     assert str(captured.value) == "secret could not be decrypted"
 
 
+def test_rotation_preserves_default_v1_fingerprint_when_initial_master_is_root() -> None:
+    v1 = SecretCipher(MASTER_KEY, key_id="v1")
+    old = v1.seal("default deployment secret", context="tenant-a")
+    v2 = SecretCipher(
+        ROTATED_KEY,
+        key_id="v2",
+        decryption_keys={"v1": MASTER_KEY},
+        fingerprint_key=MASTER_KEY,
+    )
+
+    resealed = v2.seal("default deployment secret", context="tenant-a")
+
+    assert resealed.fingerprint == old.fingerprint
+    assert v2.open(old, context="tenant-a") == "default deployment secret"
+
+
+def test_rotation_requires_explicit_stable_fingerprint_root() -> None:
+    with pytest.raises(ValueError, match="fingerprint_key is required"):
+        SecretCipher(
+            ROTATED_KEY,
+            key_id="v2",
+            decryption_keys={"v1": MASTER_KEY},
+        )
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"fingerprint_key": b"short"},
+        {"fingerprint_key": b""},
+        {"fingerprint_key": bytes(31)},
+        {"fingerprint_key": bytes(33)},
         {"decryption_keys": {"v0": b"short"}},
         {"decryption_keys": {"unsafe key id": MASTER_KEY}},
         {"key_id": "v1", "decryption_keys": {"v1": OTHER_KEY}},
@@ -151,6 +179,77 @@ def test_seal_rejects_unpaired_surrogate_without_disclosing_input() -> None:
 
     assert str(captured.value) == "secret could not be encoded"
     assert "private" not in str(captured.value)
+    _assert_exception_has_no_sensitive_state(captured.value, ("private",))
+
+
+def test_surrogate_context_has_context_free_safe_errors() -> None:
+    cipher = SecretCipher(MASTER_KEY)
+    valid = cipher.seal("safe", context="tenant-a")
+    sensitive_context = "sensitive-context-\ud800"
+    sensitive_plaintext = b64decode(
+        "c2Vuc2l0aXZlLXBsYWludGV4dA=="
+    ).decode("ascii")
+
+    with pytest.raises(SecretValidationError) as seal_error:
+        cipher.seal(sensitive_plaintext, context=sensitive_context)
+    with pytest.raises(SecretDecryptionError) as open_error:
+        cipher.open(valid, context=sensitive_context)
+
+    assert str(seal_error.value) == "secret context is invalid"
+    assert str(open_error.value) == "secret could not be decrypted"
+    for error in (seal_error.value, open_error.value):
+        _assert_exception_has_no_sensitive_state(
+            error,
+            ("sensitive-context", "sensitive-plaintext"),
+        )
+
+
+def test_non_utf8_decryption_error_has_no_decrypted_bytes_in_exception_state() -> None:
+    payload = b"DECRYPTED-SENSITIVE-MARKER-\xff"
+    nonce = bytes(range(12))
+    raw_ciphertext = AESGCM(MASTER_KEY).encrypt(
+        nonce,
+        payload,
+        b"agent-hub-secret-v1\x00tenant-a",
+    )
+    sealed = SealedSecret(
+        key_id="v1",
+        nonce=b64encode(nonce).decode("ascii"),
+        ciphertext=b64encode(raw_ciphertext).decode("ascii"),
+        fingerprint="0" * 64,
+    )
+
+    with pytest.raises(SecretDecryptionError) as captured:
+        SecretCipher(MASTER_KEY).open(sealed, context="tenant-a")
+
+    _assert_exception_has_no_sensitive_state(
+        captured.value,
+        ("DECRYPTED-SENSITIVE-MARKER", sealed.ciphertext),
+    )
+
+
+@pytest.mark.parametrize("failure", ["invalid-base64", "invalid-tag"])
+def test_decode_and_auth_errors_have_no_sealed_payload_in_exception_state(
+    failure: str,
+) -> None:
+    cipher = SecretCipher(MASTER_KEY)
+    sealed = cipher.seal("authentication-sensitive-plaintext", context="tenant-a")
+    if failure == "invalid-base64":
+        changed = replace(sealed, nonce="!!!!!!!!!!!!!!!?")
+        marker = changed.nonce
+    else:
+        tampered = bytearray(b64decode(sealed.ciphertext))
+        tampered[0] ^= 1
+        changed = replace(sealed, ciphertext=b64encode(tampered).decode("ascii"))
+        marker = changed.ciphertext
+
+    with pytest.raises(SecretDecryptionError) as captured:
+        cipher.open(changed, context="tenant-a")
+
+    _assert_exception_has_no_sensitive_state(
+        captured.value,
+        ("authentication-sensitive-plaintext", marker),
+    )
 
 
 @pytest.mark.parametrize(
@@ -296,6 +395,26 @@ def _authenticated_non_utf8_secret() -> SealedSecret:
         ciphertext=b64encode(raw_ciphertext).decode("ascii"),
         fingerprint="0" * 64,
     )
+
+
+def _assert_exception_has_no_sensitive_state(
+    error: BaseException,
+    markers: tuple[str, ...],
+) -> None:
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    exposed = [repr(error.args), "".join(traceback.format_exception(error))]
+    current_traceback = error.__traceback__
+    while current_traceback is not None:
+        frame = current_traceback.tb_frame
+        module_name = str(frame.f_globals.get("__name__", ""))
+        if module_name.startswith("agent_hub"):
+            exposed.extend(
+                f"{name}={value!r}" for name, value in frame.f_locals.items()
+            )
+        current_traceback = current_traceback.tb_next
+    rendered = " ".join(exposed)
+    assert all(marker not in rendered for marker in markers)
 
 
 def test_sealed_secret_repr_and_str_redact_all_payload_fields() -> None:

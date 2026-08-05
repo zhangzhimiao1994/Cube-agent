@@ -8,6 +8,7 @@ import re
 import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import NoReturn
 from uuid import UUID, uuid4
 
 from cryptography.exceptions import InvalidTag
@@ -21,7 +22,11 @@ from agent_hub.db.models import SecretRow
 
 _DOMAIN_SEPARATOR = b"agent-hub-secret-v1"
 _FINGERPRINT_KEY_LABEL = _DOMAIN_SEPARATOR + b"\x00fingerprint-key"
-_FINGERPRINT_DOMAIN = b"agent-hub-secret-fingerprint-v2"
+# Fingerprint scheme v2 is the first production scheme; see the hardening plan.
+_FINGERPRINT_SCHEME_VERSION = b"v2"
+_FINGERPRINT_DOMAIN = (
+    b"agent-hub-secret-fingerprint-" + _FINGERPRINT_SCHEME_VERSION
+)
 _MAX_SECRET_BYTES = 65_536
 _MAX_CONTEXT_BYTES = 1_024
 _NONCE_BYTES = 12
@@ -34,6 +39,7 @@ _REFERENCE_PATTERN = re.compile(
     r"secret://[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{12}\Z"
 )
+_DECRYPTION_FAILED = object()
 
 
 class SecretValidationError(ValueError):
@@ -68,10 +74,12 @@ class SealedSecret:
 class SecretCipher:
     """Encrypt secrets with an active key and decrypt with a validated keyring.
 
-    Rotations must reuse an independent ``fingerprint_key`` and provide retired
-    AES keys through ``decryption_keys`` so existing rows keep deduplicating and
-    remain decryptable. The single-key default derives a fingerprint key from
-    ``master_key`` for convenient backwards-compatible configuration.
+    ``fingerprint_key`` is 32-byte root material, not the direct HMAC key. Every
+    path domain-derives the effective HMAC key from that root. Rotations must
+    explicitly reuse the initial stable root and provide retired AES keys via
+    ``decryption_keys``. A first single-key deployment defaults the root to
+    ``master_key``; rotating that deployment passes the initial master key as
+    ``fingerprint_key``.
     """
 
     def __init__(
@@ -84,6 +92,10 @@ class SecretCipher:
     ) -> None:
         _validate_key(master_key, description="AES-256 master key")
         _validate_key_id(key_id)
+        if decryption_keys and fingerprint_key is None:
+            raise ValueError(
+                "fingerprint_key is required when decryption_keys are configured"
+            )
         self._aead_keys = {key_id: AESGCM(master_key)}
         for decrypt_key_id, decrypt_key in (decryption_keys or {}).items():
             _validate_key_id(decrypt_key_id)
@@ -91,34 +103,54 @@ class SecretCipher:
                 raise ValueError("active key_id must not appear in decryption_keys")
             _validate_key(decrypt_key, description="AES-256 decryption key")
             self._aead_keys[decrypt_key_id] = AESGCM(decrypt_key)
-        if fingerprint_key is None:
-            fingerprint_key = hmac.digest(
-                master_key, _FINGERPRINT_KEY_LABEL, hashlib.sha256
-            )
-        else:
-            _validate_key(fingerprint_key, description="fingerprint key")
-        self._fingerprint_key = fingerprint_key
+        fingerprint_root = master_key if fingerprint_key is None else fingerprint_key
+        _validate_key(fingerprint_root, description="fingerprint key")
+        self._fingerprint_key = hmac.digest(
+            fingerprint_root, _FINGERPRINT_KEY_LABEL, hashlib.sha256
+        )
         self._key_id = key_id
 
     def seal(self, plaintext: str, *, context: str) -> SealedSecret:
-        encoded = _validated_plaintext(plaintext)
+        encoded = _try_validated_plaintext(plaintext)
+        if isinstance(encoded, str):
+            validation_message = encoded
+            del plaintext, context, encoded
+            _raise_secret_validation_error(validation_message)
+        context_bytes = _try_validated_context(context)
+        if context_bytes is None:
+            del plaintext, context, encoded
+            _raise_secret_validation_error("secret context is invalid")
+        del plaintext, context
         nonce = secrets.token_bytes(_NONCE_BYTES)
         ciphertext = self._aead_keys[self._key_id].encrypt(
-            nonce, encoded, _aad(context)
+            nonce, encoded, _aad(context_bytes)
         )
         return SealedSecret(
             key_id=self._key_id,
             nonce=_canonical_b64encode(nonce),
             ciphertext=_canonical_b64encode(ciphertext),
-            fingerprint=self._fingerprint(encoded, context),
+            fingerprint=self._fingerprint(encoded, context_bytes),
         )
 
     def open(self, sealed: SealedSecret, *, context: str) -> str:
+        opened = self._try_open(sealed, context)
+        if opened is _DECRYPTION_FAILED:
+            del sealed, context
+            _raise_secret_decryption_error()
+        assert isinstance(opened, str)
+        return opened
+
+    def _try_open(
+        self, sealed: SealedSecret, context: str
+    ) -> str | object:
         try:
             _validate_sealed_fields(sealed)
+            context_bytes = _try_validated_context(context)
+            if context_bytes is None:
+                return _DECRYPTION_FAILED
             aead = self._aead_keys.get(sealed.key_id)
             if aead is None:
-                raise ValueError
+                return _DECRYPTION_FAILED
             nonce = _canonical_b64decode(sealed.nonce)
             ciphertext = _canonical_b64decode(sealed.ciphertext)
             if (
@@ -126,24 +158,24 @@ class SecretCipher:
                 or len(ciphertext) < 16
                 or len(ciphertext) > _MAX_CIPHERTEXT_BYTES
             ):
-                raise ValueError
-            plaintext = aead.decrypt(nonce, ciphertext, _aad(context))
+                return _DECRYPTION_FAILED
+            plaintext = aead.decrypt(nonce, ciphertext, _aad(context_bytes))
             decoded = plaintext.decode("utf-8")
             if not hmac.compare_digest(
-                self._fingerprint(plaintext, context), sealed.fingerprint
+                self._fingerprint(plaintext, context_bytes), sealed.fingerprint
             ):
-                raise ValueError
-            _validated_plaintext(decoded)
+                return _DECRYPTION_FAILED
+            if isinstance(_try_validated_plaintext(decoded), str):
+                return _DECRYPTION_FAILED
             return decoded
         except (InvalidTag, UnicodeDecodeError, ValueError, TypeError):
-            raise SecretDecryptionError("secret could not be decrypted") from None
+            return _DECRYPTION_FAILED
 
-    def _fingerprint(self, plaintext: bytes, context: str) -> str:
-        context_bytes = context.encode("utf-8")
+    def _fingerprint(self, plaintext: bytes, context: bytes) -> str:
         fingerprint_input = (
             _FINGERPRINT_DOMAIN
-            + len(context_bytes).to_bytes(4, "big")
-            + context_bytes
+            + len(context).to_bytes(4, "big")
+            + context
             + plaintext
         )
         return hmac.digest(
@@ -272,7 +304,12 @@ class SecretService:
     async def create_or_get(
         self, tenant_id: UUID, actor_id: UUID | None, plaintext: str
     ) -> SecretReference:
-        sealed = self._cipher.seal(plaintext, context=str(tenant_id))
+        sealed = self._try_seal_for_storage(tenant_id, plaintext)
+        del plaintext
+        if isinstance(sealed, str):
+            validation_message = sealed
+            del sealed
+            _raise_secret_validation_error(validation_message)
         try:
             async with self._session_factory() as session, session.begin():
                 secret_id = await self._repository.create_or_get_id(
@@ -284,7 +321,16 @@ class SecretService:
             return SecretReference(tenant_id=tenant_id, secret_id=secret_id)
         except SQLAlchemyError:
             pass
-        raise SecretPersistenceError("secret could not be stored") from None
+        del sealed
+        _raise_secret_persistence_error()
+
+    def _try_seal_for_storage(
+        self, tenant_id: UUID, plaintext: str
+    ) -> SealedSecret | str:
+        try:
+            return self._cipher.seal(plaintext, context=str(tenant_id))
+        except SecretValidationError as error:
+            return str(error)
 
     async def resolve(
         self, tenant_id: UUID, reference: SecretReference | UUID | str
@@ -311,20 +357,32 @@ class SecretService:
         return SecretReference.parse(tenant_id, reference).secret_id
 
 
-def _validated_plaintext(plaintext: str) -> bytes:
+def _try_validated_plaintext(plaintext: str) -> bytes | str:
     if not isinstance(plaintext, str):
-        raise SecretValidationError("secret must be a non-blank string")
+        return "secret must be a non-blank string"
     if len(plaintext) > _MAX_SECRET_BYTES:
-        raise SecretValidationError("secret must be at most 65536 UTF-8 bytes")
+        return "secret must be at most 65536 UTF-8 bytes"
     if not plaintext.strip():
-        raise SecretValidationError("secret must be a non-blank string")
+        return "secret must be a non-blank string"
     try:
         encoded = plaintext.encode("utf-8")
     except UnicodeEncodeError:
-        raise SecretValidationError("secret could not be encoded") from None
+        return "secret could not be encoded"
     if len(encoded) > _MAX_SECRET_BYTES:
-        raise SecretValidationError("secret must be at most 65536 UTF-8 bytes")
+        return "secret must be at most 65536 UTF-8 bytes"
     return encoded
+
+
+def _raise_secret_validation_error(message: str) -> NoReturn:
+    raise SecretValidationError(message)
+
+
+def _raise_secret_decryption_error() -> NoReturn:
+    raise SecretDecryptionError("secret could not be decrypted")
+
+
+def _raise_secret_persistence_error() -> NoReturn:
+    raise SecretPersistenceError("secret could not be stored")
 
 
 def _validate_key(key: bytes, *, description: str) -> None:
@@ -357,19 +415,19 @@ def _validate_sealed_fields(sealed: SealedSecret) -> None:
         raise ValueError
 
 
-def _aad(context: str) -> bytes:
-    return _DOMAIN_SEPARATOR + b"\x00" + _validated_context(context)
+def _aad(context: bytes) -> bytes:
+    return _DOMAIN_SEPARATOR + b"\x00" + context
 
 
-def _validated_context(context: str) -> bytes:
+def _try_validated_context(context: str) -> bytes | None:
     if not isinstance(context, str) or len(context) > _MAX_CONTEXT_BYTES:
-        raise ValueError("secret context is invalid")
+        return None
     try:
         encoded = context.encode("utf-8")
     except UnicodeEncodeError:
-        raise ValueError("secret context is invalid") from None
+        return None
     if len(encoded) > _MAX_CONTEXT_BYTES:
-        raise ValueError("secret context is invalid")
+        return None
     return encoded
 
 
