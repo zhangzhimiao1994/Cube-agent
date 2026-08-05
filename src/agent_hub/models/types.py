@@ -1,0 +1,241 @@
+import math
+import re
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
+from enum import StrEnum
+from types import MappingProxyType
+from urllib.parse import urlsplit
+
+_SAFE_IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+_SAFE_SCHEMA_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
+_MAX_IDENTIFIER_LENGTH = 128
+
+type JsonScalar = str | int | float | bool | None
+type JsonValue = JsonScalar | tuple[JsonValue, ...] | Mapping[str, JsonValue]
+type ContentPart = Mapping[str, object]
+type MessageContent = str | tuple[ContentPart, ...]
+
+
+class ModelCapability(StrEnum):
+    TEXT = "text"
+    VISION = "vision"
+    TOOL_CALLING = "tool_calling"
+    STRUCTURED_OUTPUT = "structured_output"
+
+
+def _require_safe_identifier(name: str, value: str) -> None:
+    if len(value) > _MAX_IDENTIFIER_LENGTH or _SAFE_IDENTIFIER.fullmatch(value) is None:
+        raise ValueError(f"{name} must be a safe identifier")
+
+
+def _require_unpadded(name: str, value: str, *, max_length: int) -> None:
+    if not value or value != value.strip() or len(value) > max_length:
+        raise ValueError(f"{name} must be nonblank, unpadded, and at most {max_length} characters")
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _freeze_json(value: object) -> JsonValue:
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, Mapping):
+        frozen: dict[str, JsonValue] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("JSON object keys must be strings")
+            frozen[key] = _freeze_json(item)
+        return MappingProxyType(frozen)
+    if isinstance(value, Iterable):
+        return tuple(_freeze_json(item) for item in value)
+    raise ValueError("value is not JSON-compatible")
+
+
+def _normalize_content_part(value: Mapping[str, object]) -> ContentPart:
+    part_type = value.get("type")
+    if part_type == "text":
+        if set(value) != {"type", "text"} or not isinstance(value.get("text"), str):
+            raise ValueError("text content parts require only type and text strings")
+    elif part_type == "image_url":
+        if set(value) != {"type", "image_url"}:
+            raise ValueError("image_url content parts require only type and image_url")
+        image_url = value.get("image_url")
+        if not isinstance(image_url, Mapping):
+            raise ValueError("image_url must be an object")
+        if not set(image_url).issubset({"url", "detail"}) or "url" not in image_url:
+            raise ValueError("image_url requires url and optional detail")
+        url = image_url.get("url")
+        if not isinstance(url, str) or not url or url != url.strip():
+            raise ValueError("image url must be a nonblank, unpadded string")
+        detail = image_url.get("detail")
+        if detail is not None and detail not in {"auto", "low", "high"}:
+            raise ValueError("image detail must be auto, low, or high")
+    else:
+        raise ValueError("content part type must be text or image_url")
+
+    frozen = _freeze_json(value)
+    if not isinstance(frozen, Mapping):  # pragma: no cover - guaranteed by input type
+        raise TypeError("content part normalization produced a non-object")
+    return frozen
+
+
+@dataclass(frozen=True, slots=True)
+class Deployment:
+    id: str
+    logical_model: str
+    provider_model: str = "openai/gpt-4o-mini"
+    api_base: str = "http://litellm:4000/v1"
+    secret_ref: str = field(default="litellm-internal-key", repr=False)
+    quota_scope_id: str = "default-account"
+    max_concurrency: int = 1
+    target_utilization: float = 0.8
+    reserved_slots: int = 0
+    rpm: int | None = None
+    tpm: int | None = None
+    weight: int = 100
+    capabilities: frozenset[ModelCapability] = field(
+        default_factory=lambda: frozenset({ModelCapability.TEXT})
+    )
+
+    def __post_init__(self) -> None:
+        _require_safe_identifier("deployment id", self.id)
+        _require_safe_identifier("logical_model", self.logical_model)
+        _require_unpadded("provider_model", self.provider_model, max_length=512)
+        _require_unpadded("secret_ref", self.secret_ref, max_length=512)
+        _require_unpadded("quota_scope_id", self.quota_scope_id, max_length=128)
+
+        parsed_base = urlsplit(self.api_base)
+        if (
+            self.api_base != self.api_base.strip()
+            or parsed_base.scheme not in {"http", "https"}
+            or not parsed_base.netloc
+            or parsed_base.username is not None
+            or parsed_base.password is not None
+        ):
+            raise ValueError("api_base must be a valid HTTP(S) URL")
+        if not _is_int(self.max_concurrency) or not 1 <= self.max_concurrency <= 1000:
+            raise ValueError("max_concurrency must be between 1 and 1000")
+        if not math.isfinite(self.target_utilization) or not 0.5 <= self.target_utilization <= 0.9:
+            raise ValueError("target_utilization must be finite and between 0.5 and 0.9")
+        if (
+            not _is_int(self.reserved_slots)
+            or self.reserved_slots < 0
+            or self.reserved_slots >= self.max_concurrency
+        ):
+            raise ValueError("reserved_slots must be nonnegative and below max_concurrency")
+        if self.rpm is not None and (not _is_int(self.rpm) or self.rpm <= 0):
+            raise ValueError("rpm must be positive")
+        if self.tpm is not None and (not _is_int(self.tpm) or self.tpm <= 0):
+            raise ValueError("tpm must be positive")
+        if not _is_int(self.weight) or self.weight <= 0:
+            raise ValueError("weight must be positive")
+
+        capabilities = frozenset(ModelCapability(item) for item in self.capabilities)
+        if not capabilities:
+            raise ValueError("capabilities must not be empty")
+        object.__setattr__(self, "capabilities", capabilities)
+
+
+@dataclass(frozen=True, slots=True)
+class ModelMessage:
+    role: str
+    content: MessageContent
+
+    def __post_init__(self) -> None:
+        _require_unpadded("role", self.role, max_length=64)
+        if isinstance(self.content, str):
+            return
+        if not self.content:
+            raise ValueError("multimodal content must not be empty")
+        if not all(isinstance(part, Mapping) for part in self.content):
+            raise ValueError("multimodal content parts must be objects")
+        object.__setattr__(
+            self,
+            "content",
+            tuple(_normalize_content_part(part) for part in self.content),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredResponseSchema:
+    name: str
+    schema: Mapping[str, JsonValue]
+
+    def __post_init__(self) -> None:
+        if len(self.name) > 64 or _SAFE_SCHEMA_NAME.fullmatch(self.name) is None:
+            raise ValueError("schema name must be 1-64 safe characters")
+        frozen = _freeze_json(self.schema)
+        if not isinstance(frozen, Mapping):  # pragma: no cover - guaranteed by annotation
+            raise TypeError("schema must be a JSON object")
+        object.__setattr__(self, "schema", frozen)
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRequest:
+    logical_model: str
+    messages: tuple[ModelMessage, ...]
+    required_capabilities: frozenset[ModelCapability] = field(default_factory=frozenset)
+    timeout_seconds: float = 60
+    allow_fallback: bool = True
+    response_schema: StructuredResponseSchema | None = None
+
+    def __post_init__(self) -> None:
+        _require_safe_identifier("logical_model", self.logical_model)
+        if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive and finite")
+        object.__setattr__(self, "messages", tuple(self.messages))
+        object.__setattr__(
+            self,
+            "required_capabilities",
+            frozenset(ModelCapability(item) for item in self.required_capabilities),
+        )
+        if (
+            self.response_schema is not None
+            and ModelCapability.STRUCTURED_OUTPUT not in self.required_capabilities
+        ):
+            raise ValueError("response schema requires structured_output capability")
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCall:
+    id: str
+    name: str
+    arguments: Mapping[str, JsonValue]
+
+    def __post_init__(self) -> None:
+        _require_unpadded("tool call id", self.id, max_length=512)
+        _require_unpadded("tool name", self.name, max_length=512)
+        frozen = _freeze_json(self.arguments)
+        if not isinstance(frozen, Mapping):  # pragma: no cover - guaranteed by annotation
+            raise TypeError("tool arguments must be a JSON object")
+        object.__setattr__(self, "arguments", frozen)
+
+
+@dataclass(frozen=True, slots=True)
+class TokenUsage:
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+    def __post_init__(self) -> None:
+        if min(self.prompt_tokens, self.completion_tokens, self.total_tokens) < 0:
+            raise ValueError("token counts must be nonnegative")
+
+
+@dataclass(frozen=True, slots=True)
+class ModelResponse:
+    text: str | None
+    tool_calls: tuple[ToolCall, ...] = ()
+    usage: TokenUsage | None = None
+    provider_metadata: Mapping[str, JsonScalar] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "tool_calls", tuple(self.tool_calls))
+        object.__setattr__(
+            self,
+            "provider_metadata",
+            MappingProxyType(dict(self.provider_metadata)),
+        )
