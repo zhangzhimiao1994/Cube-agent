@@ -134,6 +134,22 @@ def test_contract_validation_strings_and_safe_factory_hide_hostile_input() -> No
     assert sentinel not in exception_graph_text(safe.value)
 
 
+def test_safe_factory_rejects_wide_payload_before_json_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    def forbidden_dumps(*_args: object, **_kwargs: object) -> str:
+        nonlocal called
+        called = True
+        raise AssertionError("json.dumps must not run")
+
+    monkeypatch.setattr("agent_hub.runtime.contracts.json.dumps", forbidden_dumps)
+    with pytest.raises(RuntimeContractError):
+        Artifact.from_payload({"items": [None] * 1_000_000})
+    assert not called
+
+
 def test_artifact_freezes_nested_json_and_computes_hash() -> None:
     content: dict[str, object] = {"text": "evidence", "items": [{"score": 1}]}
     artifact = Artifact(
@@ -154,6 +170,13 @@ def test_artifact_freezes_nested_json_and_computes_hash() -> None:
         artifact.id = uuid4()
     assert "evidence" not in repr(artifact)
     assert artifact.version == 1
+    for mode in ("python", "json"):
+        dumped = artifact.model_dump(mode=mode)
+        json.dumps(dumped)
+        assert "mappingproxy" not in repr(dumped)
+        restored = Artifact.from_payload(dumped)
+        assert restored.content_sha256 == artifact.content_sha256
+    json.loads(artifact.model_dump_json())
 
 
 def test_artifact_hash_binds_metadata_sources_and_provenance() -> None:
@@ -260,6 +283,11 @@ def test_checkpoint_freezes_and_hashes_bounded_safe_state() -> None:
     assert checkpoint.state_sha256 == checkpoint.recompute_state_sha256()
     assert "artifact_id" not in repr(checkpoint)
     assert json.loads(json.dumps(checkpoint.to_payload()))["run_id"] == str(RUN_ID)
+    for mode in ("python", "json"):
+        dumped = checkpoint.model_dump(mode=mode)
+        json.dumps(dumped)
+        assert RuntimeCheckpoint.from_payload(dumped) == checkpoint
+    json.loads(checkpoint.model_dump_json())
 
     with pytest.raises(ValidationError, match="sensitive"):
         RuntimeCheckpoint(
@@ -288,6 +316,30 @@ def test_event_kind_cross_field_invariants() -> None:
         RunEvent(kind=EventKind.RUNTIME_FAILED, sequence=1, run_id=RUN_ID)
     with pytest.raises(ValidationError):
         RunEvent(kind=EventKind.MODEL_STARTED, sequence=True, run_id=RUN_ID)
+
+
+def test_event_and_context_serializers_thaw_recursive_json() -> None:
+    artifact = Artifact(
+        id=uuid4(),
+        type="data",
+        producer="main",
+        content=cast(Mapping[str, JsonValue], {"nested": [{"value": 1}]}),
+    )
+    event = RunEvent(
+        kind="custom.progress",
+        sequence=1,
+        run_id=RUN_ID,
+        payload=cast(Mapping[str, JsonValue], {"nested": [{"x": 1}]}),
+    )
+    task = context(artifacts=(artifact,))
+    for value in (event, task):
+        python_dump = value.model_dump(mode="python")
+        json.dumps(python_dump)
+        assert "mappingproxy" not in repr(python_dump)
+        json.loads(value.model_dump_json())
+    for mode in ("python", "json"):
+        assert RunEvent.from_payload(event.model_dump(mode=mode)) == event
+        assert TaskContext.from_payload(task.model_dump(mode=mode)) == task
 
 
 def test_event_contract_supports_bounded_framework_neutral_evolution() -> None:
@@ -440,6 +492,22 @@ def test_cost_event_accepts_zero_and_rejects_unbounded_decimal_inputs_quickly() 
                 currency="USD",
             )
         assert "9" * 100 not in str(caught.value)
+
+    class HostileInt(int):
+        def __str__(self) -> str:
+            raise RuntimeError("cost-subclass-sentinel")
+
+    with pytest.raises(ValidationError) as subclass_error:
+        RunEvent(
+            kind=EventKind.COST_RECORDED,
+            sequence=3,
+            run_id=RUN_ID,
+            actor="main",
+            provider_id="deepseek",
+            cost_usd=cast(Decimal, HostileInt(1)),
+            currency="USD",
+        )
+    assert "sentinel" not in str(subclass_error.value)
     with pytest.raises(ValidationError):
         RunEvent(
             kind="step.completed",
@@ -543,6 +611,21 @@ def test_registry_stops_consuming_at_duplicate_and_hard_limit() -> None:
     assert consumed <= 17
 
 
+def test_registry_rejects_missing_or_hostile_runtime_interface_immediately() -> None:
+    consumed = 0
+
+    def plugins() -> object:
+        nonlocal consumed
+        consumed += 1
+        yield object()
+        consumed += 1
+        yield DirectRuntime(FakeGateway(), logical_model="general")
+
+    with pytest.raises(InvalidRuntimeRegistration):
+        RuntimeRegistry(plugins())  # type: ignore[arg-type]
+    assert consumed == 1
+
+
 def test_direct_runtime_rejects_unsafe_logical_model_identifier() -> None:
     with pytest.raises(ValueError, match="logical_model"):
         DirectRuntime(FakeGateway(), logical_model="GENERAL/secret")
@@ -574,6 +657,31 @@ async def test_direct_runtime_emits_exact_events_artifact_and_checkpoint() -> No
     assert gateway.requests[0].required_capabilities == frozenset({ModelCapability.TEXT})
     assert gateway.requests[0].max_output_tokens < context().token_budget
     assert await runtime.save_checkpoint() == checkpoint
+
+
+async def test_unstarted_stream_close_releases_reservation_and_clears_old_checkpoint() -> None:
+    runtime = DirectRuntime(FakeGateway(), logical_model="general")
+    await collect(runtime, context())
+    stream = runtime.run(context(run_id=uuid4()))
+    with pytest.raises(RuntimeExecutionError, match="boundary"):
+        await runtime.save_checkpoint()
+    await cast(AsyncGenerator[RunEvent, None], stream).aclose()
+    assert (await collect(runtime, context(run_id=uuid4())))[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_stream_rejects_second_consumer_without_consuming_event() -> None:
+    gateway = FakeGateway()
+    gateway.block = True
+    runtime = DirectRuntime(gateway, logical_model="general")
+    stream = runtime.run(context())
+    assert (await anext(stream)).kind is EventKind.MODEL_STARTED
+
+    async def other_consumer() -> RunEvent:
+        return await anext(stream)
+
+    with pytest.raises(RuntimeBusy, match="consumer"):
+        await asyncio.create_task(other_consumer())
+    await stream.aclose()  # type: ignore[attr-defined]
 
 
 async def test_direct_request_marks_prior_artifacts_untrusted_and_excludes_checkpoint_state() -> None:
@@ -729,7 +837,7 @@ async def test_direct_rejects_task_context_subclasses_at_trust_boundary() -> Non
         def to_payload(self) -> dict[str, object]:
             return context().to_payload()
 
-    hostile = HostileContext(**context().model_dump(round_trip=True))
+    hostile = HostileContext.model_validate_json(context().model_dump_json(), strict=True)
     gateway = FakeGateway()
     with pytest.raises(RuntimeExecutionError, match="context"):
         await collect(DirectRuntime(gateway, logical_model="general"), hostile)

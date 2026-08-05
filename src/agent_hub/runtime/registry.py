@@ -58,7 +58,7 @@ class RuntimeRegistry:
             if len(registered) >= 16:
                 del value, iterator, registered
                 return None, "runtime registration limit exceeded"
-            valid_mode, mode = RuntimeRegistry._mode(value)
+            valid_mode, mode = RuntimeRegistry._runtime_contract(value)
             if not valid_mode or not isinstance(mode, TaskMode) or mode is TaskMode.AUTO:
                 del value, iterator, registered
                 return None, "runtime mode must be explicitly executable"
@@ -79,15 +79,21 @@ class RuntimeRegistry:
             return "error", None
 
     @staticmethod
-    def _mode(runtime: object) -> tuple[bool, object]:
+    def _runtime_contract(runtime: object) -> tuple[bool, object]:
         mode: object = None
         try:
             mode = cast(ExecutionRuntime, runtime).mode
+            members = tuple(
+                getattr(runtime, name)
+                for name in ("run", "save_checkpoint", "restore_checkpoint", "cancel")
+            )
         except Exception as error:  # noqa: BLE001 - hostile plugin boundary
             RuntimeRegistry._scrub_exception(error)
             del error
             return False, None
-        return True, mode
+        valid = type(mode) is TaskMode and all(callable(member) for member in members)
+        del members, runtime
+        return valid, mode
 
     @staticmethod
     def _scrub_exception(error: BaseException) -> None:

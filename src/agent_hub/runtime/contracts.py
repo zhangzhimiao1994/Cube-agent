@@ -14,7 +14,14 @@ from types import MappingProxyType
 from typing import Literal, Never, Protocol, Self, cast
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from agent_hub.domain.runs import TaskMode
 
@@ -156,6 +163,64 @@ def _safe_identifier(value: str, *, name: str) -> str:
     return value
 
 
+def _preflight_payload(value: object) -> None:
+    nodes = 0
+    estimated_bytes = 0
+    active: set[int] = set()
+
+    def visit(item: object, depth: int) -> None:
+        nonlocal nodes, estimated_bytes
+        nodes += 1
+        if nodes > _MAX_JSON_NODES or depth > _MAX_JSON_DEPTH:
+            raise ValueError("payload exceeds structural limits")
+        if item is None or type(item) is bool:
+            estimated_bytes += 5
+            return
+        if type(item) is int:
+            if item.bit_length() > 4096:
+                raise ValueError("payload integer exceeds size limit")
+            estimated_bytes += max(1, len(str(item)))
+            return
+        if type(item) is float:
+            if not math.isfinite(item):
+                raise ValueError("payload numbers must be finite")
+            estimated_bytes += 32
+            return
+        if type(item) is str:
+            size = len(item.encode("utf-8"))
+            if size > _MAX_JSON_STRING:
+                raise ValueError("payload string exceeds size limit")
+            estimated_bytes += size + 2
+            return
+        if type(item) is dict:
+            container_size = len(cast(dict[object, object], item))
+        elif type(item) is list:
+            container_size = len(cast(list[object], item))
+        else:
+            raise TypeError("payload must contain exact JSON types")
+        if container_size > _MAX_JSON_NODES:
+            raise ValueError("payload container exceeds width limit")
+        identity = id(item)
+        if identity in active:
+            raise ValueError("payload cycles are forbidden")
+        active.add(identity)
+        estimated_bytes += 2
+        if type(item) is dict:
+            for key, child in cast(dict[object, object], item).items():
+                if type(key) is not str:
+                    raise TypeError("payload keys must be strings")
+                visit(key, depth + 1)
+                visit(child, depth + 1)
+        else:
+            for child in cast(list[object], item):
+                visit(child, depth + 1)
+        active.remove(identity)
+        if estimated_bytes > _MAX_JSON_BYTES:
+            raise ValueError("payload exceeds estimated size limit")
+
+    visit(value, 0)
+
+
 class RuntimeContractError(ValueError):
     """A stable error that never exposes hostile contract input."""
 
@@ -179,6 +244,7 @@ class _RuntimeContractModel(BaseModel):
         validated: Self | None = None
         encoded: str | None = None
         try:
+            _preflight_payload(payload)
             encoded = json.dumps(
                 payload,
                 ensure_ascii=False,
@@ -332,6 +398,10 @@ class Artifact(_RuntimeContractModel):
             else GatewayProvenance.to_payload(self.provenance),
         }
 
+    @model_serializer(mode="plain")
+    def serialize_model(self) -> dict[str, object]:
+        return self.to_payload()
+
 
 class RuntimeCheckpoint(_RuntimeContractModel):
     """A resumable boundary whose immutable state is locally content-addressed."""
@@ -396,6 +466,10 @@ class RuntimeCheckpoint(_RuntimeContractModel):
             "state": _mutable_json(self.state),
             "state_sha256": self.state_sha256,
         }
+
+    @model_serializer(mode="plain")
+    def serialize_model(self) -> dict[str, object]:
+        return self.to_payload()
 
 
 class EventKind(StrEnum):
@@ -528,17 +602,17 @@ class RunEvent(_RuntimeContractModel):
         if type(value) is bool:
             raise ValueError("cost_usd must be a bounded decimal")
         text: str
-        if isinstance(value, bytes):
+        if type(value) is bytes:
             if len(value) > 32:
                 raise ValueError("cost_usd must be a bounded decimal")
             try:
                 text = value.decode("ascii")
             except UnicodeDecodeError:
                 raise ValueError("cost_usd must be a bounded decimal") from None
-        elif isinstance(value, Decimal | int | float | str):
+        elif type(value) in {Decimal, int, float, str}:
             text = str(value)
         else:
-            raise ValueError("cost_usd must be a bounded decimal")  # noqa: TRY004
+            raise ValueError("cost_usd must be a bounded decimal")
         if len(text) > 32 or re.fullmatch(r"(?:0|[1-9][0-9]{0,6})(?:\.[0-9]{1,6})?", text) is None:
             raise ValueError("cost_usd must be a bounded decimal")
         number = Decimal(text)
@@ -763,6 +837,35 @@ class RunEvent(_RuntimeContractModel):
             raise ValueError("extension events require payload and forbid direct objects")
         return self
 
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "kind": self.kind.value if isinstance(self.kind, EventKind) else self.kind,
+            "sequence": self.sequence,
+            "run_id": str(self.run_id),
+            "artifact": None if self.artifact is None else self.artifact.to_payload(),
+            "checkpoint": None if self.checkpoint is None else self.checkpoint.to_payload(),
+            "reason": self.reason,
+            "inputs": [item.to_payload() for item in self.inputs],
+            "step_id": self.step_id,
+            "actor": self.actor,
+            "message": self.message,
+            "payload": _mutable_json(self.payload),
+            "session_id": self.session_id,
+            "participants": list(self.participants),
+            "tool_call_id": self.tool_call_id,
+            "tool_name": self.tool_name,
+            "approval_id": self.approval_id,
+            "action": self.action,
+            "decision": self.decision,
+            "provider_id": self.provider_id,
+            "cost_usd": None if self.cost_usd is None else str(self.cost_usd),
+            "currency": self.currency,
+        }
+
+    @model_serializer(mode="plain")
+    def serialize_model(self) -> dict[str, object]:
+        return self.to_payload()
+
 
 class TaskContext(_RuntimeContractModel):
     """The only durable input accepted by an execution runtime."""
@@ -835,6 +938,10 @@ class TaskContext(_RuntimeContractModel):
             "timeout_seconds": self.timeout_seconds,
             "token_budget": self.token_budget,
         }
+
+    @model_serializer(mode="plain")
+    def serialize_model(self) -> dict[str, object]:
+        return self.to_payload()
 
 
 class ExecutionRuntime(Protocol):

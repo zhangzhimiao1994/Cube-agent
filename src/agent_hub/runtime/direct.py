@@ -40,16 +40,6 @@ class Gateway(Protocol):
     async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion: ...
 
 
-class _TrackedStream(Protocol):
-    ag_running: bool
-
-    def __aiter__(self) -> AsyncIterator[RunEvent]: ...
-
-    async def __anext__(self) -> RunEvent: ...
-
-    async def aclose(self) -> None: ...
-
-
 @dataclass(frozen=True, slots=True, repr=False)
 class _PromptOutcome:
     messages: tuple[ModelMessage, ...] | None = field(default=None, repr=False)
@@ -77,6 +67,49 @@ def _raise_execution_error(message: str) -> Never:
     raise RuntimeExecutionError(message) from None
 
 
+class DirectRunStream:
+    """A single-consumer session wrapper with explicit close ownership."""
+
+    def __init__(
+        self,
+        runtime: DirectRuntime,
+        generator: AsyncIterator[RunEvent],
+        token: object,
+    ) -> None:
+        self._runtime = runtime
+        self._generator = generator
+        self._token = token
+        self._owner: asyncio.Task[object] | None = None
+        self._closed = False
+        self._lock = asyncio.Lock()
+
+    def __aiter__(self) -> DirectRunStream:
+        return self
+
+    async def __anext__(self) -> RunEvent:
+        current = asyncio.current_task()
+        if current is None:  # pragma: no cover - asyncio invariant
+            raise RuntimeExecutionError("runtime consumer unavailable")
+        async with self._lock:
+            if self._closed:
+                raise StopAsyncIteration
+            if self._owner is None:
+                self._owner = cast(asyncio.Task[object], current)
+            elif self._owner is not current:
+                raise RuntimeBusy("runtime stream has a different consumer")
+        try:
+            return await anext(self._generator)
+        except StopAsyncIteration:
+            self._closed = True
+            raise
+
+    async def aclose(self) -> None:
+        await self._runtime._close_stream(self)
+
+    def _mark_closed(self) -> None:
+        self._closed = True
+
+
 class DirectRuntime:
     mode = TaskMode.DIRECT
 
@@ -87,7 +120,7 @@ class DirectRuntime:
         self._logical_model = logical_model
         self._cancel_lock = asyncio.Lock()
         self._active_token: object | None = None
-        self._active_stream: _TrackedStream | None = None
+        self._active_stream: DirectRunStream | None = None
         self._active_done: asyncio.Event | None = None
         self._active_task: asyncio.Task[GatewayCompletion] | None = None
         self._last_checkpoint: RuntimeCheckpoint | None = None
@@ -101,7 +134,9 @@ class DirectRuntime:
             raise RuntimeBusy("runtime is busy")
         token = object()
         done = asyncio.Event()
-        stream = cast(_TrackedStream, self._run(context, token, done))
+        generator = self._run(context, token, done)
+        stream = DirectRunStream(self, generator, token)
+        self._last_checkpoint = None
         self._active_token = token
         self._active_stream = stream
         self._active_done = done
@@ -274,10 +309,13 @@ class DirectRuntime:
                     gateway_task.cancel()
                 await self._consume_task_terminal(gateway_task)
             if self._active_token is token:
+                active_stream = self._active_stream
                 self._active_token = None
                 self._active_stream = None
                 self._active_done = None
                 self._active_task = None
+                if active_stream is not None:
+                    active_stream._mark_closed()
             done.set()
 
     def _build_request(self, context: TaskContext) -> _RequestOutcome:
@@ -560,17 +598,27 @@ class DirectRuntime:
         )
 
     async def cancel(self) -> None:
+        stream = self._active_stream
+        if stream is not None:
+            await self._close_stream(stream)
+
+    async def _close_stream(self, stream: DirectRunStream) -> None:
         async with self._cancel_lock:
-            stream = self._active_stream
+            if stream._closed:
+                return
+            active_stream = self._active_stream
             done = self._active_done
             active = self._active_task
             token = self._active_token
-            if stream is None or done is None or token is None:
+            if active_stream is not stream or done is None or token is None:
+                stream._mark_closed()
                 return
             if active is not None and not active.done():
                 active.cancel()
-            if not stream.ag_running:
-                await stream.aclose()
+            generator = stream._generator
+            ag_running = bool(getattr(generator, "ag_running", False))
+            if not ag_running:
+                await generator.aclose()  # type: ignore[attr-defined]
             else:
                 try:
                     await asyncio.wait_for(done.wait(), timeout=5)
@@ -582,3 +630,4 @@ class DirectRuntime:
                 self._active_done = None
                 self._active_task = None
                 done.set()
+            stream._mark_closed()
