@@ -86,6 +86,20 @@ def test_auth_migration_downgrades_reupgrades_and_generates_incremental_sql(
 
 
 @pytest.mark.integration
+def test_username_check_migration_downgrades_reupgrades_and_generates_incremental_sql(
+    alembic_config: Config,
+) -> None:
+    command.downgrade(alembic_config, "0005_auth")
+
+    output = StringIO()
+    alembic_config.output_buffer = output
+    command.upgrade(alembic_config, "0005_auth:0006_username_check", sql=True)
+    assert "ck_agent_hub_users_username" in output.getvalue()
+
+    command.upgrade(alembic_config, "head")
+
+
+@pytest.mark.integration
 async def test_user_role_check_rejects_unknown_role(db_session: AsyncSession) -> None:
     tenant = TenantRow(slug="role-check", name="Role check")
     db_session.add(tenant)
@@ -93,6 +107,22 @@ async def test_user_role_check_rejects_unknown_role(db_session: AsyncSession) ->
     db_session.add(UserRow(tenant_id=tenant.id, username="bad-role", role="owner"))
 
     with pytest.raises(IntegrityError, match="ck_agent_hub_users_role"):
+        await db_session.commit()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "username", ["Bad", "ab", "bad..name", "bad--name", "bad__name"]
+)
+async def test_username_check_rejects_noncanonical_values(
+    db_session: AsyncSession, username: str
+) -> None:
+    tenant = TenantRow(slug=f"username-check-{uuid4()}", name="Username check")
+    db_session.add(tenant)
+    await db_session.flush()
+    db_session.add(UserRow(tenant_id=tenant.id, username=username, role="viewer"))
+
+    with pytest.raises(IntegrityError, match="ck_agent_hub_users_username"):
         await db_session.commit()
 
 
@@ -105,6 +135,20 @@ def test_auth_migration_rejects_preexisting_invalid_roles(
     try:
         with pytest.raises(SQLAlchemyError, match="invalid roles"):
             command.upgrade(alembic_config, "0005_auth")
+    finally:
+        asyncio.run(_delete_user_and_tenant(database_url, tenant_id))
+        command.upgrade(alembic_config, "head")
+
+
+@pytest.mark.integration
+def test_username_migration_rejects_preexisting_invalid_values(
+    alembic_config: Config, database_url: str
+) -> None:
+    command.downgrade(alembic_config, "0005_auth")
+    tenant_id = asyncio.run(_seed_invalid_username(database_url))
+    try:
+        with pytest.raises(SQLAlchemyError, match="invalid usernames"):
+            command.upgrade(alembic_config, "0006_username_check")
     finally:
         asyncio.run(_delete_user_and_tenant(database_url, tenant_id))
         command.upgrade(alembic_config, "head")
@@ -170,6 +214,28 @@ async def _seed_invalid_role(database_url: str) -> UUID:
             session.add(TenantRow(id=tenant_id, slug=f"invalid-role-{tenant_id}", name="Invalid"))
             await session.flush()
             session.add(UserRow(tenant_id=tenant_id, username="invalid", role="owner"))
+            await session.commit()
+    finally:
+        await database.dispose()
+    return tenant_id
+
+
+async def _seed_invalid_username(database_url: str) -> UUID:
+    database = build_database(database_url)
+    tenant_id = uuid4()
+    try:
+        async with database.session_factory() as session:
+            session.add(
+                TenantRow(
+                    id=tenant_id,
+                    slug=f"invalid-username-{tenant_id}",
+                    name="Invalid",
+                )
+            )
+            await session.flush()
+            session.add(
+                UserRow(tenant_id=tenant_id, username="Invalid..Name", role="viewer")
+            )
             await session.commit()
     finally:
         await database.dispose()

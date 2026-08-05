@@ -39,6 +39,13 @@ class UserRow(Base):
             "role IN ('super_admin', 'admin', 'operator', 'viewer')",
             name="ck_agent_hub_users_role",
         ),
+        CheckConstraint(
+            "username ~ '^[a-z][a-z0-9_-]{2,63}$' "
+            "AND strpos(username, '..') = 0 "
+            "AND strpos(username, '--') = 0 "
+            "AND strpos(username, '__') = 0",
+            name="ck_agent_hub_users_username",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)

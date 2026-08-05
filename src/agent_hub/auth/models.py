@@ -59,6 +59,10 @@ class AuthenticationPersistenceError(RuntimeError):
     pass
 
 
+class AuthenticationBusy(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class AuthenticatedPrincipal:
     user_id: UUID

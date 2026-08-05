@@ -1,4 +1,5 @@
 import asyncio
+import base64
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -9,6 +10,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.auth.models import (
+    AuthenticationPersistenceError,
+    AuthResult,
     BootstrapClosed,
     InvalidBootstrapCode,
     InvalidCredentials,
@@ -16,7 +19,7 @@ from agent_hub.auth.models import (
 )
 from agent_hub.auth.passwords import PasswordService
 from agent_hub.auth.service import AuthService
-from agent_hub.auth.tokens import AccessTokenService
+from agent_hub.auth.tokens import AccessTokenService, InvalidTokenError
 from agent_hub.db.models import BootstrapCodeRow, TenantRow, UserRow
 
 NOW = datetime(2026, 8, 5, 0, 0, tzinfo=UTC)
@@ -35,9 +38,71 @@ class SpyPasswordService(PasswordService):
         super().__init__()
         self.verified_hashes: list[str] = []
 
-    def verify(self, password_hash: str, password: str) -> bool:
+    async def verify_async(self, password_hash: str, password: str) -> bool:
         self.verified_hashes.append(password_hash)
-        return super().verify(password_hash, password)
+        return await super().verify_async(password_hash, password)
+
+
+class CountingPasswordService(PasswordService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.hash_calls = 0
+
+    def hash(self, password: str) -> str:
+        self.hash_calls += 1
+        return super().hash(password)
+
+    async def hash_async(self, password: str) -> str:
+        self.hash_calls += 1
+        return await super().hash_async(password)
+
+
+class AsyncOnlyPasswordService(PasswordService):
+    def hash(self, password: str) -> str:
+        raise AssertionError("AuthService must not call synchronous Argon2 hash")
+
+    def verify(self, password_hash: str, password: str) -> bool:
+        raise AssertionError("AuthService must not call synchronous Argon2 verify")
+
+
+class PausingRehashPasswordService(PasswordService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rehash_started = asyncio.Event()
+        self.allow_rehash = asyncio.Event()
+
+    async def hash_async(self, password: str) -> str:
+        self.rehash_started.set()
+        await self.allow_rehash.wait()
+        return await super().hash_async(password)
+
+
+class FailingTokenService(AccessTokenService):
+    def encode(
+        self,
+        user_id: UUID,
+        tenant_id: UUID,
+        role: Role,
+        *,
+        ttl_seconds: int = 900,
+    ) -> str:
+        raise ValueError("forced token failure")
+
+
+def _assert_production_frames_do_not_contain(
+    error: BaseException, *secrets: object
+) -> None:
+    rendered = [repr(secret) for secret in secrets]
+    traceback = error.__traceback__
+    while traceback is not None:
+        filename = traceback.tb_frame.f_code.co_filename.replace("\\", "/")
+        if "/src/agent_hub/" in filename:
+            for value in traceback.tb_frame.f_locals.values():
+                rendered_value = repr(value)
+                assert all(secret not in rendered_value for secret in rendered)
+        traceback = traceback.tb_next
+    assert error.__cause__ is None
+    assert error.__context__ is None
 
 
 async def _tenant(factory: async_sessionmaker[AsyncSession], *, slug: str = "bootstrap") -> UUID:
@@ -150,6 +215,55 @@ async def test_invalid_expired_and_consumed_codes_never_create_another_user(
 
 
 @pytest.mark.integration
+async def test_rejected_bootstrap_codes_do_not_run_argon2(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _tenant(auth_session_factory)
+    clock = MutableClock()
+    passwords = CountingPasswordService()
+    service = _service(auth_session_factory, tenant_id, clock=clock, passwords=passwords)
+
+    with pytest.raises(InvalidBootstrapCode):
+        await service.consume_bootstrap_code(
+            "not-a-code", "first-admin", "valid password 123"
+        )
+    assert passwords.hash_calls == 0
+
+    expired = await service.issue_bootstrap_code(ttl_seconds=60)
+    clock.now += timedelta(seconds=61)
+    with pytest.raises(InvalidBootstrapCode):
+        await service.consume_bootstrap_code(
+            expired, "first-admin", "valid password 123"
+        )
+    assert passwords.hash_calls == 0
+
+    clock.now = NOW
+    valid = await service.issue_bootstrap_code()
+    await service.consume_bootstrap_code(valid, "first-admin", "valid password 123")
+    assert passwords.hash_calls == 1
+    passwords.hash_calls = 0
+    with pytest.raises(InvalidBootstrapCode):
+        await service.consume_bootstrap_code(valid, "second-admin", "valid password 456")
+    assert passwords.hash_calls == 0
+
+
+@pytest.mark.integration
+async def test_auth_service_uses_only_async_password_operations(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _tenant(auth_session_factory)
+    service = _service(
+        auth_session_factory, tenant_id, passwords=AsyncOnlyPasswordService()
+    )
+    code = await service.issue_bootstrap_code()
+
+    await service.consume_bootstrap_code(code, "first-admin", "valid password 123")
+    result = await service.login(tenant_id, "first-admin", "valid password 123")
+
+    assert result.principal.role is Role.SUPER_ADMIN
+
+
+@pytest.mark.integration
 async def test_bootstrap_is_globally_closed_after_any_super_admin_exists(
     auth_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -192,6 +306,45 @@ async def test_concurrent_consumers_can_create_only_one_global_super_admin(
 
 
 @pytest.mark.integration
+async def test_separate_services_serialize_issue_against_consume(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _tenant(auth_session_factory)
+    issuer = _service(auth_session_factory, tenant_id)
+    consumer = _service(auth_session_factory, tenant_id)
+    initial_code = await issuer.issue_bootstrap_code()
+    start = asyncio.Event()
+
+    async def issue() -> object:
+        await start.wait()
+        try:
+            return await issuer.issue_bootstrap_code()
+        except BootstrapClosed as error:
+            return error
+
+    async def consume() -> object:
+        await start.wait()
+        return await consumer.consume_bootstrap_code(
+            initial_code, "first-admin", "valid password 123"
+        )
+
+    issue_task = asyncio.create_task(issue())
+    consume_task = asyncio.create_task(consume())
+    start.set()
+    issued, consumed = await asyncio.gather(issue_task, consume_task)
+
+    assert isinstance(consumed, AuthResult)
+    assert isinstance(issued, (str, BootstrapClosed))
+    async with auth_session_factory() as session:
+        assert (
+            await session.scalar(
+                select(func.count()).select_from(UserRow).where(UserRow.role == "super_admin")
+            )
+            == 1
+        )
+
+
+@pytest.mark.integration
 async def test_login_is_tenant_scoped_and_returns_token_principal(
     auth_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -207,6 +360,31 @@ async def test_login_is_tenant_scoped_and_returns_token_principal(
     assert authenticated == logged_in.principal
     with pytest.raises(InvalidCredentials, match="invalid credentials"):
         await service.login(uuid4(), "first-admin", "valid password 123")
+
+
+@pytest.mark.integration
+async def test_auth_failures_do_not_retain_credentials_or_tokens_in_tracebacks(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _tenant(auth_session_factory)
+    service = _service(auth_session_factory, tenant_id)
+    code = "invalid-bootstrap-code"
+    password = "sensitive password 123"
+
+    with pytest.raises(InvalidBootstrapCode) as bootstrap_error:
+        await service.consume_bootstrap_code(code, "first-admin", password)
+    _assert_production_frames_do_not_contain(
+        bootstrap_error.value, code, password
+    )
+
+    with pytest.raises(InvalidCredentials) as login_error:
+        await service.login(tenant_id, "missing-user", password)
+    _assert_production_frames_do_not_contain(login_error.value, password)
+
+    token = "not.a.sensitive-token"
+    with pytest.raises(InvalidTokenError) as token_error:
+        service.authenticate_token(token)
+    _assert_production_frames_do_not_contain(token_error.value, token)
 
 
 @pytest.mark.integration
@@ -283,6 +461,116 @@ async def test_successful_login_upgrades_an_old_argon2_hash(
     assert new_hash is not None
     assert new_hash != old_hash
     assert current_passwords.needs_rehash(new_hash) is False
+
+
+@pytest.mark.integration
+async def test_rehash_cas_never_overwrites_a_concurrent_password_change(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _tenant(auth_session_factory)
+    old_passwords = PasswordService(
+        PasswordHasher(time_cost=1, memory_cost=8192, parallelism=1, type=Type.ID)
+    )
+    bootstrap = _service(auth_session_factory, tenant_id, passwords=old_passwords)
+    code = await bootstrap.issue_bootstrap_code()
+    old_password = "old valid password 123"
+    new_password = "new valid password 456"
+    await bootstrap.consume_bootstrap_code(code, "first-admin", old_password)
+
+    pausing = PausingRehashPasswordService()
+    login_task = asyncio.create_task(
+        _service(auth_session_factory, tenant_id, passwords=pausing).login(
+            tenant_id, "first-admin", old_password
+        )
+    )
+    await asyncio.wait_for(pausing.rehash_started.wait(), timeout=2)
+    replacement_hash = await PasswordService().hash_async(new_password)
+    async with auth_session_factory() as session, session.begin():
+        user = await session.scalar(select(UserRow).where(UserRow.username == "first-admin"))
+        assert user is not None
+        user.password_hash = replacement_hash
+    pausing.allow_rehash.set()
+
+    with pytest.raises(InvalidCredentials):
+        await login_task
+    async with auth_session_factory() as session:
+        stored_hash = await session.scalar(select(UserRow.password_hash))
+    assert stored_hash == replacement_hash
+    await _service(auth_session_factory, tenant_id).login(
+        tenant_id, "first-admin", new_password
+    )
+
+
+@pytest.mark.integration
+async def test_bootstrap_database_failure_rolls_back_and_hides_secrets(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant_id = await _tenant(auth_session_factory)
+    service = _service(auth_session_factory, uuid4())
+    raw_code = b"z" * 32
+    expected_code = base64.urlsafe_b64encode(raw_code).decode("ascii").rstrip("=")
+    monkeypatch.setattr("agent_hub.auth.service.secrets.token_bytes", lambda _: raw_code)
+
+    with pytest.raises(AuthenticationPersistenceError) as captured:
+        await service.issue_bootstrap_code()
+
+    _assert_production_frames_do_not_contain(captured.value, expected_code)
+    async with auth_session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(BootstrapCodeRow)) == 0
+        assert await session.scalar(select(func.count()).select_from(UserRow)) == 0
+
+    valid_service = _service(auth_session_factory, tenant_id)
+    code = await valid_service.issue_bootstrap_code()
+    async with auth_session_factory() as session, session.begin():
+        session.add(
+            UserRow(
+                tenant_id=tenant_id,
+                username="duplicate",
+                password_hash=None,
+                role=Role.VIEWER.value,
+            )
+        )
+    password = "sensitive password 123"
+    with pytest.raises(AuthenticationPersistenceError) as consume_error:
+        await valid_service.consume_bootstrap_code(code, "duplicate", password)
+    _assert_production_frames_do_not_contain(
+        consume_error.value, code, password
+    )
+    async with auth_session_factory() as session:
+        stored_code = await session.scalar(
+            select(BootstrapCodeRow).where(BootstrapCodeRow.code_hash.is_not(None))
+        )
+        assert stored_code is not None
+        assert stored_code.consumed_at is None
+        assert await session.scalar(select(func.count()).select_from(UserRow)) == 1
+
+
+@pytest.mark.integration
+async def test_token_creation_failure_rolls_back_bootstrap_without_secret_trace(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _tenant(auth_session_factory)
+    issuer = _service(auth_session_factory, tenant_id)
+    code = await issuer.issue_bootstrap_code()
+    password = "sensitive password 123"
+    failing = AuthService(
+        auth_session_factory,
+        tenant_id,
+        PasswordService(),
+        FailingTokenService(b"t" * 32, clock=MutableClock()),
+        clock=MutableClock(),
+    )
+
+    with pytest.raises(AuthenticationPersistenceError) as captured:
+        await failing.consume_bootstrap_code(code, "first-admin", password)
+
+    _assert_production_frames_do_not_contain(captured.value, code, password)
+    async with auth_session_factory() as session:
+        stored_code = await session.scalar(select(BootstrapCodeRow))
+        assert stored_code is not None
+        assert stored_code.consumed_at is None
+        assert await session.scalar(select(func.count()).select_from(UserRow)) == 0
 
 
 @pytest.mark.integration

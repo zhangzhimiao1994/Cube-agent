@@ -1,8 +1,61 @@
+import asyncio
+import threading
+from typing import Literal
+
 import pytest
 from argon2 import PasswordHasher
 from argon2.low_level import Type
 
+from agent_hub.auth.models import AuthenticationBusy
 from agent_hub.auth.passwords import PasswordService, PasswordValidationError
+
+
+class RejectingEmbeddedCostHasher(PasswordHasher):
+    def __init__(self) -> None:
+        super().__init__(type=Type.ID)
+        self.verify_calls = 0
+        self.rehash_calls = 0
+
+    def verify(self, hash: str | bytes, password: str | bytes) -> Literal[True]:
+        self.verify_calls += 1
+        return super().verify(hash, password)
+
+    def check_needs_rehash(self, hash: str | bytes) -> bool:
+        self.rehash_calls += 1
+        return super().check_needs_rehash(hash)
+
+
+class BlockingHasher(PasswordHasher):
+    def __init__(self) -> None:
+        super().__init__(time_cost=1, memory_cost=8192, parallelism=1, type=Type.ID)
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.active = 0
+        self.peak = 0
+        self._lock = threading.Lock()
+
+    def hash(self, password: str | bytes, *, salt: bytes | None = None) -> str:
+        with self._lock:
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+        self.started.set()
+        self.release.wait(timeout=2)
+        try:
+            return super().hash(password, salt=salt)
+        finally:
+            with self._lock:
+                self.active -= 1
+
+
+def _assert_password_absent(error: BaseException, password: str) -> None:
+    traceback = error.__traceback__
+    while traceback is not None:
+        filename = traceback.tb_frame.f_code.co_filename.replace("\\", "/")
+        if "/src/agent_hub/" in filename:
+            assert all(password not in repr(value) for value in traceback.tb_frame.f_locals.values())
+        traceback = traceback.tb_next
+    assert error.__cause__ is None
+    assert error.__context__ is None
 
 
 def test_argon2id_round_trip_and_wrong_password() -> None:
@@ -66,3 +119,51 @@ def test_password_policy_accepts_boundaries_without_normalizing() -> None:
     assert service.verify(minimum_hash, " x" + "y" * 10)
     assert not service.verify(minimum_hash, "x" + "y" * 10)
     assert service.verify(maximum_hash, "z" * 1024)
+
+
+def test_embedded_extreme_argon_cost_is_rejected_before_the_hasher() -> None:
+    hasher = RejectingEmbeddedCostHasher()
+    service = PasswordService(hasher)
+    extreme = "$argon2id$v=19$m=999999999,t=999,p=999$c2FsdHNhbHQ$YWJjZA"
+
+    assert service.verify(extreme, "correct horse battery staple") is False
+    assert service.needs_rehash(extreme) is False
+    assert hasher.verify_calls == 0
+    assert hasher.rehash_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_async_argon_is_offloaded_and_has_bounded_admission() -> None:
+    hasher = BlockingHasher()
+    service = PasswordService(hasher, max_concurrency=1, max_queue=0)
+    first = asyncio.create_task(service.hash_async("first valid password"))
+    assert await asyncio.to_thread(hasher.started.wait, 1)
+
+    heartbeat = asyncio.create_task(asyncio.sleep(0.01))
+    await heartbeat
+    with pytest.raises(AuthenticationBusy, match="authentication is busy") as busy:
+        await service.hash_async("second valid password")
+    _assert_password_absent(busy.value, "second valid password")
+
+    hasher.release.set()
+    assert (await first).startswith("$argon2id$")
+    assert hasher.peak == 1
+
+
+@pytest.mark.asyncio
+async def test_async_password_validation_error_has_no_password_in_frames() -> None:
+    password = "too-short"
+
+    with pytest.raises(PasswordValidationError) as captured:
+        await PasswordService().hash_async(password)
+
+    _assert_password_absent(captured.value, password)
+
+
+def test_sync_password_validation_error_has_no_password_in_frames() -> None:
+    password = "too-short"
+
+    with pytest.raises(PasswordValidationError) as captured:
+        PasswordService().hash(password)
+
+    _assert_password_absent(captured.value, password)

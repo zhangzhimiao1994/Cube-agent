@@ -3,7 +3,7 @@
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Final
+from typing import Final, NoReturn
 from uuid import UUID, uuid4
 
 import jwt
@@ -57,23 +57,31 @@ class AccessTokenService:
         clock: Callable[[], datetime] | None = None,
         leeway_seconds: int = 0,
     ) -> None:
-        key = _validated_key(signing_key)
-        if algorithm not in _ALLOWED_ALGORITHMS:
-            raise ValueError("access token algorithm is not allowed")
-        if not issuer or not audience:
-            raise ValueError("token issuer and audience must be non-empty")
-        if (
-            not isinstance(leeway_seconds, int)
-            or isinstance(leeway_seconds, bool)
-            or not 0 <= leeway_seconds <= 60
-        ):
-            raise ValueError("token leeway must be 0-60 seconds")
+        configuration_error = _configuration_error(
+            algorithm, issuer, audience, leeway_seconds
+        )
+        key, key_error = _try_validated_key(signing_key)
+        del signing_key
+        if configuration_error is not None:
+            del key, key_error
+            _raise_token_configuration_error(configuration_error)
+        if key_error is not None:
+            del key, configuration_error
+            _raise_token_configuration_error(key_error)
+        assert key is not None
         self._key = key
         self._algorithm = algorithm
         self._issuer = issuer
         self._audience = audience
         self._clock = clock or (lambda: datetime.now(UTC))
         self._leeway = timedelta(seconds=leeway_seconds)
+
+    def __repr__(self) -> str:
+        return (
+            f"AccessTokenService(algorithm={getattr(self, '_algorithm', '<invalid>')!r}, "
+            f"issuer={getattr(self, '_issuer', '<invalid>')!r}, "
+            f"audience={getattr(self, '_audience', '<invalid>')!r}, key=<redacted>)"
+        )
 
     def encode(
         self,
@@ -111,11 +119,13 @@ class AccessTokenService:
 
     def decode(self, token: str) -> DecodedAccessToken:
         payload = self._try_decode(token)
+        del token
         if payload is None:
-            raise InvalidTokenError("invalid access token")
+            _raise_invalid_token()
         decoded = self._try_materialize(payload)
+        del payload
         if decoded is None:
-            raise InvalidTokenError("invalid access token")
+            _raise_invalid_token()
         return decoded
 
     def _try_decode(self, token: str) -> Mapping[str, object] | None:
@@ -141,6 +151,8 @@ class AccessTokenService:
 
     def _try_materialize(self, payload: Mapping[str, object]) -> DecodedAccessToken | None:
         try:
+            if set(payload) != set(_REQUIRED_CLAIMS):
+                return None
             issued_timestamp = payload["iat"]
             expires_timestamp = payload["exp"]
             if (
@@ -175,19 +187,48 @@ class AccessTokenService:
             return None
 
 
-def _validated_key(signing_key: bytes | str) -> bytes:
+def _try_validated_key(signing_key: object) -> tuple[bytes | None, str | None]:
     if isinstance(signing_key, str):
         try:
             key = signing_key.encode("utf-8")
         except UnicodeEncodeError:
-            raise ValueError("access token signing key is invalid") from None
+            return None, "access token signing key is invalid"
     elif isinstance(signing_key, bytes):
         key = signing_key
     else:
-        raise TypeError("access token signing key must be bytes or text")
+        return None, "access token signing key must be bytes or text"
     if len(key) < 32:
-        raise ValueError("access token signing key must be at least 32 bytes")
-    return key
+        return None, "access token signing key must be at least 32 bytes"
+    return key, None
+
+
+def _configuration_error(
+    algorithm: object, issuer: object, audience: object, leeway_seconds: object
+) -> str | None:
+    if algorithm not in _ALLOWED_ALGORITHMS:
+        return "access token algorithm is not allowed"
+    if (
+        not isinstance(issuer, str)
+        or not issuer
+        or not isinstance(audience, str)
+        or not audience
+    ):
+        return "token issuer and audience must be non-empty"
+    if (
+        not isinstance(leeway_seconds, int)
+        or isinstance(leeway_seconds, bool)
+        or not 0 <= leeway_seconds <= 60
+    ):
+        return "token leeway must be 0-60 seconds"
+    return None
+
+
+def _raise_token_configuration_error(message: str) -> None:
+    raise ValueError(message)
+
+
+def _raise_invalid_token() -> NoReturn:
+    raise InvalidTokenError("invalid access token")
 
 
 def _utc_clock_value(value: datetime) -> datetime:

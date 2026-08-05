@@ -32,6 +32,21 @@ def _encode_payload(payload: dict[str, object], key: bytes = KEY) -> str:
     return jwt.encode(payload, key, algorithm="HS256")
 
 
+def _assert_production_frames_do_not_contain(error: BaseException, secret: object) -> None:
+    rendered_secret = repr(secret)
+    traceback = error.__traceback__
+    while traceback is not None:
+        filename = traceback.tb_frame.f_code.co_filename.replace("\\", "/")
+        if "/src/agent_hub/" in filename:
+            assert all(
+                rendered_secret not in repr(value)
+                for value in traceback.tb_frame.f_locals.values()
+            )
+        traceback = traceback.tb_next
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
 def test_access_token_round_trip_has_exact_claims() -> None:
     service = _service()
     user_id = uuid4()
@@ -64,8 +79,10 @@ def test_encode_rejects_ttl_outside_the_supported_range(ttl: object) -> None:
 
 
 def test_short_signing_key_is_rejected() -> None:
-    with pytest.raises(ValueError, match="at least 32 bytes"):
-        AccessTokenService(b"development-only-change-me")
+    key = b"development-only-change-me"
+    with pytest.raises(ValueError, match="at least 32 bytes") as captured:
+        AccessTokenService(key)
+    _assert_production_frames_do_not_contain(captured.value, key)
 
 
 @pytest.mark.parametrize(
@@ -85,6 +102,34 @@ def test_decode_rejects_audience_lists_with_one_safe_failure(
     assert token not in str(captured.value)
     assert captured.value.__cause__ is None
     assert captured.value.__context__ is None
+
+
+def test_decode_rejects_signed_extra_claim_without_retaining_token() -> None:
+    payload = _valid_payload()
+    payload["admin"] = True
+    token = _encode_payload(payload)
+
+    with pytest.raises(InvalidTokenError, match="invalid access token") as captured:
+        _service().decode(token)
+
+    _assert_production_frames_do_not_contain(captured.value, token)
+
+
+@pytest.mark.parametrize(
+    "constructor",
+    [
+        lambda key: AccessTokenService(key, algorithm="HS512"),
+        lambda key: AccessTokenService(key, leeway_seconds=61),
+        lambda key: AccessTokenService(key, issuer=""),
+    ],
+)
+def test_constructor_errors_do_not_retain_signing_key(constructor: object) -> None:
+    key = b"sensitive-signing-key-material!!"
+
+    with pytest.raises(ValueError) as captured:
+        constructor(key)  # type: ignore[operator]
+
+    _assert_production_frames_do_not_contain(captured.value, key)
 
 
 @pytest.mark.parametrize(
@@ -146,3 +191,12 @@ def test_wrong_signature_and_none_algorithm_have_one_safe_failure() -> None:
         assert token not in str(captured.value)
         assert captured.value.__cause__ is None
         assert captured.value.__context__ is None
+
+
+def test_decode_error_frames_do_not_retain_the_token() -> None:
+    token = _encode_payload(_valid_payload(), b"x" * 32)
+
+    with pytest.raises(InvalidTokenError) as captured:
+        _service().decode(token)
+
+    _assert_production_frames_do_not_contain(captured.value, token)
