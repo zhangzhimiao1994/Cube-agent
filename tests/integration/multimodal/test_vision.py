@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import threading
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -85,8 +86,14 @@ class AuditStub:
 
 
 class ReferenceStub:
-    def __init__(self, reference: object) -> None:
+    def __init__(
+        self,
+        reference: object,
+        *,
+        allowed_hosts: frozenset[str] = frozenset({"public.example", "trusted.example"}),
+    ) -> None:
         self.reference_value = reference
+        self.allowed_hosts = allowed_hosts
 
     async def reference(
         self, image: SanitizedImage, stored: StoredImageObject
@@ -260,6 +267,8 @@ async def test_reference_cancellation_cleans_up_and_preserves_identity(tmp_path:
     cancellation = asyncio.CancelledError("reference-cancelled")
 
     class CancellingReference:
+        allowed_hosts = frozenset({"public.example"})
+
         async def reference(
             self, image: SanitizedImage, stored: StoredImageObject
         ) -> SignedImageReference:
@@ -293,6 +302,105 @@ async def test_audit_cancellation_cleans_up_and_preserves_identity(tmp_path: Pat
     with pytest.raises(asyncio.CancelledError) as captured:
         await service.analyze(png_bytes(), "image/png", "tenant", "vision-primary")
     assert captured.value is cancellation
+    assert list(tmp_path.rglob("*.png")) == []
+
+
+async def _wait_for_thread_event(event: threading.Event) -> None:
+    while not event.is_set():
+        await asyncio.sleep(0)
+
+
+class BlockingFilesystemStore(FilesystemImageStore):
+    def __init__(self, root: Path, *, block_put: bool = False, block_delete: bool = True) -> None:
+        super().__init__(root)
+        self.put_started = threading.Event()
+        self.put_finished = threading.Event()
+        self.put_release = threading.Event()
+        self.delete_started = threading.Event()
+        self.delete_release = threading.Event()
+        if not block_put:
+            self.put_release.set()
+        if not block_delete:
+            self.delete_release.set()
+
+    def _put_sync_safe(
+        self, tenant_id: str, object_key: str, data: bytes, content_type: str
+    ) -> StoredImageObject | ValueError | None:
+        self.put_started.set()
+        self.put_release.wait()
+        result = super()._put_sync_safe(tenant_id, object_key, data, content_type)
+        self.put_finished.set()
+        return result
+
+    def _delete_sync_safe(self, tenant_id: str, object_key: str) -> bool:
+        self.delete_started.set()
+        self.delete_release.wait()
+        return super()._delete_sync_safe(tenant_id, object_key)
+
+
+async def test_repeated_put_and_cleanup_cancellation_cannot_leave_late_file(
+    tmp_path: Path,
+) -> None:
+    store = BlockingFilesystemStore(tmp_path, block_put=True)
+    task = asyncio.create_task(
+        VisionService(GatewayStub(response()), store).analyze(
+            png_bytes(), "image/png", "tenant", "vision-primary"
+        )
+    )
+    await _wait_for_thread_event(store.put_started)
+    task.cancel("first-cancel")
+    await asyncio.sleep(0)
+    assert not task.done()
+    task.cancel("second-cancel")
+    await asyncio.sleep(0)
+    delete_started_before_put_release = store.delete_started.is_set()
+    store.put_release.set()
+    await _wait_for_thread_event(store.delete_started)
+    put_finished_before_delete = store.put_finished.is_set()
+    task.cancel("third-cancel")
+    await asyncio.sleep(0)
+    task.cancel("fourth-cancel")
+    store.delete_release.set()
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await task
+    assert captured.value.args == ("first-cancel",)
+    assert task.cancelled()
+    assert not delete_started_before_put_release
+    assert put_finished_before_delete
+    assert list(tmp_path.rglob("*.png")) == []
+
+
+async def test_repeated_model_phase_cancellation_cannot_interrupt_cleanup(
+    tmp_path: Path,
+) -> None:
+    gateway_started = asyncio.Event()
+
+    class BlockingGateway(GatewayStub):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            gateway_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    store = BlockingFilesystemStore(tmp_path)
+    task = asyncio.create_task(
+        VisionService(BlockingGateway(response()), store).analyze(
+            png_bytes(), "image/png", "tenant", "vision-primary"
+        )
+    )
+    await gateway_started.wait()
+    task.cancel("model-cancel")
+    await _wait_for_thread_event(store.delete_started)
+    task.cancel("cleanup-cancel-two")
+    await asyncio.sleep(0)
+    task.cancel("cleanup-cancel-three")
+    store.delete_release.set()
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await task
+    assert captured.value.args == ("model-cancel",)
+    assert task.cancelled()
     assert list(tmp_path.rglob("*.png")) == []
 
 
@@ -389,6 +497,71 @@ async def test_valid_short_lived_signed_reference_is_passed_to_gateway(tmp_path:
     image_part = content[1]["image_url"]
     assert isinstance(image_part, Mapping) and image_part["url"] == url
     assert result.stored_object.object_key
+
+
+@pytest.mark.parametrize(
+    ("allowed_hosts", "url"),
+    [
+        (frozenset({"trusted.example"}), "https://evil.example/image?sig=value"),
+        (frozenset({"trusted.example"}), "https://trusted.example.evil/image?sig=value"),
+        (frozenset({"trusted.example"}), "https://sub.trusted.example/image?sig=value"),
+        (frozenset({"trusted.example"}), "https://trusted.example:8443/image?sig=value"),
+        (frozenset({"trusted.example"}), "https://anything.nip.io/image?sig=value"),
+        (frozenset({"trusted.example"}), "https://localhost.example/image?sig=value"),
+    ],
+)
+async def test_signed_reference_host_must_exactly_match_trusted_allowlist(
+    tmp_path: Path, allowed_hosts: frozenset[str], url: str
+) -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    service = VisionService(
+        GatewayStub(response()),
+        FilesystemImageStore(tmp_path),
+        reference_provider=ReferenceStub(
+            SignedImageReference(
+                url=url,
+                expires_at=now + timedelta(seconds=60),
+                signed=True,
+                provider_id="signed-store",
+            ),
+            allowed_hosts=allowed_hosts,
+        ),
+        utc_now=lambda: now,
+    )
+    with pytest.raises(VisionAnalysisError, match="image reference failed"):
+        await service.analyze(png_bytes(), "image/png", "tenant", "vision-primary")
+    assert list(tmp_path.rglob("*.png")) == []
+
+
+@pytest.mark.parametrize(
+    ("allowed_host", "url"),
+    [
+        ("TRUSTED.EXAMPLE", "https://trusted.example:443/image?sig=value"),
+        ("trusted.example:8443", "https://TRUSTED.EXAMPLE:8443/image?sig=value"),
+        ("bücher.example", "https://BÜCHER.example/image?sig=value"),
+        ("sub.trusted.example", "https://sub.trusted.example/image?sig=value"),
+    ],
+)
+async def test_trusted_reference_authority_normalization_is_exact(
+    tmp_path: Path, allowed_host: str, url: str
+) -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    gateway = GatewayStub(response())
+    result = await VisionService(
+        gateway,
+        FilesystemImageStore(tmp_path),
+        reference_provider=ReferenceStub(
+            SignedImageReference(
+                url=url,
+                expires_at=now + timedelta(seconds=60),
+                signed=True,
+                provider_id="signed-store",
+            ),
+            allowed_hosts=frozenset({allowed_host}),
+        ),
+        utc_now=lambda: now,
+    ).analyze(png_bytes(), "image/png", "tenant", "vision-primary")
+    assert result.artifact.summary == "A red square"
 
 
 async def test_async_invalid_image_traceback_does_not_retain_payload(tmp_path: Path) -> None:

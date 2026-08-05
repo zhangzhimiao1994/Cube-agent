@@ -134,6 +134,8 @@ class OCRAdapter(Protocol):
 
 
 class ImageReferenceProvider(Protocol):
+    allowed_hosts: frozenset[str]
+
     async def reference(
         self, image: SanitizedImage, stored: StoredImageObject
     ) -> SignedImageReference: ...

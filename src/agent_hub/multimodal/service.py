@@ -27,7 +27,7 @@ from agent_hub.models.types import (
     ModelRequest,
     StructuredResponseSchema,
 )
-from agent_hub.multimodal.images import sanitize_image
+from agent_hub.multimodal.images import _await_task_uninterruptibly, sanitize_image
 from agent_hub.multimodal.types import (
     ImageAnalysisArtifact,
     ImageLimits,
@@ -87,7 +87,73 @@ def _parse_payload(raw_response: str | None) -> _ModelVisionPayload | None:
         return None
 
 
-def _valid_https_reference(reference: str, maximum: int) -> bool:
+type _TrustedAuthority = tuple[str, int]
+
+
+def _normalize_hostname(hostname: str) -> str | None:
+    try:
+        normalized = hostname.rstrip(".").encode("idna").decode("ascii").lower()
+    except (UnicodeError, ValueError):
+        return None
+    if not normalized or len(normalized) > 253:
+        return None
+    try:
+        ipaddress.ip_address(normalized)
+    except ValueError:
+        pass
+    else:
+        return None
+    labels = normalized.split(".")
+    if (
+        len(labels) < 2
+        or any(
+            not label
+            or len(label) > 63
+            or not label[0].isalnum()
+            or not label[-1].isalnum()
+            or any(not character.isalnum() and character != "-" for character in label)
+            for label in labels
+        )
+        or labels[0] == "localhost"
+        or normalized in {"localhost.localdomain", "nip.io", "sslip.io"}
+        or normalized.endswith(
+            (".local", ".internal", ".localhost", ".lan", ".nip.io", ".sslip.io")
+        )
+    ):
+        return None
+    return normalized
+
+
+def _normalize_allowed_authority(value: object) -> _TrustedAuthority | None:
+    if (
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or len(value) > 300
+        or any(character.isspace() or ord(character) < 32 for character in value)
+    ):
+        return None
+    try:
+        parsed = urlsplit(f"//{value}")
+        port = parsed.port or 443
+    except ValueError:
+        return None
+    if (
+        parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    hostname = _normalize_hostname(parsed.hostname)
+    return None if hostname is None else (hostname, port)
+
+
+def _valid_https_reference(
+    reference: str, maximum: int, allowed_authorities: frozenset[_TrustedAuthority]
+) -> bool:
     if (
         type(reference) is not str
         or not reference
@@ -105,32 +171,13 @@ def _valid_https_reference(reference: str, maximum: int) -> bool:
     except ValueError:
         return False
     hostname = parsed.hostname
-    if hostname is None or not hostname.isascii() or "\\" in reference:
+    if hostname is None or "\\" in reference:
         return False
-    try:
-        ipaddress.ip_address(hostname)
-    except ValueError:
-        pass
-    else:
-        return False
-    lowered_host = hostname.lower().rstrip(".")
-    labels = lowered_host.split(".")
-    valid_dns = (
-        len(labels) >= 2
-        and all(
-            label
-            and len(label) <= 63
-            and label[0].isalnum()
-            and label[-1].isalnum()
-            and all(character.isalnum() or character == "-" for character in label)
-            for label in labels
-        )
-        and lowered_host not in {"localhost", "localhost.localdomain"}
-        and not lowered_host.endswith((".local", ".internal", ".localhost", ".lan"))
-    )
+    normalized_host = _normalize_hostname(hostname)
+    authority = None if normalized_host is None else (normalized_host, parsed.port or 443)
     return (
         parsed.scheme == "https"
-        and valid_dns
+        and authority in allowed_authorities
         and parsed.username is None
         and parsed.password is None
         and not parsed.fragment
@@ -178,6 +225,24 @@ class VisionService:
         self._limits = limits or ImageLimits()
         self._ocr = ocr_adapter
         self._reference_provider = reference_provider
+        self._reference_allowed_authorities: frozenset[_TrustedAuthority] = frozenset()
+        if reference_provider is not None:
+            try:
+                configured_hosts = reference_provider.allowed_hosts
+            except Exception as error:  # noqa: BLE001 - invalid injected configuration
+                error.__traceback__ = None
+                del error
+                raise ValueError("reference provider allowlist is invalid") from None
+            if type(configured_hosts) is not frozenset or not 1 <= len(configured_hosts) <= 32:
+                raise ValueError("reference provider allowlist is invalid")
+            normalized_hosts = {
+                _normalize_allowed_authority(host) for host in configured_hosts
+            }
+            if None in normalized_hosts:
+                raise ValueError("reference provider allowlist is invalid")
+            self._reference_allowed_authorities = frozenset(
+                authority for authority in normalized_hosts if authority is not None
+            )
         self._audit = audit_sink or NoopVisionAuditSink()
         self._review_threshold = float(review_threshold)
         self._max_reference_length = max_reference_length
@@ -294,12 +359,19 @@ class VisionService:
         cleanup = asyncio.create_task(self._object_store.delete(tenant_id, object_key))
         del tenant_id, object_key
         try:
-            await asyncio.shield(cleanup)
+            await _await_task_uninterruptibly(cleanup)
         except asyncio.CancelledError as cancellation:
-            await asyncio.gather(cleanup, return_exceptions=True)
+            cleanup_ok = not cleanup.cancelled()
+            if cleanup_ok:
+                try:
+                    cleanup.result()
+                except BaseException as cleanup_error:  # noqa: BLE001 - inspect settled task
+                    cleanup_error.__traceback__ = None
+                    del cleanup_error
+                    cleanup_ok = False
             cancellation.__traceback__ = None
             del cleanup
-            return cancellation, True
+            return cancellation, cleanup_ok
         except Exception as error:  # noqa: BLE001 - cleanup details are redacted
             error.__traceback__ = None
             del error, cleanup
@@ -403,14 +475,18 @@ class VisionService:
     ) -> tuple[str | None, asyncio.CancelledError | None]:
         if self._reference_provider is None:
             try:
-                encoded = await asyncio.to_thread(
-                    lambda value: base64.b64encode(value).decode("ascii"),
-                    sanitized.canonical_bytes,
+                encoding = asyncio.create_task(
+                    asyncio.to_thread(
+                        lambda value: base64.b64encode(value).decode("ascii"),
+                        sanitized.canonical_bytes,
+                    )
                 )
+                encoded = await _await_task_uninterruptibly(encoding)
             except asyncio.CancelledError as cancellation:
                 cancellation.__traceback__ = None
-                del sanitized, stored
+                del sanitized, stored, encoding
                 return None, cancellation
+            del encoding
             reference = f"data:image/png;base64,{encoded}"
             if len(reference) <= self._max_reference_length:
                 del sanitized, stored, encoded
@@ -446,7 +522,9 @@ class VisionService:
             not isinstance(signed_reference, SignedImageReference)
             or not valid_expiry
             or not _valid_https_reference(
-                signed_reference.url, min(self._max_reference_length, 8192)
+                signed_reference.url,
+                min(self._max_reference_length, 8192),
+                self._reference_allowed_authorities,
             )
         ):
             del sanitized, stored, signed_reference
@@ -469,9 +547,8 @@ class VisionService:
                 )
             )
             try:
-                result = await asyncio.shield(worker)
+                result = await _await_task_uninterruptibly(worker)
             except asyncio.CancelledError:
-                await asyncio.gather(worker, return_exceptions=True)
                 del data, worker
                 raise
             except InvalidImage as error:

@@ -30,6 +30,24 @@ _OBJECT_KEY = re.compile(
     r"[89ab][0-9a-f]{3}-[0-9a-f]{12})\.png$"
 )
 _TENANT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}$")
+async def _await_task_uninterruptibly[T](task: asyncio.Task[T]) -> T:
+    first_cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as cancellation:
+            if first_cancellation is None:
+                first_cancellation = cancellation
+        except BaseException:
+            if first_cancellation is None:
+                raise
+            break
+    if first_cancellation is not None:
+        if task.done() and not task.cancelled():
+            task.exception()
+        first_cancellation.__traceback__ = None
+        raise first_cancellation from None
+    return task.result()
 
 
 class StrictSignatureDetector:
@@ -335,10 +353,9 @@ class FilesystemImageStore:
         )
         del copied, tenant_id, object_key, content_type
         try:
-            result = await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            await asyncio.shield(worker)
-            raise
+            result = await _await_task_uninterruptibly(worker)
+        finally:
+            del worker
         if result is None:
             raise OSError("image storage failed") from None
         if isinstance(result, ValueError):
@@ -351,10 +368,9 @@ class FilesystemImageStore:
         )
         del tenant_id, object_key
         try:
-            deleted = await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            await asyncio.gather(worker, return_exceptions=True)
-            raise
+            deleted = await _await_task_uninterruptibly(worker)
+        finally:
+            del worker
         if not deleted:
             raise OSError("image storage cleanup failed") from None
 
