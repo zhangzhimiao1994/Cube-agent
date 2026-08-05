@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from typing import Never, Protocol, cast
 from uuid import UUID, uuid4
 
@@ -47,6 +48,21 @@ class _TrackedStream(Protocol):
     async def __anext__(self) -> RunEvent: ...
 
     async def aclose(self) -> None: ...
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _PromptOutcome:
+    messages: tuple[ModelMessage, ...] | None = field(default=None, repr=False)
+    included_source_ids: tuple[str, ...] = ()
+    prompt_estimate: int = 0
+    error_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _RequestOutcome:
+    request: ModelRequest | None = field(default=None, repr=False)
+    included_source_ids: tuple[str, ...] = ()
+    error_code: str | None = None
 
 
 class RuntimeExecutionError(RuntimeError):
@@ -116,7 +132,14 @@ class DirectRuntime:
             if context.checkpoint is not None:
                 raise RuntimeExecutionError("runtime checkpoint was not restored")
 
-            request, included_source_ids = self._build_request(context)
+            request_outcome = self._build_request(context)
+            if request_outcome.request is None:
+                error_code = request_outcome.error_code or "runtime context is invalid"
+                del request_outcome, context
+                _raise_execution_error(error_code)
+            request = request_outcome.request
+            included_source_ids = request_outcome.included_source_ids
+            del request_outcome
             gateway_task = asyncio.create_task(self._gateway.complete_with_context(request))
             if self._active_token is not token:  # pragma: no cover - defensive
                 gateway_task.cancel()
@@ -257,63 +280,90 @@ class DirectRuntime:
                 self._active_task = None
             done.set()
 
-    def _build_request(self, context: TaskContext) -> tuple[ModelRequest, tuple[str, ...]]:
-        messages, included_source_ids, prompt_estimate = self._build_prompt(context)
-        max_output_tokens = min(context.token_budget - prompt_estimate, 1_000_000)
+    def _build_request(self, context: TaskContext) -> _RequestOutcome:
+        prompt = self._build_prompt(context)
+        messages = prompt.messages
+        if messages is None:
+            outcome = _RequestOutcome(error_code=prompt.error_code)
+            del prompt, context, messages
+            return outcome
+        max_output_tokens = min(context.token_budget - prompt.prompt_estimate, 1_000_000)
         if max_output_tokens <= 0:
-            raise RuntimeExecutionError("runtime token budget is insufficient")
-        return (
-            ModelRequest(
+            del prompt, context, messages
+            return _RequestOutcome(error_code="runtime token budget is insufficient")
+        request: ModelRequest | None = None
+        failed = False
+        try:
+            request = ModelRequest(
                 logical_model=self._logical_model,
                 messages=messages,
                 required_capabilities=frozenset({ModelCapability.TEXT}),
                 timeout_seconds=context.timeout_seconds,
                 max_output_tokens=max_output_tokens,
-            ),
-            included_source_ids,
-        )
+            )
+        except Exception as error:  # noqa: BLE001 - normalized request boundary
+            error.__traceback__ = None
+            error.__context__ = None
+            error.__cause__ = None
+            del error
+            failed = True
+        included_source_ids = prompt.included_source_ids
+        del prompt, context, messages
+        if failed or request is None:
+            return _RequestOutcome(error_code="runtime model request is invalid")
+        return _RequestOutcome(request=request, included_source_ids=included_source_ids)
 
     def _build_prompt(
         self, context: TaskContext
-    ) -> tuple[tuple[ModelMessage, ...], tuple[str, ...], int]:
+    ) -> _PromptOutcome:
         prior: list[dict[str, object]] = []
         included_source_ids: list[str] = []
-        for artifact in context.artifacts:
-            if artifact.type != "text":
-                continue
-            text = artifact.content.get("text")
-            if type(text) is not str:
-                continue
-            prior.append(
-                {
-                    "id": str(artifact.id),
-                    "producer": artifact.producer,
-                    "content_sha256": artifact.content_sha256,
-                    "text": text,
-                }
+        artifact: Artifact | None = None
+        text: object = None
+        task_payload: str | None = None
+        prior_payload: str | None = None
+        payload: str | None = None
+        serialized_messages: str | None = None
+        messages: tuple[ModelMessage, ...] | None = None
+        error_code: str | None = None
+        try:
+            for artifact in context.artifacts:
+                if artifact.type != "text":
+                    continue
+                text = artifact.content.get("text")
+                if type(text) is not str:
+                    continue
+                prior.append(
+                    {
+                        "id": str(artifact.id),
+                        "producer": artifact.producer,
+                        "content_sha256": artifact.content_sha256,
+                        "text": text,
+                    }
+                )
+                included_source_ids.append(str(artifact.id))
+            task_payload = json.dumps(
+                {"request": context.request},
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
             )
-            included_source_ids.append(str(artifact.id))
-        task_payload = json.dumps(
-            {"request": context.request},
-            ensure_ascii=False,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        prior_payload = json.dumps(
-            prior,
-            ensure_ascii=False,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).replace("<", "\\u003c").replace(">", "\\u003e")
-        payload = (
-            f"<USER_REQUEST_JSON>{task_payload}</USER_REQUEST_JSON>\n"
-            f"<UNTRUSTED_ARTIFACTS_JSON>{prior_payload}</UNTRUSTED_ARTIFACTS_JSON>"
-        )
-        if len(payload.encode("utf-8")) > _MAX_CONTEXT_BYTES:
-            raise RuntimeExecutionError("runtime context exceeds size limit")
-        messages = (
+            prior_payload = json.dumps(
+                prior,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).replace("<", "\\u003c").replace(">", "\\u003e")
+            payload = (
+                f"<USER_REQUEST_JSON>{task_payload}</USER_REQUEST_JSON>\n"
+                f"<UNTRUSTED_ARTIFACTS_JSON>{prior_payload}</UNTRUSTED_ARTIFACTS_JSON>"
+            )
+            if len(payload.encode("utf-8")) > _MAX_CONTEXT_BYTES:
+                error_code = "runtime context exceeds size limit"
+            else:
+                messages = (
                 ModelMessage(
                     role="system",
                     content=(
@@ -323,19 +373,42 @@ class DirectRuntime:
                     ),
                 ),
                 ModelMessage(role="user", content=payload),
-        )
-        serialized_messages = json.dumps(
-            [{"role": item.role, "content": item.content} for item in messages],
-            ensure_ascii=False,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        return (
+                )
+                serialized_messages = json.dumps(
+                    [{"role": item.role, "content": item.content} for item in messages],
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+        except Exception as error:  # noqa: BLE001 - sensitive prompt boundary
+            error.__traceback__ = None
+            error.__context__ = None
+            error.__cause__ = None
+            del error
+            error_code = "runtime prompt serialization failed"
+        if error_code is None and messages is not None and serialized_messages is not None:
+            outcome = _PromptOutcome(
+                messages=messages,
+                included_source_ids=tuple(included_source_ids),
+                prompt_estimate=len(serialized_messages.encode("utf-8")),
+            )
+        else:
+            outcome = _PromptOutcome(error_code=error_code or "runtime prompt is invalid")
+        del (
+            context,
+            prior,
+            included_source_ids,
+            artifact,
+            text,
+            task_payload,
+            prior_payload,
+            payload,
+            serialized_messages,
             messages,
-            tuple(included_source_ids),
-            len(serialized_messages.encode("utf-8")),
+            error_code,
         )
+        return outcome
 
     @staticmethod
     def _strict_context(context: TaskContext) -> TaskContext:

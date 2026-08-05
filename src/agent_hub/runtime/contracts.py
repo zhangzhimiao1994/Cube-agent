@@ -442,7 +442,14 @@ class RunEvent(_RuntimeContractModel):
     action: str | None = None
     decision: Literal["approved", "rejected"] | None = None
     provider_id: str | None = None
-    cost_usd: Decimal | None = Field(default=None, gt=0, allow_inf_nan=False)
+    cost_usd: Decimal | None = Field(
+        default=None,
+        ge=0,
+        le=Decimal(1000000),
+        max_digits=13,
+        decimal_places=6,
+        allow_inf_nan=False,
+    )
     currency: Literal["USD"] | None = None
 
     @field_validator("kind", mode="before")
@@ -512,6 +519,32 @@ class RunEvent(_RuntimeContractModel):
         if len(set(result)) != len(result):
             raise ValueError("participants must be unique")
         return cast(tuple[str, ...], result)
+
+    @field_validator("cost_usd", mode="before")
+    @classmethod
+    def bounded_cost_input(cls, value: object) -> Decimal | None:
+        if value is None:
+            return None
+        if type(value) is bool:
+            raise ValueError("cost_usd must be a bounded decimal")
+        text: str
+        if isinstance(value, bytes):
+            if len(value) > 32:
+                raise ValueError("cost_usd must be a bounded decimal")
+            try:
+                text = value.decode("ascii")
+            except UnicodeDecodeError:
+                raise ValueError("cost_usd must be a bounded decimal") from None
+        elif isinstance(value, Decimal | int | float | str):
+            text = str(value)
+        else:
+            raise ValueError("cost_usd must be a bounded decimal")  # noqa: TRY004
+        if len(text) > 32 or re.fullmatch(r"(?:0|[1-9][0-9]{0,6})(?:\.[0-9]{1,6})?", text) is None:
+            raise ValueError("cost_usd must be a bounded decimal")
+        number = Decimal(text)
+        if not number.is_finite():  # pragma: no cover - excluded by lexical grammar
+            raise ValueError("cost_usd must be finite")
+        return Decimal(0) if number.is_zero() else number.normalize()
 
     @field_validator("inputs", mode="before")
     @classmethod

@@ -405,6 +405,41 @@ def test_known_future_events_enforce_kind_specific_semantics() -> None:
             cost_usd=Decimal("NaN"),
             currency="USD",
         )
+
+
+def test_cost_event_accepts_zero_and_rejects_unbounded_decimal_inputs_quickly() -> None:
+    zero = RunEvent(
+        kind=EventKind.COST_RECORDED,
+        sequence=1,
+        run_id=RUN_ID,
+        actor="main",
+        provider_id="deepseek",
+        cost_usd=Decimal("0.000000"),
+        currency="USD",
+    )
+    assert zero.cost_usd == Decimal(0)
+    invalid: tuple[object, ...] = (
+        True,
+        -1,
+        "1000001",
+        "0.0000001",
+        "NaN",
+        "Infinity",
+        "1e100000",
+        "9" * 300_000,
+    )
+    for value in invalid:
+        with pytest.raises(ValidationError) as caught:
+            RunEvent(
+                kind=EventKind.COST_RECORDED,
+                sequence=2,
+                run_id=RUN_ID,
+                actor="main",
+                provider_id="deepseek",
+                cost_usd=value,  # type: ignore[arg-type]
+                currency="USD",
+            )
+        assert "9" * 100 not in str(caught.value)
     with pytest.raises(ValidationError):
         RunEvent(
             kind="step.completed",
@@ -575,6 +610,27 @@ async def test_direct_claims_only_sources_actually_included_in_prompt() -> None:
     prompt = str(gateway.requests[0].messages[1].content)
     assert str(text.id) in prompt
     assert str(image.id) not in prompt
+
+
+async def test_combined_prompt_limit_is_redacted_across_all_runtime_frames() -> None:
+    sentinel = "combined-prompt-model-sentinel"
+    artifacts = tuple(
+        Artifact(
+            id=uuid4(),
+            type="text",
+            producer="researcher",
+            content={"text": sentinel + (str(index) * 60_000)},
+        )
+        for index in range(4)
+    )
+    gateway = FakeGateway()
+    runtime = DirectRuntime(gateway, logical_model="general")
+    with pytest.raises(RuntimeExecutionError) as caught:
+        await collect(runtime, context(artifacts=artifacts))
+    assert sentinel not in exception_graph_text(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert not gateway.requests
 
 
 async def test_direct_escapes_untrusted_delimiter_text() -> None:
