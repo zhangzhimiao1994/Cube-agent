@@ -97,6 +97,30 @@ class UnknownRuntimeHasher(PasswordHasher):
         raise RuntimeError("forced unknown hashing failure")
 
 
+class UnknownRuntimeRehashHasher(PasswordHasher):
+    def __init__(self) -> None:
+        super().__init__(time_cost=1, memory_cost=8192, parallelism=1, type=Type.ID)
+
+    def check_needs_rehash(self, hash: str | bytes) -> bool:
+        raise RuntimeError("forced unknown rehash failure")
+
+
+class BlockingUnknownRuntimeHasher(PasswordHasher):
+    def __init__(self) -> None:
+        super().__init__(time_cost=1, memory_cost=8192, parallelism=1, type=Type.ID)
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.failed = False
+
+    def hash(self, password: str | bytes, *, salt: bytes | None = None) -> str:
+        if not self.failed:
+            self.failed = True
+            self.started.set()
+            assert self.release.wait(2)
+            raise RuntimeError("forced background unknown failure")
+        return super().hash(password, salt=salt)
+
+
 def _assert_password_absent(error: BaseException, password: str) -> None:
     traceback = error.__traceback__
     while traceback is not None:
@@ -327,7 +351,16 @@ def test_sync_actual_hashing_error_is_sanitized() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cancelled_background_hashing_error_releases_capacity() -> None:
+async def test_cancelled_background_hashing_error_is_observable_and_releases_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, object]] = []
+
+    def record_event(message: str, *, extra: object) -> None:
+        events.append((message, extra))
+
+    monkeypatch.setattr("agent_hub.auth.passwords._LOGGER.warning", record_event)
+    password = "first sensitive password"
     hasher = BlockingFailOnceHashingHasher()
     service = PasswordService(
         hasher,
@@ -335,7 +368,7 @@ async def test_cancelled_background_hashing_error_releases_capacity() -> None:
         max_concurrency=1,
         max_waiters=0,
     )
-    running = asyncio.create_task(service.hash_async("first sensitive password"))
+    running = asyncio.create_task(service.hash_async(password))
     assert await asyncio.to_thread(hasher.started.wait, 1)
 
     running.cancel()
@@ -353,6 +386,69 @@ async def test_cancelled_background_hashing_error_releases_capacity() -> None:
             break
     else:
         pytest.fail("background hashing failure did not release capacity")
+    for _ in range(500):
+        if service.background_failure_count == 1:
+            break
+        await asyncio.sleep(0.01)
+    assert service.background_failure_count == 1
+    assert events == [
+        (
+            "background password worker failed",
+            {"failure_category": "password_backend"},
+        )
+    ]
+    assert password not in repr(events)
+    assert TEST_DUMMY_HASH not in repr(events)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_background_unknown_failure_logs_only_safe_category(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, object]] = []
+
+    def record_event(message: str, *, extra: object) -> None:
+        events.append((message, extra))
+
+    monkeypatch.setattr("agent_hub.auth.passwords._LOGGER.warning", record_event)
+    password = "first sensitive password"
+    hasher = BlockingUnknownRuntimeHasher()
+    service = PasswordService(
+        hasher,
+        dummy_hash=TEST_DUMMY_HASH,
+        max_concurrency=1,
+        max_waiters=0,
+    )
+    running = asyncio.create_task(service.hash_async(password))
+    assert await asyncio.to_thread(hasher.started.wait, 1)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    hasher.release.set()
+
+    for _ in range(500):
+        if service.background_failure_count == 1:
+            break
+        await asyncio.sleep(0.01)
+    assert service.background_failure_count == 1
+    assert events == [
+        (
+            "background password worker failed",
+            {"failure_category": "unexpected"},
+        )
+    ]
+    assert password not in repr(events)
+    assert TEST_DUMMY_HASH not in repr(events)
+    for _ in range(100):
+        try:
+            result = await service.hash_async("second valid password")
+        except AuthenticationBusy:
+            await asyncio.sleep(0.01)
+        else:
+            assert result.startswith("$argon2id$")
+            break
+    else:
+        pytest.fail("background unknown failure did not release capacity")
 
 
 def test_unknown_runtime_hash_failure_propagates_without_password_frames() -> None:
@@ -363,6 +459,20 @@ def test_unknown_runtime_hash_failure_propagates_without_password_frames() -> No
         service.hash(password)
 
     _assert_password_absent(captured.value, password)
+
+
+def test_unknown_runtime_rehash_failure_propagates_without_hash_frames() -> None:
+    password_hash = PasswordHasher(
+        time_cost=1, memory_cost=8192, parallelism=1, type=Type.ID
+    ).hash("valid password value")
+    service = PasswordService(
+        UnknownRuntimeRehashHasher(), dummy_hash=TEST_DUMMY_HASH
+    )
+
+    with pytest.raises(RuntimeError, match="forced unknown rehash failure") as captured:
+        service.needs_rehash(password_hash)
+
+    _assert_password_absent(captured.value, password_hash)
 
 
 def test_injected_hasher_over_budget_is_rejected() -> None:

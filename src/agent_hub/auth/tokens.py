@@ -1,5 +1,11 @@
-"""Strict HS256 access-token issuing and validation."""
+"""Strict HS256 access-token issuing and validation.
 
+Signing keys are either 32-64 raw bytes or canonical ``base64url:``/``hex:`` text.
+"""
+
+import base64
+import binascii
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -7,6 +13,9 @@ from typing import Final, NoReturn
 from uuid import UUID, uuid4
 
 import jwt
+from cryptography import x509
+from cryptography.exceptions import UnsupportedAlgorithm
+from cryptography.hazmat.primitives import serialization
 
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
 
@@ -25,6 +34,10 @@ _REQUIRED_CLAIMS: Final[tuple[str, ...]] = (
     "jti",
 )
 _TOKEN_BACKEND_FAILURE: Final[object] = object()
+_BASE64URL_KEY = re.compile(r"[A-Za-z0-9_-]+\Z")
+_HEX_KEY = re.compile(r"[0-9a-f]+\Z")
+_MIN_KEY_BYTES = 32
+_MAX_KEY_BYTES = 64
 
 
 class InvalidTokenError(RuntimeError):
@@ -131,98 +144,188 @@ class AccessTokenService:
         return outcome
 
     def decode(self, token: str) -> DecodedAccessToken:
-        payload = self._try_decode(token)
-        del token
-        if payload is None:
-            _raise_invalid_token()
-        decoded = self._try_materialize(payload)
-        del payload
-        if decoded is None:
-            _raise_invalid_token()
-        return decoded
+        decoded = None
+        payload = None
+        try:
+            payload = self._try_decode(token)
+            if payload is None:
+                _raise_invalid_token()
+            decoded = self._try_materialize(payload)
+            if decoded is None:
+                _raise_invalid_token()
+            return decoded
+        finally:
+            del decoded, payload, token
 
     def _try_decode(self, token: str) -> Mapping[str, object] | None:
-        if not isinstance(token, str) or not token or len(token) > _MAX_TOKEN_CHARS:
-            return None
+        payload = None
         try:
-            payload = jwt.decode(
-                token,
-                self._key,
-                algorithms=list(_ALLOWED_ALGORITHMS),
-                audience=self._audience,
-                issuer=self._issuer,
-                options={
-                    "require": list(_REQUIRED_CLAIMS),
-                    "strict_aud": True,
-                    "verify_exp": False,
-                    "verify_iat": False,
-                },
-            )
-        except (jwt.PyJWTError, TypeError, ValueError):
-            return None
-        return payload
+            if not isinstance(token, str) or not token or len(token) > _MAX_TOKEN_CHARS:
+                return None
+            try:
+                payload = jwt.decode(
+                    token,
+                    self._key,
+                    algorithms=list(_ALLOWED_ALGORITHMS),
+                    audience=self._audience,
+                    issuer=self._issuer,
+                    options={
+                        "require": list(_REQUIRED_CLAIMS),
+                        "strict_aud": True,
+                        "verify_exp": False,
+                        "verify_iat": False,
+                    },
+                )
+            except (jwt.PyJWTError, TypeError, ValueError):
+                return None
+            return payload
+        finally:
+            del payload, token
 
     def _try_materialize(self, payload: Mapping[str, object]) -> DecodedAccessToken | None:
         try:
-            if set(payload) != set(_REQUIRED_CLAIMS):
+            try:
+                if set(payload) != set(_REQUIRED_CLAIMS):
+                    return None
+                issued_timestamp = payload["iat"]
+                expires_timestamp = payload["exp"]
+                if (
+                    not isinstance(issued_timestamp, int)
+                    or isinstance(issued_timestamp, bool)
+                    or not isinstance(expires_timestamp, int)
+                    or isinstance(expires_timestamp, bool)
+                ):
+                    return None
+                audience = payload["aud"]
+                if not isinstance(audience, str) or audience != self._audience:
+                    return None
+                lifetime_seconds = expires_timestamp - issued_timestamp
+                if not _MIN_TTL_SECONDS <= lifetime_seconds <= _MAX_TTL_SECONDS:
+                    return None
+                issued_at = datetime.fromtimestamp(issued_timestamp, UTC)
+                expires_at = datetime.fromtimestamp(expires_timestamp, UTC)
+                now = _utc_clock_value(self._clock())
+                if issued_at > now + self._leeway or expires_at <= now - self._leeway:
+                    return None
+                if expires_at <= issued_at:
+                    return None
+                return DecodedAccessToken(
+                    user_id=_canonical_uuid_claim(payload, "sub"),
+                    tenant_id=_canonical_uuid_claim(payload, "tenant_id"),
+                    role=Role(_claim_string(payload, "role")),
+                    issued_at=issued_at,
+                    expires_at=expires_at,
+                    token_id=_canonical_uuid_claim(payload, "jti"),
+                )
+            except (KeyError, TypeError, ValueError, OverflowError, OSError):
                 return None
-            issued_timestamp = payload["iat"]
-            expires_timestamp = payload["exp"]
-            if (
-                not isinstance(issued_timestamp, int)
-                or isinstance(issued_timestamp, bool)
-                or not isinstance(expires_timestamp, int)
-                or isinstance(expires_timestamp, bool)
-            ):
-                return None
-            audience = payload["aud"]
-            if not isinstance(audience, str) or audience != self._audience:
-                return None
-            lifetime_seconds = expires_timestamp - issued_timestamp
-            if not _MIN_TTL_SECONDS <= lifetime_seconds <= _MAX_TTL_SECONDS:
-                return None
-            issued_at = datetime.fromtimestamp(issued_timestamp, UTC)
-            expires_at = datetime.fromtimestamp(expires_timestamp, UTC)
-            now = _utc_clock_value(self._clock())
-            if issued_at > now + self._leeway or expires_at <= now - self._leeway:
-                return None
-            if expires_at <= issued_at:
-                return None
-            return DecodedAccessToken(
-                user_id=_canonical_uuid_claim(payload, "sub"),
-                tenant_id=_canonical_uuid_claim(payload, "tenant_id"),
-                role=Role(_claim_string(payload, "role")),
-                issued_at=issued_at,
-                expires_at=expires_at,
-                token_id=_canonical_uuid_claim(payload, "jti"),
-            )
-        except (KeyError, TypeError, ValueError, OverflowError, OSError):
-            return None
+        finally:
+            del payload
 
 
 def _try_validated_key(signing_key: object) -> tuple[bytes | None, str | None]:
-    if isinstance(signing_key, str):
+    key = None
+    try:
+        if isinstance(signing_key, str):
+            key = _try_decode_text_key(signing_key)
+            if key is None:
+                return None, "text signing keys must use canonical base64url: or hex: format"
+        elif isinstance(signing_key, bytes):
+            key = signing_key
+        else:
+            return None, "access token signing key must be raw bytes or canonical text"
+        if not _MIN_KEY_BYTES <= len(key) <= _MAX_KEY_BYTES:
+            return None, "access token signing key must decode to 32-64 bytes"
+        if _is_structured_key_material(key):
+            return None, "HS256 signing key must be symmetric key material"
+        return key, None
+    finally:
+        del key, signing_key
+
+
+def _try_decode_text_key(signing_key: str) -> bytes | None:
+    encoded = None
+    key = None
+    try:
+        if signing_key.startswith("base64url:"):
+            encoded = signing_key.removeprefix("base64url:")
+            if not encoded or _BASE64URL_KEY.fullmatch(encoded) is None:
+                return None
+            padding = "=" * (-len(encoded) % 4)
+            try:
+                key = base64.b64decode(encoded + padding, altchars=b"-_", validate=True)
+            except (binascii.Error, ValueError):
+                return None
+            if base64.urlsafe_b64encode(key).decode("ascii").rstrip("=") != encoded:
+                return None
+            return key
+        if signing_key.startswith("hex:"):
+            encoded = signing_key.removeprefix("hex:")
+            if not encoded or len(encoded) % 2 or _HEX_KEY.fullmatch(encoded) is None:
+                return None
+            key = bytes.fromhex(encoded)
+            return key
+        return None
+    finally:
+        del encoded, key, signing_key
+
+
+def _is_structured_key_material(key: bytes) -> bool:
+    candidate = None
+    parser = None
+    text = None
+    try:
         try:
-            key = signing_key.encode("utf-8")
-        except UnicodeEncodeError:
-            return None, "access token signing key is invalid"
-    elif isinstance(signing_key, bytes):
-        key = signing_key
-    else:
-        return None, "access token signing key must be bytes or text"
-    if _looks_asymmetric(key):
-        return None, "HS256 signing key must be symmetric key material"
-    if len(key) < 32:
-        return None, "access token signing key must be at least 32 bytes"
-    return key, None
+            text = key.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+        else:
+            candidate = text.lstrip("\ufeff \t\r\n").lower()
+            if candidate.startswith(("{", "[")):
+                return True
+            markers = (
+                "-----begin ",
+                "---- begin ssh2 public key ----",
+                "ssh-rsa ",
+                "ssh-ed25519 ",
+                "ecdsa-sha2-",
+                "sk-ssh-",
+                "sk-ecdsa-",
+            )
+            if any(marker in candidate for marker in markers):
+                return True
+        parsers: tuple[Callable[[bytes], object], ...] = (
+            serialization.load_pem_public_key,
+            _load_pem_private_key,
+            serialization.load_der_public_key,
+            _load_der_private_key,
+            serialization.load_ssh_public_key,
+            x509.load_pem_x509_certificate,
+            x509.load_der_x509_certificate,
+        )
+        for parser in parsers:
+            try:
+                parser(key)
+            except (ValueError, TypeError, UnsupportedAlgorithm):
+                continue
+            return True
+        return False
+    finally:
+        del candidate, key, parser, text
 
 
-def _looks_asymmetric(key: bytes) -> bool:
-    candidate = key.lstrip().lower()
-    return (
-        candidate.startswith((b"-----begin ", b"ssh-", b"ecdsa-sha2-"))
-        or (candidate.startswith(b"{") and b'"kty"' in candidate)
-    )
+def _load_pem_private_key(key: bytes) -> object:
+    try:
+        return serialization.load_pem_private_key(key, password=None)
+    finally:
+        del key
+
+
+def _load_der_private_key(key: bytes) -> object:
+    try:
+        return serialization.load_der_private_key(key, password=None)
+    finally:
+        del key
 
 
 def _try_jwt_encode(
@@ -277,15 +380,24 @@ def _utc_clock_value(value: datetime) -> datetime:
 
 
 def _claim_string(payload: Mapping[str, object], claim: str) -> str:
-    value = payload[claim]
-    if not isinstance(value, str):
-        raise TypeError
-    return value
+    value = None
+    try:
+        value = payload[claim]
+        if not isinstance(value, str):
+            raise TypeError
+        return value
+    finally:
+        del payload, value
 
 
 def _canonical_uuid_claim(payload: Mapping[str, object], claim: str) -> UUID:
-    value = _claim_string(payload, claim)
-    parsed = UUID(value)
-    if str(parsed) != value:
-        raise ValueError
-    return parsed
+    parsed = None
+    value = None
+    try:
+        value = _claim_string(payload, claim)
+        parsed = UUID(value)
+        if str(parsed) != value:
+            raise ValueError
+        return parsed
+    finally:
+        del parsed, payload, value

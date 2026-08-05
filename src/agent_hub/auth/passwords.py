@@ -1,6 +1,7 @@
 """Argon2id local-password hashing with bounded asynchronous admission."""
 
 import asyncio
+import logging
 import re
 import threading
 from collections.abc import Callable
@@ -11,6 +12,8 @@ from argon2.exceptions import HashingError, InvalidHashError, VerificationError
 from argon2.low_level import Type
 
 from agent_hub.auth.models import AuthenticationBusy
+
+_LOGGER = logging.getLogger(__name__)
 
 _MIN_PASSWORD_CHARS = 12
 _MAX_PASSWORD_CHARS = 1024
@@ -107,6 +110,8 @@ class PasswordService:
         self._admission_capacity = max_concurrency + max_waiters
         self._admitted = 0
         self._acquire_timeout_seconds = acquire_timeout_seconds
+        self._background_failure_lock = threading.Lock()
+        self._background_failure_count = 0
 
     def hash(self, password: str) -> str:
         if not _is_valid_password(password):
@@ -125,6 +130,11 @@ class PasswordService:
     @property
     def dummy_hash(self) -> str:
         return self._dummy_hash
+
+    @property
+    def background_failure_count(self) -> int:
+        with self._background_failure_lock:
+            return self._background_failure_count
 
     async def hash_async(self, password: str) -> str:
         if not _is_valid_password(password):
@@ -173,12 +183,15 @@ class PasswordService:
         return outcome
 
     def needs_rehash(self, password_hash: str) -> bool:
-        if not _is_safe_argon2id_encoding(password_hash):
-            return False
         try:
-            return self._hasher.check_needs_rehash(password_hash)
-        except (InvalidHashError, TypeError, ValueError):
-            return False
+            if not _is_safe_argon2id_encoding(password_hash):
+                return False
+            try:
+                return self._hasher.check_needs_rehash(password_hash)
+            except (InvalidHashError, TypeError, ValueError):
+                return False
+        finally:
+            del password_hash
 
     def _verify_prevalidated(self, password_hash: str, password: str) -> bool:
         try:
@@ -201,7 +214,7 @@ class PasswordService:
             try:
                 return await asyncio.shield(worker)
             except asyncio.CancelledError:
-                worker.add_done_callback(_retrieve_background_result)
+                worker.add_done_callback(self._retrieve_background_result)
                 return _CANCELLED
         finally:
             del args, operation, worker
@@ -230,6 +243,29 @@ class PasswordService:
                 self._admitted -= 1
             del args, operation
 
+    def _retrieve_background_result(self, task: asyncio.Task[object]) -> None:
+        category = None
+        try:
+            try:
+                result = task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:  # noqa: BLE001 - caller can no longer receive failure
+                category = "unexpected"
+            else:
+                if result is _BACKEND_FAILURE:
+                    category = "password_backend"
+            if category is None:
+                return
+            _LOGGER.warning(
+                "background password worker failed",
+                extra={"failure_category": category},
+            )
+            with self._background_failure_lock:
+                self._background_failure_count += 1
+        finally:
+            del category, task
+
 
 def _is_valid_password(password: object) -> bool:
     if not isinstance(password, str):
@@ -255,17 +291,21 @@ def _try_hash(hasher: PasswordHasher, password: str) -> str | object:
 
 
 def _is_safe_argon2id_encoding(password_hash: object) -> bool:
-    if not isinstance(password_hash, str) or len(password_hash) > _MAX_HASH_CHARS:
-        return False
-    match = _ARGON2ID_ENCODING.fullmatch(password_hash)
-    if match is None:
-        return False
-    return (
-        int(match.group("version")) == 19
-        and 8 <= int(match.group("memory")) <= _MAX_MEMORY_COST
-        and 1 <= int(match.group("time")) <= _MAX_TIME_COST
-        and 1 <= int(match.group("parallelism")) <= _MAX_PARALLELISM
-    )
+    match = None
+    try:
+        if not isinstance(password_hash, str) or len(password_hash) > _MAX_HASH_CHARS:
+            return False
+        match = _ARGON2ID_ENCODING.fullmatch(password_hash)
+        if match is None:
+            return False
+        return (
+            int(match.group("version")) == 19
+            and 8 <= int(match.group("memory")) <= _MAX_MEMORY_COST
+            and 1 <= int(match.group("time")) <= _MAX_TIME_COST
+            and 1 <= int(match.group("parallelism")) <= _MAX_PARALLELISM
+        )
+    finally:
+        del match, password_hash
 
 
 def _dummy_matches_hasher_profile(dummy_hash: object, hasher: PasswordHasher) -> bool:
@@ -302,12 +342,3 @@ def _raise_password_backend_error() -> NoReturn:
 
 def _raise_cancelled() -> NoReturn:
     raise asyncio.CancelledError
-
-
-def _retrieve_background_result(task: asyncio.Task[object]) -> None:
-    try:
-        task.result()
-    except asyncio.CancelledError:
-        return
-    except Exception:  # noqa: BLE001 - cancelled caller can no longer receive worker failure
-        return

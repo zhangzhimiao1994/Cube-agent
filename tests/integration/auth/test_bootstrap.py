@@ -3,6 +3,7 @@ import base64
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
+import jwt
 import pytest
 from argon2 import PasswordHasher
 from argon2.exceptions import HashingError
@@ -136,6 +137,14 @@ class HashingFailureHasher(PasswordHasher):
 
     def hash(self, password: str | bytes, *, salt: bytes | None = None) -> str:
         raise HashingError("forced hashing failure")
+
+
+class UnknownRuntimeRehashHasher(PasswordHasher):
+    def __init__(self) -> None:
+        super().__init__(time_cost=3, memory_cost=65_536, parallelism=4, type=Type.ID)
+
+    def check_needs_rehash(self, hash: str | bytes) -> bool:
+        raise RuntimeError("forced unknown rehash failure")
 
 
 def _assert_production_frames_do_not_contain(
@@ -434,6 +443,25 @@ async def test_auth_failures_do_not_retain_credentials_or_tokens_in_tracebacks(
     with pytest.raises(InvalidTokenError) as token_error:
         service.authenticate_token(token)
     _assert_production_frames_do_not_contain(token_error.value, token)
+
+
+@pytest.mark.integration
+async def test_unknown_decode_runtime_propagates_through_auth_without_token_frames(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant_id = await _tenant(auth_session_factory)
+    service = _service(auth_session_factory, tenant_id)
+    token = "sensitive.header.payload.signature"
+
+    def fail_decode(*args: object, **kwargs: object) -> dict[str, object]:
+        raise RuntimeError("forced unknown decode failure")
+
+    monkeypatch.setattr(jwt, "decode", fail_decode)
+    with pytest.raises(RuntimeError, match="forced unknown decode failure") as captured:
+        service.authenticate_token(token)
+
+    _assert_production_frames_do_not_contain(captured.value, token)
 
 
 @pytest.mark.integration
@@ -812,6 +840,32 @@ async def test_actual_hashing_error_rolls_back_login_rehash_without_secret_trace
         await service.login(tenant_id, "first-admin", password)
 
     _assert_production_frames_do_not_contain(captured.value, password)
+    async with auth_session_factory() as session:
+        assert await session.scalar(select(UserRow.password_hash)) == old_hash
+
+
+@pytest.mark.integration
+async def test_unknown_rehash_runtime_rolls_back_login_without_hash_or_password_frames(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _tenant(auth_session_factory)
+    issuer = _service(auth_session_factory, tenant_id)
+    code = await issuer.issue_bootstrap_code()
+    password = "sensitive password 123"
+    await issuer.consume_bootstrap_code(code, "first-admin", password)
+    async with auth_session_factory() as session:
+        old_hash = await session.scalar(select(UserRow.password_hash))
+    assert isinstance(old_hash, str)
+    service = _service(
+        auth_session_factory,
+        tenant_id,
+        passwords=PasswordService(UnknownRuntimeRehashHasher()),
+    )
+
+    with pytest.raises(RuntimeError, match="forced unknown rehash failure") as captured:
+        await service.login(tenant_id, "first-admin", password)
+
+    _assert_production_frames_do_not_contain(captured.value, password, old_hash)
     async with auth_session_factory() as session:
         assert await session.scalar(select(UserRow.password_hash)) == old_hash
 

@@ -355,8 +355,11 @@ class AuthService:
             )
 
     def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
-        principal = _try_decode_principal(self._tokens, token)
-        del token
+        principal = None
+        try:
+            principal = _try_decode_principal(self._tokens, token)
+        finally:
+            del token
         if principal is None:
             _raise_invalid_token()
         return principal
@@ -391,9 +394,12 @@ def _try_decode_principal(
     token_service: AccessTokenService, token: str
 ) -> AuthenticatedPrincipal | None:
     try:
-        return token_service.decode(token).principal
-    except InvalidTokenError:
-        return None
+        try:
+            return token_service.decode(token).principal
+        except InvalidTokenError:
+            return None
+    finally:
+        del token
 
 
 def _validate_bootstrap_ttl(ttl_seconds: int) -> None:
