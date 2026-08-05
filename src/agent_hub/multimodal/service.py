@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import json
 import math
+from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Annotated, Protocol
 from urllib.parse import urlsplit
 
@@ -34,6 +37,7 @@ from agent_hub.multimodal.types import (
     OCRAdapter,
     OCRObservation,
     SanitizedImage,
+    SignedImageReference,
     StoredImageObject,
     VisionAnalysisError,
     VisionAnalysisResult,
@@ -79,7 +83,7 @@ def _parse_payload(raw_response: str | None) -> _ModelVisionPayload | None:
     try:
         decoded = json.loads(raw_response)
         return _ModelVisionPayload.model_validate(decoded)
-    except (json.JSONDecodeError, TypeError, ValueError, ValidationError):
+    except (json.JSONDecodeError, RecursionError, TypeError, ValueError, ValidationError):
         return None
 
 
@@ -100,9 +104,33 @@ def _valid_https_reference(reference: str, maximum: int) -> bool:
         _ = parsed.port
     except ValueError:
         return False
+    hostname = parsed.hostname
+    if hostname is None or not hostname.isascii() or "\\" in reference:
+        return False
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    else:
+        return False
+    lowered_host = hostname.lower().rstrip(".")
+    labels = lowered_host.split(".")
+    valid_dns = (
+        len(labels) >= 2
+        and all(
+            label
+            and len(label) <= 63
+            and label[0].isalnum()
+            and label[-1].isalnum()
+            and all(character.isalnum() or character == "-" for character in label)
+            for label in labels
+        )
+        and lowered_host not in {"localhost", "localhost.localdomain"}
+        and not lowered_host.endswith((".local", ".internal", ".localhost", ".lan"))
+    )
     return (
         parsed.scheme == "https"
-        and parsed.hostname is not None
+        and valid_dns
         and parsed.username is None
         and parsed.password is None
         and not parsed.fragment
@@ -124,6 +152,8 @@ class VisionService:
         review_threshold: float = 0.7,
         max_reference_length: int = 30_000_000,
         max_concurrent_image_tasks: int = 4,
+        max_signed_url_ttl_seconds: float = 300,
+        utc_now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         if (
             isinstance(review_threshold, bool)
@@ -136,6 +166,13 @@ class VisionService:
             raise ValueError("max_reference_length must be a strict positive integer")
         if type(max_concurrent_image_tasks) is not int or max_concurrent_image_tasks <= 0:
             raise ValueError("max_concurrent_image_tasks must be a strict positive integer")
+        if (
+            isinstance(max_signed_url_ttl_seconds, bool)
+            or not isinstance(max_signed_url_ttl_seconds, int | float)
+            or not math.isfinite(max_signed_url_ttl_seconds)
+            or max_signed_url_ttl_seconds <= 0
+        ):
+            raise ValueError("max_signed_url_ttl_seconds must be finite and positive")
         self._gateway = gateway
         self._object_store = object_store
         self._limits = limits or ImageLimits()
@@ -145,6 +182,8 @@ class VisionService:
         self._review_threshold = float(review_threshold)
         self._max_reference_length = max_reference_length
         self._image_slots = asyncio.Semaphore(max_concurrent_image_tasks)
+        self._max_signed_url_ttl_seconds = float(max_signed_url_ttl_seconds)
+        self._utc_now = utc_now
 
     async def analyze(
         self,
@@ -168,7 +207,59 @@ class VisionService:
         if sanitized is None:
             raise InvalidImage("image rejected") from None
         del declared_mime
+        object_key = sanitized.object_key
         tenant_digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()
+        stored, storage_cancellation = await self._store_image(sanitized, tenant_id)
+        if storage_cancellation is not None:
+            del sanitized, stored
+            _cleanup_cancellation, _cleanup_ok = await self._cleanup_object(
+                tenant_id, object_key
+            )
+            del object_key, tenant_id, tenant_digest
+            storage_cancellation.__traceback__ = None
+            raise storage_cancellation from None
+        if stored is None or not self._stored_matches(stored, sanitized):
+            del sanitized, stored
+            cleanup_cancellation, cleanup_ok = await self._cleanup_object(tenant_id, object_key)
+            del object_key, tenant_id, tenant_digest
+            if cleanup_cancellation is not None:
+                cleanup_cancellation.__traceback__ = None
+                raise cleanup_cancellation from None
+            if not cleanup_ok:
+                raise VisionAnalysisError("image cleanup failed") from None
+            raise VisionAnalysisError("image storage failed") from None
+
+        try:
+            result, failure, cancellation = await self._analyze_stored(
+                sanitized, stored, logical_model, tenant_digest
+            )
+        except asyncio.CancelledError as unexpected_cancellation:
+            unexpected_cancellation.__traceback__ = None
+            result, failure, cancellation = None, None, unexpected_cancellation
+        except Exception as error:  # noqa: BLE001 - fail closed around injected components
+            error.__traceback__ = None
+            del error
+            result, failure, cancellation = None, "vision analysis failed", None
+        del sanitized
+        if result is not None:
+            del tenant_id, object_key, stored
+            return result
+
+        cleanup_cancellation, cleanup_ok = await self._cleanup_object(tenant_id, object_key)
+        del tenant_id, object_key, stored
+        if cancellation is not None:
+            cancellation.__traceback__ = None
+            raise cancellation from None
+        if cleanup_cancellation is not None:
+            cleanup_cancellation.__traceback__ = None
+            raise cleanup_cancellation from None
+        if not cleanup_ok:
+            raise VisionAnalysisError("image cleanup failed") from None
+        raise VisionAnalysisError(failure or "vision analysis failed") from None
+
+    async def _store_image(
+        self, sanitized: SanitizedImage, tenant_id: str
+    ) -> tuple[StoredImageObject | None, asyncio.CancelledError | None]:
         try:
             stored = await self._object_store.put(
                 tenant_id,
@@ -176,41 +267,93 @@ class VisionService:
                 sanitized.canonical_bytes,
                 sanitized.media_type,
             )
-        except asyncio.CancelledError:
-            raise
+        except asyncio.CancelledError as cancellation:
+            cancellation.__traceback__ = None
+            del sanitized, tenant_id
+            return None, cancellation
         except Exception as error:  # noqa: BLE001 - adapter details are untrusted
             error.__traceback__ = None
-            del error, tenant_id
-            raise VisionAnalysisError("image storage failed") from None
-        del tenant_id
-        if (
-            not isinstance(stored, StoredImageObject)
-            or stored.object_key != sanitized.object_key
-            or stored.content_type != sanitized.media_type
-            or stored.sha256 != sanitized.canonical_sha256
-            or stored.byte_length != len(sanitized.canonical_bytes)
-        ):
-            raise VisionAnalysisError("image storage failed") from None
+            del error, sanitized, tenant_id
+            return None, None
+        del sanitized, tenant_id
+        return stored, None
 
-        reference = await self._image_reference(sanitized, stored)
-        request = self._request(logical_model, reference)
+    @staticmethod
+    def _stored_matches(stored: StoredImageObject, sanitized: SanitizedImage) -> bool:
+        return (
+            isinstance(stored, StoredImageObject)
+            and stored.object_key == sanitized.object_key
+            and stored.content_type == sanitized.media_type
+            and stored.sha256 == sanitized.canonical_sha256
+            and stored.byte_length == len(sanitized.canonical_bytes)
+        )
+
+    async def _cleanup_object(
+        self, tenant_id: str, object_key: str
+    ) -> tuple[asyncio.CancelledError | None, bool]:
+        cleanup = asyncio.create_task(self._object_store.delete(tenant_id, object_key))
+        del tenant_id, object_key
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError as cancellation:
+            await asyncio.gather(cleanup, return_exceptions=True)
+            cancellation.__traceback__ = None
+            del cleanup
+            return cancellation, True
+        except Exception as error:  # noqa: BLE001 - cleanup details are redacted
+            error.__traceback__ = None
+            del error, cleanup
+            return None, False
+        del cleanup
+        return None, True
+
+    async def _analyze_stored(
+        self,
+        sanitized: SanitizedImage,
+        stored: StoredImageObject,
+        requested_logical_model: str,
+        tenant_digest: str,
+    ) -> tuple[
+        VisionAnalysisResult | None,
+        str | None,
+        asyncio.CancelledError | None,
+    ]:
+        reference, cancellation = await self._image_reference(sanitized, stored)
+        if cancellation is not None:
+            del sanitized, stored
+            return None, None, cancellation
+        if reference is None:
+            del sanitized, stored
+            return None, "image reference failed", None
+        try:
+            request = self._request(requested_logical_model, reference)
+        except (TypeError, ValueError):
+            del sanitized, stored, reference
+            return None, "vision analysis failed", None
         completion: GatewayCompletion | None = None
         try:
             completion = await self._gateway.complete_with_context(request)
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:  # noqa: BLE001 - gateway adapter details are redacted
+        except asyncio.CancelledError as gateway_cancellation:
+            gateway_cancellation.__traceback__ = None
+            del sanitized, stored, request, reference
+            return None, None, gateway_cancellation
+        except Exception as error:  # noqa: BLE001 - gateway details are redacted
             error.__traceback__ = None
             del error
         del request, reference
 
         payload = None if completion is None else _parse_payload(completion.response.text)
-        artifact = self._trusted_artifact(payload, sanitized, logical_model, completion)
+        artifact = self._trusted_artifact(payload, sanitized, completion)
         primary_unavailable = artifact is None
         low_confidence = artifact is not None and artifact.confidence < self._review_threshold
 
         if self._ocr is not None and (primary_unavailable or low_confidence):
-            ocr = await self._safe_ocr(sanitized.canonical_bytes)
+            try:
+                ocr = await self._safe_ocr(sanitized.canonical_bytes)
+            except asyncio.CancelledError as ocr_cancellation:
+                ocr_cancellation.__traceback__ = None
+                del sanitized, stored, completion, payload
+                return None, None, ocr_cancellation
             if ocr is not None and ocr.text_oriented:
                 artifact = ImageAnalysisArtifact(
                     source_sha256=sanitized.source_sha256,
@@ -218,50 +361,99 @@ class VisionService:
                     extracted_text=ocr.text,
                     objects=[],
                     confidence=float(ocr.confidence),
-                    logical_model=logical_model,
+                    logical_model=requested_logical_model,
                     deployment_id="local-ocr",
                 )
                 result = VisionAnalysisResult(artifact, stored, True, True)
-                await self._audit_result(result, sanitized, tenant_digest, "local-ocr")
-                return result
+                audit_failure, audit_cancellation = await self._audit_outcome(
+                    result, sanitized, tenant_digest, "local-ocr", "local-ocr"
+                )
+                del sanitized, stored, completion, payload, ocr
+                if audit_cancellation is not None:
+                    return None, None, audit_cancellation
+                if audit_failure:
+                    return None, "vision audit failed", None
+                return result, None, None
 
-        if artifact is None:
-            del completion, payload
-            raise VisionAnalysisError("vision analysis failed") from None
+        if artifact is None or completion is None:
+            del sanitized, stored, completion, payload
+            return None, "vision analysis failed", None
         result = VisionAnalysisResult(
             artifact=artifact,
             stored_object=stored,
             ocr_only=False,
             requires_review=artifact.confidence < self._review_threshold,
         )
-        await self._audit_result(result, sanitized, tenant_digest, "model-gateway")
-        return result
+        audit_failure, audit_cancellation = await self._audit_outcome(
+            result,
+            sanitized,
+            tenant_digest,
+            completion.provider_id,
+            completion.provider_model,
+        )
+        del sanitized, stored, completion, payload
+        if audit_cancellation is not None:
+            return None, None, audit_cancellation
+        if audit_failure:
+            return None, "vision audit failed", None
+        return result, None, None
 
     async def _image_reference(
         self, sanitized: SanitizedImage, stored: StoredImageObject
-    ) -> str:
+    ) -> tuple[str | None, asyncio.CancelledError | None]:
         if self._reference_provider is None:
-            encoded = await asyncio.to_thread(
-                lambda value: base64.b64encode(value).decode("ascii"),
-                sanitized.canonical_bytes,
-            )
+            try:
+                encoded = await asyncio.to_thread(
+                    lambda value: base64.b64encode(value).decode("ascii"),
+                    sanitized.canonical_bytes,
+                )
+            except asyncio.CancelledError as cancellation:
+                cancellation.__traceback__ = None
+                del sanitized, stored
+                return None, cancellation
             reference = f"data:image/png;base64,{encoded}"
             if len(reference) <= self._max_reference_length:
-                return reference
-            del encoded, reference
-            raise VisionAnalysisError("image reference failed") from None
+                del sanitized, stored, encoded
+                return reference, None
+            del sanitized, stored, encoded, reference
+            return None, None
         try:
-            reference = await self._reference_provider.reference(sanitized, stored)
-        except asyncio.CancelledError:
-            raise
+            signed_reference = await self._reference_provider.reference(sanitized, stored)
+        except asyncio.CancelledError as cancellation:
+            cancellation.__traceback__ = None
+            del sanitized, stored
+            return None, cancellation
         except Exception as error:  # noqa: BLE001 - provider details are redacted
             error.__traceback__ = None
-            del error
-            raise VisionAnalysisError("image reference failed") from None
-        if not _valid_https_reference(reference, self._max_reference_length):
-            del reference
-            raise VisionAnalysisError("image reference failed") from None
-        return reference
+            del error, sanitized, stored
+            return None, None
+        try:
+            now = self._utc_now()
+        except Exception as error:  # noqa: BLE001 - injected clock details are redacted
+            error.__traceback__ = None
+            del error, sanitized, stored, signed_reference
+            return None, None
+        valid_expiry = False
+        if (
+            isinstance(now, datetime)
+            and now.tzinfo is not None
+            and now.utcoffset() is not None
+            and isinstance(signed_reference, SignedImageReference)
+        ):
+            ttl = (signed_reference.expires_at - now).total_seconds()
+            valid_expiry = 0 < ttl <= self._max_signed_url_ttl_seconds
+        if (
+            not isinstance(signed_reference, SignedImageReference)
+            or not valid_expiry
+            or not _valid_https_reference(
+                signed_reference.url, min(self._max_reference_length, 8192)
+            )
+        ):
+            del sanitized, stored, signed_reference
+            return None, None
+        url = signed_reference.url
+        del sanitized, stored, signed_reference
+        return url, None
 
     async def _sanitize_input(
         self, data: bytes | bytearray | memoryview, declared_mime: str, tenant_id: str
@@ -323,7 +515,6 @@ class VisionService:
     def _trusted_artifact(
         payload: _ModelVisionPayload | None,
         sanitized: SanitizedImage,
-        logical_model: str,
         completion: GatewayCompletion | None,
     ) -> ImageAnalysisArtifact | None:
         if payload is None or completion is None:
@@ -335,7 +526,7 @@ class VisionService:
                 extracted_text=payload.extracted_text,
                 objects=payload.objects,
                 confidence=payload.confidence,
-                logical_model=logical_model,
+                logical_model=completion.logical_model,
                 deployment_id=completion.deployment_id,
             )
         except (TypeError, ValueError, ValidationError):
@@ -354,13 +545,14 @@ class VisionService:
             return None
         return observation if isinstance(observation, OCRObservation) else None
 
-    async def _audit_result(
+    async def _audit_outcome(
         self,
         result: VisionAnalysisResult,
         sanitized: SanitizedImage,
         tenant_digest: str,
         provider_id: str,
-    ) -> None:
+        provider_model: str,
+    ) -> tuple[bool, asyncio.CancelledError | None]:
         event = VisionAuditEvent(
             tenant_sha256=tenant_digest,
             source_sha256=sanitized.source_sha256,
@@ -372,15 +564,20 @@ class VisionService:
             logical_model=result.artifact.logical_model,
             deployment_id=result.artifact.deployment_id,
             provider_id=provider_id,
+            provider_model=provider_model,
             confidence=result.artifact.confidence,
             ocr_only=result.ocr_only,
             requires_review=result.requires_review,
         )
         try:
             await self._audit.record(event)
-        except asyncio.CancelledError:
-            raise
+        except asyncio.CancelledError as cancellation:
+            cancellation.__traceback__ = None
+            del result, sanitized, event
+            return False, cancellation
         except Exception as error:  # noqa: BLE001 - audit details are untrusted
             error.__traceback__ = None
-            del error, event
-            raise VisionAnalysisError("vision audit failed") from None
+            del error, result, sanitized, event
+            return True, None
+        del result, sanitized, event
+        return False, None

@@ -33,11 +33,24 @@ class GatewayCompletion:
 
     response: ModelResponse = field(repr=False)
     deployment_id: str
+    logical_model: str
+    provider_id: str
+    provider_model: str = field(repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.response, ModelResponse):
             raise TypeError("response must be ModelResponse")
         _require_safe_identifier("deployment id", self.deployment_id)
+        _require_safe_identifier("logical model", self.logical_model)
+        _require_safe_identifier("provider id", self.provider_id)
+        if (
+            not self.provider_model
+            or self.provider_model != self.provider_model.strip()
+            or len(self.provider_model) > 512
+        ):
+            raise ValueError("provider_model must be bounded and unpadded")
+        if self.provider_model.split("/", 1)[0] != self.provider_id:
+            raise ValueError("provider provenance is inconsistent")
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,7 +255,13 @@ class ModelGateway:
         if lease is None or selected is None:
             raise CapacityUnavailable("model capacity unavailable") from None
         response = await self._complete_leased(selected, lease, request)
-        return GatewayCompletion(response=response, deployment_id=selected.id)
+        return GatewayCompletion(
+            response=response,
+            deployment_id=selected.id,
+            logical_model=selected.logical_model,
+            provider_id=selected.provider_model.split("/", 1)[0],
+            provider_model=selected.provider_model,
+        )
 
     def _fallback_chain(self, primary: str, allow_fallback: bool) -> tuple[str, ...]:
         chain = [primary]

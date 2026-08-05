@@ -630,6 +630,28 @@ async def test_capacity_timeout_traverses_fallback_only_when_allowed() -> None:
     assert capacity.initialize_calls == 2
 
 
+async def test_completion_context_reports_actual_fallback_provenance() -> None:
+    primary = deployment("primary-key")
+    backup = deployment("backup-key", "backup")
+    capacity = CapacityStub([CapacityWaitTimeout("busy"), lease("backup-key")])
+    gateway = ModelGateway(
+        ModelRegistry([primary, backup]),
+        capacity,
+        SecretStub(capacity.events),
+        TransportStub(capacity.events),
+        fallbacks={"primary": "backup"},
+    )
+
+    completion = await gateway.complete_with_context(request())
+
+    assert completion.deployment_id == "backup-key"
+    assert completion.logical_model == "backup"
+    assert completion.provider_id == "openai"
+    assert completion.provider_model == "openai/gpt-4o-mini"
+    assert "provider_model" not in repr(completion)
+    assert not hasattr(completion, "quota_scope_id")
+
+
 async def test_no_fallback_when_request_disallows_it() -> None:
     primary = deployment("primary-key")
     backup = deployment("backup-key", "backup")

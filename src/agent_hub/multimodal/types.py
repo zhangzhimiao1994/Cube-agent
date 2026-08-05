@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -121,6 +122,8 @@ class ImageObjectStore(Protocol):
         self, tenant_id: str, object_key: str, data: bytes, content_type: str
     ) -> StoredImageObject: ...
 
+    async def delete(self, tenant_id: str, object_key: str) -> None: ...
+
 
 class ContentTypeDetector(Protocol):
     def detect(self, data: bytes) -> str | None: ...
@@ -131,11 +134,35 @@ class OCRAdapter(Protocol):
 
 
 class ImageReferenceProvider(Protocol):
-    async def reference(self, image: SanitizedImage, stored: StoredImageObject) -> str: ...
+    async def reference(
+        self, image: SanitizedImage, stored: StoredImageObject
+    ) -> SignedImageReference: ...
 
 
 class VisionAuditSink(Protocol):
     async def record(self, event: VisionAuditEvent) -> None: ...
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class SignedImageReference:
+    url: str = field(repr=False)
+    expires_at: datetime
+    signed: bool
+    provider_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.url) is not str or not self.url or len(self.url) > 8192:
+            raise ValueError("signed image URL must be nonempty and bounded")
+        if (
+            not isinstance(self.expires_at, datetime)
+            or self.expires_at.tzinfo is None
+            or self.expires_at.utcoffset() is None
+        ):
+            raise ValueError("signed image reference expiry must be timezone-aware")
+        if self.signed is not True:
+            raise ValueError("image reference must be signed")
+        if _SAFE_ID.fullmatch(self.provider_id) is None:
+            raise ValueError("image reference provider must be a safe identifier")
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -207,6 +234,7 @@ class VisionAuditEvent:
     logical_model: str
     deployment_id: str
     provider_id: str
+    provider_model: str
     confidence: float
     ocr_only: bool
     requires_review: bool
@@ -222,6 +250,12 @@ class VisionAuditEvent:
         for value in (self.logical_model, self.deployment_id, self.provider_id):
             if _SAFE_ID.fullmatch(value) is None:
                 raise ValueError("audit identifiers must be safe")
+        if (
+            not self.provider_model
+            or len(self.provider_model) > 512
+            or re.fullmatch(r"[A-Za-z0-9_./:-]+", self.provider_model) is None
+        ):
+            raise ValueError("audit provider model must be a bounded safe value")
         _positive_int("width", self.width)
         _positive_int("height", self.height)
         if not math.isfinite(self.confidence) or not 0 <= self.confidence <= 1:

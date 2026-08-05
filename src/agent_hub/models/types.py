@@ -121,6 +121,7 @@ class Deployment:
         _require_safe_identifier("deployment id", self.id)
         _require_safe_identifier("logical_model", self.logical_model)
         _require_unpadded("provider_model", self.provider_model, max_length=512)
+        _require_safe_identifier("provider id", self.provider_model.split("/", 1)[0])
         _require_unpadded("secret_ref", self.secret_ref, max_length=512)
         _require_safe_identifier("quota_scope_id", self.quota_scope_id)
 

@@ -57,15 +57,109 @@ def _copy_input(raw: object, maximum: int) -> bytes | None:
         return None
 
 
+def _valid_png_container(data: bytes) -> bool:
+    offset = 8
+    chunks = 0
+    while offset + 12 <= len(data):
+        length = int.from_bytes(data[offset : offset + 4], "big")
+        chunk_type = data[offset + 4 : offset + 8]
+        end = offset + 12 + length
+        if end > len(data):
+            return False
+        chunks += 1
+        if chunks == 1 and (chunk_type != b"IHDR" or length != 13):
+            return False
+        if chunk_type == b"IEND":
+            return length == 0 and end == len(data)
+        offset = end
+    return False
+
+
+def _valid_jpeg_container(data: bytes) -> bool:
+    if not data.startswith(b"\xff\xd8"):
+        return False
+    offset = 2
+    in_scan = False
+    while offset < len(data):
+        if in_scan:
+            marker_start = data.find(b"\xff", offset)
+            if marker_start < 0 or marker_start + 1 >= len(data):
+                return False
+            code_offset = marker_start + 1
+            while code_offset < len(data) and data[code_offset] == 0xFF:
+                code_offset += 1
+            if code_offset >= len(data):
+                return False
+            code = data[code_offset]
+            if code == 0x00 or 0xD0 <= code <= 0xD7:
+                offset = code_offset + 1
+                continue
+            offset = marker_start
+            in_scan = False
+            continue
+
+        if data[offset] != 0xFF:
+            return False
+        marker_start = offset
+        offset += 1
+        while offset < len(data) and data[offset] == 0xFF:
+            offset += 1
+        if offset >= len(data):
+            return False
+        code = data[offset]
+        offset += 1
+        if code == 0xD9:
+            return offset == len(data)
+        if code in {0x00, 0xD8}:
+            return False
+        if code == 0x01 or 0xD0 <= code <= 0xD7:
+            continue
+        if offset + 2 > len(data):
+            return False
+        segment_length = int.from_bytes(data[offset : offset + 2], "big")
+        if segment_length < 2 or offset + segment_length > len(data):
+            return False
+        offset += segment_length
+        if code == 0xDA:
+            in_scan = True
+        if offset <= marker_start:  # pragma: no cover - defensive progress invariant
+            return False
+    return False
+
+
+def _valid_webp_container(data: bytes) -> bool:
+    if (
+        len(data) < 20
+        or data[:4] != b"RIFF"
+        or data[8:12] != b"WEBP"
+        or int.from_bytes(data[4:8], "little") + 8 != len(data)
+    ):
+        return False
+    allowed = {b"VP8 ", b"VP8L", b"VP8X", b"ALPH", b"ICCP", b"EXIF", b"XMP "}
+    offset = 12
+    image_chunks = 0
+    while offset + 8 <= len(data):
+        chunk_type = data[offset : offset + 4]
+        length = int.from_bytes(data[offset + 4 : offset + 8], "little")
+        payload_end = offset + 8 + length
+        padded_end = payload_end + (length & 1)
+        if chunk_type not in allowed or padded_end > len(data):
+            return False
+        if length & 1 and data[payload_end:padded_end] != b"\x00":
+            return False
+        if chunk_type in {b"VP8 ", b"VP8L"}:
+            image_chunks += 1
+        offset = padded_end
+    return offset == len(data) and image_chunks == 1
+
+
 def _has_exact_container_length(data: bytes, detected_mime: str) -> bool:
     if detected_mime == "image/png":
-        marker = b"IEND\xaeB`\x82"
-        position = data.rfind(marker)
-        return position >= 0 and position + len(marker) == len(data)
-    if detected_mime == "image/webp":
-        return len(data) >= 12 and int.from_bytes(data[4:8], "little") + 8 == len(data)
+        return _valid_png_container(data)
     if detected_mime == "image/jpeg":
-        return data.endswith(b"\xff\xd9")
+        return _valid_jpeg_container(data)
+    if detected_mime == "image/webp":
+        return _valid_webp_container(data)
     return False
 
 
@@ -251,6 +345,19 @@ class FilesystemImageStore:
             raise result from None
         return result
 
+    async def delete(self, tenant_id: str, object_key: str) -> None:
+        worker = asyncio.create_task(
+            asyncio.to_thread(self._delete_sync_safe, tenant_id, object_key)
+        )
+        del tenant_id, object_key
+        try:
+            deleted = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            await asyncio.gather(worker, return_exceptions=True)
+            raise
+        if not deleted:
+            raise OSError("image storage cleanup failed") from None
+
     def _put_sync_safe(
         self, tenant_id: str, object_key: str, data: bytes, content_type: str
     ) -> StoredImageObject | ValueError | None:
@@ -307,3 +414,28 @@ class FilesystemImageStore:
             )
         except (OSError, UnicodeError, ValueError):
             return None
+
+    def _delete_sync_safe(self, tenant_id: str, object_key: str) -> bool:
+        try:
+            match = _OBJECT_KEY.fullmatch(object_key)
+            if _TENANT_ID.fullmatch(tenant_id) is None or match is None:
+                return False
+            tenant_digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()
+            if match.group(1) != tenant_digest:
+                return False
+            for candidate in (self._configured_root, *self._configured_root.parents):
+                if candidate.exists() and candidate.is_symlink():
+                    return False
+            parent = self._root / "tenants" / tenant_digest
+            if not parent.exists():
+                return True
+            if parent.is_symlink() or parent.resolve(strict=True) != parent:
+                return False
+            target = parent / f"{match.group(2)}.png"
+            if target.is_symlink():
+                return False
+            if target.exists():
+                target.unlink()
+            return True
+        except (OSError, UnicodeError, ValueError):
+            return False

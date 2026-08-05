@@ -62,6 +62,15 @@ def test_applies_exif_orientation_and_strips_metadata() -> None:
         assert "exif" not in canonical.info and "icc_profile" not in canonical.info
 
 
+def test_accepts_progressive_jpeg_with_multiple_scans() -> None:
+    result = sanitize_image(
+        encoded_image("JPEG", size=(16, 12), progressive=True),
+        "image/jpeg",
+        "tenant",
+    )
+    assert result.original_format == "JPEG" and (result.width, result.height) == (16, 12)
+
+
 def test_copies_mutable_caller_buffer() -> None:
     source = bytearray(encoded_image())
     expected = hashlib.sha256(source).hexdigest()
@@ -107,6 +116,27 @@ def test_rejects_animated_images() -> None:
     frames[0].save(output, "WEBP", save_all=True, append_images=frames[1:], duration=10)
     with pytest.raises(InvalidImage, match="image rejected"):
         sanitize_image(output.getvalue(), "image/webp", "tenant")
+
+
+@pytest.mark.parametrize("image_format", ["PNG", "JPEG", "WEBP"])
+def test_rejects_container_aware_trailing_polyglots(image_format: str) -> None:
+    raw = encoded_image(image_format)
+    if image_format == "PNG":
+        polyglot = raw + b"MZ-executable" + b"IEND\xaeB`\x82"
+        mime = "image/png"
+    elif image_format == "JPEG":
+        polyglot = raw + b"MZ-executable" + b"\xff\xd9"
+        mime = "image/jpeg"
+    else:
+        payload = b"MZ-executable"
+        chunk = b"JUNK" + len(payload).to_bytes(4, "little") + payload
+        if len(payload) % 2:
+            chunk += b"\x00"
+        polyglot = raw + chunk
+        polyglot = polyglot[:4] + (len(polyglot) - 8).to_bytes(4, "little") + polyglot[8:]
+        mime = "image/webp"
+    with pytest.raises(InvalidImage, match="^image rejected$"):
+        sanitize_image(polyglot, mime, "tenant")
 
 
 @pytest.mark.parametrize(
@@ -211,6 +241,19 @@ async def test_filesystem_store_writes_atomically_with_private_permissions(tmp_p
     assert stored.content_type == "image/png"
     if os.name == "posix":
         assert os.stat(target).st_mode & 0o777 == 0o600
+
+    await store.delete("tenant", key)
+    assert not target.exists()
+
+
+async def test_filesystem_store_delete_is_tenant_bound(tmp_path: Path) -> None:
+    store = FilesystemImageStore(tmp_path)
+    digest = hashlib.sha256(b"tenant").hexdigest()
+    key = f"tenants/{digest}/123e4567-e89b-42d3-a456-426614174000.png"
+    await store.put("tenant", key, b"canonical", "image/png")
+    with pytest.raises(OSError, match="cleanup failed"):
+        await store.delete("different-tenant", key)
+    assert tmp_path.joinpath(*key.split("/")).exists()
 
 
 @pytest.mark.parametrize(
