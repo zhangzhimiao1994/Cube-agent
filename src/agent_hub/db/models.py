@@ -5,11 +5,13 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
@@ -48,6 +50,12 @@ class ConfigRevisionRow(Base):
         CheckConstraint(
             "status IN ('draft', 'published', 'superseded')",
             name="ck_agent_hub_config_revisions_status",
+        ),
+        Index(
+            "uq_agent_hub_config_revisions_one_published_per_tenant",
+            "tenant_id",
+            unique=True,
+            postgresql_where=text("status = 'published'"),
         ),
     )
 

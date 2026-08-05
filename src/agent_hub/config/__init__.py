@@ -15,6 +15,7 @@ from agent_hub.config.service import (
     ConfigPublishedEvent,
     ConfigPublishedNotifier,
     ConfigService,
+    ConfigValidationError,
     NoopConfigPublishedNotifier,
     PostCommitNotificationError,
 )
@@ -29,6 +30,7 @@ __all__ = [
     "ConfigService",
     "ConfigStatus",
     "ConfigStatusError",
+    "ConfigValidationError",
     "DeploymentDefinition",
     "LogicalModelDefinition",
     "NoopConfigPublishedNotifier",

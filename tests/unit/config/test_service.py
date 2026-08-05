@@ -3,7 +3,7 @@ from typing import Self, cast
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.config.repository import ConfigRepository, ConfigStatusError
 from agent_hub.config.service import ConfigService
@@ -24,8 +24,24 @@ class TransactionStub:
 
 
 class SessionStub:
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        return None
+
     def begin(self) -> TransactionStub:
         return TransactionStub()
+
+
+class SessionFactoryStub:
+    def __call__(self) -> SessionStub:
+        return SessionStub()
 
 
 class ArchivedSourceRepository(ConfigRepository):
@@ -60,8 +76,11 @@ class ArchivedSourceRepository(ConfigRepository):
 
 
 async def test_rollback_rejects_source_outside_published_statuses() -> None:
-    service = ConfigService(ArchivedSourceRepository())
-    session = cast(AsyncSession, SessionStub())
+    session_factory = cast(
+        async_sessionmaker[AsyncSession],
+        SessionFactoryStub(),
+    )
+    service = ConfigService(session_factory, ArchivedSourceRepository())
 
     with pytest.raises(ConfigStatusError, match="published or superseded"):
-        await service.rollback(session, uuid4(), 1, uuid4())
+        await service.rollback(uuid4(), 1, uuid4())

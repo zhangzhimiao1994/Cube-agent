@@ -1,34 +1,50 @@
 import re
-from typing import Self
+from typing import Literal, Self
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 SAFE_IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+MAX_IDENTIFIER_LENGTH = 128
+Capability = Literal["text", "vision", "tool_calling", "structured_output"]
 
 
-def _non_blank(value: str) -> str:
-    if not value.strip():
+def _default_capabilities() -> set[Capability]:
+    return {"text"}
+
+
+def _unpadded_non_blank(value: str) -> str:
+    if not value:
         raise ValueError("must not be blank")
+    if value != value.strip():
+        raise ValueError("must not have leading or trailing whitespace")
     return value
 
 
-class DeploymentDefinition(BaseModel):
-    provider: str
-    model: str
-    api_base: str | None = None
-    secret_ref: str
-    quota_scope_id: str
+class StrictConfigModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class DeploymentDefinition(StrictConfigModel):
+    provider: str = Field(max_length=512)
+    model: str = Field(max_length=512)
+    api_base: str | None = Field(default=None, max_length=2048)
+    secret_ref: str = Field(max_length=512)
+    quota_scope_id: str = Field(max_length=MAX_IDENTIFIER_LENGTH)
     max_concurrency: int = Field(default=1, ge=1, le=1000)
-    target_utilization: float = Field(default=0.8, ge=0.5, le=0.9)
+    target_utilization: float = Field(
+        default=0.8, ge=0.5, le=0.9, allow_inf_nan=False
+    )
     reserved_slots: int = Field(default=0, ge=0)
     rpm: int | None = Field(default=None, gt=0)
     tpm: int | None = Field(default=None, gt=0)
-    capabilities: set[str] = Field(default_factory=lambda: {"text"})
+    capabilities: set[Capability] = Field(
+        default_factory=_default_capabilities, min_length=1, max_length=4
+    )
 
-    @field_validator("provider", "model", "secret_ref", "quota_scope_id")
+    @field_validator("provider", "model", "api_base", "secret_ref", "quota_scope_id")
     @classmethod
-    def critical_strings_are_not_blank(cls, value: str) -> str:
-        return _non_blank(value)
+    def strings_are_unpadded_and_not_blank(cls, value: str | None) -> str | None:
+        return None if value is None else _unpadded_non_blank(value)
 
     @model_validator(mode="after")
     def reserved_capacity_is_below_maximum(self) -> Self:
@@ -37,31 +53,54 @@ class DeploymentDefinition(BaseModel):
         return self
 
 
-class LogicalModelDefinition(BaseModel):
-    deployments: list[DeploymentDefinition] = Field(min_length=1)
-    fallback_model: str | None = None
+class LogicalModelDefinition(StrictConfigModel):
+    deployments: list[DeploymentDefinition] = Field(min_length=1, max_length=128)
+    fallback_model: str | None = Field(default=None, max_length=MAX_IDENTIFIER_LENGTH)
+
+    @field_validator("fallback_model")
+    @classmethod
+    def fallback_is_unpadded_and_not_blank(cls, value: str | None) -> str | None:
+        return None if value is None else _unpadded_non_blank(value)
 
 
-class AgentDefinition(BaseModel):
-    id: str = Field(pattern=SAFE_IDENTIFIER.pattern)
-    role: str
-    prompt: str
-    model: str
-    skills: list[str] = Field(default_factory=list)
+class AgentDefinition(StrictConfigModel):
+    id: str = Field(pattern=SAFE_IDENTIFIER.pattern, max_length=MAX_IDENTIFIER_LENGTH)
+    role: str = Field(max_length=256)
+    prompt: str = Field(max_length=100_000)
+    model: str = Field(max_length=MAX_IDENTIFIER_LENGTH)
+    skills: list[str] = Field(default_factory=list, max_length=128)
 
     @field_validator("role", "prompt", "model")
     @classmethod
-    def critical_strings_are_not_blank(cls, value: str) -> str:
-        return _non_blank(value)
+    def strings_are_unpadded_and_not_blank(cls, value: str) -> str:
+        return _unpadded_non_blank(value)
+
+    @field_validator("skills")
+    @classmethod
+    def skills_are_unique_safe_identifiers(cls, skills: list[str]) -> list[str]:
+        if len(skills) != len(set(skills)):
+            raise ValueError("skills must be unique")
+        invalid = [
+            skill
+            for skill in skills
+            if len(skill) > MAX_IDENTIFIER_LENGTH or SAFE_IDENTIFIER.fullmatch(skill) is None
+        ]
+        if invalid:
+            raise ValueError(f"invalid skill identifier: {invalid}")
+        return skills
 
 
-class PlatformConfig(BaseModel):
-    models: dict[str, LogicalModelDefinition]
-    agents: list[AgentDefinition]
+class PlatformConfig(StrictConfigModel):
+    models: dict[str, LogicalModelDefinition] = Field(max_length=256)
+    agents: list[AgentDefinition] = Field(max_length=1024)
 
     @model_validator(mode="after")
     def references_are_valid(self) -> Self:
-        unsafe_keys = sorted(key for key in self.models if SAFE_IDENTIFIER.fullmatch(key) is None)
+        unsafe_keys = sorted(
+            key
+            for key in self.models
+            if len(key) > MAX_IDENTIFIER_LENGTH or SAFE_IDENTIFIER.fullmatch(key) is None
+        )
         if unsafe_keys:
             raise ValueError(f"invalid logical model key: {unsafe_keys}")
 

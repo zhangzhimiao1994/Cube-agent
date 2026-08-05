@@ -115,3 +115,115 @@ def test_mutable_defaults_are_independent() -> None:
     assert second_deployment.capabilities == {"text"}
     assert first_agent.skills == ["browser"]
     assert second_agent.skills == []
+
+
+@pytest.mark.parametrize(
+    ("validator", "value"),
+    [
+        (DeploymentDefinition, {**deployment().model_dump(), "unknown": True}),
+        (
+            LogicalModelDefinition,
+            {"deployments": [deployment()], "unknown": True},
+        ),
+        (AgentDefinition, {**agent().model_dump(), "unknown": True}),
+        (PlatformConfig, {"models": {}, "agents": [], "unknown": True}),
+    ],
+)
+def test_configuration_models_reject_unknown_fields(
+    validator: type[DeploymentDefinition]
+    | type[LogicalModelDefinition]
+    | type[AgentDefinition]
+    | type[PlatformConfig],
+    value: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        validator.model_validate(value)
+
+
+@pytest.mark.parametrize("capabilities", [set(), {"audio"}])
+def test_capabilities_are_non_empty_and_known(capabilities: set[str]) -> None:
+    with pytest.raises(ValidationError):
+        deployment(capabilities=capabilities)
+
+
+@pytest.mark.parametrize(
+    "skills",
+    [
+        [""],
+        [" browser"],
+        ["browser "],
+        ["has space"],
+        ["browser", "browser"],
+        ["a" * 129],
+        [f"skill-{index}" for index in range(129)],
+    ],
+)
+def test_skills_are_bounded_unique_safe_identifiers(skills: list[str]) -> None:
+    with pytest.raises(ValidationError):
+        AgentDefinition(
+            id="researcher",
+            role="researcher",
+            prompt="Research carefully.",
+            model="primary",
+            skills=skills,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("provider", " openai"),
+        ("model", "gpt-5 "),
+        ("secret_ref", " OPENAI_API_KEY"),
+        ("quota_scope_id", "primary "),
+        ("api_base", " "),
+        ("api_base", "https://proxy.example.com "),
+    ],
+)
+def test_deployment_strings_reject_edge_whitespace(field: str, value: str) -> None:
+    with pytest.raises(ValidationError):
+        deployment(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("role", " assistant"), ("prompt", "Help. "), ("model", " primary")],
+)
+def test_agent_strings_reject_edge_whitespace(field: str, value: str) -> None:
+    values = agent().model_dump()
+    values[field] = value
+    with pytest.raises(ValidationError):
+        AgentDefinition.model_validate(values)
+
+
+def test_fallback_rejects_edge_whitespace() -> None:
+    with pytest.raises(ValidationError):
+        LogicalModelDefinition(deployments=[deployment()], fallback_model=" backup")
+
+
+def test_identifiers_have_a_length_limit() -> None:
+    with pytest.raises(ValidationError):
+        agent(identifier="a" * 129)
+    with pytest.raises(ValidationError, match="logical model key"):
+        PlatformConfig(models={"a" * 129: logical_model()}, agents=[])
+
+
+@pytest.mark.parametrize("target", [float("nan"), float("inf"), float("-inf")])
+def test_target_utilization_must_be_finite(target: float) -> None:
+    with pytest.raises(ValidationError):
+        deployment(target_utilization=target)
+
+
+def test_configuration_collections_have_upper_bounds() -> None:
+    with pytest.raises(ValidationError):
+        LogicalModelDefinition(deployments=[deployment() for _ in range(129)])
+    with pytest.raises(ValidationError):
+        PlatformConfig(
+            models={f"model-{index}": logical_model() for index in range(257)},
+            agents=[],
+        )
+    with pytest.raises(ValidationError):
+        PlatformConfig(
+            models={"primary": logical_model()},
+            agents=[agent(identifier=f"agent-{index}") for index in range(1025)],
+        )

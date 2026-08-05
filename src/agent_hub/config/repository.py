@@ -2,7 +2,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal, cast
+from typing import Literal
 from uuid import UUID
 
 from sqlalchemy import func, select, text
@@ -109,7 +109,8 @@ class ConfigRepository:
         )
         if for_update:
             statement = statement.with_for_update()
-        return cast(ConfigRevisionRow | None, await session.scalar(statement))
+        result = await session.execute(statement)
+        return result.scalars().one_or_none()
 
     async def get_current_row(
         self,
@@ -124,7 +125,8 @@ class ConfigRepository:
         )
         if for_update:
             statement = statement.with_for_update()
-        return cast(ConfigRevisionRow | None, await session.scalar(statement))
+        result = await session.execute(statement)
+        return result.scalars().one_or_none()
 
     async def get_current(
         self, session: AsyncSession, tenant_id: UUID
