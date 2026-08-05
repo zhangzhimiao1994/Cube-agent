@@ -3,7 +3,7 @@ import secrets
 from uuid import uuid4
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from agent_hub.auth.models import Role
 from agent_hub.auth.tokens import AccessTokenService
@@ -15,7 +15,7 @@ def _canonical_key(raw: bytes) -> str:
 
 
 def test_default_development_settings_cannot_sign_tokens() -> None:
-    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    settings = Settings.model_validate({})
     key = settings.jwt_signing_key_value()
 
     with pytest.raises(ValueError):
@@ -28,7 +28,7 @@ def test_production_rejects_the_default_placeholder() -> None:
     placeholder = "development-only-change-me"
 
     with pytest.raises(ValidationError) as captured:
-        Settings(environment="production", _env_file=None)  # type: ignore[call-arg]
+        Settings.model_validate({"environment": "production"})
 
     assert placeholder not in str(captured.value)
     assert placeholder not in repr(captured.value)
@@ -37,41 +37,60 @@ def test_production_rejects_the_default_placeholder() -> None:
 @pytest.mark.parametrize(
     ("environment", "key"),
     [
-        ("production", ""),
-        ("production", "development-only-change-me"),
+        (" production ", SecretStr(" \t ")),
+        ("PRODUCTION", SecretStr(" development-only-change-me ")),
         (
-            "production",
-            "base64url:YWdlbnQtaHViLWRldmVsb3BtZW50LWtleS0wMDAwMDE",
+            " StAgInG ",
+            SecretStr(
+                "\tbase64url:YWdlbnQtaHViLWRldmVsb3BtZW50LWtleS0wMDAwMDE\n"
+            ),
         ),
-        ("staging", "base64url:" + "A" * 43),
-        ("production", "hex:" + "00" * 32),
+        ("staging", SecretStr(" base64url:" + "A" * 43 + " ")),
+        ("Production", SecretStr("\nhex:" + "00" * 32 + "\t")),
     ],
 )
 def test_nonlocal_environments_reject_known_insecure_keys_without_echoing_them(
-    environment: str, key: str
+    environment: str, key: SecretStr
 ) -> None:
+    raw_key = key.get_secret_value()
     with pytest.raises(ValidationError) as captured:
-        Settings(
-            environment=environment,
-            jwt_signing_key=key,
-            _env_file=None,  # type: ignore[call-arg]
+        Settings.model_validate(
+            {"environment": environment, "jwt_signing_key": key}
         )
 
-    if key:
-        assert key not in str(captured.value)
-        assert key not in repr(captured.value)
+    assert raw_key not in str(captured.value)
+    assert raw_key not in repr(captured.value)
+    if raw_key.strip():
+        assert raw_key.strip() not in str(captured.value)
+        assert raw_key.strip() not in repr(captured.value)
 
 
 def test_production_accepts_a_locally_generated_canonical_key() -> None:
     key = _canonical_key(secrets.token_bytes(32))
 
-    settings = Settings(
-        environment="production",
-        jwt_signing_key=key,
-        _env_file=None,  # type: ignore[call-arg]
+    settings = Settings.model_validate(
+        {
+            "environment": "production",
+            "jwt_signing_key": SecretStr(key),
+        }
     )
     service = AccessTokenService(settings.jwt_signing_key_value())
     token = service.encode(uuid4(), uuid4(), Role.VIEWER)
 
     assert token
     assert key not in repr(settings)
+
+
+def test_settings_preserve_whitespace_for_downstream_canonical_validation() -> None:
+    canonical_key = _canonical_key(secrets.token_bytes(32))
+    configured_key = f" {canonical_key} "
+    settings = Settings.model_validate(
+        {
+            "environment": "development",
+            "jwt_signing_key": SecretStr(configured_key),
+        }
+    )
+
+    assert settings.jwt_signing_key_value() == configured_key
+    with pytest.raises(ValueError):
+        AccessTokenService(settings.jwt_signing_key_value())

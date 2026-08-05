@@ -42,8 +42,9 @@ class Settings(BaseSettings):
     ) -> SecretStr:
         environment = str(info.data.get("environment", "development")).strip().lower()
         key = value.get_secret_value()
+        normalized_key = key.strip()
         if environment not in cls._LOCAL_ENVIRONMENTS and (
-            not key.strip() or key in cls._INSECURE_JWT_KEYS
+            not normalized_key or normalized_key in cls._INSECURE_JWT_KEYS
         ):
             raise ValueError("a securely generated JWT signing key is required")
         return value
