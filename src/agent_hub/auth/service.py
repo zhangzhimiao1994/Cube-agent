@@ -1,5 +1,6 @@
 """Transactional local bootstrap and login orchestration."""
 
+import asyncio
 import base64
 import hashlib
 import re
@@ -17,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from agent_hub.auth.models import (
     AuthenticatedPrincipal,
     AuthenticationBusy,
+    AuthenticationOperationError,
     AuthenticationPersistenceError,
     AuthResult,
     BootstrapClosed,
@@ -49,6 +51,8 @@ class _Failure(Enum):
     INVALID_PASSWORD = auto()
     INVALID_USERNAME = auto()
     BUSY = auto()
+    CANCELLED = auto()
+    OPERATION = auto()
     PERSISTENCE = auto()
 
 
@@ -85,6 +89,12 @@ class AuthService:
         if outcome is _Failure.PERSISTENCE:
             del outcome
             _raise_authentication_persistence("authentication state could not be stored")
+        if outcome is _Failure.OPERATION:
+            del outcome
+            _raise_authentication_operation()
+        if outcome is _Failure.CANCELLED:
+            del outcome
+            _raise_cancelled()
         assert isinstance(outcome, str)
         return outcome
 
@@ -108,6 +118,10 @@ class AuthService:
             return code
         except SQLAlchemyError:
             return _Failure.PERSISTENCE
+        except asyncio.CancelledError:
+            return _Failure.CANCELLED
+        except RuntimeError:
+            return _Failure.OPERATION
 
     async def consume_bootstrap_code(
         self, code: str, username: str, password: str
@@ -130,6 +144,12 @@ class AuthService:
         if failure is _Failure.PERSISTENCE:
             del failure
             _raise_authentication_persistence("authentication state could not be stored")
+        if failure is _Failure.OPERATION:
+            del failure
+            _raise_authentication_operation()
+        if failure is _Failure.CANCELLED:
+            del failure
+            _raise_cancelled()
         del failure
         _raise_invalid_bootstrap()
 
@@ -171,7 +191,7 @@ class AuthService:
                 )
                 access_token = _try_encode_token(self._tokens, principal)
                 if access_token is None:
-                    return _Failure.PERSISTENCE
+                    return _Failure.OPERATION
                 row.consumed_at = now
                 session.add(
                     UserRow(
@@ -187,6 +207,10 @@ class AuthService:
             return result
         except SQLAlchemyError:
             return _Failure.PERSISTENCE
+        except asyncio.CancelledError:
+            return _Failure.CANCELLED
+        except RuntimeError:
+            return _Failure.OPERATION
 
     async def login(
         self, tenant_id: UUID, username: str, password: str
@@ -203,6 +227,12 @@ class AuthService:
         if failure is _Failure.PERSISTENCE:
             del failure
             _raise_authentication_persistence("authentication state could not be read")
+        if failure is _Failure.OPERATION:
+            del failure
+            _raise_authentication_operation()
+        if failure is _Failure.CANCELLED:
+            del failure
+            _raise_cancelled()
         del failure
         _raise_invalid_credentials()
 
@@ -239,7 +269,7 @@ class AuthService:
                 principal = AuthenticatedPrincipal(row.id, row.tenant_id, role)
                 access_token = _try_encode_token(self._tokens, principal)
                 if access_token is None:
-                    return _Failure.PERSISTENCE
+                    return _Failure.OPERATION
                 if self._passwords.needs_rehash(old_hash):
                     try:
                         new_hash = await self._passwords.hash_async(password)  # type: ignore[arg-type]
@@ -258,6 +288,10 @@ class AuthService:
             return result
         except SQLAlchemyError:
             return _Failure.PERSISTENCE
+        except asyncio.CancelledError:
+            return _Failure.CANCELLED
+        except RuntimeError:
+            return _Failure.OPERATION
 
     def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
         principal = _try_decode_principal(self._tokens, token)
@@ -288,7 +322,7 @@ def _try_encode_token(
         return token_service.encode(
             principal.user_id, principal.tenant_id, principal.role
         )
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RuntimeError):
         return None
 
 
@@ -378,6 +412,14 @@ def _raise_authentication_busy() -> NoReturn:
 
 def _raise_authentication_persistence(message: str) -> NoReturn:
     raise AuthenticationPersistenceError(message)
+
+
+def _raise_authentication_operation() -> NoReturn:
+    raise AuthenticationOperationError("authentication operation failed")
+
+
+def _raise_cancelled() -> NoReturn:
+    raise asyncio.CancelledError
 
 
 def _raise_invalid_token() -> NoReturn:

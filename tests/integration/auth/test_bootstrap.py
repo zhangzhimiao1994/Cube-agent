@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.auth.models import (
+    AuthenticationOperationError,
     AuthenticationPersistenceError,
     AuthResult,
     BootstrapClosed,
@@ -86,7 +87,34 @@ class FailingTokenService(AccessTokenService):
         *,
         ttl_seconds: int = 900,
     ) -> str:
-        raise ValueError("forced token failure")
+        raise RuntimeError("forced token failure")
+
+
+class CancellableHashPasswordService(PasswordService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+
+    async def hash_async(self, password: str) -> str:
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+class CancellableVerifyPasswordService(PasswordService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+
+    async def verify_async(self, password_hash: str, password: str) -> bool:
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+class RuntimeVerifyPasswordService(PasswordService):
+    async def verify_async(self, password_hash: str, password: str) -> bool:
+        raise RuntimeError("forced password backend failure")
 
 
 def _assert_production_frames_do_not_contain(
@@ -562,7 +590,7 @@ async def test_token_creation_failure_rolls_back_bootstrap_without_secret_trace(
         clock=MutableClock(),
     )
 
-    with pytest.raises(AuthenticationPersistenceError) as captured:
+    with pytest.raises(AuthenticationOperationError) as captured:
         await failing.consume_bootstrap_code(code, "first-admin", password)
 
     _assert_production_frames_do_not_contain(captured.value, code, password)
@@ -571,6 +599,134 @@ async def test_token_creation_failure_rolls_back_bootstrap_without_secret_trace(
         assert stored_code is not None
         assert stored_code.consumed_at is None
         assert await session.scalar(select(func.count()).select_from(UserRow)) == 0
+
+
+@pytest.mark.integration
+async def test_cancelled_consume_rolls_back_and_sanitizes_credentials(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _tenant(auth_session_factory)
+    issuer = _service(auth_session_factory, tenant_id)
+    code = await issuer.issue_bootstrap_code()
+    passwords = CancellableHashPasswordService()
+    service = _service(auth_session_factory, tenant_id, passwords=passwords)
+    password = "sensitive password 123"
+    task = asyncio.create_task(
+        service.consume_bootstrap_code(code, "first-admin", password)
+    )
+    await asyncio.wait_for(passwords.started.wait(), timeout=2)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await task
+
+    _assert_production_frames_do_not_contain(captured.value, code, password)
+    async with auth_session_factory() as session:
+        stored_code = await session.scalar(select(BootstrapCodeRow))
+        assert stored_code is not None
+        assert stored_code.consumed_at is None
+        assert await session.scalar(select(func.count()).select_from(UserRow)) == 0
+
+
+@pytest.mark.integration
+async def test_cancelled_login_rolls_back_and_sanitizes_password(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _tenant(auth_session_factory)
+    issuer = _service(auth_session_factory, tenant_id)
+    code = await issuer.issue_bootstrap_code()
+    password = "sensitive password 123"
+    await issuer.consume_bootstrap_code(code, "first-admin", password)
+    async with auth_session_factory() as session:
+        old_hash = await session.scalar(select(UserRow.password_hash))
+    passwords = CancellableVerifyPasswordService()
+    service = _service(auth_session_factory, tenant_id, passwords=passwords)
+    task = asyncio.create_task(service.login(tenant_id, "first-admin", password))
+    await asyncio.wait_for(passwords.started.wait(), timeout=2)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await task
+
+    _assert_production_frames_do_not_contain(captured.value, password)
+    async with auth_session_factory() as session:
+        assert await session.scalar(select(UserRow.password_hash)) == old_hash
+
+
+@pytest.mark.integration
+async def test_cancelled_issue_after_code_generation_hides_code_and_writes_nothing(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant_id = await _tenant(auth_session_factory)
+    raw_code = b"c" * 32
+    expected_code = base64.urlsafe_b64encode(raw_code).decode("ascii").rstrip("=")
+    monkeypatch.setattr("agent_hub.auth.service.secrets.token_bytes", lambda _: raw_code)
+
+    def cancel_clock() -> datetime:
+        raise asyncio.CancelledError
+
+    service = AuthService(
+        auth_session_factory,
+        tenant_id,
+        PasswordService(),
+        AccessTokenService(b"t" * 32, clock=MutableClock()),
+        clock=cancel_clock,
+    )
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await service.issue_bootstrap_code()
+
+    _assert_production_frames_do_not_contain(captured.value, expected_code)
+    async with auth_session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(BootstrapCodeRow)) == 0
+
+
+@pytest.mark.integration
+async def test_runtime_token_failure_prevents_login_rehash_and_is_sanitized(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _tenant(auth_session_factory)
+    old_passwords = PasswordService(
+        PasswordHasher(time_cost=1, memory_cost=8192, parallelism=1, type=Type.ID)
+    )
+    issuer = _service(auth_session_factory, tenant_id, passwords=old_passwords)
+    code = await issuer.issue_bootstrap_code()
+    password = "sensitive password 123"
+    await issuer.consume_bootstrap_code(code, "first-admin", password)
+    async with auth_session_factory() as session:
+        old_hash = await session.scalar(select(UserRow.password_hash))
+    service = AuthService(
+        auth_session_factory,
+        tenant_id,
+        PasswordService(),
+        FailingTokenService(b"t" * 32, clock=MutableClock()),
+        clock=MutableClock(),
+    )
+
+    with pytest.raises(AuthenticationOperationError) as captured:
+        await service.login(tenant_id, "first-admin", password)
+
+    _assert_production_frames_do_not_contain(captured.value, password)
+    async with auth_session_factory() as session:
+        assert await session.scalar(select(UserRow.password_hash)) == old_hash
+
+
+@pytest.mark.integration
+async def test_runtime_password_backend_failure_is_sanitized(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _tenant(auth_session_factory)
+    password = "sensitive password 123"
+    service = _service(
+        auth_session_factory,
+        tenant_id,
+        passwords=RuntimeVerifyPasswordService(),
+    )
+
+    with pytest.raises(AuthenticationOperationError) as captured:
+        await service.login(tenant_id, "missing-user", password)
+
+    _assert_production_frames_do_not_contain(captured.value, password)
 
 
 @pytest.mark.integration

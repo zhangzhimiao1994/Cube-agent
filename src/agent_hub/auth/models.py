@@ -63,6 +63,10 @@ class AuthenticationBusy(RuntimeError):
     pass
 
 
+class AuthenticationOperationError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class AuthenticatedPrincipal:
     user_id: UUID

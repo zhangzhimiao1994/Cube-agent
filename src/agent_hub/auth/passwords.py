@@ -2,6 +2,7 @@
 
 import asyncio
 import re
+import threading
 from collections.abc import Callable
 from typing import Final, NoReturn
 
@@ -24,6 +25,7 @@ _ARGON2ID_ENCODING = re.compile(
     r"[A-Za-z0-9+/]{8,128}\$[A-Za-z0-9+/]{8,128}\Z"
 )
 _BUSY: Final[object] = object()
+_CANCELLED: Final[object] = object()
 
 
 class PasswordValidationError(ValueError):
@@ -36,7 +38,7 @@ class PasswordService:
         hasher: PasswordHasher | None = None,
         *,
         max_concurrency: int = 2,
-        max_queue: int = 4,
+        max_waiters: int = 4,
         acquire_timeout_seconds: float = 0.1,
     ) -> None:
         if (
@@ -46,11 +48,11 @@ class PasswordService:
         ):
             raise ValueError("max_concurrency must be a positive integer")
         if (
-            not isinstance(max_queue, int)
-            or isinstance(max_queue, bool)
-            or max_queue < 0
+            not isinstance(max_waiters, int)
+            or isinstance(max_waiters, bool)
+            or max_waiters < 0
         ):
-            raise ValueError("max_queue must be a non-negative integer")
+            raise ValueError("max_waiters must be a non-negative integer")
         if not 0 < acquire_timeout_seconds <= 5:
             raise ValueError("acquire timeout must be between 0 and 5 seconds")
         self._hasher = hasher or PasswordHasher(
@@ -61,8 +63,9 @@ class PasswordService:
             salt_len=16,
             type=Type.ID,
         )
-        self._semaphore = asyncio.Semaphore(max_concurrency)
-        self._admission_capacity = max_concurrency + max_queue
+        self._work_slots = threading.BoundedSemaphore(max_concurrency)
+        self._admission_lock = threading.Lock()
+        self._admission_capacity = max_concurrency + max_waiters
         self._admitted = 0
         self._acquire_timeout_seconds = acquire_timeout_seconds
 
@@ -78,6 +81,9 @@ class PasswordService:
             _raise_password_validation_error()
         outcome = await self._run_bounded(self._hasher.hash, password)
         del password
+        if outcome is _CANCELLED:
+            del outcome
+            _raise_cancelled()
         if outcome is _BUSY:
             del outcome
             _raise_authentication_busy()
@@ -96,6 +102,9 @@ class PasswordService:
             self._verify_prevalidated, password_hash, password
         )
         del password_hash, password
+        if outcome is _CANCELLED:
+            del outcome
+            _raise_cancelled()
         if outcome is _BUSY:
             del outcome
             _raise_authentication_busy()
@@ -119,23 +128,38 @@ class PasswordService:
     async def _run_bounded(
         self, operation: Callable[..., object], *args: object
     ) -> object:
-        if self._admitted >= self._admission_capacity:
+        if not self._try_admit():
             return _BUSY
-        self._admitted += 1
-        acquired = False
+        worker = asyncio.create_task(
+            asyncio.to_thread(self._run_admitted, operation, args)
+        )
         try:
-            try:
-                await asyncio.wait_for(
-                    self._semaphore.acquire(), timeout=self._acquire_timeout_seconds
-                )
-                acquired = True
-            except TimeoutError:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            worker.add_done_callback(_retrieve_background_result)
+            return _CANCELLED
+
+    def _try_admit(self) -> bool:
+        with self._admission_lock:
+            if self._admitted >= self._admission_capacity:
+                return False
+            self._admitted += 1
+            return True
+
+    def _run_admitted(
+        self, operation: Callable[..., object], args: tuple[object, ...]
+    ) -> object:
+        acquired = self._work_slots.acquire(timeout=self._acquire_timeout_seconds)
+        try:
+            if not acquired:
                 return _BUSY
-            return await asyncio.to_thread(operation, *args)
+            return operation(*args)
         finally:
             if acquired:
-                self._semaphore.release()
-            self._admitted -= 1
+                self._work_slots.release()
+            with self._admission_lock:
+                assert self._admitted > 0
+                self._admitted -= 1
 
 
 def _is_valid_password(password: object) -> bool:
@@ -174,3 +198,16 @@ def _raise_password_validation_error() -> NoReturn:
 
 def _raise_authentication_busy() -> NoReturn:
     raise AuthenticationBusy("authentication is busy")
+
+
+def _raise_cancelled() -> NoReturn:
+    raise asyncio.CancelledError
+
+
+def _retrieve_background_result(task: asyncio.Task[object]) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception:  # noqa: BLE001 - cancelled caller can no longer receive worker failure
+        return

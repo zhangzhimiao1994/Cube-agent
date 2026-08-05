@@ -30,8 +30,10 @@ class BlockingHasher(PasswordHasher):
         super().__init__(time_cost=1, memory_cost=8192, parallelism=1, type=Type.ID)
         self.started = threading.Event()
         self.release = threading.Event()
+        self.finished = threading.Event()
         self.active = 0
         self.peak = 0
+        self.completed = 0
         self._lock = threading.Lock()
 
     def hash(self, password: str | bytes, *, salt: bytes | None = None) -> str:
@@ -45,6 +47,8 @@ class BlockingHasher(PasswordHasher):
         finally:
             with self._lock:
                 self.active -= 1
+                self.completed += 1
+                self.finished.set()
 
 
 def _assert_password_absent(error: BaseException, password: str) -> None:
@@ -135,7 +139,7 @@ def test_embedded_extreme_argon_cost_is_rejected_before_the_hasher() -> None:
 @pytest.mark.asyncio
 async def test_async_argon_is_offloaded_and_has_bounded_admission() -> None:
     hasher = BlockingHasher()
-    service = PasswordService(hasher, max_concurrency=1, max_queue=0)
+    service = PasswordService(hasher, max_concurrency=1, max_waiters=0)
     first = asyncio.create_task(service.hash_async("first valid password"))
     assert await asyncio.to_thread(hasher.started.wait, 1)
 
@@ -147,6 +151,82 @@ async def test_async_argon_is_offloaded_and_has_bounded_admission() -> None:
 
     hasher.release.set()
     assert (await first).startswith("$argon2id$")
+    assert hasher.peak == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelling_running_argon_does_not_release_real_capacity() -> None:
+    hasher = BlockingHasher()
+    service = PasswordService(
+        hasher, max_concurrency=1, max_waiters=0, acquire_timeout_seconds=2
+    )
+    running = asyncio.create_task(service.hash_async("first valid password"))
+    assert await asyncio.to_thread(hasher.started.wait, 1)
+
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await running
+    _assert_password_absent(cancelled.value, "first valid password")
+    with pytest.raises(AuthenticationBusy):
+        await service.hash_async("second valid password")
+
+    hasher.release.set()
+    assert await asyncio.to_thread(hasher.finished.wait, 2)
+    assert (await service.hash_async("third valid password")).startswith("$argon2id$")
+    assert hasher.peak == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelling_waiting_argon_keeps_admission_until_worker_finishes() -> None:
+    hasher = BlockingHasher()
+    service = PasswordService(
+        hasher, max_concurrency=1, max_waiters=1, acquire_timeout_seconds=2
+    )
+    running = asyncio.create_task(service.hash_async("first valid password"))
+    assert await asyncio.to_thread(hasher.started.wait, 1)
+    waiting = asyncio.create_task(service.hash_async("second valid password"))
+    await asyncio.sleep(0.05)
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    with pytest.raises(AuthenticationBusy):
+        await service.hash_async("third valid password")
+
+    hasher.release.set()
+    await running
+    for _ in range(100):
+        if hasher.completed >= 2:
+            break
+        await asyncio.sleep(0.01)
+    assert hasher.completed == 2
+    assert (await service.hash_async("fourth valid password")).startswith("$argon2id$")
+    assert hasher.peak == 1
+
+
+def test_password_service_is_safe_across_concurrent_event_loops() -> None:
+    hasher = BlockingHasher()
+    service = PasswordService(
+        hasher, max_concurrency=1, max_waiters=1, acquire_timeout_seconds=2
+    )
+    outcomes: list[str | RuntimeError] = []
+
+    def run(password: str) -> None:
+        try:
+            outcomes.append(asyncio.run(service.hash_async(password)))
+        except RuntimeError as error:
+            outcomes.append(error)
+
+    first = threading.Thread(target=run, args=("first valid password",))
+    second = threading.Thread(target=run, args=("second valid password",))
+    first.start()
+    assert hasher.started.wait(timeout=1)
+    second.start()
+    hasher.release.set()
+    first.join(timeout=3)
+    second.join(timeout=3)
+
+    assert len(outcomes) == 2
+    assert all(isinstance(outcome, str) for outcome in outcomes)
     assert hasher.peak == 1
 
 
