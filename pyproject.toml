@@ -18,6 +18,7 @@ dependencies = [
     "pillow>=12.3,<13",
     "pydantic-settings>=2.10,<3",
     "pyjwt[crypto]>=2.10,<3",
+    "pyyaml>=6,<7",
     "redis>=6,<7",
     "sqlalchemy[asyncio]>=2.0.41,<3",
     "uvicorn[standard]>=0.35,<1",
@@ -29,6 +30,7 @@ dev = [
     "pytest>=8.4,<9",
     "pytest-asyncio>=1,<2",
     "ruff>=0.12,<1",
+    "types-pyyaml>=6,<7",
 ]
 
 [tool.pytest.ini_options]
