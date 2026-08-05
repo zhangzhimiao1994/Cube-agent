@@ -141,6 +141,7 @@ async def test_uses_exact_openai_compatible_chat_completions_surface() -> None:
     create.assert_awaited_once_with(
         model="deepseek/deepseek-chat",
         messages=[{"role": "user", "content": PROMPT}],
+        max_completion_tokens=4096,
         timeout=12,
         stream=False,
     )
@@ -265,6 +266,13 @@ async def test_parses_first_choice_tool_calls_usage_and_allowlisted_metadata() -
     assert "forbidden" not in result.provider_metadata
     with pytest.raises(TypeError):
         result.tool_calls[0].arguments["query"] = "changed"
+
+
+async def test_passes_strict_completion_budget_to_openai_compatible_transport() -> None:
+    transport, _, create, _ = mock_transport()
+    await transport.complete(deployment(), request(max_output_tokens=321), API_KEY)
+    assert create.await_args is not None
+    assert create.await_args.kwargs["max_completion_tokens"] == 321
 
 
 async def test_drops_provider_metadata_containing_runtime_secrets_or_prompt_content() -> None:

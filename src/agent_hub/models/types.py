@@ -218,6 +218,7 @@ class ModelRequest:
     required_capabilities: frozenset[ModelCapability] = field(default_factory=frozenset)
     timeout_seconds: float = 60
     allow_fallback: bool = True
+    max_output_tokens: int = 4096
     response_schema: StructuredResponseSchema | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -231,6 +232,11 @@ class ModelRequest:
             raise ValueError("timeout_seconds must be positive and finite")
         if type(self.allow_fallback) is not bool:
             raise ValueError("allow_fallback must be a boolean")
+        if (
+            type(self.max_output_tokens) is not int
+            or not 1 <= self.max_output_tokens <= 1_000_000
+        ):
+            raise ValueError("max_output_tokens must be a strict integer between 1 and 1000000")
         if self.response_schema is not None and not isinstance(
             self.response_schema, StructuredResponseSchema
         ):

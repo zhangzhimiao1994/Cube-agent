@@ -104,12 +104,7 @@ class CapacityController(Protocol):
 
 
 class ConservativeTokenEstimator:
-    """Deterministic local upper estimate with fixed response headroom."""
-
-    def __init__(self, output_token_allowance: int = 4096) -> None:
-        if type(output_token_allowance) is not int or output_token_allowance < 0:
-            raise ValueError("output_token_allowance must be a nonnegative integer")
-        self._output_token_allowance = output_token_allowance
+    """Deterministic local upper estimate using the request's output budget."""
 
     def estimate(self, request: ModelRequest) -> int:
         payload: dict[str, object] = {
@@ -121,6 +116,7 @@ class ConservativeTokenEstimator:
             "required_capabilities": sorted(str(item) for item in request.required_capabilities),
             "timeout_seconds": request.timeout_seconds,
             "allow_fallback": request.allow_fallback,
+            "max_output_tokens": request.max_output_tokens,
             "response_schema": None,
         }
         if request.response_schema is not None:
@@ -135,7 +131,7 @@ class ConservativeTokenEstimator:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
-        return len(normalized) + self._output_token_allowance
+        return len(normalized) + request.max_output_tokens
 
     def _mutable_json(self, value: object) -> object:
         if isinstance(value, Mapping):

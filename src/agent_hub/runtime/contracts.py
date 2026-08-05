@@ -10,7 +10,7 @@ import unicodedata
 from collections.abc import AsyncIterator, Mapping
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Protocol, cast
+from typing import Protocol, Self, cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -155,10 +155,45 @@ def _safe_identifier(value: str, *, name: str) -> str:
     return value
 
 
-class GatewayProvenance(BaseModel):
-    """Only gateway-trusted supplier metadata; credentials never belong here."""
+class RuntimeContractError(ValueError):
+    """A stable error that never exposes hostile contract input."""
 
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+class _RuntimeContractModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    @classmethod
+    def from_payload(cls, payload: object) -> Self:
+        failed = False
+        validated: Self | None = None
+        try:
+            encoded = json.dumps(
+                payload,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            validated = cls.model_validate_json(encoded, strict=True)
+        except Exception as error:  # noqa: BLE001 - hostile serialization boundary
+            error.__traceback__ = None
+            error.__context__ = None
+            error.__cause__ = None
+            del error
+            failed = True
+        if failed or validated is None:
+            raise RuntimeContractError("invalid runtime contract") from None
+        return validated
+
+
+class GatewayProvenance(_RuntimeContractModel):
+    """Only gateway-trusted supplier metadata; credentials never belong here."""
 
     logical_model: str
     deployment_id: str
@@ -185,15 +220,22 @@ class GatewayProvenance(BaseModel):
             raise ValueError("provider provenance is inconsistent")
         return self
 
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "logical_model": self.logical_model,
+            "deployment_id": self.deployment_id,
+            "provider_id": self.provider_id,
+            "provider_model": self.provider_model,
+        }
 
-class Artifact(BaseModel):
+
+class Artifact(_RuntimeContractModel):
     """A bounded, content-addressed runtime output."""
 
-    model_config = ConfigDict(
-        extra="forbid", strict=True, frozen=True, arbitrary_types_allowed=True
-    )
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     id: UUID
+    version: int = Field(default=1, ge=1, le=2**31 - 1)
     type: str
     producer: str
     content: Mapping[str, JsonValue] = Field(repr=False)
@@ -205,6 +247,13 @@ class Artifact(BaseModel):
     @classmethod
     def validate_identifier(cls, value: str) -> str:
         return _safe_identifier(value, name="artifact identifier")
+
+    @field_validator("version")
+    @classmethod
+    def strict_version(cls, value: int) -> int:
+        if type(value) is not int:
+            raise TypeError("artifact version must be an integer")
+        return value
 
     @field_validator("content", mode="before")
     @classmethod
@@ -245,11 +294,27 @@ class Artifact(BaseModel):
         return self
 
     def recompute_content_sha256(self) -> str:
-        return hashlib.sha256(_canonical_json_bytes(self.content)).hexdigest()
+        provenance: Mapping[str, JsonValue] | None = None
+        if self.provenance is not None:
+            provenance = MappingProxyType(
+                cast(dict[str, JsonValue], GatewayProvenance.to_payload(self.provenance))
+            )
+        envelope: Mapping[str, JsonValue] = MappingProxyType(
+            {
+                "type": self.type,
+                "producer": self.producer,
+                "version": self.version,
+                "content": self.content,
+                "source_ids": self.source_ids,
+                "provenance": provenance,
+            }
+        )
+        return hashlib.sha256(_canonical_json_bytes(envelope)).hexdigest()
 
     def to_payload(self) -> dict[str, object]:
         return {
             "id": str(self.id),
+            "version": self.version,
             "type": self.type,
             "producer": self.producer,
             "content": _mutable_json(self.content),
@@ -257,16 +322,14 @@ class Artifact(BaseModel):
             "content_sha256": self.content_sha256,
             "provenance": None
             if self.provenance is None
-            else self.provenance.model_dump(mode="json"),
+            else GatewayProvenance.to_payload(self.provenance),
         }
 
 
-class RuntimeCheckpoint(BaseModel):
+class RuntimeCheckpoint(_RuntimeContractModel):
     """A resumable boundary whose immutable state is locally content-addressed."""
 
-    model_config = ConfigDict(
-        extra="forbid", strict=True, frozen=True, arbitrary_types_allowed=True
-    )
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     id: UUID
     runtime_type: str
@@ -335,20 +398,49 @@ class EventKind(StrEnum):
     RUNTIME_COMPLETED = "runtime.completed"
     RUNTIME_FAILED = "runtime.failed"
     RUNTIME_CANCELLED = "runtime.cancelled"
+    STEP_STARTED = "step.started"
+    STEP_COMPLETED = "step.completed"
+    STEP_FAILED = "step.failed"
+    STEP_RETRYING = "step.retrying"
+    REVIEW_COMPLETED = "review.completed"
+    DISCUSSION_STARTED = "discussion.started"
+    MESSAGE_CREATED = "message.created"
+    TOOL_STARTED = "tool.started"
+    TOOL_COMPLETED = "tool.completed"
+    TOOL_FAILED = "tool.failed"
+    APPROVAL_REQUESTED = "approval.requested"
+    APPROVAL_RESOLVED = "approval.resolved"
+    COST_RECORDED = "cost.recorded"
 
 
-class RunEvent(BaseModel):
+class RunEvent(_RuntimeContractModel):
     """One monotonically sequenced event within a run."""
 
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
-
-    kind: EventKind
+    kind: EventKind | str
     sequence: int = Field(ge=1, le=2**63 - 1)
     run_id: UUID
     artifact: Artifact | None = None
     checkpoint: RuntimeCheckpoint | None = None
     reason: str | None = Field(default=None, repr=False, max_length=512)
     inputs: tuple[Artifact, ...] = Field(default=(), max_length=64)
+    step_id: str | None = None
+    actor: str | None = None
+    message: str | None = Field(default=None, repr=False)
+    payload: Mapping[str, JsonValue] = Field(default_factory=dict, repr=False)
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def safe_kind(cls, value: object) -> EventKind | str:
+        if isinstance(value, EventKind):
+            return value
+        if type(value) is not str or re.fullmatch(
+            r"[a-z][a-z0-9_]{0,31}\.[a-z][a-z0-9_]{0,31}", value
+        ) is None:
+            raise ValueError("event kind must be a safe namespaced identifier")
+        try:
+            return EventKind(value)
+        except ValueError:
+            return value
 
     @field_validator("sequence")
     @classmethod
@@ -364,6 +456,25 @@ class RunEvent(BaseModel):
             _safe_free_text(value, name="event reason", max_bytes=512)
         return value
 
+    @field_validator("step_id", "actor")
+    @classmethod
+    def safe_optional_identifier(cls, value: str | None) -> str | None:
+        if value is not None:
+            return _safe_identifier(value, name="event identifier")
+        return value
+
+    @field_validator("message")
+    @classmethod
+    def safe_message(cls, value: str | None) -> str | None:
+        if value is not None:
+            return _safe_free_text(value, name="event message", max_bytes=65_536)
+        return value
+
+    @field_validator("payload", mode="before")
+    @classmethod
+    def validate_payload(cls, value: object) -> object:
+        return _strict_json_input(_freeze_object(value, name="event payload"))
+
     @field_validator("inputs", mode="before")
     @classmethod
     def freeze_inputs(cls, value: object) -> tuple[Artifact, ...]:
@@ -373,6 +484,9 @@ class RunEvent(BaseModel):
 
     @model_validator(mode="after")
     def event_invariants(self) -> RunEvent:
+        object.__setattr__(self, "payload", _freeze_object(self.payload, name="event payload"))
+        if _contains_sensitive_key(self.payload):
+            raise ValueError("event payload contains sensitive data")
         if self.kind is EventKind.ARTIFACT_CREATED:
             if self.artifact is None or self.checkpoint is not None or self.reason is not None:
                 raise ValueError("artifact.created requires only an artifact")
@@ -390,22 +504,58 @@ class RunEvent(BaseModel):
             if self.kind is EventKind.MODEL_STARTED and (self.reason is not None or self.inputs):
                 raise ValueError("model.started forbids reason and inputs")
         elif self.kind is EventKind.RUNTIME_COMPLETED and (
-            self.artifact is not None or self.checkpoint is not None or self.reason is not None
+            self.artifact is not None or self.checkpoint is not None
         ):
-            raise ValueError("runtime.completed forbids artifact, checkpoint, and reason")
+            raise ValueError("runtime.completed forbids artifact and checkpoint")
         if self.kind in {
             EventKind.ARTIFACT_CREATED,
             EventKind.CHECKPOINT_SAVED,
             EventKind.RUNTIME_FAILED,
         } and self.inputs:
             raise ValueError("event kind forbids inputs")
+        step_kinds = {
+            EventKind.STEP_STARTED,
+            EventKind.STEP_COMPLETED,
+            EventKind.STEP_FAILED,
+            EventKind.STEP_RETRYING,
+        }
+        if self.kind in step_kinds and (self.step_id is None or self.actor is None):
+            raise ValueError("step events require step_id and actor")
+        if self.kind in {EventKind.STEP_FAILED, EventKind.TOOL_FAILED} and self.reason is None:
+            raise ValueError("failed events require a reason")
+        if self.kind is EventKind.MESSAGE_CREATED and (
+            self.actor is None or self.message is None
+        ):
+            raise ValueError("message.created requires actor and message")
+        direct_kinds = {
+            EventKind.MODEL_STARTED,
+            EventKind.ARTIFACT_CREATED,
+            EventKind.CHECKPOINT_SAVED,
+            EventKind.RUNTIME_COMPLETED,
+            EventKind.RUNTIME_FAILED,
+            EventKind.RUNTIME_CANCELLED,
+        }
+        if self.kind in direct_kinds and (
+            self.step_id is not None or self.actor is not None or self.message is not None or self.payload
+        ):
+            raise ValueError("direct runtime events forbid extension fields")
+        if self.artifact is not None and self.kind is not EventKind.ARTIFACT_CREATED:
+            raise ValueError("only artifact.created may carry an artifact")
+        if self.checkpoint is not None and self.kind is not EventKind.CHECKPOINT_SAVED:
+            raise ValueError("only checkpoint.saved may carry a checkpoint")
+        if self.message is not None and self.kind is not EventKind.MESSAGE_CREATED:
+            raise ValueError("only message.created may carry a message")
+        if (
+            isinstance(self.kind, str)
+            and not isinstance(self.kind, EventKind)
+            and (not self.payload or self.artifact is not None or self.checkpoint is not None)
+        ):
+            raise ValueError("extension events require payload and forbid direct objects")
         return self
 
 
-class TaskContext(BaseModel):
+class TaskContext(_RuntimeContractModel):
     """The only durable input accepted by an execution runtime."""
-
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     run_id: UUID
     tenant_id: UUID
@@ -461,6 +611,20 @@ class TaskContext(BaseModel):
         ):
             raise ValueError("checkpoint run, tenant, or mode does not match task context")
         return self
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "run_id": str(self.run_id),
+            "tenant_id": str(self.tenant_id),
+            "mode": self.mode.value,
+            "request": self.request,
+            "artifacts": [Artifact.to_payload(item) for item in self.artifacts],
+            "checkpoint": None
+            if self.checkpoint is None
+            else RuntimeCheckpoint.to_payload(self.checkpoint),
+            "timeout_seconds": self.timeout_seconds,
+            "token_budget": self.token_budget,
+        }
 
 
 class ExecutionRuntime(Protocol):

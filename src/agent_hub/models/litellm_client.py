@@ -323,6 +323,7 @@ class LiteLLMClient:
             create_kwargs = {
                 "model": deployment.provider_model,
                 "messages": _messages(request),
+                "max_completion_tokens": request.max_output_tokens,
                 "timeout": request.timeout_seconds,
                 "stream": False,
             }

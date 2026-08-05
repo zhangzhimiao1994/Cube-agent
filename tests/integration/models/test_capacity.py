@@ -1636,8 +1636,9 @@ async def test_conservative_payload_estimate_is_rejected_by_tpm(
     request = ModelRequest(
         logical_model="chat",
         messages=(ModelMessage(role="user", content="界" * 300),),
+        max_output_tokens=1,
     )
-    estimate = ConservativeTokenEstimator(output_token_allowance=0).estimate(request)
+    estimate = ConservativeTokenEstimator().estimate(request)
     assert estimate > 500
     with pytest.raises(CapacityUnavailable):
         await pool.acquire([limited], wait_timeout=0, estimated_tokens=estimate)

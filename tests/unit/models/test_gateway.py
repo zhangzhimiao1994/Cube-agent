@@ -743,7 +743,9 @@ def test_default_estimator_is_deterministic_positive_and_prompt_safe() -> None:
     model_request = request()
     estimator = ConservativeTokenEstimator()
     assert estimator.estimate(model_request) == estimator.estimate(model_request)
-    assert estimator.estimate(model_request) >= 4096 + len(b"private prompt")
+    assert estimator.estimate(model_request) >= model_request.max_output_tokens + len(
+        b"private prompt"
+    )
     assert "private prompt" not in repr(estimator)
 
 
@@ -772,8 +774,9 @@ def test_estimator_covers_normalized_utf8_numbers_booleans_null_and_nesting() ->
         ),
         required_capabilities=frozenset({ModelCapability.STRUCTURED_OUTPUT}),
         response_schema=StructuredResponseSchema(name="Payload", schema=schema_value),
+        max_output_tokens=17,
     )
-    estimator = ConservativeTokenEstimator(output_token_allowance=17)
+    estimator = ConservativeTokenEstimator()
     serialized_schema_bytes = len(
         json.dumps(schema_value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     )
@@ -784,10 +787,14 @@ def test_estimator_covers_normalized_utf8_numbers_booleans_null_and_nesting() ->
     assert estimate > 1100
 
 
-@pytest.mark.parametrize("allowance", [-1, 1.0, True, None])
-def test_estimator_requires_strict_nonnegative_output_allowance(allowance: object) -> None:
-    with pytest.raises(ValueError, match="output_token_allowance"):
-        ConservativeTokenEstimator(output_token_allowance=allowance)  # type: ignore[arg-type]
+@pytest.mark.parametrize("allowance", [0, -1, 1.0, True, None, 1_000_001])
+def test_model_request_requires_strict_bounded_output_budget(allowance: object) -> None:
+    with pytest.raises((TypeError, ValueError), match="max_output_tokens"):
+        ModelRequest(
+            logical_model="primary",
+            messages=(),
+            max_output_tokens=allowance,  # type: ignore[arg-type]
+        )
 
 
 def test_capacity_lease_repr_is_redacted_and_fields_are_validated() -> None:
