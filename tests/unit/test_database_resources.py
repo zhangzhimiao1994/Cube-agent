@@ -21,6 +21,14 @@ async def test_database_exposes_and_disposes_its_owned_engine() -> None:
     await database.dispose()
 
 
+async def test_runtime_engine_hides_sql_parameter_values() -> None:
+    database = build_database("postgresql+asyncpg://user:password@localhost:5432/database")
+    try:
+        assert database.engine.sync_engine.hide_parameters is True
+    finally:
+        await database.dispose()
+
+
 async def test_session_factory_uses_caller_owned_engine() -> None:
     database = build_database("postgresql+asyncpg://user:password@localhost:5432/database")
     try:

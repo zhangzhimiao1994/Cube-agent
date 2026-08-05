@@ -19,6 +19,8 @@ from agent_hub.security.secrets import (
 
 MASTER_KEY = bytes(range(32))
 OTHER_KEY = bytes(reversed(range(32)))
+ROTATED_KEY = b"r" * 32
+FINGERPRINT_KEY = b"f" * 32
 OpenFailureFactory = Callable[
     [SecretCipher, SealedSecret],
     tuple[SecretCipher, SealedSecret, str],
@@ -48,6 +50,53 @@ def test_sealing_same_plaintext_uses_random_ciphertext_but_stable_fingerprint() 
     assert cipher.seal("different secret", context="tenant-a").fingerprint != first.fingerprint
 
 
+def test_fingerprint_is_tenant_local() -> None:
+    cipher = SecretCipher(MASTER_KEY)
+
+    tenant_a = cipher.seal("same secret", context="tenant-a")
+    tenant_b = cipher.seal("same secret", context="tenant-b")
+
+    assert tenant_a.fingerprint != tenant_b.fingerprint
+
+
+def test_cipher_rotation_uses_keyring_and_stable_independent_fingerprint_key() -> None:
+    v1 = SecretCipher(MASTER_KEY, key_id="v1", fingerprint_key=FINGERPRINT_KEY)
+    old = v1.seal("rotated secret", context="tenant-a")
+    v2 = SecretCipher(
+        ROTATED_KEY,
+        key_id="v2",
+        decryption_keys={"v1": MASTER_KEY},
+        fingerprint_key=FINGERPRINT_KEY,
+    )
+
+    resealed = v2.seal("rotated secret", context="tenant-a")
+
+    assert v2.open(old, context="tenant-a") == "rotated secret"
+    assert resealed.key_id == "v2"
+    assert resealed.fingerprint == old.fingerprint
+    with pytest.raises(SecretDecryptionError) as captured:
+        SecretCipher(
+            ROTATED_KEY,
+            key_id="v2",
+            fingerprint_key=FINGERPRINT_KEY,
+        ).open(old, context="tenant-a")
+    assert str(captured.value) == "secret could not be decrypted"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"fingerprint_key": b"short"},
+        {"decryption_keys": {"v0": b"short"}},
+        {"decryption_keys": {"unsafe key id": MASTER_KEY}},
+        {"key_id": "v1", "decryption_keys": {"v1": OTHER_KEY}},
+    ],
+)
+def test_cipher_rejects_invalid_rotation_configuration(kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        SecretCipher(MASTER_KEY, **kwargs)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize("key", [b"", b"short", bytes(31), bytes(33)])
 def test_secret_cipher_rejects_non_aes256_keys(key: bytes) -> None:
     with pytest.raises(ValueError, match="32 bytes"):
@@ -65,6 +114,35 @@ def test_seal_rejects_secret_larger_than_64_kib_utf8() -> None:
         SecretCipher(MASTER_KEY).seal("x" * 65_537, context="tenant-a")
 
 
+def test_seal_accepts_exact_64_kib_utf8_boundary() -> None:
+    cipher = SecretCipher(MASTER_KEY)
+    plaintext = "é" * 32_768
+
+    sealed = cipher.seal(plaintext, context="tenant-a")
+
+    assert cipher.open(sealed, context="tenant-a") == plaintext
+
+
+def test_seal_rejects_multibyte_secret_over_64_kib() -> None:
+    with pytest.raises(SecretValidationError, match="65536"):
+        SecretCipher(MASTER_KEY).seal("é" * 32_769, context="tenant-a")
+
+
+class _OversizedWhitespace(str):
+    def strip(self, chars: str | None = None) -> str:
+        raise AssertionError("strip must not run for oversized text")
+
+    def encode(self, encoding: str = "utf-8", errors: str = "strict") -> bytes:
+        raise AssertionError("encode must not run for oversized text")
+
+
+def test_seal_fast_rejects_oversized_whitespace_before_strip_or_encode() -> None:
+    plaintext = _OversizedWhitespace(" " * 65_537)
+
+    with pytest.raises(SecretValidationError, match="65536"):
+        SecretCipher(MASTER_KEY).seal(plaintext, context="tenant-a")
+
+
 def test_seal_rejects_unpaired_surrogate_without_disclosing_input() -> None:
     plaintext = "private-\ud800-value"
 
@@ -73,6 +151,54 @@ def test_seal_rejects_unpaired_surrogate_without_disclosing_input() -> None:
 
     assert str(captured.value) == "secret could not be encoded"
     assert "private" not in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        SealedSecret("v1", "A" * 17, "A" * 24, "0" * 64),
+        SealedSecret("v1", "A" * 16, "A" * 24, "0" * 65),
+        SealedSecret("v1", "A" * 16, "A" * 87_405, "0" * 64),
+        SealedSecret("k" * 65, "A" * 16, "A" * 24, "0" * 64),
+    ],
+    ids=["nonce", "fingerprint", "ciphertext", "key-id"],
+)
+def test_open_rejects_oversized_stored_fields_before_base64_decode(
+    changed: SealedSecret, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_decode(*args: object, **kwargs: object) -> bytes:
+        raise AssertionError("base64 decode must not run for oversized fields")
+
+    monkeypatch.setattr(
+        "agent_hub.security.secrets.base64.b64decode",
+        fail_decode,
+    )
+
+    with pytest.raises(SecretDecryptionError) as captured:
+        SecretCipher(MASTER_KEY).open(changed, context="tenant-a")
+
+    assert str(captured.value) == "secret could not be decrypted"
+
+
+def test_open_rejects_oversized_decoded_ciphertext_before_aes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cipher = SecretCipher(MASTER_KEY)
+    sealed = cipher.seal("small", context="tenant-a")
+    oversized = replace(
+        sealed,
+        ciphertext=b64encode(bytes(65_553)).decode("ascii"),
+    )
+
+    def fail_decrypt(*args: object, **kwargs: object) -> bytes:
+        raise AssertionError("AES decrypt must not run for oversized ciphertext")
+
+    monkeypatch.setattr(AESGCM, "decrypt", fail_decrypt)
+
+    with pytest.raises(SecretDecryptionError) as captured:
+        cipher.open(oversized, context="tenant-a")
+
+    assert str(captured.value) == "secret could not be decrypted"
 
 
 @pytest.mark.parametrize(
