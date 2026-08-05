@@ -154,12 +154,12 @@ class InMemoryDecisionTokenStore:
             now = self._clock_now_locked()
             self._purge(now)
             state = self._subjects.get(subject)
-            if state is None and len(self._subjects) >= self._max_records:
+            if state is None and len(self._records) >= self._max_records:
                 raise RuntimeError("confirmation token capacity unavailable")
             current_version = 0 if state is None else state.version
             if state is not None and state.current_digest is not None:
                 self._records.pop(state.current_digest, None)
-                self._subjects[subject] = _SubjectTokenState(state.version, None)
+                self._subjects.pop(subject, None)
             if current_version >= self._max_version:
                 raise RuntimeError("confirmation token version exhausted")
             version = current_version + 1
@@ -216,7 +216,7 @@ class InMemoryDecisionTokenStore:
             ):
                 return None
             del self._records[digest]
-            self._subjects[subject] = _SubjectTokenState(version, None)
+            self._subjects.pop(subject, None)
             return ConsumedDecisionToken(snapshot=record.snapshot, version=version)
 
     def _purge(self, now: float) -> None:
@@ -225,7 +225,7 @@ class InMemoryDecisionTokenStore:
             record = self._records.pop(digest)
             state = self._subjects.get(record.subject)
             if state is not None and state.current_digest == digest:
-                self._subjects[record.subject] = _SubjectTokenState(state.version, None)
+                self._subjects.pop(record.subject, None)
 
     def _clock_now_locked(self) -> float:
         try:
@@ -246,10 +246,7 @@ class InMemoryDecisionTokenStore:
 
     def _invalidate_current_tokens(self) -> None:
         self._records.clear()
-        self._subjects = {
-            subject: _SubjectTokenState(state.version, None)
-            for subject, state in self._subjects.items()
-        }
+        self._subjects.clear()
 
 
 def _safe_text(value: str, *, name: str) -> str:

@@ -322,6 +322,18 @@ async def test_multilingual_explicit_risk_preserves_mode_and_approval(
         "删除全部客户记录",
         "Explain JSON, then delete production database",
         "说明后删除生产数据库",
+        "sudo rm -rf /var/lib/app",
+        "rm -fr ./cache",
+        "rm -r -f /tmp/data",
+        "printf ok\n  sudo   rm   -f   -r   /opt/app",
+        "ｓｕｄｏ ｒｍ －ｒｆ ／ｖａｒ／ｌｉｂ／ａｐｐ",
+        "wipe production volume",
+        "format customer-data drive",
+        "shut down production server",
+        "transfer 100 USD to recipient",
+        "wire 500 EUR to account",
+        "pay $100 to beneficiary",
+        "send ¥500 to the payee",
     ],
 )
 async def test_multilingual_high_risk_auto_routing_always_waits(text: str) -> None:
@@ -648,6 +660,96 @@ async def test_token_subject_capacity_is_bounded_and_fails_closed() -> None:
     )
     assert first.decision_token is not None
     assert blocked.decision_token is None
+
+
+async def test_consumed_active_record_releases_capacity_for_another_subject() -> None:
+    store = InMemoryDecisionTokenStore(max_records=1)
+    selected_router = ModeRouter(
+        FakeClassifier(assessment(TaskMode.DISPATCH)),
+        FakeClassifier(assessment(TaskMode.DISCUSS, source=RouteSource.VERIFIER)),
+        token_store=store,
+    )
+    first = await selected_router.route("ambiguous request", confirmation_subject=subject())
+    await selected_router.confirm_mode(
+        TaskMode.DIRECT,
+        decision_token=first.decision_token,
+        version=first.version,
+        confirmation_subject=subject(),
+    )
+    second = await selected_router.route(
+        "ambiguous request", confirmation_subject=subject(task_id="task-2")
+    )
+    assert second.decision_token is not None
+
+
+async def test_expired_active_record_releases_capacity_for_another_subject() -> None:
+    now = [10.0]
+    store = InMemoryDecisionTokenStore(max_records=1, monotonic=lambda: now[0])
+    selected_router = ModeRouter(
+        FakeClassifier(assessment(TaskMode.DISPATCH)),
+        FakeClassifier(assessment(TaskMode.DISCUSS, source=RouteSource.VERIFIER)),
+        token_store=store,
+        policy=RoutingPolicy(confirmation_ttl_seconds=1),
+    )
+    await selected_router.route("ambiguous request", confirmation_subject=subject())
+    now[0] = 11.0
+    second = await selected_router.route(
+        "ambiguous request", confirmation_subject=subject(task_id="task-2")
+    )
+    assert second.decision_token is not None
+
+
+async def test_many_unique_consumed_subjects_do_not_exhaust_active_capacity() -> None:
+    store = InMemoryDecisionTokenStore(max_records=1)
+    selected_router = ModeRouter(
+        FakeClassifier(assessment(TaskMode.DISPATCH)),
+        FakeClassifier(assessment(TaskMode.DISCUSS, source=RouteSource.VERIFIER)),
+        token_store=store,
+    )
+    for index in range(20):
+        current_subject = subject(task_id=f"task-{index}")
+        waiting = await selected_router.route(
+            "ambiguous request", confirmation_subject=current_subject
+        )
+        assert waiting.decision_token is not None
+        await selected_router.confirm_mode(
+            TaskMode.DIRECT,
+            decision_token=waiting.decision_token,
+            version=waiting.version,
+            confirmation_subject=current_subject,
+        )
+
+
+async def test_old_digest_cannot_consume_new_record_after_version_reset() -> None:
+    store = InMemoryDecisionTokenStore(max_records=1)
+    selected_router = ModeRouter(
+        FakeClassifier(assessment(TaskMode.DISPATCH)),
+        FakeClassifier(assessment(TaskMode.DISCUSS, source=RouteSource.VERIFIER)),
+        token_store=store,
+    )
+    first = await selected_router.route("ambiguous request", confirmation_subject=subject())
+    await selected_router.confirm_mode(
+        TaskMode.DIRECT,
+        decision_token=first.decision_token,
+        version=first.version,
+        confirmation_subject=subject(),
+    )
+    second = await selected_router.route("ambiguous request", confirmation_subject=subject())
+    assert second.version == 1
+    with pytest.raises(ValueError, match="stale"):
+        await selected_router.confirm_mode(
+            TaskMode.DIRECT,
+            decision_token=first.decision_token,
+            version=first.version,
+            confirmation_subject=subject(),
+        )
+    ready = await selected_router.confirm_mode(
+        TaskMode.DIRECT,
+        decision_token=second.decision_token,
+        version=second.version,
+        confirmation_subject=subject(),
+    )
+    assert ready.status == "ready"
 
 
 async def test_nonfinite_or_reversing_clock_invalidates_confirmation_tokens() -> None:

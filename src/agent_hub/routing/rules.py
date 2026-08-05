@@ -81,6 +81,11 @@ class RiskRulePolicy:
         "records",
         "customer",
         "customers",
+        "drive",
+        "volume",
+        "device",
+        "partition",
+        "filesystem",
     )
     financial_actions: tuple[str, ...] = (
         "transfer",
@@ -99,6 +104,10 @@ class RiskRulePolicy:
         "supplier",
         "vendor",
         "account",
+        "recipient",
+        "payee",
+        "beneficiary",
+        "receiver",
     )
     sensitive_actions: tuple[str, ...] = (
         "change",
@@ -139,7 +148,7 @@ class RiskRulePolicy:
 
     def is_high_risk(self, task_text: str) -> bool:
         normalized = unicodedata.normalize("NFKC", task_text).casefold()
-        if re.search(r"\brm\s+-(?:[a-z]*r[a-z]*f|[a-z]*f[a-z]*r)\s+/(?:\s|$)", normalized):
+        if self._has_recursive_force_remove(normalized):
             return True
 
         english_tokens = frozenset(re.findall(r"[a-z0-9]+", normalized))
@@ -147,9 +156,20 @@ class RiskRulePolicy:
         def has(values: tuple[str, ...]) -> bool:
             return not english_tokens.isdisjoint(values)
 
+        destructive_action = has(self.destructive_actions) or (
+            "shut" in english_tokens and "down" in english_tokens
+        )
+        currency_amount = re.search(
+            r"(?:[$€£¥]\s*\d+(?:[.,]\d+)?)|"
+            r"(?:\b\d+(?:[.,]\d+)?\s*(?:usd|eur|gbp|cny|rmb|jpy)\b)",
+            normalized,
+        ) is not None
         explicit_english_risk = (
-            (has(self.destructive_actions) and has(self.destructive_targets))
-            or (has(self.financial_actions) and has(self.financial_targets))
+            (destructive_action and has(self.destructive_targets))
+            or (
+                has(self.financial_actions)
+                and (has(self.financial_targets) or currency_amount)
+            )
             or (has(self.sensitive_actions) and has(self.sensitive_targets))
             or (has(self.external_actions) and has(self.external_targets))
             or any(marker in normalized for marker in self.irreversible_markers)
@@ -239,6 +259,20 @@ class RiskRulePolicy:
             )
         )
         return explicit_chinese_risk and not chinese_read_only
+
+    @staticmethod
+    def _has_recursive_force_remove(normalized: str) -> bool:
+        """Detect a dangerous rm form as text only; this never parses or executes a shell."""
+        command = re.compile(
+            r"(?:^|[\n;&|])\s*(?:sudo\s+)?rm\s+"
+            r"(?P<flags>(?:-[a-z]+\s+)+)(?:--\s+)?(?P<target>[^\s;&|]+)",
+            re.IGNORECASE,
+        )
+        for match in command.finditer(normalized):
+            flag_letters = "".join(re.findall(r"[a-z]", match.group("flags")))
+            if "r" in flag_letters and "f" in flag_letters and match.group("target"):
+                return True
+        return False
 
 
 def validate_task_text(task_text: object) -> str:
