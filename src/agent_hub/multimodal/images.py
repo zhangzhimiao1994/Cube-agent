@@ -8,7 +8,6 @@ import re
 import stat
 import threading
 import uuid
-import warnings
 from pathlib import Path
 
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -31,7 +30,6 @@ _OBJECT_KEY = re.compile(
     r"[89ab][0-9a-f]{3}-[0-9a-f]{12})\.png$"
 )
 _TENANT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}$")
-_PILLOW_DECODE_LOCK = threading.RLock()
 
 
 async def _await_task_uninterruptibly[T](task: asyncio.Task[T]) -> T:
@@ -195,6 +193,116 @@ def _has_exact_container_length(data: bytes, detected_mime: str, maximum_segment
     return False
 
 
+def _png_dimensions(data: bytes) -> tuple[int, int] | None:
+    if len(data) < 33 or data[12:16] != b"IHDR":
+        return None
+    width = int.from_bytes(data[16:20], "big")
+    height = int.from_bytes(data[20:24], "big")
+    return (width, height) if width and height else None
+
+
+def _jpeg_dimensions(data: bytes, maximum_segments: int) -> tuple[int, int] | None:
+    offset = 2
+    dimensions: tuple[int, int] | None = None
+    sof_markers = {
+        0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+        0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+    }
+    segments = 0
+    while offset < len(data):
+        segments += 1
+        if segments > maximum_segments or data[offset] != 0xFF:
+            return None
+        offset += 1
+        while offset < len(data) and data[offset] == 0xFF:
+            offset += 1
+        if offset >= len(data):
+            return None
+        code = data[offset]
+        offset += 1
+        if code == 0xD9:
+            return dimensions
+        if code in {0x00, 0xD8}:
+            return None
+        if code == 0x01 or 0xD0 <= code <= 0xD7:
+            continue
+        if offset + 2 > len(data):
+            return None
+        segment_length = int.from_bytes(data[offset : offset + 2], "big")
+        if segment_length < 2 or offset + segment_length > len(data):
+            return None
+        if code in sof_markers:
+            if segment_length < 8:
+                return None
+            height = int.from_bytes(data[offset + 3 : offset + 5], "big")
+            width = int.from_bytes(data[offset + 5 : offset + 7], "big")
+            candidate = (width, height)
+            if not width or not height or (dimensions is not None and dimensions != candidate):
+                return None
+            dimensions = candidate
+        if code == 0xDA:
+            return dimensions
+        offset += segment_length
+    return None
+
+
+def _webp_dimensions(data: bytes, maximum_segments: int) -> tuple[int, int] | None:
+    offset = 12
+    chunks = 0
+    canvas: tuple[int, int] | None = None
+    image_dimensions: tuple[int, int] | None = None
+    while offset + 8 <= len(data):
+        chunks += 1
+        if chunks > maximum_segments:
+            return None
+        chunk_type = data[offset : offset + 4]
+        length = int.from_bytes(data[offset + 4 : offset + 8], "little")
+        payload_end = offset + 8 + length
+        if payload_end > len(data):
+            return None
+        payload = data[offset + 8 : payload_end]
+        candidate: tuple[int, int] | None = None
+        if chunk_type == b"VP8X":
+            if len(payload) != 10:
+                return None
+            canvas = (
+                int.from_bytes(payload[4:7], "little") + 1,
+                int.from_bytes(payload[7:10], "little") + 1,
+            )
+        elif chunk_type == b"VP8 ":
+            if len(payload) < 10 or payload[3:6] != b"\x9d\x01\x2a":
+                return None
+            candidate = (
+                int.from_bytes(payload[6:8], "little") & 0x3FFF,
+                int.from_bytes(payload[8:10], "little") & 0x3FFF,
+            )
+        elif chunk_type == b"VP8L":
+            if len(payload) < 5 or payload[0] != 0x2F:
+                return None
+            bits = int.from_bytes(payload[1:5], "little")
+            candidate = ((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)
+        if candidate is not None:
+            if image_dimensions is not None or not candidate[0] or not candidate[1]:
+                return None
+            image_dimensions = candidate
+        offset = payload_end + (length & 1)
+    if image_dimensions is None or (canvas is not None and canvas != image_dimensions):
+        return None
+    return image_dimensions
+
+
+def _container_dimensions(
+    data: bytes, detected_mime: str, maximum_segments: int
+) -> tuple[int, int] | None:
+    if detected_mime == "image/png":
+        return _png_dimensions(data)
+    if detected_mime == "image/jpeg":
+        return _jpeg_dimensions(data, maximum_segments)
+    if detected_mime == "image/webp":
+        return _webp_dimensions(data, maximum_segments)
+    return None
+
+
 def _dimensions_allowed(width: int, height: int, limits: ImageLimits) -> bool:
     pixels = width * height
     return (
@@ -208,7 +316,7 @@ def _dimensions_allowed(width: int, height: int, limits: ImageLimits) -> bool:
     )
 
 
-def _decode_and_canonicalize_locked(
+def _decode_and_canonicalize(
     data: bytes,
     declared_mime: str,
     limits: ImageLimits,
@@ -225,41 +333,51 @@ def _decode_and_canonicalize_locked(
             )
         ):
             return None
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(io.BytesIO(data)) as probe:
-                decoded_format = probe.format
-                if decoded_format != expected_format:
-                    return None
-                if getattr(probe, "n_frames", 1) != 1 or getattr(probe, "is_animated", False):
-                    return None
-                if not _dimensions_allowed(probe.width, probe.height, limits):
-                    return None
-                probe.verify()
+        header_dimensions = _container_dimensions(
+            data, detected_mime or "", limits.max_container_segments
+        )
+        if header_dimensions is None or not _dimensions_allowed(*header_dimensions, limits):
+            return None
+        with Image.open(io.BytesIO(data)) as probe:
+            decoded_format = probe.format
+            if decoded_format != expected_format:
+                return None
+            if getattr(probe, "n_frames", 1) != 1 or getattr(probe, "is_animated", False):
+                return None
+            if probe.size != header_dimensions or not _dimensions_allowed(
+                probe.width, probe.height, limits
+            ):
+                return None
+            probe.verify()
 
-            with Image.open(io.BytesIO(data)) as decoded:
-                if decoded.format != decoded_format or getattr(decoded, "n_frames", 1) != 1:
+        with Image.open(io.BytesIO(data)) as decoded:
+            if (
+                decoded.format != decoded_format
+                or getattr(decoded, "n_frames", 1) != 1
+                or decoded.size != header_dimensions
+            ):
+                return None
+            decoded.load()
+            if not _dimensions_allowed(decoded.width, decoded.height, limits):
+                return None
+            if decoded.width * decoded.height * 4 / len(data) > limits.max_compression_ratio:
+                return None
+            transposed = ImageOps.exif_transpose(decoded)
+            try:
+                if not _dimensions_allowed(transposed.width, transposed.height, limits):
                     return None
-                decoded.load()
-                if not _dimensions_allowed(decoded.width, decoded.height, limits):
-                    return None
-                if decoded.width * decoded.height * 4 / len(data) > limits.max_compression_ratio:
-                    return None
-                transposed = ImageOps.exif_transpose(decoded)
+                final_size = transposed.size
+                target_mode = "RGBA" if "A" in transposed.getbands() else "RGB"
+                converted = transposed.convert(target_mode)
                 try:
-                    if not _dimensions_allowed(transposed.width, transposed.height, limits):
-                        return None
-                    target_mode = "RGBA" if "A" in transposed.getbands() else "RGB"
-                    converted = transposed.convert(target_mode)
-                    try:
-                        # Copy pixels into a new image so no decoder metadata or lazy source aliases survive.
-                        clean = Image.new(target_mode, converted.size)
-                        clean.frombytes(converted.tobytes())
-                    finally:
-                        converted.close()
+                    # Copy pixels into a new image so no decoder metadata or lazy source aliases survive.
+                    clean = Image.new(target_mode, converted.size)
+                    clean.frombytes(converted.tobytes())
                 finally:
-                    if transposed is not decoded:
-                        transposed.close()
+                    converted.close()
+            finally:
+                if transposed is not decoded:
+                    transposed.close()
 
         output = io.BytesIO()
         try:
@@ -270,21 +388,18 @@ def _decode_and_canonicalize_locked(
             output.close()
         if not canonical or len(canonical) > limits.max_canonical_bytes:
             return None
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(io.BytesIO(canonical)) as verified:
-                if (
-                    verified.format != "PNG"
-                    or getattr(verified, "n_frames", 1) != 1
-                    or verified.size != (transposed.width, transposed.height)
-                    or verified.info
-                ):
-                    return None
-                verified.load()
-        return canonical, decoded_format, verified.width, verified.height
+        with Image.open(io.BytesIO(canonical)) as verified:
+            if (
+                verified.format != "PNG"
+                or getattr(verified, "n_frames", 1) != 1
+                or verified.size != final_size
+                or verified.info
+            ):
+                return None
+            verified.load()
+        return canonical, decoded_format, final_size[0], final_size[1]
     except (
         Image.DecompressionBombError,
-        Image.DecompressionBombWarning,
         UnidentifiedImageError,
         OSError,
         ValueError,
@@ -296,16 +411,6 @@ def _decode_and_canonicalize_locked(
         error.__traceback__ = None
         del error
         return None
-
-
-def _decode_and_canonicalize(
-    data: bytes,
-    declared_mime: str,
-    limits: ImageLimits,
-    detector: ContentTypeDetector,
-) -> tuple[bytes, str, int, int] | None:
-    with _PILLOW_DECODE_LOCK:
-        return _decode_and_canonicalize_locked(data, declared_mime, limits, detector)
 
 
 def _sanitize_copied(
@@ -424,6 +529,17 @@ class MemoryImageStore:
         return (tenant_id, object_key) in self._objects
 
 
+class ImageStoreCommitUncertain(OSError):
+    """A published target could not be durably rolled back."""
+
+    def __init__(self, object_key: str) -> None:
+        super().__init__("image store commit state is uncertain")
+        self.object_key = object_key
+
+    def __repr__(self) -> str:
+        return f"ImageStoreCommitUncertain(object_key={self.object_key!r})"
+
+
 class FilesystemImageStore:
     """POSIX dirfd-based adapter that never follows filesystem links."""
 
@@ -522,7 +638,7 @@ class FilesystemImageStore:
             del worker
         if result is None:
             raise OSError("image storage failed") from None
-        if isinstance(result, ValueError):
+        if isinstance(result, ValueError | ImageStoreCommitUncertain):
             raise result from None
         return result
 
@@ -540,9 +656,11 @@ class FilesystemImageStore:
 
     def _put_sync_safe(
         self, tenant_id: str, object_key: str, data: bytes, content_type: str
-    ) -> StoredImageObject | ValueError | None:
+    ) -> StoredImageObject | ValueError | ImageStoreCommitUncertain | None:
         root_fd = tenants_fd = tenant_fd = -1
         temporary_name: str | None = None
+        target_name: str | None = None
+        target_created = False
         try:
             try:
                 match = _validated_store_match(tenant_id, object_key, data, content_type)
@@ -583,6 +701,7 @@ class FilesystemImageStore:
                 dst_dir_fd=tenant_fd,
                 follow_symlinks=False,
             )
+            target_created = True
             os.unlink(temporary_name, dir_fd=tenant_fd)
             temporary_name = None
             os.fsync(tenant_fd)
@@ -592,7 +711,15 @@ class FilesystemImageStore:
                 content_type=content_type,
                 sha256=hashlib.sha256(data).hexdigest(),
             )
-        except (OSError, UnicodeError, ValueError):
+        except (Exception, asyncio.CancelledError) as error:  # noqa: BLE001 - adapter boundary
+            error.__traceback__ = None
+            del error
+            if target_created and target_name is not None:
+                try:
+                    os.unlink(target_name, dir_fd=tenant_fd)
+                    os.fsync(tenant_fd)
+                except (OSError, ValueError):
+                    return ImageStoreCommitUncertain(object_key)
             return None
         finally:
             if temporary_name is not None and tenant_fd >= 0:

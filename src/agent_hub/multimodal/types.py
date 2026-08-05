@@ -14,6 +14,8 @@ _OBJECT_KEY = re.compile(
     r"[89ab][0-9a-f]{3}-[0-9a-f]{12}\.png$"
 )
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
+_MAX_SAFE_IMAGE_DIMENSION = 16_384
+_MAX_SAFE_IMAGE_PIXELS = 40_000_000
 
 
 class InvalidImage(ValueError):
@@ -26,6 +28,10 @@ class VisionAnalysisError(RuntimeError):
 
 class VisionBusyError(VisionAnalysisError):
     """Bounded image worker admission is full."""
+
+
+class VisionCleanupError(VisionAnalysisError):
+    """Stable cleanup or recovery-recording failure."""
 
 
 def _positive_int(name: str, value: object) -> None:
@@ -66,6 +72,12 @@ class ImageLimits:
             "max_canonical_bytes",
         ):
             _positive_int(name, getattr(self, name))
+        if self.max_width > _MAX_SAFE_IMAGE_DIMENSION:
+            raise ValueError("max_width exceeds the hard safety ceiling")
+        if self.max_height > _MAX_SAFE_IMAGE_DIMENSION:
+            raise ValueError("max_height exceeds the hard safety ceiling")
+        if self.max_pixels > _MAX_SAFE_IMAGE_PIXELS:
+            raise ValueError("max_pixels exceeds the hard safety ceiling")
         _positive_number("max_compression_ratio", self.max_compression_ratio)
         _positive_number("max_aspect_ratio", self.max_aspect_ratio)
 
@@ -134,6 +146,36 @@ class ImageObjectStore(Protocol):
     ) -> StoredImageObject: ...
 
     async def delete(self, tenant_id: str, object_key: str) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ImageCleanupRecoveryItem:
+    tenant_sha256: str
+    object_key: str
+    canonical_sha256: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        if _SHA256.fullmatch(self.tenant_sha256) is None:
+            raise ValueError("tenant_sha256 must be a SHA-256 digest")
+        if _OBJECT_KEY.fullmatch(self.object_key) is None:
+            raise ValueError("object key is invalid")
+        if _SHA256.fullmatch(self.canonical_sha256) is None:
+            raise ValueError("canonical_sha256 must be a SHA-256 digest")
+        if self.reason not in {
+            "put_failed",
+            "put_cancelled",
+            "stored_metadata_mismatch",
+            "analysis_failed",
+            "analysis_cancelled",
+        }:
+            raise ValueError("cleanup recovery reason is invalid")
+
+
+class ImageCleanupRecoverySink(Protocol):
+    """Reliably persist bounded compensation work before returning."""
+
+    async def enqueue(self, item: ImageCleanupRecoveryItem) -> None: ...
 
 
 class ContentTypeDetector(Protocol):

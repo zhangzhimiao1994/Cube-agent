@@ -7,6 +7,7 @@ import ipaddress
 import json
 import math
 import re
+import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Annotated, Protocol
@@ -31,6 +32,8 @@ from agent_hub.models.types import (
 from agent_hub.multimodal.images import _await_task_uninterruptibly, sanitize_image
 from agent_hub.multimodal.types import (
     ImageAnalysisArtifact,
+    ImageCleanupRecoveryItem,
+    ImageCleanupRecoverySink,
     ImageLimits,
     ImageObjectStore,
     ImageReferenceProvider,
@@ -45,6 +48,7 @@ from agent_hub.multimodal.types import (
     VisionAuditEvent,
     VisionAuditSink,
     VisionBusyError,
+    VisionCleanupError,
 )
 
 _OCR_SUMMARY = "OCR-only text extraction; visual description unavailable"
@@ -212,6 +216,7 @@ class VisionService:
         gateway: VisionGateway,
         object_store: ImageObjectStore,
         *,
+        cleanup_recovery_sink: ImageCleanupRecoverySink,
         limits: ImageLimits | None = None,
         ocr_adapter: OCRAdapter | None = None,
         reference_provider: ImageReferenceProvider | None = None,
@@ -221,6 +226,8 @@ class VisionService:
         max_concurrent_image_tasks: int = 4,
         max_active_image_tasks: int | None = None,
         max_waiting_image_tasks: int = 16,
+        cleanup_attempts: int = 3,
+        cleanup_backoff_seconds: float = 0.01,
         max_signed_url_ttl_seconds: float = 300,
         utc_now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
@@ -240,6 +247,15 @@ class VisionService:
             raise ValueError("max_concurrent_image_tasks must be a strict positive integer")
         if type(max_waiting_image_tasks) is not int or max_waiting_image_tasks < 0:
             raise ValueError("max_waiting_image_tasks must be a strict nonnegative integer")
+        if type(cleanup_attempts) is not int or cleanup_attempts <= 0:
+            raise ValueError("cleanup_attempts must be a strict positive integer")
+        if (
+            isinstance(cleanup_backoff_seconds, bool)
+            or not isinstance(cleanup_backoff_seconds, int | float)
+            or not math.isfinite(cleanup_backoff_seconds)
+            or cleanup_backoff_seconds < 0
+        ):
+            raise ValueError("cleanup_backoff_seconds must be finite and nonnegative")
         if (
             isinstance(max_signed_url_ttl_seconds, bool)
             or not isinstance(max_signed_url_ttl_seconds, int | float)
@@ -249,6 +265,7 @@ class VisionService:
             raise ValueError("max_signed_url_ttl_seconds must be finite and positive")
         self._gateway = gateway
         self._object_store = object_store
+        self._cleanup_recovery_sink = cleanup_recovery_sink
         self._limits = limits or ImageLimits()
         self._ocr = ocr_adapter
         self._reference_provider = reference_provider
@@ -272,10 +289,15 @@ class VisionService:
         self._review_threshold = float(review_threshold)
         self._max_reference_length = max_reference_length
         self._image_slots = asyncio.Semaphore(active_limit)
+        self._admission_lock = threading.Lock()
         self._max_active_image_tasks = active_limit
         self._max_waiting_image_tasks = max_waiting_image_tasks
+        self._max_admitted_image_tasks = active_limit + max_waiting_image_tasks
+        self._admitted_image_tasks = 0
         self._active_image_tasks = 0
         self._waiting_image_tasks = 0
+        self._cleanup_attempts = cleanup_attempts
+        self._cleanup_backoff_seconds = float(cleanup_backoff_seconds)
         self._max_signed_url_ttl_seconds = float(max_signed_url_ttl_seconds)
         self._utc_now = utc_now
 
@@ -316,26 +338,53 @@ class VisionService:
         tenant_digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()
         stored, storage_cancellation = await self._store_image(sanitized, tenant_id)
         if storage_cancellation is not None:
-            if stored is not None:
-                del sanitized, stored
-                await self._cleanup_object(tenant_id, object_key)
-            else:
-                del sanitized, stored
+            _cleanup_cancellation, recovery_queued = await self._cleanup_object(
+                tenant_id,
+                object_key,
+                tenant_digest,
+                sanitized.canonical_sha256,
+                "put_cancelled",
+            )
+            del sanitized, stored
             del object_key, tenant_id, tenant_digest
+            if recovery_queued:
+                storage_cancellation.add_note("image cleanup recovery queued")
             storage_cancellation.__traceback__ = None
             raise storage_cancellation from None
         if stored is None:
+            cleanup_cancellation, recovery_queued = await self._cleanup_object(
+                tenant_id,
+                object_key,
+                tenant_digest,
+                sanitized.canonical_sha256,
+                "put_failed",
+            )
             del sanitized, stored, object_key, tenant_id, tenant_digest
-            raise VisionAnalysisError("image storage failed") from None
-        if not self._stored_matches(stored, sanitized):
-            del sanitized, stored
-            cleanup_cancellation, cleanup_ok = await self._cleanup_object(tenant_id, object_key)
-            del object_key, tenant_id, tenant_digest
             if cleanup_cancellation is not None:
+                if recovery_queued:
+                    cleanup_cancellation.add_note("image cleanup recovery queued")
                 cleanup_cancellation.__traceback__ = None
                 raise cleanup_cancellation from None
-            if not cleanup_ok:
-                raise VisionAnalysisError("image cleanup failed") from None
+            if recovery_queued:
+                raise VisionCleanupError("image cleanup failed; recovery queued") from None
+            raise VisionAnalysisError("image storage failed") from None
+        if not self._stored_matches(stored, sanitized):
+            cleanup_cancellation, recovery_queued = await self._cleanup_object(
+                tenant_id,
+                object_key,
+                tenant_digest,
+                sanitized.canonical_sha256,
+                "stored_metadata_mismatch",
+            )
+            del sanitized, stored
+            del object_key, tenant_id, tenant_digest
+            if cleanup_cancellation is not None:
+                if recovery_queued:
+                    cleanup_cancellation.add_note("image cleanup recovery queued")
+                cleanup_cancellation.__traceback__ = None
+                raise cleanup_cancellation from None
+            if recovery_queued:
+                raise VisionCleanupError("image cleanup failed; recovery queued") from None
             raise VisionAnalysisError("image storage failed") from None
 
         try:
@@ -349,41 +398,64 @@ class VisionService:
             error.__traceback__ = None
             del error
             result, failure, cancellation = None, "vision analysis failed", None
-        del sanitized
         if result is not None:
+            del sanitized
             del tenant_id, object_key, stored
             return result
 
-        cleanup_cancellation, cleanup_ok = await self._cleanup_object(tenant_id, object_key)
+        cleanup_cancellation, recovery_queued = await self._cleanup_object(
+            tenant_id,
+            object_key,
+            tenant_digest,
+            sanitized.canonical_sha256,
+            "analysis_cancelled" if cancellation is not None else "analysis_failed",
+        )
+        del sanitized
         del tenant_id, object_key, stored
         if cancellation is not None:
+            if recovery_queued:
+                cancellation.add_note("image cleanup recovery queued")
             cancellation.__traceback__ = None
             raise cancellation from None
         if cleanup_cancellation is not None:
+            if recovery_queued:
+                cleanup_cancellation.add_note("image cleanup recovery queued")
             cleanup_cancellation.__traceback__ = None
             raise cleanup_cancellation from None
-        if not cleanup_ok:
-            raise VisionAnalysisError("image cleanup failed") from None
+        if recovery_queued:
+            raise VisionCleanupError("image cleanup failed; recovery queued") from None
         raise VisionAnalysisError(failure or "vision analysis failed") from None
 
     async def _acquire_image_slot(self) -> None:
-        queued = self._active_image_tasks >= self._max_active_image_tasks
-        if queued:
-            if self._waiting_image_tasks >= self._max_waiting_image_tasks:
+        with self._admission_lock:
+            if self._admitted_image_tasks >= self._max_admitted_image_tasks:
                 raise VisionBusyError("vision image workers busy") from None
-            self._waiting_image_tasks += 1
+            self._admitted_image_tasks += 1
+            self._waiting_image_tasks = (
+                self._admitted_image_tasks - self._active_image_tasks
+            )
         try:
             await self._image_slots.acquire()
         except BaseException:
-            if queued:
-                self._waiting_image_tasks -= 1
+            with self._admission_lock:
+                self._admitted_image_tasks -= 1
+                self._waiting_image_tasks = (
+                    self._admitted_image_tasks - self._active_image_tasks
+                )
             raise
-        if queued:
-            self._waiting_image_tasks -= 1
-        self._active_image_tasks += 1
+        with self._admission_lock:
+            self._active_image_tasks += 1
+            self._waiting_image_tasks = (
+                self._admitted_image_tasks - self._active_image_tasks
+            )
 
     def _release_image_slot(self) -> None:
-        self._active_image_tasks -= 1
+        with self._admission_lock:
+            self._active_image_tasks -= 1
+            self._admitted_image_tasks -= 1
+            self._waiting_image_tasks = (
+                self._admitted_image_tasks - self._active_image_tasks
+            )
         self._image_slots.release()
 
     async def _store_image(
@@ -430,30 +502,72 @@ class VisionService:
         )
 
     async def _cleanup_object(
-        self, tenant_id: str, object_key: str
+        self,
+        tenant_id: str,
+        object_key: str,
+        tenant_digest: str,
+        canonical_sha256: str,
+        reason: str,
     ) -> tuple[asyncio.CancelledError | None, bool]:
-        cleanup = asyncio.create_task(self._object_store.delete(tenant_id, object_key))
-        del tenant_id, object_key
+        cleanup = asyncio.create_task(
+            self._cleanup_or_enqueue_recovery(
+                tenant_id,
+                object_key,
+                tenant_digest,
+                canonical_sha256,
+                reason,
+            )
+        )
+        del tenant_id, object_key, tenant_digest, canonical_sha256, reason
         try:
-            await _await_task_uninterruptibly(cleanup)
+            recovery_queued = await _await_task_uninterruptibly(cleanup)
         except asyncio.CancelledError as cancellation:
-            cleanup_ok = not cleanup.cancelled()
-            if cleanup_ok:
-                try:
-                    cleanup.result()
-                except BaseException as cleanup_error:  # noqa: BLE001 - inspect settled task
-                    cleanup_error.__traceback__ = None
-                    del cleanup_error
-                    cleanup_ok = False
+            try:
+                recovery_queued = cleanup.result()
+            except VisionCleanupError:
+                raise
+            except BaseException as cleanup_error:  # noqa: BLE001 - terminal task inspection
+                cleanup_error.__traceback__ = None
+                del cleanup_error
+                raise VisionCleanupError("image cleanup recovery recording failed") from None
             cancellation.__traceback__ = None
             del cleanup
-            return cancellation, cleanup_ok
-        except Exception as error:  # noqa: BLE001 - cleanup details are redacted
-            error.__traceback__ = None
-            del error, cleanup
-            return None, False
+            return cancellation, recovery_queued
         del cleanup
-        return None, True
+        return None, recovery_queued
+
+    async def _cleanup_or_enqueue_recovery(
+        self,
+        tenant_id: str,
+        object_key: str,
+        tenant_digest: str,
+        canonical_sha256: str,
+        reason: str,
+    ) -> bool:
+        for attempt in range(self._cleanup_attempts):
+            try:
+                await self._object_store.delete(tenant_id, object_key)
+            except (Exception, asyncio.CancelledError) as error:  # noqa: BLE001 - adapter
+                error.__traceback__ = None
+                del error
+                if attempt + 1 < self._cleanup_attempts and self._cleanup_backoff_seconds:
+                    await asyncio.sleep(self._cleanup_backoff_seconds)
+            else:
+                return False
+        item = ImageCleanupRecoveryItem(
+            tenant_sha256=tenant_digest,
+            object_key=object_key,
+            canonical_sha256=canonical_sha256,
+            reason=reason,
+        )
+        try:
+            await self._cleanup_recovery_sink.enqueue(item)
+        except (Exception, asyncio.CancelledError) as error:  # noqa: BLE001 - recovery sink
+            error.__traceback__ = None
+            del error, item
+            raise VisionCleanupError("image cleanup recovery recording failed") from None
+        del item
+        return True
 
     async def _analyze_stored(
         self,

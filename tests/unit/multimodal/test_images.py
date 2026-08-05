@@ -3,16 +3,23 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import stat
 import threading
-import time
 import warnings
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Self
 
 import pytest
 from PIL import Image, PngImagePlugin
 
-from agent_hub.multimodal.images import FilesystemImageStore, sanitize_image
+import agent_hub.multimodal.images as image_module
+from agent_hub.multimodal.images import (
+    FilesystemImageStore,
+    ImageStoreCommitUncertain,
+    sanitize_image,
+)
 from agent_hub.multimodal.types import ImageLimits, InvalidImage
 
 
@@ -176,10 +183,9 @@ def test_limits_require_strict_finite_positive_values(field: str, value: object)
         ImageLimits(**{field: value})  # type: ignore[arg-type]
 
 
-def test_decompression_bomb_warning_is_rejected_without_mutating_pillow_global(
+def test_pillow_warning_does_not_control_acceptance_or_mutate_filters(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original = Image.MAX_IMAGE_PIXELS
     real_open = Image.open
 
     def warning_open(source: io.BytesIO) -> Image.Image:
@@ -187,48 +193,114 @@ def test_decompression_bomb_warning_is_rejected_without_mutating_pillow_global(
         return real_open(source)
 
     monkeypatch.setattr(Image, "open", warning_open)
-    with pytest.raises(InvalidImage, match="image rejected"):
-        sanitize_image(encoded_image(), "image/png", "tenant")
-    assert Image.MAX_IMAGE_PIXELS == original
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+        filters_before = list(warnings.filters)
+        result = sanitize_image(encoded_image(), "image/png", "tenant")
+        assert warnings.filters == filters_before
+    assert result.width == 8
 
 
-def test_pillow_warning_and_decode_context_is_serialized(
+def test_sanitize_does_not_clobber_warning_filter_owned_by_another_thread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     real_open = Image.open
-    first_opened = threading.Event()
-    release_first = threading.Event()
-    state_lock = threading.Lock()
-    active = 0
-    maximum_active = 0
+    production_opened = threading.Event()
+    external_filter_set = threading.Event()
+    sanitize_done = threading.Event()
+
+    class ExternalWarning(Warning):
+        pass
 
     def controlled_open(source: io.BytesIO) -> Image.Image:
-        nonlocal active, maximum_active
-        with state_lock:
-            active += 1
-            maximum_active = max(maximum_active, active)
-            is_first = not first_opened.is_set()
-            if is_first:
-                first_opened.set()
-        try:
-            if is_first:
-                assert release_first.wait(timeout=5)
-            return real_open(source)
-        finally:
-            with state_lock:
-                active -= 1
+        production_opened.set()
+        assert external_filter_set.wait(timeout=5)
+        return real_open(source)
+
+    def external_warning_owner() -> bool:
+        assert production_opened.wait(timeout=5)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", ExternalWarning)
+            external_filter_set.set()
+            assert sanitize_done.wait(timeout=5)
+            try:
+                warnings.warn("external", ExternalWarning, stacklevel=1)
+            except ExternalWarning:
+                return True
+            return False
 
     monkeypatch.setattr(Image, "open", controlled_open)
-    raw = encoded_image()
     with ThreadPoolExecutor(max_workers=2) as executor:
-        first = executor.submit(sanitize_image, raw, "image/png", "tenant-a")
-        assert first_opened.wait(timeout=5)
-        second = executor.submit(sanitize_image, raw, "image/png", "tenant-b")
-        time.sleep(0.05)
-        assert maximum_active == 1
-        release_first.set()
-        assert first.result(timeout=5).width == 8
-        assert second.result(timeout=5).width == 8
+        sanitization = executor.submit(
+            sanitize_image, encoded_image(), "image/png", "tenant"
+        )
+        owner = executor.submit(external_warning_owner)
+        assert sanitization.result(timeout=5).width == 8
+        sanitize_done.set()
+        assert owner.result(timeout=5)
+
+
+def test_unsafe_png_header_dimensions_are_rejected_before_pillow_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = bytearray(encoded_image())
+    dimensions = (8192).to_bytes(4, "big") * 2
+    payload[16:24] = dimensions
+    payload[29:33] = zlib.crc32(b"IHDR" + dimensions + payload[24:29]).to_bytes(4, "big")
+    opens = 0
+
+    def forbidden_open(source: io.BytesIO) -> Image.Image:
+        nonlocal opens
+        del source
+        opens += 1
+        raise AssertionError("Pillow must not see unsafe dimensions")
+
+    monkeypatch.setattr(Image, "open", forbidden_open)
+    with pytest.raises(InvalidImage, match="image rejected"):
+        sanitize_image(bytes(payload), "image/png", "tenant")
+    assert opens == 0
+
+
+def test_configured_pixel_limit_cannot_exceed_hard_safety_ceiling() -> None:
+    with pytest.raises(ValueError, match="max_pixels"):
+        ImageLimits(max_pixels=40_000_001)
+
+
+def test_header_and_decoder_dimensions_must_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_open = Image.open
+    first = True
+
+    class MismatchedProbe:
+        def __init__(self, image: Image.Image) -> None:
+            self._image = image
+            self.format = image.format
+            self.width = image.width + 1
+            self.height = image.height
+            self.size = (self.width, self.height)
+            self.n_frames = 1
+            self.is_animated = False
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+            self._image.close()
+
+        def verify(self) -> None:
+            self._image.verify()
+
+    def mismatched_open(source: io.BytesIO) -> Image.Image | MismatchedProbe:
+        nonlocal first
+        image = real_open(source)
+        if first:
+            first = False
+            return MismatchedProbe(image)
+        return image
+
+    monkeypatch.setattr(Image, "open", mismatched_open)
+    with pytest.raises(InvalidImage, match="image rejected"):
+        sanitize_image(encoded_image(), "image/png", "tenant")
 
 
 def test_injected_detector_failure_is_redacted() -> None:
@@ -349,3 +421,74 @@ async def test_filesystem_store_rejects_configured_symlink_root(tmp_path: Path) 
 def test_filesystem_store_fails_closed_off_posix(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="POSIX"):
         FilesystemImageStore(tmp_path)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX dirfd adapter")
+@pytest.mark.parametrize("failure", ["temp_unlink", "directory_fsync", "result"])
+async def test_filesystem_store_rolls_back_every_post_publish_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    store = FilesystemImageStore(tmp_path)
+    digest = hashlib.sha256(b"tenant").hexdigest()
+    key = f"tenants/{digest}/123e4567-e89b-42d3-a456-426614174000.png"
+    target = tmp_path.joinpath(*key.split("/"))
+    real_unlink = os.unlink
+    real_fsync = os.fsync
+
+    def injected_unlink(path: str, *, dir_fd: int | None = None) -> None:
+        if failure == "temp_unlink" and path.startswith("."):
+            raise OSError("injected")
+        real_unlink(path, dir_fd=dir_fd)
+
+    def injected_fsync(descriptor: int) -> None:
+        if failure == "directory_fsync" and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("injected")
+        real_fsync(descriptor)
+
+    class FailingStoredImageObject:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+            raise RuntimeError("injected")
+
+    monkeypatch.setattr(os, "unlink", injected_unlink)
+    monkeypatch.setattr(os, "fsync", injected_fsync)
+    if failure == "result":
+        monkeypatch.setattr(image_module, "StoredImageObject", FailingStoredImageObject)
+    with pytest.raises((OSError, RuntimeError)):
+        await store.put("tenant", key, b"canonical", "image/png")
+    assert not target.exists()
+    store.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX dirfd adapter")
+async def test_filesystem_store_reports_commit_uncertain_when_rollback_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    baseline_descriptors = len(os.listdir("/proc/self/fd"))
+    store = FilesystemImageStore(tmp_path)
+    digest = hashlib.sha256(b"tenant").hexdigest()
+    key = f"tenants/{digest}/123e4567-e89b-42d3-a456-426614174000.png"
+    target_name = key.rsplit("/", 1)[1]
+    real_unlink = os.unlink
+    real_fsync = os.fsync
+
+    def injected_unlink(path: str, *, dir_fd: int | None = None) -> None:
+        if path == target_name:
+            raise OSError("injected rollback failure")
+        real_unlink(path, dir_fd=dir_fd)
+
+    def injected_fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("injected publish failure")
+        real_fsync(descriptor)
+
+    with monkeypatch.context() as injected:
+        injected.setattr(os, "unlink", injected_unlink)
+        injected.setattr(os, "fsync", injected_fsync)
+        with pytest.raises(ImageStoreCommitUncertain) as captured:
+            await store.put("tenant", key, b"canonical", "image/png")
+    assert captured.value.object_key == key
+    assert "canonical" not in repr(captured.value)
+    await store.delete("tenant", key)
+    store.close()
+    assert len(os.listdir("/proc/self/fd")) == baseline_descriptors

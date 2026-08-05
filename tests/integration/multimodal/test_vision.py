@@ -23,9 +23,10 @@ from agent_hub.multimodal.images import (
     MemoryImageStore,
     sanitize_image,
 )
-from agent_hub.multimodal.service import VisionService
+from agent_hub.multimodal.service import VisionService as ProductionVisionService
 from agent_hub.multimodal.types import (
     ImageAnalysisArtifact,
+    ImageCleanupRecoveryItem,
     ImageLimits,
     InvalidImage,
     OCRObservation,
@@ -38,6 +39,20 @@ from agent_hub.multimodal.types import (
 )
 
 FilesystemImageStore = PosixFilesystemImageStore if os.name == "posix" else MemoryImageStore
+
+
+class ReliableRecoverySink:
+    def __init__(self) -> None:
+        self.items: list[ImageCleanupRecoveryItem] = []
+
+    async def enqueue(self, item: ImageCleanupRecoveryItem) -> None:
+        self.items.append(item)
+
+
+class VisionService(ProductionVisionService):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        kwargs.setdefault("cleanup_recovery_sink", ReliableRecoverySink())
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
 
 
 def png_bytes() -> bytes:
@@ -891,7 +906,36 @@ async def test_generic_store_put_reaches_terminal_commit_before_cancel_cleanup()
     assert store.put_finished and store.committed == set()
 
 
-async def test_normal_store_put_failure_does_not_attempt_delete() -> None:
+async def test_admission_counts_all_handoff_waiters_and_recovers_after_cancellation() -> None:
+    service = VisionService(
+        GatewayStub(response()),
+        MemoryImageStore(),
+        max_active_image_tasks=1,
+        max_waiting_image_tasks=1,
+    )
+    await service._image_slots.acquire()
+    release = asyncio.Event()
+
+    async def admitted_worker() -> None:
+        await service._acquire_image_slot()
+        try:
+            await release.wait()
+        finally:
+            service._release_image_slot()
+
+    workers = [asyncio.create_task(admitted_worker()) for _ in range(20)]
+    await asyncio.sleep(0)
+    assert service._admitted_image_tasks == 2
+    assert sum(worker.done() for worker in workers) == 18
+    for worker in workers:
+        worker.cancel("capacity-test-cancel")
+    await asyncio.gather(*workers, return_exceptions=True)
+    assert service._admitted_image_tasks == 0
+    assert service._active_image_tasks == 0
+    service._image_slots.release()
+
+
+async def test_put_failure_retries_idempotent_cleanup_before_reporting_failure() -> None:
     class FailingStore:
         def __init__(self) -> None:
             self.delete_calls = 0
@@ -905,10 +949,142 @@ async def test_normal_store_put_failure_does_not_attempt_delete() -> None:
         async def delete(self, tenant_id: str, object_key: str) -> None:
             del tenant_id, object_key
             self.delete_calls += 1
+            if self.delete_calls < 3:
+                raise OSError("temporary cleanup failure")
+
+    class RecoverySink:
+        def __init__(self) -> None:
+            self.items: list[ImageCleanupRecoveryItem] = []
+
+        async def enqueue(self, item: ImageCleanupRecoveryItem) -> None:
+            self.items.append(item)
 
     store = FailingStore()
+    recovery = RecoverySink()
     with pytest.raises(VisionAnalysisError, match="image storage failed"):
-        await VisionService(GatewayStub(response()), store).analyze(
+        await VisionService(
+            GatewayStub(response()),
+            store,
+            cleanup_recovery_sink=recovery,
+            cleanup_backoff_seconds=0,
+        ).analyze(
             png_bytes(), "image/png", "tenant"
         )
-    assert store.delete_calls == 0
+    assert store.delete_calls == 3
+    assert recovery.items == []
+
+
+async def test_permanent_cleanup_failure_records_bounded_recovery_item() -> None:
+    class FailingStore:
+        async def put(
+            self, tenant_id: str, object_key: str, data: bytes, content_type: str
+        ) -> StoredImageObject:
+            del tenant_id, object_key, data, content_type
+            raise RuntimeError("private put detail")
+
+        async def delete(self, tenant_id: str, object_key: str) -> None:
+            del tenant_id, object_key
+            raise OSError("private delete detail")
+
+    class RecoverySink:
+        def __init__(self) -> None:
+            self.items: list[ImageCleanupRecoveryItem] = []
+
+        async def enqueue(self, item: ImageCleanupRecoveryItem) -> None:
+            self.items.append(item)
+
+    recovery = RecoverySink()
+    with pytest.raises(VisionAnalysisError, match="cleanup failed") as captured:
+        await VisionService(
+            GatewayStub(response()),
+            FailingStore(),
+            cleanup_recovery_sink=recovery,
+            cleanup_backoff_seconds=0,
+        ).analyze(png_bytes(), "image/png", "tenant")
+    assert type(captured.value).__name__ == "VisionCleanupError"
+    assert len(recovery.items) == 1
+    item = recovery.items[0]
+    assert item.tenant_sha256 == hashlib.sha256(b"tenant").hexdigest()
+    assert item.canonical_sha256 == sanitize_image(
+        png_bytes(), "image/png", "tenant"
+    ).canonical_sha256
+    assert item.reason == "put_failed"
+    assert "canonical_bytes" not in repr(item)
+
+
+async def test_recovery_sink_failure_is_fixed_and_observable() -> None:
+    class FailingStore:
+        async def put(
+            self, tenant_id: str, object_key: str, data: bytes, content_type: str
+        ) -> StoredImageObject:
+            del tenant_id, object_key, data, content_type
+            raise RuntimeError("private put detail")
+
+        async def delete(self, tenant_id: str, object_key: str) -> None:
+            del tenant_id, object_key
+            raise OSError("private delete detail")
+
+    class FailingRecoverySink:
+        async def enqueue(self, item: object) -> None:
+            del item
+            raise RuntimeError("private recovery detail")
+
+    with pytest.raises(VisionAnalysisError, match="cleanup recovery recording failed") as captured:
+        await VisionService(
+            GatewayStub(response()),
+            FailingStore(),
+            cleanup_recovery_sink=FailingRecoverySink(),
+            cleanup_backoff_seconds=0,
+        ).analyze(png_bytes(), "image/png", "tenant")
+    assert type(captured.value).__name__ == "VisionCleanupError"
+    assert "private" not in repr(captured.value)
+
+
+async def test_cancelled_put_with_permanent_delete_failure_queues_recovery_and_preserves_identity(
+) -> None:
+    class DelayedCommittingStore:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.committed: set[tuple[str, str]] = set()
+
+        async def put(
+            self, tenant_id: str, object_key: str, data: bytes, content_type: str
+        ) -> StoredImageObject:
+            self.started.set()
+            await self.release.wait()
+            self.committed.add((tenant_id, object_key))
+            return StoredImageObject(
+                object_key=object_key,
+                byte_length=len(data),
+                content_type=content_type,
+                sha256=hashlib.sha256(data).hexdigest(),
+            )
+
+        async def delete(self, tenant_id: str, object_key: str) -> None:
+            del tenant_id, object_key
+            raise OSError("permanent private failure")
+
+    store = DelayedCommittingStore()
+    recovery = ReliableRecoverySink()
+    cancellation = asyncio.CancelledError("original-cancel")
+    task = asyncio.create_task(
+        VisionService(
+            GatewayStub(response()),
+            store,
+            cleanup_recovery_sink=recovery,
+            cleanup_backoff_seconds=0,
+        ).analyze(png_bytes(), "image/png", "tenant")
+    )
+    await store.started.wait()
+    task.cancel(cancellation.args[0])
+    await asyncio.sleep(0)
+    task.cancel("later-cancel")
+    store.release.set()
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await task
+    assert captured.value.args == cancellation.args
+    assert captured.value.__notes__ == ["image cleanup recovery queued"]
+    assert store.committed
+    assert len(recovery.items) == 1
+    assert recovery.items[0].reason == "put_cancelled"
