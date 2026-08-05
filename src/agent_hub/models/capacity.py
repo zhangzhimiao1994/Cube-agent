@@ -273,6 +273,7 @@ class CapacityPool:
         self._scope_policies: dict[str, _ScopePolicy] = {}
         self._catalog_by_id: dict[str, Deployment] = {}
         self._initialized = False
+        self._has_valid_registration = False
         self._refresh_in_progress = False
         self._next_metadata_refresh = 0.0
         self._observed_loads: dict[str, int] = {}
@@ -287,7 +288,7 @@ class CapacityPool:
             existing_deployment = self._catalog_by_id.get(deployment.id)
             if existing_deployment is not None and existing_deployment != deployment:
                 raise CapacityConfigurationError("deployment capacity configuration conflicts")
-            if self._initialized and existing_deployment is None:
+            if self._has_valid_registration and existing_deployment is None:
                 raise CapacityConfigurationError("capacity catalog is already initialized")
             self._catalog_by_id[deployment.id] = deployment
             policy = _ScopePolicy(
@@ -336,6 +337,7 @@ class CapacityPool:
                 raise
             else:
                 self._initialized = True
+                self._has_valid_registration = True
                 self._next_metadata_refresh = (
                     self._clock_now() + self._metadata_refresh_interval
                 )
@@ -358,12 +360,22 @@ class CapacityPool:
             fingerprint_scopes[fingerprint] = deployment.quota_scope_id
             deployment_fingerprints.append((deployment, fingerprint))
         owner = self._owner_id
+        had_valid_registration = self._has_valid_registration
+        planned_fingerprint_keys = list(
+            dict.fromkeys(
+                self._fingerprint_keys(fingerprint)
+                for _deployment, fingerprint in deployment_fingerprints
+            )
+        )
+        planned_policy_keys = [
+            self._keys(quota_scope_id) for quota_scope_id in self._scope_policies
+        ]
         fingerprint_keys: list[tuple[str, str]] = []
         policy_keys: list[Mapping[str, str]] = []
         try:
             for deployment, fingerprint in deployment_fingerprints:
                 claim_keys = self._fingerprint_keys(fingerprint)
-                claimed = await self._redis.eval(
+                claimed, cancellation = await self._registration_eval(
                     _CLAIM_FINGERPRINT_SCRIPT,
                     2,
                     *claim_keys,
@@ -387,9 +399,11 @@ class CapacityPool:
                     )
                 if created:
                     fingerprint_keys.append(claim_keys)
+                if cancellation is not None:
+                    raise cancellation
             for quota_scope_id, policy in self._scope_policies.items():
                 keys = self._keys(quota_scope_id)
-                result = await self._redis.eval(
+                result, cancellation = await self._registration_eval(
                     _REGISTER_SCOPE_SCRIPT,
                     7,
                     *self._policy_registration_keys(keys),
@@ -407,13 +421,33 @@ class CapacityPool:
                     )
                 if created:
                     policy_keys.append(keys)
+                if cancellation is not None:
+                    raise cancellation
         except BaseException as error:
-            await self._rollback_registration(owner, fingerprint_keys, policy_keys)
+            await self._rollback_registration(
+                owner,
+                fingerprint_keys if had_valid_registration else planned_fingerprint_keys,
+                policy_keys if had_valid_registration else planned_policy_keys,
+            )
             if isinstance(error, asyncio.CancelledError | CapacityConfigurationError):
                 raise
             if isinstance(error, CapacityBackendError):
                 raise
             raise CapacityBackendError("model capacity backend unavailable") from None
+
+    async def _registration_eval(
+        self, script: str, key_count: int, *args: object
+    ) -> tuple[object, asyncio.CancelledError | None]:
+        task = asyncio.create_task(self._redis.eval(script, key_count, *args))
+        try:
+            return await asyncio.shield(task), None
+        except asyncio.CancelledError as cancellation:
+            try:
+                result = await asyncio.shield(task)
+            except BaseException as inner_error:  # noqa: BLE001 - preserve cancellation
+                del inner_error
+                raise cancellation from None
+            return result, cancellation
 
     async def _rollback_registration(
         self,
@@ -427,7 +461,7 @@ class CapacityPool:
                     await self._redis.eval(
                         _ROLLBACK_FINGERPRINT_SCRIPT, 2, *claim_keys, owner
                     )
-                except Exception as cleanup_error:  # noqa: BLE001 - best effort rollback
+                except BaseException as cleanup_error:  # noqa: BLE001 - best effort rollback
                     del cleanup_error
             for keys in reversed(policies):
                 try:
@@ -437,14 +471,17 @@ class CapacityPool:
                         *self._policy_registration_keys(keys),
                         owner,
                     )
-                except Exception as cleanup_error:  # noqa: BLE001 - best effort rollback
+                except BaseException as cleanup_error:  # noqa: BLE001 - best effort rollback
                     del cleanup_error
 
         task = asyncio.create_task(cleanup())
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
-            await task
+            try:
+                await asyncio.shield(task)
+            except BaseException as cleanup_error:  # noqa: BLE001 - preserve primary outcome
+                del cleanup_error
 
     def _clock_now(self) -> float:
         value = self._monotonic()

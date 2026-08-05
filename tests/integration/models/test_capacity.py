@@ -134,6 +134,28 @@ class DelayedAcquireRedis:
         return result
 
 
+class PostCommitRegistrationRedis:
+    def __init__(self, client: Redis) -> None:
+        self.client = client
+        self.calls = 0
+        self.block_after_call: int | None = None
+        self.raise_after_call: int | None = None
+        self.committed = asyncio.Event()
+        self.proceed = asyncio.Event()
+
+    async def eval(self, script: str, key_count: int, *args: object) -> object:
+        self.calls += 1
+        call = self.calls
+        redis_eval = cast(Callable[..., Awaitable[object]], self.client.eval)
+        result = await redis_eval(script, key_count, *args)
+        if call == self.block_after_call:
+            self.committed.set()
+            await self.proceed.wait()
+        if call == self.raise_after_call:
+            raise ConnectionError("redis://post-commit-private")
+        return result
+
+
 class SecretResolver:
     async def resolve(self, secret_ref: str) -> str:
         return "test-key"
@@ -702,6 +724,7 @@ async def test_failed_or_cancelled_initialize_is_retryable(
     cancelled = asyncio.create_task(pool.initialize())
     await registration_redis.started.wait()
     cancelled.cancel("registration cancelled")
+    registration_redis.proceed.set()
     with pytest.raises(asyncio.CancelledError) as captured_cancelled:
         await cancelled
     assert captured_cancelled.value.args == ("registration cancelled",)
@@ -1004,6 +1027,7 @@ async def test_partial_registration_rolls_back_only_its_owner_claims(
         task = asyncio.create_task(failed.initialize())
         await wrapped.started.wait()
         task.cancel()
+        wrapped.proceed.set()
         with pytest.raises(asyncio.CancelledError):
             await task
     else:
@@ -1022,6 +1046,115 @@ async def test_partial_registration_rolls_back_only_its_owner_claims(
         key_prefix=prefix,
     )
     await replacement.initialize()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("blocked_call", [1, 2])
+async def test_post_commit_cancellation_rolls_back_first_registration_exactly(
+    redis_client: Redis, prefix: str, blocked_call: int
+) -> None:
+    original = deployment("post-cancel", "post-cancel-scope")
+    shared = fingerprint("post-cancel-shared")
+    wrapped = PostCommitRegistrationRedis(redis_client)
+    wrapped.block_after_call = blocked_call
+    pool = CapacityPool(
+        wrapped,
+        deployments=[original],
+        credentials=CredentialRegistry([CredentialDescriptor(original.secret_ref, shared)]),
+        key_prefix=prefix,
+    )
+    task = asyncio.create_task(pool.initialize())
+    await wrapped.committed.wait()
+    task.cancel("post-commit registration cancelled")
+    wrapped.proceed.set()
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await task
+    assert captured.value.args == ("post-commit registration cancelled",)
+    assert task.cancelled()
+    assert not [key async for key in redis_client.scan_iter(match=f"{prefix}*")]
+
+    replacement = deployment("post-cancel-replacement", "replacement-scope")
+    replacement_pool = CapacityPool(
+        redis_client,
+        deployments=[replacement],
+        credentials=CredentialRegistry(
+            [CredentialDescriptor(replacement.secret_ref, shared)]
+        ),
+        key_prefix=prefix,
+    )
+    await replacement_pool.initialize()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("failed_call", [1, 2])
+async def test_post_commit_backend_failure_cleans_uncertain_first_registration(
+    redis_client: Redis, prefix: str, failed_call: int
+) -> None:
+    original = deployment("post-error", "post-error-scope")
+    wrapped = PostCommitRegistrationRedis(redis_client)
+    wrapped.raise_after_call = failed_call
+    pool = CapacityPool(
+        wrapped,
+        deployments=[original],
+        credentials=credentials("post-error"),
+        key_prefix=prefix,
+    )
+    with pytest.raises(CapacityBackendError) as captured:
+        await pool.initialize()
+    assert "post-commit-private" not in str(captured.value)
+    assert not [key async for key in redis_client.scan_iter(match=f"{prefix}*")]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("failure_mode", ["cancel", "error"])
+async def test_failed_post_commit_refresh_preserves_valid_stable_owner(
+    redis_client: Redis, prefix: str, failure_mode: str
+) -> None:
+    serial = deployment("post-refresh", "post-refresh-scope")
+    clock = ManualClock()
+    wrapped = PostCommitRegistrationRedis(redis_client)
+    pool = CapacityPool(
+        wrapped,
+        deployments=[serial],
+        credentials=credentials("post-refresh"),
+        key_prefix=prefix,
+        lease_seconds=0.05,
+        metadata_ttl_seconds=0.3,
+        metadata_refresh_interval=0.05,
+        monotonic=clock,
+    )
+    await pool.initialize()
+    clock.advance(0.06)
+    if failure_mode == "cancel":
+        wrapped.block_after_call = 3
+        refresh = asyncio.create_task(pool.initialize())
+        await wrapped.committed.wait()
+        refresh.cancel("post-commit refresh cancelled")
+        wrapped.proceed.set()
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await refresh
+        assert captured.value.args == ("post-commit refresh cancelled",)
+        assert refresh.cancelled()
+    else:
+        wrapped.raise_after_call = 4
+        with pytest.raises(CapacityBackendError):
+            await pool.initialize()
+
+    owner_keys = [
+        key
+        async for key in redis_client.scan_iter(match=f"{prefix}*")
+        if key.decode("ascii").endswith((":expires", ":policy-expires"))
+    ]
+    assert len(owner_keys) == 2
+    assert [await redis_client.zcard(key) for key in owner_keys] == [1, 1]
+    with pytest.raises(CapacityConfigurationError, match="not initialized"):
+        await pool.acquire([serial], wait_timeout=0.01, estimated_tokens=1)
+
+    wrapped.block_after_call = None
+    wrapped.raise_after_call = None
+    await pool.initialize()
+    lease = await pool.acquire([serial], wait_timeout=0.05, estimated_tokens=1)
+    await pool.release(lease)
 
 
 @pytest.mark.integration
