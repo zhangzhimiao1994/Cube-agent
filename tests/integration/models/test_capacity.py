@@ -1,6 +1,6 @@
 import asyncio
 import hashlib
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import cast
 from uuid import uuid4
 
@@ -56,6 +56,39 @@ def credentials(*identifiers: str) -> CredentialRegistry:
         CredentialDescriptor(f"secret://{identifier}", fingerprint(identifier))
         for identifier in identifiers
     )
+
+
+class ManualClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
+class RegistrationRedis:
+    def __init__(self, client: Redis) -> None:
+        self.client = client
+        self.calls = 0
+        self.fail_next = False
+        self.block_next = False
+        self.started = asyncio.Event()
+        self.proceed = asyncio.Event()
+
+    async def eval(self, script: str, key_count: int, *args: object) -> object:
+        self.calls += 1
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("redis://private-backend")
+        if self.block_next:
+            self.block_next = False
+            self.started.set()
+            await self.proceed.wait()
+        redis_eval = cast(Callable[..., Awaitable[object]], self.client.eval)
+        return await redis_eval(script, key_count, *args)
 
 
 @pytest.mark.integration
@@ -330,6 +363,175 @@ async def test_capacity_state_keys_have_bounded_ttls(redis_client: Redis, prefix
     ttls = [await redis_client.ttl(key) for key in keys]
     assert all(0 < ttl <= 3600 for ttl in ttls)
     await pool.release(held)
+
+
+@pytest.mark.integration
+async def test_repeat_initialize_refreshes_active_metadata_ttls(
+    redis_client: Redis, prefix: str
+) -> None:
+    serial = deployment("refresh-active", "refresh-active-scope")
+    clock = ManualClock()
+    pool = CapacityPool(
+        redis_client,
+        deployments=[serial],
+        credentials=credentials("refresh-active"),
+        key_prefix=prefix,
+        metadata_ttl_seconds=0.2,
+        metadata_refresh_interval=0.05,
+        monotonic=clock,
+    )
+    await pool.initialize()
+    metadata_keys = [
+        key
+        async for key in redis_client.scan_iter(match=f"{prefix}*")
+        if key.decode("ascii").endswith((":policy", ":scope"))
+    ]
+    assert len(metadata_keys) == 2
+    await asyncio.sleep(0.08)
+    decayed = [await redis_client.pttl(key) for key in metadata_keys]
+    clock.advance(0.06)
+
+    await pool.initialize()
+
+    refreshed = [await redis_client.pttl(key) for key in metadata_keys]
+    assert all(after > before + 40 for before, after in zip(decayed, refreshed, strict=True))
+
+
+@pytest.mark.integration
+async def test_initialize_reconstructs_expired_metadata_before_acquire(
+    redis_client: Redis, prefix: str
+) -> None:
+    serial = deployment("refresh-expired", "refresh-expired-scope")
+    clock = ManualClock()
+    pool = CapacityPool(
+        redis_client,
+        deployments=[serial],
+        credentials=credentials("refresh-expired"),
+        key_prefix=prefix,
+        metadata_ttl_seconds=0.08,
+        metadata_refresh_interval=0.02,
+        monotonic=clock,
+    )
+    await pool.initialize()
+    await asyncio.sleep(0.1)
+    assert not [key async for key in redis_client.scan_iter(match=f"{prefix}*")]
+    clock.advance(0.03)
+
+    await pool.initialize()
+    recovered = await pool.acquire([serial], wait_timeout=0.05, estimated_tokens=1)
+
+    assert recovered.quota_scope_id == "refresh-expired-scope"
+    await pool.release(recovered)
+
+
+@pytest.mark.integration
+async def test_expired_claim_conflict_blocks_original_worker(
+    redis_client: Redis, redis_url: str, prefix: str
+) -> None:
+    other_client = Redis.from_url(redis_url)
+    first = deployment("expired-a", "expired-scope-a")
+    second = deployment("expired-b", "expired-scope-b")
+    shared = fingerprint("expired-shared-credential")
+    first_clock = ManualClock()
+    second_clock = ManualClock()
+    first_pool = CapacityPool(
+        redis_client,
+        deployments=[first],
+        credentials=CredentialRegistry([CredentialDescriptor(first.secret_ref, shared)]),
+        key_prefix=prefix,
+        metadata_ttl_seconds=0.08,
+        metadata_refresh_interval=0.02,
+        monotonic=first_clock,
+    )
+    second_pool = CapacityPool(
+        other_client,
+        deployments=[second],
+        credentials=CredentialRegistry([CredentialDescriptor(second.secret_ref, shared)]),
+        key_prefix=prefix,
+        metadata_ttl_seconds=0.2,
+        metadata_refresh_interval=0.05,
+        monotonic=second_clock,
+    )
+    try:
+        await first_pool.initialize()
+        await asyncio.sleep(0.1)
+        await second_pool.initialize()
+        first_clock.advance(0.03)
+
+        with pytest.raises(CapacityConfigurationError, match="quota scope conflicts"):
+            await first_pool.initialize()
+        with pytest.raises(CapacityConfigurationError, match="not initialized"):
+            await first_pool.acquire([first], wait_timeout=0.01, estimated_tokens=1)
+        second_lease = await second_pool.acquire(
+            [second], wait_timeout=0.05, estimated_tokens=1
+        )
+        await second_pool.release(second_lease)
+    finally:
+        await other_client.aclose()
+
+
+@pytest.mark.integration
+async def test_concurrent_due_initialize_performs_one_registration_sequence(
+    redis_client: Redis, prefix: str
+) -> None:
+    serial = deployment("refresh-concurrent", "refresh-concurrent-scope")
+    clock = ManualClock()
+    registration_redis = RegistrationRedis(redis_client)
+    pool = CapacityPool(
+        registration_redis,
+        deployments=[serial],
+        credentials=credentials("refresh-concurrent"),
+        key_prefix=prefix,
+        metadata_ttl_seconds=0.3,
+        metadata_refresh_interval=0.05,
+        monotonic=clock,
+    )
+    await pool.initialize()
+    assert registration_redis.calls == 2
+    registration_redis.calls = 0
+    clock.advance(0.06)
+
+    await asyncio.gather(*(pool.initialize() for _ in range(20)))
+
+    assert registration_redis.calls == 2
+    lease = await pool.acquire([serial], wait_timeout=0.05, estimated_tokens=1)
+    await pool.release(lease)
+
+
+@pytest.mark.integration
+async def test_failed_or_cancelled_initialize_is_retryable(
+    redis_client: Redis, prefix: str
+) -> None:
+    serial = deployment("refresh-retry", "refresh-retry-scope")
+    registration_redis = RegistrationRedis(redis_client)
+    pool = CapacityPool(
+        registration_redis,
+        deployments=[serial],
+        credentials=credentials("refresh-retry"),
+        key_prefix=prefix,
+        metadata_ttl_seconds=0.3,
+        metadata_refresh_interval=0.05,
+    )
+    registration_redis.fail_next = True
+    with pytest.raises(CapacityBackendError) as captured:
+        await pool.initialize()
+    assert "private-backend" not in str(captured.value)
+    with pytest.raises(CapacityConfigurationError, match="not initialized"):
+        await pool.acquire([serial], wait_timeout=0.01, estimated_tokens=1)
+
+    registration_redis.block_next = True
+    cancelled = asyncio.create_task(pool.initialize())
+    await registration_redis.started.wait()
+    cancelled.cancel("registration cancelled")
+    with pytest.raises(asyncio.CancelledError) as captured_cancelled:
+        await cancelled
+    assert captured_cancelled.value.args == ("registration cancelled",)
+    with pytest.raises(CapacityConfigurationError, match="not initialized"):
+        await pool.acquire([serial], wait_timeout=0.01, estimated_tokens=1)
+
+    await pool.initialize()
+    lease = await pool.acquire([serial], wait_timeout=0.05, estimated_tokens=1)
+    await pool.release(lease)
 
 
 @pytest.mark.integration

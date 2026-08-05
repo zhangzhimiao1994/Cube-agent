@@ -19,8 +19,6 @@ if base_limit == nil or base_limit < 1 or base_limit ~= math.floor(base_limit)
     or state_ttl_ms == nil or state_ttl_ms < 1 then
     return redis.error_reply('invalid model health outcome')
 end
-redis.call('PEXPIRE', KEYS[3], state_ttl_ms)
-
 redis.call('RPUSH', KEYS[2], latency_ms)
 redis.call('LTRIM', KEYS[2], -window, -1)
 redis.call('PEXPIRE', KEYS[2], state_ttl_ms)

@@ -73,6 +73,7 @@ class CapacityStub:
     async def initialize(self) -> None:
         self.initialize_calls += 1
         self.initialized = True
+        self.events.append(("initialize",))
 
     def validate_configuration(self, deployments: Sequence[Deployment]) -> None:
         self.configured = tuple(deployments)
@@ -204,8 +205,9 @@ async def test_gateway_acquires_before_resolving_selected_deployment_secret() ->
     response = await gateway.complete(request())
 
     assert response.text == "ok"
-    assert events[0] == ("acquire", ("alpha", "beta"), 5.0, 73)
-    assert events[1] == ("resolve", "secret://beta")
+    assert events[0] == ("initialize",)
+    assert events[1] == ("acquire", ("alpha", "beta"), 5.0, 73)
+    assert events[2] == ("resolve", "secret://beta")
     assert transport.calls[0][0] is beta
     assert transport.calls[0][2] == "key-for-secret://beta"
     assert capacity.records == [("scope-beta", 200, 0.25, True)]
@@ -401,6 +403,7 @@ async def test_capacity_timeout_traverses_fallback_only_when_allowed() -> None:
         ("acquire", ("primary-key",), 0.02, 520),
         ("acquire", ("backup-key",), 0.02, 520),
     ]
+    assert capacity.initialize_calls == 2
 
 
 async def test_no_fallback_when_request_disallows_it() -> None:

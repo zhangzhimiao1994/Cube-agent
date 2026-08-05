@@ -4,7 +4,8 @@ import asyncio
 import hashlib
 import math
 import re
-from collections.abc import Iterable, Mapping, Sequence
+import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib.resources import files
@@ -139,7 +140,6 @@ local value = tonumber(redis.call('HGET', KEYS[1], 'effective')) or base
 value = math.max(1, math.min(value, base))
 redis.call('HSET', KEYS[1], 'effective', value)
 redis.call('PEXPIRE', KEYS[1], ARGV[1])
-redis.call('PEXPIRE', KEYS[2], ARGV[1])
 return value
 """
 
@@ -166,6 +166,9 @@ class CapacityPool:
         cooldown_seconds: float = 30,
         latency_threshold_seconds: float = 30,
         health_window: int = 20,
+        metadata_ttl_seconds: float = 3600,
+        metadata_refresh_interval: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if _SAFE_PREFIX.fullmatch(key_prefix) is None:
             raise ValueError("capacity key prefix is invalid")
@@ -186,6 +189,26 @@ class CapacityPool:
             raise ValueError("max_waiters must be a positive integer")
         if type(health_window) is not int or not 1 <= health_window <= 100:
             raise ValueError("health_window must be between 1 and 100")
+        if (
+            isinstance(metadata_ttl_seconds, bool)
+            or not isinstance(metadata_ttl_seconds, int | float)
+            or not math.isfinite(metadata_ttl_seconds)
+            or metadata_ttl_seconds <= 0
+        ):
+            raise ValueError("metadata_ttl_seconds must be positive and finite")
+        refresh_interval = (
+            float(metadata_ttl_seconds) / 4
+            if metadata_refresh_interval is None
+            else metadata_refresh_interval
+        )
+        if (
+            isinstance(refresh_interval, bool)
+            or not isinstance(refresh_interval, int | float)
+            or not math.isfinite(refresh_interval)
+            or refresh_interval <= 0
+            or refresh_interval >= float(metadata_ttl_seconds) / 3
+        ):
+            raise ValueError("metadata_refresh_interval must be positive and below TTL/3")
         self._redis = cast(RedisCapacityClient, redis_client)
         self._credentials = credentials
         self._key_prefix = key_prefix
@@ -195,11 +218,16 @@ class CapacityPool:
         self._cooldown_ms = math.ceil(cooldown_seconds * 1000)
         self._latency_threshold_ms = math.ceil(latency_threshold_seconds * 1000)
         self._health_window = health_window
+        self._metadata_ttl_ms = math.ceil(float(metadata_ttl_seconds) * 1000)
+        self._metadata_refresh_interval = float(refresh_interval)
+        self._monotonic = monotonic
         self._waiters = 0
         self._waiter_lock = asyncio.Lock()
+        self._registration_lock = asyncio.Lock()
         self._scope_policies: dict[str, _ScopePolicy] = {}
         self._catalog_by_id: dict[str, Deployment] = {}
         self._initialized = False
+        self._next_metadata_refresh = 0.0
         self._observed_loads: dict[str, int] = {}
         self._weights: dict[str, int] = {}
         configured = tuple(deployments)
@@ -239,16 +267,30 @@ class CapacityPool:
         Every worker must receive the same full catalog. Redis only converges values
         downward, so a permissive or stale worker can never raise a scope policy.
         """
-        if self._initialized:
-            return
         if not self._catalog_by_id:
             raise CapacityConfigurationError("model capacity catalog is empty")
         if self._credentials is None:
             raise CapacityConfigurationError("credential fingerprints are required")
+        now = self._clock_now()
+        if self._initialized and now < self._next_metadata_refresh:
+            return
+        async with self._registration_lock:
+            now = self._clock_now()
+            if self._initialized and now < self._next_metadata_refresh:
+                return
+            self._initialized = False
+            await self._register_metadata()
+            self._initialized = True
+            self._next_metadata_refresh = self._clock_now() + self._metadata_refresh_interval
+
+    async def _register_metadata(self) -> None:
+        credentials = self._credentials
+        if credentials is None:  # pragma: no cover - initialize validates before entry
+            raise CapacityConfigurationError("credential fingerprints are required")
         fingerprint_scopes: dict[str, str] = {}
         deployment_fingerprints: list[tuple[Deployment, str]] = []
         for deployment in self._catalog_by_id.values():
-            fingerprint = self._credentials.fingerprint_for(deployment.secret_ref)
+            fingerprint = credentials.fingerprint_for(deployment.secret_ref)
             if fingerprint is None:
                 raise CapacityConfigurationError("credential fingerprint metadata is incomplete")
             previous_scope = fingerprint_scopes.get(fingerprint)
@@ -263,7 +305,7 @@ class CapacityPool:
                     1,
                     self._fingerprint_key(fingerprint),
                     self._scope_digest(deployment.quota_scope_id),
-                    _STATE_TTL_MS,
+                    self._metadata_ttl_ms,
                 )
                 if int(cast(int | bytes | str, claimed)) != 1:
                     raise CapacityConfigurationError(
@@ -277,7 +319,7 @@ class CapacityPool:
                     policy.base_limit,
                     policy.rpm or 0,
                     policy.tpm or 0,
-                    _STATE_TTL_MS,
+                    self._metadata_ttl_ms,
                 )
                 self._integer_result(result, 3)
         except asyncio.CancelledError:
@@ -286,7 +328,12 @@ class CapacityPool:
             raise
         except Exception:  # noqa: BLE001 - initialization fails closed without Redis details
             raise CapacityBackendError("model capacity backend unavailable") from None
-        self._initialized = True
+
+    def _clock_now(self) -> float:
+        value = self._monotonic()
+        if not math.isfinite(value):
+            raise CapacityConfigurationError("capacity monotonic clock is invalid")
+        return value
 
     def _require_initialized(self) -> None:
         if not self._initialized:

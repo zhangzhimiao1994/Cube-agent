@@ -148,7 +148,6 @@ class ModelGateway:
                 current = fallbacks[current]
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
-        await self._capacity.initialize()
         estimated_tokens = self._token_estimator.estimate(request)
         if type(estimated_tokens) is not int or estimated_tokens <= 0:
             raise ValueError("token estimator must return a strict positive integer")
@@ -165,6 +164,7 @@ class ModelGateway:
                     raise
                 break
             try:
+                await self._capacity.initialize()
                 lease = await self._capacity.acquire(
                     candidates,
                     self._capacity_wait_timeout,

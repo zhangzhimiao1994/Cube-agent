@@ -13,8 +13,6 @@ if lease_ttl_ms == nil or lease_ttl_ms < 1
     or rpm == nil or rpm < 0 or tpm == nil or tpm < 0 then
     return redis.error_reply('model scope policy is unavailable')
 end
-redis.call('PEXPIRE', KEYS[5], state_ttl_ms)
-
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now_ms)
 local active = redis.call('ZCARD', KEYS[1])
 local effective = tonumber(redis.call('HGET', KEYS[4], 'effective')) or base_limit
