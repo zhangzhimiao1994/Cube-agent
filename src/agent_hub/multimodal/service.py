@@ -6,6 +6,7 @@ import hashlib
 import ipaddress
 import json
 import math
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Annotated, Protocol
@@ -135,7 +136,7 @@ def _normalize_allowed_authority(value: object) -> _TrustedAuthority | None:
         return None
     try:
         parsed = urlsplit(f"//{value}")
-        port = parsed.port or 443
+        parsed_port = parsed.port
     except ValueError:
         return None
     if (
@@ -146,6 +147,15 @@ def _normalize_allowed_authority(value: object) -> _TrustedAuthority | None:
         or parsed.query
         or parsed.fragment
     ):
+        return None
+    authority_text = parsed.netloc.rsplit("@", 1)[-1]
+    has_explicit_port = ":" in authority_text
+    if has_explicit_port:
+        port_text = authority_text.rsplit(":", 1)[1]
+        if re.fullmatch(r"[0-9]+", port_text) is None:
+            return None
+    port = 443 if parsed_port is None else parsed_port
+    if port <= 0 or port > 65535 or (has_explicit_port and parsed_port is None):
         return None
     hostname = _normalize_hostname(parsed.hostname)
     return None if hostname is None else (hostname, port)
@@ -167,14 +177,23 @@ def _valid_https_reference(
         return False
     try:
         parsed = urlsplit(reference)
-        _ = parsed.port
+        parsed_port = parsed.port
     except ValueError:
         return False
     hostname = parsed.hostname
     if hostname is None or "\\" in reference:
         return False
+    authority_text = parsed.netloc.rsplit("@", 1)[-1]
+    has_explicit_port = ":" in authority_text
+    if has_explicit_port:
+        port_text = authority_text.rsplit(":", 1)[1]
+        if re.fullmatch(r"[0-9]+", port_text) is None:
+            return False
+    port = 443 if parsed_port is None else parsed_port
+    if port <= 0 or port > 65535 or (has_explicit_port and parsed_port is None):
+        return False
     normalized_host = _normalize_hostname(hostname)
-    authority = None if normalized_host is None else (normalized_host, parsed.port or 443)
+    authority = None if normalized_host is None else (normalized_host, port)
     return (
         parsed.scheme == "https"
         and authority in allowed_authorities

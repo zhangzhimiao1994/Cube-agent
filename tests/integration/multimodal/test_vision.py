@@ -564,6 +564,96 @@ async def test_trusted_reference_authority_normalization_is_exact(
     assert result.artifact.summary == "A red square"
 
 
+@pytest.mark.parametrize(
+    "allowed_host",
+    [
+        "trusted.example:0",
+        "trusted.example:",
+        "trusted.example:-1",
+        "trusted.example:65536",
+        "trusted.example:not-a-port",
+    ],
+)
+def test_reference_allowlist_rejects_invalid_or_empty_ports(
+    tmp_path: Path, allowed_host: str
+) -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    with pytest.raises(ValueError, match="allowlist"):
+        VisionService(
+            GatewayStub(response()),
+            FilesystemImageStore(tmp_path),
+            reference_provider=ReferenceStub(
+                SignedImageReference(
+                    url="https://trusted.example/image?sig=value",
+                    expires_at=now + timedelta(seconds=60),
+                    signed=True,
+                    provider_id="signed-store",
+                ),
+                allowed_hosts=frozenset({allowed_host}),
+            ),
+            utc_now=lambda: now,
+        )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://trusted.example:0/image?sig=value",
+        "https://trusted.example:/image?sig=value",
+        "https://trusted.example:-1/image?sig=value",
+        "https://trusted.example:65536/image?sig=value",
+        "https://trusted.example:not-a-port/image?sig=value",
+    ],
+)
+async def test_signed_reference_rejects_invalid_or_empty_ports(tmp_path: Path, url: str) -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    service = VisionService(
+        GatewayStub(response()),
+        FilesystemImageStore(tmp_path),
+        reference_provider=ReferenceStub(
+            SignedImageReference(
+                url=url,
+                expires_at=now + timedelta(seconds=60),
+                signed=True,
+                provider_id="signed-store",
+            ),
+            allowed_hosts=frozenset({"trusted.example"}),
+        ),
+        utc_now=lambda: now,
+    )
+    with pytest.raises(VisionAnalysisError, match="image reference failed"):
+        await service.analyze(png_bytes(), "image/png", "tenant", "vision-primary")
+
+
+@pytest.mark.parametrize(
+    ("allowed_host", "url"),
+    [
+        ("trusted.example", "https://trusted.example/image?sig=value"),
+        ("trusted.example", "https://trusted.example:443/image?sig=value"),
+        ("trusted.example:443", "https://trusted.example/image?sig=value"),
+    ],
+)
+async def test_default_and_explicit_https_port_are_equivalent(
+    tmp_path: Path, allowed_host: str, url: str
+) -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    result = await VisionService(
+        GatewayStub(response()),
+        FilesystemImageStore(tmp_path),
+        reference_provider=ReferenceStub(
+            SignedImageReference(
+                url=url,
+                expires_at=now + timedelta(seconds=60),
+                signed=True,
+                provider_id="signed-store",
+            ),
+            allowed_hosts=frozenset({allowed_host}),
+        ),
+        utc_now=lambda: now,
+    ).analyze(png_bytes(), "image/png", "tenant", "vision-primary")
+    assert result.artifact.summary == "A red square"
+
+
 async def test_async_invalid_image_traceback_does_not_retain_payload(tmp_path: Path) -> None:
     payload = b"private-async-image" * 100
     service = VisionService(GatewayStub(response()), FilesystemImageStore(tmp_path))
