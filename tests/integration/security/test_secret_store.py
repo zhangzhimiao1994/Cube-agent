@@ -15,6 +15,7 @@ from agent_hub.security.secrets import (
     SecretNotFoundError,
     SecretReference,
     SecretService,
+    SecretValidationError,
 )
 
 MASTER_KEY = bytes(range(32))
@@ -123,6 +124,61 @@ async def test_database_contains_only_encrypted_secret_and_ciphertext_is_tenant_
     with pytest.raises(SecretDecryptionError):
         cipher.open(sealed, context=str(tenant_b))
     assert cipher.open(sealed, context=str(tenant_a)) == plaintext
+
+
+@pytest.mark.integration
+async def test_resolve_rejects_ciphertext_copied_to_another_tenant(
+    secret_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_a = await _create_tenant(secret_session_factory, slug="copied-a")
+    tenant_b = await _create_tenant(secret_session_factory, slug="copied-b")
+    service = SecretService(secret_session_factory, SecretCipher(MASTER_KEY))
+    source_reference = await service.create_or_get(
+        tenant_a, uuid4(), "tenant-a-only-plaintext"
+    )
+    copied_id = uuid4()
+
+    async with secret_session_factory() as session, session.begin():
+        source = await session.scalar(
+            select(SecretRow).where(SecretRow.id == source_reference.secret_id)
+        )
+        assert source is not None
+        session.add(
+            SecretRow(
+                id=copied_id,
+                tenant_id=tenant_b,
+                fingerprint="0" * 64,
+                key_id=source.key_id,
+                nonce=source.nonce,
+                ciphertext=source.ciphertext,
+                created_by=uuid4(),
+            )
+        )
+
+    copied_reference = SecretReference(tenant_id=tenant_b, secret_id=copied_id)
+    with pytest.raises(SecretDecryptionError) as captured:
+        await service.resolve(tenant_b, copied_reference)
+
+    assert type(captured.value) is SecretDecryptionError
+    assert str(captured.value) == "secret could not be decrypted"
+    assert "tenant-a-only-plaintext" not in str(captured.value)
+
+
+@pytest.mark.integration
+async def test_create_or_get_rejects_unpaired_surrogate_without_writing_a_row(
+    secret_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _create_tenant(secret_session_factory, slug="surrogate")
+    service = SecretService(secret_session_factory, SecretCipher(MASTER_KEY))
+    plaintext = "private-\ud800-value"
+
+    with pytest.raises(SecretValidationError) as captured:
+        await service.create_or_get(tenant_id, uuid4(), plaintext)
+
+    assert str(captured.value) == "secret could not be encoded"
+    assert "private" not in str(captured.value)
+    async with secret_session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(SecretRow)) == 0
 
 
 @pytest.mark.integration

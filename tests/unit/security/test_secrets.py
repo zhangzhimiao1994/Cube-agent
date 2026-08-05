@@ -1,4 +1,5 @@
 from base64 import b64encode
+from collections.abc import Callable
 from dataclasses import replace
 from uuid import UUID, uuid4
 
@@ -18,6 +19,10 @@ from agent_hub.security.secrets import (
 
 MASTER_KEY = bytes(range(32))
 OTHER_KEY = bytes(reversed(range(32)))
+OpenFailureFactory = Callable[
+    [SecretCipher, SealedSecret],
+    tuple[SecretCipher, SealedSecret, str],
+]
 
 
 def test_secret_cipher_round_trip_is_bound_to_context() -> None:
@@ -60,55 +65,98 @@ def test_seal_rejects_secret_larger_than_64_kib_utf8() -> None:
         SecretCipher(MASTER_KEY).seal("x" * 65_537, context="tenant-a")
 
 
+def test_seal_rejects_unpaired_surrogate_without_disclosing_input() -> None:
+    plaintext = "private-\ud800-value"
+
+    with pytest.raises(SecretValidationError) as captured:
+        SecretCipher(MASTER_KEY).seal(plaintext, context="tenant-a")
+
+    assert str(captured.value) == "secret could not be encoded"
+    assert "private" not in str(captured.value)
+
+
 @pytest.mark.parametrize(
-    "mutate,context",
+    "failure_factory",
     [
-        (lambda sealed: sealed, "tenant-b"),
-        (
-            lambda sealed: replace(
-                sealed,
-                ciphertext=b64encode(b"tampered ciphertext").decode("ascii"),
+        pytest.param(
+            lambda cipher, sealed: (
+                cipher,
+                replace(sealed, key_id="retired-key"),
+                "tenant-a",
             ),
-            "tenant-a",
+            id="unknown-key-id",
         ),
-        (lambda sealed: replace(sealed, nonce="not/base64!"), "tenant-a"),
-        (lambda sealed: replace(sealed, nonce=b64encode(b"too short").decode("ascii")), "tenant-a"),
-        (lambda sealed: replace(sealed, fingerprint="z" * 64), "tenant-a"),
+        pytest.param(
+            lambda cipher, sealed: (
+                cipher,
+                replace(sealed, nonce="not/base64!"),
+                "tenant-a",
+            ),
+            id="invalid-base64",
+        ),
+        pytest.param(
+            lambda cipher, sealed: (
+                cipher,
+                replace(sealed, nonce=b64encode(b"too short").decode("ascii")),
+                "tenant-a",
+            ),
+            id="invalid-nonce-length",
+        ),
+        pytest.param(
+            lambda cipher, sealed: (cipher, sealed, "tenant-b"),
+            id="authentication-wrong-context",
+        ),
+        pytest.param(
+            lambda cipher, sealed: (SecretCipher(OTHER_KEY), sealed, "tenant-a"),
+            id="authentication-wrong-key",
+        ),
+        pytest.param(
+            lambda cipher, sealed: (
+                cipher,
+                replace(
+                    sealed,
+                    ciphertext=b64encode(b"tampered ciphertext").decode("ascii"),
+                ),
+                "tenant-a",
+            ),
+            id="authentication-tampered-ciphertext",
+        ),
+        pytest.param(
+            lambda cipher, sealed: (
+                cipher,
+                replace(sealed, fingerprint="0" * 64),
+                "tenant-a",
+            ),
+            id="fingerprint-mismatch",
+        ),
+        pytest.param(
+            lambda cipher, sealed: (
+                cipher,
+                _authenticated_non_utf8_secret(),
+                "tenant-a",
+            ),
+            id="non-utf8-plaintext",
+        ),
     ],
 )
-def test_open_safely_rejects_wrong_context_tampering_and_invalid_encoding(
-    mutate: object, context: str
+def test_open_uses_one_safe_error_for_all_decryption_failures(
+    failure_factory: OpenFailureFactory,
 ) -> None:
     cipher = SecretCipher(MASTER_KEY)
     sealed = cipher.seal("never reveal this", context="tenant-a")
-    changed = mutate(sealed)  # type: ignore[operator]
+    decrypting_cipher, changed, context = failure_factory(cipher, sealed)
 
     with pytest.raises(SecretDecryptionError) as captured:
-        cipher.open(changed, context=context)
+        decrypting_cipher.open(changed, context=context)
 
-    message = str(captured.value)
-    assert "never reveal this" not in message
-    assert sealed.ciphertext not in message
-
-
-def test_open_rejects_ciphertext_from_different_key() -> None:
-    sealed = SecretCipher(MASTER_KEY).seal("private", context="tenant-a")
-
-    with pytest.raises(SecretDecryptionError, match="could not be decrypted"):
-        SecretCipher(OTHER_KEY).open(sealed, context="tenant-a")
-
-
-def test_open_rejects_unknown_key_id_without_exposing_it() -> None:
-    cipher = SecretCipher(MASTER_KEY)
-    sealed = replace(cipher.seal("private", context="tenant-a"), key_id="retired-key")
-
-    with pytest.raises(SecretDecryptionError, match="key is not available") as captured:
-        cipher.open(sealed, context="tenant-a")
-
+    assert type(captured.value) is SecretDecryptionError
+    assert str(captured.value) == "secret could not be decrypted"
+    assert "never reveal this" not in str(captured.value)
+    assert sealed.ciphertext not in str(captured.value)
     assert "retired-key" not in str(captured.value)
 
 
-def test_open_rejects_valid_authenticated_non_utf8_plaintext() -> None:
+def _authenticated_non_utf8_secret() -> SealedSecret:
     nonce = bytes(range(12))
     context = "tenant-a"
     raw_ciphertext = AESGCM(MASTER_KEY).encrypt(
@@ -116,15 +164,12 @@ def test_open_rejects_valid_authenticated_non_utf8_plaintext() -> None:
         b"\xff\xfe",
         b"agent-hub-secret-v1\x00" + context.encode("utf-8"),
     )
-    sealed = SealedSecret(
+    return SealedSecret(
         key_id="v1",
         nonce=b64encode(nonce).decode("ascii"),
         ciphertext=b64encode(raw_ciphertext).decode("ascii"),
         fingerprint="0" * 64,
     )
-
-    with pytest.raises(SecretDecryptionError, match="could not be decrypted"):
-        SecretCipher(MASTER_KEY).open(sealed, context=context)
 
 
 def test_sealed_secret_repr_and_str_redact_all_payload_fields() -> None:

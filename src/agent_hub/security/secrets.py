@@ -78,7 +78,7 @@ class SecretCipher:
 
     def open(self, sealed: SealedSecret, *, context: str) -> str:
         if sealed.key_id != self._key_id:
-            raise SecretDecryptionError("secret key is not available")
+            raise SecretDecryptionError("secret could not be decrypted")
         try:
             nonce = _canonical_b64decode(sealed.nonce)
             ciphertext = _canonical_b64decode(sealed.ciphertext)
@@ -239,7 +239,10 @@ class SecretService:
 def _validated_plaintext(plaintext: str) -> bytes:
     if not isinstance(plaintext, str) or not plaintext.strip():
         raise SecretValidationError("secret must be a non-blank string")
-    encoded = plaintext.encode("utf-8")
+    try:
+        encoded = plaintext.encode("utf-8")
+    except UnicodeEncodeError:
+        raise SecretValidationError("secret could not be encoded") from None
     if len(encoded) > _MAX_SECRET_BYTES:
         raise SecretValidationError("secret must be at most 65536 UTF-8 bytes")
     return encoded
