@@ -1,14 +1,23 @@
 import math
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
+from typing import cast
 from urllib.parse import urlsplit
 
 _SAFE_IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _SAFE_SCHEMA_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 _MAX_IDENTIFIER_LENGTH = 128
+_PROVIDER_METADATA_KEYS = frozenset({
+    "request_id",
+    "model",
+    "created",
+    "system_fingerprint",
+    "finish_reason",
+})
+_SAFE_PROVIDER_METADATA_STRING = re.compile(r"^[A-Za-z0-9_./:-]{1,256}$")
 
 type JsonScalar = str | int | float | bool | None
 type JsonValue = JsonScalar | tuple[JsonValue, ...] | Mapping[str, JsonValue]
@@ -34,11 +43,21 @@ def _require_unpadded(name: str, value: str, *, max_length: int) -> None:
 
 
 def _is_int(value: object) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
+    return type(value) is int
 
 
 def _freeze_json(value: object) -> JsonValue:
-    if value is None or isinstance(value, str | int | float | bool):
+    if value is None:
+        return None
+    if type(value) is str:
+        return value
+    if type(value) is bool:
+        return value
+    if type(value) is int:
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("JSON numbers must be finite")
         return value
     if isinstance(value, Mapping):
         frozen: dict[str, JsonValue] = {}
@@ -47,9 +66,9 @@ def _freeze_json(value: object) -> JsonValue:
                 raise TypeError("JSON object keys must be strings")
             frozen[key] = _freeze_json(item)
         return MappingProxyType(frozen)
-    if isinstance(value, Iterable):
+    if isinstance(value, list | tuple):
         return tuple(_freeze_json(item) for item in value)
-    raise ValueError("value is not JSON-compatible")
+    raise TypeError("value is not JSON-compatible")
 
 
 def _normalize_content_part(value: Mapping[str, object]) -> ContentPart:
@@ -105,19 +124,32 @@ class Deployment:
         _require_unpadded("secret_ref", self.secret_ref, max_length=512)
         _require_unpadded("quota_scope_id", self.quota_scope_id, max_length=128)
 
-        parsed_base = urlsplit(self.api_base)
+        if any(ord(character) < 32 or ord(character) == 127 for character in self.api_base):
+            raise ValueError("api_base must be a valid HTTP(S) URL")
+        try:
+            parsed_base = urlsplit(self.api_base)
+            _ = parsed_base.port
+        except ValueError:
+            raise ValueError("api_base must be a valid HTTP(S) URL") from None
         if (
             len(self.api_base) > 2048
             or self.api_base != self.api_base.strip()
             or parsed_base.scheme not in {"http", "https"}
             or not parsed_base.netloc
+            or parsed_base.hostname is None
+            or any(character.isspace() for character in parsed_base.netloc)
             or parsed_base.username is not None
             or parsed_base.password is not None
         ):
             raise ValueError("api_base must be a valid HTTP(S) URL")
         if not _is_int(self.max_concurrency) or not 1 <= self.max_concurrency <= 1000:
             raise ValueError("max_concurrency must be between 1 and 1000")
-        if not math.isfinite(self.target_utilization) or not 0.5 <= self.target_utilization <= 0.9:
+        if (
+            isinstance(self.target_utilization, bool)
+            or not isinstance(self.target_utilization, int | float)
+            or not math.isfinite(self.target_utilization)
+            or not 0.5 <= self.target_utilization <= 0.9
+        ):
             raise ValueError("target_utilization must be finite and between 0.5 and 0.9")
         if (
             not _is_int(self.reserved_slots)
@@ -141,7 +173,7 @@ class Deployment:
 @dataclass(frozen=True, slots=True)
 class ModelMessage:
     role: str
-    content: MessageContent
+    content: MessageContent = field(repr=False)
 
     def __post_init__(self) -> None:
         _require_unpadded("role", self.role, max_length=64)
@@ -161,7 +193,7 @@ class ModelMessage:
 @dataclass(frozen=True, slots=True)
 class StructuredResponseSchema:
     name: str
-    schema: Mapping[str, JsonValue]
+    schema: Mapping[str, JsonValue] = field(repr=False)
 
     def __post_init__(self) -> None:
         if len(self.name) > 64 or _SAFE_SCHEMA_NAME.fullmatch(self.name) is None:
@@ -175,15 +207,20 @@ class StructuredResponseSchema:
 @dataclass(frozen=True, slots=True)
 class ModelRequest:
     logical_model: str
-    messages: tuple[ModelMessage, ...]
+    messages: tuple[ModelMessage, ...] = field(repr=False)
     required_capabilities: frozenset[ModelCapability] = field(default_factory=frozenset)
     timeout_seconds: float = 60
     allow_fallback: bool = True
-    response_schema: StructuredResponseSchema | None = None
+    response_schema: StructuredResponseSchema | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _require_safe_identifier("logical_model", self.logical_model)
-        if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
+        if (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, int | float)
+            or not math.isfinite(self.timeout_seconds)
+            or self.timeout_seconds <= 0
+        ):
             raise ValueError("timeout_seconds must be positive and finite")
         messages = tuple(self.messages)
         if not all(isinstance(message, ModelMessage) for message in messages):
@@ -203,9 +240,9 @@ class ModelRequest:
 
 @dataclass(frozen=True, slots=True)
 class ToolCall:
-    id: str
-    name: str
-    arguments: Mapping[str, JsonValue]
+    id: str = field(repr=False)
+    name: str = field(repr=False)
+    arguments: Mapping[str, JsonValue] = field(repr=False)
 
     def __post_init__(self) -> None:
         _require_unpadded("tool call id", self.id, max_length=512)
@@ -223,23 +260,53 @@ class TokenUsage:
     total_tokens: int
 
     def __post_init__(self) -> None:
-        if min(self.prompt_tokens, self.completion_tokens, self.total_tokens) < 0:
+        values = (self.prompt_tokens, self.completion_tokens, self.total_tokens)
+        if not all(_is_int(value) and value >= 0 for value in values):
             raise ValueError("token counts must be nonnegative")
 
 
 @dataclass(frozen=True, slots=True)
 class ModelResponse:
-    text: str | None
-    tool_calls: tuple[ToolCall, ...] = ()
+    text: str | None = field(repr=False)
+    tool_calls: tuple[ToolCall, ...] = field(default=(), repr=False)
     usage: TokenUsage | None = None
     provider_metadata: Mapping[str, JsonScalar] = field(
-        default_factory=lambda: MappingProxyType({})
+        default_factory=lambda: MappingProxyType({}), repr=False
     )
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "tool_calls", tuple(self.tool_calls))
+        if self.text is not None and not isinstance(self.text, str):
+            raise TypeError("response text must be a string or None")
+        tool_calls = tuple(self.tool_calls)
+        if not all(isinstance(tool_call, ToolCall) for tool_call in tool_calls):
+            raise TypeError("tool_calls must contain only ToolCall values")
+        if self.usage is not None and not isinstance(self.usage, TokenUsage):
+            raise TypeError("usage must be TokenUsage or None")
+
+        metadata: dict[str, JsonScalar] = {}
+        for key, value in self.provider_metadata.items():
+            if key not in _PROVIDER_METADATA_KEYS:
+                raise ValueError("provider metadata contains an unknown key")
+            if key == "created":
+                if not _is_int(value) or not 0 <= cast(int, value) < 2**63:
+                    raise ValueError("provider metadata created must be a bounded integer")
+            elif (
+                type(value) is not str
+                or _SAFE_PROVIDER_METADATA_STRING.fullmatch(value) is None
+            ):
+                raise ValueError("provider metadata strings must be bounded safe values")
+            metadata[key] = value
+
+        object.__setattr__(self, "tool_calls", tool_calls)
         object.__setattr__(
             self,
             "provider_metadata",
-            MappingProxyType(dict(self.provider_metadata)),
+            MappingProxyType(metadata),
         )
+
+
+ModelMessage.__hash__ = None  # type: ignore[assignment]
+StructuredResponseSchema.__hash__ = None  # type: ignore[assignment]
+ModelRequest.__hash__ = None  # type: ignore[assignment]
+ToolCall.__hash__ = None  # type: ignore[assignment]
+ModelResponse.__hash__ = None  # type: ignore[assignment]

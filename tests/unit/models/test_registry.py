@@ -4,7 +4,16 @@ from math import inf, nan
 import pytest
 
 from agent_hub.models.registry import ModelRegistry, NoCapableDeployment
-from agent_hub.models.types import Deployment, ModelCapability, ModelMessage, ModelRequest
+from agent_hub.models.types import (
+    Deployment,
+    ModelCapability,
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    StructuredResponseSchema,
+    TokenUsage,
+    ToolCall,
+)
 
 
 def test_deployment_has_safe_litellm_defaults() -> None:
@@ -134,6 +143,7 @@ def test_deployment_rejects_invalid_strings(field: str, value: str) -> None:
         {"target_utilization": 0.91},
         {"target_utilization": nan},
         {"target_utilization": inf},
+        {"target_utilization": "0.8"},
         {"reserved_slots": -1},
         {"max_concurrency": 2, "reserved_slots": 2},
         {"rpm": 0},
@@ -195,16 +205,146 @@ def test_api_base_enforces_config_schema_length_boundary() -> None:
         Deployment(id="too-long", logical_model="primary", api_base=maximum + "a")
 
 
+@pytest.mark.parametrize(
+    "api_base",
+    [
+        "https://proxy.example.com/\nadmin",
+        "https://proxy.example.com/\x00admin",
+        "https://proxy.example.com/\x7fadmin",
+        "https://proxy example.com/v1",
+        "https://proxy.example.com:not-a-port/v1",
+        "https://[broken/v1",
+    ],
+)
+def test_api_base_rejects_control_characters_and_malformed_authority(api_base: str) -> None:
+    with pytest.raises(ValueError, match="api_base"):
+        Deployment(id="invalid-url", logical_model="primary", api_base=api_base)
+
+
 @pytest.mark.parametrize("logical_model", ["", "UPPER", " padded", "a" * 129])
 def test_request_rejects_invalid_logical_model(logical_model: str) -> None:
     with pytest.raises(ValueError):
         ModelRequest(logical_model=logical_model, messages=())
 
 
-@pytest.mark.parametrize("timeout", [0, -1, nan, inf])
-def test_request_timeout_must_be_positive_and_finite(timeout: float) -> None:
+@pytest.mark.parametrize("timeout", [0, -1, nan, inf, True])
+def test_request_timeout_must_be_positive_finite_number(timeout: float) -> None:
     with pytest.raises(ValueError):
         ModelRequest(logical_model="primary", messages=(), timeout_seconds=timeout)
+
+
+@pytest.mark.parametrize("value", [b"bytes", {"set"}, iter(["generator"])])
+def test_structured_schema_rejects_non_json_iterables(value: object) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        StructuredResponseSchema(name="strict_json", schema={"value": value})  # type: ignore[dict-item]
+
+
+@pytest.mark.parametrize("value", [nan, inf, -inf])
+def test_structured_schema_rejects_nonfinite_numbers_at_any_depth(value: float) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        StructuredResponseSchema(name="strict_json", schema={"nested": [value]})  # type: ignore[dict-item]
+
+
+def test_structured_schema_preserves_json_boolean_type() -> None:
+    schema = StructuredResponseSchema(name="strict_json", schema={"flag": True})
+
+    assert schema.schema["flag"] is True
+    assert type(schema.schema["flag"]) is bool
+
+
+def test_structured_schema_rejects_json_scalar_subclasses() -> None:
+    class StringSubclass(str):
+        pass
+
+    class IntegerSubclass(int):
+        pass
+
+    class FloatSubclass(float):
+        pass
+
+    for value in (StringSubclass("value"), IntegerSubclass(1), FloatSubclass(1.0)):
+        with pytest.raises(TypeError):
+            StructuredResponseSchema(name="strict_json", schema={"value": value})
+
+
+@pytest.mark.parametrize("value", [True, False, 1.5, nan, inf, -1])
+def test_token_usage_requires_exact_nonnegative_integers(value: object) -> None:
+    with pytest.raises(ValueError):
+        TokenUsage(prompt_tokens=value, completion_tokens=0, total_tokens=0)  # type: ignore[arg-type]
+
+
+def test_token_usage_rejects_integer_subclasses() -> None:
+    class IntegerSubclass(int):
+        pass
+
+    with pytest.raises(ValueError):
+        TokenUsage(IntegerSubclass(1), 0, 1)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"text": 1},
+        {"tool_calls": [object()]},
+        {"usage": {"prompt_tokens": 1}},
+        {"provider_metadata": {"unknown": "value"}},
+        {"provider_metadata": {"model": ["mutable"]}},
+        {"provider_metadata": {"created": True}},
+        {"provider_metadata": {"created": 1.5}},
+        {"provider_metadata": {"created": 2**63}},
+        {"provider_metadata": {"model": "x" * 257}},
+    ],
+)
+def test_model_response_rejects_invalid_nested_contracts(overrides: dict[str, object]) -> None:
+    values: dict[str, object] = {"text": None}
+    values.update(overrides)
+    with pytest.raises((TypeError, ValueError)):
+        ModelResponse(**values)  # type: ignore[arg-type]
+
+
+def test_model_response_metadata_rejects_scalar_subclasses() -> None:
+    class IntegerSubclass(int):
+        pass
+
+    class StringSubclass(str):
+        pass
+
+    with pytest.raises(ValueError):
+        ModelResponse(text=None, provider_metadata={"created": IntegerSubclass(1)})
+    with pytest.raises(ValueError):
+        ModelResponse(text=None, provider_metadata={"model": StringSubclass("safe")})
+
+
+def test_model_response_copies_and_freezes_input_collections() -> None:
+    tool = ToolCall(id="call_safe", name="lookup", arguments={"query": "safe"})
+    tool_calls = [tool]
+    metadata: dict[str, object] = {"model": "openai/safe-model", "created": 1}
+
+    response = ModelResponse(
+        text="safe",
+        tool_calls=tool_calls,  # type: ignore[arg-type]
+        usage=TokenUsage(1, 2, 3),
+        provider_metadata=metadata,  # type: ignore[arg-type]
+    )
+    tool_calls.clear()
+    metadata["model"] = "changed"
+
+    assert response.tool_calls == (tool,)
+    assert dict(response.provider_metadata) == {"model": "openai/safe-model", "created": 1}
+    with pytest.raises(TypeError):
+        response.provider_metadata["model"] = "changed"  # type: ignore[index]
+
+
+def test_content_bearing_value_objects_are_explicitly_unhashable() -> None:
+    message = ModelMessage(role="user", content="safe")
+    schema = StructuredResponseSchema(name="safe", schema={})
+    request = ModelRequest(logical_model="primary", messages=(message,))
+    tool = ToolCall(id="call_safe", name="lookup", arguments={})
+    response = ModelResponse(text="safe")
+
+    for value in (message, schema, request, tool, response):
+        with pytest.raises(TypeError):
+            hash(value)
 
 
 def test_message_rejects_noncanonical_or_empty_multimodal_content() -> None:

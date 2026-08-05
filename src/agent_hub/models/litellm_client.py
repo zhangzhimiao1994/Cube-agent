@@ -49,6 +49,14 @@ class ModelResponseError(ModelTransportError):
     """Stable error for an invalid provider response contract."""
 
 
+class _CancelledOutcome:
+    pass
+
+
+def _reject_json_constant(_: str) -> object:
+    raise ValueError("non-finite JSON constant")
+
+
 def _attribute(value: object, name: str) -> object:
     return cast(object, getattr(value, name, None))
 
@@ -77,7 +85,10 @@ def _messages(request: ModelRequest) -> list[dict[str, object]]:
 
 
 def _contains_sensitive(value: str, sensitive_values: Sequence[str]) -> bool:
-    return any(sensitive and sensitive in value for sensitive in sensitive_values)
+    return any(
+        sensitive and (sensitive in value or value in sensitive)
+        for sensitive in sensitive_values
+    )
 
 
 def _safe_provider_string(
@@ -152,7 +163,10 @@ def _parse_tool_calls(raw_calls: object, deployment_id: str) -> tuple[ToolCall, 
             )
         parsed_call: ToolCall | None = None
         try:
-            loaded = cast(object, json.loads(raw_arguments))
+            loaded = cast(
+                object,
+                json.loads(raw_arguments, parse_constant=_reject_json_constant),
+            )
             if isinstance(loaded, Mapping):
                 frozen = _freeze_json(loaded)
                 if isinstance(frozen, Mapping):
@@ -234,13 +248,13 @@ def _transport_error(
     return ModelTransportError(f"model transport failed for deployment {deployment_id!r}{suffix}")
 
 
-async def _close_after_failure(client: _OpenAIClient | None) -> None:
+async def _close_ignoring_failures(client: _OpenAIClient | None) -> None:
     if client is None:
         return
     try:
         await client.close()
     except asyncio.CancelledError:
-        raise
+        return
     except Exception:  # noqa: BLE001 - cleanup must not replace the primary safe error
         return
 
@@ -257,24 +271,40 @@ class LiteLLMClient:
         request: ModelRequest,
         api_key: str,
     ) -> ModelResponse:
+        outcome = await self._complete_outcome(deployment, request, api_key)
+        del deployment, request, api_key
+        if isinstance(outcome, _CancelledOutcome):
+            raise asyncio.CancelledError
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    async def _complete_outcome(
+        self,
+        deployment: Deployment,
+        request: ModelRequest,
+        api_key: str,
+    ) -> ModelResponse | Exception | _CancelledOutcome:
         if not api_key or not api_key.strip():
-            raise ValueError("API key must not be blank")
+            return ValueError("API key must not be blank")
         if request.response_schema is not None and (
             ModelCapability.STRUCTURED_OUTPUT not in deployment.capabilities
         ):
-            raise ValueError("deployment lacks structured_output capability")
+            return ValueError("deployment lacks structured_output capability")
 
         sensitive_values = _sensitive_values(request, api_key)
         client: _OpenAIClient | None = None
         parsed: ModelResponse | None = None
-        mapped_error: ModelTransportError | None = None
+        create_kwargs: dict[str, object] | None = None
+        response: object | None = None
+        safe_failure: ModelTransportError | None = None
         try:
             client = self._client_factory(
                 api_key=api_key,
                 base_url=deployment.api_base,
                 max_retries=0,
             )
-            create_kwargs: dict[str, object] = {
+            create_kwargs = {
                 "model": deployment.provider_model,
                 "messages": _messages(request),
                 "timeout": request.timeout_seconds,
@@ -292,27 +322,26 @@ class LiteLLMClient:
             response = await client.chat.completions.create(**create_kwargs)
             parsed = _parse_response(response, deployment.id, sensitive_values)
         except asyncio.CancelledError:
-            await _close_after_failure(client)
-            raise
-        except ModelTransportError:
-            await _close_after_failure(client)
-            raise
+            await _close_ignoring_failures(client)
+            return _CANCELLED
+        except ModelResponseError as error:
+            safe_failure = ModelResponseError(str(error))
         except Exception as error:  # noqa: BLE001 - redact every SDK/network failure
-            await _close_after_failure(client)
-            mapped_error = _transport_error(deployment.id, error, sensitive_values)
+            safe_failure = _transport_error(deployment.id, error, sensitive_values)
 
-        if mapped_error is not None:
-            raise mapped_error
+        if safe_failure is not None:
+            await _close_ignoring_failures(client)
+            return safe_failure
         if client is None or parsed is None:  # pragma: no cover - defensive invariant
-            raise AssertionError("transport completed without a client response")
+            return AssertionError("transport completed without a client response")
 
-        close_error: ModelTransportError | None = None
         try:
             await client.close()
         except asyncio.CancelledError:
-            raise
+            return _CANCELLED
         except Exception as error:  # noqa: BLE001 - close failures are provider failures
-            close_error = _transport_error(deployment.id, error, sensitive_values)
-        if close_error is not None:
-            raise close_error
+            return _transport_error(deployment.id, error, sensitive_values)
         return parsed
+
+
+_CANCELLED = _CancelledOutcome()
