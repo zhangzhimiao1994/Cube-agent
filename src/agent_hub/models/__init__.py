@@ -14,6 +14,7 @@ from agent_hub.models.capacity import (
 )
 from agent_hub.models.gateway import (
     ConservativeTokenEstimator,
+    GatewayCompletion,
     ModelGateway,
     ModelGatewayError,
     TokenEstimator,
@@ -47,6 +48,7 @@ __all__ = [
     "CredentialDescriptor",
     "CredentialRegistry",
     "Deployment",
+    "GatewayCompletion",
     "LiteLLMClient",
     "ModelCapability",
     "ModelGateway",

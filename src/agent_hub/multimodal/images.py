@@ -6,6 +6,7 @@ import io
 import os
 import re
 import stat
+import threading
 import uuid
 import warnings
 from pathlib import Path
@@ -30,6 +31,9 @@ _OBJECT_KEY = re.compile(
     r"[89ab][0-9a-f]{3}-[0-9a-f]{12})\.png$"
 )
 _TENANT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}$")
+_PILLOW_DECODE_LOCK = threading.RLock()
+
+
 async def _await_task_uninterruptibly[T](task: asyncio.Task[T]) -> T:
     first_cancellation: asyncio.CancelledError | None = None
     while not task.done():
@@ -75,7 +79,7 @@ def _copy_input(raw: object, maximum: int) -> bytes | None:
         return None
 
 
-def _valid_png_container(data: bytes) -> bool:
+def _valid_png_container(data: bytes, maximum_segments: int) -> bool:
     offset = 8
     chunks = 0
     while offset + 12 <= len(data):
@@ -85,6 +89,8 @@ def _valid_png_container(data: bytes) -> bool:
         if end > len(data):
             return False
         chunks += 1
+        if chunks > maximum_segments:
+            return False
         if chunks == 1 and (chunk_type != b"IHDR" or length != 13):
             return False
         if chunk_type == b"IEND":
@@ -93,12 +99,16 @@ def _valid_png_container(data: bytes) -> bool:
     return False
 
 
-def _valid_jpeg_container(data: bytes) -> bool:
+def _valid_jpeg_container(data: bytes, maximum_segments: int) -> bool:
     if not data.startswith(b"\xff\xd8"):
         return False
     offset = 2
     in_scan = False
+    segments = 0
     while offset < len(data):
+        segments += 1
+        if segments > maximum_segments:
+            return False
         if in_scan:
             marker_start = data.find(b"\xff", offset)
             if marker_start < 0 or marker_start + 1 >= len(data):
@@ -145,7 +155,7 @@ def _valid_jpeg_container(data: bytes) -> bool:
     return False
 
 
-def _valid_webp_container(data: bytes) -> bool:
+def _valid_webp_container(data: bytes, maximum_segments: int) -> bool:
     if (
         len(data) < 20
         or data[:4] != b"RIFF"
@@ -156,7 +166,11 @@ def _valid_webp_container(data: bytes) -> bool:
     allowed = {b"VP8 ", b"VP8L", b"VP8X", b"ALPH", b"ICCP", b"EXIF", b"XMP "}
     offset = 12
     image_chunks = 0
+    chunks = 0
     while offset + 8 <= len(data):
+        chunks += 1
+        if chunks > maximum_segments:
+            return False
         chunk_type = data[offset : offset + 4]
         length = int.from_bytes(data[offset + 4 : offset + 8], "little")
         payload_end = offset + 8 + length
@@ -171,13 +185,13 @@ def _valid_webp_container(data: bytes) -> bool:
     return offset == len(data) and image_chunks == 1
 
 
-def _has_exact_container_length(data: bytes, detected_mime: str) -> bool:
+def _has_exact_container_length(data: bytes, detected_mime: str, maximum_segments: int) -> bool:
     if detected_mime == "image/png":
-        return _valid_png_container(data)
+        return _valid_png_container(data, maximum_segments)
     if detected_mime == "image/jpeg":
-        return _valid_jpeg_container(data)
+        return _valid_jpeg_container(data, maximum_segments)
     if detected_mime == "image/webp":
-        return _valid_webp_container(data)
+        return _valid_webp_container(data, maximum_segments)
     return False
 
 
@@ -194,7 +208,7 @@ def _dimensions_allowed(width: int, height: int, limits: ImageLimits) -> bool:
     )
 
 
-def _decode_and_canonicalize(
+def _decode_and_canonicalize_locked(
     data: bytes,
     declared_mime: str,
     limits: ImageLimits,
@@ -206,7 +220,9 @@ def _decode_and_canonicalize(
         if (
             expected_format is None
             or detected_mime != declared_mime
-            or not _has_exact_container_length(data, detected_mime or "")
+            or not _has_exact_container_length(
+                data, detected_mime or "", limits.max_container_segments
+            )
         ):
             return None
         with warnings.catch_warnings():
@@ -282,6 +298,16 @@ def _decode_and_canonicalize(
         return None
 
 
+def _decode_and_canonicalize(
+    data: bytes,
+    declared_mime: str,
+    limits: ImageLimits,
+    detector: ContentTypeDetector,
+) -> tuple[bytes, str, int, int] | None:
+    with _PILLOW_DECODE_LOCK:
+        return _decode_and_canonicalize_locked(data, declared_mime, limits, detector)
+
+
 def _sanitize_copied(
     data: bytes,
     declared_mime: object,
@@ -327,8 +353,12 @@ def sanitize_image(
     copied = _copy_input(raw, configured_limits.max_raw_bytes)
     del raw
     configured_detector = detector or StrictSignatureDetector()
-    result = None if copied is None else _sanitize_copied(
-        copied, declared_mime, tenant_id, configured_limits, configured_detector
+    result = (
+        None
+        if copied is None
+        else _sanitize_copied(
+            copied, declared_mime, tenant_id, configured_limits, configured_detector
+        )
     )
     del copied, declared_mime, tenant_id, configured_detector, configured_limits
     if result is None:
@@ -336,12 +366,146 @@ def sanitize_image(
     return result
 
 
+def _validated_store_match(
+    tenant_id: str, object_key: str, data: bytes, content_type: str
+) -> re.Match[str]:
+    match = _OBJECT_KEY.fullmatch(object_key)
+    if type(tenant_id) is not str or _TENANT_ID.fullmatch(tenant_id) is None:
+        raise ValueError("invalid image object key or metadata")
+    tenant_digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()
+    if (
+        match is None
+        or match.group(1) != tenant_digest
+        or content_type != "image/png"
+        or type(data) is not bytes
+        or not data
+    ):
+        raise ValueError("invalid image object key or metadata")
+    return match
+
+
+def _effective_uid() -> int:
+    get_effective_uid = getattr(os, "geteuid", None)
+    if not callable(get_effective_uid):
+        raise OSError("effective user identity is unavailable")
+    return int(get_effective_uid())
+
+
+class MemoryImageStore:
+    """Portable test/development adapter with the same tenant-bound key contract."""
+
+    def __init__(self, root: Path | str | None = None) -> None:
+        del root
+        self._objects: dict[tuple[str, str], bytes] = {}
+
+    async def put(
+        self, tenant_id: str, object_key: str, data: bytes, content_type: str
+    ) -> StoredImageObject:
+        _validated_store_match(tenant_id, object_key, data, content_type)
+        copied = bytes(data)
+        self._objects[(tenant_id, object_key)] = copied
+        return StoredImageObject(
+            object_key=object_key,
+            byte_length=len(copied),
+            content_type=content_type,
+            sha256=hashlib.sha256(copied).hexdigest(),
+        )
+
+    async def delete(self, tenant_id: str, object_key: str) -> None:
+        if type(tenant_id) is not str or _TENANT_ID.fullmatch(tenant_id) is None:
+            raise OSError("image storage cleanup failed") from None
+        match = _OBJECT_KEY.fullmatch(object_key)
+        digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()
+        if match is None or match.group(1) != digest:
+            raise OSError("image storage cleanup failed") from None
+        self._objects.pop((tenant_id, object_key), None)
+
+    def contains(self, tenant_id: str, object_key: str) -> bool:
+        return (tenant_id, object_key) in self._objects
+
+
 class FilesystemImageStore:
-    """Local production adapter with tenant-bound keys and atomic private files."""
+    """POSIX dirfd-based adapter that never follows filesystem links."""
 
     def __init__(self, root: Path | str) -> None:
-        self._configured_root = Path(root).absolute()
-        self._root = self._configured_root.resolve(strict=False)
+        if os.name != "posix":
+            raise RuntimeError("FilesystemImageStore requires POSIX dirfd semantics")
+        required = ("O_DIRECTORY", "O_NOFOLLOW")
+        if any(not hasattr(os, name) for name in required):
+            raise RuntimeError("FilesystemImageStore requires POSIX dirfd semantics")
+        configured_root = Path(root).absolute()
+        if not configured_root.is_absolute():  # pragma: no cover - absolute() invariant
+            raise ValueError("image store root must be absolute")
+        self._fd_lock = threading.Lock()
+        self._root_fd = self._open_secure_root(configured_root)
+
+    @staticmethod
+    def _directory_flags() -> int:
+        directory = int(os.O_DIRECTORY)  # type: ignore[attr-defined]
+        nofollow = int(os.O_NOFOLLOW)  # type: ignore[attr-defined]
+        return os.O_RDONLY | directory | nofollow
+
+    @classmethod
+    def _open_secure_root(cls, root: Path) -> int:
+        descriptor = os.open(root.anchor, cls._directory_flags())
+        try:
+            for part in root.parts[1:]:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                child = os.open(part, cls._directory_flags(), dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+            cls._validate_directory(descriptor, private=True)
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _validate_directory(descriptor: int, *, private: bool) -> None:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != _effective_uid():
+            raise OSError("unsafe image store directory")
+        if private and metadata.st_mode & 0o077:
+            raise OSError("unsafe image store directory permissions")
+
+    @classmethod
+    def _open_private_directory(cls, parent_fd: int, name: str, *, create: bool) -> int:
+        if create:
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+        descriptor = os.open(name, cls._directory_flags(), dir_fd=parent_fd)
+        try:
+            cls._validate_directory(descriptor, private=True)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor
+
+    def _duplicate_root_fd(self) -> int:
+        with self._fd_lock:
+            if self._root_fd < 0:
+                raise OSError("image store is closed")
+            return os.dup(self._root_fd)
+
+    def close(self) -> None:
+        with self._fd_lock:
+            descriptor, self._root_fd = self._root_fd, -1
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    def __del__(self) -> None:
+        descriptor = getattr(self, "_root_fd", -1)
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            self._root_fd = -1
 
     async def put(
         self, tenant_id: str, object_key: str, data: bytes, content_type: str
@@ -377,51 +541,51 @@ class FilesystemImageStore:
     def _put_sync_safe(
         self, tenant_id: str, object_key: str, data: bytes, content_type: str
     ) -> StoredImageObject | ValueError | None:
+        root_fd = tenants_fd = tenant_fd = -1
+        temporary_name: str | None = None
         try:
-            match = _OBJECT_KEY.fullmatch(object_key)
-            if _TENANT_ID.fullmatch(tenant_id) is None:
-                return ValueError("invalid image object key or metadata")
-            tenant_digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()
-            if (
-                match is None
-                or match.group(1) != tenant_digest
-                or content_type != "image/png"
-                or not data
-            ):
-                return ValueError("invalid image object key or metadata")
-            for candidate in (self._configured_root, *self._configured_root.parents):
-                if candidate.exists() and candidate.is_symlink():
-                    return None
-            self._configured_root.mkdir(parents=True, exist_ok=True)
-            if self._configured_root.resolve(strict=True) != self._root:
-                return None
-            parent = self._root / "tenants" / match.group(1)
-            current = self._root
-            for part in ("tenants", match.group(1)):
-                current = current / part
-                if current.exists() and current.is_symlink():
-                    return None
-                current.mkdir(mode=0o700, exist_ok=True)
-            resolved_parent = parent.resolve(strict=True)
-            if resolved_parent != self._root / "tenants" / match.group(1):
-                return None
-            target = resolved_parent / f"{match.group(2)}.png"
-            if target.exists() or target.is_symlink():
-                return None
-            temporary = resolved_parent / f".{uuid.uuid4()}.tmp"
-            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             try:
-                with os.fdopen(descriptor, "wb", closefd=True) as output:
-                    output.write(data)
-                    output.flush()
-                    os.fsync(output.fileno())
-                os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)
-                os.replace(temporary, target)
+                match = _validated_store_match(tenant_id, object_key, data, content_type)
+            except ValueError as error:
+                return error
+            root_fd = self._duplicate_root_fd()
+            tenants_fd = self._open_private_directory(root_fd, "tenants", create=True)
+            tenant_fd = self._open_private_directory(tenants_fd, match.group(1), create=True)
+            temporary_name = f".{uuid.uuid4()}.tmp"
+            descriptor = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,  # type: ignore[attr-defined]
+                0o600,
+                dir_fd=tenant_fd,
+            )
+            try:
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_uid != _effective_uid()
+                    or metadata.st_mode & 0o177
+                ):
+                    raise OSError("unsafe temporary image object")
+                view = memoryview(data)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError("short image object write")
+                    view = view[written:]
+                os.fsync(descriptor)
             finally:
-                try:
-                    temporary.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                os.close(descriptor)
+            target_name = f"{match.group(2)}.png"
+            os.link(
+                temporary_name,
+                target_name,
+                src_dir_fd=tenant_fd,
+                dst_dir_fd=tenant_fd,
+                follow_symlinks=False,
+            )
+            os.unlink(temporary_name, dir_fd=tenant_fd)
+            temporary_name = None
+            os.fsync(tenant_fd)
             return StoredImageObject(
                 object_key=object_key,
                 byte_length=len(data),
@@ -430,28 +594,57 @@ class FilesystemImageStore:
             )
         except (OSError, UnicodeError, ValueError):
             return None
+        finally:
+            if temporary_name is not None and tenant_fd >= 0:
+                try:
+                    os.unlink(temporary_name, dir_fd=tenant_fd)
+                except OSError:
+                    pass
+            for descriptor in (tenant_fd, tenants_fd, root_fd):
+                if descriptor >= 0:
+                    os.close(descriptor)
 
     def _delete_sync_safe(self, tenant_id: str, object_key: str) -> bool:
+        root_fd = tenants_fd = tenant_fd = target_fd = -1
         try:
             match = _OBJECT_KEY.fullmatch(object_key)
-            if _TENANT_ID.fullmatch(tenant_id) is None or match is None:
+            if (
+                type(tenant_id) is not str
+                or _TENANT_ID.fullmatch(tenant_id) is None
+                or match is None
+            ):
                 return False
             tenant_digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()
             if match.group(1) != tenant_digest:
                 return False
-            for candidate in (self._configured_root, *self._configured_root.parents):
-                if candidate.exists() and candidate.is_symlink():
-                    return False
-            parent = self._root / "tenants" / tenant_digest
-            if not parent.exists():
+            root_fd = self._duplicate_root_fd()
+            try:
+                tenants_fd = self._open_private_directory(root_fd, "tenants", create=False)
+                tenant_fd = self._open_private_directory(tenants_fd, tenant_digest, create=False)
+            except FileNotFoundError:
                 return True
-            if parent.is_symlink() or parent.resolve(strict=True) != parent:
+            target_name = f"{match.group(2)}.png"
+            try:
+                target_fd = os.open(
+                    target_name,
+                    os.O_RDONLY | os.O_NOFOLLOW,  # type: ignore[attr-defined]
+                    dir_fd=tenant_fd,
+                )
+            except FileNotFoundError:
+                return True
+            metadata = os.fstat(target_fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != _effective_uid()
+                or metadata.st_mode & 0o177
+            ):
                 return False
-            target = parent / f"{match.group(2)}.png"
-            if target.is_symlink():
-                return False
-            if target.exists():
-                target.unlink()
+            os.unlink(target_name, dir_fd=tenant_fd)
+            os.fsync(tenant_fd)
             return True
         except (OSError, UnicodeError, ValueError):
             return False
+        finally:
+            for descriptor in (target_fd, tenant_fd, tenants_fd, root_fd):
+                if descriptor >= 0:
+                    os.close(descriptor)

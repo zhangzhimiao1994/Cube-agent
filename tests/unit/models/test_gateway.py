@@ -16,6 +16,7 @@ from agent_hub.models.capacity import (
 )
 from agent_hub.models.gateway import (
     ConservativeTokenEstimator,
+    GatewayCompletion,
     ModelGateway,
     ModelGatewayError,
 )
@@ -30,6 +31,12 @@ from agent_hub.models.types import (
     ModelResponse,
     StructuredResponseSchema,
 )
+
+
+def test_gateway_completion_is_exported_from_models_package() -> None:
+    from agent_hub.models import GatewayCompletion as PublicGatewayCompletion
+
+    assert PublicGatewayCompletion is GatewayCompletion
 
 
 def deployment(

@@ -24,6 +24,10 @@ class VisionAnalysisError(RuntimeError):
     """Stable, redacted vision pipeline failure."""
 
 
+class VisionBusyError(VisionAnalysisError):
+    """Bounded image worker admission is full."""
+
+
 def _positive_int(name: str, value: object) -> None:
     if type(value) is not int or value <= 0:
         raise ValueError(f"{name} must be a strict positive integer")
@@ -45,7 +49,7 @@ class ImageLimits:
     max_width: int = 8192
     max_height: int = 8192
     max_pixels: int = 40_000_000
-    max_frames: int = 1
+    max_container_segments: int = 10_000
     max_decoded_bytes: int = 160_000_000
     max_compression_ratio: float = 500.0
     max_aspect_ratio: float = 100.0
@@ -53,8 +57,13 @@ class ImageLimits:
 
     def __post_init__(self) -> None:
         for name in (
-            "max_raw_bytes", "max_width", "max_height", "max_pixels", "max_frames",
-            "max_decoded_bytes", "max_canonical_bytes",
+            "max_raw_bytes",
+            "max_width",
+            "max_height",
+            "max_pixels",
+            "max_container_segments",
+            "max_decoded_bytes",
+            "max_canonical_bytes",
         ):
             _positive_int(name, getattr(self, name))
         _positive_number("max_compression_ratio", self.max_compression_ratio)
@@ -118,6 +127,8 @@ class StoredImageObject:
 
 
 class ImageObjectStore(Protocol):
+    """Put must reach a terminal commit/failure state before returning or raising."""
+
     async def put(
         self, tenant_id: str, object_key: str, data: bytes, content_type: str
     ) -> StoredImageObject: ...

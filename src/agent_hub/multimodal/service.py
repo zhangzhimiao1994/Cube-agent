@@ -44,6 +44,7 @@ from agent_hub.multimodal.types import (
     VisionAnalysisResult,
     VisionAuditEvent,
     VisionAuditSink,
+    VisionBusyError,
 )
 
 _OCR_SUMMARY = "OCR-only text extraction; visual description unavailable"
@@ -218,6 +219,8 @@ class VisionService:
         review_threshold: float = 0.7,
         max_reference_length: int = 30_000_000,
         max_concurrent_image_tasks: int = 4,
+        max_active_image_tasks: int | None = None,
+        max_waiting_image_tasks: int = 16,
         max_signed_url_ttl_seconds: float = 300,
         utc_now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
@@ -230,8 +233,13 @@ class VisionService:
             raise ValueError("review_threshold must be finite and between zero and one")
         if type(max_reference_length) is not int or max_reference_length <= 0:
             raise ValueError("max_reference_length must be a strict positive integer")
-        if type(max_concurrent_image_tasks) is not int or max_concurrent_image_tasks <= 0:
+        active_limit = (
+            max_concurrent_image_tasks if max_active_image_tasks is None else max_active_image_tasks
+        )
+        if type(active_limit) is not int or active_limit <= 0:
             raise ValueError("max_concurrent_image_tasks must be a strict positive integer")
+        if type(max_waiting_image_tasks) is not int or max_waiting_image_tasks < 0:
+            raise ValueError("max_waiting_image_tasks must be a strict nonnegative integer")
         if (
             isinstance(max_signed_url_ttl_seconds, bool)
             or not isinstance(max_signed_url_ttl_seconds, int | float)
@@ -254,9 +262,7 @@ class VisionService:
                 raise ValueError("reference provider allowlist is invalid") from None
             if type(configured_hosts) is not frozenset or not 1 <= len(configured_hosts) <= 32:
                 raise ValueError("reference provider allowlist is invalid")
-            normalized_hosts = {
-                _normalize_allowed_authority(host) for host in configured_hosts
-            }
+            normalized_hosts = {_normalize_allowed_authority(host) for host in configured_hosts}
             if None in normalized_hosts:
                 raise ValueError("reference provider allowlist is invalid")
             self._reference_allowed_authorities = frozenset(
@@ -265,7 +271,11 @@ class VisionService:
         self._audit = audit_sink or NoopVisionAuditSink()
         self._review_threshold = float(review_threshold)
         self._max_reference_length = max_reference_length
-        self._image_slots = asyncio.Semaphore(max_concurrent_image_tasks)
+        self._image_slots = asyncio.Semaphore(active_limit)
+        self._max_active_image_tasks = active_limit
+        self._max_waiting_image_tasks = max_waiting_image_tasks
+        self._active_image_tasks = 0
+        self._waiting_image_tasks = 0
         self._max_signed_url_ttl_seconds = float(max_signed_url_ttl_seconds)
         self._utc_now = utc_now
 
@@ -276,18 +286,29 @@ class VisionService:
         tenant_id: str,
         logical_model: str = "vision-primary",
     ) -> VisionAnalysisResult:
-        immutable = bytes(raw) if isinstance(raw, bytes | bytearray | memoryview) else raw
-        del raw
-        sanitization = asyncio.create_task(
-            self._sanitize_input(immutable, declared_mime, tenant_id)
-        )
-        del immutable
+        if not isinstance(raw, bytes | bytearray | memoryview):
+            del raw
+            raise InvalidImage("image rejected") from None
         try:
-            sanitized = await sanitization
-        except asyncio.CancelledError:
-            del sanitization
-            raise
-        del sanitization
+            raw_size = raw.nbytes if isinstance(raw, memoryview) else len(raw)
+        except (TypeError, ValueError, OverflowError):
+            del raw
+            raise InvalidImage("image rejected") from None
+        if raw_size == 0 or raw_size > self._limits.max_raw_bytes:
+            del raw
+            raise InvalidImage("image rejected") from None
+        await self._acquire_image_slot()
+        try:
+            try:
+                immutable = bytes(raw)
+            except (TypeError, ValueError, OverflowError, MemoryError):
+                del raw
+                raise InvalidImage("image rejected") from None
+            del raw
+            sanitized = await self._sanitize_input(immutable, declared_mime, tenant_id)
+            del immutable
+        finally:
+            self._release_image_slot()
         if sanitized is None:
             raise InvalidImage("image rejected") from None
         del declared_mime
@@ -295,14 +316,18 @@ class VisionService:
         tenant_digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()
         stored, storage_cancellation = await self._store_image(sanitized, tenant_id)
         if storage_cancellation is not None:
-            del sanitized, stored
-            _cleanup_cancellation, _cleanup_ok = await self._cleanup_object(
-                tenant_id, object_key
-            )
+            if stored is not None:
+                del sanitized, stored
+                await self._cleanup_object(tenant_id, object_key)
+            else:
+                del sanitized, stored
             del object_key, tenant_id, tenant_digest
             storage_cancellation.__traceback__ = None
             raise storage_cancellation from None
-        if stored is None or not self._stored_matches(stored, sanitized):
+        if stored is None:
+            del sanitized, stored, object_key, tenant_id, tenant_digest
+            raise VisionAnalysisError("image storage failed") from None
+        if not self._stored_matches(stored, sanitized):
             del sanitized, stored
             cleanup_cancellation, cleanup_ok = await self._cleanup_object(tenant_id, object_key)
             del object_key, tenant_id, tenant_digest
@@ -341,25 +366,57 @@ class VisionService:
             raise VisionAnalysisError("image cleanup failed") from None
         raise VisionAnalysisError(failure or "vision analysis failed") from None
 
+    async def _acquire_image_slot(self) -> None:
+        queued = self._active_image_tasks >= self._max_active_image_tasks
+        if queued:
+            if self._waiting_image_tasks >= self._max_waiting_image_tasks:
+                raise VisionBusyError("vision image workers busy") from None
+            self._waiting_image_tasks += 1
+        try:
+            await self._image_slots.acquire()
+        except BaseException:
+            if queued:
+                self._waiting_image_tasks -= 1
+            raise
+        if queued:
+            self._waiting_image_tasks -= 1
+        self._active_image_tasks += 1
+
+    def _release_image_slot(self) -> None:
+        self._active_image_tasks -= 1
+        self._image_slots.release()
+
     async def _store_image(
         self, sanitized: SanitizedImage, tenant_id: str
     ) -> tuple[StoredImageObject | None, asyncio.CancelledError | None]:
-        try:
-            stored = await self._object_store.put(
+        put_task = asyncio.create_task(
+            self._object_store.put(
                 tenant_id,
                 sanitized.object_key,
                 sanitized.canonical_bytes,
                 sanitized.media_type,
             )
+        )
+        try:
+            stored = await _await_task_uninterruptibly(put_task)
         except asyncio.CancelledError as cancellation:
+            stored = None
+            if not put_task.cancelled():
+                try:
+                    settled = put_task.result()
+                    if isinstance(settled, StoredImageObject):
+                        stored = settled
+                except BaseException as put_error:  # noqa: BLE001 - inspect terminal put
+                    put_error.__traceback__ = None
+                    del put_error
             cancellation.__traceback__ = None
-            del sanitized, tenant_id
-            return None, cancellation
+            del sanitized, tenant_id, put_task
+            return stored, cancellation
         except Exception as error:  # noqa: BLE001 - adapter details are untrusted
             error.__traceback__ = None
-            del error, sanitized, tenant_id
+            del error, sanitized, tenant_id, put_task
             return None, None
-        del sanitized, tenant_id
+        del sanitized, tenant_id, put_task
         return stored, None
 
     @staticmethod
@@ -555,29 +612,28 @@ class VisionService:
     async def _sanitize_input(
         self, data: bytes | bytearray | memoryview, declared_mime: str, tenant_id: str
     ) -> SanitizedImage | None:
-        async with self._image_slots:
-            worker = asyncio.create_task(
-                asyncio.to_thread(
-                    sanitize_image,
-                    data,
-                    declared_mime,
-                    tenant_id,
-                    limits=self._limits,
-                )
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                sanitize_image,
+                data,
+                declared_mime,
+                tenant_id,
+                limits=self._limits,
             )
-            try:
-                result = await _await_task_uninterruptibly(worker)
-            except asyncio.CancelledError:
-                del data, worker
-                raise
-            except InvalidImage as error:
-                error.__traceback__ = None
-                del data, error, worker
-                return None
-            except Exception as error:  # noqa: BLE001 - sanitize boundary is redacted
-                error.__traceback__ = None
-                del data, error, worker
-                return None
+        )
+        try:
+            result = await _await_task_uninterruptibly(worker)
+        except asyncio.CancelledError:
+            del data, worker
+            raise
+        except InvalidImage as error:
+            error.__traceback__ = None
+            del data, error, worker
+            return None
+        except Exception as error:  # noqa: BLE001 - sanitize boundary is redacted
+            error.__traceback__ = None
+            del data, error, worker
+            return None
         del data, worker
         return result
 

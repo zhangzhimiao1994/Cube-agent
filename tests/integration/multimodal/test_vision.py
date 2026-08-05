@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
+import os
 import threading
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
@@ -14,17 +16,28 @@ from PIL import Image
 
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelCapability, ModelRequest, ModelResponse
-from agent_hub.multimodal.images import FilesystemImageStore, sanitize_image
+from agent_hub.multimodal.images import (
+    FilesystemImageStore as PosixFilesystemImageStore,
+)
+from agent_hub.multimodal.images import (
+    MemoryImageStore,
+    sanitize_image,
+)
 from agent_hub.multimodal.service import VisionService
 from agent_hub.multimodal.types import (
     ImageAnalysisArtifact,
+    ImageLimits,
+    InvalidImage,
     OCRObservation,
     SanitizedImage,
     SignedImageReference,
     StoredImageObject,
     VisionAnalysisError,
     VisionAuditEvent,
+    VisionBusyError,
 )
+
+FilesystemImageStore = PosixFilesystemImageStore if os.name == "posix" else MemoryImageStore
 
 
 def png_bytes() -> bytes:
@@ -116,12 +129,14 @@ def response(confidence: float = 0.9, **extra: object) -> str:
     return json.dumps(body)
 
 
-async def test_vision_uses_gateway_capabilities_schema_and_trusted_provenance(tmp_path: Path) -> None:
+async def test_vision_uses_gateway_capabilities_schema_and_trusted_provenance(
+    tmp_path: Path,
+) -> None:
     gateway = GatewayStub(response())
     audit = AuditStub()
-    result = await VisionService(
-        gateway, FilesystemImageStore(tmp_path), audit_sink=audit
-    ).analyze(png_bytes(), "image/png", "tenant-a", "vision-primary")
+    result = await VisionService(gateway, FilesystemImageStore(tmp_path), audit_sink=audit).analyze(
+        png_bytes(), "image/png", "tenant-a", "vision-primary"
+    )
     assert result.artifact.source_sha256 != "f" * 64
     assert result.artifact.logical_model == "vision-primary"
     assert result.artifact.deployment_id == "vision-deployment"
@@ -145,8 +160,13 @@ async def test_vision_uses_gateway_capabilities_schema_and_trusted_provenance(tm
     assert isinstance(required, tuple)
     required_fields = {item for item in required if isinstance(item, str)}
     assert required_fields == {
-        "source_sha256", "summary", "extracted_text", "objects", "confidence",
-        "logical_model", "deployment_id",
+        "source_sha256",
+        "summary",
+        "extracted_text",
+        "objects",
+        "confidence",
+        "logical_model",
+        "deployment_id",
     }
     content = request.messages[0].content
     assert not isinstance(content, str)
@@ -156,7 +176,8 @@ async def test_vision_uses_gateway_capabilities_schema_and_trusted_provenance(tm
     assert len(audit.events) == 1
     assert "data:image" not in repr(audit.events[0])
     assert "canonical_bytes" not in repr(result)
-    assert len(list(tmp_path.rglob("*.png"))) == 1
+    if os.name == "posix":
+        assert len(list(tmp_path.rglob("*.png"))) == 1
 
 
 async def test_fallback_artifact_and_audit_use_actual_gateway_provenance(tmp_path: Path) -> None:
@@ -168,9 +189,9 @@ async def test_fallback_artifact_and_audit_use_actual_gateway_provenance(tmp_pat
         provider_model="anthropic/claude-vision",
     )
     audit = AuditStub()
-    result = await VisionService(
-        gateway, FilesystemImageStore(tmp_path), audit_sink=audit
-    ).analyze(png_bytes(), "image/png", "tenant", "vision-primary")
+    result = await VisionService(gateway, FilesystemImageStore(tmp_path), audit_sink=audit).analyze(
+        png_bytes(), "image/png", "tenant", "vision-primary"
+    )
 
     assert result.artifact.logical_model == "vision-backup"
     assert result.artifact.deployment_id == "backup-deployment"
@@ -182,10 +203,19 @@ async def test_fallback_artifact_and_audit_use_actual_gateway_provenance(tmp_pat
 
 @pytest.mark.parametrize(
     "payload",
-    [None, "", "not-json-private-output", "{}", response(extra_field="forbidden"),
-     response(summary="x" * 2001), response(confidence=float("nan"))],
+    [
+        None,
+        "",
+        "not-json-private-output",
+        "{}",
+        response(extra_field="forbidden"),
+        response(summary="x" * 2001),
+        response(confidence=float("nan")),
+    ],
 )
-async def test_malformed_model_response_is_safely_rejected(tmp_path: Path, payload: str | None) -> None:
+async def test_malformed_model_response_is_safely_rejected(
+    tmp_path: Path, payload: str | None
+) -> None:
     service = VisionService(GatewayStub(payload), FilesystemImageStore(tmp_path))
     with pytest.raises(VisionAnalysisError, match="vision analysis failed") as captured:
         await service.analyze(png_bytes(), "image/png", "tenant", "vision-primary")
@@ -195,7 +225,8 @@ async def test_malformed_model_response_is_safely_rejected(tmp_path: Path, paylo
 
 async def test_low_confidence_requires_review(tmp_path: Path) -> None:
     result = await VisionService(
-        GatewayStub(response(confidence=0.2)), FilesystemImageStore(tmp_path),
+        GatewayStub(response(confidence=0.2)),
+        FilesystemImageStore(tmp_path),
         review_threshold=0.7,
     ).analyze(png_bytes(), "image/png", "tenant", "vision-primary")
     assert result.requires_review and not result.ocr_only
@@ -205,7 +236,8 @@ async def test_ocr_fallback_is_fixed_and_non_fabricating_for_text_image(tmp_path
     ocr = OCRStub(OCRObservation(text="invoice 123", confidence=0.8, text_oriented=True))
     service = VisionService(
         GatewayStub(None, error=RuntimeError("provider detail")),
-        FilesystemImageStore(tmp_path), ocr_adapter=ocr,
+        FilesystemImageStore(tmp_path),
+        ocr_adapter=ocr,
     )
     result = await service.analyze(png_bytes(), "image/png", "tenant", "vision-primary")
     assert result.ocr_only and result.requires_review
@@ -218,7 +250,8 @@ async def test_ocr_fallback_is_fixed_and_non_fabricating_for_text_image(tmp_path
 async def test_non_text_oriented_ocr_cannot_replace_vision(tmp_path: Path) -> None:
     ocr = OCRStub(OCRObservation(text="noise", confidence=0.8, text_oriented=False))
     service = VisionService(
-        GatewayStub(None, error=RuntimeError("down")), FilesystemImageStore(tmp_path),
+        GatewayStub(None, error=RuntimeError("down")),
+        FilesystemImageStore(tmp_path),
         ocr_adapter=ocr,
     )
     with pytest.raises(VisionAnalysisError, match="vision analysis failed"):
@@ -310,7 +343,7 @@ async def _wait_for_thread_event(event: threading.Event) -> None:
         await asyncio.sleep(0)
 
 
-class BlockingFilesystemStore(FilesystemImageStore):
+class BlockingFilesystemStore(PosixFilesystemImageStore):
     def __init__(self, root: Path, *, block_put: bool = False, block_delete: bool = True) -> None:
         super().__init__(root)
         self.put_started = threading.Event()
@@ -338,6 +371,7 @@ class BlockingFilesystemStore(FilesystemImageStore):
         return super()._delete_sync_safe(tenant_id, object_key)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX filesystem race test")
 async def test_repeated_put_and_cleanup_cancellation_cannot_leave_late_file(
     tmp_path: Path,
 ) -> None:
@@ -371,6 +405,7 @@ async def test_repeated_put_and_cleanup_cancellation_cannot_leave_late_file(
     assert list(tmp_path.rglob("*.png")) == []
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX filesystem race test")
 async def test_repeated_model_phase_cancellation_cannot_interrupt_cleanup(
     tmp_path: Path,
 ) -> None:
@@ -752,3 +787,128 @@ def test_signed_reference_contract_is_strict_and_hides_url() -> None:
             signed=True,
             provider_id="signed-store",
         )
+
+
+async def test_oversize_input_is_rejected_before_copying() -> None:
+    class CopyExplodes(bytearray):
+        def __bytes__(self) -> bytes:
+            raise AssertionError("oversize input was copied")
+
+    service = VisionService(
+        GatewayStub(response()),
+        MemoryImageStore(),
+        limits=ImageLimits(max_raw_bytes=4),
+    )
+    with pytest.raises(InvalidImage, match="^image rejected$"):
+        await service.analyze(CopyExplodes(b"oversize"), "image/png", "tenant")
+
+
+async def test_image_admission_is_bounded_and_recovers_after_waiter_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    template = sanitize_image(png_bytes(), "image/png", "tenant")
+    first_started = threading.Event()
+    release_first = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def controlled_sanitize(*args: object, **kwargs: object) -> SanitizedImage:
+        nonlocal calls
+        del args, kwargs
+        with calls_lock:
+            calls += 1
+            first = calls == 1
+        if first:
+            first_started.set()
+            assert release_first.wait(timeout=5)
+        return template
+
+    monkeypatch.setattr("agent_hub.multimodal.service.sanitize_image", controlled_sanitize)
+    service = VisionService(
+        GatewayStub(response()),
+        MemoryImageStore(),
+        max_active_image_tasks=1,
+        max_waiting_image_tasks=1,
+    )
+    first = asyncio.create_task(service.analyze(b"a", "image/png", "tenant"))
+    while not first_started.is_set():
+        await asyncio.sleep(0)
+    waiter = asyncio.create_task(service.analyze(b"b", "image/png", "tenant"))
+    while service._waiting_image_tasks != 1:
+        await asyncio.sleep(0)
+    with pytest.raises(VisionBusyError, match="workers busy"):
+        await service.analyze(b"c", "image/png", "tenant")
+    waiter.cancel("waiting-cancel")
+    with pytest.raises(asyncio.CancelledError, match="waiting-cancel"):
+        await waiter
+    release_first.set()
+    assert (await first).artifact.summary == "A red square"
+    assert service._active_image_tasks == 0
+    assert service._waiting_image_tasks == 0
+    assert (await service.analyze(b"d", "image/png", "tenant")).artifact.summary
+
+
+async def test_generic_store_put_reaches_terminal_commit_before_cancel_cleanup() -> None:
+    class DelayedStore:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.committed: set[tuple[str, str]] = set()
+            self.put_finished = False
+
+        async def put(
+            self, tenant_id: str, object_key: str, data: bytes, content_type: str
+        ) -> StoredImageObject:
+            self.started.set()
+            await self.release.wait()
+            self.committed.add((tenant_id, object_key))
+            self.put_finished = True
+            return StoredImageObject(
+                object_key=object_key,
+                byte_length=len(data),
+                content_type=content_type,
+                sha256=hashlib.sha256(data).hexdigest(),
+            )
+
+        async def delete(self, tenant_id: str, object_key: str) -> None:
+            assert self.put_finished
+            self.committed.discard((tenant_id, object_key))
+
+    store = DelayedStore()
+    task = asyncio.create_task(
+        VisionService(GatewayStub(response()), store).analyze(png_bytes(), "image/png", "tenant")
+    )
+    await store.started.wait()
+    task.cancel("first-cancel")
+    await asyncio.sleep(0)
+    task.cancel("second-cancel")
+    await asyncio.sleep(0)
+    assert not task.done()
+    store.release.set()
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await task
+    assert captured.value.args == ("first-cancel",)
+    assert store.put_finished and store.committed == set()
+
+
+async def test_normal_store_put_failure_does_not_attempt_delete() -> None:
+    class FailingStore:
+        def __init__(self) -> None:
+            self.delete_calls = 0
+
+        async def put(
+            self, tenant_id: str, object_key: str, data: bytes, content_type: str
+        ) -> StoredImageObject:
+            del tenant_id, object_key, data, content_type
+            raise RuntimeError("private storage failure")
+
+        async def delete(self, tenant_id: str, object_key: str) -> None:
+            del tenant_id, object_key
+            self.delete_calls += 1
+
+    store = FailingStore()
+    with pytest.raises(VisionAnalysisError, match="image storage failed"):
+        await VisionService(GatewayStub(response()), store).analyze(
+            png_bytes(), "image/png", "tenant"
+        )
+    assert store.delete_calls == 0

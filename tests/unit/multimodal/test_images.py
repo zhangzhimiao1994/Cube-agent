@@ -3,7 +3,10 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import threading
+import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -146,6 +149,7 @@ def test_rejects_container_aware_trailing_polyglots(image_format: str) -> None:
         ImageLimits(max_width=3),
         ImageLimits(max_height=3),
         ImageLimits(max_pixels=20),
+        ImageLimits(max_container_segments=2),
         ImageLimits(max_aspect_ratio=1.1),
         ImageLimits(max_decoded_bytes=50),
         ImageLimits(max_compression_ratio=0.1),
@@ -162,7 +166,7 @@ def test_enforces_resource_limits(limits: ImageLimits) -> None:
     [
         ("max_raw_bytes", True),
         ("max_width", 0),
-        ("max_frames", 1.0),
+        ("max_container_segments", 1.0),
         ("max_aspect_ratio", float("nan")),
         ("max_compression_ratio", float("inf")),
     ],
@@ -186,6 +190,45 @@ def test_decompression_bomb_warning_is_rejected_without_mutating_pillow_global(
     with pytest.raises(InvalidImage, match="image rejected"):
         sanitize_image(encoded_image(), "image/png", "tenant")
     assert Image.MAX_IMAGE_PIXELS == original
+
+
+def test_pillow_warning_and_decode_context_is_serialized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_open = Image.open
+    first_opened = threading.Event()
+    release_first = threading.Event()
+    state_lock = threading.Lock()
+    active = 0
+    maximum_active = 0
+
+    def controlled_open(source: io.BytesIO) -> Image.Image:
+        nonlocal active, maximum_active
+        with state_lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+            is_first = not first_opened.is_set()
+            if is_first:
+                first_opened.set()
+        try:
+            if is_first:
+                assert release_first.wait(timeout=5)
+            return real_open(source)
+        finally:
+            with state_lock:
+                active -= 1
+
+    monkeypatch.setattr(Image, "open", controlled_open)
+    raw = encoded_image()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(sanitize_image, raw, "image/png", "tenant-a")
+        assert first_opened.wait(timeout=5)
+        second = executor.submit(sanitize_image, raw, "image/png", "tenant-b")
+        time.sleep(0.05)
+        assert maximum_active == 1
+        release_first.set()
+        assert first.result(timeout=5).width == 8
+        assert second.result(timeout=5).width == 8
 
 
 def test_injected_detector_failure_is_redacted() -> None:
@@ -229,6 +272,7 @@ def test_sanitized_image_repr_hides_bytes_and_is_unhashable() -> None:
         hash(result)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX dirfd adapter")
 async def test_filesystem_store_writes_atomically_with_private_permissions(tmp_path: Path) -> None:
     store = FilesystemImageStore(tmp_path)
     digest = hashlib.sha256(b"tenant").hexdigest()
@@ -246,6 +290,7 @@ async def test_filesystem_store_writes_atomically_with_private_permissions(tmp_p
     assert not target.exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX dirfd adapter")
 async def test_filesystem_store_delete_is_tenant_bound(tmp_path: Path) -> None:
     store = FilesystemImageStore(tmp_path)
     digest = hashlib.sha256(b"tenant").hexdigest()
@@ -261,10 +306,13 @@ async def test_filesystem_store_delete_is_tenant_bound(tmp_path: Path) -> None:
     ["../escape.png", "/absolute.png", "tenants/a/../../escape", "tenants/a/not-uuid.png"],
 )
 async def test_filesystem_store_rejects_untrusted_keys(tmp_path: Path, key: str) -> None:
+    if os.name != "posix":
+        pytest.skip("POSIX dirfd adapter")
     with pytest.raises(ValueError, match="object key"):
         await FilesystemImageStore(tmp_path).put("tenant", key, b"data", "image/png")
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX dirfd adapter")
 async def test_filesystem_store_rejects_symlink_traversal(tmp_path: Path) -> None:
     outside = tmp_path.parent / f"{tmp_path.name}-outside"
     outside.mkdir()
@@ -281,6 +329,7 @@ async def test_filesystem_store_rejects_symlink_traversal(tmp_path: Path) -> Non
     assert list(outside.iterdir()) == []
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX dirfd adapter")
 async def test_filesystem_store_rejects_configured_symlink_root(tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -294,3 +343,9 @@ async def test_filesystem_store_rejects_configured_symlink_root(tmp_path: Path) 
     with pytest.raises(OSError, match="image storage failed"):
         await FilesystemImageStore(linked_root).put("tenant", key, b"data", "image/png")
     assert list(outside.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name == "posix", reason="non-POSIX only")
+def test_filesystem_store_fails_closed_off_posix(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="POSIX"):
+        FilesystemImageStore(tmp_path)
