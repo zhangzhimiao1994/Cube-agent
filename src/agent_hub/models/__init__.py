@@ -1,5 +1,20 @@
 """Model registry and transport contracts."""
 
+from agent_hub.models.capacity import (
+    CapacityBackendError,
+    CapacityLease,
+    CapacityPool,
+    CapacityUnavailable,
+    CredentialDescriptor,
+    CredentialRegistry,
+    safe_operational_limit,
+)
+from agent_hub.models.gateway import (
+    ConservativeTokenEstimator,
+    ModelGateway,
+    ModelGatewayError,
+    TokenEstimator,
+)
 from agent_hub.models.litellm_client import (
     LiteLLMClient,
     ModelResponseError,
@@ -18,9 +33,18 @@ from agent_hub.models.types import (
 )
 
 __all__ = [
+    "CapacityBackendError",
+    "CapacityLease",
+    "CapacityPool",
+    "CapacityUnavailable",
+    "ConservativeTokenEstimator",
+    "CredentialDescriptor",
+    "CredentialRegistry",
     "Deployment",
     "LiteLLMClient",
     "ModelCapability",
+    "ModelGateway",
+    "ModelGatewayError",
     "ModelMessage",
     "ModelRegistry",
     "ModelRequest",
@@ -29,6 +53,8 @@ __all__ = [
     "ModelTransportError",
     "NoCapableDeployment",
     "StructuredResponseSchema",
+    "TokenEstimator",
     "TokenUsage",
     "ToolCall",
+    "safe_operational_limit",
 ]

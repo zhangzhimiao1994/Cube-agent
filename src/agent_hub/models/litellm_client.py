@@ -44,6 +44,14 @@ class OpenAIClientFactory(Protocol):
 class ModelTransportError(RuntimeError):
     """Stable, redacted model transport failure."""
 
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        if status_code is not None and (
+            type(status_code) is not int or not 100 <= status_code <= 599
+        ):
+            raise ValueError("status_code must be None or between 100 and 599")
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class ModelResponseError(ModelTransportError):
     """Stable error for an invalid provider response contract."""
@@ -245,7 +253,13 @@ def _transport_error(
     if request_id is not None:
         details.append(f"request_id={request_id}")
     suffix = f" ({', '.join(details)})" if details else ""
-    return ModelTransportError(f"model transport failed for deployment {deployment_id!r}{suffix}")
+    safe_status = status if isinstance(status, int) and not isinstance(status, bool) else None
+    if safe_status is not None and not 100 <= safe_status <= 599:
+        safe_status = None
+    return ModelTransportError(
+        f"model transport failed for deployment {deployment_id!r}{suffix}",
+        status_code=safe_status,
+    )
 
 
 async def _close_ignoring_failures(client: _OpenAIClient | None) -> bool:

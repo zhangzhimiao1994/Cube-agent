@@ -25,6 +25,15 @@ class ModelRegistry:
             logical_model: tuple(candidates)
             for logical_model, candidates in sorted(grouped.items())
         })
+        self._deployments = ordered
+
+    @property
+    def deployments(self) -> tuple[Deployment, ...]:
+        return self._deployments
+
+    @property
+    def logical_models(self) -> frozenset[str]:
+        return frozenset(self._by_logical_model)
 
     def candidates(
         self,
