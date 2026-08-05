@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import io
 import os
 import re
 import stat
 import threading
 import uuid
+from enum import Enum
 from pathlib import Path
 
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -33,6 +35,8 @@ _OBJECT_KEY = re.compile(
     r"[89ab][0-9a-f]{3}-[0-9a-f]{12})\.png$"
 )
 _TENANT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}$")
+_SHA256 = re.compile(r"^[a-f0-9]{64}$")
+_MAX_STORED_IMAGE_BYTES = 20_000_000
 
 
 async def _await_task_uninterruptibly[T](task: asyncio.Task[T]) -> T:
@@ -487,6 +491,7 @@ def _validated_store_match(
         or content_type != "image/png"
         or type(data) is not bytes
         or not data
+        or len(data) > _MAX_STORED_IMAGE_BYTES
     ):
         raise ValueError("invalid image object key or metadata")
     return match
@@ -518,6 +523,8 @@ class MemoryImageStore:
         self, tenant_id: str, object_key: str, data: bytes, content_type: str
     ) -> StoredImageObject:
         _validated_store_match(tenant_id, object_key, data, content_type)
+        if object_key in self._objects:
+            raise OSError("image object already exists") from None
         copied = bytes(data)
         self._objects[object_key] = copied
         return StoredImageObject(
@@ -527,10 +534,22 @@ class MemoryImageStore:
             sha256=hashlib.sha256(copied).hexdigest(),
         )
 
-    async def delete_by_object_key(self, object_key: str) -> None:
-        if type(object_key) is not str or _OBJECT_KEY.fullmatch(object_key) is None:
+    async def delete_by_object_key(
+        self, object_key: str, expected_sha256: str
+    ) -> None:
+        if (
+            type(object_key) is not str
+            or _OBJECT_KEY.fullmatch(object_key) is None
+            or type(expected_sha256) is not str
+            or _SHA256.fullmatch(expected_sha256) is None
+        ):
             raise OSError("image storage cleanup failed") from None
-        self._objects.pop(object_key, None)
+        current = self._objects.get(object_key)
+        if current is None:
+            return
+        if not hmac.compare_digest(hashlib.sha256(current).hexdigest(), expected_sha256):
+            raise OSError("image object hash mismatch") from None
+        del self._objects[object_key]
 
     def contains(self, tenant_id: str, object_key: str) -> bool:
         digest = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()
@@ -544,7 +563,7 @@ async def replay_image_cleanup(
         raise VisionCleanupError("recovery item store mismatch") from None
     failed = False
     try:
-        await store.delete_by_object_key(item.object_key)
+        await store.delete_by_object_key(item.object_key, item.canonical_sha256)
     except (Exception, asyncio.CancelledError) as error:  # noqa: BLE001 - adapter boundary
         error.__traceback__ = None
         error.__context__ = None
@@ -564,6 +583,12 @@ class ImageStoreCommitUncertain(OSError):
 
     def __repr__(self) -> str:
         return f"ImageStoreCommitUncertain(object_key={self.object_key!r})"
+
+
+class _DeleteResult(Enum):
+    DELETED = "deleted"
+    HASH_MISMATCH = "hash_mismatch"
+    FAILED = "failed"
 
 
 class FilesystemImageStore:
@@ -670,14 +695,20 @@ class FilesystemImageStore:
             raise result from None
         return result
 
-    async def delete_by_object_key(self, object_key: str) -> None:
-        worker = asyncio.create_task(asyncio.to_thread(self._delete_sync_safe, object_key))
-        del object_key
+    async def delete_by_object_key(
+        self, object_key: str, expected_sha256: str
+    ) -> None:
+        worker = asyncio.create_task(
+            asyncio.to_thread(self._delete_sync_safe, object_key, expected_sha256)
+        )
+        del object_key, expected_sha256
         try:
-            deleted = await _await_task_uninterruptibly(worker)
+            result = await _await_task_uninterruptibly(worker)
         finally:
             del worker
-        if not deleted:
+        if result is _DeleteResult.HASH_MISMATCH:
+            raise OSError("image object hash mismatch") from None
+        if result is not _DeleteResult.DELETED:
             raise OSError("image storage cleanup failed") from None
 
     def _put_sync_safe(
@@ -757,19 +788,21 @@ class FilesystemImageStore:
                 if descriptor >= 0:
                     os.close(descriptor)
 
-    def _delete_sync_safe(self, object_key: str) -> bool:
+    def _delete_sync_safe(
+        self, object_key: str, expected_sha256: str
+    ) -> _DeleteResult:
         root_fd = tenants_fd = tenant_fd = target_fd = -1
         try:
             match = _OBJECT_KEY.fullmatch(object_key)
-            if match is None:
-                return False
+            if match is None or _SHA256.fullmatch(expected_sha256) is None:
+                return _DeleteResult.FAILED
             tenant_digest = match.group(1)
             root_fd = self._duplicate_root_fd()
             try:
                 tenants_fd = self._open_private_directory(root_fd, "tenants", create=False)
                 tenant_fd = self._open_private_directory(tenants_fd, tenant_digest, create=False)
             except FileNotFoundError:
-                return True
+                return _DeleteResult.DELETED
             target_name = f"{match.group(2)}.png"
             try:
                 target_fd = os.open(
@@ -778,19 +811,35 @@ class FilesystemImageStore:
                     dir_fd=tenant_fd,
                 )
             except FileNotFoundError:
-                return True
+                return _DeleteResult.DELETED
             metadata = os.fstat(target_fd)
             if (
                 not stat.S_ISREG(metadata.st_mode)
                 or metadata.st_uid != _effective_uid()
                 or metadata.st_mode & 0o177
+                or metadata.st_size > _MAX_STORED_IMAGE_BYTES
             ):
-                return False
+                return _DeleteResult.FAILED
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(target_fd, 128 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            if not hmac.compare_digest(digest.hexdigest(), expected_sha256):
+                return _DeleteResult.HASH_MISMATCH
+            current = os.stat(target_name, dir_fd=tenant_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_dev != metadata.st_dev
+                or current.st_ino != metadata.st_ino
+            ):
+                return _DeleteResult.FAILED
             os.unlink(target_name, dir_fd=tenant_fd)
             os.fsync(tenant_fd)
-            return True
+            return _DeleteResult.DELETED
         except (OSError, UnicodeError, ValueError):
-            return False
+            return _DeleteResult.FAILED
         finally:
             for descriptor in (target_fd, tenant_fd, tenants_fd, root_fd):
                 if descriptor >= 0:

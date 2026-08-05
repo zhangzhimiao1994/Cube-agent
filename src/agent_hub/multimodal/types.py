@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _SHA256 = re.compile(r"^[a-f0-9]{64}$")
 _OBJECT_KEY = re.compile(
-    r"^tenants/[a-f0-9]{64}/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+    r"^tenants/([a-f0-9]{64})/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
     r"[89ab][0-9a-f]{3}-[0-9a-f]{12}\.png$"
 )
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
@@ -149,7 +149,9 @@ class ImageObjectStore(Protocol):
         self, tenant_id: str, object_key: str, data: bytes, content_type: str
     ) -> StoredImageObject: ...
 
-    async def delete_by_object_key(self, object_key: str) -> None: ...
+    async def delete_by_object_key(
+        self, object_key: str, expected_sha256: str
+    ) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,8 +170,11 @@ class ImageCleanupRecoveryItem:
             raise ValueError("cleanup namespace must be a safe identifier")
         if _SHA256.fullmatch(self.tenant_sha256) is None:
             raise ValueError("tenant_sha256 must be a SHA-256 digest")
-        if _OBJECT_KEY.fullmatch(self.object_key) is None:
+        object_key_match = _OBJECT_KEY.fullmatch(self.object_key)
+        if object_key_match is None:
             raise ValueError("object key is invalid")
+        if object_key_match.group(1) != self.tenant_sha256:
+            raise ValueError("object key tenant digest does not match tenant_sha256")
         if _SHA256.fullmatch(self.canonical_sha256) is None:
             raise ValueError("canonical_sha256 must be a SHA-256 digest")
         if self.reason not in {

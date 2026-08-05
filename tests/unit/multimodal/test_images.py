@@ -364,7 +364,7 @@ async def test_filesystem_store_writes_atomically_with_private_permissions(tmp_p
     if os.name == "posix":
         assert os.stat(target).st_mode & 0o777 == 0o600
 
-    await store.delete_by_object_key(key)
+    await store.delete_by_object_key(key, hashlib.sha256(b"canonical").hexdigest())
     assert not target.exists()
 
 
@@ -374,8 +374,9 @@ async def test_filesystem_store_delete_by_object_key_is_idempotent(tmp_path: Pat
     digest = hashlib.sha256(b"tenant").hexdigest()
     key = f"tenants/{digest}/123e4567-e89b-42d3-a456-426614174000.png"
     await store.put("tenant", key, b"canonical", "image/png")
-    await store.delete_by_object_key(key)
-    await store.delete_by_object_key(key)
+    expected = hashlib.sha256(b"canonical").hexdigest()
+    await store.delete_by_object_key(key, expected)
+    await store.delete_by_object_key(key, expected)
     assert not tmp_path.joinpath(*key.split("/")).exists()
 
 
@@ -477,6 +478,68 @@ async def test_recovery_replay_rejects_wrong_store_without_deleting() -> None:
     assert wrong.contains("tenant", sanitized.object_key)
 
 
+def test_recovery_item_rejects_tenant_hash_that_disagrees_with_object_key() -> None:
+    sanitized = sanitize_image(encoded_image(), "image/png", "tenant-a")
+    with pytest.raises(ValueError, match="tenant"):
+        ImageCleanupRecoveryItem(
+            store_id="memory-store",
+            namespace="tenant-images",
+            tenant_sha256=hashlib.sha256(b"tenant-b").hexdigest(),
+            object_key=sanitized.object_key,
+            canonical_sha256=sanitized.canonical_sha256,
+            reason="analysis_failed",
+        )
+
+
+async def test_memory_store_conditional_delete_rejects_wrong_hash_and_deletes_match() -> None:
+    store = MemoryImageStore(store_id="memory-store", namespace="tenant-images")
+    sanitized = sanitize_image(encoded_image(), "image/png", "tenant")
+    await store.put(
+        "tenant",
+        sanitized.object_key,
+        sanitized.canonical_bytes,
+        sanitized.media_type,
+    )
+    with pytest.raises(OSError, match="hash mismatch"):
+        await store.delete_by_object_key(sanitized.object_key, "0" * 64)
+    assert store.contains("tenant", sanitized.object_key)
+    await store.delete_by_object_key(sanitized.object_key, sanitized.canonical_sha256)
+    assert not store.contains("tenant", sanitized.object_key)
+
+
+async def test_stale_recovery_does_not_delete_replacement_at_same_key() -> None:
+    store = MemoryImageStore(store_id="memory-store", namespace="tenant-images")
+    first = sanitize_image(encoded_image(), "image/png", "tenant")
+    await store.put("tenant", first.object_key, first.canonical_bytes, first.media_type)
+    await store.delete_by_object_key(first.object_key, first.canonical_sha256)
+    replacement = b"replacement-canonical-object"
+    await store.put("tenant", first.object_key, replacement, "image/png")
+    stale = ImageCleanupRecoveryItem(
+        store_id=store.store_id,
+        namespace=store.namespace,
+        tenant_sha256=hashlib.sha256(b"tenant").hexdigest(),
+        object_key=first.object_key,
+        canonical_sha256=first.canonical_sha256,
+        reason="analysis_failed",
+    )
+    with pytest.raises(VisionCleanupError, match="recovery cleanup failed"):
+        await image_module.replay_image_cleanup(stale, store)
+    assert store.contains("tenant", first.object_key)
+
+
+async def test_memory_store_rejects_unconditional_same_key_overwrite() -> None:
+    store = MemoryImageStore(store_id="memory-store", namespace="tenant-images")
+    sanitized = sanitize_image(encoded_image(), "image/png", "tenant")
+    await store.put(
+        "tenant",
+        sanitized.object_key,
+        sanitized.canonical_bytes,
+        sanitized.media_type,
+    )
+    with pytest.raises(OSError, match="already exists"):
+        await store.put("tenant", sanitized.object_key, b"replacement", "image/png")
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX dirfd adapter")
 @pytest.mark.parametrize("failure", ["temp_unlink", "directory_fsync", "result"])
 async def test_filesystem_store_rolls_back_every_post_publish_failure(
@@ -543,6 +606,6 @@ async def test_filesystem_store_reports_commit_uncertain_when_rollback_fails(
             await store.put("tenant", key, b"canonical", "image/png")
     assert captured.value.object_key == key
     assert "canonical" not in repr(captured.value)
-    await store.delete_by_object_key(key)
+    await store.delete_by_object_key(key, hashlib.sha256(b"canonical").hexdigest())
     store.close()
     assert len(os.listdir("/proc/self/fd")) == baseline_descriptors

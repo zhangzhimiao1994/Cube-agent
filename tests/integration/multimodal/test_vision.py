@@ -9,7 +9,7 @@ import threading
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from PIL import Image
@@ -381,10 +381,10 @@ class BlockingFilesystemStore(PosixFilesystemImageStore):
         self.put_finished.set()
         return result
 
-    def _delete_sync_safe(self, object_key: str) -> bool:
+    def _delete_sync_safe(self, object_key: str, expected_sha256: str) -> Any:
         self.delete_started.set()
         self.delete_release.wait()
-        return super()._delete_sync_safe(object_key)
+        return super()._delete_sync_safe(object_key, expected_sha256)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX filesystem race test")
@@ -822,7 +822,6 @@ async def test_oversize_input_is_rejected_before_copying() -> None:
 async def test_image_admission_is_bounded_and_recovers_after_waiter_cancellation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    template = sanitize_image(png_bytes(), "image/png", "tenant")
     first_started = threading.Event()
     release_first = threading.Event()
     calls = 0
@@ -837,7 +836,7 @@ async def test_image_admission_is_bounded_and_recovers_after_waiter_cancellation
         if first:
             first_started.set()
             assert release_first.wait(timeout=5)
-        return template
+        return sanitize_image(png_bytes(), "image/png", "tenant")
 
     monkeypatch.setattr("agent_hub.multimodal.service.sanitize_image", controlled_sanitize)
     service = VisionService(
@@ -889,7 +888,10 @@ async def test_generic_store_put_reaches_terminal_commit_before_cancel_cleanup()
                 sha256=hashlib.sha256(data).hexdigest(),
             )
 
-        async def delete_by_object_key(self, object_key: str) -> None:
+        async def delete_by_object_key(
+            self, object_key: str, expected_sha256: str
+        ) -> None:
+            del expected_sha256
             assert self.put_finished
             self.committed = {entry for entry in self.committed if entry[1] != object_key}
 
@@ -953,8 +955,10 @@ async def test_put_failure_retries_idempotent_cleanup_before_reporting_failure()
             del tenant_id, object_key, data, content_type
             raise RuntimeError("private storage failure")
 
-        async def delete_by_object_key(self, object_key: str) -> None:
-            del object_key
+        async def delete_by_object_key(
+            self, object_key: str, expected_sha256: str
+        ) -> None:
+            del object_key, expected_sha256
             self.delete_calls += 1
             if self.delete_calls < 3:
                 raise OSError("temporary cleanup failure")
@@ -992,8 +996,10 @@ async def test_permanent_cleanup_failure_records_bounded_recovery_item() -> None
             del tenant_id, object_key, data, content_type
             raise RuntimeError("private put detail")
 
-        async def delete_by_object_key(self, object_key: str) -> None:
-            del object_key
+        async def delete_by_object_key(
+            self, object_key: str, expected_sha256: str
+        ) -> None:
+            del object_key, expected_sha256
             raise OSError("private delete detail")
 
     class RecoverySink:
@@ -1033,8 +1039,10 @@ async def test_recovery_sink_failure_is_fixed_and_observable() -> None:
             del tenant_id, object_key, data, content_type
             raise RuntimeError("private put detail")
 
-        async def delete_by_object_key(self, object_key: str) -> None:
-            del object_key
+        async def delete_by_object_key(
+            self, object_key: str, expected_sha256: str
+        ) -> None:
+            del object_key, expected_sha256
             raise OSError("private delete detail")
 
     class FailingRecoverySink:
@@ -1075,8 +1083,10 @@ async def test_original_model_cancellation_wins_over_recovery_sink_failure(
             raise original
 
     class PermanentDeleteFailure(MemoryImageStore):
-        async def delete_by_object_key(self, object_key: str) -> None:
-            del object_key
+        async def delete_by_object_key(
+            self, object_key: str, expected_sha256: str
+        ) -> None:
+            del object_key, expected_sha256
             raise OSError("private permanent delete failure")
 
     class FailingRecoverySink:
@@ -1098,6 +1108,54 @@ async def test_original_model_cancellation_wins_over_recovery_sink_failure(
         await task
     assert captured.value is original
     assert captured.value.args == ("original-model-cancel",)
+    assert captured.value.__notes__ == ["image cleanup recovery recording failed"]
+    assert captured.value.__cause__ is None and captured.value.__context__ is None
+    assert task.cancelled()
+
+
+async def test_cleanup_cancellation_during_failed_recovery_is_rethrown_with_note() -> None:
+    class PermanentDeleteFailure(MemoryImageStore):
+        async def delete_by_object_key(
+            self, object_key: str, expected_sha256: str
+        ) -> None:
+            del object_key, expected_sha256
+            raise OSError("private permanent delete failure")
+
+    class BlockingFailingRecoverySink:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def enqueue(self, item: ImageCleanupRecoveryItem) -> None:
+            del item
+            self.started.set()
+            await self.release.wait()
+            raise RuntimeError("private recovery failure")
+
+    sink = BlockingFailingRecoverySink()
+    service = VisionService(
+        GatewayStub(response()),
+        PermanentDeleteFailure(),
+        cleanup_recovery_sink=sink,
+        cleanup_backoff_seconds=0,
+    )
+    sanitized = sanitize_image(png_bytes(), "image/png", "tenant")
+    task = asyncio.create_task(
+        service._cleanup_object(
+            sanitized.object_key,
+            hashlib.sha256(b"tenant").hexdigest(),
+            sanitized.canonical_sha256,
+            "analysis_failed",
+        )
+    )
+    await sink.started.wait()
+    task.cancel("first-cleanup-cancel")
+    await asyncio.sleep(0)
+    task.cancel("later-cleanup-cancel")
+    sink.release.set()
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await task
+    assert captured.value.args == ("first-cleanup-cancel",)
     assert captured.value.__notes__ == ["image cleanup recovery recording failed"]
     assert captured.value.__cause__ is None and captured.value.__context__ is None
     assert task.cancelled()
@@ -1127,8 +1185,10 @@ async def test_cancelled_put_with_permanent_delete_failure_queues_recovery_and_p
                 sha256=hashlib.sha256(data).hexdigest(),
             )
 
-        async def delete_by_object_key(self, object_key: str) -> None:
-            del object_key
+        async def delete_by_object_key(
+            self, object_key: str, expected_sha256: str
+        ) -> None:
+            del object_key, expected_sha256
             raise OSError("permanent private failure")
 
     store = DelayedCommittingStore()

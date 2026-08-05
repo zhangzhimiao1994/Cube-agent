@@ -547,8 +547,12 @@ class VisionService:
         del cleanup
         if cleanup_cancellation is not None:
             _clear_exception(cleanup_cancellation)
-            if original_cancellation is None and outcome is not _CleanupOutcome.RECOVERY_RECORDING_FAILED:
-                if outcome is _CleanupOutcome.RECOVERY_QUEUED:
+            if original_cancellation is None:
+                if outcome is _CleanupOutcome.RECOVERY_RECORDING_FAILED:
+                    cleanup_cancellation.add_note(
+                        "image cleanup recovery recording failed"
+                    )
+                elif outcome is _CleanupOutcome.RECOVERY_QUEUED:
                     cleanup_cancellation.add_note("image cleanup recovery queued")
                 raise cleanup_cancellation from None
             del cleanup_cancellation
@@ -563,7 +567,9 @@ class VisionService:
     ) -> _CleanupOutcome:
         for attempt in range(self._cleanup_attempts):
             try:
-                await self._object_store.delete_by_object_key(object_key)
+                await self._object_store.delete_by_object_key(
+                    object_key, canonical_sha256
+                )
             except (Exception, asyncio.CancelledError) as error:  # noqa: BLE001 - adapter
                 _clear_exception(error)
                 del error
