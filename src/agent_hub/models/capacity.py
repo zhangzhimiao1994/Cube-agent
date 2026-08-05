@@ -15,16 +15,28 @@ from uuid import uuid4
 from agent_hub.models.types import Deployment
 
 _SAFE_PREFIX = re.compile(r"^[A-Za-z0-9:_-]{1,128}$")
-_SAFE_FINGERPRINT = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
+_SAFE_FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
 _STATE_TTL_MS = 3_600_000
 
 
 class CapacityUnavailable(asyncio.TimeoutError):
-    """A bounded model-capacity wait could not obtain a lease."""
+    """Stable base class for ordinary capacity admission failures."""
+
+
+class CapacityWaitTimeout(CapacityUnavailable):
+    """The configured capacity wait deadline elapsed without a lease."""
+
+
+class CapacityQueueFull(CapacityUnavailable):
+    """The bounded local wait queue rejected admission immediately."""
 
 
 class CapacityBackendError(RuntimeError):
     """Stable fail-closed error for unavailable or malformed capacity state."""
+
+
+class CapacityConfigurationError(RuntimeError):
+    """Stable error for incomplete or conflicting non-secret capacity metadata."""
 
 
 class RedisCapacityClient(Protocol):
@@ -52,7 +64,7 @@ class CredentialDescriptor:
         if not self.secret_ref or self.secret_ref != self.secret_ref.strip():
             raise ValueError("secret_ref must be nonblank and unpadded")
         if _SAFE_FINGERPRINT.fullmatch(self.fingerprint) is None:
-            raise ValueError("credential fingerprint must be bounded safe metadata")
+            raise ValueError("credential fingerprint must be a lowercase SHA-256 digest")
 
     def __repr__(self) -> str:
         return "CredentialDescriptor(<redacted>)"
@@ -118,11 +130,16 @@ _ACQUIRE_SCRIPT = _script("acquire_lease.lua")
 _RELEASE_SCRIPT = _script("release_lease.lua")
 _RENEW_SCRIPT = _script("renew_lease.lua")
 _RECORD_OUTCOME_SCRIPT = _script("record_outcome.lua")
+_REGISTER_SCOPE_SCRIPT = _script("register_scope_policy.lua")
+_CLAIM_FINGERPRINT_SCRIPT = _script("claim_fingerprint.lua")
 _EFFECTIVE_LIMIT_SCRIPT = """
-local value = tonumber(redis.call('HGET', KEYS[1], 'effective')) or tonumber(ARGV[1])
-value = math.max(1, math.min(value, tonumber(ARGV[1])))
+local base = tonumber(redis.call('HGET', KEYS[2], 'base'))
+if base == nil or base < 1 then return redis.error_reply('model scope policy is unavailable') end
+local value = tonumber(redis.call('HGET', KEYS[1], 'effective')) or base
+value = math.max(1, math.min(value, base))
 redis.call('HSET', KEYS[1], 'effective', value)
-redis.call('PEXPIRE', KEYS[1], ARGV[2])
+redis.call('PEXPIRE', KEYS[1], ARGV[1])
+redis.call('PEXPIRE', KEYS[2], ARGV[1])
 return value
 """
 
@@ -181,7 +198,8 @@ class CapacityPool:
         self._waiters = 0
         self._waiter_lock = asyncio.Lock()
         self._scope_policies: dict[str, _ScopePolicy] = {}
-        self._fingerprint_scopes: dict[str, str] = {}
+        self._catalog_by_id: dict[str, Deployment] = {}
+        self._initialized = False
         self._observed_loads: dict[str, int] = {}
         self._weights: dict[str, int] = {}
         configured = tuple(deployments)
@@ -191,6 +209,12 @@ class CapacityPool:
         for deployment in deployments:
             if not isinstance(deployment, Deployment):
                 raise TypeError("deployments must contain only Deployment values")
+            existing_deployment = self._catalog_by_id.get(deployment.id)
+            if existing_deployment is not None and existing_deployment != deployment:
+                raise CapacityConfigurationError("deployment capacity configuration conflicts")
+            if self._initialized and existing_deployment is None:
+                raise CapacityConfigurationError("capacity catalog is already initialized")
+            self._catalog_by_id[deployment.id] = deployment
             policy = _ScopePolicy(
                 safe_operational_limit(
                     deployment.max_concurrency,
@@ -209,15 +233,64 @@ class CapacityPool:
                 )
             self._scope_policies[deployment.quota_scope_id] = policy
 
-            fingerprint = None
-            if self._credentials is not None:
-                fingerprint = self._credentials.fingerprint_for(deployment.secret_ref)
+    async def initialize(self) -> None:
+        """Atomically register a complete published catalog before serving requests.
+
+        Every worker must receive the same full catalog. Redis only converges values
+        downward, so a permissive or stale worker can never raise a scope policy.
+        """
+        if self._initialized:
+            return
+        if not self._catalog_by_id:
+            raise CapacityConfigurationError("model capacity catalog is empty")
+        if self._credentials is None:
+            raise CapacityConfigurationError("credential fingerprints are required")
+        fingerprint_scopes: dict[str, str] = {}
+        deployment_fingerprints: list[tuple[Deployment, str]] = []
+        for deployment in self._catalog_by_id.values():
+            fingerprint = self._credentials.fingerprint_for(deployment.secret_ref)
             if fingerprint is None:
-                fingerprint = hashlib.sha256(deployment.secret_ref.encode("utf-8")).hexdigest()
-            previous_scope = self._fingerprint_scopes.get(fingerprint)
+                raise CapacityConfigurationError("credential fingerprint metadata is incomplete")
+            previous_scope = fingerprint_scopes.get(fingerprint)
             if previous_scope is not None and previous_scope != deployment.quota_scope_id:
-                raise ValueError("credential fingerprint is assigned to conflicting quota scopes")
-            self._fingerprint_scopes[fingerprint] = deployment.quota_scope_id
+                raise CapacityConfigurationError("credential fingerprint quota scope conflicts")
+            fingerprint_scopes[fingerprint] = deployment.quota_scope_id
+            deployment_fingerprints.append((deployment, fingerprint))
+        try:
+            for deployment, fingerprint in deployment_fingerprints:
+                claimed = await self._redis.eval(
+                    _CLAIM_FINGERPRINT_SCRIPT,
+                    1,
+                    self._fingerprint_key(fingerprint),
+                    self._scope_digest(deployment.quota_scope_id),
+                    _STATE_TTL_MS,
+                )
+                if int(cast(int | bytes | str, claimed)) != 1:
+                    raise CapacityConfigurationError(
+                        "credential fingerprint quota scope conflicts"
+                    )
+            for quota_scope_id, policy in self._scope_policies.items():
+                result = await self._redis.eval(
+                    _REGISTER_SCOPE_SCRIPT,
+                    1,
+                    self._keys(quota_scope_id)["policy"],
+                    policy.base_limit,
+                    policy.rpm or 0,
+                    policy.tpm or 0,
+                    _STATE_TTL_MS,
+                )
+                self._integer_result(result, 3)
+        except asyncio.CancelledError:
+            raise
+        except CapacityConfigurationError:
+            raise
+        except Exception:  # noqa: BLE001 - initialization fails closed without Redis details
+            raise CapacityBackendError("model capacity backend unavailable") from None
+        self._initialized = True
+
+    def _require_initialized(self) -> None:
+        if not self._initialized:
+            raise CapacityConfigurationError("model capacity pool is not initialized")
 
     async def acquire(
         self,
@@ -240,10 +313,13 @@ class CapacityPool:
             raise ValueError("wait_timeout must be nonnegative and finite")
         if type(estimated_tokens) is not int or estimated_tokens <= 0:
             raise ValueError("estimated_tokens must be a strict positive integer")
-        self.validate_configuration(ordered)
+        self._require_initialized()
+        for candidate in ordered:
+            if self._catalog_by_id.get(candidate.id) != candidate:
+                raise CapacityConfigurationError("candidate is outside initialized catalog")
         async with self._waiter_lock:
             if self._waiters >= self._max_waiters:
-                raise CapacityUnavailable("model capacity queue is full")
+                raise CapacityQueueFull("model capacity queue is full")
             self._waiters += 1
         try:
             deadline = asyncio.get_running_loop().time() + float(wait_timeout)
@@ -254,7 +330,7 @@ class CapacityPool:
                         return lease
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
-                    raise CapacityUnavailable("model capacity queue timeout")
+                    raise CapacityWaitTimeout("model capacity queue timeout")
                 await asyncio.sleep(min(self._poll_interval, remaining))
         finally:
             async with self._waiter_lock:
@@ -290,22 +366,19 @@ class CapacityPool:
     async def _try_acquire(
         self, deployment: Deployment, estimated_tokens: int
     ) -> CapacityLease | None:
-        policy = self._scope_policies[deployment.quota_scope_id]
         lease_id = str(uuid4())
         keys = self._keys(deployment.quota_scope_id)
         try:
             result = await self._redis.eval(
                 _ACQUIRE_SCRIPT,
-                4,
+                5,
                 keys["leases"],
                 keys["rpm"],
                 keys["tpm"],
                 keys["health"],
+                keys["policy"],
                 lease_id,
                 self._lease_ms,
-                policy.base_limit,
-                policy.rpm or 0,
-                policy.tpm or 0,
                 estimated_tokens,
                 _STATE_TTL_MS,
             )
@@ -396,14 +469,17 @@ class CapacityPool:
         *,
         status_code: int | None,
         latency_seconds: float,
+        succeeded: bool,
     ) -> None:
-        policy = self._scope_policies.get(quota_scope_id)
-        if policy is None:
+        self._require_initialized()
+        if quota_scope_id not in self._scope_policies:
             raise ValueError("unknown quota scope")
         if status_code is not None and (
             type(status_code) is not int or not 100 <= status_code <= 599
         ):
             raise ValueError("status_code must be None or between 100 and 599")
+        if type(succeeded) is not bool:
+            raise ValueError("succeeded must be a boolean")
         if (
             isinstance(latency_seconds, bool)
             or not isinstance(latency_seconds, int | float)
@@ -415,11 +491,12 @@ class CapacityPool:
         try:
             result = await self._redis.eval(
                 _RECORD_OUTCOME_SCRIPT,
-                2,
+                3,
                 keys["health"],
                 keys["latency"],
-                policy.base_limit,
+                keys["policy"],
                 status_code or 0,
+                int(succeeded),
                 math.ceil(latency_seconds * 1000),
                 self._cooldown_ms,
                 self._latency_threshold_ms,
@@ -435,15 +512,16 @@ class CapacityPool:
             raise CapacityBackendError("model capacity backend unavailable") from None
 
     async def effective_limit(self, quota_scope_id: str) -> int:
+        self._require_initialized()
         policy = self._scope_policies.get(quota_scope_id)
         if policy is None:
             raise ValueError("unknown quota scope")
         try:
             result = await self._redis.eval(
                 _EFFECTIVE_LIMIT_SCRIPT,
-                1,
+                2,
                 self._keys(quota_scope_id)["health"],
-                policy.base_limit,
+                self._keys(quota_scope_id)["policy"],
                 _STATE_TTL_MS,
             )
             value = int(cast(int | bytes | str, result))
@@ -451,7 +529,7 @@ class CapacityPool:
             raise
         except Exception:  # noqa: BLE001 - capacity must fail closed and redact Redis details
             raise CapacityBackendError("model capacity backend unavailable") from None
-        if not 1 <= value <= policy.base_limit:
+        if value < 1:
             raise CapacityBackendError("model capacity backend returned invalid state")
         return value
 
@@ -465,7 +543,16 @@ class CapacityPool:
             "tpm": root + "tpm",
             "health": root + "health",
             "latency": root + "latency",
+            "policy": root + "policy",
         }
+
+    @staticmethod
+    def _scope_digest(quota_scope_id: str) -> str:
+        return hashlib.sha256(quota_scope_id.encode("utf-8")).hexdigest()
+
+    def _fingerprint_key(self, fingerprint: str) -> str:
+        digest = hashlib.sha256(fingerprint.encode("ascii")).hexdigest()
+        return f"{self._key_prefix}credential:{{{digest}}}:scope"
 
     @staticmethod
     def _integer_result(result: object, length: int) -> tuple[int, ...]:

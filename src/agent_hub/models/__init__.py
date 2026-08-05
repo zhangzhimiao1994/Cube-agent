@@ -2,9 +2,12 @@
 
 from agent_hub.models.capacity import (
     CapacityBackendError,
+    CapacityConfigurationError,
     CapacityLease,
     CapacityPool,
+    CapacityQueueFull,
     CapacityUnavailable,
+    CapacityWaitTimeout,
     CredentialDescriptor,
     CredentialRegistry,
     safe_operational_limit,
@@ -34,9 +37,12 @@ from agent_hub.models.types import (
 
 __all__ = [
     "CapacityBackendError",
+    "CapacityConfigurationError",
     "CapacityLease",
     "CapacityPool",
+    "CapacityQueueFull",
     "CapacityUnavailable",
+    "CapacityWaitTimeout",
     "ConservativeTokenEstimator",
     "CredentialDescriptor",
     "CredentialRegistry",

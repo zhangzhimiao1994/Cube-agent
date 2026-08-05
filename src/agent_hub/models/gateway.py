@@ -12,6 +12,7 @@ from agent_hub.models.capacity import (
     CapacityLease,
     CapacityPool,
     CapacityUnavailable,
+    CapacityWaitTimeout,
 )
 from agent_hub.models.litellm_client import ModelTransportError
 from agent_hub.models.registry import ModelRegistry, NoCapableDeployment
@@ -37,6 +38,8 @@ class TokenEstimator(Protocol):
 
 
 class CapacityController(Protocol):
+    async def initialize(self) -> None: ...
+
     def validate_configuration(self, deployments: Sequence[Deployment]) -> None: ...
 
     async def acquire(
@@ -57,6 +60,7 @@ class CapacityController(Protocol):
         *,
         status_code: int | None,
         latency_seconds: float,
+        succeeded: bool,
     ) -> None: ...
 
 
@@ -144,6 +148,7 @@ class ModelGateway:
                 current = fallbacks[current]
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
+        await self._capacity.initialize()
         estimated_tokens = self._token_estimator.estimate(request)
         if type(estimated_tokens) is not int or estimated_tokens <= 0:
             raise ValueError("token estimator must return a strict positive integer")
@@ -165,7 +170,7 @@ class ModelGateway:
                     self._capacity_wait_timeout,
                     estimated_tokens=estimated_tokens,
                 )
-            except CapacityUnavailable:
+            except CapacityWaitTimeout:
                 continue
             selected = next(
                 (item for item in candidates if item.id == lease.deployment_id), None
@@ -230,6 +235,7 @@ class ModelGateway:
                         lease.quota_scope_id,
                         status_code=status_code,
                         latency_seconds=latency,
+                        succeeded=response is not None,
                     )
                 except asyncio.CancelledError as error:
                     if primary_error is None:

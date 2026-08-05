@@ -4,7 +4,13 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from agent_hub.models.capacity import CapacityLease, CapacityUnavailable
+from agent_hub.models.capacity import (
+    CapacityBackendError,
+    CapacityLease,
+    CapacityQueueFull,
+    CapacityUnavailable,
+    CapacityWaitTimeout,
+)
 from agent_hub.models.gateway import (
     ConservativeTokenEstimator,
     ModelGateway,
@@ -55,12 +61,18 @@ class CapacityStub:
         self.events: list[object] = []
         self.releases: list[CapacityLease] = []
         self.renews = 0
-        self.records: list[tuple[str, int | None, float]] = []
+        self.records: list[tuple[str, int | None, float, bool]] = []
         self.configured: tuple[Deployment, ...] = ()
         self.record_error: Exception | None = None
         self.release_error: Exception | None = None
         self.release_block: asyncio.Event | None = None
         self.release_started = asyncio.Event()
+        self.initialize_calls = 0
+        self.initialized = False
+
+    async def initialize(self) -> None:
+        self.initialize_calls += 1
+        self.initialized = True
 
     def validate_configuration(self, deployments: Sequence[Deployment]) -> None:
         self.configured = tuple(deployments)
@@ -72,6 +84,7 @@ class CapacityStub:
         *,
         estimated_tokens: int,
     ) -> CapacityLease:
+        assert self.initialized is True
         self.events.append(
             ("acquire", tuple(item.id for item in candidates), wait_timeout, estimated_tokens)
         )
@@ -101,9 +114,14 @@ class CapacityStub:
         )
 
     async def record_outcome(
-        self, quota_scope_id: str, *, status_code: int | None, latency_seconds: float
+        self,
+        quota_scope_id: str,
+        *,
+        status_code: int | None,
+        latency_seconds: float,
+        succeeded: bool,
     ) -> None:
-        self.records.append((quota_scope_id, status_code, latency_seconds))
+        self.records.append((quota_scope_id, status_code, latency_seconds, succeeded))
         if self.record_error is not None:
             raise self.record_error
 
@@ -190,9 +208,10 @@ async def test_gateway_acquires_before_resolving_selected_deployment_secret() ->
     assert events[1] == ("resolve", "secret://beta")
     assert transport.calls[0][0] is beta
     assert transport.calls[0][2] == "key-for-secret://beta"
-    assert capacity.records == [("scope-beta", 200, 0.25)]
+    assert capacity.records == [("scope-beta", 200, 0.25, True)]
     assert capacity.releases == [selected_lease]
     assert capacity.configured == (alpha, beta)
+    assert capacity.initialize_calls == 1
 
 
 async def test_secret_resolution_failure_is_redacted_and_releases() -> None:
@@ -228,10 +247,32 @@ async def test_429_status_and_latency_are_recorded_and_release_occurs() -> None:
         await gateway.complete(request())
 
     assert len(capacity.records) == 1
-    recorded_scope, recorded_status, recorded_latency = capacity.records[0]
-    assert (recorded_scope, recorded_status) == ("scope-selected", 429)
+    recorded_scope, recorded_status, recorded_latency, succeeded = capacity.records[0]
+    assert (recorded_scope, recorded_status, succeeded) == ("scope-selected", 429, False)
     assert recorded_latency == pytest.approx(0.4)
     assert len(capacity.releases) == 1
+
+
+@pytest.mark.parametrize("status_code", [None, 500])
+async def test_transport_failure_never_records_success(status_code: int | None) -> None:
+    selected = deployment("selected")
+    capacity = CapacityStub([lease("selected")])
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        SecretStub(capacity.events),
+        TransportStub(
+            capacity.events,
+            failure=ModelTransportError("safe failure", status_code=status_code),
+        ),
+    )
+
+    with pytest.raises(ModelTransportError):
+        await gateway.complete(request())
+
+    assert len(capacity.records) == 1
+    assert capacity.records[0][1] == status_code
+    assert capacity.records[0][3] is False
 
 
 async def test_typed_transport_error_traceback_drops_transport_key_locals() -> None:
@@ -344,7 +385,7 @@ async def test_long_call_renews_lease_until_nonstream_response_finishes() -> Non
 async def test_capacity_timeout_traverses_fallback_only_when_allowed() -> None:
     primary = deployment("primary-key")
     backup = deployment("backup-key", "backup")
-    capacity = CapacityStub([CapacityUnavailable("busy"), lease("backup-key")])
+    capacity = CapacityStub([CapacityWaitTimeout("busy"), lease("backup-key")])
     gateway = ModelGateway(
         ModelRegistry([primary, backup]),
         capacity,
@@ -365,7 +406,7 @@ async def test_capacity_timeout_traverses_fallback_only_when_allowed() -> None:
 async def test_no_fallback_when_request_disallows_it() -> None:
     primary = deployment("primary-key")
     backup = deployment("backup-key", "backup")
-    capacity = CapacityStub([CapacityUnavailable("busy")])
+    capacity = CapacityStub([CapacityWaitTimeout("busy")])
     gateway = ModelGateway(
         ModelRegistry([primary, backup]),
         capacity,
@@ -384,7 +425,7 @@ async def test_fallback_must_satisfy_request_capabilities() -> None:
         "primary-key", capabilities=frozenset({ModelCapability.TEXT, ModelCapability.VISION})
     )
     backup = deployment("backup-key", "backup")
-    capacity = CapacityStub([CapacityUnavailable("busy")])
+    capacity = CapacityStub([CapacityWaitTimeout("busy")])
     gateway = ModelGateway(
         ModelRegistry([primary, backup]),
         capacity,
@@ -395,6 +436,27 @@ async def test_fallback_must_satisfy_request_capabilities() -> None:
 
     with pytest.raises(CapacityUnavailable, match="model capacity unavailable"):
         await gateway.complete(request(required=frozenset({ModelCapability.VISION})))
+    assert len([event for event in capacity.events if event[0] == "acquire"]) == 1  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [CapacityQueueFull("full"), CapacityBackendError("backend unavailable")],
+)
+async def test_immediate_capacity_failure_does_not_fallback(failure: Exception) -> None:
+    primary = deployment("primary-key")
+    backup = deployment("backup-key", "backup")
+    capacity = CapacityStub([failure])
+    gateway = ModelGateway(
+        ModelRegistry([primary, backup]),
+        capacity,
+        SecretStub(capacity.events),
+        TransportStub(capacity.events),
+        fallbacks={"primary": "backup"},
+    )
+
+    with pytest.raises(type(failure)):
+        await gateway.complete(request())
     assert len([event for event in capacity.events if event[0] == "acquire"]) == 1  # type: ignore[index]
 
 
