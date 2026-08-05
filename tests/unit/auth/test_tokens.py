@@ -5,7 +5,7 @@ import jwt
 import pytest
 
 from agent_hub.auth.models import Role
-from agent_hub.auth.tokens import AccessTokenService, InvalidTokenError
+from agent_hub.auth.tokens import AccessTokenService, InvalidTokenError, TokenBackendError
 
 NOW = datetime(2026, 8, 5, 0, 0, tzinfo=UTC)
 KEY = b"k" * 32
@@ -82,6 +82,53 @@ def test_short_signing_key_is_rejected() -> None:
     key = b"development-only-change-me"
     with pytest.raises(ValueError, match="at least 32 bytes") as captured:
         AccessTokenService(key)
+    _assert_production_frames_do_not_contain(captured.value, key)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        b"-----BEGIN PRIVATE KEY-----\nnot-real-but-long-enough",
+        b"ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCfake",
+        b'{"kty":"RSA","n":"fake-material-long-enough"}',
+    ],
+)
+def test_hs256_rejects_asymmetric_key_material_without_retaining_it(key: bytes) -> None:
+    with pytest.raises(ValueError, match="symmetric") as captured:
+        AccessTokenService(key)
+
+    _assert_production_frames_do_not_contain(captured.value, key)
+
+
+def test_actual_pyjwt_encode_error_is_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = b"sensitive-signing-key-material!!"
+    service = AccessTokenService(key, clock=lambda: NOW)
+
+    def fail_encode(*args: object, **kwargs: object) -> str:
+        raise jwt.InvalidKeyError("forced invalid key")
+
+    monkeypatch.setattr(jwt, "encode", fail_encode)
+    with pytest.raises(TokenBackendError, match="token backend failed") as captured:
+        service.encode(uuid4(), uuid4(), Role.VIEWER)
+
+    _assert_production_frames_do_not_contain(captured.value, key)
+
+
+def test_unknown_jwt_runtime_propagates_without_retaining_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = b"sensitive-signing-key-material!!"
+    service = AccessTokenService(key, clock=lambda: NOW)
+
+    def fail_encode(*args: object, **kwargs: object) -> str:
+        raise RuntimeError("forced unknown token failure")
+
+    monkeypatch.setattr(jwt, "encode", fail_encode)
+    with pytest.raises(RuntimeError, match="forced unknown token failure") as captured:
+        service.encode(uuid4(), uuid4(), Role.VIEWER)
+
     _assert_production_frames_do_not_contain(captured.value, key)
 
 

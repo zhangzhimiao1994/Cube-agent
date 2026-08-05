@@ -6,8 +6,8 @@ import threading
 from collections.abc import Callable
 from typing import Final, NoReturn
 
-from argon2 import PasswordHasher
-from argon2.exceptions import InvalidHashError, VerificationError
+from argon2 import PasswordHasher, extract_parameters
+from argon2.exceptions import HashingError, InvalidHashError, VerificationError
 from argon2.low_level import Type
 
 from agent_hub.auth.models import AuthenticationBusy
@@ -16,9 +16,9 @@ _MIN_PASSWORD_CHARS = 12
 _MAX_PASSWORD_CHARS = 1024
 _MAX_PASSWORD_BYTES = 4096
 _MAX_HASH_CHARS = 512
-_MAX_MEMORY_COST = 262_144
-_MAX_TIME_COST = 10
-_MAX_PARALLELISM = 16
+_MAX_MEMORY_COST = 65_536
+_MAX_TIME_COST = 5
+_MAX_PARALLELISM = 4
 _ARGON2ID_ENCODING = re.compile(
     r"\$argon2id\$v=(?P<version>[0-9]+)\$"
     r"m=(?P<memory>[0-9]+),t=(?P<time>[0-9]+),p=(?P<parallelism>[0-9]+)\$"
@@ -26,9 +26,19 @@ _ARGON2ID_ENCODING = re.compile(
 )
 _BUSY: Final[object] = object()
 _CANCELLED: Final[object] = object()
+_BACKEND_FAILURE: Final[object] = object()
+_DUMMY_PASSWORD = "agent hub dummy password value"
+_DEFAULT_DUMMY_HASH = (
+    "$argon2id$v=19$m=65536,t=3,p=4$/UuOtaxqYGUC5cqERobfOA$"
+    "ejLTLxTVcey4qaTa6Jf3zCiI8k6qjqbuZQXIrdfR/i4"
+)
 
 
 class PasswordValidationError(ValueError):
+    pass
+
+
+class PasswordBackendError(RuntimeError):
     pass
 
 
@@ -37,6 +47,7 @@ class PasswordService:
         self,
         hasher: PasswordHasher | None = None,
         *,
+        dummy_hash: str | None = None,
         max_concurrency: int = 2,
         max_waiters: int = 4,
         acquire_timeout_seconds: float = 0.1,
@@ -55,6 +66,7 @@ class PasswordService:
             raise ValueError("max_waiters must be a non-negative integer")
         if not 0 < acquire_timeout_seconds <= 5:
             raise ValueError("acquire timeout must be between 0 and 5 seconds")
+        supplied_hasher = hasher is not None
         self._hasher = hasher or PasswordHasher(
             time_cost=3,
             memory_cost=65_536,
@@ -63,6 +75,33 @@ class PasswordService:
             salt_len=16,
             type=Type.ID,
         )
+        if (
+            self._hasher.memory_cost > _MAX_MEMORY_COST
+            or self._hasher.time_cost > _MAX_TIME_COST
+            or self._hasher.parallelism > _MAX_PARALLELISM
+        ):
+            raise ValueError("Argon2 profile exceeds the configured per-worker budget")
+        if dummy_hash is None and not supplied_hasher:
+            dummy_hash = _DEFAULT_DUMMY_HASH
+        elif dummy_hash is None:
+            dummy_hasher = PasswordHasher(
+                time_cost=self._hasher.time_cost,
+                memory_cost=self._hasher.memory_cost,
+                parallelism=self._hasher.parallelism,
+                hash_len=self._hasher.hash_len,
+                salt_len=self._hasher.salt_len,
+                encoding=self._hasher.encoding,
+                type=self._hasher.type,
+            )
+            generated = _try_hash(dummy_hasher, _DUMMY_PASSWORD)
+            del dummy_hasher
+            if generated is _BACKEND_FAILURE:
+                _raise_password_backend_error()
+            assert isinstance(generated, str)
+            dummy_hash = generated
+        if not _dummy_matches_hasher_profile(dummy_hash, self._hasher):
+            raise ValueError("dummy hash must match the configured Argon2 profile")
+        self._dummy_hash = dummy_hash
         self._work_slots = threading.BoundedSemaphore(max_concurrency)
         self._admission_lock = threading.Lock()
         self._admission_capacity = max_concurrency + max_waiters
@@ -73,17 +112,34 @@ class PasswordService:
         if not _is_valid_password(password):
             del password
             _raise_password_validation_error()
-        return self._hasher.hash(password)
+        try:
+            outcome = _try_hash(self._hasher, password)
+        finally:
+            del password
+        if outcome is _BACKEND_FAILURE:
+            del outcome
+            _raise_password_backend_error()
+        assert isinstance(outcome, str)
+        return outcome
+
+    @property
+    def dummy_hash(self) -> str:
+        return self._dummy_hash
 
     async def hash_async(self, password: str) -> str:
         if not _is_valid_password(password):
             del password
             _raise_password_validation_error()
-        outcome = await self._run_bounded(self._hasher.hash, password)
-        del password
+        try:
+            outcome = await self._run_bounded(_try_hash, self._hasher, password)
+        finally:
+            del password
         if outcome is _CANCELLED:
             del outcome
             _raise_cancelled()
+        if outcome is _BACKEND_FAILURE:
+            del outcome
+            _raise_password_backend_error()
         if outcome is _BUSY:
             del outcome
             _raise_authentication_busy()
@@ -93,15 +149,20 @@ class PasswordService:
     def verify(self, password_hash: str, password: str) -> bool:
         if not _is_safe_argon2id_encoding(password_hash) or not _is_valid_password(password):
             return False
-        return self._verify_prevalidated(password_hash, password)
+        try:
+            return self._verify_prevalidated(password_hash, password)
+        finally:
+            del password_hash, password
 
     async def verify_async(self, password_hash: str, password: str) -> bool:
         if not _is_safe_argon2id_encoding(password_hash) or not _is_valid_password(password):
             return False
-        outcome = await self._run_bounded(
-            self._verify_prevalidated, password_hash, password
-        )
-        del password_hash, password
+        try:
+            outcome = await self._run_bounded(
+                self._verify_prevalidated, password_hash, password
+            )
+        finally:
+            del password_hash, password
         if outcome is _CANCELLED:
             del outcome
             _raise_cancelled()
@@ -124,20 +185,26 @@ class PasswordService:
             return self._hasher.verify(password_hash, password)
         except (VerificationError, InvalidHashError, TypeError, ValueError):
             return False
+        finally:
+            del password_hash, password
 
     async def _run_bounded(
         self, operation: Callable[..., object], *args: object
     ) -> object:
-        if not self._try_admit():
-            return _BUSY
-        worker = asyncio.create_task(
-            asyncio.to_thread(self._run_admitted, operation, args)
-        )
+        worker = None
         try:
-            return await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            worker.add_done_callback(_retrieve_background_result)
-            return _CANCELLED
+            if not self._try_admit():
+                return _BUSY
+            worker = asyncio.create_task(
+                asyncio.to_thread(self._run_admitted, operation, args)
+            )
+            try:
+                return await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                worker.add_done_callback(_retrieve_background_result)
+                return _CANCELLED
+        finally:
+            del args, operation, worker
 
     def _try_admit(self) -> bool:
         with self._admission_lock:
@@ -149,8 +216,9 @@ class PasswordService:
     def _run_admitted(
         self, operation: Callable[..., object], args: tuple[object, ...]
     ) -> object:
-        acquired = self._work_slots.acquire(timeout=self._acquire_timeout_seconds)
+        acquired = False
         try:
+            acquired = self._work_slots.acquire(timeout=self._acquire_timeout_seconds)
             if not acquired:
                 return _BUSY
             return operation(*args)
@@ -160,6 +228,7 @@ class PasswordService:
             with self._admission_lock:
                 assert self._admitted > 0
                 self._admitted -= 1
+            del args, operation
 
 
 def _is_valid_password(password: object) -> bool:
@@ -176,6 +245,15 @@ def _is_valid_password(password: object) -> bool:
     return len(encoded) <= _MAX_PASSWORD_BYTES
 
 
+def _try_hash(hasher: PasswordHasher, password: str) -> str | object:
+    try:
+        return hasher.hash(password)
+    except HashingError:
+        return _BACKEND_FAILURE
+    finally:
+        del password
+
+
 def _is_safe_argon2id_encoding(password_hash: object) -> bool:
     if not isinstance(password_hash, str) or len(password_hash) > _MAX_HASH_CHARS:
         return False
@@ -190,6 +268,24 @@ def _is_safe_argon2id_encoding(password_hash: object) -> bool:
     )
 
 
+def _dummy_matches_hasher_profile(dummy_hash: object, hasher: PasswordHasher) -> bool:
+    if not _is_safe_argon2id_encoding(dummy_hash):
+        return False
+    assert isinstance(dummy_hash, str)
+    try:
+        parameters = extract_parameters(dummy_hash)
+    except InvalidHashError:
+        return False
+    return (
+        parameters.type is hasher.type
+        and parameters.time_cost == hasher.time_cost
+        and parameters.memory_cost == hasher.memory_cost
+        and parameters.parallelism == hasher.parallelism
+        and parameters.hash_len == hasher.hash_len
+        and parameters.salt_len == hasher.salt_len
+    )
+
+
 def _raise_password_validation_error() -> NoReturn:
     raise PasswordValidationError(
         "password must be a non-blank UTF-8 string of 12-1024 characters and at most 4096 bytes"
@@ -198,6 +294,10 @@ def _raise_password_validation_error() -> NoReturn:
 
 def _raise_authentication_busy() -> NoReturn:
     raise AuthenticationBusy("authentication is busy")
+
+
+def _raise_password_backend_error() -> NoReturn:
+    raise PasswordBackendError("password backend failed")
 
 
 def _raise_cancelled() -> NoReturn:

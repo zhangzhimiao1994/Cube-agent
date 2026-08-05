@@ -8,7 +8,7 @@ import secrets
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from enum import Enum, auto
-from typing import Final, NoReturn
+from typing import NoReturn
 from uuid import UUID, uuid4
 
 from sqlalchemy import select, text, update
@@ -27,8 +27,12 @@ from agent_hub.auth.models import (
     Role,
     UsernameValidationError,
 )
-from agent_hub.auth.passwords import PasswordService, PasswordValidationError
-from agent_hub.auth.tokens import AccessTokenService, InvalidTokenError
+from agent_hub.auth.passwords import (
+    PasswordBackendError,
+    PasswordService,
+    PasswordValidationError,
+)
+from agent_hub.auth.tokens import AccessTokenService, InvalidTokenError, TokenBackendError
 from agent_hub.db.models import BootstrapCodeRow, UserRow
 
 _BOOTSTRAP_BYTES = 32
@@ -37,10 +41,6 @@ _USERNAME_PATTERN = re.compile(r"[a-z][a-z0-9_-]{2,63}\Z")
 _MIN_BOOTSTRAP_TTL_SECONDS = 60
 _MAX_BOOTSTRAP_TTL_SECONDS = 3600
 _BOOTSTRAP_LOCK_KEY = 0x4148554241555448
-_DUMMY_PASSWORD_HASH: Final[str] = (
-    "$argon2id$v=19$m=65536,t=3,p=4$/UuOtaxqYGUC5cqERobfOA$"
-    "ejLTLxTVcey4qaTa6Jf3zCiI8k6qjqbuZQXIrdfR/i4"
-)
 _INVALID_BOOTSTRAP_HASH = hashlib.sha256(b"invalid-bootstrap-code").hexdigest()
 
 
@@ -99,6 +99,8 @@ class AuthService:
         return outcome
 
     async def _try_issue_bootstrap_code(self, ttl_seconds: int) -> str | _Failure:
+        code = None
+        session = None
         try:
             async with self._session_factory() as session, session.begin():
                 await _lock_bootstrap(session)
@@ -115,19 +117,22 @@ class AuthService:
                     )
                 )
                 await session.flush()
+            assert isinstance(code, str)
             return code
         except SQLAlchemyError:
             return _Failure.PERSISTENCE
         except asyncio.CancelledError:
             return _Failure.CANCELLED
-        except RuntimeError:
-            return _Failure.OPERATION
+        finally:
+            del code, session
 
     async def consume_bootstrap_code(
         self, code: str, username: str, password: str
     ) -> AuthResult:
-        outcome = await self._try_consume_bootstrap_code(code, username, password)
-        del code, username, password
+        try:
+            outcome = await self._try_consume_bootstrap_code(code, username, password)
+        finally:
+            del code, username, password
         if isinstance(outcome, AuthResult):
             return outcome
         failure = outcome
@@ -156,12 +161,21 @@ class AuthService:
     async def _try_consume_bootstrap_code(
         self, code: object, username: object, password: object
     ) -> AuthResult | _Failure:
-        if not _is_valid_username(username):
-            return _Failure.INVALID_USERNAME
-        assert isinstance(username, str)
-        code_hash = _try_hash_canonical_bootstrap_code(code)
-        lookup_hash = code_hash or _INVALID_BOOTSTRAP_HASH
+        access_token = None
+        code_hash = None
+        lookup_hash = None
+        password_hash = None
+        principal = None
+        result = None
+        row = None
+        session = None
+        user_id = None
         try:
+            if not _is_valid_username(username):
+                return _Failure.INVALID_USERNAME
+            assert isinstance(username, str)
+            code_hash = _try_hash_canonical_bootstrap_code(code)
+            lookup_hash = code_hash or _INVALID_BOOTSTRAP_HASH
             async with self._session_factory() as session, session.begin():
                 await _lock_bootstrap(session)
                 if await _has_super_admin(session):
@@ -183,6 +197,8 @@ class AuthService:
                     return _Failure.INVALID_PASSWORD
                 except AuthenticationBusy:
                     return _Failure.BUSY
+                except PasswordBackendError:
+                    return _Failure.OPERATION
                 user_id = uuid4()
                 principal = AuthenticatedPrincipal(
                     user_id=user_id,
@@ -209,14 +225,29 @@ class AuthService:
             return _Failure.PERSISTENCE
         except asyncio.CancelledError:
             return _Failure.CANCELLED
-        except RuntimeError:
-            return _Failure.OPERATION
+        finally:
+            del (
+                access_token,
+                code,
+                code_hash,
+                lookup_hash,
+                password,
+                password_hash,
+                principal,
+                result,
+                row,
+                session,
+                user_id,
+                username,
+            )
 
     async def login(
         self, tenant_id: UUID, username: str, password: str
     ) -> AuthResult:
-        outcome = await self._try_login(tenant_id, username, password)
-        del username, password
+        try:
+            outcome = await self._try_login(tenant_id, username, password)
+        finally:
+            del username, password
         if isinstance(outcome, AuthResult):
             return outcome
         failure = outcome
@@ -239,6 +270,17 @@ class AuthService:
     async def _try_login(
         self, tenant_id: object, username: object, password: object
     ) -> AuthResult | _Failure:
+        access_token = None
+        changed = None
+        new_hash = None
+        old_hash = None
+        principal = None
+        result = None
+        role = None
+        row = None
+        session = None
+        statement = None
+        verified = False
         try:
             async with self._session_factory() as session, session.begin():
                 row = None
@@ -252,7 +294,7 @@ class AuthService:
                 old_hash = (
                     row.password_hash
                     if row is not None and row.password_hash is not None
-                    else _DUMMY_PASSWORD_HASH
+                    else self._passwords.dummy_hash
                 )
                 try:
                     verified = await self._passwords.verify_async(
@@ -260,6 +302,8 @@ class AuthService:
                     )
                 except AuthenticationBusy:
                     return _Failure.BUSY
+                except PasswordBackendError:
+                    return _Failure.OPERATION
                 if row is None or row.password_hash is None or not verified:
                     return _Failure.INVALID_CREDENTIALS
                 try:
@@ -275,6 +319,8 @@ class AuthService:
                         new_hash = await self._passwords.hash_async(password)  # type: ignore[arg-type]
                     except (AuthenticationBusy, PasswordValidationError):
                         return _Failure.BUSY
+                    except PasswordBackendError:
+                        return _Failure.OPERATION
                     statement = (
                         update(UserRow)
                         .where(UserRow.id == row.id, UserRow.password_hash == old_hash)
@@ -290,8 +336,23 @@ class AuthService:
             return _Failure.PERSISTENCE
         except asyncio.CancelledError:
             return _Failure.CANCELLED
-        except RuntimeError:
-            return _Failure.OPERATION
+        finally:
+            del (
+                access_token,
+                changed,
+                new_hash,
+                old_hash,
+                password,
+                principal,
+                result,
+                role,
+                row,
+                session,
+                statement,
+                tenant_id,
+                username,
+                verified,
+            )
 
     def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
         principal = _try_decode_principal(self._tokens, token)
@@ -322,7 +383,7 @@ def _try_encode_token(
         return token_service.encode(
             principal.user_id, principal.tenant_id, principal.role
         )
-    except (TypeError, ValueError, RuntimeError):
+    except TokenBackendError:
         return None
 
 

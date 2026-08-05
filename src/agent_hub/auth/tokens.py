@@ -24,9 +24,14 @@ _REQUIRED_CLAIMS: Final[tuple[str, ...]] = (
     "aud",
     "jti",
 )
+_TOKEN_BACKEND_FAILURE: Final[object] = object()
 
 
 class InvalidTokenError(RuntimeError):
+    pass
+
+
+class TokenBackendError(RuntimeError):
     pass
 
 
@@ -105,7 +110,7 @@ class AccessTokenService:
             raise TypeError("access token subject, tenant, and role are invalid")
         now = _utc_clock_value(self._clock())
         expires_at = now + timedelta(seconds=ttl_seconds)
-        payload = {
+        payload: dict[str, object] = {
             "sub": str(user_id),
             "tenant_id": str(tenant_id),
             "role": role.value,
@@ -115,7 +120,15 @@ class AccessTokenService:
             "aud": self._audience,
             "jti": str(uuid4()),
         }
-        return jwt.encode(payload, self._key, algorithm=self._algorithm)
+        try:
+            outcome = _try_jwt_encode(payload, self._key, self._algorithm)
+        finally:
+            del payload
+        if outcome is _TOKEN_BACKEND_FAILURE:
+            del outcome
+            _raise_token_backend_error()
+        assert isinstance(outcome, str)
+        return outcome
 
     def decode(self, token: str) -> DecodedAccessToken:
         payload = self._try_decode(token)
@@ -197,9 +210,31 @@ def _try_validated_key(signing_key: object) -> tuple[bytes | None, str | None]:
         key = signing_key
     else:
         return None, "access token signing key must be bytes or text"
+    if _looks_asymmetric(key):
+        return None, "HS256 signing key must be symmetric key material"
     if len(key) < 32:
         return None, "access token signing key must be at least 32 bytes"
     return key, None
+
+
+def _looks_asymmetric(key: bytes) -> bool:
+    candidate = key.lstrip().lower()
+    return (
+        candidate.startswith((b"-----begin ", b"ssh-", b"ecdsa-sha2-"))
+        or (candidate.startswith(b"{") and b'"kty"' in candidate)
+    )
+
+
+def _try_jwt_encode(
+    payload: dict[str, object], key: bytes, algorithm: str
+) -> str | object:
+    try:
+        try:
+            return jwt.encode(payload, key, algorithm=algorithm)
+        except jwt.PyJWTError:
+            return _TOKEN_BACKEND_FAILURE
+    finally:
+        del algorithm, key, payload
 
 
 def _configuration_error(
@@ -229,6 +264,10 @@ def _raise_token_configuration_error(message: str) -> None:
 
 def _raise_invalid_token() -> NoReturn:
     raise InvalidTokenError("invalid access token")
+
+
+def _raise_token_backend_error() -> NoReturn:
+    raise TokenBackendError("token backend failed")
 
 
 def _utc_clock_value(value: datetime) -> datetime:

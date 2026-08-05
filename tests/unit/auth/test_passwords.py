@@ -4,10 +4,20 @@ from typing import Literal
 
 import pytest
 from argon2 import PasswordHasher
+from argon2.exceptions import HashingError
 from argon2.low_level import Type
 
 from agent_hub.auth.models import AuthenticationBusy
-from agent_hub.auth.passwords import PasswordService, PasswordValidationError
+from agent_hub.auth.passwords import (
+    PasswordBackendError,
+    PasswordService,
+    PasswordValidationError,
+)
+
+TEST_DUMMY_HASH = (
+    "$argon2id$v=19$m=8192,t=1,p=1$X45yGanxAm7M2b7x9Pi+Og$"
+    "9Tpgsp/efdQ6JoS/zeQCPqlemnZ5drKVVuGWTae5wcA"
+)
 
 
 class RejectingEmbeddedCostHasher(PasswordHasher):
@@ -49,6 +59,42 @@ class BlockingHasher(PasswordHasher):
                 self.active -= 1
                 self.completed += 1
                 self.finished.set()
+
+
+class FailOnceHashingHasher(PasswordHasher):
+    def __init__(self) -> None:
+        super().__init__(time_cost=1, memory_cost=8192, parallelism=1, type=Type.ID)
+        self.failed = False
+
+    def hash(self, password: str | bytes, *, salt: bytes | None = None) -> str:
+        if not self.failed:
+            self.failed = True
+            raise HashingError("forced hashing failure")
+        return super().hash(password, salt=salt)
+
+
+class BlockingFailOnceHashingHasher(PasswordHasher):
+    def __init__(self) -> None:
+        super().__init__(time_cost=1, memory_cost=8192, parallelism=1, type=Type.ID)
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.failed = False
+
+    def hash(self, password: str | bytes, *, salt: bytes | None = None) -> str:
+        if not self.failed:
+            self.failed = True
+            self.started.set()
+            assert self.release.wait(2)
+            raise HashingError("forced background hashing failure")
+        return super().hash(password, salt=salt)
+
+
+class UnknownRuntimeHasher(PasswordHasher):
+    def __init__(self) -> None:
+        super().__init__(time_cost=1, memory_cost=8192, parallelism=1, type=Type.ID)
+
+    def hash(self, password: str | bytes, *, salt: bytes | None = None) -> str:
+        raise RuntimeError("forced unknown hashing failure")
 
 
 def _assert_password_absent(error: BaseException, password: str) -> None:
@@ -247,3 +293,80 @@ def test_sync_password_validation_error_has_no_password_in_frames() -> None:
         PasswordService().hash(password)
 
     _assert_password_absent(captured.value, password)
+
+
+@pytest.mark.asyncio
+async def test_actual_hashing_error_is_sanitized_and_releases_admission() -> None:
+    password = "sensitive valid password"
+    service = PasswordService(
+        FailOnceHashingHasher(),
+        dummy_hash=TEST_DUMMY_HASH,
+        max_concurrency=1,
+        max_waiters=0,
+    )
+
+    with pytest.raises(PasswordBackendError, match="password backend failed") as captured:
+        await service.hash_async(password)
+
+    _assert_password_absent(captured.value, password)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert (await service.hash_async("second valid password")).startswith("$argon2id$")
+
+
+def test_sync_actual_hashing_error_is_sanitized() -> None:
+    password = "sensitive valid password"
+    service = PasswordService(FailOnceHashingHasher(), dummy_hash=TEST_DUMMY_HASH)
+
+    with pytest.raises(PasswordBackendError) as captured:
+        service.hash(password)
+
+    _assert_password_absent(captured.value, password)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_background_hashing_error_releases_capacity() -> None:
+    hasher = BlockingFailOnceHashingHasher()
+    service = PasswordService(
+        hasher,
+        dummy_hash=TEST_DUMMY_HASH,
+        max_concurrency=1,
+        max_waiters=0,
+    )
+    running = asyncio.create_task(service.hash_async("first sensitive password"))
+    assert await asyncio.to_thread(hasher.started.wait, 1)
+
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    hasher.release.set()
+
+    for _ in range(100):
+        try:
+            result = await service.hash_async("second valid password")
+        except AuthenticationBusy:
+            await asyncio.sleep(0.01)
+        else:
+            assert result.startswith("$argon2id$")
+            break
+    else:
+        pytest.fail("background hashing failure did not release capacity")
+
+
+def test_unknown_runtime_hash_failure_propagates_without_password_frames() -> None:
+    password = "sensitive valid password"
+    service = PasswordService(UnknownRuntimeHasher(), dummy_hash=TEST_DUMMY_HASH)
+
+    with pytest.raises(RuntimeError, match="forced unknown hashing failure") as captured:
+        service.hash(password)
+
+    _assert_password_absent(captured.value, password)
+
+
+def test_injected_hasher_over_budget_is_rejected() -> None:
+    hasher = PasswordHasher(time_cost=6, memory_cost=65_536, parallelism=4, type=Type.ID)
+
+    with pytest.raises(ValueError, match="budget"):
+        PasswordService(hasher, dummy_hash=TEST_DUMMY_HASH)

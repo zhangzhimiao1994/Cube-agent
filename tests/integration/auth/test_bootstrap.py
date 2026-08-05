@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from argon2 import PasswordHasher
+from argon2.exceptions import HashingError
 from argon2.low_level import Type
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -20,7 +21,7 @@ from agent_hub.auth.models import (
 )
 from agent_hub.auth.passwords import PasswordService
 from agent_hub.auth.service import AuthService
-from agent_hub.auth.tokens import AccessTokenService, InvalidTokenError
+from agent_hub.auth.tokens import AccessTokenService, InvalidTokenError, TokenBackendError
 from agent_hub.db.models import BootstrapCodeRow, TenantRow, UserRow
 
 NOW = datetime(2026, 8, 5, 0, 0, tzinfo=UTC)
@@ -35,8 +36,8 @@ class MutableClock:
 
 
 class SpyPasswordService(PasswordService):
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, hasher: PasswordHasher | None = None) -> None:
+        super().__init__(hasher)
         self.verified_hashes: list[str] = []
 
     async def verify_async(self, password_hash: str, password: str) -> bool:
@@ -87,7 +88,19 @@ class FailingTokenService(AccessTokenService):
         *,
         ttl_seconds: int = 900,
     ) -> str:
-        raise RuntimeError("forced token failure")
+        raise TokenBackendError("forced token failure")
+
+
+class UnknownRuntimeTokenService(AccessTokenService):
+    def encode(
+        self,
+        user_id: UUID,
+        tenant_id: UUID,
+        role: Role,
+        *,
+        ttl_seconds: int = 900,
+    ) -> str:
+        raise RuntimeError("forced unknown token failure")
 
 
 class CancellableHashPasswordService(PasswordService):
@@ -115,6 +128,14 @@ class CancellableVerifyPasswordService(PasswordService):
 class RuntimeVerifyPasswordService(PasswordService):
     async def verify_async(self, password_hash: str, password: str) -> bool:
         raise RuntimeError("forced password backend failure")
+
+
+class HashingFailureHasher(PasswordHasher):
+    def __init__(self) -> None:
+        super().__init__(time_cost=3, memory_cost=65_536, parallelism=4, type=Type.ID)
+
+    def hash(self, password: str | bytes, *, salt: bytes | None = None) -> str:
+        raise HashingError("forced hashing failure")
 
 
 def _assert_production_frames_do_not_contain(
@@ -443,7 +464,9 @@ async def test_login_with_no_local_password_uses_dummy_verify_and_fails_closed(
     auth_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     tenant_id = await _tenant(auth_session_factory)
-    passwords = SpyPasswordService()
+    passwords = SpyPasswordService(
+        PasswordHasher(time_cost=1, memory_cost=8192, parallelism=1, type=Type.ID)
+    )
     async with auth_session_factory() as session, session.begin():
         session.add(
             UserRow(
@@ -460,7 +483,9 @@ async def test_login_with_no_local_password_uses_dummy_verify_and_fails_closed(
         await service.login(tenant_id, "oauth-user", "valid password 123")
 
     assert len(passwords.verified_hashes) == 1
-    assert passwords.verified_hashes[0].startswith("$argon2id$")
+    assert passwords.verified_hashes[0] == passwords.dummy_hash
+    assert "$m=8192,t=1,p=1$" in passwords.dummy_hash
+    assert passwords.needs_rehash(passwords.dummy_hash) is False
 
 
 @pytest.mark.integration
@@ -602,6 +627,58 @@ async def test_token_creation_failure_rolls_back_bootstrap_without_secret_trace(
 
 
 @pytest.mark.integration
+async def test_actual_hashing_error_rolls_back_bootstrap_without_secret_trace(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _tenant(auth_session_factory)
+    issuer = _service(auth_session_factory, tenant_id)
+    code = await issuer.issue_bootstrap_code()
+    password = "sensitive password 123"
+    failing = _service(
+        auth_session_factory,
+        tenant_id,
+        passwords=PasswordService(HashingFailureHasher()),
+    )
+
+    with pytest.raises(AuthenticationOperationError) as captured:
+        await failing.consume_bootstrap_code(code, "first-admin", password)
+
+    _assert_production_frames_do_not_contain(captured.value, code, password)
+    async with auth_session_factory() as session:
+        stored_code = await session.scalar(select(BootstrapCodeRow))
+        assert stored_code is not None
+        assert stored_code.consumed_at is None
+        assert await session.scalar(select(func.count()).select_from(UserRow)) == 0
+
+
+@pytest.mark.integration
+async def test_unknown_runtime_propagates_after_bootstrap_rollback_and_cleanup(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _tenant(auth_session_factory)
+    issuer = _service(auth_session_factory, tenant_id)
+    code = await issuer.issue_bootstrap_code()
+    password = "sensitive password 123"
+    failing = AuthService(
+        auth_session_factory,
+        tenant_id,
+        PasswordService(),
+        UnknownRuntimeTokenService(b"t" * 32, clock=MutableClock()),
+        clock=MutableClock(),
+    )
+
+    with pytest.raises(RuntimeError, match="forced unknown token failure") as captured:
+        await failing.consume_bootstrap_code(code, "first-admin", password)
+
+    _assert_production_frames_do_not_contain(captured.value, code, password)
+    async with auth_session_factory() as session:
+        stored_code = await session.scalar(select(BootstrapCodeRow))
+        assert stored_code is not None
+        assert stored_code.consumed_at is None
+        assert await session.scalar(select(func.count()).select_from(UserRow)) == 0
+
+
+@pytest.mark.integration
 async def test_cancelled_consume_rolls_back_and_sanitizes_credentials(
     auth_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -712,7 +789,35 @@ async def test_runtime_token_failure_prevents_login_rehash_and_is_sanitized(
 
 
 @pytest.mark.integration
-async def test_runtime_password_backend_failure_is_sanitized(
+async def test_actual_hashing_error_rolls_back_login_rehash_without_secret_trace(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _tenant(auth_session_factory)
+    old_passwords = PasswordService(
+        PasswordHasher(time_cost=1, memory_cost=8192, parallelism=1, type=Type.ID)
+    )
+    issuer = _service(auth_session_factory, tenant_id, passwords=old_passwords)
+    code = await issuer.issue_bootstrap_code()
+    password = "sensitive password 123"
+    await issuer.consume_bootstrap_code(code, "first-admin", password)
+    async with auth_session_factory() as session:
+        old_hash = await session.scalar(select(UserRow.password_hash))
+    service = _service(
+        auth_session_factory,
+        tenant_id,
+        passwords=PasswordService(HashingFailureHasher()),
+    )
+
+    with pytest.raises(AuthenticationOperationError) as captured:
+        await service.login(tenant_id, "first-admin", password)
+
+    _assert_production_frames_do_not_contain(captured.value, password)
+    async with auth_session_factory() as session:
+        assert await session.scalar(select(UserRow.password_hash)) == old_hash
+
+
+@pytest.mark.integration
+async def test_unknown_runtime_password_failure_propagates_after_cleanup(
     auth_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     tenant_id = await _tenant(auth_session_factory)
@@ -723,7 +828,7 @@ async def test_runtime_password_backend_failure_is_sanitized(
         passwords=RuntimeVerifyPasswordService(),
     )
 
-    with pytest.raises(AuthenticationOperationError) as captured:
+    with pytest.raises(RuntimeError, match="forced password backend failure") as captured:
         await service.login(tenant_id, "missing-user", password)
 
     _assert_production_frames_do_not_contain(captured.value, password)
