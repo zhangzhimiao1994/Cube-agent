@@ -1,9 +1,12 @@
 """The sole leased, redacted path from model requests to model transports."""
 
 import asyncio
+import json
 import math
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Protocol
 
@@ -22,6 +25,15 @@ from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, _req
 
 class ModelGatewayError(RuntimeError):
     """Stable, redacted failure at the model gateway boundary."""
+
+
+@dataclass(frozen=True, slots=True)
+class _SafeTransportFailure:
+    error: ModelTransportError | ModelGatewayError
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 class SecretResolver(Protocol):
@@ -68,26 +80,43 @@ class CapacityController(Protocol):
 class ConservativeTokenEstimator:
     """Deterministic local upper estimate with fixed response headroom."""
 
-    def estimate(self, request: ModelRequest) -> int:
-        characters = 0
-        for message in request.messages:
-            if isinstance(message.content, str):
-                characters += len(message.content)
-                continue
-            for part in message.content:
-                characters += self._string_size(part)
-        if request.response_schema is not None:
-            characters += self._string_size(request.response_schema.schema)
-        return 513 + max(1, math.ceil(characters / 2))
+    def __init__(self, output_token_allowance: int = 4096) -> None:
+        if type(output_token_allowance) is not int or output_token_allowance < 0:
+            raise ValueError("output_token_allowance must be a nonnegative integer")
+        self._output_token_allowance = output_token_allowance
 
-    def _string_size(self, value: object) -> int:
-        if isinstance(value, str):
-            return len(value)
+    def estimate(self, request: ModelRequest) -> int:
+        payload: dict[str, object] = {
+            "logical_model": request.logical_model,
+            "messages": [
+                {"role": message.role, "content": self._mutable_json(message.content)}
+                for message in request.messages
+            ],
+            "required_capabilities": sorted(str(item) for item in request.required_capabilities),
+            "timeout_seconds": request.timeout_seconds,
+            "allow_fallback": request.allow_fallback,
+            "response_schema": None,
+        }
+        if request.response_schema is not None:
+            payload["response_schema"] = {
+                "name": request.response_schema.name,
+                "schema": self._mutable_json(request.response_schema.schema),
+            }
+        normalized = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return len(normalized) + self._output_token_allowance
+
+    def _mutable_json(self, value: object) -> object:
         if isinstance(value, Mapping):
-            return sum(len(key) + self._string_size(item) for key, item in value.items())
+            return {key: self._mutable_json(item) for key, item in value.items()}
         if isinstance(value, tuple | list):
-            return sum(self._string_size(item) for item in value)
-        return 0
+            return [self._mutable_json(item) for item in value]
+        return value
 
 
 class ModelGateway:
@@ -101,8 +130,10 @@ class ModelGateway:
         fallbacks: Mapping[str, str] | None = None,
         capacity_wait_timeout: float = 5,
         heartbeat_interval: float = 10,
+        heartbeat_safety_fraction: float = 0.5,
         token_estimator: TokenEstimator | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        utc_now: Callable[[], datetime] = _utc_now,
     ) -> None:
         for name, value in (
             ("capacity_wait_timeout", capacity_wait_timeout),
@@ -115,6 +146,13 @@ class ModelGateway:
                 or value <= 0
             ):
                 raise ValueError(f"{name} must be positive and finite")
+        if (
+            isinstance(heartbeat_safety_fraction, bool)
+            or not isinstance(heartbeat_safety_fraction, int | float)
+            or not math.isfinite(heartbeat_safety_fraction)
+            or not 0 < heartbeat_safety_fraction <= 0.5
+        ):
+            raise ValueError("heartbeat_safety_fraction must be finite and between 0 and 0.5")
         configured_fallbacks = dict(fallbacks or {})
         self._validate_fallbacks(registry, configured_fallbacks)
         capacity_pool.validate_configuration(registry.deployments)
@@ -125,8 +163,10 @@ class ModelGateway:
         self._fallbacks = MappingProxyType(configured_fallbacks)
         self._capacity_wait_timeout = float(capacity_wait_timeout)
         self._heartbeat_interval = float(heartbeat_interval)
+        self._heartbeat_safety_fraction = float(heartbeat_safety_fraction)
         self._token_estimator = token_estimator or ConservativeTokenEstimator()
         self._monotonic = monotonic
+        self._utc_now = utc_now
 
     @staticmethod
     def _validate_fallbacks(registry: ModelRegistry, fallbacks: Mapping[str, str]) -> None:
@@ -177,7 +217,11 @@ class ModelGateway:
                 (item for item in candidates if item.id == lease.deployment_id), None
             )
             if selected is None or selected.quota_scope_id != lease.quota_scope_id:
-                await self._release_cleanup(lease)
+                cleanup_error = await self._release_cleanup(lease)
+                if isinstance(cleanup_error, asyncio.CancelledError):
+                    raise cleanup_error
+                if cleanup_error is not None:
+                    raise CapacityBackendError("model capacity release failed") from None
                 raise CapacityBackendError("model capacity returned an unknown deployment")
             break
         if lease is None or selected is None:
@@ -198,7 +242,7 @@ class ModelGateway:
     ) -> ModelResponse:
         primary_error: BaseException | None = None
         response: ModelResponse | None = None
-        start = self._monotonic()
+        transport_started: float | None = None
         should_record = False
         status_code: int | None = None
         try:
@@ -209,20 +253,27 @@ class ModelGateway:
             except Exception:  # noqa: BLE001 - redact resolver details at the boundary
                 primary_error = ModelGatewayError("model credential resolution failed")
             else:
+                transport_started = self._monotonic()
                 invocation = asyncio.create_task(
                     self._invoke_with_heartbeat(deployment, request, api_key, lease)
                 )
                 del api_key
                 try:
-                    response = await invocation
-                    status_code = 200
-                    should_record = True
+                    try:
+                        outcome = await invocation
+                    finally:
+                        del invocation
+                    if isinstance(outcome, _SafeTransportFailure):
+                        primary_error = outcome.error
+                        if isinstance(outcome.error, ModelTransportError):
+                            status_code = outcome.error.status_code
+                        should_record = True
+                    else:
+                        response = outcome
+                        status_code = 200
+                        should_record = True
                 except asyncio.CancelledError as error:
                     primary_error = error
-                except ModelTransportError as error:
-                    status_code = error.status_code
-                    should_record = True
-                    primary_error = error.with_traceback(None)
                 except (CapacityBackendError, CapacityConfigurationError) as error:
                     primary_error = error
                 except Exception:  # noqa: BLE001 - redact arbitrary injected transport failures
@@ -230,7 +281,9 @@ class ModelGateway:
                     primary_error = ModelGatewayError("model transport failed")
 
             if should_record:
-                latency = max(0.0, self._monotonic() - start)
+                if transport_started is None:  # pragma: no cover - invariant
+                    raise ModelGatewayError("model transport timing unavailable")
+                latency = max(0.0, self._monotonic() - transport_started)
                 try:
                     await self._capacity.record_outcome(
                         lease.quota_scope_id,
@@ -264,9 +317,9 @@ class ModelGateway:
         request: ModelRequest,
         api_key: str,
         lease: CapacityLease,
-    ) -> ModelResponse:
+    ) -> ModelResponse | _SafeTransportFailure:
         transport_task = asyncio.create_task(
-            self._transport.complete(deployment, request, api_key)
+            self._call_transport_safely(deployment, request, api_key)
         )
         del api_key
         heartbeat_task = asyncio.create_task(self._heartbeat(lease))
@@ -287,14 +340,50 @@ class ModelGateway:
                     task.cancel()
             await asyncio.gather(transport_task, heartbeat_task, return_exceptions=True)
 
+    async def _call_transport_safely(
+        self,
+        deployment: Deployment,
+        request: ModelRequest,
+        api_key: str,
+    ) -> ModelResponse | _SafeTransportFailure:
+        outcome: ModelResponse | _SafeTransportFailure
+        try:
+            outcome = await self._transport.complete(deployment, request, api_key)
+        except asyncio.CancelledError:
+            raise
+        except ModelTransportError as error:
+            outcome = _SafeTransportFailure(
+                ModelTransportError(str(error), status_code=error.status_code)
+            )
+            error.__traceback__ = None
+            del error
+        except Exception as error:  # noqa: BLE001 - consume and redact injected failures
+            error.__traceback__ = None
+            del error
+            outcome = _SafeTransportFailure(ModelGatewayError("model transport failed"))
+        del api_key, request
+        return outcome
+
     async def _heartbeat(self, lease: CapacityLease) -> ModelResponse:
         current = lease
         while True:
-            await asyncio.sleep(self._heartbeat_interval)
+            now = self._heartbeat_now()
+            remaining = (current.expires_at.astimezone(UTC) - now).total_seconds()
+            delay = max(
+                0.0,
+                min(self._heartbeat_interval, remaining * self._heartbeat_safety_fraction),
+            )
+            await asyncio.sleep(delay)
             renewed = await self._capacity.renew(current)
             if renewed is None:
                 raise CapacityBackendError("model capacity lease expired")
             current = renewed
+
+    def _heartbeat_now(self) -> datetime:
+        now = self._utc_now()
+        if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+            raise ModelGatewayError("model heartbeat clock is invalid")
+        return now.astimezone(UTC)
 
     async def _release_cleanup(self, lease: CapacityLease) -> BaseException | None:
         release_task = asyncio.create_task(self._capacity.release(lease))

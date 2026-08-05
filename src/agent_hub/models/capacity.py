@@ -11,9 +11,9 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from types import MappingProxyType
 from typing import Protocol, cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
-from agent_hub.models.types import Deployment
+from agent_hub.models.types import Deployment, _require_safe_identifier
 
 _SAFE_PREFIX = re.compile(r"^[A-Za-z0-9:_-]{1,128}$")
 _SAFE_FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
@@ -44,7 +44,7 @@ class RedisCapacityClient(Protocol):
     async def eval(self, script: str, key_count: int, *args: object) -> object: ...
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class CapacityLease:
     id: str
     deployment_id: str
@@ -52,8 +52,30 @@ class CapacityLease:
     expires_at: datetime
 
     def __post_init__(self) -> None:
+        try:
+            parsed_id = UUID(self.id)
+        except (ValueError, TypeError, AttributeError):
+            raise ValueError("lease id must be a canonical UUID") from None
+        if str(parsed_id) != self.id:
+            raise ValueError("lease id must be a canonical UUID")
+        _require_safe_identifier("deployment id", self.deployment_id)
+        _require_safe_identifier("quota_scope_id", self.quota_scope_id)
         if self.expires_at.tzinfo is None or self.expires_at.utcoffset() is None:
             raise ValueError("lease expiry must be timezone-aware")
+        try:
+            timestamp = self.expires_at.timestamp()
+        except (OverflowError, OSError, ValueError):
+            raise ValueError("lease expiry must be finite") from None
+        if not math.isfinite(timestamp):
+            raise ValueError("lease expiry must be finite")
+
+    def __repr__(self) -> str:
+        return "CapacityLease(<redacted>)"
+
+    __str__ = __repr__
+
+
+CapacityLease.__hash__ = None  # type: ignore[assignment]
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -133,6 +155,8 @@ _RENEW_SCRIPT = _script("renew_lease.lua")
 _RECORD_OUTCOME_SCRIPT = _script("record_outcome.lua")
 _REGISTER_SCOPE_SCRIPT = _script("register_scope_policy.lua")
 _CLAIM_FINGERPRINT_SCRIPT = _script("claim_fingerprint.lua")
+_ROLLBACK_FINGERPRINT_SCRIPT = _script("rollback_fingerprint.lua")
+_ROLLBACK_SCOPE_SCRIPT = _script("rollback_scope_policy.lua")
 _EFFECTIVE_LIMIT_SCRIPT = """
 local base = tonumber(redis.call('HGET', KEYS[2], 'base'))
 if base == nil or base < 1 then return redis.error_reply('model scope policy is unavailable') end
@@ -231,6 +255,7 @@ class CapacityPool:
         self._scope_policies: dict[str, _ScopePolicy] = {}
         self._catalog_by_id: dict[str, Deployment] = {}
         self._initialized = False
+        self._refresh_in_progress = False
         self._next_metadata_refresh = 0.0
         self._observed_loads: dict[str, int] = {}
         self._weights: dict[str, int] = {}
@@ -285,10 +310,19 @@ class CapacityPool:
             now = self._clock_now()
             if not force and self._initialized and now < self._next_metadata_refresh:
                 return
-            self._initialized = False
-            await self._register_metadata()
-            self._initialized = True
-            self._next_metadata_refresh = self._clock_now() + self._metadata_refresh_interval
+            self._refresh_in_progress = True
+            try:
+                await self._register_metadata()
+            except BaseException:
+                self._initialized = False
+                raise
+            else:
+                self._initialized = True
+                self._next_metadata_refresh = (
+                    self._clock_now() + self._metadata_refresh_interval
+                )
+            finally:
+                self._refresh_in_progress = False
 
     async def _register_metadata(self) -> None:
         credentials = self._credentials
@@ -305,36 +339,77 @@ class CapacityPool:
                 raise CapacityConfigurationError("credential fingerprint quota scope conflicts")
             fingerprint_scopes[fingerprint] = deployment.quota_scope_id
             deployment_fingerprints.append((deployment, fingerprint))
+        owner = str(uuid4())
+        fingerprint_keys: list[tuple[str, str]] = []
+        policy_keys: list[Mapping[str, str]] = []
         try:
             for deployment, fingerprint in deployment_fingerprints:
+                claim_keys = self._fingerprint_keys(fingerprint)
+                fingerprint_keys.append(claim_keys)
                 claimed = await self._redis.eval(
                     _CLAIM_FINGERPRINT_SCRIPT,
-                    1,
-                    self._fingerprint_key(fingerprint),
+                    2,
+                    *claim_keys,
+                    owner,
                     self._scope_digest(deployment.quota_scope_id),
                     self._metadata_ttl_ms,
                 )
-                if int(cast(int | bytes | str, claimed)) != 1:
+                if self._strict_redis_int(claimed) != 1:
                     raise CapacityConfigurationError(
                         "credential fingerprint quota scope conflicts"
                     )
             for quota_scope_id, policy in self._scope_policies.items():
+                keys = self._keys(quota_scope_id)
+                policy_keys.append(keys)
                 result = await self._redis.eval(
                     _REGISTER_SCOPE_SCRIPT,
-                    1,
-                    self._keys(quota_scope_id)["policy"],
+                    7,
+                    *self._policy_registration_keys(keys),
+                    owner,
                     policy.base_limit,
                     policy.rpm or 0,
                     policy.tpm or 0,
                     self._metadata_ttl_ms,
                 )
                 self._integer_result(result, 3)
-        except asyncio.CancelledError:
-            raise
-        except CapacityConfigurationError:
-            raise
-        except Exception:  # noqa: BLE001 - initialization fails closed without Redis details
+        except BaseException as error:
+            await self._rollback_registration(owner, fingerprint_keys, policy_keys)
+            if isinstance(error, asyncio.CancelledError | CapacityConfigurationError):
+                raise
+            if isinstance(error, CapacityBackendError):
+                raise
             raise CapacityBackendError("model capacity backend unavailable") from None
+
+    async def _rollback_registration(
+        self,
+        owner: str,
+        fingerprints: Sequence[tuple[str, str]],
+        policies: Sequence[Mapping[str, str]],
+    ) -> None:
+        async def cleanup() -> None:
+            for claim_keys in reversed(fingerprints):
+                try:
+                    await self._redis.eval(
+                        _ROLLBACK_FINGERPRINT_SCRIPT, 2, *claim_keys, owner
+                    )
+                except Exception as cleanup_error:  # noqa: BLE001 - best effort rollback
+                    del cleanup_error
+            for keys in reversed(policies):
+                try:
+                    await self._redis.eval(
+                        _ROLLBACK_SCOPE_SCRIPT,
+                        7,
+                        *self._policy_registration_keys(keys),
+                        owner,
+                    )
+                except Exception as cleanup_error:  # noqa: BLE001 - best effort rollback
+                    del cleanup_error
+
+        task = asyncio.create_task(cleanup())
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
 
     def _clock_now(self) -> float:
         value = self._monotonic()
@@ -343,7 +418,7 @@ class CapacityPool:
         return value
 
     def _require_initialized(self) -> None:
-        if not self._initialized:
+        if not self._initialized or self._refresh_in_progress:
             raise CapacityConfigurationError("model capacity pool is not initialized")
 
     async def acquire(
@@ -441,15 +516,20 @@ class CapacityPool:
             raise
         except Exception:  # noqa: BLE001 - capacity must fail closed and redact Redis details
             raise CapacityBackendError("model capacity backend unavailable") from None
-        values = self._integer_result(result, 4)
-        acquired, active, _effective, final_value = values
-        self._observed_loads[deployment.quota_scope_id] = active
-        if acquired == 0:
-            if final_value not in {1, 2}:
+        try:
+            acquired, active, _effective, final_value = self._integer_result(result, 4)
+            self._observed_loads[deployment.quota_scope_id] = active
+            if acquired == 0:
+                if final_value not in {1, 2}:
+                    raise CapacityBackendError(
+                        "model capacity backend returned invalid state"
+                    )
+                return None
+            if acquired != 1 or final_value <= 0:
                 raise CapacityBackendError("model capacity backend returned invalid state")
-            return None
-        if acquired != 1 or final_value <= 0:
-            raise CapacityBackendError("model capacity backend returned invalid state")
+        except CapacityBackendError:
+            await self._release_id_ignoring_errors(keys["leases"], lease_id)
+            raise
         return CapacityLease(
             id=lease_id,
             deployment_id=deployment.id,
@@ -465,7 +545,7 @@ class CapacityPool:
             result = await self._redis.eval(
                 _RELEASE_SCRIPT, 1, key, lease.id, _STATE_TTL_MS
             )
-            removed = int(cast(int | bytes | str, result))
+            removed = self._strict_redis_int(result)
         except asyncio.CancelledError:
             await self._release_id_ignoring_errors(key, lease.id)
             raise
@@ -508,7 +588,7 @@ class CapacityPool:
             result = await self._redis.eval(
                 _RENEW_SCRIPT, 1, key, lease.id, self._lease_ms, _STATE_TTL_MS
             )
-            expires_ms = int(cast(int | bytes | str, result))
+            expires_ms = self._strict_redis_int(result)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - capacity must fail closed and redact Redis details
@@ -532,7 +612,6 @@ class CapacityPool:
         latency_seconds: float,
         succeeded: bool,
     ) -> None:
-        self._require_initialized()
         if quota_scope_id not in self._scope_policies:
             raise ValueError("unknown quota scope")
         if status_code is not None and (
@@ -573,7 +652,6 @@ class CapacityPool:
             raise CapacityBackendError("model capacity backend unavailable") from None
 
     async def effective_limit(self, quota_scope_id: str) -> int:
-        self._require_initialized()
         policy = self._scope_policies.get(quota_scope_id)
         if policy is None:
             raise ValueError("unknown quota scope")
@@ -585,7 +663,7 @@ class CapacityPool:
                 self._keys(quota_scope_id)["policy"],
                 _STATE_TTL_MS,
             )
-            value = int(cast(int | bytes | str, result))
+            value = self._strict_redis_int(result)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - capacity must fail closed and redact Redis details
@@ -605,21 +683,55 @@ class CapacityPool:
             "health": root + "health",
             "latency": root + "latency",
             "policy": root + "policy",
+            "policy_expires": root + "policy-expires",
+            "policy_base": root + "policy-base",
+            "policy_rpm": root + "policy-rpm",
+            "policy_tpm": root + "policy-tpm",
+            "policy_owners": root + "policy-owners",
         }
 
     @staticmethod
     def _scope_digest(quota_scope_id: str) -> str:
         return hashlib.sha256(quota_scope_id.encode("utf-8")).hexdigest()
 
-    def _fingerprint_key(self, fingerprint: str) -> str:
+    def _fingerprint_keys(self, fingerprint: str) -> tuple[str, str]:
         digest = hashlib.sha256(fingerprint.encode("ascii")).hexdigest()
-        return f"{self._key_prefix}credential:{{{digest}}}:scope"
+        root = f"{self._key_prefix}credential:{{{digest}}}:"
+        return root + "expires", root + "scopes"
+
+    @staticmethod
+    def _policy_registration_keys(keys: Mapping[str, str]) -> tuple[str, ...]:
+        return (
+            keys["policy"],
+            keys["policy_expires"],
+            keys["policy_base"],
+            keys["policy_rpm"],
+            keys["policy_tpm"],
+            keys["policy_owners"],
+            keys["health"],
+        )
+
+    @staticmethod
+    def _strict_redis_int(value: object) -> int:
+        if type(value) is int:
+            return value
+        if isinstance(value, bytes):
+            try:
+                text = value.decode("ascii")
+            except UnicodeDecodeError:
+                raise CapacityBackendError(
+                    "model capacity backend returned invalid state"
+                ) from None
+        elif isinstance(value, str):
+            text = value
+        else:
+            raise CapacityBackendError("model capacity backend returned invalid state")
+        if re.fullmatch(r"(?:0|-?[1-9][0-9]*)", text) is None:
+            raise CapacityBackendError("model capacity backend returned invalid state")
+        return int(text)
 
     @staticmethod
     def _integer_result(result: object, length: int) -> tuple[int, ...]:
         if not isinstance(result, list | tuple) or len(result) != length:
             raise CapacityBackendError("model capacity backend returned invalid state")
-        try:
-            return tuple(int(cast(int | bytes | str, value)) for value in result)
-        except (TypeError, ValueError):
-            raise CapacityBackendError("model capacity backend returned invalid state") from None
+        return tuple(CapacityPool._strict_redis_int(value) for value in result)

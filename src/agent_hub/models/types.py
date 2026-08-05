@@ -122,7 +122,7 @@ class Deployment:
         _require_safe_identifier("logical_model", self.logical_model)
         _require_unpadded("provider_model", self.provider_model, max_length=512)
         _require_unpadded("secret_ref", self.secret_ref, max_length=512)
-        _require_unpadded("quota_scope_id", self.quota_scope_id, max_length=128)
+        _require_safe_identifier("quota_scope_id", self.quota_scope_id)
 
         if any(ord(character) < 32 or ord(character) == 127 for character in self.api_base):
             raise ValueError("api_base must be a valid HTTP(S) URL")

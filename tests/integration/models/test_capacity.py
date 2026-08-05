@@ -16,7 +16,9 @@ from agent_hub.models.capacity import (
     CredentialRegistry,
     safe_operational_limit,
 )
-from agent_hub.models.types import Deployment
+from agent_hub.models.gateway import ConservativeTokenEstimator, ModelGateway
+from agent_hub.models.registry import ModelRegistry
+from agent_hub.models.types import Deployment, ModelMessage, ModelRequest, ModelResponse
 
 
 @pytest.fixture
@@ -30,8 +32,12 @@ async def redis_client(redis_url: str) -> AsyncIterator[Redis]:
 
 
 @pytest.fixture
-def prefix() -> str:
-    return f"agent-hub:test:capacity:{uuid4()}:"
+async def prefix(redis_client: Redis) -> AsyncIterator[str]:
+    value = f"agent-hub:test:capacity:{uuid4()}:"
+    yield value
+    keys = [key async for key in redis_client.scan_iter(match=f"{value}*")]
+    if keys:
+        await redis_client.unlink(*keys)
 
 
 def deployment(identifier: str, scope: str, **overrides: object) -> Deployment:
@@ -75,20 +81,61 @@ class RegistrationRedis:
         self.calls = 0
         self.fail_next = False
         self.block_next = False
+        self.block_on_call: int | None = None
+        self.fail_on_call: int | None = None
+        self.fail_after_block = False
         self.started = asyncio.Event()
         self.proceed = asyncio.Event()
 
     async def eval(self, script: str, key_count: int, *args: object) -> object:
         self.calls += 1
-        if self.fail_next:
+        if self.fail_next or self.fail_on_call == self.calls:
             self.fail_next = False
             raise RuntimeError("redis://private-backend")
-        if self.block_next:
+        if self.block_next or self.block_on_call == self.calls:
             self.block_next = False
             self.started.set()
             await self.proceed.wait()
+            if self.fail_after_block:
+                self.fail_after_block = False
+                raise RuntimeError("redis://private-backend")
         redis_eval = cast(Callable[..., Awaitable[object]], self.client.eval)
         return await redis_eval(script, key_count, *args)
+
+
+class MalformedAcquireRedis:
+    def __init__(self, client: Redis, malformed: object) -> None:
+        self.client = client
+        self.malformed = malformed
+        self.intercept = False
+
+    async def eval(self, script: str, key_count: int, *args: object) -> object:
+        redis_eval = cast(Callable[..., Awaitable[object]], self.client.eval)
+        result = await redis_eval(script, key_count, *args)
+        if self.intercept and key_count == 5:
+            self.intercept = False
+            values = list(cast(list[object], result))
+            values[0] = self.malformed
+            return values
+        return result
+
+
+class SecretResolver:
+    async def resolve(self, secret_ref: str) -> str:
+        return "test-key"
+
+
+class BlockingTransport:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.finish = asyncio.Event()
+
+    async def complete(
+        self, deployment: Deployment, request: ModelRequest, api_key: str
+    ) -> ModelResponse:
+        self.started.set()
+        await self.finish.wait()
+        return ModelResponse(text="ok")
 
 
 async def redis_key(client: Redis, pattern: str, *, member: str | None = None) -> bytes:
@@ -313,8 +360,10 @@ async def test_renew_fails_without_extending_after_fingerprint_takeover(
             redis_client, f"{prefix}*:leases", member=first_lease.id
         )
         old_score = await redis_client.zscore(first_lease_key, first_lease.id)
-        claim_key = await redis_key(redis_client, f"{prefix}credential:*:scope")
-        await redis_client.delete(claim_key)
+        claim_keys = [
+            key async for key in redis_client.scan_iter(match=f"{prefix}credential:*")
+        ]
+        await redis_client.delete(*claim_keys)
         await second_pool.initialize()
         second_lease = await second_pool.acquire(
             [second], wait_timeout=0.05, estimated_tokens=1
@@ -350,7 +399,7 @@ async def test_successful_renew_refreshes_fingerprint_claim(
     )
     await pool.initialize()
     active = await pool.acquire([serial], wait_timeout=0.05, estimated_tokens=1)
-    claim_key = await redis_key(redis_client, f"{prefix}credential:*:scope")
+    claim_key = await redis_key(redis_client, f"{prefix}credential:*:expires")
     await redis_client.pexpire(claim_key, 800)
     before = await redis_client.pttl(claim_key)
 
@@ -460,7 +509,7 @@ async def test_capacity_state_keys_have_bounded_ttls(redis_client: Redis, prefix
 
     keys = [key async for key in redis_client.scan_iter(match=f"{prefix}*")]
     decoded = {key.decode("ascii") for key in keys}
-    for suffix in (":leases", ":rpm", ":tpm", ":policy", ":health", ":latency", ":scope"):
+    for suffix in (":leases", ":rpm", ":tpm", ":policy", ":health", ":latency", ":scopes"):
         assert any(key.endswith(suffix) for key in decoded)
     ttls = [await redis_client.ttl(key) for key in keys]
     assert all(0 < ttl <= 3600 for ttl in ttls)
@@ -487,7 +536,7 @@ async def test_repeat_initialize_refreshes_active_metadata_ttls(
     metadata_keys = [
         key
         async for key in redis_client.scan_iter(match=f"{prefix}*")
-        if key.decode("ascii").endswith((":policy", ":scope"))
+        if key.decode("ascii").endswith((":policy", ":scopes"))
     ]
     assert len(metadata_keys) == 2
     await asyncio.sleep(0.08)
@@ -912,3 +961,264 @@ async def test_backend_failure_fails_closed_without_backend_details(prefix: str)
     finally:
         await unavailable.aclose()
     assert "127.0.0.1" not in str(captured.value)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_partial_registration_rolls_back_only_its_owner_claims(
+    redis_client: Redis, prefix: str, cancelled: bool
+) -> None:
+    first = deployment("partial-a", "partial-scope-a")
+    second = deployment("partial-b", "partial-scope-b")
+    wrapped = RegistrationRedis(redis_client)
+    failed = CapacityPool(
+        wrapped,
+        deployments=[first, second],
+        credentials=credentials("partial-a", "partial-b"),
+        key_prefix=prefix,
+    )
+    if cancelled:
+        wrapped.block_on_call = 2
+        task = asyncio.create_task(failed.initialize())
+        await wrapped.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        wrapped.fail_on_call = 2
+        with pytest.raises(CapacityBackendError):
+            await failed.initialize()
+
+    takeover = deployment("takeover", "different-scope")
+    same_fingerprint = CredentialRegistry(
+        [CredentialDescriptor(takeover.secret_ref, fingerprint("partial-a"))]
+    )
+    replacement = CapacityPool(
+        redis_client,
+        deployments=[takeover],
+        credentials=same_fingerprint,
+        key_prefix=prefix,
+    )
+    await replacement.initialize()
+
+
+@pytest.mark.integration
+async def test_failed_registration_rollback_preserves_another_active_owner(
+    redis_client: Redis, prefix: str
+) -> None:
+    shared = fingerprint("owner-shared")
+    active_deployment = deployment("owner-active", "owner-scope")
+    active = CapacityPool(
+        redis_client,
+        deployments=[active_deployment],
+        credentials=CredentialRegistry(
+            [CredentialDescriptor(active_deployment.secret_ref, shared)]
+        ),
+        key_prefix=prefix,
+    )
+    await active.initialize()
+
+    same = deployment("owner-attempt", "owner-scope")
+    later = deployment("owner-later", "owner-later-scope")
+    wrapped = RegistrationRedis(redis_client)
+    wrapped.fail_on_call = 2
+    attempt = CapacityPool(
+        wrapped,
+        deployments=[same, later],
+        credentials=CredentialRegistry(
+            [
+                CredentialDescriptor(same.secret_ref, shared),
+                CredentialDescriptor(later.secret_ref, fingerprint("owner-later")),
+            ]
+        ),
+        key_prefix=prefix,
+    )
+    with pytest.raises(CapacityBackendError):
+        await attempt.initialize()
+
+    conflicting = deployment("owner-conflict", "owner-conflict-scope")
+    conflict_pool = CapacityPool(
+        redis_client,
+        deployments=[conflicting],
+        credentials=CredentialRegistry(
+            [CredentialDescriptor(conflicting.secret_ref, shared)]
+        ),
+        key_prefix=prefix,
+    )
+    with pytest.raises(CapacityConfigurationError, match="quota scope conflicts"):
+        await conflict_pool.initialize()
+
+
+@pytest.mark.integration
+async def test_retired_strict_policy_expires_and_active_owner_can_relax_limit(
+    redis_client: Redis, redis_url: str, prefix: str
+) -> None:
+    other = Redis.from_url(redis_url)
+    strict = deployment("retired-strict", "retired", max_concurrency=1)
+    relaxed = deployment("active-relaxed", "retired", max_concurrency=5)
+    strict_clock = ManualClock()
+    relaxed_clock = ManualClock()
+    strict_pool = CapacityPool(
+        redis_client,
+        deployments=[strict],
+        credentials=credentials("retired-strict"),
+        key_prefix=prefix,
+        lease_seconds=0.02,
+        metadata_ttl_seconds=0.12,
+        metadata_refresh_interval=0.03,
+        monotonic=strict_clock,
+    )
+    relaxed_pool = CapacityPool(
+        other,
+        deployments=[relaxed],
+        credentials=credentials("active-relaxed"),
+        key_prefix=prefix,
+        lease_seconds=0.02,
+        metadata_ttl_seconds=0.12,
+        metadata_refresh_interval=0.03,
+        monotonic=relaxed_clock,
+    )
+    try:
+        await strict_pool.initialize()
+        await relaxed_pool.initialize()
+        assert await relaxed_pool.effective_limit("retired") == 1
+        await asyncio.sleep(0.07)
+        relaxed_clock.advance(0.04)
+        await relaxed_pool.initialize()
+        await asyncio.sleep(0.07)
+        relaxed_clock.advance(0.04)
+        await relaxed_pool.initialize()
+        assert await relaxed_pool.effective_limit("retired") == 4
+    finally:
+        await other.aclose()
+
+
+@pytest.mark.integration
+async def test_failed_refresh_blocks_admission_but_not_inflight_outcome(
+    redis_client: Redis, prefix: str
+) -> None:
+    serial = deployment("refresh-race", "refresh-race-scope")
+    clock = ManualClock()
+    wrapped = RegistrationRedis(redis_client)
+    pool = CapacityPool(
+        wrapped,
+        deployments=[serial],
+        credentials=credentials("refresh-race"),
+        key_prefix=prefix,
+        lease_seconds=0.05,
+        metadata_ttl_seconds=0.3,
+        metadata_refresh_interval=0.05,
+        monotonic=clock,
+    )
+    await pool.initialize()
+    lease = await pool.acquire([serial], wait_timeout=0.05, estimated_tokens=1)
+    clock.advance(0.06)
+    wrapped.block_next = True
+    wrapped.fail_after_block = True
+    refresh = asyncio.create_task(pool.initialize())
+    await wrapped.started.wait()
+
+    await pool.record_outcome(
+        "refresh-race-scope", status_code=200, latency_seconds=0.01, succeeded=True
+    )
+    wrapped.proceed.set()
+    with pytest.raises(CapacityBackendError):
+        await refresh
+    with pytest.raises(CapacityConfigurationError, match="not initialized"):
+        await pool.acquire([serial], wait_timeout=0.01, estimated_tokens=1)
+    assert await pool.release(lease) is True
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("malformed", [True, 1.0, b"01", " 1"])
+async def test_malformed_acquire_result_cleans_exact_inserted_lease(
+    redis_client: Redis, prefix: str, malformed: object
+) -> None:
+    serial = deployment("malformed", "malformed-scope")
+    wrapped = MalformedAcquireRedis(redis_client, malformed)
+    pool = CapacityPool(
+        wrapped,
+        deployments=[serial],
+        credentials=credentials("malformed"),
+        key_prefix=prefix,
+    )
+    await pool.initialize()
+    wrapped.intercept = True
+    with pytest.raises(CapacityBackendError, match="invalid state"):
+        await pool.acquire([serial], wait_timeout=0, estimated_tokens=1)
+    lease_keys = [key async for key in redis_client.scan_iter(match=f"{prefix}*:leases")]
+    lease_counts = [await redis_client.zcard(key) for key in lease_keys]
+    assert all(count == 0 for count in lease_counts)
+
+
+@pytest.mark.integration
+async def test_gateway_renews_short_real_redis_lease_before_expiry(
+    redis_client: Redis, redis_url: str, prefix: str
+) -> None:
+    other = Redis.from_url(redis_url)
+    serial = deployment("heartbeat-real", "heartbeat-real-scope")
+    primary = CapacityPool(
+        redis_client,
+        deployments=[serial],
+        credentials=credentials("heartbeat-real"),
+        key_prefix=prefix,
+        lease_seconds=0.06,
+        metadata_ttl_seconds=0.24,
+        metadata_refresh_interval=0.05,
+        poll_interval=0.002,
+    )
+    challenger = CapacityPool(
+        other,
+        deployments=[serial],
+        credentials=credentials("heartbeat-real"),
+        key_prefix=prefix,
+        lease_seconds=0.06,
+        metadata_ttl_seconds=0.24,
+        metadata_refresh_interval=0.05,
+        poll_interval=0.002,
+    )
+    transport = BlockingTransport()
+    gateway = ModelGateway(
+        ModelRegistry([serial]),
+        primary,
+        SecretResolver(),
+        transport,
+        heartbeat_interval=10,
+        capacity_wait_timeout=0.05,
+    )
+    request = ModelRequest(
+        logical_model="chat", messages=(ModelMessage(role="user", content="hi"),)
+    )
+    try:
+        task = asyncio.create_task(gateway.complete(request))
+        await transport.started.wait()
+        await asyncio.sleep(0.14)
+        await challenger.initialize()
+        with pytest.raises(CapacityUnavailable):
+            await challenger.acquire([serial], wait_timeout=0.025, estimated_tokens=1)
+        transport.finish.set()
+        assert (await task).text == "ok"
+    finally:
+        await other.aclose()
+
+
+@pytest.mark.integration
+async def test_conservative_payload_estimate_is_rejected_by_tpm(
+    redis_client: Redis, prefix: str
+) -> None:
+    limited = deployment("payload-tpm", "payload-tpm-scope", tpm=500)
+    pool = CapacityPool(
+        redis_client,
+        deployments=[limited],
+        credentials=credentials("payload-tpm"),
+        key_prefix=prefix,
+    )
+    await pool.initialize()
+    request = ModelRequest(
+        logical_model="chat",
+        messages=(ModelMessage(role="user", content="界" * 300),),
+    )
+    estimate = ConservativeTokenEstimator(output_token_allowance=0).estimate(request)
+    assert estimate > 500
+    with pytest.raises(CapacityUnavailable):
+        await pool.acquire([limited], wait_timeout=0, estimated_tokens=estimate)

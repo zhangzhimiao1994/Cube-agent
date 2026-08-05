@@ -1,6 +1,8 @@
 import asyncio
-from collections.abc import Callable, Sequence
+import json
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+from uuid import NAMESPACE_DNS, uuid5
 
 import pytest
 
@@ -21,10 +23,12 @@ from agent_hub.models.litellm_client import ModelTransportError
 from agent_hub.models.registry import ModelRegistry
 from agent_hub.models.types import (
     Deployment,
+    JsonValue,
     ModelCapability,
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    StructuredResponseSchema,
 )
 
 
@@ -181,9 +185,45 @@ class EstimatorStub:
         return 73
 
 
+class RawFailingTransport:
+    def __init__(self) -> None:
+        self.task: asyncio.Task[object] | None = None
+
+    async def complete(
+        self, deployment: Deployment, model_request: ModelRequest, api_key: str
+    ) -> ModelResponse:
+        del deployment, model_request
+        current = asyncio.current_task()
+        assert current is not None
+        self.task = current
+        raise RuntimeError(f"raw-provider-detail:{api_key}")
+
+
+class AdvancingSecretResolver:
+    def __init__(self, clock: list[float]) -> None:
+        self.clock = clock
+
+    async def resolve(self, secret_ref: str) -> str:
+        del secret_ref
+        self.clock[0] += 100
+        return "private-api-key"
+
+
+class AdvancingTransport:
+    def __init__(self, clock: list[float]) -> None:
+        self.clock = clock
+
+    async def complete(
+        self, deployment: Deployment, model_request: ModelRequest, api_key: str
+    ) -> ModelResponse:
+        del deployment, model_request, api_key
+        self.clock[0] += 0.25
+        return ModelResponse(text="ok")
+
+
 def lease(identifier: str, scope: str | None = None) -> CapacityLease:
     return CapacityLease(
-        id=f"lease-{identifier}",
+        id=str(uuid5(NAMESPACE_DNS, identifier)),
         deployment_id=identifier,
         quota_scope_id=scope or f"scope-{identifier}",
         expires_at=datetime.now(UTC) + timedelta(seconds=30),
@@ -310,6 +350,54 @@ async def test_typed_transport_error_traceback_drops_transport_key_locals() -> N
     assert "key-for-secret://selected" not in " ".join(frame_values)
 
 
+async def test_raw_transport_failure_does_not_escape_task_or_public_traceback() -> None:
+    selected = deployment("selected")
+    capacity = CapacityStub([lease("selected")])
+    transport = RawFailingTransport()
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        SecretStub(capacity.events),
+        transport,
+    )
+
+    with pytest.raises(ModelGatewayError) as captured:
+        await gateway.complete(request())
+
+    public = captured.value
+    assert "raw-provider-detail" not in str(public)
+    assert "key-for-secret://selected" not in repr(public)
+    assert public.__cause__ is None
+    assert public.__context__ is None
+    assert transport.task is not None and transport.task.done()
+    assert transport.task.exception() is None
+    frame_values: list[str] = []
+    traceback = public.__traceback__
+    while traceback is not None:
+        frame_values.extend(repr(value) for value in traceback.tb_frame.f_locals.values())
+        traceback = traceback.tb_next
+    captured_locals = " ".join(frame_values)
+    assert "raw-provider-detail" not in captured_locals
+    assert "key-for-secret://selected" not in captured_locals
+
+
+async def test_health_latency_excludes_secret_resolution_time() -> None:
+    selected = deployment("selected")
+    capacity = CapacityStub([lease("selected")])
+    clock = [5.0]
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        AdvancingSecretResolver(clock),
+        AdvancingTransport(clock),
+        monotonic=lambda: clock[0],
+    )
+
+    await gateway.complete(request())
+
+    assert capacity.records[0][2] == pytest.approx(0.25)
+
+
 async def test_record_and_release_failures_do_not_replace_primary_transport_error() -> None:
     selected = deployment("selected")
     capacity = CapacityStub([lease("selected")])
@@ -373,6 +461,29 @@ async def test_cancellation_during_release_wait_propagates_after_cleanup() -> No
     assert len(capacity.releases) == 1
 
 
+async def test_cancellation_during_unknown_lease_cleanup_remains_cancelled() -> None:
+    selected = deployment("selected")
+    capacity = CapacityStub([lease("unknown")])
+    capacity.release_block = asyncio.Event()
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        SecretStub(capacity.events),
+        TransportStub(capacity.events),
+    )
+    task = asyncio.create_task(gateway.complete(request()))
+    await capacity.release_started.wait()
+    task.cancel("unknown lease cleanup cancelled")
+    capacity.release_block.set()
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await task
+
+    assert captured.value.args == ("unknown lease cleanup cancelled",)
+    assert task.cancelled()
+    assert len(capacity.releases) == 1
+
+
 async def test_long_call_renews_lease_until_nonstream_response_finishes() -> None:
     selected = deployment("selected")
     capacity = CapacityStub([lease("selected")])
@@ -391,6 +502,35 @@ async def test_long_call_renews_lease_until_nonstream_response_finishes() -> Non
     block.set()
     assert (await task).text == "ok"
     assert len(capacity.releases) == 1
+
+
+async def test_short_lease_renews_before_expiry_with_large_heartbeat_cap() -> None:
+    selected = deployment("selected")
+    short_lease = CapacityLease(
+        id=str(uuid5(NAMESPACE_DNS, "short-lease")),
+        deployment_id="selected",
+        quota_scope_id="scope-selected",
+        expires_at=datetime.now(UTC) + timedelta(seconds=0.08),
+    )
+    capacity = CapacityStub([short_lease])
+    block = asyncio.Event()
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        SecretStub(capacity.events),
+        TransportStub(capacity.events, block=block),
+        heartbeat_interval=10,
+    )
+    task = asyncio.create_task(gateway.complete(request()))
+
+    async def wait_for_renew() -> None:
+        while capacity.renews == 0:
+            await asyncio.sleep(0.002)
+
+    await asyncio.wait_for(wait_for_renew(), timeout=0.2)
+    block.set()
+    await task
+    assert capacity.renews >= 1
 
 
 async def test_heartbeat_ownership_conflict_cancels_transport_and_releases_once() -> None:
@@ -412,7 +552,7 @@ async def test_heartbeat_ownership_conflict_cancels_transport_and_releases_once(
 
     assert transport.cancelled.is_set()
     assert len(capacity.releases) == 1
-    assert capacity.events.count(("release", "lease-selected")) == 1
+    assert capacity.events.count(("release", lease("selected").id)) == 1
 
 
 async def test_capacity_timeout_traverses_fallback_only_when_allowed() -> None:
@@ -430,9 +570,10 @@ async def test_capacity_timeout_traverses_fallback_only_when_allowed() -> None:
 
     assert (await gateway.complete(request())).text == "ok"
     acquire_events = [event for event in capacity.events if event[0] == "acquire"]  # type: ignore[index]
+    estimated = ConservativeTokenEstimator().estimate(request())
     assert acquire_events == [
-        ("acquire", ("primary-key",), 0.02, 520),
-        ("acquire", ("backup-key",), 0.02, 520),
+        ("acquire", ("primary-key",), 0.02, estimated),
+        ("acquire", ("backup-key",), 0.02, estimated),
     ]
     assert capacity.initialize_calls == 2
 
@@ -520,8 +661,72 @@ def test_fallback_configuration_is_validated(
 def test_default_estimator_is_deterministic_positive_and_prompt_safe() -> None:
     model_request = request()
     estimator = ConservativeTokenEstimator()
-    assert estimator.estimate(model_request) == estimator.estimate(model_request) == 520
+    assert estimator.estimate(model_request) == estimator.estimate(model_request)
+    assert estimator.estimate(model_request) >= 4096 + len(b"private prompt")
     assert "private prompt" not in repr(estimator)
+
+
+def test_estimator_covers_normalized_utf8_numbers_booleans_null_and_nesting() -> None:
+    huge_integer = 10**999
+    schema_value: Mapping[str, JsonValue] = {
+        "type": "object",
+        "properties": {
+            "value": {"enum": (huge_integer, 1.25, True, None, "雪")},
+        },
+    }
+    model_request = ModelRequest(
+        logical_model="primary",
+        messages=(
+            ModelMessage(role="user", content="你好"),
+            ModelMessage(
+                role="user",
+                content=(
+                    {"type": "text", "text": "nested"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.test/雪.png", "detail": "high"},
+                    },
+                ),
+            ),
+        ),
+        required_capabilities=frozenset({ModelCapability.STRUCTURED_OUTPUT}),
+        response_schema=StructuredResponseSchema(name="Payload", schema=schema_value),
+    )
+    estimator = ConservativeTokenEstimator(output_token_allowance=17)
+    serialized_schema_bytes = len(
+        json.dumps(schema_value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+
+    estimate = estimator.estimate(model_request)
+
+    assert estimate >= serialized_schema_bytes + 17
+    assert estimate > 1100
+
+
+@pytest.mark.parametrize("allowance", [-1, 1.0, True, None])
+def test_estimator_requires_strict_nonnegative_output_allowance(allowance: object) -> None:
+    with pytest.raises(ValueError, match="output_token_allowance"):
+        ConservativeTokenEstimator(output_token_allowance=allowance)  # type: ignore[arg-type]
+
+
+def test_capacity_lease_repr_is_redacted_and_fields_are_validated() -> None:
+    active = lease("sensitive-deployment", "sensitive-scope")
+    assert repr(active) == "CapacityLease(<redacted>)"
+    assert "sensitive" not in repr(active)
+
+    with pytest.raises(ValueError, match="lease id"):
+        CapacityLease("not-a-uuid", "deployment", "scope", datetime.now(UTC))
+    with pytest.raises(ValueError, match="deployment id"):
+        CapacityLease(str(uuid5(NAMESPACE_DNS, "x")), "Bad Deployment", "scope", datetime.now(UTC))
+    with pytest.raises(ValueError, match="quota_scope_id"):
+        CapacityLease(str(uuid5(NAMESPACE_DNS, "x")), "deployment", "bad scope", datetime.now(UTC))
+    with pytest.raises(ValueError, match="timezone-aware"):
+        CapacityLease(
+            str(uuid5(NAMESPACE_DNS, "x")),
+            "deployment",
+            "scope",
+            datetime(2025, 1, 1),  # noqa: DTZ001 - intentionally exercises naive rejection
+        )
 
 
 @pytest.mark.parametrize("status", [99, 600, True, "429"])
