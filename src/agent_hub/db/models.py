@@ -317,3 +317,42 @@ class RunOutboxRow(Base):
         DateTime(timezone=True), server_default=func.now()
     )
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ChannelInboundDedupRow(Base):
+    __tablename__ = "agent_hub_channel_dedup"
+    __table_args__ = (
+        UniqueConstraint(
+            "channel",
+            "tenant_external_id",
+            "event_id",
+            name="uq_agent_hub_channel_dedup_event",
+        ),
+        UniqueConstraint(
+            "channel",
+            "tenant_external_id",
+            "message_id",
+            name="uq_agent_hub_channel_dedup_message",
+        ),
+        CheckConstraint(
+            "status IN ('reserved', 'submitted', 'completed')",
+            name="ck_agent_hub_channel_dedup_status",
+        ),
+        Index("ix_agent_hub_channel_dedup_cleanup", "status", "completed_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    tenant_external_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    event_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    message_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    run_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+ChannelDedupRow = ChannelInboundDedupRow
