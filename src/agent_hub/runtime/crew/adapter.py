@@ -63,6 +63,7 @@ _MAX_TOOL_ARGUMENT_BYTES = 32_768
 _MAX_AUDITED_TOKENS = 100_000_000
 _MAX_AUDITED_COST_USD = Decimal(64000000)
 _TASK_CANCELLATION_GRACE_SECONDS = 0.25
+_ARTIFACT_ROLLBACK_TIMEOUT_SECONDS = 5.0
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _CREWAI_IMPORT_LOCK = threading.Lock()
 _CREWAI_STORAGE_CONTEXT: ContextVar[Path | None] = ContextVar(
@@ -568,16 +569,25 @@ class _RunState:
     crew_generation: CrewStepGeneration | None = None
     open: bool = True
     commit_tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    pending_artifact_writes: dict[UUID, ArtifactReference] = field(default_factory=dict)
+    cleanup_error: RuntimeExecutionError | None = None
 
 
 class CrewRunStream:
     """Single-consumer async stream with explicit cancellation ownership."""
 
-    def __init__(self, runtime: CrewDispatchRuntime, generator: AsyncIterator[RunEvent]) -> None:
+    def __init__(
+        self,
+        runtime: CrewDispatchRuntime,
+        generator: AsyncIterator[RunEvent],
+        state: _RunState,
+    ) -> None:
         self._runtime = runtime
         self._generator = generator
+        self._state = state
         self._owner: asyncio.Task[object] | None = None
         self._closed = False
+        self._pending_terminal: BaseException | None = None
         self._lock = asyncio.Lock()
 
     def __aiter__(self) -> CrewRunStream:
@@ -588,6 +598,10 @@ class CrewRunStream:
         if current is None:  # pragma: no cover
             _fail("runtime consumer unavailable")
         async with self._lock:
+            if self._pending_terminal is not None:
+                error = self._pending_terminal
+                self._pending_terminal = None
+                raise error
             if self._closed:
                 raise StopAsyncIteration
             if self._owner is None:
@@ -649,7 +663,7 @@ class CrewDispatchRuntime:
         self._current_token = token
         state = _RunState(token=token)
         generator = self._run(context, state)
-        stream = CrewRunStream(self, generator)
+        stream = CrewRunStream(self, generator, state)
         self._active_stream = stream
         self._active_done = asyncio.Event()
         self._last_checkpoint = None
@@ -717,23 +731,30 @@ class CrewDispatchRuntime:
         hydrating_restored = protected_checkpoint is not None
         terminal_item: _Terminal | None = None
 
-        async def store_artifact(artifact: Artifact) -> None:
+        async def store_artifact(artifact: Artifact) -> UUID:
             reference = ArtifactReference(id=artifact.id, sha256=artifact.content_sha256)
+            write_id = uuid4()
+            state.pending_artifact_writes[write_id] = reference
             async with asyncio.timeout(self._remaining_timeout(state)):
                 await self._artifact_repository.put(
-                    context.tenant_id, context.run_id, artifact
+                    context.tenant_id,
+                    context.run_id,
+                    artifact,
+                    write_id=write_id,
                 )
                 resolved = await self._artifact_repository.get_many(
                     context.tenant_id, context.run_id, (reference,)
                 )
             if resolved != (artifact,):
                 _fail("artifact repository verification failed")
+            return write_id
 
         async def emit(**values: object) -> None:
             artifact = values.get("artifact")
             if type(artifact) is Artifact and str(artifact.id) not in artifact_registry:
-                await store_artifact(artifact)
+                write_id = await store_artifact(artifact)
                 artifact_registry[str(artifact.id)] = artifact
+                state.pending_artifact_writes.pop(write_id, None)
             if run_open and self._is_current_run(state):
                 await queue.put(await sequence.event(run_id=context.run_id, **values))
 
@@ -1085,7 +1106,7 @@ class CrewDispatchRuntime:
                             str(artifact.id): artifact,
                         },
                     )
-                    await store_artifact(artifact)
+                    write_id = await store_artifact(artifact)
                     model_ledger.states[key] = model_state
                     model_ledger.artifacts[key] = artifact
                     artifact_registry[str(artifact.id)] = artifact
@@ -1099,6 +1120,7 @@ class CrewDispatchRuntime:
                     usage_ledger.step_token_overflows = candidate_usage.step_token_overflows
                     usage_ledger.step_cost_overflows = candidate_usage.step_cost_overflows
                     self._publish_checkpoint(state, checkpoint)
+                    state.pending_artifact_writes.pop(write_id, None)
                     await emit(kind=EventKind.ARTIFACT_CREATED, artifact=artifact)
                     if response_cost:
                         await emit(
@@ -1306,6 +1328,45 @@ class CrewDispatchRuntime:
                 emit_error.__cause__ = None
                 del emit_error
         finally:
+            if state.pending_artifact_writes:
+                pending_writes = tuple(state.pending_artifact_writes.items())
+
+                async def rollback_pending() -> None:
+                    for write_id, reference in pending_writes:
+                        await self._artifact_repository.delete_if_hash(
+                            context.tenant_id,
+                            context.run_id,
+                            reference,
+                            write_id=write_id,
+                        )
+                        state.pending_artifact_writes.pop(write_id, None)
+
+                rollback = asyncio.create_task(rollback_pending())
+                try:
+                    async with asyncio.timeout(_ARTIFACT_ROLLBACK_TIMEOUT_SECONDS):
+                        await asyncio.shield(rollback)
+                except Exception as rollback_error:  # noqa: BLE001
+                    rollback_error.__traceback__ = None
+                    rollback_error.__context__ = None
+                    rollback_error.__cause__ = None
+                    if not rollback.done():
+                        rollback.cancel()
+                    await asyncio.gather(rollback, return_exceptions=True)
+                    cleanup_error = RuntimeExecutionError("artifact rollback failed")
+                    state.cleanup_error = cleanup_error
+                    terminal_item = _Terminal(cleanup_error)
+                    if run_open and self._is_current_run(state):
+                        try:
+                            queue.put_nowait(
+                                await sequence.event(
+                                    run_id=context.run_id,
+                                    kind=EventKind.RUNTIME_FAILED,
+                                    reason="artifact rollback failed",
+                                )
+                            )
+                        except asyncio.QueueFull as queue_full:
+                            del queue_full
+                    del rollback_error
             run_open = False
             state.open = False
             state.deadline = None
@@ -3447,11 +3508,18 @@ class CrewDispatchRuntime:
     async def cancel(self) -> None:
         stream = self._active_stream
         if stream is not None:
-            await self._close_stream(stream)
+            await self._close_stream(stream, preserve_cancel=True)
 
-    async def _close_stream(self, stream: CrewRunStream) -> None:
+    async def _close_stream(
+        self,
+        stream: CrewRunStream,
+        *,
+        preserve_cancel: bool = False,
+    ) -> None:
         async with self._cancel_lock:
             if stream._closed:
+                if stream._state.cleanup_error is not None:
+                    raise stream._state.cleanup_error
                 return
             if self._active_stream is not stream:
                 stream._closed = True
@@ -3462,6 +3530,10 @@ class CrewDispatchRuntime:
             generator = stream._generator
             if not bool(getattr(generator, "ag_running", False)):
                 await generator.aclose()  # type: ignore[attr-defined]
+                if preserve_cancel:
+                    stream._pending_terminal = (
+                        stream._state.cleanup_error or asyncio.CancelledError()
+                    )
             else:
                 done = self._active_done
                 if done is not None:
@@ -3477,6 +3549,8 @@ class CrewDispatchRuntime:
                 if done is not None:
                     done.set()
             stream._closed = True
+            if stream._state.cleanup_error is not None:
+                raise stream._state.cleanup_error
 
 
 __all__ = [

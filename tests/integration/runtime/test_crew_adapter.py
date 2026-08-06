@@ -35,6 +35,7 @@ from agent_hub.runtime.artifacts import (
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
+    JsonValue,
     RunEvent,
     RuntimeCheckpoint,
     TaskContext,
@@ -2911,11 +2912,20 @@ async def test_partial_repository_write_recovers_from_last_durable_boundary() ->
             self.delegate = InMemoryArtifactRepository()
             self.puts = 0
 
-        async def put(self, tenant_id: UUID, run_id: UUID, artifact: Artifact) -> None:
+        async def put(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            artifact: Artifact,
+            *,
+            write_id: UUID | None = None,
+        ) -> None:
             if self.puts >= 1:
                 raise ArtifactRepositoryError("artifact repository write failed")
             self.puts += 1
-            await self.delegate.put(tenant_id, run_id, artifact)
+            await self.delegate.put(
+                tenant_id, run_id, artifact, write_id=write_id
+            )
 
         async def get_many(
             self,
@@ -2924,6 +2934,18 @@ async def test_partial_repository_write_recovers_from_last_durable_boundary() ->
             references: tuple[ArtifactReference, ...],
         ) -> tuple[Artifact, ...]:
             return await self.delegate.get_many(tenant_id, run_id, references)
+
+        async def delete_if_hash(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            reference: ArtifactReference,
+            *,
+            write_id: UUID,
+        ) -> bool:
+            return await self.delegate.delete_if_hash(
+                tenant_id, run_id, reference, write_id=write_id
+            )
 
     failing = FailAfterOnePut()
     first = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=failing)
@@ -2950,8 +2972,17 @@ async def test_cancelled_repository_hydration_never_replaces_checkpoint() -> Non
             self.delegate = delegate
             self.started = asyncio.Event()
 
-        async def put(self, tenant_id: UUID, run_id: UUID, artifact: Artifact) -> None:
-            await self.delegate.put(tenant_id, run_id, artifact)
+        async def put(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            artifact: Artifact,
+            *,
+            write_id: UUID | None = None,
+        ) -> None:
+            await self.delegate.put(
+                tenant_id, run_id, artifact, write_id=write_id
+            )
 
         async def get_many(
             self,
@@ -2962,6 +2993,18 @@ async def test_cancelled_repository_hydration_never_replaces_checkpoint() -> Non
             self.started.set()
             await asyncio.Event().wait()
             return await self.delegate.get_many(tenant_id, run_id, references)
+
+        async def delete_if_hash(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            reference: ArtifactReference,
+            *,
+            write_id: UUID,
+        ) -> bool:
+            return await self.delegate.delete_if_hash(
+                tenant_id, run_id, reference, write_id=write_id
+            )
 
     repository = InMemoryArtifactRepository()
     first = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=repository)
@@ -2983,8 +3026,15 @@ async def test_cancelled_repository_hydration_never_replaces_checkpoint() -> Non
 
 async def test_failed_model_artifact_put_preserves_running_boundary_and_zero_usage() -> None:
     class RejectingRepository:
-        async def put(self, tenant_id: UUID, run_id: UUID, artifact: Artifact) -> None:
-            del tenant_id, run_id, artifact
+        async def put(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            artifact: Artifact,
+            *,
+            write_id: UUID | None = None,
+        ) -> None:
+            del tenant_id, run_id, artifact, write_id
             raise ArtifactRepositoryError("artifact repository write failed")
 
         async def get_many(
@@ -2996,6 +3046,17 @@ async def test_failed_model_artifact_put_preserves_running_boundary_and_zero_usa
             del tenant_id, run_id
             assert references == ()
             return ()
+
+        async def delete_if_hash(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            reference: ArtifactReference,
+            *,
+            write_id: UUID,
+        ) -> bool:
+            del tenant_id, run_id, reference, write_id
+            return False
 
     repository = RejectingRepository()
     gateway = FakeGateway()
@@ -3208,10 +3269,19 @@ async def test_repository_verification_failure_keeps_model_running_and_terminate
     class UntrustedRepository:
         def __init__(self) -> None:
             self.stored: Artifact | None = None
+            self.write_id: UUID | None = None
 
-        async def put(self, tenant_id: UUID, run_id: UUID, artifact: Artifact) -> None:
+        async def put(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            artifact: Artifact,
+            *,
+            write_id: UUID | None = None,
+        ) -> None:
             del tenant_id, run_id
             self.stored = artifact
+            self.write_id = write_id
 
         async def get_many(
             self,
@@ -3234,11 +3304,32 @@ async def test_repository_verification_failure_keeps_model_running_and_terminate
                 ),
             )
 
+        async def delete_if_hash(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            reference: ArtifactReference,
+            *,
+            write_id: UUID,
+        ) -> bool:
+            del tenant_id, run_id
+            if (
+                self.stored is None
+                or self.write_id != write_id
+                or self.stored.id != reference.id
+                or self.stored.content_sha256 != reference.sha256
+            ):
+                return False
+            self.stored = None
+            self.write_id = None
+            return True
+
     gateway = FakeGateway()
+    repository = UntrustedRepository()
     runtime = make_runtime(
         gateway,
         one_step_plan(),
-        artifact_repository=UntrustedRepository(),
+        artifact_repository=repository,
     )
 
     with pytest.raises(RuntimeExecutionError):
@@ -3249,6 +3340,7 @@ async def test_repository_verification_failure_keeps_model_running_and_terminate
     assert {item["status"] for item in models.values()} == {"running"}
     assert checkpoint.state["artifact_registry"] == {}
     assert len(gateway.requests) == 1
+    assert repository.stored is None
 
 
 async def test_candidate_checkpoint_failure_keeps_last_running_boundary() -> None:
@@ -3278,8 +3370,15 @@ async def test_candidate_checkpoint_failure_keeps_last_running_boundary() -> Non
 
 async def test_unexpected_repository_exception_still_delivers_terminal() -> None:
     class ExplodingRepository:
-        async def put(self, tenant_id: UUID, run_id: UUID, artifact: Artifact) -> None:
-            del tenant_id, run_id, artifact
+        async def put(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            artifact: Artifact,
+            *,
+            write_id: UUID | None = None,
+        ) -> None:
+            del tenant_id, run_id, artifact, write_id
             raise ValueError("synthetic repository defect")
 
         async def get_many(
@@ -3290,6 +3389,17 @@ async def test_unexpected_repository_exception_still_delivers_terminal() -> None
         ) -> tuple[Artifact, ...]:
             del tenant_id, run_id, references
             return ()
+
+        async def delete_if_hash(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            reference: ArtifactReference,
+            *,
+            write_id: UUID,
+        ) -> bool:
+            del tenant_id, run_id, reference, write_id
+            return False
 
     runtime = make_runtime(
         FakeGateway(),
@@ -3307,10 +3417,20 @@ async def test_pre_capability_checkpoints_never_publish_provisional_success() ->
             super().__init__()
             self.started = asyncio.Event()
 
-        async def execute(self, **kwargs):  # type: ignore[no-untyped-def]
+        async def execute(
+            self,
+            *,
+            tenant_id: UUID,
+            run_id: UUID,
+            actor: str,
+            name: str,
+            arguments: Mapping[str, JsonValue],
+            idempotency_key: str,
+        ) -> Mapping[str, JsonValue]:
+            del tenant_id, run_id, actor, name, arguments, idempotency_key
             self.started.set()
             await asyncio.Event().wait()
-            return await super().execute(**kwargs)  # pragma: no cover
+            return {}  # pragma: no cover
 
     repository = InMemoryArtifactRepository()
     capabilities = BlockingCapabilities()
@@ -3456,11 +3576,20 @@ async def test_cancel_during_artifact_commit_leaves_no_commit_task_and_reuses_ru
             self.started = asyncio.Event()
             self.release = asyncio.Event()
 
-        async def put(self, tenant_id: UUID, run_id: UUID, artifact: Artifact) -> None:
+        async def put(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            artifact: Artifact,
+            *,
+            write_id: UUID | None = None,
+        ) -> None:
             if self.block:
                 self.started.set()
                 await self.release.wait()
-            await self.delegate.put(tenant_id, run_id, artifact)
+            await self.delegate.put(
+                tenant_id, run_id, artifact, write_id=write_id
+            )
 
         async def get_many(
             self,
@@ -3469,6 +3598,18 @@ async def test_cancel_during_artifact_commit_leaves_no_commit_task_and_reuses_ru
             references: tuple[ArtifactReference, ...],
         ) -> tuple[Artifact, ...]:
             return await self.delegate.get_many(tenant_id, run_id, references)
+
+        async def delete_if_hash(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            reference: ArtifactReference,
+            *,
+            write_id: UUID,
+        ) -> bool:
+            return await self.delegate.delete_if_hash(
+                tenant_id, run_id, reference, write_id=write_id
+            )
 
     repository = BlockingRepository()
     runtime = make_runtime(
@@ -3517,6 +3658,187 @@ async def test_early_close_with_full_event_queue_is_bounded_and_runtime_reusable
     await anext(stream)
     await asyncio.wait_for(stream.aclose(), timeout=2)
 
+    assert (
+        await asyncio.wait_for(
+            collect(runtime, context(token_budget=100)),
+            timeout=2,
+        )
+    )[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_cancel_rolls_back_a_repository_write_completed_before_put_returns() -> None:
+    class WrittenThenBlockingRepository:
+        def __init__(self) -> None:
+            self.delegate = InMemoryArtifactRepository()
+            self.block = True
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.stored: Artifact | None = None
+
+        async def put(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            artifact: Artifact,
+            *,
+            write_id: UUID | None = None,
+        ) -> None:
+            self.stored = artifact
+            if write_id is None:
+                await self.delegate.put(tenant_id, run_id, artifact)
+            else:
+                await self.delegate.put(
+                    tenant_id, run_id, artifact, write_id=write_id
+                )
+            if self.block:
+                self.started.set()
+                await self.release.wait()
+
+        async def get_many(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            references: tuple[ArtifactReference, ...],
+        ) -> tuple[Artifact, ...]:
+            return await self.delegate.get_many(tenant_id, run_id, references)
+
+        async def delete_if_hash(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            reference: ArtifactReference,
+            *,
+            write_id: UUID,
+        ) -> bool:
+            return await self.delegate.delete_if_hash(
+                tenant_id, run_id, reference, write_id=write_id
+            )
+
+    repository = WrittenThenBlockingRepository()
+    runtime = make_runtime(
+        FakeGateway(), one_step_plan(), artifact_repository=repository
+    )
+    consumer = asyncio.create_task(collect(runtime, context(token_budget=100)))
+    await repository.started.wait()
+
+    await asyncio.wait_for(runtime.cancel(), timeout=2)
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+    assert repository.stored is not None
+    reference = ArtifactReference(
+        id=repository.stored.id,
+        sha256=repository.stored.content_sha256,
+    )
+    with pytest.raises(ArtifactRepositoryError, match="unavailable"):
+        await repository.get_many(TENANT_ID, RUN_ID, (reference,))
+    assert (await runtime.save_checkpoint()).state["artifact_registry"] == {}
+    assert not any(
+        not task.done() and "usage_boundary" in repr(task.get_coro())
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+    )
+
+    repository.block = False
+    assert (
+        await collect(runtime, context(token_budget=100))
+    )[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+@pytest.mark.parametrize("rollback_mode", ("error", "timeout"))
+async def test_failed_artifact_rollback_is_an_explicit_terminal_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    rollback_mode: str,
+) -> None:
+    adapter_module = importlib.import_module("agent_hub.runtime.crew.adapter")
+    monkeypatch.setattr(
+        adapter_module,
+        "_ARTIFACT_ROLLBACK_TIMEOUT_SECONDS",
+        0.01,
+        raising=False,
+    )
+
+    class FailedRollbackRepository:
+        def __init__(self) -> None:
+            self.delegate = InMemoryArtifactRepository()
+            self.started = asyncio.Event()
+
+        async def put(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            artifact: Artifact,
+            *,
+            write_id: UUID | None = None,
+        ) -> None:
+            if write_id is None:
+                await self.delegate.put(tenant_id, run_id, artifact)
+            else:
+                await self.delegate.put(
+                    tenant_id, run_id, artifact, write_id=write_id
+                )
+            self.started.set()
+            await asyncio.Event().wait()
+
+        async def get_many(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            references: tuple[ArtifactReference, ...],
+        ) -> tuple[Artifact, ...]:
+            return await self.delegate.get_many(tenant_id, run_id, references)
+
+        async def delete_if_hash(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            reference: ArtifactReference,
+            *,
+            write_id: UUID,
+        ) -> bool:
+            del tenant_id, run_id, reference, write_id
+            if rollback_mode == "error":
+                raise ArtifactRepositoryError("synthetic rollback failure")
+            await asyncio.Event().wait()
+            return False  # pragma: no cover
+
+    repository = FailedRollbackRepository()
+    runtime = make_runtime(
+        FakeGateway(), one_step_plan(), artifact_repository=repository
+    )
+    consumer = asyncio.create_task(collect(runtime, context(token_budget=100)))
+    await repository.started.wait()
+
+    with pytest.raises(RuntimeExecutionError, match="artifact rollback failed"):
+        await asyncio.wait_for(runtime.cancel(), timeout=2)
+    with pytest.raises(RuntimeExecutionError, match="artifact rollback failed"):
+        await consumer
+
+
+async def test_runtime_cancel_preserves_cancelled_error_for_a_paused_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter_module = importlib.import_module("agent_hub.runtime.crew.adapter")
+    queue_type = asyncio.Queue
+    monkeypatch.setattr(
+        adapter_module.asyncio,
+        "Queue",
+        lambda maxsize=0: queue_type(maxsize=1),
+    )
+    runtime = make_runtime(FakeGateway(), one_step_plan())
+    stream = cast(CrewRunStream, runtime.run(context(token_budget=100)))
+    while (await anext(stream)).kind is not EventKind.STEP_STARTED:
+        pass
+
+    await asyncio.wait_for(runtime.cancel(), timeout=2)
+    with pytest.raises(asyncio.CancelledError):
+        await anext(stream)
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+    assert not any(
+        not task.done() and "CrewDispatchRuntime" in repr(task.get_coro())
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+    )
     assert (
         await asyncio.wait_for(
             collect(runtime, context(token_budget=100)),

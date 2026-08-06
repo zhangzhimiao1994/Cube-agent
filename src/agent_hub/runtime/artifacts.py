@@ -36,7 +36,14 @@ class ArtifactReference:
 
 
 class ArtifactRepository(Protocol):
-    async def put(self, tenant_id: UUID, run_id: UUID, artifact: Artifact) -> None: ...
+    async def put(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        artifact: Artifact,
+        *,
+        write_id: UUID | None = None,
+    ) -> None: ...
 
     async def get_many(
         self,
@@ -44,6 +51,15 @@ class ArtifactRepository(Protocol):
         run_id: UUID,
         references: tuple[ArtifactReference, ...],
     ) -> tuple[Artifact, ...]: ...
+
+    async def delete_if_hash(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        reference: ArtifactReference,
+        *,
+        write_id: UUID,
+    ) -> bool: ...
 
 
 class InMemoryArtifactRepository:
@@ -73,6 +89,7 @@ class InMemoryArtifactRepository:
         self._sizes: dict[tuple[UUID, UUID, UUID], int] = {}
         self._scope_counts: dict[tuple[UUID, UUID], int] = {}
         self._scope_bytes: dict[tuple[UUID, UUID], int] = {}
+        self._write_owners: dict[tuple[UUID, UUID, UUID], set[UUID] | None] = {}
         self._lock = asyncio.Lock()
 
     @staticmethod
@@ -99,8 +116,17 @@ class InMemoryArtifactRepository:
             raise ArtifactRepositoryError("artifact repository capacity exceeded")
         return size
 
-    async def put(self, tenant_id: UUID, run_id: UUID, artifact: Artifact) -> None:
+    async def put(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        artifact: Artifact,
+        *,
+        write_id: UUID | None = None,
+    ) -> None:
         scope = self._scope(tenant_id, run_id)
+        if write_id is not None and type(write_id) is not UUID:
+            raise ArtifactRepositoryError("artifact write identity is invalid")
         size = self._encoded_size(artifact)
         key = (*scope, artifact.id)
         async with self._lock:
@@ -108,6 +134,12 @@ class InMemoryArtifactRepository:
             if existing is not None:
                 if existing.content_sha256 != artifact.content_sha256:
                     raise ArtifactRepositoryError("artifact is unavailable")
+                owners = self._write_owners[key]
+                if owners is not None:
+                    if write_id is None:
+                        self._write_owners[key] = None
+                    else:
+                        owners.add(write_id)
                 return
             count = self._scope_counts.get(scope, 0)
             total = self._scope_bytes.get(scope, 0)
@@ -120,6 +152,7 @@ class InMemoryArtifactRepository:
             self._sizes[key] = size
             self._scope_counts[scope] = count + 1
             self._scope_bytes[scope] = total + size
+            self._write_owners[key] = None if write_id is None else {write_id}
 
     async def get_many(
         self,
@@ -152,6 +185,45 @@ class InMemoryArtifactRepository:
                     raise ArtifactRepositoryError("artifact repository capacity exceeded")
                 resolved.append(artifact)
             return tuple(resolved)
+
+    async def delete_if_hash(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        reference: ArtifactReference,
+        *,
+        write_id: UUID,
+    ) -> bool:
+        scope = self._scope(tenant_id, run_id)
+        if type(reference) is not ArtifactReference or type(write_id) is not UUID:
+            raise ArtifactRepositoryError("artifact rollback identity is invalid")
+        key = (*scope, reference.id)
+        async with self._lock:
+            artifact = self._artifacts.get(key)
+            if (
+                artifact is None
+                or artifact.content_sha256 != reference.sha256
+                or artifact.recompute_content_sha256() != reference.sha256
+            ):
+                return False
+            owners = self._write_owners[key]
+            if owners is None or write_id not in owners:
+                return False
+            owners.remove(write_id)
+            if owners:
+                return False
+            size = self._sizes.pop(key)
+            del self._artifacts[key]
+            del self._write_owners[key]
+            count = self._scope_counts[scope] - 1
+            total = self._scope_bytes[scope] - size
+            if count:
+                self._scope_counts[scope] = count
+                self._scope_bytes[scope] = total
+            else:
+                del self._scope_counts[scope]
+                del self._scope_bytes[scope]
+            return True
 
 
 __all__ = [

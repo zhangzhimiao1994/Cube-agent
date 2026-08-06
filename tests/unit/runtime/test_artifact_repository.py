@@ -92,3 +92,44 @@ async def test_repository_accepts_idempotent_second_put_without_using_capacity()
     await repository.put(TENANT_ID, RUN_ID, stored)
 
     assert await repository.get_many(TENANT_ID, RUN_ID, (reference,)) == (stored,)
+
+
+async def test_conditional_rollback_removes_only_the_matching_write_owner() -> None:
+    repository = InMemoryArtifactRepository()
+    stored = artifact("safe")
+    reference = ArtifactReference(id=stored.id, sha256=stored.content_sha256)
+    first_owner = uuid4()
+    second_owner = uuid4()
+
+    await repository.put(TENANT_ID, RUN_ID, stored, write_id=first_owner)
+    await repository.put(TENANT_ID, RUN_ID, stored, write_id=second_owner)
+
+    assert not await repository.delete_if_hash(
+        TENANT_ID, RUN_ID, reference, write_id=first_owner
+    )
+    assert await repository.get_many(TENANT_ID, RUN_ID, (reference,)) == (stored,)
+    assert await repository.delete_if_hash(
+        TENANT_ID, RUN_ID, reference, write_id=second_owner
+    )
+    with pytest.raises(ArtifactRepositoryError, match="unavailable"):
+        await repository.get_many(TENANT_ID, RUN_ID, (reference,))
+
+
+async def test_conditional_rollback_never_deletes_a_permanent_or_hash_mismatched_write() -> None:
+    repository = InMemoryArtifactRepository()
+    stored = artifact("safe")
+    reference = ArtifactReference(id=stored.id, sha256=stored.content_sha256)
+    owner = uuid4()
+    await repository.put(TENANT_ID, RUN_ID, stored)
+    await repository.put(TENANT_ID, RUN_ID, stored, write_id=owner)
+
+    assert not await repository.delete_if_hash(
+        TENANT_ID,
+        RUN_ID,
+        ArtifactReference(id=stored.id, sha256="0" * 64),
+        write_id=owner,
+    )
+    assert not await repository.delete_if_hash(
+        TENANT_ID, RUN_ID, reference, write_id=owner
+    )
+    assert await repository.get_many(TENANT_ID, RUN_ID, (reference,)) == (stored,)
