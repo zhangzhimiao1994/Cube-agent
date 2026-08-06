@@ -1,0 +1,83 @@
+from uuid import UUID, uuid4
+
+import pytest
+
+from agent_hub.runtime.artifacts import (
+    ArtifactReference,
+    ArtifactRepositoryError,
+    InMemoryArtifactRepository,
+)
+from agent_hub.runtime.contracts import Artifact
+
+TENANT_ID = UUID("00000000-0000-4000-8000-000000000031")
+RUN_ID = UUID("00000000-0000-4000-8000-000000000032")
+
+
+def artifact(text: str) -> Artifact:
+    return Artifact(
+        id=uuid4(),
+        type="text",
+        producer="writer",
+        content={"text": text},
+    )
+
+
+async def test_repository_round_trips_only_inside_tenant_run_scope() -> None:
+    repository = InMemoryArtifactRepository()
+    stored = artifact("safe")
+    reference = ArtifactReference(id=stored.id, sha256=stored.content_sha256)
+    await repository.put(TENANT_ID, RUN_ID, stored)
+
+    assert await repository.get_many(TENANT_ID, RUN_ID, (reference,)) == (stored,)
+    with pytest.raises(ArtifactRepositoryError, match="unavailable"):
+        await repository.get_many(uuid4(), RUN_ID, (reference,))
+    with pytest.raises(ArtifactRepositoryError, match="unavailable"):
+        await repository.get_many(TENANT_ID, uuid4(), (reference,))
+
+
+async def test_repository_rejects_hash_mismatch_without_returning_content() -> None:
+    repository = InMemoryArtifactRepository()
+    stored = artifact("safe")
+    await repository.put(TENANT_ID, RUN_ID, stored)
+    reference = ArtifactReference(id=stored.id, sha256="0" * 64)
+
+    with pytest.raises(ArtifactRepositoryError, match="unavailable"):
+        await repository.get_many(TENANT_ID, RUN_ID, (reference,))
+
+
+async def test_repository_capacity_failure_keeps_prior_writes_readable() -> None:
+    repository = InMemoryArtifactRepository(max_artifacts_per_run=1)
+    first = artifact("first")
+    second = artifact("second")
+    first_reference = ArtifactReference(id=first.id, sha256=first.content_sha256)
+    await repository.put(TENANT_ID, RUN_ID, first)
+
+    with pytest.raises(ArtifactRepositoryError, match="capacity"):
+        await repository.put(TENANT_ID, RUN_ID, second)
+
+    assert await repository.get_many(TENANT_ID, RUN_ID, (first_reference,)) == (first,)
+
+
+async def test_repository_total_byte_limit_is_atomic() -> None:
+    first = artifact("first")
+    repository = InMemoryArtifactRepository(
+        max_total_bytes_per_run=len(str(first.to_payload()).encode("utf-8")) + 128
+    )
+    await repository.put(TENANT_ID, RUN_ID, first)
+    second = artifact("x" * 256)
+
+    with pytest.raises(ArtifactRepositoryError, match="capacity"):
+        await repository.put(TENANT_ID, RUN_ID, second)
+
+    reference = ArtifactReference(id=first.id, sha256=first.content_sha256)
+    assert await repository.get_many(TENANT_ID, RUN_ID, (reference,)) == (first,)
+
+
+async def test_repository_rejects_duplicate_batch_references() -> None:
+    repository = InMemoryArtifactRepository()
+    stored = artifact("safe")
+    reference = ArtifactReference(id=stored.id, sha256=stored.content_sha256)
+    await repository.put(TENANT_ID, RUN_ID, stored)
+
+    with pytest.raises(ArtifactRepositoryError, match="references"):
+        await repository.get_many(TENANT_ID, RUN_ID, (reference, reference))

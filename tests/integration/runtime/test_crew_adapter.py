@@ -26,6 +26,12 @@ from agent_hub.models.types import (
     TokenUsage,
     ToolCall,
 )
+from agent_hub.runtime.artifacts import (
+    ArtifactReference,
+    ArtifactRepository,
+    ArtifactRepositoryError,
+    InMemoryArtifactRepository,
+)
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
@@ -262,7 +268,38 @@ def one_step_plan(*, tools: tuple[str, ...] = ()) -> DispatchPlan:
     )
 
 
-def context(*, checkpoint=None, artifacts=()) -> TaskContext:  # type: ignore[no-untyped-def]
+def chain_plan(step_count: int, *, review: bool = False) -> DispatchPlan:
+    agents = [
+        AgentSpec(id="writer", role="writer", goal="Write", logical_model="general")
+    ]
+    if review:
+        agents.append(
+            AgentSpec(id="critic", role="critic", goal="Review", logical_model="general")
+        )
+    return DispatchPlan(
+        agents=tuple(agents),
+        steps=tuple(
+            DispatchStep(
+                id=f"step-{index}",
+                agent="writer",
+                task=f"Write part {index}",
+                depends_on=() if index == 0 else (f"step-{index - 1}",),
+                reviewer="critic" if review else None,
+                reviewer_retries=1 if review else 0,
+                final_synthesizer=index == step_count - 1,
+                token_budget=100,
+                timeout_seconds=1,
+            )
+            for index in range(step_count)
+        ),
+        max_parallelism=1,
+        total_token_budget=step_count * 100 * (4 if review else 1),
+    )
+
+
+def context(  # type: ignore[no-untyped-def]
+    *, checkpoint=None, artifacts=(), token_budget: int = 1000
+) -> TaskContext:
     return TaskContext(
         run_id=RUN_ID,
         tenant_id=TENANT_ID,
@@ -270,7 +307,7 @@ def context(*, checkpoint=None, artifacts=()) -> TaskContext:  # type: ignore[no
         request="Do bounded research",
         checkpoint=checkpoint,
         artifacts=artifacts,
-        token_budget=1000,
+        token_budget=token_budget,
     )
 
 
@@ -284,13 +321,15 @@ def make_runtime(
     *,
     capability_gateway: CapabilityGateway | None = None,
     crew_factory: CrewObjectFactory | None = None,
+    artifact_repository: ArtifactRepository | None = None,
 ) -> CrewDispatchRuntime:
-    return CrewDispatchRuntime(
-        gateway,
-        dispatch_plan or plan(),
-        capability_gateway=capability_gateway,
-        crew_factory=crew_factory or FastFactory(),
-    )
+    kwargs: dict[str, object] = {
+        "capability_gateway": capability_gateway,
+        "crew_factory": crew_factory or FastFactory(),
+    }
+    if artifact_repository is not None:
+        kwargs["artifact_repository"] = artifact_repository
+    return CrewDispatchRuntime(gateway, dispatch_plan or plan(), **kwargs)  # type: ignore[arg-type]
 
 
 async def test_ready_steps_execute_in_parallel_and_emit_framework_neutral_events() -> None:
@@ -726,6 +765,54 @@ async def test_running_model_checkpoint_requires_confirmation_without_replay() -
 
     assert checkpoint_3.state["models"] == checkpoint.state["models"]
     assert third_gateway.requests == []
+
+
+@pytest.mark.parametrize("failure", ("factory", "budget"))
+async def test_pre_hydrate_failure_never_replaces_uncertain_checkpoint(failure: str) -> None:
+    first_gateway = FakeGateway(barrier=99)
+    first = make_runtime(first_gateway, one_step_plan())
+    consumer = asyncio.create_task(collect(first, context()))
+    while not first_gateway.requests:
+        await asyncio.sleep(0)
+    checkpoint_1 = await first.save_checkpoint()
+    await first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+
+    class FailingFactory(FastFactory):
+        def build(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            del args, kwargs
+            raise RuntimeError("temporary factory failure")
+
+    failed_gateway = FakeGateway()
+    failed = make_runtime(
+        failed_gateway,
+        one_step_plan(),
+        crew_factory=FailingFactory() if failure == "factory" else FastFactory(),
+    )
+    await failed.restore_checkpoint(checkpoint_1)
+    with pytest.raises(RuntimeExecutionError):
+        await collect(
+            failed,
+            context(
+                checkpoint=checkpoint_1,
+                token_budget=1 if failure == "budget" else 1000,
+            ),
+        )
+    checkpoint_2 = await failed.save_checkpoint()
+
+    assert checkpoint_2.state["models"] == checkpoint_1.state["models"]
+    assert checkpoint_2.state["tools"] == checkpoint_1.state["tools"]
+    assert checkpoint_2.state["usage"] == checkpoint_1.state["usage"]
+    assert failed_gateway.requests == []
+
+    recovered_gateway = FakeGateway()
+    recovered = make_runtime(recovered_gateway, one_step_plan())
+    await recovered.restore_checkpoint(checkpoint_2)
+    with pytest.raises(ModelOutcomeUncertain):
+        await collect(recovered, context(checkpoint=checkpoint_2))
+
+    assert recovered_gateway.requests == []
 
 
 async def test_model_tool_and_final_artifacts_form_a_traceable_graph() -> None:
@@ -2710,3 +2797,185 @@ async def test_crewai_router_initialization_failure_recovers_under_concurrency(
     assert sum(isinstance(result, RuntimeError) for result in results) == 1
     assert sum(not isinstance(result, BaseException) for result in results) == 1
     assert dict(os.environ) == before_environment
+
+
+@pytest.mark.parametrize("step_count", (33, 64))
+async def test_shared_repository_recovers_long_chain_without_context_artifacts(
+    step_count: int,
+) -> None:
+    repository = InMemoryArtifactRepository()
+    dispatch_plan = chain_plan(step_count)
+    first = make_runtime(
+        FakeGateway(), dispatch_plan, artifact_repository=repository
+    )
+    await collect(first, context(token_budget=dispatch_plan.total_token_budget))
+    checkpoint = await first.save_checkpoint()
+    registry = cast(Mapping[str, str], checkpoint.state["artifact_registry"])
+    assert len(registry) == step_count * 2
+
+    gateway = FakeGateway()
+    resumed = make_runtime(gateway, dispatch_plan, artifact_repository=repository)
+    await resumed.restore_checkpoint(checkpoint)
+    events = await collect(
+        resumed,
+        context(checkpoint=checkpoint, token_budget=dispatch_plan.total_token_budget),
+    )
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert gateway.requests == []
+
+
+async def test_repository_recovers_more_than_64_review_retry_artifacts() -> None:
+    step_count = 11
+    reviews = [item for _ in range(step_count) for item in (
+        '{"verdict":"revise","feedback":"tighten"}',
+        '{"verdict":"approve"}',
+    )]
+    repository = InMemoryArtifactRepository()
+    dispatch_plan = chain_plan(step_count, review=True)
+    first = make_runtime(
+        FakeGateway(reviews=reviews),
+        dispatch_plan,
+        artifact_repository=repository,
+    )
+    await collect(first, context(token_budget=dispatch_plan.total_token_budget))
+    checkpoint = await first.save_checkpoint()
+    registry = cast(Mapping[str, str], checkpoint.state["artifact_registry"])
+    assert len(registry) > 64
+
+    gateway = FakeGateway()
+    resumed = make_runtime(gateway, dispatch_plan, artifact_repository=repository)
+    await resumed.restore_checkpoint(checkpoint)
+    assert (
+        await collect(
+            resumed,
+            context(checkpoint=checkpoint, token_budget=dispatch_plan.total_token_budget),
+        )
+    )[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert gateway.requests == []
+
+
+async def test_missing_repository_artifacts_preserve_restored_checkpoint() -> None:
+    repository = InMemoryArtifactRepository()
+    first = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=repository)
+    await collect(first, context(token_budget=100))
+    checkpoint = await first.save_checkpoint()
+    resumed = make_runtime(
+        FakeGateway(),
+        one_step_plan(),
+        artifact_repository=InMemoryArtifactRepository(),
+    )
+    await resumed.restore_checkpoint(checkpoint)
+
+    with pytest.raises(RuntimeExecutionError, match="artifacts are unavailable"):
+        await collect(resumed, context(checkpoint=checkpoint, token_budget=100))
+
+    assert (await resumed.save_checkpoint()).id == checkpoint.id
+
+
+async def test_tampered_repository_hash_preserves_restored_checkpoint() -> None:
+    repository = InMemoryArtifactRepository()
+    first = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=repository)
+    await collect(first, context(token_budget=100))
+    payload = (await first.save_checkpoint()).to_payload()
+    state = cast(dict[str, object], payload["state"])
+    registry = cast(dict[str, object], state["artifact_registry"])
+    registry[next(iter(registry))] = "0" * 64
+    payload["state_sha256"] = ""
+    tampered = RuntimeCheckpoint.from_payload(payload)
+    resumed = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=repository)
+    await resumed.restore_checkpoint(tampered)
+
+    with pytest.raises(RuntimeExecutionError, match="artifacts are unavailable"):
+        await collect(resumed, context(checkpoint=tampered, token_budget=100))
+
+    assert (await resumed.save_checkpoint()).id == tampered.id
+
+
+async def test_known_checkpoint_metadata_overflow_fails_before_gateway() -> None:
+    dispatch_plan = chain_plan(64, review=True)
+    gateway = FakeGateway()
+
+    with pytest.raises(RuntimeExecutionError, match="metadata budget"):
+        await collect(
+            make_runtime(gateway, dispatch_plan),
+            context(token_budget=dispatch_plan.total_token_budget),
+        )
+
+    assert gateway.requests == []
+
+
+async def test_partial_repository_write_recovers_from_last_durable_boundary() -> None:
+    class FailAfterOnePut:
+        def __init__(self) -> None:
+            self.delegate = InMemoryArtifactRepository()
+            self.puts = 0
+
+        async def put(self, tenant_id: UUID, run_id: UUID, artifact: Artifact) -> None:
+            if self.puts >= 1:
+                raise ArtifactRepositoryError("artifact repository write failed")
+            self.puts += 1
+            await self.delegate.put(tenant_id, run_id, artifact)
+
+        async def get_many(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            references: tuple[ArtifactReference, ...],
+        ) -> tuple[Artifact, ...]:
+            return await self.delegate.get_many(tenant_id, run_id, references)
+
+    failing = FailAfterOnePut()
+    first = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=failing)
+    with pytest.raises(RuntimeExecutionError):
+        await collect(first, context(token_budget=100))
+    checkpoint = await first.save_checkpoint()
+    models = cast(Mapping[str, Mapping[str, object]], checkpoint.state["models"])
+    assert next(iter(models.values()))["status"] == "succeeded"
+
+    gateway = FakeGateway()
+    resumed = make_runtime(
+        gateway, one_step_plan(), artifact_repository=failing.delegate
+    )
+    await resumed.restore_checkpoint(checkpoint)
+    assert (
+        await collect(resumed, context(checkpoint=checkpoint, token_budget=100))
+    )[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert gateway.requests == []
+
+
+async def test_cancelled_repository_hydration_never_replaces_checkpoint() -> None:
+    class BlockingGetRepository:
+        def __init__(self, delegate: InMemoryArtifactRepository) -> None:
+            self.delegate = delegate
+            self.started = asyncio.Event()
+
+        async def put(self, tenant_id: UUID, run_id: UUID, artifact: Artifact) -> None:
+            await self.delegate.put(tenant_id, run_id, artifact)
+
+        async def get_many(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            references: tuple[ArtifactReference, ...],
+        ) -> tuple[Artifact, ...]:
+            self.started.set()
+            await asyncio.Event().wait()
+            return await self.delegate.get_many(tenant_id, run_id, references)
+
+    repository = InMemoryArtifactRepository()
+    first = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=repository)
+    await collect(first, context(token_budget=100))
+    checkpoint = await first.save_checkpoint()
+    blocking = BlockingGetRepository(repository)
+    resumed = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=blocking)
+    await resumed.restore_checkpoint(checkpoint)
+    task = asyncio.create_task(
+        collect(resumed, context(checkpoint=checkpoint, token_budget=100))
+    )
+    await blocking.started.wait()
+
+    await resumed.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert (await resumed.save_checkpoint()).id == checkpoint.id

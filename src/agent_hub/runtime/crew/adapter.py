@@ -35,6 +35,12 @@ from agent_hub.models.types import (
     TokenUsage,
     ToolCall,
 )
+from agent_hub.runtime.artifacts import (
+    ArtifactReference,
+    ArtifactRepository,
+    ArtifactRepositoryError,
+    InMemoryArtifactRepository,
+)
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
@@ -47,7 +53,8 @@ from agent_hub.runtime.contracts import (
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 
 _RUNTIME_TYPE = "crew"
-_RUNTIME_VERSION = "6"
+_RUNTIME_VERSION = "7"
+_MAX_CHECKPOINT_ARTIFACTS = 16_384
 _MAX_PROMPT_BYTES = 196_608
 _MAX_OUTPUT_BYTES = 65_536
 _MAX_TOOL_ROUNDS = 8
@@ -607,18 +614,25 @@ class CrewDispatchRuntime:
         *,
         capability_gateway: CapabilityGateway | None = None,
         crew_factory: CrewObjectFactory | None = None,
+        artifact_repository: ArtifactRepository | None = None,
     ) -> None:
         self._gateway = gateway
         self._plan = plan
         self._capabilities = capability_gateway
         default_storage = Path.cwd() / ".agent-hub-data" / "crewai"
         self._factory = crew_factory or CrewAIObjectFactory(storage_dir=default_storage)
+        self._artifact_repository = (
+            artifact_repository
+            if artifact_repository is not None
+            else InMemoryArtifactRepository()
+        )
         self._active_stream: CrewRunStream | None = None
         self._active_task: asyncio.Task[None] | None = None
         self._active_done: asyncio.Event | None = None
         self._cancel_lock = asyncio.Lock()
         self._last_checkpoint: RuntimeCheckpoint | None = None
         self._restored_checkpoint: RuntimeCheckpoint | None = None
+        self._current_artifact_registry: dict[str, Artifact] = {}
         self._generation = 0
         self._current_token: _RunToken | None = None
 
@@ -679,15 +693,26 @@ class CrewDispatchRuntime:
         model_ledger = _ModelLedger()
         usage_ledger = _UsageLedger()
         review_ledger = _ReviewLedger()
+        artifact_registry: dict[str, Artifact] = {}
+        self._current_artifact_registry = artifact_registry
         restored = self._restored_checkpoint
-        hydrating_restored = False
+        protected_checkpoint = restored or context.checkpoint
+        hydrating_restored = protected_checkpoint is not None
 
         async def emit(**values: object) -> None:
+            artifact = values.get("artifact")
+            if type(artifact) is Artifact:
+                async with asyncio.timeout(self._remaining_timeout(state)):
+                    await self._artifact_repository.put(
+                        context.tenant_id, context.run_id, artifact
+                    )
+                artifact_registry[str(artifact.id)] = artifact
             if run_open and self._is_current_run(state):
                 await queue.put(await sequence.event(run_id=context.run_id, **values))
 
         try:
             plan = DispatchPlan.revalidate(self._plan)
+            self._validate_checkpoint_metadata_budget(plan)
             state.deadline = asyncio.get_running_loop().time() + min(
                 context.timeout_seconds, plan.total_timeout_seconds
             )
@@ -711,7 +736,9 @@ class CrewDispatchRuntime:
                     model_ledger,
                     usage_ledger,
                     review_ledger,
-                ) = self._hydrate_checkpoint(restored, context, plan)
+                    restored_artifacts,
+                ) = await self._hydrate_checkpoint(restored, context, plan, state)
+                artifact_registry.update(restored_artifacts)
                 hydrating_restored = False
                 self._restored_checkpoint = None
                 restored_phase = restored.state.get("phase")
@@ -742,16 +769,7 @@ class CrewDispatchRuntime:
             initial_artifacts = tuple(
                 artifact
                 for artifact in context.artifacts
-                if str(artifact.id)
-                not in {
-                    str(item.id)
-                    for item in (
-                        *completed.values(),
-                        *tool_ledger.artifacts.values(),
-                        *model_ledger.artifacts.values(),
-                        *review_ledger.artifacts.values(),
-                    )
-                }
+                if str(artifact.id) not in artifact_registry
             )
             steps = {step.id: step for step in plan.steps}
             checkpoint_lock = asyncio.Lock()
@@ -1030,7 +1048,9 @@ class CrewDispatchRuntime:
             cancel_error = asyncio.CancelledError(*caught_cancel.args)
 
             async def finish_cancel() -> None:
-                if plan is not None:
+                if hydrating_restored and protected_checkpoint is not None:
+                    self._publish_checkpoint(state, protected_checkpoint)
+                elif plan is not None:
                     checkpoint = self._make_checkpoint(
                         context,
                         plan,
@@ -1082,8 +1102,8 @@ class CrewDispatchRuntime:
             error.__cause__ = None
             await queue.put(_Terminal(error))
         except RuntimeExecutionError as error:
-            if hydrating_restored and restored is not None:
-                self._publish_checkpoint(state, restored)
+            if hydrating_restored and protected_checkpoint is not None:
+                self._publish_checkpoint(state, protected_checkpoint)
             elif plan is not None:
                 checkpoint = self._make_checkpoint(
                     context,
@@ -1110,8 +1130,8 @@ class CrewDispatchRuntime:
             error.__context__ = None
             error.__cause__ = None
             del error
-            if hydrating_restored and restored is not None:
-                self._publish_checkpoint(state, restored)
+            if hydrating_restored and protected_checkpoint is not None:
+                self._publish_checkpoint(state, protected_checkpoint)
             elif plan is not None:
                 checkpoint = self._make_checkpoint(
                     context,
@@ -2202,6 +2222,12 @@ class CrewDispatchRuntime:
                     }
                     for key in sorted(review_ledger.artifacts)
                 },
+                "artifact_registry": {
+                    artifact_id: self._current_artifact_registry[
+                        artifact_id
+                    ].content_sha256
+                    for artifact_id in sorted(self._current_artifact_registry)
+                },
                 "usage": {
                     "tokens": usage_ledger.tokens,
                     "cost_usd": str(usage_ledger.cost_usd),
@@ -2248,6 +2274,7 @@ class CrewDispatchRuntime:
             "tools",
             "models",
             "review_refs",
+            "artifact_registry",
             "usage",
             "step_usage",
             "audit_overflow",
@@ -2260,6 +2287,7 @@ class CrewDispatchRuntime:
         tools = state["tools"]
         models = state["models"]
         review_refs = state["review_refs"]
+        artifact_registry = state["artifact_registry"]
         usage = state["usage"]
         step_usage = state["step_usage"]
         audit_overflow = state["audit_overflow"]
@@ -2271,6 +2299,7 @@ class CrewDispatchRuntime:
             or not isinstance(tools, Mapping)
             or not isinstance(models, Mapping)
             or not isinstance(review_refs, Mapping)
+            or not isinstance(artifact_registry, Mapping)
             or not isinstance(usage, Mapping)
             or not isinstance(step_usage, Mapping)
             or not isinstance(audit_overflow, Mapping)
@@ -2289,6 +2318,23 @@ class CrewDispatchRuntime:
             or not 1 <= state["next_sequence"] <= 2**63 - 1
         ):
             _fail("runtime checkpoint is incompatible")
+        if len(artifact_registry) > _MAX_CHECKPOINT_ARTIFACTS:
+            _fail("runtime checkpoint is incompatible")
+        registry_ids: set[str] = set()
+        for artifact_id, sha256 in artifact_registry.items():
+            if (
+                type(artifact_id) is not str
+                or type(sha256) is not str
+                or _SHA256.fullmatch(sha256) is None
+                or artifact_id in registry_ids
+            ):
+                _fail("runtime checkpoint is incompatible")
+            try:
+                if str(UUID(artifact_id)) != artifact_id:
+                    _fail("runtime checkpoint is incompatible")
+            except ValueError:
+                _fail("runtime checkpoint is incompatible")
+            registry_ids.add(artifact_id)
         if (
             set(usage) != {"tokens", "cost_usd"}
             or type(usage["tokens"]) is not int
@@ -2678,6 +2724,23 @@ class CrewDispatchRuntime:
             task.add_done_callback(CrewDispatchRuntime._retrieve_detached_task)
 
     @staticmethod
+    def _validate_checkpoint_metadata_budget(plan: DispatchPlan) -> None:
+        # This is a conservative bound for deterministic ledger metadata.
+        # Dynamic capability calls remain bounded independently by runtime limits.
+        estimated_nodes = 128
+        for step in plan.steps:
+            attempts = step.reviewer_retries + 1
+            model_calls = attempts * (2 if step.reviewer is not None else 1)
+            artifact_count = model_calls + attempts
+            if step.reviewer is not None:
+                artifact_count += step.reviewer_retries
+            estimated_nodes += 19 + (29 * model_calls) + (2 * artifact_count)
+            if step.reviewer_retries:
+                estimated_nodes += 10
+        if estimated_nodes > 3_800:
+            _fail("dispatch checkpoint metadata budget is insufficient")
+
+    @staticmethod
     def _retrieve_detached_task(task: asyncio.Task[Any]) -> None:
         try:
             task.exception()
@@ -2687,14 +2750,13 @@ class CrewDispatchRuntime:
     def _validate_artifact_graph(
         self,
         plan: DispatchPlan,
-        context: TaskContext,
+        artifacts: tuple[Artifact, ...],
         completed: Mapping[str, Artifact],
         retries: Mapping[str, int],
         tool_ledger: _ToolLedger,
         model_ledger: _ModelLedger,
         review_ledger: _ReviewLedger,
     ) -> None:
-        artifacts = context.artifacts
         by_id = {str(artifact.id): artifact for artifact in artifacts}
         if len(by_id) != len(artifacts):
             _fail("runtime checkpoint artifact graph is invalid")
@@ -2927,8 +2989,12 @@ class CrewDispatchRuntime:
         ):
             _fail("runtime checkpoint artifact graph is invalid")
 
-    def _hydrate_checkpoint(
-        self, checkpoint: RuntimeCheckpoint, context: TaskContext, plan: DispatchPlan
+    async def _hydrate_checkpoint(
+        self,
+        checkpoint: RuntimeCheckpoint,
+        context: TaskContext,
+        plan: DispatchPlan,
+        run_state: _RunState,
     ) -> tuple[
         dict[str, Artifact],
         dict[str, int],
@@ -2936,9 +3002,60 @@ class CrewDispatchRuntime:
         _ModelLedger,
         _UsageLedger,
         _ReviewLedger,
+        dict[str, Artifact],
     ]:
         self._validate_checkpoint(checkpoint, context, plan)
-        by_id = {str(artifact.id): artifact for artifact in context.artifacts}
+        raw_registry = cast(Mapping[str, str], checkpoint.state["artifact_registry"])
+        references = tuple(
+            ArtifactReference(id=UUID(artifact_id), sha256=sha256)
+            for artifact_id, sha256 in raw_registry.items()
+        )
+        supplemental = {str(artifact.id): artifact for artifact in context.artifacts}
+        try:
+            async with asyncio.timeout(self._remaining_timeout(run_state)):
+                stored = await self._artifact_repository.get_many(
+                    context.tenant_id, context.run_id, references
+                )
+        except ArtifactRepositoryError:
+            compatible = tuple(supplemental.get(str(reference.id)) for reference in references)
+            if any(
+                artifact is None or artifact.content_sha256 != reference.sha256
+                for artifact, reference in zip(compatible, references, strict=True)
+            ):
+                review_ids = {
+                    item["id"]
+                    for item in cast(
+                        Mapping[str, Mapping[str, str]],
+                        checkpoint.state["review_refs"],
+                    ).values()
+                }
+                if any(str(reference.id) in review_ids for reference in references):
+                    _fail("runtime checkpoint review artifact is unavailable")
+                _fail("runtime checkpoint artifacts are unavailable")
+            stored = cast(tuple[Artifact, ...], compatible)
+        if (
+            type(stored) is not tuple
+            or len(stored) != len(references)
+            or any(
+                type(artifact) is not Artifact
+                or artifact.id != reference.id
+                or artifact.content_sha256 != reference.sha256
+                or artifact.recompute_content_sha256() != reference.sha256
+                for artifact, reference in zip(stored, references, strict=True)
+            )
+        ):
+            _fail("runtime checkpoint artifacts are unavailable")
+        by_id = dict(supplemental)
+        for stored_artifact in stored:
+            artifact_id = str(stored_artifact.id)
+            existing = by_id.get(artifact_id)
+            if (
+                existing is not None
+                and existing.content_sha256 != stored_artifact.content_sha256
+            ):
+                _fail("runtime checkpoint artifacts are unavailable")
+            by_id[artifact_id] = stored_artifact
+        registry = {str(artifact.id): artifact for artifact in stored}
         agents = {agent.id: agent for agent in plan.agents}
         steps = {step.id: step for step in plan.steps}
         completed: dict[str, Artifact] = {}
@@ -3079,7 +3196,7 @@ class CrewDispatchRuntime:
             review_ledger.artifacts[step_id] = artifact
         self._validate_artifact_graph(
             plan,
-            context,
+            tuple(by_id.values()),
             completed,
             retries,
             tool_ledger,
@@ -3088,7 +3205,15 @@ class CrewDispatchRuntime:
         )
         if outcome_error is not None:
             raise outcome_error
-        return completed, retries, tool_ledger, model_ledger, usage_ledger, review_ledger
+        return (
+            completed,
+            retries,
+            tool_ledger,
+            model_ledger,
+            usage_ledger,
+            review_ledger,
+            registry,
+        )
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
         checkpoint = self._last_checkpoint

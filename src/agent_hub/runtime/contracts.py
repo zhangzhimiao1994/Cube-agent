@@ -33,7 +33,7 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){0,2}$")
 _EXECUTABLE_MODES = frozenset(TaskMode) - {TaskMode.AUTO}
 _MAX_JSON_DEPTH = 20
-_MAX_JSON_NODES = 2_048
+_MAX_JSON_NODES = 4_096
 _MAX_JSON_STRING = 65_536
 _MAX_JSON_BYTES = 262_144
 _MAX_TEXT_BYTES = 65_536
@@ -108,6 +108,11 @@ def _freeze_json(value: object) -> JsonValue:
             for key, nested in item.items():
                 if type(key) is not str:
                     raise TypeError("JSON object keys must be strings")
+                nodes += 1
+                if nodes > _MAX_JSON_NODES:
+                    raise ValueError("JSON value exceeds structural limits")
+                if len(key.encode("utf-8")) > _MAX_JSON_STRING:
+                    raise ValueError("JSON string exceeds size limit")
                 frozen[key] = visit(nested, depth + 1)
             return MappingProxyType(frozen)
         if isinstance(item, list | tuple):
@@ -450,6 +455,18 @@ class RuntimeCheckpoint(_RuntimeContractModel):
         if self.state_sha256 and self.state_sha256 != digest:
             raise ValueError("checkpoint state hash does not match state")
         object.__setattr__(self, "state_sha256", digest)
+        _preflight_payload(
+            {
+                "id": str(self.id),
+                "runtime_type": self.runtime_type,
+                "runtime_version": self.runtime_version,
+                "run_id": str(self.run_id),
+                "tenant_id": str(self.tenant_id),
+                "mode": self.mode.value,
+                "state": _mutable_json(self.state),
+                "state_sha256": digest,
+            }
+        )
         return self
 
     def recompute_state_sha256(self) -> str:
