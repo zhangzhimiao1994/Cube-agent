@@ -64,6 +64,13 @@ _MAX_AUDITED_TOKENS = 100_000_000
 _MAX_AUDITED_COST_USD = Decimal(64000000)
 _TASK_CANCELLATION_GRACE_SECONDS = 0.25
 _ARTIFACT_ROLLBACK_TIMEOUT_SECONDS = 5.0
+_ARTIFACT_CLEANUP_HARD_DEADLINE_SECONDS = 0.25
+_ARTIFACT_CLEANUP_CANCEL_INTERVAL_SECONDS = 0.01
+_RUNTIME_CANCEL_TIMEOUT_SECONDS = (
+    _ARTIFACT_ROLLBACK_TIMEOUT_SECONDS
+    + _ARTIFACT_CLEANUP_HARD_DEADLINE_SECONDS
+    + _TASK_CANCELLATION_GRACE_SECONDS
+)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _CREWAI_IMPORT_LOCK = threading.Lock()
 _CREWAI_STORAGE_CONTEXT: ContextVar[Path | None] = ContextVar(
@@ -651,6 +658,7 @@ class CrewDispatchRuntime:
         self._current_artifact_registry: dict[str, Artifact] = {}
         self._generation = 0
         self._current_token: _RunToken | None = None
+        self._cleanup_tasks: set[asyncio.Task[Any]] = set()
 
     def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
         context = self._strict_context(context)
@@ -736,6 +744,12 @@ class CrewDispatchRuntime:
             write_id = uuid4()
             state.pending_artifact_writes[write_id] = reference
             async with asyncio.timeout(self._remaining_timeout(state)):
+                await self._artifact_repository.reserve_write(
+                    context.tenant_id,
+                    context.run_id,
+                    reference,
+                    write_id=write_id,
+                )
                 await self._artifact_repository.put(
                     context.tenant_id,
                     context.run_id,
@@ -1328,12 +1342,25 @@ class CrewDispatchRuntime:
                 emit_error.__cause__ = None
                 del emit_error
         finally:
+            state.open = False
+            if state.commit_tasks:
+                for commit_task in tuple(state.commit_tasks):
+                    collected = await self._force_cancel_cleanup_task(
+                        commit_task,
+                        timeout=_TASK_CANCELLATION_GRACE_SECONDS,
+                    )
+                    if not collected:
+                        state.cleanup_error = RuntimeExecutionError(
+                            "artifact rollback failed"
+                        )
+                state.commit_tasks.clear()
+            cleanup_succeeded = True
             if state.pending_artifact_writes:
                 pending_writes = tuple(state.pending_artifact_writes.items())
 
                 async def rollback_pending() -> None:
                     for write_id, reference in pending_writes:
-                        await self._artifact_repository.delete_if_hash(
+                        await self._artifact_repository.abort_write(
                             context.tenant_id,
                             context.run_id,
                             reference,
@@ -1342,38 +1369,49 @@ class CrewDispatchRuntime:
                         state.pending_artifact_writes.pop(write_id, None)
 
                 rollback = asyncio.create_task(rollback_pending())
+                supervisor = asyncio.create_task(
+                    self._supervise_artifact_rollback(rollback)
+                )
+                self._cleanup_tasks.add(supervisor)
                 try:
-                    async with asyncio.timeout(_ARTIFACT_ROLLBACK_TIMEOUT_SECONDS):
-                        await asyncio.shield(rollback)
-                except Exception as rollback_error:  # noqa: BLE001
-                    rollback_error.__traceback__ = None
-                    rollback_error.__context__ = None
-                    rollback_error.__cause__ = None
-                    if not rollback.done():
-                        rollback.cancel()
-                    await asyncio.gather(rollback, return_exceptions=True)
-                    cleanup_error = RuntimeExecutionError("artifact rollback failed")
-                    state.cleanup_error = cleanup_error
-                    terminal_item = _Terminal(cleanup_error)
-                    if run_open and self._is_current_run(state):
-                        try:
-                            queue.put_nowait(
-                                await sequence.event(
-                                    run_id=context.run_id,
-                                    kind=EventKind.RUNTIME_FAILED,
-                                    reason="artifact rollback failed",
-                                )
+                    cleanup_succeeded = await asyncio.shield(supervisor)
+                except asyncio.CancelledError as cleanup_cancelled:
+                    cleanup_cancelled.__traceback__ = None
+                    cleanup_cancelled.__context__ = None
+                    cleanup_cancelled.__cause__ = None
+                    del cleanup_cancelled
+                    cleanup_succeeded = False
+                    cleanup_done, _ = await asyncio.wait(
+                        {supervisor},
+                        timeout=(
+                            _ARTIFACT_ROLLBACK_TIMEOUT_SECONDS
+                            + _ARTIFACT_CLEANUP_HARD_DEADLINE_SECONDS
+                        ),
+                    )
+                    if not cleanup_done:
+                        supervisor.cancel()
+                        supervisor.add_done_callback(self._finish_cleanup_task)
+                finally:
+                    if supervisor.done():
+                        self._finish_cleanup_task(supervisor)
+            if not cleanup_succeeded or state.cleanup_error is not None:
+                cleanup_error = RuntimeExecutionError("artifact rollback failed")
+                state.cleanup_error = cleanup_error
+                terminal_item = _Terminal(cleanup_error)
+                if run_open and self._current_token is state.token:
+                    try:
+                        queue.put_nowait(
+                            await sequence.event(
+                                run_id=context.run_id,
+                                kind=EventKind.RUNTIME_FAILED,
+                                reason="artifact rollback failed",
                             )
-                        except asyncio.QueueFull as queue_full:
-                            del queue_full
-                    del rollback_error
+                        )
+                    except asyncio.QueueFull as queue_full:
+                        del queue_full
             run_open = False
-            state.open = False
             state.deadline = None
             state.crew_generation = None
-            if state.commit_tasks:
-                await self._cancel_tasks_bounded(tuple(state.commit_tasks))
-                state.commit_tasks.clear()
             if terminal_item is None:
                 terminal_item = _Terminal(RuntimeExecutionError("dispatch execution failed"))
             if not terminal_future.done():
@@ -2307,12 +2345,85 @@ class CrewDispatchRuntime:
         task = asyncio.create_task(commit)
         run_state.commit_tasks.add(task)
         try:
-            await task
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            collected = await self._force_cancel_cleanup_task(
+                task,
+                timeout=_TASK_CANCELLATION_GRACE_SECONDS,
+            )
+            if not collected:
+                run_state.cleanup_error = RuntimeExecutionError(
+                    "artifact rollback failed"
+                )
+            raise
         finally:
-            if not task.done():
-                task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
             run_state.commit_tasks.discard(task)
+            if not task.done():
+                self._cleanup_tasks.add(task)
+                task.add_done_callback(self._finish_cleanup_task)
+
+    async def _supervise_artifact_rollback(
+        self,
+        rollback: asyncio.Task[None],
+    ) -> bool:
+        done, _ = await asyncio.wait(
+            {rollback}, timeout=_ARTIFACT_ROLLBACK_TIMEOUT_SECONDS
+        )
+        if done:
+            return self._cleanup_task_succeeded(rollback)
+
+        deadline = (
+            asyncio.get_running_loop().time()
+            + _ARTIFACT_CLEANUP_HARD_DEADLINE_SECONDS
+        )
+        while not rollback.done():
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            await self._force_cancel_cleanup_task(rollback, timeout=remaining)
+        return False
+
+    async def _force_cancel_cleanup_task(
+        self,
+        task: asyncio.Task[Any],
+        *,
+        timeout: float,
+    ) -> bool:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while not task.done():
+            task.cancel()
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            await asyncio.wait(
+                {task},
+                timeout=min(
+                    remaining,
+                    _ARTIFACT_CLEANUP_CANCEL_INTERVAL_SECONDS,
+                ),
+            )
+        if task.done():
+            self._retrieve_detached_task(task)
+            return True
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._finish_cleanup_task)
+        return False
+
+    @staticmethod
+    def _cleanup_task_succeeded(task: asyncio.Task[Any]) -> bool:
+        try:
+            task.result()
+        except BaseException as error:  # noqa: BLE001 - cancellation is cleanup failure
+            error.__traceback__ = None
+            error.__context__ = None
+            error.__cause__ = None
+            del error
+            return False
+        return True
+
+    def _finish_cleanup_task(self, task: asyncio.Task[Any]) -> None:
+        self._cleanup_tasks.discard(task)
+        self._retrieve_detached_task(task)
 
     @staticmethod
     def _remaining_timeout(run_state: _RunState, step_deadline: float | None = None) -> float:
@@ -3538,7 +3649,9 @@ class CrewDispatchRuntime:
                 done = self._active_done
                 if done is not None:
                     try:
-                        await asyncio.wait_for(done.wait(), timeout=5)
+                        await asyncio.wait_for(
+                            done.wait(), timeout=_RUNTIME_CANCEL_TIMEOUT_SECONDS
+                        )
                     except TimeoutError:
                         _fail("runtime cancellation timed out")
             if self._active_stream is stream:

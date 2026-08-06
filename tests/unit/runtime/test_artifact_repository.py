@@ -1,3 +1,4 @@
+import asyncio
 from uuid import UUID, uuid4
 
 import pytest
@@ -131,5 +132,66 @@ async def test_conditional_rollback_never_deletes_a_permanent_or_hash_mismatched
     )
     assert not await repository.delete_if_hash(
         TENANT_ID, RUN_ID, reference, write_id=owner
+    )
+    assert await repository.get_many(TENANT_ID, RUN_ID, (reference,)) == (stored,)
+
+
+async def test_aborted_reservation_fences_a_late_put() -> None:
+    repository = InMemoryArtifactRepository()
+    stored = artifact("late")
+    reference = ArtifactReference(id=stored.id, sha256=stored.content_sha256)
+    write_id = uuid4()
+
+    await repository.reserve_write(TENANT_ID, RUN_ID, reference, write_id=write_id)
+    assert await repository.abort_write(
+        TENANT_ID, RUN_ID, reference, write_id=write_id
+    )
+    with pytest.raises(ArtifactRepositoryError, match="unavailable"):
+        await repository.put(TENANT_ID, RUN_ID, stored, write_id=write_id)
+    with pytest.raises(ArtifactRepositoryError, match="unavailable"):
+        await repository.get_many(TENANT_ID, RUN_ID, (reference,))
+
+
+async def test_put_abort_race_never_leaves_an_uncommitted_artifact() -> None:
+    repository = InMemoryArtifactRepository()
+    for index in range(32):
+        stored = artifact(f"race-{index}")
+        reference = ArtifactReference(id=stored.id, sha256=stored.content_sha256)
+        write_id = uuid4()
+        await repository.reserve_write(TENANT_ID, RUN_ID, reference, write_id=write_id)
+
+        await asyncio.gather(
+            repository.put(TENANT_ID, RUN_ID, stored, write_id=write_id),
+            repository.abort_write(TENANT_ID, RUN_ID, reference, write_id=write_id),
+            return_exceptions=True,
+        )
+
+        with pytest.raises(ArtifactRepositoryError, match="unavailable"):
+            await repository.get_many(TENANT_ID, RUN_ID, (reference,))
+
+
+async def test_committed_or_other_owned_artifact_cannot_be_removed_by_abort() -> None:
+    repository = InMemoryArtifactRepository()
+    stored = artifact("shared")
+    reference = ArtifactReference(id=stored.id, sha256=stored.content_sha256)
+    first_owner = uuid4()
+    committed_owner = uuid4()
+    await repository.reserve_write(
+        TENANT_ID, RUN_ID, reference, write_id=first_owner
+    )
+    await repository.reserve_write(
+        TENANT_ID, RUN_ID, reference, write_id=committed_owner
+    )
+    await repository.put(TENANT_ID, RUN_ID, stored, write_id=first_owner)
+    await repository.put(TENANT_ID, RUN_ID, stored, write_id=committed_owner)
+    await repository.commit_write(
+        TENANT_ID, RUN_ID, reference, write_id=committed_owner
+    )
+
+    assert not await repository.abort_write(
+        TENANT_ID, RUN_ID, reference, write_id=first_owner
+    )
+    assert not await repository.abort_write(
+        TENANT_ID, RUN_ID, reference, write_id=committed_owner
     )
     assert await repository.get_many(TENANT_ID, RUN_ID, (reference,)) == (stored,)

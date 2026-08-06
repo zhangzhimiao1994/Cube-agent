@@ -16,6 +16,7 @@ _DEFAULT_MAX_ARTIFACTS_PER_RUN = 16_384
 _DEFAULT_MAX_TOTAL_BYTES_PER_RUN = 64 * 1024 * 1024
 _DEFAULT_MAX_ARTIFACT_BYTES = 1024 * 1024
 _DEFAULT_MAX_BATCH_SIZE = 16_384
+_DEFAULT_MAX_WRITE_RESERVATIONS_PER_RUN = 65_536
 
 
 class ArtifactRepositoryError(RuntimeError):
@@ -36,6 +37,15 @@ class ArtifactReference:
 
 
 class ArtifactRepository(Protocol):
+    async def reserve_write(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        reference: ArtifactReference,
+        *,
+        write_id: UUID,
+    ) -> None: ...
+
     async def put(
         self,
         tenant_id: UUID,
@@ -52,14 +62,16 @@ class ArtifactRepository(Protocol):
         references: tuple[ArtifactReference, ...],
     ) -> tuple[Artifact, ...]: ...
 
-    async def delete_if_hash(
+    async def abort_write(
         self,
         tenant_id: UUID,
         run_id: UUID,
         reference: ArtifactReference,
         *,
         write_id: UUID,
-    ) -> bool: ...
+    ) -> bool:
+        """Fence and release a write; implementations must propagate cancellation."""
+        ...
 
 
 class InMemoryArtifactRepository:
@@ -72,12 +84,14 @@ class InMemoryArtifactRepository:
         max_total_bytes_per_run: int = _DEFAULT_MAX_TOTAL_BYTES_PER_RUN,
         max_artifact_bytes: int = _DEFAULT_MAX_ARTIFACT_BYTES,
         max_batch_size: int = _DEFAULT_MAX_BATCH_SIZE,
+        max_write_reservations_per_run: int = _DEFAULT_MAX_WRITE_RESERVATIONS_PER_RUN,
     ) -> None:
         limits = (
             max_artifacts_per_run,
             max_total_bytes_per_run,
             max_artifact_bytes,
             max_batch_size,
+            max_write_reservations_per_run,
         )
         if any(type(limit) is not int or limit < 1 for limit in limits):
             raise ValueError("artifact repository limits must be positive integers")
@@ -85,12 +99,56 @@ class InMemoryArtifactRepository:
         self._max_total_bytes_per_run = max_total_bytes_per_run
         self._max_artifact_bytes = max_artifact_bytes
         self._max_batch_size = max_batch_size
+        self._max_write_reservations_per_run = max_write_reservations_per_run
         self._artifacts: dict[tuple[UUID, UUID, UUID], Artifact] = {}
         self._sizes: dict[tuple[UUID, UUID, UUID], int] = {}
         self._scope_counts: dict[tuple[UUID, UUID], int] = {}
         self._scope_bytes: dict[tuple[UUID, UUID], int] = {}
         self._write_owners: dict[tuple[UUID, UUID, UUID], set[UUID] | None] = {}
+        self._write_reservations: dict[
+            tuple[UUID, UUID, UUID], tuple[ArtifactReference, str]
+        ] = {}
+        self._scope_reservation_counts: dict[tuple[UUID, UUID], int] = {}
         self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _write_identity(
+        reference: ArtifactReference,
+        write_id: UUID,
+    ) -> None:
+        if type(reference) is not ArtifactReference or type(write_id) is not UUID:
+            raise ArtifactRepositoryError("artifact write identity is invalid")
+
+    def _reserve_locked(
+        self,
+        scope: tuple[UUID, UUID],
+        reference: ArtifactReference,
+        write_id: UUID,
+    ) -> None:
+        reservation_key = (*scope, write_id)
+        existing = self._write_reservations.get(reservation_key)
+        if existing is not None:
+            if existing[0] != reference or existing[1] != "reserved":
+                raise ArtifactRepositoryError("artifact is unavailable")
+            return
+        count = self._scope_reservation_counts.get(scope, 0)
+        if count >= self._max_write_reservations_per_run:
+            raise ArtifactRepositoryError("artifact repository capacity exceeded")
+        self._write_reservations[reservation_key] = (reference, "reserved")
+        self._scope_reservation_counts[scope] = count + 1
+
+    async def reserve_write(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        reference: ArtifactReference,
+        *,
+        write_id: UUID,
+    ) -> None:
+        scope = self._scope(tenant_id, run_id)
+        self._write_identity(reference, write_id)
+        async with self._lock:
+            self._reserve_locked(scope, reference, write_id)
 
     @staticmethod
     def _scope(tenant_id: UUID, run_id: UUID) -> tuple[UUID, UUID]:
@@ -130,6 +188,11 @@ class InMemoryArtifactRepository:
         size = self._encoded_size(artifact)
         key = (*scope, artifact.id)
         async with self._lock:
+            if write_id is not None:
+                reference = ArtifactReference(
+                    id=artifact.id, sha256=artifact.content_sha256
+                )
+                self._reserve_locked(scope, reference, write_id)
             existing = self._artifacts.get(key)
             if existing is not None:
                 if existing.content_sha256 != artifact.content_sha256:
@@ -186,7 +249,7 @@ class InMemoryArtifactRepository:
                 resolved.append(artifact)
             return tuple(resolved)
 
-    async def delete_if_hash(
+    async def abort_write(
         self,
         tenant_id: UUID,
         run_id: UUID,
@@ -195,17 +258,30 @@ class InMemoryArtifactRepository:
         write_id: UUID,
     ) -> bool:
         scope = self._scope(tenant_id, run_id)
-        if type(reference) is not ArtifactReference or type(write_id) is not UUID:
-            raise ArtifactRepositoryError("artifact rollback identity is invalid")
+        self._write_identity(reference, write_id)
         key = (*scope, reference.id)
         async with self._lock:
+            reservation_key = (*scope, write_id)
+            reservation = self._write_reservations.get(reservation_key)
+            if reservation is None:
+                count = self._scope_reservation_counts.get(scope, 0)
+                if count >= self._max_write_reservations_per_run:
+                    raise ArtifactRepositoryError("artifact repository capacity exceeded")
+                self._write_reservations[reservation_key] = (reference, "aborted")
+                self._scope_reservation_counts[scope] = count + 1
+            else:
+                if reservation[0] != reference:
+                    return False
+                if reservation[1] == "committed":
+                    return False
+                self._write_reservations[reservation_key] = (reference, "aborted")
             artifact = self._artifacts.get(key)
             if (
                 artifact is None
                 or artifact.content_sha256 != reference.sha256
                 or artifact.recompute_content_sha256() != reference.sha256
             ):
-                return False
+                return reservation is None or reservation[1] == "reserved"
             owners = self._write_owners[key]
             if owners is None or write_id not in owners:
                 return False
@@ -224,6 +300,50 @@ class InMemoryArtifactRepository:
                 del self._scope_counts[scope]
                 del self._scope_bytes[scope]
             return True
+
+    async def commit_write(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        reference: ArtifactReference,
+        *,
+        write_id: UUID,
+    ) -> None:
+        scope = self._scope(tenant_id, run_id)
+        self._write_identity(reference, write_id)
+        key = (*scope, reference.id)
+        async with self._lock:
+            reservation_key = (*scope, write_id)
+            reservation = self._write_reservations.get(reservation_key)
+            artifact = self._artifacts.get(key)
+            if (
+                reservation is None
+                or reservation[0] != reference
+                or reservation[1] == "aborted"
+                or artifact is None
+                or artifact.content_sha256 != reference.sha256
+                or artifact.recompute_content_sha256() != reference.sha256
+            ):
+                raise ArtifactRepositoryError("artifact is unavailable")
+            if reservation[1] == "committed":
+                return
+            owners = self._write_owners[key]
+            if owners is not None and write_id not in owners:
+                raise ArtifactRepositoryError("artifact is unavailable")
+            self._write_owners[key] = None
+            self._write_reservations[reservation_key] = (reference, "committed")
+
+    async def delete_if_hash(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        reference: ArtifactReference,
+        *,
+        write_id: UUID,
+    ) -> bool:
+        return await self.abort_write(
+            tenant_id, run_id, reference, write_id=write_id
+        )
 
 
 __all__ = [
