@@ -151,16 +151,12 @@ def test_ag2_can_be_selected_explicitly_without_enabling_legacy_autogen() -> Non
 
 
 def test_autogen_legacy_requires_explicit_backend_selection() -> None:
-    registry = DiscussionRuntimeRegistry(
-        (Provider(DiscussionBackend.AUTOGEN_LEGACY, "autogen"),)
-    )
+    registry = DiscussionRuntimeRegistry((Provider(DiscussionBackend.AUTOGEN_LEGACY, "autogen"),))
 
     with pytest.raises(DiscussionBackendUnavailable, match="MAF or AG2"):
         registry.create(DiscussionBackendSelection())
 
-    runtime = registry.create(
-        DiscussionBackendSelection(backend=DiscussionBackend.AUTOGEN_LEGACY)
-    )
+    runtime = registry.create(DiscussionBackendSelection(backend=DiscussionBackend.AUTOGEN_LEGACY))
 
     assert isinstance(runtime, SentinelRuntime)
     assert runtime.marker == "autogen"
@@ -222,9 +218,7 @@ def test_provider_protocol_requires_discuss_runtime() -> None:
 
 
 def test_malformed_runtime_fails_closed_without_exposing_hostile_details() -> None:
-    registry = DiscussionRuntimeRegistry(
-        (RuntimeProvider(DiscussionBackend.MAF, DirectRuntime()),)
-    )
+    registry = DiscussionRuntimeRegistry((RuntimeProvider(DiscussionBackend.MAF, DirectRuntime()),))
 
     with pytest.raises(DiscussionBackendUnavailable, match="Discuss runtime"):
         registry.create(DiscussionBackendSelection())
