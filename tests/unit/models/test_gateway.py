@@ -2,6 +2,7 @@ import asyncio
 import json
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from uuid import NAMESPACE_DNS, uuid5
 
 import pytest
@@ -16,6 +17,7 @@ from agent_hub.models.capacity import (
 )
 from agent_hub.models.gateway import (
     ConservativeTokenEstimator,
+    DeploymentPricing,
     GatewayCompletion,
     ModelGateway,
     ModelGatewayError,
@@ -30,13 +32,16 @@ from agent_hub.models.types import (
     ModelRequest,
     ModelResponse,
     StructuredResponseSchema,
+    TokenUsage,
 )
 
 
 def test_gateway_completion_is_exported_from_models_package() -> None:
+    import agent_hub.models as public_models
     from agent_hub.models import GatewayCompletion as PublicGatewayCompletion
 
     assert PublicGatewayCompletion is GatewayCompletion
+    assert getattr(public_models, "DeploymentPricing", None) is DeploymentPricing
 
 
 def deployment(
@@ -164,10 +169,12 @@ class TransportStub:
         *,
         failure: Exception | None = None,
         block: asyncio.Event | None = None,
+        response: ModelResponse | None = None,
     ) -> None:
         self.events = events
         self.failure = failure
         self.block = block
+        self.response = response or ModelResponse(text="ok")
         self.calls: list[tuple[Deployment, ModelRequest, str]] = []
         self.cancelled = asyncio.Event()
 
@@ -184,7 +191,7 @@ class TransportStub:
                 raise
         if self.failure is not None:
             raise self.failure
-        return ModelResponse(text="ok")
+        return self.response
 
 
 class EstimatorStub:
@@ -659,6 +666,86 @@ async def test_completion_context_reports_actual_fallback_provenance() -> None:
     assert not hasattr(completion, "quota_scope_id")
 
 
+async def test_completion_cost_uses_trusted_deployment_pricing_and_token_usage() -> None:
+    selected = deployment("selected")
+    capacity = CapacityStub([lease("selected")])
+    response = ModelResponse(
+        text="ok",
+        usage=TokenUsage(prompt_tokens=1_000, completion_tokens=500, total_tokens=1_500),
+    )
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        SecretStub(capacity.events),
+        TransportStub(capacity.events, response=response),
+        pricing={
+            "selected": DeploymentPricing(
+                input_per_million_usd=Decimal("0.15"),
+                output_per_million_usd=Decimal("0.60"),
+            )
+        },
+    )
+
+    completion = await gateway.complete_with_context(request())
+
+    assert completion.cost_usd == Decimal("0.000450")
+
+
+async def test_completion_cost_ignores_untrusted_provider_model_metadata() -> None:
+    selected = deployment("selected")
+    capacity = CapacityStub([lease("selected")])
+    response = ModelResponse(
+        text="ok",
+        usage=TokenUsage(prompt_tokens=1_000, completion_tokens=500, total_tokens=1_500),
+        provider_metadata={"model": "openai/provider-claimed-free-model"},
+    )
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        SecretStub(capacity.events),
+        TransportStub(capacity.events, response=response),
+        pricing={
+            "selected": DeploymentPricing(
+                input_per_million_usd=Decimal("0.15"),
+                output_per_million_usd=Decimal("0.60"),
+            )
+        },
+    )
+
+    completion = await gateway.complete_with_context(request())
+
+    assert completion.cost_usd == Decimal("0.000450")
+
+
+async def test_completion_cost_is_zero_when_validated_usage_is_missing() -> None:
+    selected = deployment("selected")
+    capacity = CapacityStub([lease("selected")])
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        SecretStub(capacity.events),
+        TransportStub(capacity.events),
+        pricing={
+            "selected": DeploymentPricing(
+                input_per_million_usd=Decimal("0.15"),
+                output_per_million_usd=Decimal("0.60"),
+            )
+        },
+    )
+
+    completion = await gateway.complete_with_context(request())
+
+    assert completion.cost_usd == Decimal(0)
+
+
+def test_deployment_pricing_rejects_non_decimal_rates_safely() -> None:
+    with pytest.raises(TypeError, match="input_per_million_usd"):
+        DeploymentPricing(
+            input_per_million_usd=0.15,  # type: ignore[arg-type]
+            output_per_million_usd=Decimal("0.60"),
+        )
+
+
 async def test_no_fallback_when_request_disallows_it() -> None:
     primary = deployment("primary-key")
     backup = deployment("backup-key", "backup")
@@ -725,9 +812,7 @@ async def test_immediate_capacity_failure_does_not_fallback(failure: Exception) 
         ({"Primary": "backup"}, "safe identifier"),
     ],
 )
-def test_fallback_configuration_is_validated(
-    fallbacks: dict[str, str], message: str
-) -> None:
+def test_fallback_configuration_is_validated(fallbacks: dict[str, str], message: str) -> None:
     registry = ModelRegistry([deployment("one"), deployment("two", "backup")])
     with pytest.raises(ValueError, match=message):
         ModelGateway(

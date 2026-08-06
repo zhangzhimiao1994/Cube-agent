@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 from types import MappingProxyType
 from typing import Protocol
 
@@ -26,6 +26,30 @@ from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, _req
 
 class ModelGatewayError(RuntimeError):
     """Stable, redacted failure at the model gateway boundary."""
+
+
+@dataclass(frozen=True, slots=True)
+class DeploymentPricing:
+    """Gateway-owned token pricing in USD per one million tokens."""
+
+    input_per_million_usd: Decimal
+    output_per_million_usd: Decimal
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("input_per_million_usd", self.input_per_million_usd),
+            ("output_per_million_usd", self.output_per_million_usd),
+        ):
+            if type(value) is not Decimal:
+                raise TypeError(f"{name} must be a Decimal")
+            exponent = value.as_tuple().exponent
+            if (
+                not value.is_finite()
+                or value < 0
+                or (isinstance(exponent, int) and exponent < -6)
+                or value > Decimal(1000000)
+            ):
+                raise ValueError(f"{name} must be a bounded USD decimal")
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,10 +82,7 @@ class GatewayCompletion:
             type(self.cost_usd) is not Decimal
             or not self.cost_usd.is_finite()
             or self.cost_usd < 0
-            or (
-                isinstance(cost_exponent, int)
-                and cost_exponent < -6
-            )
+            or (isinstance(cost_exponent, int) and cost_exponent < -6)
             or self.cost_usd > Decimal(1000000)
         ):
             raise ValueError("gateway cost must be a bounded USD decimal")
@@ -168,6 +189,7 @@ class ModelGateway:
         heartbeat_interval: float = 10,
         heartbeat_safety_fraction: float = 0.5,
         token_estimator: TokenEstimator | None = None,
+        pricing: Mapping[str, DeploymentPricing] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         utc_now: Callable[[], datetime] = _utc_now,
     ) -> None:
@@ -191,12 +213,21 @@ class ModelGateway:
             raise ValueError("heartbeat_safety_fraction must be finite and between 0 and 0.5")
         configured_fallbacks = dict(fallbacks or {})
         self._validate_fallbacks(registry, configured_fallbacks)
+        configured_pricing = dict(pricing or {})
+        deployment_ids = {deployment.id for deployment in registry.deployments}
+        for deployment_id, deployment_pricing in configured_pricing.items():
+            _require_safe_identifier("pricing deployment id", deployment_id)
+            if deployment_id not in deployment_ids:
+                raise ValueError(f"unknown pricing deployment {deployment_id!r}")
+            if type(deployment_pricing) is not DeploymentPricing:
+                raise TypeError("pricing values must be DeploymentPricing")
         capacity_pool.validate_configuration(registry.deployments)
         self._registry = registry
         self._capacity = capacity_pool
         self._secret_resolver = secret_resolver
         self._transport = transport
         self._fallbacks = MappingProxyType(configured_fallbacks)
+        self._pricing = MappingProxyType(configured_pricing)
         self._capacity_wait_timeout = float(capacity_wait_timeout)
         self._heartbeat_interval = float(heartbeat_interval)
         del heartbeat_safety_fraction, utc_now
@@ -235,9 +266,7 @@ class ModelGateway:
         selected: Deployment | None = None
         for logical_model in models:
             try:
-                candidates = self._registry.candidates(
-                    logical_model, request.required_capabilities
-                )
+                candidates = self._registry.candidates(logical_model, request.required_capabilities)
             except NoCapableDeployment:
                 if logical_model == request.logical_model:
                     raise
@@ -251,9 +280,7 @@ class ModelGateway:
                 )
             except CapacityWaitTimeout:
                 continue
-            selected = next(
-                (item for item in candidates if item.id == lease.deployment_id), None
-            )
+            selected = next((item for item in candidates if item.id == lease.deployment_id), None)
             if selected is None or selected.quota_scope_id != lease.quota_scope_id:
                 cleanup_error = await self._release_cleanup(lease)
                 if isinstance(cleanup_error, asyncio.CancelledError):
@@ -271,7 +298,19 @@ class ModelGateway:
             logical_model=selected.logical_model,
             provider_id=selected.provider_model.split("/", 1)[0],
             provider_model=selected.provider_model,
+            cost_usd=self._cost_usd(selected, response),
         )
+
+    def _cost_usd(self, deployment: Deployment, response: ModelResponse) -> Decimal:
+        pricing = self._pricing.get(deployment.id)
+        usage = response.usage
+        if pricing is None or usage is None:
+            return Decimal(0)
+        cost = (
+            Decimal(usage.prompt_tokens) * pricing.input_per_million_usd
+            + Decimal(usage.completion_tokens) * pricing.output_per_million_usd
+        ) / Decimal(1000000)
+        return cost.quantize(Decimal("0.000001"), rounding=ROUND_CEILING)
 
     def _fallback_chain(self, primary: str, allow_fallback: bool) -> tuple[str, ...]:
         chain = [primary]

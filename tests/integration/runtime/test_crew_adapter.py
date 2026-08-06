@@ -1,6 +1,12 @@
 import asyncio
+import importlib
+import json
+import os
+import time
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from pathlib import Path
 from typing import cast
 from uuid import UUID, uuid4
 
@@ -84,7 +90,9 @@ class ToolGateway(FakeGateway):
         response = (
             ModelResponse(
                 text=None,
-                tool_calls=(ToolCall(id="provider-call", name="web.search", arguments={"q": "safe"}),),
+                tool_calls=(
+                    ToolCall(id="provider-call", name="web.search", arguments={"q": "safe"}),
+                ),
                 usage=TokenUsage(1, 1, 2),
             )
             if len(self.requests) == 1
@@ -96,6 +104,23 @@ class ToolGateway(FakeGateway):
             logical_model=request.logical_model,
             provider_id="deepseek",
             provider_model="deepseek/chat",
+        )
+
+
+class CostGateway(FakeGateway):
+    def __init__(self, cost_usd: Decimal, *, reviews: list[str] | None = None) -> None:
+        super().__init__(reviews=reviews)
+        self.cost_usd = cost_usd
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        completion = await super().complete_with_context(request)
+        return GatewayCompletion(
+            response=completion.response,
+            deployment_id=completion.deployment_id,
+            logical_model=completion.logical_model,
+            provider_id=completion.provider_id,
+            provider_model=completion.provider_model,
+            cost_usd=self.cost_usd,
         )
 
 
@@ -122,8 +147,9 @@ class FastGeneration:
         bridge: CrewLLMBridge,
         *,
         agent_id: str | None = None,
+        storage_scope: tuple[UUID, UUID],
     ) -> str:
-        del step_id, agent_id
+        del step_id, agent_id, storage_scope
         return await bridge.complete([{"role": "system", "content": prompt}])
 
 
@@ -299,9 +325,7 @@ async def test_real_model_gateway_queues_agents_sharing_one_quota_scope() -> Non
     )
     capacity = SharedCapacity()
     transport = Transport()
-    gateway = LeasedModelGateway(
-        ModelRegistry(deployments), capacity, Secrets(), transport
-    )
+    gateway = LeasedModelGateway(ModelRegistry(deployments), capacity, Secrets(), transport)
 
     events = await collect(make_runtime(gateway), context())
 
@@ -312,7 +336,9 @@ async def test_real_model_gateway_queues_agents_sharing_one_quota_scope() -> Non
 
 
 async def test_reviewer_feedback_causes_only_bounded_retry() -> None:
-    gateway = FakeGateway(reviews=['{"verdict":"revise","feedback":"fix it"}', '{"verdict":"approve"}'])
+    gateway = FakeGateway(
+        reviews=['{"verdict":"revise","feedback":"fix it"}', '{"verdict":"approve"}']
+    )
     events = await collect(make_runtime(gateway, plan(review=True)), context())
     assert len([event for event in events if event.kind is EventKind.STEP_RETRYING]) == 1
     assert any(event.kind is EventKind.REVIEW_COMPLETED for event in events)
@@ -321,6 +347,117 @@ async def test_reviewer_feedback_causes_only_bounded_retry() -> None:
     )
     assert events[review_index + 1].kind is EventKind.CHECKPOINT_SAVED
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_reviewer_feedback_artifact_survives_crash_resume() -> None:
+    class CrashOnRetryGeneration(FastGeneration):
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.prompts: list[str] = []
+
+        async def execute(
+            self,
+            step_id: str,
+            prompt: str,
+            bridge: CrewLLMBridge,
+            *,
+            agent_id: str | None = None,
+            storage_scope: tuple[UUID, UUID],
+        ) -> str:
+            self.prompts.append(prompt)
+            if "untrusted_reviewer_feedback" in prompt:
+                self.started.set()
+                await asyncio.Event().wait()
+            return await super().execute(
+                step_id,
+                prompt,
+                bridge,
+                agent_id=agent_id,
+                storage_scope=storage_scope,
+            )
+
+    generation = CrashOnRetryGeneration()
+
+    class Factory(FastFactory):
+        def build(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            del args, kwargs
+            return generation
+
+    first = make_runtime(
+        FakeGateway(reviews=['{"verdict":"revise","feedback":"persist me"}']),
+        plan(review=True),
+        crew_factory=Factory(),
+    )
+    first_events: list[RunEvent] = []
+
+    async def consume() -> None:
+        async for event in first.run(context()):
+            first_events.append(event)
+
+    task = asyncio.create_task(consume())
+    await generation.started.wait()
+    await first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    checkpoint = next(
+        event.checkpoint
+        for event in reversed(first_events)
+        if event.kind is EventKind.CHECKPOINT_SAVED
+        and event.checkpoint is not None
+        and event.checkpoint.state["phase"] == "running"
+    )
+    assert "persist me" not in json.dumps(checkpoint.to_payload())
+
+    referenced_ids = {
+        reference["id"]
+        for field in ("artifact_refs", "review_refs")
+        for reference in cast(Mapping[str, Mapping[str, str]], checkpoint.state[field]).values()
+    }
+    artifacts = tuple(
+        event.artifact
+        for event in first_events
+        if event.artifact is not None and str(event.artifact.id) in referenced_ids
+    )
+
+    class CapturingGeneration(FastGeneration):
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        async def execute(
+            self,
+            step_id: str,
+            prompt: str,
+            bridge: CrewLLMBridge,
+            *,
+            agent_id: str | None = None,
+            storage_scope: tuple[UUID, UUID],
+        ) -> str:
+            self.prompts.append(prompt)
+            return await super().execute(
+                step_id,
+                prompt,
+                bridge,
+                agent_id=agent_id,
+                storage_scope=storage_scope,
+            )
+
+    resumed_generation = CapturingGeneration()
+
+    class ResumedFactory(FastFactory):
+        def build(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            del args, kwargs
+            return resumed_generation
+
+    resumed = make_runtime(
+        FakeGateway(reviews=['{"verdict":"approve"}']),
+        plan(review=True),
+        crew_factory=ResumedFactory(),
+    )
+    await resumed.restore_checkpoint(checkpoint)
+    events = await collect(resumed, context(checkpoint=checkpoint, artifacts=artifacts))
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert any("persist me" in prompt for prompt in resumed_generation.prompts)
 
 
 async def test_review_retry_exhaustion_prevents_synthesis_and_redacts_output() -> None:
@@ -335,16 +472,16 @@ async def test_review_retry_exhaustion_prevents_synthesis_and_redacts_output() -
     with pytest.raises(RuntimeExecutionError) as caught:
         await collect(runtime, context())
     assert sentinel not in str(caught.value)
-    assert not any("SYNTHESIZER" in cast(str, request.messages[0].content) for request in gateway.requests)
+    assert not any(
+        "SYNTHESIZER" in cast(str, request.messages[0].content) for request in gateway.requests
+    )
 
 
 async def test_checkpoint_can_resume_completed_run_without_model_calls() -> None:
     first = make_runtime(FakeGateway())
     events = await collect(first, context())
     checkpoint = next(
-        event.checkpoint
-        for event in reversed(events)
-        if event.kind is EventKind.CHECKPOINT_SAVED
+        event.checkpoint for event in reversed(events) if event.kind is EventKind.CHECKPOINT_SAVED
     )
     assert checkpoint is not None
     second_gateway = FakeGateway()
@@ -355,9 +492,7 @@ async def test_checkpoint_can_resume_completed_run_without_model_calls() -> None
         for event in events
         if event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
     )
-    resumed = await collect(
-        second, context(checkpoint=checkpoint, artifacts=stored_artifacts)
-    )
+    resumed = await collect(second, context(checkpoint=checkpoint, artifacts=stored_artifacts))
     assert [event.kind for event in resumed] == [EventKind.RUNTIME_COMPLETED]
     assert not second_gateway.requests
 
@@ -443,6 +578,7 @@ async def test_noncooperative_generation_is_detached_and_runtime_cancelled_is_em
             bridge: CrewLLMBridge,
             *,
             agent_id: str | None = None,
+            storage_scope: tuple[UUID, UUID],
         ) -> str:
             if self.block:
                 self.started.set()
@@ -452,7 +588,11 @@ async def test_noncooperative_generation_is_detached_and_runtime_cancelled_is_em
                     await self.release.wait()
                 return "detached result"
             return await super().execute(
-                step_id, prompt, bridge, agent_id=agent_id
+                step_id,
+                prompt,
+                bridge,
+                agent_id=agent_id,
+                storage_scope=storage_scope,
             )
 
     class Factory(FastFactory):
@@ -471,9 +611,7 @@ async def test_noncooperative_generation_is_detached_and_runtime_cancelled_is_em
             return self.generation
 
     generation = NoncooperativeGeneration()
-    runtime = make_runtime(
-        FakeGateway(), crew_factory=Factory(generation)
-    )
+    runtime = make_runtime(FakeGateway(), crew_factory=Factory(generation))
     events: list[RunEvent] = []
 
     async def consume() -> None:
@@ -573,9 +711,7 @@ async def test_tool_calls_only_cross_the_capability_gateway() -> None:
     )
     capabilities = FakeCapabilities()
     events = await collect(
-        make_runtime(
-            ToolGateway(), tool_plan, capability_gateway=capabilities
-        ),
+        make_runtime(ToolGateway(), tool_plan, capability_gateway=capabilities),
         context(),
     )
     assert capabilities.calls == [("writer", "web.search")]
@@ -636,9 +772,7 @@ async def test_succeeded_tool_result_resumes_without_repeating_side_effect() -> 
     assert len(tool_artifacts) == 1
 
     second_capabilities = FakeCapabilities()
-    resumed = make_runtime(
-        ToolGateway(), tool_plan, capability_gateway=second_capabilities
-    )
+    resumed = make_runtime(ToolGateway(), tool_plan, capability_gateway=second_capabilities)
     await resumed.restore_checkpoint(checkpoint)
     events = await collect(
         resumed,
@@ -693,9 +827,7 @@ async def test_replay_safe_running_tool_reuses_stable_idempotency_key() -> None:
         total_token_budget=100,
     )
     first_capabilities = RecordingCapabilities(block=True)
-    first = make_runtime(
-        ToolGateway(), tool_plan, capability_gateway=first_capabilities
-    )
+    first = make_runtime(ToolGateway(), tool_plan, capability_gateway=first_capabilities)
     task = asyncio.create_task(collect(first, context()))
     await first_capabilities.started.wait()
     checkpoint = await first.save_checkpoint()
@@ -709,14 +841,76 @@ async def test_replay_safe_running_tool_reuses_stable_idempotency_key() -> None:
         await task
 
     second_capabilities = RecordingCapabilities(block=False)
-    resumed = make_runtime(
-        ToolGateway(), tool_plan, capability_gateway=second_capabilities
-    )
+    resumed = make_runtime(ToolGateway(), tool_plan, capability_gateway=second_capabilities)
     await resumed.restore_checkpoint(checkpoint)
     events = await collect(resumed, context(checkpoint=checkpoint))
 
     assert second_capabilities.keys == first_capabilities.keys
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_detached_old_tool_cannot_overwrite_new_run_checkpoint() -> None:
+    class LateToolCapabilities(FakeCapabilities):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.returned = asyncio.Event()
+
+        async def execute(  # type: ignore[no-untyped-def]
+            self, *, tenant_id, run_id, actor, name, arguments, idempotency_key
+        ):
+            del tenant_id, run_id, arguments, idempotency_key
+            self.calls.append((actor, name))
+            self.started.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                await self.release.wait()
+            self.returned.set()
+            return {"items": ["late result"]}
+
+    tool_plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+                allowed_tools=("web.search",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                tools=("web.search",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=("web.search",),
+        total_token_budget=100,
+    )
+    capabilities = LateToolCapabilities()
+    runtime = make_runtime(ToolGateway(), tool_plan, capability_gateway=capabilities)
+    old_task = asyncio.create_task(collect(runtime, context()))
+    await capabilities.started.wait()
+    await runtime.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await old_task
+
+    assert (await collect(runtime, context()))[-1].kind is EventKind.RUNTIME_COMPLETED
+    current_checkpoint = await runtime.save_checkpoint()
+    assert current_checkpoint.state["phase"] == "completed"
+
+    capabilities.release.set()
+    await capabilities.returned.wait()
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert (await runtime.save_checkpoint()).id == current_checkpoint.id
 
 
 async def test_uncertain_tool_checkpoint_fails_closed_without_replay() -> None:
@@ -797,6 +991,194 @@ async def test_uncertain_tool_checkpoint_fails_closed_without_replay() -> None:
         await collect(resumed, context(checkpoint=checkpoint))
 
 
+async def test_tool_idempotency_key_changes_when_canonical_arguments_change() -> None:
+    class ArgumentGateway(ToolGateway):
+        def __init__(self, query: str) -> None:
+            super().__init__()
+            self.query = query
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            response = (
+                ModelResponse(
+                    text=None,
+                    tool_calls=(
+                        ToolCall(
+                            id="provider-call",
+                            name="web.search",
+                            arguments={"q": self.query},
+                        ),
+                    ),
+                    usage=TokenUsage(1, 1, 2),
+                )
+                if len(self.requests) == 1
+                else ModelResponse(text="done", usage=TokenUsage(1, 1, 2))
+            )
+            return GatewayCompletion(
+                response=response,
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/chat",
+            )
+
+    class KeyCapabilities(FakeCapabilities):
+        def __init__(self) -> None:
+            super().__init__()
+            self.keys: list[str] = []
+
+        async def execute(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.keys.append(kwargs["idempotency_key"])
+            return await super().execute(**kwargs)  # type: ignore[no-untyped-call]
+
+    tool_plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+                allowed_tools=("web.search",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                tools=("web.search",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=("web.search",),
+        total_token_budget=100,
+    )
+    capabilities = KeyCapabilities()
+    await collect(
+        make_runtime(
+            ArgumentGateway("first"),
+            tool_plan,
+            capability_gateway=capabilities,
+        ),
+        context(),
+    )
+    await collect(
+        make_runtime(
+            ArgumentGateway("second"),
+            tool_plan,
+            capability_gateway=capabilities,
+        ),
+        context(),
+    )
+
+    assert len(capabilities.keys) == 2
+    assert capabilities.keys[0] != capabilities.keys[1]
+
+
+@pytest.mark.parametrize("limit_source", ["step", "run"])
+async def test_one_monotonic_deadline_bounds_cumulative_step_work(
+    limit_source: str,
+) -> None:
+    class SlowGateway(ToolGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            await asyncio.sleep(0.06)
+            return await super().complete_with_context(request)
+
+    class SlowCapabilities(FakeCapabilities):
+        async def execute(self, **kwargs):  # type: ignore[no-untyped-def]
+            await asyncio.sleep(0.06)
+            return await super().execute(**kwargs)  # type: ignore[no-untyped-call]
+
+    deadline = 0.1
+    step_timeout = deadline if limit_source == "step" else 0.5
+    run_timeout = deadline if limit_source == "run" else 0.5
+    tool_plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+                allowed_tools=("web.search",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                tools=("web.search",),
+                final_synthesizer=True,
+                token_budget=100,
+                timeout_seconds=step_timeout,
+            ),
+        ),
+        allowed_tools=("web.search",),
+        total_token_budget=100,
+        total_timeout_seconds=0.5,
+    )
+    ctx = context().model_copy(update={"timeout_seconds": run_timeout})
+    started = time.monotonic()
+    with pytest.raises(RuntimeExecutionError):
+        await collect(
+            make_runtime(
+                SlowGateway(),
+                tool_plan,
+                capability_gateway=SlowCapabilities(),
+            ),
+            ctx,
+        )
+
+    assert time.monotonic() - started < 0.2
+
+
+async def test_trusted_cost_is_atomic_in_parallel_checkpoint_and_retry() -> None:
+    priced_steps = tuple(
+        step.model_copy(update={"cost_budget_usd": Decimal("0.10")})
+        for step in plan(review=True).steps
+    )
+    priced_plan = plan(review=True).model_copy(
+        update={
+            "steps": priced_steps,
+            "total_cost_usd": Decimal("1.00"),
+        }
+    )
+    gateway = CostGateway(
+        Decimal("0.01"),
+        reviews=['{"verdict":"revise","feedback":"retry"}', '{"verdict":"approve"}'],
+    )
+    events = await collect(make_runtime(gateway, priced_plan), context())
+    final_checkpoint = next(
+        event.checkpoint for event in reversed(events) if event.checkpoint is not None
+    )
+
+    cost_events = [event for event in events if event.kind is EventKind.COST_RECORDED]
+    assert len(cost_events) == 6
+    assert all(event.cost_usd == Decimal("0.01") for event in cost_events)
+    assert final_checkpoint.state["usage"] == {
+        "tokens": 12,
+        "cost_usd": "0.06",
+    }
+
+
+async def test_trusted_cost_fails_closed_at_step_budget() -> None:
+    base = plan(max_parallelism=1)
+    priced_plan = base.model_copy(
+        update={
+            "steps": tuple(
+                step.model_copy(update={"cost_budget_usd": Decimal("0.01")}) for step in base.steps
+            ),
+            "total_cost_usd": Decimal(1),
+        }
+    )
+    with pytest.raises(RuntimeExecutionError):
+        await collect(
+            make_runtime(CostGateway(Decimal("0.02")), priced_plan),
+            context(),
+        )
+
+
 async def test_private_factory_receives_locked_down_framework_generation() -> None:
     captured: dict[str, object] = {}
 
@@ -817,20 +1199,107 @@ async def test_private_factory_receives_locked_down_framework_generation() -> No
     agents = captured["agents"]
     assert isinstance(agents, tuple)
     assert all(
-        not item.allow_delegation and not item.memory and not item.code_execution
-        for item in agents
+        not item.allow_delegation and not item.memory and not item.code_execution for item in agents
     )
 
 
-async def test_real_crewai_akickoff_uses_only_model_gateway(tmp_path) -> None:  # type: ignore[no-untyped-def]
+async def test_real_crewai_akickoff_uses_only_model_gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CREWAI_TRACING_ENABLED", "true")
+    storage_root = tmp_path / "crewai"
+    scoped_storage = storage_root / "agent-hub" / str(TENANT_ID) / str(RUN_ID)
+    scoped_storage.mkdir(parents=True)
+    (scoped_storage / ".crewai_user.json").write_text(
+        json.dumps({"first_execution_done": True, "trace_consent": True}),
+        encoding="utf-8",
+    )
     gateway = FakeGateway()
     events = await collect(
         make_runtime(
             gateway,
-            crew_factory=CrewAIObjectFactory(storage_dir=tmp_path / "crewai"),
+            crew_factory=CrewAIObjectFactory(storage_dir=storage_root),
+        ),
+        context(),
+    )
+    tracing_utils = importlib.import_module("crewai.events.listeners.tracing.utils")
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(gateway.requests) == 3
+    assert tracing_utils.is_tracing_enabled_in_context() is False
+
+
+async def test_real_crewai_storage_is_scoped_without_global_pollution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    appdirs_module = importlib.import_module("appdirs")
+    forbidden_calls: list[tuple[object, ...]] = []
+
+    def forbidden_default_storage(*args, **kwargs):  # type: ignore[no-untyped-def]
+        del kwargs
+        forbidden_calls.append(args)
+        raise AssertionError("default user storage must not be consulted")
+
+    monkeypatch.setattr(appdirs_module, "user_data_dir", forbidden_default_storage)
+    before_function = appdirs_module.user_data_dir
+    before_environment = dict(os.environ)
+    before_cwd = os.getcwd()
+    storage_root = tmp_path / "controlled-crewai"
+
+    events = await collect(
+        make_runtime(
+            FakeGateway(),
+            crew_factory=CrewAIObjectFactory(storage_dir=storage_root),
         ),
         context(),
     )
 
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
-    assert len(gateway.requests) == 3
+    assert forbidden_calls == []
+    assert appdirs_module.user_data_dir is before_function
+    assert dict(os.environ) == before_environment
+    assert os.getcwd() == before_cwd
+    files = tuple(path for path in storage_root.rglob("*") if path.is_file())
+    assert files
+    assert all(str(path).startswith(str(storage_root)) for path in files)
+
+
+async def test_real_crewai_concurrent_runs_use_distinct_storage_scopes(
+    tmp_path: Path,
+) -> None:
+    storage_root = tmp_path / "concurrent-crewai"
+    factory = CrewAIObjectFactory(storage_dir=storage_root)
+    first_context = context().model_copy(update={"run_id": uuid4(), "tenant_id": uuid4()})
+    second_context = context().model_copy(update={"run_id": uuid4(), "tenant_id": uuid4()})
+
+    first_events, second_events = await asyncio.gather(
+        collect(
+            make_runtime(FakeGateway(), crew_factory=factory),
+            first_context,
+        ),
+        collect(
+            make_runtime(FakeGateway(), crew_factory=factory),
+            second_context,
+        ),
+    )
+
+    assert first_events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert second_events[-1].kind is EventKind.RUNTIME_COMPLETED
+    for ctx in (first_context, second_context):
+        scope = storage_root / "agent-hub" / str(ctx.tenant_id) / str(ctx.run_id)
+        assert scope.is_dir()
+        assert any(path.is_file() for path in scope.rglob("*"))
+
+
+def test_crewai_storage_router_preserves_external_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter_module = importlib.import_module("agent_hub.runtime.crew.adapter")
+    sentinel = "external-crewai-storage"
+    monkeypatch.setattr(
+        adapter_module,
+        "_CREWAI_DEFAULT_STORAGE_PATH",
+        lambda: sentinel,
+    )
+
+    assert adapter_module._contextual_crewai_storage_path() == sentinel
