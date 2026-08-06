@@ -290,6 +290,70 @@ class RunRepository:
             await session.flush()
             return self._record(row)
 
+    async def begin_capability_approval(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        *,
+        approval_id: str,
+        approval_fingerprint: str,
+    ) -> RunRecord:
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if row is None:
+                raise RunNotFound("run was not found")
+            routing_decision = {} if row.routing_decision is None else dict(row.routing_decision)
+            if (
+                RunStatus(row.status) is RunStatus.WAITING_APPROVAL
+                and routing_decision.get("approval_id") == approval_id
+                and routing_decision.get("approval_fingerprint") == approval_fingerprint
+            ):
+                return self._record(row)
+            if RunStatus(row.status) is not RunStatus.RUNNING:
+                raise RunConflict("run is not running")
+            row.status = RunStatus.WAITING_APPROVAL.value
+            row.routing_decision = {
+                **routing_decision,
+                "approval_id": approval_id,
+                "approval_fingerprint": approval_fingerprint,
+            }
+            row.version += 1
+            await session.flush()
+            return self._record(row)
+
+    async def resolve_capability_approval(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        status: RunStatus,
+        *,
+        approval_id: str,
+        approval_fingerprint: str,
+    ) -> RunRecord:
+        if status not in {RunStatus.RUNNING, RunStatus.CANCELLED}:
+            raise RunConflict("approval resolution status is invalid")
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if row is None:
+                raise RunNotFound("run was not found")
+            if RunStatus(row.status) is not RunStatus.WAITING_APPROVAL:
+                raise RunConflict("run is not waiting for approval")
+            routing_decision = {} if row.routing_decision is None else dict(row.routing_decision)
+            if (
+                routing_decision.get("approval_id") != approval_id
+                or routing_decision.get("approval_fingerprint") != approval_fingerprint
+            ):
+                raise RunConflict("run is waiting for a different approval")
+            row.status = status.value
+            row.routing_decision = {
+                key: value
+                for key, value in routing_decision.items()
+                if key not in {"approval_id", "approval_fingerprint"}
+            }
+            row.version += 1
+            await session.flush()
+            return self._record(row)
+
     async def fail_run(self, run_id: UUID, *, reason: str) -> RunRecord:
         async with self._session_factory() as session, session.begin():
             row = await self.get_for_update(session, run_id)
