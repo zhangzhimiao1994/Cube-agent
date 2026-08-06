@@ -7,6 +7,7 @@ const NAVIGATION = [
   { to: "/config", label: "配置", permission: "config:read" },
   { to: "/skills", label: "Skills", permission: "skill:read" },
   { to: "/mcp", label: "MCP", permission: "mcp:read" },
+  { to: "/users", label: "用户", permission: "user:read" },
   { to: "/audit", label: "审计", permission: "audit:read" },
 ];
 

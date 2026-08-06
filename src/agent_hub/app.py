@@ -25,7 +25,7 @@ from agent_hub.api.errors import (
     public_error_handler,
 )
 from agent_hub.api.middleware import RequestBodyLimitMiddleware, SafeExceptionMiddleware
-from agent_hub.api.routers import auth, config, runs, system
+from agent_hub.api.routers import auth, config, runs, system, users
 from agent_hub.auth.passwords import PasswordService
 from agent_hub.auth.rate_limit import RedisAuthRateLimiter
 from agent_hub.auth.service import AuthService
@@ -264,6 +264,7 @@ def create_app(
     application.router.routes.extend(auth.router.routes)
     application.router.routes.extend(config.router.routes)
     application.router.routes.extend(runs.router.routes)
+    application.router.routes.extend(users.router.routes)
     return application
 
 

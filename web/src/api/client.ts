@@ -8,6 +8,16 @@ const MeSchema = z.object({
 
 export type CurrentUser = z.infer<typeof MeSchema>;
 
+const UserSchema = z.object({
+  id: z.string(),
+  username: z.string(),
+  role: z.string(),
+  disabled: z.boolean(),
+  feishu_open_id: z.string().nullable(),
+});
+
+export type ManagedUser = z.infer<typeof UserSchema>;
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -60,5 +70,15 @@ export const api = {
       method: "POST",
       credentials: "include",
     });
+  },
+  users(): Promise<ManagedUser[]> {
+    return request("/api/v1/users", { method: "GET" }, z.array(UserSchema));
+  },
+  changeUserRole(userId: string, role: string): Promise<ManagedUser> {
+    return request(
+      `/api/v1/users/${userId}/role`,
+      { method: "PATCH", body: JSON.stringify({ role }) },
+      UserSchema,
+    );
   },
 };

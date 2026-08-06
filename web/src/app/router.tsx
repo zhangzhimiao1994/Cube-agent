@@ -5,6 +5,7 @@ import { AppShell } from "./AppShell";
 import { AuthProvider, RequireAuth } from "../auth/AuthProvider";
 import { LoginPage } from "../pages/LoginPage";
 import { SetupPage } from "../pages/SetupPage";
+import { UsersPage } from "../pages/UsersPage";
 
 const queryClient = new QueryClient();
 
@@ -33,6 +34,7 @@ export function AppRoutes() {
         <Route path="config" element={<PlaceholderPage title="配置" />} />
         <Route path="skills" element={<PlaceholderPage title="Skills" />} />
         <Route path="mcp" element={<PlaceholderPage title="MCP" />} />
+        <Route path="users" element={<UsersPage />} />
         <Route path="audit" element={<PlaceholderPage title="审计" />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
