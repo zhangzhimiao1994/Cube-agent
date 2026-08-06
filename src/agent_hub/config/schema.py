@@ -1,7 +1,10 @@
 import re
+from decimal import Decimal
 from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from agent_hub.models.types import Deployment, ModelCapability
 
 SAFE_IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 MAX_IDENTIFIER_LENGTH = 128
@@ -37,6 +40,8 @@ class DeploymentDefinition(StrictConfigModel):
     reserved_slots: int = Field(default=0, ge=0)
     rpm: int | None = Field(default=None, gt=0)
     tpm: int | None = Field(default=None, gt=0)
+    input_per_million_usd: Decimal | None = None
+    output_per_million_usd: Decimal | None = None
     capabilities: set[Capability] = Field(
         default_factory=_default_capabilities, min_length=1, max_length=4
     )
@@ -50,7 +55,52 @@ class DeploymentDefinition(StrictConfigModel):
     def reserved_capacity_is_below_maximum(self) -> Self:
         if self.reserved_slots >= self.max_concurrency:
             raise ValueError("reserved_slots must be less than max_concurrency")
+        if (self.input_per_million_usd is None) is not (
+            self.output_per_million_usd is None
+        ):
+            raise ValueError("deployment pricing must provide both input and output rates")
         return self
+
+    @field_validator("input_per_million_usd", "output_per_million_usd", mode="before")
+    @classmethod
+    def pricing_is_a_bounded_decimal(cls, value: object) -> object:
+        if value is None:
+            return None
+        if type(value) not in {str, Decimal}:
+            raise ValueError("pricing must be a decimal string")
+        try:
+            parsed = value if isinstance(value, Decimal) else Decimal(str(value))
+        except Exception as error:
+            raise ValueError("pricing must be a bounded USD decimal") from error
+        exponent = parsed.as_tuple().exponent
+        if (
+            not parsed.is_finite()
+            or parsed < 0
+            or parsed > Decimal(1000000)
+            or (isinstance(exponent, int) and exponent < -6)
+        ):
+            raise ValueError("pricing must be a bounded USD decimal")
+        return parsed
+
+    def to_deployment(self, *, deployment_id: str, logical_model: str) -> Deployment:
+        values: dict[str, object] = {
+            "id": deployment_id,
+            "logical_model": logical_model,
+            "provider_model": f"{self.provider}/{self.model}",
+            "secret_ref": self.secret_ref,
+            "quota_scope_id": self.quota_scope_id,
+            "max_concurrency": self.max_concurrency,
+            "target_utilization": self.target_utilization,
+            "reserved_slots": self.reserved_slots,
+            "rpm": self.rpm,
+            "tpm": self.tpm,
+            "capabilities": frozenset(ModelCapability(item) for item in self.capabilities),
+            "input_per_million_usd": self.input_per_million_usd,
+            "output_per_million_usd": self.output_per_million_usd,
+        }
+        if self.api_base is not None:
+            values["api_base"] = self.api_base
+        return Deployment(**values)  # type: ignore[arg-type]
 
 
 class LogicalModelDefinition(StrictConfigModel):

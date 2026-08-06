@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 import pytest
 from pydantic import ValidationError
 
@@ -227,3 +229,47 @@ def test_configuration_collections_have_upper_bounds() -> None:
             models={"primary": logical_model()},
             agents=[agent(identifier=f"agent-{index}") for index in range(1025)],
         )
+
+
+def test_deployment_pricing_round_trips_and_builds_runtime_deployment() -> None:
+    definition = deployment(
+        input_per_million_usd="0.150000",
+        output_per_million_usd=Decimal(0),
+    )
+
+    restored = DeploymentDefinition.model_validate_json(definition.model_dump_json())
+    runtime = restored.to_deployment(deployment_id="primary-1", logical_model="primary")
+
+    assert restored.input_per_million_usd == Decimal("0.150000")
+    assert restored.output_per_million_usd == Decimal(0)
+    assert runtime.input_per_million_usd == Decimal("0.150000")
+    assert runtime.output_per_million_usd == Decimal(0)
+    assert runtime.provider_model == "openai/gpt-5"
+
+
+def test_deployment_pricing_distinguishes_unknown_from_explicit_free() -> None:
+    unknown = deployment()
+    free = deployment(input_per_million_usd="0", output_per_million_usd="0")
+
+    assert unknown.input_per_million_usd is None
+    assert unknown.output_per_million_usd is None
+    assert free.input_per_million_usd == Decimal(0)
+    assert free.output_per_million_usd == Decimal(0)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"input_per_million_usd": "0", "output_per_million_usd": None},
+        {"input_per_million_usd": None, "output_per_million_usd": "0"},
+        {"input_per_million_usd": "NaN", "output_per_million_usd": "0"},
+        {"input_per_million_usd": "-0.01", "output_per_million_usd": "0"},
+        {"input_per_million_usd": "0.0000001", "output_per_million_usd": "0"},
+        {"input_per_million_usd": 0.1, "output_per_million_usd": "0"},
+    ],
+)
+def test_deployment_pricing_rejects_partial_or_invalid_decimals(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        deployment(**overrides)

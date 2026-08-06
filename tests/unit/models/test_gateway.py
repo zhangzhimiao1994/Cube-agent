@@ -49,6 +49,7 @@ def deployment(
     logical_model: str = "primary",
     *,
     capabilities: frozenset[ModelCapability] = frozenset({ModelCapability.TEXT}),
+    **overrides: object,
 ) -> Deployment:
     return Deployment(
         id=identifier,
@@ -56,6 +57,7 @@ def deployment(
         secret_ref=f"secret://{identifier}",
         quota_scope_id=f"scope-{identifier}",
         capabilities=capabilities,
+        **overrides,  # type: ignore[arg-type]
     )
 
 
@@ -775,6 +777,39 @@ def test_deployment_pricing_rejects_non_decimal_rates_safely() -> None:
             input_per_million_usd=0.15,  # type: ignore[arg-type]
             output_per_million_usd=Decimal("0.60"),
         )
+
+
+def test_gateway_completion_is_unaccounted_unless_cost_is_explicit() -> None:
+    completion = GatewayCompletion(
+        response=ModelResponse(text="ok"),
+        deployment_id="selected",
+        logical_model="primary",
+        provider_id="openai",
+        provider_model="openai/gpt-5",
+    )
+
+    assert completion.cost_usd is None
+
+
+async def test_completion_cost_uses_pricing_from_deployment_configuration() -> None:
+    selected = deployment(
+        "selected",
+        input_per_million_usd=Decimal("0.15"),
+        output_per_million_usd=Decimal("0.60"),
+    )
+    capacity = CapacityStub([lease("selected")])
+    response = ModelResponse(
+        text="ok",
+        usage=TokenUsage(prompt_tokens=1_000, completion_tokens=500, total_tokens=1_500),
+    )
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        SecretStub(capacity.events),
+        TransportStub(capacity.events, response=response),
+    )
+
+    assert (await gateway.complete_with_context(request())).cost_usd == Decimal("0.000450")
 
 
 async def test_no_fallback_when_request_disallows_it() -> None:

@@ -61,7 +61,7 @@ class GatewayCompletion:
     logical_model: str
     provider_id: str
     provider_model: str = field(repr=False)
-    cost_usd: Decimal | None = Decimal(0)
+    cost_usd: Decimal | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.response, ModelResponse):
@@ -304,6 +304,15 @@ class ModelGateway:
 
     def _cost_usd(self, deployment: Deployment, response: ModelResponse) -> Decimal | None:
         pricing = self._pricing.get(deployment.id)
+        if (
+            pricing is None
+            and deployment.input_per_million_usd is not None
+            and deployment.output_per_million_usd is not None
+        ):
+            pricing = DeploymentPricing(
+                input_per_million_usd=deployment.input_per_million_usd,
+                output_per_million_usd=deployment.output_per_million_usd,
+            )
         usage = response.usage
         if pricing is None or usage is None:
             return None

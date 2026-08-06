@@ -2,6 +2,7 @@ import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from decimal import Decimal
 from enum import StrEnum
 from types import MappingProxyType
 from typing import cast
@@ -113,6 +114,8 @@ class Deployment:
     rpm: int | None = None
     tpm: int | None = None
     weight: int = 100
+    input_per_million_usd: Decimal | None = None
+    output_per_million_usd: Decimal | None = None
     capabilities: frozenset[ModelCapability] = field(
         default_factory=lambda: frozenset({ModelCapability.TEXT})
     )
@@ -164,6 +167,25 @@ class Deployment:
             raise ValueError("tpm must be positive")
         if not _is_int(self.weight) or self.weight <= 0:
             raise ValueError("weight must be positive")
+        prices = (self.input_per_million_usd, self.output_per_million_usd)
+        if (prices[0] is None) is not (prices[1] is None):
+            raise ValueError("deployment pricing must provide both input and output rates")
+        for name, value in (
+            ("input_per_million_usd", self.input_per_million_usd),
+            ("output_per_million_usd", self.output_per_million_usd),
+        ):
+            if value is None:
+                continue
+            if type(value) is not Decimal:
+                raise TypeError(f"{name} must be a Decimal or None")
+            exponent = value.as_tuple().exponent
+            if (
+                not value.is_finite()
+                or value < 0
+                or value > Decimal(1000000)
+                or (isinstance(exponent, int) and exponent < -6)
+            ):
+                raise ValueError(f"{name} must be a bounded USD decimal")
 
         capabilities = frozenset(ModelCapability(item) for item in self.capabilities)
         if not capabilities:

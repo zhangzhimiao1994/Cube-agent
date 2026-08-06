@@ -27,7 +27,14 @@ from uuid import UUID, uuid4
 
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.gateway import GatewayCompletion
-from agent_hub.models.types import ModelCapability, ModelMessage, ModelRequest, ModelResponse
+from agent_hub.models.types import (
+    ModelCapability,
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TokenUsage,
+    ToolCall,
+)
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
@@ -40,7 +47,7 @@ from agent_hub.runtime.contracts import (
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 
 _RUNTIME_TYPE = "crew"
-_RUNTIME_VERSION = "4"
+_RUNTIME_VERSION = "5"
 _MAX_PROMPT_BYTES = 196_608
 _MAX_OUTPUT_BYTES = 65_536
 _MAX_TOOL_ROUNDS = 8
@@ -165,7 +172,7 @@ def _call_in_crewai_scope(storage_path: Path, callback: Any, *args: object) -> A
             del _CREWAI_INVOCATION_THREAD.depth
 
 
-def _mutable_json(value: JsonValue) -> object:
+def _mutable_json(value: object) -> object:
     if isinstance(value, Mapping):
         return {key: _mutable_json(item) for key, item in value.items()}
     if isinstance(value, tuple):
@@ -212,6 +219,10 @@ class CapabilityOutcomeUncertain(RuntimeExecutionError):
     """A restricted capability may have committed but cannot be confirmed."""
 
 
+class ModelOutcomeUncertain(RuntimeExecutionError):
+    """A paid model request may have completed but cannot be confirmed."""
+
+
 class EventEmitter(Protocol):
     async def __call__(self, **values: object) -> None: ...
 
@@ -231,8 +242,20 @@ class ToolBoundary(Protocol):
     ) -> None: ...
 
 
+class ModelStateBoundary(Protocol):
+    async def __call__(self, key: str, model_state: Mapping[str, JsonValue]) -> None: ...
+
+
 class UsageBoundary(Protocol):
-    async def __call__(self, completion: GatewayCompletion, actor: str, step_id: str) -> None: ...
+    async def __call__(
+        self,
+        completion: GatewayCompletion,
+        actor: str,
+        step_id: str,
+        key: str,
+        model_state: Mapping[str, JsonValue],
+        artifact: Artifact,
+    ) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -497,6 +520,17 @@ class _ToolLedger:
 
 
 @dataclass(slots=True)
+class _ModelLedger:
+    states: dict[str, Mapping[str, JsonValue]] = field(default_factory=dict)
+    artifacts: dict[str, Artifact] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _ModelCallCursor:
+    value: int = 0
+
+
+@dataclass(slots=True)
 class _UsageLedger:
     tokens: int = 0
     cost_usd: Decimal = Decimal(0)
@@ -642,6 +676,7 @@ class CrewDispatchRuntime:
         completed: dict[str, Artifact] = {}
         retry_counts: dict[str, int] = {}
         tool_ledger = _ToolLedger()
+        model_ledger = _ModelLedger()
         usage_ledger = _UsageLedger()
         review_ledger = _ReviewLedger()
 
@@ -671,6 +706,7 @@ class CrewDispatchRuntime:
                     completed,
                     retry_counts,
                     tool_ledger,
+                    model_ledger,
                     usage_ledger,
                     review_ledger,
                 ) = self._hydrate_checkpoint(restored, context, plan)
@@ -709,6 +745,7 @@ class CrewDispatchRuntime:
                     for item in (
                         *completed.values(),
                         *tool_ledger.artifacts.values(),
+                        *model_ledger.artifacts.values(),
                         *review_ledger.artifacts.values(),
                     )
                 }
@@ -735,6 +772,7 @@ class CrewDispatchRuntime:
                         completed,
                         retry_counts,
                         tool_ledger,
+                        model_ledger,
                         usage_ledger,
                         review_ledger,
                         next_sequence=sequence.value + 2,
@@ -763,6 +801,7 @@ class CrewDispatchRuntime:
                         completed,
                         retry_counts,
                         tool_ledger,
+                        model_ledger,
                         usage_ledger,
                         review_ledger,
                         next_sequence=sequence.value + 2,
@@ -772,13 +811,47 @@ class CrewDispatchRuntime:
                     self._publish_checkpoint(state, checkpoint)
                     await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
 
+            async def model_state_boundary(
+                key: str,
+                model_state: Mapping[str, JsonValue],
+            ) -> None:
+                async with checkpoint_lock:
+                    if not run_open or not self._is_current_run(state):
+                        return
+                    if usage_ledger.terminal_phase is not None:
+                        return
+                    model_ledger.states[key] = model_state
+                    checkpoint = self._make_checkpoint(
+                        context,
+                        plan,
+                        completed,
+                        retry_counts,
+                        tool_ledger,
+                        model_ledger,
+                        usage_ledger,
+                        review_ledger,
+                        next_sequence=sequence.value + 2,
+                        terminal=False,
+                        phase="running",
+                    )
+                    self._publish_checkpoint(state, checkpoint)
+                    await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
+
             async def usage_boundary(
-                completion: GatewayCompletion, actor: str, step_id: str
+                completion: GatewayCompletion,
+                actor: str,
+                step_id: str,
+                key: str,
+                model_state: Mapping[str, JsonValue],
+                artifact: Artifact,
             ) -> None:
                 response_usage = completion.response.usage
                 async with checkpoint_lock:
                     if not run_open or not self._is_current_run(state):
                         return
+                    model_ledger.states[key] = model_state
+                    model_ledger.artifacts[key] = artifact
+                    await emit(kind=EventKind.ARTIFACT_CREATED, artifact=artifact)
                     response_tokens = 0 if response_usage is None else response_usage.total_tokens
                     response_cost = completion.cost_usd
                     raw_new_tokens = usage_ledger.tokens + response_tokens
@@ -841,6 +914,7 @@ class CrewDispatchRuntime:
                         completed,
                         retry_counts,
                         tool_ledger,
+                        model_ledger,
                         usage_ledger,
                         review_ledger,
                         next_sequence=sequence.value + 2,
@@ -876,8 +950,10 @@ class CrewDispatchRuntime:
                             emit,
                             boundary,
                             tool_boundary,
+                            model_state_boundary,
                             usage_boundary,
                             tool_ledger,
+                            model_ledger,
                             state,
                             review_ledger,
                         )
@@ -910,6 +986,7 @@ class CrewDispatchRuntime:
                                     completed,
                                     retry_counts,
                                     tool_ledger,
+                                    model_ledger,
                                     usage_ledger,
                                     review_ledger,
                                     next_sequence=sequence.value + 2,
@@ -957,6 +1034,7 @@ class CrewDispatchRuntime:
                         completed,
                         retry_counts,
                         tool_ledger,
+                        model_ledger,
                         usage_ledger,
                         review_ledger,
                         next_sequence=sequence.value + 3,
@@ -987,6 +1065,7 @@ class CrewDispatchRuntime:
                     completed,
                     retry_counts,
                     tool_ledger,
+                    model_ledger,
                     usage_ledger,
                     review_ledger,
                     next_sequence=sequence.value + 2,
@@ -1007,6 +1086,7 @@ class CrewDispatchRuntime:
                     completed,
                     retry_counts,
                     tool_ledger,
+                    model_ledger,
                     usage_ledger,
                     review_ledger,
                     next_sequence=sequence.value + 3,
@@ -1032,6 +1112,7 @@ class CrewDispatchRuntime:
                     completed,
                     retry_counts,
                     tool_ledger,
+                    model_ledger,
                     usage_ledger,
                     review_ledger,
                     next_sequence=sequence.value + 3,
@@ -1058,8 +1139,10 @@ class CrewDispatchRuntime:
         emit: EventEmitter,
         checkpoint_boundary: CheckpointBoundary,
         tool_boundary: ToolBoundary,
+        model_state_boundary: ModelStateBoundary,
         usage_boundary: UsageBoundary,
         tool_ledger: _ToolLedger,
+        model_ledger: _ModelLedger,
         run_state: _RunState,
         review_ledger: _ReviewLedger,
     ) -> _StepResult:
@@ -1078,40 +1161,52 @@ class CrewDispatchRuntime:
             step.timeout_seconds, self._remaining_timeout(run_state)
         )
         while True:
+            attempt_sources = self._ordered_artifacts(
+                (*sources, *((feedback_artifact,) if feedback_artifact is not None else ()))
+            )
             await event(
                 kind=EventKind.STEP_STARTED,
                 step_id=step.id,
                 actor=step.agent,
-                inputs=sources,
+                inputs=attempt_sources,
                 payload={"attempt": retries + 1},
             )
             try:
-                completion = await self._complete_agent(
+                completion, evidence = await self._complete_agent(
                     context,
                     step,
                     agent,
-                    sources,
+                    attempt_sources,
                     feedback,
                     event,
                     checkpoint_boundary,
                     tool_boundary,
+                    model_state_boundary,
                     usage_boundary,
                     tool_ledger,
+                    model_ledger,
                     retries,
                     run_state,
                     step_deadline,
                 )
-                artifact = self._artifact(step, completion, sources, version=retries + 1)
+                artifact = self._artifact(
+                    step,
+                    completion,
+                    self._ordered_artifacts((*attempt_sources, *evidence)),
+                    version=retries + 1,
+                )
                 await event(kind=EventKind.ARTIFACT_CREATED, artifact=artifact)
                 if step.reviewer is not None:
-                    verdict, feedback = await self._review(
+                    verdict, feedback, review_evidence = await self._review(
                         context,
                         step,
                         agents[step.reviewer],
                         artifact,
                         event,
                         checkpoint_boundary,
+                        model_state_boundary,
                         usage_boundary,
+                        model_ledger,
                         retries,
                         run_state,
                         step_deadline,
@@ -1135,7 +1230,12 @@ class CrewDispatchRuntime:
                             type="review_feedback",
                             producer=step.reviewer,
                             content={"feedback": feedback},
-                            source_ids=(str(artifact.id),),
+                            source_ids=tuple(
+                                str(item.id)
+                                for item in self._ordered_artifacts(
+                                    (artifact, *review_evidence)
+                                )
+                            ),
                         )
                         await event(
                             kind=EventKind.ARTIFACT_CREATED,
@@ -1190,12 +1290,14 @@ class CrewDispatchRuntime:
         emit: EventEmitter,
         checkpoint_boundary: CheckpointBoundary,
         tool_boundary: ToolBoundary,
+        model_state_boundary: ModelStateBoundary,
         usage_boundary: UsageBoundary,
         tool_ledger: _ToolLedger,
+        model_ledger: _ModelLedger,
         retries: int,
         run_state: _RunState,
         step_deadline: float,
-    ) -> GatewayCompletion:
+    ) -> tuple[GatewayCompletion, tuple[Artifact, ...]]:
         source_payload = [artifact.to_payload() for artifact in sources]
         user = {
             "request": context.request,
@@ -1211,6 +1313,8 @@ class CrewDispatchRuntime:
         if generation is None:
             _fail("CrewAI generation is unavailable")
         last_completion: GatewayCompletion | None = None
+        evidence: list[Artifact] = []
+        call_cursor = _ModelCallCursor()
         runtime = self
 
         class StepBridge:
@@ -1224,8 +1328,13 @@ class CrewDispatchRuntime:
                     emit,
                     checkpoint_boundary,
                     tool_boundary,
+                    model_state_boundary,
                     usage_boundary,
                     tool_ledger,
+                    model_ledger,
+                    call_cursor,
+                    evidence,
+                    sources,
                     retries,
                     run_state,
                     step_deadline,
@@ -1271,7 +1380,7 @@ class CrewDispatchRuntime:
                 provider_model=completion.provider_model,
                 cost_usd=completion.cost_usd,
             )
-        return completion
+        return completion, tuple(evidence)
 
     async def _complete_gateway_messages(
         self,
@@ -1282,8 +1391,13 @@ class CrewDispatchRuntime:
         emit: EventEmitter,
         checkpoint_boundary: CheckpointBoundary,
         tool_boundary: ToolBoundary,
+        model_state_boundary: ModelStateBoundary,
         usage_boundary: UsageBoundary,
         tool_ledger: _ToolLedger,
+        model_ledger: _ModelLedger,
+        call_cursor: _ModelCallCursor,
+        evidence: list[Artifact],
+        input_sources: tuple[Artifact, ...],
         retries: int,
         run_state: _RunState,
         step_deadline: float,
@@ -1298,11 +1412,88 @@ class CrewDispatchRuntime:
                 timeout_seconds=self._remaining_timeout(run_state, step_deadline),
                 max_output_tokens=min(agent.max_output_tokens, step.token_budget),
             )
-            async with asyncio.timeout(self._remaining_timeout(run_state, step_deadline)):
-                completion = await self._gateway.complete_with_context(request)
-            response = self._valid_response(completion)
-            await usage_boundary(completion, step.agent, step.id)
-            await checkpoint_boundary(step.id, retries)
+            call_index = call_cursor.value
+            call_cursor.value += 1
+            request_sha256 = self._model_request_sha256(request)
+            key = self._model_call_key(
+                context.run_id,
+                step.id,
+                retries,
+                "step",
+                agent.id,
+                call_index,
+            )
+            existing = model_ledger.states.get(key)
+            if existing is not None:
+                if existing.get("request_sha256") != request_sha256:
+                    _fail("model request changed after checkpoint")
+                if existing.get("status") == "succeeded":
+                    model_artifact = model_ledger.artifacts.get(key)
+                    if model_artifact is None:
+                        _fail("model response artifact is unavailable")
+                    completion = self._completion_from_model_artifact(model_artifact)
+                    response = self._valid_response(completion)
+                    evidence.append(model_artifact)
+                elif existing.get("status") == "running":
+                    raise ModelOutcomeUncertain("model outcome requires confirmation")
+                elif existing.get("status") == "prepared":
+                    completion = None
+                    response = None
+                else:
+                    _fail("model ledger state is invalid")
+            else:
+                completion = None
+                response = None
+                prepared: Mapping[str, JsonValue] = {
+                    "status": "prepared",
+                    "step_id": step.id,
+                    "attempt": retries,
+                    "purpose": "step",
+                    "actor": agent.id,
+                    "call_index": call_index,
+                    "request_sha256": request_sha256,
+                    "artifact_id": None,
+                    "sha256": None,
+                    "provenance": None,
+                }
+                await model_state_boundary(key, prepared)
+                existing = prepared
+            if completion is None:
+                running = dict(existing)
+                running["status"] = "running"
+                await model_state_boundary(key, running)
+                async with asyncio.timeout(self._remaining_timeout(run_state, step_deadline)):
+                    completion = await self._gateway.complete_with_context(request)
+                response = self._valid_response(completion)
+                model_artifact = self._model_artifact(
+                    completion,
+                    agent.id,
+                    self._ordered_artifacts((*input_sources, *evidence)),
+                )
+                succeeded = dict(running)
+                succeeded.update(
+                    status="succeeded",
+                    artifact_id=str(model_artifact.id),
+                    sha256=model_artifact.content_sha256,
+                    provenance={
+                        "logical_model": completion.logical_model,
+                        "deployment_id": completion.deployment_id,
+                        "provider_id": completion.provider_id,
+                        "provider_model": completion.provider_model,
+                    },
+                )
+                await asyncio.shield(
+                    usage_boundary(
+                        completion,
+                        step.agent,
+                        step.id,
+                        key,
+                        succeeded,
+                        model_artifact,
+                    )
+                )
+                evidence.append(model_artifact)
+            assert response is not None
             if not response.tool_calls:
                 return completion
             if self._capabilities is None or not step.tools:
@@ -1347,9 +1538,10 @@ class CrewDispatchRuntime:
                     results.append(
                         {
                             "name": tool_call.name,
-                            "result": artifact.to_payload()["content"],
+                            "result": artifact.content["result"],
                         }
                     )
+                    evidence.append(artifact)
                     continue
                 replay_safe_method = getattr(self._capabilities, "is_replay_safe", None)
                 replay_safe = bool(
@@ -1361,7 +1553,7 @@ class CrewDispatchRuntime:
                     and not (existing.get("status") == "running" and replay_safe)
                 ):
                     raise CapabilityOutcomeUncertain("capability outcome requires confirmation")
-                prepared: Mapping[str, JsonValue] = {
+                tool_prepared: Mapping[str, JsonValue] = {
                     "status": "prepared",
                     "step_id": step.id,
                     "name": tool_call.name,
@@ -1370,16 +1562,16 @@ class CrewDispatchRuntime:
                     "artifact_id": None,
                     "sha256": None,
                 }
-                await tool_boundary(idempotency_key, prepared, None)
+                await tool_boundary(idempotency_key, tool_prepared, None)
                 await emit(
                     kind=EventKind.TOOL_STARTED,
                     actor=step.agent,
                     tool_call_id=call_id,
                     tool_name=tool_call.name,
                 )
-                running = dict(prepared)
-                running["status"] = "running"
-                await tool_boundary(idempotency_key, running, None)
+                tool_running = dict(tool_prepared)
+                tool_running["status"] = "running"
+                await tool_boundary(idempotency_key, tool_running, None)
                 try:
                     async with asyncio.timeout(self._remaining_timeout(run_state, step_deadline)):
                         result = await self._capabilities.execute(
@@ -1395,7 +1587,7 @@ class CrewDispatchRuntime:
                         _fail("capability result exceeds limit")
                 except asyncio.CancelledError:
                     if not replay_safe:
-                        uncertain = dict(running)
+                        uncertain = dict(tool_running)
                         uncertain["status"] = "uncertain"
                         await asyncio.shield(tool_boundary(idempotency_key, uncertain, None))
                     raise
@@ -1409,7 +1601,7 @@ class CrewDispatchRuntime:
                         tool_name=tool_call.name,
                         reason="capability execution failed",
                     )
-                    uncertain = dict(running)
+                    uncertain = dict(tool_running)
                     uncertain["status"] = "uncertain"
                     await tool_boundary(idempotency_key, uncertain, None)
                     raise CapabilityOutcomeUncertain(
@@ -1420,7 +1612,7 @@ class CrewDispatchRuntime:
                     type="tool_result",
                     producer=step.agent,
                     content={"result": result},
-                    source_ids=(),
+                    source_ids=(str(evidence[-1].id),),
                 )
                 await emit(
                     kind=EventKind.TOOL_COMPLETED,
@@ -1429,13 +1621,14 @@ class CrewDispatchRuntime:
                     tool_name=tool_call.name,
                     artifact=artifact,
                 )
-                succeeded = dict(running)
+                succeeded = dict(tool_running)
                 succeeded.update(
                     status="succeeded",
                     artifact_id=str(artifact.id),
                     sha256=artifact.content_sha256,
                 )
                 await tool_boundary(idempotency_key, succeeded, artifact)
+                evidence.append(artifact)
                 results.append({"name": tool_call.name, "result": result})
             messages.append(
                 ModelMessage(
@@ -1447,6 +1640,177 @@ class CrewDispatchRuntime:
                 )
             )
         _fail("step capability round limit exceeded")
+
+    @staticmethod
+    def _ordered_artifacts(artifacts: tuple[Artifact, ...]) -> tuple[Artifact, ...]:
+        ordered: list[Artifact] = []
+        seen: set[UUID] = set()
+        for artifact in artifacts:
+            if artifact.id not in seen:
+                seen.add(artifact.id)
+                ordered.append(artifact)
+        if len(ordered) > 64:
+            _fail("artifact lineage exceeds limit")
+        return tuple(ordered)
+
+    @staticmethod
+    def _model_call_key(
+        run_id: UUID,
+        step_id: str,
+        attempt: int,
+        purpose: str,
+        actor: str,
+        call_index: int,
+    ) -> str:
+        material = f"{run_id}:{step_id}:{attempt}:{purpose}:{actor}:{call_index}"
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _model_request_sha256(request: ModelRequest) -> str:
+        schema: object = None
+        if request.response_schema is not None:
+            schema = {
+                "name": request.response_schema.name,
+                "schema": _mutable_json(request.response_schema.schema),
+            }
+        payload = {
+            "logical_model": request.logical_model,
+            "messages": tuple(
+                {"role": message.role, "content": _mutable_json(message.content)}
+                for message in request.messages
+            ),
+            "required_capabilities": tuple(sorted(str(item) for item in request.required_capabilities)),
+            "allow_fallback": request.allow_fallback,
+            "max_output_tokens": request.max_output_tokens,
+            "response_schema": schema,
+        }
+        try:
+            encoded = json.dumps(
+                payload,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            _fail("model request is invalid")
+        if len(encoded) > _MAX_PROMPT_BYTES + 16_384:
+            _fail("model request exceeds ledger limit")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _model_artifact(
+        completion: GatewayCompletion,
+        actor: str,
+        sources: tuple[Artifact, ...],
+    ) -> Artifact:
+        response = completion.response
+        usage: Mapping[str, JsonValue] | None = None
+        if response.usage is not None:
+            usage = {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens,
+            }
+        content: Mapping[str, JsonValue] = {
+            "text": response.text,
+            "tool_calls": tuple(
+                {
+                    "id": tool_call.id,
+                    "name": tool_call.name,
+                    "arguments": cast(JsonValue, tool_call.arguments),
+                }
+                for tool_call in response.tool_calls
+            ),
+            "usage": usage,
+            "cost_usd": None if completion.cost_usd is None else str(completion.cost_usd),
+        }
+        encoded = json.dumps(_mutable_json(content), ensure_ascii=False, allow_nan=False)
+        if len(encoded.encode("utf-8")) > _MAX_PROMPT_BYTES:
+            _fail("model response evidence exceeds limit")
+        return Artifact(
+            id=uuid4(),
+            type="model_response",
+            producer=actor,
+            content=content,
+            source_ids=tuple(str(item.id) for item in sources),
+            provenance=GatewayProvenance(
+                logical_model=completion.logical_model,
+                deployment_id=completion.deployment_id,
+                provider_id=completion.provider_id,
+                provider_model=completion.provider_model,
+            ),
+        )
+
+    @staticmethod
+    def _completion_from_model_artifact(artifact: Artifact) -> GatewayCompletion:
+        provenance = artifact.provenance
+        content = artifact.content
+        if artifact.type != "model_response" or provenance is None or set(content) != {
+            "text",
+            "tool_calls",
+            "usage",
+            "cost_usd",
+        }:
+            _fail("model response artifact is invalid")
+        text = content["text"]
+        raw_calls = content["tool_calls"]
+        raw_usage = content["usage"]
+        raw_cost = content["cost_usd"]
+        if text is not None and type(text) is not str:
+            _fail("model response artifact is invalid")
+        if not isinstance(raw_calls, tuple):
+            _fail("model response artifact is invalid")
+        calls: list[ToolCall] = []
+        for raw_call in raw_calls:
+            if not isinstance(raw_call, Mapping) or set(raw_call) != {"id", "name", "arguments"}:
+                _fail("model response artifact is invalid")
+            arguments = raw_call["arguments"]
+            if (
+                type(raw_call["id"]) is not str
+                or type(raw_call["name"]) is not str
+                or not isinstance(arguments, Mapping)
+            ):
+                _fail("model response artifact is invalid")
+            calls.append(
+                ToolCall(
+                    id=raw_call["id"],
+                    name=raw_call["name"],
+                    arguments=arguments,
+                )
+            )
+        usage: TokenUsage | None = None
+        if raw_usage is not None:
+            if not isinstance(raw_usage, Mapping) or set(raw_usage) != {
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+            }:
+                _fail("model response artifact is invalid")
+            usage = TokenUsage(
+                prompt_tokens=cast(int, raw_usage["prompt_tokens"]),
+                completion_tokens=cast(int, raw_usage["completion_tokens"]),
+                total_tokens=cast(int, raw_usage["total_tokens"]),
+            )
+        cost: Decimal | None = None
+        if raw_cost is not None:
+            if type(raw_cost) is not str:
+                _fail("model response artifact is invalid")
+            try:
+                cost = Decimal(raw_cost)
+            except Exception:  # noqa: BLE001 - hostile artifact decimal
+                _fail("model response artifact is invalid")
+        try:
+            return GatewayCompletion(
+                response=ModelResponse(text=text, tool_calls=tuple(calls), usage=usage),
+                deployment_id=provenance.deployment_id,
+                logical_model=provenance.logical_model,
+                provider_id=provenance.provider_id,
+                provider_model=provenance.provider_model,
+                cost_usd=cost,
+            )
+        except (TypeError, ValueError):
+            _fail("model response artifact is invalid")
 
     @staticmethod
     def _normalize_crewai_messages(messages: object) -> tuple[ModelMessage, ...]:
@@ -1486,11 +1850,13 @@ class CrewDispatchRuntime:
         artifact: Artifact,
         emit: EventEmitter,
         checkpoint_boundary: CheckpointBoundary,
+        model_state_boundary: ModelStateBoundary,
         usage_boundary: UsageBoundary,
+        model_ledger: _ModelLedger,
         retries: int,
         run_state: _RunState,
         step_deadline: float,
-    ) -> tuple[str, str | None]:
+    ) -> tuple[str, str | None, tuple[Artifact, ...]]:
         payload = json.dumps(artifact.to_payload(), ensure_ascii=False, sort_keys=True)
         if len(payload.encode("utf-8")) > _MAX_PROMPT_BYTES:
             _fail("review input exceeds limit")
@@ -1498,6 +1864,8 @@ class CrewDispatchRuntime:
         if generation is None:
             _fail("CrewAI generation is unavailable")
         completion: GatewayCompletion | None = None
+        evidence: list[Artifact] = []
+        call_cursor = _ModelCallCursor()
         runtime = self
 
         class ReviewBridge:
@@ -1511,11 +1879,86 @@ class CrewDispatchRuntime:
                     timeout_seconds=runtime._remaining_timeout(run_state, step_deadline),
                     max_output_tokens=min(reviewer.max_output_tokens, step.token_budget),
                 )
-                async with asyncio.timeout(runtime._remaining_timeout(run_state, step_deadline)):
-                    completion = await runtime._gateway.complete_with_context(request)
+                call_index = call_cursor.value
+                call_cursor.value += 1
+                request_sha256 = runtime._model_request_sha256(request)
+                key = runtime._model_call_key(
+                    context.run_id,
+                    step.id,
+                    retries,
+                    "review",
+                    reviewer.id,
+                    call_index,
+                )
+                existing = model_ledger.states.get(key)
+                if existing is not None:
+                    if existing.get("request_sha256") != request_sha256:
+                        _fail("model request changed after checkpoint")
+                    if existing.get("status") == "succeeded":
+                        model_artifact = model_ledger.artifacts.get(key)
+                        if model_artifact is None:
+                            _fail("model response artifact is unavailable")
+                        completion = runtime._completion_from_model_artifact(model_artifact)
+                        evidence.append(model_artifact)
+                    elif existing.get("status") == "running":
+                        raise ModelOutcomeUncertain("model outcome requires confirmation")
+                    elif existing.get("status") != "prepared":
+                        _fail("model ledger state is invalid")
+                if completion is None:
+                    prepared: Mapping[str, JsonValue]
+                    if existing is None:
+                        prepared = {
+                            "status": "prepared",
+                            "step_id": step.id,
+                            "attempt": retries,
+                            "purpose": "review",
+                            "actor": reviewer.id,
+                            "call_index": call_index,
+                            "request_sha256": request_sha256,
+                            "artifact_id": None,
+                            "sha256": None,
+                            "provenance": None,
+                        }
+                        await model_state_boundary(key, prepared)
+                    else:
+                        prepared = existing
+                    running = dict(prepared)
+                    running["status"] = "running"
+                    await model_state_boundary(key, running)
+                    async with asyncio.timeout(
+                        runtime._remaining_timeout(run_state, step_deadline)
+                    ):
+                        completion = await runtime._gateway.complete_with_context(request)
+                    runtime._valid_response(completion)
+                    model_artifact = runtime._model_artifact(
+                        completion,
+                        reviewer.id,
+                        runtime._ordered_artifacts((artifact, *evidence)),
+                    )
+                    succeeded = dict(running)
+                    succeeded.update(
+                        status="succeeded",
+                        artifact_id=str(model_artifact.id),
+                        sha256=model_artifact.content_sha256,
+                        provenance={
+                            "logical_model": completion.logical_model,
+                            "deployment_id": completion.deployment_id,
+                            "provider_id": completion.provider_id,
+                            "provider_model": completion.provider_model,
+                        },
+                    )
+                    await asyncio.shield(
+                        usage_boundary(
+                            completion,
+                            reviewer.id,
+                            step.id,
+                            key,
+                            succeeded,
+                            model_artifact,
+                        )
+                    )
+                    evidence.append(model_artifact)
                 response = runtime._valid_response(completion)
-                await usage_boundary(completion, reviewer.id, step.id)
-                await checkpoint_boundary(step.id, retries)
                 if response.text is None or response.tool_calls:
                     _fail("review response is invalid")
                 return response.text
@@ -1552,7 +1995,7 @@ class CrewDispatchRuntime:
             or len(feedback.encode("utf-8")) > 8192
         ):
             _fail("review response is invalid")
-        return cast(str, verdict), feedback
+        return cast(str, verdict), feedback, tuple(evidence)
 
     @staticmethod
     def _valid_response(completion: GatewayCompletion) -> ModelResponse:
@@ -1673,6 +2116,7 @@ class CrewDispatchRuntime:
         completed: Mapping[str, Artifact],
         retries: Mapping[str, int],
         tool_ledger: _ToolLedger,
+        model_ledger: _ModelLedger,
         usage_ledger: _UsageLedger,
         review_ledger: _ReviewLedger,
         *,
@@ -1710,6 +2154,9 @@ class CrewDispatchRuntime:
                 "terminal": terminal,
                 "phase": phase,
                 "tools": {key: dict(tool_ledger.states[key]) for key in sorted(tool_ledger.states)},
+                "models": {
+                    key: dict(model_ledger.states[key]) for key in sorted(model_ledger.states)
+                },
                 "review_refs": {
                     key: {
                         "id": str(review_ledger.artifacts[key].id),
@@ -1761,6 +2208,7 @@ class CrewDispatchRuntime:
             "terminal",
             "phase",
             "tools",
+            "models",
             "review_refs",
             "usage",
             "step_usage",
@@ -1772,6 +2220,7 @@ class CrewDispatchRuntime:
         refs = state["artifact_refs"]
         frontier = state["frontier"]
         tools = state["tools"]
+        models = state["models"]
         review_refs = state["review_refs"]
         usage = state["usage"]
         step_usage = state["step_usage"]
@@ -1782,6 +2231,7 @@ class CrewDispatchRuntime:
             or not isinstance(retries, Mapping)
             or not isinstance(refs, Mapping)
             or not isinstance(tools, Mapping)
+            or not isinstance(models, Mapping)
             or not isinstance(review_refs, Mapping)
             or not isinstance(usage, Mapping)
             or not isinstance(step_usage, Mapping)
@@ -1967,6 +2417,106 @@ class CrewDispatchRuntime:
                     _fail("runtime checkpoint is incompatible")
             elif value["artifact_id"] is not None or value["sha256"] is not None:
                 _fail("runtime checkpoint is incompatible")
+        model_indices: dict[tuple[str, int, str, str], set[int]] = {}
+        if len(models) > 4096:
+            _fail("runtime checkpoint is incompatible")
+        model_entries = cast(Mapping[str, Mapping[str, JsonValue]], models)
+        for key, value in model_entries.items():
+            if (
+                type(key) is not str
+                or _SHA256.fullmatch(key) is None
+                or not isinstance(value, Mapping)
+                or set(value)
+                != {
+                    "status",
+                    "step_id",
+                    "attempt",
+                    "purpose",
+                    "actor",
+                    "call_index",
+                    "request_sha256",
+                    "artifact_id",
+                    "sha256",
+                    "provenance",
+                }
+            ):
+                _fail("runtime checkpoint is incompatible")
+            status = value["status"]
+            model_step_id = value["step_id"]
+            attempt = value["attempt"]
+            purpose = value["purpose"]
+            actor = value["actor"]
+            call_index = value["call_index"]
+            if (
+                status not in {"prepared", "running", "succeeded"}
+                or type(model_step_id) is not str
+                or model_step_id not in steps
+                or type(attempt) is not int
+                or not 0 <= attempt <= steps[model_step_id].reviewer_retries
+                or purpose not in {"step", "review"}
+                or type(actor) is not str
+                or type(call_index) is not int
+                or not 0 <= call_index <= 64
+                or type(value["request_sha256"]) is not str
+                or _SHA256.fullmatch(value["request_sha256"]) is None
+            ):
+                _fail("runtime checkpoint is incompatible")
+            expected_actor = (
+                steps[model_step_id].agent
+                if purpose == "step"
+                else steps[model_step_id].reviewer
+            )
+            if actor != expected_actor or key != self._model_call_key(
+                context.run_id,
+                model_step_id,
+                attempt,
+                purpose,
+                actor,
+                call_index,
+            ):
+                _fail("runtime checkpoint is incompatible")
+            group = (model_step_id, attempt, purpose, actor)
+            model_indices.setdefault(group, set()).add(call_index)
+            if status == "succeeded":
+                provenance = value["provenance"]
+                if (
+                    type(value["artifact_id"]) is not str
+                    or type(value["sha256"]) is not str
+                    or _SHA256.fullmatch(value["sha256"]) is None
+                    or not isinstance(provenance, Mapping)
+                    or set(provenance)
+                    != {
+                        "logical_model",
+                        "deployment_id",
+                        "provider_id",
+                        "provider_model",
+                    }
+                ):
+                    _fail("runtime checkpoint is incompatible")
+                try:
+                    if str(UUID(value["artifact_id"])) != value["artifact_id"]:
+                        _fail("runtime checkpoint is incompatible")
+                    GatewayProvenance.model_validate(dict(provenance), strict=True)
+                except (TypeError, ValueError):
+                    _fail("runtime checkpoint is incompatible")
+            elif (
+                value["artifact_id"] is not None
+                or value["sha256"] is not None
+                or value["provenance"] is not None
+            ):
+                _fail("runtime checkpoint is incompatible")
+        if any(indices != set(range(max(indices) + 1)) for indices in model_indices.values()):
+            _fail("runtime checkpoint is incompatible")
+        if any(
+            not any(
+                model_state["step_id"] == step_id
+                and model_state["purpose"] == "step"
+                and model_state["status"] == "succeeded"
+                for model_state in model_entries.values()
+            )
+            for step_id in completed_set
+        ):
+            _fail("runtime checkpoint is incompatible")
         for step_id, reference in review_refs.items():
             retry_value = retries.get(step_id)
             if (
@@ -2049,23 +2599,53 @@ class CrewDispatchRuntime:
         dict[str, Artifact],
         dict[str, int],
         _ToolLedger,
+        _ModelLedger,
         _UsageLedger,
         _ReviewLedger,
     ]:
         self._validate_checkpoint(checkpoint, context, plan)
         by_id = {str(artifact.id): artifact for artifact in context.artifacts}
+        agents = {agent.id: agent for agent in plan.agents}
+        steps = {step.id: step for step in plan.steps}
         completed: dict[str, Artifact] = {}
         refs = cast(Mapping[str, Mapping[str, str]], checkpoint.state["artifact_refs"])
         for step_id in cast(tuple[str, ...], checkpoint.state["completed"]):
             reference = refs[step_id]
             artifact = by_id.get(reference["id"])
-            if artifact is None or artifact.content_sha256 != reference["sha256"]:
+            if (
+                artifact is None
+                or artifact.content_sha256 != reference["sha256"]
+                or artifact.type != "text"
+                or any(source_id not in by_id for source_id in artifact.source_ids)
+            ):
                 _fail("runtime checkpoint artifacts are unavailable")
             completed[step_id] = artifact
         retries = {
             key: cast(int, value)
             for key, value in cast(Mapping[str, JsonValue], checkpoint.state["retries"]).items()
         }
+        model_ledger = _ModelLedger()
+        model_states = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["models"])
+        for key, model_state in model_states.items():
+            model_ledger.states[key] = model_state
+            if model_state["status"] == "succeeded":
+                artifact_id = cast(str, model_state["artifact_id"])
+                artifact = by_id.get(artifact_id)
+                provenance = artifact.provenance if artifact is not None else None
+                if (
+                    artifact is None
+                    or artifact.content_sha256 != model_state["sha256"]
+                    or artifact.type != "model_response"
+                    or artifact.producer != model_state["actor"]
+                    or provenance is None
+                    or provenance.to_payload() != model_state["provenance"]
+                    or any(source_id not in by_id for source_id in artifact.source_ids)
+                ):
+                    _fail("runtime checkpoint model artifacts are unavailable")
+                self._completion_from_model_artifact(artifact)
+                model_ledger.artifacts[key] = artifact
+            elif model_state["status"] == "running":
+                raise ModelOutcomeUncertain("model outcome requires confirmation")
         tool_ledger = _ToolLedger()
         tool_states = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["tools"])
         for key, state in tool_states.items():
@@ -2073,7 +2653,18 @@ class CrewDispatchRuntime:
             if state["status"] == "succeeded":
                 artifact_id = cast(str, state["artifact_id"])
                 artifact = by_id.get(artifact_id)
-                if artifact is None or artifact.content_sha256 != state["sha256"]:
+                if (
+                    artifact is None
+                    or artifact.content_sha256 != state["sha256"]
+                    or artifact.type != "tool_result"
+                    or artifact.producer != steps[cast(str, state["step_id"])].agent
+                    or not artifact.source_ids
+                    or any(
+                        source_id
+                        not in {str(item.id) for item in model_ledger.artifacts.values()}
+                        for source_id in artifact.source_ids
+                    )
+                ):
                     _fail("runtime checkpoint capability artifacts are unavailable")
                 tool_ledger.artifacts[key] = artifact
             elif state["status"] == "uncertain" or (
@@ -2106,12 +2697,27 @@ class CrewDispatchRuntime:
         )
         review_ledger = _ReviewLedger()
         review_refs = cast(Mapping[str, Mapping[str, str]], checkpoint.state["review_refs"])
-        agents = {agent.id: agent for agent in plan.agents}
-        steps = {step.id: step for step in plan.steps}
         for step_id, reference in review_refs.items():
             artifact = by_id.get(reference["id"])
             feedback = artifact.content.get("feedback") if artifact is not None else None
             reviewer = steps[step_id].reviewer
+            candidate = (
+                by_id.get(artifact.source_ids[0])
+                if artifact is not None and artifact.source_ids
+                else None
+            )
+            reviewed_attempt = retries[step_id] - 1
+            review_model_ids = tuple(
+                cast(str, model_state["artifact_id"])
+                for _, model_state in sorted(
+                    model_states.items(),
+                    key=lambda item: cast(int, item[1]["call_index"]),
+                )
+                if model_state["status"] == "succeeded"
+                and model_state["step_id"] == step_id
+                and model_state["purpose"] == "review"
+                and model_state["attempt"] == reviewed_attempt
+            )
             if (
                 artifact is None
                 or artifact.content_sha256 != reference["sha256"]
@@ -2121,10 +2727,20 @@ class CrewDispatchRuntime:
                 or type(feedback) is not str
                 or not feedback.strip()
                 or len(feedback.encode("utf-8")) > 8192
+                or candidate is None
+                or candidate.type != "text"
+                or candidate.producer != steps[step_id].agent
+                or not review_model_ids
+                or artifact.source_ids != (str(candidate.id), *review_model_ids)
+                or any(
+                    not by_id[model_id].source_ids
+                    or by_id[model_id].source_ids[0] != str(candidate.id)
+                    for model_id in review_model_ids
+                )
             ):
                 _fail("runtime checkpoint review artifact is unavailable")
             review_ledger.artifacts[step_id] = artifact
-        return completed, retries, tool_ledger, usage_ledger, review_ledger
+        return completed, retries, tool_ledger, model_ledger, usage_ledger, review_ledger
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
         checkpoint = self._last_checkpoint
@@ -2211,6 +2827,7 @@ __all__ = [
     "CrewRunStream",
     "CrewTaskDefinition",
     "IsolatedCrewFactory",
+    "ModelOutcomeUncertain",
     "RuntimeBusy",
     "RuntimeExecutionError",
 ]
