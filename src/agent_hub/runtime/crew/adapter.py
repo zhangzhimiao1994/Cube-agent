@@ -58,6 +58,7 @@ _MAX_CHECKPOINT_ARTIFACTS = 16_384
 _MAX_PROMPT_BYTES = 196_608
 _MAX_OUTPUT_BYTES = 65_536
 _MAX_TOOL_ROUNDS = 8
+_MAX_TOOL_CALLS_PER_RESPONSE = 16
 _MAX_TOOL_ARGUMENT_BYTES = 32_768
 _MAX_AUDITED_TOKENS = 100_000_000
 _MAX_AUDITED_COST_USD = Decimal(64000000)
@@ -698,14 +699,24 @@ class CrewDispatchRuntime:
         restored = self._restored_checkpoint
         protected_checkpoint = restored or context.checkpoint
         hydrating_restored = protected_checkpoint is not None
+        terminal_item: _Terminal | None = None
+
+        async def store_artifact(artifact: Artifact) -> None:
+            reference = ArtifactReference(id=artifact.id, sha256=artifact.content_sha256)
+            async with asyncio.timeout(self._remaining_timeout(state)):
+                await self._artifact_repository.put(
+                    context.tenant_id, context.run_id, artifact
+                )
+                resolved = await self._artifact_repository.get_many(
+                    context.tenant_id, context.run_id, (reference,)
+                )
+            if resolved != (artifact,):
+                _fail("artifact repository verification failed")
 
         async def emit(**values: object) -> None:
             artifact = values.get("artifact")
-            if type(artifact) is Artifact:
-                async with asyncio.timeout(self._remaining_timeout(state)):
-                    await self._artifact_repository.put(
-                        context.tenant_id, context.run_id, artifact
-                    )
+            if type(artifact) is Artifact and str(artifact.id) not in artifact_registry:
+                await store_artifact(artifact)
                 artifact_registry[str(artifact.id)] = artifact
             if run_open and self._is_current_run(state):
                 await queue.put(await sequence.event(run_id=context.run_id, **values))
@@ -747,7 +758,7 @@ class CrewDispatchRuntime:
                         kind=EventKind.RUNTIME_COMPLETED,
                         inputs=(completed[plan.final_step.id],),
                     )
-                    await queue.put(_Terminal())
+                    terminal_item = _Terminal()
                     return
                 if restored_phase in {
                     "budget_exhausted",
@@ -758,13 +769,13 @@ class CrewDispatchRuntime:
                         kind=EventKind.RUNTIME_FAILED,
                         reason="dispatch accounting exhausted",
                     )
-                    await queue.put(
-                        _Terminal(RuntimeExecutionError("dispatch accounting exhausted"))
+                    terminal_item = _Terminal(
+                        RuntimeExecutionError("dispatch accounting exhausted")
                     )
                     return
                 if restored_phase == "cancelled":
                     await emit(kind=EventKind.RUNTIME_CANCELLED)
-                    await queue.put(_Terminal())
+                    terminal_item = _Terminal()
                     return
             initial_artifacts = tuple(
                 artifact
@@ -870,9 +881,6 @@ class CrewDispatchRuntime:
                 async with checkpoint_lock:
                     if not run_open or not self._is_current_run(state):
                         return
-                    model_ledger.states[key] = model_state
-                    model_ledger.artifacts[key] = artifact
-                    await emit(kind=EventKind.ARTIFACT_CREATED, artifact=artifact)
                     response_tokens = 0 if response_usage is None else response_usage.total_tokens
                     response_cost = completion.cost_usd
                     raw_new_tokens = usage_ledger.tokens + response_tokens
@@ -889,22 +897,16 @@ class CrewDispatchRuntime:
                     new_step_tokens = min(raw_step_tokens, _MAX_AUDITED_TOKENS)
                     new_cost = min(raw_new_cost, _MAX_AUDITED_COST_USD)
                     new_step_cost = min(raw_step_cost, _MAX_AUDITED_COST_USD)
-                    usage_ledger.tokens = new_tokens
-                    usage_ledger.cost_usd = new_cost
-                    usage_ledger.step_tokens[step_id] = new_step_tokens
-                    usage_ledger.step_costs_usd[step_id] = new_step_cost
-                    usage_ledger.token_overflow |= token_overflow
-                    usage_ledger.cost_overflow |= cost_overflow
-                    if step_token_overflow:
-                        usage_ledger.step_token_overflows.add(step_id)
-                    if step_cost_overflow:
-                        usage_ledger.step_cost_overflows.add(step_id)
                     terminal_phase = usage_ledger.terminal_phase
                     if (
                         usage_ledger.token_overflow
+                        or token_overflow
                         or usage_ledger.cost_overflow
+                        or cost_overflow
                         or usage_ledger.step_token_overflows
+                        or step_token_overflow
                         or usage_ledger.step_cost_overflows
+                        or step_cost_overflow
                     ):
                         terminal_phase = "audit_overflow"
                     elif terminal_phase is None and (
@@ -918,7 +920,148 @@ class CrewDispatchRuntime:
                         or new_step_cost > steps[step_id].cost_budget_usd
                     ):
                         terminal_phase = "budget_exhausted"
-                    usage_ledger.terminal_phase = terminal_phase
+                    candidate_models = _ModelLedger(
+                        states=dict(model_ledger.states),
+                        artifacts=dict(model_ledger.artifacts),
+                    )
+                    candidate_models.states[key] = model_state
+                    candidate_models.artifacts[key] = artifact
+                    candidate_usage = _UsageLedger(
+                        tokens=new_tokens,
+                        cost_usd=new_cost,
+                        step_tokens={**usage_ledger.step_tokens, step_id: new_step_tokens},
+                        step_costs_usd={
+                            **usage_ledger.step_costs_usd,
+                            step_id: new_step_cost,
+                        },
+                        terminal_phase=terminal_phase,
+                        token_overflow=usage_ledger.token_overflow or token_overflow,
+                        cost_overflow=usage_ledger.cost_overflow or cost_overflow,
+                        step_token_overflows=(
+                            usage_ledger.step_token_overflows
+                            | ({step_id} if step_token_overflow else set())
+                        ),
+                        step_cost_overflows=(
+                            usage_ledger.step_cost_overflows
+                            | ({step_id} if step_cost_overflow else set())
+                        ),
+                    )
+                    candidate_registry = dict(artifact_registry)
+                    candidate_registry[str(artifact.id)] = artifact
+                    candidate_tools = tool_ledger
+                    if (
+                        completion.response.tool_calls
+                        and model_state["purpose"] == "step"
+                    ):
+                        if (
+                            len(artifact.source_ids)
+                            + 1
+                            + len(completion.response.tool_calls)
+                            > 63
+                        ):
+                            _fail("artifact lineage exceeds limit")
+                        provisional = _ToolLedger(
+                            states=dict(tool_ledger.states),
+                            artifacts=dict(tool_ledger.artifacts),
+                        )
+                        attempt = cast(int, model_state["attempt"])
+                        round_index = cast(int, model_state["call_index"])
+                        for tool_index, tool_call in enumerate(
+                            completion.response.tool_calls
+                        ):
+                            if tool_call.name not in steps[step_id].tools:
+                                _fail("step requested a forbidden capability")
+                            try:
+                                canonical_arguments = json.dumps(
+                                    _mutable_json(tool_call.arguments),
+                                    ensure_ascii=False,
+                                    allow_nan=False,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                )
+                            except (TypeError, ValueError):
+                                _fail("capability arguments are invalid")
+                            if (
+                                len(canonical_arguments.encode("utf-8"))
+                                > _MAX_TOOL_ARGUMENT_BYTES
+                            ):
+                                _fail("capability arguments exceed limit")
+                            arguments_sha256 = hashlib.sha256(
+                                canonical_arguments.encode("utf-8")
+                            ).hexdigest()
+                            tool_key = self._tool_call_key(
+                                context.run_id,
+                                step_id,
+                                attempt,
+                                round_index,
+                                tool_index,
+                                tool_call.name,
+                                arguments_sha256,
+                            )
+                            replay_safe_method = getattr(
+                                self._capabilities, "is_replay_safe", None
+                            )
+                            replay_safe = bool(
+                                callable(replay_safe_method)
+                                and replay_safe_method(tool_call.name)
+                            )
+                            placeholder = Artifact(
+                                id=uuid4(),
+                                type="tool_result",
+                                producer=step_id,
+                                content={"result": None},
+                                source_ids=(str(artifact.id),),
+                            )
+                            provisional.states[tool_key] = {
+                                "status": "succeeded",
+                                "step_id": step_id,
+                                "attempt": attempt,
+                                "round": round_index,
+                                "tool_index": tool_index,
+                                "name": tool_call.name,
+                                "arguments_sha256": arguments_sha256,
+                                "trigger_model_artifact_id": str(artifact.id),
+                                "replay_safe": replay_safe,
+                                "artifact_id": str(placeholder.id),
+                                "sha256": placeholder.content_sha256,
+                            }
+                            provisional.artifacts[tool_key] = placeholder
+                            candidate_registry[str(placeholder.id)] = placeholder
+                        candidate_tools = provisional
+                    checkpoint = self._make_checkpoint(
+                        context,
+                        plan,
+                        completed,
+                        retry_counts,
+                        candidate_tools,
+                        candidate_models,
+                        candidate_usage,
+                        review_ledger,
+                        next_sequence=sequence.value
+                        + (
+                            (5 if response_cost else 4)
+                            if terminal_phase is not None
+                            else (4 if response_cost else 3)
+                        ),
+                        terminal=terminal_phase is not None,
+                        phase=terminal_phase or "running",
+                        artifact_registry=candidate_registry,
+                    )
+                    await store_artifact(artifact)
+                    model_ledger.states[key] = model_state
+                    model_ledger.artifacts[key] = artifact
+                    artifact_registry[str(artifact.id)] = artifact
+                    usage_ledger.tokens = candidate_usage.tokens
+                    usage_ledger.cost_usd = candidate_usage.cost_usd
+                    usage_ledger.step_tokens = candidate_usage.step_tokens
+                    usage_ledger.step_costs_usd = candidate_usage.step_costs_usd
+                    usage_ledger.terminal_phase = candidate_usage.terminal_phase
+                    usage_ledger.token_overflow = candidate_usage.token_overflow
+                    usage_ledger.cost_overflow = candidate_usage.cost_overflow
+                    usage_ledger.step_token_overflows = candidate_usage.step_token_overflows
+                    usage_ledger.step_cost_overflows = candidate_usage.step_cost_overflows
+                    self._publish_checkpoint(state, checkpoint)
+                    await emit(kind=EventKind.ARTIFACT_CREATED, artifact=artifact)
                     if response_cost:
                         await emit(
                             kind=EventKind.COST_RECORDED,
@@ -929,20 +1072,6 @@ class CrewDispatchRuntime:
                         )
                     if terminal_phase is not None:
                         raise _StableTerminalError("dispatch accounting exhausted")
-                    checkpoint = self._make_checkpoint(
-                        context,
-                        plan,
-                        completed,
-                        retry_counts,
-                        tool_ledger,
-                        model_ledger,
-                        usage_ledger,
-                        review_ledger,
-                        next_sequence=sequence.value + 2,
-                        terminal=False,
-                        phase="running",
-                    )
-                    self._publish_checkpoint(state, checkpoint)
                     await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
 
             while len(completed) < len(steps):
@@ -1043,31 +1172,34 @@ class CrewDispatchRuntime:
                     raise
             final = completed[plan.final_step.id]
             await emit(kind=EventKind.RUNTIME_COMPLETED, inputs=(final,))
-            await queue.put(_Terminal())
+            terminal_item = _Terminal()
         except asyncio.CancelledError as caught_cancel:
             cancel_error = asyncio.CancelledError(*caught_cancel.args)
+            terminal_item = _Terminal(cancel_error)
 
             async def finish_cancel() -> None:
-                if hydrating_restored and protected_checkpoint is not None:
-                    self._publish_checkpoint(state, protected_checkpoint)
-                elif plan is not None:
-                    checkpoint = self._make_checkpoint(
-                        context,
-                        plan,
-                        completed,
-                        retry_counts,
-                        tool_ledger,
-                        model_ledger,
-                        usage_ledger,
-                        review_ledger,
-                        next_sequence=sequence.value + 3,
-                        terminal=False,
-                        phase="cancelled",
-                    )
-                    self._publish_checkpoint(state, checkpoint)
-                    await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
-                await emit(kind=EventKind.RUNTIME_CANCELLED)
-                await queue.put(_Terminal(cancel_error))
+                try:
+                    if hydrating_restored and protected_checkpoint is not None:
+                        self._publish_checkpoint(state, protected_checkpoint)
+                    elif plan is not None:
+                        checkpoint = self._make_checkpoint(
+                            context,
+                            plan,
+                            completed,
+                            retry_counts,
+                            tool_ledger,
+                            model_ledger,
+                            usage_ledger,
+                            review_ledger,
+                            next_sequence=sequence.value + 3,
+                            terminal=False,
+                            phase="cancelled",
+                        )
+                        self._publish_checkpoint(state, checkpoint)
+                        await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
+                    await emit(kind=EventKind.RUNTIME_CANCELLED)
+                except Exception:  # noqa: BLE001 - terminal delivery is authoritative
+                    return
 
             cleanup = asyncio.create_task(finish_cancel())
             try:
@@ -1077,84 +1209,60 @@ class CrewDispatchRuntime:
             run_open = False
             raise
         except _StableTerminalError as error:
-            await emit(
-                kind=EventKind.RUNTIME_FAILED,
-                reason="dispatch accounting exhausted",
-            )
-            if plan is not None and usage_ledger.terminal_phase is not None:
-                checkpoint = self._make_checkpoint(
-                    context,
-                    plan,
-                    completed,
-                    retry_counts,
-                    tool_ledger,
-                    model_ledger,
-                    usage_ledger,
-                    review_ledger,
-                    next_sequence=sequence.value + 2,
-                    terminal=True,
-                    phase=usage_ledger.terminal_phase,
-                )
-                self._publish_checkpoint(state, checkpoint)
-                await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None
-            await queue.put(_Terminal(error))
+            terminal_item = _Terminal(error)
+            try:
+                await emit(
+                    kind=EventKind.RUNTIME_FAILED,
+                    reason="dispatch accounting exhausted",
+                )
+            except Exception as emit_error:  # noqa: BLE001
+                emit_error.__traceback__ = None
+                emit_error.__context__ = None
+                emit_error.__cause__ = None
+                del emit_error
         except RuntimeExecutionError as error:
+            error.__traceback__ = None
+            error.__context__ = None
+            error.__cause__ = None
+            terminal_item = _Terminal(error)
             if hydrating_restored and protected_checkpoint is not None:
                 self._publish_checkpoint(state, protected_checkpoint)
-            elif plan is not None:
-                checkpoint = self._make_checkpoint(
-                    context,
-                    plan,
-                    completed,
-                    retry_counts,
-                    tool_ledger,
-                    model_ledger,
-                    usage_ledger,
-                    review_ledger,
-                    next_sequence=sequence.value + 3,
-                    terminal=False,
-                    phase="failed",
-                )
-                self._publish_checkpoint(state, checkpoint)
-                await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
-            await emit(kind=EventKind.RUNTIME_FAILED, reason="dispatch execution failed")
-            error.__traceback__ = None
-            error.__context__ = None
-            error.__cause__ = None
-            await queue.put(_Terminal(error))
+            try:
+                await emit(kind=EventKind.RUNTIME_FAILED, reason="dispatch execution failed")
+            except Exception as emit_error:  # noqa: BLE001
+                emit_error.__traceback__ = None
+                emit_error.__context__ = None
+                emit_error.__cause__ = None
+                del emit_error
         except Exception as error:  # noqa: BLE001 - redact all plugin/gateway failures
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None
             del error
+            terminal_item = _Terminal(RuntimeExecutionError("dispatch execution failed"))
             if hydrating_restored and protected_checkpoint is not None:
                 self._publish_checkpoint(state, protected_checkpoint)
-            elif plan is not None:
-                checkpoint = self._make_checkpoint(
-                    context,
-                    plan,
-                    completed,
-                    retry_counts,
-                    tool_ledger,
-                    model_ledger,
-                    usage_ledger,
-                    review_ledger,
-                    next_sequence=sequence.value + 3,
-                    terminal=False,
-                    phase="failed",
-                )
-                self._publish_checkpoint(state, checkpoint)
-                await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
-            await emit(kind=EventKind.RUNTIME_FAILED, reason="dispatch execution failed")
-            await queue.put(_Terminal(RuntimeExecutionError("dispatch execution failed")))
+            try:
+                await emit(kind=EventKind.RUNTIME_FAILED, reason="dispatch execution failed")
+            except Exception as emit_error:  # noqa: BLE001
+                emit_error.__traceback__ = None
+                emit_error.__context__ = None
+                emit_error.__cause__ = None
+                del emit_error
         finally:
             run_open = False
             state.open = False
             state.deadline = None
             state.crew_generation = None
+            if terminal_item is None:
+                terminal_item = _Terminal(RuntimeExecutionError("dispatch execution failed"))
+            try:
+                queue.put_nowait(terminal_item)
+            except asyncio.QueueFull:
+                await asyncio.shield(queue.put(terminal_item))
 
     async def _execute_step(
         self,
@@ -1819,6 +1927,8 @@ class CrewDispatchRuntime:
             _fail("model response artifact is invalid")
         if not isinstance(raw_calls, tuple):
             _fail("model response artifact is invalid")
+        if len(raw_calls) > _MAX_TOOL_CALLS_PER_RESPONSE:
+            _fail("model response artifact is invalid")
         calls: list[ToolCall] = []
         for raw_call in raw_calls:
             if not isinstance(raw_call, Mapping) or set(raw_call) != {"id", "name", "arguments"}:
@@ -2062,6 +2172,8 @@ class CrewDispatchRuntime:
         response = completion.response
         if not isinstance(response, ModelResponse):
             _fail("model response is invalid")
+        if len(response.tool_calls) > _MAX_TOOL_CALLS_PER_RESPONSE:
+            _fail("model response exceeds tool call limit")
         if response.text is not None and (
             not response.text.strip() or len(response.text.encode("utf-8")) > _MAX_OUTPUT_BYTES
         ):
@@ -2181,7 +2293,13 @@ class CrewDispatchRuntime:
         next_sequence: int,
         terminal: bool,
         phase: str,
+        artifact_registry: Mapping[str, Artifact] | None = None,
     ) -> RuntimeCheckpoint:
+        checkpoint_artifacts = (
+            self._current_artifact_registry
+            if artifact_registry is None
+            else artifact_registry
+        )
         completed_ids = tuple(sorted(completed))
         frontier = tuple(
             step.id
@@ -2223,10 +2341,8 @@ class CrewDispatchRuntime:
                     for key in sorted(review_ledger.artifacts)
                 },
                 "artifact_registry": {
-                    artifact_id: self._current_artifact_registry[
-                        artifact_id
-                    ].content_sha256
-                    for artifact_id in sorted(self._current_artifact_registry)
+                    artifact_id: checkpoint_artifacts[artifact_id].content_sha256
+                    for artifact_id in sorted(checkpoint_artifacts)
                 },
                 "usage": {
                     "tokens": usage_ledger.tokens,

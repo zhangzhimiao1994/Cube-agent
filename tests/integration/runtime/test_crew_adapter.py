@@ -2979,3 +2979,323 @@ async def test_cancelled_repository_hydration_never_replaces_checkpoint() -> Non
     with pytest.raises(asyncio.CancelledError):
         await task
     assert (await resumed.save_checkpoint()).id == checkpoint.id
+
+
+async def test_failed_model_artifact_put_preserves_running_boundary_and_zero_usage() -> None:
+    class RejectingRepository:
+        async def put(self, tenant_id: UUID, run_id: UUID, artifact: Artifact) -> None:
+            del tenant_id, run_id, artifact
+            raise ArtifactRepositoryError("artifact repository write failed")
+
+        async def get_many(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            references: tuple[ArtifactReference, ...],
+        ) -> tuple[Artifact, ...]:
+            del tenant_id, run_id
+            assert references == ()
+            return ()
+
+    repository = RejectingRepository()
+    gateway = FakeGateway()
+    first = make_runtime(gateway, one_step_plan(), artifact_repository=repository)
+
+    with pytest.raises(RuntimeExecutionError):
+        await collect(first, context(token_budget=100))
+
+    checkpoint = await first.save_checkpoint()
+    models = cast(Mapping[str, Mapping[str, object]], checkpoint.state["models"])
+    assert len(gateway.requests) == 1
+    assert {item["status"] for item in models.values()} == {"running"}
+    assert checkpoint.state["usage"] == {"tokens": 0, "cost_usd": "0"}
+    assert checkpoint.state["step_usage"] == {}
+    assert checkpoint.state["artifact_registry"] == {}
+
+    for _ in range(2):
+        resumed_gateway = FakeGateway()
+        resumed = make_runtime(
+            resumed_gateway,
+            one_step_plan(),
+            artifact_repository=repository,
+        )
+        await resumed.restore_checkpoint(checkpoint)
+        with pytest.raises(ModelOutcomeUncertain, match="requires confirmation"):
+            await collect(resumed, context(checkpoint=checkpoint, token_budget=100))
+        assert resumed_gateway.requests == []
+        checkpoint = await resumed.save_checkpoint()
+
+
+class BatchedToolGateway(FakeGateway):
+    def __init__(self, batches: tuple[int, ...]) -> None:
+        super().__init__()
+        self.batches = list(batches)
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        count = self.batches.pop(0) if self.batches else 0
+        response = (
+            ModelResponse(
+                text=None,
+                tool_calls=tuple(
+                    ToolCall(
+                        id=f"provider-{len(self.requests)}-{index}",
+                        name="web.search",
+                        arguments={"q": str(index)},
+                    )
+                    for index in range(count)
+                ),
+                usage=TokenUsage(1, 1, 2),
+            )
+            if count
+            else ModelResponse(text="bounded answer", usage=TokenUsage(1, 1, 2))
+        )
+        return GatewayCompletion(
+            response=response,
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/chat",
+            cost_usd=Decimal(0),
+        )
+
+
+@pytest.mark.parametrize("call_count", (17, 180))
+async def test_tool_call_response_limit_fails_before_capability_and_terminates(
+    call_count: int,
+) -> None:
+    gateway = BatchedToolGateway((call_count,))
+    capabilities = FakeCapabilities()
+    runtime = make_runtime(
+        gateway,
+        one_step_plan(tools=("web.search",)),
+        capability_gateway=capabilities,
+    )
+
+    with pytest.raises(RuntimeExecutionError, match="tool call limit"):
+        await asyncio.wait_for(collect(runtime, context(token_budget=100)), timeout=2)
+
+    assert len(gateway.requests) == 1
+    assert capabilities.calls == []
+    gateway.batches = [0]
+    assert (
+        await collect(runtime, context(token_budget=100))
+    )[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_tool_call_response_at_limit_executes_normally() -> None:
+    gateway = BatchedToolGateway((16, 0))
+    capabilities = FakeCapabilities()
+
+    events = await collect(
+        make_runtime(
+            gateway,
+            one_step_plan(tools=("web.search",)),
+            capability_gateway=capabilities,
+        ),
+        context(token_budget=100),
+    )
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(capabilities.calls) == 16
+
+
+@pytest.mark.parametrize(
+    ("last_batch", "succeeds", "expected_calls"),
+    ((11, True, 59), (12, False, 48)),
+)
+async def test_cumulative_tool_evidence_budget_is_preflighted_before_batch(
+    last_batch: int,
+    succeeds: bool,
+    expected_calls: int,
+) -> None:
+    gateway = BatchedToolGateway((16, 16, 16, last_batch, 0))
+    capabilities = FakeCapabilities()
+    runtime = make_runtime(
+        gateway,
+        one_step_plan(tools=("web.search",)),
+        capability_gateway=capabilities,
+    )
+
+    if succeeds:
+        assert (
+            await collect(runtime, context(token_budget=100))
+        )[-1].kind is EventKind.RUNTIME_COMPLETED
+    else:
+        with pytest.raises(RuntimeExecutionError):
+            await asyncio.wait_for(collect(runtime, context(token_budget=100)), timeout=2)
+        checkpoint = await runtime.save_checkpoint()
+        models = cast(Mapping[str, Mapping[str, object]], checkpoint.state["models"])
+        latest = max(models.values(), key=lambda item: cast(int, item["call_index"]))
+        assert latest["status"] == "running"
+        assert checkpoint.state["usage"] == {"tokens": 6, "cost_usd": "0"}
+    assert len(capabilities.calls) == expected_calls
+
+
+async def test_checkpoint_serialization_failure_still_terminates_and_allows_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = make_runtime(FakeGateway(), one_step_plan())
+    original = runtime._make_checkpoint
+
+    def fail_checkpoint(*args, **kwargs):  # type: ignore[no-untyped-def]
+        del args, kwargs
+        raise RuntimeError("synthetic checkpoint failure")
+
+    monkeypatch.setattr(runtime, "_make_checkpoint", fail_checkpoint)
+    with pytest.raises(RuntimeExecutionError):
+        await asyncio.wait_for(collect(runtime, context(token_budget=100)), timeout=2)
+
+    monkeypatch.setattr(runtime, "_make_checkpoint", original)
+    assert (
+        await collect(runtime, context(token_budget=100))
+    )[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_failure_event_exception_still_delivers_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter_module = importlib.import_module("agent_hub.runtime.crew.adapter")
+    original = adapter_module._Sequence.event
+
+    async def fail_runtime_failed(self, **values):  # type: ignore[no-untyped-def]
+        if values.get("kind") is EventKind.RUNTIME_FAILED:
+            raise RuntimeError("synthetic event failure")
+        return await original(self, **values)
+
+    class RejectGateway(FakeGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            del request
+            raise RuntimeError("synthetic gateway failure")
+
+    monkeypatch.setattr(adapter_module._Sequence, "event", fail_runtime_failed)
+    with pytest.raises(RuntimeExecutionError):
+        await asyncio.wait_for(
+            collect(make_runtime(RejectGateway(), one_step_plan()), context(token_budget=100)),
+            timeout=2,
+        )
+
+
+@pytest.mark.parametrize("call_count", (17, 180))
+def test_restored_model_artifact_rejects_oversized_tool_call_batch(
+    call_count: int,
+) -> None:
+    completion = GatewayCompletion(
+        response=ModelResponse(
+            text=None,
+            tool_calls=tuple(
+                ToolCall(id=f"call-{index}", name="web.search", arguments={"q": "x"})
+                for index in range(call_count)
+            ),
+            usage=TokenUsage(1, 1, 2),
+        ),
+        deployment_id="primary",
+        logical_model="general",
+        provider_id="deepseek",
+        provider_model="deepseek/chat",
+        cost_usd=Decimal(0),
+    )
+    artifact = CrewDispatchRuntime._model_artifact(completion, "writer", ())
+
+    with pytest.raises(RuntimeExecutionError, match="artifact is invalid"):
+        CrewDispatchRuntime._completion_from_model_artifact(artifact)
+
+
+@pytest.mark.parametrize("mode", ("missing", "wrong"))
+async def test_repository_verification_failure_keeps_model_running_and_terminates(
+    mode: str,
+) -> None:
+    class UntrustedRepository:
+        def __init__(self) -> None:
+            self.stored: Artifact | None = None
+
+        async def put(self, tenant_id: UUID, run_id: UUID, artifact: Artifact) -> None:
+            del tenant_id, run_id
+            self.stored = artifact
+
+        async def get_many(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            references: tuple[ArtifactReference, ...],
+        ) -> tuple[Artifact, ...]:
+            del tenant_id, run_id, references
+            if mode == "missing":
+                return ()
+            assert self.stored is not None
+            return (
+                Artifact(
+                    id=self.stored.id,
+                    type="model_response",
+                    producer=self.stored.producer,
+                    content={"text": "wrong"},
+                    source_ids=self.stored.source_ids,
+                    provenance=self.stored.provenance,
+                ),
+            )
+
+    gateway = FakeGateway()
+    runtime = make_runtime(
+        gateway,
+        one_step_plan(),
+        artifact_repository=UntrustedRepository(),
+    )
+
+    with pytest.raises(RuntimeExecutionError):
+        await asyncio.wait_for(collect(runtime, context(token_budget=100)), timeout=2)
+
+    checkpoint = await runtime.save_checkpoint()
+    models = cast(Mapping[str, Mapping[str, object]], checkpoint.state["models"])
+    assert {item["status"] for item in models.values()} == {"running"}
+    assert checkpoint.state["artifact_registry"] == {}
+    assert len(gateway.requests) == 1
+
+
+async def test_candidate_checkpoint_failure_keeps_last_running_boundary() -> None:
+    gateway = FakeGateway()
+    runtime = make_runtime(gateway, one_step_plan())
+    original = runtime._make_checkpoint
+    calls = 0
+
+    def fail_candidate(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise RuntimeError("synthetic candidate checkpoint failure")
+        return original(*args, **kwargs)
+
+    runtime._make_checkpoint = fail_candidate  # type: ignore[method-assign]
+    with pytest.raises(RuntimeExecutionError):
+        await asyncio.wait_for(collect(runtime, context(token_budget=100)), timeout=2)
+
+    checkpoint = await runtime.save_checkpoint()
+    models = cast(Mapping[str, Mapping[str, object]], checkpoint.state["models"])
+    assert {item["status"] for item in models.values()} == {"running"}
+    assert checkpoint.state["usage"] == {"tokens": 0, "cost_usd": "0"}
+    assert checkpoint.state["artifact_registry"] == {}
+    assert len(gateway.requests) == 1
+
+
+async def test_unexpected_repository_exception_still_delivers_terminal() -> None:
+    class ExplodingRepository:
+        async def put(self, tenant_id: UUID, run_id: UUID, artifact: Artifact) -> None:
+            del tenant_id, run_id, artifact
+            raise ValueError("synthetic repository defect")
+
+        async def get_many(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            references: tuple[ArtifactReference, ...],
+        ) -> tuple[Artifact, ...]:
+            del tenant_id, run_id, references
+            return ()
+
+    runtime = make_runtime(
+        FakeGateway(),
+        one_step_plan(),
+        artifact_repository=ExplodingRepository(),
+    )
+
+    with pytest.raises(RuntimeExecutionError, match="execution failed"):
+        await asyncio.wait_for(collect(runtime, context(token_budget=100)), timeout=2)

@@ -81,3 +81,14 @@ async def test_repository_rejects_duplicate_batch_references() -> None:
 
     with pytest.raises(ArtifactRepositoryError, match="references"):
         await repository.get_many(TENANT_ID, RUN_ID, (reference, reference))
+
+
+async def test_repository_accepts_idempotent_second_put_without_using_capacity() -> None:
+    repository = InMemoryArtifactRepository(max_artifacts_per_run=1)
+    stored = artifact("safe")
+    reference = ArtifactReference(id=stored.id, sha256=stored.content_sha256)
+
+    await repository.put(TENANT_ID, RUN_ID, stored)
+    await repository.put(TENANT_ID, RUN_ID, stored)
+
+    assert await repository.get_many(TENANT_ID, RUN_ID, (reference,)) == (stored,)
