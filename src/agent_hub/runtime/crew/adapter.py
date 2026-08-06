@@ -47,7 +47,7 @@ from agent_hub.runtime.contracts import (
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 
 _RUNTIME_TYPE = "crew"
-_RUNTIME_VERSION = "5"
+_RUNTIME_VERSION = "6"
 _MAX_PROMPT_BYTES = 196_608
 _MAX_OUTPUT_BYTES = 65_536
 _MAX_TOOL_ROUNDS = 8
@@ -679,6 +679,8 @@ class CrewDispatchRuntime:
         model_ledger = _ModelLedger()
         usage_ledger = _UsageLedger()
         review_ledger = _ReviewLedger()
+        restored = self._restored_checkpoint
+        hydrating_restored = False
 
         async def emit(**values: object) -> None:
             if run_open and self._is_current_run(state):
@@ -692,7 +694,6 @@ class CrewDispatchRuntime:
             state.crew_generation = self._prepare_private_generation(plan)
             if context.token_budget < plan.total_token_budget:
                 _fail("task token budget is below the dispatch plan budget")
-            restored = self._restored_checkpoint
             if restored is not None:
                 self._validate_checkpoint(restored, context, plan)
                 if context.checkpoint is None or context.checkpoint.id != restored.id:
@@ -702,6 +703,7 @@ class CrewDispatchRuntime:
                 _fail("runtime checkpoint was not restored")
 
             if restored is not None:
+                hydrating_restored = True
                 (
                     completed,
                     retry_counts,
@@ -710,6 +712,7 @@ class CrewDispatchRuntime:
                     usage_ledger,
                     review_ledger,
                 ) = self._hydrate_checkpoint(restored, context, plan)
+                hydrating_restored = False
                 self._restored_checkpoint = None
                 restored_phase = restored.state.get("phase")
                 if restored_phase == "completed":
@@ -1079,7 +1082,9 @@ class CrewDispatchRuntime:
             error.__cause__ = None
             await queue.put(_Terminal(error))
         except RuntimeExecutionError as error:
-            if plan is not None:
+            if hydrating_restored and restored is not None:
+                self._publish_checkpoint(state, restored)
+            elif plan is not None:
                 checkpoint = self._make_checkpoint(
                     context,
                     plan,
@@ -1105,7 +1110,9 @@ class CrewDispatchRuntime:
             error.__context__ = None
             error.__cause__ = None
             del error
-            if plan is not None:
+            if hydrating_restored and restored is not None:
+                self._publish_checkpoint(state, restored)
+            elif plan is not None:
                 checkpoint = self._make_checkpoint(
                     context,
                     plan,
@@ -1232,9 +1239,7 @@ class CrewDispatchRuntime:
                             content={"feedback": feedback},
                             source_ids=tuple(
                                 str(item.id)
-                                for item in self._ordered_artifacts(
-                                    (artifact, *review_evidence)
-                                )
+                                for item in self._ordered_artifacts((artifact, *review_evidence))
                             ),
                         )
                         await event(
@@ -1500,6 +1505,9 @@ class CrewDispatchRuntime:
                 _fail("step requested an unavailable capability")
             if _round == _MAX_TOOL_ROUNDS:
                 _fail("step capability round limit exceeded")
+            trigger_model_artifact = evidence[-1]
+            if trigger_model_artifact.type != "model_response":
+                _fail("capability trigger evidence is invalid")
             results: list[dict[str, object]] = []
             for tool_index, tool_call in enumerate(response.tool_calls):
                 if tool_call.name not in step.tools:
@@ -1517,11 +1525,15 @@ class CrewDispatchRuntime:
                 if len(canonical_arguments.encode("utf-8")) > _MAX_TOOL_ARGUMENT_BYTES:
                     _fail("capability arguments exceed limit")
                 arguments_sha256 = hashlib.sha256(canonical_arguments.encode("utf-8")).hexdigest()
-                key_material = (
-                    f"{context.run_id}:{step.id}:{retries}:{_round}:{tool_index}:"
-                    f"{tool_call.name}:{arguments_sha256}"
+                idempotency_key = self._tool_call_key(
+                    context.run_id,
+                    step.id,
+                    retries,
+                    _round,
+                    tool_index,
+                    tool_call.name,
+                    arguments_sha256,
                 )
-                idempotency_key = hashlib.sha256(key_material.encode("utf-8")).hexdigest()
                 call_id = f"call-{idempotency_key[:32]}"
                 existing = tool_ledger.states.get(idempotency_key)
                 if existing is not None and existing.get("status") == "succeeded":
@@ -1556,8 +1568,12 @@ class CrewDispatchRuntime:
                 tool_prepared: Mapping[str, JsonValue] = {
                     "status": "prepared",
                     "step_id": step.id,
+                    "attempt": retries,
+                    "round": _round,
+                    "tool_index": tool_index,
                     "name": tool_call.name,
                     "arguments_sha256": arguments_sha256,
+                    "trigger_model_artifact_id": str(trigger_model_artifact.id),
                     "replay_safe": replay_safe,
                     "artifact_id": None,
                     "sha256": None,
@@ -1612,7 +1628,7 @@ class CrewDispatchRuntime:
                     type="tool_result",
                     producer=step.agent,
                     content={"result": result},
-                    source_ids=(str(evidence[-1].id),),
+                    source_ids=(str(trigger_model_artifact.id),),
                 )
                 await emit(
                     kind=EventKind.TOOL_COMPLETED,
@@ -1666,6 +1682,21 @@ class CrewDispatchRuntime:
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     @staticmethod
+    def _tool_call_key(
+        run_id: UUID,
+        step_id: str,
+        attempt: int,
+        round_index: int,
+        tool_index: int,
+        name: str,
+        arguments_sha256: str,
+    ) -> str:
+        material = (
+            f"{run_id}:{step_id}:{attempt}:{round_index}:{tool_index}:{name}:{arguments_sha256}"
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    @staticmethod
     def _model_request_sha256(request: ModelRequest) -> str:
         schema: object = None
         if request.response_schema is not None:
@@ -1679,7 +1710,9 @@ class CrewDispatchRuntime:
                 {"role": message.role, "content": _mutable_json(message.content)}
                 for message in request.messages
             ),
-            "required_capabilities": tuple(sorted(str(item) for item in request.required_capabilities)),
+            "required_capabilities": tuple(
+                sorted(str(item) for item in request.required_capabilities)
+            ),
             "allow_fallback": request.allow_fallback,
             "max_output_tokens": request.max_output_tokens,
             "response_schema": schema,
@@ -1746,12 +1779,17 @@ class CrewDispatchRuntime:
     def _completion_from_model_artifact(artifact: Artifact) -> GatewayCompletion:
         provenance = artifact.provenance
         content = artifact.content
-        if artifact.type != "model_response" or provenance is None or set(content) != {
-            "text",
-            "tool_calls",
-            "usage",
-            "cost_usd",
-        }:
+        if (
+            artifact.type != "model_response"
+            or provenance is None
+            or set(content)
+            != {
+                "text",
+                "tool_calls",
+                "usage",
+                "cost_usd",
+            }
+        ):
             _fail("model response artifact is invalid")
         text = content["text"]
         raw_calls = content["tool_calls"]
@@ -2372,7 +2410,11 @@ class CrewDispatchRuntime:
                 _fail("runtime checkpoint is incompatible")
             if not set(steps[step_id].depends_on) <= completed_set:
                 _fail("runtime checkpoint is incompatible")
-        for key, value in tools.items():
+        if len(tools) > 4096:
+            _fail("runtime checkpoint is incompatible")
+        tool_entries = cast(Mapping[str, Mapping[str, JsonValue]], tools)
+        tool_indices: dict[tuple[str, int, int], set[int]] = {}
+        for key, value in tool_entries.items():
             if (
                 type(key) is not str
                 or _SHA256.fullmatch(key) is None
@@ -2382,8 +2424,12 @@ class CrewDispatchRuntime:
             if set(value) != {
                 "status",
                 "step_id",
+                "attempt",
+                "round",
+                "tool_index",
                 "name",
                 "arguments_sha256",
+                "trigger_model_artifact_id",
                 "replay_safe",
                 "artifact_id",
                 "sha256",
@@ -2391,18 +2437,46 @@ class CrewDispatchRuntime:
                 _fail("runtime checkpoint is incompatible")
             status = value["status"]
             tool_step_id = value["step_id"]
+            attempt = value["attempt"]
+            round_index = value["round"]
+            tool_index = value["tool_index"]
             name = value["name"]
+            arguments_sha256 = value["arguments_sha256"]
+            trigger_model_artifact_id = value["trigger_model_artifact_id"]
             if (
                 status not in {"prepared", "running", "succeeded", "uncertain"}
                 or type(tool_step_id) is not str
                 or tool_step_id not in steps
+                or type(attempt) is not int
+                or not 0 <= attempt <= steps[tool_step_id].reviewer_retries
+                or type(round_index) is not int
+                or not 0 <= round_index <= _MAX_TOOL_ROUNDS
+                or type(tool_index) is not int
+                or not 0 <= tool_index <= 64
                 or type(name) is not str
                 or name not in steps[tool_step_id].tools
-                or type(value["arguments_sha256"]) is not str
-                or _SHA256.fullmatch(value["arguments_sha256"]) is None
+                or type(arguments_sha256) is not str
+                or _SHA256.fullmatch(arguments_sha256) is None
+                or type(trigger_model_artifact_id) is not str
                 or type(value["replay_safe"]) is not bool
             ):
                 _fail("runtime checkpoint is incompatible")
+            try:
+                if str(UUID(trigger_model_artifact_id)) != trigger_model_artifact_id:
+                    _fail("runtime checkpoint is incompatible")
+            except ValueError:
+                _fail("runtime checkpoint is incompatible")
+            if key != self._tool_call_key(
+                context.run_id,
+                tool_step_id,
+                attempt,
+                round_index,
+                tool_index,
+                name,
+                arguments_sha256,
+            ):
+                _fail("runtime checkpoint is incompatible")
+            tool_indices.setdefault((tool_step_id, attempt, round_index), set()).add(tool_index)
             if status == "succeeded":
                 if (
                     type(value["artifact_id"]) is not str
@@ -2462,9 +2536,7 @@ class CrewDispatchRuntime:
             ):
                 _fail("runtime checkpoint is incompatible")
             expected_actor = (
-                steps[model_step_id].agent
-                if purpose == "step"
-                else steps[model_step_id].reviewer
+                steps[model_step_id].agent if purpose == "step" else steps[model_step_id].reviewer
             )
             if actor != expected_actor or key != self._model_call_key(
                 context.run_id,
@@ -2507,6 +2579,25 @@ class CrewDispatchRuntime:
                 _fail("runtime checkpoint is incompatible")
         if any(indices != set(range(max(indices) + 1)) for indices in model_indices.values()):
             _fail("runtime checkpoint is incompatible")
+        if any(indices != set(range(max(indices) + 1)) for indices in tool_indices.values()):
+            _fail("runtime checkpoint is incompatible")
+        model_triggers = {
+            (
+                model_state["step_id"],
+                model_state["attempt"],
+                model_state["call_index"],
+            ): model_state["artifact_id"]
+            for model_state in model_entries.values()
+            if model_state["status"] == "succeeded" and model_state["purpose"] == "step"
+        }
+        for tool_state in tool_entries.values():
+            coordinate = (
+                tool_state["step_id"],
+                tool_state["attempt"],
+                tool_state["round"],
+            )
+            if model_triggers.get(coordinate) != tool_state["trigger_model_artifact_id"]:
+                _fail("runtime checkpoint is incompatible")
         if any(
             not any(
                 model_state["step_id"] == step_id
@@ -2593,6 +2684,249 @@ class CrewDispatchRuntime:
         except asyncio.CancelledError:
             pass
 
+    def _validate_artifact_graph(
+        self,
+        plan: DispatchPlan,
+        context: TaskContext,
+        completed: Mapping[str, Artifact],
+        retries: Mapping[str, int],
+        tool_ledger: _ToolLedger,
+        model_ledger: _ModelLedger,
+        review_ledger: _ReviewLedger,
+    ) -> None:
+        artifacts = context.artifacts
+        by_id = {str(artifact.id): artifact for artifact in artifacts}
+        if len(by_id) != len(artifacts):
+            _fail("runtime checkpoint artifact graph is invalid")
+        agents = {agent.id: agent for agent in plan.agents}
+        models: dict[
+            tuple[str, int, str], dict[int, tuple[Mapping[str, JsonValue], Artifact | None]]
+        ] = {}
+        model_ids: set[str] = set()
+        candidate_ids: set[str] = set()
+        for key, state in model_ledger.states.items():
+            artifact = model_ledger.artifacts.get(key)
+            model_group = (
+                cast(str, state["step_id"]),
+                cast(int, state["attempt"]),
+                cast(str, state["purpose"]),
+            )
+            index = cast(int, state["call_index"])
+            models.setdefault(model_group, {})[index] = (state, artifact)
+            if artifact is not None:
+                model_ids.add(str(artifact.id))
+                if state["purpose"] == "review" and artifact.source_ids:
+                    candidate_ids.add(artifact.source_ids[0])
+        tools: dict[
+            tuple[str, int, int], dict[int, tuple[Mapping[str, JsonValue], Artifact | None]]
+        ] = {}
+        tool_ids: set[str] = set()
+        for key, tool_state in tool_ledger.states.items():
+            artifact = tool_ledger.artifacts.get(key)
+            tool_group = (
+                cast(str, tool_state["step_id"]),
+                cast(int, tool_state["attempt"]),
+                cast(int, tool_state["round"]),
+            )
+            index = cast(int, tool_state["tool_index"])
+            tools.setdefault(tool_group, {})[index] = (tool_state, artifact)
+            if artifact is not None:
+                tool_ids.add(str(artifact.id))
+        completed_ids = {str(artifact.id) for artifact in completed.values()}
+        feedback_artifacts = tuple(
+            artifact for artifact in artifacts if artifact.type == "review_feedback"
+        )
+        feedback_ids = {str(artifact.id) for artifact in feedback_artifacts}
+        internal_ids = completed_ids | model_ids | tool_ids | feedback_ids | candidate_ids
+        external_pool = {
+            str(artifact.id) for artifact in artifacts if str(artifact.id) not in internal_ids
+        }
+        root_inputs = {
+            first_call[1].source_ids
+            for step in plan.steps
+            if not step.depends_on
+            for first_call in [models.get((step.id, 0, "step"), {}).get(0)]
+            if first_call is not None and first_call[1] is not None
+        }
+        if len(root_inputs) > 1:
+            _fail("runtime checkpoint artifact graph is invalid")
+        external_ids = next(iter(root_inputs), ())
+        if any(source_id not in external_pool for source_id in external_ids):
+            _fail("runtime checkpoint artifact graph is invalid")
+        if {
+            str(artifact.id) for artifact in artifacts if artifact.type == "model_response"
+        } != model_ids or {
+            str(artifact.id) for artifact in artifacts if artifact.type == "tool_result"
+        } != tool_ids:
+            _fail("runtime checkpoint artifact graph is invalid")
+        feedback_by_sources: dict[tuple[str, tuple[str, ...]], list[Artifact]] = {}
+        for artifact in feedback_artifacts:
+            feedback_by_sources.setdefault((artifact.producer, artifact.source_ids), []).append(
+                artifact
+            )
+        consumed_models: set[str] = set()
+        consumed_tools: set[str] = set()
+        consumed_feedback: set[str] = set()
+        consumed_candidates: set[str] = set()
+        model_step_ids = {group[0] for group in models}
+        tool_step_ids = {group[0] for group in tools}
+
+        for step in plan.steps:
+            if step.depends_on and any(
+                dependency not in completed for dependency in step.depends_on
+            ):
+                if step.id in completed or step.id in model_step_ids or step.id in tool_step_ids:
+                    _fail("runtime checkpoint artifact graph is invalid")
+                continue
+            base_ids = (
+                tuple(str(completed[dependency].id) for dependency in step.depends_on)
+                if step.depends_on
+                else external_ids
+            )
+            retry_count = retries.get(step.id, 0)
+            feedback_id: str | None = None
+            for attempt in range(retry_count + 1):
+                input_ids = (*base_ids, *((feedback_id,) if feedback_id is not None else ()))
+                step_calls = models.get((step.id, attempt, "step"), {})
+                evidence_ids: list[str] = []
+                last_model: Artifact | None = None
+                incomplete = False
+                for call_index in range(len(step_calls)):
+                    state, model_artifact = step_calls[call_index]
+                    if model_artifact is None:
+                        if call_index != len(step_calls) - 1:
+                            _fail("runtime checkpoint artifact graph is invalid")
+                        incomplete = True
+                        break
+                    expected_model_sources = (*input_ids, *evidence_ids)
+                    if (
+                        model_artifact.source_ids != expected_model_sources
+                        or model_artifact.producer != step.agent
+                        or model_artifact.provenance is None
+                        or model_artifact.provenance.logical_model
+                        != agents[step.agent].logical_model
+                    ):
+                        _fail("runtime checkpoint model artifact lineage is invalid")
+                    completion = self._completion_from_model_artifact(model_artifact)
+                    consumed_models.add(str(model_artifact.id))
+                    last_model = model_artifact
+                    evidence_ids.append(str(model_artifact.id))
+                    round_tools = tools.get((step.id, attempt, call_index), {})
+                    calls = completion.response.tool_calls
+                    if len(round_tools) > len(calls):
+                        _fail("runtime checkpoint capability artifact lineage is invalid")
+                    for tool_index in range(len(round_tools)):
+                        tool_state, tool_artifact = round_tools[tool_index]
+                        tool_call = calls[tool_index]
+                        canonical_arguments = json.dumps(
+                            _mutable_json(tool_call.arguments),
+                            ensure_ascii=False,
+                            allow_nan=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        if (
+                            tool_state["name"] != tool_call.name
+                            or tool_state["arguments_sha256"]
+                            != hashlib.sha256(canonical_arguments.encode("utf-8")).hexdigest()
+                            or tool_state["trigger_model_artifact_id"] != str(model_artifact.id)
+                        ):
+                            _fail("runtime checkpoint capability artifact lineage is invalid")
+                        if tool_artifact is None:
+                            if tool_index != len(round_tools) - 1:
+                                _fail("runtime checkpoint artifact graph is invalid")
+                            incomplete = True
+                            break
+                        if tool_artifact.source_ids != (str(model_artifact.id),):
+                            _fail("runtime checkpoint capability artifact lineage is invalid")
+                        consumed_tools.add(str(tool_artifact.id))
+                        evidence_ids.append(str(tool_artifact.id))
+                    if incomplete:
+                        break
+                    if call_index < len(step_calls) - 1 and len(round_tools) != len(calls):
+                        _fail("runtime checkpoint artifact graph is invalid")
+                output_sources = (*input_ids, *evidence_ids)
+                review_calls = models.get((step.id, attempt, "review"), {})
+                candidate: Artifact | None = None
+                if review_calls:
+                    first_review_artifact = review_calls[0][1]
+                    if first_review_artifact is not None and first_review_artifact.source_ids:
+                        candidate = by_id.get(first_review_artifact.source_ids[0])
+                    if (
+                        candidate is None
+                        or candidate.type != "text"
+                        or candidate.producer != step.agent
+                        or candidate.version != attempt + 1
+                        or candidate.source_ids != output_sources
+                        or last_model is None
+                        or candidate.provenance != last_model.provenance
+                    ):
+                        _fail("runtime checkpoint review artifact lineage is invalid")
+                    consumed_candidates.add(str(candidate.id))
+                    review_evidence: list[str] = []
+                    for call_index in range(len(review_calls)):
+                        state, review_model = review_calls[call_index]
+                        if review_model is None:
+                            if call_index != len(review_calls) - 1:
+                                _fail("runtime checkpoint artifact graph is invalid")
+                            incomplete = True
+                            break
+                        if (
+                            review_model.source_ids != (str(candidate.id), *review_evidence)
+                            or review_model.producer != step.reviewer
+                            or review_model.provenance is None
+                            or step.reviewer is None
+                            or review_model.provenance.logical_model
+                            != agents[step.reviewer].logical_model
+                        ):
+                            _fail("runtime checkpoint review artifact lineage is invalid")
+                        review_completion = self._completion_from_model_artifact(review_model)
+                        if (
+                            review_completion.response.text is None
+                            or review_completion.response.tool_calls
+                        ):
+                            _fail("runtime checkpoint review artifact lineage is invalid")
+                        consumed_models.add(str(review_model.id))
+                        review_evidence.append(str(review_model.id))
+                    if attempt < retry_count:
+                        expected_feedback_sources = (str(candidate.id), *review_evidence)
+                        matches = feedback_by_sources.get(
+                            (cast(str, step.reviewer), expected_feedback_sources), []
+                        )
+                        if len(matches) != 1:
+                            _fail("runtime checkpoint review artifact lineage is invalid")
+                        feedback = matches[0]
+                        value = feedback.content.get("feedback")
+                        if type(value) is not str or not value.strip():
+                            _fail("runtime checkpoint review artifact lineage is invalid")
+                        feedback_id = str(feedback.id)
+                        consumed_feedback.add(feedback_id)
+                    elif step.id in completed and completed[step.id].id != candidate.id:
+                        _fail("runtime checkpoint completed artifact lineage is invalid")
+                elif step.id in completed and retry_count == attempt:
+                    output = completed[step.id]
+                    if (
+                        incomplete
+                        or last_model is None
+                        or output.type != "text"
+                        or output.producer != step.agent
+                        or output.version != attempt + 1
+                        or output.source_ids != output_sources
+                        or output.provenance != last_model.provenance
+                    ):
+                        _fail("runtime checkpoint completed artifact lineage is invalid")
+            if step.id in review_ledger.artifacts and feedback_id != str(
+                review_ledger.artifacts[step.id].id
+            ):
+                _fail("runtime checkpoint review artifact lineage is invalid")
+        if (
+            consumed_models != model_ids
+            or consumed_tools != tool_ids
+            or consumed_feedback != feedback_ids
+            or not candidate_ids <= consumed_candidates
+        ):
+            _fail("runtime checkpoint artifact graph is invalid")
+
     def _hydrate_checkpoint(
         self, checkpoint: RuntimeCheckpoint, context: TaskContext, plan: DispatchPlan
     ) -> tuple[
@@ -2625,6 +2959,7 @@ class CrewDispatchRuntime:
             for key, value in cast(Mapping[str, JsonValue], checkpoint.state["retries"]).items()
         }
         model_ledger = _ModelLedger()
+        outcome_error: RuntimeExecutionError | None = None
         model_states = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["models"])
         for key, model_state in model_states.items():
             model_ledger.states[key] = model_state
@@ -2645,7 +2980,7 @@ class CrewDispatchRuntime:
                 self._completion_from_model_artifact(artifact)
                 model_ledger.artifacts[key] = artifact
             elif model_state["status"] == "running":
-                raise ModelOutcomeUncertain("model outcome requires confirmation")
+                outcome_error = ModelOutcomeUncertain("model outcome requires confirmation")
         tool_ledger = _ToolLedger()
         tool_states = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["tools"])
         for key, state in tool_states.items():
@@ -2660,8 +2995,7 @@ class CrewDispatchRuntime:
                     or artifact.producer != steps[cast(str, state["step_id"])].agent
                     or not artifact.source_ids
                     or any(
-                        source_id
-                        not in {str(item.id) for item in model_ledger.artifacts.values()}
+                        source_id not in {str(item.id) for item in model_ledger.artifacts.values()}
                         for source_id in artifact.source_ids
                     )
                 ):
@@ -2670,7 +3004,10 @@ class CrewDispatchRuntime:
             elif state["status"] == "uncertain" or (
                 state["status"] == "running" and state["replay_safe"] is False
             ):
-                raise CapabilityOutcomeUncertain("capability outcome requires confirmation")
+                if outcome_error is None:
+                    outcome_error = CapabilityOutcomeUncertain(
+                        "capability outcome requires confirmation"
+                    )
         usage = cast(Mapping[str, JsonValue], checkpoint.state["usage"])
         step_usage = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["step_usage"])
         audit_overflow = cast(Mapping[str, JsonValue], checkpoint.state["audit_overflow"])
@@ -2740,6 +3077,17 @@ class CrewDispatchRuntime:
             ):
                 _fail("runtime checkpoint review artifact is unavailable")
             review_ledger.artifacts[step_id] = artifact
+        self._validate_artifact_graph(
+            plan,
+            context,
+            completed,
+            retries,
+            tool_ledger,
+            model_ledger,
+            review_ledger,
+        )
+        if outcome_error is not None:
+            raise outcome_error
         return completed, retries, tool_ledger, model_ledger, usage_ledger, review_ledger
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import importlib
 import json
 import os
@@ -106,6 +107,31 @@ class ToolGateway(FakeGateway):
             )
             if len(self.requests) == 1
             else ModelResponse(text="tool-grounded answer", usage=TokenUsage(1, 1, 2))
+        )
+        return GatewayCompletion(
+            response=response,
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/chat",
+            cost_usd=Decimal(0),
+        )
+
+
+class ParallelToolGateway(ToolGateway):
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        response = (
+            ModelResponse(
+                text=None,
+                tool_calls=(
+                    ToolCall(id="provider-a", name="web.search", arguments={"q": "a"}),
+                    ToolCall(id="provider-b", name="web.search", arguments={"q": "b"}),
+                ),
+                usage=TokenUsage(1, 1, 2),
+            )
+            if len(self.requests) == 1
+            else ModelResponse(text="combined answer", usage=TokenUsage(1, 1, 2))
         )
         return GatewayCompletion(
             response=response,
@@ -679,9 +705,7 @@ async def test_running_model_checkpoint_requires_confirmation_without_replay() -
     with pytest.raises(asyncio.CancelledError):
         await consumer
 
-    model_states = cast(
-        Mapping[str, Mapping[str, object]], checkpoint.state["models"]
-    )
+    model_states = cast(Mapping[str, Mapping[str, object]], checkpoint.state["models"])
     assert {state["status"] for state in model_states.values()} == {"running"}
     resumed_gateway = FakeGateway()
     resumed = make_runtime(resumed_gateway, one_step_plan())
@@ -689,6 +713,19 @@ async def test_running_model_checkpoint_requires_confirmation_without_replay() -
     with pytest.raises(RuntimeExecutionError, match="model outcome requires confirmation"):
         await collect(resumed, context(checkpoint=checkpoint))
     assert resumed_gateway.requests == []
+
+    checkpoint_2 = await resumed.save_checkpoint()
+    assert checkpoint_2.state["models"] == checkpoint.state["models"]
+    assert checkpoint_2.state["usage"] == checkpoint.state["usage"]
+    third_gateway = FakeGateway()
+    third = make_runtime(third_gateway, one_step_plan())
+    await third.restore_checkpoint(checkpoint_2)
+    with pytest.raises(RuntimeExecutionError, match="model outcome requires confirmation"):
+        await collect(third, context(checkpoint=checkpoint_2))
+    checkpoint_3 = await third.save_checkpoint()
+
+    assert checkpoint_3.state["models"] == checkpoint.state["models"]
+    assert third_gateway.requests == []
 
 
 async def test_model_tool_and_final_artifacts_form_a_traceable_graph() -> None:
@@ -707,9 +744,131 @@ async def test_model_tool_and_final_artifacts_form_a_traceable_graph() -> None:
 
     assert len(models) == 2
     assert tool.source_ids == (str(models[0].id),)
-    assert final.source_ids == tuple(
-        str(artifact.id) for artifact in (models[0], tool, models[1])
+    assert final.source_ids == tuple(str(artifact.id) for artifact in (models[0], tool, models[1]))
+
+
+async def test_parallel_tool_calls_share_trigger_and_feed_next_model_in_order() -> None:
+    events = await collect(
+        make_runtime(
+            ParallelToolGateway(),
+            one_step_plan(tools=("web.search",)),
+            capability_gateway=FakeCapabilities(),
+        ),
+        context(),
     )
+    artifacts = tuple(event.artifact for event in events if event.artifact is not None)
+    models = tuple(artifact for artifact in artifacts if artifact.type == "model_response")
+    tools = tuple(artifact for artifact in artifacts if artifact.type == "tool_result")
+    final = next(artifact for artifact in artifacts if artifact.type == "text")
+
+    assert len(models) == 2
+    assert len(tools) == 2
+    assert {tool.source_ids for tool in tools} == {(str(models[0].id),)}
+    evidence_ids = tuple(str(artifact.id) for artifact in (models[0], *tools))
+    assert models[1].source_ids == evidence_ids
+    assert final.source_ids == (*evidence_ids, str(models[1].id))
+    checkpoint = next(
+        event.checkpoint for event in reversed(events) if event.checkpoint is not None
+    )
+    tool_states = cast(Mapping[str, Mapping[str, object]], checkpoint.state["tools"])
+    assert {state["attempt"] for state in tool_states.values()} == {0}
+    assert {state["round"] for state in tool_states.values()} == {0}
+    assert {state["tool_index"] for state in tool_states.values()} == {0, 1}
+    assert {state["trigger_model_artifact_id"] for state in tool_states.values()} == {
+        str(models[0].id)
+    }
+
+
+@pytest.mark.parametrize("tamper", ("round", "tool_index", "trigger"))
+async def test_checkpoint_rejects_tampered_tool_call_coordinates(tamper: str) -> None:
+    dispatch_plan = one_step_plan(tools=("web.search",))
+    events = await collect(
+        make_runtime(
+            ToolGateway(),
+            dispatch_plan,
+            capability_gateway=FakeCapabilities(),
+        ),
+        context(),
+    )
+    checkpoint = next(
+        event.checkpoint for event in reversed(events) if event.checkpoint is not None
+    )
+    artifacts = tuple(event.artifact for event in events if event.artifact is not None)
+    payload = checkpoint.to_payload()
+    state = cast(dict[str, object], payload["state"])
+    tool_states = cast(dict[str, dict[str, object]], state["tools"])
+    old_key, tool_state = next(iter(tool_states.items()))
+    model_states = cast(dict[str, dict[str, object]], state["models"])
+    later_model_id = next(
+        cast(str, model_state["artifact_id"])
+        for model_state in model_states.values()
+        if model_state["call_index"] == 1
+    )
+    if tamper == "round":
+        tool_state["round"] = 1
+        tool_state["trigger_model_artifact_id"] = later_model_id
+    elif tamper == "tool_index":
+        tool_state["tool_index"] = 1
+    else:
+        tool_state["trigger_model_artifact_id"] = later_model_id
+    if tamper != "trigger":
+        material = (
+            f"{RUN_ID}:{tool_state['step_id']}:{tool_state['attempt']}:"
+            f"{tool_state['round']}:{tool_state['tool_index']}:{tool_state['name']}:"
+            f"{tool_state['arguments_sha256']}"
+        )
+        new_key = hashlib.sha256(material.encode("utf-8")).hexdigest()
+        tool_states[new_key] = tool_states.pop(old_key)
+    payload["state_sha256"] = ""
+    tampered = RuntimeCheckpoint.from_payload(payload)
+    resumed = make_runtime(
+        FakeGateway(),
+        dispatch_plan,
+        capability_gateway=FakeCapabilities(),
+    )
+
+    try:
+        await resumed.restore_checkpoint(tampered)
+    except RuntimeExecutionError:
+        return
+    with pytest.raises(RuntimeExecutionError, match="artifact"):
+        await collect(
+            resumed,
+            context(checkpoint=tampered, artifacts=artifacts),
+        )
+
+
+async def test_completed_parallel_tool_graph_restores_without_replay() -> None:
+    dispatch_plan = one_step_plan(tools=("web.search",))
+    events = await collect(
+        make_runtime(
+            ParallelToolGateway(),
+            dispatch_plan,
+            capability_gateway=FakeCapabilities(),
+        ),
+        context(),
+    )
+    checkpoint = next(
+        event.checkpoint for event in reversed(events) if event.checkpoint is not None
+    )
+    artifacts = tuple(event.artifact for event in events if event.artifact is not None)
+    gateway = FakeGateway()
+    capabilities = FakeCapabilities()
+    resumed = make_runtime(
+        gateway,
+        dispatch_plan,
+        capability_gateway=capabilities,
+    )
+    await resumed.restore_checkpoint(checkpoint)
+
+    restored_events = await collect(
+        resumed,
+        context(checkpoint=checkpoint, artifacts=artifacts),
+    )
+
+    assert [event.kind for event in restored_events] == [EventKind.RUNTIME_COMPLETED]
+    assert gateway.requests == []
+    assert capabilities.calls == []
 
 
 async def test_dependency_and_synthesis_artifacts_form_a_traceable_graph() -> None:
@@ -723,8 +882,7 @@ async def test_dependency_and_synthesis_artifacts_form_a_traceable_graph() -> No
     dependencies = tuple(by_id[source_id] for source_id in final.source_ids[:2])
     synthesis_model = by_id[final.source_ids[2]]
     assert all(
-        artifact.type == "text" and artifact.producer == "researcher"
-        for artifact in dependencies
+        artifact.type == "text" and artifact.producer == "researcher" for artifact in dependencies
     )
     assert synthesis_model.type == "model_response"
     assert synthesis_model.producer == "writer"
@@ -761,7 +919,10 @@ async def test_review_feedback_records_candidate_and_reviewer_model_sources() ->
     assert revised_model.source_ids[0] == str(feedback.id)
 
 
-async def test_checkpoint_rejects_review_feedback_with_false_lineage() -> None:
+@pytest.mark.parametrize("omit_source", (False, True))
+async def test_checkpoint_rejects_review_feedback_with_false_lineage(
+    omit_source: bool,
+) -> None:
     gateway = FakeGateway(
         reviews=['{"verdict":"revise","feedback":"fix it"}', '{"verdict":"approve"}']
     )
@@ -781,7 +942,7 @@ async def test_checkpoint_rejects_review_feedback_with_false_lineage() -> None:
         type=feedback.type,
         producer=feedback.producer,
         content=feedback.content,
-        source_ids=(str(false_source.id),),
+        source_ids=(feedback.source_ids[0],) if omit_source else (str(false_source.id),),
         provenance=feedback.provenance,
     )
     artifacts[feedback_index] = tampered_feedback
@@ -799,6 +960,168 @@ async def test_checkpoint_rejects_review_feedback_with_false_lineage() -> None:
             resumed,
             context(checkpoint=tampered, artifacts=tuple(artifacts)),
         )
+
+
+@pytest.mark.parametrize(
+    "target",
+    (
+        "final",
+        "final_omit",
+        "model",
+        "model_omit",
+        "tool",
+        "tool_omit",
+        "retry_model",
+        "retry_model_omit",
+    ),
+)
+async def test_checkpoint_rejects_rehashed_artifact_with_false_lineage(target: str) -> None:
+    if target.startswith("tool"):
+        dispatch_plan = one_step_plan(tools=("web.search",))
+        events = await collect(
+            make_runtime(
+                ToolGateway(),
+                dispatch_plan,
+                capability_gateway=FakeCapabilities(),
+            ),
+            context(),
+        )
+    elif target.startswith("retry_model"):
+        dispatch_plan = plan(review=True)
+        events = await collect(
+            make_runtime(
+                FakeGateway(
+                    reviews=[
+                        '{"verdict":"revise","feedback":"fix it"}',
+                        '{"verdict":"approve"}',
+                    ]
+                ),
+                dispatch_plan,
+            ),
+            context(),
+        )
+    else:
+        dispatch_plan = plan()
+        events = await collect(make_runtime(FakeGateway(barrier=2), dispatch_plan), context())
+    checkpoint = next(
+        event.checkpoint for event in reversed(events) if event.checkpoint is not None
+    )
+    artifacts = [event.artifact for event in events if event.artifact is not None]
+    by_id = {str(artifact.id): artifact for artifact in artifacts}
+    payload = checkpoint.to_payload()
+    state = cast(dict[str, object], payload["state"])
+
+    if target.startswith("final"):
+        artifact = next(
+            item for item in artifacts if item.type == "text" and item.producer == "writer"
+        )
+        false_sources = (
+            artifact.source_ids[:-1]
+            if target.endswith("omit")
+            else (artifact.source_ids[1], artifact.source_ids[0], *artifact.source_ids[2:])
+        )
+    elif target.startswith("model"):
+        artifact = next(
+            item
+            for item in artifacts
+            if item.type == "model_response" and item.producer == "writer"
+        )
+        false_sources = (
+            artifact.source_ids[:-1]
+            if target.endswith("omit")
+            else (artifact.source_ids[1], artifact.source_ids[0])
+        )
+    elif target.startswith("tool"):
+        artifact = next(item for item in artifacts if item.type == "tool_result")
+        later_model = next(
+            item
+            for item in artifacts
+            if item.type == "model_response" and str(item.id) != artifact.source_ids[0]
+        )
+        false_sources = () if target.endswith("omit") else (str(later_model.id),)
+    else:
+        feedback = next(item for item in artifacts if item.type == "review_feedback")
+        artifact = next(
+            item
+            for item in artifacts
+            if item.type == "model_response"
+            and item.producer == "researcher"
+            and item.source_ids
+            and item.source_ids[0] == str(feedback.id)
+        )
+        rejected_candidate = by_id[feedback.source_ids[0]]
+        false_sources = (
+            artifact.source_ids[:-1]
+            if target.endswith("omit")
+            else (str(rejected_candidate.id), *artifact.source_ids[1:])
+        )
+
+    tampered_artifact = Artifact(
+        id=artifact.id,
+        version=artifact.version,
+        type=artifact.type,
+        producer=artifact.producer,
+        content=artifact.content,
+        source_ids=false_sources,
+        provenance=artifact.provenance,
+    )
+    artifacts[artifacts.index(artifact)] = tampered_artifact
+    if target.startswith("final"):
+        refs = cast(dict[str, dict[str, object]], state["artifact_refs"])
+        refs["final"]["sha256"] = tampered_artifact.content_sha256
+    elif target.startswith("tool"):
+        tool_states = cast(dict[str, dict[str, object]], state["tools"])
+        tool_state = next(
+            item for item in tool_states.values() if item["artifact_id"] == str(artifact.id)
+        )
+        tool_state["sha256"] = tampered_artifact.content_sha256
+    else:
+        model_states = cast(dict[str, dict[str, object]], state["models"])
+        model_state = next(
+            item for item in model_states.values() if item["artifact_id"] == str(artifact.id)
+        )
+        model_state["sha256"] = tampered_artifact.content_sha256
+    payload["state_sha256"] = ""
+    tampered = RuntimeCheckpoint.from_payload(payload)
+    resumed = make_runtime(FakeGateway(), dispatch_plan, capability_gateway=FakeCapabilities())
+    await resumed.restore_checkpoint(tampered)
+
+    with pytest.raises(RuntimeExecutionError, match="artifact"):
+        await collect(
+            resumed,
+            context(checkpoint=tampered, artifacts=tuple(artifacts)),
+        )
+
+
+async def test_completed_reviewed_dag_restores_without_replay() -> None:
+    dispatch_plan = plan(review=True)
+    events = await collect(
+        make_runtime(
+            FakeGateway(
+                reviews=[
+                    '{"verdict":"revise","feedback":"fix it"}',
+                    '{"verdict":"approve"}',
+                ]
+            ),
+            dispatch_plan,
+        ),
+        context(),
+    )
+    checkpoint = next(
+        event.checkpoint for event in reversed(events) if event.checkpoint is not None
+    )
+    artifacts = tuple(event.artifact for event in events if event.artifact is not None)
+    gateway = FakeGateway()
+    resumed = make_runtime(gateway, dispatch_plan)
+    await resumed.restore_checkpoint(checkpoint)
+
+    restored_events = await collect(
+        resumed,
+        context(checkpoint=checkpoint, artifacts=artifacts),
+    )
+
+    assert [event.kind for event in restored_events] == [EventKind.RUNTIME_COMPLETED]
+    assert gateway.requests == []
 
 
 @pytest.mark.parametrize(
@@ -880,9 +1203,7 @@ async def test_parallel_model_failure_preserves_sibling_and_requires_confirmatio
             first_events.append(event)
     checkpoint = await first.save_checkpoint()
     assert checkpoint.state["completed"] == ()
-    model_states = cast(
-        Mapping[str, Mapping[str, object]], checkpoint.state["models"]
-    )
+    model_states = cast(Mapping[str, Mapping[str, object]], checkpoint.state["models"])
     assert any(
         model_state["step_id"] == "left" and model_state["status"] == "succeeded"
         for model_state in model_states.values()
@@ -1146,6 +1467,10 @@ async def test_succeeded_tool_is_preserved_when_following_model_is_uncertain() -
         )
 
     assert second_capabilities.calls == []
+    checkpoint_2 = await resumed.save_checkpoint()
+    assert checkpoint_2.state["models"] == checkpoint.state["models"]
+    assert checkpoint_2.state["tools"] == checkpoint.state["tools"]
+    assert checkpoint_2.state["usage"] == checkpoint.state["usage"]
 
 
 async def test_replay_safe_running_tool_reuses_stable_idempotency_key() -> None:
@@ -1376,6 +1701,26 @@ async def test_uncertain_tool_checkpoint_fails_closed_without_replay() -> None:
             resumed,
             context(checkpoint=checkpoint, artifacts=persisted_artifacts),
         )
+
+    checkpoint_2 = await resumed.save_checkpoint()
+    assert checkpoint_2.state["models"] == checkpoint.state["models"]
+    assert checkpoint_2.state["tools"] == checkpoint.state["tools"]
+    third_gateway = RestrictedToolGateway()
+    third_capabilities = UncertainCapabilities()
+    third = make_runtime(
+        third_gateway,
+        tool_plan,
+        capability_gateway=third_capabilities,
+    )
+    await third.restore_checkpoint(checkpoint_2)
+    with pytest.raises(CapabilityOutcomeUncertain):
+        await collect(
+            third,
+            context(checkpoint=checkpoint_2, artifacts=persisted_artifacts),
+        )
+
+    assert third_gateway.requests == []
+    assert third_capabilities.calls == []
 
 
 async def test_tool_idempotency_key_changes_when_canonical_arguments_change() -> None:
