@@ -9,6 +9,8 @@ description = "Agent Hub backend"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "alembic>=1.16,<2",
+    # Upgrade only after the AutoGen adapter contract and integration suites pass.
+    "autogen-agentchat==0.7.5",
     "argon2-cffi>=23.1,<26",
     "asyncpg>=0.30,<1",
     "cryptography>=45,<47",
