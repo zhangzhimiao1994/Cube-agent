@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import threading
+import weakref
 from collections.abc import AsyncIterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -58,6 +59,9 @@ _CREWAI_TRACE_DISABLED: ContextVar[bool] = ContextVar(
 _CREWAI_TELEMETRY_DISABLED: ContextVar[bool] = ContextVar(
     "agent_hub_crewai_telemetry_disabled", default=False
 )
+_CREWAI_BOUND_TASKS: weakref.WeakKeyDictionary[asyncio.Task[Any], int] = weakref.WeakKeyDictionary()
+_CREWAI_BOUND_TASKS_LOCK = threading.Lock()
+_CREWAI_INVOCATION_THREAD = threading.local()
 _CREWAI_DEFAULT_STORAGE_PATH: Any | None = None
 _CREWAI_DEFAULT_TRACE_SETUP: Any | None = None
 _CREWAI_DEFAULT_TELEMETRY_CHECK: Any | None = None
@@ -77,6 +81,8 @@ def _contextual_crewai_storage_path() -> str:
     if scoped is not None:
         scoped.mkdir(parents=True, exist_ok=True)
         return str(scoped)
+    if _is_agent_hub_crewai_invocation():
+        raise RuntimeError("CrewAI context propagation is unavailable")
     fallback = _CREWAI_DEFAULT_STORAGE_PATH
     if fallback is None:
         raise RuntimeError("CrewAI storage router is unavailable")
@@ -85,6 +91,8 @@ def _contextual_crewai_storage_path() -> str:
 
 def _contextual_crewai_trace_setup(listener: object, event_bus: object) -> None:
     if _CREWAI_TRACE_DISABLED.get():
+        return
+    if _is_agent_hub_crewai_invocation():
         return
     fallback = _CREWAI_DEFAULT_TRACE_SETUP
     if fallback is None:
@@ -95,6 +103,8 @@ def _contextual_crewai_trace_setup(listener: object, event_bus: object) -> None:
 def _contextual_crewai_telemetry_check(instance: object) -> bool:
     if _CREWAI_TELEMETRY_DISABLED.get():
         return False
+    if _is_agent_hub_crewai_invocation():
+        return False
     fallback = _CREWAI_DEFAULT_TELEMETRY_CHECK
     if fallback is None:
         raise RuntimeError("CrewAI telemetry router is unavailable")
@@ -104,6 +114,13 @@ def _contextual_crewai_telemetry_check(instance: object) -> bool:
 @contextmanager
 def _active_crewai_scope(storage_path: Path) -> Any:
     storage_path.mkdir(parents=True, exist_ok=True)
+    try:
+        current_task = asyncio.current_task()
+    except RuntimeError:
+        current_task = None
+    if current_task is not None:
+        with _CREWAI_BOUND_TASKS_LOCK:
+            _CREWAI_BOUND_TASKS[current_task] = _CREWAI_BOUND_TASKS.get(current_task, 0) + 1
     storage_token = _CREWAI_STORAGE_CONTEXT.set(storage_path)
     trace_token = _CREWAI_TRACE_DISABLED.set(True)
     telemetry_token = _CREWAI_TELEMETRY_DISABLED.set(True)
@@ -113,11 +130,39 @@ def _active_crewai_scope(storage_path: Path) -> Any:
         _CREWAI_TELEMETRY_DISABLED.reset(telemetry_token)
         _CREWAI_TRACE_DISABLED.reset(trace_token)
         _CREWAI_STORAGE_CONTEXT.reset(storage_token)
+        if current_task is not None:
+            with _CREWAI_BOUND_TASKS_LOCK:
+                remaining = _CREWAI_BOUND_TASKS.get(current_task, 1) - 1
+                if remaining:
+                    _CREWAI_BOUND_TASKS[current_task] = remaining
+                else:
+                    _CREWAI_BOUND_TASKS.pop(current_task, None)
+
+
+def _is_agent_hub_crewai_invocation() -> bool:
+    if getattr(_CREWAI_INVOCATION_THREAD, "depth", 0) > 0:
+        return True
+    try:
+        current_task = asyncio.current_task()
+    except RuntimeError:
+        return False
+    if current_task is None:
+        return False
+    with _CREWAI_BOUND_TASKS_LOCK:
+        return _CREWAI_BOUND_TASKS.get(current_task, 0) > 0
 
 
 def _call_in_crewai_scope(storage_path: Path, callback: Any, *args: object) -> Any:
-    with _active_crewai_scope(storage_path):
-        return callback(*args)
+    depth = getattr(_CREWAI_INVOCATION_THREAD, "depth", 0)
+    _CREWAI_INVOCATION_THREAD.depth = depth + 1
+    try:
+        with _active_crewai_scope(storage_path):
+            return callback(*args)
+    finally:
+        if depth:
+            _CREWAI_INVOCATION_THREAD.depth = depth
+        else:
+            del _CREWAI_INVOCATION_THREAD.depth
 
 
 def _mutable_json(value: JsonValue) -> object:
@@ -272,24 +317,11 @@ class _CrewAIGeneration:
             raise RuntimeExecutionError("CrewAI step generation is unavailable")
         agent_definition = self._agents[selected_agent]
         BaseLLM = self._crewai.BaseLLM
-        owner_loop = asyncio.get_running_loop()
-        owner_thread = threading.get_ident()
 
         class GatewayOnlyLLM(BaseLLM):  # type: ignore[misc, valid-type]
             def call(self, messages: object, **kwargs: object) -> str:
-                del kwargs
-                if threading.get_ident() == owner_thread:
-                    raise RuntimeError("CrewAI synchronous call cannot block the owner loop")
-                future = asyncio.run_coroutine_threadsafe(bridge.complete(messages), owner_loop)
-                try:
-                    return future.result(timeout=3600)
-                except Exception as error:  # noqa: BLE001 - thread bridge boundary
-                    future.cancel()
-                    error.__traceback__ = None
-                    error.__context__ = None
-                    error.__cause__ = None
-                    del error
-                    raise RuntimeError("Agent Hub ModelGateway bridge failed") from None
+                del messages, kwargs
+                raise RuntimeError("CrewAI synchronous model calls are disabled")
 
             async def acall(self, messages: object, **kwargs: object) -> str:
                 del kwargs
@@ -320,6 +352,7 @@ class _CrewAIGeneration:
                 planning=False,
                 reasoning=False,
                 multimodal=False,
+                executor_class="CrewAgentExecutor",
                 max_iter=1,
                 max_retry_limit=0,
                 respect_context_window=False,
@@ -348,13 +381,7 @@ class _CrewAIGeneration:
                 stream=False,
                 tracing=False,
             )
-        output = await asyncio.get_running_loop().run_in_executor(
-            None,
-            _call_in_crewai_scope,
-            storage_path,
-            crew.kickoff,
-            {},
-        )
+            output = await crew.akickoff(inputs={})
         raw = getattr(output, "raw", None)
         if type(raw) is not str or not raw.strip() or len(raw.encode("utf-8")) > _MAX_OUTPUT_BYTES:
             raise RuntimeExecutionError("CrewAI output is invalid")

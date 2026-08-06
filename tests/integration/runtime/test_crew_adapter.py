@@ -1511,14 +1511,37 @@ async def test_private_factory_receives_locked_down_framework_generation() -> No
 async def test_real_crewai_akickoff_uses_only_model_gateway(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("CREWAI_TRACING_ENABLED", "true")
     storage_root = tmp_path / "crewai"
+    CrewAIObjectFactory(storage_dir=storage_root).build(
+        (), (), share_crew=False, telemetry_disabled=True
+    )
+    crewai_module = importlib.import_module("crewai")
+    real_akickoff = crewai_module.Crew.akickoff
+    native_calls: list[str] = []
+
+    async def tracked_akickoff(crew, *args, **kwargs):  # type: ignore[no-untyped-def]
+        native_calls.append("akickoff")
+        return await real_akickoff(crew, *args, **kwargs)
+
+    def forbidden_sync_kickoff(*args, **kwargs):  # type: ignore[no-untyped-def]
+        del args, kwargs
+        raise AssertionError("Agent Hub must use CrewAI's native async kickoff")
+
+    monkeypatch.setattr(crewai_module.Crew, "akickoff", tracked_akickoff)
+    monkeypatch.setattr(crewai_module.Crew, "kickoff", forbidden_sync_kickoff)
+    monkeypatch.setenv("CREWAI_TRACING_ENABLED", "true")
     scoped_storage = storage_root / "agent-hub" / str(TENANT_ID) / str(RUN_ID)
     scoped_storage.mkdir(parents=True)
     (scoped_storage / ".crewai_user.json").write_text(
         json.dumps({"first_execution_done": True, "trace_consent": True}),
         encoding="utf-8",
     )
+
+    def forbidden_executor(*args, **kwargs):  # type: ignore[no-untyped-def]
+        del args, kwargs
+        raise AssertionError("Agent Hub must not submit CrewAI work to an executor")
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "run_in_executor", forbidden_executor)
     gateway = FakeGateway()
     events = await collect(
         make_runtime(
@@ -1531,7 +1554,67 @@ async def test_real_crewai_akickoff_uses_only_model_gateway(
 
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     assert len(gateway.requests) == 3
+    assert native_calls == ["akickoff", "akickoff", "akickoff"]
     assert tracing_utils.is_tracing_enabled_in_context() is False
+
+
+async def test_real_crewai_cancellation_reaches_gateway_without_residual_work_and_reuses(
+    tmp_path: Path,
+) -> None:
+    class CancellableGateway:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.block = True
+            self.requests: list[ModelRequest] = []
+            self.cancelled = 0
+            self.in_flight: set[asyncio.Task[object]] = set()
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            current = asyncio.current_task()
+            assert current is not None
+            task = cast(asyncio.Task[object], current)
+            self.in_flight.add(task)
+            self.requests.append(request)
+            self.started.set()
+            try:
+                if self.block:
+                    await self.release.wait()
+                return GatewayCompletion(
+                    response=ModelResponse(text="safe result", usage=TokenUsage(1, 1, 2)),
+                    deployment_id="primary",
+                    logical_model=request.logical_model,
+                    provider_id="deepseek",
+                    provider_model="deepseek/chat",
+                )
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
+            finally:
+                self.in_flight.discard(task)
+
+    gateway = CancellableGateway()
+    runtime = make_runtime(
+        gateway,
+        crew_factory=CrewAIObjectFactory(storage_dir=tmp_path / "cancel-crewai"),
+    )
+
+    for _ in range(2):
+        gateway.started = asyncio.Event()
+        consumer = asyncio.create_task(collect(runtime, context()))
+        await asyncio.wait_for(gateway.started.wait(), timeout=15)
+        await asyncio.wait_for(runtime.cancel(), timeout=2)
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+        request_count = len(gateway.requests)
+        await asyncio.sleep(0.05)
+        assert gateway.in_flight == set()
+        assert len(gateway.requests) == request_count
+
+    assert gateway.cancelled >= 2
+    gateway.block = False
+    gateway.release.set()
+    assert (await collect(runtime, context()))[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
 async def test_real_crewai_storage_is_scoped_without_global_pollution(
@@ -1741,18 +1824,16 @@ async def test_missing_executor_context_fails_closed_without_external_fallback(
     scope = tmp_path / "executor-context" / "scope"
     with adapter_module._active_crewai_scope(scope):
         empty_context = Context()
-        assert empty_context.run(core_paths.db_storage_path) == "must-not-be-used"
+        with pytest.raises(RuntimeError, match="context propagation"):
+            empty_context.run(core_paths.db_storage_path)
         empty_context.run(adapter_module._contextual_crewai_trace_setup, object(), object())
         assert (
-            empty_context.run(adapter_module._contextual_crewai_telemetry_check, object()) is True
+            empty_context.run(adapter_module._contextual_crewai_telemetry_check, object()) is False
         )
 
-    assert external_calls == ["external"]
-    assert trace_calls == ["external"]
-    assert telemetry_calls == ["external"]
-    external_calls.clear()
-    trace_calls.clear()
-    telemetry_calls.clear()
+    assert external_calls == []
+    assert trace_calls == []
+    assert telemetry_calls == []
     assert await asyncio.get_running_loop().run_in_executor(
         None,
         adapter_module._call_in_crewai_scope,
@@ -1777,9 +1858,93 @@ async def test_missing_executor_context_fails_closed_without_external_fallback(
         object(),
         object(),
     )
+    inner_context = Context()
+    with pytest.raises(RuntimeError, match="context propagation"):
+        await asyncio.get_running_loop().run_in_executor(
+            None,
+            adapter_module._call_in_crewai_scope,
+            scope,
+            inner_context.run,
+            core_paths.db_storage_path,
+        )
+    await asyncio.get_running_loop().run_in_executor(
+        None,
+        adapter_module._call_in_crewai_scope,
+        scope,
+        inner_context.run,
+        adapter_module._contextual_crewai_trace_setup,
+        object(),
+        object(),
+    )
+    assert (
+        await asyncio.get_running_loop().run_in_executor(
+            None,
+            adapter_module._call_in_crewai_scope,
+            scope,
+            inner_context.run,
+            adapter_module._contextual_crewai_telemetry_check,
+            object(),
+        )
+        is False
+    )
     assert external_calls == []
     assert trace_calls == []
     assert telemetry_calls == []
+
+
+async def test_inner_empty_context_uses_invocation_identity_without_affecting_external_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter_module = importlib.import_module("agent_hub.runtime.crew.adapter")
+    external_calls: list[str] = []
+
+    def external_storage() -> str:
+        external_calls.append("storage")
+        return "external-storage"
+
+    def external_trace(listener: object, event_bus: object) -> None:
+        del listener, event_bus
+        external_calls.append("trace")
+
+    def external_telemetry(instance: object) -> bool:
+        del instance
+        external_calls.append("telemetry")
+        return True
+
+    monkeypatch.setattr(adapter_module, "_CREWAI_DEFAULT_STORAGE_PATH", external_storage)
+    monkeypatch.setattr(adapter_module, "_CREWAI_DEFAULT_TRACE_SETUP", external_trace)
+    monkeypatch.setattr(
+        adapter_module,
+        "_CREWAI_DEFAULT_TELEMETRY_CHECK",
+        external_telemetry,
+    )
+    scope = tmp_path / "task-identity" / "scope"
+
+    async def external_empty_context() -> tuple[str, bool]:
+        storage = adapter_module._contextual_crewai_storage_path()
+        adapter_module._contextual_crewai_trace_setup(object(), object())
+        telemetry = adapter_module._contextual_crewai_telemetry_check(object())
+        return storage, telemetry
+
+    with adapter_module._active_crewai_scope(scope):
+        empty_context = Context()
+        with pytest.raises(RuntimeError, match="context propagation"):
+            empty_context.run(adapter_module._contextual_crewai_storage_path)
+        empty_context.run(
+            adapter_module._contextual_crewai_trace_setup,
+            object(),
+            object(),
+        )
+        assert (
+            empty_context.run(adapter_module._contextual_crewai_telemetry_check, object()) is False
+        )
+        external_result = await asyncio.create_task(
+            external_empty_context(),
+            context=Context(),
+        )
+
+    assert external_result == ("external-storage", True)
+    assert external_calls == ["storage", "trace", "telemetry"]
 
 
 @pytest.mark.parametrize(
