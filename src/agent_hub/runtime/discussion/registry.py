@@ -7,6 +7,7 @@ AutoGen the product default.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -84,6 +85,11 @@ class DiscussionRuntimeRegistry:
     __slots__ = ("_preferred_backends", "_providers")
 
     _DEFAULT_PREFERRED = (DiscussionBackend.MAF, DiscussionBackend.AG2)
+    _GENERIC_UNAVAILABLE_REASON = "dependency or configuration is unavailable"
+    _UNSAFE_UNAVAILABLE_REASON = re.compile(
+        r"(secret|token|password|api[_-]?key|sk-[a-z0-9_-]+|://|[\\/]|=)",
+        re.IGNORECASE,
+    )
 
     def __init__(
         self,
@@ -168,7 +174,7 @@ class DiscussionRuntimeRegistry:
             except Exception as error:  # noqa: BLE001 - hostile adapter boundary
                 self._scrub_exception(error)
                 reason = None
-            reason = reason or "dependency or configuration is unavailable"
+            reason = self._safe_unavailable_reason(reason)
             raise DiscussionBackendUnavailable(
                 f"Discussion backend '{backend.value}' is unavailable: {reason}"
             )
@@ -205,6 +211,18 @@ class DiscussionRuntimeRegistry:
         error.__traceback__ = None
         error.__context__ = None
         error.__cause__ = None
+
+    @classmethod
+    def _safe_unavailable_reason(cls, reason: str | None) -> str:
+        if not reason:
+            return cls._GENERIC_UNAVAILABLE_REASON
+        if len(reason) > 160:
+            return cls._GENERIC_UNAVAILABLE_REASON
+        if any(ord(character) < 32 for character in reason):
+            return cls._GENERIC_UNAVAILABLE_REASON
+        if cls._UNSAFE_UNAVAILABLE_REASON.search(reason):
+            return cls._GENERIC_UNAVAILABLE_REASON
+        return reason
 
 
 __all__ = [

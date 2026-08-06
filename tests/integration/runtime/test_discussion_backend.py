@@ -183,6 +183,27 @@ def test_unavailable_explicit_backend_fails_closed_without_cross_framework_fallb
         registry.create(DiscussionBackendSelection(backend=DiscussionBackend.MAF))
 
 
+def test_unavailable_reason_is_sanitized_before_operator_error() -> None:
+    registry = DiscussionRuntimeRegistry(
+        (
+            Provider(
+                DiscussionBackend.MAF,
+                "maf",
+                available=False,
+                unavailable_reason="secret sk-proj-leak should not propagate",
+            ),
+        )
+    )
+
+    with pytest.raises(DiscussionBackendUnavailable) as error:
+        registry.create(DiscussionBackendSelection(backend=DiscussionBackend.MAF))
+
+    message = str(error.value)
+    assert "sk-proj-leak" not in message
+    assert "secret" not in message
+    assert "dependency or configuration is unavailable" in message
+
+
 def test_registration_rejects_direct_autogen_defaulting() -> None:
     with pytest.raises(ValueError, match="legacy"):
         DiscussionRuntimeRegistry(
