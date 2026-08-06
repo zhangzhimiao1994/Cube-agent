@@ -124,9 +124,7 @@ def test_yaml_rejects_duplicate_keys_at_every_depth(source: str) -> None:
         ),
     ],
 )
-def test_invalid_graphs_are_rejected(
-    steps: tuple[DispatchStep, ...], message: str
-) -> None:
+def test_invalid_graphs_are_rejected(steps: tuple[DispatchStep, ...], message: str) -> None:
     with pytest.raises((InvalidDispatchPlan, ValidationError), match=message):
         DispatchPlan(agents=(agent("x"),), steps=steps, total_token_budget=10_000)
 
@@ -160,9 +158,7 @@ def test_tool_permission_is_intersection_and_dangerous_tools_are_rejected() -> N
 def test_strict_bounded_numbers(field: str, value: object) -> None:
     data: dict[str, object] = {
         "agents": (agent("x"),),
-        "steps": (
-            DispatchStep(id="final", agent="x", task="Final", final_synthesizer=True),
-        ),
+        "steps": (DispatchStep(id="final", agent="x", task="Final", final_synthesizer=True),),
         "total_token_budget": 4096,
         field: value,
     }
@@ -174,11 +170,7 @@ def test_plan_rejects_unknown_agent_budget_overflow_and_construct_bypass() -> No
     with pytest.raises((InvalidDispatchPlan, ValidationError), match="agent"):
         DispatchPlan(
             agents=(agent("x"),),
-            steps=(
-                DispatchStep(
-                    id="final", agent="y", task="Final", final_synthesizer=True
-                ),
-            ),
+            steps=(DispatchStep(id="final", agent="y", task="Final", final_synthesizer=True),),
         )
     with pytest.raises((InvalidDispatchPlan, ValidationError), match="budget"):
         DispatchPlan(

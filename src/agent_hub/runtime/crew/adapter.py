@@ -649,9 +649,7 @@ class CrewDispatchRuntime:
         default_storage = Path.cwd() / ".agent-hub-data" / "crewai"
         self._factory = crew_factory or CrewAIObjectFactory(storage_dir=default_storage)
         self._artifact_repository = (
-            artifact_repository
-            if artifact_repository is not None
-            else InMemoryArtifactRepository()
+            artifact_repository if artifact_repository is not None else InMemoryArtifactRepository()
         )
         self._active_stream: CrewRunStream | None = None
         self._active_task: asyncio.Task[None] | None = None
@@ -683,12 +681,8 @@ class CrewDispatchRuntime:
 
     async def _run(self, context: TaskContext, state: _RunState) -> AsyncIterator[RunEvent]:
         queue: asyncio.Queue[RunEvent] = asyncio.Queue(maxsize=512)
-        terminal_future: asyncio.Future[_Terminal] = (
-            asyncio.get_running_loop().create_future()
-        )
-        coordinator = asyncio.create_task(
-            self._coordinate(context, queue, terminal_future, state)
-        )
+        terminal_future: asyncio.Future[_Terminal] = asyncio.get_running_loop().create_future()
+        coordinator = asyncio.create_task(self._coordinate(context, queue, terminal_future, state))
         self._active_task = coordinator
         try:
             while True:
@@ -1009,16 +1003,8 @@ class CrewDispatchRuntime:
                     candidate_registry = dict(artifact_registry)
                     candidate_registry[str(artifact.id)] = artifact
                     candidate_tools = tool_ledger
-                    if (
-                        completion.response.tool_calls
-                        and model_state["purpose"] == "step"
-                    ):
-                        if (
-                            len(artifact.source_ids)
-                            + 1
-                            + len(completion.response.tool_calls)
-                            > 63
-                        ):
+                    if completion.response.tool_calls and model_state["purpose"] == "step":
+                        if len(artifact.source_ids) + 1 + len(completion.response.tool_calls) > 63:
                             _fail("artifact lineage exceeds limit")
                         provisional = _ToolLedger(
                             states=dict(tool_ledger.states),
@@ -1026,9 +1012,7 @@ class CrewDispatchRuntime:
                         )
                         attempt = cast(int, model_state["attempt"])
                         round_index = cast(int, model_state["call_index"])
-                        for tool_index, tool_call in enumerate(
-                            completion.response.tool_calls
-                        ):
+                        for tool_index, tool_call in enumerate(completion.response.tool_calls):
                             if tool_call.name not in steps[step_id].tools:
                                 _fail("step requested a forbidden capability")
                             try:
@@ -1041,10 +1025,7 @@ class CrewDispatchRuntime:
                                 )
                             except (TypeError, ValueError):
                                 _fail("capability arguments are invalid")
-                            if (
-                                len(canonical_arguments.encode("utf-8"))
-                                > _MAX_TOOL_ARGUMENT_BYTES
-                            ):
+                            if len(canonical_arguments.encode("utf-8")) > _MAX_TOOL_ARGUMENT_BYTES:
                                 _fail("capability arguments exceed limit")
                             arguments_sha256 = hashlib.sha256(
                                 canonical_arguments.encode("utf-8")
@@ -1058,12 +1039,9 @@ class CrewDispatchRuntime:
                                 tool_call.name,
                                 arguments_sha256,
                             )
-                            replay_safe_method = getattr(
-                                self._capabilities, "is_replay_safe", None
-                            )
+                            replay_safe_method = getattr(self._capabilities, "is_replay_safe", None)
                             replay_safe = bool(
-                                callable(replay_safe_method)
-                                and replay_safe_method(tool_call.name)
+                                callable(replay_safe_method) and replay_safe_method(tool_call.name)
                             )
                             placeholder = Artifact(
                                 id=uuid4(),
@@ -1359,17 +1337,14 @@ class CrewDispatchRuntime:
             commit_tasks = tuple(state.commit_tasks)
             if commit_tasks:
                 commit_deadline = (
-                    asyncio.get_running_loop().time()
-                    + _TASK_CANCELLATION_GRACE_SECONDS
+                    asyncio.get_running_loop().time() + _TASK_CANCELLATION_GRACE_SECONDS
                 )
                 pending_commits = await self._cancel_cleanup_tasks(
                     commit_tasks,
                     deadline=commit_deadline,
                 )
                 if pending_commits:
-                    state.cleanup_error = RuntimeExecutionError(
-                        "artifact rollback failed"
-                    )
+                    state.cleanup_error = RuntimeExecutionError("artifact rollback failed")
             state.commit_tasks.clear()
             cleanup_succeeded = await self._abort_frozen_artifact_writes(
                 context,
@@ -2331,15 +2306,10 @@ class CrewDispatchRuntime:
         except asyncio.CancelledError:
             pending = await self._cancel_cleanup_tasks(
                 (task,),
-                deadline=(
-                    asyncio.get_running_loop().time()
-                    + _TASK_CANCELLATION_GRACE_SECONDS
-                ),
+                deadline=(asyncio.get_running_loop().time() + _TASK_CANCELLATION_GRACE_SECONDS),
             )
             if pending:
-                run_state.cleanup_error = RuntimeExecutionError(
-                    "artifact rollback failed"
-                )
+                run_state.cleanup_error = RuntimeExecutionError("artifact rollback failed")
             raise
         finally:
             run_state.commit_tasks.discard(task)
@@ -2410,10 +2380,7 @@ class CrewDispatchRuntime:
 
         still_pending = await self._cancel_cleanup_tasks(
             tuple(pending),
-            deadline=(
-                asyncio.get_running_loop().time()
-                + _ARTIFACT_CLEANUP_HARD_GRACE_SECONDS
-            ),
+            deadline=(asyncio.get_running_loop().time() + _ARTIFACT_CLEANUP_HARD_GRACE_SECONDS),
         )
         isolated = set(still_pending)
         for task in pending:
@@ -2569,9 +2536,7 @@ class CrewDispatchRuntime:
         artifact_registry: Mapping[str, Artifact] | None = None,
     ) -> RuntimeCheckpoint:
         checkpoint_artifacts = (
-            self._current_artifact_registry
-            if artifact_registry is None
-            else artifact_registry
+            self._current_artifact_registry if artifact_registry is None else artifact_registry
         )
         completed_ids = tuple(sorted(completed))
         frontier = tuple(
@@ -3438,10 +3403,7 @@ class CrewDispatchRuntime:
         for stored_artifact in stored:
             artifact_id = str(stored_artifact.id)
             existing = by_id.get(artifact_id)
-            if (
-                existing is not None
-                and existing.content_sha256 != stored_artifact.content_sha256
-            ):
+            if existing is not None and existing.content_sha256 != stored_artifact.content_sha256:
                 _fail("runtime checkpoint artifacts are unavailable")
             by_id[artifact_id] = stored_artifact
         registry = {str(artifact.id): artifact for artifact in stored}
@@ -3680,9 +3642,7 @@ class CrewDispatchRuntime:
                 done = self._active_done
                 if done is not None:
                     try:
-                        await asyncio.wait_for(
-                            done.wait(), timeout=_RUNTIME_CANCEL_TIMEOUT_SECONDS
-                        )
+                        await asyncio.wait_for(done.wait(), timeout=_RUNTIME_CANCEL_TIMEOUT_SECONDS)
                     except TimeoutError:
                         _fail("runtime cancellation timed out")
             if self._active_stream is stream:

@@ -39,11 +39,17 @@ def _construct_unique_mapping(
             duplicate = key in result
         except TypeError:
             raise yaml.constructor.ConstructorError(
-                "while constructing a mapping", node.start_mark, "unhashable key", key_node.start_mark
+                "while constructing a mapping",
+                node.start_mark,
+                "unhashable key",
+                key_node.start_mark,
             ) from None
         if duplicate:
             raise yaml.constructor.ConstructorError(
-                "while constructing a mapping", node.start_mark, "duplicate key", key_node.start_mark
+                "while constructing a mapping",
+                node.start_mark,
+                "duplicate key",
+                key_node.start_mark,
             ) from None
         result[key] = loader.construct_object(value_node, deep=deep)
     return result
@@ -203,7 +209,11 @@ class DispatchStep(_PlanModel):
     @field_validator("timeout_seconds")
     @classmethod
     def finite_timeout(cls, value: float) -> float:
-        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(value)
+        ):
             raise TypeError("timeout_seconds must be finite")
         return float(value)
 
@@ -269,7 +279,11 @@ class DispatchPlan(_PlanModel):
     @field_validator("total_timeout_seconds")
     @classmethod
     def finite_timeout(cls, value: float) -> float:
-        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(value)
+        ):
             raise TypeError("total_timeout_seconds must be finite")
         return float(value)
 
@@ -280,9 +294,9 @@ class DispatchPlan(_PlanModel):
 
     @model_validator(mode="after")
     def graph_invariants(self) -> DispatchPlan:
-        estimated_text_bytes = sum(
-            len(agent.goal.encode("utf-8")) for agent in self.agents
-        ) + sum(len(step.task.encode("utf-8")) for step in self.steps)
+        estimated_text_bytes = sum(len(agent.goal.encode("utf-8")) for agent in self.agents) + sum(
+            len(step.task.encode("utf-8")) for step in self.steps
+        )
         if estimated_text_bytes > _MAX_PLAN_BYTES:
             raise InvalidDispatchPlan("dispatch plan exceeds size limit")
         self.validate_graph()
@@ -302,7 +316,9 @@ class DispatchPlan(_PlanModel):
         allowed = set(self.allowed_tools)
         denied = set(self.denied_tools) | _INTRINSICALLY_DANGEROUS
         for step in self.steps:
-            if step.agent not in agents or (step.reviewer is not None and step.reviewer not in agents):
+            if step.agent not in agents or (
+                step.reviewer is not None and step.reviewer not in agents
+            ):
                 raise InvalidDispatchPlan("step references an unknown agent")
             if any(dependency not in known_steps for dependency in step.depends_on):
                 raise InvalidDispatchPlan("step references an unknown dependency")
@@ -323,24 +339,22 @@ class DispatchPlan(_PlanModel):
             step.id
             for step in self.steps
             if step.id != final_step.id
-            and not any(step.id in candidate.depends_on for candidate in self.steps if candidate.id != final_step.id)
+            and not any(
+                step.id in candidate.depends_on
+                for candidate in self.steps
+                if candidate.id != final_step.id
+            )
         }
         if not leaves <= ancestors:
             raise InvalidDispatchPlan("final synthesizer must cover every required leaf")
         required_tokens = sum(
-            step.token_budget
-            * (
-                1
-                if step.reviewer is None
-                else 2 + (2 * step.reviewer_retries)
-            )
+            step.token_budget * (1 if step.reviewer is None else 2 + (2 * step.reviewer_retries))
             for step in self.steps
         )
         if required_tokens > self.total_token_budget:
             raise InvalidDispatchPlan("total token budget is insufficient")
         required_timeout = sum(
-            step.timeout_seconds
-            * (1 if step.reviewer is None else 2 + (2 * step.reviewer_retries))
+            step.timeout_seconds * (1 if step.reviewer is None else 2 + (2 * step.reviewer_retries))
             for step in self.steps
         )
         if required_timeout > self.total_timeout_seconds:
@@ -361,7 +375,9 @@ class DispatchPlan(_PlanModel):
         layers: list[tuple[str, ...]] = []
         completed: set[str] = set()
         while remaining:
-            ready = tuple(sorted(step_id for step_id, deps in remaining.items() if deps <= completed))
+            ready = tuple(
+                sorted(step_id for step_id, deps in remaining.items() if deps <= completed)
+            )
             if not ready:
                 break
             layers.append(ready)
@@ -392,7 +408,9 @@ class DispatchPlan(_PlanModel):
 
     @property
     def digest(self) -> str:
-        data = json.dumps(self.to_payload(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        data = json.dumps(
+            self.to_payload(), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
         return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
     def to_payload(self) -> dict[str, Any]:
@@ -402,7 +420,9 @@ class DispatchPlan(_PlanModel):
     def from_payload(cls, payload: object) -> Self:
         validated: Self | None = None
         try:
-            encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+            encoded = json.dumps(
+                payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+            )
             if len(encoded.encode("utf-8")) > _MAX_PLAN_BYTES:
                 raise ValueError
             validated = cls.model_validate_json(encoded, strict=True)
@@ -418,7 +438,11 @@ class DispatchPlan(_PlanModel):
     @classmethod
     def from_yaml(cls, source: str) -> Self:
         """Load one bounded YAML document without aliases, anchors, or custom tags."""
-        if type(source) is not str or not source.strip() or len(source.encode("utf-8")) > _MAX_PLAN_BYTES:
+        if (
+            type(source) is not str
+            or not source.strip()
+            or len(source.encode("utf-8")) > _MAX_PLAN_BYTES
+        ):
             raise InvalidDispatchPlan("invalid dispatch plan")
         validated: Self | None = None
         try:

@@ -74,9 +74,7 @@ class DelegatingArtifactRepository:
         *,
         write_id: UUID,
     ) -> None:
-        await self.delegate.reserve_write(
-            tenant_id, run_id, reference, write_id=write_id
-        )
+        await self.delegate.reserve_write(tenant_id, run_id, reference, write_id=write_id)
 
     async def abort_write(
         self,
@@ -86,9 +84,7 @@ class DelegatingArtifactRepository:
         *,
         write_id: UUID,
     ) -> bool:
-        return await self.delegate.abort_write(
-            tenant_id, run_id, reference, write_id=write_id
-        )
+        return await self.delegate.abort_write(tenant_id, run_id, reference, write_id=write_id)
 
 
 class FakeGateway:
@@ -298,13 +294,9 @@ def one_step_plan(*, tools: tuple[str, ...] = ()) -> DispatchPlan:
 
 
 def chain_plan(step_count: int, *, review: bool = False) -> DispatchPlan:
-    agents = [
-        AgentSpec(id="writer", role="writer", goal="Write", logical_model="general")
-    ]
+    agents = [AgentSpec(id="writer", role="writer", goal="Write", logical_model="general")]
     if review:
-        agents.append(
-            AgentSpec(id="critic", role="critic", goal="Review", logical_model="general")
-        )
+        agents.append(AgentSpec(id="critic", role="critic", goal="Review", logical_model="general"))
     return DispatchPlan(
         agents=tuple(agents),
         steps=tuple(
@@ -2834,9 +2826,7 @@ async def test_shared_repository_recovers_long_chain_without_context_artifacts(
 ) -> None:
     repository = InMemoryArtifactRepository()
     dispatch_plan = chain_plan(step_count)
-    first = make_runtime(
-        FakeGateway(), dispatch_plan, artifact_repository=repository
-    )
+    first = make_runtime(FakeGateway(), dispatch_plan, artifact_repository=repository)
     await collect(first, context(token_budget=dispatch_plan.total_token_budget))
     checkpoint = await first.save_checkpoint()
     registry = cast(Mapping[str, str], checkpoint.state["artifact_registry"])
@@ -2856,10 +2846,14 @@ async def test_shared_repository_recovers_long_chain_without_context_artifacts(
 
 async def test_repository_recovers_more_than_64_review_retry_artifacts() -> None:
     step_count = 11
-    reviews = [item for _ in range(step_count) for item in (
-        '{"verdict":"revise","feedback":"tighten"}',
-        '{"verdict":"approve"}',
-    )]
+    reviews = [
+        item
+        for _ in range(step_count)
+        for item in (
+            '{"verdict":"revise","feedback":"tighten"}',
+            '{"verdict":"approve"}',
+        )
+    ]
     repository = InMemoryArtifactRepository()
     dispatch_plan = chain_plan(step_count, review=True)
     first = make_runtime(
@@ -2951,9 +2945,7 @@ async def test_partial_repository_write_recovers_from_last_durable_boundary() ->
             if self.puts >= 1:
                 raise ArtifactRepositoryError("artifact repository write failed")
             self.puts += 1
-            await self.delegate.put(
-                tenant_id, run_id, artifact, write_id=write_id
-            )
+            await self.delegate.put(tenant_id, run_id, artifact, write_id=write_id)
 
         async def get_many(
             self,
@@ -2972,13 +2964,11 @@ async def test_partial_repository_write_recovers_from_last_durable_boundary() ->
     assert next(iter(models.values()))["status"] == "succeeded"
 
     gateway = FakeGateway()
-    resumed = make_runtime(
-        gateway, one_step_plan(), artifact_repository=failing.delegate
-    )
+    resumed = make_runtime(gateway, one_step_plan(), artifact_repository=failing.delegate)
     await resumed.restore_checkpoint(checkpoint)
-    assert (
-        await collect(resumed, context(checkpoint=checkpoint, token_budget=100))
-    )[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert (await collect(resumed, context(checkpoint=checkpoint, token_budget=100)))[
+        -1
+    ].kind is EventKind.RUNTIME_COMPLETED
     assert gateway.requests == []
 
 
@@ -2996,9 +2986,7 @@ async def test_cancelled_repository_hydration_never_replaces_checkpoint() -> Non
             *,
             write_id: UUID | None = None,
         ) -> None:
-            await self.delegate.put(
-                tenant_id, run_id, artifact, write_id=write_id
-            )
+            await self.delegate.put(tenant_id, run_id, artifact, write_id=write_id)
 
         async def get_many(
             self,
@@ -3017,9 +3005,7 @@ async def test_cancelled_repository_hydration_never_replaces_checkpoint() -> Non
     blocking = BlockingGetRepository(repository)
     resumed = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=blocking)
     await resumed.restore_checkpoint(checkpoint)
-    task = asyncio.create_task(
-        collect(resumed, context(checkpoint=checkpoint, token_budget=100))
-    )
+    task = asyncio.create_task(collect(resumed, context(checkpoint=checkpoint, token_budget=100)))
     await blocking.started.wait()
 
     await resumed.cancel()
@@ -3153,9 +3139,9 @@ async def test_tool_call_response_limit_fails_before_capability_and_terminates(
     assert len(gateway.requests) == 1
     assert capabilities.calls == []
     gateway.batches = [0]
-    assert (
-        await collect(runtime, context(token_budget=100))
-    )[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert (await collect(runtime, context(token_budget=100)))[
+        -1
+    ].kind is EventKind.RUNTIME_COMPLETED
 
 
 async def test_tool_call_response_at_limit_executes_normally() -> None:
@@ -3193,9 +3179,9 @@ async def test_cumulative_tool_evidence_budget_is_preflighted_before_batch(
     )
 
     if succeeds:
-        assert (
-            await collect(runtime, context(token_budget=100))
-        )[-1].kind is EventKind.RUNTIME_COMPLETED
+        assert (await collect(runtime, context(token_budget=100)))[
+            -1
+        ].kind is EventKind.RUNTIME_COMPLETED
     else:
         with pytest.raises(RuntimeExecutionError):
             await asyncio.wait_for(collect(runtime, context(token_budget=100)), timeout=2)
@@ -3222,9 +3208,9 @@ async def test_checkpoint_serialization_failure_still_terminates_and_allows_reus
         await asyncio.wait_for(collect(runtime, context(token_budget=100)), timeout=2)
 
     monkeypatch.setattr(runtime, "_make_checkpoint", original)
-    assert (
-        await collect(runtime, context(token_budget=100))
-    )[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert (await collect(runtime, context(token_budget=100)))[
+        -1
+    ].kind is EventKind.RUNTIME_COMPLETED
 
 
 async def test_failure_event_exception_still_delivers_terminal(
@@ -3500,9 +3486,7 @@ async def test_pre_capability_checkpoints_never_publish_provisional_success() ->
             ArtifactReference(id=UUID(artifact_id), sha256=sha256)
             for artifact_id, sha256 in registry.items()
         )
-        assert len(
-            await repository.get_many(TENANT_ID, RUN_ID, references)
-        ) == len(references)
+        assert len(await repository.get_many(TENANT_ID, RUN_ID, references)) == len(references)
 
     await runtime.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -3540,9 +3524,7 @@ async def test_stable_terminal_checkpoint_is_emitted_and_durably_restorable(
             )
 
     terminal_plan = DispatchPlan(
-        agents=(
-            AgentSpec(id="writer", role="writer", goal="Write", logical_model="general"),
-        ),
+        agents=(AgentSpec(id="writer", role="writer", goal="Write", logical_model="general"),),
         steps=(
             DispatchStep(
                 id="final",
@@ -3551,18 +3533,12 @@ async def test_stable_terminal_checkpoint_is_emitted_and_durably_restorable(
                 final_synthesizer=True,
                 token_budget=100,
                 cost_budget_usd=(
-                    Decimal("0.01")
-                    if terminal_phase == "budget_exhausted"
-                    else Decimal(0)
+                    Decimal("0.01") if terminal_phase == "budget_exhausted" else Decimal(0)
                 ),
             ),
         ),
         total_token_budget=100,
-        total_cost_usd=(
-            Decimal("0.01")
-            if terminal_phase == "budget_exhausted"
-            else Decimal(0)
-        ),
+        total_cost_usd=(Decimal("0.01") if terminal_phase == "budget_exhausted" else Decimal(0)),
     )
     repository = InMemoryArtifactRepository()
     first_gateway = TerminalGateway()
@@ -3621,9 +3597,7 @@ async def test_cancel_during_artifact_commit_leaves_no_commit_task_and_reuses_ru
             if self.block:
                 self.started.set()
                 await self.release.wait()
-            await self.delegate.put(
-                tenant_id, run_id, artifact, write_id=write_id
-            )
+            await self.delegate.put(tenant_id, run_id, artifact, write_id=write_id)
 
         async def get_many(
             self,
@@ -3659,9 +3633,9 @@ async def test_cancel_during_artifact_commit_leaves_no_commit_task_and_reuses_ru
         await asyncio.gather(*pending_commits, return_exceptions=True)
 
     repository.block = False
-    assert (
-        await collect(runtime, context(token_budget=100))
-    )[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert (await collect(runtime, context(token_budget=100)))[
+        -1
+    ].kind is EventKind.RUNTIME_COMPLETED
 
 
 async def test_early_close_with_full_event_queue_is_bounded_and_runtime_reusable(
@@ -3709,9 +3683,7 @@ async def test_cancel_rolls_back_a_repository_write_completed_before_put_returns
             if write_id is None:
                 await self.delegate.put(tenant_id, run_id, artifact)
             else:
-                await self.delegate.put(
-                    tenant_id, run_id, artifact, write_id=write_id
-                )
+                await self.delegate.put(tenant_id, run_id, artifact, write_id=write_id)
             if self.block:
                 self.started.set()
                 await self.release.wait()
@@ -3725,9 +3697,7 @@ async def test_cancel_rolls_back_a_repository_write_completed_before_put_returns
             return await self.delegate.get_many(tenant_id, run_id, references)
 
     repository = WrittenThenBlockingRepository()
-    runtime = make_runtime(
-        FakeGateway(), one_step_plan(), artifact_repository=repository
-    )
+    runtime = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=repository)
     consumer = asyncio.create_task(collect(runtime, context(token_budget=100)))
     await repository.started.wait()
 
@@ -3749,9 +3719,9 @@ async def test_cancel_rolls_back_a_repository_write_completed_before_put_returns
     )
 
     repository.block = False
-    assert (
-        await collect(runtime, context(token_budget=100))
-    )[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert (await collect(runtime, context(token_budget=100)))[
+        -1
+    ].kind is EventKind.RUNTIME_COMPLETED
 
 
 @pytest.mark.parametrize("rollback_mode", ("error", "timeout"))
@@ -3783,9 +3753,7 @@ async def test_failed_artifact_rollback_is_an_explicit_terminal_failure(
             if write_id is None:
                 await self.delegate.put(tenant_id, run_id, artifact)
             else:
-                await self.delegate.put(
-                    tenant_id, run_id, artifact, write_id=write_id
-                )
+                await self.delegate.put(tenant_id, run_id, artifact, write_id=write_id)
             self.started.set()
             await asyncio.Event().wait()
 
@@ -3812,9 +3780,7 @@ async def test_failed_artifact_rollback_is_an_explicit_terminal_failure(
             return False  # pragma: no cover
 
     repository = FailedRollbackRepository()
-    runtime = make_runtime(
-        FakeGateway(), one_step_plan(), artifact_repository=repository
-    )
+    runtime = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=repository)
     consumer = asyncio.create_task(collect(runtime, context(token_budget=100)))
     await repository.started.wait()
 
@@ -3876,9 +3842,7 @@ async def test_rollback_cancelled_error_is_reported_as_cleanup_failure(
             *,
             write_id: UUID,
         ) -> None:
-            await self.delegate.reserve_write(
-                tenant_id, run_id, reference, write_id=write_id
-            )
+            await self.delegate.reserve_write(tenant_id, run_id, reference, write_id=write_id)
 
         async def put(
             self,
@@ -3888,9 +3852,7 @@ async def test_rollback_cancelled_error_is_reported_as_cleanup_failure(
             *,
             write_id: UUID | None = None,
         ) -> None:
-            await self.delegate.put(
-                tenant_id, run_id, artifact, write_id=write_id
-            )
+            await self.delegate.put(tenant_id, run_id, artifact, write_id=write_id)
             self.started.set()
             await asyncio.Event().wait()
 
@@ -3914,9 +3876,7 @@ async def test_rollback_cancelled_error_is_reported_as_cleanup_failure(
             raise asyncio.CancelledError
 
     repository = CancelledRollbackRepository()
-    runtime = make_runtime(
-        FakeGateway(), one_step_plan(), artifact_repository=repository
-    )
+    runtime = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=repository)
     consumer = asyncio.create_task(collect(runtime, context(token_budget=100)))
     await repository.started.wait()
 
@@ -3951,9 +3911,7 @@ async def test_rollback_that_swallows_one_cancel_is_cancelled_again_and_collecte
             *,
             write_id: UUID,
         ) -> None:
-            await self.delegate.reserve_write(
-                tenant_id, run_id, reference, write_id=write_id
-            )
+            await self.delegate.reserve_write(tenant_id, run_id, reference, write_id=write_id)
 
         async def put(
             self,
@@ -3963,9 +3921,7 @@ async def test_rollback_that_swallows_one_cancel_is_cancelled_again_and_collecte
             *,
             write_id: UUID | None = None,
         ) -> None:
-            await self.delegate.put(
-                tenant_id, run_id, artifact, write_id=write_id
-            )
+            await self.delegate.put(tenant_id, run_id, artifact, write_id=write_id)
             self.started.set()
             await asyncio.Event().wait()
 
@@ -3995,9 +3951,7 @@ async def test_rollback_that_swallows_one_cancel_is_cancelled_again_and_collecte
                         raise
 
     repository = SwallowOnceRepository()
-    runtime = make_runtime(
-        FakeGateway(), one_step_plan(), artifact_repository=repository
-    )
+    runtime = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=repository)
     consumer = asyncio.create_task(collect(runtime, context(token_budget=100)))
     await repository.started.wait()
 
@@ -4040,9 +3994,7 @@ async def test_non_cooperative_rollback_is_detached_at_hard_deadline_and_runtime
             *,
             write_id: UUID,
         ) -> None:
-            await self.delegate.reserve_write(
-                tenant_id, run_id, reference, write_id=write_id
-            )
+            await self.delegate.reserve_write(tenant_id, run_id, reference, write_id=write_id)
 
         async def put(
             self,
@@ -4052,9 +4004,7 @@ async def test_non_cooperative_rollback_is_detached_at_hard_deadline_and_runtime
             *,
             write_id: UUID | None = None,
         ) -> None:
-            await self.delegate.put(
-                tenant_id, run_id, artifact, write_id=write_id
-            )
+            await self.delegate.put(tenant_id, run_id, artifact, write_id=write_id)
             if self.block_put:
                 self.started.set()
                 await asyncio.Event().wait()
@@ -4080,14 +4030,10 @@ async def test_non_cooperative_rollback_is_detached_at_hard_deadline_and_runtime
                     await self.release.wait()
                 except asyncio.CancelledError:
                     self.cancel_count += 1
-            return await self.delegate.abort_write(
-                tenant_id, run_id, reference, write_id=write_id
-            )
+            return await self.delegate.abort_write(tenant_id, run_id, reference, write_id=write_id)
 
     repository = NonCooperativeRepository()
-    runtime = make_runtime(
-        FakeGateway(), one_step_plan(), artifact_repository=repository
-    )
+    runtime = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=repository)
     consumer = asyncio.create_task(collect(runtime, context(token_budget=100)))
     await repository.started.wait()
     cancel_task = asyncio.create_task(runtime.cancel())
@@ -4098,9 +4044,7 @@ async def test_non_cooperative_rollback_is_detached_at_hard_deadline_and_runtime
             cancel_task.result()
         with pytest.raises(RuntimeExecutionError, match="artifact rollback failed"):
             await consumer
-        detached_rollbacks = tuple(
-            task for task in runtime._cleanup_tasks if not task.done()
-        )
+        detached_rollbacks = tuple(task for task in runtime._cleanup_tasks if not task.done())
         assert len(detached_rollbacks) == 1
         repository.block_put = False
         assert (
@@ -4148,9 +4092,7 @@ async def test_aborted_write_fence_rejects_a_put_that_finishes_after_cancel(
             *,
             write_id: UUID,
         ) -> None:
-            await self.delegate.reserve_write(
-                tenant_id, run_id, reference, write_id=write_id
-            )
+            await self.delegate.reserve_write(tenant_id, run_id, reference, write_id=write_id)
 
         async def put(
             self,
@@ -4169,9 +4111,7 @@ async def test_aborted_write_fence_rejects_a_put_that_finishes_after_cancel(
                     except asyncio.CancelledError:
                         self.cancel_count += 1
             try:
-                await self.delegate.put(
-                    tenant_id, run_id, artifact, write_id=write_id
-                )
+                await self.delegate.put(tenant_id, run_id, artifact, write_id=write_id)
             except ArtifactRepositoryError:
                 self.late_rejected = True
                 raise
@@ -4194,14 +4134,10 @@ async def test_aborted_write_fence_rejects_a_put_that_finishes_after_cancel(
             *,
             write_id: UUID,
         ) -> bool:
-            return await self.delegate.abort_write(
-                tenant_id, run_id, reference, write_id=write_id
-            )
+            return await self.delegate.abort_write(tenant_id, run_id, reference, write_id=write_id)
 
     repository = LatePutRepository()
-    runtime = make_runtime(
-        FakeGateway(), one_step_plan(), artifact_repository=repository
-    )
+    runtime = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=repository)
     consumer = asyncio.create_task(collect(runtime, context(token_budget=100)))
     await repository.started.wait()
     cancel_task = asyncio.create_task(runtime.cancel())
@@ -4289,9 +4225,7 @@ async def test_compliant_abort_gets_the_full_rollback_window_before_cancellation
             write_id: UUID | None = None,
         ) -> None:
             self.stored = artifact
-            await self.delegate.put(
-                tenant_id, run_id, artifact, write_id=write_id
-            )
+            await self.delegate.put(tenant_id, run_id, artifact, write_id=write_id)
             self.started.set()
             await asyncio.Event().wait()
 
@@ -4317,14 +4251,10 @@ async def test_compliant_abort_gets_the_full_rollback_window_before_cancellation
                 self.abort_cancel_count += 1
                 raise
             self.fence_applied += 1
-            return await self.delegate.abort_write(
-                tenant_id, run_id, reference, write_id=write_id
-            )
+            return await self.delegate.abort_write(tenant_id, run_id, reference, write_id=write_id)
 
     repository = SlowFenceRepository()
-    runtime = make_runtime(
-        FakeGateway(), one_step_plan(), artifact_repository=repository
-    )
+    runtime = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=repository)
     consumer = asyncio.create_task(collect(runtime, context(token_budget=100)))
     await repository.started.wait()
     stream = runtime._active_stream
@@ -4370,9 +4300,7 @@ async def test_abort_is_cancelled_only_after_full_window_then_collected_in_hard_
             write_id: UUID | None = None,
         ) -> None:
             self.stored = artifact
-            await self.delegate.put(
-                tenant_id, run_id, artifact, write_id=write_id
-            )
+            await self.delegate.put(tenant_id, run_id, artifact, write_id=write_id)
             self.started.set()
             await asyncio.Event().wait()
 
@@ -4396,18 +4324,12 @@ async def test_abort_is_cancelled_only_after_full_window_then_collected_in_hard_
             try:
                 await asyncio.sleep(0.06)
             except asyncio.CancelledError:
-                self.abort_cancelled_after = (
-                    asyncio.get_running_loop().time() - started_at
-                )
+                self.abort_cancelled_after = asyncio.get_running_loop().time() - started_at
             self.fence_applied += 1
-            return await self.delegate.abort_write(
-                tenant_id, run_id, reference, write_id=write_id
-            )
+            return await self.delegate.abort_write(tenant_id, run_id, reference, write_id=write_id)
 
     repository = GraceFenceRepository()
-    runtime = make_runtime(
-        FakeGateway(), one_step_plan(), artifact_repository=repository
-    )
+    runtime = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=repository)
     consumer = asyncio.create_task(collect(runtime, context(token_budget=100)))
     await repository.started.wait()
     stream = runtime._active_stream
@@ -4445,9 +4367,7 @@ async def test_64_aborts_share_one_full_rollback_window(
             *,
             write_id: UUID | None = None,
         ) -> None:
-            await self.delegate.put(
-                tenant_id, run_id, artifact, write_id=write_id
-            )
+            await self.delegate.put(tenant_id, run_id, artifact, write_id=write_id)
 
         async def get_many(
             self,
@@ -4476,9 +4396,7 @@ async def test_64_aborts_share_one_full_rollback_window(
                 self.active -= 1
 
     repository = ConcurrentAbortRepository()
-    runtime = make_runtime(
-        FakeGateway(), one_step_plan(), artifact_repository=repository
-    )
+    runtime = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=repository)
     state = adapter_module._RunState(token=adapter_module._RunToken(1))
     for index in range(64):
         stored = Artifact(
@@ -4489,9 +4407,7 @@ async def test_64_aborts_share_one_full_rollback_window(
         )
         reference = ArtifactReference(id=stored.id, sha256=stored.content_sha256)
         write_id = uuid4()
-        await repository.reserve_write(
-            TENANT_ID, RUN_ID, reference, write_id=write_id
-        )
+        await repository.reserve_write(TENANT_ID, RUN_ID, reference, write_id=write_id)
         await repository.put(TENANT_ID, RUN_ID, stored, write_id=write_id)
         state.pending_artifact_writes[write_id] = reference
 
@@ -4566,9 +4482,7 @@ async def test_late_put_completed_during_cancel_grace_keeps_frozen_abort_obligat
                     await asyncio.Event().wait()
                 except asyncio.CancelledError:
                     self.cancel_count += 1
-            await self.delegate.put(
-                tenant_id, run_id, artifact, write_id=write_id
-            )
+            await self.delegate.put(tenant_id, run_id, artifact, write_id=write_id)
 
         async def get_many(
             self,
@@ -4579,9 +4493,7 @@ async def test_late_put_completed_during_cancel_grace_keeps_frozen_abort_obligat
             return await self.delegate.get_many(tenant_id, run_id, references)
 
     repository = CompletesOnSecondCancelRepository()
-    runtime = make_runtime(
-        FakeGateway(), one_step_plan(), artifact_repository=repository
-    )
+    runtime = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=repository)
     consumer = asyncio.create_task(collect(runtime, context(token_budget=100)))
     await repository.started.wait()
 
@@ -4601,9 +4513,7 @@ async def test_late_put_completed_during_cancel_grace_keeps_frozen_abort_obligat
 
 async def test_every_emitted_checkpoint_is_immediately_restorable_from_shared_repository() -> None:
     repository = InMemoryArtifactRepository()
-    runtime = make_runtime(
-        FakeGateway(), one_step_plan(), artifact_repository=repository
-    )
+    runtime = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=repository)
     checkpoint_count = 0
 
     async for event in runtime.run(context(token_budget=100)):
@@ -4611,9 +4521,7 @@ async def test_every_emitted_checkpoint_is_immediately_restorable_from_shared_re
             continue
         checkpoint_count += 1
         checkpoint = event.checkpoint
-        probe = make_runtime(
-            FakeGateway(), one_step_plan(), artifact_repository=repository
-        )
+        probe = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=repository)
         await probe.restore_checkpoint(checkpoint)
         try:
             await collect(

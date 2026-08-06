@@ -109,9 +109,7 @@ class InMemoryArtifactRepository:
         self._scope_counts: dict[tuple[UUID, UUID], int] = {}
         self._scope_bytes: dict[tuple[UUID, UUID], int] = {}
         self._write_owners: dict[tuple[UUID, UUID, UUID], set[UUID] | None] = {}
-        self._write_reservations: dict[
-            tuple[UUID, UUID, UUID], tuple[ArtifactReference, str]
-        ] = {}
+        self._write_reservations: dict[tuple[UUID, UUID, UUID], tuple[ArtifactReference, str]] = {}
         self._scope_reservation_counts: dict[tuple[UUID, UUID], int] = {}
         self._lock = asyncio.Lock()
 
@@ -193,9 +191,7 @@ class InMemoryArtifactRepository:
         key = (*scope, artifact.id)
         async with self._lock:
             if write_id is not None:
-                reference = ArtifactReference(
-                    id=artifact.id, sha256=artifact.content_sha256
-                )
+                reference = ArtifactReference(id=artifact.id, sha256=artifact.content_sha256)
                 self._reserve_locked(scope, reference, write_id)
             existing = self._artifacts.get(key)
             if existing is not None:
@@ -215,10 +211,7 @@ class InMemoryArtifactRepository:
                 return
             count = self._scope_counts.get(scope, 0)
             total = self._scope_bytes.get(scope, 0)
-            if (
-                count >= self._max_artifacts_per_run
-                or total + size > self._max_total_bytes_per_run
-            ):
+            if count >= self._max_artifacts_per_run or total + size > self._max_total_bytes_per_run:
                 raise ArtifactRepositoryError("artifact repository capacity exceeded")
             self._artifacts[key] = artifact
             self._sizes[key] = size
@@ -312,6 +305,7 @@ class InMemoryArtifactRepository:
                 del self._scope_counts[scope]
                 del self._scope_bytes[scope]
             return True
+
 
 __all__ = [
     "ArtifactReference",
