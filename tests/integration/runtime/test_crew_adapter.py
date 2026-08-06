@@ -4,6 +4,7 @@ import json
 import os
 import time
 from collections.abc import Mapping
+from contextvars import Context
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -1237,9 +1238,10 @@ async def test_budget_exhaustion_is_audited_in_stable_terminal_checkpoint() -> N
         total_cost_usd=Decimal("0.01"),
     )
     runtime = make_runtime(CostGateway(Decimal("0.02")), priced_plan)
-
+    first_events: list[RunEvent] = []
     with pytest.raises(RuntimeExecutionError):
-        await collect(runtime, context())
+        async for event in runtime.run(context()):
+            first_events.append(event)
     checkpoint = await runtime.save_checkpoint()
 
     assert checkpoint.state["terminal"] is True
@@ -1249,8 +1251,73 @@ async def test_budget_exhaustion_is_audited_in_stable_terminal_checkpoint() -> N
         "cost_usd": "0.02",
     }
     assert checkpoint.state["step_usage"] == {"final": {"tokens": 2, "cost_usd": "0.02"}}
+    assert cast(int, checkpoint.state["next_sequence"]) > max(
+        event.sequence for event in first_events
+    )
     resumed_gateway = CostGateway(Decimal("0.02"))
     resumed = make_runtime(resumed_gateway, priced_plan)
+    await resumed.restore_checkpoint(checkpoint)
+    resumed_events: list[RunEvent] = []
+    with pytest.raises(RuntimeExecutionError):
+        async for event in resumed.run(context(checkpoint=checkpoint)):
+            resumed_events.append(event)
+    assert resumed_gateway.requests == []
+    assert resumed_events[0].sequence > max(event.sequence for event in first_events)
+
+
+async def test_audit_overflow_is_saturated_terminal_and_never_replayed() -> None:
+    class OverflowGateway(FakeGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            return GatewayCompletion(
+                response=ModelResponse(
+                    text="bounded output",
+                    usage=TokenUsage(100_000_001, 0, 100_000_001),
+                ),
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/chat",
+            )
+
+    overflow_plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=100,
+    )
+    gateway = OverflowGateway()
+    runtime = make_runtime(gateway, overflow_plan)
+    with pytest.raises(RuntimeExecutionError):
+        await collect(runtime, context())
+    checkpoint = await runtime.save_checkpoint()
+
+    assert checkpoint.state["terminal"] is True
+    assert checkpoint.state["phase"] == "audit_overflow"
+    assert checkpoint.state["usage"] == {"tokens": 100_000_000, "cost_usd": "0"}
+    assert checkpoint.state["audit_overflow"] == {
+        "tokens": True,
+        "cost_usd": False,
+        "step_tokens": ("final",),
+        "step_cost_usd": (),
+    }
+
+    resumed_gateway = OverflowGateway()
+    resumed = make_runtime(resumed_gateway, overflow_plan)
     await resumed.restore_checkpoint(checkpoint)
     with pytest.raises(RuntimeExecutionError):
         await collect(resumed, context(checkpoint=checkpoint))
@@ -1673,23 +1740,43 @@ async def test_missing_executor_context_fails_closed_without_external_fallback(
     )
     scope = tmp_path / "executor-context" / "scope"
     with adapter_module._active_crewai_scope(scope):
-        with pytest.raises(RuntimeError, match="context propagation"):
-            await asyncio.get_running_loop().run_in_executor(None, core_paths.db_storage_path)
+        empty_context = Context()
+        assert empty_context.run(core_paths.db_storage_path) == "must-not-be-used"
+        empty_context.run(adapter_module._contextual_crewai_trace_setup, object(), object())
         assert (
-            await asyncio.get_running_loop().run_in_executor(
-                None,
-                adapter_module._contextual_crewai_telemetry_check,
-                object(),
-            )
-            is False
-        )
-        await asyncio.get_running_loop().run_in_executor(
-            None,
-            adapter_module._contextual_crewai_trace_setup,
-            object(),
-            object(),
+            empty_context.run(adapter_module._contextual_crewai_telemetry_check, object()) is True
         )
 
+    assert external_calls == ["external"]
+    assert trace_calls == ["external"]
+    assert telemetry_calls == ["external"]
+    external_calls.clear()
+    trace_calls.clear()
+    telemetry_calls.clear()
+    assert await asyncio.get_running_loop().run_in_executor(
+        None,
+        adapter_module._call_in_crewai_scope,
+        scope,
+        core_paths.db_storage_path,
+    ) == str(scope)
+    assert (
+        await asyncio.get_running_loop().run_in_executor(
+            None,
+            adapter_module._call_in_crewai_scope,
+            scope,
+            adapter_module._contextual_crewai_telemetry_check,
+            object(),
+        )
+        is False
+    )
+    await asyncio.get_running_loop().run_in_executor(
+        None,
+        adapter_module._call_in_crewai_scope,
+        scope,
+        adapter_module._contextual_crewai_trace_setup,
+        object(),
+        object(),
+    )
     assert external_calls == []
     assert trace_calls == []
     assert telemetry_calls == []

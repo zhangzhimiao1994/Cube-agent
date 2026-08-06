@@ -39,7 +39,7 @@ from agent_hub.runtime.contracts import (
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 
 _RUNTIME_TYPE = "crew"
-_RUNTIME_VERSION = "3"
+_RUNTIME_VERSION = "4"
 _MAX_PROMPT_BYTES = 196_608
 _MAX_OUTPUT_BYTES = 65_536
 _MAX_TOOL_ROUNDS = 8
@@ -61,8 +61,6 @@ _CREWAI_TELEMETRY_DISABLED: ContextVar[bool] = ContextVar(
 _CREWAI_DEFAULT_STORAGE_PATH: Any | None = None
 _CREWAI_DEFAULT_TRACE_SETUP: Any | None = None
 _CREWAI_DEFAULT_TELEMETRY_CHECK: Any | None = None
-_CREWAI_ACTIVE_LOCK = threading.Lock()
-_CREWAI_ACTIVE_SCOPES = 0
 _CREWAI_STORAGE_MODULES = (
     "crewai.flow.persistence.sqlite",
     "crewai.memory.storage.kickoff_task_outputs_storage",
@@ -79,8 +77,6 @@ def _contextual_crewai_storage_path() -> str:
     if scoped is not None:
         scoped.mkdir(parents=True, exist_ok=True)
         return str(scoped)
-    if _crewai_scope_is_active():
-        raise RuntimeError("CrewAI context propagation is unavailable")
     fallback = _CREWAI_DEFAULT_STORAGE_PATH
     if fallback is None:
         raise RuntimeError("CrewAI storage router is unavailable")
@@ -88,7 +84,7 @@ def _contextual_crewai_storage_path() -> str:
 
 
 def _contextual_crewai_trace_setup(listener: object, event_bus: object) -> None:
-    if _CREWAI_TRACE_DISABLED.get() or _crewai_scope_is_active():
+    if _CREWAI_TRACE_DISABLED.get():
         return
     fallback = _CREWAI_DEFAULT_TRACE_SETUP
     if fallback is None:
@@ -97,7 +93,7 @@ def _contextual_crewai_trace_setup(listener: object, event_bus: object) -> None:
 
 
 def _contextual_crewai_telemetry_check(instance: object) -> bool:
-    if _CREWAI_TELEMETRY_DISABLED.get() or _crewai_scope_is_active():
+    if _CREWAI_TELEMETRY_DISABLED.get():
         return False
     fallback = _CREWAI_DEFAULT_TELEMETRY_CHECK
     if fallback is None:
@@ -105,28 +101,23 @@ def _contextual_crewai_telemetry_check(instance: object) -> bool:
     return bool(fallback(instance))
 
 
-def _crewai_scope_is_active() -> bool:
-    with _CREWAI_ACTIVE_LOCK:
-        return _CREWAI_ACTIVE_SCOPES > 0
-
-
 @contextmanager
 def _active_crewai_scope(storage_path: Path) -> Any:
-    global _CREWAI_ACTIVE_SCOPES
     storage_path.mkdir(parents=True, exist_ok=True)
     storage_token = _CREWAI_STORAGE_CONTEXT.set(storage_path)
     trace_token = _CREWAI_TRACE_DISABLED.set(True)
     telemetry_token = _CREWAI_TELEMETRY_DISABLED.set(True)
-    with _CREWAI_ACTIVE_LOCK:
-        _CREWAI_ACTIVE_SCOPES += 1
     try:
         yield
     finally:
-        with _CREWAI_ACTIVE_LOCK:
-            _CREWAI_ACTIVE_SCOPES -= 1
         _CREWAI_TELEMETRY_DISABLED.reset(telemetry_token)
         _CREWAI_TRACE_DISABLED.reset(trace_token)
         _CREWAI_STORAGE_CONTEXT.reset(storage_token)
+
+
+def _call_in_crewai_scope(storage_path: Path, callback: Any, *args: object) -> Any:
+    with _active_crewai_scope(storage_path):
+        return callback(*args)
 
 
 def _mutable_json(value: JsonValue) -> object:
@@ -357,7 +348,13 @@ class _CrewAIGeneration:
                 stream=False,
                 tracing=False,
             )
-            output = await crew.akickoff(inputs={})
+        output = await asyncio.get_running_loop().run_in_executor(
+            None,
+            _call_in_crewai_scope,
+            storage_path,
+            crew.kickoff,
+            {},
+        )
         raw = getattr(output, "raw", None)
         if type(raw) is not str or not raw.strip() or len(raw.encode("utf-8")) > _MAX_OUTPUT_BYTES:
             raise RuntimeExecutionError("CrewAI output is invalid")
@@ -479,6 +476,10 @@ class _UsageLedger:
     step_tokens: dict[str, int] = field(default_factory=dict)
     step_costs_usd: dict[str, Decimal] = field(default_factory=dict)
     terminal_phase: str | None = None
+    token_overflow: bool = False
+    cost_overflow: bool = False
+    step_token_overflows: set[str] = field(default_factory=set)
+    step_cost_overflows: set[str] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -655,7 +656,11 @@ class CrewDispatchRuntime:
                     )
                     await queue.put(_Terminal())
                     return
-                if restored_phase in {"budget_exhausted", "unaccounted"}:
+                if restored_phase in {
+                    "budget_exhausted",
+                    "unaccounted",
+                    "audit_overflow",
+                }:
                     await emit(
                         kind=EventKind.RUNTIME_FAILED,
                         reason="dispatch accounting exhausted",
@@ -692,6 +697,8 @@ class CrewDispatchRuntime:
                 async with checkpoint_lock:
                     if not run_open or not self._is_current_run(state):
                         return
+                    if usage_ledger.terminal_phase is not None:
+                        return
                     retry_counts[step_id] = retries
                     if review_artifact is not None:
                         review_ledger.artifacts[step_id] = review_artifact
@@ -717,6 +724,8 @@ class CrewDispatchRuntime:
             ) -> None:
                 async with checkpoint_lock:
                     if not run_open or not self._is_current_run(state):
+                        return
+                    if usage_ledger.terminal_phase is not None:
                         return
                     tool_ledger.states[key] = tool_state
                     if artifact is not None:
@@ -745,25 +754,41 @@ class CrewDispatchRuntime:
                         return
                     response_tokens = 0 if response_usage is None else response_usage.total_tokens
                     response_cost = completion.cost_usd
-                    new_tokens = usage_ledger.tokens + response_tokens
-                    new_step_tokens = usage_ledger.step_tokens.get(step_id, 0) + response_tokens
-                    new_cost = usage_ledger.cost_usd + (response_cost or Decimal(0))
-                    new_step_cost = usage_ledger.step_costs_usd.get(step_id, Decimal(0)) + (
+                    raw_new_tokens = usage_ledger.tokens + response_tokens
+                    raw_step_tokens = usage_ledger.step_tokens.get(step_id, 0) + response_tokens
+                    raw_new_cost = usage_ledger.cost_usd + (response_cost or Decimal(0))
+                    raw_step_cost = usage_ledger.step_costs_usd.get(step_id, Decimal(0)) + (
                         response_cost or Decimal(0)
                     )
-                    if (
-                        new_tokens > _MAX_AUDITED_TOKENS
-                        or new_step_tokens > _MAX_AUDITED_TOKENS
-                        or new_cost > _MAX_AUDITED_COST_USD
-                        or new_step_cost > _MAX_AUDITED_COST_USD
-                    ):
-                        _fail("model usage exceeds audit safety limit")
+                    token_overflow = raw_new_tokens > _MAX_AUDITED_TOKENS
+                    step_token_overflow = raw_step_tokens > _MAX_AUDITED_TOKENS
+                    cost_overflow = raw_new_cost > _MAX_AUDITED_COST_USD
+                    step_cost_overflow = raw_step_cost > _MAX_AUDITED_COST_USD
+                    new_tokens = min(raw_new_tokens, _MAX_AUDITED_TOKENS)
+                    new_step_tokens = min(raw_step_tokens, _MAX_AUDITED_TOKENS)
+                    new_cost = min(raw_new_cost, _MAX_AUDITED_COST_USD)
+                    new_step_cost = min(raw_step_cost, _MAX_AUDITED_COST_USD)
                     usage_ledger.tokens = new_tokens
                     usage_ledger.cost_usd = new_cost
                     usage_ledger.step_tokens[step_id] = new_step_tokens
                     usage_ledger.step_costs_usd[step_id] = new_step_cost
+                    usage_ledger.token_overflow |= token_overflow
+                    usage_ledger.cost_overflow |= cost_overflow
+                    if step_token_overflow:
+                        usage_ledger.step_token_overflows.add(step_id)
+                    if step_cost_overflow:
+                        usage_ledger.step_cost_overflows.add(step_id)
                     terminal_phase = usage_ledger.terminal_phase
-                    if terminal_phase is None and (response_usage is None or response_cost is None):
+                    if (
+                        usage_ledger.token_overflow
+                        or usage_ledger.cost_overflow
+                        or usage_ledger.step_token_overflows
+                        or usage_ledger.step_cost_overflows
+                    ):
+                        terminal_phase = "audit_overflow"
+                    elif terminal_phase is None and (
+                        response_usage is None or response_cost is None
+                    ):
                         terminal_phase = "unaccounted"
                     elif terminal_phase is None and (
                         new_tokens > min(context.token_budget, plan.total_token_budget)
@@ -781,6 +806,8 @@ class CrewDispatchRuntime:
                             cost_usd=response_cost,
                             currency="USD",
                         )
+                    if terminal_phase is not None:
+                        raise _StableTerminalError("dispatch accounting exhausted")
                     checkpoint = self._make_checkpoint(
                         context,
                         plan,
@@ -790,13 +817,11 @@ class CrewDispatchRuntime:
                         usage_ledger,
                         review_ledger,
                         next_sequence=sequence.value + 2,
-                        terminal=terminal_phase is not None,
-                        phase=terminal_phase or "running",
+                        terminal=False,
+                        phase="running",
                     )
                     self._publish_checkpoint(state, checkpoint)
                     await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
-                    if terminal_phase is not None:
-                        raise _StableTerminalError("dispatch accounting exhausted")
 
             while len(completed) < len(steps):
                 ready = tuple(
@@ -848,6 +873,8 @@ class CrewDispatchRuntime:
                                 failures.append(error)
                         for result in sorted(successful, key=lambda item: item.step.id):
                             async with checkpoint_lock:
+                                if usage_ledger.terminal_phase is not None:
+                                    continue
                                 completed[result.step.id] = result.artifact
                                 retry_counts[result.step.id] = result.retries
                                 checkpoint = self._make_checkpoint(
@@ -926,6 +953,21 @@ class CrewDispatchRuntime:
                 kind=EventKind.RUNTIME_FAILED,
                 reason="dispatch accounting exhausted",
             )
+            if plan is not None and usage_ledger.terminal_phase is not None:
+                checkpoint = self._make_checkpoint(
+                    context,
+                    plan,
+                    completed,
+                    retry_counts,
+                    tool_ledger,
+                    usage_ledger,
+                    review_ledger,
+                    next_sequence=sequence.value + 2,
+                    terminal=True,
+                    phase=usage_ledger.terminal_phase,
+                )
+                self._publish_checkpoint(state, checkpoint)
+                await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None
@@ -1659,6 +1701,12 @@ class CrewDispatchRuntime:
                     }
                     for key in sorted(usage_ledger.step_tokens)
                 },
+                "audit_overflow": {
+                    "tokens": usage_ledger.token_overflow,
+                    "cost_usd": usage_ledger.cost_overflow,
+                    "step_tokens": tuple(sorted(usage_ledger.step_token_overflows)),
+                    "step_cost_usd": tuple(sorted(usage_ledger.step_cost_overflows)),
+                },
             },
         )
 
@@ -1689,6 +1737,7 @@ class CrewDispatchRuntime:
             "review_refs",
             "usage",
             "step_usage",
+            "audit_overflow",
         }:
             _fail("runtime checkpoint is incompatible")
         completed = state["completed"]
@@ -1699,6 +1748,7 @@ class CrewDispatchRuntime:
         review_refs = state["review_refs"]
         usage = state["usage"]
         step_usage = state["step_usage"]
+        audit_overflow = state["audit_overflow"]
         if (
             not isinstance(completed, tuple)
             or not isinstance(frontier, tuple)
@@ -1708,6 +1758,7 @@ class CrewDispatchRuntime:
             or not isinstance(review_refs, Mapping)
             or not isinstance(usage, Mapping)
             or not isinstance(step_usage, Mapping)
+            or not isinstance(audit_overflow, Mapping)
             or type(state["next_sequence"]) is not int
             or type(state["terminal"]) is not bool
             or state["phase"]
@@ -1718,6 +1769,7 @@ class CrewDispatchRuntime:
                 "failed",
                 "budget_exhausted",
                 "unaccounted",
+                "audit_overflow",
             }
             or not 1 <= state["next_sequence"] <= 2**63 - 1
         ):
@@ -1727,6 +1779,16 @@ class CrewDispatchRuntime:
             or type(usage["tokens"]) is not int
             or not 0 <= usage["tokens"] <= _MAX_AUDITED_TOKENS
             or type(usage["cost_usd"]) is not str
+        ):
+            _fail("runtime checkpoint is incompatible")
+        if (
+            set(audit_overflow) != {"tokens", "cost_usd", "step_tokens", "step_cost_usd"}
+            or type(audit_overflow["tokens"]) is not bool
+            or type(audit_overflow["cost_usd"]) is not bool
+            or not isinstance(audit_overflow["step_tokens"], tuple)
+            or not isinstance(audit_overflow["step_cost_usd"], tuple)
+            or not all(type(item) is str for item in audit_overflow["step_tokens"])
+            or not all(type(item) is str for item in audit_overflow["step_cost_usd"])
         ):
             _fail("runtime checkpoint is incompatible")
         try:
@@ -1742,6 +1804,15 @@ class CrewDispatchRuntime:
         ):
             _fail("runtime checkpoint is incompatible")
         steps = {step.id: step for step in plan.steps}
+        token_overflow_steps = set(cast(tuple[str, ...], audit_overflow["step_tokens"]))
+        cost_overflow_steps = set(cast(tuple[str, ...], audit_overflow["step_cost_usd"]))
+        if (
+            len(token_overflow_steps) != len(audit_overflow["step_tokens"])
+            or len(cost_overflow_steps) != len(audit_overflow["step_cost_usd"])
+            or not token_overflow_steps <= set(steps)
+            or not cost_overflow_steps <= set(steps)
+        ):
+            _fail("runtime checkpoint is incompatible")
         parsed_step_tokens: dict[str, int] = {}
         parsed_step_costs: dict[str, Decimal] = {}
         for step_id, raw_step_usage in step_usage.items():
@@ -1769,9 +1840,27 @@ class CrewDispatchRuntime:
                 _fail("runtime checkpoint is incompatible")
             parsed_step_tokens[step_id] = raw_step_usage["tokens"]
             parsed_step_costs[step_id] = step_cost
+        token_overflow = audit_overflow["tokens"]
+        cost_overflow = audit_overflow["cost_usd"]
+        summed_step_tokens = sum(parsed_step_tokens.values())
+        summed_step_cost = sum(parsed_step_costs.values(), Decimal(0))
         if (
-            sum(parsed_step_tokens.values()) != usage["tokens"]
-            or sum(parsed_step_costs.values(), Decimal(0)) != checkpoint_cost
+            (token_overflow and usage["tokens"] != _MAX_AUDITED_TOKENS)
+            or (not token_overflow and summed_step_tokens != usage["tokens"])
+            or (token_overflow and summed_step_tokens < usage["tokens"])
+            or (cost_overflow and checkpoint_cost != _MAX_AUDITED_COST_USD)
+            or (not cost_overflow and summed_step_cost != checkpoint_cost)
+            or (cost_overflow and summed_step_cost < checkpoint_cost)
+            or (bool(token_overflow_steps) and not token_overflow)
+            or (bool(cost_overflow_steps) and not cost_overflow)
+            or any(
+                parsed_step_tokens.get(step_id) != _MAX_AUDITED_TOKENS
+                for step_id in token_overflow_steps
+            )
+            or any(
+                parsed_step_costs.get(step_id) != _MAX_AUDITED_COST_USD
+                for step_id in cost_overflow_steps
+            )
         ):
             _fail("runtime checkpoint is incompatible")
         if not all(type(item) is str for item in completed):
@@ -1890,13 +1979,19 @@ class CrewDispatchRuntime:
             "completed",
             "budget_exhausted",
             "unaccounted",
+            "audit_overflow",
         }
+        any_overflow = token_overflow or cost_overflow
         if (
             frontier != expected_frontier
             or terminal_phase is not state["terminal"]
             or (state["phase"] == "completed" and len(completed_set) != len(steps))
-            or (state["phase"] == "budget_exhausted") is not budget_exceeded
-            or (state["phase"] not in {"budget_exhausted", "unaccounted"} and budget_exceeded)
+            or (state["phase"] == "budget_exhausted" and not budget_exceeded)
+            or (state["phase"] == "audit_overflow") is not any_overflow
+            or (
+                state["phase"] not in {"budget_exhausted", "unaccounted", "audit_overflow"}
+                and budget_exceeded
+            )
         ):
             _fail("runtime checkpoint is incompatible")
 
@@ -1960,6 +2055,7 @@ class CrewDispatchRuntime:
                 raise CapabilityOutcomeUncertain("capability outcome requires confirmation")
         usage = cast(Mapping[str, JsonValue], checkpoint.state["usage"])
         step_usage = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["step_usage"])
+        audit_overflow = cast(Mapping[str, JsonValue], checkpoint.state["audit_overflow"])
         usage_ledger = _UsageLedger(
             tokens=cast(int, usage["tokens"]),
             cost_usd=Decimal(cast(str, usage["cost_usd"])),
@@ -1972,9 +2068,14 @@ class CrewDispatchRuntime:
             },
             terminal_phase=(
                 checkpoint.state["phase"]
-                if checkpoint.state["phase"] in {"budget_exhausted", "unaccounted"}
+                if checkpoint.state["phase"]
+                in {"budget_exhausted", "unaccounted", "audit_overflow"}
                 else None
             ),
+            token_overflow=cast(bool, audit_overflow["tokens"]),
+            cost_overflow=cast(bool, audit_overflow["cost_usd"]),
+            step_token_overflows=set(cast(tuple[str, ...], audit_overflow["step_tokens"])),
+            step_cost_overflows=set(cast(tuple[str, ...], audit_overflow["step_cost_usd"])),
         )
         review_ledger = _ReviewLedger()
         review_refs = cast(Mapping[str, Mapping[str, str]], checkpoint.state["review_refs"])
