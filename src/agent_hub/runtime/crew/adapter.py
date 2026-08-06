@@ -16,7 +16,7 @@ import re
 import sys
 import threading
 import weakref
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Coroutine, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -567,6 +567,7 @@ class _RunState:
     deadline: float | None = None
     crew_generation: CrewStepGeneration | None = None
     open: bool = True
+    commit_tasks: set[asyncio.Task[None]] = field(default_factory=set)
 
 
 class CrewRunStream:
@@ -655,34 +656,49 @@ class CrewDispatchRuntime:
         return stream
 
     async def _run(self, context: TaskContext, state: _RunState) -> AsyncIterator[RunEvent]:
-        queue: asyncio.Queue[RunEvent | _Terminal] = asyncio.Queue(maxsize=512)
-        coordinator = asyncio.create_task(self._coordinate(context, queue, state))
+        queue: asyncio.Queue[RunEvent] = asyncio.Queue(maxsize=512)
+        terminal_future: asyncio.Future[_Terminal] = (
+            asyncio.get_running_loop().create_future()
+        )
+        coordinator = asyncio.create_task(
+            self._coordinate(context, queue, terminal_future, state)
+        )
         self._active_task = coordinator
         try:
             while True:
-                item = await queue.get()
-                if isinstance(item, _Terminal):
-                    if item.error is not None:
-                        if isinstance(item.error, asyncio.CancelledError):
-                            raise item.error
-                        raise item.error from None
+                if terminal_future.done() and queue.empty():
+                    terminal = terminal_future.result()
+                    if terminal.error is not None:
+                        if isinstance(terminal.error, asyncio.CancelledError):
+                            raise terminal.error
+                        raise terminal.error from None
                     return
-                yield item
+                next_event = asyncio.create_task(queue.get())
+                ready, _ = await asyncio.wait(
+                    (next_event, terminal_future),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if next_event in ready:
+                    yield next_event.result()
+                    continue
+                next_event.cancel()
+                await asyncio.gather(next_event, return_exceptions=True)
         finally:
             if not coordinator.done():
                 coordinator.cancel()
             await asyncio.gather(coordinator, return_exceptions=True)
             self._active_task = None
             self._active_stream = None
-            done = self._active_done
+            active_done = self._active_done
             self._active_done = None
-            if done is not None:
-                done.set()
+            if active_done is not None:
+                active_done.set()
 
     async def _coordinate(
         self,
         context: TaskContext,
-        queue: asyncio.Queue[RunEvent | _Terminal],
+        queue: asyncio.Queue[RunEvent],
+        terminal_future: asyncio.Future[_Terminal],
         state: _RunState,
     ) -> None:
         sequence = _Sequence()
@@ -1047,6 +1063,28 @@ class CrewDispatchRuntime:
                         phase=terminal_phase or "running",
                         artifact_registry=candidate_registry,
                     )
+                    checkpoint = self._make_checkpoint(
+                        context,
+                        plan,
+                        completed,
+                        retry_counts,
+                        tool_ledger,
+                        candidate_models,
+                        candidate_usage,
+                        review_ledger,
+                        next_sequence=sequence.value
+                        + (
+                            (6 if response_cost else 5)
+                            if terminal_phase is not None
+                            else (4 if response_cost else 3)
+                        ),
+                        terminal=terminal_phase is not None,
+                        phase=terminal_phase or "running",
+                        artifact_registry={
+                            **artifact_registry,
+                            str(artifact.id): artifact,
+                        },
+                    )
                     await store_artifact(artifact)
                     model_ledger.states[key] = model_state
                     model_ledger.artifacts[key] = artifact
@@ -1070,9 +1108,9 @@ class CrewDispatchRuntime:
                             cost_usd=response_cost,
                             currency="USD",
                         )
+                    await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
                     if terminal_phase is not None:
                         raise _StableTerminalError("dispatch accounting exhausted")
-                    await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
 
             while len(completed) < len(steps):
                 ready = tuple(
@@ -1124,6 +1162,12 @@ class CrewDispatchRuntime:
                                 raise
                             except Exception as error:  # noqa: BLE001
                                 failures.append(error)
+                        if failures:
+                            for failure in failures:
+                                failure.__traceback__ = None
+                                failure.__context__ = None
+                                failure.__cause__ = None
+                            raise failures[0]
                         for result in sorted(successful, key=lambda item: item.step.id):
                             async with checkpoint_lock:
                                 if usage_ledger.terminal_phase is not None:
@@ -1158,12 +1202,6 @@ class CrewDispatchRuntime:
                                     kind=EventKind.CHECKPOINT_SAVED,
                                     checkpoint=checkpoint,
                                 )
-                        if failures:
-                            for failure in failures:
-                                failure.__traceback__ = None
-                                failure.__context__ = None
-                                failure.__cause__ = None
-                            raise failures[0]
                 except asyncio.CancelledError:
                     await self._cancel_tasks_bounded(tuple(tasks))
                     raise
@@ -1196,16 +1234,31 @@ class CrewDispatchRuntime:
                             phase="cancelled",
                         )
                         self._publish_checkpoint(state, checkpoint)
-                        await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
-                    await emit(kind=EventKind.RUNTIME_CANCELLED)
+                        if run_open and self._is_current_run(state):
+                            try:
+                                queue.put_nowait(
+                                    await sequence.event(
+                                        run_id=context.run_id,
+                                        kind=EventKind.CHECKPOINT_SAVED,
+                                        checkpoint=checkpoint,
+                                    )
+                                )
+                            except asyncio.QueueFull as queue_full:
+                                del queue_full
+                    if run_open and self._is_current_run(state):
+                        try:
+                            queue.put_nowait(
+                                await sequence.event(
+                                    run_id=context.run_id,
+                                    kind=EventKind.RUNTIME_CANCELLED,
+                                )
+                            )
+                        except asyncio.QueueFull as queue_full:
+                            del queue_full
                 except Exception:  # noqa: BLE001 - terminal delivery is authoritative
                     return
 
-            cleanup = asyncio.create_task(finish_cancel())
-            try:
-                await asyncio.shield(cleanup)
-            except asyncio.CancelledError:
-                await asyncio.wait({cleanup}, timeout=5)
+            await finish_cancel()
             run_open = False
             raise
         except _StableTerminalError as error:
@@ -1257,12 +1310,13 @@ class CrewDispatchRuntime:
             state.open = False
             state.deadline = None
             state.crew_generation = None
+            if state.commit_tasks:
+                await self._cancel_tasks_bounded(tuple(state.commit_tasks))
+                state.commit_tasks.clear()
             if terminal_item is None:
                 terminal_item = _Terminal(RuntimeExecutionError("dispatch execution failed"))
-            try:
-                queue.put_nowait(terminal_item)
-            except asyncio.QueueFull:
-                await asyncio.shield(queue.put(terminal_item))
+            if not terminal_future.done():
+                terminal_future.set_result(terminal_item)
 
     async def _execute_step(
         self,
@@ -1615,7 +1669,7 @@ class CrewDispatchRuntime:
                         "provider_model": completion.provider_model,
                     },
                 )
-                await asyncio.shield(
+                await self._run_commit(
                     usage_boundary(
                         completion,
                         step.agent,
@@ -1623,7 +1677,8 @@ class CrewDispatchRuntime:
                         key,
                         succeeded,
                         model_artifact,
-                    )
+                    ),
+                    run_state,
                 )
                 evidence.append(model_artifact)
             assert response is not None
@@ -2115,7 +2170,7 @@ class CrewDispatchRuntime:
                             "provider_model": completion.provider_model,
                         },
                     )
-                    await asyncio.shield(
+                    await runtime._run_commit(
                         usage_boundary(
                             completion,
                             reviewer.id,
@@ -2123,7 +2178,8 @@ class CrewDispatchRuntime:
                             key,
                             succeeded,
                             model_artifact,
-                        )
+                        ),
+                        run_state,
                     )
                     evidence.append(model_artifact)
                 response = runtime._valid_response(completion)
@@ -2181,6 +2237,21 @@ class CrewDispatchRuntime:
         if response.text is None and not response.tool_calls:
             _fail("model response is invalid")
         return response
+
+    async def _run_commit(
+        self,
+        commit: Coroutine[Any, Any, None],
+        run_state: _RunState,
+    ) -> None:
+        task = asyncio.create_task(commit)
+        run_state.commit_tasks.add(task)
+        try:
+            await task
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            run_state.commit_tasks.discard(task)
 
     @staticmethod
     def _remaining_timeout(run_state: _RunState, step_deadline: float | None = None) -> float:

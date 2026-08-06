@@ -3299,3 +3299,227 @@ async def test_unexpected_repository_exception_still_delivers_terminal() -> None
 
     with pytest.raises(RuntimeExecutionError, match="execution failed"):
         await asyncio.wait_for(collect(runtime, context(token_budget=100)), timeout=2)
+
+
+async def test_pre_capability_checkpoints_never_publish_provisional_success() -> None:
+    class BlockingCapabilities(FakeCapabilities):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+
+        async def execute(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.started.set()
+            await asyncio.Event().wait()
+            return await super().execute(**kwargs)  # pragma: no cover
+
+    repository = InMemoryArtifactRepository()
+    capabilities = BlockingCapabilities()
+    runtime = make_runtime(
+        ToolGateway(),
+        one_step_plan(tools=("web.search",)),
+        capability_gateway=capabilities,
+        artifact_repository=repository,
+    )
+    events: list[RunEvent] = []
+    checkpoint_seen = asyncio.Event()
+
+    async def consume() -> None:
+        async for event in runtime.run(context(token_budget=100)):
+            events.append(event)
+            if event.kind is EventKind.CHECKPOINT_SAVED:
+                checkpoint_seen.set()
+
+    task = asyncio.create_task(consume())
+    await capabilities.started.wait()
+    await checkpoint_seen.wait()
+    checkpoints = tuple(
+        event.checkpoint
+        for event in events
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    )
+    assert checkpoints
+    for checkpoint in checkpoints:
+        tools = cast(Mapping[str, Mapping[str, object]], checkpoint.state["tools"])
+        assert all(tool["status"] != "succeeded" for tool in tools.values())
+        registry = cast(Mapping[str, str], checkpoint.state["artifact_registry"])
+        references = tuple(
+            ArtifactReference(id=UUID(artifact_id), sha256=sha256)
+            for artifact_id, sha256 in registry.items()
+        )
+        assert len(
+            await repository.get_many(TENANT_ID, RUN_ID, references)
+        ) == len(references)
+
+    await runtime.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.parametrize(
+    "terminal_phase",
+    ("budget_exhausted", "unaccounted", "audit_overflow"),
+)
+async def test_stable_terminal_checkpoint_is_emitted_and_durably_restorable(
+    terminal_phase: str,
+) -> None:
+    class TerminalGateway(FakeGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            usage = (
+                TokenUsage(100_000_001, 0, 100_000_001)
+                if terminal_phase == "audit_overflow"
+                else TokenUsage(1, 1, 2)
+            )
+            return GatewayCompletion(
+                response=ModelResponse(text="bounded", usage=usage),
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/chat",
+                cost_usd=(
+                    None
+                    if terminal_phase == "unaccounted"
+                    else Decimal("0.02")
+                    if terminal_phase == "budget_exhausted"
+                    else Decimal(0)
+                ),
+            )
+
+    terminal_plan = DispatchPlan(
+        agents=(
+            AgentSpec(id="writer", role="writer", goal="Write", logical_model="general"),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                final_synthesizer=True,
+                token_budget=100,
+                cost_budget_usd=(
+                    Decimal("0.01")
+                    if terminal_phase == "budget_exhausted"
+                    else Decimal(0)
+                ),
+            ),
+        ),
+        total_token_budget=100,
+        total_cost_usd=(
+            Decimal("0.01")
+            if terminal_phase == "budget_exhausted"
+            else Decimal(0)
+        ),
+    )
+    repository = InMemoryArtifactRepository()
+    first_gateway = TerminalGateway()
+    first = make_runtime(
+        first_gateway,
+        terminal_plan,
+        artifact_repository=repository,
+    )
+    events: list[RunEvent] = []
+    with pytest.raises(RuntimeExecutionError):
+        async for event in first.run(context(token_budget=100)):
+            events.append(event)
+    checkpoint = await first.save_checkpoint()
+
+    assert checkpoint.state["phase"] == terminal_phase
+    assert checkpoint.id in {
+        event.checkpoint.id
+        for event in events
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    }
+
+    resumed_gateway = FakeGateway()
+    capabilities = FakeCapabilities()
+    resumed = make_runtime(
+        resumed_gateway,
+        terminal_plan,
+        capability_gateway=capabilities,
+        artifact_repository=repository,
+    )
+    await resumed.restore_checkpoint(checkpoint)
+    with pytest.raises(RuntimeExecutionError):
+        await collect(
+            resumed,
+            context(checkpoint=checkpoint, token_budget=100),
+        )
+    assert resumed_gateway.requests == []
+    assert capabilities.calls == []
+
+
+async def test_cancel_during_artifact_commit_leaves_no_commit_task_and_reuses_runtime() -> None:
+    class BlockingRepository:
+        def __init__(self) -> None:
+            self.delegate = InMemoryArtifactRepository()
+            self.block = True
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def put(self, tenant_id: UUID, run_id: UUID, artifact: Artifact) -> None:
+            if self.block:
+                self.started.set()
+                await self.release.wait()
+            await self.delegate.put(tenant_id, run_id, artifact)
+
+        async def get_many(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            references: tuple[ArtifactReference, ...],
+        ) -> tuple[Artifact, ...]:
+            return await self.delegate.get_many(tenant_id, run_id, references)
+
+    repository = BlockingRepository()
+    runtime = make_runtime(
+        FakeGateway(),
+        one_step_plan(),
+        artifact_repository=repository,
+    )
+    consumer = asyncio.create_task(collect(runtime, context(token_budget=100)))
+    await repository.started.wait()
+
+    await asyncio.wait_for(runtime.cancel(), timeout=2)
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+    pending_commits = tuple(
+        task
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+        and not task.done()
+        and "usage_boundary" in repr(task.get_coro())
+    )
+    try:
+        assert pending_commits == ()
+    finally:
+        repository.release.set()
+        await asyncio.gather(*pending_commits, return_exceptions=True)
+
+    repository.block = False
+    assert (
+        await collect(runtime, context(token_budget=100))
+    )[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_early_close_with_full_event_queue_is_bounded_and_runtime_reusable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter_module = importlib.import_module("agent_hub.runtime.crew.adapter")
+    queue_type = asyncio.Queue
+    monkeypatch.setattr(
+        adapter_module.asyncio,
+        "Queue",
+        lambda maxsize=0: queue_type(maxsize=1),
+    )
+    runtime = make_runtime(FakeGateway(), one_step_plan())
+    stream = cast(CrewRunStream, runtime.run(context(token_budget=100)))
+
+    await anext(stream)
+    await asyncio.wait_for(stream.aclose(), timeout=2)
+
+    assert (
+        await asyncio.wait_for(
+            collect(runtime, context(token_budget=100)),
+            timeout=2,
+        )
+    )[-1].kind is EventKind.RUNTIME_COMPLETED
