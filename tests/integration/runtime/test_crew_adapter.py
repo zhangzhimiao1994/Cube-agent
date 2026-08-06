@@ -14,7 +14,7 @@ import pytest
 
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.capacity import CapacityLease
-from agent_hub.models.gateway import GatewayCompletion
+from agent_hub.models.gateway import DeploymentPricing, GatewayCompletion
 from agent_hub.models.gateway import ModelGateway as LeasedModelGateway
 from agent_hub.models.registry import ModelRegistry
 from agent_hub.models.types import (
@@ -24,7 +24,7 @@ from agent_hub.models.types import (
     TokenUsage,
     ToolCall,
 )
-from agent_hub.runtime.contracts import EventKind, RunEvent, TaskContext
+from agent_hub.runtime.contracts import EventKind, RunEvent, RuntimeCheckpoint, TaskContext
 from agent_hub.runtime.crew.adapter import (
     CapabilityGateway,
     CapabilityOutcomeUncertain,
@@ -325,7 +325,19 @@ async def test_real_model_gateway_queues_agents_sharing_one_quota_scope() -> Non
     )
     capacity = SharedCapacity()
     transport = Transport()
-    gateway = LeasedModelGateway(ModelRegistry(deployments), capacity, Secrets(), transport)
+    gateway = LeasedModelGateway(
+        ModelRegistry(deployments),
+        capacity,
+        Secrets(),
+        transport,
+        pricing={
+            deployment.id: DeploymentPricing(
+                input_per_million_usd=Decimal(0),
+                output_per_million_usd=Decimal(0),
+            )
+            for deployment in deployments
+        },
+    )
 
     events = await collect(make_runtime(gateway), context())
 
@@ -495,6 +507,23 @@ async def test_checkpoint_can_resume_completed_run_without_model_calls() -> None
     resumed = await collect(second, context(checkpoint=checkpoint, artifacts=stored_artifacts))
     assert [event.kind for event in resumed] == [EventKind.RUNTIME_COMPLETED]
     assert not second_gateway.requests
+
+
+async def test_checkpoint_rejects_mismatched_step_usage_ledger() -> None:
+    first = make_runtime(FakeGateway())
+    events = await collect(first, context())
+    checkpoint = next(
+        event.checkpoint for event in reversed(events) if event.checkpoint is not None
+    )
+    payload = checkpoint.to_payload()
+    state = cast(dict[str, object], payload["state"])
+    step_usage = cast(dict[str, dict[str, object]], state["step_usage"])
+    step_usage["left"]["tokens"] = 999
+    payload["state_sha256"] = ""
+    tampered = RuntimeCheckpoint.from_payload(payload)
+    resumed = make_runtime(FakeGateway())
+    with pytest.raises(RuntimeExecutionError):
+        await resumed.restore_checkpoint(tampered)
 
 
 async def test_nonterminal_checkpoint_resumes_sequence_without_rerunning_sibling() -> None:
@@ -1160,6 +1189,11 @@ async def test_trusted_cost_is_atomic_in_parallel_checkpoint_and_retry() -> None
         "tokens": 12,
         "cost_usd": "0.06",
     }
+    assert final_checkpoint.state["step_usage"] == {
+        "final": {"tokens": 2, "cost_usd": "0.01"},
+        "left": {"tokens": 8, "cost_usd": "0.04"},
+        "right": {"tokens": 2, "cost_usd": "0.01"},
+    }
 
 
 async def test_trusted_cost_fails_closed_at_step_budget() -> None:
@@ -1177,6 +1211,210 @@ async def test_trusted_cost_fails_closed_at_step_budget() -> None:
             make_runtime(CostGateway(Decimal("0.02")), priced_plan),
             context(),
         )
+
+
+async def test_budget_exhaustion_is_audited_in_stable_terminal_checkpoint() -> None:
+    priced_plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                final_synthesizer=True,
+                token_budget=100,
+                cost_budget_usd=Decimal("0.01"),
+            ),
+        ),
+        total_token_budget=100,
+        total_cost_usd=Decimal("0.01"),
+    )
+    runtime = make_runtime(CostGateway(Decimal("0.02")), priced_plan)
+
+    with pytest.raises(RuntimeExecutionError):
+        await collect(runtime, context())
+    checkpoint = await runtime.save_checkpoint()
+
+    assert checkpoint.state["terminal"] is True
+    assert checkpoint.state["phase"] == "budget_exhausted"
+    assert checkpoint.state["usage"] == {
+        "tokens": 2,
+        "cost_usd": "0.02",
+    }
+    assert checkpoint.state["step_usage"] == {"final": {"tokens": 2, "cost_usd": "0.02"}}
+    resumed_gateway = CostGateway(Decimal("0.02"))
+    resumed = make_runtime(resumed_gateway, priced_plan)
+    await resumed.restore_checkpoint(checkpoint)
+    with pytest.raises(RuntimeExecutionError):
+        await collect(resumed, context(checkpoint=checkpoint))
+    assert resumed_gateway.requests == []
+
+
+async def test_token_overage_is_audited_before_budget_failure() -> None:
+    token_plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                final_synthesizer=True,
+                token_budget=1,
+            ),
+        ),
+        total_token_budget=1,
+    )
+    ctx = context().model_copy(update={"token_budget": 1})
+    runtime = make_runtime(FakeGateway(), token_plan)
+
+    with pytest.raises(RuntimeExecutionError):
+        await collect(runtime, ctx)
+    checkpoint = await runtime.save_checkpoint()
+
+    assert checkpoint.state["phase"] == "budget_exhausted"
+    assert checkpoint.state["usage"] == {"tokens": 2, "cost_usd": "0"}
+    assert checkpoint.state["step_usage"] == {"final": {"tokens": 2, "cost_usd": "0"}}
+
+
+async def test_restored_step_usage_prevents_cost_cap_bypass_without_replay() -> None:
+    class CostToolGateway(ToolGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            completion = await super().complete_with_context(request)
+            return GatewayCompletion(
+                response=completion.response,
+                deployment_id=completion.deployment_id,
+                logical_model=completion.logical_model,
+                provider_id=completion.provider_id,
+                provider_model=completion.provider_model,
+                cost_usd=Decimal("0.08"),
+            )
+
+    class BlockingCapabilities(FakeCapabilities):
+        def __init__(self, *, block: bool) -> None:
+            super().__init__()
+            self.block = block
+            self.started = asyncio.Event()
+
+        async def execute(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.started.set()
+            if self.block:
+                await asyncio.Event().wait()
+            return await super().execute(**kwargs)  # type: ignore[no-untyped-call]
+
+    tool_plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+                allowed_tools=("web.search",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                tools=("web.search",),
+                final_synthesizer=True,
+                token_budget=100,
+                cost_budget_usd=Decimal("0.10"),
+            ),
+        ),
+        allowed_tools=("web.search",),
+        total_token_budget=100,
+        total_cost_usd=Decimal("0.10"),
+    )
+    first_capabilities = BlockingCapabilities(block=True)
+    first = make_runtime(
+        CostToolGateway(),
+        tool_plan,
+        capability_gateway=first_capabilities,
+    )
+    first_task = asyncio.create_task(collect(first, context()))
+    await first_capabilities.started.wait()
+    checkpoint = await first.save_checkpoint()
+    await first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_task
+
+    assert checkpoint.state["step_usage"] == {"final": {"tokens": 2, "cost_usd": "0.08"}}
+
+    resumed_gateway = CostToolGateway()
+    resumed_capabilities = BlockingCapabilities(block=False)
+    resumed = make_runtime(
+        resumed_gateway,
+        tool_plan,
+        capability_gateway=resumed_capabilities,
+    )
+    await resumed.restore_checkpoint(checkpoint)
+    with pytest.raises(RuntimeExecutionError):
+        await collect(resumed, context(checkpoint=checkpoint))
+    exhausted = await resumed.save_checkpoint()
+
+    assert len(resumed_gateway.requests) == 1
+    assert resumed_capabilities.calls == []
+    assert exhausted.state["phase"] == "budget_exhausted"
+    assert exhausted.state["step_usage"] == {"final": {"tokens": 4, "cost_usd": "0.16"}}
+
+
+async def test_unaccounted_gateway_completion_fails_closed_with_audit_checkpoint() -> None:
+    class UnknownCostGateway(FakeGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            completion = await super().complete_with_context(request)
+            return GatewayCompletion(
+                response=completion.response,
+                deployment_id=completion.deployment_id,
+                logical_model=completion.logical_model,
+                provider_id=completion.provider_id,
+                provider_model=completion.provider_model,
+                cost_usd=None,
+            )
+
+    single_plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=100,
+    )
+    runtime = make_runtime(UnknownCostGateway(), single_plan)
+    with pytest.raises(RuntimeExecutionError):
+        await collect(runtime, context())
+    checkpoint = await runtime.save_checkpoint()
+
+    assert checkpoint.state["terminal"] is True
+    assert checkpoint.state["phase"] == "unaccounted"
+    assert checkpoint.state["usage"] == {"tokens": 2, "cost_usd": "0"}
+    assert checkpoint.state["step_usage"] == {"final": {"tokens": 2, "cost_usd": "0"}}
 
 
 async def test_private_factory_receives_locked_down_framework_generation() -> None:
@@ -1303,3 +1541,203 @@ def test_crewai_storage_router_preserves_external_fallback(
     )
 
     assert adapter_module._contextual_crewai_storage_path() == sentinel
+
+
+def test_crewai_routers_capture_latest_external_overrides_on_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter_module = importlib.import_module("agent_hub.runtime.crew.adapter")
+    core_paths = importlib.import_module("crewai_core.paths")
+    factory = CrewAIObjectFactory(storage_dir=tmp_path / "router-rebuild")
+    factory.build((), (), share_crew=False, telemetry_disabled=True)
+    trace_module = importlib.import_module("crewai.events.listeners.tracing.trace_listener")
+    telemetry_module = importlib.import_module("crewai.telemetry.telemetry")
+    for name in (
+        "_CREWAI_DEFAULT_STORAGE_PATH",
+        "_CREWAI_DEFAULT_TRACE_SETUP",
+        "_CREWAI_DEFAULT_TELEMETRY_CHECK",
+    ):
+        monkeypatch.setattr(adapter_module, name, getattr(adapter_module, name))
+    storage_calls: list[str] = []
+    trace_calls: list[str] = []
+    telemetry_calls: list[str] = []
+
+    def external_storage() -> str:
+        storage_calls.append("storage")
+        return "external-new-storage"
+
+    def external_trace(listener: object, event_bus: object) -> None:
+        del listener, event_bus
+        trace_calls.append("trace")
+
+    def external_telemetry(instance: object) -> bool:
+        del instance
+        telemetry_calls.append("telemetry")
+        return True
+
+    monkeypatch.setattr(core_paths, "db_storage_path", external_storage)
+    monkeypatch.setattr(
+        trace_module.TraceCollectionListener,
+        "setup_listeners",
+        external_trace,
+    )
+    monkeypatch.setattr(
+        telemetry_module.Telemetry,
+        "_should_execute_telemetry",
+        external_telemetry,
+    )
+
+    factory.build((), (), share_crew=False, telemetry_disabled=True)
+
+    assert core_paths.db_storage_path() == "external-new-storage"
+    trace_module.TraceCollectionListener.setup_listeners(object(), object())
+    assert telemetry_module.Telemetry()._should_execute_telemetry() is True
+    assert storage_calls == ["storage"]
+    assert trace_calls == ["trace"]
+    assert telemetry_calls == ["telemetry"]
+
+
+async def test_preimported_ready_telemetry_is_disabled_only_inside_agent_hub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    factory = CrewAIObjectFactory(storage_dir=tmp_path / "preimported-telemetry")
+    factory.build((), (), share_crew=False, telemetry_disabled=True)
+    adapter_module = importlib.import_module("agent_hub.runtime.crew.adapter")
+    monkeypatch.setattr(
+        adapter_module,
+        "_CREWAI_DEFAULT_TELEMETRY_CHECK",
+        adapter_module._CREWAI_DEFAULT_TELEMETRY_CHECK,
+    )
+    telemetry_module = importlib.import_module("crewai.telemetry.telemetry")
+    telemetry = telemetry_module.Telemetry()
+    telemetry.ready = True
+    outbound_attempts: list[str] = []
+
+    def external_telemetry(instance: object) -> bool:
+        del instance
+        outbound_attempts.append("attempt")
+        return True
+
+    monkeypatch.setattr(
+        telemetry_module.Telemetry,
+        "_should_execute_telemetry",
+        external_telemetry,
+    )
+    factory.build((), (), share_crew=False, telemetry_disabled=True)
+
+    events = await collect(
+        make_runtime(FakeGateway(), crew_factory=factory),
+        context(),
+    )
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert outbound_attempts == []
+    assert telemetry._should_execute_telemetry() is True
+    assert outbound_attempts == ["attempt"]
+
+
+async def test_missing_executor_context_fails_closed_without_external_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter_module = importlib.import_module("agent_hub.runtime.crew.adapter")
+    core_paths = importlib.import_module("crewai_core.paths")
+    factory = CrewAIObjectFactory(storage_dir=tmp_path / "executor-context")
+    factory.build((), (), share_crew=False, telemetry_disabled=True)
+    external_calls: list[str] = []
+    trace_calls: list[str] = []
+    telemetry_calls: list[str] = []
+
+    def external_storage() -> str:
+        external_calls.append("external")
+        return "must-not-be-used"
+
+    def external_trace(listener: object, event_bus: object) -> None:
+        del listener, event_bus
+        trace_calls.append("external")
+
+    def external_telemetry(instance: object) -> bool:
+        del instance
+        telemetry_calls.append("external")
+        return True
+
+    monkeypatch.setattr(adapter_module, "_CREWAI_DEFAULT_STORAGE_PATH", external_storage)
+    monkeypatch.setattr(
+        adapter_module,
+        "_CREWAI_DEFAULT_TRACE_SETUP",
+        external_trace,
+    )
+    monkeypatch.setattr(
+        adapter_module,
+        "_CREWAI_DEFAULT_TELEMETRY_CHECK",
+        external_telemetry,
+    )
+    scope = tmp_path / "executor-context" / "scope"
+    with adapter_module._active_crewai_scope(scope):
+        with pytest.raises(RuntimeError, match="context propagation"):
+            await asyncio.get_running_loop().run_in_executor(None, core_paths.db_storage_path)
+        assert (
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                adapter_module._contextual_crewai_telemetry_check,
+                object(),
+            )
+            is False
+        )
+        await asyncio.get_running_loop().run_in_executor(
+            None,
+            adapter_module._contextual_crewai_trace_setup,
+            object(),
+            object(),
+        )
+
+    assert external_calls == []
+    assert trace_calls == []
+    assert telemetry_calls == []
+
+
+@pytest.mark.parametrize(
+    "failure_module",
+    [
+        "crewai_core.paths",
+        "crewai.events.listeners.tracing.trace_listener",
+    ],
+)
+async def test_crewai_router_initialization_failure_recovers_under_concurrency(
+    failure_module: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter_module = importlib.import_module("agent_hub.runtime.crew.adapter")
+    real_import = adapter_module.importlib.import_module
+    failed_once = False
+
+    def flaky_import(name: str, package: str | None = None):  # type: ignore[no-untyped-def]
+        nonlocal failed_once
+        if name == failure_module and not failed_once:
+            failed_once = True
+            raise RuntimeError("synthetic initialization failure")
+        return real_import(name, package)
+
+    monkeypatch.setattr(adapter_module.importlib, "import_module", flaky_import)
+    before_environment = dict(os.environ)
+    factory = CrewAIObjectFactory(storage_dir=tmp_path / "init-recovery")
+
+    results = await asyncio.gather(
+        asyncio.to_thread(
+            factory.build,
+            (),
+            (),
+            share_crew=False,
+            telemetry_disabled=True,
+        ),
+        asyncio.to_thread(
+            factory.build,
+            (),
+            (),
+            share_crew=False,
+            telemetry_disabled=True,
+        ),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(result, RuntimeError) for result in results) == 1
+    assert sum(not isinstance(result, BaseException) for result in results) == 1
+    assert dict(os.environ) == before_environment

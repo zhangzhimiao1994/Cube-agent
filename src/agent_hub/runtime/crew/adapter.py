@@ -16,6 +16,7 @@ import re
 import sys
 import threading
 from collections.abc import AsyncIterator, Mapping
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -38,11 +39,13 @@ from agent_hub.runtime.contracts import (
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 
 _RUNTIME_TYPE = "crew"
-_RUNTIME_VERSION = "2"
+_RUNTIME_VERSION = "3"
 _MAX_PROMPT_BYTES = 196_608
 _MAX_OUTPUT_BYTES = 65_536
 _MAX_TOOL_ROUNDS = 8
 _MAX_TOOL_ARGUMENT_BYTES = 32_768
+_MAX_AUDITED_TOKENS = 100_000_000
+_MAX_AUDITED_COST_USD = Decimal(64000000)
 _TASK_CANCELLATION_GRACE_SECONDS = 0.25
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _CREWAI_IMPORT_LOCK = threading.Lock()
@@ -52,8 +55,14 @@ _CREWAI_STORAGE_CONTEXT: ContextVar[Path | None] = ContextVar(
 _CREWAI_TRACE_DISABLED: ContextVar[bool] = ContextVar(
     "agent_hub_crewai_trace_disabled", default=False
 )
+_CREWAI_TELEMETRY_DISABLED: ContextVar[bool] = ContextVar(
+    "agent_hub_crewai_telemetry_disabled", default=False
+)
 _CREWAI_DEFAULT_STORAGE_PATH: Any | None = None
 _CREWAI_DEFAULT_TRACE_SETUP: Any | None = None
+_CREWAI_DEFAULT_TELEMETRY_CHECK: Any | None = None
+_CREWAI_ACTIVE_LOCK = threading.Lock()
+_CREWAI_ACTIVE_SCOPES = 0
 _CREWAI_STORAGE_MODULES = (
     "crewai.flow.persistence.sqlite",
     "crewai.memory.storage.kickoff_task_outputs_storage",
@@ -70,6 +79,8 @@ def _contextual_crewai_storage_path() -> str:
     if scoped is not None:
         scoped.mkdir(parents=True, exist_ok=True)
         return str(scoped)
+    if _crewai_scope_is_active():
+        raise RuntimeError("CrewAI context propagation is unavailable")
     fallback = _CREWAI_DEFAULT_STORAGE_PATH
     if fallback is None:
         raise RuntimeError("CrewAI storage router is unavailable")
@@ -77,12 +88,45 @@ def _contextual_crewai_storage_path() -> str:
 
 
 def _contextual_crewai_trace_setup(listener: object, event_bus: object) -> None:
-    if _CREWAI_TRACE_DISABLED.get():
+    if _CREWAI_TRACE_DISABLED.get() or _crewai_scope_is_active():
         return
     fallback = _CREWAI_DEFAULT_TRACE_SETUP
     if fallback is None:
         raise RuntimeError("CrewAI trace router is unavailable")
     fallback(listener, event_bus)
+
+
+def _contextual_crewai_telemetry_check(instance: object) -> bool:
+    if _CREWAI_TELEMETRY_DISABLED.get() or _crewai_scope_is_active():
+        return False
+    fallback = _CREWAI_DEFAULT_TELEMETRY_CHECK
+    if fallback is None:
+        raise RuntimeError("CrewAI telemetry router is unavailable")
+    return bool(fallback(instance))
+
+
+def _crewai_scope_is_active() -> bool:
+    with _CREWAI_ACTIVE_LOCK:
+        return _CREWAI_ACTIVE_SCOPES > 0
+
+
+@contextmanager
+def _active_crewai_scope(storage_path: Path) -> Any:
+    global _CREWAI_ACTIVE_SCOPES
+    storage_path.mkdir(parents=True, exist_ok=True)
+    storage_token = _CREWAI_STORAGE_CONTEXT.set(storage_path)
+    trace_token = _CREWAI_TRACE_DISABLED.set(True)
+    telemetry_token = _CREWAI_TELEMETRY_DISABLED.set(True)
+    with _CREWAI_ACTIVE_LOCK:
+        _CREWAI_ACTIVE_SCOPES += 1
+    try:
+        yield
+    finally:
+        with _CREWAI_ACTIVE_LOCK:
+            _CREWAI_ACTIVE_SCOPES -= 1
+        _CREWAI_TELEMETRY_DISABLED.reset(telemetry_token)
+        _CREWAI_TRACE_DISABLED.reset(trace_token)
+        _CREWAI_STORAGE_CONTEXT.reset(storage_token)
 
 
 def _mutable_json(value: JsonValue) -> object:
@@ -95,6 +139,10 @@ def _mutable_json(value: JsonValue) -> object:
 
 class RuntimeExecutionError(RuntimeError):
     """Stable dispatch failure that never includes model, tool, or plan input."""
+
+
+class _StableTerminalError(RuntimeExecutionError):
+    """A failure already durably recorded in a terminal checkpoint."""
 
 
 class RuntimeBusy(RuntimeExecutionError):
@@ -148,7 +196,7 @@ class ToolBoundary(Protocol):
 
 
 class UsageBoundary(Protocol):
-    async def __call__(self, completion: GatewayCompletion, actor: str) -> None: ...
+    async def __call__(self, completion: GatewayCompletion, actor: str, step_id: str) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,10 +314,7 @@ class _CrewAIGeneration:
         )
         tenant_id, run_id = storage_scope
         storage_path = self._storage_root / "agent-hub" / str(tenant_id) / str(run_id)
-        storage_path.mkdir(parents=True, exist_ok=True)
-        storage_token = _CREWAI_STORAGE_CONTEXT.set(storage_path)
-        trace_token = _CREWAI_TRACE_DISABLED.set(True)
-        try:
+        with _active_crewai_scope(storage_path):
             agent = self._crewai.Agent(
                 role=agent_definition.role,
                 goal=agent_definition.goal,
@@ -313,9 +358,6 @@ class _CrewAIGeneration:
                 tracing=False,
             )
             output = await crew.akickoff(inputs={})
-        finally:
-            _CREWAI_TRACE_DISABLED.reset(trace_token)
-            _CREWAI_STORAGE_CONTEXT.reset(storage_token)
         raw = getattr(output, "raw", None)
         if type(raw) is not str or not raw.strip() or len(raw.encode("utf-8")) > _MAX_OUTPUT_BYTES:
             raise RuntimeExecutionError("CrewAI output is invalid")
@@ -337,7 +379,9 @@ class CrewAIObjectFactory:
         share_crew: bool,
         telemetry_disabled: bool,
     ) -> CrewStepGeneration:
-        global _CREWAI_DEFAULT_STORAGE_PATH, _CREWAI_DEFAULT_TRACE_SETUP
+        global _CREWAI_DEFAULT_STORAGE_PATH
+        global _CREWAI_DEFAULT_TELEMETRY_CHECK
+        global _CREWAI_DEFAULT_TRACE_SETUP
         if share_crew or not telemetry_disabled:
             raise ValueError("unsafe CrewAI runtime configuration")
         if any(agent.allow_delegation or agent.memory or agent.code_execution for agent in agents):
@@ -345,7 +389,7 @@ class CrewAIObjectFactory:
         with _CREWAI_IMPORT_LOCK:
             core_paths = importlib.import_module("crewai_core.paths")
             original_storage_path = core_paths.__dict__["db_storage_path"]
-            if _CREWAI_DEFAULT_STORAGE_PATH is None:
+            if original_storage_path is not _contextual_crewai_storage_path:
                 _CREWAI_DEFAULT_STORAGE_PATH = original_storage_path
             import_storage = self._storage_dir / ".imports"
             import_environment = {
@@ -368,10 +412,17 @@ class CrewAIObjectFactory:
                 trace_listener_module = importlib.import_module(
                     "crewai.events.listeners.tracing.trace_listener"
                 )
+                telemetry_module = importlib.import_module("crewai.telemetry.telemetry")
                 trace_listener_class = trace_listener_module.TraceCollectionListener
-                if _CREWAI_DEFAULT_TRACE_SETUP is None:
-                    _CREWAI_DEFAULT_TRACE_SETUP = trace_listener_class.setup_listeners
+                current_trace_setup = trace_listener_class.setup_listeners
+                if current_trace_setup is not _contextual_crewai_trace_setup:
+                    _CREWAI_DEFAULT_TRACE_SETUP = current_trace_setup
                 trace_listener_class.setup_listeners = _contextual_crewai_trace_setup
+                telemetry_class = telemetry_module.Telemetry
+                current_telemetry_check = telemetry_class._should_execute_telemetry
+                if current_telemetry_check is not _contextual_crewai_telemetry_check:
+                    _CREWAI_DEFAULT_TELEMETRY_CHECK = current_telemetry_check
+                telemetry_class._should_execute_telemetry = _contextual_crewai_telemetry_check
             finally:
                 for key, value in original_environment.items():
                     if value is None:
@@ -425,6 +476,9 @@ class _ToolLedger:
 class _UsageLedger:
     tokens: int = 0
     cost_usd: Decimal = Decimal(0)
+    step_tokens: dict[str, int] = field(default_factory=dict)
+    step_costs_usd: dict[str, Decimal] = field(default_factory=dict)
+    terminal_phase: str | None = None
 
 
 @dataclass(slots=True)
@@ -593,14 +647,24 @@ class CrewDispatchRuntime:
                     review_ledger,
                 ) = self._hydrate_checkpoint(restored, context, plan)
                 self._restored_checkpoint = None
-                if restored.state.get("terminal") is True:
+                restored_phase = restored.state.get("phase")
+                if restored_phase == "completed":
                     await emit(
                         kind=EventKind.RUNTIME_COMPLETED,
                         inputs=(completed[plan.final_step.id],),
                     )
                     await queue.put(_Terminal())
                     return
-                if restored.state.get("phase") == "cancelled":
+                if restored_phase in {"budget_exhausted", "unaccounted"}:
+                    await emit(
+                        kind=EventKind.RUNTIME_FAILED,
+                        reason="dispatch accounting exhausted",
+                    )
+                    await queue.put(
+                        _Terminal(RuntimeExecutionError("dispatch accounting exhausted"))
+                    )
+                    return
+                if restored_phase == "cancelled":
                     await emit(kind=EventKind.RUNTIME_CANCELLED)
                     await queue.put(_Terminal())
                     return
@@ -640,8 +704,8 @@ class CrewDispatchRuntime:
                         usage_ledger,
                         review_ledger,
                         next_sequence=sequence.value + 2,
-                        terminal=False,
-                        phase="running",
+                        terminal=usage_ledger.terminal_phase is not None,
+                        phase=usage_ledger.terminal_phase or "running",
                     )
                     self._publish_checkpoint(state, checkpoint)
                     await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
@@ -666,35 +730,73 @@ class CrewDispatchRuntime:
                         usage_ledger,
                         review_ledger,
                         next_sequence=sequence.value + 2,
-                        terminal=False,
-                        phase="running",
+                        terminal=usage_ledger.terminal_phase is not None,
+                        phase=usage_ledger.terminal_phase or "running",
                     )
                     self._publish_checkpoint(state, checkpoint)
                     await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
 
-            async def usage_boundary(completion: GatewayCompletion, actor: str) -> None:
+            async def usage_boundary(
+                completion: GatewayCompletion, actor: str, step_id: str
+            ) -> None:
                 response_usage = completion.response.usage
-                if response_usage is None:
-                    _fail("model response budget is unavailable")
                 async with checkpoint_lock:
                     if not run_open or not self._is_current_run(state):
                         return
-                    new_tokens = usage_ledger.tokens + response_usage.total_tokens
-                    new_cost = usage_ledger.cost_usd + completion.cost_usd
-                    if new_tokens > min(context.token_budget, plan.total_token_budget):
-                        _fail("dispatch token budget exhausted")
-                    if new_cost > plan.total_cost_usd:
-                        _fail("dispatch cost budget exhausted")
+                    response_tokens = 0 if response_usage is None else response_usage.total_tokens
+                    response_cost = completion.cost_usd
+                    new_tokens = usage_ledger.tokens + response_tokens
+                    new_step_tokens = usage_ledger.step_tokens.get(step_id, 0) + response_tokens
+                    new_cost = usage_ledger.cost_usd + (response_cost or Decimal(0))
+                    new_step_cost = usage_ledger.step_costs_usd.get(step_id, Decimal(0)) + (
+                        response_cost or Decimal(0)
+                    )
+                    if (
+                        new_tokens > _MAX_AUDITED_TOKENS
+                        or new_step_tokens > _MAX_AUDITED_TOKENS
+                        or new_cost > _MAX_AUDITED_COST_USD
+                        or new_step_cost > _MAX_AUDITED_COST_USD
+                    ):
+                        _fail("model usage exceeds audit safety limit")
                     usage_ledger.tokens = new_tokens
                     usage_ledger.cost_usd = new_cost
-                    if completion.cost_usd:
+                    usage_ledger.step_tokens[step_id] = new_step_tokens
+                    usage_ledger.step_costs_usd[step_id] = new_step_cost
+                    terminal_phase = usage_ledger.terminal_phase
+                    if terminal_phase is None and (response_usage is None or response_cost is None):
+                        terminal_phase = "unaccounted"
+                    elif terminal_phase is None and (
+                        new_tokens > min(context.token_budget, plan.total_token_budget)
+                        or new_cost > plan.total_cost_usd
+                        or new_step_tokens > steps[step_id].token_budget
+                        or new_step_cost > steps[step_id].cost_budget_usd
+                    ):
+                        terminal_phase = "budget_exhausted"
+                    usage_ledger.terminal_phase = terminal_phase
+                    if response_cost:
                         await emit(
                             kind=EventKind.COST_RECORDED,
                             actor=actor,
                             provider_id=completion.provider_id,
-                            cost_usd=completion.cost_usd,
+                            cost_usd=response_cost,
                             currency="USD",
                         )
+                    checkpoint = self._make_checkpoint(
+                        context,
+                        plan,
+                        completed,
+                        retry_counts,
+                        tool_ledger,
+                        usage_ledger,
+                        review_ledger,
+                        next_sequence=sequence.value + 2,
+                        terminal=terminal_phase is not None,
+                        phase=terminal_phase or "running",
+                    )
+                    self._publish_checkpoint(state, checkpoint)
+                    await emit(kind=EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
+                    if terminal_phase is not None:
+                        raise _StableTerminalError("dispatch accounting exhausted")
 
             while len(completed) < len(steps):
                 ready = tuple(
@@ -757,9 +859,17 @@ class CrewDispatchRuntime:
                                     usage_ledger,
                                     review_ledger,
                                     next_sequence=sequence.value + 2,
-                                    terminal=len(completed) == len(steps),
+                                    terminal=(
+                                        usage_ledger.terminal_phase is not None
+                                        or len(completed) == len(steps)
+                                    ),
                                     phase=(
-                                        "completed" if len(completed) == len(steps) else "running"
+                                        usage_ledger.terminal_phase
+                                        or (
+                                            "completed"
+                                            if len(completed) == len(steps)
+                                            else "running"
+                                        )
                                     ),
                                 )
                                 self._publish_checkpoint(state, checkpoint)
@@ -811,6 +921,15 @@ class CrewDispatchRuntime:
                 await asyncio.wait({cleanup}, timeout=5)
             run_open = False
             raise
+        except _StableTerminalError as error:
+            await emit(
+                kind=EventKind.RUNTIME_FAILED,
+                reason="dispatch accounting exhausted",
+            )
+            error.__traceback__ = None
+            error.__context__ = None
+            error.__cause__ = None
+            await queue.put(_Terminal(error))
         except RuntimeExecutionError as error:
             if plan is not None:
                 checkpoint = self._make_checkpoint(
@@ -886,16 +1005,6 @@ class CrewDispatchRuntime:
             feedback_artifact.content.get("feedback") if feedback_artifact is not None else None
         )
         feedback = cast(str | None, feedback_value)
-        step_cost_usd = Decimal(0)
-
-        async def step_usage_boundary(completion: GatewayCompletion, actor: str) -> None:
-            nonlocal step_cost_usd
-            next_cost = step_cost_usd + completion.cost_usd
-            if next_cost > step.cost_budget_usd:
-                _fail("step cost budget exhausted")
-            await usage_boundary(completion, actor)
-            step_cost_usd = next_cost
-
         step_deadline = asyncio.get_running_loop().time() + min(
             step.timeout_seconds, self._remaining_timeout(run_state)
         )
@@ -917,7 +1026,7 @@ class CrewDispatchRuntime:
                     event,
                     checkpoint_boundary,
                     tool_boundary,
-                    step_usage_boundary,
+                    usage_boundary,
                     tool_ledger,
                     retries,
                     run_state,
@@ -933,7 +1042,7 @@ class CrewDispatchRuntime:
                         artifact,
                         event,
                         checkpoint_boundary,
-                        step_usage_boundary,
+                        usage_boundary,
                         retries,
                         run_state,
                         step_deadline,
@@ -1111,7 +1220,6 @@ class CrewDispatchRuntime:
         step_deadline: float,
     ) -> GatewayCompletion:
         messages = list(self._normalize_crewai_messages(crew_messages))
-        spent_tokens = 0
         for _round in range(_MAX_TOOL_ROUNDS + 1):
             await emit(kind=EventKind.MODEL_STARTED)
             request = ModelRequest(
@@ -1124,13 +1232,7 @@ class CrewDispatchRuntime:
             async with asyncio.timeout(self._remaining_timeout(run_state, step_deadline)):
                 completion = await self._gateway.complete_with_context(request)
             response = self._valid_response(completion)
-            await usage_boundary(completion, step.agent)
-            usage = response.usage
-            if usage is None:  # pragma: no cover - guarded by _valid_response
-                _fail("model response budget is unavailable")
-            spent_tokens += usage.total_tokens
-            if spent_tokens > step.token_budget:
-                _fail("step token budget exhausted")
+            await usage_boundary(completion, step.agent, step.id)
             await checkpoint_boundary(step.id, retries)
             if not response.tool_calls:
                 return completion
@@ -1343,9 +1445,7 @@ class CrewDispatchRuntime:
                 async with asyncio.timeout(runtime._remaining_timeout(run_state, step_deadline)):
                     completion = await runtime._gateway.complete_with_context(request)
                 response = runtime._valid_response(completion)
-                await usage_boundary(completion, reviewer.id)
-                if response.usage is None or response.usage.total_tokens > step.token_budget:
-                    _fail("review token budget exhausted")
+                await usage_boundary(completion, reviewer.id, step.id)
                 await checkpoint_boundary(step.id, retries)
                 if response.text is None or response.tool_calls:
                     _fail("review response is invalid")
@@ -1390,8 +1490,8 @@ class CrewDispatchRuntime:
         if not isinstance(completion, GatewayCompletion):
             _fail("model response is invalid")
         response = completion.response
-        if not isinstance(response, ModelResponse) or response.usage is None:
-            _fail("model response budget is unavailable")
+        if not isinstance(response, ModelResponse):
+            _fail("model response is invalid")
         if response.text is not None and (
             not response.text.strip() or len(response.text.encode("utf-8")) > _MAX_OUTPUT_BYTES
         ):
@@ -1552,6 +1652,13 @@ class CrewDispatchRuntime:
                     "tokens": usage_ledger.tokens,
                     "cost_usd": str(usage_ledger.cost_usd),
                 },
+                "step_usage": {
+                    key: {
+                        "tokens": usage_ledger.step_tokens[key],
+                        "cost_usd": str(usage_ledger.step_costs_usd[key]),
+                    }
+                    for key in sorted(usage_ledger.step_tokens)
+                },
             },
         )
 
@@ -1581,6 +1688,7 @@ class CrewDispatchRuntime:
             "tools",
             "review_refs",
             "usage",
+            "step_usage",
         }:
             _fail("runtime checkpoint is incompatible")
         completed = state["completed"]
@@ -1590,6 +1698,7 @@ class CrewDispatchRuntime:
         tools = state["tools"]
         review_refs = state["review_refs"]
         usage = state["usage"]
+        step_usage = state["step_usage"]
         if (
             not isinstance(completed, tuple)
             or not isinstance(frontier, tuple)
@@ -1598,16 +1707,25 @@ class CrewDispatchRuntime:
             or not isinstance(tools, Mapping)
             or not isinstance(review_refs, Mapping)
             or not isinstance(usage, Mapping)
+            or not isinstance(step_usage, Mapping)
             or type(state["next_sequence"]) is not int
             or type(state["terminal"]) is not bool
-            or state["phase"] not in {"running", "completed", "cancelled", "failed"}
+            or state["phase"]
+            not in {
+                "running",
+                "completed",
+                "cancelled",
+                "failed",
+                "budget_exhausted",
+                "unaccounted",
+            }
             or not 1 <= state["next_sequence"] <= 2**63 - 1
         ):
             _fail("runtime checkpoint is incompatible")
         if (
             set(usage) != {"tokens", "cost_usd"}
             or type(usage["tokens"]) is not int
-            or not 0 <= usage["tokens"] <= min(context.token_budget, plan.total_token_budget)
+            or not 0 <= usage["tokens"] <= _MAX_AUDITED_TOKENS
             or type(usage["cost_usd"]) is not str
         ):
             _fail("runtime checkpoint is incompatible")
@@ -1619,11 +1737,43 @@ class CrewDispatchRuntime:
         if (
             not checkpoint_cost.is_finite()
             or checkpoint_cost < 0
-            or checkpoint_cost > plan.total_cost_usd
+            or checkpoint_cost > _MAX_AUDITED_COST_USD
             or (isinstance(checkpoint_cost_exponent, int) and checkpoint_cost_exponent < -6)
         ):
             _fail("runtime checkpoint is incompatible")
         steps = {step.id: step for step in plan.steps}
+        parsed_step_tokens: dict[str, int] = {}
+        parsed_step_costs: dict[str, Decimal] = {}
+        for step_id, raw_step_usage in step_usage.items():
+            if (
+                type(step_id) is not str
+                or step_id not in steps
+                or not isinstance(raw_step_usage, Mapping)
+                or set(raw_step_usage) != {"tokens", "cost_usd"}
+                or type(raw_step_usage["tokens"]) is not int
+                or not 0 <= raw_step_usage["tokens"] <= _MAX_AUDITED_TOKENS
+                or type(raw_step_usage["cost_usd"]) is not str
+            ):
+                _fail("runtime checkpoint is incompatible")
+            try:
+                step_cost = Decimal(raw_step_usage["cost_usd"])
+            except Exception:  # noqa: BLE001 - hostile checkpoint decimal
+                _fail("runtime checkpoint is incompatible")
+            exponent = step_cost.as_tuple().exponent
+            if (
+                not step_cost.is_finite()
+                or step_cost < 0
+                or step_cost > _MAX_AUDITED_COST_USD
+                or (isinstance(exponent, int) and exponent < -6)
+            ):
+                _fail("runtime checkpoint is incompatible")
+            parsed_step_tokens[step_id] = raw_step_usage["tokens"]
+            parsed_step_costs[step_id] = step_cost
+        if (
+            sum(parsed_step_tokens.values()) != usage["tokens"]
+            or sum(parsed_step_costs.values(), Decimal(0)) != checkpoint_cost
+        ):
+            _fail("runtime checkpoint is incompatible")
         if not all(type(item) is str for item in completed):
             _fail("runtime checkpoint is incompatible")
         completed_ids = cast(tuple[str, ...], completed)
@@ -1727,10 +1877,26 @@ class CrewDispatchRuntime:
             if step.id not in completed_set
             and all(dependency in completed_set for dependency in step.depends_on)
         )
+        budget_exceeded = (
+            usage["tokens"] > min(context.token_budget, plan.total_token_budget)
+            or checkpoint_cost > plan.total_cost_usd
+            or any(
+                parsed_step_tokens.get(step_id, 0) > step.token_budget
+                or parsed_step_costs.get(step_id, Decimal(0)) > step.cost_budget_usd
+                for step_id, step in steps.items()
+            )
+        )
+        terminal_phase = state["phase"] in {
+            "completed",
+            "budget_exhausted",
+            "unaccounted",
+        }
         if (
             frontier != expected_frontier
-            or (state["phase"] == "completed") is not state["terminal"]
+            or terminal_phase is not state["terminal"]
             or (state["phase"] == "completed" and len(completed_set) != len(steps))
+            or (state["phase"] == "budget_exhausted") is not budget_exceeded
+            or (state["phase"] not in {"budget_exhausted", "unaccounted"} and budget_exceeded)
         ):
             _fail("runtime checkpoint is incompatible")
 
@@ -1793,9 +1959,22 @@ class CrewDispatchRuntime:
             ):
                 raise CapabilityOutcomeUncertain("capability outcome requires confirmation")
         usage = cast(Mapping[str, JsonValue], checkpoint.state["usage"])
+        step_usage = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["step_usage"])
         usage_ledger = _UsageLedger(
             tokens=cast(int, usage["tokens"]),
             cost_usd=Decimal(cast(str, usage["cost_usd"])),
+            step_tokens={
+                step_id: cast(int, values["tokens"]) for step_id, values in step_usage.items()
+            },
+            step_costs_usd={
+                step_id: Decimal(cast(str, values["cost_usd"]))
+                for step_id, values in step_usage.items()
+            },
+            terminal_phase=(
+                checkpoint.state["phase"]
+                if checkpoint.state["phase"] in {"budget_exhausted", "unaccounted"}
+                else None
+            ),
         )
         review_ledger = _ReviewLedger()
         review_refs = cast(Mapping[str, Mapping[str, str]], checkpoint.state["review_refs"])

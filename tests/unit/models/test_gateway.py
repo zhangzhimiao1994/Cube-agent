@@ -735,7 +735,38 @@ async def test_completion_cost_is_zero_when_validated_usage_is_missing() -> None
 
     completion = await gateway.complete_with_context(request())
 
-    assert completion.cost_usd == Decimal(0)
+    assert completion.cost_usd is None
+
+
+async def test_missing_pricing_is_unaccounted_but_explicit_free_pricing_is_zero() -> None:
+    selected = deployment("selected")
+    response = ModelResponse(
+        text="ok",
+        usage=TokenUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+    )
+    missing_capacity = CapacityStub([lease("selected")])
+    missing = ModelGateway(
+        ModelRegistry([selected]),
+        missing_capacity,
+        SecretStub(missing_capacity.events),
+        TransportStub(missing_capacity.events, response=response),
+    )
+    free_capacity = CapacityStub([lease("selected")])
+    explicitly_free = ModelGateway(
+        ModelRegistry([selected]),
+        free_capacity,
+        SecretStub(free_capacity.events),
+        TransportStub(free_capacity.events, response=response),
+        pricing={
+            "selected": DeploymentPricing(
+                input_per_million_usd=Decimal(0),
+                output_per_million_usd=Decimal(0),
+            )
+        },
+    )
+
+    assert (await missing.complete_with_context(request())).cost_usd is None
+    assert (await explicitly_free.complete_with_context(request())).cost_usd == Decimal(0)
 
 
 def test_deployment_pricing_rejects_non_decimal_rates_safely() -> None:

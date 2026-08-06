@@ -61,7 +61,7 @@ class GatewayCompletion:
     logical_model: str
     provider_id: str
     provider_model: str = field(repr=False)
-    cost_usd: Decimal = Decimal(0)
+    cost_usd: Decimal | None = Decimal(0)
 
     def __post_init__(self) -> None:
         if not isinstance(self.response, ModelResponse):
@@ -69,7 +69,9 @@ class GatewayCompletion:
         _require_safe_identifier("deployment id", self.deployment_id)
         _require_safe_identifier("logical model", self.logical_model)
         _require_safe_identifier("provider id", self.provider_id)
-        cost_exponent = self.cost_usd.as_tuple().exponent
+        if self.cost_usd is not None and type(self.cost_usd) is not Decimal:
+            raise ValueError("gateway cost must be a bounded USD decimal")
+        cost_exponent = None if self.cost_usd is None else self.cost_usd.as_tuple().exponent
         if (
             not self.provider_model
             or self.provider_model != self.provider_model.strip()
@@ -78,9 +80,8 @@ class GatewayCompletion:
             raise ValueError("provider_model must be bounded and unpadded")
         if self.provider_model.split("/", 1)[0] != self.provider_id:
             raise ValueError("provider provenance is inconsistent")
-        if (
-            type(self.cost_usd) is not Decimal
-            or not self.cost_usd.is_finite()
+        if self.cost_usd is not None and (
+            not self.cost_usd.is_finite()
             or self.cost_usd < 0
             or (isinstance(cost_exponent, int) and cost_exponent < -6)
             or self.cost_usd > Decimal(1000000)
@@ -301,11 +302,11 @@ class ModelGateway:
             cost_usd=self._cost_usd(selected, response),
         )
 
-    def _cost_usd(self, deployment: Deployment, response: ModelResponse) -> Decimal:
+    def _cost_usd(self, deployment: Deployment, response: ModelResponse) -> Decimal | None:
         pricing = self._pricing.get(deployment.id)
         usage = response.usage
         if pricing is None or usage is None:
-            return Decimal(0)
+            return None
         cost = (
             Decimal(usage.prompt_tokens) * pricing.input_per_million_usd
             + Decimal(usage.completion_tokens) * pricing.output_per_million_usd
