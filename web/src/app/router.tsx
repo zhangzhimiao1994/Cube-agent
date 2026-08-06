@@ -3,9 +3,13 @@ import { BrowserRouter, MemoryRouter, Navigate, Route, Routes } from "react-rout
 
 import { AppShell } from "./AppShell";
 import { AuthProvider, RequireAuth } from "../auth/AuthProvider";
+import { AgentsPage } from "../pages/AgentsPage";
+import { ConfigPage } from "../pages/ConfigPage";
 import { LoginPage } from "../pages/LoginPage";
+import { ModelsPage } from "../pages/ModelsPage";
 import { SetupPage } from "../pages/SetupPage";
 import { UsersPage } from "../pages/UsersPage";
+import { WorkflowsPage } from "../pages/WorkflowsPage";
 
 const queryClient = new QueryClient();
 
@@ -31,7 +35,10 @@ export function AppRoutes() {
         }
       >
         <Route index element={<DashboardPage />} />
-        <Route path="config" element={<PlaceholderPage title="配置" />} />
+        <Route path="config" element={<ConfigPage />} />
+        <Route path="models" element={<ModelsPage />} />
+        <Route path="agents" element={<AgentsPage />} />
+        <Route path="workflows" element={<WorkflowsPage />} />
         <Route path="skills" element={<PlaceholderPage title="Skills" />} />
         <Route path="mcp" element={<PlaceholderPage title="MCP" />} />
         <Route path="users" element={<UsersPage />} />
