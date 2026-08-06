@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Execute durable tasks through capability-aware, concurrency-limited model pools and Direct, CrewAI, AutoGen, or Hybrid execution runtimes, including image understanding and low-confidence user clarification.
+**Goal:** Execute durable tasks through capability-aware, concurrency-limited model pools and Direct, CrewAI, Discussion Runtime, or Hybrid execution runtimes, including image understanding and low-confidence user clarification.
 
 **Architecture:** Model deployments are hidden behind `ModelGateway`, which obtains Redis-backed capacity leases before calling the LiteLLM Proxy. `ModeRouter` combines explicit commands, deterministic rules, a classifier, and a verifier. Runtime adapters exchange only typed Task, Event, Artifact, and Checkpoint contracts.
 
-**Tech Stack:** LiteLLM Proxy, OpenAI Python client, Redis Lua, Celery, CrewAI, AutoGen AgentChat, Pillow, python-magic, optional Tesseract/PaddleOCR adapter, pytest.
+**Tech Stack:** LiteLLM Proxy, OpenAI Python client, Redis Lua, Celery, CrewAI, Discussion Runtime backends (MAF default, AG2 optional, AutoGen AgentChat legacy explicit), Pillow, python-magic, optional Tesseract/PaddleOCR adapter, pytest.
 
 ---
 
@@ -15,7 +15,7 @@
 - `src/agent_hub/models/`: logical model registry, LiteLLM client, capacity leases, health and fallback.
 - `src/agent_hub/multimodal/`: secure image validation and structured vision analysis.
 - `src/agent_hub/routing/`: explicit/rule/model routing and clarification decisions.
-- `src/agent_hub/runtime/`: common contracts plus Direct, CrewAI, AutoGen, and Hybrid adapters.
+- `src/agent_hub/runtime/`: common contracts plus Direct, CrewAI, Discussion Runtime backend selection, legacy AutoGen compatibility, and Hybrid adapters.
 - `src/agent_hub/runs/`: run repository, application service, Celery tasks, checkpoints, and events.
 - `tests/contracts/`: fake model/runtime implementations used to enforce boundaries.
 
@@ -471,22 +471,30 @@ git add src/agent_hub/runtime/crew tests/unit/runtime/crew tests/integration/run
 git commit -m "feat: add crewai dispatch runtime"
 ```
 
-### Task 7: Implement AutoGen discussion and Hybrid runtimes
+### Task 7: Implement Discussion Runtime backend selection and Hybrid runtimes
 
 **Files:**
+- Create: `src/agent_hub/runtime/discussion/registry.py`
+- Create: `src/agent_hub/runtime/discussion/__init__.py`
 - Create: `src/agent_hub/runtime/autogen/adapter.py`
 - Create: `src/agent_hub/runtime/autogen/termination.py`
 - Create: `src/agent_hub/runtime/hybrid.py`
+- Create: `tests/integration/runtime/test_discussion_backend.py`
 - Create: `tests/integration/runtime/test_autogen_adapter.py`
 - Create: `tests/integration/runtime/test_hybrid_runtime.py`
 
 - [ ] **Step 1: Write termination and Artifact handoff tests**
 
 ```python
-async def test_discussion_stops_at_budget(autogen_runtime, low_budget_context) -> None:
-    events = await collect(autogen_runtime.run(low_budget_context))
+async def test_discussion_stops_at_budget(discussion_runtime, low_budget_context) -> None:
+    events = await collect(discussion_runtime.run(low_budget_context))
     assert events[-1].kind == "runtime.completed"
     assert events[-1].reason == "budget_exhausted"
+
+
+def test_default_discussion_backend_prefers_maf_then_ag2(registry) -> None:
+    runtime = registry.create(DiscussionBackendSelection())
+    assert runtime.backend == "maf"
 
 
 async def test_hybrid_passes_artifacts_not_framework_state(hybrid_runtime) -> None:
@@ -497,27 +505,31 @@ async def test_hybrid_passes_artifacts_not_framework_state(hybrid_runtime) -> No
 
 - [ ] **Step 2: Confirm tests fail**
 
-Run: `uv run pytest tests/integration/runtime/test_autogen_adapter.py tests/integration/runtime/test_hybrid_runtime.py -q`
+Run: `uv run pytest tests/integration/runtime/test_discussion_backend.py tests/integration/runtime/test_autogen_adapter.py tests/integration/runtime/test_hybrid_runtime.py -q`
 
-Expected: FAIL because adapters are absent.
+Expected: FAIL because backend selection and adapters are absent.
 
-- [ ] **Step 3: Implement SelectorGroupChat adapter and composite termination**
+- [ ] **Step 3: Implement Discussion Runtime backend selection**
+
+Default `Discuss` backend selection must prefer Microsoft Agent Framework (MAF), then AG2. AutoGen AgentChat is retained only as a legacy/experimental compatibility backend and must require explicit selection. Backend selection must fail closed when the selected backend is unavailable or malformed; it must not silently fall back across frameworks and change discussion semantics.
+
+- [ ] **Step 4: Implement legacy AutoGen adapter and composite termination**
 
 Use 2–8 unique participants, a ModelGateway-backed model client, and termination conditions for explicit completion, maximum turns, wall time, tokens, cost, cancellation, and consensus. Persist only explicit messages, citations, tool events, and summaries; do not request hidden reasoning.
 
-- [ ] **Step 4: Implement HybridRuntime composition**
+- [ ] **Step 5: Implement HybridRuntime composition**
 
 Run dispatch, collect validated Artifacts, build a new discussion context from those Artifacts, run discussion, then invoke the configured synthesizer. Support Direct→Dispatch, Dispatch→Hybrid, and Discuss→Dispatch→Discuss upgrades without repeating completed Artifact-producing work.
 
-- [ ] **Step 5: Test and commit**
+- [ ] **Step 6: Test and commit**
 
-Run: `uv run pytest tests/integration/runtime/test_autogen_adapter.py tests/integration/runtime/test_hybrid_runtime.py -q`
+Run: `uv run pytest tests/integration/runtime/test_discussion_backend.py tests/integration/runtime/test_autogen_adapter.py tests/integration/runtime/test_hybrid_runtime.py -q`
 
-Expected: participant selection, all termination paths, explicit transcript storage, artifact-only handoff, upgrade, resume, and cancel tests pass.
+Expected: backend default/explicit/legacy selection, participant selection, all termination paths, explicit transcript storage, artifact-only handoff, upgrade, resume, and cancel tests pass.
 
 ```bash
-git add src/agent_hub/runtime/autogen src/agent_hub/runtime/hybrid.py tests/integration/runtime
-git commit -m "feat: add autogen discussion and hybrid runtimes"
+git add src/agent_hub/runtime/discussion src/agent_hub/runtime/autogen src/agent_hub/runtime/hybrid.py tests/integration/runtime
+git commit -m "feat: add discussion and hybrid runtimes"
 ```
 
 ### Task 8: Persist runs, events, checkpoints, and Celery execution

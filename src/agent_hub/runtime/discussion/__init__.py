@@ -1,6 +1,10 @@
-"""Framework-neutral execution runtimes."""
+"""Discussion-mode backend selection.
 
-from agent_hub.runtime.discussion import (
+Discuss remains the user-facing mode name.  Backend names are implementation
+details: MAF is preferred, AG2 is supported, and AutoGen is legacy compatibility.
+"""
+
+from agent_hub.runtime.discussion.registry import (
     CallableDiscussionRuntimeProvider,
     DiscussionBackend,
     DiscussionBackendSelection,

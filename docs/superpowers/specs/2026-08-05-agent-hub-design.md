@@ -11,7 +11,7 @@
 
 1. 同一个模型或同一个 API 可以被多个角色复用，每个角色拥有独立提示词、工具、Skill、记忆和权限。
 2. 一个任务可以同时使用多个厂商、多个中转站或多个模型。
-3. 支持 CrewAI 风格的派单执行、AutoGen 风格的群聊讨论，以及二者组合的混合执行。
+3. 支持 CrewAI 风格的派单执行、Discussion Runtime 驱动的群聊讨论，以及二者组合的混合执行。讨论后端默认优先使用 MAF（Microsoft Agent Framework），可显式选择 AG2；AutoGen AgentChat 仅作为 legacy 兼容后端保留。
 4. 主 Agent 负责识别意图、选择执行模式、控制预算、调度执行、处理审批、汇总结果和维护任务状态。
 5. 支持多模态视觉模型，能够接收和理解飞书或 Web 上传的图片。
 6. 用户可以通过飞书私聊、群聊中 `@机器人` 或 Web 管理台交互和管理系统。
@@ -29,7 +29,7 @@
 
 ## 3. 技术架构
 
-建议技术栈：Python 3.12、FastAPI、SQLAlchemy、Alembic、Celery、PostgreSQL、Redis、LiteLLM Proxy、CrewAI、AutoGen AgentChat，以及 React + TypeScript 管理台。依赖使用锁文件和固定版本，升级前运行适配器契约测试。
+建议技术栈：Python 3.12、FastAPI、SQLAlchemy、Alembic、Celery、PostgreSQL、Redis、LiteLLM Proxy、CrewAI、Discussion Runtime（默认 MAF，AG2 可选，AutoGen AgentChat legacy 显式选择），以及 React + TypeScript 管理台。依赖使用锁文件和固定版本，升级前运行适配器契约测试。
 
 ```mermaid
 flowchart TD
@@ -41,7 +41,7 @@ flowchart TD
     MA --> RR[Mode Router]
     RR --> D[Direct Runtime]
     RR --> C[CrewAI Runtime Adapter]
-    RR --> A[AutoGen Runtime Adapter]
+    RR --> A[Discussion Runtime Adapter\nMAF default / AG2 optional]
     RR --> H[Hybrid Runtime]
     D --> MG[ModelGateway / LiteLLM]
     C --> MG
@@ -63,7 +63,7 @@ flowchart TD
 
 - `api`：管理 API、Web 静态资源、飞书 Webhook、OAuth 和健康检查。
 - `feishu-connector`：飞书长连接、消息标准化、幂等去重和回复投递。
-- `worker`：执行主 Agent、CrewAI、AutoGen、定时任务和后台作业。
+- `worker`：执行主 Agent、CrewAI、Discussion Runtime、定时任务和后台作业。
 - `litellm`：统一模型协议、路由、限流、重试、降级和用量采集。
 - `skill-runner`：隔离执行经过批准的 Skill 脚本；原生部署时由 systemd 临时沙箱替代。
 
@@ -78,7 +78,7 @@ flowchart TD
 1. `Ingress`：标准化渠道消息，确定租户、用户、会话和幂等键。
 2. `ContextBuilder`：装载当前会话、相关记忆、知识、允许使用的 Skill/MCP、预算和权限。
 3. `SupervisorLoop`：理解任务、选择模式、执行或观察、必要时重规划。
-4. `ExecutionRuntime`：运行 Direct、CrewAI、AutoGen 或 Hybrid 执行引擎。
+4. `ExecutionRuntime`：运行 Direct、CrewAI、Discussion Runtime 或 Hybrid 执行引擎。
 5. `ResponseComposer`：生成适配飞书或 Web 的最终答复、引用、警告和执行摘要。
 6. `LearningHooks`：生成记忆候选和系统改进草稿，不自动发布配置变更。
 
@@ -112,7 +112,7 @@ flowchart TD
 
 ### 6.3 Discuss
 
-由 AutoGen `SelectorGroupChat` 执行。参与角色来自已发布 YAML，或由主 Agent 从角色白名单中选择 2–8 个。群聊共享任务上下文，由选择器决定下一位发言者。
+由 Discussion Runtime 执行，产品模式仍命名为 `Discuss`。默认后端优先使用 MAF；AG2 可作为可选后端显式启用；AutoGen AgentChat 已进入维护期，仅作为 legacy/experimental 兼容后端，必须通过明确配置选择。参与角色来自已发布 YAML，或由主 Agent 从角色白名单中选择 2–8 个。群聊共享任务上下文，由后端选择器决定下一位发言者。
 
 任一条件满足即结束：达成可验证共识、输出明确完成标记、达到最大轮数、时间、token 或费用上限、用户取消。结束后由独立 Synthesizer 输出共识、分歧、证据和最终建议。
 
@@ -130,7 +130,7 @@ flowchart TD
 - `RunPlan`：模式、角色、步骤、依赖、预算、工具和终止规则。
 - `Artifact`：类型、内容引用、来源、生产者、版本和完整性哈希。
 - `RunEvent`：阶段、显式消息、工具调用、审批、费用和错误事件。
-- `RuntimeCheckpoint`：可恢复的 CrewAI/AutoGen 状态和统一步骤边界。
+- `RuntimeCheckpoint`：可恢复的 CrewAI/Discussion Runtime 状态和统一步骤边界。
 
 统一状态机为：
 
@@ -170,7 +170,7 @@ API Key 不允许通过飞书提交或回显。Web 管理台可通过 HTTPS 写�
 2. 清除不需要的 EXIF 信息，将文件保存为有租户权限和过期策略的受控 Artifact。
 3. 主 Agent 判断任务是否需要 OCR、通用视觉理解或特定视觉 Skill，并选择对应视觉角色和逻辑模型。
 4. 视觉角色输出结构化 `ImageAnalysisArtifact`，包含描述、识别文本、对象/区域、置信度、模型和来源图片哈希。
-5. 后续 CrewAI 或 AutoGen 角色优先共享结构化分析结果，只有获得图片权限且确有需要的视觉模型才读取原图，以降低费用和隐私暴露。
+5. 后续 CrewAI 或 Discussion Runtime 角色优先共享结构化分析结果，只有获得图片权限且确有需要的视觉模型才读取原图，以降低费用和隐私暴露。
 
 首版支持 JPEG、PNG 和 WebP，可配置单图、单次消息总大小、图片数量和保存期限。文字型图片可配置本地 OCR 作为降级；OCR 不能替代通用视觉理解。识别置信度不足、视觉模型不可用或图片不合规时，系统明确询问用户或报告限制，不编造识别结果。
 
@@ -200,7 +200,7 @@ Web 支持飞书 OAuth 和本地账号。第一个超级管理员由环境变量
 
 ## 11. Skill、MCP 与工具权限
 
-`CapabilityGateway` 是所有能力调用的唯一入口，CrewAI 和 AutoGen 不得绕过该层直接执行工具。
+`CapabilityGateway` 是所有能力调用的唯一入口，CrewAI 和 Discussion Runtime 后端不得绕过该层直接执行工具。
 
 权限按“用户/角色 + Agent + Skill/MCP + 操作 + 资源范围”判断：
 
@@ -284,7 +284,7 @@ PostgreSQL、Redis 可安装在本机或使用外部 DSN。Nginx/Caddy 为 Web �
 测试分为：
 
 1. 单元测试：模式路由、双分类器分歧、状态机、配置 Schema、RBAC、预算和权限策略。
-2. 契约测试：CrewAI、AutoGen 与 LiteLLM 升级后仍满足统一 Runtime 接口。
+2. 契约测试：CrewAI、Discussion Runtime 后端与 LiteLLM 升级后仍满足统一 Runtime 接口。
 3. 集成测试：PostgreSQL、Redis、模型容量租约/排队/降级、MCP、Skill Runner、配置发布和检查点恢复。
 4. 端到端测试：模拟飞书长连接/Webhook、卡片失败转文本询问、任务取消、进程崩溃和恢复。
 5. 安全测试：恶意 Skill 包、路径穿越、Prompt 注入、密钥泄露、越权配置和沙箱逃逸基线。
@@ -309,7 +309,9 @@ MVP 验收必须证明：
 - OpenClaw Agent Runtime：https://docs.openclaw.ai/agent-runtime-architecture
 - CowAgent：https://github.com/zhayujie/CowAgent
 - CrewAI：https://docs.crewai.com/
-- AutoGen AgentChat：https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/
+- Microsoft Agent Framework：https://learn.microsoft.com/agent-framework/
+- AG2：https://docs.ag2.ai/
+- AutoGen AgentChat legacy：https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/
 - LiteLLM：https://docs.litellm.ai/docs/
 - 飞书事件订阅：https://open.feishu.cn/document/server-docs/event-subscription-guide/overview
 - DeepSeek 并发与隔离：https://api-docs.deepseek.com/quick_start/rate_limit

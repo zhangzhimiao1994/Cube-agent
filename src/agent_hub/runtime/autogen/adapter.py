@@ -1,4 +1,8 @@
-"""AutoGen SelectorGroupChat behind Agent Hub gateway and durable contracts."""
+"""Legacy AutoGen SelectorGroupChat behind Agent Hub gateway and durable contracts.
+
+This adapter remains for explicit compatibility.  Default Discuss runtime
+selection belongs in ``agent_hub.runtime.discussion`` and prefers MAF, then AG2.
+"""
 
 from __future__ import annotations
 
