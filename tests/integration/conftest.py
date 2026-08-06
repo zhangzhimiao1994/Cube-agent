@@ -8,12 +8,28 @@ from alembic.config import Config
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agent_hub.db.models import BootstrapCodeRow, ConfigRevisionRow, SecretRow, TenantRow, UserRow
+from agent_hub.db.models import (
+    BootstrapCodeRow,
+    ConfigRevisionRow,
+    RunApprovalRow,
+    RunArtifactRow,
+    RunCheckpointRow,
+    RunEventRow,
+    RunOutboxRow,
+    RunRow,
+    RunStepRow,
+    RunUsageRow,
+    SecretRow,
+    TenantRow,
+    UserRow,
+)
 from agent_hub.db.session import Database, build_database
 from alembic import command
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-COMPOSE_DATABASE_URL = "postgresql+asyncpg://agent_hub_test:agent_hub_test@127.0.0.1:{port}/agent_hub_test"
+COMPOSE_DATABASE_URL = (
+    "postgresql+asyncpg://agent_hub_test:agent_hub_test@127.0.0.1:{port}/agent_hub_test"
+)
 
 
 @pytest.fixture(scope="session")
@@ -62,6 +78,7 @@ async def db_session(database_url: str) -> AsyncIterator[AsyncSession]:
     try:
         async with database.session_factory() as session:
             await session.rollback()
+            await _delete_run_rows(session)
             await session.execute(delete(BootstrapCodeRow))
             await session.execute(delete(SecretRow))
             await session.execute(delete(ConfigRevisionRow))
@@ -72,6 +89,7 @@ async def db_session(database_url: str) -> AsyncIterator[AsyncSession]:
                 yield session
             finally:
                 await session.rollback()
+                await _delete_run_rows(session)
                 await session.execute(delete(BootstrapCodeRow))
                 await session.execute(delete(SecretRow))
                 await session.execute(delete(ConfigRevisionRow))
@@ -112,8 +130,23 @@ async def _clean_database(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     async with session_factory() as session, session.begin():
+        await _delete_run_rows(session)
         await session.execute(delete(BootstrapCodeRow))
         await session.execute(delete(SecretRow))
         await session.execute(delete(ConfigRevisionRow))
         await session.execute(delete(UserRow))
         await session.execute(delete(TenantRow))
+
+
+async def _delete_run_rows(session: AsyncSession) -> None:
+    for table in (
+        RunOutboxRow,
+        RunUsageRow,
+        RunApprovalRow,
+        RunCheckpointRow,
+        RunArtifactRow,
+        RunEventRow,
+        RunStepRow,
+        RunRow,
+    ):
+        await session.execute(delete(table))

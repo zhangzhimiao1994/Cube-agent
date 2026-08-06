@@ -24,14 +24,14 @@ def _unpadded_non_blank(value: str) -> str:
 
 
 class StrictConfigModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
 
 class DeploymentDefinition(StrictConfigModel):
     provider: str = Field(max_length=512)
     model: str = Field(max_length=512)
     api_base: str | None = Field(default=None, max_length=2048)
-    secret_ref: str = Field(max_length=512)
+    secret_ref: str = Field(alias="credential_ref", max_length=512)
     quota_scope_id: str = Field(max_length=MAX_IDENTIFIER_LENGTH)
     max_concurrency: int = Field(default=1, ge=1, le=1000)
     target_utilization: float = Field(

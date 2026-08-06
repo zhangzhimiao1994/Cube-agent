@@ -2,6 +2,8 @@ from datetime import datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -123,3 +125,195 @@ class ConfigRevisionRow(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class RunRow(Base):
+    __tablename__ = "agent_hub_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "idempotency_key",
+            name="uq_agent_hub_runs_tenant_idempotency_key",
+        ),
+        CheckConstraint(
+            "status IN ("
+            "'queued', 'planning', 'waiting_user_mode', 'running', "
+            "'waiting_approval', 'retrying', 'paused', 'synthesizing', "
+            "'completed', 'failed', 'cancelled')",
+            name="ck_agent_hub_runs_status",
+        ),
+        CheckConstraint(
+            "mode IS NULL OR mode IN ('direct', 'dispatch', 'discuss', 'hybrid')",
+            name="ck_agent_hub_runs_mode",
+        ),
+        Index("ix_agent_hub_runs_tenant_status", "tenant_id", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    actor_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=True)
+    request: Mapped[str] = mapped_column(Text)
+    mode: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    status: Mapped[str] = mapped_column(String(32))
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    routing_decision: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default=text("1"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class RunStepRow(Base):
+    __tablename__ = "agent_hub_run_steps"
+    __table_args__ = (
+        UniqueConstraint("run_id", "step_id", name="uq_agent_hub_run_steps_run_step"),
+        Index("ix_agent_hub_run_steps_tenant_status", "tenant_id", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_hub_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    step_id: Mapped[str] = mapped_column(String(128))
+    actor: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(32))
+    payload: Mapped[dict[str, object]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class RunEventRow(Base):
+    __tablename__ = "agent_hub_run_events"
+    __table_args__ = (
+        UniqueConstraint("run_id", "sequence", name="uq_agent_hub_run_events_run_sequence"),
+        Index("ix_agent_hub_run_events_run_sequence", "run_id", "sequence"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_hub_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    sequence: Mapped[int] = mapped_column(BigInteger)
+    kind: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[dict[str, object]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class RunArtifactRow(Base):
+    __tablename__ = "agent_hub_run_artifacts"
+    __table_args__ = (
+        UniqueConstraint("run_id", "id", name="uq_agent_hub_run_artifacts_run_id"),
+        UniqueConstraint(
+            "run_id",
+            "content_sha256",
+            name="uq_agent_hub_run_artifacts_run_hash",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_hub_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    type: Mapped[str] = mapped_column(String(128))
+    producer: Mapped[str] = mapped_column(String(128))
+    content_sha256: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[dict[str, object]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class RunCheckpointRow(Base):
+    __tablename__ = "agent_hub_run_checkpoints"
+    __table_args__ = (
+        UniqueConstraint("run_id", "sequence", name="uq_agent_hub_run_checkpoints_run_sequence"),
+        Index("ix_agent_hub_run_checkpoints_run_sequence", "run_id", "sequence"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_hub_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    sequence: Mapped[int] = mapped_column(BigInteger)
+    runtime_type: Mapped[str] = mapped_column(String(128))
+    runtime_version: Mapped[str] = mapped_column(String(32))
+    mode: Mapped[str] = mapped_column(String(20))
+    state: Mapped[dict[str, object]] = mapped_column(JSONB)
+    state_sha256: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[dict[str, object]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class RunApprovalRow(Base):
+    __tablename__ = "agent_hub_run_approvals"
+    __table_args__ = (
+        UniqueConstraint("run_id", "approval_id", name="uq_agent_hub_approvals_run_approval"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_hub_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    approval_id: Mapped[str] = mapped_column(String(128))
+    action: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(32))
+    payload: Mapped[dict[str, object]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class RunUsageRow(Base):
+    __tablename__ = "agent_hub_run_usage"
+    __table_args__ = (
+        UniqueConstraint("run_id", "sequence", name="uq_agent_hub_run_usage_run_sequence"),
+        Index("ix_agent_hub_run_usage_tenant_run", "tenant_id", "run_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_hub_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    sequence: Mapped[int] = mapped_column(BigInteger)
+    provider_id: Mapped[str] = mapped_column(String(128))
+    cost_usd: Mapped[str] = mapped_column(String(32))
+    payload: Mapped[dict[str, object]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class RunOutboxRow(Base):
+    __tablename__ = "agent_hub_run_outbox"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_agent_hub_run_outbox_idempotency_key"),
+        Index("ix_agent_hub_run_outbox_delivered", "delivered", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_hub_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    task_name: Mapped[str] = mapped_column(String(128))
+    idempotency_key: Mapped[str] = mapped_column(String(128))
+    payload: Mapped[dict[str, object]] = mapped_column(JSONB)
+    delivered: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

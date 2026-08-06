@@ -25,7 +25,7 @@ from agent_hub.api.errors import (
     public_error_handler,
 )
 from agent_hub.api.middleware import RequestBodyLimitMiddleware, SafeExceptionMiddleware
-from agent_hub.api.routers import auth, config, system
+from agent_hub.api.routers import auth, config, runs, system
 from agent_hub.auth.passwords import PasswordService
 from agent_hub.auth.rate_limit import RedisAuthRateLimiter
 from agent_hub.auth.service import AuthService
@@ -33,6 +33,9 @@ from agent_hub.auth.tokens import AccessTokenService
 from agent_hub.config.service import ConfigService
 from agent_hub.db.models import TenantRow
 from agent_hub.db.session import build_database
+from agent_hub.runs.repository import RunRepository
+from agent_hub.runs.service import ModeRouterProtocol, RunService, TaskQueue
+from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.settings import Settings, get_settings
 
 ReadinessProbe = Callable[[], Awaitable[None]]
@@ -58,6 +61,16 @@ class RedisResource(Protocol):
     async def aclose(self) -> None: ...
 
     def ping(self, **kwargs: Any) -> Any: ...
+
+
+class InProcessRunQueue:
+    """Minimal queue adapter for single-process tests and explicit publisher wiring."""
+
+    def __init__(self) -> None:
+        self.enqueued: list[tuple[UUID, str]] = []
+
+    async def enqueue_run(self, run_id: UUID, *, idempotency_key: str) -> None:
+        self.enqueued.append((run_id, idempotency_key))
 
 
 async def _cleanup_owned_resources(
@@ -125,6 +138,10 @@ def create_app(
     auth_service: object | None = None,
     rate_limiter: object | None = None,
     config_service: object | None = None,
+    run_service: object | None = None,
+    runtime_registry: RuntimeRegistry | None = None,
+    mode_router: ModeRouterProtocol | None = None,
+    task_queue: TaskQueue | None = None,
     database_factory: Callable[[str], DatabaseResource] = build_database,
     redis_factory: Callable[[str], RedisResource] = Redis.from_url,
 ) -> FastAPI:
@@ -144,7 +161,11 @@ def create_app(
         )
         try:
             application.state.trusted_proxy_ips = configured.trusted_proxy_ips
-            needs_sessions = auth_service is None or config_service is None
+            needs_sessions = (
+                auth_service is None
+                or config_service is None
+                or (run_service is None and runtime_registry is not None)
+            )
             if active_sessions is None and active_database is not None:
                 active_sessions = active_database.session_factory
             if active_sessions is None and needs_sessions:
@@ -175,6 +196,16 @@ def create_app(
             if config_service is None:
                 assert active_sessions is not None
                 application.state.config_service = ConfigService(active_sessions)
+            if run_service is None and runtime_registry is not None:
+                assert active_sessions is not None
+                queue = task_queue if task_queue is not None else InProcessRunQueue()
+                application.state.run_service = RunService(
+                    RunRepository(active_sessions),
+                    runtime_registry=runtime_registry,
+                    router=mode_router,
+                    task_queue=queue,
+                )
+                application.state.run_queue = queue
 
             if rate_limiter is None:
                 assert active_redis is not None
@@ -207,6 +238,10 @@ def create_app(
     application.state.auth_service = auth_service
     application.state.rate_limiter = rate_limiter
     application.state.config_service = config_service
+    application.state.run_service = run_service
+    application.state.runtime_registry = runtime_registry
+    application.state.mode_router = mode_router
+    application.state.run_queue = task_queue
     configured_settings = settings or Settings.model_construct()
     application.state.trusted_proxy_ips = configured_settings.trusted_proxy_ips
     application.add_exception_handler(PublicAPIError, public_error_handler)
@@ -228,6 +263,7 @@ def create_app(
     application.router.routes.extend(system.router.routes)
     application.router.routes.extend(auth.router.routes)
     application.router.routes.extend(config.router.routes)
+    application.router.routes.extend(runs.router.routes)
     return application
 
 

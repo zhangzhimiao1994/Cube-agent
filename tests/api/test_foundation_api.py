@@ -1193,7 +1193,7 @@ def test_openapi_describes_security_health_and_route_specific_errors() -> None:
                 continue
             responses = operation["responses"]
             assert "405" in responses, (path, method, responses)
-            for status_code in set(responses) - {"200", "201"}:
+            for status_code in set(responses) - {"200", "201", "202"}:
                 content = responses[status_code]["content"]["application/json"]
                 assert content["schema"] == {
                     "$ref": "#/components/schemas/ErrorResponse"
