@@ -2963,18 +2963,6 @@ async def test_partial_repository_write_recovers_from_last_durable_boundary() ->
         ) -> tuple[Artifact, ...]:
             return await self.delegate.get_many(tenant_id, run_id, references)
 
-        async def delete_if_hash(
-            self,
-            tenant_id: UUID,
-            run_id: UUID,
-            reference: ArtifactReference,
-            *,
-            write_id: UUID,
-        ) -> bool:
-            return await self.delegate.delete_if_hash(
-                tenant_id, run_id, reference, write_id=write_id
-            )
-
     failing = FailAfterOnePut()
     first = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=failing)
     with pytest.raises(RuntimeExecutionError):
@@ -3021,18 +3009,6 @@ async def test_cancelled_repository_hydration_never_replaces_checkpoint() -> Non
             self.started.set()
             await asyncio.Event().wait()
             return await self.delegate.get_many(tenant_id, run_id, references)
-
-        async def delete_if_hash(
-            self,
-            tenant_id: UUID,
-            run_id: UUID,
-            reference: ArtifactReference,
-            *,
-            write_id: UUID,
-        ) -> bool:
-            return await self.delegate.delete_if_hash(
-                tenant_id, run_id, reference, write_id=write_id
-            )
 
     repository = InMemoryArtifactRepository()
     first = make_runtime(FakeGateway(), one_step_plan(), artifact_repository=repository)
@@ -3657,18 +3633,6 @@ async def test_cancel_during_artifact_commit_leaves_no_commit_task_and_reuses_ru
         ) -> tuple[Artifact, ...]:
             return await self.delegate.get_many(tenant_id, run_id, references)
 
-        async def delete_if_hash(
-            self,
-            tenant_id: UUID,
-            run_id: UUID,
-            reference: ArtifactReference,
-            *,
-            write_id: UUID,
-        ) -> bool:
-            return await self.delegate.delete_if_hash(
-                tenant_id, run_id, reference, write_id=write_id
-            )
-
     repository = BlockingRepository()
     runtime = make_runtime(
         FakeGateway(),
@@ -3760,18 +3724,6 @@ async def test_cancel_rolls_back_a_repository_write_completed_before_put_returns
         ) -> tuple[Artifact, ...]:
             return await self.delegate.get_many(tenant_id, run_id, references)
 
-        async def delete_if_hash(
-            self,
-            tenant_id: UUID,
-            run_id: UUID,
-            reference: ArtifactReference,
-            *,
-            write_id: UUID,
-        ) -> bool:
-            return await self.delegate.delete_if_hash(
-                tenant_id, run_id, reference, write_id=write_id
-            )
-
     repository = WrittenThenBlockingRepository()
     runtime = make_runtime(
         FakeGateway(), one_step_plan(), artifact_repository=repository
@@ -3810,8 +3762,8 @@ async def test_failed_artifact_rollback_is_an_explicit_terminal_failure(
     adapter_module = importlib.import_module("agent_hub.runtime.crew.adapter")
     monkeypatch.setattr(
         adapter_module,
-        "_ARTIFACT_ROLLBACK_TIMEOUT_SECONDS",
-        0.01,
+        "_ARTIFACT_CLEANUP_DEADLINE_SECONDS",
+        0.05,
         raising=False,
     )
 
@@ -3909,7 +3861,7 @@ async def test_rollback_cancelled_error_is_reported_as_cleanup_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter_module = importlib.import_module("agent_hub.runtime.crew.adapter")
-    monkeypatch.setattr(adapter_module, "_ARTIFACT_ROLLBACK_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(adapter_module, "_ARTIFACT_CLEANUP_DEADLINE_SECONDS", 0.05)
 
     class CancelledRollbackRepository:
         def __init__(self) -> None:
@@ -3978,12 +3930,11 @@ async def test_rollback_that_swallows_one_cancel_is_cancelled_again_and_collecte
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter_module = importlib.import_module("agent_hub.runtime.crew.adapter")
-    monkeypatch.setattr(adapter_module, "_ARTIFACT_ROLLBACK_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(adapter_module, "_ARTIFACT_CLEANUP_DEADLINE_SECONDS", 0.1)
     monkeypatch.setattr(
         adapter_module,
-        "_ARTIFACT_CLEANUP_HARD_DEADLINE_SECONDS",
-        0.1,
-        raising=False,
+        "_ARTIFACT_CLEANUP_HARD_GRACE_SECONDS",
+        0.05,
     )
 
     class SwallowOnceRepository:
@@ -4066,12 +4017,11 @@ async def test_non_cooperative_rollback_is_detached_at_hard_deadline_and_runtime
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter_module = importlib.import_module("agent_hub.runtime.crew.adapter")
-    monkeypatch.setattr(adapter_module, "_ARTIFACT_ROLLBACK_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(adapter_module, "_ARTIFACT_CLEANUP_DEADLINE_SECONDS", 0.05)
     monkeypatch.setattr(
         adapter_module,
-        "_ARTIFACT_CLEANUP_HARD_DEADLINE_SECONDS",
-        0.05,
-        raising=False,
+        "_ARTIFACT_CLEANUP_HARD_GRACE_SECONDS",
+        0.02,
     )
 
     class NonCooperativeRepository:
@@ -4130,7 +4080,7 @@ async def test_non_cooperative_rollback_is_detached_at_hard_deadline_and_runtime
                     await self.release.wait()
                 except asyncio.CancelledError:
                     self.cancel_count += 1
-            return await self.delegate.delete_if_hash(
+            return await self.delegate.abort_write(
                 tenant_id, run_id, reference, write_id=write_id
             )
 
@@ -4149,14 +4099,9 @@ async def test_non_cooperative_rollback_is_detached_at_hard_deadline_and_runtime
         with pytest.raises(RuntimeExecutionError, match="artifact rollback failed"):
             await consumer
         detached_rollbacks = tuple(
-            task
-            for task in asyncio.all_tasks()
-            if task is not asyncio.current_task()
-            and not task.done()
-            and "rollback_pending" in repr(task.get_coro())
+            task for task in runtime._cleanup_tasks if not task.done()
         )
         assert len(detached_rollbacks) == 1
-        assert set(detached_rollbacks) <= runtime._cleanup_tasks
         repository.block_put = False
         assert (
             await asyncio.wait_for(
@@ -4170,11 +4115,7 @@ async def test_non_cooperative_rollback_is_detached_at_hard_deadline_and_runtime
             cancel_task.cancel()
         await asyncio.gather(cancel_task, consumer, return_exceptions=True)
         await asyncio.sleep(0)
-        assert not any(
-            not task.done() and "rollback_pending" in repr(task.get_coro())
-            for task in asyncio.all_tasks()
-            if task is not asyncio.current_task()
-        )
+        assert not any(not task.done() for task in runtime._cleanup_tasks)
 
 
 async def test_aborted_write_fence_rejects_a_put_that_finishes_after_cancel(
@@ -4184,7 +4125,7 @@ async def test_aborted_write_fence_rejects_a_put_that_finishes_after_cancel(
     monkeypatch.setattr(adapter_module, "_TASK_CANCELLATION_GRACE_SECONDS", 0.01)
     monkeypatch.setattr(
         adapter_module,
-        "_ARTIFACT_CLEANUP_HARD_DEADLINE_SECONDS",
+        "_ARTIFACT_CLEANUP_HARD_GRACE_SECONDS",
         0.05,
     )
 
@@ -4257,30 +4198,6 @@ async def test_aborted_write_fence_rejects_a_put_that_finishes_after_cancel(
                 tenant_id, run_id, reference, write_id=write_id
             )
 
-        async def commit_write(
-            self,
-            tenant_id: UUID,
-            run_id: UUID,
-            reference: ArtifactReference,
-            *,
-            write_id: UUID,
-        ) -> None:
-            await self.delegate.commit_write(
-                tenant_id, run_id, reference, write_id=write_id
-            )
-
-        async def delete_if_hash(
-            self,
-            tenant_id: UUID,
-            run_id: UUID,
-            reference: ArtifactReference,
-            *,
-            write_id: UUID,
-        ) -> bool:
-            return await self.abort_write(
-                tenant_id, run_id, reference, write_id=write_id
-            )
-
     repository = LatePutRepository()
     runtime = make_runtime(
         FakeGateway(), one_step_plan(), artifact_repository=repository
@@ -4336,13 +4253,103 @@ async def test_aborted_write_fence_rejects_a_put_that_finishes_after_cancel(
         await asyncio.gather(cancel_task, consumer, return_exceptions=True)
 
 
-def test_public_cancel_deadline_outlives_all_cleanup_deadlines() -> None:
+def test_public_cancel_deadline_has_explicit_scheduling_margin() -> None:
     adapter_module = importlib.import_module("agent_hub.runtime.crew.adapter")
 
-    assert adapter_module._RUNTIME_CANCEL_TIMEOUT_SECONDS > (
-        adapter_module._ARTIFACT_ROLLBACK_TIMEOUT_SECONDS
-        + adapter_module._ARTIFACT_CLEANUP_HARD_DEADLINE_SECONDS
+    assert adapter_module._RUNTIME_CANCEL_SCHEDULING_MARGIN_SECONDS >= 0.5
+    assert adapter_module._RUNTIME_CANCEL_TIMEOUT_SECONDS >= (
+        adapter_module._ARTIFACT_CLEANUP_DEADLINE_SECONDS
+        + adapter_module._RUNTIME_CANCEL_SCHEDULING_MARGIN_SECONDS
     )
+
+
+async def test_cleanup_batch_collects_64_tasks_under_one_absolute_deadline() -> None:
+    runtime = make_runtime(FakeGateway(), one_step_plan())
+    cancel_counts = [0] * 64
+
+    async def block(index: int) -> None:
+        while True:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancel_counts[index] += 1
+                if cancel_counts[index] >= 2:
+                    raise
+
+    tasks = tuple(asyncio.create_task(block(index)) for index in range(64))
+    await asyncio.sleep(0)
+    deadline = asyncio.get_running_loop().time() + 0.2
+    try:
+        pending = await runtime._cancel_cleanup_tasks(
+            tasks,
+            deadline=deadline,
+        )
+        assert pending == ()
+        assert all(task.done() for task in tasks)
+        assert min(cancel_counts) >= 2
+        assert asyncio.get_running_loop().time() <= deadline
+    finally:
+        for _ in range(2):
+            for task in tasks:
+                task.cancel()
+            await asyncio.sleep(0)
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_late_put_completed_during_cancel_grace_keeps_frozen_abort_obligation() -> None:
+    class CompletesOnSecondCancelRepository(DelegatingArtifactRepository):
+        def __init__(self) -> None:
+            self.delegate = InMemoryArtifactRepository()
+            self.started = asyncio.Event()
+            self.cancel_count = 0
+            self.stored: Artifact | None = None
+
+        async def put(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            artifact: Artifact,
+            *,
+            write_id: UUID | None = None,
+        ) -> None:
+            self.stored = artifact
+            self.started.set()
+            while self.cancel_count < 2:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cancel_count += 1
+            await self.delegate.put(
+                tenant_id, run_id, artifact, write_id=write_id
+            )
+
+        async def get_many(
+            self,
+            tenant_id: UUID,
+            run_id: UUID,
+            references: tuple[ArtifactReference, ...],
+        ) -> tuple[Artifact, ...]:
+            return await self.delegate.get_many(tenant_id, run_id, references)
+
+    repository = CompletesOnSecondCancelRepository()
+    runtime = make_runtime(
+        FakeGateway(), one_step_plan(), artifact_repository=repository
+    )
+    consumer = asyncio.create_task(collect(runtime, context(token_budget=100)))
+    await repository.started.wait()
+
+    await asyncio.wait_for(runtime.cancel(), timeout=1)
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+    assert repository.cancel_count >= 2
+    assert repository.stored is not None
+    reference = ArtifactReference(
+        id=repository.stored.id,
+        sha256=repository.stored.content_sha256,
+    )
+    with pytest.raises(ArtifactRepositoryError, match="unavailable"):
+        await repository.get_many(TENANT_ID, RUN_ID, (reference,))
+    assert (await runtime.save_checkpoint()).state["artifact_registry"] == {}
 
 
 async def test_every_emitted_checkpoint_is_immediately_restorable_from_shared_repository() -> None:

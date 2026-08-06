@@ -75,7 +75,11 @@ class ArtifactRepository(Protocol):
 
 
 class InMemoryArtifactRepository:
-    """Single-process repository; inject one shared instance for cross-runtime recovery."""
+    """Single-process repository; inject one shared instance for cross-runtime recovery.
+
+    A ``written`` reservation is the durable ownership proof for a checkpointed
+    artifact.  Publication deliberately requires no second repository transition.
+    """
 
     def __init__(
         self,
@@ -128,7 +132,7 @@ class InMemoryArtifactRepository:
         reservation_key = (*scope, write_id)
         existing = self._write_reservations.get(reservation_key)
         if existing is not None:
-            if existing[0] != reference or existing[1] != "reserved":
+            if existing[0] != reference or existing[1] not in {"reserved", "written"}:
                 raise ArtifactRepositoryError("artifact is unavailable")
             return
         count = self._scope_reservation_counts.get(scope, 0)
@@ -203,6 +207,11 @@ class InMemoryArtifactRepository:
                         self._write_owners[key] = None
                     else:
                         owners.add(write_id)
+                if write_id is not None:
+                    self._write_reservations[(*scope, write_id)] = (
+                        reference,
+                        "written",
+                    )
                 return
             count = self._scope_counts.get(scope, 0)
             total = self._scope_bytes.get(scope, 0)
@@ -216,6 +225,11 @@ class InMemoryArtifactRepository:
             self._scope_counts[scope] = count + 1
             self._scope_bytes[scope] = total + size
             self._write_owners[key] = None if write_id is None else {write_id}
+            if write_id is not None:
+                self._write_reservations[(*scope, write_id)] = (
+                    reference,
+                    "written",
+                )
 
     async def get_many(
         self,
@@ -272,8 +286,6 @@ class InMemoryArtifactRepository:
             else:
                 if reservation[0] != reference:
                     return False
-                if reservation[1] == "committed":
-                    return False
                 self._write_reservations[reservation_key] = (reference, "aborted")
             artifact = self._artifacts.get(key)
             if (
@@ -281,7 +293,7 @@ class InMemoryArtifactRepository:
                 or artifact.content_sha256 != reference.sha256
                 or artifact.recompute_content_sha256() != reference.sha256
             ):
-                return reservation is None or reservation[1] == "reserved"
+                return reservation is None or reservation[1] in {"reserved", "written"}
             owners = self._write_owners[key]
             if owners is None or write_id not in owners:
                 return False
@@ -300,51 +312,6 @@ class InMemoryArtifactRepository:
                 del self._scope_counts[scope]
                 del self._scope_bytes[scope]
             return True
-
-    async def commit_write(
-        self,
-        tenant_id: UUID,
-        run_id: UUID,
-        reference: ArtifactReference,
-        *,
-        write_id: UUID,
-    ) -> None:
-        scope = self._scope(tenant_id, run_id)
-        self._write_identity(reference, write_id)
-        key = (*scope, reference.id)
-        async with self._lock:
-            reservation_key = (*scope, write_id)
-            reservation = self._write_reservations.get(reservation_key)
-            artifact = self._artifacts.get(key)
-            if (
-                reservation is None
-                or reservation[0] != reference
-                or reservation[1] == "aborted"
-                or artifact is None
-                or artifact.content_sha256 != reference.sha256
-                or artifact.recompute_content_sha256() != reference.sha256
-            ):
-                raise ArtifactRepositoryError("artifact is unavailable")
-            if reservation[1] == "committed":
-                return
-            owners = self._write_owners[key]
-            if owners is not None and write_id not in owners:
-                raise ArtifactRepositoryError("artifact is unavailable")
-            self._write_owners[key] = None
-            self._write_reservations[reservation_key] = (reference, "committed")
-
-    async def delete_if_hash(
-        self,
-        tenant_id: UUID,
-        run_id: UUID,
-        reference: ArtifactReference,
-        *,
-        write_id: UUID,
-    ) -> bool:
-        return await self.abort_write(
-            tenant_id, run_id, reference, write_id=write_id
-        )
-
 
 __all__ = [
     "ArtifactReference",

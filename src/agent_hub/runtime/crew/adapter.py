@@ -63,13 +63,13 @@ _MAX_TOOL_ARGUMENT_BYTES = 32_768
 _MAX_AUDITED_TOKENS = 100_000_000
 _MAX_AUDITED_COST_USD = Decimal(64000000)
 _TASK_CANCELLATION_GRACE_SECONDS = 0.25
-_ARTIFACT_ROLLBACK_TIMEOUT_SECONDS = 5.0
-_ARTIFACT_CLEANUP_HARD_DEADLINE_SECONDS = 0.25
+_ARTIFACT_CLEANUP_DEADLINE_SECONDS = 5.0
+_ARTIFACT_CLEANUP_HARD_GRACE_SECONDS = 0.25
 _ARTIFACT_CLEANUP_CANCEL_INTERVAL_SECONDS = 0.01
+_RUNTIME_CANCEL_SCHEDULING_MARGIN_SECONDS = 1.0
 _RUNTIME_CANCEL_TIMEOUT_SECONDS = (
-    _ARTIFACT_ROLLBACK_TIMEOUT_SECONDS
-    + _ARTIFACT_CLEANUP_HARD_DEADLINE_SECONDS
-    + _TASK_CANCELLATION_GRACE_SECONDS
+    _ARTIFACT_CLEANUP_DEADLINE_SECONDS
+    + _RUNTIME_CANCEL_SCHEDULING_MARGIN_SECONDS
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _CREWAI_IMPORT_LOCK = threading.Lock()
@@ -575,6 +575,7 @@ class _RunState:
     deadline: float | None = None
     crew_generation: CrewStepGeneration | None = None
     open: bool = True
+    artifact_writes_open: bool = True
     commit_tasks: set[asyncio.Task[None]] = field(default_factory=set)
     pending_artifact_writes: dict[UUID, ArtifactReference] = field(default_factory=dict)
     cleanup_error: RuntimeExecutionError | None = None
@@ -706,6 +707,7 @@ class CrewDispatchRuntime:
                 next_event.cancel()
                 await asyncio.gather(next_event, return_exceptions=True)
         finally:
+            state.artifact_writes_open = False
             if not coordinator.done():
                 coordinator.cancel()
             await asyncio.gather(coordinator, return_exceptions=True)
@@ -740,6 +742,8 @@ class CrewDispatchRuntime:
         terminal_item: _Terminal | None = None
 
         async def store_artifact(artifact: Artifact) -> UUID:
+            if not self._accepts_artifact_writes(state):
+                raise asyncio.CancelledError
             reference = ArtifactReference(id=artifact.id, sha256=artifact.content_sha256)
             write_id = uuid4()
             state.pending_artifact_writes[write_id] = reference
@@ -767,6 +771,8 @@ class CrewDispatchRuntime:
             artifact = values.get("artifact")
             if type(artifact) is Artifact and str(artifact.id) not in artifact_registry:
                 write_id = await store_artifact(artifact)
+                if not self._accepts_artifact_writes(state):
+                    raise asyncio.CancelledError
                 artifact_registry[str(artifact.id)] = artifact
                 state.pending_artifact_writes.pop(write_id, None)
             if run_open and self._is_current_run(state):
@@ -1121,6 +1127,8 @@ class CrewDispatchRuntime:
                         },
                     )
                     write_id = await store_artifact(artifact)
+                    if not self._accepts_artifact_writes(state):
+                        raise asyncio.CancelledError
                     model_ledger.states[key] = model_state
                     model_ledger.artifacts[key] = artifact
                     artifact_registry[str(artifact.id)] = artifact
@@ -1343,57 +1351,63 @@ class CrewDispatchRuntime:
                 del emit_error
         finally:
             state.open = False
-            if state.commit_tasks:
-                for commit_task in tuple(state.commit_tasks):
-                    collected = await self._force_cancel_cleanup_task(
-                        commit_task,
-                        timeout=_TASK_CANCELLATION_GRACE_SECONDS,
+            state.artifact_writes_open = False
+            cleanup_deadline = (
+                asyncio.get_running_loop().time()
+                + _ARTIFACT_CLEANUP_DEADLINE_SECONDS
+            )
+            frozen_writes = tuple(state.pending_artifact_writes.items())
+            commit_tasks = tuple(state.commit_tasks)
+            if commit_tasks:
+                commit_deadline = min(
+                    cleanup_deadline,
+                    asyncio.get_running_loop().time()
+                    + _TASK_CANCELLATION_GRACE_SECONDS,
+                )
+                pending_commits = await self._cancel_cleanup_tasks(
+                    commit_tasks,
+                    deadline=commit_deadline,
+                )
+                if pending_commits:
+                    state.cleanup_error = RuntimeExecutionError(
+                        "artifact rollback failed"
                     )
-                    if not collected:
-                        state.cleanup_error = RuntimeExecutionError(
-                            "artifact rollback failed"
-                        )
-                state.commit_tasks.clear()
+            state.commit_tasks.clear()
             cleanup_succeeded = True
-            if state.pending_artifact_writes:
-                pending_writes = tuple(state.pending_artifact_writes.items())
-
-                async def rollback_pending() -> None:
-                    for write_id, reference in pending_writes:
-                        await self._artifact_repository.abort_write(
+            if frozen_writes:
+                abort_tasks = tuple(
+                    asyncio.create_task(
+                        self._artifact_repository.abort_write(
                             context.tenant_id,
                             context.run_id,
                             reference,
                             write_id=write_id,
                         )
-                        state.pending_artifact_writes.pop(write_id, None)
-
-                rollback = asyncio.create_task(rollback_pending())
-                supervisor = asyncio.create_task(
-                    self._supervise_artifact_rollback(rollback)
-                )
-                self._cleanup_tasks.add(supervisor)
-                try:
-                    cleanup_succeeded = await asyncio.shield(supervisor)
-                except asyncio.CancelledError as cleanup_cancelled:
-                    cleanup_cancelled.__traceback__ = None
-                    cleanup_cancelled.__context__ = None
-                    cleanup_cancelled.__cause__ = None
-                    del cleanup_cancelled
-                    cleanup_succeeded = False
-                    cleanup_done, _ = await asyncio.wait(
-                        {supervisor},
-                        timeout=(
-                            _ARTIFACT_ROLLBACK_TIMEOUT_SECONDS
-                            + _ARTIFACT_CLEANUP_HARD_DEADLINE_SECONDS
-                        ),
                     )
-                    if not cleanup_done:
-                        supervisor.cancel()
-                        supervisor.add_done_callback(self._finish_cleanup_task)
-                finally:
-                    if supervisor.done():
-                        self._finish_cleanup_task(supervisor)
+                    for write_id, reference in frozen_writes
+                )
+                soft_deadline = max(
+                    asyncio.get_running_loop().time(),
+                    cleanup_deadline - _ARTIFACT_CLEANUP_HARD_GRACE_SECONDS,
+                )
+                done_aborts, pending_aborts = await asyncio.wait(
+                    abort_tasks,
+                    timeout=max(
+                        0.0,
+                        soft_deadline - asyncio.get_running_loop().time(),
+                    ),
+                )
+                cleanup_succeeded = all(
+                    self._cleanup_task_succeeded(task) for task in done_aborts
+                )
+                if pending_aborts:
+                    cleanup_succeeded = False
+                    await self._cancel_cleanup_tasks(
+                        tuple(pending_aborts),
+                        deadline=cleanup_deadline,
+                    )
+                for write_id, _ in frozen_writes:
+                    state.pending_artifact_writes.pop(write_id, None)
             if not cleanup_succeeded or state.cleanup_error is not None:
                 cleanup_error = RuntimeExecutionError("artifact rollback failed")
                 state.cleanup_error = cleanup_error
@@ -2347,11 +2361,14 @@ class CrewDispatchRuntime:
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
-            collected = await self._force_cancel_cleanup_task(
-                task,
-                timeout=_TASK_CANCELLATION_GRACE_SECONDS,
+            pending = await self._cancel_cleanup_tasks(
+                (task,),
+                deadline=(
+                    asyncio.get_running_loop().time()
+                    + _TASK_CANCELLATION_GRACE_SECONDS
+                ),
             )
-            if not collected:
+            if pending:
                 run_state.cleanup_error = RuntimeExecutionError(
                     "artifact rollback failed"
                 )
@@ -2362,52 +2379,34 @@ class CrewDispatchRuntime:
                 self._cleanup_tasks.add(task)
                 task.add_done_callback(self._finish_cleanup_task)
 
-    async def _supervise_artifact_rollback(
+    async def _cancel_cleanup_tasks(
         self,
-        rollback: asyncio.Task[None],
-    ) -> bool:
-        done, _ = await asyncio.wait(
-            {rollback}, timeout=_ARTIFACT_ROLLBACK_TIMEOUT_SECONDS
-        )
-        if done:
-            return self._cleanup_task_succeeded(rollback)
-
-        deadline = (
-            asyncio.get_running_loop().time()
-            + _ARTIFACT_CLEANUP_HARD_DEADLINE_SECONDS
-        )
-        while not rollback.done():
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                break
-            await self._force_cancel_cleanup_task(rollback, timeout=remaining)
-        return False
-
-    async def _force_cancel_cleanup_task(
-        self,
-        task: asyncio.Task[Any],
+        tasks: tuple[asyncio.Task[Any], ...],
         *,
-        timeout: float,
-    ) -> bool:
-        deadline = asyncio.get_running_loop().time() + timeout
-        while not task.done():
+        deadline: float,
+    ) -> tuple[asyncio.Task[Any], ...]:
+        pending = {task for task in tasks if not task.done()}
+        for task in pending:
             task.cancel()
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                break
-            await asyncio.wait(
-                {task},
-                timeout=min(
-                    remaining,
-                    _ARTIFACT_CLEANUP_CANCEL_INTERVAL_SECONDS,
-                ),
+        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+        if pending and remaining:
+            _, pending = await asyncio.wait(
+                pending,
+                timeout=min(remaining, _ARTIFACT_CLEANUP_CANCEL_INTERVAL_SECONDS),
             )
-        if task.done():
-            self._retrieve_detached_task(task)
-            return True
-        self._cleanup_tasks.add(task)
-        task.add_done_callback(self._finish_cleanup_task)
-        return False
+        for task in pending:
+            task.cancel()
+        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+        if pending and remaining:
+            _, pending = await asyncio.wait(pending, timeout=remaining)
+        for task in tasks:
+            if task.done():
+                self._retrieve_detached_task(task)
+        ordered_pending = tuple(task for task in tasks if task in pending)
+        for task in ordered_pending:
+            self._cleanup_tasks.add(task)
+            task.add_done_callback(self._finish_cleanup_task)
+        return ordered_pending
 
     @staticmethod
     def _cleanup_task_succeeded(task: asyncio.Task[Any]) -> bool:
@@ -2501,6 +2500,9 @@ class CrewDispatchRuntime:
 
     def _is_current_run(self, state: _RunState) -> bool:
         return state.open and self._current_token is state.token
+
+    def _accepts_artifact_writes(self, state: _RunState) -> bool:
+        return state.artifact_writes_open and self._current_token is state.token
 
     def _publish_checkpoint(self, state: _RunState, checkpoint: RuntimeCheckpoint) -> None:
         if self._is_current_run(state):
@@ -3635,6 +3637,7 @@ class CrewDispatchRuntime:
             if self._active_stream is not stream:
                 stream._closed = True
                 return
+            stream._state.artifact_writes_open = False
             task = self._active_task
             if task is not None and not task.done():
                 task.cancel()
