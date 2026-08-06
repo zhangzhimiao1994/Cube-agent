@@ -21,6 +21,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from decimal import Decimal
+from functools import partial
 from pathlib import Path
 from typing import Any, Never, Protocol, cast
 from uuid import UUID, uuid4
@@ -68,7 +69,9 @@ _ARTIFACT_CLEANUP_HARD_GRACE_SECONDS = 0.25
 _ARTIFACT_CLEANUP_CANCEL_INTERVAL_SECONDS = 0.01
 _RUNTIME_CANCEL_SCHEDULING_MARGIN_SECONDS = 1.0
 _RUNTIME_CANCEL_TIMEOUT_SECONDS = (
-    _ARTIFACT_CLEANUP_DEADLINE_SECONDS
+    _TASK_CANCELLATION_GRACE_SECONDS
+    + _ARTIFACT_CLEANUP_DEADLINE_SECONDS
+    + _ARTIFACT_CLEANUP_HARD_GRACE_SECONDS
     + _RUNTIME_CANCEL_SCHEDULING_MARGIN_SECONDS
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -1352,17 +1355,12 @@ class CrewDispatchRuntime:
         finally:
             state.open = False
             state.artifact_writes_open = False
-            cleanup_deadline = (
-                asyncio.get_running_loop().time()
-                + _ARTIFACT_CLEANUP_DEADLINE_SECONDS
-            )
             frozen_writes = tuple(state.pending_artifact_writes.items())
             commit_tasks = tuple(state.commit_tasks)
             if commit_tasks:
-                commit_deadline = min(
-                    cleanup_deadline,
+                commit_deadline = (
                     asyncio.get_running_loop().time()
-                    + _TASK_CANCELLATION_GRACE_SECONDS,
+                    + _TASK_CANCELLATION_GRACE_SECONDS
                 )
                 pending_commits = await self._cancel_cleanup_tasks(
                     commit_tasks,
@@ -1373,41 +1371,11 @@ class CrewDispatchRuntime:
                         "artifact rollback failed"
                     )
             state.commit_tasks.clear()
-            cleanup_succeeded = True
-            if frozen_writes:
-                abort_tasks = tuple(
-                    asyncio.create_task(
-                        self._artifact_repository.abort_write(
-                            context.tenant_id,
-                            context.run_id,
-                            reference,
-                            write_id=write_id,
-                        )
-                    )
-                    for write_id, reference in frozen_writes
-                )
-                soft_deadline = max(
-                    asyncio.get_running_loop().time(),
-                    cleanup_deadline - _ARTIFACT_CLEANUP_HARD_GRACE_SECONDS,
-                )
-                done_aborts, pending_aborts = await asyncio.wait(
-                    abort_tasks,
-                    timeout=max(
-                        0.0,
-                        soft_deadline - asyncio.get_running_loop().time(),
-                    ),
-                )
-                cleanup_succeeded = all(
-                    self._cleanup_task_succeeded(task) for task in done_aborts
-                )
-                if pending_aborts:
-                    cleanup_succeeded = False
-                    await self._cancel_cleanup_tasks(
-                        tuple(pending_aborts),
-                        deadline=cleanup_deadline,
-                    )
-                for write_id, _ in frozen_writes:
-                    state.pending_artifact_writes.pop(write_id, None)
+            cleanup_succeeded = await self._abort_frozen_artifact_writes(
+                context,
+                state,
+                frozen_writes,
+            )
             if not cleanup_succeeded or state.cleanup_error is not None:
                 cleanup_error = RuntimeExecutionError("artifact rollback failed")
                 state.cleanup_error = cleanup_error
@@ -2407,6 +2375,66 @@ class CrewDispatchRuntime:
             self._cleanup_tasks.add(task)
             task.add_done_callback(self._finish_cleanup_task)
         return ordered_pending
+
+    async def _abort_frozen_artifact_writes(
+        self,
+        context: TaskContext,
+        state: _RunState,
+        frozen_writes: tuple[tuple[UUID, ArtifactReference], ...],
+    ) -> bool:
+        if not frozen_writes:
+            return True
+        tasks_by_write = {
+            asyncio.create_task(
+                self._artifact_repository.abort_write(
+                    context.tenant_id,
+                    context.run_id,
+                    reference,
+                    write_id=write_id,
+                )
+            ): write_id
+            for write_id, reference in frozen_writes
+        }
+        done, pending = await asyncio.wait(
+            tasks_by_write,
+            timeout=_ARTIFACT_CLEANUP_DEADLINE_SECONDS,
+        )
+        cleanup_succeeded = not pending
+        for task in done:
+            if self._cleanup_task_succeeded(task):
+                state.pending_artifact_writes.pop(tasks_by_write[task], None)
+            else:
+                cleanup_succeeded = False
+        if not pending:
+            return cleanup_succeeded
+
+        still_pending = await self._cancel_cleanup_tasks(
+            tuple(pending),
+            deadline=(
+                asyncio.get_running_loop().time()
+                + _ARTIFACT_CLEANUP_HARD_GRACE_SECONDS
+            ),
+        )
+        isolated = set(still_pending)
+        for task in pending:
+            write_id = tasks_by_write[task]
+            if task not in isolated:
+                if self._cleanup_task_succeeded(task):
+                    state.pending_artifact_writes.pop(write_id, None)
+            else:
+                task.add_done_callback(
+                    partial(self._finish_detached_artifact_abort, state, write_id)
+                )
+        return False
+
+    def _finish_detached_artifact_abort(
+        self,
+        state: _RunState,
+        write_id: UUID,
+        task: asyncio.Task[Any],
+    ) -> None:
+        if self._cleanup_task_succeeded(task):
+            state.pending_artifact_writes.pop(write_id, None)
 
     @staticmethod
     def _cleanup_task_succeeded(task: asyncio.Task[Any]) -> bool:
