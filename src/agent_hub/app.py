@@ -33,6 +33,7 @@ from agent_hub.auth.tokens import AccessTokenService
 from agent_hub.config.service import ConfigService
 from agent_hub.db.models import TenantRow
 from agent_hub.db.session import build_database
+from agent_hub.observability.metrics import default_metrics_registry
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import ModeRouterProtocol, RunService, TaskQueue
 from agent_hub.runtime.registry import RuntimeRegistry
@@ -242,6 +243,8 @@ def create_app(
     application.state.runtime_registry = runtime_registry
     application.state.mode_router = mode_router
     application.state.run_queue = task_queue
+    application.state.metrics_registry = default_metrics_registry()
+    application.state.extra_readiness_checks = {}
     configured_settings = settings or Settings.model_construct()
     application.state.trusted_proxy_ips = configured_settings.trusted_proxy_ips
     application.add_exception_handler(PublicAPIError, public_error_handler)

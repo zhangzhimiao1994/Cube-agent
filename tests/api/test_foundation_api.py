@@ -77,9 +77,11 @@ def test_ready_is_generic_and_requires_both_dependencies(failed_probe: str) -> N
     response = TestClient(app).get("/health/ready")
 
     assert response.status_code == 503
-    assert response.json() == {
-        "error": {"code": "service_unavailable", "message": "service unavailable"}
+    assert response.json()["error"] == {
+        "code": "service_unavailable",
+        "message": "service unavailable",
     }
+    assert response.json()["checks"][failed_probe] == "failed"
     assert "secret backend address" not in response.text
 
 
