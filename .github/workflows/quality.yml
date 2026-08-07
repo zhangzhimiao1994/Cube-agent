@@ -1,0 +1,35 @@
+name: quality
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python-web-shell:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run mypy --strict src tests
+      - run: uv run pytest -q
+      - run: npm ci
+        working-directory: web
+      - run: npm run lint
+        working-directory: web
+      - run: npm run test -- --run
+        working-directory: web
+      - run: npm run build
+        working-directory: web
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck bats
+      - run: bash -n install.sh scripts/agent-hub scripts/lib/*.sh scripts/commands/*.sh deploy/native/*.sh
+      - run: shellcheck install.sh scripts/agent-hub scripts/lib/*.sh scripts/commands/*.sh deploy/native/*.sh
+      - run: bats tests/install
+      - run: docker compose -f deploy/compose/docker-compose.yml config --quiet
+

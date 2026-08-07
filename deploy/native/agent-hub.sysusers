@@ -1,0 +1,1 @@
+u agent-hub 10001 "Agent Hub service user" /var/lib/agent-hub /usr/sbin/nologin

@@ -1,0 +1,25 @@
+[Unit]
+Description=Agent Hub API
+After=network-online.target postgresql.service redis.service
+
+[Service]
+Type=simple
+User=agent-hub
+Group=agent-hub
+EnvironmentFile=/etc/agent-hub/secrets.env
+WorkingDirectory=/opt/agent-hub/current
+ExecStart=/opt/agent-hub/current/.venv/bin/uvicorn agent_hub.app:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/agent-hub /run/agent-hub
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+LockPersonality=yes
+
+[Install]
+WantedBy=agent-hub.target

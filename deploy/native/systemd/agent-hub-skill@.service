@@ -1,0 +1,26 @@
+[Unit]
+Description=Agent Hub Skill Sandbox %i
+After=agent-hub-api.service
+
+[Service]
+Type=simple
+DynamicUser=yes
+EnvironmentFile=/etc/agent-hub/secrets.env
+WorkingDirectory=/var/lib/agent-hub/skills/%i
+ExecStart=/opt/agent-hub/current/.venv/bin/python -m agent_hub.skills.runner --skill %i
+RuntimeMaxSec=300
+MemoryMax=512M
+CPUQuota=100%
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/agent-hub/skills/%i /run/agent-hub
+
+[Install]
+WantedBy=agent-hub.target

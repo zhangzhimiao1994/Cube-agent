@@ -1,0 +1,4 @@
+mode: native
+public_url: http://127.0.0.1
+local_postgres: true
+local_redis: true

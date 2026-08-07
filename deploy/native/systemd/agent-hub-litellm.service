@@ -1,0 +1,23 @@
+[Unit]
+Description=Agent Hub LiteLLM Proxy
+After=network-online.target
+
+[Service]
+Type=simple
+User=agent-hub
+Group=agent-hub
+EnvironmentFile=/etc/agent-hub/secrets.env
+WorkingDirectory=/var/lib/agent-hub
+ExecStart=/usr/bin/env litellm --host 127.0.0.1 --port 4000
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/agent-hub /run/agent-hub
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=agent-hub.target

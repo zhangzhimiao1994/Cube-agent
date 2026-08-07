@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+COMMAND_DIR="$SCRIPT_DIR/commands"
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/agent-hub <command>
+
+Commands:
+  doctor              Diagnose host, dependencies, ports, services, and health.
+  status              Show service status.
+  logs                Tail service logs.
+  backup              Create or verify a backup.
+  restore             Restore a verified backup.
+  upgrade             Upgrade with backup and readiness rollback.
+  version             Print installed version.
+EOF
+}
+
+command="${1:-}"
+if [[ -z "$command" || "$command" == "--help" ]]; then
+  usage
+  exit 0
+fi
+shift || true
+
+case "$command" in
+  doctor|status|logs|backup|restore|upgrade)
+    exec "$COMMAND_DIR/$command.sh" "$@"
+    ;;
+  version)
+    cat "${AGENT_HUB_STATE_DIR:-/var/lib/agent-hub}/version" 2>/dev/null || printf '0.1.0\n'
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

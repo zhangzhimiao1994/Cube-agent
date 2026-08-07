@@ -1,0 +1,4 @@
+[Unit]
+Description=Agent Hub
+Wants=agent-hub-api.service agent-hub-worker.service agent-hub-feishu.service agent-hub-litellm.service
+After=network-online.target

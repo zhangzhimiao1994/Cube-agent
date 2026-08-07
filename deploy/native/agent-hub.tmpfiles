@@ -1,0 +1,3 @@
+d /run/agent-hub 0750 agent-hub agent-hub -
+d /var/lib/agent-hub 0750 agent-hub agent-hub -
+d /var/log/agent-hub 0750 agent-hub agent-hub -

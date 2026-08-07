@@ -1,0 +1,23 @@
+[Unit]
+Description=Agent Hub Worker
+After=agent-hub-api.service
+
+[Service]
+Type=simple
+User=agent-hub
+Group=agent-hub
+EnvironmentFile=/etc/agent-hub/secrets.env
+WorkingDirectory=/opt/agent-hub/current
+ExecStart=/opt/agent-hub/current/.venv/bin/python -m agent_hub.runtime.worker
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/agent-hub /run/agent-hub
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=agent-hub.target

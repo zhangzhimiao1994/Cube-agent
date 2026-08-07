@@ -1,0 +1,30 @@
+name: deploy-matrix
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "deploy/**"
+      - "install.sh"
+      - "scripts/**"
+      - "tests/install/**"
+
+jobs:
+  compose:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose -f deploy/compose/docker-compose.yml config --quiet
+      - run: bash tests/install/smoke.sh --mode docker --dry-run
+
+  native-detect:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [ubuntu, debian, rocky, almalinux]
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash deploy/native/install-packages.sh --detect tests/install/fixtures/os-release-${{ matrix.distro }}
+      - run: env AGENT_HUB_TEST=1 bash install.sh --mode auto --dry-run --yes
+
