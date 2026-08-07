@@ -56,6 +56,98 @@ const NamedResourceSchema = z.object({
 
 export type NamedResource = z.infer<typeof NamedResourceSchema>;
 
+const RunListItemSchema = z.object({
+  id: z.string(),
+  status: z.string(),
+  mode: z.string(),
+  queue_wait_ms: z.number(),
+  capacity_wait_ms: z.number(),
+  cost_usd: z.string(),
+});
+
+export type RunListItem = z.infer<typeof RunListItemSchema>;
+
+const RunEventSchema = z.object({
+  sequence: z.number(),
+  kind: z.string(),
+  message: z.string(),
+  created_at: z.string(),
+});
+
+const RunArtifactSchema = z.object({
+  id: z.string(),
+  kind: z.string(),
+  title: z.string(),
+});
+
+const RunDetailSchema = RunListItemSchema.extend({
+  request: z.string(),
+  events: z.array(RunEventSchema),
+  artifacts: z.array(RunArtifactSchema),
+  explicit_details: z.record(z.string(), z.string()),
+});
+
+export type RunDetail = z.infer<typeof RunDetailSchema>;
+
+const SkillSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  status: z.string(),
+  scan_diff: z.array(z.string()),
+  requested_permissions: z.array(z.string()),
+});
+
+export type Skill = z.infer<typeof SkillSchema>;
+
+const McpServerSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  health: z.string(),
+  allowed_tools: z.array(z.string()),
+});
+
+export type McpServer = z.infer<typeof McpServerSchema>;
+
+const MemoryRecordSchema = z.object({
+  id: z.string(),
+  scope: z.string(),
+  value: z.string(),
+});
+
+export type MemoryRecord = z.infer<typeof MemoryRecordSchema>;
+
+const AuditEventSchema = z.object({
+  id: z.string(),
+  actor: z.string(),
+  action: z.string(),
+  resource: z.string(),
+  created_at: z.string(),
+});
+
+export type AuditEvent = z.infer<typeof AuditEventSchema>;
+
+const HermesInsightSchema = z.object({
+  id: z.string(),
+  outcome: z.string(),
+  lesson: z.string(),
+  tags: z.array(z.string()),
+  weight: z.number(),
+  created_at: z.string(),
+});
+
+export type HermesInsight = z.infer<typeof HermesInsightSchema>;
+
+const HermesRecommendationSchema = z.object({
+  recommended_mode: z.string(),
+  recommended_model: z.string().nullable(),
+  recommended_skills: z.array(z.string()),
+  confidence: z.number(),
+  reasons: z.array(z.string()),
+  requires_approval: z.boolean(),
+});
+
+export type HermesRecommendation = z.infer<typeof HermesRecommendationSchema>;
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -158,6 +250,84 @@ export const api = {
       "/api/v1/admin/workflows",
       { method: "GET" },
       z.array(NamedResourceSchema),
+    );
+  },
+  runs(): Promise<RunListItem[]> {
+    return request("/api/v1/admin/runs", { method: "GET" }, z.array(RunListItemSchema));
+  },
+  run(id: string): Promise<RunDetail> {
+    return request(`/api/v1/admin/runs/${id}`, { method: "GET" }, RunDetailSchema);
+  },
+  pauseRun(id: string): Promise<RunDetail> {
+    return request(`/api/v1/admin/runs/${id}/pause`, { method: "POST" }, RunDetailSchema);
+  },
+  resumeRun(id: string): Promise<RunDetail> {
+    return request(`/api/v1/admin/runs/${id}/resume`, { method: "POST" }, RunDetailSchema);
+  },
+  cancelRun(id: string): Promise<RunDetail> {
+    return request(`/api/v1/admin/runs/${id}/cancel`, { method: "POST" }, RunDetailSchema);
+  },
+  skills(): Promise<Skill[]> {
+    return request("/api/v1/admin/skills", { method: "GET" }, z.array(SkillSchema));
+  },
+  uploadSkill(filename: string): Promise<Skill> {
+    return request(
+      "/api/v1/admin/skills",
+      { method: "POST", body: JSON.stringify({ filename }) },
+      SkillSchema,
+    );
+  },
+  approveSkill(id: string): Promise<Skill> {
+    return request(`/api/v1/admin/skills/${id}/approve`, { method: "POST" }, SkillSchema);
+  },
+  mcpServers(): Promise<McpServer[]> {
+    return request("/api/v1/admin/mcp", { method: "GET" }, z.array(McpServerSchema));
+  },
+  memory(): Promise<MemoryRecord[]> {
+    return request("/api/v1/admin/memory", { method: "GET" }, z.array(MemoryRecordSchema));
+  },
+  updateMemory(id: string, value: string): Promise<MemoryRecord> {
+    return request(
+      `/api/v1/admin/memory/${id}`,
+      { method: "PATCH", body: JSON.stringify({ value }) },
+      MemoryRecordSchema,
+    );
+  },
+  async forgetMemory(id: string): Promise<void> {
+    await fetch(`/api/v1/admin/memory/${id}`, {
+      method: "DELETE",
+      credentials: "include",
+    });
+  },
+  audit(action?: string): Promise<AuditEvent[]> {
+    const query = action ? `?action=${encodeURIComponent(action)}` : "";
+    return request(`/api/v1/admin/audit${query}`, { method: "GET" }, z.array(AuditEventSchema));
+  },
+  hermesInsights(): Promise<HermesInsight[]> {
+    return request("/api/v1/admin/hermes", { method: "GET" }, z.array(HermesInsightSchema));
+  },
+  recordHermesFeedback(payload: {
+    outcome: "success" | "failure" | "neutral";
+    lesson: string;
+    tags: string[];
+    weight: number;
+  }): Promise<HermesInsight> {
+    return request(
+      "/api/v1/admin/hermes/feedback",
+      { method: "POST", body: JSON.stringify(payload) },
+      HermesInsightSchema,
+    );
+  },
+  recommendWithHermes(payload: {
+    task: string;
+    mode_candidates: string[];
+    model_candidates: string[];
+    skill_candidates: string[];
+  }): Promise<HermesRecommendation> {
+    return request(
+      "/api/v1/admin/hermes/recommend",
+      { method: "POST", body: JSON.stringify(payload) },
+      HermesRecommendationSchema,
     );
   },
 };

@@ -4,22 +4,21 @@ import { BrowserRouter, MemoryRouter, Navigate, Route, Routes } from "react-rout
 import { AppShell } from "./AppShell";
 import { AuthProvider, RequireAuth } from "../auth/AuthProvider";
 import { AgentsPage } from "../pages/AgentsPage";
+import { AuditPage } from "../pages/AuditPage";
 import { ConfigPage } from "../pages/ConfigPage";
+import { HermesPage } from "../pages/HermesPage";
 import { LoginPage } from "../pages/LoginPage";
+import { McpPage } from "../pages/McpPage";
+import { MemoryPage } from "../pages/MemoryPage";
 import { ModelsPage } from "../pages/ModelsPage";
+import { RunDetailPage } from "../pages/RunDetailPage";
+import { RunsPage } from "../pages/RunsPage";
 import { SetupPage } from "../pages/SetupPage";
+import { SkillsPage } from "../pages/SkillsPage";
 import { UsersPage } from "../pages/UsersPage";
 import { WorkflowsPage } from "../pages/WorkflowsPage";
 
 const queryClient = new QueryClient();
-
-function DashboardPage() {
-  return <h2>运行概览</h2>;
-}
-
-function PlaceholderPage({ title }: { title: string }) {
-  return <h2>{title}</h2>;
-}
 
 export function AppRoutes() {
   return (
@@ -34,15 +33,18 @@ export function AppRoutes() {
           </RequireAuth>
         }
       >
-        <Route index element={<DashboardPage />} />
+        <Route index element={<RunsPage />} />
+        <Route path="runs/:runId" element={<RunDetailPage />} />
         <Route path="config" element={<ConfigPage />} />
         <Route path="models" element={<ModelsPage />} />
         <Route path="agents" element={<AgentsPage />} />
         <Route path="workflows" element={<WorkflowsPage />} />
-        <Route path="skills" element={<PlaceholderPage title="Skills" />} />
-        <Route path="mcp" element={<PlaceholderPage title="MCP" />} />
+        <Route path="skills" element={<SkillsPage />} />
+        <Route path="mcp" element={<McpPage />} />
+        <Route path="memory" element={<MemoryPage />} />
+        <Route path="hermes" element={<HermesPage />} />
         <Route path="users" element={<UsersPage />} />
-        <Route path="audit" element={<PlaceholderPage title="审计" />} />
+        <Route path="audit" element={<AuditPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

@@ -17,7 +17,18 @@ class Role(StrEnum):
 PERMISSIONS = MappingProxyType(
     {
         Role.SUPER_ADMIN: frozenset({"*"}),
-        Role.ADMIN: frozenset({"config:*", "agent:*", "skill:*", "mcp:*", "run:*", "audit:read"}),
+        Role.ADMIN: frozenset(
+            {
+                "config:*",
+                "agent:*",
+                "skill:*",
+                "mcp:*",
+                "memory:*",
+                "hermes:*",
+                "run:*",
+                "audit:read",
+            }
+        ),
         Role.OPERATOR: frozenset(
             {
                 "run:create",

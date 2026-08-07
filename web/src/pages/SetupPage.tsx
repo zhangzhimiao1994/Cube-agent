@@ -18,41 +18,41 @@ export function SetupPage() {
       await auth.setup(code, username, password);
       navigate("/", { replace: true });
     } catch {
-      setError("初始化失败");
+      setError("Setup failed");
     }
   }
 
   return (
     <section>
-      <h1>初始化 Agent Hub</h1>
+      <h1>Initialize Agent Hub</h1>
       <form onSubmit={(event) => void submit(event)}>
         <label>
-          初始化码
+          Setup code
           <input
-            aria-label="初始化码"
+            aria-label="Setup code"
             value={code}
             onChange={(event) => setCode(event.target.value)}
           />
         </label>
         <label>
-          用户名
+          Username
           <input
-            aria-label="用户名"
+            aria-label="Username"
             value={username}
             onChange={(event) => setUsername(event.target.value)}
           />
         </label>
         <label>
-          密码
+          Password
           <input
-            aria-label="密码"
+            aria-label="Password"
             value={password}
             type="password"
             onChange={(event) => setPassword(event.target.value)}
           />
         </label>
         {error && <p role="alert">{error}</p>}
-        <button type="submit">创建管理员</button>
+        <button type="submit">Create admin</button>
       </form>
     </section>
   );

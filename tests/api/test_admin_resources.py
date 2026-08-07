@@ -163,3 +163,122 @@ def test_agent_and_workflow_crud() -> None:
     assert (
         api.get("/api/v1/admin/workflows", headers=headers()).json()[0]["id"] == "dispatch"
     )
+
+
+def test_operational_run_listing_details_and_controls() -> None:
+    api = client()
+
+    runs = api.get("/api/v1/admin/runs", headers=headers())
+    assert runs.status_code == 200
+    run_id = runs.json()[0]["id"]
+    assert runs.json()[0]["queue_wait_ms"] >= 0
+    assert runs.json()[0]["capacity_wait_ms"] >= 0
+    assert runs.json()[0]["cost_usd"] == "0.0132"
+
+    detail = api.get(f"/api/v1/admin/runs/{run_id}", headers=headers())
+    pause = api.post(f"/api/v1/admin/runs/{run_id}/pause", headers=headers())
+    resume = api.post(f"/api/v1/admin/runs/{run_id}/resume", headers=headers())
+    cancel = api.post(f"/api/v1/admin/runs/{run_id}/cancel", headers=headers())
+
+    assert detail.status_code == 200
+    assert detail.json()["mode"] == "dispatch"
+    assert detail.json()["events"][0]["kind"] == "queued"
+    assert detail.json()["artifacts"][0]["title"] == "Readiness report"
+    assert pause.json()["status"] == "paused"
+    assert resume.json()["status"] == "running"
+    assert cancel.json()["status"] == "cancelled"
+
+
+def test_skill_upload_approve_mcp_memory_and_audit_are_safe() -> None:
+    api = client()
+
+    uploaded = api.post(
+        "/api/v1/admin/skills",
+        headers=headers(),
+        json={"filename": "safe-skill.zip"},
+    )
+    approved = api.post(
+        f"/api/v1/admin/skills/{uploaded.json()['id']}/approve",
+        headers=headers(),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+    mcp = api.get("/api/v1/admin/mcp", headers=headers())
+    memory = api.get("/api/v1/admin/memory", headers=headers())
+    updated_memory = api.patch(
+        f"/api/v1/admin/memory/{memory.json()[0]['id']}",
+        headers=headers(),
+        json={"value": "Updated non-dangerous operation policy."},
+    )
+    audit = api.get("/api/v1/admin/audit?action=config.publish", headers=headers())
+
+    assert uploaded.json()["status"] == "quarantined"
+    assert approved.json()["status"] == "enabled"
+    assert skills.json()[0]["requested_permissions"] == ["filesystem:read"]
+    assert mcp.json()[0]["health"] == "healthy"
+    assert updated_memory.json()["value"] == "Updated non-dangerous operation policy."
+    assert audit.json()[0]["action"] == "config.publish"
+    serialized = uploaded.text + approved.text + skills.text + mcp.text + memory.text + audit.text
+    for forbidden in ("api_key", "fingerprint", "hidden_reasoning", "chain_of_thought"):
+        assert forbidden not in serialized.lower()
+
+
+def test_memory_forget_removes_record() -> None:
+    api = client()
+    memory_id = api.get("/api/v1/admin/memory", headers=headers()).json()[0]["id"]
+
+    forgotten = api.delete(f"/api/v1/admin/memory/{memory_id}", headers=headers())
+    remaining = api.get("/api/v1/admin/memory", headers=headers())
+
+    assert forgotten.status_code == 200
+    assert forgotten.json() == {"status": "forgotten"}
+    assert remaining.json() == []
+
+
+def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
+    api = client()
+
+    feedback = api.post(
+        "/api/v1/admin/hermes/feedback",
+        headers=headers(),
+        json={
+            "outcome": "success",
+            "lesson": "Use group chat when debate review is required.",
+            "tags": ["debate", "review"],
+            "weight": 5,
+        },
+    )
+    recommendation = api.post(
+        "/api/v1/admin/hermes/recommend",
+        headers=headers(),
+        json={
+            "task": "Run a debate review for this architecture.",
+            "mode_candidates": ["dispatch", "group_chat"],
+            "model_candidates": ["deepseek-chat", "gpt-4o"],
+            "skill_candidates": ["architecture-review", "safe-shell"],
+        },
+    )
+    insights = api.get("/api/v1/admin/hermes", headers=headers())
+
+    assert feedback.status_code == 200
+    assert recommendation.status_code == 200
+    assert recommendation.json()["recommended_mode"] == "group_chat"
+    assert recommendation.json()["recommended_model"] == "deepseek-chat"
+    assert recommendation.json()["confidence"] > 0.45
+    assert any("Hermes lesson" in reason for reason in recommendation.json()["reasons"])
+    assert any(insight["lesson"] == "Use group chat when debate review is required." for insight in insights.json())
+
+
+def test_hermes_feedback_rejects_sensitive_content_without_echoing_it() -> None:
+    response = client().post(
+        "/api/v1/admin/hermes/feedback",
+        headers=headers(),
+        json={
+            "outcome": "failure",
+            "lesson": "Do not store api_key sk-secret-value in memory.",
+            "tags": ["security"],
+            "weight": 10,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "sk-secret-value" not in response.text

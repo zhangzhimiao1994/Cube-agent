@@ -12,7 +12,18 @@ from agent_hub.auth.models import (
 
 EXPECTED_PERMISSIONS = {
     Role.SUPER_ADMIN: frozenset({"*"}),
-    Role.ADMIN: frozenset({"config:*", "agent:*", "skill:*", "mcp:*", "run:*", "audit:read"}),
+    Role.ADMIN: frozenset(
+        {
+            "config:*",
+            "agent:*",
+            "skill:*",
+            "mcp:*",
+            "memory:*",
+            "hermes:*",
+            "run:*",
+            "audit:read",
+        }
+    ),
     Role.OPERATOR: frozenset(
         {"run:create", "run:read", "run:pause", "run:resume", "run:cancel", "config:read"}
     ),
@@ -34,6 +45,8 @@ def test_role_values_and_permission_sets_are_stable() -> None:
     [
         (Role.SUPER_ADMIN, "anything:read", True),
         (Role.ADMIN, "config:write", True),
+        (Role.ADMIN, "memory:write", True),
+        (Role.ADMIN, "hermes:write", True),
         (Role.ADMIN, "audit:read", True),
         (Role.ADMIN, "audit:write", False),
         (Role.OPERATOR, "run:create", True),

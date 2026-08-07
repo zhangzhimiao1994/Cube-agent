@@ -233,11 +233,12 @@ async def test_cleanup_removes_only_completed_old_records(
     completed = await repository.reserve(message(event_id="evt_done", message_id="om_done"))
     await repository.mark_submitted(completed.id, uuid4())
     await repository.mark_completed(completed.id)
+    old_timestamp = datetime(2026, 8, 6, tzinfo=UTC)
     async with channel_session_factory() as session, session.begin():
         await session.execute(
             update(ChannelDedupRow)
-            .where(ChannelDedupRow.id.in_([active.id, completed.id]))
-            .values(created_at=datetime(2026, 8, 6, tzinfo=UTC))
+                .where(ChannelDedupRow.id.in_([active.id, completed.id]))
+                .values(created_at=old_timestamp, completed_at=old_timestamp)
         )
 
     removed = await repository.cleanup_completed_older_than(

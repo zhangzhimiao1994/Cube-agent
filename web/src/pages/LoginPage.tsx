@@ -18,27 +18,31 @@ export function LoginPage() {
       await auth.login(username, password);
       navigate("/", { replace: true });
     } catch (caught) {
-      setError(caught instanceof ApiError && caught.status === 401 ? "用户名或密码错误" : "登录失败");
+      setError(
+        caught instanceof ApiError && caught.status === 401
+          ? "Invalid username or password"
+          : "Login failed",
+      );
     }
   }
 
   return (
     <section>
-      <h1>登录</h1>
+      <h1>Login</h1>
       <form onSubmit={(event) => void submit(event)}>
         <label>
-          用户名
+          Username
           <input
-            aria-label="用户名"
+            aria-label="Username"
             value={username}
             onChange={(event) => setUsername(event.target.value)}
             autoComplete="username"
           />
         </label>
         <label>
-          密码
+          Password
           <input
-            aria-label="密码"
+            aria-label="Password"
             value={password}
             type="password"
             onChange={(event) => setPassword(event.target.value)}
@@ -46,7 +50,7 @@ export function LoginPage() {
           />
         </label>
         {error && <p role="alert">{error}</p>}
-        <button type="submit">登录</button>
+        <button type="submit">Login</button>
       </form>
     </section>
   );
