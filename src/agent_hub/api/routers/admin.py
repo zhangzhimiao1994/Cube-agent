@@ -21,6 +21,7 @@ class ModelDeploymentRequest(BaseModel):
 
     provider: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9_-]*$")
     api_base: str = Field(min_length=1, max_length=2048)
+    upstream_model: str = Field(min_length=1, max_length=512)
     logical_model: str = Field(min_length=1, max_length=128, pattern=r"^[a-z0-9][a-z0-9_-]*$")
     capabilities: list[str] = Field(min_length=1, max_length=8)
     credential_ref: str = Field(min_length=1, max_length=128)

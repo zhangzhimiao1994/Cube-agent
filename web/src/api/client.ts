@@ -22,6 +22,7 @@ const ModelDeploymentSchema = z.object({
   id: z.string(),
   provider: z.string(),
   api_base: z.string(),
+  upstream_model: z.string(),
   logical_model: z.string(),
   capabilities: z.array(z.string()),
   credential_ref: z.string(),
@@ -39,6 +40,13 @@ const ModelDeploymentSchema = z.object({
 });
 
 export type ModelDeployment = z.infer<typeof ModelDeploymentSchema>;
+
+const SecretReferenceSchema = z.object({
+  ref: z.string(),
+  last_four: z.string(),
+});
+
+export type SecretReference = z.infer<typeof SecretReferenceSchema>;
 
 const DiffSchema = z.object({
   added: z.array(z.string()),
@@ -219,6 +227,13 @@ export const api = {
       "/api/v1/admin/models",
       { method: "POST", body: JSON.stringify(payload) },
       ModelDeploymentSchema,
+    );
+  },
+  createSecret(label: string, value: string): Promise<SecretReference> {
+    return request(
+      "/api/v1/admin/secrets",
+      { method: "POST", body: JSON.stringify({ label, value }) },
+      SecretReferenceSchema,
     );
   },
   probeModel(quota_scope: string, desired_concurrency: number) {

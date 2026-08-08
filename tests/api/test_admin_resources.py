@@ -36,6 +36,7 @@ def model_payload() -> dict[str, object]:
     return {
         "provider": "deepseek",
         "api_base": "https://api.deepseek.example/v1",
+        "upstream_model": "deepseek-chat",
         "logical_model": "planner",
         "capabilities": ["text", "tool_calling"],
         "credential_ref": "secret_1",
@@ -56,6 +57,7 @@ def test_model_pool_reports_serial_slot_and_queue_policy() -> None:
 
     assert response.status_code == 200
     body = response.json()
+    assert body["upstream_model"] == "deepseek-chat"
     assert body["effective_slots"] == 1
     assert body["saturation_policy"] == "queue_first_then_fallback"
 
