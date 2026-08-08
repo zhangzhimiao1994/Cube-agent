@@ -4,6 +4,23 @@ rand_secret() {
   openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
 }
 
+is_private_ipv4() {
+  local ip="$1" a b c d
+  IFS=. read -r a b c d <<< "$ip"
+  [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ && "$c" =~ ^[0-9]+$ && "$d" =~ ^[0-9]+$ ]] || return 1
+  ((a >= 0 && a <= 255 && b >= 0 && b <= 255 && c >= 0 && c <= 255 && d >= 0 && d <= 255)) || return 1
+
+  if ((a == 10)); then return 0; fi
+  if ((a == 127)); then return 0; fi
+  if ((a == 169 && b == 254)); then return 0; fi
+  if ((a == 172 && b >= 16 && b <= 31)); then return 0; fi
+  if ((a == 192 && b == 168)); then return 0; fi
+  if ((a == 100 && b >= 64 && b <= 127)); then return 0; fi
+  if ((a == 0)); then return 0; fi
+  if ((a >= 224)); then return 0; fi
+  return 1
+}
+
 detect_public_url() {
   if [[ -n "${AGENT_HUB_PUBLIC_URL:-}" ]]; then
     validate_public_url "$AGENT_HUB_PUBLIC_URL"
@@ -21,11 +38,15 @@ detect_public_url() {
   fi
 
   if command -v hostname >/dev/null 2>&1; then
-    ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-    if [[ -n "$ip" ]]; then
+    for ip in $(hostname -I 2>/dev/null || true); do
+      [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+      if is_private_ipv4 "$ip"; then
+        warn "detected private or loopback address $ip; set AGENT_HUB_PUBLIC_URL=http(s)://your-public-host for external access"
+        continue
+      fi
       printf 'http://%s\n' "$ip"
       return 0
-    fi
+    done
   fi
 
   printf 'http://127.0.0.1\n'

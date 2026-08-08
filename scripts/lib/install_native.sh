@@ -362,8 +362,13 @@ deploy_native_release() {
   )
 
   chown -R agent-hub:agent-hub "$release" 2>/dev/null || true
+  chmod 0755 "$INSTALL_ROOT" "$INSTALL_ROOT/releases"
+  chmod 0755 "$release"
+  if [[ -d "$release/web" ]]; then
+    chmod 0755 "$release/web"
+  fi
   if [[ -d "$release/web/dist" ]]; then
-    chmod 0755 "$release" "$release/web" "$release/web/dist"
+    chmod 0755 "$release/web/dist"
     chmod -R a+rX "$release/web/dist"
   fi
   ln -sfn "$release" "$INSTALL_ROOT/current"

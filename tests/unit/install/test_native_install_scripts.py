@@ -71,6 +71,8 @@ def test_installer_defaults_management_url_to_external_address() -> None:
     assert "detect_public_url" in secrets
     assert "api.ipify.org" in secrets
     assert "hostname -I" in secrets
+    assert "is_private_ipv4" in secrets
+    assert "private or loopback address" in secrets
 
 
 def test_native_api_stays_private_and_caddy_exposes_management_ui() -> None:
@@ -84,7 +86,10 @@ def test_native_api_stays_private_and_caddy_exposes_management_ui() -> None:
     assert "http://*)\n      printf ':80" in installer
     assert "handle /setup*" in caddyfile
     assert "handle /setup*" in installer
-    assert 'chmod 0755 "$release" "$release/web" "$release/web/dist"' in installer
+    assert 'chmod 0755 "$INSTALL_ROOT" "$INSTALL_ROOT/releases"' in installer
+    assert 'chmod 0755 "$release"' in installer
+    assert 'chmod 0755 "$release/web"' in installer
+    assert 'chmod 0755 "$release/web/dist"' in installer
     assert 'chmod -R a+rX "$release/web/dist"' in installer
     assert "chown -R agent-hub:agent-hub" in installer
 
