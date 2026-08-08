@@ -38,12 +38,34 @@ def test_docker_install_overrides_container_internal_service_urls() -> None:
     assert "@127.0.0.1:5432" not in installer
 
 
+def test_docker_install_prefers_china_mirrors_unless_official_mode() -> None:
+    installer = read("scripts/lib/install_docker.sh")
+
+    assert 'if [[ "${AGENT_HUB_MIRROR_MODE:-auto}" != "official" ]]; then' in installer
+    assert "configure_china_docker_mirror || true" in installer
+    assert "configure_docker_build_mirrors" in installer
+    assert "pypi.tuna.tsinghua.edu.cn" in installer
+    assert "registry.npmmirror.com" in installer
+    assert installer.index("configure_china_docker_mirror || true") < installer.index(
+        "if docker_compose_up"
+    )
+
+
 def test_dockerfile_builds_virtualenv_at_runtime_path_without_editable_install() -> None:
     dockerfile = read("Dockerfile")
+    compose = read("deploy/compose/docker-compose.yml")
 
     assert "WORKDIR /opt/agent-hub" in dockerfile
     assert "uv sync --frozen --no-dev --no-editable" in dockerfile
-    assert "uv pip install --no-deps -e ." not in dockerfile
+    assert "AGENT_HUB_PYPI_MIRROR" in dockerfile
+    assert "AGENT_HUB_NPM_MIRROR" in dockerfile
+    assert "uv pip install --python .venv/bin/python" in dockerfile
+    assert "--index-url \"${AGENT_HUB_PYPI_MIRROR}\"" in dockerfile
+    assert "--registry=\"${AGENT_HUB_NPM_MIRROR}\"" in dockerfile
+    assert "ghcr.io/astral-sh/uv" not in dockerfile
+    assert "-e ." not in dockerfile
+    assert "AGENT_HUB_PYPI_MIRROR:" in compose
+    assert "AGENT_HUB_NPM_MIRROR:" in compose
     assert "COPY --from=python-build --chown=10001:10001 /opt/agent-hub/.venv ./.venv" in dockerfile
 
 

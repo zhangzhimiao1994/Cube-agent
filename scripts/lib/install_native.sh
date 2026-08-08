@@ -2,7 +2,7 @@
 
 native_python() {
   if command -v uv >/dev/null 2>&1; then
-    uv python find 3.12
+    native_uv_env uv python find 3.12
     return 0
   fi
   die "uv runtime not found after native bootstrap"
@@ -31,8 +31,15 @@ native_mirror_mode() {
   printf '%s\n' "${AGENT_HUB_MIRROR_MODE:-auto}"
 }
 
-python_mirror_env() {
+native_uv_env() {
   env \
+    UV_PYTHON_INSTALL_DIR="${AGENT_HUB_UV_PYTHON_INSTALL_DIR:-$INSTALL_ROOT/uv-python}" \
+    UV_CACHE_DIR="${AGENT_HUB_UV_CACHE_DIR:-$INSTALL_ROOT/uv-cache}" \
+    "$@"
+}
+
+python_mirror_env() {
+  native_uv_env env \
     UV_DEFAULT_INDEX="${AGENT_HUB_PYPI_MIRROR:-https://pypi.tuna.tsinghua.edu.cn/simple}" \
     PIP_INDEX_URL="${AGENT_HUB_PYPI_MIRROR:-https://pypi.tuna.tsinghua.edu.cn/simple}" \
     UV_PYTHON_INSTALL_MIRROR="${AGENT_HUB_UV_PYTHON_INSTALL_MIRROR:-https://registry.npmmirror.com/-/binary/python-build-standalone}" \
@@ -76,7 +83,7 @@ run_uv_python_install_with_mirror_fallback() {
     python_mirror_env uv python install 3.12
     return
   fi
-  if uv python install 3.12; then
+  if native_uv_env uv python install 3.12; then
     return
   fi
   [[ "$mode" == "official" ]] && return 1
@@ -88,27 +95,38 @@ pypi_mirror_url() {
   printf '%s\n' "${AGENT_HUB_PYPI_MIRROR:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 }
 
+ensure_native_uv_dirs() {
+  mkdir -p \
+    "${AGENT_HUB_UV_PYTHON_INSTALL_DIR:-$INSTALL_ROOT/uv-python}" \
+    "${AGENT_HUB_UV_CACHE_DIR:-$INSTALL_ROOT/uv-cache}"
+  chmod 0755 \
+    "${AGENT_HUB_UV_PYTHON_INSTALL_DIR:-$INSTALL_ROOT/uv-python}" \
+    "${AGENT_HUB_UV_CACHE_DIR:-$INSTALL_ROOT/uv-cache}"
+}
+
+install_python_project_from_mirror() {
+  local mirror="$1"
+  warn "locked uv sync is skipped in China mirror mode or after official lock install fails"
+  python_mirror_env uv pip install --python .venv/bin/python --index-url "$mirror" .
+}
+
 sync_python_project_with_lock_or_mirror() {
   local mode mirror
   mode="$(native_mirror_mode)"
   mirror="$(pypi_mirror_url)"
 
   if [[ "$mode" == "china" ]]; then
-    if python_mirror_env uv sync --frozen --no-dev; then
-      return 0
-    fi
-    warn "locked uv sync failed; installing project from China PyPI mirror without lock file URLs"
-    python_mirror_env uv pip install --python .venv/bin/python --index-url "$mirror" -e .
+    install_python_project_from_mirror "$mirror"
     return
   fi
 
-  if uv sync --frozen --no-dev; then
+  if native_uv_env uv sync --frozen --no-dev; then
     return 0
   fi
 
   [[ "$mode" == "official" ]] && return 1
   warn "official locked uv sync failed; installing project from China PyPI mirror without lock file URLs"
-  python_mirror_env uv pip install --python .venv/bin/python --index-url "$mirror" -e .
+  install_python_project_from_mirror "$mirror"
 }
 
 postgres_exec() {
@@ -309,6 +327,7 @@ deploy_native_release() {
   release_id="$(date -u +%Y%m%d%H%M%S)"
   release="$INSTALL_ROOT/releases/$release_id"
   ensure_native_uv
+  ensure_native_uv_dirs
   run_uv_python_install_with_mirror_fallback
   python_bin="$(native_python)"
 

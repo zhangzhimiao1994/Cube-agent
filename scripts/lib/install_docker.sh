@@ -26,6 +26,24 @@ EOF
   chmod 0644 "$INSTALL_ROOT/compose/litellm.yaml"
 }
 
+configure_docker_build_mirrors() {
+  if [[ "${AGENT_HUB_MIRROR_MODE:-auto}" == "official" ]]; then
+    set_env_value "$INSTALL_ROOT/compose/.env" \
+      AGENT_HUB_PYPI_MIRROR \
+      "${AGENT_HUB_PYPI_MIRROR:-https://pypi.org/simple}"
+    set_env_value "$INSTALL_ROOT/compose/.env" \
+      AGENT_HUB_NPM_MIRROR \
+      "${AGENT_HUB_NPM_MIRROR:-https://registry.npmjs.org}"
+    return
+  fi
+  set_env_value "$INSTALL_ROOT/compose/.env" \
+    AGENT_HUB_PYPI_MIRROR \
+    "${AGENT_HUB_PYPI_MIRROR:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+  set_env_value "$INSTALL_ROOT/compose/.env" \
+    AGENT_HUB_NPM_MIRROR \
+    "${AGENT_HUB_NPM_MIRROR:-https://registry.npmmirror.com}"
+}
+
 configure_china_docker_mirror() {
   local mirror daemon_config
   mirror="${AGENT_HUB_DOCKER_REGISTRY_MIRROR:-https://registry.cn-hangzhou.aliyuncs.com}"
@@ -71,8 +89,9 @@ install_docker_mode() {
     DATABASE_URL \
     "postgresql+asyncpg://agent_hub:${postgres_password}@postgres:5432/agent_hub"
   set_env_value "$INSTALL_ROOT/compose/.env" REDIS_URL "redis://redis:6379/0"
+  configure_docker_build_mirrors
 
-  if [[ "${AGENT_HUB_MIRROR_MODE:-auto}" == "china" ]]; then
+  if [[ "${AGENT_HUB_MIRROR_MODE:-auto}" != "official" ]]; then
     configure_china_docker_mirror || true
   fi
   if docker_compose_up; then
@@ -82,7 +101,7 @@ install_docker_mode() {
   if [[ "${AGENT_HUB_MIRROR_MODE:-auto}" == "official" ]]; then
     return 1
   fi
-  warn "official Docker image pull/build failed; retrying after configuring China docker.io registry mirror"
+  warn "Docker image pull/build failed; retrying after checking China docker.io registry mirror"
   configure_china_docker_mirror || true
   docker_compose_up
   mark_stage "docker-up"

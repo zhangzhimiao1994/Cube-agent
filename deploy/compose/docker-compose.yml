@@ -6,6 +6,9 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
+      args:
+        AGENT_HUB_PYPI_MIRROR: ${AGENT_HUB_PYPI_MIRROR:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        AGENT_HUB_NPM_MIRROR: ${AGENT_HUB_NPM_MIRROR:-https://registry.npmmirror.com}
     env_file:
       - path: .env
         required: false
@@ -56,6 +59,9 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
+      args:
+        AGENT_HUB_PYPI_MIRROR: ${AGENT_HUB_PYPI_MIRROR:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        AGENT_HUB_NPM_MIRROR: ${AGENT_HUB_NPM_MIRROR:-https://registry.npmmirror.com}
     env_file:
       - path: .env
         required: false

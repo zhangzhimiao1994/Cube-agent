@@ -99,6 +99,10 @@ def test_native_install_packages_installs_uv_runtime_dependencies() -> None:
     assert "npm" in packages
     assert "uv python install 3.12" in installer
     assert "uv venv --python" in installer
+    assert "UV_PYTHON_INSTALL_DIR" in installer
+    assert "${AGENT_HUB_UV_PYTHON_INSTALL_DIR:-$INSTALL_ROOT/uv-python}" in installer
+    assert "native_uv_env uv python install 3.12" in installer
+    assert "native_uv_env uv python find 3.12" in installer
 
 
 def test_native_installer_falls_back_to_china_mirrors_when_official_sources_fail() -> None:
@@ -114,6 +118,16 @@ def test_native_installer_falls_back_to_china_mirrors_when_official_sources_fail
     assert "registry.npmmirror.com" in installer
     assert "docker.io" in docker
     assert "registry.cn-hangzhou.aliyuncs.com" in docker
+
+
+def test_native_installer_uses_mirror_install_without_locked_wheel_urls_in_china_mode() -> None:
+    script = read("scripts/lib/install_native.sh")
+
+    assert "sync_python_project_with_lock_or_mirror" in script
+    assert 'if [[ "$mode" == "china" ]]; then\n    install_python_project_from_mirror "$mirror"\n    return\n  fi' in script
+    assert "locked uv sync is skipped in China mirror mode" in script
+    assert "uv pip install --python .venv/bin/python" in script
+    assert "--index-url" in script
 
 
 def test_native_installer_falls_back_from_locked_uv_sync_to_mirror_pip_install() -> None:
