@@ -21,6 +21,19 @@ def test_native_installer_deploys_release_before_starting_services() -> None:
     assert deploy < start
 
 
+def test_installer_failure_output_includes_context_and_hints() -> None:
+    common = read("scripts/lib/common.sh")
+    install = read("install.sh")
+
+    assert 'installer_failed "$LINENO" "$?" "$BASH_COMMAND"' in install
+    assert "Failed stage:" in common
+    assert "Failed command:" in common
+    assert "Common causes and checks:" in common
+    assert "journalctl -u agent-hub-api" in common
+    assert "systemctl status caddy" in common
+    assert "curl -v http://127.0.0.1:8000/health/ready" in common
+
+
 def test_native_installer_creates_runtime_dirs_and_migrates_before_services() -> None:
     script = read("scripts/lib/install_native.sh")
 

@@ -48,7 +48,7 @@ if [[ "${AGENT_HUB_TEST:-0}" != "1" ]]; then
   [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "run with sudo bash install.sh"
 fi
 
-trap 'installer_failed "$LINENO" "$?"' ERR
+trap 'installer_failed "$LINENO" "$?" "$BASH_COMMAND"' ERR
 
 main() {
   log "starting Agent Hub installer"

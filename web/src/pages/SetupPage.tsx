@@ -1,6 +1,7 @@
 import { FormEvent, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
+import { formatApiError } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
 
 const INSTALL_STEPS = [
@@ -25,8 +26,8 @@ export function SetupPage() {
     try {
       await auth.setup(code, username, password);
       navigate("/", { replace: true });
-    } catch {
-      setError("Setup failed");
+    } catch (caught) {
+      setError(formatApiError(caught, "Setup failed"));
     }
   }
 

@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 
-import { api } from "../api/client";
+import { api, formatApiError } from "../api/client";
 
 export function AuditPage() {
   const [action, setAction] = useState("");
@@ -19,7 +19,9 @@ export function AuditPage() {
   };
 
   if (audit.isLoading) return <p>Loading audit...</p>;
-  if (audit.isError) return <p role="alert">Failed to load audit</p>;
+  if (audit.isError) {
+    return <p role="alert">{formatApiError(audit.error, "Failed to load audit")}</p>;
+  }
   return (
     <section>
       <h2>Audit log</h2>

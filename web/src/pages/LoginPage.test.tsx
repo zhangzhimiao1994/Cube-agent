@@ -43,9 +43,19 @@ describe("LoginPage", () => {
           if (body.username === "owner" && body.password === "correct horse battery staple") {
             return jsonResponse(owner);
           }
-          return jsonResponse({ error: "invalid_credentials" }, { status: 401 });
+          return jsonResponse(
+            { error: { code: "invalid_credentials", message: "invalid credentials" } },
+            { status: 401 },
+          );
         }
         if (path === "/api/v1/setup") {
+          const body = JSON.parse(String(init?.body));
+          if (body.code !== "setup-code") {
+            return jsonResponse(
+              { error: { code: "invalid_bootstrap", message: "invalid bootstrap code" } },
+              { status: 401 },
+            );
+          }
           return jsonResponse(owner);
         }
         if (path === "/api/v1/admin/runs") {
@@ -100,6 +110,18 @@ describe("LoginPage", () => {
     await userEvent.click(screen.getByRole("button", { name: "Create admin" }));
 
     expect(await screen.findByRole("heading", { name: "Run operations" })).not.toBeNull();
+  });
+
+  it("shows the setup failure reason returned by the API", async () => {
+    render(<TestApp initialPath="/setup" />);
+    await userEvent.type(await screen.findByLabelText("Setup code"), "wrong-code");
+    await userEvent.type(screen.getByLabelText("Username"), "owner");
+    await userEvent.type(screen.getByLabelText("Password"), "correct horse battery staple");
+    await userEvent.click(screen.getByRole("button", { name: "Create admin" }));
+
+    expect((await screen.findByRole("alert")).textContent).toBe(
+      "Setup failed: invalid bootstrap code (invalid_bootstrap, HTTP 401)",
+    );
   });
 
   it("protects the dashboard while session is missing", async () => {

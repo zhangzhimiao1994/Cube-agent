@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
-import { api } from "../api/client";
+import { api, formatApiError } from "../api/client";
 
 export function SkillsPage() {
   const [filename, setFilename] = useState("");
@@ -20,7 +20,9 @@ export function SkillsPage() {
   });
 
   if (skills.isLoading) return <p>Loading skills...</p>;
-  if (skills.isError) return <p role="alert">Failed to load skills</p>;
+  if (skills.isError) {
+    return <p role="alert">{formatApiError(skills.error, "Failed to load skills")}</p>;
+  }
   return (
     <section>
       <h2>Skills governance</h2>
@@ -36,6 +38,12 @@ export function SkillsPage() {
       <button type="button" disabled={!filename} onClick={() => upload.mutate()}>
         Upload
       </button>
+      {upload.isError ? (
+        <p role="alert">{formatApiError(upload.error, "Skill upload failed")}</p>
+      ) : null}
+      {approve.isError ? (
+        <p role="alert">{formatApiError(approve.error, "Skill approval failed")}</p>
+      ) : null}
       {skills.data?.map((skill) => (
         <article key={skill.id}>
           <h3>{skill.name}</h3>

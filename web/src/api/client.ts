@@ -156,13 +156,51 @@ const HermesRecommendationSchema = z.object({
 
 export type HermesRecommendation = z.infer<typeof HermesRecommendationSchema>;
 
+const ErrorEnvelopeSchema = z.object({
+  error: z.union([
+    z.string(),
+    z.object({
+      code: z.string(),
+      message: z.string(),
+    }),
+  ]),
+});
+
 export class ApiError extends Error {
   constructor(
     message: string,
     public readonly status: number,
+    public readonly code: string = "request_failed",
+    public readonly errorId: string | null = null,
   ) {
     super(message);
   }
+}
+
+export function formatApiError(error: unknown, fallback: string): string {
+  if (!(error instanceof ApiError)) return fallback;
+  const parts = [error.code, `HTTP ${error.status}`];
+  if (error.errorId) parts.push(`error ${error.errorId}`);
+  return `${fallback}: ${error.message} (${parts.join(", ")})`;
+}
+
+async function errorFromResponse(response: Response): Promise<ApiError> {
+  const errorId = response.headers.get("x-error-id");
+  const fallbackMessage = response.statusText || "request failed";
+  try {
+    const payload: unknown = await response.json();
+    const parsed = ErrorEnvelopeSchema.safeParse(payload);
+    if (parsed.success) {
+      const error = parsed.data.error;
+      if (typeof error === "string") {
+        return new ApiError(error || fallbackMessage, response.status, "request_failed", errorId);
+      }
+      return new ApiError(error.message, response.status, error.code, errorId);
+    }
+  } catch {
+    return new ApiError(fallbackMessage, response.status, "invalid_error_response", errorId);
+  }
+  return new ApiError(fallbackMessage, response.status, "invalid_error_response", errorId);
 }
 
 async function request<T>(
@@ -170,19 +208,28 @@ async function request<T>(
   init: RequestInit,
   schema: z.ZodType<T>,
 ): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    credentials: "include",
-    headers: {
-      "Content-Type": "application/json",
-      ...(init.headers ?? {}),
-    },
-  });
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      ...init,
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        ...(init.headers ?? {}),
+      },
+    });
+  } catch {
+    throw new ApiError("network request failed", 0, "network_error");
+  }
   if (!response.ok) {
-    throw new ApiError("request failed", response.status);
+    throw await errorFromResponse(response);
   }
   const payload = await response.json();
-  return schema.parse(payload);
+  const parsed = schema.safeParse(payload);
+  if (!parsed.success) {
+    throw new ApiError("response schema validation failed", response.status, "invalid_response");
+  }
+  return parsed.data;
 }
 
 export const api = {

@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
-import { api } from "../api/client";
+import { api, formatApiError } from "../api/client";
 
 export function UsersPage() {
   const queryClient = useQueryClient();
@@ -12,7 +12,9 @@ export function UsersPage() {
   }
 
   if (users.isLoading) return <p>加载用户...</p>;
-  if (users.isError) return <p role="alert">用户列表加载失败</p>;
+  if (users.isError) {
+    return <p role="alert">{formatApiError(users.error, "用户列表加载失败")}</p>;
+  }
   return (
     <section>
       <h2>用户管理</h2>

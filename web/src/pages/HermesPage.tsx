@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useState } from "react";
 
-import { api, type HermesRecommendation } from "../api/client";
+import { api, formatApiError, type HermesRecommendation } from "../api/client";
 
 export function HermesPage() {
   const queryClient = useQueryClient();
@@ -44,7 +44,9 @@ export function HermesPage() {
   }
 
   if (insights.isLoading) return <p>Loading Hermes...</p>;
-  if (insights.isError) return <p role="alert">Failed to load Hermes</p>;
+  if (insights.isError) {
+    return <p role="alert">{formatApiError(insights.error, "Failed to load Hermes")}</p>;
+  }
   return (
     <section>
       <h2>Hermes learning</h2>
@@ -63,6 +65,9 @@ export function HermesPage() {
         </label>
         <button type="submit">Ask Hermes</button>
       </form>
+      {recommend.isError ? (
+        <p role="alert">{formatApiError(recommend.error, "Hermes recommendation failed")}</p>
+      ) : null}
       {recommendation && (
         <article>
           <h3>Recommendation</h3>
@@ -89,6 +94,9 @@ export function HermesPage() {
         </label>
         <button type="submit">Record feedback</button>
       </form>
+      {feedback.isError ? (
+        <p role="alert">{formatApiError(feedback.error, "Hermes feedback failed")}</p>
+      ) : null}
       <h3>Experience memory</h3>
       {insights.data?.map((insight) => (
         <article key={insight.id}>

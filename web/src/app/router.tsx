@@ -18,7 +18,12 @@ import { SkillsPage } from "../pages/SkillsPage";
 import { UsersPage } from "../pages/UsersPage";
 import { WorkflowsPage } from "../pages/WorkflowsPage";
 
-const queryClient = new QueryClient();
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: { retry: false },
+    mutations: { retry: false },
+  },
+});
 
 export function AppRoutes() {
   return (
@@ -64,7 +69,12 @@ export function AppRouter() {
 }
 
 export function TestApp({ initialPath = "/" }: { initialPath?: string }) {
-  const testClient = new QueryClient();
+  const testClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },
+      mutations: { retry: false },
+    },
+  });
   return (
     <QueryClientProvider client={testClient}>
       <MemoryRouter initialEntries={[initialPath]}>

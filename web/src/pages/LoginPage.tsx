@@ -1,7 +1,7 @@
 import { FormEvent, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
-import { ApiError } from "../api/client";
+import { ApiError, formatApiError } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
 
 export function LoginPage() {
@@ -19,9 +19,9 @@ export function LoginPage() {
       navigate("/", { replace: true });
     } catch (caught) {
       setError(
-        caught instanceof ApiError && caught.status === 401
+        caught instanceof ApiError && caught.code === "invalid_credentials"
           ? "Invalid username or password"
-          : "Login failed",
+          : formatApiError(caught, "Login failed"),
       );
     }
   }

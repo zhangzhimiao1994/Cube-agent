@@ -1,12 +1,12 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 
-import { api } from "../api/client";
+import { api, formatApiError } from "../api/client";
 
 export function RunsPage() {
   const runs = useQuery({ queryKey: ["runs"], queryFn: () => api.runs() });
   if (runs.isLoading) return <p>Loading runs...</p>;
-  if (runs.isError) return <p role="alert">Failed to load runs</p>;
+  if (runs.isError) return <p role="alert">{formatApiError(runs.error, "Failed to load runs")}</p>;
   return (
     <section>
       <h2>Run operations</h2>

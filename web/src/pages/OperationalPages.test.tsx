@@ -219,4 +219,33 @@ describe("operational management pages", () => {
     await userEvent.click(screen.getByRole("button", { name: "Record feedback" }));
     expect(await screen.findByText("Use dispatch mode when the request has clear deliverables.")).not.toBeNull();
   });
+
+  it("shows detailed API errors on data loading failures", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path === "/api/v1/me") {
+          return jsonResponse({
+            username: "owner",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === "/api/v1/admin/runs") {
+          return jsonResponse(
+            { error: { code: "service_unavailable", message: "database is not ready" } },
+            { status: 503, headers: { "X-Error-ID": "err_123" } },
+          );
+        }
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath="/" />);
+
+    expect((await screen.findByRole("alert")).textContent).toBe(
+      "Failed to load runs: database is not ready (service_unavailable, HTTP 503, error err_123)",
+    );
+  });
 });

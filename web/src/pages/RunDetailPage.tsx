@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useParams } from "react-router-dom";
 
-import { api } from "../api/client";
+import { api, formatApiError } from "../api/client";
 
 export function RunDetailPage() {
   const { runId = "" } = useParams();
@@ -24,7 +24,9 @@ export function RunDetailPage() {
   });
 
   if (run.isLoading) return <p>Loading run...</p>;
-  if (run.isError || !run.data) return <p role="alert">Failed to load run</p>;
+  if (run.isError || !run.data) {
+    return <p role="alert">{formatApiError(run.error, "Failed to load run")}</p>;
+  }
 
   return (
     <section>
@@ -46,6 +48,9 @@ export function RunDetailPage() {
           Cancel
         </button>
       </div>
+      {control.isError ? (
+        <p role="alert">{formatApiError(control.error, "Run control failed")}</p>
+      ) : null}
       <h3>Events</h3>
       <ol>
         {run.data.events.map((event) => (

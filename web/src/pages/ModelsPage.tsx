@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useMemo, useState } from "react";
 
-import { api } from "../api/client";
+import { api, formatApiError } from "../api/client";
 
 const CUSTOM_PROVIDER = "custom";
 const CUSTOM_MODEL = "__custom_model__";
@@ -219,7 +219,9 @@ export function ModelsPage() {
   }
 
   if (models.isLoading) return <p>加载模型...</p>;
-  if (models.isError) return <p role="alert">模型加载失败</p>;
+  if (models.isError) {
+    return <p role="alert">{formatApiError(models.error, "模型加载失败")}</p>;
+  }
 
   return (
     <section>
@@ -350,7 +352,11 @@ export function ModelsPage() {
           {saveModel.isPending ? "保存中..." : "保存模型"}
         </button>
         {saveMessage ? <p role="status">{saveMessage}</p> : null}
-        {saveModel.isError ? <p role="alert">模型保存失败，请检查 API Key、API Base 或后端日志。</p> : null}
+        {saveModel.isError ? (
+          <p role="alert">
+            {formatApiError(saveModel.error, "模型保存失败，请检查 API Key、API Base 或后端日志。")}
+          </p>
+        ) : null}
       </form>
 
       {models.data?.map((model) => (
