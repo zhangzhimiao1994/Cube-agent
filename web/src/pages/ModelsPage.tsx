@@ -166,10 +166,10 @@ export function ModelsPage() {
         fallback: null,
         weight: 100,
       });
-      return { model, secret, resolvedModel };
+      return { model, secret };
     },
     onSuccess: async ({ secret }) => {
-      setSaveMessage(`模型已保存，Key 引用：${secret.ref}`);
+      setSaveMessage(`模型已通过可用性测试并保存，Key 引用：${secret.ref}`);
       setApiKey("");
       await queryClient.invalidateQueries({ queryKey: ["models"] });
     },
@@ -226,11 +226,12 @@ export function ModelsPage() {
   return (
     <section>
       <h2>模型与并发</h2>
-      <p>同一服务商账号下的多个 Key 可能共享配额，不能重复计算容量。</p>
+      <p>保存模型前系统会自动发起一次最小请求测试；测试失败不会发布该模型配置。</p>
+      <p>同一服务商账号下的多个 Key 可能共享配额，不要把并发设置到跑满额度。</p>
 
       <form onSubmit={submit} aria-label="添加模型配置">
         <h3>添加模型配置</h3>
-        <p>先选择服务商，模型列表只显示该服务商下属模型；需要中转站或新模型时选择自定义。</p>
+        <p>选择服务商后，模型下拉框只显示该服务商下属模型；中转站或新模型可选择自定义。</p>
 
         <label htmlFor="provider">服务商</label>
         <select id="provider" value={provider} onChange={(event) => changeProvider(event.target.value)}>
@@ -349,12 +350,12 @@ export function ModelsPage() {
         <input id="tpm" type="number" min="1" value={tpm} onChange={(event) => setTpm(event.target.value)} />
 
         <button type="submit" disabled={saveModel.isPending}>
-          {saveModel.isPending ? "保存中..." : "保存模型"}
+          {saveModel.isPending ? "测试并保存中..." : "测试并保存模型"}
         </button>
         {saveMessage ? <p role="status">{saveMessage}</p> : null}
         {saveModel.isError ? (
           <p role="alert">
-            {formatApiError(saveModel.error, "模型保存失败，请检查 API Key、API Base 或后端日志。")}
+            {formatApiError(saveModel.error, "模型测试或保存失败，请检查 API Key、API Base、模型名或后端日志")}
           </p>
         ) : null}
       </form>

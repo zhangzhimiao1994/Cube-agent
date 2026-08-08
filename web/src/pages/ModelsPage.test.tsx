@@ -4,6 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TestApp } from "../app/router";
 
+const principal = {
+  user_id: "11111111-1111-4111-8111-111111111111",
+  tenant_id: "33333333-3333-4333-8333-333333333333",
+  role: "super_admin",
+};
+
 function jsonResponse(payload: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(payload), {
     status: 200,
@@ -14,23 +20,23 @@ function jsonResponse(payload: unknown, init: ResponseInit = {}) {
 
 describe("ModelsPage", () => {
   const requests: Array<{ body: unknown; method: string; path: string }> = [];
+  let failModelSave = false;
 
   beforeEach(() => {
     requests.length = 0;
+    failModelSave = false;
+    window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const path = String(input);
         const method = init?.method ?? "GET";
+        expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer owner-token");
         if (init?.body) {
           requests.push({ path, method, body: JSON.parse(String(init.body)) });
         }
-        if (path === "/api/v1/me") {
-          return jsonResponse({
-            username: "owner",
-            role: "super_admin",
-            permissions: ["*", "config:read", "agent:read"],
-          });
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse(principal);
         }
         if (path === "/api/v1/admin/models" && method === "GET") {
           return jsonResponse([
@@ -60,33 +66,32 @@ describe("ModelsPage", () => {
           return jsonResponse({ ref: "secret_created", last_four: "1234" });
         }
         if (path === "/api/v1/admin/models" && method === "POST") {
+          if (failModelSave) {
+            return jsonResponse(
+              {
+                error: {
+                  code: "model_unavailable",
+                  message: "model availability check failed: status=401",
+                },
+              },
+              { status: 422 },
+            );
+          }
+          const body = JSON.parse(String(init?.body));
           return jsonResponse({
             id: "22222222-2222-4222-8222-222222222222",
-            provider: "deepseek",
-            api_base: "https://api.deepseek.com/v1",
-            upstream_model: "deepseek-chat",
-            logical_model: "planner",
-            capabilities: ["text", "tool_calling"],
-            credential_ref: "secret_created",
-            quota_scope: "deepseek-account",
-            max_concurrency: 4,
-            target_utilization: 0.8,
-            reserved_capacity: 0,
-            rpm: 60,
-            tpm: 100000,
-            queue_timeout_seconds: 60,
-            fallback: null,
-            weight: 100,
-            effective_slots: 4,
+            ...body,
+            effective_slots: body.max_concurrency,
             saturation_policy: "queue_first_then_fallback",
           });
         }
-        return jsonResponse([]);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
       }),
     );
   });
 
   afterEach(() => {
+    window.sessionStorage.clear();
     vi.unstubAllGlobals();
   });
 
@@ -95,9 +100,7 @@ describe("ModelsPage", () => {
 
     expect(await screen.findByText("最大并发：1")).not.toBeNull();
     expect(screen.getByText("满载策略：先排队，超时后降级")).not.toBeNull();
-    expect(
-      screen.getByText("同一服务商账号下的多个 Key 可能共享配额，不能重复计算容量。"),
-    ).not.toBeNull();
+    expect(screen.getByText("同一服务商账号下的多个 Key 可能共享配额，不要把并发设置到跑满额度。")).not.toBeNull();
   });
 
   it("limits the model dropdown to the selected provider and saves the api key as a secret", async () => {
@@ -126,9 +129,9 @@ describe("ModelsPage", () => {
     await user.type(screen.getByLabelText("Quota Scope"), "deepseek-account");
     await user.clear(screen.getByLabelText("最大并发"));
     await user.type(screen.getByLabelText("最大并发"), "4");
-    await user.click(screen.getByRole("button", { name: "保存模型" }));
+    await user.click(screen.getByRole("button", { name: "测试并保存模型" }));
 
-    await screen.findByText("模型已保存，Key 引用：secret_created");
+    await screen.findByText("模型已通过可用性测试并保存，Key 引用：secret_created");
 
     expect(requests[0]).toEqual({
       path: "/api/v1/admin/secrets",
@@ -158,6 +161,20 @@ describe("ModelsPage", () => {
     });
   });
 
+  it("shows the backend model check failure reason", async () => {
+    failModelSave = true;
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/models" />);
+
+    await screen.findByText("添加模型配置");
+    await user.type(screen.getByLabelText("API Key"), "sk-bad-1234");
+    await user.click(screen.getByRole("button", { name: "测试并保存模型" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("model availability check failed: status=401");
+    expect(alert.textContent).toContain("model_unavailable");
+  });
+
   it("allows a custom model under any selected provider", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/models" />);
@@ -171,9 +188,9 @@ describe("ModelsPage", () => {
     await user.clear(screen.getByLabelText("逻辑模型名"));
     await user.type(screen.getByLabelText("逻辑模型名"), "custom-main");
     await user.type(screen.getByLabelText("API Key"), "sk-custom-1234");
-    await user.click(screen.getByRole("button", { name: "保存模型" }));
+    await user.click(screen.getByRole("button", { name: "测试并保存模型" }));
 
-    await screen.findByText("模型已保存，Key 引用：secret_created");
+    await screen.findByText("模型已通过可用性测试并保存，Key 引用：secret_created");
 
     expect(requests[1]).toMatchObject({
       path: "/api/v1/admin/models",
@@ -200,9 +217,9 @@ describe("ModelsPage", () => {
     await user.clear(screen.getByLabelText("逻辑模型名"));
     await user.type(screen.getByLabelText("逻辑模型名"), "custom-main");
     await user.type(screen.getByLabelText("API Key"), "sk-custom-1234");
-    await user.click(screen.getByRole("button", { name: "保存模型" }));
+    await user.click(screen.getByRole("button", { name: "测试并保存模型" }));
 
-    await screen.findByText("模型已保存，Key 引用：secret_created");
+    await screen.findByText("模型已通过可用性测试并保存，Key 引用：secret_created");
 
     expect(requests[1]).toMatchObject({
       path: "/api/v1/admin/models",

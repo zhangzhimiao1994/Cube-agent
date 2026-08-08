@@ -1,6 +1,7 @@
 """Local bootstrap and login endpoints."""
 
 from typing import Annotated, Protocol, cast
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request, status
 
@@ -149,9 +150,15 @@ async def login(
     service: Annotated[AuthenticationService, Depends(_auth_service)],
 ) -> TokenResponse:
     await _enforce_rate_limit(request, "login")
+    tenant_id = body.tenant_id
+    if tenant_id is None:
+        configured_tenant_id = getattr(request.app.state, "bootstrap_tenant_id", None)
+        if not isinstance(configured_tenant_id, UUID):
+            raise PublicAPIError(503, "service_unavailable", "service unavailable")
+        tenant_id = configured_tenant_id
     try:
         result = await service.login(
-            body.tenant_id,
+            tenant_id,
             body.username,
             body.password.get_secret_value(),
         )

@@ -105,6 +105,7 @@ class Deployment:
     id: str
     logical_model: str
     provider_model: str = "openai/gpt-4o-mini"
+    request_model: str | None = None
     api_base: str = "http://litellm:4000/v1"
     secret_ref: str = field(default="litellm-internal-key", repr=False)
     quota_scope_id: str = "default-account"
@@ -125,6 +126,8 @@ class Deployment:
         _require_safe_identifier("logical_model", self.logical_model)
         _require_unpadded("provider_model", self.provider_model, max_length=512)
         _require_safe_identifier("provider id", self.provider_model.split("/", 1)[0])
+        if self.request_model is not None:
+            _require_unpadded("request_model", self.request_model, max_length=512)
         _require_unpadded("secret_ref", self.secret_ref, max_length=512)
         _require_safe_identifier("quota_scope_id", self.quota_scope_id)
 

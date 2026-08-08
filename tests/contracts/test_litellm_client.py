@@ -149,6 +149,15 @@ async def test_uses_exact_openai_compatible_chat_completions_surface() -> None:
     assert result.text == "hello"
 
 
+async def test_uses_request_model_when_deployment_keeps_provider_prefixed_provenance() -> None:
+    transport, _, create, _ = mock_transport()
+
+    await transport.complete(deployment(request_model="deepseek-chat"), request(), API_KEY)
+
+    assert create.await_args is not None
+    assert create.await_args.kwargs["model"] == "deepseek-chat"
+
+
 async def test_normalizes_multimodal_parts_without_mutating_caller_data() -> None:
     transport, _, create, _ = mock_transport()
     caller_parts: list[dict[str, Any]] = [

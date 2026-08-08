@@ -1,12 +1,104 @@
 import { z } from "zod";
 
+const PrincipalSchema = z.object({
+  user_id: z.string(),
+  tenant_id: z.string(),
+  role: z.string(),
+});
+
 const MeSchema = z.object({
+  user_id: z.string(),
+  tenant_id: z.string(),
   username: z.string(),
   role: z.string(),
   permissions: z.array(z.string()),
 });
 
 export type CurrentUser = z.infer<typeof MeSchema>;
+
+const TokenResponseSchema = z.object({
+  access_token: z.string(),
+  token_type: z.string(),
+  principal: PrincipalSchema,
+});
+
+type Principal = z.infer<typeof PrincipalSchema>;
+
+const TOKEN_STORAGE_KEY = "agent_hub_access_token";
+const TENANT_STORAGE_KEY = "agent_hub_tenant_id";
+
+const ROLE_PERMISSIONS: Record<string, string[]> = {
+  super_admin: ["*"],
+  admin: [
+    "config:*",
+    "agent:*",
+    "skill:*",
+    "mcp:*",
+    "memory:*",
+    "hermes:*",
+    "run:*",
+    "audit:read",
+  ],
+  operator: ["run:create", "run:read", "run:pause", "run:resume", "run:cancel", "config:read"],
+  viewer: ["run:read", "config:read", "audit:read"],
+};
+
+function safeSessionGet(key: string): string | null {
+  try {
+    return window.sessionStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function safeSessionSet(key: string, value: string): void {
+  try {
+    window.sessionStorage.setItem(key, value);
+  } catch {
+    // Ignore storage failures; the in-memory token still works for the current page lifetime.
+  }
+}
+
+function safeSessionRemove(key: string): void {
+  try {
+    window.sessionStorage.removeItem(key);
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
+let accessToken = safeSessionGet(TOKEN_STORAGE_KEY);
+
+function currentAccessToken(): string | null {
+  return accessToken ?? safeSessionGet(TOKEN_STORAGE_KEY);
+}
+
+function principalToCurrentUser(principal: Principal): CurrentUser {
+  return {
+    user_id: principal.user_id,
+    tenant_id: principal.tenant_id,
+    username: `${principal.role}:${principal.user_id.slice(0, 8)}`,
+    role: principal.role,
+    permissions: ROLE_PERMISSIONS[principal.role] ?? [],
+  };
+}
+
+function rememberSession(token: string, principal: Principal): CurrentUser {
+  accessToken = token;
+  safeSessionSet(TOKEN_STORAGE_KEY, token);
+  safeSessionSet(TENANT_STORAGE_KEY, principal.tenant_id);
+  return principalToCurrentUser(principal);
+}
+
+function clearSession(): void {
+  accessToken = null;
+  safeSessionRemove(TOKEN_STORAGE_KEY);
+  safeSessionRemove(TENANT_STORAGE_KEY);
+}
+
+export function rememberedTenantId(): string {
+  return safeSessionGet(TENANT_STORAGE_KEY) ?? "";
+}
 
 const UserSchema = z.object({
   id: z.string(),
@@ -209,12 +301,14 @@ async function request<T>(
   schema: z.ZodType<T>,
 ): Promise<T> {
   let response: Response;
+  const token = currentAccessToken();
   try {
     response = await fetch(path, {
       ...init,
       credentials: "include",
       headers: {
         "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...(init.headers ?? {}),
       },
     });
@@ -227,34 +321,66 @@ async function request<T>(
   const payload = await response.json();
   const parsed = schema.safeParse(payload);
   if (!parsed.success) {
-    throw new ApiError("response schema validation failed", response.status, "invalid_response");
+    throw new ApiError(
+      `response schema validation failed for ${path}`,
+      response.status,
+      "invalid_response",
+    );
   }
   return parsed.data;
 }
 
+async function requestNoContent(path: string, init: RequestInit): Promise<void> {
+  let response: Response;
+  const token = currentAccessToken();
+  try {
+    response = await fetch(path, {
+      ...init,
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(init.headers ?? {}),
+      },
+    });
+  } catch {
+    throw new ApiError("network request failed", 0, "network_error");
+  }
+  if (!response.ok) {
+    throw await errorFromResponse(response);
+  }
+}
+
 export const api = {
   me(): Promise<CurrentUser> {
-    return request("/api/v1/me", { method: "GET" }, MeSchema);
+    return request("/api/v1/auth/me", { method: "GET" }, PrincipalSchema).then((principal) =>
+      principalToCurrentUser(principal),
+    );
   },
-  login(username: string, password: string): Promise<CurrentUser> {
+  login(username: string, password: string, tenant_id = ""): Promise<CurrentUser> {
+    const trimmedTenantId = tenant_id.trim();
     return request(
       "/api/v1/auth/login",
-      { method: "POST", body: JSON.stringify({ username, password }) },
-      MeSchema,
-    );
+      {
+        method: "POST",
+        body: JSON.stringify({
+          ...(trimmedTenantId ? { tenant_id: trimmedTenantId } : {}),
+          username,
+          password,
+        }),
+      },
+      TokenResponseSchema,
+    ).then((response) => rememberSession(response.access_token, response.principal));
   },
   setup(code: string, username: string, password: string): Promise<CurrentUser> {
     return request(
       "/api/v1/setup",
       { method: "POST", body: JSON.stringify({ code, username, password }) },
-      MeSchema,
-    );
+      TokenResponseSchema,
+    ).then((response) => rememberSession(response.access_token, response.principal));
   },
   async logout(): Promise<void> {
-    await fetch("/api/v1/auth/logout", {
-      method: "POST",
-      credentials: "include",
-    });
+    clearSession();
   },
   users(): Promise<ManagedUser[]> {
     return request("/api/v1/users", { method: "GET" }, z.array(UserSchema));
@@ -356,10 +482,7 @@ export const api = {
     );
   },
   async forgetMemory(id: string): Promise<void> {
-    await fetch(`/api/v1/admin/memory/${id}`, {
-      method: "DELETE",
-      credentials: "include",
-    });
+    await requestNoContent(`/api/v1/admin/memory/${id}`, { method: "DELETE" });
   },
   audit(action?: string): Promise<AuditEvent[]> {
     const query = action ? `?action=${encodeURIComponent(action)}` : "";

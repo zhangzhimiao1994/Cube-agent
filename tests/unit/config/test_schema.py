@@ -245,6 +245,7 @@ def test_deployment_pricing_round_trips_and_builds_runtime_deployment() -> None:
     assert runtime.input_per_million_usd == Decimal("0.150000")
     assert runtime.output_per_million_usd == Decimal(0)
     assert runtime.provider_model == "openai/gpt-5"
+    assert runtime.request_model == "gpt-5"
 
 
 def test_deployment_pricing_distinguishes_unknown_from_explicit_free() -> None:

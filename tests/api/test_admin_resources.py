@@ -1,14 +1,120 @@
-from __future__ import annotations
+from datetime import UTC, datetime
+from uuid import UUID, uuid4
 
-from uuid import UUID
-
+import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
-from agent_hub.api.routers.admin import InMemoryAdminResourceService
+from agent_hub.api.errors import PublicAPIError
+from agent_hub.api.routers.admin import (
+    InMemoryAdminResourceService,
+    ModelDeploymentRequest,
+    PersistentAdminResourceService,
+    SecretCreateRequest,
+)
 from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
+from agent_hub.config.repository import ConfigRevision, ConfigStatus
+from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, TokenUsage
+from agent_hub.security.secrets import SecretReference
+
+
+class FakeConfigService:
+    def __init__(self) -> None:
+        self.current: ConfigRevision | None = None
+        self.drafts: list[dict[str, object]] = []
+
+    async def get_current(self, tenant_id: UUID) -> ConfigRevision | None:
+        assert tenant_id == TENANT_ID
+        return self.current
+
+    async def create_draft(
+        self,
+        tenant_id: UUID,
+        actor_id: UUID,
+        document: object,
+    ) -> ConfigRevision:
+        assert tenant_id == TENANT_ID
+        assert actor_id == ACTOR_ID
+        assert isinstance(document, dict)
+        self.drafts.append(document)
+        return ConfigRevision(
+            id=uuid4(),
+            tenant_id=tenant_id,
+            version=len(self.drafts),
+            status=ConfigStatus.DRAFT,
+            document=document,
+            created_by=actor_id,
+            created_at=datetime.now(UTC),
+        )
+
+    async def publish(
+        self,
+        tenant_id: UUID,
+        version: int,
+        actor_id: UUID,
+    ) -> ConfigRevision:
+        assert tenant_id == TENANT_ID
+        assert actor_id == ACTOR_ID
+        document = self.drafts[version - 1]
+        self.current = ConfigRevision(
+            id=uuid4(),
+            tenant_id=tenant_id,
+            version=version,
+            status=ConfigStatus.PUBLISHED,
+            document=document,
+            created_by=actor_id,
+            created_at=datetime.now(UTC),
+        )
+        return self.current
+
+
+class FakeSecretService:
+    def __init__(self) -> None:
+        self.values: list[str] = []
+        self.resolved: list[tuple[UUID, str]] = []
+
+    async def create_or_get(
+        self,
+        tenant_id: UUID,
+        actor_id: UUID,
+        plaintext: str,
+    ) -> SecretReference:
+        assert tenant_id == TENANT_ID
+        assert actor_id == ACTOR_ID
+        self.values.append(plaintext)
+        return SecretReference(tenant_id=tenant_id, secret_id=SECRET_ID)
+
+    async def resolve(self, tenant_id: UUID, reference: object) -> str:
+        assert tenant_id == TENANT_ID
+        assert isinstance(reference, str)
+        self.resolved.append((tenant_id, reference))
+        return "sk-live"
+
+
+class FakeModelTransport:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.calls: list[tuple[Deployment, ModelRequest, str]] = []
+
+    async def complete(
+        self,
+        deployment: Deployment,
+        request: ModelRequest,
+        api_key: str,
+    ) -> ModelResponse:
+        self.calls.append((deployment, request, api_key))
+        if self.error is not None:
+            raise self.error
+        return ModelResponse(
+            text="agent-hub-model-check-ok",
+            usage=TokenUsage(prompt_tokens=5, completion_tokens=5, total_tokens=10),
+        )
+
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
+ACTOR_ID = UUID("11111111-1111-4111-8111-111111111111")
+SECRET_ID = UUID("22222222-2222-4222-8222-222222222222")
 USER_ID = UUID("11111111-1111-4111-8111-111111111111")
 
 
@@ -267,7 +373,10 @@ def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
     assert recommendation.json()["recommended_model"] == "deepseek-chat"
     assert recommendation.json()["confidence"] > 0.45
     assert any("Hermes lesson" in reason for reason in recommendation.json()["reasons"])
-    assert any(insight["lesson"] == "Use group chat when debate review is required." for insight in insights.json())
+    assert any(
+        insight["lesson"] == "Use group chat when debate review is required."
+        for insight in insights.json()
+    )
 
 
 def test_hermes_feedback_rejects_sensitive_content_without_echoing_it() -> None:
@@ -284,3 +393,129 @@ def test_hermes_feedback_rejects_sensitive_content_without_echoing_it() -> None:
 
     assert response.status_code == 422
     assert "sk-secret-value" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_persistent_admin_models_write_to_published_config() -> None:
+    configs = FakeConfigService()
+    secrets = FakeSecretService()
+    transport = FakeModelTransport()
+    service = PersistentAdminResourceService(
+        config_service=configs,  # type: ignore[arg-type]
+        secret_service=secrets,  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        model_transport=transport,
+    )
+
+    created = await service.create_model(
+        ModelDeploymentRequest(
+            provider="deepseek",
+            api_base="https://api.deepseek.com/v1",
+            upstream_model="deepseek-chat",
+            logical_model="main",
+            capabilities=["text", "tool_calling"],
+            credential_ref=f"secret://{SECRET_ID}",
+            quota_scope="deepseek-account",
+            max_concurrency=4,
+            target_utilization=0.8,
+            reserved_capacity=0,
+            rpm=60,
+            tpm=100000,
+            queue_timeout_seconds=60,
+            fallback=None,
+            weight=100,
+        )
+    )
+
+    assert created.logical_model == "main"
+    assert created.upstream_model == "deepseek-chat"
+    assert configs.current is not None
+    deployment, request, api_key = transport.calls[0]
+    assert deployment.provider_model == "deepseek/deepseek-chat"
+    assert deployment.request_model == "deepseek-chat"
+    assert request.logical_model == "main"
+    assert api_key == "sk-live"
+    assert secrets.resolved == [
+        (TENANT_ID, f"secret://{SECRET_ID}"),
+    ]
+    assert configs.current.document == {
+        "models": {
+            "main": {
+                "deployments": [
+                    {
+                        "provider": "deepseek",
+                        "model": "deepseek-chat",
+                        "api_base": "https://api.deepseek.com/v1",
+                        "credential_ref": f"secret://{SECRET_ID}",
+                        "quota_scope_id": "deepseek-account",
+                        "max_concurrency": 4,
+                        "target_utilization": 0.8,
+                        "reserved_slots": 0,
+                        "rpm": 60,
+                        "tpm": 100000,
+                        "capabilities": ["text", "tool_calling"],
+                    }
+                ]
+            },
+        },
+        "agents": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_persistent_admin_model_is_not_published_when_availability_check_fails() -> None:
+    configs = FakeConfigService()
+    service = PersistentAdminResourceService(
+        config_service=configs,  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        model_transport=FakeModelTransport(RuntimeError("provider returned status=401")),
+    )
+
+    with pytest.raises(PublicAPIError) as error:
+        await service.create_model(
+            ModelDeploymentRequest(
+                provider="deepseek",
+                api_base="https://api.deepseek.com/v1",
+                upstream_model="deepseek-chat",
+                logical_model="main",
+                capabilities=["text"],
+                credential_ref=f"secret://{SECRET_ID}",
+                quota_scope="deepseek-account",
+                max_concurrency=4,
+                target_utilization=0.8,
+                reserved_capacity=0,
+                rpm=60,
+                tpm=100000,
+                queue_timeout_seconds=60,
+                fallback=None,
+                weight=100,
+            )
+        )
+
+    assert error.value.code == "model_unavailable"
+    assert "status=401" in error.value.public_message
+    assert "sk-live" not in error.value.public_message
+    assert configs.drafts == []
+    assert configs.current is None
+
+
+@pytest.mark.asyncio
+async def test_persistent_admin_secret_uses_sealed_secret_service() -> None:
+    secrets = FakeSecretService()
+    service = PersistentAdminResourceService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=secrets,  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+    )
+
+    reference = await service.create_secret(
+        SecretCreateRequest(label="deepseek", value=SecretStr("sk-live-1234"))
+    )
+
+    assert reference.ref == f"secret://{SECRET_ID}"
+    assert reference.last_four == "1234"
+    assert secrets.values == ["sk-live-1234"]

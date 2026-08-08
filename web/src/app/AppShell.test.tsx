@@ -17,11 +17,11 @@ describe("AppShell presentation", () => {
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
         const path = String(input);
-        if (path === "/api/v1/me") {
+        if (path === "/api/v1/auth/me") {
           return jsonResponse({
-            username: "owner",
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
             role: "super_admin",
-            permissions: ["*"],
           });
         }
         if (path === "/api/v1/admin/runs") {

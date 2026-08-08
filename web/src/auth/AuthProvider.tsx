@@ -59,7 +59,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       },
       hasPermission(permission) {
         if (user === null) return false;
-        return user.permissions.includes("*") || user.permissions.includes(permission);
+        return user.permissions.some(
+          (granted) =>
+            granted === "*" ||
+            granted === permission ||
+            (granted.endsWith(":*") && permission.startsWith(granted.slice(0, -1))),
+        );
       },
     }),
     [loading, user],
@@ -79,7 +84,7 @@ export function useAuth(): AuthState {
 export function RequireAuth({ children }: { children: ReactNode }) {
   const auth = useAuth();
   const location = useLocation();
-  if (auth.loading) return <p>加载中...</p>;
+  if (auth.loading) return <p>Loading...</p>;
   if (auth.user === null) {
     return <Navigate to="/login" replace state={{ from: location.pathname }} />;
   }

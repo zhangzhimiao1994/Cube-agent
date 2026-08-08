@@ -8,9 +8,13 @@ async function mockAdminApi(page: Page) {
     const request = route.request();
     const url = new URL(request.url());
     const path = url.pathname;
-    if (path === "/api/v1/me") {
+    if (path === "/api/v1/auth/me") {
       await route.fulfill({
-        json: { username: "owner", role: "super_admin", permissions: ["*"] },
+        json: {
+          user_id: "11111111-1111-4111-8111-111111111111",
+          tenant_id: "00000000-0000-4000-8000-000000000001",
+          role: "super_admin",
+        },
       });
       return;
     }

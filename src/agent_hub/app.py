@@ -45,8 +45,9 @@ from agent_hub.observability.logging import configure_logging
 from agent_hub.observability.metrics import default_metrics_registry
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import ModeRouterProtocol, RunService, TaskQueue
-from agent_hub.runtime.defaults import default_runtime_registry
+from agent_hub.runtime.defaults import configured_runtime_registry
 from agent_hub.runtime.registry import RuntimeRegistry
+from agent_hub.security.secrets import SecretCipher, SecretService
 from agent_hub.settings import Settings, get_settings
 
 ReadinessProbe = Callable[[], Awaitable[None]]
@@ -149,6 +150,7 @@ def create_app(
     auth_service: object | None = None,
     rate_limiter: object | None = None,
     config_service: object | None = None,
+    admin_resource_service: object | None = None,
     run_service: object | None = None,
     runtime_registry: RuntimeRegistry | None = None,
     mode_router: ModeRouterProtocol | None = None,
@@ -161,12 +163,11 @@ def create_app(
 
     configured_settings = settings or Settings.model_construct()
     active_runtime_registry = runtime_registry
-    if active_runtime_registry is None and run_service is None:
-        active_runtime_registry = default_runtime_registry()
     configure_logging(level=configured_settings.log_level)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        nonlocal active_runtime_registry
         configured = settings or get_settings()
         active_database = database
         active_redis = redis_client
@@ -179,11 +180,8 @@ def create_app(
         )
         try:
             application.state.trusted_proxy_ips = configured.trusted_proxy_ips
-            needs_sessions = (
-                auth_service is None
-                or config_service is None
-                or (run_service is None and active_runtime_registry is not None)
-            )
+            application.state.bootstrap_tenant_id = configured.bootstrap_tenant_id
+            needs_sessions = auth_service is None or config_service is None or run_service is None
             if active_sessions is None and active_database is not None:
                 active_sessions = active_database.session_factory
             if active_sessions is None and needs_sessions:
@@ -191,7 +189,9 @@ def create_app(
                 cleanup_callbacks.append(("database", active_database.dispose))
                 active_sessions = active_database.session_factory
 
-            needs_redis = rate_limiter is None or redis_probe is None
+            needs_redis = rate_limiter is None or redis_probe is None or (
+                run_service is None and active_runtime_registry is None
+            )
             if active_redis is None and needs_redis:
                 active_redis = redis_factory(configured.redis_url_value())
                 cleanup_callbacks.append(("redis", active_redis.aclose))
@@ -214,8 +214,30 @@ def create_app(
             if config_service is None:
                 assert active_sessions is not None
                 application.state.config_service = ConfigService(active_sessions)
-            if run_service is None and active_runtime_registry is not None:
+            active_secret_service = None
+            if active_sessions is not None:
+                active_secret_service = SecretService(
+                    active_sessions,
+                    SecretCipher(configured.master_key_bytes()),
+                )
+            if admin_resource_service is None and active_sessions is not None:
+                assert active_secret_service is not None
+                application.state.admin_resource_service = admin.PersistentAdminResourceService(
+                    config_service=ConfigService(active_sessions),
+                    secret_service=active_secret_service,
+                    tenant_id=configured.bootstrap_tenant_id,
+                    actor_id=configured.bootstrap_tenant_id,
+                )
+            if run_service is None:
                 assert active_sessions is not None
+                if active_runtime_registry is None:
+                    assert active_redis is not None
+                    assert active_secret_service is not None
+                    active_runtime_registry = configured_runtime_registry(
+                        config_service=ConfigService(active_sessions),
+                        secret_service=active_secret_service,
+                        redis_client=active_redis,
+                    )
                 queue = task_queue if task_queue is not None else InProcessRunQueue()
                 application.state.run_service = RunService(
                     RunRepository(active_sessions),
@@ -271,6 +293,8 @@ def create_app(
     application.state.auth_service = auth_service
     application.state.rate_limiter = rate_limiter
     application.state.config_service = config_service
+    application.state.admin_resource_service = admin_resource_service
+    application.state.bootstrap_tenant_id = configured_settings.bootstrap_tenant_id
     application.state.run_service = run_service
     application.state.runtime_registry = active_runtime_registry
     application.state.mode_router = mode_router

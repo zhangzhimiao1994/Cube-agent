@@ -30,7 +30,7 @@ class SetupRequest(APIModel):
 
 
 class LoginRequest(APIModel):
-    tenant_id: UUID
+    tenant_id: UUID | None = None
     username: str = Field(
         min_length=3,
         max_length=64,

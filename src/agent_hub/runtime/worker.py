@@ -6,10 +6,14 @@ import signal
 from typing import Protocol
 from uuid import UUID
 
+from redis.asyncio import Redis
+
+from agent_hub.config.service import ConfigService
 from agent_hub.db.session import Database, build_database
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import RunService
-from agent_hub.runtime.defaults import default_runtime_registry
+from agent_hub.runtime.defaults import configured_runtime_registry
+from agent_hub.security.secrets import SecretCipher, SecretService
 from agent_hub.settings import Settings, get_settings
 
 _LOGGER = logging.getLogger(__name__)
@@ -83,16 +87,27 @@ async def run_worker_loop(
             pass
 
 
-def build_worker_service(settings: Settings) -> tuple[Database, RunService, LocalRunQueue]:
+def build_worker_service(
+    settings: Settings,
+) -> tuple[Database, Redis, RunService, LocalRunQueue]:
     database = build_database(settings.database_url_value())
+    redis_client = Redis.from_url(settings.redis_url_value())
     queue = LocalRunQueue()
+    secret_service = SecretService(
+        database.session_factory,
+        SecretCipher(settings.master_key_bytes()),
+    )
     service = RunService(
         RunRepository(database.session_factory),
-        runtime_registry=default_runtime_registry(),
+        runtime_registry=configured_runtime_registry(
+            config_service=ConfigService(database.session_factory),
+            secret_service=secret_service,
+            redis_client=redis_client,
+        ),
         router=None,
         task_queue=queue,
     )
-    return database, service, queue
+    return database, redis_client, service, queue
 
 
 async def _run() -> None:
@@ -104,10 +119,11 @@ async def _run() -> None:
         except NotImplementedError:
             pass
 
-    database, service, queue = build_worker_service(get_settings())
+    database, redis_client, service, queue = build_worker_service(get_settings())
     try:
         await run_worker_loop(service, queue, stop=stop)
     finally:
+        await redis_client.aclose()
         await database.dispose()
 
 

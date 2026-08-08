@@ -87,6 +87,7 @@ class DeploymentDefinition(StrictConfigModel):
             "id": deployment_id,
             "logical_model": logical_model,
             "provider_model": f"{self.provider}/{self.model}",
+            "request_model": self.model,
             "secret_ref": self.secret_ref,
             "quota_scope_id": self.quota_scope_id,
             "max_concurrency": self.max_concurrency,

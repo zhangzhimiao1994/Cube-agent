@@ -4,7 +4,7 @@ import hashlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Annotated, Protocol, cast
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
@@ -12,6 +12,12 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from agent_hub.api.dependencies import current_principal
 from agent_hub.api.errors import BASE_ERROR_RESPONSES, PublicAPIError, error_responses
 from agent_hub.auth.models import AuthenticatedPrincipal, Authorizer, PermissionDenied
+from agent_hub.config.schema import PlatformConfig
+from agent_hub.config.service import ConfigService, ConfigValidationError
+from agent_hub.models.gateway import ModelTransport
+from agent_hub.models.litellm_client import LiteLLMClient
+from agent_hub.models.types import Deployment, ModelCapability, ModelMessage, ModelRequest
+from agent_hub.security.secrets import SecretService, SecretValidationError
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"], responses=BASE_ERROR_RESPONSES)
 
@@ -401,6 +407,7 @@ class InMemoryAdminResourceService:
         self.models[response.id] = response
         return response
 
+
     async def create_secret(self, request: SecretCreateRequest) -> SecretReferenceResponse:
         raw = request.value.get_secret_value()
         fingerprint = hashlib.sha256(raw.encode()).hexdigest()
@@ -601,11 +608,212 @@ class InMemoryAdminResourceService:
         )
 
 
+class PersistentAdminResourceService(InMemoryAdminResourceService):
+    """Production admin resource service backed by config revisions and sealed secrets."""
+
+    def __init__(
+        self,
+        *,
+        config_service: ConfigService,
+        secret_service: SecretService,
+        tenant_id: UUID,
+        actor_id: UUID,
+        model_transport: ModelTransport | None = None,
+    ) -> None:
+        super().__init__()
+        self._config_service = config_service
+        self._secret_service = secret_service
+        self._tenant_id = tenant_id
+        self._actor_id = actor_id
+        self._model_transport = model_transport or LiteLLMClient()
+
+    async def list_models(self) -> tuple[ModelDeploymentResponse, ...]:
+        revision = await self._config_service.get_current(self._tenant_id)
+        if revision is None:
+            return ()
+        config = PlatformConfig.model_validate(revision.document)
+        responses: list[ModelDeploymentResponse] = []
+        for logical_model, definition in sorted(config.models.items()):
+            for index, deployment in enumerate(definition.deployments):
+                responses.append(
+                    self._model_response(
+                        logical_model,
+                        definition.fallback_model,
+                        index,
+                        deployment,
+                    )
+                )
+        return tuple(responses)
+
+    async def create_model(self, request: ModelDeploymentRequest) -> ModelDeploymentResponse:
+        document = await self._current_document()
+        models = cast(dict[str, object], document.setdefault("models", {}))
+        existing = models.get(request.logical_model)
+        if existing is None:
+            logical_definition: dict[str, object] = {"deployments": []}
+        else:
+            logical_definition = dict(cast(dict[str, object], existing))
+            logical_definition["deployments"] = list(
+                cast(list[object], logical_definition.get("deployments", []))
+            )
+        deployment = {
+            "provider": request.provider,
+            "model": request.upstream_model,
+            "api_base": request.api_base,
+            "credential_ref": request.credential_ref,
+            "quota_scope_id": request.quota_scope,
+            "max_concurrency": request.max_concurrency,
+            "target_utilization": request.target_utilization,
+            "reserved_slots": request.reserved_capacity,
+            "rpm": request.rpm,
+            "tpm": request.tpm,
+            "capabilities": request.capabilities,
+        }
+        deployments = cast(list[object], logical_definition["deployments"])
+        deployment_index = len(deployments)
+        deployments.append(deployment)
+        if request.fallback is not None:
+            logical_definition["fallback_model"] = request.fallback
+        models[request.logical_model] = logical_definition
+        try:
+            checked_deployment = PlatformConfig.model_validate(document).models[
+                request.logical_model
+            ].deployments[deployment_index]
+            await self._verify_model_availability(
+                checked_deployment.to_deployment(
+                    deployment_id=f"{request.logical_model}_{deployment_index + 1}",
+                    logical_model=request.logical_model,
+                )
+            )
+            draft = await self._config_service.create_draft(
+                self._tenant_id,
+                self._actor_id,
+                document,
+            )
+            await self._config_service.publish(
+                self._tenant_id,
+                draft.version,
+                self._actor_id,
+            )
+        except ConfigValidationError:
+            raise PublicAPIError(422, "request_validation", "request validation failed") from None
+        current = await self._config_service.get_current(self._tenant_id)
+        if current is None:
+            raise PublicAPIError(503, "service_unavailable", "service unavailable")
+        published = PlatformConfig.model_validate(current.document)
+        created_definition = published.models[request.logical_model]
+        return self._model_response(
+            request.logical_model,
+            created_definition.fallback_model,
+            deployment_index,
+            created_definition.deployments[deployment_index],
+        )
+
+    async def create_secret(self, request: SecretCreateRequest) -> SecretReferenceResponse:
+        try:
+            reference = await self._secret_service.create_or_get(
+                self._tenant_id,
+                self._actor_id,
+                request.value.get_secret_value(),
+            )
+        except SecretValidationError:
+            raise PublicAPIError(422, "request_validation", "request validation failed") from None
+        value = request.value.get_secret_value()
+        return SecretReferenceResponse(ref=reference.reference, last_four=value[-4:])
+
+    async def _verify_model_availability(self, deployment: Deployment) -> None:
+        if ModelCapability.TEXT not in deployment.capabilities:
+            raise PublicAPIError(
+                422,
+                "model_unavailable",
+                "model availability check requires text capability",
+            )
+        try:
+            api_key = await self._secret_service.resolve(self._tenant_id, deployment.secret_ref)
+            await self._model_transport.complete(
+                deployment,
+                ModelRequest(
+                    logical_model=deployment.logical_model,
+                    messages=(
+                        ModelMessage(
+                            role="user",
+                            content="Reply with the exact text: agent-hub-model-check-ok",
+                        ),
+                    ),
+                    required_capabilities=frozenset({ModelCapability.TEXT}),
+                    timeout_seconds=30,
+                    allow_fallback=False,
+                    max_output_tokens=32,
+                ),
+                api_key,
+            )
+        except PublicAPIError:
+            raise
+        except Exception as error:  # noqa: BLE001 - redact provider/SDK failures.
+            reason = _safe_model_check_reason(error)
+            raise PublicAPIError(
+                422,
+                "model_unavailable",
+                f"model availability check failed: {reason}",
+            ) from None
+
+    async def _current_document(self) -> dict[str, object]:
+        revision = await self._config_service.get_current(self._tenant_id)
+        if revision is None:
+            return {"models": {}, "agents": []}
+        config = PlatformConfig.model_validate(revision.document)
+        return config.model_dump(mode="json")
+
+    def _model_response(
+        self,
+        logical_model: str,
+        fallback_model: str | None,
+        index: int,
+        deployment: object,
+    ) -> ModelDeploymentResponse:
+        parsed = PlatformConfig.model_validate(
+            {"models": {logical_model: {"deployments": [deployment]}}, "agents": []}
+        ).models[logical_model].deployments[0]
+        response_id = uuid5(
+            NAMESPACE_URL,
+            ":".join(
+                (
+                    "agent-hub-model",
+                    str(self._tenant_id),
+                    logical_model,
+                    str(index),
+                    parsed.provider,
+                    parsed.model,
+                    parsed.secret_ref,
+                )
+            ),
+        )
+        return ModelDeploymentResponse(
+            id=response_id,
+            provider=parsed.provider,
+            api_base=parsed.api_base or "http://litellm:4000/v1",
+            upstream_model=parsed.model,
+            logical_model=logical_model,
+            capabilities=sorted(parsed.capabilities),
+            credential_ref=parsed.secret_ref,
+            quota_scope=parsed.quota_scope_id,
+            max_concurrency=parsed.max_concurrency,
+            target_utilization=parsed.target_utilization,
+            reserved_capacity=parsed.reserved_slots,
+            rpm=parsed.rpm,
+            tpm=parsed.tpm,
+            queue_timeout_seconds=60,
+            fallback=fallback_model,
+            weight=100,
+            effective_slots=max(0, parsed.max_concurrency - parsed.reserved_slots),
+            saturation_policy="queue_first_then_fallback",
+        )
+
+
 def _service(request: Request) -> AdminResourceService:
     service = getattr(request.app.state, "admin_resource_service", None)
     if service is None:
-        service = InMemoryAdminResourceService()
-        request.app.state.admin_resource_service = service
+        raise PublicAPIError(503, "service_unavailable", "service unavailable")
     return cast(AdminResourceService, service)
 
 
@@ -622,6 +830,13 @@ def _contains_sensitive_marker(value: str) -> bool:
         marker in lowered
         for marker in ("api_key", "authorization:", "bearer ", "password", "secret", "sk-")
     )
+
+
+def _safe_model_check_reason(error: Exception) -> str:
+    message = str(error).strip()
+    if not message or _contains_sensitive_marker(message):
+        return "provider request failed"
+    return message[:300]
 
 
 @router.get("/models", response_model=list[ModelDeploymentResponse], responses=error_responses(401, 403, 422))
@@ -949,4 +1164,4 @@ async def recommend_with_hermes(
     return await service.recommend_with_hermes(body)
 
 
-__all__ = ["InMemoryAdminResourceService", "router"]
+__all__ = ["InMemoryAdminResourceService", "PersistentAdminResourceService", "router"]

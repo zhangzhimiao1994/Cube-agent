@@ -202,6 +202,7 @@ class StubAuthService:
         self.principal = principal or AuthenticatedPrincipal(uuid4(), uuid4(), Role.ADMIN)
         self.login_error: Exception | None = None
         self.seen_tokens: list[str] = []
+        self.login_tenant_ids: list[UUID] = []
 
     async def consume_bootstrap_code(
         self, code: str, username: str, password: str
@@ -209,6 +210,7 @@ class StubAuthService:
         return AuthResult(self.principal, "setup-access-token")
 
     async def login(self, tenant_id: UUID, username: str, password: str) -> AuthResult:
+        self.login_tenant_ids.append(tenant_id)
         if self.login_error is not None:
             raise self.login_error
         return AuthResult(self.principal, "login-access-token")
@@ -284,6 +286,27 @@ def test_setup_and_login_return_only_safe_principal_fields() -> None:
     }
     assert "password" not in setup.text
     assert "code" not in setup.text
+
+
+def test_login_uses_bootstrap_tenant_when_tenant_id_is_omitted() -> None:
+    principal = AuthenticatedPrincipal(
+        uuid4(),
+        Settings.model_validate({}).bootstrap_tenant_id,
+        Role.ADMIN,
+    )
+    auth = StubAuthService(principal)
+    client = auth_client(auth)
+
+    response = client.post(
+        "/api/v1/auth/login",
+        json={
+            "username": "owner",
+            "password": "correct horse battery staple",
+        },
+    )
+
+    assert response.status_code == 200
+    assert auth.login_tenant_ids == [principal.tenant_id]
 
 
 def test_login_invalid_credentials_is_generic_401_with_challenge() -> None:

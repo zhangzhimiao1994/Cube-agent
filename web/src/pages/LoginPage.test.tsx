@@ -4,10 +4,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TestApp } from "../app/router";
 
-const owner = {
-  username: "owner",
+const principal = {
+  user_id: "11111111-1111-4111-8111-111111111111",
+  tenant_id: "33333333-3333-4333-8333-333333333333",
   role: "super_admin",
-  permissions: ["*"],
+};
+
+const ownerToken = {
+  access_token: "owner-token",
+  token_type: "bearer",
+  principal,
 };
 
 const runs = [
@@ -31,17 +37,22 @@ function jsonResponse(payload: unknown, init: ResponseInit = {}) {
 
 describe("LoginPage", () => {
   beforeEach(() => {
+    window.sessionStorage.clear();
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const path = String(input);
-        if (path === "/api/v1/me") {
+        if (path === "/api/v1/auth/me") {
           return jsonResponse({ error: "unauthenticated" }, { status: 401 });
         }
         if (path === "/api/v1/auth/login") {
           const body = JSON.parse(String(init?.body));
-          if (body.username === "owner" && body.password === "correct horse battery staple") {
-            return jsonResponse(owner);
+          if (
+            (body.tenant_id === principal.tenant_id || body.tenant_id === undefined) &&
+            body.username === "owner" &&
+            body.password === "correct horse battery staple"
+          ) {
+            return jsonResponse(ownerToken);
           }
           return jsonResponse(
             { error: { code: "invalid_credentials", message: "invalid credentials" } },
@@ -56,13 +67,17 @@ describe("LoginPage", () => {
               { status: 401 },
             );
           }
-          return jsonResponse(owner);
+          return jsonResponse(ownerToken);
         }
         if (path === "/api/v1/admin/runs") {
+          if (init?.headers instanceof Headers) {
+            expect(init.headers.get("Authorization")).toBe("Bearer owner-token");
+          } else {
+            expect((init?.headers as Record<string, string>).Authorization).toBe(
+              "Bearer owner-token",
+            );
+          }
           return jsonResponse(runs);
-        }
-        if (path === "/api/v1/auth/logout") {
-          return new Response(null, { status: 204 });
         }
         return jsonResponse({ error: "not_found" }, { status: 404 });
       }),
@@ -134,11 +149,11 @@ describe("LoginPage", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
-        if (String(input) === "/api/v1/me") {
+        if (String(input) === "/api/v1/auth/me") {
           return jsonResponse({
-            username: "viewer",
+            user_id: "44444444-4444-4444-8444-444444444444",
+            tenant_id: principal.tenant_id,
             role: "viewer",
-            permissions: ["run:read", "config:read"],
           });
         }
         if (String(input) === "/api/v1/admin/runs") {

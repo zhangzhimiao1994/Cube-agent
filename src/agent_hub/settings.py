@@ -1,5 +1,7 @@
 """Application settings."""
 
+import base64
+import binascii
 from functools import lru_cache
 from pathlib import Path
 from typing import ClassVar
@@ -79,6 +81,18 @@ class Settings(BaseSettings):
         """Return the Redis URL only at the connection boundary."""
 
         return self.redis_url.get_secret_value()
+
+    def master_key_bytes(self) -> bytes:
+        """Return the configured AES-256 master key decoded from base64."""
+
+        raw = self.master_key.get_secret_value().strip()
+        try:
+            decoded = base64.b64decode(raw, validate=True)
+        except (binascii.Error, ValueError):
+            raise ValueError("master_key must be canonical base64 for 32 bytes") from None
+        if len(decoded) != 32:
+            raise ValueError("master_key must decode to exactly 32 bytes")
+        return decoded
 
     @field_validator("trusted_proxy_ips", mode="before")
     @classmethod
