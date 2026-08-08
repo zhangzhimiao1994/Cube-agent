@@ -504,6 +504,13 @@ def _effective_uid() -> int:
     return int(get_effective_uid())
 
 
+def _os_flag(name: str) -> int:
+    value = getattr(os, name)
+    if not isinstance(value, int):
+        raise TypeError("POSIX filesystem flag is unavailable")
+    return value
+
+
 class MemoryImageStore:
     """Portable test/development adapter with the same tenant-bound key contract."""
 
@@ -610,9 +617,11 @@ class FilesystemImageStore:
 
     @staticmethod
     def _directory_flags() -> int:
-        directory = int(os.O_DIRECTORY)  # type: ignore[attr-defined]
-        nofollow = int(os.O_NOFOLLOW)  # type: ignore[attr-defined]
-        return os.O_RDONLY | directory | nofollow
+        return os.O_RDONLY | _os_flag("O_DIRECTORY") | _os_flag("O_NOFOLLOW")
+
+    @staticmethod
+    def _nofollow_flag() -> int:
+        return _os_flag("O_NOFOLLOW")
 
     @classmethod
     def _open_secure_root(cls, root: Path) -> int:
@@ -729,7 +738,7 @@ class FilesystemImageStore:
             temporary_name = f".{uuid.uuid4()}.tmp"
             descriptor = os.open(
                 temporary_name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,  # type: ignore[attr-defined]
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | self._nofollow_flag(),
                 0o600,
                 dir_fd=tenant_fd,
             )
@@ -807,7 +816,7 @@ class FilesystemImageStore:
             try:
                 target_fd = os.open(
                     target_name,
-                    os.O_RDONLY | os.O_NOFOLLOW,  # type: ignore[attr-defined]
+                    os.O_RDONLY | self._nofollow_flag(),
                     dir_fd=tenant_fd,
                 )
             except FileNotFoundError:
