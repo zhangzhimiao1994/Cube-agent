@@ -11,6 +11,7 @@ def test_native_installer_deploys_release_before_starting_services() -> None:
     script = read("scripts/lib/install_native.sh")
 
     assert "deploy_native_release" in script
+    assert "normalize_native_release_line_endings" in script
     assert "ln -sfn" in script
     assert '"$INSTALL_ROOT/current"' in script
     assert "uv sync --frozen --no-dev" in script
@@ -42,6 +43,16 @@ def test_native_installer_starts_local_dependencies_and_writes_runtime_urls() ->
     assert "systemctl enable --now postgresql" in script
     assert "systemctl enable --now redis" in script
     assert "createdb" in script
+
+
+def test_native_installer_normalizes_release_and_systemd_line_endings() -> None:
+    script = read("scripts/lib/install_native.sh")
+
+    assert "normalize_native_release_line_endings" in script
+    assert "normalize_native_systemd_units" in script
+    assert "sed -i 's/\\r$//'" in script
+    assert "-name '*.sh'" in script
+    assert "-name '*.service'" in script
 
 
 def test_installer_defaults_management_url_to_external_address() -> None:
@@ -93,3 +104,13 @@ def test_native_installer_falls_back_to_china_mirrors_when_official_sources_fail
     assert "registry.npmmirror.com" in installer
     assert "docker.io" in docker
     assert "registry.cn-hangzhou.aliyuncs.com" in docker
+
+
+def test_native_installer_falls_back_from_locked_uv_sync_to_mirror_pip_install() -> None:
+    script = read("scripts/lib/install_native.sh")
+
+    assert "sync_python_project_with_lock_or_mirror" in script
+    assert "uv sync --frozen --no-dev" in script
+    assert "uv pip install --python .venv/bin/python" in script
+    assert "--index-url" in script
+    assert "official locked uv sync failed" in script

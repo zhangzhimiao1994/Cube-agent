@@ -76,6 +76,33 @@ run_uv_python_install_with_mirror_fallback() {
   python_mirror_env uv python install 3.12
 }
 
+pypi_mirror_url() {
+  printf '%s\n' "${AGENT_HUB_PYPI_MIRROR:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+}
+
+sync_python_project_with_lock_or_mirror() {
+  local mode mirror
+  mode="$(native_mirror_mode)"
+  mirror="$(pypi_mirror_url)"
+
+  if [[ "$mode" == "china" ]]; then
+    if python_mirror_env uv sync --frozen --no-dev; then
+      return 0
+    fi
+    warn "locked uv sync failed; installing project from China PyPI mirror without lock file URLs"
+    python_mirror_env uv pip install --python .venv/bin/python --index-url "$mirror" -e .
+    return
+  fi
+
+  if uv sync --frozen --no-dev; then
+    return 0
+  fi
+
+  [[ "$mode" == "official" ]] && return 1
+  warn "official locked uv sync failed; installing project from China PyPI mirror without lock file URLs"
+  python_mirror_env uv pip install --python .venv/bin/python --index-url "$mirror" -e .
+}
+
 postgres_exec() {
   if command -v sudo >/dev/null 2>&1; then
     sudo -u postgres "$@"
@@ -201,6 +228,32 @@ ensure_native_uv() {
   command -v uv >/dev/null 2>&1 || die "uv installation failed"
 }
 
+normalize_native_release_line_endings() {
+  local release="$1"
+  find "$release" -type f \( \
+    -name '*.sh' \
+    -o -name '*.service' \
+    -o -name '*.target' \
+    -o -name '*.socket' \
+    -o -name '*.timer' \
+    -o -name 'Caddyfile' \
+  \) -exec sed -i 's/\r$//' {} +
+}
+
+normalize_native_systemd_units() {
+  find /etc/systemd/system -maxdepth 1 -type f \( \
+    -name 'agent-hub*.service' \
+    -o -name 'agent-hub*.target' \
+    -o -name 'agent-hub*.socket' \
+    -o -name 'agent-hub*.timer' \
+  \) -exec sed -i 's/\r$//' {} +
+}
+
+install_native_systemd_units() {
+  install -m 0644 "$SCRIPT_DIR"/deploy/native/systemd/* /etc/systemd/system/
+  normalize_native_systemd_units
+}
+
 native_public_url() {
   if [[ -f "$SECRETS_FILE" ]]; then
     native_secret_value AGENT_HUB_PUBLIC_URL
@@ -242,12 +295,13 @@ deploy_native_release() {
     --exclude='.mypy_cache' \
     --exclude='.ruff_cache' \
     -cf - -C "$SCRIPT_DIR" . | tar -xf - -C "$release"
+  normalize_native_release_line_endings "$release"
 
   (
     cd "$release"
     run_python_with_mirror_fallback uv venv --python "$python_bin" .venv
-    run_python_with_mirror_fallback uv sync --frozen --no-dev
-    run_python_with_mirror_fallback .venv/bin/python -m pip install 'litellm[proxy]>=1.75,<2'
+    sync_python_project_with_lock_or_mirror
+    run_python_with_mirror_fallback uv pip install --python .venv/bin/python 'litellm[proxy]>=1.75,<2'
     if command -v npm >/dev/null 2>&1; then
       run_npm_with_mirror_fallback
       npm --prefix web run build
@@ -359,7 +413,7 @@ install_native_mode() {
   fi
   deploy_native_release
   install_native_caddy
-  install -m 0644 "$SCRIPT_DIR"/deploy/native/systemd/* /etc/systemd/system/
+  install_native_systemd_units
   configure_native_database
   run_native_migrations
   systemctl daemon-reload
