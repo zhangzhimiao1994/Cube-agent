@@ -16,6 +16,16 @@ set_env_value() {
   chmod 0600 "$file"
 }
 
+write_litellm_config() {
+  cat > "$INSTALL_ROOT/compose/litellm.yaml" <<'EOF'
+model_list: []
+litellm_settings:
+  drop_params: true
+  request_timeout: 600
+EOF
+  chmod 0644 "$INSTALL_ROOT/compose/litellm.yaml"
+}
+
 configure_china_docker_mirror() {
   local mirror daemon_config
   mirror="${AGENT_HUB_DOCKER_REGISTRY_MIRROR:-https://registry.cn-hangzhou.aliyuncs.com}"
@@ -49,6 +59,7 @@ install_docker_mode() {
   mkdir -p "$INSTALL_ROOT"
   cp -R "$SCRIPT_DIR/deploy/compose" "$INSTALL_ROOT/compose"
   cp "$SECRETS_FILE" "$INSTALL_ROOT/compose/.env"
+  write_litellm_config
   local postgres_password
   postgres_password="$(grep '^POSTGRES_PASSWORD=' "$INSTALL_ROOT/compose/.env" | cut -d= -f2-)"
   [[ -n "$postgres_password" ]] || die "POSTGRES_PASSWORD is missing from compose environment"

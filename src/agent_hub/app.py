@@ -7,7 +7,7 @@ import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from uuid import UUID
 
 from fastapi import FastAPI, Request
@@ -31,6 +31,13 @@ from agent_hub.auth.passwords import PasswordService
 from agent_hub.auth.rate_limit import RedisAuthRateLimiter
 from agent_hub.auth.service import AuthService
 from agent_hub.auth.tokens import AccessTokenService
+from agent_hub.channels.dedup import InboundDedupRepository
+from agent_hub.channels.feishu.webhook import (
+    ChannelGatewayProtocol,
+    create_lazy_feishu_webhook_router,
+)
+from agent_hub.channels.gateway import ChannelGateway
+from agent_hub.channels.submitter import RunServiceInboundSubmitter, RunSubmissionService
 from agent_hub.config.service import ConfigService
 from agent_hub.db.models import TenantRow
 from agent_hub.db.session import build_database
@@ -146,6 +153,7 @@ def create_app(
     runtime_registry: RuntimeRegistry | None = None,
     mode_router: ModeRouterProtocol | None = None,
     task_queue: TaskQueue | None = None,
+    feishu_gateway: ChannelGatewayProtocol | None = None,
     database_factory: Callable[[str], DatabaseResource] = build_database,
     redis_factory: Callable[[str], RedisResource] = Redis.from_url,
 ) -> FastAPI:
@@ -216,6 +224,21 @@ def create_app(
                     task_queue=queue,
                 )
                 application.state.run_queue = queue
+            if (
+                feishu_gateway is None
+                and active_sessions is not None
+                and getattr(application.state, "run_service", None) is not None
+            ):
+                application.state.feishu_gateway = ChannelGateway(
+                    submitter=RunServiceInboundSubmitter(
+                        run_service=cast(
+                            RunSubmissionService,
+                            application.state.run_service,
+                        ),
+                        tenant_id=configured.bootstrap_tenant_id,
+                    ),
+                    deduplicator=InboundDedupRepository(active_sessions),
+                )
 
             if rate_limiter is None:
                 assert active_redis is not None
@@ -252,6 +275,7 @@ def create_app(
     application.state.runtime_registry = active_runtime_registry
     application.state.mode_router = mode_router
     application.state.run_queue = task_queue
+    application.state.feishu_gateway = feishu_gateway
     application.state.metrics_registry = default_metrics_registry()
     application.state.extra_readiness_checks = {}
     application.state.trusted_proxy_ips = configured_settings.trusted_proxy_ips
@@ -277,6 +301,11 @@ def create_app(
     application.router.routes.extend(runs.router.routes)
     application.router.routes.extend(admin.router.routes)
     application.router.routes.extend(users.router.routes)
+    application.router.routes.extend(
+        create_lazy_feishu_webhook_router(
+            gateway_provider=_feishu_gateway_from_request,
+        ).routes
+    )
 
     @application.get("/{path:path}", include_in_schema=False, response_model=None)
     async def web_ui(path: str) -> Response:
@@ -299,7 +328,7 @@ def create_app(
 def _web_ui_response(web_dir: Path, path: str) -> Response:
     root = web_dir.resolve()
     target = (root / path).resolve()
-    if not str(target).startswith(str(root)) or target.is_dir() or not target.exists():
+    if not target.is_relative_to(root) or target.is_dir() or not target.exists():
         target = root / "index.html"
     if not target.exists() or not target.is_file():
         return JSONResponse(
@@ -307,6 +336,13 @@ def _web_ui_response(web_dir: Path, path: str) -> Response:
             content=error_payload("not_found", "resource not found"),
         )
     return FileResponse(target)
+
+
+def _feishu_gateway_from_request(request: Request) -> ChannelGatewayProtocol | None:
+    gateway = getattr(request.app.state, "feishu_gateway", None)
+    if gateway is None:
+        return None
+    return cast(ChannelGatewayProtocol, gateway)
 
 
 def _database_probe(

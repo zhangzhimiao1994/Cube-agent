@@ -1,4 +1,4 @@
-{$AGENT_HUB_PUBLIC_URL:localhost} {
+{$AGENT_HUB_PUBLIC_URL} {
   encode zstd gzip
   reverse_proxy api:8000
 }

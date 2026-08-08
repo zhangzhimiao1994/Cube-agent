@@ -5,14 +5,17 @@ import asyncio
 import hashlib
 import json
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 
 from agent_hub.auth.service import _try_hash_canonical_bootstrap_code
-from agent_hub.db.models import BootstrapCodeRow, TenantRow
+from agent_hub.db.models import BootstrapCodeRow, TenantRow, UserRow
 from agent_hub.db.session import build_database
 
 
@@ -37,14 +40,17 @@ async def seed_bootstrap_code(
     tenant_id: UUID,
     tenant_slug: str,
     tenant_name: str,
+    database_factory: Callable[[str], Any] = build_database,
 ) -> None:
     code_hash = _try_hash_canonical_bootstrap_code(code)
     if code_hash is None:
         raise ValueError("setup code must be a canonical 32-byte base64url value")
     expires_at = datetime.now(UTC) + timedelta(minutes=minutes)
-    database = build_database(database_url)
+    database = database_factory(database_url)
     try:
         async with database.session_factory() as session, session.begin():
+            if await _has_super_admin(session):
+                return
             tenant_statement = (
                 insert(TenantRow)
                 .values(id=tenant_id, slug=tenant_slug, name=tenant_name)
@@ -53,24 +59,47 @@ async def seed_bootstrap_code(
                     set_={"slug": tenant_slug, "name": tenant_name},
                 )
             )
-            code_statement = (
-                insert(BootstrapCodeRow)
-                .values(
-                    id=uuid4(),
+            await session.execute(tenant_statement)
+            await session.execute(
+                _bootstrap_code_insert_statement(
                     code_hash=code_hash,
                     tenant_id=tenant_id,
                     expires_at=expires_at,
-                    consumed_at=None,
-                )
-                .on_conflict_do_update(
-                    constraint="uq_agent_hub_bootstrap_codes_code_hash",
-                    set_={"expires_at": expires_at, "consumed_at": None},
                 )
             )
-            await session.execute(tenant_statement)
-            await session.execute(code_statement)
     finally:
         await database.dispose()
+
+
+async def _has_super_admin(session: Any) -> bool:
+    return (
+        await session.scalar(
+            select(UserRow.id).where(UserRow.role == "super_admin").limit(1)
+        )
+    ) is not None
+
+
+def _bootstrap_code_insert_statement(
+    *,
+    code_hash: str,
+    tenant_id: UUID,
+    expires_at: datetime,
+) -> Any:
+    return (
+        insert(BootstrapCodeRow)
+        .values(
+            id=uuid4(),
+            code_hash=code_hash,
+            tenant_id=tenant_id,
+            expires_at=expires_at,
+            consumed_at=None,
+        )
+        .on_conflict_do_update(
+            constraint="uq_agent_hub_bootstrap_codes_code_hash",
+            set_={"expires_at": expires_at},
+            where=BootstrapCodeRow.consumed_at.is_(None),
+        )
+    )
 
 
 def main() -> None:

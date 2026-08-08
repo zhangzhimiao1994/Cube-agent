@@ -83,22 +83,6 @@ services:
       timeout: 5s
       retries: 3
 
-  feishu:
-    image: ${AGENT_HUB_IMAGE:-agent-hub:latest}
-    env_file:
-      - path: .env
-        required: false
-    command: ["uvicorn", "agent_hub.app:app", "--host", "0.0.0.0", "--port", "8001"]
-    depends_on:
-      api:
-        condition: service_healthy
-    restart: unless-stopped
-    networks: [backend]
-    read_only: true
-    tmpfs: ["/tmp:size=128m,mode=1777"]
-    security_opt: ["no-new-privileges:true"]
-    cap_drop: [ALL]
-
   worker:
     image: ${AGENT_HUB_IMAGE:-agent-hub:latest}
     env_file:
@@ -122,9 +106,11 @@ services:
     env_file:
       - path: .env
         required: false
-    command: ["--port", "4000", "--host", "0.0.0.0"]
+    command: ["--config", "/etc/litellm/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
     restart: unless-stopped
     networks: [backend]
+    volumes:
+      - ./litellm.yaml:/etc/litellm/config.yaml:ro
     security_opt: ["no-new-privileges:true"]
 
   skill-runner:

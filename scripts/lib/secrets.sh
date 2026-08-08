@@ -6,6 +6,7 @@ rand_secret() {
 
 detect_public_url() {
   if [[ -n "${AGENT_HUB_PUBLIC_URL:-}" ]]; then
+    validate_public_url "$AGENT_HUB_PUBLIC_URL"
     printf '%s\n' "$AGENT_HUB_PUBLIC_URL"
     return 0
   fi
@@ -30,21 +31,30 @@ detect_public_url() {
   printf 'http://127.0.0.1\n'
 }
 
+validate_public_url() {
+  local url="$1"
+  case "$url" in
+    http://*|https://*) ;;
+    *) die "AGENT_HUB_PUBLIC_URL must start with http:// or https://" ;;
+  esac
+}
+
 generate_or_keep_secrets() {
   mkdir -p "$CONFIG_DIR" "$STATE_DIR"
   if [[ -f "$SECRETS_FILE" ]]; then
     log "keeping existing secrets at $SECRETS_FILE"
     return 0
   fi
-  local tmp postgres_password
+  local tmp postgres_password jwt_signing_key public_url
   tmp="$(mktemp "$CONFIG_DIR/secrets.env.XXXXXX")"
   postgres_password="$(rand_secret)"
+  jwt_signing_key="$(rand_secret)"
+  public_url="$(detect_public_url)"
   {
     printf 'AGENT_HUB_ENVIRONMENT=production\n'
-    printf 'AGENT_HUB_SECRET_KEY=%s\n' "$(rand_secret)"
     printf 'AGENT_HUB_MASTER_KEY=%s\n' "$(openssl rand -base64 32)"
-    printf 'AGENT_HUB_JWT_SIGNING_KEY=base64url:%s\n' "$(rand_secret)"
-    printf 'JWT_SIGNING_KEY=base64url:%s\n' "$(rand_secret)"
+    printf 'AGENT_HUB_JWT_SIGNING_KEY=base64url:%s\n' "$jwt_signing_key"
+    printf 'JWT_SIGNING_KEY=base64url:%s\n' "$jwt_signing_key"
     printf 'POSTGRES_DB=agent_hub\n'
     printf 'POSTGRES_USER=agent_hub\n'
     printf 'POSTGRES_PASSWORD=%s\n' "$postgres_password"
@@ -54,7 +64,7 @@ generate_or_keep_secrets() {
     printf 'REDIS_URL=redis://127.0.0.1:6379/0\n'
     printf 'LITELLM_MASTER_KEY=%s\n' "$(rand_secret)"
     printf 'AGENT_HUB_SETUP_CODE=%s\n' "$(rand_secret)"
-    printf 'AGENT_HUB_PUBLIC_URL=%s\n' "$(detect_public_url)"
+    printf 'AGENT_HUB_PUBLIC_URL=%s\n' "$public_url"
     printf 'AGENT_HUB_TLS_CERT_FILE=%s\n' "${AGENT_HUB_TLS_CERT_FILE:-}"
     printf 'AGENT_HUB_TLS_KEY_FILE=%s\n' "${AGENT_HUB_TLS_KEY_FILE:-}"
     printf 'AGENT_HUB_API_BIND_HOST=%s\n' "${AGENT_HUB_API_BIND_HOST:-127.0.0.1}"

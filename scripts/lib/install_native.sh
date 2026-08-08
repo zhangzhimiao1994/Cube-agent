@@ -161,6 +161,18 @@ ensure_native_runtime_urls() {
   append_secret_if_missing REDIS_URL "redis://127.0.0.1:6379/0"
 }
 
+write_litellm_config() {
+  mkdir -p "$CONFIG_DIR"
+  cat > "$CONFIG_DIR/litellm.yaml" <<'EOF'
+model_list: []
+litellm_settings:
+  drop_params: true
+  request_timeout: 600
+EOF
+  chown root:agent-hub "$CONFIG_DIR/litellm.yaml" 2>/dev/null || true
+  chmod 0640 "$CONFIG_DIR/litellm.yaml"
+}
+
 configure_native_database() {
   local database_url postgres_db postgres_user postgres_password postgres_password_sql role_exists db_exists
   start_native_dependencies
@@ -387,6 +399,10 @@ $tls_directive
     reverse_proxy 127.0.0.1:$api_port
   }
 
+  handle /channels/* {
+    reverse_proxy 127.0.0.1:$api_port
+  }
+
   handle /metrics {
     reverse_proxy 127.0.0.1:$api_port
   }
@@ -444,6 +460,7 @@ install_native_mode() {
     chmod 0750 /run/agent-hub "$STATE_DIR" /var/log/agent-hub
   fi
   deploy_native_release
+  write_litellm_config
   install_native_caddy
   install_native_systemd_units
   configure_native_database

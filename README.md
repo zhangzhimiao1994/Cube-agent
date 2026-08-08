@@ -5,8 +5,8 @@ Agent Hub is a multi-agent orchestration server with Feishu and Web management, 
 ## One-click install on a new Linux server
 
 ```bash
-git clone git@github.com:zhangzhimiao1994/mix-agent-.git
-cd mix-agent-
+git clone https://github.com/zhangzhimiao1994/mix-agent.git
+cd mix-agent
 sudo bash install.sh --mode auto --yes
 ```
 

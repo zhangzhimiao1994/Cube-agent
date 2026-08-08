@@ -3,7 +3,7 @@
 @test "compose declares every required service" {
   run docker compose -f deploy/compose/docker-compose.yml config --services
   [ "$status" -eq 0 ]
-  for service in api feishu worker litellm skill-runner postgres redis caddy; do
+  for service in api worker litellm skill-runner postgres redis caddy; do
     [[ "$output" == *"$service"* ]]
   done
 }
