@@ -111,6 +111,10 @@ postgres_exec() {
   fi
 }
 
+sql_literal() {
+  printf "%s" "$1" | sed "s/'/''/g"
+}
+
 start_native_dependencies() {
   if command -v postgresql-setup >/dev/null 2>&1; then
     postgresql-setup --initdb 2>/dev/null || true
@@ -146,7 +150,7 @@ ensure_native_runtime_urls() {
 }
 
 configure_native_database() {
-  local database_url postgres_db postgres_user postgres_password role_exists db_exists
+  local database_url postgres_db postgres_user postgres_password postgres_password_sql role_exists db_exists
   start_native_dependencies
   ensure_native_runtime_urls
 
@@ -166,14 +170,15 @@ configure_native_database() {
   postgres_user="${postgres_user:-agent_hub}"
   [[ "$postgres_db" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "POSTGRES_DB must be a simple SQL identifier"
   [[ "$postgres_user" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "POSTGRES_USER must be a simple SQL identifier"
+  postgres_password_sql="$(sql_literal "$postgres_password")"
 
   role_exists="$(postgres_exec psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${postgres_user}'" | tr -d '[:space:]')"
   if [[ "$role_exists" == "1" ]]; then
-    postgres_exec psql -v ON_ERROR_STOP=1 -v role="$postgres_user" -v password="$postgres_password" \
-      -c "ALTER ROLE :\"role\" WITH LOGIN PASSWORD :'password';"
+    postgres_exec psql -v ON_ERROR_STOP=1 \
+      -c "ALTER ROLE \"${postgres_user}\" WITH LOGIN PASSWORD '${postgres_password_sql}';"
   else
-    postgres_exec psql -v ON_ERROR_STOP=1 -v role="$postgres_user" -v password="$postgres_password" \
-      -c "CREATE ROLE :\"role\" LOGIN PASSWORD :'password';"
+    postgres_exec psql -v ON_ERROR_STOP=1 \
+      -c "CREATE ROLE \"${postgres_user}\" LOGIN PASSWORD '${postgres_password_sql}';"
   fi
 
   db_exists="$(postgres_exec psql -tAc "SELECT 1 FROM pg_database WHERE datname='${postgres_db}'" | tr -d '[:space:]')"

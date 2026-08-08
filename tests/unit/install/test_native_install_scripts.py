@@ -45,6 +45,16 @@ def test_native_installer_starts_local_dependencies_and_writes_runtime_urls() ->
     assert "createdb" in script
 
 
+def test_native_database_bootstrap_avoids_psql_variable_identifier_interpolation() -> None:
+    script = read("scripts/lib/install_native.sh")
+
+    assert ':"role"' not in script
+    assert ":'password'" not in script
+    assert "sql_literal" in script
+    assert 'CREATE ROLE \\"${postgres_user}\\" LOGIN PASSWORD' in script
+    assert 'ALTER ROLE \\"${postgres_user}\\" WITH LOGIN PASSWORD' in script
+
+
 def test_native_installer_normalizes_release_and_systemd_line_endings() -> None:
     script = read("scripts/lib/install_native.sh")
 
