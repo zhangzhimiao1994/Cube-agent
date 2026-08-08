@@ -36,6 +36,8 @@ def test_docker_install_overrides_container_internal_service_urls() -> None:
     assert "AGENT_HUB_REDIS_URL" in installer
     assert "redis://redis:6379/0" in installer
     assert "@127.0.0.1:5432" not in installer
+    assert "AGENT_HUB_LITELLM_HEALTH_URL" in installer
+    assert "http://litellm:4000/health/liveliness" in installer
 
 
 def test_docker_install_prefers_china_mirrors_unless_official_mode() -> None:
@@ -101,6 +103,15 @@ def test_compose_and_native_litellm_use_config_file() -> None:
     assert "write_litellm_config" in native_installer
 
 
+def test_compose_litellm_is_health_checked_and_can_reach_provider_apis() -> None:
+    compose = read("deploy/compose/docker-compose.yml")
+
+    assert "litellm:\n        condition: service_healthy" in compose
+    assert "networks: [backend, egress]" in compose
+    assert "  egress:\n" in compose
+    assert "socket.create_connection(('127.0.0.1', 4000), 3)" in compose
+
+
 def test_compose_caddy_requires_explicit_public_url_without_localhost_default() -> None:
     caddyfile = read("deploy/compose/Caddyfile")
 
@@ -115,6 +126,7 @@ def test_compose_env_example_uses_prefixed_application_environment() -> None:
     assert "AGENT_HUB_REDIS_URL=" in example
     assert "AGENT_HUB_JWT_SIGNING_KEY=" in example
     assert "AGENT_HUB_MASTER_KEY=" in example
+    assert "AGENT_HUB_LITELLM_HEALTH_URL=http://litellm:4000/health/liveliness" in example
     assert "\nDATABASE_URL=" not in f"\n{example}"
     assert "\nJWT_SIGNING_KEY=" not in f"\n{example}"
     assert "${POSTGRES_PASSWORD}" not in example

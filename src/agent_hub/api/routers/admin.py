@@ -14,9 +14,11 @@ from agent_hub.api.errors import BASE_ERROR_RESPONSES, PublicAPIError, error_res
 from agent_hub.auth.models import AuthenticatedPrincipal, Authorizer, PermissionDenied
 from agent_hub.config.schema import PlatformConfig
 from agent_hub.config.service import ConfigService, ConfigValidationError
+from agent_hub.domain.runs import RunStatus
 from agent_hub.models.gateway import ModelTransport
 from agent_hub.models.litellm_client import LiteLLMClient
 from agent_hub.models.types import Deployment, ModelCapability, ModelMessage, ModelRequest
+from agent_hub.runs.repository import RunConflict, RunNotFound, RunRecord, RunRepository
 from agent_hub.security.secrets import SecretService, SecretValidationError
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"], responses=BASE_ERROR_RESPONSES)
@@ -619,6 +621,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         tenant_id: UUID,
         actor_id: UUID,
         model_transport: ModelTransport | None = None,
+        run_repository: RunRepository | None = None,
     ) -> None:
         super().__init__()
         self._config_service = config_service
@@ -626,6 +629,105 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         self._tenant_id = tenant_id
         self._actor_id = actor_id
         self._model_transport = model_transport or LiteLLMClient()
+        self._run_repository = run_repository
+
+    async def list_runs(self) -> tuple[RunListItem, ...]:
+        if self._run_repository is None:
+            return await super().list_runs()
+        records = await self._run_repository.list_recent(self._tenant_id)
+        items: list[RunListItem] = []
+        for record in records:
+            items.append(await self._run_list_item(record))
+        return tuple(items)
+
+    async def get_run(self, run_id: UUID) -> RunDetailResponse:
+        if self._run_repository is None:
+            return await super().get_run(run_id)
+        try:
+            record = await self._run_repository.get(self._tenant_id, run_id)
+        except RunNotFound:
+            raise KeyError(run_id) from None
+        return await self._run_detail(record)
+
+    async def pause_run(self, run_id: UUID) -> RunDetailResponse:
+        if self._run_repository is None:
+            return await super().pause_run(run_id)
+        try:
+            record = await self._run_repository.update_control_status(
+                self._tenant_id,
+                run_id,
+                RunStatus.PAUSED,
+            )
+        except RunNotFound:
+            raise KeyError(run_id) from None
+        except RunConflict:
+            raise PublicAPIError(409, "run_conflict", "run state conflict") from None
+        return await self._run_detail(record)
+
+    async def resume_run(self, run_id: UUID) -> RunDetailResponse:
+        if self._run_repository is None:
+            return await super().resume_run(run_id)
+        try:
+            record = await self._run_repository.enqueue_existing_run(
+                tenant_id=self._tenant_id,
+                run_id=run_id,
+                from_status=RunStatus.PAUSED,
+                idempotency_suffix="admin-resume",
+            )
+        except RunNotFound:
+            raise KeyError(run_id) from None
+        except RunConflict:
+            raise PublicAPIError(409, "run_conflict", "run state conflict") from None
+        return await self._run_detail(record)
+
+    async def cancel_run(self, run_id: UUID) -> RunDetailResponse:
+        if self._run_repository is None:
+            return await super().cancel_run(run_id)
+        try:
+            record = await self._run_repository.update_control_status(
+                self._tenant_id,
+                run_id,
+                RunStatus.CANCELLED,
+            )
+        except RunNotFound:
+            raise KeyError(run_id) from None
+        except RunConflict:
+            raise PublicAPIError(409, "run_conflict", "run state conflict") from None
+        return await self._run_detail(record)
+
+    async def _run_list_item(self, record: RunRecord) -> RunListItem:
+        assert self._run_repository is not None
+        return RunListItem(
+            id=record.id,
+            status=record.status.value,
+            mode="auto" if record.mode is None else record.mode.value,
+            queue_wait_ms=0,
+            capacity_wait_ms=0,
+            cost_usd=str(await self._run_repository.usage_cost(self._tenant_id, record.id)),
+        )
+
+    async def _run_detail(self, record: RunRecord) -> RunDetailResponse:
+        assert self._run_repository is not None
+        list_item = await self._run_list_item(record)
+        events = await self._run_repository.events(self._tenant_id, record.id)
+        artifact_ids = await self._run_repository.artifact_ids(self._tenant_id, record.id)
+        return RunDetailResponse(
+            **list_item.model_dump(),
+            request=record.request,
+            events=[_admin_run_event(event) for event in events],
+            artifacts=[
+                RunArtifactResponse(
+                    id=str(artifact_id),
+                    kind="artifact",
+                    title=str(artifact_id),
+                )
+                for artifact_id in artifact_ids
+            ],
+            explicit_details={
+                "source": "database",
+                "version": str(record.version),
+            },
+        )
 
     async def list_models(self) -> tuple[ModelDeploymentResponse, ...]:
         revision = await self._config_service.get_current(self._tenant_id)
@@ -837,6 +939,18 @@ def _safe_model_check_reason(error: Exception) -> str:
     if not message or _contains_sensitive_marker(message):
         return "provider request failed"
     return message[:300]
+
+
+def _admin_run_event(event: dict[str, object]) -> RunEventResponse:
+    sequence = event.get("sequence")
+    kind = event.get("kind")
+    message = event.get("reason") or event.get("message") or kind
+    return RunEventResponse(
+        sequence=sequence if type(sequence) is int else 1,
+        kind=kind if type(kind) is str else "event",
+        message=message if type(message) is str else "event recorded",
+        created_at=datetime.now(UTC),
+    )
 
 
 @router.get("/models", response_model=list[ModelDeploymentResponse], responses=error_responses(401, 403, 422))

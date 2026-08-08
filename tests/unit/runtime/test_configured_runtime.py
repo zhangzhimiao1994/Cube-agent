@@ -10,7 +10,14 @@ from agent_hub.models.capacity import CapacityLease
 from agent_hub.models.gateway import CapacityController
 from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, TokenUsage
 from agent_hub.runtime.contracts import EventKind, TaskContext
-from agent_hub.runtime.defaults import ConfigBackedDirectRuntime
+from agent_hub.runtime.defaults import (
+    ConfigBackedDirectRuntime,
+    ConfigBackedDiscussionRuntime,
+    ConfigBackedDispatchRuntime,
+    ConfigBackedHybridRuntime,
+    UnavailableRuntime,
+    configured_runtime_registry,
+)
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
 
@@ -204,3 +211,20 @@ def _remember_capacity(
     capacity = ImmediateCapacity(deployments)
     capacities.append(capacity)
     return capacity
+
+
+def test_configured_runtime_registry_registers_all_production_modes() -> None:
+    registry = configured_runtime_registry(
+        config_service=FakeConfigService(None),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        redis_client=object(),
+        transport=FakeTransport(),
+    )
+
+    assert type(registry.get(TaskMode.DIRECT)) is ConfigBackedDirectRuntime
+    assert type(registry.get(TaskMode.DISPATCH)) is ConfigBackedDispatchRuntime
+    assert type(registry.get(TaskMode.DISCUSS)) is ConfigBackedDiscussionRuntime
+    assert type(registry.get(TaskMode.HYBRID)) is ConfigBackedHybridRuntime
+    assert not isinstance(registry.get(TaskMode.DISPATCH), UnavailableRuntime)
+    assert not isinstance(registry.get(TaskMode.DISCUSS), UnavailableRuntime)
+    assert not isinstance(registry.get(TaskMode.HYBRID), UnavailableRuntime)

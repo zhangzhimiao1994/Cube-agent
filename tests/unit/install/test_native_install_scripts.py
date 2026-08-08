@@ -34,6 +34,28 @@ def test_installer_failure_output_includes_context_and_hints() -> None:
     assert "curl -v http://127.0.0.1:8000/health/ready" in common
 
 
+def test_installer_preflights_required_support_files_before_sourcing() -> None:
+    install = read("install.sh")
+
+    assert "require_installer_files" in install
+    assert "installation package is incomplete" in install
+    assert install.index("require_installer_files") < install.index(
+        'source "$SCRIPT_DIR/scripts/lib/common.sh"'
+    )
+    assert '"$SCRIPT_DIR/scripts/lib/install_docker.sh"' in install
+    assert '"$SCRIPT_DIR/scripts/lib/install_native.sh"' in install
+
+
+def test_install_verification_uses_public_url_for_docker_mode() -> None:
+    verify = read("scripts/lib/verify.sh")
+
+    assert "installation_health_base_url" in verify
+    assert '[[ "${MODE:-}" == "docker" ]]' in verify
+    assert "AGENT_HUB_PUBLIC_URL" in verify
+    assert 'verify_url "$base_url/health/live"' in verify
+    assert 'verify_url "$base_url/health/ready"' in verify
+
+
 def test_native_installer_creates_runtime_dirs_and_migrates_before_services() -> None:
     script = read("scripts/lib/install_native.sh")
 

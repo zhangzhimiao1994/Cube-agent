@@ -813,6 +813,15 @@ async def test_direct_fails_closed_when_usage_cannot_prove_budget(
         await runtime.save_checkpoint()
 
 
+async def test_direct_accepts_provider_usage_with_additional_token_categories() -> None:
+    gateway = FakeGateway(ModelResponse(text="answer", usage=TokenUsage(1, 1, 3)))
+    runtime = DirectRuntime(gateway, logical_model="general")
+
+    events = await collect(runtime, context(token_budget=10_000))
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
 async def test_direct_revalidates_constructed_context_before_gateway() -> None:
     sentinel = "raw-api-key-sentinel"
     gateway = FakeGateway()

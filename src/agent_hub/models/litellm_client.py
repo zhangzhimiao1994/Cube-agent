@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import re
 from collections.abc import Mapping, Sequence
 from typing import Protocol, cast
@@ -19,6 +20,7 @@ from agent_hub.models.types import (
 )
 
 _SAFE_PROVIDER_VALUE = re.compile(r"^[A-Za-z0-9_./:-]{1,256}$")
+_LOGGER = logging.getLogger(__name__)
 
 
 class _Completions(Protocol):
@@ -133,20 +135,47 @@ def _sensitive_values(request: ModelRequest, api_key: str) -> tuple[str, ...]:
 def _parse_usage(raw_usage: object, deployment_id: str) -> TokenUsage | None:
     if raw_usage is None:
         return None
-    values = (
+    prompt_tokens = _coerce_usage_count(
         _attribute(raw_usage, "prompt_tokens"),
-        _attribute(raw_usage, "completion_tokens"),
-        _attribute(raw_usage, "total_tokens"),
+        field_name="usage.prompt_tokens",
+        deployment_id=deployment_id,
     )
-    if not all(isinstance(item, int) and not isinstance(item, bool) for item in values):
-        raise ModelResponseError(f"malformed model response for deployment {deployment_id!r}")
-    prompt_tokens, completion_tokens, total_tokens = cast(tuple[int, int, int], values)
+    completion_tokens = _coerce_usage_count(
+        _attribute(raw_usage, "completion_tokens"),
+        field_name="usage.completion_tokens",
+        deployment_id=deployment_id,
+    )
+    total_tokens = _coerce_usage_count(
+        _attribute(raw_usage, "total_tokens"),
+        field_name="usage.total_tokens",
+        deployment_id=deployment_id,
+    )
     try:
         return TokenUsage(prompt_tokens, completion_tokens, total_tokens)
     except ValueError:
         raise ModelResponseError(
-            f"malformed model response for deployment {deployment_id!r}"
+            f"malformed usage totals in model response for deployment {deployment_id!r}"
         ) from None
+
+
+def _coerce_usage_count(
+    value: object,
+    *,
+    field_name: str,
+    deployment_id: str,
+) -> int:
+    parsed: int | None = None
+    if type(value) is int:
+        parsed = value
+    elif (type(value) is float and value.is_integer()) or (
+        type(value) is str and value.isdecimal()
+    ):
+        parsed = int(value)
+    if parsed is None or parsed < 0:
+        raise ModelResponseError(
+            f"malformed {field_name} in model response for deployment {deployment_id!r}"
+        )
+    return parsed
 
 
 def _parse_tool_calls(raw_calls: object, deployment_id: str) -> tuple[ToolCall, ...]:
@@ -270,7 +299,11 @@ async def _close_ignoring_failures(client: _OpenAIClient | None) -> bool:
     except asyncio.CancelledError:
         task = asyncio.current_task()
         return task is not None and task.cancelling() > 0
-    except Exception:  # noqa: BLE001 - cleanup must not replace the primary safe error
+    except Exception as error:  # noqa: BLE001 - cleanup must not replace the primary safe error
+        _LOGGER.warning(
+            "litellm_client_close_failed error_type=%s",
+            type(error).__name__,
+        )
         return False
     return False
 
@@ -351,7 +384,9 @@ class LiteLLMClient:
                 return _CANCELLED
             return safe_failure
         if client is None or parsed is None:  # pragma: no cover - defensive invariant
-            return AssertionError("transport completed without a client response")
+            return ModelTransportError(
+                f"model transport failed for deployment {deployment.id!r}"
+            )
 
         try:
             await client.close()

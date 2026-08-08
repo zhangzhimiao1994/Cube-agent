@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     trusted_proxy_ips: frozenset[str] = Field(default=frozenset(), max_length=32)
     log_level: str = Field(default="WARNING", pattern=r"^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
     web_dir: Path | None = None
+    litellm_health_url: str | None = None
     bootstrap_tenant_id: UUID = UUID("00000000-0000-4000-8000-000000000001")
     bootstrap_tenant_slug: str = Field(
         default="default", min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9-]*$"
@@ -119,6 +120,18 @@ class Settings(BaseSettings):
         if not value.strip() or value != value.strip():
             raise ValueError("bootstrap tenant name must be unpadded and non-blank")
         return value
+
+    @field_validator("litellm_health_url", mode="after")
+    @classmethod
+    def validate_litellm_health_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if not normalized.startswith(("http://", "https://")):
+            raise ValueError("litellm_health_url must start with http:// or https://")
+        return normalized
 
 
 @lru_cache

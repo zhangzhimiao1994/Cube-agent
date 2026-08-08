@@ -61,13 +61,20 @@ async def run_worker_loop(
 ) -> None:
     idle_polls = 0
     while not stop.is_set():
-        delivered = await service.publish_pending(batch_limit)
+        try:
+            delivered = await service.publish_pending(batch_limit)
+        except Exception as error:
+            delivered = 0
+            _LOGGER.exception(
+                "run_worker_publish_pending_failed error_type=%s",
+                type(error).__name__,
+            )
         while not queue.empty() and not stop.is_set():
             run_id = await queue.get()
             try:
                 await service.execute(run_id)
-            except Exception as error:  # noqa: BLE001 - keep worker alive after one bad run.
-                _LOGGER.error(
+            except Exception as error:
+                _LOGGER.exception(
                     "run_worker_execute_failed run_id=%s error_type=%s",
                     run_id,
                     type(error).__name__,

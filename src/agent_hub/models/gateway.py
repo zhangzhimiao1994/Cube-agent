@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import math
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -22,6 +23,8 @@ from agent_hub.models.capacity import (
 from agent_hub.models.litellm_client import ModelTransportError
 from agent_hub.models.registry import ModelRegistry, NoCapableDeployment
 from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, _require_safe_identifier
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class ModelGatewayError(RuntimeError):
@@ -446,12 +449,23 @@ class ModelGateway:
         except asyncio.CancelledError:
             raise
         except ModelTransportError as error:
+            _LOGGER.exception(
+                "model_transport_failed deployment_id=%s status_code=%s error_type=%s",
+                deployment.id,
+                error.status_code,
+                type(error).__name__,
+            )
             outcome = _SafeTransportFailure(
                 ModelTransportError("model transport failed", status_code=error.status_code)
             )
             error.__traceback__ = None
             del error
         except Exception as error:  # noqa: BLE001 - consume and redact injected failures
+            _LOGGER.error(
+                "model_transport_unexpected_failure deployment_id=%s error_type=%s",
+                deployment.id,
+                type(error).__name__,
+            )
             error.__traceback__ = None
             del error
             outcome = _SafeTransportFailure(ModelGatewayError("model transport failed"))

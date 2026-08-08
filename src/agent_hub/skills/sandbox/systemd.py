@@ -15,7 +15,7 @@ from agent_hub.skills.sandbox.base import (
 
 @dataclass(frozen=True, slots=True)
 class SystemdSandboxSettings:
-    runner: str = "/usr/local/bin/agent-hub-skill-runner"
+    python: str = "/opt/agent-hub/current/.venv/bin/python"
 
 
 class SystemdSkillSandbox:
@@ -92,6 +92,8 @@ def build_systemd_run_command(
         f"ReadOnlyPaths={_path_arg(invocation.package_path)}",
         "-p",
         f"ReadWritePaths={_path_arg(invocation.writable_tmp_path)}",
+        "-p",
+        f"WorkingDirectory={_path_arg(invocation.writable_tmp_path)}",
         "-E",
         f"AGENT_HUB_EXECUTION_ID={invocation.execution_id}",
         "-E",
@@ -100,10 +102,14 @@ def build_systemd_run_command(
         f"AGENT_HUB_PACKAGE_SHA256={invocation.package_sha256}",
         "-E",
         f"AGENT_HUB_OUTPUT_LIMIT_BYTES={invocation.output_limit_bytes}",
+        "-E",
+        f"AGENT_HUB_WORKDIR={_path_arg(invocation.writable_tmp_path)}",
+        "-E",
+        f"AGENT_HUB_TIMEOUT_SECONDS={invocation.timeout_seconds}",
     ]
     for input_path in invocation.read_only_inputs:
         command.extend(("-p", f"ReadOnlyPaths={_path_arg(input_path)}"))
-    command.append(settings.runner)
+    command.extend((settings.python, "-m", "agent_hub.skills.runner"))
     return tuple(command)
 
 

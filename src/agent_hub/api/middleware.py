@@ -44,7 +44,7 @@ class SafeExceptionMiddleware:
 
         try:
             await self.app(scope, receive, tracked_send)
-        except Exception as error:  # noqa: BLE001 -- this is the outer request safety boundary.
+        except Exception as error:  # noqa: BLE001 - final HTTP safety boundary
             error_id = str(uuid4())
             _LOGGER.error(
                 "unhandled_request_error error_id=%s error_type=%s response_started=%s",

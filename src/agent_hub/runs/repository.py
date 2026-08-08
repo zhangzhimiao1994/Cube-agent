@@ -134,6 +134,20 @@ class RunRepository:
                 raise RunNotFound("run was not found")
             return self._record(row)
 
+    async def list_recent(self, tenant_id: UUID, *, limit: int = 100) -> tuple[RunRecord, ...]:
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise ValueError("run list limit must be between 1 and 500")
+        async with self._session_factory() as session:
+            rows = (
+                await session.scalars(
+                    select(RunRow)
+                    .where(RunRow.tenant_id == tenant_id)
+                    .order_by(RunRow.created_at.desc(), RunRow.id.desc())
+                    .limit(limit)
+                )
+            ).all()
+            return tuple(self._record(row) for row in rows)
+
     async def get_for_update(self, session: AsyncSession, run_id: UUID) -> RunRow:
         row = await session.scalar(select(RunRow).where(RunRow.id == run_id).with_for_update())
         if row is None:

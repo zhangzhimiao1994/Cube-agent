@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Protocol
@@ -12,6 +13,8 @@ from agent_hub.routing.types import RouteDecision
 from agent_hub.runs.repository import RunAlreadyActive, RunRecord, RunRepository
 from agent_hub.runtime.contracts import EventKind, TaskContext
 from agent_hub.runtime.registry import RuntimeRegistry
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,7 +260,12 @@ class RunService:
                         locked.version += 1
                 if crash_after_event_kind is not None and event.kind is crash_after_event_kind:
                     return await self._submitted_by_run_id(tenant_id, run_id)
-        except Exception:  # noqa: BLE001 - runtime boundary is persisted as a safe terminal event.
+        except Exception as error:
+            _LOGGER.exception(
+                "run_execute_failed run_id=%s error_type=%s",
+                run_id,
+                type(error).__name__,
+            )
             return _submitted(await self._repository.fail_run(run_id, reason="runtime_failed"))
         if terminal is RunStatus.RUNNING:
             terminal = RunStatus.COMPLETED

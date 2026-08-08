@@ -33,6 +33,7 @@ def sdk_response(
     content: str | None = "hello",
     tool_calls: list[object] | None = None,
     choices: list[object] | None = None,
+    usage: object | None = None,
 ) -> object:
     if choices is None:
         choices = [
@@ -48,7 +49,11 @@ def sdk_response(
         created=123456,
         system_fingerprint="fp_safe",
         choices=choices,
-        usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5),
+        usage=(
+            SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)
+            if usage is None
+            else usage
+        ),
         forbidden=API_KEY,
     )
 
@@ -275,6 +280,44 @@ async def test_parses_first_choice_tool_calls_usage_and_allowlisted_metadata() -
     assert "forbidden" not in result.provider_metadata
     with pytest.raises(TypeError):
         result.tool_calls[0].arguments["query"] = "changed"
+
+
+async def test_parses_provider_usage_integer_strings_and_integral_floats() -> None:
+    transport, _, _, _ = mock_transport(
+        result=sdk_response(
+            usage=SimpleNamespace(
+                prompt_tokens="2",
+                completion_tokens=3.0,
+                total_tokens="5",
+            )
+        )
+    )
+
+    result = await transport.complete(deployment(), request(), API_KEY)
+
+    assert result.usage is not None
+    assert result.usage.prompt_tokens == 2
+    assert result.usage.completion_tokens == 3
+    assert result.usage.total_tokens == 5
+
+
+async def test_rejects_malformed_usage_with_field_specific_error() -> None:
+    transport, _, _, close = mock_transport(
+        result=sdk_response(
+            usage=SimpleNamespace(
+                prompt_tokens=2,
+                completion_tokens=3.5,
+                total_tokens=5,
+            )
+        )
+    )
+
+    with pytest.raises(ModelResponseError, match="usage.completion_tokens") as caught:
+        await transport.complete(deployment(), request(), API_KEY)
+
+    close.assert_awaited_once_with()
+    assert API_KEY not in repr(caught.value)
+    assert PROMPT not in repr(caught.value)
 
 
 async def test_passes_strict_completion_budget_to_openai_compatible_transport() -> None:

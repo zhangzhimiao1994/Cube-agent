@@ -94,6 +94,8 @@ def build_docker_command(
         settings.isolated_network_name if invocation.network_allowlist else "none",
         "--tmpfs",
         "/tmp:rw,noexec,nosuid,nodev,size=64m",
+        "--workdir",
+        settings.container_workdir,
         "--mount",
         _bind_mount(invocation.package_path, settings.container_package_path, readonly=True),
         "--mount",
@@ -106,6 +108,8 @@ def build_docker_command(
         f"AGENT_HUB_TIMEOUT_SECONDS={invocation.timeout_seconds}",
         "--env",
         f"AGENT_HUB_OUTPUT_LIMIT_BYTES={invocation.output_limit_bytes}",
+        "--env",
+        f"AGENT_HUB_WORKDIR={settings.container_workdir}",
     ]
     for index, input_path in enumerate(invocation.read_only_inputs):
         command.extend(
@@ -114,7 +118,7 @@ def build_docker_command(
                 _bind_mount(input_path, f"/inputs/{index}", readonly=True),
             )
         )
-    command.extend((settings.image, "python", "-m", "agent_hub_skill_runner"))
+    command.extend((settings.image, "python", "-m", "agent_hub.skills.runner"))
     return tuple(command)
 
 

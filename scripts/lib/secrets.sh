@@ -81,6 +81,7 @@ generate_or_keep_secrets() {
     printf 'POSTGRES_PASSWORD=%s\n' "$postgres_password"
     printf 'AGENT_HUB_DATABASE_URL=postgresql+asyncpg://agent_hub:%s@127.0.0.1:5432/agent_hub\n' "$postgres_password"
     printf 'AGENT_HUB_REDIS_URL=redis://127.0.0.1:6379/0\n'
+    printf 'AGENT_HUB_LITELLM_HEALTH_URL=http://127.0.0.1:%s/health/liveliness\n' "${LITELLM_PORT:-4000}"
     printf 'DATABASE_URL=postgresql+asyncpg://agent_hub:%s@127.0.0.1:5432/agent_hub\n' "$postgres_password"
     printf 'REDIS_URL=redis://127.0.0.1:6379/0\n'
     printf 'LITELLM_MASTER_KEY=%s\n' "$(rand_secret)"

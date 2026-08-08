@@ -3,6 +3,33 @@ set -Eeuo pipefail
 umask 077
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+require_installer_files() {
+  local file missing
+  missing=0
+  for file in "$@"; do
+    if [[ ! -r "$file" ]]; then
+      printf '[agent-hub] error: installer support file is missing or unreadable: %s\n' "$file" >&2
+      missing=1
+    fi
+  done
+  if [[ "$missing" -ne 0 ]]; then
+    printf '[agent-hub] error: installation package is incomplete; re-clone the repository or re-download the release archive\n' >&2
+    exit 1
+  fi
+}
+
+require_installer_files \
+  "$SCRIPT_DIR/scripts/lib/common.sh" \
+  "$SCRIPT_DIR/scripts/lib/detect.sh" \
+  "$SCRIPT_DIR/scripts/lib/prompts.sh" \
+  "$SCRIPT_DIR/scripts/lib/secrets.sh" \
+  "$SCRIPT_DIR/scripts/lib/database.sh" \
+  "$SCRIPT_DIR/scripts/lib/tls.sh" \
+  "$SCRIPT_DIR/scripts/lib/install_docker.sh" \
+  "$SCRIPT_DIR/scripts/lib/install_native.sh" \
+  "$SCRIPT_DIR/scripts/lib/verify.sh"
+
 source "$SCRIPT_DIR/scripts/lib/common.sh"
 source "$SCRIPT_DIR/scripts/lib/detect.sh"
 source "$SCRIPT_DIR/scripts/lib/prompts.sh"

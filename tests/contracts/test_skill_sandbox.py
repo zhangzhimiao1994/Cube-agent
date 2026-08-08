@@ -74,10 +74,17 @@ def test_docker_command_enforces_default_hardening_and_no_network() -> None:
     assert _value_after(command, "--memory") == str(128 * 1024 * 1024)
     assert _value_after(command, "--cpus") == "0.5"
     assert _value_after(command, "--network") == "none"
+    assert _value_after(command, "--workdir") == "/workspace"
     assert all("docker.sock" not in part for part in command)
     assert any("target=/package/skill.zip,readonly" in part for part in command)
     assert any("target=/inputs/0,readonly" in part for part in command)
     assert any("target=/workspace" in part and "readonly" not in part for part in command)
+    assert command[-4:] == (
+        "agent-hub-skill-runner:latest",
+        "python",
+        "-m",
+        "agent_hub.skills.runner",
+    )
 
 
 def test_docker_command_uses_isolated_network_when_network_policy_allows() -> None:
@@ -125,8 +132,14 @@ def test_systemd_command_enforces_process_filesystem_and_network_restrictions() 
     assert properties["CPUQuota"] == "50%"
     assert properties["RuntimeMaxSec"] == "3s"
     assert properties["ReadWritePaths"] == "/srv/agent-hub/tmp/exec_1"
+    assert properties["WorkingDirectory"] == "/srv/agent-hub/tmp/exec_1"
     assert any(item == "ReadOnlyPaths=/srv/agent-hub/packages/pkg.zip" for item in _property_values(command))
     assert any(item == "ReadOnlyPaths=/srv/agent-hub/input.txt" for item in _property_values(command))
+    assert command[-3:] == (
+        "/opt/agent-hub/current/.venv/bin/python",
+        "-m",
+        "agent_hub.skills.runner",
+    )
 
 
 async def test_subprocess_runner_enforces_timeout_and_bounded_output() -> None:

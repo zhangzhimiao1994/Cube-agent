@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 from uuid import UUID
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -225,6 +226,7 @@ def create_app(
                 application.state.admin_resource_service = admin.PersistentAdminResourceService(
                     config_service=ConfigService(active_sessions),
                     secret_service=active_secret_service,
+                    run_repository=RunRepository(active_sessions),
                     tenant_id=configured.bootstrap_tenant_id,
                     actor_id=configured.bootstrap_tenant_id,
                 )
@@ -275,6 +277,13 @@ def create_app(
                 application.state.database_probe = _database_probe(active_sessions)
             if redis_probe is None and active_redis is not None:
                 application.state.redis_probe = _redis_probe(active_redis)
+            if configured.litellm_health_url is not None:
+                extra_checks = dict(application.state.extra_readiness_checks)
+                extra_checks["litellm"] = _http_readiness_probe(
+                    configured.litellm_health_url,
+                    timeout_seconds=readiness_timeout_seconds,
+                )
+                application.state.extra_readiness_checks = extra_checks
             yield
         finally:
             await _cleanup_owned_resources(
@@ -382,6 +391,15 @@ def _database_probe(
 def _redis_probe(redis_client: RedisResource) -> ReadinessProbe:
     async def probe() -> None:
         await redis_client.ping()
+
+    return probe
+
+
+def _http_readiness_probe(url: str, *, timeout_seconds: float) -> ReadinessProbe:
+    async def probe() -> None:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            response = await client.get(url)
+            response.raise_for_status()
 
     return probe
 

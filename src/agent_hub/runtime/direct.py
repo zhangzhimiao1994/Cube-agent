@@ -227,7 +227,7 @@ class DirectRuntime:
             usage = response.usage
             if (
                 usage is None
-                or usage.prompt_tokens + usage.completion_tokens != usage.total_tokens
+                or usage.total_tokens < usage.prompt_tokens + usage.completion_tokens
                 or usage.completion_tokens > request.max_output_tokens
                 or usage.total_tokens > context.token_budget
             ):

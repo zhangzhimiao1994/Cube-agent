@@ -71,7 +71,7 @@ services:
       redis:
         condition: service_healthy
       litellm:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
     networks: [backend, public]
     read_only: true
@@ -99,7 +99,7 @@ services:
       bootstrap:
         condition: service_completed_successfully
     restart: unless-stopped
-    networks: [backend]
+    networks: [backend, egress]
     read_only: true
     tmpfs: ["/tmp:size=256m,mode=1777"]
     volumes:
@@ -114,28 +114,19 @@ services:
         required: false
     command: ["--config", "/etc/litellm/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
     restart: unless-stopped
-    networks: [backend]
+    networks: [backend, egress]
     volumes:
       - ./litellm.yaml:/etc/litellm/config.yaml:ro
     security_opt: ["no-new-privileges:true"]
-
-  skill-runner:
-    image: ${AGENT_HUB_IMAGE:-agent-hub:latest}
-    env_file:
-      - path: .env
-        required: false
-    command: ["python", "-m", "agent_hub.skills.runner"]
-    restart: unless-stopped
-    networks: [skills]
-    read_only: true
-    tmpfs:
-      - /tmp:size=256m,mode=1777
-      - /workspace:size=512m,mode=0700
-    security_opt: ["no-new-privileges:true"]
-    cap_drop: [ALL]
-    pids_limit: 128
-    mem_limit: 512m
-    cpus: 1.0
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import socket; s=socket.create_connection(('127.0.0.1', 4000), 3); s.close()\"",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
 
   postgres:
     image: ${POSTGRES_IMAGE:-postgres:16-alpine}
@@ -187,6 +178,7 @@ networks:
   public:
   backend:
     internal: true
+  egress:
   skills:
     internal: true
 
