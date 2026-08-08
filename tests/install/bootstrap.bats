@@ -8,7 +8,7 @@
 }
 
 @test "bootstrap CLI stores only code hash" {
-  run python -m agent_hub.cli.bootstrap --code setup-secret-code --output "$BATS_TEST_TMPDIR/bootstrap.json"
+  run uv run python -m agent_hub.cli.bootstrap --code setup-secret-code --output "$BATS_TEST_TMPDIR/bootstrap.json"
   [ "$status" -eq 0 ]
   ! grep -q "setup-secret-code" "$BATS_TEST_TMPDIR/bootstrap.json"
   grep -q "code_hash" "$BATS_TEST_TMPDIR/bootstrap.json"

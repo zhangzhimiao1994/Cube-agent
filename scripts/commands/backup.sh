@@ -11,6 +11,10 @@ if [[ "$mode" == "verify" ]]; then
   exit 0
 fi
 
+if [[ "$mode" != "create" ]]; then
+  output="$mode"
+fi
+
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/payload"
