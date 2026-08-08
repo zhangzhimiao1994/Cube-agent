@@ -1,0 +1,21 @@
+{$AGENT_HUB_CADDY_SITE::80} {
+	encode gzip
+
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8000
+	}
+
+	handle /health/* {
+		reverse_proxy 127.0.0.1:8000
+	}
+
+	handle /metrics {
+		reverse_proxy 127.0.0.1:8000
+	}
+
+	handle {
+		root * {$AGENT_HUB_WEB_ROOT:/opt/agent-hub/current/web/dist}
+		try_files {path} /index.html
+		file_server
+	}
+}

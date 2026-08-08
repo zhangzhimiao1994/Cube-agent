@@ -9,6 +9,23 @@ curl -fsSL https://example.invalid/agent-hub/install.sh -o install.sh
 sudo bash install.sh --mode auto --yes
 ```
 
+For China-region servers without stable access to official package registries:
+
+```bash
+sudo env AGENT_HUB_MIRROR_MODE=auto bash install.sh --mode auto --yes
+```
+
+`auto` tries official sources first, then falls back to China mirrors for OS packages, PyPI/uv, npm, and Docker registry mirrors where possible. Use `AGENT_HUB_MIRROR_MODE=china` to use China mirrors immediately.
+
+For HTTPS with your own certificate:
+
+```bash
+sudo env AGENT_HUB_PUBLIC_URL=https://agent.example.com \
+  AGENT_HUB_TLS_CERT_FILE=/root/certs/fullchain.pem \
+  AGENT_HUB_TLS_KEY_FILE=/root/certs/privkey.pem \
+  bash install.sh --mode auto --yes
+```
+
 The installer detects the host, chooses Docker for broad Linux compatibility, generates secrets, starts services, runs health checks, and prints:
 
 - `Management URL: .../setup`
@@ -27,7 +44,7 @@ scripts/agent-hub doctor
 - Docker mode: recommended for new cloud servers and unknown Linux distributions.
 - Native mode: supported on Ubuntu 22.04/24.04, Debian 12/13, Rocky Linux 9, and AlmaLinux 9.
 
-The installer does not modify cloud security groups. Open ports in your cloud console deliberately after confirming the management URL and TLS choice.
+The installer does not modify cloud security groups. Open ports in your cloud console deliberately after confirming the management URL and TLS choice. Caddy is the public entry point; the API, LiteLLM, database, and Redis stay on private local/internal networks by default.
 
 ## Development validation
 
