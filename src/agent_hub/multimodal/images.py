@@ -613,7 +613,10 @@ class FilesystemImageStore:
         self._fd_lock = threading.Lock()
         self.store_id = "filesystem-image-store"
         self.namespace = hashlib.sha256(os.fsencode(configured_root)).hexdigest()
-        self._root_fd = self._open_secure_root(configured_root)
+        try:
+            self._root_fd = self._open_secure_root(configured_root)
+        except OSError:
+            raise OSError("image storage failed") from None
 
     @staticmethod
     def _directory_flags() -> int:
