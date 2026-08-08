@@ -40,11 +40,16 @@ generate_or_keep_secrets() {
   tmp="$(mktemp "$CONFIG_DIR/secrets.env.XXXXXX")"
   postgres_password="$(rand_secret)"
   {
+    printf 'AGENT_HUB_ENVIRONMENT=production\n'
     printf 'AGENT_HUB_SECRET_KEY=%s\n' "$(rand_secret)"
+    printf 'AGENT_HUB_MASTER_KEY=%s\n' "$(openssl rand -base64 32)"
+    printf 'AGENT_HUB_JWT_SIGNING_KEY=base64url:%s\n' "$(rand_secret)"
     printf 'JWT_SIGNING_KEY=base64url:%s\n' "$(rand_secret)"
     printf 'POSTGRES_DB=agent_hub\n'
     printf 'POSTGRES_USER=agent_hub\n'
     printf 'POSTGRES_PASSWORD=%s\n' "$postgres_password"
+    printf 'AGENT_HUB_DATABASE_URL=postgresql+asyncpg://agent_hub:%s@127.0.0.1:5432/agent_hub\n' "$postgres_password"
+    printf 'AGENT_HUB_REDIS_URL=redis://127.0.0.1:6379/0\n'
     printf 'DATABASE_URL=postgresql+asyncpg://agent_hub:%s@127.0.0.1:5432/agent_hub\n' "$postgres_password"
     printf 'REDIS_URL=redis://127.0.0.1:6379/0\n'
     printf 'LITELLM_MASTER_KEY=%s\n' "$(rand_secret)"

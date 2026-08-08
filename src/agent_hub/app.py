@@ -6,12 +6,13 @@ import logging
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Protocol
 from uuid import UUID
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import insert
@@ -37,6 +38,7 @@ from agent_hub.observability.logging import configure_logging
 from agent_hub.observability.metrics import default_metrics_registry
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import ModeRouterProtocol, RunService, TaskQueue
+from agent_hub.runtime.defaults import default_runtime_registry
 from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.settings import Settings, get_settings
 
@@ -150,6 +152,9 @@ def create_app(
     """Create an application without opening network resources at import time."""
 
     configured_settings = settings or Settings.model_construct()
+    active_runtime_registry = runtime_registry
+    if active_runtime_registry is None and run_service is None:
+        active_runtime_registry = default_runtime_registry()
     configure_logging(level=configured_settings.log_level)
 
     @asynccontextmanager
@@ -169,7 +174,7 @@ def create_app(
             needs_sessions = (
                 auth_service is None
                 or config_service is None
-                or (run_service is None and runtime_registry is not None)
+                or (run_service is None and active_runtime_registry is not None)
             )
             if active_sessions is None and active_database is not None:
                 active_sessions = active_database.session_factory
@@ -201,12 +206,12 @@ def create_app(
             if config_service is None:
                 assert active_sessions is not None
                 application.state.config_service = ConfigService(active_sessions)
-            if run_service is None and runtime_registry is not None:
+            if run_service is None and active_runtime_registry is not None:
                 assert active_sessions is not None
                 queue = task_queue if task_queue is not None else InProcessRunQueue()
                 application.state.run_service = RunService(
                     RunRepository(active_sessions),
-                    runtime_registry=runtime_registry,
+                    runtime_registry=active_runtime_registry,
                     router=mode_router,
                     task_queue=queue,
                 )
@@ -244,7 +249,7 @@ def create_app(
     application.state.rate_limiter = rate_limiter
     application.state.config_service = config_service
     application.state.run_service = run_service
-    application.state.runtime_registry = runtime_registry
+    application.state.runtime_registry = active_runtime_registry
     application.state.mode_router = mode_router
     application.state.run_queue = task_queue
     application.state.metrics_registry = default_metrics_registry()
@@ -272,7 +277,36 @@ def create_app(
     application.router.routes.extend(runs.router.routes)
     application.router.routes.extend(admin.router.routes)
     application.router.routes.extend(users.router.routes)
+
+    @application.get("/{path:path}", include_in_schema=False, response_model=None)
+    async def web_ui(path: str) -> Response:
+        if path == "api" or path.startswith("api/"):
+            return JSONResponse(
+                status_code=404,
+                content=error_payload("not_found", "resource not found"),
+            )
+        configured = settings or get_settings()
+        if configured.web_dir is None:
+            return JSONResponse(
+                status_code=404,
+                content=error_payload("not_found", "resource not found"),
+            )
+        return _web_ui_response(configured.web_dir, path)
+
     return application
+
+
+def _web_ui_response(web_dir: Path, path: str) -> Response:
+    root = web_dir.resolve()
+    target = (root / path).resolve()
+    if not str(target).startswith(str(root)) or target.is_dir() or not target.exists():
+        target = root / "index.html"
+    if not target.exists() or not target.is_file():
+        return JSONResponse(
+            status_code=404,
+            content=error_payload("not_found", "resource not found"),
+        )
+    return FileResponse(target)
 
 
 def _database_probe(

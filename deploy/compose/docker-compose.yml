@@ -1,6 +1,56 @@
 name: agent-hub
 
 services:
+  migrate:
+    image: ${AGENT_HUB_IMAGE:-agent-hub:latest}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks: [backend]
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+
+  bootstrap:
+    image: ${AGENT_HUB_IMAGE:-agent-hub:latest}
+    env_file:
+      - path: .env
+        required: false
+    command:
+      [
+        "python",
+        "-m",
+        "agent_hub.cli.bootstrap",
+        "--code-env",
+        "AGENT_HUB_SETUP_CODE",
+        "--database-url-env",
+        "AGENT_HUB_DATABASE_URL",
+        "--minutes",
+        "60",
+      ]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+    networks: [backend]
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+
   api:
     image: ${AGENT_HUB_IMAGE:-agent-hub:latest}
     build:
@@ -10,8 +60,8 @@ services:
       - path: .env
         required: false
     depends_on:
-      postgres:
-        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
       litellm:
@@ -56,8 +106,8 @@ services:
         required: false
     command: ["python", "-m", "agent_hub.runtime.worker"]
     depends_on:
-      api:
-        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
     restart: unless-stopped
     networks: [backend]
     read_only: true

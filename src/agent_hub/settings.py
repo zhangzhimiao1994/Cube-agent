@@ -1,6 +1,7 @@
 """Application settings."""
 
 from functools import lru_cache
+from pathlib import Path
 from typing import ClassVar
 from uuid import UUID
 
@@ -37,10 +38,13 @@ class Settings(BaseSettings):
         "postgresql+asyncpg://agent_hub:agent_hub@localhost/agent_hub"
     )
     redis_url: SecretStr = SecretStr("redis://localhost:6379/0")
-    jwt_signing_key: SecretStr = SecretStr("development-only-change-me")
+    jwt_signing_key: SecretStr = SecretStr(
+        "base64url:YWdlbnQtaHViLWRldmVsb3BtZW50LWtleS0wMDAwMDE"
+    )
     master_key: SecretStr = SecretStr("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
     trusted_proxy_ips: frozenset[str] = Field(default=frozenset(), max_length=32)
     log_level: str = Field(default="WARNING", pattern=r"^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
+    web_dir: Path | None = None
     bootstrap_tenant_id: UUID = UUID("00000000-0000-4000-8000-000000000001")
     bootstrap_tenant_slug: str = Field(
         default="default", min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9-]*$"

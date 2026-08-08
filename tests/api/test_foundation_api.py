@@ -186,10 +186,14 @@ async def test_cancelling_ready_request_cancels_and_reaps_both_probes() -> None:
     assert redis.task is not None and redis.task.done()
 
 
-def test_default_placeholder_fails_closed_when_lifespan_starts() -> None:
-    app = create_app(settings=Settings.model_validate({}))
+def test_default_development_key_allows_lifespan_to_start() -> None:
+    app = create_app(
+        settings=Settings.model_validate({}),
+        database=FakeDatabase(),
+        redis_client=FakeRedis(),
+    )
 
-    with pytest.raises(ValueError), TestClient(app):
+    with TestClient(app):
         pass
 
 
@@ -984,7 +988,9 @@ def test_invalid_jwt_key_is_rejected_before_resource_factories_run() -> None:
         return FakeRedis()
 
     app = create_app(
-        settings=Settings.model_validate({}),
+        settings=Settings.model_validate(
+            {"jwt_signing_key": "development-only-change-me"}
+        ),
         database_factory=database_factory,
         redis_factory=redis_factory,
     )

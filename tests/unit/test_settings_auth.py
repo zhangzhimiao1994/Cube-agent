@@ -14,18 +14,19 @@ def _canonical_key(raw: bytes) -> str:
     return "base64url:" + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
-def test_default_development_settings_cannot_sign_tokens() -> None:
+def test_default_development_settings_can_sign_tokens() -> None:
     settings = Settings.model_validate({})
     key = settings.jwt_signing_key_value()
 
-    with pytest.raises(ValueError):
-        AccessTokenService(key)
+    service = AccessTokenService(key)
+    token = service.encode(uuid4(), uuid4(), Role.VIEWER)
 
+    assert token
     assert key not in repr(settings)
 
 
 def test_production_rejects_the_default_placeholder() -> None:
-    placeholder = "development-only-change-me"
+    placeholder = Settings.model_validate({}).jwt_signing_key_value()
 
     with pytest.raises(ValidationError) as captured:
         Settings.model_validate({"environment": "production"})

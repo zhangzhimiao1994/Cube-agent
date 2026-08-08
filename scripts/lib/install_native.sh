@@ -13,9 +13,17 @@ native_secret_value() {
   local value
   if [[ -f "$SECRETS_FILE" ]]; then
     value="$(grep "^${name}=" "$SECRETS_FILE" | cut -d= -f2- || true)"
+    if [[ -z "$value" && "$name" != AGENT_HUB_* ]]; then
+      value="$(grep "^AGENT_HUB_${name}=" "$SECRETS_FILE" | cut -d= -f2- || true)"
+    fi
     printf '%s\n' "$value"
   else
-    printf '%s\n' "${!name:-}"
+    value="${!name:-}"
+    if [[ -z "$value" && "$name" != AGENT_HUB_* ]]; then
+      local prefixed="AGENT_HUB_${name}"
+      value="${!prefixed:-}"
+    fi
+    printf '%s\n' "$value"
   fi
 }
 
@@ -143,6 +151,10 @@ ensure_native_runtime_urls() {
   postgres_user="${postgres_user:-agent_hub}"
   [[ -n "$postgres_password" ]] || die "POSTGRES_PASSWORD is missing from $SECRETS_FILE"
 
+  append_secret_if_missing \
+    AGENT_HUB_DATABASE_URL \
+    "postgresql+asyncpg://${postgres_user}:${postgres_password}@127.0.0.1:5432/${postgres_db}"
+  append_secret_if_missing AGENT_HUB_REDIS_URL "redis://127.0.0.1:6379/0"
   append_secret_if_missing \
     DATABASE_URL \
     "postgresql+asyncpg://${postgres_user}:${postgres_password}@127.0.0.1:5432/${postgres_db}"
@@ -401,6 +413,21 @@ run_native_migrations() {
   )
 }
 
+run_native_bootstrap_seed() {
+  log "seeding one-time setup code"
+  (
+    cd "$INSTALL_ROOT/current"
+    set -a
+    # shellcheck disable=SC1090
+    source "$SECRETS_FILE"
+    set +a
+    .venv/bin/python -m agent_hub.cli.bootstrap \
+      --code-env AGENT_HUB_SETUP_CODE \
+      --database-url-env AGENT_HUB_DATABASE_URL \
+      --minutes 60
+  )
+}
+
 install_native_mode() {
   "$SCRIPT_DIR/deploy/native/install-packages.sh" --local-db --local-redis
   mkdir -p "$INSTALL_ROOT/releases" "$STATE_DIR"
@@ -421,6 +448,7 @@ install_native_mode() {
   install_native_systemd_units
   configure_native_database
   run_native_migrations
+  run_native_bootstrap_seed
   systemctl daemon-reload
   systemctl enable --now caddy
   systemctl enable --now agent-hub.target

@@ -13,14 +13,13 @@ RUN npm run build
 FROM ${PYTHON_IMAGE} AS python-build
 ENV UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1
-WORKDIR /build
+WORKDIR /opt/agent-hub
 COPY --from=ghcr.io/astral-sh/uv:0.5.30 /uv /usr/local/bin/uv
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --no-editable
 COPY alembic.ini ./alembic.ini
 COPY alembic ./alembic
 COPY src ./src
-RUN uv pip install --no-deps -e .
 
 FROM ${PYTHON_IMAGE} AS runtime
 ENV PATH="/opt/agent-hub/.venv/bin:${PATH}" \
@@ -31,10 +30,10 @@ RUN groupadd --gid 10001 agent-hub \
     && useradd --uid 10001 --gid 10001 --home-dir /opt/agent-hub --shell /usr/sbin/nologin agent-hub \
     && mkdir -p /opt/agent-hub/web /var/lib/agent-hub /run/agent-hub \
     && chown -R 10001:10001 /opt/agent-hub /var/lib/agent-hub /run/agent-hub
-COPY --from=python-build --chown=10001:10001 /build/.venv ./.venv
-COPY --from=python-build --chown=10001:10001 /build/alembic.ini ./alembic.ini
-COPY --from=python-build --chown=10001:10001 /build/alembic ./alembic
-COPY --from=python-build --chown=10001:10001 /build/src ./src
+COPY --from=python-build --chown=10001:10001 /opt/agent-hub/.venv ./.venv
+COPY --from=python-build --chown=10001:10001 /opt/agent-hub/alembic.ini ./alembic.ini
+COPY --from=python-build --chown=10001:10001 /opt/agent-hub/alembic ./alembic
+COPY --from=python-build --chown=10001:10001 /opt/agent-hub/src ./src
 COPY --from=web-build --chown=10001:10001 /build/web/dist ./web
 COPY deploy/compose/healthcheck.sh /usr/local/bin/agent-hub-healthcheck
 RUN chmod 0755 /usr/local/bin/agent-hub-healthcheck

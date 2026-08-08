@@ -4,6 +4,18 @@ docker_compose_up() {
   docker compose -f "$INSTALL_ROOT/compose/docker-compose.yml" --env-file "$INSTALL_ROOT/compose/.env" up -d
 }
 
+set_env_value() {
+  local file="$1"
+  local name="$2"
+  local value="$3"
+  local tmp
+  tmp="$(mktemp "$file.XXXXXX")"
+  grep -v "^${name}=" "$file" > "$tmp" || true
+  printf '%s=%s\n' "$name" "$value" >> "$tmp"
+  mv "$tmp" "$file"
+  chmod 0600 "$file"
+}
+
 configure_china_docker_mirror() {
   local mirror daemon_config
   mirror="${AGENT_HUB_DOCKER_REGISTRY_MIRROR:-https://registry.cn-hangzhou.aliyuncs.com}"
@@ -37,11 +49,17 @@ install_docker_mode() {
   mkdir -p "$INSTALL_ROOT"
   cp -R "$SCRIPT_DIR/deploy/compose" "$INSTALL_ROOT/compose"
   cp "$SECRETS_FILE" "$INSTALL_ROOT/compose/.env"
-  if ! grep -q '^DATABASE_URL=' "$INSTALL_ROOT/compose/.env"; then
-    # shellcheck disable=SC2016
-    printf 'DATABASE_URL=postgresql+asyncpg://agent_hub:${POSTGRES_PASSWORD}@postgres:5432/agent_hub\n' >> "$INSTALL_ROOT/compose/.env"
-    printf 'REDIS_URL=redis://redis:6379/0\n' >> "$INSTALL_ROOT/compose/.env"
-  fi
+  local postgres_password
+  postgres_password="$(grep '^POSTGRES_PASSWORD=' "$INSTALL_ROOT/compose/.env" | cut -d= -f2-)"
+  [[ -n "$postgres_password" ]] || die "POSTGRES_PASSWORD is missing from compose environment"
+  set_env_value "$INSTALL_ROOT/compose/.env" \
+    AGENT_HUB_DATABASE_URL \
+    "postgresql+asyncpg://agent_hub:${postgres_password}@postgres:5432/agent_hub"
+  set_env_value "$INSTALL_ROOT/compose/.env" AGENT_HUB_REDIS_URL "redis://redis:6379/0"
+  set_env_value "$INSTALL_ROOT/compose/.env" \
+    DATABASE_URL \
+    "postgresql+asyncpg://agent_hub:${postgres_password}@postgres:5432/agent_hub"
+  set_env_value "$INSTALL_ROOT/compose/.env" REDIS_URL "redis://redis:6379/0"
 
   if [[ "${AGENT_HUB_MIRROR_MODE:-auto}" == "china" ]]; then
     configure_china_docker_mirror || true
