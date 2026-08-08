@@ -76,9 +76,17 @@ def test_installer_defaults_management_url_to_external_address() -> None:
 def test_native_api_stays_private_and_caddy_exposes_management_ui() -> None:
     api_unit = read("deploy/native/systemd/agent-hub-api.service")
     caddyfile = read("deploy/native/Caddyfile")
+    installer = read("scripts/lib/install_native.sh")
 
     assert "--host ${AGENT_HUB_API_BIND_HOST:-127.0.0.1}" in api_unit
     assert "reverse_proxy 127.0.0.1:8000" in caddyfile
+    assert "AGENT_HUB_WEB_DIR=/opt/agent-hub/current/web/dist" in api_unit
+    assert "http://*)\n      printf ':80" in installer
+    assert "handle /setup*" in caddyfile
+    assert "handle /setup*" in installer
+    assert 'chmod 0755 "$release" "$release/web" "$release/web/dist"' in installer
+    assert 'chmod -R a+rX "$release/web/dist"' in installer
+    assert "chown -R agent-hub:agent-hub" in installer
 
 
 def test_native_caddy_supports_user_supplied_tls_certificate() -> None:

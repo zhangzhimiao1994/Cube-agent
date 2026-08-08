@@ -9,6 +9,14 @@
 		reverse_proxy 127.0.0.1:8000
 	}
 
+	handle /setup* {
+		reverse_proxy 127.0.0.1:8000
+	}
+
+	handle /channels/* {
+		reverse_proxy 127.0.0.1:8000
+	}
+
 	handle /metrics {
 		reverse_proxy 127.0.0.1:8000
 	}

@@ -27,9 +27,20 @@ export function LoginPage() {
   }
 
   return (
-    <section>
-      <h1>Login</h1>
-      <form onSubmit={(event) => void submit(event)}>
+    <section className="auth-layout">
+      <div className="auth-hero">
+        <span className="eyebrow">Agent Hub</span>
+        <h1>Login</h1>
+        <p>
+          Manage model routing, agent roles, skills, memory and audit trails from one protected
+          operations console.
+        </p>
+      </div>
+      <form className="auth-card" onSubmit={(event) => void submit(event)}>
+        <div>
+          <span className="eyebrow">Session</span>
+          <h2>Welcome back</h2>
+        </div>
         <label>
           Username
           <input

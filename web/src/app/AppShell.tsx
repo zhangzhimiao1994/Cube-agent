@@ -1,4 +1,4 @@
-import { Link, Outlet } from "react-router-dom";
+import { NavLink, Outlet } from "react-router-dom";
 
 import { useAuth } from "../auth/AuthProvider";
 
@@ -16,27 +16,59 @@ const NAVIGATION = [
   { to: "/audit", label: "Audit", permission: "audit:read" },
 ];
 
+const HEALTH_CARDS = [
+  ["Live routing", "Auto, dispatch, discuss, hybrid"],
+  ["Guarded tools", "Skills and MCP approval gates"],
+  ["Hermes learning", "Experience feedback without bypassing approvals"],
+] as const;
+
 export function AppShell() {
   const auth = useAuth();
   return (
-    <div>
-      <header>
-        <h1>Agent Hub</h1>
-        <p>{auth.user?.username}</p>
-        <button type="button" onClick={() => void auth.logout()}>
-          Logout
-        </button>
-      </header>
-      <nav aria-label="Main navigation">
-        {NAVIGATION.filter((item) => auth.hasPermission(item.permission)).map((item) => (
-          <Link key={item.to} to={item.to}>
-            {item.label}
-          </Link>
-        ))}
-      </nav>
-      <main>
-        <Outlet />
-      </main>
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand-card">
+          <span className="eyebrow">Agent Hub</span>
+          <h1>Control console</h1>
+          <p>Operations console for multi-agent workflows</p>
+        </div>
+        <nav aria-label="Main navigation" className="nav-list">
+          {NAVIGATION.filter((item) => auth.hasPermission(item.permission)).map((item) => (
+            <NavLink
+              key={item.to}
+              to={item.to}
+              className={({ isActive }) => `nav-link${isActive ? " nav-link-active" : ""}`}
+            >
+              {item.label}
+            </NavLink>
+          ))}
+        </nav>
+      </aside>
+      <div className="workspace">
+        <header className="topbar">
+          <div>
+            <p className="eyebrow">Production management</p>
+            <h2>Agent orchestration control plane</h2>
+          </div>
+          <div className="user-chip">
+            <span>{auth.user?.username}</span>
+            <button type="button" onClick={() => void auth.logout()}>
+              Logout
+            </button>
+          </div>
+        </header>
+        <section className="status-grid" aria-label="Console status">
+          {HEALTH_CARDS.map(([title, detail]) => (
+            <article className="status-card" key={title}>
+              <span>{title}</span>
+              <p>{detail}</p>
+            </article>
+          ))}
+        </section>
+        <main className="page-surface">
+          <Outlet />
+        </main>
+      </div>
     </div>
   );
 }

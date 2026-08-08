@@ -313,6 +313,9 @@ native_caddy_site() {
   local public_url
   public_url="$(native_public_url)"
   case "$public_url" in
+    http://*)
+      printf ':80\n'
+      ;;
     http://127.0.0.1*|https://127.0.0.1*|http://localhost*|https://localhost*)
       printf ':80\n'
       ;;
@@ -359,6 +362,10 @@ deploy_native_release() {
   )
 
   chown -R agent-hub:agent-hub "$release" 2>/dev/null || true
+  if [[ -d "$release/web/dist" ]]; then
+    chmod 0755 "$release" "$release/web" "$release/web/dist"
+    chmod -R a+rX "$release/web/dist"
+  fi
   ln -sfn "$release" "$INSTALL_ROOT/current"
 }
 
@@ -415,6 +422,10 @@ $tls_directive
   }
 
   handle /health/* {
+    reverse_proxy 127.0.0.1:$api_port
+  }
+
+  handle /setup* {
     reverse_proxy 127.0.0.1:$api_port
   }
 

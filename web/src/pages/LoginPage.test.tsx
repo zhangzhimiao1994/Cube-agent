@@ -87,6 +87,13 @@ describe("LoginPage", () => {
 
   it("creates the first admin through setup", async () => {
     render(<TestApp initialPath="/setup" />);
+    expect(await screen.findByText("Secure first-run setup")).not.toBeNull();
+    expect(screen.getByText("Use the one-time code printed by the installer.")).not.toBeNull();
+    expect(screen.getByText("Install packages")).not.toBeNull();
+    expect(screen.getByText("Deploy release")).not.toBeNull();
+    expect(screen.getByText("Run migrations")).not.toBeNull();
+    expect(screen.getByText("Start services")).not.toBeNull();
+    expect(screen.getByText("Create administrator account")).not.toBeNull();
     await userEvent.type(screen.getByLabelText("Setup code"), "setup-code");
     await userEvent.type(screen.getByLabelText("Username"), "owner");
     await userEvent.type(screen.getByLabelText("Password"), "correct horse battery staple");

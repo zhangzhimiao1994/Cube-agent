@@ -7,6 +7,7 @@ Type=simple
 User=agent-hub
 Group=agent-hub
 EnvironmentFile=/etc/agent-hub/secrets.env
+Environment=AGENT_HUB_WEB_DIR=/opt/agent-hub/current/web/dist
 WorkingDirectory=/opt/agent-hub/current
 ExecStart=/bin/sh -c 'exec /opt/agent-hub/current/.venv/bin/uvicorn agent_hub.app:app --host ${AGENT_HUB_API_BIND_HOST:-127.0.0.1} --port ${AGENT_HUB_API_PORT:-8000}'
 Restart=on-failure
