@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 
+# Sourced by installer modules; shellcheck checks files independently.
+# shellcheck disable=SC2034
 INSTALL_ROOT="${AGENT_HUB_INSTALL_ROOT:-/opt/agent-hub}"
 STATE_DIR="${AGENT_HUB_STATE_DIR:-/var/lib/agent-hub}"
 CONFIG_DIR="${AGENT_HUB_CONFIG_DIR:-/etc/agent-hub}"
+# Sourced by installer modules; shellcheck checks files independently.
+# shellcheck disable=SC2034
 SECRETS_FILE="$CONFIG_DIR/secrets.env"
 JOURNAL_FILE="$STATE_DIR/install-journal"
 

@@ -14,6 +14,8 @@ source "$SCRIPT_DIR/scripts/lib/install_native.sh"
 source "$SCRIPT_DIR/scripts/lib/verify.sh"
 
 MODE=""
+# Reserved for future config-file driven installs.
+# shellcheck disable=SC2034
 CONFIG_FILE=""
 DRY_RUN=0
 ASSUME_YES=0

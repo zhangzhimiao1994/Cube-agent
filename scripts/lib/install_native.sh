@@ -313,10 +313,10 @@ native_caddy_site() {
   local public_url
   public_url="$(native_public_url)"
   case "$public_url" in
-    http://*)
+    http://127.0.0.1*|https://127.0.0.1*|http://localhost*|https://localhost*)
       printf ':80\n'
       ;;
-    http://127.0.0.1*|https://127.0.0.1*|http://localhost*|https://localhost*)
+    http://*)
       printf ':80\n'
       ;;
     *)
@@ -349,7 +349,7 @@ deploy_native_release() {
   normalize_native_release_line_endings "$release"
 
   (
-    cd "$release"
+    cd "$release" || exit
     run_python_with_mirror_fallback uv venv --python "$python_bin" .venv
     sync_python_project_with_lock_or_mirror
     run_python_with_mirror_fallback uv pip install --python .venv/bin/python 'litellm[proxy]>=1.75,<2'
@@ -455,7 +455,7 @@ EOF
 run_native_migrations() {
   log "running native database migrations"
   (
-    cd "$INSTALL_ROOT/current"
+    cd "$INSTALL_ROOT/current" || exit
     set -a
     # shellcheck disable=SC1090
     source "$SECRETS_FILE"
@@ -467,7 +467,7 @@ run_native_migrations() {
 run_native_bootstrap_seed() {
   log "seeding one-time setup code"
   (
-    cd "$INSTALL_ROOT/current"
+    cd "$INSTALL_ROOT/current" || exit
     set -a
     # shellcheck disable=SC1090
     source "$SECRETS_FILE"

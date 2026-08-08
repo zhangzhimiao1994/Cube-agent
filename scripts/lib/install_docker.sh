@@ -56,7 +56,9 @@ configure_china_docker_mirror() {
   fi
 
   mkdir -p /etc/docker
-  [[ -f "$daemon_config" ]] && cp -n "$daemon_config" "$daemon_config.agent-hub.bak" 2>/dev/null || true
+  if [[ -f "$daemon_config" ]]; then
+    cp -n "$daemon_config" "$daemon_config.agent-hub.bak" 2>/dev/null || true
+  fi
   cat > "$daemon_config" <<EOF
 {
   "registry-mirrors": ["$mirror"]

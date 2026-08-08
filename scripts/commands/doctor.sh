@@ -22,10 +22,16 @@ port_free() {
 health_live() {
   ! has_command curl || curl -fsS http://127.0.0.1:8000/health/live >/dev/null 2>&1
 }
+disk_has_2gb_free() {
+  df -Pk / | awk 'NR==2 { exit !($4 > 2097152) }'
+}
+memory_has_1gb_total() {
+  awk '/MemTotal/ { exit !($2 > 1048576) }' /proc/meminfo
+}
 
 check "linux kernel" test "$(uname -s)" = "Linux"
-check "disk has 2GB free" bash -c 'df -Pk / | awk "NR==2 { exit !(\$4 > 2097152) }"'
-check "memory has 1GB total" bash -c 'awk "/MemTotal/ { exit !(\\$2 > 1048576) }" /proc/meminfo'
+check "disk has 2GB free" disk_has_2gb_free
+check "memory has 1GB total" memory_has_1gb_total
 check "port 80 free or deliberately occupied by proxy" port_free 80
 check "port 443 free or deliberately occupied by proxy" port_free 443
 check "docker available for universal install path" has_command docker

@@ -117,6 +117,8 @@ configure_china_package_mirror() {
     for file in /etc/yum.repos.d/*.repo; do
       [[ -f "$file" ]] || continue
       cp -n "$file" "$file.agent-hub.bak" 2>/dev/null || true
+      # Keep dnf's $contentdir literal in repo URLs.
+      # shellcheck disable=SC2016
       sed -i \
         -e 's#https\?://download.rockylinux.org/\$contentdir#https://mirrors.aliyun.com/rockylinux#g' \
         -e 's#https\?://repo.almalinux.org/almalinux#https://mirrors.aliyun.com/almalinux#g' \

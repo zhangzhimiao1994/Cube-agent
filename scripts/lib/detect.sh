@@ -6,6 +6,8 @@ HOST_MANAGER="unknown"
 ARCH="$(uname -m)"
 HAS_DOCKER=0
 HAS_SYSTEMD=0
+# Reserved for repair/upgrade branching.
+# shellcheck disable=SC2034
 EXISTING_INSTALL=0
 
 detect_host() {
