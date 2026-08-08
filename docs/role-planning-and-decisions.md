@@ -13,8 +13,13 @@ or Hybrid execution.
   installer, doctor agent, and rollback planner.
 - Discuss mode creates judgment roles such as moderator, domain expert, skeptic, risk officer, and
   decision recorder.
+- Daily work roles are supplied by `RoleCatalog`, including director, copywriter, video editor,
+  economic analyst, marketing strategist, product manager, designer, sales advisor, finance
+  analyst, legal/compliance reviewer, project manager, operations coordinator, and quality reviewer.
 - Each role includes mission, required questions, allowed tools, forbidden actions, skill hints,
   model binding, and output schema.
+- The role system is extensible: custom `RoleDefinition` entries can be added to a `RoleCatalog`
+  without changing `RolePlanner` code.
 - If the task is high-risk and too ambiguous, the planner returns `requires_user=True` instead of
   guessing a role layout.
 

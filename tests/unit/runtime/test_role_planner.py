@@ -1,4 +1,5 @@
 from agent_hub.domain.runs import TaskMode
+from agent_hub.runtime.role_catalog import RoleDefinition, default_role_catalog
 from agent_hub.runtime.role_planner import (
     RolePlanner,
     RolePlanningRequest,
@@ -26,10 +27,15 @@ def test_discussion_software_task_gets_dynamic_constrained_discussion_roles() ->
     assert {
         "moderator",
         "software_architect",
+        "implementation_strategist",
+        "test_strategist",
         "skeptic",
         "risk_officer",
+        "cost_estimator",
+        "user_advocate",
         "decision_recorder",
     }.issubset(role_ids)
+    assert len(plan.roles) >= 8
     assert all(role.model == "main-agent" for role in plan.roles)
     assert all(role.output_schema for role in plan.roles)
     assert plan.role("skeptic").purpose is RolePurpose.CRITIQUE
@@ -55,13 +61,145 @@ def test_dispatch_deployment_task_gets_execution_roles_not_discussion_only_roles
         "ops_planner",
         "installer",
         "doctor_agent",
+        "dependency_resolver",
+        "network_tls_engineer",
+        "release_engineer",
         "security_reviewer",
         "rollback_planner",
     }.issubset(role_ids)
+    assert len(plan.roles) >= 8
     assert "moderator" not in role_ids
     assert plan.role("installer").purpose is RolePurpose.EXECUTE
     assert "run_safe_command" in plan.role("installer").allowed_tools
     assert "delete_file" in plan.role("installer").forbidden_actions
+
+
+def test_research_discussion_includes_data_source_and_writer_roles() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="调研一个市场并输出可执行建议",
+            mode=TaskMode.DISCUSS,
+            profile=TaskProfile.RESEARCH,
+            default_model="research-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert {
+        "moderator",
+        "domain_researcher",
+        "source_validator",
+        "data_analyst",
+        "synthesis_writer",
+        "skeptic",
+        "decision_recorder",
+    }.issubset(role_ids)
+    assert len(plan.roles) >= 7
+
+
+def test_operations_dispatch_includes_monitoring_and_incident_roles() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="排查线上系统异常并给出修复步骤",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.OPERATIONS,
+            default_model="ops-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert {
+        "incident_commander",
+        "log_analyst",
+        "metrics_analyst",
+        "runbook_executor",
+        "reliability_reviewer",
+        "postmortem_writer",
+    }.issubset(role_ids)
+    assert len(plan.roles) >= 6
+
+
+def test_general_discussion_includes_daily_work_creative_business_and_review_roles() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="做一个短视频营销方案，同时评估预算和商业回报",
+            mode=TaskMode.DISCUSS,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert {
+        "director",
+        "copywriter",
+        "video_editor",
+        "economic_analyst",
+        "marketing_strategist",
+        "product_manager",
+        "finance_analyst",
+        "legal_compliance_reviewer",
+        "designer",
+        "sales_advisor",
+    }.issubset(role_ids)
+    assert len(plan.roles) >= 14
+
+
+def test_general_dispatch_includes_daily_execution_roles() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="生成活动文案、预算测算、销售话术和交付清单",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert {
+        "project_manager",
+        "copywriter",
+        "content_editor",
+        "economic_analyst",
+        "finance_analyst",
+        "operations_coordinator",
+        "legal_compliance_reviewer",
+        "quality_reviewer",
+    }.issubset(role_ids)
+    assert len(plan.roles) >= 8
+
+
+def test_role_catalog_can_be_extended_without_changing_role_planner_code() -> None:
+    catalog = default_role_catalog().with_role(
+        RoleDefinition(
+            id="custom_hr_advisor",
+            role="Custom HR Advisor",
+            purpose="expertise",
+            mission="Review hiring, team, incentive, and org design questions.",
+            must_answer=("What people risk exists?",),
+            allowed_tools=("read_context",),
+            forbidden_actions=("do not contact candidates",),
+            skills=("hr",),
+            output_schema={"summary": "string", "risks": "string[]"},
+            modes=frozenset({"discuss"}),
+            profiles=frozenset({"general"}),
+        )
+    )
+
+    plan = RolePlanner(role_catalog=catalog).plan(
+        RolePlanningRequest(
+            task="讨论团队招聘方案",
+            mode=TaskMode.DISCUSS,
+            profile=TaskProfile.GENERAL,
+        )
+    )
+
+    assert plan.role("custom_hr_advisor").role == "Custom HR Advisor"
+    assert plan.role("custom_hr_advisor").skills == ("hr",)
 
 
 def test_unknown_high_risk_role_plan_asks_user_instead_of_guessing() -> None:

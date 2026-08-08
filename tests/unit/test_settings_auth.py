@@ -123,6 +123,14 @@ def test_trusted_proxy_limit_accepts_32_and_rejects_33() -> None:
         )
 
 
+def test_log_level_accepts_known_levels_and_rejects_invalid_values() -> None:
+    assert Settings.model_validate({}).log_level == "WARNING"
+    assert Settings.model_validate({"log_level": "ERROR"}).log_level == "ERROR"
+
+    with pytest.raises(ValidationError):
+        Settings.model_validate({"log_level": "VERBOSE"})
+
+
 @pytest.mark.parametrize(
     "name", [" ", "\tName", "Name\n", "x" * 201]
 )

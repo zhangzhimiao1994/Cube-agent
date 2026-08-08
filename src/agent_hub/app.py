@@ -33,6 +33,7 @@ from agent_hub.auth.tokens import AccessTokenService
 from agent_hub.config.service import ConfigService
 from agent_hub.db.models import TenantRow
 from agent_hub.db.session import build_database
+from agent_hub.observability.logging import configure_logging
 from agent_hub.observability.metrics import default_metrics_registry
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import ModeRouterProtocol, RunService, TaskQueue
@@ -148,6 +149,9 @@ def create_app(
 ) -> FastAPI:
     """Create an application without opening network resources at import time."""
 
+    configured_settings = settings or Settings.model_construct()
+    configure_logging(level=configured_settings.log_level)
+
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         configured = settings or get_settings()
@@ -245,7 +249,6 @@ def create_app(
     application.state.run_queue = task_queue
     application.state.metrics_registry = default_metrics_registry()
     application.state.extra_readiness_checks = {}
-    configured_settings = settings or Settings.model_construct()
     application.state.trusted_proxy_ips = configured_settings.trusted_proxy_ips
     application.add_exception_handler(PublicAPIError, public_error_handler)
     application.add_exception_handler(StarletteHTTPException, http_exception_handler)

@@ -21,6 +21,7 @@ generate_or_keep_secrets() {
     printf 'LITELLM_MASTER_KEY=%s\n' "$(rand_secret)"
     printf 'AGENT_HUB_SETUP_CODE=%s\n' "$(rand_secret)"
     printf 'AGENT_HUB_PUBLIC_URL=%s\n' "${AGENT_HUB_PUBLIC_URL:-http://127.0.0.1}"
+    printf 'AGENT_HUB_LOG_LEVEL=%s\n' "${AGENT_HUB_LOG_LEVEL:-WARNING}"
   } > "$tmp"
   chmod 0600 "$tmp"
   mv "$tmp" "$SECRETS_FILE"

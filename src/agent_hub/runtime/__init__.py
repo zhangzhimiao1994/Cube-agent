@@ -15,6 +15,7 @@ from agent_hub.runtime.discussion import (
     ResolutionRequest,
     ResolutionResult,
 )
+from agent_hub.runtime.role_catalog import RoleCatalog, RoleDefinition, default_role_catalog
 from agent_hub.runtime.role_planner import (
     RoleAssignment,
     RolePlan,
@@ -39,9 +40,12 @@ __all__ = [
     "ResolutionRequest",
     "ResolutionResult",
     "RoleAssignment",
+    "RoleCatalog",
+    "RoleDefinition",
     "RolePlan",
     "RolePlanner",
     "RolePlanningRequest",
     "RolePurpose",
     "TaskProfile",
+    "default_role_catalog",
 ]

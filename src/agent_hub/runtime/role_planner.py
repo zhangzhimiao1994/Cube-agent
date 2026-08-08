@@ -9,6 +9,7 @@ from enum import StrEnum
 from types import MappingProxyType
 
 from agent_hub.domain.runs import TaskMode
+from agent_hub.runtime.role_catalog import RoleCatalog, RoleDefinition, default_role_catalog
 
 
 class TaskProfile(StrEnum):
@@ -170,6 +171,11 @@ class RolePlan:
 class RolePlanner:
     """Build per-run roles from task profile and execution mode."""
 
+    __slots__ = ("_role_catalog",)
+
+    def __init__(self, role_catalog: RoleCatalog | None = None) -> None:
+        self._role_catalog = role_catalog or default_role_catalog()
+
     def plan(self, request: RolePlanningRequest) -> RolePlan:
         if type(request) is not RolePlanningRequest:
             raise ValueError("request must be RolePlanningRequest")
@@ -189,6 +195,17 @@ class RolePlanner:
             role_specs = _discussion_specs(request.profile, request.high_risk)
         else:
             role_specs = _dispatch_specs(request.profile)
+        role_specs = (
+            *role_specs,
+            *(
+                _catalog_spec(role)
+                for role in self._role_catalog.roles_for(
+                    mode=request.mode.value,
+                    profile=request.profile.value,
+                    high_risk=request.high_risk,
+                )
+            ),
+        )
         roles = tuple(_assignment(spec, request) for spec in role_specs)
         return RolePlan(mode=request.mode, profile=request.profile, roles=roles)
 
@@ -285,6 +302,126 @@ def _discussion_specs(profile: TaskProfile, high_risk: bool) -> tuple[_RoleSpec,
             _DISCUSSION_SCHEMA,
         ),
     ]
+    if profile is TaskProfile.SOFTWARE:
+        specs.extend(
+            [
+                (
+                    "implementation_strategist",
+                    "Implementation Strategist",
+                    RolePurpose.EXPERTISE,
+                    "Translate the proposed design into implementation slices and sequencing.",
+                    (
+                        "Which implementation path is lowest risk?",
+                        "What can be built first?",
+                        "What integration points are fragile?",
+                    ),
+                    ("read_context",),
+                    ("do not execute external operations", "do not bypass tests"),
+                    ("implementation",),
+                    _DISCUSSION_SCHEMA,
+                ),
+                (
+                    "test_strategist",
+                    "Test Strategist",
+                    RolePurpose.VERIFY,
+                    "Define the tests and checks needed before the plan is trusted.",
+                    (
+                        "Which behavior needs tests?",
+                        "What failure would prove the plan is wrong?",
+                        "Which checks are required before completion?",
+                    ),
+                    ("read_context",),
+                    ("do not execute external operations", "do not waive verification"),
+                    ("test",),
+                    _DISCUSSION_SCHEMA,
+                ),
+            ]
+        )
+    elif profile is TaskProfile.RESEARCH:
+        specs.extend(
+            [
+                (
+                    "source_validator",
+                    "Source Validator",
+                    RolePurpose.VERIFY,
+                    "Check source quality, recency, conflicts, and citation gaps.",
+                    (
+                        "Which sources are trustworthy?",
+                        "Which claims need verification?",
+                        "Are there conflicting sources?",
+                    ),
+                    ("read_context",),
+                    ("do not invent citations", "do not ignore stale evidence"),
+                    ("research",),
+                    _DISCUSSION_SCHEMA,
+                ),
+                (
+                    "data_analyst",
+                    "Data Analyst",
+                    RolePurpose.EXPERTISE,
+                    "Evaluate numbers, comparisons, assumptions, and uncertainty.",
+                    (
+                        "What data supports the conclusion?",
+                        "What assumptions affect the result?",
+                        "How large is the uncertainty?",
+                    ),
+                    ("read_context",),
+                    ("do not fabricate data", "do not hide uncertainty"),
+                    ("analysis",),
+                    _DISCUSSION_SCHEMA,
+                ),
+                (
+                    "synthesis_writer",
+                    "Synthesis Writer",
+                    RolePurpose.RECORD_DECISION,
+                    "Turn discussion evidence into a clear recommendation and caveats.",
+                    (
+                        "What is the concise recommendation?",
+                        "What caveats must be shown?",
+                        "What next action is supported?",
+                    ),
+                    ("read_context",),
+                    ("do not remove material caveats", "do not overstate confidence"),
+                    ("writing",),
+                    _DISCUSSION_SCHEMA,
+                ),
+            ]
+        )
+    elif profile is TaskProfile.DEPLOYMENT:
+        specs.extend(
+            [
+                (
+                    "dependency_resolver",
+                    "Dependency Resolver",
+                    RolePurpose.EXPERTISE,
+                    "Identify OS, package, service, and runtime dependency constraints.",
+                    (
+                        "Which dependencies are required?",
+                        "Which versions are risky?",
+                        "What fallback exists?",
+                    ),
+                    ("read_context",),
+                    ("do not install packages directly", "do not ignore distro differences"),
+                    ("ops",),
+                    _DISCUSSION_SCHEMA,
+                ),
+                (
+                    "network_tls_engineer",
+                    "Network/TLS Engineer",
+                    RolePurpose.EXPERTISE,
+                    "Evaluate ports, DNS, TLS, proxy, and webhook reachability.",
+                    (
+                        "Which endpoints must be reachable?",
+                        "What TLS/DNS setup is needed?",
+                        "What network failure should be tested?",
+                    ),
+                    ("read_context",),
+                    ("do not change DNS or certificates directly", "do not expose private services"),
+                    ("ops",),
+                    _DISCUSSION_SCHEMA,
+                ),
+            ]
+        )
     if high_risk:
         specs.insert(
             3,
@@ -300,6 +437,40 @@ def _discussion_specs(profile: TaskProfile, high_risk: bool) -> tuple[_RoleSpec,
                 _DISCUSSION_SCHEMA,
             ),
         )
+    specs.extend(
+        [
+            (
+                "cost_estimator",
+                "Cost Estimator",
+                RolePurpose.RISK_REVIEW,
+                "Estimate model, tool, infrastructure, and retry cost before execution.",
+                (
+                    "What drives cost?",
+                    "What can be limited?",
+                    "When should user approval be required?",
+                ),
+                ("read_context",),
+                ("do not approve spending", "do not ignore quota limits"),
+                (),
+                _DISCUSSION_SCHEMA,
+            ),
+            (
+                "user_advocate",
+                "User Advocate",
+                RolePurpose.CRITIQUE,
+                "Check whether the plan matches the user's stated intent and constraints.",
+                (
+                    "Does this satisfy the user request?",
+                    "What assumption should be confirmed?",
+                    "Is the result understandable?",
+                ),
+                ("read_context",),
+                ("do not expand scope silently", "do not override explicit user choices"),
+                (),
+                _DISCUSSION_SCHEMA,
+            ),
+        ]
+    )
     return tuple(specs)
 
 
@@ -340,6 +511,36 @@ def _dispatch_specs(profile: TaskProfile) -> tuple[_RoleSpec, ...]:
                 _DISPATCH_SCHEMA,
             ),
             (
+                "dependency_resolver",
+                "Dependency Resolver",
+                RolePurpose.PLAN,
+                "Resolve package managers, runtime dependencies, service users, and distro variants.",
+                (
+                    "Which dependency path applies?",
+                    "What is missing?",
+                    "What safe remediation is available?",
+                ),
+                ("read_context", "run_safe_command"),
+                ("delete_file", "push_to_remote", "send_external_message"),
+                ("ops",),
+                _DISPATCH_SCHEMA,
+            ),
+            (
+                "network_tls_engineer",
+                "Network/TLS Engineer",
+                RolePurpose.VERIFY,
+                "Validate ports, reverse proxy, TLS, public URL, and Feishu connectivity.",
+                (
+                    "Which ports must be open?",
+                    "Is TLS/proxy healthy?",
+                    "What connectivity check passed?",
+                ),
+                ("read_context", "run_safe_command"),
+                ("delete_file", "push_to_remote", "send_external_message"),
+                ("ops",),
+                _DISPATCH_SCHEMA,
+            ),
+            (
                 "security_reviewer",
                 "Security Reviewer",
                 RolePurpose.RISK_REVIEW,
@@ -351,6 +552,21 @@ def _dispatch_specs(profile: TaskProfile) -> tuple[_RoleSpec, ...]:
                 _DISPATCH_SCHEMA,
             ),
             (
+                "release_engineer",
+                "Release Engineer",
+                RolePurpose.RELEASE,
+                "Package deployment artifacts, version metadata, service restart order, and smoke checks.",
+                (
+                    "What version was deployed?",
+                    "What smoke check passed?",
+                    "What operational note is needed?",
+                ),
+                ("read_context", "run_safe_command"),
+                ("delete_file", "push_to_remote", "send_external_message"),
+                ("release",),
+                _DISPATCH_SCHEMA,
+            ),
+            (
                 "rollback_planner",
                 "Rollback Planner",
                 RolePurpose.RELEASE,
@@ -359,6 +575,99 @@ def _dispatch_specs(profile: TaskProfile) -> tuple[_RoleSpec, ...]:
                 ("read_context",),
                 ("delete_file", "push_to_remote", "send_external_message"),
                 (),
+                _DISPATCH_SCHEMA,
+            ),
+        )
+    if profile is TaskProfile.OPERATIONS:
+        return (
+            (
+                "incident_commander",
+                "Incident Commander",
+                RolePurpose.PLAN,
+                "Coordinate incident triage, scope, priority, and safe next actions.",
+                (
+                    "What is impacted?",
+                    "What is the current hypothesis?",
+                    "What action is safe next?",
+                ),
+                ("read_context",),
+                ("delete_file", "push_to_remote", "send_external_message"),
+                ("ops",),
+                _DISPATCH_SCHEMA,
+            ),
+            (
+                "log_analyst",
+                "Log Analyst",
+                RolePurpose.EXPERTISE,
+                "Inspect relevant application and service logs without exposing secrets.",
+                (
+                    "What errors appear in logs?",
+                    "What timestamps matter?",
+                    "What sensitive data must be redacted?",
+                ),
+                ("read_context", "run_safe_command"),
+                ("delete_file", "push_to_remote", "send_external_message"),
+                ("diagnostics",),
+                _DISPATCH_SCHEMA,
+            ),
+            (
+                "metrics_analyst",
+                "Metrics Analyst",
+                RolePurpose.EXPERTISE,
+                "Review health, latency, capacity, queue, and error-rate metrics.",
+                (
+                    "Which metric changed?",
+                    "What threshold was crossed?",
+                    "What evidence supports the hypothesis?",
+                ),
+                ("read_context", "run_safe_command"),
+                ("delete_file", "push_to_remote", "send_external_message"),
+                ("diagnostics",),
+                _DISPATCH_SCHEMA,
+            ),
+            (
+                "runbook_executor",
+                "Runbook Executor",
+                RolePurpose.EXECUTE,
+                "Execute only safe, approved runbook steps and report exact outcomes.",
+                (
+                    "Which runbook step ran?",
+                    "What output proves it worked?",
+                    "What step needs approval?",
+                ),
+                ("read_context", "run_safe_command"),
+                ("delete_file", "push_to_remote", "send_external_message"),
+                ("ops",),
+                _DISPATCH_SCHEMA,
+            ),
+            (
+                "reliability_reviewer",
+                "Reliability Reviewer",
+                RolePurpose.RISK_REVIEW,
+                "Check blast radius, rollback safety, recurrence risk, and service impact.",
+                (
+                    "What is the blast radius?",
+                    "Can we roll back safely?",
+                    "What recurrence risk remains?",
+                ),
+                ("read_context",),
+                ("delete_file", "push_to_remote", "send_external_message"),
+                ("reliability",),
+                _DISPATCH_SCHEMA,
+            ),
+            (
+                "postmortem_writer",
+                "Postmortem Writer",
+                RolePurpose.RECORD_DECISION,
+                "Summarize incident timeline, root cause, mitigation, and follow-up items.",
+                (
+                    "What happened?",
+                    "What fixed it?",
+                    "What follow-up is needed?",
+                ),
+                ("read_context",),
+                ("delete_file", "push_to_remote", "send_external_message"),
+                ("writing",),
                 _DISPATCH_SCHEMA,
             ),
         )
@@ -458,6 +767,20 @@ def _assignment(spec: _RoleSpec, request: RolePlanningRequest) -> RoleAssignment
         skills=merged_skills,
         output_schema=schema,
         model=model,
+    )
+
+
+def _catalog_spec(role: RoleDefinition) -> _RoleSpec:
+    return (
+        role.id,
+        role.role,
+        RolePurpose(role.purpose),
+        role.mission,
+        role.must_answer,
+        role.allowed_tools,
+        role.forbidden_actions,
+        role.skills,
+        role.output_schema,
     )
 
 

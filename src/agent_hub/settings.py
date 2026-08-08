@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     jwt_signing_key: SecretStr = SecretStr("development-only-change-me")
     master_key: SecretStr = SecretStr("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
     trusted_proxy_ips: frozenset[str] = Field(default=frozenset(), max_length=32)
+    log_level: str = Field(default="WARNING", pattern=r"^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
     bootstrap_tenant_id: UUID = UUID("00000000-0000-4000-8000-000000000001")
     bootstrap_tenant_slug: str = Field(
         default="default", min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9-]*$"
