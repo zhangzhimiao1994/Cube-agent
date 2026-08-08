@@ -45,6 +45,12 @@ while (($#)); do
   esac
 done
 
+if [[ -n "$CONFIG_FILE" ]]; then
+  [[ -r "$CONFIG_FILE" ]] || die "config file is not readable: $CONFIG_FILE"
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+fi
+
 [[ -z "$MODE" || "$MODE" == "auto" || "$MODE" == "docker" || "$MODE" == "native" ]] || die "mode must be auto, docker, or native"
 if [[ "${AGENT_HUB_TEST:-0}" != "1" ]]; then
   [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "run with sudo bash install.sh"

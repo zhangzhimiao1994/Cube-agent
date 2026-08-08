@@ -30,6 +30,7 @@ detect_host() {
 detect_existing_install() {
   if [[ -d "$INSTALL_ROOT" || -f "$SECRETS_FILE" ]]; then
     EXISTING_INSTALL=1
+    export EXISTING_INSTALL
     log "existing installation detected; repair/upgrade mode will preserve data and secrets"
   fi
 }
