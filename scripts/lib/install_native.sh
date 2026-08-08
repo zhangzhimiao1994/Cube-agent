@@ -361,6 +361,15 @@ deploy_native_release() {
     fi
   )
 
+  ln -sfn "$release" "$INSTALL_ROOT/current"
+  fix_native_web_permissions "$release"
+}
+
+fix_native_web_permissions() {
+  local release="${1:-}"
+  [[ -n "$release" ]] || release="$(readlink -f "$INSTALL_ROOT/current" 2>/dev/null || true)"
+  [[ -n "$release" && -d "$release" ]] || return 0
+
   chown -R agent-hub:agent-hub "$release" 2>/dev/null || true
   chmod 0755 "$INSTALL_ROOT" "$INSTALL_ROOT/releases"
   chmod 0755 "$release"
@@ -371,7 +380,6 @@ deploy_native_release() {
     chmod 0755 "$release/web/dist"
     chmod -R a+rX "$release/web/dist"
   fi
-  ln -sfn "$release" "$INSTALL_ROOT/current"
 }
 
 install_native_tls_assets() {

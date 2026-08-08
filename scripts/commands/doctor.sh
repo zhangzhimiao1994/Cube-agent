@@ -28,6 +28,42 @@ disk_has_2gb_free() {
 memory_has_1gb_total() {
   awk '/MemTotal/ { exit !($2 > 1048576) }' /proc/meminfo
 }
+web_root() {
+  printf '%s\n' "${AGENT_HUB_WEB_ROOT:-/opt/agent-hub/current/web/dist}"
+}
+readable_as_caddy() {
+  local path="$1"
+  if id caddy >/dev/null 2>&1 && [[ "${EUID:-$(id -u)}" -eq 0 ]] && command -v runuser >/dev/null 2>&1; then
+    runuser -u caddy -- test -r "$path"
+    return $?
+  fi
+  test -r "$path"
+}
+web_assets_readable() {
+  local root index asset
+  root="$(web_root)"
+  index="$root/index.html"
+  if [[ ! -d "$root" ]]; then
+    printf 'detail: web root does not exist: %s\n' "$root" >&2
+    return 1
+  fi
+  if ! readable_as_caddy "$index"; then
+    printf 'detail: Caddy cannot read Web UI entry file: %s\n' "$index" >&2
+    return 1
+  fi
+  asset="$(find "$root/assets" -type f \( -name '*.js' -o -name '*.css' \) -print -quit 2>/dev/null || true)"
+  if [[ -z "$asset" ]]; then
+    printf 'detail: Web UI assets are missing under %s/assets\n' "$root" >&2
+    return 1
+  fi
+  if ! readable_as_caddy "$asset"; then
+    printf 'detail: Caddy cannot read Web UI asset: %s\n' "$asset" >&2
+    if command -v namei >/dev/null 2>&1; then
+      namei -l "$asset" >&2 || true
+    fi
+    return 1
+  fi
+}
 
 check "linux kernel" test "$(uname -s)" = "Linux"
 check "disk has 2GB free" disk_has_2gb_free
@@ -38,6 +74,7 @@ check "docker available for universal install path" has_command docker
 check "systemd available for native path" has_command systemctl
 check "curl available for health checks" has_command curl
 check "api live health" health_live
+check "web ui assets readable by Caddy" web_assets_readable
 
 if [[ "$failures" -gt 0 ]]; then
   cat <<'EOF'
@@ -46,6 +83,11 @@ Suggested fixes:
   - Port conflict: stop the existing web server or set HTTP_PORT/HTTPS_PORT.
   - Missing Docker: install Docker Engine, then rerun installer.
   - Native mode unsupported: rerun with `--mode docker`.
+  - Web UI white screen / asset 403:
+      release="$(readlink -f /opt/agent-hub/current)" && test -n "$release"
+      sudo chmod 0755 /opt/agent-hub /opt/agent-hub/releases "$release" "$release/web" "$release/web/dist"
+      sudo chmod -R a+rX "$release/web/dist"
+      sudo systemctl restart caddy
 EOF
   exit 1
 fi

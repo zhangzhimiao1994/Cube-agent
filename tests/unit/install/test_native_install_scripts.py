@@ -121,12 +121,22 @@ def test_native_api_stays_private_and_caddy_exposes_management_ui() -> None:
     assert "http://*)\n      printf ':80" in installer
     assert "handle /setup*" in caddyfile
     assert "handle /setup*" in installer
+    assert "fix_native_web_permissions" in installer
     assert 'chmod 0755 "$INSTALL_ROOT" "$INSTALL_ROOT/releases"' in installer
     assert 'chmod 0755 "$release"' in installer
     assert 'chmod 0755 "$release/web"' in installer
     assert 'chmod 0755 "$release/web/dist"' in installer
     assert 'chmod -R a+rX "$release/web/dist"' in installer
     assert "chown -R agent-hub:agent-hub" in installer
+
+
+def test_doctor_diagnoses_web_asset_permission_failures() -> None:
+    doctor = read("scripts/commands/doctor.sh")
+
+    assert "web ui assets readable by Caddy" in doctor
+    assert "Caddy cannot read Web UI asset" in doctor
+    assert "namei -l" in doctor
+    assert "chmod -R a+rX" in doctor
 
 
 def test_native_caddy_supports_user_supplied_tls_certificate() -> None:
