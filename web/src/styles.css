@@ -463,6 +463,53 @@ article:hover {
   margin: 1rem 0;
 }
 
+.compact-page-intro {
+  margin-bottom: 0.8rem;
+}
+
+.run-compose {
+  margin: 1rem 0;
+}
+
+.run-compose form {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.055), transparent),
+    var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 1.55rem;
+  box-shadow: var(--shadow);
+  padding: 1.1rem;
+}
+
+.mode-help {
+  align-self: end;
+  background: rgba(3, 10, 20, 0.42);
+  border: 1px solid rgba(123, 225, 255, 0.16);
+  border-radius: 1rem;
+  padding: 0.85rem;
+}
+
+.mode-help p {
+  color: var(--muted);
+  font-size: 0.86rem;
+  line-height: 1.45;
+  margin: 0.25rem 0 0;
+}
+
+.inline-guide {
+  background: rgba(3, 10, 20, 0.36);
+  border: 1px solid rgba(123, 225, 255, 0.16);
+  border-radius: 1rem;
+  color: var(--muted);
+  padding: 0.85rem;
+}
+
+.inline-guide summary {
+  color: var(--accent);
+  cursor: pointer;
+  font-weight: 900;
+}
+
 .card-grid {
   display: grid;
   gap: 1rem;
@@ -520,6 +567,35 @@ article:hover {
   display: grid;
   gap: 1rem;
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.link-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  margin: 0.8rem 0;
+}
+
+.link-actions a {
+  border: 1px solid rgba(85, 215, 255, 0.3);
+  border-radius: 999px;
+  background: rgba(85, 215, 255, 0.08);
+  color: var(--accent);
+  font-weight: 900;
+  padding: 0.62rem 0.9rem;
+  text-decoration: none;
+}
+
+.compact-list {
+  color: var(--muted);
+  line-height: 1.6;
+  margin: 0.65rem 0 0;
+  padding-left: 1.2rem;
+}
+
+.dense-table th,
+.dense-table td {
+  padding: 0.62rem 0.75rem;
 }
 
 .channel-console {

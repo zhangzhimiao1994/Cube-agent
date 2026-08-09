@@ -197,6 +197,17 @@ def test_default_development_key_allows_lifespan_to_start() -> None:
         pass
 
 
+def test_default_app_wires_user_management_service() -> None:
+    app = create_app(
+        settings=valid_settings(),
+        database=FakeDatabase(),
+        redis_client=FakeRedis(),
+    )
+
+    with TestClient(app):
+        assert getattr(app.state, "user_admin_service", None) is not None
+
+
 class StubAuthService:
     def __init__(self, principal: AuthenticatedPrincipal | None = None) -> None:
         self.principal = principal or AuthenticatedPrincipal(uuid4(), uuid4(), Role.ADMIN)

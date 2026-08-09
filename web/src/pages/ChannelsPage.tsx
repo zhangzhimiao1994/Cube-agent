@@ -6,8 +6,12 @@ import { api, formatApiError, type ChannelStatus } from "../api/client";
 type ChannelGuide = {
   purpose: string;
   auth: string;
-  fields: { env: string; label: string; secret?: boolean; placeholder: string }[];
+  docUrl: string;
+  consoleUrl?: string;
+  consolePath: string[];
+  fields: { env: string; label: string; secret?: boolean; placeholder: string; source: string }[];
   steps: string[];
+  verify: string[];
 };
 
 const STATUS_LABELS: Record<string, string> = {
@@ -19,12 +23,19 @@ const CHANNEL_GUIDES: Record<string, ChannelGuide> = {
   feishu: {
     purpose: "用于飞书机器人、群聊和私聊入口，支持事件订阅进入主 Agent。",
     auth: "飞书签名 + verification token + encrypt key",
+    docUrl: "https://open.feishu.cn/document/server-docs/event-subscription-guide/overview?lang=zh-CN",
+    consoleUrl: "https://open.feishu.cn/app",
+    consolePath: [
+      "开发者后台 → 我的应用 → 选择应用 → 凭证与基础信息",
+      "事件与回调 → 事件订阅 → 将事件发送至开发者服务器",
+      "事件与回调 → 加密策略 → 复制 Verification Token 和 Encrypt Key",
+    ],
     fields: [
-      { env: "FEISHU_APP_ID", label: "App ID", placeholder: "cli_xxx" },
-      { env: "FEISHU_APP_SECRET", label: "App Secret", secret: true, placeholder: "飞书应用密钥" },
-      { env: "FEISHU_VERIFICATION_TOKEN", label: "Verification Token", secret: true, placeholder: "事件订阅校验 token" },
-      { env: "FEISHU_ENCRYPT_KEY", label: "Encrypt Key", secret: true, placeholder: "事件加密 key" },
-      { env: "AGENT_HUB_PUBLIC_URL", label: "公网访问地址", placeholder: "https://agent.example.com" },
+      { env: "FEISHU_APP_ID", label: "App ID", placeholder: "cli_xxx", source: "凭证与基础信息 → App ID" },
+      { env: "FEISHU_APP_SECRET", label: "App Secret", secret: true, placeholder: "飞书应用密钥", source: "凭证与基础信息 → App Secret" },
+      { env: "FEISHU_VERIFICATION_TOKEN", label: "Verification Token", secret: true, placeholder: "事件订阅校验 token", source: "事件与回调 → 加密策略 → Verification Token" },
+      { env: "FEISHU_ENCRYPT_KEY", label: "Encrypt Key", secret: true, placeholder: "事件加密 key", source: "事件与回调 → 加密策略 → Encrypt Key" },
+      { env: "AGENT_HUB_PUBLIC_URL", label: "公网访问地址", placeholder: "https://agent.example.com", source: "你的服务器域名，必须能被飞书公网访问" },
     ],
     steps: [
       "在飞书开放平台创建企业自建应用并启用机器人能力。",
@@ -32,129 +43,203 @@ const CHANNEL_GUIDES: Record<string, ChannelGuide> = {
       "把本页列出的环境变量写入服务器配置后重启 API 服务。",
       "在飞书里给机器人发送一条文本消息，任务页应出现新运行记录。",
     ],
+    verify: ["飞书后台 URL 验证通过", "发送文本后任务页出现新任务", "失败时查看系统日志中的 channel=feishu"],
   },
   dingtalk: {
     purpose: "用于钉钉机器人或应用事件入口。",
     auth: "共享 Webhook Token，服务端校验 x-agent-hub-channel-token 或 token 参数",
+    docUrl: "https://open.dingtalk.com/document/development/event-subscription-enables-disables-application-events",
+    consoleUrl: "https://open-dev.dingtalk.com/",
+    consolePath: [
+      "应用开发 → 企业内部应用/机器人 → 选择应用",
+      "应用信息 → 复制 AppKey / AppSecret",
+      "事件订阅或开发管理 → HTTP 回调 → 填写本页 Webhook 地址",
+    ],
     fields: [
-      { env: "DINGTALK_APP_KEY", label: "App Key", placeholder: "ding app key" },
-      { env: "DINGTALK_APP_SECRET", label: "App Secret", secret: true, placeholder: "ding app secret" },
-      { env: "DINGTALK_WEBHOOK_TOKEN", label: "Webhook Token", secret: true, placeholder: "自定义高强度 token" },
+      { env: "DINGTALK_APP_KEY", label: "App Key", placeholder: "ding app key", source: "应用信息 → AppKey / Client ID" },
+      { env: "DINGTALK_APP_SECRET", label: "App Secret", secret: true, placeholder: "ding app secret", source: "应用信息 → AppSecret / Client Secret" },
+      { env: "DINGTALK_WEBHOOK_TOKEN", label: "Webhook Token", secret: true, placeholder: "自定义高强度 token", source: "Agent Hub 自生成共享 token，并同步填入回调 URL token 参数或请求头" },
     ],
     steps: [
       "在钉钉开放平台或机器人配置中创建事件回调。",
       "Webhook 指向本页地址，并带上配置的 token。",
       "发送文本事件后，到任务页查看是否创建运行记录。",
     ],
+    verify: ["钉钉后台保存回调成功", "Webhook 测试返回 2xx", "任务页出现钉钉来源的新任务"],
   },
   wecom_bot: {
     purpose: "用于企业微信群智能机器人。",
     auth: "共享 Webhook Token",
+    docUrl: "https://developer.work.weixin.qq.com/document/path/91770",
+    consoleUrl: "https://work.weixin.qq.com/wework_admin/frame",
+    consolePath: [
+      "企业微信群 → 群设置 → 群机器人 → 添加机器人",
+      "复制机器人 Webhook 地址中的 key 参数",
+      "Agent Hub 中生成共享 Webhook Token 后写入服务器环境",
+    ],
     fields: [
-      { env: "WECOM_BOT_WEBHOOK_KEY", label: "Webhook Key", secret: true, placeholder: "企微机器人 key" },
-      { env: "WECOM_BOT_WEBHOOK_TOKEN", label: "Webhook Token", secret: true, placeholder: "自定义高强度 token" },
+      { env: "WECOM_BOT_WEBHOOK_KEY", label: "Webhook Key", secret: true, placeholder: "企微机器人 key", source: "群机器人 Webhook URL 中的 key" },
+      { env: "WECOM_BOT_WEBHOOK_TOKEN", label: "Webhook Token", secret: true, placeholder: "自定义高强度 token", source: "Agent Hub 自生成共享 token，用于保护入站 Webhook" },
     ],
     steps: [
       "在企业微信群添加机器人并取得 Webhook Key。",
       "把回调地址设置为本页 Webhook，并配置共享 token。",
       "在群内发送测试文本，检查任务页和运行详情。",
     ],
+    verify: ["群内发送测试消息", "任务页出现企微机器人来源的新任务", "失败时检查 key 与 token 是否同时配置"],
   },
   wecom_app: {
     purpose: "用于企业微信自建应用，适合内部私聊机器人和审批入口。",
     auth: "企业微信 SHA1 回调签名",
+    docUrl: "https://developer.work.weixin.qq.com/document/path/90238",
+    consoleUrl: "https://work.weixin.qq.com/wework_admin/frame",
+    consolePath: [
+      "企业微信管理后台 → 应用管理 → 自建 → 选择应用",
+      "应用详情 → 复制 AgentId 和 Secret",
+      "我的企业 → 企业信息 → 复制企业 ID",
+      "应用详情 → 接收消息 → 设置 API 接收 → 填写 URL / Token",
+    ],
     fields: [
-      { env: "WECOM_CORP_ID", label: "Corp ID", placeholder: "wwxxxx" },
-      { env: "WECOM_AGENT_ID", label: "Agent ID", placeholder: "1000002" },
-      { env: "WECOM_SECRET", label: "Secret", secret: true, placeholder: "自建应用 secret" },
-      { env: "WECOM_TOKEN", label: "Token", secret: true, placeholder: "回调 token" },
+      { env: "WECOM_CORP_ID", label: "Corp ID", placeholder: "wwxxxx", source: "我的企业 → 企业信息 → 企业 ID" },
+      { env: "WECOM_AGENT_ID", label: "Agent ID", placeholder: "1000002", source: "应用管理 → 自建应用详情 → AgentId" },
+      { env: "WECOM_SECRET", label: "Secret", secret: true, placeholder: "自建应用 secret", source: "应用管理 → 自建应用详情 → Secret" },
+      { env: "WECOM_TOKEN", label: "Token", secret: true, placeholder: "回调 token", source: "接收消息 → 设置 API 接收 → Token" },
     ],
     steps: [
       "在企业微信管理后台创建自建应用。",
       "把接收消息服务器 URL 设置为本页 Webhook。",
       "保存 token 和 secret 后重启服务，并用企业微信发送文本消息测试。",
     ],
+    verify: ["企业微信 URL 校验通过", "应用私聊发送文本后任务页出现新任务", "失败时检查 CorpID/AgentID/Token 是否来自同一个应用"],
   },
   wechat_official: {
     purpose: "用于微信公众号消息入口。",
     auth: "微信 SHA1 回调签名",
+    docUrl: "https://developers.weixin.qq.com/doc/offiaccount/Basic_Information/Access_Overview.html",
+    consoleUrl: "https://mp.weixin.qq.com/",
+    consolePath: [
+      "公众号后台 → 设置与开发 → 基本配置",
+      "公众号开发信息 → 复制 AppID / AppSecret",
+      "服务器配置 → 修改配置 → 填写 URL / Token",
+    ],
     fields: [
-      { env: "WECHATMP_APP_ID", label: "App ID", placeholder: "公众号 app id" },
-      { env: "WECHATMP_APP_SECRET", label: "App Secret", secret: true, placeholder: "公众号 app secret" },
-      { env: "WECHATMP_TOKEN", label: "Token", secret: true, placeholder: "服务器配置 token" },
+      { env: "WECHATMP_APP_ID", label: "App ID", placeholder: "公众号 app id", source: "基本配置 → 公众号开发信息 → AppID" },
+      { env: "WECHATMP_APP_SECRET", label: "App Secret", secret: true, placeholder: "公众号 app secret", source: "基本配置 → 公众号开发信息 → AppSecret" },
+      { env: "WECHATMP_TOKEN", label: "Token", secret: true, placeholder: "服务器配置 token", source: "服务器配置 → Token，自定义后两边保持一致" },
     ],
     steps: [
       "在公众号后台启用服务器配置。",
       "URL 填本页 Webhook，Token 填环境变量中的 WECHATMP_TOKEN。",
       "关注公众号后发送文本消息，到任务页核验。",
     ],
+    verify: ["公众号后台服务器配置启用成功", "关注后发送文本消息", "任务页出现公众号来源的新任务"],
   },
   wechat_customer_service: {
     purpose: "用于微信客服入口。",
     auth: "微信客服 SHA1 回调签名",
+    docUrl: "https://developer.work.weixin.qq.com/document/path/94638",
+    consoleUrl: "https://work.weixin.qq.com/kf/",
+    consolePath: [
+      "微信客服后台 → 开发配置 / API 配置",
+      "企业微信管理后台 → 我的企业 → 企业信息 → 企业 ID",
+      "复制 Secret / Token，并把回调 URL 填为本页 Webhook",
+    ],
     fields: [
-      { env: "WECHAT_KF_CORP_ID", label: "Corp ID", placeholder: "企业 ID" },
-      { env: "WECHAT_KF_SECRET", label: "Secret", secret: true, placeholder: "客服 secret" },
-      { env: "WECHAT_KF_TOKEN", label: "Token", secret: true, placeholder: "回调 token" },
+      { env: "WECHAT_KF_CORP_ID", label: "Corp ID", placeholder: "企业 ID", source: "企业微信管理后台 → 我的企业 → 企业 ID" },
+      { env: "WECHAT_KF_SECRET", label: "Secret", secret: true, placeholder: "客服 secret", source: "微信客服后台 → 开发配置 → Secret" },
+      { env: "WECHAT_KF_TOKEN", label: "Token", secret: true, placeholder: "回调 token", source: "微信客服后台 → 开发配置 → Token" },
     ],
     steps: [
       "在微信客服后台配置回调地址。",
       "按本页字段配置企业 ID、Secret 和 Token。",
       "通过客服入口发送测试文本，检查任务是否进入队列。",
     ],
+    verify: ["微信客服回调配置保存成功", "客服入口发送消息后任务页出现新任务", "失败时检查 CorpID 与客服账号归属"],
   },
   telegram: {
     purpose: "用于 Telegram Bot Webhook。",
     auth: "Telegram Secret Token 请求头",
+    docUrl: "https://core.telegram.org/bots/api#setwebhook",
+    consoleUrl: "https://t.me/BotFather",
+    consolePath: [
+      "Telegram → 打开 BotFather → /newbot 或 /mybots",
+      "复制 Bot Token",
+      "调用 setWebhook，将 url 设为本页 Webhook，将 secret_token 设为 TELEGRAM_WEBHOOK_TOKEN",
+    ],
     fields: [
-      { env: "TELEGRAM_BOT_TOKEN", label: "Bot Token", secret: true, placeholder: "123456:ABC" },
-      { env: "TELEGRAM_WEBHOOK_TOKEN", label: "Webhook Secret Token", secret: true, placeholder: "自定义高强度 token" },
-      { env: "AGENT_HUB_PUBLIC_URL", label: "公网访问地址", placeholder: "https://agent.example.com" },
+      { env: "TELEGRAM_BOT_TOKEN", label: "Bot Token", secret: true, placeholder: "123456:ABC", source: "BotFather → 机器人详情 → API token" },
+      { env: "TELEGRAM_WEBHOOK_TOKEN", label: "Webhook Secret Token", secret: true, placeholder: "自定义高强度 token", source: "你生成的 1-256 位 secret_token，只允许字母、数字、下划线、短横线" },
+      { env: "AGENT_HUB_PUBLIC_URL", label: "公网访问地址", placeholder: "https://agent.example.com", source: "你的服务器域名，Telegram Webhook 支持 443/80/88/8443" },
     ],
     steps: [
       "在 BotFather 创建机器人并取得 Bot Token。",
       "调用 Telegram setWebhook，把 secret_token 设置为 TELEGRAM_WEBHOOK_TOKEN。",
       "向机器人发送消息后，在任务页查看运行记录。",
     ],
+    verify: ["setWebhook 返回 ok=true", "机器人收到文本后任务页出现新任务", "失败时检查证书、端口和 secret_token 请求头"],
   },
   slack: {
     purpose: "用于 Slack Events API。",
     auth: "Slack Signing Secret HMAC 签名",
+    docUrl: "https://api.slack.com/apis/http",
+    consoleUrl: "https://api.slack.com/apps",
+    consolePath: [
+      "Slack API → Your Apps → 选择应用 → Basic Information",
+      "App Credentials → 复制 Signing Secret",
+      "OAuth & Permissions → 复制 Bot User OAuth Token",
+      "Event Subscriptions → Enable Events → Request URL 填本页 Webhook",
+    ],
     fields: [
-      { env: "SLACK_BOT_TOKEN", label: "Bot Token", secret: true, placeholder: "xoxb-..." },
-      { env: "SLACK_SIGNING_SECRET", label: "Signing Secret", secret: true, placeholder: "Slack signing secret" },
+      { env: "SLACK_BOT_TOKEN", label: "Bot Token", secret: true, placeholder: "xoxb-...", source: "OAuth & Permissions → Bot User OAuth Token" },
+      { env: "SLACK_SIGNING_SECRET", label: "Signing Secret", secret: true, placeholder: "Slack signing secret", source: "Basic Information → App Credentials → Signing Secret" },
     ],
     steps: [
       "在 Slack App 中启用 Event Subscriptions。",
       "Request URL 填写本页 Webhook 地址。",
       "订阅 message 相关事件后安装到 workspace 并发送测试消息。",
     ],
+    verify: ["Slack Request URL 验证通过", "事件订阅保存成功", "频道中 @机器人 后任务页出现新任务"],
   },
   qq: {
     purpose: "用于 QQ 机器人或频道消息入口。",
     auth: "共享 Webhook Token",
+    docUrl: "https://bot.q.qq.com/wiki/",
+    consoleUrl: "https://q.qq.com/",
+    consolePath: [
+      "QQ 机器人平台 → 我的机器人/应用 → 选择机器人",
+      "开发设置 → 复制 App ID / Token",
+      "事件回调或 Webhook 配置 → 填写本页 Webhook 地址",
+    ],
     fields: [
-      { env: "QQ_BOT_APP_ID", label: "App ID", placeholder: "QQ bot app id" },
-      { env: "QQ_BOT_TOKEN", label: "Bot Token", secret: true, placeholder: "QQ bot token" },
-      { env: "QQ_WEBHOOK_TOKEN", label: "Webhook Token", secret: true, placeholder: "自定义高强度 token" },
+      { env: "QQ_BOT_APP_ID", label: "App ID", placeholder: "QQ bot app id", source: "QQ 机器人平台 → 开发设置 → App ID" },
+      { env: "QQ_BOT_TOKEN", label: "Bot Token", secret: true, placeholder: "QQ bot token", source: "QQ 机器人平台 → 开发设置 → Token" },
+      { env: "QQ_WEBHOOK_TOKEN", label: "Webhook Token", secret: true, placeholder: "自定义高强度 token", source: "Agent Hub 自生成共享 token，用于保护入站 Webhook" },
     ],
     steps: [
       "在 QQ 机器人平台创建应用并启用事件。",
       "把事件回调地址设置为本页 Webhook。",
       "发送文本消息并检查运行详情中的归一化事件。",
     ],
+    verify: ["平台回调保存成功", "QQ 侧发送文本消息", "任务页出现 QQ 来源的新任务"],
   },
   custom_webhook: {
     purpose: "用于接入其他支持 HTTP Webhook 的聊天软件或内部系统。",
     auth: "共享 Webhook Token",
+    docUrl: "https://developer.mozilla.org/en-US/docs/Web/HTTP",
+    consolePath: [
+      "在第三方系统中找到 Webhook / Callback / Event Subscription 设置",
+      "URL 填写本页 Webhook 地址",
+      "Header 填 x-agent-hub-channel-token，值为 CUSTOM_WEBHOOK_TOKEN",
+    ],
     fields: [
-      { env: "CUSTOM_WEBHOOK_TOKEN", label: "Webhook Token", secret: true, placeholder: "自定义高强度 token" },
+      { env: "CUSTOM_WEBHOOK_TOKEN", label: "Webhook Token", secret: true, placeholder: "自定义高强度 token", source: "Agent Hub 自生成共享 token，第三方系统请求时放到请求头" },
     ],
     steps: [
       "调用本页 Webhook 地址，Body 使用 JSON 对象。",
       "请求头加入 x-agent-hub-channel-token，值为 CUSTOM_WEBHOOK_TOKEN。",
       "JSON 中至少包含 text 或 content 字段。",
     ],
+    verify: ["curl 或第三方平台测试返回 2xx", "JSON 中的 text/content 进入任务页", "失败时查看响应体中的错误代码"],
   },
 };
 
@@ -242,6 +327,25 @@ export function ChannelsPage() {
             </article>
 
             <article>
+              <h3>官方入口与点击路径</h3>
+              <div className="link-actions">
+                <a href={guide.docUrl} target="_blank" rel="noreferrer">
+                  打开{selected.name}官方文档
+                </a>
+                {guide.consoleUrl ? (
+                  <a href={guide.consoleUrl} target="_blank" rel="noreferrer">
+                    打开{selected.name}控制台
+                  </a>
+                ) : null}
+              </div>
+              <ol className="compact-list">
+                {guide.consolePath.map((step) => (
+                  <li key={step}>{step}</li>
+                ))}
+              </ol>
+            </article>
+
+            <article>
               <h3>配置内容</h3>
               <div className="form-grid">
                 {guide.fields.map((field) => (
@@ -254,6 +358,7 @@ export function ChannelsPage() {
                       placeholder={field.placeholder}
                     />
                     <span className="field-help">{field.env}</span>
+                    <span className="field-help">来源：{field.source}</span>
                   </label>
                 ))}
               </div>
@@ -270,6 +375,12 @@ export function ChannelsPage() {
               <ol>
                 {guide.steps.map((step) => (
                   <li key={step}>{step}</li>
+                ))}
+              </ol>
+              <h4>验证方式</h4>
+              <ol className="compact-list">
+                {guide.verify.map((item) => (
+                  <li key={item}>{item}</li>
                 ))}
               </ol>
               <p>{selected.notes.join(" ")}</p>

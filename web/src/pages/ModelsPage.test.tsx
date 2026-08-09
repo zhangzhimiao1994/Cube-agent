@@ -169,6 +169,27 @@ describe("ModelsPage", () => {
     });
   });
 
+  it("includes Anthropic and Claude Code presets with provider-scoped models", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/models" />);
+
+    await screen.findByText("添加模型配置");
+    await user.selectOptions(screen.getByLabelText("服务商"), "anthropic");
+
+    const modelSelect = screen.getByLabelText("模型") as HTMLSelectElement;
+    const optionValues = Array.from(modelSelect.options).map((option) => option.value);
+    expect(optionValues).toContain("claude-sonnet-4-20250514");
+    expect(optionValues).toContain("claude-opus-4-20250514");
+    expect(optionValues).toContain("__custom_model__");
+    expect(optionValues).not.toContain("deepseek-chat");
+    expect((screen.getByLabelText("API Base") as HTMLInputElement).value).toBe(
+      "https://api.anthropic.com/v1",
+    );
+    expect((screen.getByLabelText("Quota Scope") as HTMLInputElement).value).toBe(
+      "anthropic-account",
+    );
+  });
+
   it("shows the backend model check failure reason", async () => {
     failModelSave = true;
     const user = userEvent.setup();

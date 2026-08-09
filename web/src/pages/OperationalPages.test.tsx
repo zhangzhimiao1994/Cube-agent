@@ -189,6 +189,14 @@ describe("operational management pages", () => {
     await waitFor(() => expect(screen.getByText("paused")).not.toBeNull());
   });
 
+  it("keeps the task creation page compact while preserving guidance", async () => {
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话任务" })).not.toBeNull();
+    expect(screen.getByText("模式会按当前选择即时解释，详细规则放在可展开说明里。")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "提交任务" })).not.toBeNull();
+  });
+
   it("uploads and approves a skill", async () => {
     render(<TestApp initialPath="/skills" />);
 
@@ -213,6 +221,9 @@ describe("operational management pages", () => {
 
     render(<TestApp initialPath="/audit" />);
     expect(await screen.findByText("config.publish")).not.toBeNull();
+    expect(screen.getByRole("columnheader", { name: "操作" })).not.toBeNull();
+    expect(screen.getByRole("columnheader", { name: "资源" })).not.toBeNull();
+    expect(screen.getByRole("columnheader", { name: "操作者" })).not.toBeNull();
     expect(screen.queryByText(/api_key|hidden_reasoning|fingerprint/i)).toBeNull();
   });
 

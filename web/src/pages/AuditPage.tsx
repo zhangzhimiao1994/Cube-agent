@@ -56,16 +56,28 @@ export function AuditPage() {
           <p>调整过滤条件，或先执行一次配置保存、任务控制等操作。</p>
         </article>
       ) : (
-        <div className="card-grid">
-          {events.map((event) => (
-            <article key={event.id}>
-              <span className="eyebrow">{event.action}</span>
-              <h3>{event.resource}</h3>
-              <p>操作者：{event.actor}</p>
-              <time dateTime={event.created_at}>{event.created_at}</time>
-            </article>
-          ))}
-        </div>
+        <table className="dense-table">
+          <thead>
+            <tr>
+              <th>操作</th>
+              <th>资源</th>
+              <th>操作者</th>
+              <th>时间</th>
+            </tr>
+          </thead>
+          <tbody>
+            {events.map((event) => (
+              <tr key={event.id}>
+                <td>{event.action}</td>
+                <td>{event.resource}</td>
+                <td>{event.actor}</td>
+                <td>
+                  <time dateTime={event.created_at}>{event.created_at}</time>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       )}
     </section>
   );

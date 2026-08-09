@@ -53,6 +53,30 @@ const PROVIDERS: ProviderPreset[] = [
     ],
   },
   {
+    label: "Anthropic / Claude Code",
+    value: "anthropic",
+    apiBase: "https://api.anthropic.com/v1",
+    quotaScope: "anthropic-account",
+    capabilities: ["text", "tool_calling"],
+    models: [
+      {
+        label: "Claude Code / Claude Sonnet 4",
+        value: "claude-sonnet-4-20250514",
+        capabilities: ["text", "tool_calling"],
+      },
+      {
+        label: "Claude Opus 4",
+        value: "claude-opus-4-20250514",
+        capabilities: ["text", "tool_calling"],
+      },
+      {
+        label: "Claude 3.5 Haiku",
+        value: "claude-3-5-haiku-20241022",
+        capabilities: ["text"],
+      },
+    ],
+  },
+  {
     label: "Kimi / Moonshot",
     value: "kimi",
     apiBase: "https://api.moonshot.cn/v1",
@@ -239,6 +263,28 @@ export function ModelsPage() {
       <h2>模型与 API</h2>
       <p>保存模型前系统会自动发起一次最小请求测试；测试失败不会发布该模型配置。</p>
       <p>同一服务商账号下的多个 Key 可能共享配额，不要把并发设置到跑满额度。</p>
+
+      <article>
+        <h3>填写指引</h3>
+        <div className="detail-grid">
+          <div>
+            <span className="eyebrow">服务商 / 模型</span>
+            <p>选择服务商后只显示该服务商模型；Claude Code 可选 Anthropic / Claude Code，也可用自定义模型名接中转站。</p>
+          </div>
+          <div>
+            <span className="eyebrow">API Base / Key</span>
+            <p>API Base 填服务商兼容 OpenAI 或 Anthropic 的接口地址；API Key 会加密保存，页面不会回显明文。</p>
+          </div>
+          <div>
+            <span className="eyebrow">逻辑模型名</span>
+            <p>Agent 只引用逻辑模型名，例如 main、planner、critic；以后换供应商不需要改角色配置。</p>
+          </div>
+          <div>
+            <span className="eyebrow">并发与限流</span>
+            <p>同一账号共用配额时保持相同 Quota Scope；新 Key 建议先从并发 1、RPM 60 开始，稳定后再提升。</p>
+          </div>
+        </div>
+      </article>
 
       <form onSubmit={submit} aria-label="添加模型配置">
         <h3>添加模型配置</h3>

@@ -50,23 +50,28 @@ export function RunsPage() {
     <section>
       <p className="eyebrow">Run operations</p>
       <h2>对话任务</h2>
-      <p>
-        这里可以直接从网页提交任务，也可以查看通道进入的任务。主 Agent 会根据模式调度子 Agent、
-        Skill 和工具，并把错误写入运行事件，方便后续排查。
-      </p>
+      <p className="compact-page-intro">从网页或聊天通道提交任务，主 Agent 会选择模式、调度角色，并把错误写入运行事件。</p>
 
-      <div className="two-column">
+      <div className="run-compose">
         <form onSubmit={submit} aria-label="新建任务">
           <h3>新建任务</h3>
-          <label htmlFor="run-mode">运行模式</label>
-          <select id="run-mode" value={mode} onChange={(event) => setMode(event.target.value as RunMode)}>
-            {RUN_MODES.map((item) => (
-              <option key={item.value} value={item.value}>
-                {item.label}
-              </option>
-            ))}
-          </select>
-          <p className="field-help">{selectedMode.description}</p>
+          <div className="form-grid">
+            <label htmlFor="run-mode">
+              运行模式
+              <select id="run-mode" value={mode} onChange={(event) => setMode(event.target.value as RunMode)}>
+                {RUN_MODES.map((item) => (
+                  <option key={item.value} value={item.value}>
+                    {item.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="mode-help" aria-live="polite">
+              <span className="eyebrow">{selectedMode.label}</span>
+              <p>{selectedMode.description}</p>
+              <p>模式会按当前选择即时解释，详细规则放在可展开说明里。</p>
+            </div>
+          </div>
 
           <label htmlFor="run-message">任务内容</label>
           <textarea
@@ -87,16 +92,15 @@ export function RunsPage() {
             </p>
           ) : null}
           {createRun.isError ? <p role="alert">{formatApiError(createRun.error, "任务提交失败")}</p> : null}
+          <details className="inline-guide">
+            <summary>查看模式选择规则</summary>
+            <ol>
+              <li>不确定就选“自动识别”；识别不确定时主 Agent 会询问。</li>
+              <li>讨论式出现分歧时，按证据质量、任务目标和约束裁决。</li>
+              <li>模型、角色、Skill 未配置完整时，详情页会显示失败事件原因。</li>
+            </ol>
+          </details>
         </form>
-
-        <article>
-          <h3>配置指引</h3>
-          <ol>
-            <li>如果不确定用哪种模式，选择“自动识别”。识别不确定时主 Agent 会询问。</li>
-            <li>讨论式出现分歧时，主 Agent 根据证据质量、任务目标和约束做裁决。</li>
-            <li>模型、角色、Skill 未配置完整时，任务可能进入失败状态；详情页会显示事件原因。</li>
-          </ol>
-        </article>
       </div>
 
       <section aria-label="任务列表">

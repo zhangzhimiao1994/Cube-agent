@@ -33,6 +33,7 @@ from agent_hub.auth.passwords import PasswordService
 from agent_hub.auth.rate_limit import RedisAuthRateLimiter
 from agent_hub.auth.service import AuthService
 from agent_hub.auth.tokens import AccessTokenService
+from agent_hub.auth.user_admin import PersistentUserAdminService
 from agent_hub.channels.dedup import InboundDedupRepository
 from agent_hub.channels.feishu.webhook import (
     ChannelGatewayProtocol,
@@ -154,6 +155,7 @@ def create_app(
     rate_limiter: object | None = None,
     config_service: object | None = None,
     admin_resource_service: object | None = None,
+    user_admin_service: object | None = None,
     run_service: object | None = None,
     runtime_registry: RuntimeRegistry | None = None,
     mode_router: ModeRouterProtocol | None = None,
@@ -184,7 +186,13 @@ def create_app(
         try:
             application.state.trusted_proxy_ips = configured.trusted_proxy_ips
             application.state.bootstrap_tenant_id = configured.bootstrap_tenant_id
-            needs_sessions = auth_service is None or config_service is None or run_service is None
+            needs_sessions = (
+                auth_service is None
+                or config_service is None
+                or run_service is None
+                or admin_resource_service is None
+                or user_admin_service is None
+            )
             if active_sessions is None and active_database is not None:
                 active_sessions = active_database.session_factory
             if active_sessions is None and needs_sessions:
@@ -233,6 +241,10 @@ def create_app(
                     actor_id=configured.bootstrap_tenant_id,
                     session_factory=active_sessions,
                     skill_store_dir=configured.skill_store_dir,
+                )
+            if user_admin_service is None and active_sessions is not None:
+                application.state.user_admin_service = PersistentUserAdminService(
+                    active_sessions
                 )
             if run_service is None:
                 assert active_sessions is not None
@@ -307,6 +319,7 @@ def create_app(
     application.state.rate_limiter = rate_limiter
     application.state.config_service = config_service
     application.state.admin_resource_service = admin_resource_service
+    application.state.user_admin_service = user_admin_service
     application.state.bootstrap_tenant_id = configured_settings.bootstrap_tenant_id
     application.state.run_service = run_service
     application.state.runtime_registry = active_runtime_registry
