@@ -1,7 +1,7 @@
 import { NavLink, Outlet } from "react-router-dom";
 
-import { useAuth } from "../auth/AuthProvider";
 import { MODULE_GROUPS } from "./navigation";
+import { useAuth } from "../auth/AuthProvider";
 
 export function AppShell() {
   const auth = useAuth();
@@ -14,9 +14,7 @@ export function AppShell() {
           <p>面向生产环境的多 Agent 调度与配置控制台</p>
         </div>
         <nav aria-label="Main navigation" className="nav-list">
-          {MODULE_GROUPS.filter((group) =>
-            group.modules.some((item) => auth.hasPermission(item.permission)),
-          ).map((item) => (
+          {MODULE_GROUPS.map((item) => (
             <NavLink
               key={item.to}
               to={item.to}
