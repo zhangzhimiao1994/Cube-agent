@@ -232,6 +232,7 @@ def create_app(
                     tenant_id=configured.bootstrap_tenant_id,
                     actor_id=configured.bootstrap_tenant_id,
                     session_factory=active_sessions,
+                    skill_store_dir=configured.skill_store_dir,
                 )
             if run_service is None:
                 assert active_sessions is not None

@@ -383,6 +383,40 @@ async function requestNoContent(path: string, init: RequestInit): Promise<void> 
   }
 }
 
+async function requestBinary<T>(
+  path: string,
+  init: RequestInit,
+  schema: z.ZodType<T>,
+): Promise<T> {
+  let response: Response;
+  const token = currentAccessToken();
+  try {
+    response = await fetch(path, {
+      ...init,
+      credentials: "include",
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(init.headers ?? {}),
+      },
+    });
+  } catch {
+    throw new ApiError("network request failed", 0, "network_error");
+  }
+  if (!response.ok) {
+    throw await errorFromResponse(response);
+  }
+  const payload = await response.json();
+  const parsed = schema.safeParse(payload);
+  if (!parsed.success) {
+    throw new ApiError(
+      `response schema validation failed for ${path}`,
+      response.status,
+      "invalid_response",
+    );
+  }
+  return parsed.data;
+}
+
 export const api = {
   me(): Promise<CurrentUser> {
     return request("/api/v1/auth/me", { method: "GET" }, PrincipalSchema).then((principal) =>
@@ -518,6 +552,20 @@ export const api = {
     return request(
       "/api/v1/admin/skills",
       { method: "POST", body: JSON.stringify({ filename }) },
+      SkillSchema,
+    );
+  },
+  uploadSkillArchive(file: File): Promise<Skill> {
+    return requestBinary(
+      "/api/v1/admin/skills/upload",
+      {
+        method: "POST",
+        body: file,
+        headers: {
+          "Content-Type": "application/zip",
+          "X-Agent-Hub-Skill-Filename": file.name,
+        },
+      },
       SkillSchema,
     );
   },

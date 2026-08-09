@@ -4,13 +4,16 @@ import { useState } from "react";
 import { api, formatApiError } from "../api/client";
 
 export function SkillsPage() {
-  const [filename, setFilename] = useState("");
+  const [file, setFile] = useState<File | null>(null);
   const queryClient = useQueryClient();
   const skills = useQuery({ queryKey: ["skills"], queryFn: () => api.skills() });
   const upload = useMutation({
-    mutationFn: () => api.uploadSkill(filename),
+    mutationFn: () => {
+      if (!file) throw new Error("请选择 Skill ZIP 文件");
+      return api.uploadSkillArchive(file);
+    },
     onSuccess: () => {
-      setFilename("");
+      setFile(null);
       void queryClient.invalidateQueries({ queryKey: ["skills"] });
     },
   });
@@ -32,11 +35,11 @@ export function SkillsPage() {
           aria-label="Skill ZIP"
           type="file"
           accept=".zip"
-          onChange={(event) => setFilename(event.currentTarget.files?.[0]?.name ?? "")}
+          onChange={(event) => setFile(event.currentTarget.files?.[0] ?? null)}
         />
       </label>
-      <button type="button" disabled={!filename} onClick={() => upload.mutate()}>
-        Upload
+      <button type="button" disabled={!file} onClick={() => upload.mutate()}>
+        Upload and scan
       </button>
       {upload.isError ? (
         <p role="alert">{formatApiError(upload.error, "Skill upload failed")}</p>

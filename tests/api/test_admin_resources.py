@@ -1,3 +1,5 @@
+import io
+import zipfile
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -157,6 +159,24 @@ def model_payload() -> dict[str, object]:
         "fallback": "planner_backup",
         "weight": 100,
     }
+
+
+def skill_archive() -> bytes:
+    manifest = (
+        "name: safe_skill\n"
+        "version: 1.0.0\n"
+        "entry_point: main.py\n"
+        "compatible_runtime: python3.12\n"
+        "declared_tools:\n"
+        "  - filesystem.read\n"
+        "dependency_lock_hash: "
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("skill.yaml", manifest)
+        archive.writestr("main.py", "print('ok')\n")
+    return buffer.getvalue()
 
 
 def test_model_pool_reports_serial_slot_and_queue_policy() -> None:
@@ -412,6 +432,40 @@ def test_skill_upload_approve_mcp_memory_and_audit_are_safe() -> None:
     serialized = uploaded.text + approved.text + skills.text + mcp.text + memory.text + audit.text
     for forbidden in ("api_key", "fingerprint", "hidden_reasoning", "chain_of_thought"):
         assert forbidden not in serialized.lower()
+
+
+def test_skill_archive_upload_scans_real_zip_package() -> None:
+    api = client()
+
+    uploaded = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=skill_archive(),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert uploaded.status_code == 200
+    body = uploaded.json()
+    assert body["name"] == "safe_skill"
+    assert body["status"] == "scanned"
+    assert body["requested_permissions"] == ["tool:filesystem.read"]
+    assert any("content sha256" in item for item in body["scan_diff"])
+    assert skills.json()[0]["id"] == body["id"]
+
+
+def test_skill_archive_upload_rejects_invalid_zip_without_saving_metadata() -> None:
+    api = client()
+
+    uploaded = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "broken.zip"},
+        content=b"not-a-zip",
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert uploaded.status_code == 422
+    assert uploaded.json()["error"]["code"] == "invalid_skill_package"
+    assert skills.json() == []
 
 
 def test_memory_forget_removes_record() -> None:

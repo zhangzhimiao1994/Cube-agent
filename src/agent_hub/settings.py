@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     trusted_proxy_ips: frozenset[str] = Field(default=frozenset(), max_length=32)
     log_level: str = Field(default="WARNING", pattern=r"^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
     web_dir: Path | None = None
+    skill_store_dir: Path = Path("/var/lib/agent-hub/skills")
     litellm_health_url: str | None = None
     bootstrap_tenant_id: UUID = UUID("00000000-0000-4000-8000-000000000001")
     bootstrap_tenant_slug: str = Field(

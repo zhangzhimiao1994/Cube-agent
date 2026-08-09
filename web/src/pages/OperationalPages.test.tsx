@@ -40,7 +40,7 @@ function jsonResponse(payload: unknown, init: ResponseInit = {}) {
 
 describe("operational management pages", () => {
   beforeEach(() => {
-    let skillStatus: "missing" | "quarantined" | "enabled" = "missing";
+    let skillStatus: "missing" | "scanned" | "enabled" = "missing";
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -76,13 +76,17 @@ describe("operational management pages", () => {
                 ],
           );
         }
-        if (path === "/api/v1/admin/skills" && init?.method === "POST") {
-          skillStatus = "quarantined";
+        if (path === "/api/v1/admin/skills/upload" && init?.method === "POST") {
+          expect(init.body).toBeInstanceOf(File);
+          expect((init.headers as Record<string, string>)["X-Agent-Hub-Skill-Filename"]).toBe(
+            "safe-skill.zip",
+          );
+          skillStatus = "scanned";
           return jsonResponse({
             id: "safe-skill",
             name: "safe-skill",
-            status: "quarantined",
-            scan_diff: ["added SKILL.md"],
+            status: "scanned",
+            scan_diff: ["package safe-skill.zip scanned"],
             requested_permissions: ["filesystem:read"],
           });
         }
@@ -190,9 +194,9 @@ describe("operational management pages", () => {
     await screen.findByRole("heading", { name: "Skills governance" });
     const file = new File(["safe"], "safe-skill.zip", { type: "application/zip" });
     await userEvent.upload(screen.getByLabelText("Skill ZIP"), file);
-    await userEvent.click(screen.getByRole("button", { name: "Upload" }));
+    await userEvent.click(screen.getByRole("button", { name: "Upload and scan" }));
 
-    expect(await screen.findByText("Status: quarantined")).not.toBeNull();
+    expect(await screen.findByText("Status: scanned")).not.toBeNull();
     await userEvent.click(screen.getByRole("button", { name: "Approve and enable" }));
     expect(await screen.findByText("Status: enabled")).not.toBeNull();
   });

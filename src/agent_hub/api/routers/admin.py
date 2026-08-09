@@ -4,6 +4,7 @@ import hashlib
 import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated, Protocol, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -25,6 +26,8 @@ from agent_hub.models.litellm_client import LiteLLMClient
 from agent_hub.models.types import Deployment, ModelCapability, ModelMessage, ModelRequest
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRecord, RunRepository
 from agent_hub.security.secrets import SecretService, SecretValidationError
+from agent_hub.skills.package import InvalidSkillPackage
+from agent_hub.skills.scanner import SkillScanner
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"], responses=BASE_ERROR_RESPONSES)
 
@@ -426,6 +429,8 @@ class AdminResourceService(Protocol):
 
     async def upload_skill(self, request: SkillUploadRequest) -> SkillResponse: ...
 
+    async def upload_skill_archive(self, filename: str, archive_bytes: bytes) -> SkillResponse: ...
+
     async def approve_skill(self, skill_id: str) -> SkillResponse: ...
 
     async def list_mcp_servers(self) -> tuple[McpServerResponse, ...]: ...
@@ -655,6 +660,22 @@ class InMemoryAdminResourceService:
         self.skills[response.id] = response
         return response
 
+    async def upload_skill_archive(self, filename: str, archive_bytes: bytes) -> SkillResponse:
+        inspection = SkillScanner().scan(archive_bytes).inspection
+        response = SkillResponse(
+            id=f"skill_{uuid4().hex}",
+            name=inspection.manifest.name,
+            status="scanned",
+            scan_diff=[
+                f"package {filename} scanned",
+                f"entry point: {inspection.manifest.entry_point}",
+                f"content sha256: {inspection.content_sha256}",
+            ],
+            requested_permissions=list(inspection.requested_capabilities),
+        )
+        self.skills[response.id] = response
+        return response
+
     async def approve_skill(self, skill_id: str) -> SkillResponse:
         current = self.skills[skill_id]
         updated = current.model_copy(update={"status": "enabled"})
@@ -765,6 +786,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         model_transport: ModelTransport | None = None,
         run_repository: RunRepository | None = None,
         session_factory: async_sessionmaker[AsyncSession] | None = None,
+        skill_store_dir: Path | None = None,
     ) -> None:
         super().__init__()
         self._config_service = config_service
@@ -774,6 +796,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         self._model_transport = model_transport or LiteLLMClient()
         self._run_repository = run_repository
         self._session_factory = session_factory
+        self._skill_store_dir = skill_store_dir or Path("/var/lib/agent-hub/skills")
 
     async def list_runs(self) -> tuple[RunListItem, ...]:
         if self._run_repository is None:
@@ -1084,12 +1107,43 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         await self._record_audit("skill.upload", f"skill:{skill_id}", {"filename": request.filename})
         return response
 
+    async def upload_skill_archive(self, filename: str, archive_bytes: bytes) -> SkillResponse:
+        try:
+            scan_report = SkillScanner().scan(archive_bytes)
+        except InvalidSkillPackage:
+            raise PublicAPIError(422, "invalid_skill_package", "skill package is invalid") from None
+        skill_id = f"skill_{uuid4().hex}"
+        try:
+            archive_path = self._skill_archive_path(skill_id)
+            archive_path.parent.mkdir(parents=True, exist_ok=True)
+            archive_path.write_bytes(archive_bytes)
+        except OSError:
+            raise PublicAPIError(503, "skill_store_unavailable", "skill store is unavailable") from None
+        inspection = scan_report.inspection
+        response = SkillResponse(
+            id=skill_id,
+            name=inspection.manifest.name,
+            status="scanned",
+            scan_diff=[
+                f"package {filename} scanned",
+                f"entry point: {inspection.manifest.entry_point}",
+                f"content sha256: {inspection.content_sha256}",
+            ],
+            requested_permissions=list(inspection.requested_capabilities),
+        )
+        if not await self._upsert_admin_payload("skill", skill_id, response.model_dump(mode="json")):
+            return await super().upload_skill_archive(filename, archive_bytes)
+        await self._record_audit("skill.upload", f"skill:{skill_id}", {"filename": filename})
+        return response
+
     async def approve_skill(self, skill_id: str) -> SkillResponse:
         payload = await self._get_admin_payload("skill", skill_id)
         if payload is None:
             return await super().approve_skill(skill_id)
         if not payload:
             raise KeyError(skill_id)
+        if not self._skill_archive_path(skill_id).is_file():
+            raise PublicAPIError(409, "skill_archive_missing", "approved skill archive is missing")
         current = SkillResponse.model_validate(payload)
         response = SkillResponse(
             **{
@@ -1101,6 +1155,15 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         await self._upsert_admin_payload("skill", skill_id, response.model_dump(mode="json"))
         await self._record_audit("skill.approve", f"skill:{skill_id}", {"id": skill_id})
         return response
+
+    def _skill_archive_path(self, skill_id: str) -> Path:
+        if not _is_safe_admin_identifier(skill_id):
+            raise PublicAPIError(422, "request_validation", "invalid skill id")
+        root = self._skill_store_dir.resolve()
+        target = (root / str(self._tenant_id) / f"{skill_id}.zip").resolve()
+        if not target.is_relative_to(root):
+            raise PublicAPIError(422, "request_validation", "invalid skill id")
+        return target
 
     async def list_mcp_servers(self) -> tuple[McpServerResponse, ...]:
         resources = await self._list_admin_payloads("mcp")
@@ -1408,6 +1471,31 @@ def _contains_sensitive_marker(value: str) -> bool:
     )
 
 
+def _is_safe_admin_identifier(value: str) -> bool:
+    return (
+        1 <= len(value) <= 128
+        and value[0].isalnum()
+        and all(character.isalnum() or character in "_-" for character in value)
+    )
+
+
+def _safe_skill_upload_filename(value: str | None) -> str:
+    if value is None:
+        raise PublicAPIError(422, "request_validation", "skill filename is required")
+    filename = value.strip()
+    if (
+        not filename
+        or len(filename) > 255
+        or "/" in filename
+        or "\\" in filename
+        or filename in {".", ".."}
+        or not filename.lower().endswith(".zip")
+        or any(ord(character) < 32 or ord(character) == 127 for character in filename)
+    ):
+        raise PublicAPIError(422, "request_validation", "skill filename must be a safe .zip name")
+    return filename
+
+
 def _safe_model_check_reason(error: Exception) -> str:
     message = str(error).strip()
     if not message or _contains_sensitive_marker(message):
@@ -1707,6 +1795,23 @@ async def upload_skill(
 ) -> SkillResponse:
     _require(principal, "skill:write")
     return await service.upload_skill(body)
+
+
+@router.post("/skills/upload", response_model=SkillResponse, responses=error_responses(401, 403, 413, 422, 503))
+async def upload_skill_archive(
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> SkillResponse:
+    _require(principal, "skill:write")
+    filename = _safe_skill_upload_filename(request.headers.get("x-agent-hub-skill-filename"))
+    archive_bytes = await request.body()
+    if not archive_bytes:
+        raise PublicAPIError(422, "request_validation", "skill archive is empty")
+    try:
+        return await service.upload_skill_archive(filename, archive_bytes)
+    except InvalidSkillPackage:
+        raise PublicAPIError(422, "invalid_skill_package", "skill package is invalid") from None
 
 
 @router.post("/skills/{skill_id}/approve", response_model=SkillResponse, responses=error_responses(401, 403, 404, 422))
