@@ -350,6 +350,94 @@ async def test_retries_with_legacy_max_tokens_for_openai_compatible_relays() -> 
     close.assert_awaited_once_with()
 
 
+async def test_retries_root_relay_base_with_v1_suffix_when_route_is_missing() -> None:
+    not_found = RuntimeError("not found")
+    not_found.status_code = 404  # type: ignore[attr-defined]
+    first_create = AsyncMock(side_effect=not_found)
+    second_create = AsyncMock(return_value=sdk_response())
+    first_close = AsyncMock()
+    second_close = AsyncMock()
+    clients = [
+        SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=first_create)),
+            close=first_close,
+        ),
+        SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=second_create)),
+            close=second_close,
+        ),
+    ]
+    factory = MagicMock(side_effect=clients)
+    transport = LiteLLMClient(client_factory=factory)
+
+    result = await transport.complete(
+        deployment(api_base="https://inferaiapi.com"),
+        request(max_output_tokens=321),
+        API_KEY,
+    )
+
+    assert result.text == "hello"
+    assert [call.kwargs["base_url"] for call in factory.call_args_list] == [
+        "https://inferaiapi.com",
+        "https://inferaiapi.com/v1",
+    ]
+    first_create.assert_awaited_once()
+    second_create.assert_awaited_once()
+    first_close.assert_awaited_once_with()
+    second_close.assert_awaited_once_with()
+
+
+async def test_uses_anthropic_messages_surface_when_base_points_to_messages() -> None:
+    post = AsyncMock(
+        return_value=SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "id": "msg_safe123",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": "你好，我是 Claude。"}],
+                "usage": {"input_tokens": 8, "output_tokens": 9},
+            },
+        )
+    )
+    close = AsyncMock()
+    http_client = SimpleNamespace(post=post, aclose=close)
+    openai_factory = MagicMock()
+    http_factory = MagicMock(return_value=http_client)
+    transport = LiteLLMClient(
+        client_factory=openai_factory,
+        http_client_factory=http_factory,
+    )
+
+    result = await transport.complete(
+        deployment(
+            api_base="https://toapis.com/v1/messages",
+            provider_model="openai-compatible/claude-sonnet-4-6",
+            request_model="claude-sonnet-4-6",
+        ),
+        request(max_output_tokens=1024),
+        API_KEY,
+    )
+
+    openai_factory.assert_not_called()
+    http_factory.assert_called_once_with(timeout=12)
+    post.assert_awaited_once_with(
+        "https://toapis.com/v1/messages",
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": PROMPT}],
+        },
+    )
+    close.assert_awaited_once_with()
+    assert result.text == "你好，我是 Claude。"
+    assert result.usage is not None
+    assert result.usage.total_tokens == 17
+
+
 async def test_drops_provider_metadata_containing_runtime_secrets_or_prompt_content() -> None:
     poisoned = sdk_response()
     poisoned._request_id = "req-" + API_KEY  # type: ignore[attr-defined]

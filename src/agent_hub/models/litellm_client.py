@@ -4,7 +4,9 @@ import logging
 import re
 from collections.abc import Mapping, Sequence
 from typing import Protocol, cast
+from urllib.parse import urlsplit, urlunsplit
 
+import httpx
 from openai import AsyncOpenAI
 
 from agent_hub.models.types import (
@@ -50,10 +52,32 @@ class _OpenAIClient(Protocol):
     async def close(self) -> None: ...
 
 
+class _HTTPResponse(Protocol):
+    status_code: int
+
+    def json(self) -> object: ...
+
+
+class _HTTPClient(Protocol):
+    async def post(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        json: Mapping[str, object],
+    ) -> _HTTPResponse: ...
+
+    async def aclose(self) -> None: ...
+
+
 class OpenAIClientFactory(Protocol):
     def __call__(
         self, *, api_key: str, base_url: str, max_retries: int
     ) -> _OpenAIClient: ...
+
+
+class HTTPClientFactory(Protocol):
+    def __call__(self, *, timeout: float) -> _HTTPClient: ...
 
 
 class ModelTransportError(RuntimeError):
@@ -321,11 +345,36 @@ async def _close_ignoring_failures(client: _OpenAIClient | None) -> bool:
     return False
 
 
+async def _aclose_ignoring_failures(client: _HTTPClient | None) -> bool:
+    if client is None:
+        return False
+    try:
+        await client.aclose()
+    except asyncio.CancelledError:
+        task = asyncio.current_task()
+        return task is not None and task.cancelling() > 0
+    except Exception as error:  # noqa: BLE001 - cleanup must not replace the primary safe error
+        _LOGGER.warning(
+            "http_client_close_failed error_type=%s",
+            type(error).__name__,
+        )
+        return False
+    return False
+
+
 class LiteLLMClient:
     """OpenAI-compatible Chat Completions transport for LiteLLM Proxy."""
 
-    def __init__(self, client_factory: OpenAIClientFactory | None = None) -> None:
+    def __init__(
+        self,
+        client_factory: OpenAIClientFactory | None = None,
+        http_client_factory: HTTPClientFactory | None = None,
+    ) -> None:
         self._client_factory = client_factory or cast(OpenAIClientFactory, AsyncOpenAI)
+        self._http_client_factory = http_client_factory or cast(
+            HTTPClientFactory,
+            httpx.AsyncClient,
+        )
 
     async def complete(
         self,
@@ -353,6 +402,8 @@ class LiteLLMClient:
             ModelCapability.STRUCTURED_OUTPUT not in deployment.capabilities
         ):
             return ValueError("deployment lacks structured_output capability")
+        if _is_messages_endpoint(deployment.api_base):
+            return await self._messages_outcome(deployment, request, api_key)
 
         sensitive_values = _sensitive_values(request, api_key)
         client: _OpenAIClient | None = None
@@ -411,6 +462,32 @@ class LiteLLMClient:
                         retry_error,
                         sensitive_values,
                     )
+            elif (
+                client is not None
+                and create_kwargs is not None
+                and _should_retry_root_base_with_v1(error, deployment.api_base)
+            ):
+                if await _close_ignoring_failures(client):
+                    return _CANCELLED
+                client = self._client_factory(
+                    api_key=api_key,
+                    base_url=cast(str, _api_base_with_v1(deployment.api_base)),
+                    max_retries=0,
+                )
+                try:
+                    response = await client.chat.completions.create(**create_kwargs)
+                    parsed = _parse_response(response, deployment.id, sensitive_values)
+                except asyncio.CancelledError:
+                    await _close_ignoring_failures(client)
+                    return _CANCELLED
+                except ModelResponseError as retry_error:
+                    safe_failure = ModelResponseError(str(retry_error))
+                except Exception as retry_error:  # noqa: BLE001 - redact retry failure
+                    safe_failure = _transport_error(
+                        deployment.id,
+                        retry_error,
+                        sensitive_values,
+                    )
             else:
                 safe_failure = _transport_error(deployment.id, error, sensitive_values)
 
@@ -431,8 +508,136 @@ class LiteLLMClient:
             return _transport_error(deployment.id, error, sensitive_values)
         return parsed
 
+    async def _messages_outcome(
+        self,
+        deployment: Deployment,
+        request: ModelRequest,
+        api_key: str,
+    ) -> ModelResponse | Exception | _CancelledOutcome:
+        sensitive_values = _sensitive_values(request, api_key)
+        client = self._http_client_factory(timeout=request.timeout_seconds)
+        try:
+            response = await client.post(
+                deployment.api_base,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=_messages_endpoint_payload(deployment, request),
+            )
+            if response.status_code >= 400:
+                return ModelTransportError(
+                    f"messages endpoint failed for deployment {deployment.id!r}",
+                    status_code=response.status_code,
+                )
+            return _parse_messages_endpoint_response(
+                response.json(),
+                deployment.id,
+                sensitive_values,
+            )
+        except asyncio.CancelledError:
+            return _CANCELLED
+        except ModelResponseError as error:
+            return ModelResponseError(str(error))
+        except Exception as error:  # noqa: BLE001 - redact direct HTTP/provider failures
+            return _transport_error(deployment.id, error, sensitive_values)
+        finally:
+            await _aclose_ignoring_failures(client)
+
 
 _CANCELLED = _CancelledOutcome()
+
+
+def _is_messages_endpoint(api_base: str) -> bool:
+    return urlsplit(api_base).path.rstrip("/").endswith("/messages")
+
+
+def _messages_endpoint_payload(
+    deployment: Deployment,
+    request: ModelRequest,
+) -> Mapping[str, object]:
+    messages: list[dict[str, object]] = []
+    system_messages: list[str] = []
+    for message in request.messages:
+        content = message.content
+        if message.role == "system" and isinstance(content, str):
+            system_messages.append(content)
+            continue
+        role = "assistant" if message.role == "assistant" else "user"
+        messages.append({"role": role, "content": _messages_endpoint_content(content)})
+    payload: dict[str, object] = {
+        "model": deployment.request_model or deployment.provider_model,
+        "max_tokens": request.max_output_tokens,
+        "messages": messages,
+    }
+    if system_messages:
+        payload["system"] = "\n\n".join(system_messages)
+    return payload
+
+
+def _messages_endpoint_content(content: object) -> object:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, Sequence) and not isinstance(content, str | bytes):
+        parts: list[dict[str, object]] = []
+        for part in content:
+            if not isinstance(part, Mapping):
+                continue
+            if part.get("type") == "text" and isinstance(part.get("text"), str):
+                parts.append({"type": "text", "text": part["text"]})
+        if parts:
+            return parts
+    return ""
+
+
+def _parse_messages_endpoint_response(
+    payload: object,
+    deployment_id: str,
+    sensitive_values: Sequence[str],
+) -> ModelResponse:
+    if not isinstance(payload, Mapping):
+        raise ModelResponseError(f"malformed messages response for deployment {deployment_id!r}")
+    content = payload.get("content")
+    text = _messages_endpoint_text(content)
+    if text is None:
+        raise ModelResponseError(f"malformed messages response for deployment {deployment_id!r}")
+    usage = _messages_endpoint_usage(payload.get("usage"))
+    metadata: dict[str, JsonScalar] = {}
+    request_id = _safe_provider_string(payload.get("id"), sensitive_values)
+    if request_id is not None:
+        metadata["request_id"] = request_id
+    model = _safe_provider_string(payload.get("model"), sensitive_values)
+    if model is not None:
+        metadata["model"] = model
+    return ModelResponse(text=text, usage=usage, provider_metadata=metadata)
+
+
+def _messages_endpoint_text(content: object) -> str | None:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, Sequence) or isinstance(content, str | bytes):
+        return None
+    texts: list[str] = []
+    for block in content:
+        if not isinstance(block, Mapping):
+            continue
+        if block.get("type") == "text" and isinstance(block.get("text"), str):
+            texts.append(cast(str, block["text"]))
+    return "\n".join(texts) if texts else None
+
+
+def _messages_endpoint_usage(usage: object) -> TokenUsage | None:
+    if not isinstance(usage, Mapping):
+        return None
+    input_tokens = usage.get("input_tokens")
+    output_tokens = usage.get("output_tokens")
+    if type(input_tokens) is not int or type(output_tokens) is not int:
+        return None
+    return TokenUsage(
+        prompt_tokens=input_tokens,
+        completion_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+    )
 
 
 def _should_retry_with_legacy_max_tokens(error: Exception) -> bool:
@@ -440,3 +645,21 @@ def _should_retry_with_legacy_max_tokens(error: Exception) -> bool:
     return any(marker in message for marker in _LEGACY_MAX_TOKENS_MARKERS) and any(
         marker in message for marker in _UNSUPPORTED_PARAMETER_MARKERS
     )
+
+
+def _should_retry_root_base_with_v1(error: Exception, api_base: str) -> bool:
+    return _safe_status_code(error) in {404, 405} and _api_base_with_v1(api_base) is not None
+
+
+def _safe_status_code(error: Exception) -> int | None:
+    status_code = getattr(error, "status_code", None)
+    if isinstance(status_code, int) and not isinstance(status_code, bool):
+        return status_code
+    return None
+
+
+def _api_base_with_v1(api_base: str) -> str | None:
+    parsed = urlsplit(api_base)
+    if parsed.path not in {"", "/"}:
+        return None
+    return urlunsplit((parsed.scheme, parsed.netloc, "/v1", "", ""))

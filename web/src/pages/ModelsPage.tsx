@@ -399,7 +399,7 @@ export function ModelsPage() {
           required
         />
         <p className="field-hint">
-          中转站通常填写到 /v1 即可；如果粘贴 /v1/chat/completions，保存时会自动修正为 /v1。
+          中转站可以填写根域名、/v1 或 /v1/messages；如果粘贴 /v1/chat/completions，保存时会自动修正为 /v1。
         </p>
 
         <label htmlFor="api-key">API Key</label>
