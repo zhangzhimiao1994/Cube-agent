@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from agent_hub.db.models import RunEventRow
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import RunRepository
-from agent_hub.runs.service import RunService
+from agent_hub.runs.service import HermesRunAdvice, HermesRunOutcome, RunService
 from agent_hub.runs.tasks import CeleryRunQueue
 from agent_hub.runtime.contracts import (
     Artifact,
@@ -178,6 +178,40 @@ class RecordingQueue:
             self.idempotency_keys.append(idempotency_key)
 
 
+@dataclass(slots=True)
+class RecordingHermesAdvisor:
+    advice: HermesRunAdvice | None = None
+    advise_calls: list[dict[str, object]] | None = None
+    outcomes: list[HermesRunOutcome] | None = None
+
+    async def advise(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        message: str,
+        mode: TaskMode,
+        agent_ids: tuple[str, ...],
+        workflow_id: str | None,
+    ) -> HermesRunAdvice | None:
+        if self.advise_calls is not None:
+            self.advise_calls.append(
+                {
+                    "tenant_id": tenant_id,
+                    "actor_id": actor_id,
+                    "message": message,
+                    "mode": mode,
+                    "agent_ids": agent_ids,
+                    "workflow_id": workflow_id,
+                }
+            )
+        return self.advice
+
+    async def record_outcome(self, outcome: HermesRunOutcome) -> None:
+        if self.outcomes is not None:
+            self.outcomes.append(outcome)
+
+
 class Router(Protocol):
     async def route(
         self, task_text: object, *, confirmation_subject: object | None = None
@@ -239,6 +273,97 @@ async def test_worker_resumes_from_latest_safe_checkpoint_without_duplicate_arti
     assert sum(event["kind"] == "artifact.created" for event in events) == 1
     assert runtime.calls == 2
     assert len(runtime.restored) == 1
+
+
+async def test_hermes_high_confidence_auto_advice_queues_recommended_mode(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    user_id = uuid4()
+    queue = RecordingQueue([])
+    advisor = RecordingHermesAdvisor(
+        advice=HermesRunAdvice(
+            recommended_mode=TaskMode.DISPATCH,
+            confidence=0.86,
+            reasons=("matched previous short-video workflow",),
+            recommended_skills=("script-review",),
+            requires_approval=False,
+        ),
+        advise_calls=[],
+    )
+    service = RunService(
+        RunRepository(run_session_factory),
+        runtime_registry=RuntimeRegistry((FakeRuntime(),)),
+        router=None,
+        task_queue=queue,
+        hermes_advisor=advisor,
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        message="short video script",
+        mode=TaskMode.AUTO,
+        agent_ids=("director",),
+        workflow_id="short-video-dispatch",
+    )
+    record = await RunRepository(run_session_factory).get(tenant_id, submitted.id)
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DISPATCH
+    assert queue.enqueued == []
+    assert advisor.advise_calls == [
+        {
+            "tenant_id": tenant_id,
+            "actor_id": user_id,
+            "message": "short video script",
+            "mode": TaskMode.AUTO,
+            "agent_ids": ("director",),
+            "workflow_id": "short-video-dispatch",
+        }
+    ]
+    assert record.routing_decision is not None
+    assert record.routing_decision["reason"] == "hermes_recommendation"
+    assert record.routing_decision["hermes"]["confidence"] == 0.86
+
+
+async def test_completed_run_records_bounded_hermes_outcome(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    user_id = uuid4()
+    outcomes: list[HermesRunOutcome] = []
+    advisor = RecordingHermesAdvisor(outcomes=outcomes)
+    service = RunService(
+        RunRepository(run_session_factory),
+        runtime_registry=RuntimeRegistry((FakeRuntime(),)),
+        router=None,
+        task_queue=RecordingQueue([]),
+        hermes_advisor=advisor,
+    )
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        message="secret-free request must not be copied into Hermes",
+        mode=TaskMode.DISPATCH,
+        agent_ids=("director", "copywriter"),
+        workflow_id="short-video-dispatch",
+    )
+
+    completed = await service.execute(submitted.id)
+
+    assert completed.status is RunStatus.COMPLETED
+    assert outcomes == [
+        HermesRunOutcome(
+            tenant_id=tenant_id,
+            actor_id=user_id,
+            run_id=submitted.id,
+            status=RunStatus.COMPLETED,
+            mode=TaskMode.DISPATCH,
+            workflow_id="short-video-dispatch",
+            agent_ids=("director", "copywriter"),
+        )
+    ]
 
 
 async def test_recovery_fails_safe_when_side_effect_event_has_no_checkpoint(

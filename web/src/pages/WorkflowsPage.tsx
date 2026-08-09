@@ -5,6 +5,21 @@ import { api, formatApiError, type WorkflowResource } from "../api/client";
 
 const WORKFLOW_PRESETS: Array<WorkflowResource & { description: string; suggested_roles: string[] }> = [
   {
+    id: "custom-workflow",
+    name: "自定义工作流",
+    enabled: true,
+    mode: "auto",
+    task_type: "",
+    suggested_roles: [],
+    agent_ids: [],
+    objective: "",
+    steps: [],
+    deliverables: [],
+    role_selection_policy: "根据任务目标选择真正需要的角色，不按模板固定派单对象。",
+    decision_policy: "如果角色意见冲突，主 Agent 根据用户目标、证据质量、风险和可交付性做最终裁决；无法判断时询问用户。",
+    description: "从空白配置开始，适合你自己定义新的任务类型、参与角色、步骤、交付物和裁决规则。",
+  },
+  {
     id: "short-video-dispatch",
     name: "短视频生产派单",
     enabled: true,
@@ -192,7 +207,9 @@ export function WorkflowsPage() {
               ))}
             </select>
           </label>
-          <p className="field-help">{preset.description}</p>
+          <p className="field-help">
+            {preset.description} 模板只负责快速填充，下面所有字段都可以改；如果要完全自定义，选择“自定义工作流”。
+          </p>
 
           <div className="form-grid">
             <label htmlFor="workflow-id">

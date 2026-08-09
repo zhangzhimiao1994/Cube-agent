@@ -205,6 +205,13 @@ class RunDetailResponse(RunListItem):
     explicit_details: dict[str, str]
 
 
+class ConversationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    conversation_id: str
+    runs: list[RunDetailResponse]
+
+
 class SkillUploadRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -494,6 +501,8 @@ class AdminResourceService(Protocol):
 
     async def get_run(self, run_id: UUID) -> RunDetailResponse: ...
 
+    async def get_conversation(self, conversation_id: str) -> ConversationResponse: ...
+
     async def pause_run(self, run_id: UUID) -> RunDetailResponse: ...
 
     async def resume_run(self, run_id: UUID) -> RunDetailResponse: ...
@@ -588,6 +597,7 @@ class InMemoryAdminResourceService:
                 explicit_details={
                     "routing": "dispatch mode selected explicitly",
                     "saturation": "queue first, fallback after timeout",
+                    "conversation_id": "conv-readiness",
                 },
             )
         if not self.mcp_servers:
@@ -738,6 +748,16 @@ class InMemoryAdminResourceService:
 
     async def get_run(self, run_id: UUID) -> RunDetailResponse:
         return self.runs[run_id]
+
+    async def get_conversation(self, conversation_id: str) -> ConversationResponse:
+        return ConversationResponse(
+            conversation_id=conversation_id,
+            runs=[
+                run
+                for run in self.runs.values()
+                if run.explicit_details.get("conversation_id") == conversation_id
+            ],
+        )
 
     async def pause_run(self, run_id: UUID) -> RunDetailResponse:
         return self._set_run_status(run_id, "paused")
@@ -1012,6 +1032,17 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         except RunNotFound:
             raise KeyError(run_id) from None
         return await self._run_detail(record)
+
+    async def get_conversation(self, conversation_id: str) -> ConversationResponse:
+        if self._run_repository is None:
+            return await super().get_conversation(conversation_id)
+        records = await self._run_repository.list_recent(self._tenant_id, limit=200)
+        runs: list[RunDetailResponse] = []
+        for record in records:
+            details = _routing_details(record.routing_decision)
+            if details.get("conversation_id") == conversation_id:
+                runs.append(await self._run_detail(record))
+        return ConversationResponse(conversation_id=conversation_id, runs=runs)
 
     async def pause_run(self, run_id: UUID) -> RunDetailResponse:
         if self._run_repository is None:
@@ -2172,6 +2203,12 @@ def _routing_details(routing_decision: dict[str, object] | None) -> dict[str, st
     workflow_id = routing_decision.get("workflow_id")
     if isinstance(workflow_id, str) and workflow_id:
         details["workflow_id"] = workflow_id
+    conversation_id = routing_decision.get("conversation_id")
+    if isinstance(conversation_id, str) and conversation_id:
+        details["conversation_id"] = conversation_id
+    reference_conversation_id = routing_decision.get("reference_conversation_id")
+    if isinstance(reference_conversation_id, str) and reference_conversation_id:
+        details["reference_conversation_id"] = reference_conversation_id
     selected_agent_ids = routing_decision.get("selected_agent_ids")
     if isinstance(selected_agent_ids, list):
         safe_ids = [item for item in selected_agent_ids if isinstance(item, str) and item]
@@ -2180,6 +2217,19 @@ def _routing_details(routing_decision: dict[str, object] | None) -> dict[str, st
     reason = routing_decision.get("reason")
     if isinstance(reason, str) and reason:
         details["routing_reason"] = reason
+    hermes = routing_decision.get("hermes")
+    if isinstance(hermes, dict):
+        confidence = hermes.get("confidence")
+        mode = hermes.get("recommended_mode")
+        reasons = hermes.get("reasons")
+        if isinstance(mode, str) and mode:
+            details["hermes_recommended_mode"] = mode
+        if isinstance(confidence, (int, float)):
+            details["hermes_confidence"] = f"{confidence:.2f}"
+        if isinstance(reasons, list):
+            safe_reasons = [str(item)[:160] for item in reasons[:3]]
+            if safe_reasons:
+                details["hermes_reasons"] = " | ".join(safe_reasons)
     return details
 
 
@@ -2304,7 +2354,7 @@ async def upsert_agent(
 async def list_workflows(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
-) -> list[NamedResourceResponse]:
+) -> list[WorkflowResourceResponse]:
     _require(principal, "agent:read")
     return list(await service.list_workflows())
 
@@ -2345,6 +2395,20 @@ async def list_operational_runs(
 ) -> list[RunListItem]:
     _require(principal, "run:read")
     return list(await service.list_runs())
+
+
+@router.get(
+    "/conversations/{conversation_id}",
+    response_model=ConversationResponse,
+    responses=error_responses(401, 403, 422),
+)
+async def get_conversation(
+    conversation_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> ConversationResponse:
+    _require(principal, "run:read")
+    return await service.get_conversation(conversation_id)
 
 
 @router.get("/runs/{run_id}", response_model=RunDetailResponse, responses=error_responses(401, 403, 404, 422))

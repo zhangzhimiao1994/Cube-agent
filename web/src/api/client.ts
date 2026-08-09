@@ -220,6 +220,8 @@ const SubmittedRunSchema = z.object({
   decision_token: z.string().nullable(),
   version: z.number(),
   clarification_reason: z.string().nullable(),
+  conversation_id: z.string().nullable().optional(),
+  reference_conversation_id: z.string().nullable().optional(),
 });
 
 export type SubmittedRun = z.infer<typeof SubmittedRunSchema>;
@@ -245,6 +247,13 @@ const RunDetailSchema = RunListItemSchema.extend({
 });
 
 export type RunDetail = z.infer<typeof RunDetailSchema>;
+
+const ConversationSchema = z.object({
+  conversation_id: z.string(),
+  runs: z.array(RunDetailSchema),
+});
+
+export type Conversation = z.infer<typeof ConversationSchema>;
 
 const SkillSchema = z.object({
   id: z.string(),
@@ -609,6 +618,8 @@ export const api = {
     mode: "auto" | "direct" | "dispatch" | "discuss" | "hybrid";
     agent_ids?: string[];
     workflow_id?: string | null;
+    conversation_id?: string | null;
+    reference_conversation_id?: string | null;
   }): Promise<SubmittedRun> {
     return request(
       "/api/v1/runs",
@@ -621,6 +632,13 @@ export const api = {
   },
   run(id: string): Promise<RunDetail> {
     return request(`/api/v1/admin/runs/${id}`, { method: "GET" }, RunDetailSchema);
+  },
+  conversation(conversationId: string): Promise<Conversation> {
+    return request(
+      `/api/v1/admin/conversations/${encodeURIComponent(conversationId)}`,
+      { method: "GET" },
+      ConversationSchema,
+    );
   },
   pauseRun(id: string): Promise<RunDetail> {
     return request(`/api/v1/admin/runs/${id}/pause`, { method: "POST" }, RunDetailSchema);

@@ -10,6 +10,7 @@ from redis.asyncio import Redis
 
 from agent_hub.config.service import ConfigService
 from agent_hub.db.session import Database, build_database
+from agent_hub.hermes import PersistentHermesRunAdvisor
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import RunService
 from agent_hub.runtime.defaults import configured_runtime_registry
@@ -113,6 +114,7 @@ def build_worker_service(
         ),
         router=None,
         task_queue=queue,
+        hermes_advisor=PersistentHermesRunAdvisor(database.session_factory),
     )
     return database, redis_client, service, queue
 

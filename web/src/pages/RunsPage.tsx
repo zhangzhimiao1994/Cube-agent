@@ -16,6 +16,13 @@ type RunMode = (typeof RUN_MODES)[number]["value"];
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
+function newConversationId() {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return `conv-${crypto.randomUUID()}`;
+  }
+  return `conv-${Date.now().toString(36)}`;
+}
+
 function displayMode(mode: string | null | undefined) {
   return RUN_MODES.find((item) => item.value === mode)?.label ?? mode ?? "等待选择";
 }
@@ -79,8 +86,11 @@ export function RunsPage() {
   const [mode, setMode] = useState<RunMode>("auto");
   const [workflowId, setWorkflowId] = useState("");
   const [agentIds, setAgentIds] = useState<string[]>([]);
+  const [conversationId, setConversationId] = useState(newConversationId);
+  const [referenceConversationId, setReferenceConversationId] = useState("");
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [submitNotice, setSubmitNotice] = useState<string | null>(null);
+  const trimmedReferenceConversationId = referenceConversationId.trim();
 
   const selectedWorkflow = useMemo(
     () => (workflows.data ?? []).find((workflow) => workflow.id === workflowId),
@@ -95,6 +105,12 @@ export function RunsPage() {
       const data = query.state.data;
       return data && !TERMINAL_STATUSES.has(data.status) ? 2000 : false;
     },
+  });
+
+  const referenceConversation = useQuery({
+    queryKey: ["conversation", trimmedReferenceConversationId],
+    queryFn: () => api.conversation(trimmedReferenceConversationId),
+    enabled: false,
   });
 
   useEffect(() => {
@@ -117,9 +133,12 @@ export function RunsPage() {
         mode,
         workflow_id: workflowId || null,
         agent_ids: agentIds,
+        conversation_id: conversationId,
+        reference_conversation_id: referenceConversationId.trim() || null,
       }),
     onSuccess: async (run) => {
       setSelectedRunId(run.id);
+      if (run.conversation_id) setConversationId(run.conversation_id);
       setSubmitNotice(explainActualMode(run));
       setMessage("");
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
@@ -133,17 +152,21 @@ export function RunsPage() {
     createRun.mutate();
   }
 
-  if (runs.isLoading || agents.isLoading || workflows.isLoading || settings.isLoading) {
+  function loadReferenceConversation() {
+    if (!trimmedReferenceConversationId) return;
+    void referenceConversation.refetch();
+  }
+
+  if (runs.isLoading) {
     return <p>正在加载对话任务...</p>;
   }
   if (runs.isError) return <p role="alert">{formatApiError(runs.error, "任务列表加载失败")}</p>;
-  if (agents.isError) return <p role="alert">{formatApiError(agents.error, "Agent 列表加载失败")}</p>;
-  if (workflows.isError) return <p role="alert">{formatApiError(workflows.error, "工作流列表加载失败")}</p>;
-  if (settings.isError) return <p role="alert">{formatApiError(settings.error, "系统设置加载失败")}</p>;
 
   const items = runs.data ?? [];
   const selectedMode = RUN_MODES.find((item) => item.value === mode) ?? RUN_MODES[0];
   const messages = detailMessages(selectedRun.data);
+  const savedAgents = agents.data ?? [];
+  const savedWorkflows = workflows.data ?? [];
 
   return (
     <section>
@@ -153,8 +176,14 @@ export function RunsPage() {
         工作流配置和工作流使用是分开的：这里负责选择本次对话怎么运行，配置请到“工作流配置”页面维护。
       </p>
 
+      <div className="mobile-chat-hierarchy" aria-label="移动端对话层级">
+        <span>1 · 会话</span>
+        <span>2 · 对话</span>
+        <span>3 · 设置 / 详情</span>
+      </div>
+
       <div className="chat-console">
-        <aside className="conversation-list" aria-label="任务会话列表">
+        <nav className="conversation-list" aria-label="手机版会话导航">
           <div className="conversation-list-header">
             <h3>会话</h3>
             <span>{items.length}</span>
@@ -175,10 +204,12 @@ export function RunsPage() {
               </button>
             ))
           )}
-        </aside>
+        </nav>
 
         <div className="chat-panel">
-          <div className="chat-config-strip" aria-label="本次对话运行设置">
+          <details className="run-settings-panel" aria-label="本次运行设置" open>
+            <summary aria-label="展开或收起本次运行设置">本次运行设置</summary>
+            <div className="chat-config-strip" aria-label="本次对话运行设置">
             <label htmlFor="run-mode">
               模式
               <select id="run-mode" value={mode} onChange={(event) => setMode(event.target.value as RunMode)}>
@@ -193,7 +224,7 @@ export function RunsPage() {
               使用工作流
               <select id="run-workflow" value={workflowId} onChange={(event) => setWorkflowId(event.target.value)}>
                 <option value="">不使用固定工作流</option>
-                {(workflows.data ?? [])
+                {savedWorkflows
                   .filter((workflow) => workflow.enabled)
                   .map((workflow) => (
                     <option key={workflow.id} value={workflow.id}>
@@ -202,9 +233,41 @@ export function RunsPage() {
                   ))}
               </select>
             </label>
+            <label htmlFor="conversation-id">
+              本次会话 ID
+              <input
+                id="conversation-id"
+                value={conversationId}
+                onChange={(event) => setConversationId(event.target.value)}
+              />
+            </label>
+            <label htmlFor="reference-conversation-id">
+              参考会话 ID
+              <input
+                id="reference-conversation-id"
+                value={referenceConversationId}
+                onChange={(event) => setReferenceConversationId(event.target.value)}
+                placeholder="可选：粘贴其他会话 ID"
+              />
+            </label>
+            <button
+              className="secondary-action inline-action"
+              type="button"
+              disabled={!trimmedReferenceConversationId || referenceConversation.isFetching}
+              onClick={loadReferenceConversation}
+            >
+              {referenceConversation.isFetching ? "读取中..." : "读取参考会话"}
+            </button>
             <div className="mode-help">
               <span className="eyebrow">{selectedMode.label}</span>
               <p>{selectedMode.description}</p>
+              {settings.isLoading ? <p>正在加载默认运行设置...</p> : null}
+              {settings.isError ? (
+                <p role="alert">{formatApiError(settings.error, "系统设置加载失败")}</p>
+              ) : null}
+              {workflows.isError ? (
+                <p role="alert">{formatApiError(workflows.error, "工作流列表加载失败")}</p>
+              ) : null}
               {selectedWorkflow ? (
                 <p>
                   当前工作流：{selectedWorkflow.name}
@@ -214,7 +277,22 @@ export function RunsPage() {
                 <p>未选择工作流时，主 Agent 会按任务内容和你勾选的角色进行调度。</p>
               )}
             </div>
-          </div>
+            {referenceConversation.data ? (
+              <div className="reference-preview">
+                <span className="eyebrow">{referenceConversation.data.conversation_id}</span>
+                <strong>已读取 {referenceConversation.data.runs.length} 条运行</strong>
+                {referenceConversation.data.runs.slice(0, 3).map((run) => (
+                  <p key={run.id}>{run.request}</p>
+                ))}
+              </div>
+            ) : null}
+            {referenceConversation.isError ? (
+              <p className="form-error" role="alert">
+                {formatApiError(referenceConversation.error, "参考会话读取失败")}
+              </p>
+            ) : null}
+            </div>
+          </details>
 
           <details className="inline-guide">
             <summary>选择本次参与角色</summary>
@@ -223,10 +301,16 @@ export function RunsPage() {
             </p>
             <fieldset>
               <legend>角色</legend>
-              {(agents.data ?? []).length === 0 ? (
+              {agents.isLoading ? (
+                <p className="field-help">正在加载 Agent 角色...</p>
+              ) : agents.isError ? (
+                <p className="field-help" role="alert">
+                  {formatApiError(agents.error, "Agent 列表加载失败")}
+                </p>
+              ) : savedAgents.length === 0 ? (
                 <p className="field-help">还没有 Agent。请先到 Agent 页面创建角色。</p>
               ) : (
-                (agents.data ?? []).map((agent) => (
+                savedAgents.map((agent) => (
                   <label key={agent.id} className="inline-check">
                     <input
                       type="checkbox"
@@ -240,7 +324,7 @@ export function RunsPage() {
             </fieldset>
           </details>
 
-          <div className="chat-stream" aria-live="polite">
+          <div className="chat-stream" role="region" aria-label="主对话内容" aria-live="polite">
             {selectedRun.isLoading ? <p>正在加载会话...</p> : null}
             {selectedRun.isError ? <p role="alert">{formatApiError(selectedRun.error, "会话加载失败")}</p> : null}
             {!selectedRunId ? (
@@ -278,6 +362,7 @@ export function RunsPage() {
               <span>
                 {mode === "auto" ? "自动检测模式" : `手动模式：${displayMode(mode)}`}
                 {agentIds.length > 0 ? ` · 角色 ${agentIds.length} 个` : " · 未固定角色"}
+                {referenceConversationId.trim() ? " · 已引用会话" : ""}
               </span>
               <button type="submit" disabled={createRun.isPending || message.trim().length === 0}>
                 {createRun.isPending ? "发送中..." : "发送"}

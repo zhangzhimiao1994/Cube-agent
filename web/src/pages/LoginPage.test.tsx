@@ -163,8 +163,8 @@ describe("LoginPage", () => {
 
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("link", { name: "对话任务" })).not.toBeNull();
-    expect(screen.getByRole("link", { name: "系统设置" })).not.toBeNull();
+    expect(await screen.findByRole("link", { name: "对话" })).not.toBeNull();
+    expect(screen.getByRole("link", { name: "设置" })).not.toBeNull();
     expect(screen.queryByRole("link", { name: "技能" })).toBeNull();
   });
 });

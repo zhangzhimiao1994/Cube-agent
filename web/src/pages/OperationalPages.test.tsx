@@ -31,6 +31,7 @@ const runDetail = {
     workflow_id: "short-video-dispatch",
     selected_agent_ids: "director,copywriter,editor",
     routing_reason: "workflow selected explicitly",
+    conversation_id: "conv-previous",
   },
 };
 
@@ -125,6 +126,9 @@ describe("operational management pages", () => {
         }
         if (path === `/api/v1/admin/runs/${runId}`) {
           return jsonResponse(runDetail);
+        }
+        if (path === "/api/v1/admin/conversations/conv-previous") {
+          return jsonResponse({ conversation_id: "conv-previous", runs: [runDetail] });
         }
         if (path === `/api/v1/admin/runs/${runId}/pause`) {
           return jsonResponse({ ...runDetail, status: "paused" });
@@ -239,6 +243,31 @@ describe("operational management pages", () => {
       },
     });
   });
+
+  it("keeps a clear mobile hierarchy for chat sessions, content, and run settings", async () => {
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话任务" })).not.toBeNull();
+    expect(screen.getByRole("navigation", { name: "手机版会话导航" })).not.toBeNull();
+    expect(screen.getByRole("region", { name: "主对话内容" })).not.toBeNull();
+    expect(screen.getByRole("group", { name: "本次运行设置" })).not.toBeNull();
+    expect(screen.getByText("本次运行设置")).not.toBeNull();
+  });
+
+
+  it("loads a referenced conversation by id from the chat page", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话任务" })).not.toBeNull();
+    await user.type(screen.getByLabelText("参考会话 ID"), "conv-previous");
+    await user.click(screen.getByRole("button", { name: "读取参考会话" }));
+
+    expect(await screen.findByText("conv-previous")).not.toBeNull();
+    expect(screen.getByText(/已读取 1 条运行/)).not.toBeNull();
+    expect(screen.getByText(runDetail.request)).not.toBeNull();
+  });
+
 
   it("shows MCP, memory, and modular log pages", async () => {
     render(<TestApp initialPath="/mcp" />);

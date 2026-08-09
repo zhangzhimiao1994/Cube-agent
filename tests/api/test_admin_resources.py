@@ -403,6 +403,18 @@ def test_operational_run_listing_details_and_controls() -> None:
     assert cancel.json()["status"] == "cancelled"
 
 
+def test_conversation_can_be_loaded_by_session_id() -> None:
+    api = client()
+
+    response = api.get("/api/v1/admin/conversations/conv-readiness", headers=headers())
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["conversation_id"] == "conv-readiness"
+    assert len(payload["runs"]) == 1
+    assert payload["runs"][0]["request"] == "Summarize current deployment readiness."
+
+
 def test_skill_upload_approve_mcp_memory_and_audit_are_safe() -> None:
     api = client()
 

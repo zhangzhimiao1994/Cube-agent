@@ -474,6 +474,10 @@ article:hover {
   margin-bottom: 0.8rem;
 }
 
+.mobile-chat-hierarchy {
+  display: none;
+}
+
 .run-compose {
   margin: 1rem 0;
 }
@@ -542,11 +546,40 @@ article:hover {
   overflow: hidden;
 }
 
-.chat-config-strip {
+.run-settings-panel {
   border-bottom: 1px solid rgba(123, 225, 255, 0.12);
+}
+
+.run-settings-panel > summary {
+  align-items: center;
+  background:
+    linear-gradient(90deg, rgba(85, 215, 255, 0.12), rgba(125, 255, 189, 0.055)),
+    rgba(3, 10, 20, 0.36);
+  color: var(--accent);
+  cursor: pointer;
+  display: flex;
+  font-weight: 950;
+  justify-content: space-between;
+  letter-spacing: 0.03em;
+  list-style: none;
+  padding: 0.85rem 1rem;
+}
+
+.run-settings-panel > summary::-webkit-details-marker {
+  display: none;
+}
+
+.run-settings-panel > summary::after {
+  color: var(--muted);
+  content: "展开 / 收起";
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.chat-config-strip {
   display: grid;
   gap: 1rem;
-  grid-template-columns: minmax(180px, 0.35fr) minmax(220px, 0.45fr) minmax(0, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   padding: 1rem;
 }
 
@@ -608,6 +641,32 @@ article:hover {
   transform: translateY(-1px);
 }
 
+.inline-action {
+  align-self: end;
+}
+
+.reference-preview {
+  background: rgba(125, 255, 189, 0.06);
+  border: 1px solid rgba(125, 255, 189, 0.18);
+  border-radius: 1rem;
+  color: var(--muted);
+  display: grid;
+  gap: 0.35rem;
+  grid-column: 1 / -1;
+  padding: 0.85rem;
+}
+
+.reference-preview strong {
+  color: var(--ink);
+}
+
+.reference-preview p {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .chat-composer {
   border-top: 1px solid rgba(123, 225, 255, 0.12);
   padding: 1rem;
@@ -632,6 +691,7 @@ article:hover {
   background: rgba(3, 10, 20, 0.42);
   border: 1px solid rgba(123, 225, 255, 0.16);
   border-radius: 1rem;
+  grid-column: 1 / -1;
   padding: 0.85rem;
 }
 
@@ -1095,6 +1155,165 @@ article:hover {
   .topbar {
     align-items: flex-start;
     flex-direction: column;
+  }
+}
+
+@media (max-width: 640px) {
+  .app-shell,
+  .auth-layout {
+    min-height: 100dvh;
+  }
+
+  .workspace {
+    padding: 0.65rem;
+  }
+
+  .topbar {
+    margin-bottom: 0.65rem;
+  }
+
+  .topbar h2 {
+    font-size: 1.65rem;
+  }
+
+  .user-chip {
+    align-items: stretch;
+    border-radius: 1rem;
+    flex-direction: column;
+    width: 100%;
+  }
+
+  .page-surface {
+    border-radius: 1.35rem;
+    min-height: calc(100dvh - 9rem);
+    padding: 0.75rem;
+  }
+
+  .compact-page-intro {
+    font-size: 0.9rem;
+  }
+
+  .mobile-chat-hierarchy {
+    background: rgba(3, 10, 20, 0.46);
+    border: 1px solid rgba(85, 215, 255, 0.14);
+    border-radius: 999px;
+    display: grid;
+    gap: 0.35rem;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    margin: 0.7rem 0;
+    padding: 0.35rem;
+  }
+
+  .mobile-chat-hierarchy span {
+    background: rgba(85, 215, 255, 0.08);
+    border-radius: 999px;
+    color: var(--muted);
+    font-size: 0.72rem;
+    font-weight: 900;
+    letter-spacing: 0.02em;
+    padding: 0.45rem 0.35rem;
+    text-align: center;
+  }
+
+  .chat-console {
+    gap: 0.75rem;
+    min-height: auto;
+  }
+
+  .conversation-list {
+    border-radius: 1.15rem;
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(10.5rem, 68vw);
+    grid-template-columns: minmax(7rem, max-content);
+    overflow-x: auto;
+    padding: 0.75rem;
+    scroll-snap-type: x proximity;
+  }
+
+  .conversation-list-header,
+  .conversation-item {
+    scroll-snap-align: start;
+  }
+
+  .conversation-list-header {
+    align-content: center;
+    background: rgba(85, 215, 255, 0.08);
+    border: 1px solid rgba(85, 215, 255, 0.18);
+    border-radius: 1rem;
+    display: grid;
+    justify-items: start;
+    padding: 0.8rem;
+  }
+
+  .conversation-item {
+    min-height: 5.4rem;
+  }
+
+  .chat-panel {
+    border-radius: 1.15rem;
+    grid-template-rows: auto auto minmax(42dvh, 1fr) auto;
+  }
+
+  .run-settings-panel > summary {
+    padding: 0.85rem;
+  }
+
+  .run-settings-panel > summary::after {
+    content: "设置";
+  }
+
+  .chat-config-strip {
+    gap: 0.75rem;
+    padding: 0.75rem;
+  }
+
+  .inline-action {
+    width: 100%;
+  }
+
+  .inline-guide {
+    margin: 0.75rem;
+  }
+
+  .chat-stream {
+    min-height: 42dvh;
+    padding: 0.75rem;
+  }
+
+  .chat-message {
+    border-radius: 1.2rem;
+    max-width: 100%;
+  }
+
+  .chat-detail-action {
+    border-radius: 1rem;
+    justify-content: flex-start;
+    width: 100%;
+  }
+
+  .chat-composer {
+    background:
+      linear-gradient(180deg, rgba(3, 10, 20, 0), rgba(3, 10, 20, 0.92) 22%),
+      rgba(3, 10, 20, 0.88);
+    bottom: 0;
+    position: sticky;
+    z-index: 3;
+  }
+
+  .chat-composer textarea {
+    min-height: 5rem;
+  }
+
+  .composer-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .composer-actions button,
+  .secondary-action {
+    text-align: center;
+    width: 100%;
   }
 }
 

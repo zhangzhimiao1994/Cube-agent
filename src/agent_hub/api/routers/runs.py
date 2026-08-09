@@ -33,6 +33,8 @@ class RunServiceProtocol(Protocol):
         mode: TaskMode,
         agent_ids: tuple[str, ...] = (),
         workflow_id: str | None = None,
+        conversation_id: str | None = None,
+        reference_conversation_id: str | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun: ...
 
@@ -63,6 +65,8 @@ class CreateRunRequest(BaseModel):
     mode: TaskMode = TaskMode.AUTO
     agent_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=64)
     workflow_id: str | None = Field(default=None, max_length=128)
+    conversation_id: str | None = Field(default=None, min_length=4, max_length=128)
+    reference_conversation_id: str | None = Field(default=None, min_length=4, max_length=128)
 
 
 class ChooseModeRequest(BaseModel):
@@ -79,6 +83,8 @@ class SubmittedRunResponse(BaseModel):
     decision_token: str | None = None
     version: int
     clarification_reason: str | None = None
+    conversation_id: str | None = None
+    reference_conversation_id: str | None = None
 
     @classmethod
     def from_submitted(cls, run: SubmittedRun) -> SubmittedRunResponse:
@@ -90,6 +96,8 @@ class SubmittedRunResponse(BaseModel):
             decision_token=run.decision_token,
             version=run.version,
             clarification_reason=run.clarification_reason,
+            conversation_id=run.conversation_id,
+            reference_conversation_id=run.reference_conversation_id,
         )
 
 
@@ -160,6 +168,8 @@ async def create_run(
         mode=body.mode,
         agent_ids=body.agent_ids,
         workflow_id=body.workflow_id,
+        conversation_id=body.conversation_id,
+        reference_conversation_id=body.reference_conversation_id,
         idempotency_key=idempotency_key,
     )
     return SubmittedRunResponse.from_submitted(submitted)

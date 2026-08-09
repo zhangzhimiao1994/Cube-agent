@@ -45,6 +45,7 @@ from agent_hub.channels.submitter import RunServiceInboundSubmitter, RunSubmissi
 from agent_hub.config.service import ConfigService
 from agent_hub.db.models import TenantRow
 from agent_hub.db.session import build_database
+from agent_hub.hermes import PersistentHermesRunAdvisor
 from agent_hub.observability.logging import configure_logging
 from agent_hub.observability.metrics import default_metrics_registry
 from agent_hub.runs.repository import RunRepository
@@ -262,6 +263,7 @@ def create_app(
                     runtime_registry=active_runtime_registry,
                     router=mode_router,
                     task_queue=queue,
+                    hermes_advisor=PersistentHermesRunAdvisor(active_sessions),
                 )
                 application.state.run_queue = queue
             if (

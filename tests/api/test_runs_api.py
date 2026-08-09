@@ -24,7 +24,9 @@ class StubAuthService:
 
 @dataclass(slots=True)
 class StubRunService:
-    submitted: list[tuple[UUID, UUID, str, TaskMode, tuple[str, ...], str | None]]
+    submitted: list[
+        tuple[UUID, UUID, str, TaskMode, tuple[str, ...], str | None, str | None, str | None]
+    ]
     enqueue_count: int = 0
 
     async def submit(
@@ -36,10 +38,23 @@ class StubRunService:
         mode: TaskMode,
         agent_ids: tuple[str, ...] = (),
         workflow_id: str | None = None,
+        conversation_id: str | None = None,
+        reference_conversation_id: str | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         del idempotency_key
-        self.submitted.append((tenant_id, actor_id, message, mode, agent_ids, workflow_id))
+        self.submitted.append(
+            (
+                tenant_id,
+                actor_id,
+                message,
+                mode,
+                agent_ids,
+                workflow_id,
+                conversation_id,
+                reference_conversation_id,
+            )
+        )
         status = RunStatus.WAITING_USER_MODE if mode is TaskMode.AUTO else RunStatus.QUEUED
         if status is RunStatus.QUEUED:
             self.enqueue_count += 1
@@ -55,6 +70,8 @@ class StubRunService:
             clarification_reason="routing_requires_user_choice"
             if status is RunStatus.WAITING_USER_MODE
             else None,
+            conversation_id=conversation_id or "conv-test",
+            reference_conversation_id=reference_conversation_id,
         )
 
     async def choose_mode(
@@ -157,7 +174,16 @@ def test_low_confidence_submission_returns_202_waiting_user_mode_and_does_not_en
     assert body["mode"] is None
     assert body["decision_token"] is not None
     assert service.submitted == [
-        (principal.tenant_id, principal.user_id, "ambiguous task", TaskMode.AUTO, (), None)
+        (
+            principal.tenant_id,
+            principal.user_id,
+            "ambiguous task",
+            TaskMode.AUTO,
+            (),
+            None,
+            None,
+            None,
+        )
     ]
     assert service.enqueue_count == 0
 
@@ -172,11 +198,15 @@ def test_submission_forwards_selected_workflow_and_agents() -> None:
             "message": "make a short video script",
             "mode": "dispatch",
             "workflow_id": "short-video-dispatch",
+            "conversation_id": "conv-short-video",
+            "reference_conversation_id": "conv-previous",
             "agent_ids": ["director", "copywriter", "editor"],
         },
     )
 
     assert response.status_code == 202
+    assert response.json()["conversation_id"] == "conv-short-video"
+    assert response.json()["reference_conversation_id"] == "conv-previous"
     assert service.submitted == [
         (
             principal.tenant_id,
@@ -185,6 +215,8 @@ def test_submission_forwards_selected_workflow_and_agents() -> None:
             TaskMode.DISPATCH,
             ("director", "copywriter", "editor"),
             "short-video-dispatch",
+            "conv-short-video",
+            "conv-previous",
         )
     ]
 
