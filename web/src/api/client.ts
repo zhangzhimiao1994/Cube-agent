@@ -322,6 +322,10 @@ const HermesInsightSchema = z.object({
   id: z.string(),
   outcome: z.string(),
   lesson: z.string(),
+  summary: z.string(),
+  run_id: z.string().nullable(),
+  conversation_id: z.string().nullable(),
+  confirmed_at: z.string().nullable(),
   tags: z.array(z.string()),
   weight: z.number(),
   created_at: z.string(),
@@ -720,7 +724,15 @@ export const api = {
   hermesInsights(): Promise<HermesInsight[]> {
     return request("/api/v1/admin/hermes", { method: "GET" }, z.array(HermesInsightSchema));
   },
+  hermesInsight(id: string): Promise<HermesInsight> {
+    return request(`/api/v1/admin/hermes/${encodeURIComponent(id)}`, { method: "GET" }, HermesInsightSchema);
+  },
+  confirmHermesInsight(id: string): Promise<HermesInsight> {
+    return request(`/api/v1/admin/hermes/${encodeURIComponent(id)}/confirm`, { method: "POST" }, HermesInsightSchema);
+  },
   recordHermesFeedback(payload: {
+    run_id?: string | null;
+    conversation_id?: string | null;
     outcome: "success" | "failure" | "neutral";
     lesson: string;
     tags: string[];

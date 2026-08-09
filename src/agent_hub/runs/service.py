@@ -67,6 +67,7 @@ class HermesRunOutcome:
     status: RunStatus
     mode: TaskMode | None
     workflow_id: str | None
+    conversation_id: str | None
     agent_ids: tuple[str, ...]
 
 
@@ -445,6 +446,7 @@ class RunService:
                     status=status,
                     mode=mode,
                     workflow_id=_string_or_none(decision.get("workflow_id")),
+                    conversation_id=_string_or_none(decision.get("conversation_id")),
                     agent_ids=_string_tuple(decision.get("selected_agent_ids")),
                 )
             )

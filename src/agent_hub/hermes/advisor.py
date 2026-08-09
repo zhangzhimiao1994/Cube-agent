@@ -69,16 +69,25 @@ class PersistentHermesRunAdvisor:
             return
         mode = "unknown" if outcome.mode is None else outcome.mode.value
         workflow = outcome.workflow_id or "no-workflow"
+        conversation_id = outcome.conversation_id or "unknown-conversation"
         status = outcome.status.value
         lesson_id = f"hermes_run_{uuid4().hex}"
+        lesson = f"Run {status} with mode={mode}, workflow={workflow}."
         payload: dict[str, object] = {
             "id": lesson_id,
             "outcome": "success" if outcome.status is RunStatus.COMPLETED else "failure",
-            "lesson": f"Run {status} with mode={mode}, workflow={workflow}.",
+            "lesson": lesson,
+            "summary": (
+                f"Hermes learned from conversation {conversation_id}: "
+                f"{lesson} Tags: {status}, {mode}, {workflow}. "
+                f"Weight: {4 if outcome.status is RunStatus.COMPLETED else 2}."
+            ),
             "tags": [status, mode, workflow, *outcome.agent_ids[:8]],
             "weight": 4 if outcome.status is RunStatus.COMPLETED else 2,
             "created_at": datetime.now(UTC).isoformat(),
             "run_id": str(outcome.run_id),
+            "conversation_id": outcome.conversation_id,
+            "confirmed_at": None,
         }
         await self._upsert(outcome.tenant_id, lesson_id, payload)
 

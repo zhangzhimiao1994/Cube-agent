@@ -361,6 +361,7 @@ async def test_completed_run_records_bounded_hermes_outcome(
             status=RunStatus.COMPLETED,
             mode=TaskMode.DISPATCH,
             workflow_id="short-video-dispatch",
+            conversation_id=submitted.conversation_id,
             agent_ids=("director", "copywriter"),
         )
     ]

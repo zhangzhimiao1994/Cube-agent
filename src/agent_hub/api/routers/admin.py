@@ -429,6 +429,7 @@ class HermesFeedbackRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     run_id: UUID | None = None
+    conversation_id: str | None = Field(default=None, max_length=128)
     outcome: str = Field(pattern=r"^(success|failure|neutral)$")
     lesson: str = Field(min_length=1, max_length=4000)
     tags: list[str] = Field(default_factory=list, max_length=12)
@@ -441,6 +442,10 @@ class HermesInsightResponse(BaseModel):
     id: str
     outcome: str
     lesson: str
+    summary: str
+    run_id: UUID | None = None
+    conversation_id: str | None = None
+    confirmed_at: datetime | None = None
     tags: list[str]
     weight: int
     created_at: datetime
@@ -537,6 +542,10 @@ class AdminResourceService(Protocol):
 
     async def list_hermes_insights(self) -> tuple[HermesInsightResponse, ...]: ...
 
+    async def get_hermes_insight(self, insight_id: str) -> HermesInsightResponse: ...
+
+    async def confirm_hermes_insight(self, insight_id: str) -> HermesInsightResponse: ...
+
     async def record_hermes_feedback(
         self, request: HermesFeedbackRequest
     ) -> HermesInsightResponse: ...
@@ -628,6 +637,15 @@ class InMemoryAdminResourceService:
                 id="hermes-1",
                 outcome="success",
                 lesson="Use dispatch mode when the request has clear deliverables and separable steps.",
+                summary=_hermes_feedback_summary(
+                    outcome="success",
+                    lesson="Use dispatch mode when the request has clear deliverables and separable steps.",
+                    tags=["dispatch", "planning", "clear-task"],
+                    weight=3,
+                ),
+                run_id=None,
+                conversation_id="conv-readiness",
+                confirmed_at=None,
                 tags=["dispatch", "planning", "clear-task"],
                 weight=3,
                 created_at=datetime.now(UTC),
@@ -920,6 +938,15 @@ class InMemoryAdminResourceService:
     async def list_hermes_insights(self) -> tuple[HermesInsightResponse, ...]:
         return tuple(sorted(self.hermes_insights.values(), key=lambda insight: insight.created_at))
 
+    async def get_hermes_insight(self, insight_id: str) -> HermesInsightResponse:
+        return self.hermes_insights[insight_id]
+
+    async def confirm_hermes_insight(self, insight_id: str) -> HermesInsightResponse:
+        current = self.hermes_insights[insight_id]
+        updated = current.model_copy(update={"confirmed_at": datetime.now(UTC)})
+        self.hermes_insights[insight_id] = updated
+        return updated
+
     async def record_hermes_feedback(
         self, request: HermesFeedbackRequest
     ) -> HermesInsightResponse:
@@ -937,6 +964,15 @@ class InMemoryAdminResourceService:
             id=f"hermes-{uuid4().hex}",
             outcome=request.outcome,
             lesson=request.lesson,
+            summary=_hermes_feedback_summary(
+                outcome=request.outcome,
+                lesson=request.lesson,
+                tags=request.tags,
+                weight=request.weight,
+            ),
+            run_id=request.run_id,
+            conversation_id=request.conversation_id,
+            confirmed_at=None,
             tags=request.tags,
             weight=request.weight,
             created_at=datetime.now(UTC),
@@ -1580,6 +1616,22 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             return await super().list_hermes_insights()
         return tuple(_hermes_response_from_payload(payload) for payload in resources)
 
+    async def get_hermes_insight(self, insight_id: str) -> HermesInsightResponse:
+        payload = await self._get_admin_payload("hermes", insight_id)
+        if payload:
+            return _hermes_response_from_payload(payload)
+        return await super().get_hermes_insight(insight_id)
+
+    async def confirm_hermes_insight(self, insight_id: str) -> HermesInsightResponse:
+        payload = await self._get_admin_payload("hermes", insight_id)
+        if not payload:
+            return await super().confirm_hermes_insight(insight_id)
+        payload["confirmed_at"] = datetime.now(UTC).isoformat()
+        if not await self._upsert_admin_payload("hermes", insight_id, payload):
+            return await super().confirm_hermes_insight(insight_id)
+        await self._record_audit("hermes.confirm", f"hermes:{insight_id}", {"id": insight_id})
+        return _hermes_response_from_payload(payload)
+
     async def record_hermes_feedback(
         self, request: HermesFeedbackRequest
     ) -> HermesInsightResponse:
@@ -1598,6 +1650,15 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             id=insight_id,
             outcome=request.outcome,
             lesson=request.lesson,
+            summary=_hermes_feedback_summary(
+                outcome=request.outcome,
+                lesson=request.lesson,
+                tags=request.tags,
+                weight=request.weight,
+            ),
+            run_id=request.run_id,
+            conversation_id=request.conversation_id,
+            confirmed_at=None,
             tags=request.tags,
             weight=request.weight,
             created_at=datetime.now(UTC),
@@ -2106,14 +2167,50 @@ def _audit_response_from_payload(payload: dict[str, object]) -> AuditEventRespon
 def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightResponse:
     tags = payload.get("tags")
     raw_weight = payload.get("weight", 1)
+    normalized_tags = [str(tag) for tag in tags] if isinstance(tags, list) else []
+    weight = raw_weight if type(raw_weight) is int else 1
+    outcome = str(payload.get("outcome", "neutral"))
+    lesson = str(payload.get("lesson", ""))
+    raw_summary = payload.get("summary")
+    run_id = _uuid_from_json(payload.get("run_id"))
+    raw_conversation_id = payload.get("conversation_id")
+    raw_confirmed_at = payload.get("confirmed_at")
     return HermesInsightResponse(
         id=str(payload.get("id", "")),
-        outcome=str(payload.get("outcome", "neutral")),
-        lesson=str(payload.get("lesson", "")),
-        tags=[str(tag) for tag in tags] if isinstance(tags, list) else [],
-        weight=raw_weight if type(raw_weight) is int else 1,
+        outcome=outcome,
+        lesson=lesson,
+        summary=raw_summary
+        if isinstance(raw_summary, str) and raw_summary
+        else _hermes_feedback_summary(
+            outcome=outcome,
+            lesson=lesson,
+            tags=normalized_tags,
+            weight=weight,
+        ),
+        run_id=run_id,
+        conversation_id=raw_conversation_id if isinstance(raw_conversation_id, str) else None,
+        confirmed_at=_datetime_from_json(raw_confirmed_at) if raw_confirmed_at else None,
+        tags=normalized_tags,
+        weight=weight,
         created_at=_datetime_from_json(payload.get("created_at")),
     )
+
+
+def _hermes_feedback_summary(
+    *,
+    outcome: str,
+    lesson: str,
+    tags: list[str],
+    weight: int,
+) -> str:
+    label = {
+        "success": "Learned success pattern",
+        "failure": "Learned failure pattern",
+        "neutral": "Learned neutral observation",
+    }.get(outcome, "Learned observation")
+    normalized_tags = ", ".join(tag for tag in tags if tag)
+    tags_part = normalized_tags or "none"
+    return f"{label}: {lesson.strip()} Tags: {tags_part}. Weight: {weight}."
 
 
 def _datetime_from_json(value: object) -> datetime:
@@ -2125,6 +2222,17 @@ def _datetime_from_json(value: object) -> datetime:
         except ValueError:
             return datetime.now(UTC)
     return datetime.now(UTC)
+
+
+def _uuid_from_json(value: object) -> UUID | None:
+    if isinstance(value, UUID):
+        return value
+    if isinstance(value, str):
+        try:
+            return UUID(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _channel_statuses_from_environment() -> tuple[ChannelStatusResponse, ...]:
@@ -2654,6 +2762,32 @@ async def recommend_with_hermes(
 ) -> HermesRecommendationResponse:
     _require(principal, "hermes:read")
     return await service.recommend_with_hermes(body)
+
+
+@router.get("/hermes/{insight_id}", response_model=HermesInsightResponse, responses=error_responses(401, 403, 404, 422))
+async def get_hermes_insight(
+    insight_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> HermesInsightResponse:
+    _require(principal, "hermes:read")
+    try:
+        return await service.get_hermes_insight(insight_id)
+    except KeyError:
+        raise PublicAPIError(404, "hermes_not_found", "Hermes learning record was not found") from None
+
+
+@router.post("/hermes/{insight_id}/confirm", response_model=HermesInsightResponse, responses=error_responses(401, 403, 404, 422))
+async def confirm_hermes_insight(
+    insight_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> HermesInsightResponse:
+    _require(principal, "hermes:write")
+    try:
+        return await service.confirm_hermes_insight(insight_id)
+    except KeyError:
+        raise PublicAPIError(404, "hermes_not_found", "Hermes learning record was not found") from None
 
 
 __all__ = ["InMemoryAdminResourceService", "PersistentAdminResourceService", "router"]

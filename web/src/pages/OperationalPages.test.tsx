@@ -46,6 +46,19 @@ const settings = {
   channel_entry: "web",
 };
 
+const hermesInsight = {
+  id: "hermes-1",
+  outcome: "success",
+  lesson: "Use group chat when debate review is required.",
+  summary: "Learned success pattern: Use group chat when debate review is required. Tags: debate, review. Weight: 5.",
+  run_id: runId,
+  conversation_id: "conv-architecture-1",
+  confirmed_at: null,
+  tags: ["debate", "review"],
+  weight: 5,
+  created_at: "2026-08-07T00:04:00Z",
+};
+
 const agents = [
   {
     id: "director",
@@ -152,6 +165,15 @@ describe("operational management pages", () => {
         }
         if (path === "/api/v1/admin/workflows") {
           return jsonResponse(workflows);
+        }
+        if (path === "/api/v1/admin/hermes") {
+          return jsonResponse([hermesInsight]);
+        }
+        if (path === "/api/v1/admin/hermes/hermes-1") {
+          return jsonResponse(hermesInsight);
+        }
+        if (path === "/api/v1/admin/hermes/hermes-1/confirm" && method === "POST") {
+          return jsonResponse({ ...hermesInsight, confirmed_at: "2026-08-07T00:05:00Z" });
         }
         if (path === "/api/v1/admin/mcp") {
           return jsonResponse([{ id: "filesystem", name: "Filesystem MCP", health: "healthy", allowed_tools: ["read_file"] }]);
@@ -292,6 +314,22 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "模型配置与调用错误", level: 2 })).not.toBeNull();
     expect(await screen.findByText("provider returned status=401")).not.toBeNull();
     expect(screen.queryByText("dispatch runtime failed")).toBeNull();
+  });
+
+  it("shows Hermes learning by time and conversation id with detail confirmation", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/hermes" />);
+
+    expect(await screen.findByRole("table", { name: /Hermes/ })).not.toBeNull();
+    expect(screen.getByText("conv-architecture-1")).not.toBeNull();
+    expect(screen.getByText("2026-08-07T00:04:00Z")).not.toBeNull();
+    await user.click(screen.getByRole("link", { name: /conv-architecture-1/ }));
+
+    expect(await screen.findByText(hermesInsight.summary)).not.toBeNull();
+    expect(screen.getByText(hermesInsight.lesson)).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: /确认/ }));
+
+    await waitFor(() => expect(screen.getByText("2026-08-07T00:05:00Z")).not.toBeNull());
   });
 
   it("shows detailed API errors on run list loading failures", async () => {

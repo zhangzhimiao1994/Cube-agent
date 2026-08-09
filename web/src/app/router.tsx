@@ -50,6 +50,7 @@ export function AppRoutes() {
         <Route path="channels" element={<ChannelsPage />} />
         <Route path="memory" element={<MemoryPage />} />
         <Route path="hermes" element={<HermesPage />} />
+        <Route path="hermes/:insightId" element={<HermesPage />} />
         <Route path="users" element={<UsersPage />} />
         <Route path="logs" element={<LogsPage />} />
         <Route path="logs/:module" element={<LogsPage />} />

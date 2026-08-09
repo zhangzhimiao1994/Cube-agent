@@ -599,6 +599,7 @@ def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
         json={
             "outcome": "success",
             "lesson": "Use group chat when debate review is required.",
+            "conversation_id": "conv-architecture-1",
             "tags": ["debate", "review"],
             "weight": 5,
         },
@@ -616,13 +617,28 @@ def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
     insights = api.get("/api/v1/admin/hermes", headers=headers())
 
     assert feedback.status_code == 200
+    insight_id = feedback.json()["id"]
+    assert feedback.json()["conversation_id"] == "conv-architecture-1"
+    assert feedback.json()["confirmed_at"] is None
+    assert feedback.json()["summary"] == (
+        "Learned success pattern: Use group chat when debate review is required. "
+        "Tags: debate, review. Weight: 5."
+    )
+    detail = api.get(f"/api/v1/admin/hermes/{insight_id}", headers=headers())
+    confirmed = api.post(f"/api/v1/admin/hermes/{insight_id}/confirm", headers=headers())
     assert recommendation.status_code == 200
+    assert detail.status_code == 200
+    assert detail.json()["id"] == insight_id
+    assert detail.json()["conversation_id"] == "conv-architecture-1"
+    assert confirmed.status_code == 200
+    assert confirmed.json()["confirmed_at"] is not None
     assert recommendation.json()["recommended_mode"] == "group_chat"
     assert recommendation.json()["recommended_model"] == "deepseek-chat"
     assert recommendation.json()["confidence"] > 0.45
     assert any("Hermes lesson" in reason for reason in recommendation.json()["reasons"])
     assert any(
         insight["lesson"] == "Use group chat when debate review is required."
+        and insight["summary"].startswith("Learned success pattern:")
         for insight in insights.json()
     )
 

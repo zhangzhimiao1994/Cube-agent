@@ -470,6 +470,64 @@ article:hover {
   margin: 1rem 0;
 }
 
+.table-shell {
+  border: 1px solid var(--line);
+  border-radius: 1.35rem;
+  overflow-x: auto;
+}
+
+.table-shell table {
+  border-collapse: collapse;
+  min-width: 760px;
+  width: 100%;
+}
+
+.table-shell th,
+.table-shell td {
+  border-bottom: 1px solid rgba(123, 225, 255, 0.12);
+  padding: 0.85rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.table-shell th {
+  color: var(--accent);
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.table-shell td {
+  color: var(--muted);
+}
+
+.detail-list {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  margin: 1rem 0;
+}
+
+.detail-list div {
+  background: rgba(3, 10, 20, 0.34);
+  border: 1px solid rgba(123, 225, 255, 0.14);
+  border-radius: 1rem;
+  padding: 0.85rem;
+}
+
+.detail-list dt {
+  color: var(--accent-2);
+  font-size: 0.78rem;
+  font-weight: 900;
+  margin-bottom: 0.35rem;
+}
+
+.detail-list dd {
+  color: var(--muted);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
 .compact-page-intro {
   margin-bottom: 0.8rem;
 }
