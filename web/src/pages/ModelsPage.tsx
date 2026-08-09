@@ -5,6 +5,7 @@ import { ApiError, api, formatApiError } from "../api/client";
 
 const CUSTOM_PROVIDER = "custom";
 const CUSTOM_MODEL = "__custom_model__";
+const CHAT_COMPLETIONS_SUFFIX = /\/chat\/completions\/?$/i;
 
 type ModelPreset = {
   label: string;
@@ -152,6 +153,10 @@ function toOptionalPositiveNumber(value: string) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
+function normalizeApiBase(value: string) {
+  return value.trim().replace(CHAT_COMPLETIONS_SUFFIX, "").replace(/\/+$/, "");
+}
+
 function displayCapability(capability: string) {
   return ALL_CAPABILITIES.find((item) => item.value === capability)?.label ?? capability;
 }
@@ -215,7 +220,7 @@ export function ModelsPage() {
       const secret = await api.createSecret(`${logicalModel.trim()} ${resolvedProvider}`, apiKey);
       const model = await api.createModel({
         provider: resolvedProvider,
-        api_base: apiBase.trim(),
+        api_base: normalizeApiBase(apiBase),
         upstream_model: resolvedModel,
         logical_model: logicalModel.trim(),
         capabilities,
@@ -393,6 +398,9 @@ export function ModelsPage() {
           placeholder="https://api.example.com/v1"
           required
         />
+        <p className="field-hint">
+          中转站通常填写到 /v1 即可；如果粘贴 /v1/chat/completions，保存时会自动修正为 /v1。
+        </p>
 
         <label htmlFor="api-key">API Key</label>
         <input

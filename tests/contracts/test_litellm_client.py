@@ -327,6 +327,29 @@ async def test_passes_strict_completion_budget_to_openai_compatible_transport() 
     assert create.await_args.kwargs["max_completion_tokens"] == 321
 
 
+async def test_retries_with_legacy_max_tokens_for_openai_compatible_relays() -> None:
+    provider_error = RuntimeError("unknown parameter: max_completion_tokens")
+    provider_error.status_code = 400  # type: ignore[attr-defined]
+    create = AsyncMock(side_effect=[provider_error, sdk_response()])
+    close = AsyncMock()
+    sdk_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        close=close,
+    )
+    transport = LiteLLMClient(client_factory=MagicMock(return_value=sdk_client))
+
+    result = await transport.complete(deployment(), request(max_output_tokens=321), API_KEY)
+
+    assert result.text == "hello"
+    assert create.await_count == 2
+    first_call, second_call = create.await_args_list
+    assert first_call.kwargs["max_completion_tokens"] == 321
+    assert "max_tokens" not in first_call.kwargs
+    assert second_call.kwargs["max_tokens"] == 321
+    assert "max_completion_tokens" not in second_call.kwargs
+    close.assert_awaited_once_with()
+
+
 async def test_drops_provider_metadata_containing_runtime_secrets_or_prompt_content() -> None:
     poisoned = sdk_response()
     poisoned._request_id = "req-" + API_KEY  # type: ignore[attr-defined]

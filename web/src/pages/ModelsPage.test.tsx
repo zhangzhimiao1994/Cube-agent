@@ -262,7 +262,7 @@ describe("ModelsPage", () => {
 
     await user.type(screen.getByLabelText("中转站模型名"), "deepseek/deepseek-chat");
     await user.clear(screen.getByLabelText("API Base"));
-    await user.type(screen.getByLabelText("API Base"), "https://relay.example.com/v1");
+    await user.type(screen.getByLabelText("API Base"), "https://relay.example.com/v1/chat/completions/");
     await user.clear(screen.getByLabelText("逻辑模型名"));
     await user.type(screen.getByLabelText("逻辑模型名"), "relay-main");
     await user.type(screen.getByLabelText("API Key"), "sk-relay-1234");

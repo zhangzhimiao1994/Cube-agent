@@ -20,6 +20,19 @@ from agent_hub.models.types import (
 )
 
 _SAFE_PROVIDER_VALUE = re.compile(r"^[A-Za-z0-9_./:-]{1,256}$")
+_LEGACY_MAX_TOKENS_MARKERS = (
+    "max_completion_tokens",
+    "max completion tokens",
+)
+_UNSUPPORTED_PARAMETER_MARKERS = (
+    "unknown parameter",
+    "unrecognized parameter",
+    "unsupported parameter",
+    "extra_forbidden",
+    "invalid parameter",
+    "not support",
+    "not supported",
+)
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -377,7 +390,29 @@ class LiteLLMClient:
         except ModelResponseError as error:
             safe_failure = ModelResponseError(str(error))
         except Exception as error:  # noqa: BLE001 - redact every SDK/network failure
-            safe_failure = _transport_error(deployment.id, error, sensitive_values)
+            if (
+                client is not None
+                and create_kwargs is not None
+                and _should_retry_with_legacy_max_tokens(error)
+            ):
+                legacy_kwargs = dict(create_kwargs)
+                legacy_kwargs["max_tokens"] = legacy_kwargs.pop("max_completion_tokens")
+                try:
+                    response = await client.chat.completions.create(**legacy_kwargs)
+                    parsed = _parse_response(response, deployment.id, sensitive_values)
+                except asyncio.CancelledError:
+                    await _close_ignoring_failures(client)
+                    return _CANCELLED
+                except ModelResponseError as retry_error:
+                    safe_failure = ModelResponseError(str(retry_error))
+                except Exception as retry_error:  # noqa: BLE001 - redact retry failure
+                    safe_failure = _transport_error(
+                        deployment.id,
+                        retry_error,
+                        sensitive_values,
+                    )
+            else:
+                safe_failure = _transport_error(deployment.id, error, sensitive_values)
 
         if safe_failure is not None:
             if await _close_ignoring_failures(client):
@@ -398,3 +433,10 @@ class LiteLLMClient:
 
 
 _CANCELLED = _CancelledOutcome()
+
+
+def _should_retry_with_legacy_max_tokens(error: Exception) -> bool:
+    message = str(error).lower()
+    return any(marker in message for marker in _LEGACY_MAX_TOKENS_MARKERS) and any(
+        marker in message for marker in _UNSUPPORTED_PARAMETER_MARKERS
+    )
