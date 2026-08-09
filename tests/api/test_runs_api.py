@@ -24,7 +24,7 @@ class StubAuthService:
 
 @dataclass(slots=True)
 class StubRunService:
-    submitted: list[tuple[UUID, UUID, str, TaskMode]]
+    submitted: list[tuple[UUID, UUID, str, TaskMode, tuple[str, ...], str | None]]
     enqueue_count: int = 0
 
     async def submit(
@@ -34,10 +34,12 @@ class StubRunService:
         actor_id: UUID,
         message: str,
         mode: TaskMode,
+        agent_ids: tuple[str, ...] = (),
+        workflow_id: str | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         del idempotency_key
-        self.submitted.append((tenant_id, actor_id, message, mode))
+        self.submitted.append((tenant_id, actor_id, message, mode, agent_ids, workflow_id))
         status = RunStatus.WAITING_USER_MODE if mode is TaskMode.AUTO else RunStatus.QUEUED
         if status is RunStatus.QUEUED:
             self.enqueue_count += 1
@@ -155,9 +157,36 @@ def test_low_confidence_submission_returns_202_waiting_user_mode_and_does_not_en
     assert body["mode"] is None
     assert body["decision_token"] is not None
     assert service.submitted == [
-        (principal.tenant_id, principal.user_id, "ambiguous task", TaskMode.AUTO)
+        (principal.tenant_id, principal.user_id, "ambiguous task", TaskMode.AUTO, (), None)
     ]
     assert service.enqueue_count == 0
+
+
+def test_submission_forwards_selected_workflow_and_agents() -> None:
+    client, service, principal = _client()
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": "make a short video script",
+            "mode": "dispatch",
+            "workflow_id": "short-video-dispatch",
+            "agent_ids": ["director", "copywriter", "editor"],
+        },
+    )
+
+    assert response.status_code == 202
+    assert service.submitted == [
+        (
+            principal.tenant_id,
+            principal.user_id,
+            "make a short video script",
+            TaskMode.DISPATCH,
+            ("director", "copywriter", "editor"),
+            "short-video-dispatch",
+        )
+    ]
 
 
 def test_choose_mode_enqueues_waiting_run_safely() -> None:

@@ -3,6 +3,8 @@ import { Link, useParams } from "react-router-dom";
 
 import { api, formatApiError } from "../api/client";
 
+const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
 export function RunDetailPage() {
   const { runId = "" } = useParams();
   const queryClient = useQueryClient();
@@ -28,12 +30,16 @@ export function RunDetailPage() {
     return <p role="alert">{formatApiError(run.error, "运行详情加载失败")}</p>;
   }
 
+  const canPause = ["queued", "running"].includes(run.data.status);
+  const canResume = run.data.status === "paused";
+  const canCancel = !TERMINAL_STATUSES.has(run.data.status);
+
   return (
     <section>
       <p className="eyebrow">Run detail</p>
       <h2>运行详情</h2>
       <p>
-        <Link to="/">返回任务列表</Link>
+        <Link to="/">返回对话任务</Link>
       </p>
 
       <div className="detail-grid">
@@ -59,16 +65,19 @@ export function RunDetailPage() {
         <h3>原始请求</h3>
         <p>{run.data.request}</p>
         <div className="toolbar">
-          <button type="button" onClick={() => control.mutate("pause")}>
+          <button type="button" disabled={!canPause || control.isPending} onClick={() => control.mutate("pause")}>
             暂停
           </button>
-          <button type="button" onClick={() => control.mutate("resume")}>
+          <button type="button" disabled={!canResume || control.isPending} onClick={() => control.mutate("resume")}>
             恢复
           </button>
-          <button type="button" onClick={() => control.mutate("cancel")}>
+          <button type="button" disabled={!canCancel || control.isPending} onClick={() => control.mutate("cancel")}>
             取消
           </button>
         </div>
+        {!canPause && !canResume && canCancel ? (
+          <p className="field-help">当前状态不支持暂停或恢复，只能取消。</p>
+        ) : null}
         {control.isError ? <p role="alert">{formatApiError(control.error, "运行控制失败")}</p> : null}
       </article>
 
@@ -103,7 +112,7 @@ export function RunDetailPage() {
       </article>
 
       <article>
-        <h3>显式决策详情</h3>
+        <h3>模式、工作流与角色</h3>
         {Object.keys(run.data.explicit_details).length === 0 ? (
           <p>暂无显式详情。</p>
         ) : (

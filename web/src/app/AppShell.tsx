@@ -3,11 +3,11 @@ import { NavLink, Outlet } from "react-router-dom";
 import { useAuth } from "../auth/AuthProvider";
 
 const NAVIGATION = [
-  { to: "/", label: "对话任务", permission: "run:read" },
-  { to: "/config", label: "系统设置", permission: "config:read" },
+  { to: "/", label: "对话", permission: "run:read" },
+  { to: "/config", label: "设置", permission: "config:read" },
   { to: "/models", label: "模型与 API", permission: "config:read" },
   { to: "/agents", label: "Agent 角色", permission: "agent:read" },
-  { to: "/workflows", label: "工作流", permission: "agent:read" },
+  { to: "/workflows", label: "工作流配置", permission: "agent:read" },
   { to: "/skills", label: "技能", permission: "skill:read" },
   { to: "/mcp", label: "MCP 工具", permission: "mcp:read" },
   { to: "/channels", label: "通道连接", permission: "config:read" },
@@ -18,7 +18,7 @@ const NAVIGATION = [
 ];
 
 const HEALTH_CARDS = [
-  ["实时调度", "自动、派单、讨论、混合模式"],
+  ["实时调度", "自动、直接、派单、讨论、混合模式"],
   ["工具防护", "Skill 与 MCP 均经过权限边界"],
   ["Hermes 学习", "沉淀经验，但不绕过审批"],
 ] as const;

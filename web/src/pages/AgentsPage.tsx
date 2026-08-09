@@ -12,6 +12,7 @@ type RoleTemplate = {
 };
 
 const ROLE_TEMPLATES: RoleTemplate[] = [
+  { id: "custom-agent", name: "自定义角色", role: "", prompt: "", skills: [] },
   {
     id: "director",
     name: "导演",
@@ -51,7 +52,7 @@ const ROLE_TEMPLATES: RoleTemplate[] = [
     id: "critic",
     name: "审查员",
     role: "审查员",
-    prompt: "负责发现逻辑漏洞、风险、遗漏条件和潜在失败路径，不直接替代决策。",
+    prompt: "负责发现逻辑漏洞、风险、遗漏条件和潜在失败路径，不直接替代最终决策。",
     skills: [],
   },
   {
@@ -177,8 +178,8 @@ export function AgentsPage() {
   function changeTemplate(nextId: string) {
     const next = ROLE_TEMPLATES.find((item) => item.id === nextId) ?? ROLE_TEMPLATES[0];
     setTemplateId(next.id);
-    setAgentId(next.id);
-    setName(next.name);
+    setAgentId(next.id === "custom-agent" ? "" : next.id);
+    setName(next.id === "custom-agent" ? "" : next.name);
     setRole(next.role);
     setPrompt(next.prompt);
     setSkills(next.skills.join(","));
@@ -200,15 +201,16 @@ export function AgentsPage() {
       <p className="eyebrow">Role orchestration</p>
       <h2>Agent 角色编排</h2>
       <p>
-        子 Agent 的角色不是写死的。这里提供常用模板，也允许直接改角色、提示词和技能列表；
-        保存后会写入生产配置，运行任务时由主 Agent 根据任务模式调度。
+        子 Agent 的角色不是写死的。模板只是快速起点，你可以创建完全自定义的角色、提示词、模型绑定和 Skill 白名单。
       </p>
+
       <article>
         <h3>配置指引</h3>
         <ol>
-          <li>先配置可用模型，再创建 Agent；每个 Agent 必须绑定一个已通过测试的逻辑模型。</li>
-          <li>角色模板只是起点，可以直接修改角色名称、提示词和允许 Skill。</li>
-          <li>讨论模式下，主 Agent 会按任务临时选择相关角色，并在意见冲突时做最终裁决。</li>
+          <li>先在“模型”页面添加并测试可用模型，再创建 Agent。</li>
+          <li>如果模板不合适，选择“自定义角色”，自己填写 Agent ID、显示名称、角色名称和提示词。</li>
+          <li>讨论模式下，主 Agent 会按任务临时选择相关角色；如果你在任务或工作流中指定角色，则优先使用指定角色。</li>
+          <li>Skill 字段填写允许该角色使用的 Skill ID，多个 ID 用英文逗号分隔。</li>
         </ol>
       </article>
 
@@ -217,55 +219,69 @@ export function AgentsPage() {
       ) : null}
 
       <form onSubmit={submit} aria-label="保存 Agent">
-        <label htmlFor="role-template">角色模板</label>
-        <select id="role-template" value={templateId} onChange={(event) => changeTemplate(event.target.value)}>
-          {ROLE_TEMPLATES.map((item) => (
-            <option key={item.id} value={item.id}>
-              {item.name}
-            </option>
-          ))}
-        </select>
+        <label htmlFor="role-template">
+          角色模板
+          <select id="role-template" value={templateId} onChange={(event) => changeTemplate(event.target.value)}>
+            {ROLE_TEMPLATES.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.name}
+              </option>
+            ))}
+          </select>
+        </label>
 
-        <label htmlFor="agent-id">Agent ID</label>
-        <input
-          id="agent-id"
-          value={agentId}
-          onChange={(event) => setAgentId(event.target.value)}
-          placeholder="例如 director"
-          required
-        />
+        <div className="form-grid">
+          <label htmlFor="agent-id">
+            Agent ID
+            <input
+              id="agent-id"
+              value={agentId}
+              onChange={(event) => setAgentId(event.target.value)}
+              placeholder="例如 short-video-director"
+              required
+            />
+          </label>
+          <label htmlFor="agent-name">
+            显示名称
+            <input id="agent-name" value={name} onChange={(event) => setName(event.target.value)} required />
+          </label>
+          <label htmlFor="agent-role">
+            角色名称
+            <input id="agent-role" value={role} onChange={(event) => setRole(event.target.value)} required />
+          </label>
+          <label htmlFor="agent-model">
+            绑定逻辑模型
+            <select
+              id="agent-model"
+              value={selectedModel}
+              onChange={(event) => setModel(event.target.value)}
+              disabled={modelOptions.length === 0}
+              required
+            >
+              {modelOptions.map((item) => (
+                <option key={item} value={item}>
+                  {item}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
 
-        <label htmlFor="agent-name">显示名称</label>
-        <input id="agent-name" value={name} onChange={(event) => setName(event.target.value)} required />
+        <label htmlFor="agent-skills">
+          允许使用的 Skill ID
+          <input
+            id="agent-skills"
+            value={skills}
+            onChange={(event) => setSkills(event.target.value)}
+            placeholder="例如 script_review,safe_search"
+          />
+        </label>
+        <p className="field-help">留空表示该 Agent 暂不绑定 Skill；危险工具仍会被系统权限边界拦截。</p>
 
-        <label htmlFor="agent-role">角色名称</label>
-        <input id="agent-role" value={role} onChange={(event) => setRole(event.target.value)} required />
-
-        <label htmlFor="agent-model">绑定逻辑模型</label>
-        <select
-          id="agent-model"
-          value={selectedModel}
-          onChange={(event) => setModel(event.target.value)}
-          disabled={modelOptions.length === 0}
-          required
-        >
-          {modelOptions.map((item) => (
-            <option key={item} value={item}>
-              {item}
-            </option>
-          ))}
-        </select>
-
-        <label htmlFor="agent-skills">允许使用的 Skill ID，多个用英文逗号分隔</label>
-        <input
-          id="agent-skills"
-          value={skills}
-          onChange={(event) => setSkills(event.target.value)}
-          placeholder="例如 script_review,safe_search"
-        />
-
-        <label htmlFor="agent-prompt">系统提示词</label>
-        <textarea id="agent-prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} required />
+        <label htmlFor="agent-prompt">
+          系统提示词
+          <textarea id="agent-prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} required />
+        </label>
 
         <button type="submit" disabled={saveAgent.isPending || modelOptions.length === 0}>
           {saveAgent.isPending ? "正在保存..." : "保存 Agent"}
@@ -274,19 +290,23 @@ export function AgentsPage() {
         {saveAgent.isError ? <p role="alert">{formatApiError(saveAgent.error, "Agent 保存失败")}</p> : null}
       </form>
 
-      <div>
-        {(agents.data ?? []).length === 0 ? <p>当前还没有 Agent。可以从上方模板创建第一个角色。</p> : null}
-        {(agents.data ?? []).map((agent) => (
-          <article key={agent.id}>
-            <h3>{agent.name}</h3>
-            <p>ID：{agent.id}</p>
-            <p>角色：{agent.role ?? agent.name}</p>
-            <p>模型：{agent.model ?? "未绑定"}</p>
-            <p>Skill：{(agent.skills ?? []).join(", ") || "无"}</p>
-            {agent.prompt ? <p>提示词：{agent.prompt}</p> : null}
-          </article>
-        ))}
-      </div>
+      <section aria-label="已保存 Agent">
+        <h3>已保存 Agent</h3>
+        {(agents.data ?? []).length === 0 ? <p>当前还没有 Agent。可以从上方模板或自定义角色创建第一个角色。</p> : null}
+        <div className="card-grid">
+          {(agents.data ?? []).map((agent) => (
+            <article key={agent.id}>
+              <span className="eyebrow">{agent.enabled ? "enabled" : "disabled"}</span>
+              <h3>{agent.name}</h3>
+              <p>ID：{agent.id}</p>
+              <p>角色：{agent.role ?? agent.name}</p>
+              <p>模型：{agent.model ?? "未绑定"}</p>
+              <p>Skill：{(agent.skills ?? []).join(", ") || "无"}</p>
+              {agent.prompt ? <p>提示词：{agent.prompt}</p> : null}
+            </article>
+          ))}
+        </div>
+      </section>
     </section>
   );
 }

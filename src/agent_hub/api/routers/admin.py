@@ -136,6 +136,24 @@ class NamedResourceResponse(NamedResourceRequest):
     pass
 
 
+class WorkflowResourceRequest(NamedResourceRequest):
+    mode: str | None = Field(
+        default=None,
+        pattern=r"^(auto|direct|dispatch|discuss|hybrid)$",
+    )
+    task_type: str | None = Field(default=None, max_length=256)
+    role_selection_policy: str | None = Field(default=None, max_length=10_000)
+    agent_ids: list[str] = Field(default_factory=list, max_length=64)
+    objective: str | None = Field(default=None, max_length=10_000)
+    steps: list[str] = Field(default_factory=list, max_length=128)
+    deliverables: list[str] = Field(default_factory=list, max_length=128)
+    decision_policy: str | None = Field(default=None, max_length=10_000)
+
+
+class WorkflowResourceResponse(WorkflowResourceRequest):
+    pass
+
+
 class AgentResourceRequest(NamedResourceRequest):
     role: str | None = Field(default=None, min_length=1, max_length=256)
     prompt: str | None = Field(default=None, min_length=1, max_length=100_000)
@@ -380,6 +398,26 @@ class LogEntryResponse(BaseModel):
     created_at: datetime
 
 
+class SystemSettingsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    default_mode: str = Field(
+        default="auto",
+        pattern=r"^(auto|direct|dispatch|discuss|hybrid)$",
+    )
+    default_workflow_id: str | None = Field(default=None, max_length=128)
+    default_agent_ids: list[str] = Field(default_factory=list, max_length=64)
+    log_level: str = Field(default="warning", pattern=r"^(warning|error)$")
+    hermes_enabled: bool = True
+    safe_tools_enabled: bool = True
+    require_approval_for_tools: bool = True
+    channel_entry: str = Field(default="web", max_length=64)
+
+
+class SystemSettingsResponse(SystemSettingsRequest):
+    pass
+
+
 class HermesFeedbackRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -444,9 +482,13 @@ class AdminResourceService(Protocol):
 
     async def upsert_agent(self, request: AgentResourceRequest) -> AgentResourceResponse: ...
 
-    async def list_workflows(self) -> tuple[NamedResourceResponse, ...]: ...
+    async def list_workflows(self) -> tuple[WorkflowResourceResponse, ...]: ...
 
-    async def upsert_workflow(self, request: NamedResourceRequest) -> NamedResourceResponse: ...
+    async def upsert_workflow(self, request: WorkflowResourceRequest) -> WorkflowResourceResponse: ...
+
+    async def get_settings(self) -> SystemSettingsResponse: ...
+
+    async def update_settings(self, request: SystemSettingsRequest) -> SystemSettingsResponse: ...
 
     async def list_runs(self) -> tuple[RunListItem, ...]: ...
 
@@ -504,7 +546,8 @@ class InMemoryAdminResourceService:
     published_yaml: str = ""
     version: int = 0
     agents: dict[str, AgentResourceResponse] = field(default_factory=dict)
-    workflows: dict[str, NamedResourceResponse] = field(default_factory=dict)
+    workflows: dict[str, WorkflowResourceResponse] = field(default_factory=dict)
+    settings: SystemSettingsResponse = field(default_factory=SystemSettingsResponse)
     runs: dict[UUID, RunDetailResponse] = field(default_factory=dict)
     skills: dict[str, SkillResponse] = field(default_factory=dict)
     mcp_servers: dict[str, McpServerResponse] = field(default_factory=dict)
@@ -664,12 +707,20 @@ class InMemoryAdminResourceService:
         self.agents[response.id] = response
         return response
 
-    async def list_workflows(self) -> tuple[NamedResourceResponse, ...]:
+    async def list_workflows(self) -> tuple[WorkflowResourceResponse, ...]:
         return tuple(self.workflows.values())
 
-    async def upsert_workflow(self, request: NamedResourceRequest) -> NamedResourceResponse:
-        response = NamedResourceResponse(**request.model_dump())
+    async def upsert_workflow(self, request: WorkflowResourceRequest) -> WorkflowResourceResponse:
+        response = WorkflowResourceResponse(**request.model_dump())
         self.workflows[response.id] = response
+        return response
+
+    async def get_settings(self) -> SystemSettingsResponse:
+        return self.settings
+
+    async def update_settings(self, request: SystemSettingsRequest) -> SystemSettingsResponse:
+        response = SystemSettingsResponse(**request.model_dump())
+        self.settings = response
         return response
 
     async def list_runs(self) -> tuple[RunListItem, ...]:
@@ -973,8 +1024,14 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             )
         except RunNotFound:
             raise KeyError(run_id) from None
-        except RunConflict:
-            raise PublicAPIError(409, "run_conflict", "run state conflict") from None
+        except RunConflict as error:
+            reason = str(error) or "run state conflict"
+            raise PublicAPIError(
+                409,
+                "run_conflict",
+                reason,
+                details={"reason": reason, "action": "pause"},
+            ) from None
         return await self._run_detail(record)
 
     async def resume_run(self, run_id: UUID) -> RunDetailResponse:
@@ -989,8 +1046,14 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             )
         except RunNotFound:
             raise KeyError(run_id) from None
-        except RunConflict:
-            raise PublicAPIError(409, "run_conflict", "run state conflict") from None
+        except RunConflict as error:
+            reason = str(error) or "run state conflict"
+            raise PublicAPIError(
+                409,
+                "run_conflict",
+                reason,
+                details={"reason": reason, "action": "resume"},
+            ) from None
         return await self._run_detail(record)
 
     async def cancel_run(self, run_id: UUID) -> RunDetailResponse:
@@ -1004,8 +1067,14 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             )
         except RunNotFound:
             raise KeyError(run_id) from None
-        except RunConflict:
-            raise PublicAPIError(409, "run_conflict", "run state conflict") from None
+        except RunConflict as error:
+            reason = str(error) or "run state conflict"
+            raise PublicAPIError(
+                409,
+                "run_conflict",
+                reason,
+                details={"reason": reason, "action": "cancel"},
+            ) from None
         return await self._run_detail(record)
 
     async def _run_list_item(self, record: RunRecord) -> RunListItem:
@@ -1039,6 +1108,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             explicit_details={
                 "source": "database",
                 "version": str(record.version),
+                **_routing_details(record.routing_decision),
             },
         )
 
@@ -1241,17 +1311,32 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 return response
         raise PublicAPIError(503, "service_unavailable", "service unavailable")
 
-    async def list_workflows(self) -> tuple[NamedResourceResponse, ...]:
+    async def list_workflows(self) -> tuple[WorkflowResourceResponse, ...]:
         resources = await self._list_admin_payloads("workflow")
         if resources is None:
             return await super().list_workflows()
-        return tuple(NamedResourceResponse.model_validate(payload) for payload in resources)
+        return tuple(WorkflowResourceResponse.model_validate(payload) for payload in resources)
 
-    async def upsert_workflow(self, request: NamedResourceRequest) -> NamedResourceResponse:
-        response = NamedResourceResponse(**request.model_dump())
+    async def upsert_workflow(self, request: WorkflowResourceRequest) -> WorkflowResourceResponse:
+        response = WorkflowResourceResponse(**request.model_dump())
         if not await self._upsert_admin_payload("workflow", response.id, response.model_dump(mode="json")):
             return await super().upsert_workflow(request)
         await self._record_audit("workflow.upsert", f"workflow:{response.id}", {"id": response.id})
+        return response
+
+    async def get_settings(self) -> SystemSettingsResponse:
+        payload = await self._get_admin_payload("setting", "system")
+        if payload is None:
+            return await super().get_settings()
+        if not payload:
+            return SystemSettingsResponse()
+        return SystemSettingsResponse.model_validate(payload)
+
+    async def update_settings(self, request: SystemSettingsRequest) -> SystemSettingsResponse:
+        response = SystemSettingsResponse(**request.model_dump())
+        if not await self._upsert_admin_payload("setting", "system", response.model_dump(mode="json")):
+            return await super().update_settings(request)
+        await self._record_audit("settings.update", "settings:system", {"default_mode": response.default_mode})
         return response
 
     async def list_skills(self) -> tuple[SkillResponse, ...]:
@@ -2080,6 +2165,24 @@ def _admin_run_event(event: dict[str, object]) -> RunEventResponse:
     )
 
 
+def _routing_details(routing_decision: dict[str, object] | None) -> dict[str, str]:
+    if not routing_decision:
+        return {}
+    details: dict[str, str] = {}
+    workflow_id = routing_decision.get("workflow_id")
+    if isinstance(workflow_id, str) and workflow_id:
+        details["workflow_id"] = workflow_id
+    selected_agent_ids = routing_decision.get("selected_agent_ids")
+    if isinstance(selected_agent_ids, list):
+        safe_ids = [item for item in selected_agent_ids if isinstance(item, str) and item]
+        if safe_ids:
+            details["selected_agent_ids"] = ", ".join(safe_ids)
+    reason = routing_decision.get("reason")
+    if isinstance(reason, str) and reason:
+        details["routing_reason"] = reason
+    return details
+
+
 @router.get("/models", response_model=list[ModelDeploymentResponse], responses=error_responses(401, 403, 422))
 async def list_models(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -2197,7 +2300,7 @@ async def upsert_agent(
     return await service.upsert_agent(body)
 
 
-@router.get("/workflows", response_model=list[NamedResourceResponse], responses=error_responses(401, 403, 422))
+@router.get("/workflows", response_model=list[WorkflowResourceResponse], responses=error_responses(401, 403, 422))
 async def list_workflows(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
@@ -2206,14 +2309,33 @@ async def list_workflows(
     return list(await service.list_workflows())
 
 
-@router.post("/workflows", response_model=NamedResourceResponse, responses=error_responses(401, 403, 422))
+@router.post("/workflows", response_model=WorkflowResourceResponse, responses=error_responses(401, 403, 422))
 async def upsert_workflow(
-    body: NamedResourceRequest,
+    body: WorkflowResourceRequest,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
-) -> NamedResourceResponse:
+) -> WorkflowResourceResponse:
     _require(principal, "agent:write")
     return await service.upsert_workflow(body)
+
+
+@router.get("/settings", response_model=SystemSettingsResponse, responses=error_responses(401, 403, 422))
+async def get_settings(
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> SystemSettingsResponse:
+    _require(principal, "config:read")
+    return await service.get_settings()
+
+
+@router.put("/settings", response_model=SystemSettingsResponse, responses=error_responses(401, 403, 422))
+async def update_settings(
+    body: SystemSettingsRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> SystemSettingsResponse:
+    _require(principal, "config:write")
+    return await service.update_settings(body)
 
 
 @router.get("/runs", response_model=list[RunListItem], responses=error_responses(401, 403, 422))

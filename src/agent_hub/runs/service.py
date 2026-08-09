@@ -71,8 +71,14 @@ class RunService:
         actor_id: UUID,
         message: str,
         mode: TaskMode,
+        agent_ids: tuple[str, ...] = (),
+        workflow_id: str | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
+        operator_selection: dict[str, object] = {
+            "selected_agent_ids": list(agent_ids),
+            "workflow_id": workflow_id,
+        }
         if mode is TaskMode.AUTO:
             decision: RouteDecision | None = None
             if self._router is not None:
@@ -86,7 +92,10 @@ class RunService:
                     mode=decision.mode,
                     status=RunStatus.QUEUED,
                     idempotency_key=idempotency_key,
-                    routing_decision=decision.model_dump(mode="json"),
+                    routing_decision={
+                        **decision.model_dump(mode="json"),
+                        **operator_selection,
+                    },
                     enqueue=True,
                 )
                 return _submitted(record)
@@ -112,6 +121,7 @@ class RunService:
                     "reason": clarification_reason,
                     "decision_token": token,
                     "decision": None if decision is None else decision.model_dump(mode="json"),
+                    **operator_selection,
                 },
                 enqueue=False,
             )
@@ -133,6 +143,7 @@ class RunService:
             mode=mode,
             status=RunStatus.QUEUED,
             idempotency_key=idempotency_key,
+            routing_decision=operator_selection,
             enqueue=True,
         )
         return _submitted(record)

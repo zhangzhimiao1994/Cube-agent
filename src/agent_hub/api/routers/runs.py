@@ -31,6 +31,8 @@ class RunServiceProtocol(Protocol):
         actor_id: UUID,
         message: str,
         mode: TaskMode,
+        agent_ids: tuple[str, ...] = (),
+        workflow_id: str | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun: ...
 
@@ -59,6 +61,8 @@ class RunServiceProtocol(Protocol):
 class CreateRunRequest(BaseModel):
     message: str = Field(min_length=1, max_length=65_536)
     mode: TaskMode = TaskMode.AUTO
+    agent_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=64)
+    workflow_id: str | None = Field(default=None, max_length=128)
 
 
 class ChooseModeRequest(BaseModel):
@@ -128,8 +132,14 @@ def _run_not_found() -> PublicAPIError:
     return PublicAPIError(404, "run_not_found", "run was not found")
 
 
-def _run_conflict() -> PublicAPIError:
-    return PublicAPIError(409, "run_conflict", "run state conflict")
+def _run_conflict(error: RunConflict) -> PublicAPIError:
+    reason = str(error) or "run state conflict"
+    return PublicAPIError(
+        409,
+        "run_conflict",
+        reason,
+        details={"reason": reason},
+    )
 
 
 @router.post(
@@ -148,6 +158,8 @@ async def create_run(
         actor_id=principal.user_id,
         message=body.message,
         mode=body.mode,
+        agent_ids=body.agent_ids,
+        workflow_id=body.workflow_id,
         idempotency_key=idempotency_key,
     )
     return SubmittedRunResponse.from_submitted(submitted)
@@ -178,7 +190,7 @@ async def choose_mode(
     except RunNotFound as error:
         raise _run_not_found() from error
     except RunConflict as error:
-        raise _run_conflict() from error
+        raise _run_conflict(error) from error
     return SubmittedRunResponse.from_submitted(submitted)
 
 
@@ -232,7 +244,7 @@ async def pause_run(
     except RunNotFound as error:
         raise _run_not_found() from error
     except RunConflict as error:
-        raise _run_conflict() from error
+        raise _run_conflict(error) from error
     return RunSummaryResponse.from_summary(summary)
 
 
@@ -247,7 +259,7 @@ async def resume_run(
     except RunNotFound as error:
         raise _run_not_found() from error
     except RunConflict as error:
-        raise _run_conflict() from error
+        raise _run_conflict(error) from error
     return RunSummaryResponse.from_summary(summary)
 
 
@@ -262,5 +274,5 @@ async def cancel_run(
     except RunNotFound as error:
         raise _run_not_found() from error
     except RunConflict as error:
-        raise _run_conflict() from error
+        raise _run_conflict(error) from error
     return RunSummaryResponse.from_summary(summary)

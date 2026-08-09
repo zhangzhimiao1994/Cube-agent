@@ -1,7 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 
-import { ApiError, api, formatApiError, type ConfigRevision } from "../api/client";
+import { ApiError, api, formatApiError, type ConfigRevision, type SystemSettings } from "../api/client";
 
 type EditableConfig = {
   models: Record<string, unknown>;
@@ -23,7 +24,7 @@ function parseConfigJson(value: string): EditableConfig {
     throw new Error(`JSON 解析失败：${message}`);
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error("JSON 解析失败：配置根节点必须是对象。");
+    throw new Error("JSON 校验失败：配置根节点必须是对象。");
   }
   const document = parsed as Record<string, unknown>;
   if (typeof document.models !== "object" || document.models === null || Array.isArray(document.models)) {
@@ -44,9 +45,17 @@ function currentOrEmpty(revision: ConfigRevision | undefined, error: unknown) {
   return null;
 }
 
+function toggle(list: string[], value: string) {
+  return list.includes(value) ? list.filter((item) => item !== value) : [...list, value];
+}
+
 export function ConfigPage() {
   const queryClient = useQueryClient();
   const current = useQuery({ queryKey: ["config-current"], queryFn: () => api.currentConfig() });
+  const settingsQuery = useQuery({ queryKey: ["settings"], queryFn: () => api.settings() });
+  const agentsQuery = useQuery({ queryKey: ["agents"], queryFn: () => api.agents() });
+  const workflowsQuery = useQuery({ queryKey: ["workflows"], queryFn: () => api.workflows() });
+  const modelsQuery = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
   const document = useMemo(
     () => currentOrEmpty(current.data, current.error),
     [current.data, current.error],
@@ -54,10 +63,26 @@ export function ConfigPage() {
   const [json, setJson] = useState(formatDocument(EMPTY_CONFIG));
   const [localError, setLocalError] = useState<string | null>(null);
   const [published, setPublished] = useState<string | null>(null);
+  const [settings, setSettings] = useState<SystemSettings | null>(null);
 
   useEffect(() => {
     if (document) setJson(formatDocument(document));
   }, [document]);
+
+  useEffect(() => {
+    if (settingsQuery.data) setSettings(settingsQuery.data);
+  }, [settingsQuery.data]);
+
+  const saveSettings = useMutation({
+    mutationFn: async () => {
+      if (!settings) throw new Error("设置尚未加载完成");
+      return api.updateSettings(settings);
+    },
+    onSuccess: async (saved) => {
+      setSettings(saved);
+      await queryClient.invalidateQueries({ queryKey: ["settings"] });
+    },
+  });
 
   const publish = useMutation({
     mutationFn: async () => {
@@ -80,27 +105,44 @@ export function ConfigPage() {
     },
   });
 
-  if (current.isLoading) return <p>正在加载生产配置...</p>;
+  if (current.isLoading || settingsQuery.isLoading || agentsQuery.isLoading || workflowsQuery.isLoading || modelsQuery.isLoading) {
+    return <p>正在加载系统设置...</p>;
+  }
   if (current.isError && !(current.error instanceof ApiError && current.error.status === 404)) {
     return <p role="alert">{formatApiError(current.error, "生产配置加载失败")}</p>;
   }
+  if (settingsQuery.isError) return <p role="alert">{formatApiError(settingsQuery.error, "系统设置加载失败")}</p>;
+  if (agentsQuery.isError) return <p role="alert">{formatApiError(agentsQuery.error, "Agent 列表加载失败")}</p>;
+  if (workflowsQuery.isError) return <p role="alert">{formatApiError(workflowsQuery.error, "工作流列表加载失败")}</p>;
+  if (modelsQuery.isError) return <p role="alert">{formatApiError(modelsQuery.error, "模型列表加载失败")}</p>;
+  if (!settings) return <p role="alert">系统设置加载失败：后端没有返回设置内容。</p>;
 
-  const modelCount = Object.keys(document?.models ?? {}).length;
-  const agentCount = document?.agents.length ?? 0;
+  const agents = agentsQuery.data ?? [];
+  const workflows = workflowsQuery.data ?? [];
+  const modelCount = Object.keys(document?.models ?? {}).length || (modelsQuery.data ?? []).length;
+  const agentCount = document?.agents.length || agents.length;
+
+  function updateSettings(patch: Partial<SystemSettings>) {
+    setSettings((currentSettings) => (currentSettings ? { ...currentSettings, ...patch } : currentSettings));
+  }
+
+  function submitSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    saveSettings.mutate();
+  }
 
   return (
     <section>
-      <p className="eyebrow">Production config</p>
-      <h2>生产配置中心</h2>
+      <p className="eyebrow">Settings center</p>
+      <h2>系统设置</h2>
       <p>
-        这里编辑的是正式发布配置。模型建议优先在“模型”页面添加，系统会先真实请求模型 API；
-        Agent 建议在“Agent”页面创建，避免手写字段出错。
+        这里是面向生产环境的配置中心。常用配置直接在本页完成；模型、Agent、工作流、通道等复杂配置可以从下方入口进入专门页面。
       </p>
 
       <div className="status-grid" aria-label="配置状态">
         <article className="status-card">
           <span>当前发布版本</span>
-          <p>{current.data ? `当前发布版本：${current.data.version}` : "当前没有已发布配置"}</p>
+          <p>{current.data ? `版本 ${current.data.version}` : "暂无已发布配置"}</p>
         </article>
         <article className="status-card">
           <span>模型数量</span>
@@ -112,43 +154,163 @@ export function ConfigPage() {
         </article>
       </div>
 
-      <article>
-        <h3>配置指引</h3>
-        <ol>
-          <li>先到“模型”页面选择服务商、模型、API Base 和 API Key，保存前会自动测试可用性。</li>
-          <li>再到“Agent”页面选择角色模板，绑定一个已经通过测试的逻辑模型。</li>
-          <li>只有需要批量调整或排错时，才直接编辑下方 JSON。</li>
-          <li>发布失败时页面会显示后端返回的错误码、HTTP 状态和错误 ID，便于查日志。</li>
-        </ol>
-      </article>
+      <div className="settings-shortcuts">
+        <Link to="/models">配置模型与 API Key</Link>
+        <Link to="/agents">配置 Agent 角色</Link>
+        <Link to="/workflows">配置工作流</Link>
+        <Link to="/channels">配置聊天通道</Link>
+        <Link to="/logs">查看错误日志</Link>
+      </div>
 
-      <form
-        onSubmit={(event) => {
-          event.preventDefault();
-          publish.mutate();
-        }}
-        aria-label="发布生产配置"
-      >
-        <label htmlFor="config-json">配置 JSON</label>
-        <textarea
-          id="config-json"
-          value={json}
-          onChange={(event) => {
-            setJson(event.target.value);
-            setLocalError(null);
-            setPublished(null);
-          }}
-          spellCheck={false}
-        />
-        <button type="submit" disabled={publish.isPending}>
-          {publish.isPending ? "正在创建草稿并发布..." : "创建草稿并发布"}
+      <form onSubmit={submitSettings} aria-label="保存系统设置" className="settings-form">
+        <h3>运行默认值</h3>
+        <div className="form-grid">
+          <label htmlFor="default-mode">
+            默认运行模式
+            <select
+              id="default-mode"
+              value={settings.default_mode}
+              onChange={(event) => updateSettings({ default_mode: event.target.value as SystemSettings["default_mode"] })}
+            >
+              <option value="auto">自动识别</option>
+              <option value="direct">直接执行</option>
+              <option value="dispatch">派单式</option>
+              <option value="discuss">讨论式</option>
+              <option value="hybrid">混合式</option>
+            </select>
+          </label>
+          <label htmlFor="default-workflow">
+            默认工作流
+            <select
+              id="default-workflow"
+              value={settings.default_workflow_id ?? ""}
+              onChange={(event) => updateSettings({ default_workflow_id: event.target.value || null })}
+            >
+              <option value="">不固定，由任务选择</option>
+              {workflows.map((workflow) => (
+                <option key={workflow.id} value={workflow.id}>
+                  {workflow.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label htmlFor="log-level">
+            日志收集等级
+            <select
+              id="log-level"
+              value={settings.log_level}
+              onChange={(event) => updateSettings({ log_level: event.target.value as SystemSettings["log_level"] })}
+            >
+              <option value="warning">warning：只收集警告和错误</option>
+              <option value="error">error：只收集错误</option>
+            </select>
+          </label>
+        </div>
+
+        <fieldset>
+          <legend>默认参与角色</legend>
+          {agents.length === 0 ? (
+            <p className="field-help">还没有 Agent。请先进入 Agent 页面创建角色。</p>
+          ) : (
+            agents.map((agent) => (
+              <label key={agent.id} className="inline-check">
+                <input
+                  type="checkbox"
+                  checked={settings.default_agent_ids.includes(agent.id)}
+                  onChange={() => updateSettings({ default_agent_ids: toggle(settings.default_agent_ids, agent.id) })}
+                />
+                {agent.name}（{agent.id}）
+              </label>
+            ))
+          )}
+        </fieldset>
+
+        <h3>安全与学习</h3>
+        <fieldset>
+          <legend>生产安全策略</legend>
+          <label className="inline-check">
+            <input
+              type="checkbox"
+              checked={settings.hermes_enabled}
+              onChange={(event) => updateSettings({ hermes_enabled: event.target.checked })}
+            />
+            启用 Hermes 学习，但不绕过审批
+          </label>
+          <label className="inline-check">
+            <input
+              type="checkbox"
+              checked={settings.safe_tools_enabled}
+              onChange={(event) => updateSettings({ safe_tools_enabled: event.target.checked })}
+            />
+            允许非危险工具操作
+          </label>
+          <label className="inline-check">
+            <input
+              type="checkbox"
+              checked={settings.require_approval_for_tools}
+              onChange={(event) => updateSettings({ require_approval_for_tools: event.target.checked })}
+            />
+            高风险工具调用必须审批
+          </label>
+        </fieldset>
+
+        <label htmlFor="channel-entry">
+          默认交互入口
+          <select
+            id="channel-entry"
+            value={settings.channel_entry}
+            onChange={(event) => updateSettings({ channel_entry: event.target.value })}
+          >
+            <option value="web">网页控制台</option>
+            <option value="feishu">飞书</option>
+            <option value="dingtalk">钉钉</option>
+            <option value="wecom_bot">企业微信机器人</option>
+            <option value="telegram">Telegram</option>
+            <option value="slack">Slack</option>
+            <option value="custom_webhook">自定义 Webhook</option>
+          </select>
+        </label>
+
+        <button type="submit" disabled={saveSettings.isPending}>
+          {saveSettings.isPending ? "正在保存设置..." : "保存系统设置"}
         </button>
-        {published ? <p role="status">{published}</p> : null}
-        {localError ? <p role="alert">{localError}</p> : null}
-        {publish.isError && !localError ? (
-          <p role="alert">{formatApiError(publish.error, "配置发布失败")}</p>
-        ) : null}
+        {saveSettings.isSuccess ? <p role="status">系统设置已保存，并会在后续任务提交时作为默认值使用。</p> : null}
+        {saveSettings.isError ? <p role="alert">{formatApiError(saveSettings.error, "系统设置保存失败")}</p> : null}
       </form>
+
+      <details className="inline-guide">
+        <summary>高级：直接编辑生产配置 JSON</summary>
+        <p>
+          只有需要批量调整或排错时才建议编辑这里。普通模型、Agent、工作流和通道配置请优先使用对应页面，避免手写字段出错。
+        </p>
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            publish.mutate();
+          }}
+          aria-label="发布生产配置"
+        >
+          <label htmlFor="config-json">配置 JSON</label>
+          <textarea
+            id="config-json"
+            value={json}
+            onChange={(event) => {
+              setJson(event.target.value);
+              setLocalError(null);
+              setPublished(null);
+            }}
+            spellCheck={false}
+          />
+          <button type="submit" disabled={publish.isPending}>
+            {publish.isPending ? "正在创建草稿并发布..." : "创建草稿并发布"}
+          </button>
+          {published ? <p role="status">{published}</p> : null}
+          {localError ? <p role="alert">{localError}</p> : null}
+          {publish.isError && !localError ? (
+            <p role="alert">{formatApiError(publish.error, "配置发布失败")}</p>
+          ) : null}
+        </form>
+      </details>
     </section>
   );
 }

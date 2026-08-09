@@ -10,6 +10,17 @@ const principal = {
   role: "super_admin",
 };
 
+const settings = {
+  default_mode: "auto",
+  default_workflow_id: null,
+  default_agent_ids: [],
+  log_level: "warning",
+  hermes_enabled: true,
+  safe_tools_enabled: true,
+  require_approval_for_tools: true,
+  channel_entry: "web",
+};
+
 function jsonResponse(payload: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(payload), {
     status: 200,
@@ -35,6 +46,43 @@ describe("ConfigPage", () => {
         if (path === "/api/v1/auth/me") {
           return jsonResponse(principal);
         }
+        if (path === "/api/v1/admin/settings") {
+          if (method === "PUT") return jsonResponse(JSON.parse(String(init?.body)));
+          return jsonResponse(settings);
+        }
+        if (path === "/api/v1/admin/agents") {
+          return jsonResponse([
+            {
+              id: "director",
+              name: "导演",
+              enabled: true,
+              role: "导演",
+              prompt: "负责选题、分镜和最终把关。",
+              model: "main",
+              skills: [],
+            },
+          ]);
+        }
+        if (path === "/api/v1/admin/workflows") {
+          return jsonResponse([
+            {
+              id: "short-video-dispatch",
+              name: "短视频派单",
+              enabled: true,
+              mode: "dispatch",
+              task_type: "短视频",
+              role_selection_policy: "按任务类型选择导演、文案、剪辑师。",
+              agent_ids: ["director"],
+              objective: "生产短视频方案",
+              steps: ["拆解需求", "分派角色", "汇总产物"],
+              deliverables: ["脚本", "分镜"],
+              decision_policy: "主 Agent 汇总裁决",
+            },
+          ]);
+        }
+        if (path === "/api/v1/admin/models") {
+          return jsonResponse([]);
+        }
         if (path === "/api/v1/config/current") {
           return jsonResponse({
             id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -43,14 +91,7 @@ describe("ConfigPage", () => {
             document: {
               models: {
                 main: {
-                  deployments: [
-                    {
-                      provider: "deepseek",
-                      model: "deepseek-chat",
-                      credential_ref: "secret://live",
-                      quota_scope_id: "deepseek-account",
-                    },
-                  ],
+                  deployments: [{ provider: "deepseek", model: "deepseek-chat" }],
                 },
               },
               agents: [],
@@ -77,7 +118,7 @@ describe("ConfigPage", () => {
             id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
             version: 4,
             status: "published",
-            document: requests[0]?.body,
+            document: requests.at(-1)?.body,
             created_by: principal.user_id,
             created_at: "2026-08-08T00:01:00Z",
             notification_status: "sent",
@@ -93,31 +134,38 @@ describe("ConfigPage", () => {
     vi.unstubAllGlobals();
   });
 
-  it("loads the current production config and publishes a validated draft", async () => {
+  it("loads system settings and saves production defaults through dedicated controls", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/config" />);
 
-    expect(await screen.findByText("生产配置中心")).not.toBeNull();
-    expect(screen.getByText("当前发布版本：3")).not.toBeNull();
-    const editor = screen.getByLabelText("配置 JSON") as HTMLTextAreaElement;
-    expect(editor.value).toContain('"models"');
+    expect(await screen.findByRole("heading", { name: "系统设置" })).not.toBeNull();
+    expect(screen.getByText("版本 3")).not.toBeNull();
 
-    fireEvent.change(editor, { target: { value: '{"models":{},"agents":[]}' } });
-    await user.click(screen.getByRole("button", { name: "创建草稿并发布" }));
+    await user.selectOptions(screen.getByLabelText("默认运行模式"), "dispatch");
+    await user.selectOptions(screen.getByLabelText("默认工作流"), "short-video-dispatch");
+    await user.click(screen.getByLabelText(/导演/));
+    await user.click(screen.getByRole("button", { name: "保存系统设置" }));
 
-    expect((await screen.findByRole("status")).textContent).toContain("已发布配置版本 4");
-    expect(requests[0]).toEqual({
-      path: "/api/v1/config/drafts",
-      method: "POST",
-      body: { models: {}, agents: [] },
+    expect((await screen.findByRole("status")).textContent).toContain("系统设置已保存");
+    expect(requests.find((request) => request.path === "/api/v1/admin/settings")).toMatchObject({
+      method: "PUT",
+      body: {
+        ...settings,
+        default_mode: "dispatch",
+        default_workflow_id: "short-video-dispatch",
+        default_agent_ids: ["director"],
+      },
     });
   });
 
-  it("shows a detailed parse error instead of a generic failure", async () => {
+  it("keeps advanced JSON publishing available with detailed parse errors", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/config" />);
 
-    const editor = (await screen.findByLabelText("配置 JSON")) as HTMLTextAreaElement;
+    await user.click(await screen.findByText("高级：直接编辑生产配置 JSON"));
+    const editor = screen.getByLabelText("配置 JSON") as HTMLTextAreaElement;
+    expect(editor.value).toContain('"models"');
+
     fireEvent.change(editor, { target: { value: "{broken" } });
     await user.click(screen.getByRole("button", { name: "创建草稿并发布" }));
 

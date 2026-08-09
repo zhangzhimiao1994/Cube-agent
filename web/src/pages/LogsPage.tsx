@@ -13,31 +13,31 @@ const LOG_MODULES = [
   {
     path: "model",
     category: "model_error",
-    title: "大模型错误",
-    description: "模型可用性测试、上游状态码、API Base、模型名等诊断信息。",
+    title: "模型配置与调用错误",
+    description: "模型配置校验、可用性测试、上游状态码、API Base、模型名和运行调用错误。",
   },
   {
     path: "mode",
     category: "mode_error",
     title: "模式运行错误",
-    description: "direct、dispatch、discuss、hybrid 等模式执行失败记录。",
+    description: "直接、派单、讨论、混合等模式执行失败记录。",
   },
   {
     path: "feature",
     category: "feature_error",
-    title: "主要功能运行错误",
+    title: "主要功能错误",
     description: "Skill、MCP、记忆、Hermes 等主要功能的 warning/error。",
   },
   {
     path: "agent",
     category: "agent_error",
-    title: "Agent 角色",
+    title: "Agent 角色错误",
     description: "角色配置、模型绑定、提示词缺失等 Agent 配置错误。",
   },
   {
     path: "channel",
     category: "channel_error",
-    title: "通道连接",
+    title: "通道连接错误",
     description: "飞书、企业微信、钉钉、Telegram、Slack、QQ 等通道配置缺失或连接异常。",
   },
 ] as const;

@@ -160,6 +160,32 @@ const NamedResourceSchema = z.object({
 
 export type NamedResource = z.infer<typeof NamedResourceSchema>;
 
+const WorkflowResourceSchema = NamedResourceSchema.extend({
+  mode: z.enum(["auto", "direct", "dispatch", "discuss", "hybrid"]).nullable().optional(),
+  task_type: z.string().nullable().optional(),
+  role_selection_policy: z.string().nullable().optional(),
+  agent_ids: z.array(z.string()).optional(),
+  objective: z.string().nullable().optional(),
+  steps: z.array(z.string()).optional(),
+  deliverables: z.array(z.string()).optional(),
+  decision_policy: z.string().nullable().optional(),
+});
+
+export type WorkflowResource = z.infer<typeof WorkflowResourceSchema>;
+
+const SystemSettingsSchema = z.object({
+  default_mode: z.enum(["auto", "direct", "dispatch", "discuss", "hybrid"]),
+  default_workflow_id: z.string().nullable(),
+  default_agent_ids: z.array(z.string()),
+  log_level: z.enum(["warning", "error"]),
+  hermes_enabled: z.boolean(),
+  safe_tools_enabled: z.boolean(),
+  require_approval_for_tools: z.boolean(),
+  channel_entry: z.string(),
+});
+
+export type SystemSettings = z.infer<typeof SystemSettingsSchema>;
+
 const ConfigRevisionSchema = z.object({
   id: z.string(),
   version: z.number(),
@@ -554,21 +580,36 @@ export const api = {
       NamedResourceSchema,
     );
   },
-  workflows(): Promise<NamedResource[]> {
+  workflows(): Promise<WorkflowResource[]> {
     return request(
       "/api/v1/admin/workflows",
       { method: "GET" },
-      z.array(NamedResourceSchema),
+      z.array(WorkflowResourceSchema),
     );
   },
-  createWorkflow(payload: NamedResource): Promise<NamedResource> {
+  createWorkflow(payload: WorkflowResource): Promise<WorkflowResource> {
     return request(
       "/api/v1/admin/workflows",
       { method: "POST", body: JSON.stringify(payload) },
-      NamedResourceSchema,
+      WorkflowResourceSchema,
     );
   },
-  createRun(payload: { message: string; mode: "auto" | "direct" | "dispatch" | "discuss" | "hybrid" }): Promise<SubmittedRun> {
+  settings(): Promise<SystemSettings> {
+    return request("/api/v1/admin/settings", { method: "GET" }, SystemSettingsSchema);
+  },
+  updateSettings(payload: SystemSettings): Promise<SystemSettings> {
+    return request(
+      "/api/v1/admin/settings",
+      { method: "PUT", body: JSON.stringify(payload) },
+      SystemSettingsSchema,
+    );
+  },
+  createRun(payload: {
+    message: string;
+    mode: "auto" | "direct" | "dispatch" | "discuss" | "hybrid";
+    agent_ids?: string[];
+    workflow_id?: string | null;
+  }): Promise<SubmittedRun> {
     return request(
       "/api/v1/runs",
       { method: "POST", body: JSON.stringify(payload) },
