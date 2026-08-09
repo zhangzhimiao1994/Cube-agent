@@ -55,6 +55,13 @@ function detailMessages(detail: RunDetail | undefined) {
       body: [
         `运行模式：${displayMode(detail.mode)}`,
         detail.explicit_details.workflow_id ? `工作流：${detail.explicit_details.workflow_id}` : null,
+        detail.explicit_details.workflow_adjustment_policy
+          ? `工作流调整：${
+              detail.explicit_details.workflow_adjustment_policy === "ask_before_apply"
+                ? "允许提出，执行前核对"
+                : "严格按预设"
+            }`
+          : null,
         detail.explicit_details.selected_agent_ids ? `参与角色：${detail.explicit_details.selected_agent_ids}` : null,
         detail.explicit_details.routing_reason ? `路由原因：${detail.explicit_details.routing_reason}` : null,
       ]
@@ -132,7 +139,8 @@ export function RunsPage() {
         message: message.trim(),
         mode,
         workflow_id: workflowId || null,
-        agent_ids: agentIds,
+        allow_workflow_adjustment: selectedWorkflow?.allow_main_agent_override ?? false,
+        agent_ids: mode === "direct" ? agentIds.slice(0, 1) : agentIds,
         conversation_id: conversationId,
         reference_conversation_id: referenceConversationId.trim() || null,
       }),
@@ -167,6 +175,7 @@ export function RunsPage() {
   const messages = detailMessages(selectedRun.data);
   const savedAgents = agents.data ?? [];
   const savedWorkflows = workflows.data ?? [];
+  const directAnswerer = mode === "direct" && agentIds.length > 0 ? agentIds[0] : "main_agent";
 
   return (
     <section>
@@ -269,10 +278,18 @@ export function RunsPage() {
                 <p role="alert">{formatApiError(workflows.error, "工作流列表加载失败")}</p>
               ) : null}
               {selectedWorkflow ? (
-                <p>
-                  当前工作流：{selectedWorkflow.name}
-                  {selectedWorkflow.task_type ? `；适用场景：${selectedWorkflow.task_type}` : ""}
-                </p>
+                <>
+                  <p>
+                    当前工作流：{selectedWorkflow.name}
+                    {selectedWorkflow.task_type ? `；适用场景：${selectedWorkflow.task_type}` : ""}
+                  </p>
+                  <p>
+                    工作流临场调整：
+                    {selectedWorkflow.allow_main_agent_override
+                      ? "主 Agent 可以提出改步骤、换角色或加交付物，但执行前必须向你核对。"
+                      : "关闭；主 Agent 会按该工作流预设执行，只提示明显不匹配风险。"}
+                  </p>
+                </>
               ) : (
                 <p>未选择工作流时，主 Agent 会按任务内容和你勾选的角色进行调度。</p>
               )}
@@ -294,34 +311,69 @@ export function RunsPage() {
             </div>
           </details>
 
-          <details className="inline-guide">
-            <summary>选择本次参与角色</summary>
-            <p className="field-help">
-              同一个模式可以派给不同对象。选择工作流会自动带出默认角色；你也可以为本次任务临时增删。
-            </p>
-            <fieldset>
-              <legend>角色</legend>
-              {agents.isLoading ? (
-                <p className="field-help">正在加载 Agent 角色...</p>
-              ) : agents.isError ? (
-                <p className="field-help" role="alert">
-                  {formatApiError(agents.error, "Agent 列表加载失败")}
+          <details className="inline-guide" open={mode === "direct"}>
+            <summary>{mode === "direct" ? "选择直连回答者" : "选择本次参与角色池"}</summary>
+            {mode === "direct" ? (
+              <>
+                <p className="field-help">
+                  直接执行只会让一个对象回答。选择“主 Agent 自己回答”会提交空角色列表；选择某个角色会提交该角色 ID。
                 </p>
-              ) : savedAgents.length === 0 ? (
-                <p className="field-help">还没有 Agent。请先到 Agent 页面创建角色。</p>
-              ) : (
-                savedAgents.map((agent) => (
-                  <label key={agent.id} className="inline-check">
-                    <input
-                      type="checkbox"
-                      checked={agentIds.includes(agent.id)}
-                      onChange={() => setAgentIds((current) => toggle(current, agent.id))}
-                    />
-                    {agent.name}（{agent.id}）
-                  </label>
-                ))
-              )}
-            </fieldset>
+                <label htmlFor="direct-answerer">
+                  直连回答者
+                  <select
+                    id="direct-answerer"
+                    value={directAnswerer}
+                    onChange={(event) =>
+                      setAgentIds(event.target.value === "main_agent" ? [] : [event.target.value])
+                    }
+                  >
+                    <option value="main_agent">主 Agent 自己回答</option>
+                    {savedAgents
+                      .filter((agent) => agent.enabled)
+                      .map((agent) => (
+                        <option key={agent.id} value={agent.id}>
+                          {agent.name}（{agent.id}）
+                        </option>
+                      ))}
+                  </select>
+                </label>
+                {agents.isLoading ? <p className="field-help">正在加载 Agent 角色...</p> : null}
+                {agents.isError ? (
+                  <p className="field-help" role="alert">
+                    {formatApiError(agents.error, "Agent 列表加载失败")}
+                  </p>
+                ) : null}
+              </>
+            ) : (
+              <>
+                <p className="field-help">
+                  同一个模式可以派给不同对象。选择工作流会自动带出默认角色；你也可以为本次任务临时增删。
+                </p>
+                <fieldset>
+                  <legend>角色池</legend>
+                  {agents.isLoading ? (
+                    <p className="field-help">正在加载 Agent 角色...</p>
+                  ) : agents.isError ? (
+                    <p className="field-help" role="alert">
+                      {formatApiError(agents.error, "Agent 列表加载失败")}
+                    </p>
+                  ) : savedAgents.length === 0 ? (
+                    <p className="field-help">还没有 Agent。请先到 Agent 页面创建角色。</p>
+                  ) : (
+                    savedAgents.map((agent) => (
+                      <label key={agent.id} className="inline-check">
+                        <input
+                          type="checkbox"
+                          checked={agentIds.includes(agent.id)}
+                          onChange={() => setAgentIds((current) => toggle(current, agent.id))}
+                        />
+                        {agent.name}（{agent.id}）
+                      </label>
+                    ))
+                  )}
+                </fieldset>
+              </>
+            )}
           </details>
 
           <div className="chat-stream" role="region" aria-label="主对话内容" aria-live="polite">

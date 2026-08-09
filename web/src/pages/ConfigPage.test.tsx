@@ -136,10 +136,11 @@ describe("ConfigPage", () => {
 
   it("loads system settings and saves production defaults through dedicated controls", async () => {
     const user = userEvent.setup();
-    render(<TestApp initialPath="/config" />);
+    const view = render(<TestApp initialPath="/config" />);
 
     expect(await screen.findByRole("heading", { name: "系统设置" })).not.toBeNull();
     expect(screen.getByText("版本 3")).not.toBeNull();
+    expect(view.container.querySelectorAll(".settings-shortcut-card")).toHaveLength(5);
 
     await user.selectOptions(screen.getByLabelText("默认运行模式"), "dispatch");
     await user.selectOptions(screen.getByLabelText("默认工作流"), "short-video-dispatch");

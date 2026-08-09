@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Protocol, cast
+from urllib.parse import urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from fastapi import APIRouter, Depends, Request
@@ -42,6 +43,10 @@ class ModelDeploymentRequest(BaseModel):
 
     provider: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9_-]*$")
     api_base: str = Field(min_length=1, max_length=2048)
+    api_protocol: str = Field(
+        default="openai_compatible",
+        pattern=r"^(openai_compatible|anthropic_messages)$",
+    )
     upstream_model: str = Field(min_length=1, max_length=512)
     logical_model: str = Field(min_length=1, max_length=128, pattern=r"^[a-z0-9][a-z0-9_-]*$")
     capabilities: list[str] = Field(min_length=1, max_length=8)
@@ -142,6 +147,7 @@ class WorkflowResourceRequest(NamedResourceRequest):
         pattern=r"^(auto|direct|dispatch|discuss|hybrid)$",
     )
     task_type: str | None = Field(default=None, max_length=256)
+    allow_main_agent_override: bool = False
     role_selection_policy: str | None = Field(default=None, max_length=10_000)
     agent_ids: list[str] = Field(default_factory=list, max_length=64)
     objective: str | None = Field(default=None, max_length=10_000)
@@ -425,6 +431,58 @@ class SystemSettingsResponse(SystemSettingsRequest):
     pass
 
 
+class MainAgentModelConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    api_base: str = Field(min_length=1, max_length=2048)
+    api_protocol: str = Field(
+        default="openai_compatible",
+        pattern=r"^(openai_compatible|anthropic_messages)$",
+    )
+    upstream_model: str = Field(min_length=1, max_length=512)
+    credential_ref: str = Field(min_length=1, max_length=128)
+    capabilities: list[str] = Field(default_factory=lambda: ["text"], min_length=1, max_length=8)
+
+
+class MainAgentConfigRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: MainAgentModelConfig | None = None
+    control_mode: str = Field(
+        default="supervisor",
+        pattern=r"^(supervisor|planner|reviewer|autonomous)$",
+    )
+    decision_policy: str = Field(
+        default="choose mode first, select the role pool, then let the main agent make the final decision",
+        min_length=1,
+        max_length=10_000,
+    )
+    operating_style: str = Field(
+        default=(
+            "control the room: clarify goals, choose the execution mode, select the direct "
+            "answerer or role pool, resolve conflicts, and review failures before closing"
+        ),
+        min_length=1,
+        max_length=10_000,
+    )
+    direct_answerer: str = Field(
+        default="main_agent",
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$",
+    )
+    hermes_policy: str = Field(
+        default="observe",
+        pattern=r"^(off|observe|suggest|confirm_before_apply)$",
+    )
+    max_review_rounds: int = Field(default=2, ge=1, le=20)
+
+
+class MainAgentConfigResponse(MainAgentConfigRequest):
+    pass
+
+
 class HermesFeedbackRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -502,6 +560,12 @@ class AdminResourceService(Protocol):
 
     async def update_settings(self, request: SystemSettingsRequest) -> SystemSettingsResponse: ...
 
+    async def get_main_agent_config(self) -> MainAgentConfigResponse: ...
+
+    async def update_main_agent_config(
+        self, request: MainAgentConfigRequest
+    ) -> MainAgentConfigResponse: ...
+
     async def list_runs(self) -> tuple[RunListItem, ...]: ...
 
     async def get_run(self, run_id: UUID) -> RunDetailResponse: ...
@@ -566,6 +630,7 @@ class InMemoryAdminResourceService:
     agents: dict[str, AgentResourceResponse] = field(default_factory=dict)
     workflows: dict[str, WorkflowResourceResponse] = field(default_factory=dict)
     settings: SystemSettingsResponse = field(default_factory=SystemSettingsResponse)
+    main_agent_config: MainAgentConfigResponse = field(default_factory=MainAgentConfigResponse)
     runs: dict[UUID, RunDetailResponse] = field(default_factory=dict)
     skills: dict[str, SkillResponse] = field(default_factory=dict)
     mcp_servers: dict[str, McpServerResponse] = field(default_factory=dict)
@@ -655,6 +720,7 @@ class InMemoryAdminResourceService:
         return tuple(self.models.values())
 
     async def create_model(self, request: ModelDeploymentRequest) -> ModelDeploymentResponse:
+        request = _normalize_model_request_api_base(request)
         response = ModelDeploymentResponse(
             **request.model_dump(),
             id=uuid4(),
@@ -662,6 +728,17 @@ class InMemoryAdminResourceService:
             saturation_policy="queue_first_then_fallback",
         )
         self.models[response.id] = response
+        return response
+
+    async def get_main_agent_config(self) -> MainAgentConfigResponse:
+        return self.main_agent_config
+
+    async def update_main_agent_config(
+        self,
+        request: MainAgentConfigRequest,
+    ) -> MainAgentConfigResponse:
+        response = MainAgentConfigResponse(**_normalize_main_agent_config(request).model_dump())
+        self.main_agent_config = response
         return response
 
 
@@ -1198,6 +1275,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         return tuple(responses)
 
     async def create_model(self, request: ModelDeploymentRequest) -> ModelDeploymentResponse:
+        request = _normalize_model_request_api_base(request)
         document = await self._current_document()
         models = cast(dict[str, object], document.setdefault("models", {}))
         existing = models.get(request.logical_model)
@@ -1404,6 +1482,46 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         if not await self._upsert_admin_payload("setting", "system", response.model_dump(mode="json")):
             return await super().update_settings(request)
         await self._record_audit("settings.update", "settings:system", {"default_mode": response.default_mode})
+        return response
+
+    async def get_main_agent_config(self) -> MainAgentConfigResponse:
+        payload = await self._get_admin_payload("main_agent", "default")
+        if payload is None:
+            return await super().get_main_agent_config()
+        if not payload:
+            request = MainAgentConfigRequest()
+        else:
+            request = MainAgentConfigRequest.model_validate(payload)
+        return MainAgentConfigResponse(**request.model_dump())
+
+    async def update_main_agent_config(
+        self,
+        request: MainAgentConfigRequest,
+    ) -> MainAgentConfigResponse:
+        request = _normalize_main_agent_config(request)
+        if request.model is not None:
+            await self._verify_model_availability(
+                _main_agent_model_deployment(request.model),
+                source="main_agent.update",
+            )
+        response = MainAgentConfigResponse(**request.model_dump())
+        if not await self._upsert_admin_payload(
+            "main_agent",
+            "default",
+            request.model_dump(mode="json"),
+        ):
+            return await super().update_main_agent_config(request)
+        await self._record_audit(
+            "main_agent.update",
+            "main_agent:default",
+            {
+                "provider": request.model.provider if request.model is not None else "",
+                "api_protocol": request.model.api_protocol if request.model is not None else "",
+                "upstream_model": request.model.upstream_model if request.model is not None else "",
+                "control_mode": request.control_mode,
+                "hermes_policy": request.hermes_policy,
+            },
+        )
         return response
 
     async def list_skills(self) -> tuple[SkillResponse, ...]:
@@ -1818,10 +1936,19 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             audit_payload["details"] = payload
         await self._upsert_admin_payload("audit", event.id, audit_payload)
 
-    async def _verify_model_availability(self, deployment: Deployment) -> None:
+    async def _verify_model_availability(
+        self,
+        deployment: Deployment,
+        *,
+        source: str = "models.create",
+    ) -> None:
         if ModelCapability.TEXT not in deployment.capabilities:
             reason = "model availability check requires text capability"
-            details = await self._record_model_availability_failure(deployment, reason)
+            details = await self._record_model_availability_failure(
+                deployment,
+                reason,
+                source=source,
+            )
             raise PublicAPIError(
                 422,
                 "model_unavailable",
@@ -1852,6 +1979,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 deployment,
                 error.public_message,
                 status_code=str(error.status_code),
+                source=source,
             )
             raise PublicAPIError(
                 error.status_code,
@@ -1867,6 +1995,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 deployment,
                 reason,
                 status_code=details["status_code"],
+                source=source,
             )
             raise PublicAPIError(
                 422,
@@ -1881,6 +2010,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         reason: str,
         *,
         status_code: str = "unknown",
+        source: str = "models.create",
     ) -> dict[str, str]:
         details = _model_check_failure_details(deployment, reason, status_code=status_code)
         _LOGGER.warning(
@@ -1898,7 +2028,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             level="error",
             title="模型可用性测试失败",
             message=reason,
-            source="models.create",
+            source=source,
             details=details,
         )
         return details
@@ -1963,6 +2093,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             id=response_id,
             provider=parsed.provider,
             api_base=parsed.api_base or "http://litellm:4000/v1",
+            api_protocol="anthropic_messages"
+            if (parsed.api_base or "").rstrip("/").lower().endswith("/messages")
+            else "openai_compatible",
             upstream_model=parsed.model,
             logical_model=logical_model,
             capabilities=sorted(parsed.capabilities),
@@ -2026,6 +2159,70 @@ def _safe_skill_upload_filename(value: str | None) -> str:
     ):
         raise PublicAPIError(422, "request_validation", "skill filename must be a safe .zip name")
     return filename
+
+
+def _normalize_model_request_api_base(request: ModelDeploymentRequest) -> ModelDeploymentRequest:
+    normalized = _normalized_model_api_base(request.api_protocol, request.api_base)
+    if normalized == request.api_base:
+        return request
+    return request.model_copy(update={"api_base": normalized})
+
+
+def _normalize_main_agent_config(request: MainAgentConfigRequest) -> MainAgentConfigRequest:
+    if request.model is None:
+        return request
+    normalized = _normalized_model_api_base(request.model.api_protocol, request.model.api_base)
+    if normalized == request.model.api_base:
+        return request
+    return request.model_copy(update={"model": request.model.model_copy(update={"api_base": normalized})})
+
+
+def _main_agent_model_deployment(model: MainAgentModelConfig) -> Deployment:
+    return Deployment(
+        id="main_agent_1",
+        logical_model="main_agent",
+        provider_model=f"{model.provider}/{model.upstream_model}",
+        request_model=model.upstream_model,
+        api_base=model.api_base,
+        secret_ref=model.credential_ref,
+        quota_scope_id="main-agent",
+        max_concurrency=1,
+        target_utilization=0.8,
+        reserved_slots=0,
+        capabilities=frozenset(ModelCapability(item) for item in model.capabilities),
+    )
+
+
+def _normalized_model_api_base(api_protocol: str, api_base: str) -> str:
+    stripped = api_base.strip().rstrip("/")
+    if api_protocol == "anthropic_messages":
+        return _normalized_anthropic_messages_base(stripped)
+    return _normalized_openai_compatible_base(stripped)
+
+
+def _normalized_openai_compatible_base(fallback: str) -> str:
+    path = urlsplit(fallback).path.rstrip("/")
+    if path.lower().endswith("/chat/completions"):
+        without_suffix = fallback[: -len("/chat/completions")].rstrip("/")
+        return without_suffix
+    if path in {"", "/"}:
+        parsed_url = urlsplit(fallback)
+        return urlunsplit((parsed_url.scheme, parsed_url.netloc, "/v1", "", ""))
+    return fallback
+
+
+def _normalized_anthropic_messages_base(fallback: str) -> str:
+    parsed_url = urlsplit(fallback)
+    path = parsed_url.path.rstrip("/")
+    if path.lower().endswith("/messages"):
+        return fallback
+    if path.lower().endswith("/v1"):
+        next_path = f"{path}/messages"
+    elif path in {"", "/"}:
+        next_path = "/v1/messages"
+    else:
+        return fallback
+    return urlunsplit((parsed_url.scheme, parsed_url.netloc, next_path, "", ""))
 
 
 def _safe_model_check_reason(error: Exception) -> str:
@@ -2317,6 +2514,11 @@ def _routing_details(routing_decision: dict[str, object] | None) -> dict[str, st
     reference_conversation_id = routing_decision.get("reference_conversation_id")
     if isinstance(reference_conversation_id, str) and reference_conversation_id:
         details["reference_conversation_id"] = reference_conversation_id
+    adjustment_policy = routing_decision.get("workflow_adjustment_policy")
+    if adjustment_policy == "ask_before_apply":
+        details["workflow_adjustment_policy"] = "ask_before_apply"
+    elif adjustment_policy == "strict_preset":
+        details["workflow_adjustment_policy"] = "strict_preset"
     selected_agent_ids = routing_decision.get("selected_agent_ids")
     if isinstance(selected_agent_ids, list):
         safe_ids = [item for item in selected_agent_ids if isinstance(item, str) and item]
@@ -2494,6 +2696,25 @@ async def update_settings(
 ) -> SystemSettingsResponse:
     _require(principal, "config:write")
     return await service.update_settings(body)
+
+
+@router.get("/main-agent", response_model=MainAgentConfigResponse, responses=error_responses(401, 403, 422))
+async def get_main_agent_config(
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> MainAgentConfigResponse:
+    _require(principal, "config:read")
+    return await service.get_main_agent_config()
+
+
+@router.put("/main-agent", response_model=MainAgentConfigResponse, responses=error_responses(401, 403, 422))
+async def update_main_agent_config(
+    body: MainAgentConfigRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> MainAgentConfigResponse:
+    _require(principal, "config:write")
+    return await service.update_main_agent_config(body)
 
 
 @router.get("/runs", response_model=list[RunListItem], responses=error_responses(401, 403, 422))

@@ -25,7 +25,17 @@ class StubAuthService:
 @dataclass(slots=True)
 class StubRunService:
     submitted: list[
-        tuple[UUID, UUID, str, TaskMode, tuple[str, ...], str | None, str | None, str | None]
+        tuple[
+            UUID,
+            UUID,
+            str,
+            TaskMode,
+            tuple[str, ...],
+            str | None,
+            bool,
+            str | None,
+            str | None,
+        ]
     ]
     enqueue_count: int = 0
 
@@ -38,6 +48,7 @@ class StubRunService:
         mode: TaskMode,
         agent_ids: tuple[str, ...] = (),
         workflow_id: str | None = None,
+        allow_workflow_adjustment: bool = False,
         conversation_id: str | None = None,
         reference_conversation_id: str | None = None,
         idempotency_key: str | None = None,
@@ -51,6 +62,7 @@ class StubRunService:
                 mode,
                 agent_ids,
                 workflow_id,
+                allow_workflow_adjustment,
                 conversation_id,
                 reference_conversation_id,
             )
@@ -181,6 +193,7 @@ def test_low_confidence_submission_returns_202_waiting_user_mode_and_does_not_en
             TaskMode.AUTO,
             (),
             None,
+            False,
             None,
             None,
         )
@@ -198,6 +211,7 @@ def test_submission_forwards_selected_workflow_and_agents() -> None:
             "message": "make a short video script",
             "mode": "dispatch",
             "workflow_id": "short-video-dispatch",
+            "allow_workflow_adjustment": True,
             "conversation_id": "conv-short-video",
             "reference_conversation_id": "conv-previous",
             "agent_ids": ["director", "copywriter", "editor"],
@@ -215,6 +229,7 @@ def test_submission_forwards_selected_workflow_and_agents() -> None:
             TaskMode.DISPATCH,
             ("director", "copywriter", "editor"),
             "short-video-dispatch",
+            True,
             "conv-short-video",
             "conv-previous",
         )

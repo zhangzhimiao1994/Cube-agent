@@ -9,6 +9,7 @@ import { ConfigPage } from "../pages/ConfigPage";
 import { HermesPage } from "../pages/HermesPage";
 import { LoginPage } from "../pages/LoginPage";
 import { LogsPage } from "../pages/LogsPage";
+import { MainAgentPage } from "../pages/MainAgentPage";
 import { McpPage } from "../pages/McpPage";
 import { MemoryPage } from "../pages/MemoryPage";
 import { ModelsPage } from "../pages/ModelsPage";
@@ -42,6 +43,7 @@ export function AppRoutes() {
         <Route index element={<RunsPage />} />
         <Route path="runs/:runId" element={<RunDetailPage />} />
         <Route path="config" element={<ConfigPage />} />
+        <Route path="main-agent" element={<MainAgentPage />} />
         <Route path="models" element={<ModelsPage />} />
         <Route path="agents" element={<AgentsPage />} />
         <Route path="workflows" element={<WorkflowsPage />} />

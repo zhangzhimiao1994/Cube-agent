@@ -162,6 +162,7 @@ describe("ModelsPage", () => {
       body: {
         provider: "deepseek",
         api_base: "https://api.deepseek.com/v1",
+        api_protocol: "openai_compatible",
         upstream_model: "deepseek-chat",
         logical_model: "planner",
         capabilities: ["text", "tool_calling"],
@@ -193,11 +194,40 @@ describe("ModelsPage", () => {
     expect(optionValues).toContain("__custom_model__");
     expect(optionValues).not.toContain("deepseek-chat");
     expect((screen.getByLabelText("API Base") as HTMLInputElement).value).toBe(
-      "https://api.anthropic.com/v1",
+      "https://api.anthropic.com/v1/messages",
     );
     expect((screen.getByLabelText("Quota Scope") as HTMLInputElement).value).toBe(
       "anthropic-account",
     );
+  });
+
+  it("keeps Claude Code API relay endpoints on the Anthropic Messages protocol", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/models" />);
+
+    await screen.findByText("添加模型配置");
+    await user.selectOptions(screen.getByLabelText("服务商"), "claude-code-relay");
+    expect(screen.getByLabelText("接口类型")).not.toBeNull();
+    await user.type(screen.getByLabelText("中转站模型名"), "claude-sonnet-4-6");
+    await user.clear(screen.getByLabelText("API Base"));
+    await user.type(screen.getByLabelText("API Base"), "https://toapis.com/v1");
+    await user.clear(screen.getByLabelText("逻辑模型名"));
+    await user.type(screen.getByLabelText("逻辑模型名"), "main");
+    await user.type(screen.getByLabelText("API Key"), "sk-claude-1234");
+    await user.click(screen.getByRole("button", { name: "测试并保存模型" }));
+
+    await screen.findByText("模型已通过可用性测试并保存，Key 引用：secret_created");
+    expect(requests[1]).toMatchObject({
+      path: "/api/v1/admin/models",
+      method: "POST",
+      body: {
+        provider: "claude-code-relay",
+        api_base: "https://toapis.com/v1/messages",
+        api_protocol: "anthropic_messages",
+        upstream_model: "claude-sonnet-4-6",
+        logical_model: "main",
+      },
+    });
   });
 
   it("shows the backend model check failure reason", async () => {
@@ -276,22 +306,51 @@ describe("ModelsPage", () => {
       body: {
         provider: "openai-compatible",
         api_base: "https://relay.example.com/v1",
+        api_protocol: "openai_compatible",
         upstream_model: "deepseek/deepseek-chat",
         logical_model: "relay-main",
       },
     });
   });
 
-  it("allows custom provider and custom model values", async () => {
+  it("adds /v1 for OpenAI-compatible relay root domains before saving", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/models" />);
+
+    await screen.findByText("添加模型配置");
+    await user.selectOptions(screen.getByLabelText("服务商"), "openai-compatible");
+    await user.type(screen.getByLabelText("中转站模型名"), "deepseek-chat");
+    await user.clear(screen.getByLabelText("API Base"));
+    await user.type(screen.getByLabelText("API Base"), "https://gsykj.com");
+    await user.clear(screen.getByLabelText("逻辑模型名"));
+    await user.type(screen.getByLabelText("逻辑模型名"), "relay-main");
+    await user.type(screen.getByLabelText("API Key"), "sk-relay-1234");
+    await user.click(screen.getByRole("button", { name: "测试并保存模型" }));
+
+    await screen.findByText("模型已通过可用性测试并保存，Key 引用：secret_created");
+    expect(requests[1]).toMatchObject({
+      path: "/api/v1/admin/models",
+      method: "POST",
+      body: {
+        provider: "openai-compatible",
+        api_base: "https://gsykj.com/v1",
+        api_protocol: "openai_compatible",
+        upstream_model: "deepseek-chat",
+      },
+    });
+  });
+
+  it("allows custom provider and Anthropic Messages relay values", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/models" />);
 
     await screen.findByText("添加模型配置");
     await user.selectOptions(screen.getByLabelText("服务商"), "custom");
-    await user.type(screen.getByLabelText("自定义服务商"), "my-proxy");
-    await user.type(screen.getByLabelText("自定义模型"), "my-model-v1");
+    await user.selectOptions(screen.getByLabelText("接口类型"), "anthropic_messages");
+    await user.type(screen.getByLabelText("自定义服务商"), "claude-proxy");
+    await user.type(screen.getByLabelText("自定义模型"), "claude-sonnet-4-6");
     await user.clear(screen.getByLabelText("API Base"));
-    await user.type(screen.getByLabelText("API Base"), "https://proxy.example.com/v1");
+    await user.type(screen.getByLabelText("API Base"), "https://proxy.example.com");
     await user.clear(screen.getByLabelText("逻辑模型名"));
     await user.type(screen.getByLabelText("逻辑模型名"), "custom-main");
     await user.type(screen.getByLabelText("API Key"), "sk-custom-1234");
@@ -303,9 +362,10 @@ describe("ModelsPage", () => {
       path: "/api/v1/admin/models",
       method: "POST",
       body: {
-        provider: "my-proxy",
-        api_base: "https://proxy.example.com/v1",
-        upstream_model: "my-model-v1",
+        provider: "claude-proxy",
+        api_base: "https://proxy.example.com/v1/messages",
+        api_protocol: "anthropic_messages",
+        upstream_model: "claude-sonnet-4-6",
         logical_model: "custom-main",
       },
     });

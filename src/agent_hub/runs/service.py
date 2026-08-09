@@ -113,6 +113,7 @@ class RunService:
         mode: TaskMode,
         agent_ids: tuple[str, ...] = (),
         workflow_id: str | None = None,
+        allow_workflow_adjustment: bool = False,
         conversation_id: str | None = None,
         reference_conversation_id: str | None = None,
         idempotency_key: str | None = None,
@@ -121,6 +122,10 @@ class RunService:
         operator_selection: dict[str, object] = {
             "selected_agent_ids": list(agent_ids),
             "workflow_id": workflow_id,
+            "allow_workflow_adjustment": allow_workflow_adjustment,
+            "workflow_adjustment_policy": "ask_before_apply"
+            if allow_workflow_adjustment
+            else "strict_preset",
             "conversation_id": effective_conversation_id,
             "reference_conversation_id": reference_conversation_id,
         }

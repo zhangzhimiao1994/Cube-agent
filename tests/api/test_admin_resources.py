@@ -13,6 +13,8 @@ from agent_hub.api.errors import PublicAPIError
 from agent_hub.api.routers.admin import (
     AgentResourceRequest,
     InMemoryAdminResourceService,
+    MainAgentConfigRequest,
+    MainAgentModelConfig,
     ModelDeploymentRequest,
     PersistentAdminResourceService,
     SecretCreateRequest,
@@ -189,6 +191,62 @@ def test_model_pool_reports_serial_slot_and_queue_policy() -> None:
     assert body["upstream_model"] == "deepseek-chat"
     assert body["effective_slots"] == 1
     assert body["saturation_policy"] == "queue_first_then_fallback"
+
+
+def test_main_agent_config_saves_dedicated_model_api_and_control_policy() -> None:
+    api = client()
+
+    updated = api.put(
+        "/api/v1/admin/main-agent",
+        headers=headers(),
+        json={
+            "model": {
+                "provider": "openai-compatible",
+                "api_base": "https://gsykj.com",
+                "api_protocol": "openai_compatible",
+                "upstream_model": "deepseek-chat",
+                "credential_ref": "secret://main-agent",
+                "capabilities": ["text", "tool_calling"],
+            },
+            "control_mode": "supervisor",
+            "decision_policy": "choose mode first, then roles; main agent makes the final decision",
+            "hermes_policy": "confirm_before_apply",
+            "max_review_rounds": 3,
+        },
+    )
+    fetched = api.get("/api/v1/admin/main-agent", headers=headers())
+
+    assert updated.status_code == 200
+    assert fetched.status_code == 200
+    assert fetched.json()["model"]["provider"] == "openai-compatible"
+    assert fetched.json()["model"]["api_base"] == "https://gsykj.com/v1"
+    assert fetched.json()["model"]["api_protocol"] == "openai_compatible"
+    assert fetched.json()["control_mode"] == "supervisor"
+    assert fetched.json()["hermes_policy"] == "confirm_before_apply"
+
+
+def test_main_agent_config_rejects_missing_dedicated_model_key() -> None:
+    response = client().put(
+        "/api/v1/admin/main-agent",
+        headers=headers(),
+        json={
+            "model": {
+                "provider": "openai-compatible",
+                "api_base": "https://gsykj.com",
+                "api_protocol": "openai_compatible",
+                "upstream_model": "deepseek-chat",
+                "credential_ref": "",
+                "capabilities": ["text"],
+            },
+            "control_mode": "supervisor",
+            "decision_policy": "use a dedicated main agent model",
+            "hermes_policy": "observe",
+            "max_review_rounds": 2,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "request_validation"
 
 
 def test_secret_create_and_get_never_return_value_or_fingerprint() -> None:
@@ -725,6 +783,127 @@ async def test_persistent_admin_models_write_to_published_config() -> None:
         },
         "agents": [],
     }
+
+
+@pytest.mark.asyncio
+async def test_persistent_admin_normalizes_openai_compatible_root_api_base() -> None:
+    configs = FakeConfigService()
+    secrets = FakeSecretService()
+    transport = FakeModelTransport()
+    service = PersistentAdminResourceService(
+        config_service=configs,  # type: ignore[arg-type]
+        secret_service=secrets,  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        model_transport=transport,
+    )
+
+    created = await service.create_model(
+        ModelDeploymentRequest(
+            provider="openai-compatible",
+            api_base="https://gsykj.com",
+            upstream_model="deepseek-chat",
+            logical_model="main",
+            capabilities=["text", "tool_calling"],
+            credential_ref=f"secret://{SECRET_ID}",
+            quota_scope="relay-account",
+            max_concurrency=2,
+            target_utilization=0.8,
+            reserved_capacity=0,
+            rpm=60,
+            tpm=100000,
+            queue_timeout_seconds=60,
+            fallback=None,
+            weight=100,
+        )
+    )
+
+    assert created.api_base == "https://gsykj.com/v1"
+    assert transport.calls[0][0].api_base == "https://gsykj.com/v1"
+    assert configs.current is not None
+    deployment = cast(
+        dict[str, object],
+        cast(dict[str, object], configs.current.document["models"])["main"],
+    )["deployments"]
+    assert cast(list[dict[str, object]], deployment)[0]["api_base"] == "https://gsykj.com/v1"
+
+
+@pytest.mark.asyncio
+async def test_persistent_admin_normalizes_anthropic_messages_api_base() -> None:
+    configs = FakeConfigService()
+    secrets = FakeSecretService()
+    transport = FakeModelTransport()
+    service = PersistentAdminResourceService(
+        config_service=configs,  # type: ignore[arg-type]
+        secret_service=secrets,  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        model_transport=transport,
+    )
+
+    created = await service.create_model(
+        ModelDeploymentRequest(
+            provider="claude-code-compatible",
+            api_base="https://toapis.com/v1",
+            api_protocol="anthropic_messages",
+            upstream_model="claude-sonnet-4-6",
+            logical_model="main",
+            capabilities=["text", "tool_calling"],
+            credential_ref=f"secret://{SECRET_ID}",
+            quota_scope="anthropic-account",
+            max_concurrency=2,
+            target_utilization=0.8,
+            reserved_capacity=0,
+            rpm=60,
+            tpm=100000,
+            queue_timeout_seconds=60,
+            fallback=None,
+            weight=100,
+        )
+    )
+
+    assert created.api_base == "https://toapis.com/v1/messages"
+    assert created.api_protocol == "anthropic_messages"
+    assert transport.calls[0][0].api_base == "https://toapis.com/v1/messages"
+
+
+@pytest.mark.asyncio
+async def test_persistent_admin_verifies_dedicated_main_agent_model() -> None:
+    configs = FakeConfigService()
+    secrets = FakeSecretService()
+    transport = FakeModelTransport()
+    service = PersistentAdminResourceService(
+        config_service=configs,  # type: ignore[arg-type]
+        secret_service=secrets,  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        model_transport=transport,
+    )
+
+    response = await service.update_main_agent_config(
+        MainAgentConfigRequest(
+            model=MainAgentModelConfig(
+                provider="claude-code-relay",
+                api_base="https://toapis.com/v1",
+                api_protocol="anthropic_messages",
+                upstream_model="claude-sonnet-4-6",
+                credential_ref=f"secret://{SECRET_ID}",
+                capabilities=["text", "tool_calling"],
+            ),
+            control_mode="supervisor",
+            hermes_policy="confirm_before_apply",
+            decision_policy="choose mode and role pool; ask before workflow changes",
+            operating_style="control the room and ask before changing a chosen workflow",
+            direct_answerer="main_agent",
+            max_review_rounds=2,
+        )
+    )
+
+    assert response.model is not None
+    assert response.model.api_base == "https://toapis.com/v1/messages"
+    assert transport.calls[0][0].logical_model == "main_agent"
+    assert transport.calls[0][0].api_base == "https://toapis.com/v1/messages"
+    assert transport.calls[0][2] == "sk-live"
 
 
 @pytest.mark.asyncio

@@ -33,6 +33,7 @@ class RunServiceProtocol(Protocol):
         mode: TaskMode,
         agent_ids: tuple[str, ...] = (),
         workflow_id: str | None = None,
+        allow_workflow_adjustment: bool = False,
         conversation_id: str | None = None,
         reference_conversation_id: str | None = None,
         idempotency_key: str | None = None,
@@ -65,6 +66,7 @@ class CreateRunRequest(BaseModel):
     mode: TaskMode = TaskMode.AUTO
     agent_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=64)
     workflow_id: str | None = Field(default=None, max_length=128)
+    allow_workflow_adjustment: bool = False
     conversation_id: str | None = Field(default=None, min_length=4, max_length=128)
     reference_conversation_id: str | None = Field(default=None, min_length=4, max_length=128)
 
@@ -168,6 +170,7 @@ async def create_run(
         mode=body.mode,
         agent_ids=body.agent_ids,
         workflow_id=body.workflow_id,
+        allow_workflow_adjustment=body.allow_workflow_adjustment,
         conversation_id=body.conversation_id,
         reference_conversation_id=body.reference_conversation_id,
         idempotency_key=idempotency_key,

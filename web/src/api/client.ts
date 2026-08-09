@@ -114,6 +114,7 @@ const ModelDeploymentSchema = z.object({
   id: z.string(),
   provider: z.string(),
   api_base: z.string(),
+  api_protocol: z.enum(["openai_compatible", "anthropic_messages"]).default("openai_compatible"),
   upstream_model: z.string(),
   logical_model: z.string(),
   capabilities: z.array(z.string()),
@@ -163,6 +164,7 @@ export type NamedResource = z.infer<typeof NamedResourceSchema>;
 const WorkflowResourceSchema = NamedResourceSchema.extend({
   mode: z.enum(["auto", "direct", "dispatch", "discuss", "hybrid"]).nullable().optional(),
   task_type: z.string().nullable().optional(),
+  allow_main_agent_override: z.boolean().default(false),
   role_selection_policy: z.string().nullable().optional(),
   agent_ids: z.array(z.string()).optional(),
   objective: z.string().nullable().optional(),
@@ -185,6 +187,27 @@ const SystemSettingsSchema = z.object({
 });
 
 export type SystemSettings = z.infer<typeof SystemSettingsSchema>;
+
+const MainAgentModelConfigSchema = z.object({
+  provider: z.string(),
+  api_base: z.string(),
+  api_protocol: z.enum(["openai_compatible", "anthropic_messages"]),
+  upstream_model: z.string(),
+  credential_ref: z.string(),
+  capabilities: z.array(z.string()),
+});
+
+const MainAgentConfigSchema = z.object({
+  model: MainAgentModelConfigSchema.nullable(),
+  control_mode: z.enum(["supervisor", "planner", "reviewer", "autonomous"]),
+  decision_policy: z.string(),
+  operating_style: z.string().default("control the room, clarify goals, choose mode and roles, decide conflicts, review failures"),
+  direct_answerer: z.string().default("main_agent"),
+  hermes_policy: z.enum(["off", "observe", "suggest", "confirm_before_apply"]),
+  max_review_rounds: z.number(),
+});
+
+export type MainAgentConfig = z.infer<typeof MainAgentConfigSchema>;
 
 const ConfigRevisionSchema = z.object({
   id: z.string(),
@@ -617,11 +640,24 @@ export const api = {
       SystemSettingsSchema,
     );
   },
+  mainAgent(): Promise<MainAgentConfig> {
+    return request("/api/v1/admin/main-agent", { method: "GET" }, MainAgentConfigSchema);
+  },
+  updateMainAgent(
+    payload: MainAgentConfig,
+  ): Promise<MainAgentConfig> {
+    return request(
+      "/api/v1/admin/main-agent",
+      { method: "PUT", body: JSON.stringify(payload) },
+      MainAgentConfigSchema,
+    );
+  },
   createRun(payload: {
     message: string;
     mode: "auto" | "direct" | "dispatch" | "discuss" | "hybrid";
     agent_ids?: string[];
     workflow_id?: string | null;
+    allow_workflow_adjustment?: boolean;
     conversation_id?: string | null;
     reference_conversation_id?: string | null;
   }): Promise<SubmittedRun> {

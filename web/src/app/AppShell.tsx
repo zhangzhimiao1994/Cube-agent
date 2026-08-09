@@ -5,6 +5,7 @@ import { useAuth } from "../auth/AuthProvider";
 const NAVIGATION = [
   { to: "/", label: "对话", permission: "run:read" },
   { to: "/config", label: "设置", permission: "config:read" },
+  { to: "/main-agent", label: "主 Agent", permission: "config:read" },
   { to: "/models", label: "模型与 API", permission: "config:read" },
   { to: "/agents", label: "Agent 角色", permission: "agent:read" },
   { to: "/workflows", label: "工作流配置", permission: "agent:read" },

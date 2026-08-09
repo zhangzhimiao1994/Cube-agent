@@ -7,6 +7,8 @@ const CUSTOM_PROVIDER = "custom";
 const CUSTOM_MODEL = "__custom_model__";
 const CHAT_COMPLETIONS_SUFFIX = /\/chat\/completions\/?$/i;
 
+type ApiProtocol = "openai_compatible" | "anthropic_messages";
+
 type ModelPreset = {
   label: string;
   value: string;
@@ -15,6 +17,7 @@ type ModelPreset = {
 
 type ProviderPreset = {
   apiBase: string;
+  apiProtocol: ApiProtocol;
   capabilities: string[];
   label: string;
   modelHelp?: string;
@@ -29,6 +32,7 @@ const PROVIDERS: ProviderPreset[] = [
     label: "OpenAI",
     value: "openai",
     apiBase: "https://api.openai.com/v1",
+    apiProtocol: "openai_compatible",
     quotaScope: "openai-account",
     capabilities: ["text", "tool_calling", "structured_output"],
     models: [
@@ -48,6 +52,7 @@ const PROVIDERS: ProviderPreset[] = [
     label: "DeepSeek",
     value: "deepseek",
     apiBase: "https://api.deepseek.com/v1",
+    apiProtocol: "openai_compatible",
     quotaScope: "deepseek-account",
     capabilities: ["text", "tool_calling"],
     models: [
@@ -56,12 +61,18 @@ const PROVIDERS: ProviderPreset[] = [
     ],
   },
   {
-    label: "Anthropic / Claude Code",
+    label: "Anthropic",
     value: "anthropic",
-    apiBase: "https://api.anthropic.com/v1",
+    apiBase: "https://api.anthropic.com/v1/messages",
+    apiProtocol: "anthropic_messages",
     quotaScope: "anthropic-account",
     capabilities: ["text", "tool_calling"],
     models: [
+      {
+        label: "Claude Code / Claude Sonnet 4.6",
+        value: "claude-sonnet-4-6",
+        capabilities: ["text", "tool_calling"],
+      },
       {
         label: "Claude Code / Claude Sonnet 4",
         value: "claude-sonnet-4-20250514",
@@ -83,6 +94,7 @@ const PROVIDERS: ProviderPreset[] = [
     label: "Kimi / Moonshot",
     value: "kimi",
     apiBase: "https://api.moonshot.cn/v1",
+    apiProtocol: "openai_compatible",
     quotaScope: "kimi-account",
     capabilities: ["text", "tool_calling"],
     models: [
@@ -98,6 +110,7 @@ const PROVIDERS: ProviderPreset[] = [
     label: "阿里 Qwen / DashScope",
     value: "qwen",
     apiBase: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    apiProtocol: "openai_compatible",
     quotaScope: "qwen-account",
     capabilities: ["text", "tool_calling"],
     models: [
@@ -110,6 +123,7 @@ const PROVIDERS: ProviderPreset[] = [
     label: "MiniMax",
     value: "minimax",
     apiBase: "https://api.minimax.chat/v1",
+    apiProtocol: "openai_compatible",
     quotaScope: "minimax-account",
     capabilities: ["text"],
     models: [
@@ -121,6 +135,7 @@ const PROVIDERS: ProviderPreset[] = [
     label: "OpenAI 兼容中转站 / 混合模型池",
     value: "openai-compatible",
     apiBase: "",
+    apiProtocol: "openai_compatible",
     quotaScope: "relay-account",
     capabilities: ["text", "tool_calling", "structured_output"],
     modelEntryMode: "freeform",
@@ -135,6 +150,21 @@ const PROVIDERS: ProviderPreset[] = [
       { label: "MiniMax M1", value: "minimax-m1", capabilities: ["text"] },
     ],
   },
+  {
+    label: "Claude Code API 中转站 / Anthropic Messages",
+    value: "claude-code-relay",
+    apiBase: "",
+    apiProtocol: "anthropic_messages",
+    quotaScope: "claude-code-relay-account",
+    capabilities: ["text", "tool_calling"],
+    modelEntryMode: "freeform",
+    modelHelp: "如果中转站遵守 CC-Switch / Claude Code 的 Anthropic Messages 规则，请选择此项并填写后台给出的模型 ID。",
+    models: [
+      { label: "Claude Sonnet 4.6", value: "claude-sonnet-4-6", capabilities: ["text", "tool_calling"] },
+      { label: "Claude Sonnet 4", value: "claude-sonnet-4-20250514", capabilities: ["text", "tool_calling"] },
+      { label: "Claude Opus 4", value: "claude-opus-4-20250514", capabilities: ["text", "tool_calling"] },
+    ],
+  },
 ];
 
 const ALL_CAPABILITIES = [
@@ -142,6 +172,11 @@ const ALL_CAPABILITIES = [
   { label: "工具调用", value: "tool_calling" },
   { label: "结构化输出", value: "structured_output" },
 ];
+
+const API_PROTOCOL_LABELS: Record<ApiProtocol, string> = {
+  openai_compatible: "OpenAI-compatible（/v1/chat/completions）",
+  anthropic_messages: "Anthropic Messages / Claude Code API（/v1/messages）",
+};
 
 function toPositiveNumber(value: string, fallback: number) {
   const parsed = Number(value);
@@ -153,8 +188,19 @@ function toOptionalPositiveNumber(value: string) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
-function normalizeApiBase(value: string) {
-  return value.trim().replace(CHAT_COMPLETIONS_SUFFIX, "").replace(/\/+$/, "");
+function normalizeApiBase(value: string, apiProtocol: ApiProtocol) {
+  const normalized = value.trim().replace(CHAT_COMPLETIONS_SUFFIX, "").replace(/\/+$/, "");
+  if (apiProtocol !== "anthropic_messages") {
+    try {
+      const parsed = new URL(normalized);
+      return parsed.pathname === "/" || parsed.pathname === "" ? `${normalized}/v1` : normalized;
+    } catch {
+      return normalized;
+    }
+  }
+  if (/\/messages$/i.test(normalized)) return normalized;
+  if (/\/v1$/i.test(normalized)) return `${normalized}/messages`;
+  return `${normalized}/v1/messages`;
 }
 
 function displayCapability(capability: string) {
@@ -195,6 +241,7 @@ export function ModelsPage() {
   const [selectedModel, setSelectedModel] = useState(PROVIDERS[0].models[0].value);
   const [customModel, setCustomModel] = useState("");
   const [apiBase, setApiBase] = useState(PROVIDERS[0].apiBase);
+  const [apiProtocol, setApiProtocol] = useState<ApiProtocol>(PROVIDERS[0].apiProtocol);
   const [apiKey, setApiKey] = useState("");
   const [logicalModel, setLogicalModel] = useState("main");
   const [quotaScope, setQuotaScope] = useState(PROVIDERS[0].quotaScope);
@@ -212,6 +259,7 @@ export function ModelsPage() {
   const isCustomProvider = provider === CUSTOM_PROVIDER;
   const isFreeformProvider = selectedProviderPreset?.modelEntryMode === "freeform";
   const isCustomModel = isCustomProvider || isFreeformProvider || selectedModel === CUSTOM_MODEL;
+  const canChooseProtocol = isCustomProvider || isFreeformProvider;
 
   const saveModel = useMutation({
     mutationFn: async () => {
@@ -220,7 +268,8 @@ export function ModelsPage() {
       const secret = await api.createSecret(`${logicalModel.trim()} ${resolvedProvider}`, apiKey);
       const model = await api.createModel({
         provider: resolvedProvider,
-        api_base: normalizeApiBase(apiBase),
+        api_base: normalizeApiBase(apiBase, apiProtocol),
+        api_protocol: apiProtocol,
         upstream_model: resolvedModel,
         logical_model: logicalModel.trim(),
         capabilities,
@@ -250,6 +299,7 @@ export function ModelsPage() {
     if (nextProvider === CUSTOM_PROVIDER) {
       setSelectedModel(CUSTOM_MODEL);
       setApiBase("");
+      setApiProtocol("openai_compatible");
       setQuotaScope("");
       setCapabilities(["text"]);
       return;
@@ -259,6 +309,7 @@ export function ModelsPage() {
     setSelectedModel(preset.modelEntryMode === "freeform" ? CUSTOM_MODEL : defaultModel.value);
     setCustomModel("");
     setApiBase(preset.apiBase);
+    setApiProtocol(preset.apiProtocol);
     setQuotaScope(preset.quotaScope);
     setCapabilities(preset.modelEntryMode === "freeform" ? preset.capabilities : defaultModel.capabilities);
   }
@@ -294,6 +345,10 @@ export function ModelsPage() {
   }
 
   const savedModels = models.data ?? [];
+  const protocolHint =
+    apiProtocol === "anthropic_messages"
+      ? "Claude Code API 管理工具（例如 CC-Switch）里如果显示的是 Anthropic Messages 兼容接口，请把它的根域名、/v1 或完整 /v1/messages 填到这里；保存前会统一为 /v1/messages。"
+      : "OpenAI-compatible 聚合 API 通常填写根域名或 /v1；如果粘贴 /v1/chat/completions，保存前会自动修正为 /v1。";
 
   return (
     <section>
@@ -390,6 +445,25 @@ export function ModelsPage() {
           </>
         ) : null}
 
+        {canChooseProtocol ? (
+          <label htmlFor="api-protocol">
+            接口类型
+            <select
+              id="api-protocol"
+              value={apiProtocol}
+              onChange={(event) => setApiProtocol(event.target.value as ApiProtocol)}
+            >
+              {Object.entries(API_PROTOCOL_LABELS).map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : (
+          <p className="field-hint">官方预设已内置接口类型：{API_PROTOCOL_LABELS[apiProtocol]}。</p>
+        )}
+
         <label htmlFor="api-base">API Base</label>
         <input
           id="api-base"
@@ -401,6 +475,7 @@ export function ModelsPage() {
         <p className="field-hint">
           中转站可以填写根域名、/v1 或 /v1/messages；如果粘贴 /v1/chat/completions，保存时会自动修正为 /v1。
         </p>
+        <p className="field-hint">{protocolHint}</p>
 
         <label htmlFor="api-key">API Key</label>
         <input

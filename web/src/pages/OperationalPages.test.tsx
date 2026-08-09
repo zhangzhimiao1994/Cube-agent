@@ -29,6 +29,7 @@ const runDetail = {
   artifacts: [{ id: "artifact-1", kind: "markdown", title: "短视频脚本" }],
   explicit_details: {
     workflow_id: "short-video-dispatch",
+    workflow_adjustment_policy: "ask_before_apply",
     selected_agent_ids: "director,copywriter,editor",
     routing_reason: "workflow selected explicitly",
     conversation_id: "conv-previous",
@@ -95,6 +96,7 @@ const workflows = [
     name: "短视频派单",
     enabled: true,
     mode: "dispatch",
+    allow_main_agent_override: true,
     task_type: "短视频内容生产",
     role_selection_policy: "导演、文案、剪辑师参与；不默认派给程序员。",
     agent_ids: ["director", "copywriter", "editor"],
@@ -248,6 +250,7 @@ describe("operational management pages", () => {
     expect(screen.getByText(/工作流配置和工作流使用是分开的/)).not.toBeNull();
 
     await user.selectOptions(screen.getByLabelText("使用工作流"), "short-video-dispatch");
+    expect(screen.getByText(/执行前必须向你核对/)).not.toBeNull();
     await user.type(screen.getByPlaceholderText(/输入任务/), "给我做一个短视频脚本方案。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
@@ -261,7 +264,30 @@ describe("operational management pages", () => {
         message: "给我做一个短视频脚本方案。",
         mode: "dispatch",
         workflow_id: "short-video-dispatch",
+        allow_workflow_adjustment: true,
         agent_ids: ["director", "copywriter", "editor"],
+      },
+    });
+  });
+
+  it("uses a single direct answerer when direct mode is selected", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话任务" })).not.toBeNull();
+    await user.selectOptions(screen.getByLabelText("模式"), "direct");
+    await user.selectOptions(screen.getByLabelText("直连回答者"), "copywriter");
+    await user.type(screen.getByPlaceholderText(/输入任务/), "帮我写一段口播。");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    await screen.findByRole("link", { name: "查看运行详情" });
+    expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
+      method: "POST",
+      body: {
+        message: "帮我写一段口播。",
+        mode: "direct",
+        allow_workflow_adjustment: false,
+        agent_ids: ["copywriter"],
       },
     });
   });
@@ -321,6 +347,8 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/hermes" />);
 
     expect(await screen.findByRole("table", { name: /Hermes/ })).not.toBeNull();
+    expect(screen.queryByText("请求 Hermes 推荐")).toBeNull();
+    expect(screen.queryByText("推荐结果")).toBeNull();
     expect(screen.getByText("conv-architecture-1")).not.toBeNull();
     expect(screen.getByText("2026-08-07T00:04:00Z")).not.toBeNull();
     await user.click(screen.getByRole("link", { name: /conv-architecture-1/ }));

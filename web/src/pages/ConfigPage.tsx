@@ -173,11 +173,11 @@ export function ConfigPage() {
       </div>
 
       <div className="settings-shortcuts">
-        <Link to="/models">配置模型与 API Key</Link>
-        <Link to="/agents">配置 Agent 角色</Link>
-        <Link to="/workflows">配置工作流</Link>
-        <Link to="/channels">配置聊天通道</Link>
-        <Link to="/logs">查看错误日志</Link>
+        <Link className="settings-shortcut-card" to="/models">配置模型与 API Key</Link>
+        <Link className="settings-shortcut-card" to="/agents">配置 Agent 角色</Link>
+        <Link className="settings-shortcut-card" to="/workflows">配置工作流</Link>
+        <Link className="settings-shortcut-card" to="/channels">配置聊天通道</Link>
+        <Link className="settings-shortcut-card" to="/logs">查看错误日志</Link>
       </div>
 
       <form onSubmit={submitSettings} aria-label="保存系统设置" className="settings-form">

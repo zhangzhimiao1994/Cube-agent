@@ -3,7 +3,13 @@ import { FormEvent, useState } from "react";
 
 import { api, formatApiError, type WorkflowResource } from "../api/client";
 
-const WORKFLOW_PRESETS: Array<WorkflowResource & { description: string; suggested_roles: string[] }> = [
+const WORKFLOW_PRESETS: Array<
+  Omit<WorkflowResource, "allow_main_agent_override"> & {
+    allow_main_agent_override?: boolean;
+    description: string;
+    suggested_roles: string[];
+  }
+> = [
   {
     id: "custom-workflow",
     name: "自定义工作流",
@@ -121,6 +127,9 @@ export function WorkflowsPage() {
   const [name, setName] = useState<string>(preset.name);
   const [enabled, setEnabled] = useState(true);
   const [mode, setMode] = useState<NonNullable<WorkflowResource["mode"]>>(preset.mode ?? "dispatch");
+  const [allowMainAgentOverride, setAllowMainAgentOverride] = useState<boolean>(
+    preset.allow_main_agent_override ?? false,
+  );
   const [taskType, setTaskType] = useState<string>(preset.task_type ?? "");
   const [agentIds, setAgentIds] = useState<string[]>([]);
   const [objective, setObjective] = useState<string>(preset.objective ?? "");
@@ -137,6 +146,7 @@ export function WorkflowsPage() {
         name: name.trim(),
         enabled,
         mode,
+        allow_main_agent_override: allowMainAgentOverride,
         task_type: taskType.trim(),
         role_selection_policy: roleSelectionPolicy.trim(),
         agent_ids: agentIds,
@@ -158,6 +168,7 @@ export function WorkflowsPage() {
     setName(next.name);
     setEnabled(next.enabled);
     setMode(next.mode ?? "dispatch");
+    setAllowMainAgentOverride(next.allow_main_agent_override ?? false);
     setTaskType(next.task_type ?? "");
     setAgentIds([]);
     setObjective(next.objective ?? "");
@@ -235,6 +246,23 @@ export function WorkflowsPage() {
               </select>
             </label>
           </div>
+          <p className="field-help">
+            工作流配置的是默认步骤、角色池和交付物。主 Agent 仍然负责判断本次任务该走哪种模式；
+            下面的开关只决定它能不能针对这个工作流提出临场调整。
+          </p>
+
+          <label className="inline-check">
+            <input
+              type="checkbox"
+              checked={allowMainAgentOverride}
+              onChange={(event) => setAllowMainAgentOverride(event.target.checked)}
+            />
+            允许主 Agent 提出工作流临场调整（执行前必须向用户核对）
+          </label>
+          <p className="field-help">
+            开启后，如果主 Agent 认为当前任务需要改步骤、换角色或增加交付物，它只能先说明原因并请求确认；
+            确认前仍按原工作流预设执行。关闭后，主 Agent 只提示风险，不改工作流。
+          </p>
 
           <label htmlFor="workflow-objective">
             工作流目标
@@ -324,6 +352,7 @@ export function WorkflowsPage() {
                 <p>ID：{workflow.id}</p>
                 <p>任务类型：{workflow.task_type || "未设置"}</p>
                 <p>默认模式：{workflow.mode ?? "auto"}</p>
+                <p>工作流临场调整：{workflow.allow_main_agent_override ? "允许提出，执行前必须核对" : "关闭，严格按预设"}</p>
                 <p>默认角色：{(workflow.agent_ids ?? []).join(", ") || "未固定"}</p>
                 {workflow.objective ? <p>{workflow.objective}</p> : null}
               </article>
