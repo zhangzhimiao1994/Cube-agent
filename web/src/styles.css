@@ -387,6 +387,93 @@ article:hover {
   transform: translateX(2px);
 }
 
+.module-hub {
+  position: relative;
+}
+
+.module-hub::before {
+  background: radial-gradient(circle, rgba(85, 215, 255, 0.12), transparent 62%);
+  content: "";
+  height: 18rem;
+  inset: -6rem auto auto 44%;
+  pointer-events: none;
+  position: absolute;
+  width: 18rem;
+}
+
+.module-card-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  list-style: none;
+  margin-top: 1.35rem;
+}
+
+.module-entry-card {
+  --module-accent: 85, 215, 255;
+  background:
+    linear-gradient(145deg, rgba(var(--module-accent), 0.18), rgba(255, 255, 255, 0.035) 42%),
+    rgba(5, 12, 24, 0.78);
+  border: 1px solid rgba(var(--module-accent), 0.24);
+  border-radius: 1.5rem;
+  color: var(--ink);
+  display: grid;
+  gap: 0.85rem;
+  min-height: 11rem;
+  padding: 1.2rem;
+  position: relative;
+  text-decoration: none;
+  transition:
+    border-color 160ms var(--ease),
+    box-shadow 160ms var(--ease),
+    transform 160ms var(--ease);
+}
+
+.module-entry-card:hover,
+.module-entry-card:focus-visible {
+  border-color: rgba(var(--module-accent), 0.54);
+  box-shadow: 0 0 32px rgba(var(--module-accent), 0.14);
+  transform: translateY(-3px);
+}
+
+.module-entry-card-green {
+  --module-accent: 111, 255, 173;
+}
+
+.module-entry-card-amber {
+  --module-accent: 255, 196, 87;
+}
+
+.module-entry-card-violet {
+  --module-accent: 178, 132, 255;
+}
+
+.module-entry-card-blue {
+  --module-accent: 93, 171, 255;
+}
+
+.module-entry-card-slate {
+  --module-accent: 178, 205, 224;
+}
+
+.module-entry-number {
+  color: rgba(var(--module-accent), 0.9);
+  font-size: 0.74rem;
+  font-weight: 950;
+  letter-spacing: 0.18em;
+}
+
+.module-entry-card strong {
+  font-size: 1.35rem;
+  letter-spacing: -0.04em;
+}
+
+.module-entry-card p {
+  color: var(--muted);
+  line-height: 1.55;
+  margin: 0;
+}
+
 .workspace {
   min-width: 0;
   padding: clamp(1rem, 2vw, 1.75rem);
@@ -1218,17 +1305,45 @@ article:hover {
 
   .sidebar {
     height: auto;
+    padding: 0.85rem;
     position: static;
+  }
+
+  .brand-card {
+    border-radius: 1.35rem;
+    padding: 0.85rem;
+  }
+
+  .brand-card h1 {
+    font-size: 1.35rem;
+  }
+
+  .brand-card p {
+    margin: 0.35rem 0 0;
   }
 
   .nav-list {
     display: flex;
     overflow-x: auto;
     padding-bottom: 0.25rem;
+    scroll-snap-type: x proximity;
   }
 
   .nav-link {
+    flex: 0 0 auto;
+    min-width: 4.6rem;
+    scroll-snap-align: start;
+    text-align: center;
     white-space: nowrap;
+  }
+
+  .nav-link:hover,
+  .nav-link-active {
+    transform: translateY(-1px);
+  }
+
+  .module-card-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .status-grid {
@@ -1268,6 +1383,38 @@ article:hover {
 
   .topbar h2 {
     font-size: 1.65rem;
+  }
+
+  .brand-card p,
+  .topbar .eyebrow {
+    display: none;
+  }
+
+  .nav-list {
+    gap: 0.45rem;
+  }
+
+  .nav-link {
+    border-radius: 999px;
+    font-size: 0.92rem;
+    min-width: 4rem;
+    padding: 0.62rem 0.8rem;
+  }
+
+  .module-card-grid {
+    gap: 0.75rem;
+    grid-template-columns: 1fr;
+    margin-top: 1rem;
+  }
+
+  .module-entry-card {
+    border-radius: 1.15rem;
+    min-height: auto;
+    padding: 1rem;
+  }
+
+  .module-entry-card strong {
+    font-size: 1.1rem;
   }
 
   .user-chip {

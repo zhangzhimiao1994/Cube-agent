@@ -163,8 +163,11 @@ describe("LoginPage", () => {
 
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("link", { name: "对话" })).not.toBeNull();
-    expect(screen.getByRole("link", { name: "设置" })).not.toBeNull();
-    expect(screen.queryByRole("link", { name: "技能" })).toBeNull();
+    expect(await screen.findByRole("link", { name: "工作台" })).not.toBeNull();
+    expect(screen.getByRole("link", { name: "编排" })).not.toBeNull();
+    expect(screen.getByRole("link", { name: "资源" })).not.toBeNull();
+    expect(screen.getByRole("link", { name: "通道" })).not.toBeNull();
+    expect(screen.getByRole("link", { name: "系统" })).not.toBeNull();
+    expect(screen.queryByRole("link", { name: "工具" })).toBeNull();
   });
 });

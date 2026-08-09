@@ -1,22 +1,7 @@
 import { NavLink, Outlet } from "react-router-dom";
 
 import { useAuth } from "../auth/AuthProvider";
-
-const NAVIGATION = [
-  { to: "/", label: "对话", permission: "run:read" },
-  { to: "/config", label: "设置", permission: "config:read" },
-  { to: "/main-agent", label: "主 Agent", permission: "config:read" },
-  { to: "/models", label: "模型与 API", permission: "config:read" },
-  { to: "/agents", label: "Agent 角色", permission: "agent:read" },
-  { to: "/workflows", label: "工作流配置", permission: "agent:read" },
-  { to: "/skills", label: "技能", permission: "skill:read" },
-  { to: "/mcp", label: "MCP 工具", permission: "mcp:read" },
-  { to: "/channels", label: "通道连接", permission: "config:read" },
-  { to: "/memory", label: "记忆", permission: "memory:read" },
-  { to: "/hermes", label: "Hermes 学习", permission: "hermes:read" },
-  { to: "/users", label: "用户", permission: "user:read" },
-  { to: "/logs", label: "日志", permission: "audit:read" },
-];
+import { MODULE_GROUPS } from "./navigation";
 
 export function AppShell() {
   const auth = useAuth();
@@ -29,7 +14,9 @@ export function AppShell() {
           <p>面向生产环境的多 Agent 调度与配置控制台</p>
         </div>
         <nav aria-label="Main navigation" className="nav-list">
-          {NAVIGATION.filter((item) => auth.hasPermission(item.permission)).map((item) => (
+          {MODULE_GROUPS.filter((group) =>
+            group.modules.some((item) => auth.hasPermission(item.permission)),
+          ).map((item) => (
             <NavLink
               key={item.to}
               to={item.to}

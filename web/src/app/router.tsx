@@ -13,12 +13,14 @@ import { MainAgentPage } from "../pages/MainAgentPage";
 import { McpPage } from "../pages/McpPage";
 import { MemoryPage } from "../pages/MemoryPage";
 import { ModelsPage } from "../pages/ModelsPage";
+import { ModuleHubPage } from "../pages/ModuleHubPage";
 import { RunDetailPage } from "../pages/RunDetailPage";
 import { RunsPage } from "../pages/RunsPage";
 import { SetupPage } from "../pages/SetupPage";
 import { SkillsPage } from "../pages/SkillsPage";
 import { UsersPage } from "../pages/UsersPage";
 import { WorkflowsPage } from "../pages/WorkflowsPage";
+import { MODULE_GROUPS } from "./navigation";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -41,6 +43,9 @@ export function AppRoutes() {
         }
       >
         <Route index element={<RunsPage />} />
+        {MODULE_GROUPS.map((group) => (
+          <Route key={group.id} path={group.to.slice(1)} element={<ModuleHubPage group={group} />} />
+        ))}
         <Route path="runs/:runId" element={<RunDetailPage />} />
         <Route path="config" element={<ConfigPage />} />
         <Route path="main-agent" element={<MainAgentPage />} />

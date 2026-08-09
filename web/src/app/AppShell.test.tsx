@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TestApp } from "./router";
@@ -56,11 +56,31 @@ describe("AppShell presentation", () => {
 
     expect(await screen.findByText("Agent 编排控制台")).not.toBeNull();
     expect(screen.getByText("控制中枢")).not.toBeNull();
-    expect(screen.getByRole("link", { name: "对话" })).not.toBeNull();
-    expect(screen.getByRole("link", { name: "设置" })).not.toBeNull();
-    expect(screen.getByRole("link", { name: "Hermes 学习" })).not.toBeNull();
+    expect(screen.getByRole("link", { name: "工作台" })).not.toBeNull();
+    expect(screen.getByRole("link", { name: "编排" })).not.toBeNull();
+    expect(screen.getByRole("link", { name: "系统" })).not.toBeNull();
     expect(screen.queryByText("实时调度")).toBeNull();
     expect(screen.queryByText("工具防护")).toBeNull();
     expect(screen.queryByText("沉淀经验，但不绕过审批")).toBeNull();
+  });
+
+  it("groups navigation into six module hubs with colored module cards", async () => {
+    render(<TestApp initialPath="/orchestration" />);
+
+    expect(await screen.findByText("Agent 编排控制台")).not.toBeNull();
+    const navigation = screen.getByRole("navigation", { name: "Main navigation" });
+    expect(within(navigation).getAllByRole("link")).toHaveLength(6);
+    expect(within(navigation).getByRole("link", { name: "工作台" })).not.toBeNull();
+    expect(within(navigation).getByRole("link", { name: "编排" })).not.toBeNull();
+    expect(within(navigation).getByRole("link", { name: "资源" })).not.toBeNull();
+    expect(within(navigation).getByRole("link", { name: "工具" })).not.toBeNull();
+    expect(within(navigation).getByRole("link", { name: "通道" })).not.toBeNull();
+    expect(within(navigation).getByRole("link", { name: "系统" })).not.toBeNull();
+
+    const moduleGrid = screen.getByRole("list", { name: "编排模块" });
+    expect(within(moduleGrid).getByRole("link", { name: /主 Agent/ })).not.toBeNull();
+    expect(within(moduleGrid).getByRole("link", { name: /Agent 角色/ })).not.toBeNull();
+    expect(within(moduleGrid).getByRole("link", { name: /工作流配置/ })).not.toBeNull();
+    expect(within(moduleGrid).getByRole("link", { name: /Hermes 学习/ })).not.toBeNull();
   });
 });
