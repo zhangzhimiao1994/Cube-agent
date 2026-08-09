@@ -752,6 +752,142 @@ article:hover {
   padding: 0.8rem 0.95rem;
 }
 
+[role="alert"] p {
+  margin: 0;
+}
+
+.error-log-panel {
+  background: rgba(9, 15, 28, 0.64);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 0.85rem;
+  color: var(--text);
+  margin-top: 0.75rem;
+  padding: 0.85rem;
+}
+
+.error-log-panel h4 {
+  color: #ffd0d5;
+  font-size: 0.95rem;
+  margin: 0 0 0.35rem;
+}
+
+.error-log-panel p {
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-weight: 700;
+  margin: 0 0 0.75rem;
+}
+
+.diagnostic-grid {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0;
+}
+
+.diagnostic-row {
+  align-items: start;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 0.7rem;
+  display: grid;
+  gap: 0.4rem;
+  grid-template-columns: minmax(5.5rem, 0.32fr) 1fr;
+  padding: 0.55rem 0.65rem;
+}
+
+.diagnostic-row dt {
+  color: #ffb7c0;
+  font-size: 0.8rem;
+  font-weight: 950;
+}
+
+.diagnostic-row dd {
+  color: var(--text);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.82rem;
+  font-weight: 800;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.log-module-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  margin-top: 1.25rem;
+}
+
+.log-module-card,
+.button-link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.log-module-card {
+  background: rgba(255, 255, 255, 0.055);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 1rem;
+  display: block;
+  padding: 1rem;
+  transition:
+    border-color 160ms ease,
+    transform 160ms ease;
+}
+
+.log-module-card:hover {
+  border-color: rgba(85, 215, 255, 0.36);
+  transform: translateY(-2px);
+}
+
+.log-module-card h3 {
+  margin: 0.35rem 0;
+}
+
+.log-list {
+  display: grid;
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.log-entry {
+  margin: 0;
+}
+
+.log-entry-header {
+  align-items: flex-start;
+  display: flex;
+  gap: 0.8rem;
+  margin-bottom: 0.85rem;
+}
+
+.log-entry-header h3,
+.log-entry-header p {
+  margin: 0;
+}
+
+.level-pill {
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 950;
+  padding: 0.25rem 0.55rem;
+  text-transform: uppercase;
+}
+
+.level-error {
+  background: rgba(255, 109, 122, 0.16);
+  color: #ff9aa4;
+}
+
+.level-warning {
+  background: rgba(255, 204, 102, 0.16);
+  color: #ffd277;
+}
+
+.level-info {
+  background: rgba(85, 215, 255, 0.14);
+  color: var(--accent);
+}
+
 [role="status"] {
   background: rgba(125, 255, 189, 0.1);
   border: 1px solid rgba(125, 255, 189, 0.25);

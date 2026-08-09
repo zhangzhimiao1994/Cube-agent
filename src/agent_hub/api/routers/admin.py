@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,7 +24,7 @@ from agent_hub.config.service import ConfigService, ConfigValidationError
 from agent_hub.db.models import AdminResourceRow
 from agent_hub.domain.runs import RunStatus
 from agent_hub.models.gateway import ModelTransport
-from agent_hub.models.litellm_client import LiteLLMClient
+from agent_hub.models.litellm_client import LiteLLMClient, ModelTransportError
 from agent_hub.models.types import Deployment, ModelCapability, ModelMessage, ModelRequest
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRecord, RunRepository
 from agent_hub.security.secrets import SecretService, SecretValidationError
@@ -30,6 +32,9 @@ from agent_hub.skills.package import InvalidSkillPackage
 from agent_hub.skills.scanner import SkillScanner
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"], responses=BASE_ERROR_RESPONSES)
+_LOGGER = logging.getLogger(__name__)
+_MODEL_CHECK_STATUS_RE = re.compile(r"\bstatus[=_: ](?P<status>[1-5][0-9]{2})\b")
+_MODEL_CHECK_HINT = "检查 API Key 是否有效、API Base 是否可从服务器访问、模型名是否属于该服务商账号。"
 
 
 class ModelDeploymentRequest(BaseModel):
@@ -360,6 +365,21 @@ class AuditEventResponse(BaseModel):
     created_at: datetime
 
 
+class LogEntryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    category: str = Field(
+        pattern=r"^(audit|model_error|mode_error|feature_error|agent_error|channel_error)$"
+    )
+    level: str = Field(pattern=r"^(info|warning|error)$")
+    title: str
+    message: str
+    source: str
+    details: dict[str, str]
+    created_at: datetime
+
+
 class HermesFeedbackRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -462,6 +482,8 @@ class AdminResourceService(Protocol):
 
     async def list_audit_events(self, action: str | None = None) -> tuple[AuditEventResponse, ...]: ...
 
+    async def list_logs(self, category: str | None = None) -> tuple[LogEntryResponse, ...]: ...
+
     async def list_hermes_insights(self) -> tuple[HermesInsightResponse, ...]: ...
 
     async def record_hermes_feedback(
@@ -488,6 +510,7 @@ class InMemoryAdminResourceService:
     mcp_servers: dict[str, McpServerResponse] = field(default_factory=dict)
     memory: dict[str, MemoryRecordResponse] = field(default_factory=dict)
     audit_events: list[AuditEventResponse] = field(default_factory=list)
+    logs: list[LogEntryResponse] = field(default_factory=list)
     hermes_insights: dict[str, HermesInsightResponse] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -619,6 +642,24 @@ class InMemoryAdminResourceService:
         return tuple(self.agents.values())
 
     async def upsert_agent(self, request: AgentResourceRequest) -> AgentResourceResponse:
+        if request.model is None:
+            await self.record_log(
+                category="agent_error",
+                level="warning",
+                title="Agent 角色配置错误",
+                message="agent model is required",
+                source="agents.upsert",
+                details={"agent_id": request.id, "reason": "missing_model"},
+            )
+        if request.prompt is None:
+            await self.record_log(
+                category="agent_error",
+                level="warning",
+                title="Agent 角色配置错误",
+                message="agent prompt is required",
+                source="agents.upsert",
+                details={"agent_id": request.id, "reason": "missing_prompt"},
+            )
         response = AgentResourceResponse(**request.model_dump())
         self.agents[response.id] = response
         return response
@@ -678,7 +719,18 @@ class InMemoryAdminResourceService:
         return response
 
     async def upload_skill_archive(self, filename: str, archive_bytes: bytes) -> SkillResponse:
-        inspection = SkillScanner().scan(archive_bytes).inspection
+        try:
+            inspection = SkillScanner().scan(archive_bytes).inspection
+        except InvalidSkillPackage:
+            await self.record_log(
+                category="feature_error",
+                level="warning",
+                title="主要功能运行错误",
+                message="skill package is invalid",
+                source="skills.upload",
+                details={"feature": "skills", "filename": filename},
+            )
+            raise
         response = SkillResponse(
             id=f"skill_{uuid4().hex}",
             name=inspection.manifest.name,
@@ -740,6 +792,60 @@ class InMemoryAdminResourceService:
             events = [event for event in events if event.action == action]
         return tuple(events)
 
+    def make_log(
+        self,
+        *,
+        category: str,
+        level: str,
+        title: str,
+        message: str,
+        source: str,
+        details: dict[str, str] | None = None,
+    ) -> LogEntryResponse:
+        return LogEntryResponse(
+            id=f"log_{uuid4().hex}",
+            category=category,
+            level=level,
+            title=title,
+            message=message,
+            source=source,
+            details=_safe_log_details(details or {}),
+            created_at=datetime.now(UTC),
+        )
+
+    async def record_log(
+        self,
+        *,
+        category: str,
+        level: str,
+        title: str,
+        message: str,
+        source: str,
+        details: dict[str, str] | None = None,
+    ) -> LogEntryResponse:
+        entry = self.make_log(
+            category=category,
+            level=level,
+            title=title,
+            message=message,
+            source=source,
+            details=details,
+        )
+        if entry.level != "info":
+            self.logs.append(entry)
+        return entry
+
+    async def list_logs(self, category: str | None = None) -> tuple[LogEntryResponse, ...]:
+        entries = [
+            *(_audit_log_entry(event) for event in self.audit_events),
+            *self.logs,
+            *(_mode_error_log_from_run(run) for run in self.runs.values() if run.status == "failed"),
+            *_channel_error_logs_from_environment(),
+        ]
+        if category is not None:
+            entries = [entry for entry in entries if entry.category == category]
+        return tuple(sorted(entries, key=lambda entry: entry.created_at, reverse=True))
+
     async def list_hermes_insights(self) -> tuple[HermesInsightResponse, ...]:
         return tuple(sorted(self.hermes_insights.values(), key=lambda insight: insight.created_at))
 
@@ -747,6 +853,14 @@ class InMemoryAdminResourceService:
         self, request: HermesFeedbackRequest
     ) -> HermesInsightResponse:
         if _contains_sensitive_marker(request.lesson):
+            await self.record_log(
+                category="feature_error",
+                level="warning",
+                title="主要功能运行错误",
+                message="Hermes feedback contains sensitive content",
+                source="hermes.feedback",
+                details={"feature": "hermes", "reason": "sensitive_content"},
+            )
             raise ValueError("sensitive content")
         insight = HermesInsightResponse(
             id=f"hermes-{uuid4().hex}",
@@ -1049,8 +1163,24 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
 
     async def upsert_agent(self, request: AgentResourceRequest) -> AgentResourceResponse:
         if request.model is None:
+            await self.record_log(
+                category="agent_error",
+                level="warning",
+                title="Agent 角色配置错误",
+                message="agent model is required",
+                source="agents.upsert",
+                details={"agent_id": request.id, "reason": "missing_model"},
+            )
             raise PublicAPIError(422, "request_validation", "agent model is required")
         if request.prompt is None:
+            await self.record_log(
+                category="agent_error",
+                level="warning",
+                title="Agent 角色配置错误",
+                message="agent prompt is required",
+                source="agents.upsert",
+                details={"agent_id": request.id, "reason": "missing_prompt"},
+            )
             raise PublicAPIError(422, "request_validation", "agent prompt is required")
         role = request.role or request.name
         document = await self._current_document()
@@ -1143,6 +1273,14 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         try:
             scan_report = SkillScanner().scan(archive_bytes)
         except InvalidSkillPackage:
+            await self.record_log(
+                category="feature_error",
+                level="warning",
+                title="主要功能运行错误",
+                message="skill package is invalid",
+                source="skills.upload",
+                details={"feature": "skills", "filename": _safe_model_check_detail(filename)},
+            )
             raise PublicAPIError(422, "invalid_skill_package", "skill package is invalid") from None
         skill_id = f"skill_{uuid4().hex}"
         try:
@@ -1150,6 +1288,14 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             archive_path.parent.mkdir(parents=True, exist_ok=True)
             archive_path.write_bytes(archive_bytes)
         except OSError:
+            await self.record_log(
+                category="feature_error",
+                level="error",
+                title="主要功能运行错误",
+                message="skill store is unavailable",
+                source="skills.upload",
+                details={"feature": "skills", "filename": _safe_model_check_detail(filename)},
+            )
             raise PublicAPIError(503, "skill_store_unavailable", "skill store is unavailable") from None
         inspection = scan_report.inspection
         response = SkillResponse(
@@ -1262,6 +1408,51 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             events = tuple(event for event in events if event.action == action)
         return tuple(sorted(events, key=lambda event: event.created_at, reverse=True))
 
+    async def record_log(
+        self,
+        *,
+        category: str,
+        level: str,
+        title: str,
+        message: str,
+        source: str,
+        details: dict[str, str] | None = None,
+    ) -> LogEntryResponse:
+        entry = self.make_log(
+            category=category,
+            level=level,
+            title=title,
+            message=message,
+            source=source,
+            details=details,
+        )
+        if entry.level == "info":
+            return entry
+        if not await self._upsert_admin_payload("log", entry.id, entry.model_dump(mode="json")):
+            return await super().record_log(
+                category=category,
+                level=level,
+                title=title,
+                message=message,
+                source=source,
+                details=details,
+            )
+        return entry
+
+    async def list_logs(self, category: str | None = None) -> tuple[LogEntryResponse, ...]:
+        resources = await self._list_admin_payloads("log")
+        if resources is None:
+            return await super().list_logs(category)
+        entries = [
+            *(_audit_log_entry(event) for event in await self.list_audit_events()),
+            *(_log_response_from_payload(payload) for payload in resources),
+            *(await self._mode_error_logs_from_repository()),
+            *_channel_error_logs_from_environment(),
+        ]
+        if category is not None:
+            entries = [entry for entry in entries if entry.category == category]
+        return tuple(sorted(entries, key=lambda entry: entry.created_at, reverse=True))
+
     async def list_hermes_insights(self) -> tuple[HermesInsightResponse, ...]:
         resources = await self._list_admin_payloads("hermes")
         if resources is None:
@@ -1272,6 +1463,14 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         self, request: HermesFeedbackRequest
     ) -> HermesInsightResponse:
         if _contains_sensitive_marker(request.lesson):
+            await self.record_log(
+                category="feature_error",
+                level="warning",
+                title="主要功能运行错误",
+                message="Hermes feedback contains sensitive content",
+                source="hermes.feedback",
+                details={"feature": "hermes", "reason": "sensitive_content"},
+            )
             raise ValueError("sensitive content")
         insight_id = f"hermes_{uuid4().hex}"
         response = HermesInsightResponse(
@@ -1325,6 +1524,30 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             reasons=[f"Hermes lesson matched: {best.lesson}"],
             requires_approval=True,
         )
+
+    async def _mode_error_logs_from_repository(self) -> tuple[LogEntryResponse, ...]:
+        if self._run_repository is None:
+            return ()
+        entries: list[LogEntryResponse] = []
+        for record in await self._run_repository.list_recent(self._tenant_id, limit=100):
+            if record.status is not RunStatus.FAILED:
+                continue
+            mode = "unknown" if record.mode is None else record.mode.value
+            entries.append(
+                self.make_log(
+                    category="mode_error",
+                    level="error",
+                    title="模式运行失败",
+                    message=f"{mode} run failed",
+                    source="runs.execute",
+                    details={
+                        "run_id": str(record.id),
+                        "mode": mode,
+                        "status": record.status.value,
+                    },
+                )
+            )
+        return tuple(entries)
 
     async def _list_admin_payloads(self, kind: str) -> list[dict[str, object]] | None:
         if self._session_factory is None:
@@ -1443,10 +1666,30 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             raise
         except Exception as error:  # noqa: BLE001 - redact provider/SDK failures.
             reason = _safe_model_check_reason(error)
+            details = _model_check_error_details(deployment, error, reason)
+            _LOGGER.warning(
+                "model_availability_check_failed provider=%s logical_model=%s upstream_model=%s "
+                "api_base=%s status_code=%s reason=%s",
+                details["provider"],
+                details["logical_model"],
+                details["upstream_model"],
+                details["api_base"],
+                details["status_code"],
+                details["reason"],
+            )
+            await self.record_log(
+                category="model_error",
+                level="error",
+                title="模型可用性测试失败",
+                message=reason,
+                source="models.create",
+                details=details,
+            )
             raise PublicAPIError(
                 422,
                 "model_unavailable",
                 f"model availability check failed: {reason}",
+                details=details,
             ) from None
 
     async def _current_document(self) -> dict[str, object]:
@@ -1556,6 +1799,111 @@ def _safe_model_check_reason(error: Exception) -> str:
     return message[:300]
 
 
+def _model_check_error_details(
+    deployment: Deployment,
+    error: Exception,
+    reason: str,
+) -> dict[str, str]:
+    provider, upstream_model = _deployment_provider_and_model(deployment)
+    return {
+        "stage": "model_availability_check",
+        "provider": _safe_model_check_detail(provider),
+        "api_base": _safe_model_check_detail(deployment.api_base),
+        "logical_model": _safe_model_check_detail(deployment.logical_model),
+        "upstream_model": _safe_model_check_detail(upstream_model),
+        "status_code": _model_check_status_code(error) or "unknown",
+        "reason": _safe_model_check_detail(reason),
+        "hint": _MODEL_CHECK_HINT,
+    }
+
+
+def _deployment_provider_and_model(deployment: Deployment) -> tuple[str, str]:
+    provider, _, provider_model = deployment.provider_model.partition("/")
+    upstream_model = deployment.request_model or provider_model or deployment.provider_model
+    return provider or "unknown", upstream_model
+
+
+def _safe_model_check_detail(value: str) -> str:
+    cleaned = value.strip()
+    if not cleaned or _contains_sensitive_marker(cleaned):
+        return "redacted"
+    return cleaned[:300]
+
+
+def _safe_log_details(details: dict[str, str]) -> dict[str, str]:
+    safe: dict[str, str] = {}
+    for key, value in details.items():
+        if _contains_sensitive_marker(key):
+            continue
+        safe[key[:80]] = _safe_model_check_detail(str(value))
+    return safe
+
+
+def _audit_log_entry(event: AuditEventResponse) -> LogEntryResponse:
+    return LogEntryResponse(
+        id=f"log_{event.id}",
+        category="audit",
+        level="info",
+        title="审计日志",
+        message=event.action,
+        source="admin.audit",
+        details=_safe_log_details(
+            {
+                "actor": event.actor,
+                "resource": event.resource,
+                "action": event.action,
+            }
+        ),
+        created_at=event.created_at,
+    )
+
+
+def _mode_error_log_from_run(run: RunDetailResponse) -> LogEntryResponse:
+    return LogEntryResponse(
+        id=f"log_run_{run.id}",
+        category="mode_error",
+        level="error",
+        title="模式运行失败",
+        message=f"{run.mode} run failed",
+        source="runs.execute",
+        details=_safe_log_details(
+            {
+                "run_id": str(run.id),
+                "mode": run.mode,
+                "status": run.status,
+            }
+        ),
+        created_at=datetime.now(UTC),
+    )
+
+
+def _log_response_from_payload(payload: dict[str, object]) -> LogEntryResponse:
+    details = payload.get("details")
+    return LogEntryResponse(
+        id=str(payload.get("id", "")),
+        category=str(payload.get("category", "feature_error")),
+        level=str(payload.get("level", "warning")),
+        title=str(payload.get("title", "主要功能运行错误")),
+        message=str(payload.get("message", "runtime error")),
+        source=str(payload.get("source", "system")),
+        details=_safe_log_details(
+            {str(key): str(value) for key, value in details.items()}
+            if isinstance(details, dict)
+            else {}
+        ),
+        created_at=_datetime_from_json(payload.get("created_at")),
+    )
+
+
+def _model_check_status_code(error: Exception) -> str | None:
+    if isinstance(error, ModelTransportError) and error.status_code is not None:
+        return str(error.status_code)
+    match = _MODEL_CHECK_STATUS_RE.search(str(error))
+    if match is None:
+        return None
+    return match.group("status")
+
+
 def _audit_response_from_payload(payload: dict[str, object]) -> AuditEventResponse:
     created_at = payload.get("created_at")
     return AuditEventResponse(
@@ -1620,6 +1968,32 @@ def _channel_statuses_from_environment() -> tuple[ChannelStatusResponse, ...]:
             )
         )
     return tuple(statuses)
+
+
+def _channel_error_logs_from_environment() -> tuple[LogEntryResponse, ...]:
+    entries: list[LogEntryResponse] = []
+    for status in _channel_statuses_from_environment():
+        if status.status == "configured":
+            continue
+        entries.append(
+            LogEntryResponse(
+                id=f"log_channel_{status.id}",
+                category="channel_error",
+                level="warning",
+                title="通道连接配置错误",
+                message=f"{status.name} missing configuration",
+                source="channels.status",
+                details=_safe_log_details(
+                    {
+                        "channel": status.id,
+                        "missing": ",".join(status.missing),
+                        "webhook_path": status.webhook_path or "",
+                    }
+                ),
+                created_at=datetime.now(UTC),
+            )
+        )
+    return tuple(entries)
 
 
 def _admin_run_event(event: dict[str, object]) -> RunEventResponse:
@@ -1967,6 +2341,25 @@ async def list_audit_events(
 ) -> list[AuditEventResponse]:
     _require(principal, "audit:read")
     return list(await service.list_audit_events(action))
+
+
+@router.get("/logs", response_model=list[LogEntryResponse], responses=error_responses(401, 403, 422))
+async def list_logs(
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+    category: str | None = None,
+) -> list[LogEntryResponse]:
+    _require(principal, "audit:read")
+    if category is not None and category not in {
+        "audit",
+        "model_error",
+        "mode_error",
+        "feature_error",
+        "agent_error",
+        "channel_error",
+    }:
+        raise PublicAPIError(422, "request_validation", "invalid log category")
+    return list(await service.list_logs(category))
 
 
 @router.get("/hermes", response_model=list[HermesInsightResponse], responses=error_responses(401, 403, 422))

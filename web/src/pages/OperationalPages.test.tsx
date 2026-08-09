@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -137,6 +137,73 @@ describe("operational management pages", () => {
             },
           ]);
         }
+        if (path.startsWith("/api/v1/admin/logs")) {
+          const logs = [
+            {
+              id: "audit-1",
+              category: "audit",
+              level: "info",
+              title: "配置发布",
+              message: "config.publish",
+              source: "admin.audit",
+              details: { resource: "configuration", actor: "system" },
+              created_at: "2026-08-07T00:00:00Z",
+            },
+            {
+              id: "model-error-1",
+              category: "model_error",
+              level: "error",
+              title: "模型可用性测试失败",
+              message: "provider returned status=401",
+              source: "models.create",
+              details: { provider: "deepseek", status_code: "401" },
+              created_at: "2026-08-07T00:01:00Z",
+            },
+            {
+              id: "mode-error-1",
+              category: "mode_error",
+              level: "error",
+              title: "模式运行失败",
+              message: "dispatch runtime failed",
+              source: "runs.execute",
+              details: { mode: "dispatch", run_id: runId },
+              created_at: "2026-08-07T00:02:00Z",
+            },
+            {
+              id: "feature-error-1",
+              category: "feature_error",
+              level: "warning",
+              title: "主要功能运行错误",
+              message: "skill package is invalid",
+              source: "skills.upload",
+              details: { feature: "skills" },
+              created_at: "2026-08-07T00:03:00Z",
+            },
+            {
+              id: "agent-error-1",
+              category: "agent_error",
+              level: "warning",
+              title: "Agent 角色配置错误",
+              message: "agent model is required",
+              source: "agents.upsert",
+              details: { agent_id: "director", reason: "missing_model" },
+              created_at: "2026-08-07T00:04:00Z",
+            },
+            {
+              id: "channel-error-1",
+              category: "channel_error",
+              level: "warning",
+              title: "通道连接配置错误",
+              message: "Feishu missing configuration",
+              source: "channels.status",
+              details: { channel: "feishu", missing: "FEISHU_APP_ID,FEISHU_APP_SECRET" },
+              created_at: "2026-08-07T00:05:00Z",
+            },
+          ];
+          const url = new URL(path, "https://agent-hub.test");
+          const category = url.searchParams.get("category");
+          return jsonResponse(category ? logs.filter((item) => item.category === category) : logs);
+        }
         if (path === "/api/v1/admin/hermes" && init?.method === "GET") {
           return jsonResponse([
             {
@@ -210,7 +277,7 @@ describe("operational management pages", () => {
     expect(await screen.findByText("enabled")).not.toBeNull();
   });
 
-  it("shows MCP, memory, and audit governance pages", async () => {
+  it("shows MCP, memory, and unified log governance pages", async () => {
     render(<TestApp initialPath="/mcp" />);
     expect(await screen.findByText("Filesystem MCP")).not.toBeNull();
     expect(screen.getByText("healthy")).not.toBeNull();
@@ -219,11 +286,36 @@ describe("operational management pages", () => {
     expect(await screen.findByText("project-policy")).not.toBeNull();
     expect(screen.getByText("tenant")).not.toBeNull();
 
-    render(<TestApp initialPath="/audit" />);
+    const logsView = render(<TestApp initialPath="/logs" />);
+    expect(await screen.findByRole("heading", { name: "日志" })).not.toBeNull();
+    const logsMain = within(logsView.container.querySelector("main") as HTMLElement);
+    expect(logsMain.getByRole("link", { name: /审计日志/ })).not.toBeNull();
+    expect(logsMain.getByRole("link", { name: /大模型错误/ })).not.toBeNull();
+    expect(logsMain.getByRole("link", { name: /模式运行错误/ })).not.toBeNull();
+    expect(logsMain.getByRole("link", { name: /主要功能运行错误/ })).not.toBeNull();
+    expect(logsMain.getByRole("link", { name: /Agent 角色/ })).not.toBeNull();
+    expect(logsMain.getByRole("link", { name: /通道连接/ })).not.toBeNull();
+
+    render(<TestApp initialPath="/logs/model" />);
+    expect(await screen.findByRole("heading", { name: "大模型错误" })).not.toBeNull();
+    expect(await screen.findByText("provider returned status=401")).not.toBeNull();
+    expect(screen.queryByText("dispatch runtime failed")).toBeNull();
+
+    render(<TestApp initialPath="/logs/mode" />);
+    expect(await screen.findByRole("heading", { name: "模式运行错误" })).not.toBeNull();
+    expect(await screen.findByText("dispatch runtime failed")).not.toBeNull();
+
+    render(<TestApp initialPath="/logs/audit" />);
+    expect(await screen.findByRole("heading", { name: "审计日志" })).not.toBeNull();
     expect(await screen.findByText("config.publish")).not.toBeNull();
-    expect(screen.getByRole("columnheader", { name: "操作" })).not.toBeNull();
-    expect(screen.getByRole("columnheader", { name: "资源" })).not.toBeNull();
-    expect(screen.getByRole("columnheader", { name: "操作者" })).not.toBeNull();
+
+    render(<TestApp initialPath="/logs/agent" />);
+    expect(await screen.findByRole("heading", { name: "Agent 角色" })).not.toBeNull();
+    expect(await screen.findByText("agent model is required")).not.toBeNull();
+
+    render(<TestApp initialPath="/logs/channel" />);
+    expect(await screen.findByRole("heading", { name: "通道连接" })).not.toBeNull();
+    expect(await screen.findByText("Feishu missing configuration")).not.toBeNull();
     expect(screen.queryByText(/api_key|hidden_reasoning|fingerprint/i)).toBeNull();
   });
 

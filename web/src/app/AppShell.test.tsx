@@ -27,6 +27,9 @@ describe("AppShell presentation", () => {
         if (path === "/api/v1/admin/runs") {
           return jsonResponse([]);
         }
+        if (path.startsWith("/api/v1/admin/logs")) {
+          return jsonResponse([]);
+        }
         return jsonResponse({ error: "not_found" }, { status: 404 });
       }),
     );
@@ -48,6 +51,8 @@ describe("AppShell presentation", () => {
     expect(screen.getByRole("link", { name: "技能" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "通道连接" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "系统设置" })).not.toBeNull();
+    expect(screen.getByRole("link", { name: "日志" })).not.toBeNull();
+    expect(screen.queryByRole("link", { name: "审计日志" })).toBeNull();
     expect(screen.getAllByText("Hermes 学习").length).toBeGreaterThan(0);
   });
 });

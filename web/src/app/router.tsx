@@ -4,11 +4,11 @@ import { BrowserRouter, MemoryRouter, Navigate, Route, Routes } from "react-rout
 import { AppShell } from "./AppShell";
 import { AuthProvider, RequireAuth } from "../auth/AuthProvider";
 import { AgentsPage } from "../pages/AgentsPage";
-import { AuditPage } from "../pages/AuditPage";
 import { ChannelsPage } from "../pages/ChannelsPage";
 import { ConfigPage } from "../pages/ConfigPage";
 import { HermesPage } from "../pages/HermesPage";
 import { LoginPage } from "../pages/LoginPage";
+import { LogsPage } from "../pages/LogsPage";
 import { McpPage } from "../pages/McpPage";
 import { MemoryPage } from "../pages/MemoryPage";
 import { ModelsPage } from "../pages/ModelsPage";
@@ -51,7 +51,9 @@ export function AppRoutes() {
         <Route path="memory" element={<MemoryPage />} />
         <Route path="hermes" element={<HermesPage />} />
         <Route path="users" element={<UsersPage />} />
-        <Route path="audit" element={<AuditPage />} />
+        <Route path="logs" element={<LogsPage />} />
+        <Route path="logs/:module" element={<LogsPage />} />
+        <Route path="audit" element={<Navigate to="/logs/audit" replace />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

@@ -270,6 +270,19 @@ const AuditEventSchema = z.object({
 
 export type AuditEvent = z.infer<typeof AuditEventSchema>;
 
+const LogEntrySchema = z.object({
+  id: z.string(),
+  category: z.string(),
+  level: z.string(),
+  title: z.string(),
+  message: z.string(),
+  source: z.string(),
+  details: z.record(z.string(), z.string()),
+  created_at: z.string(),
+});
+
+export type LogEntry = z.infer<typeof LogEntrySchema>;
+
 const HermesInsightSchema = z.object({
   id: z.string(),
   outcome: z.string(),
@@ -292,15 +305,20 @@ const HermesRecommendationSchema = z.object({
 
 export type HermesRecommendation = z.infer<typeof HermesRecommendationSchema>;
 
+const ErrorDetailValueSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
+
 const ErrorEnvelopeSchema = z.object({
   error: z.union([
     z.string(),
     z.object({
       code: z.string(),
       message: z.string(),
+      details: z.record(z.string(), ErrorDetailValueSchema).optional(),
     }),
   ]),
 });
+
+export type ApiErrorDetails = Record<string, string | number | boolean | null>;
 
 export class ApiError extends Error {
   constructor(
@@ -308,6 +326,7 @@ export class ApiError extends Error {
     public readonly status: number,
     public readonly code: string = "request_failed",
     public readonly errorId: string | null = null,
+    public readonly details: ApiErrorDetails | null = null,
   ) {
     super(message);
   }
@@ -331,7 +350,7 @@ async function errorFromResponse(response: Response): Promise<ApiError> {
       if (typeof error === "string") {
         return new ApiError(error || fallbackMessage, response.status, "request_failed", errorId);
       }
-      return new ApiError(error.message, response.status, error.code, errorId);
+      return new ApiError(error.message, response.status, error.code, errorId, error.details ?? null);
     }
   } catch {
     return new ApiError(fallbackMessage, response.status, "invalid_error_response", errorId);
@@ -634,6 +653,10 @@ export const api = {
   audit(action?: string): Promise<AuditEvent[]> {
     const query = action ? `?action=${encodeURIComponent(action)}` : "";
     return request(`/api/v1/admin/audit${query}`, { method: "GET" }, z.array(AuditEventSchema));
+  },
+  logs(category?: string): Promise<LogEntry[]> {
+    const query = category ? `?category=${encodeURIComponent(category)}` : "";
+    return request(`/api/v1/admin/logs${query}`, { method: "GET" }, z.array(LogEntrySchema));
   },
   hermesInsights(): Promise<HermesInsight[]> {
     return request("/api/v1/admin/hermes", { method: "GET" }, z.array(HermesInsightSchema));

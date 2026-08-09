@@ -14,7 +14,7 @@ const NAVIGATION = [
   { to: "/memory", label: "记忆", permission: "memory:read" },
   { to: "/hermes", label: "Hermes 学习", permission: "hermes:read" },
   { to: "/users", label: "用户", permission: "user:read" },
-  { to: "/audit", label: "审计日志", permission: "audit:read" },
+  { to: "/logs", label: "日志", permission: "audit:read" },
 ];
 
 const HEALTH_CARDS = [

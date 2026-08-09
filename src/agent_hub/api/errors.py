@@ -13,6 +13,7 @@ class ErrorBody(BaseModel):
 
     code: str
     message: str
+    details: dict[str, str] | None = None
 
 
 class ErrorResponse(BaseModel):
@@ -34,8 +35,15 @@ BASE_ERROR_RESPONSES = error_responses(405, 500)
 _SAFE_HTTP_HEADERS = frozenset({"allow", "www-authenticate", "retry-after"})
 
 
-def error_payload(code: str, message: str) -> dict[str, dict[str, str]]:
-    return {"error": {"code": code, "message": message}}
+def error_payload(
+    code: str,
+    message: str,
+    details: dict[str, str] | None = None,
+) -> dict[str, dict[str, object]]:
+    body: dict[str, object] = {"code": code, "message": message}
+    if details:
+        body["details"] = details
+    return {"error": body}
 
 
 class PublicAPIError(RuntimeError):
@@ -45,11 +53,13 @@ class PublicAPIError(RuntimeError):
         code: str,
         message: str,
         *,
+        details: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
     ) -> None:
         self.status_code = status_code
         self.code = code
         self.public_message = message
+        self.details = details
         self.headers = headers
         super().__init__(code)
 
@@ -59,7 +69,7 @@ async def public_error_handler(request: Request, error: Exception) -> JSONRespon
     assert isinstance(error, PublicAPIError)
     return JSONResponse(
         status_code=error.status_code,
-        content=error_payload(error.code, error.public_message),
+        content=error_payload(error.code, error.public_message, error.details),
         headers=error.headers,
     )
 

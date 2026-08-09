@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useMemo, useState } from "react";
 
-import { api, formatApiError } from "../api/client";
+import { ApiError, api, formatApiError } from "../api/client";
 
 const CUSTOM_PROVIDER = "custom";
 const CUSTOM_MODEL = "__custom_model__";
@@ -16,6 +16,8 @@ type ProviderPreset = {
   apiBase: string;
   capabilities: string[];
   label: string;
+  modelHelp?: string;
+  modelEntryMode?: "catalog" | "freeform";
   models: ModelPreset[];
   quotaScope: string;
   value: string;
@@ -115,14 +117,21 @@ const PROVIDERS: ProviderPreset[] = [
     ],
   },
   {
-    label: "OpenAI 兼容中转站",
+    label: "OpenAI 兼容中转站 / 混合模型池",
     value: "openai-compatible",
-    apiBase: "https://proxy.example.com/v1",
-    quotaScope: "proxy-account",
-    capabilities: ["text", "tool_calling"],
+    apiBase: "",
+    quotaScope: "relay-account",
+    capabilities: ["text", "tool_calling", "structured_output"],
+    modelEntryMode: "freeform",
+    modelHelp: "中转站通常会混合多个厂商模型，请填写中转站后台显示的完整模型 ID。",
     models: [
-      { label: "GPT 兼容模型", value: "gpt-compatible", capabilities: ["text", "tool_calling"] },
-      { label: "Claude 兼容模型", value: "claude-compatible", capabilities: ["text"] },
+      { label: "DeepSeek Chat", value: "deepseek-chat", capabilities: ["text", "tool_calling"] },
+      { label: "DeepSeek Reasoner", value: "deepseek-reasoner", capabilities: ["text"] },
+      { label: "Kimi K2 Turbo Preview", value: "kimi-k2-turbo-preview", capabilities: ["text", "tool_calling"] },
+      { label: "Qwen Plus", value: "qwen-plus", capabilities: ["text", "tool_calling"] },
+      { label: "Claude Sonnet 4", value: "claude-sonnet-4-20250514", capabilities: ["text", "tool_calling"] },
+      { label: "GPT-5.6 Terra", value: "gpt-5.6-terra", capabilities: ["text", "tool_calling", "structured_output"] },
+      { label: "MiniMax M1", value: "minimax-m1", capabilities: ["text"] },
     ],
   },
 ];
@@ -151,6 +160,28 @@ function displaySaturationPolicy(policy: string) {
   return policy === "queue_first_then_fallback" ? "先排队，超时后降级" : policy;
 }
 
+const MODEL_ERROR_LABELS: Record<string, string> = {
+  stage: "阶段",
+  provider: "服务商",
+  api_base: "API Base",
+  logical_model: "逻辑模型",
+  upstream_model: "上游模型",
+  status_code: "HTTP 状态",
+  reason: "失败原因",
+  hint: "处理建议",
+};
+
+function modelErrorDiagnostics(error: unknown) {
+  if (!(error instanceof ApiError) || !error.details) return [];
+  return Object.entries(error.details)
+    .filter(([, value]) => value !== null && value !== "")
+    .map(([key, value]) => ({
+      key,
+      label: MODEL_ERROR_LABELS[key] ?? key,
+      value: String(value),
+    }));
+}
+
 export function ModelsPage() {
   const queryClient = useQueryClient();
   const models = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
@@ -174,7 +205,8 @@ export function ModelsPage() {
   );
   const modelOptions = selectedProviderPreset?.models ?? [];
   const isCustomProvider = provider === CUSTOM_PROVIDER;
-  const isCustomModel = isCustomProvider || selectedModel === CUSTOM_MODEL;
+  const isFreeformProvider = selectedProviderPreset?.modelEntryMode === "freeform";
+  const isCustomModel = isCustomProvider || isFreeformProvider || selectedModel === CUSTOM_MODEL;
 
   const saveModel = useMutation({
     mutationFn: async () => {
@@ -219,10 +251,11 @@ export function ModelsPage() {
     }
     const preset = PROVIDERS.find((item) => item.value === nextProvider) ?? PROVIDERS[0];
     const defaultModel = preset.models[0];
-    setSelectedModel(defaultModel.value);
+    setSelectedModel(preset.modelEntryMode === "freeform" ? CUSTOM_MODEL : defaultModel.value);
+    setCustomModel("");
     setApiBase(preset.apiBase);
     setQuotaScope(preset.quotaScope);
-    setCapabilities(defaultModel.capabilities);
+    setCapabilities(preset.modelEntryMode === "freeform" ? preset.capabilities : defaultModel.capabilities);
   }
 
   function changeModel(nextModel: string) {
@@ -269,7 +302,7 @@ export function ModelsPage() {
         <div className="detail-grid">
           <div>
             <span className="eyebrow">服务商 / 模型</span>
-            <p>选择服务商后只显示该服务商模型；Claude Code 可选 Anthropic / Claude Code，也可用自定义模型名接中转站。</p>
+            <p>普通服务商会显示对应模型；中转站是混合模型池，直接填写中转站后台给出的完整模型 ID。</p>
           </div>
           <div>
             <span className="eyebrow">API Base / Key</span>
@@ -288,7 +321,7 @@ export function ModelsPage() {
 
       <form onSubmit={submit} aria-label="添加模型配置">
         <h3>添加模型配置</h3>
-        <p>选择服务商后，模型下拉框只显示该服务商下属模型；中转站或新模型可选择自定义。</p>
+        <p>选择服务商后，普通服务商只显示其下属模型；中转站支持直接输入任意上游模型名，并会照常做 API 可用性测试。</p>
 
         <label htmlFor="provider">服务商</label>
         <select id="provider" value={provider} onChange={(event) => changeProvider(event.target.value)}>
@@ -313,7 +346,7 @@ export function ModelsPage() {
           </>
         ) : null}
 
-        {!isCustomProvider ? (
+        {!isCustomProvider && !isFreeformProvider ? (
           <>
             <label htmlFor="model">模型</label>
             <select id="model" value={selectedModel} onChange={(event) => changeModel(event.target.value)}>
@@ -327,16 +360,28 @@ export function ModelsPage() {
           </>
         ) : null}
 
+        {isFreeformProvider && selectedProviderPreset?.modelHelp ? <p>{selectedProviderPreset.modelHelp}</p> : null}
+
         {isCustomModel ? (
           <>
-            <label htmlFor="custom-model">自定义模型</label>
+            <label htmlFor="custom-model">{isFreeformProvider ? "中转站模型名" : "自定义模型"}</label>
             <input
               id="custom-model"
+              list={isFreeformProvider ? "relay-model-suggestions" : undefined}
               value={customModel}
               onChange={(event) => setCustomModel(event.target.value)}
-              placeholder="填写服务商实际模型名"
+              placeholder={isFreeformProvider ? "粘贴中转站后台提供的模型 ID" : "填写服务商实际模型名"}
               required
             />
+            {isFreeformProvider ? (
+              <datalist id="relay-model-suggestions">
+                {modelOptions.map((model) => (
+                  <option key={model.value} value={model.value}>
+                    {model.label}
+                  </option>
+                ))}
+              </datalist>
+            ) : null}
           </>
         ) : null}
 
@@ -411,9 +456,25 @@ export function ModelsPage() {
         </button>
         {saveMessage ? <p role="status">{saveMessage}</p> : null}
         {saveModel.isError ? (
-          <p role="alert">
-            {formatApiError(saveModel.error, "模型测试或保存失败，请检查 API Key、API Base、模型名或后端日志")}
-          </p>
+          <div role="alert">
+            <p>
+              {formatApiError(saveModel.error, "模型测试或保存失败，请检查 API Key、API Base、模型名或后端日志")}
+            </p>
+            {modelErrorDiagnostics(saveModel.error).length > 0 ? (
+              <section className="error-log-panel" aria-label="模型配置错误日志">
+                <h4>模型配置错误日志</h4>
+                <p>下面是后端返回的脱敏诊断信息，不包含 API Key，可直接用于排查服务商配置。</p>
+                <dl className="diagnostic-grid">
+                  {modelErrorDiagnostics(saveModel.error).map((item) => (
+                    <div key={item.key} className="diagnostic-row">
+                      <dt>{item.label}</dt>
+                      <dd>{item.value}</dd>
+                    </div>
+                  ))}
+                </dl>
+              </section>
+            ) : null}
+          </div>
         ) : null}
       </form>
 

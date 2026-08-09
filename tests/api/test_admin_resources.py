@@ -1,6 +1,8 @@
+import asyncio
 import io
 import zipfile
 from datetime import UTC, datetime
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -451,6 +453,85 @@ def test_skill_upload_approve_mcp_memory_and_audit_are_safe() -> None:
         assert forbidden not in serialized.lower()
 
 
+def test_unified_logs_include_audit_model_mode_and_feature_errors() -> None:
+    api = client()
+    app = cast(Any, api.app)
+    service = cast(
+        InMemoryAdminResourceService,
+        app.state.admin_resource_service,
+    )
+
+    service.logs.extend(
+        [
+            service.make_log(
+                category="model_error",
+                level="error",
+                title="模型可用性测试失败",
+                message="provider returned status=401",
+                source="models.create",
+                details={"provider": "deepseek", "status_code": "401"},
+            ),
+            service.make_log(
+                category="mode_error",
+                level="error",
+                title="模式运行失败",
+                message="dispatch runtime failed",
+                source="runs.execute",
+                details={"mode": "dispatch"},
+            ),
+            service.make_log(
+                category="feature_error",
+                level="warning",
+                title="主要功能运行错误",
+                message="skill package is invalid",
+                source="skills.upload",
+                details={"feature": "skills"},
+            ),
+            service.make_log(
+                category="agent_error",
+                level="warning",
+                title="Agent 角色配置错误",
+                message="agent model is required",
+                source="agents.upsert",
+                details={"agent_id": "director", "reason": "missing_model"},
+            ),
+        ]
+    )
+    asyncio.run(
+        service.record_log(
+            category="feature_error",
+            level="info",
+            title="正常运行流水",
+            message="this normal trace must not be collected",
+            source="feature.normal",
+        )
+    )
+
+    all_logs = api.get("/api/v1/admin/logs", headers=headers())
+    model_logs = api.get("/api/v1/admin/logs?category=model_error", headers=headers())
+    channel_logs = api.get("/api/v1/admin/logs?category=channel_error", headers=headers())
+
+    assert all_logs.status_code == 200
+    categories = {item["category"] for item in all_logs.json()}
+    assert {
+        "audit",
+        "model_error",
+        "mode_error",
+        "feature_error",
+        "agent_error",
+        "channel_error",
+    } <= categories
+    assert model_logs.status_code == 200
+    assert [item["category"] for item in model_logs.json()] == ["model_error"]
+    assert channel_logs.status_code == 200
+    assert channel_logs.json()
+    assert all(item["level"] == "warning" for item in channel_logs.json())
+    serialized = all_logs.text
+    assert "this normal trace must not be collected" not in serialized
+    for forbidden in ("api_key", "fingerprint", "hidden_reasoning", "chain_of_thought"):
+        assert forbidden not in serialized.lower()
+
+
 def test_skill_archive_upload_scans_real_zip_package() -> None:
     api = client()
 
@@ -714,7 +795,18 @@ async def test_persistent_admin_model_is_not_published_when_availability_check_f
 
     assert error.value.code == "model_unavailable"
     assert "status=401" in error.value.public_message
+    assert error.value.details == {
+        "stage": "model_availability_check",
+        "provider": "deepseek",
+        "api_base": "https://api.deepseek.com/v1",
+        "logical_model": "main",
+        "upstream_model": "deepseek-chat",
+        "status_code": "401",
+        "reason": "provider returned status=401",
+        "hint": "检查 API Key 是否有效、API Base 是否可从服务器访问、模型名是否属于该服务商账号。",
+    }
     assert "sk-live" not in error.value.public_message
+    assert "credential_ref" not in error.value.details
     assert configs.drafts == []
     assert configs.current is None
 

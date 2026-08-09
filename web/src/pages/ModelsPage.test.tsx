@@ -72,6 +72,16 @@ describe("ModelsPage", () => {
                 error: {
                   code: "model_unavailable",
                   message: "model availability check failed: status=401",
+                  details: {
+                    stage: "model_availability_check",
+                    provider: "deepseek",
+                    api_base: "https://api.deepseek.com/v1",
+                    logical_model: "main",
+                    upstream_model: "deepseek-chat",
+                    status_code: "401",
+                    reason: "provider returned status=401",
+                    hint: "检查 API Key 是否有效、API Base 是否可从服务器访问、模型名是否属于该服务商账号。",
+                  },
                 },
               },
               { status: 422 },
@@ -202,6 +212,12 @@ describe("ModelsPage", () => {
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("model availability check failed: status=401");
     expect(alert.textContent).toContain("model_unavailable");
+    expect(alert.textContent).toContain("模型配置错误日志");
+    expect(alert.textContent).toContain("HTTP 状态");
+    expect(alert.textContent).toContain("401");
+    expect(alert.textContent).toContain("provider returned status=401");
+    expect(alert.textContent).toContain("检查 API Key 是否有效");
+    expect(alert.textContent).not.toContain("sk-bad-1234");
   });
 
   it("allows a custom model under any selected provider", async () => {
@@ -229,6 +245,39 @@ describe("ModelsPage", () => {
         api_base: "https://api.moonshot.cn/v1",
         upstream_model: "kimi-custom-routed-model",
         logical_model: "custom-main",
+      },
+    });
+  });
+
+  it("uses freeform model entry for OpenAI-compatible relay providers", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/models" />);
+
+    await screen.findByText("添加模型配置");
+    await user.selectOptions(screen.getByLabelText("服务商"), "openai-compatible");
+
+    expect(screen.queryByLabelText("模型")).toBeNull();
+    expect(screen.getByText("中转站通常会混合多个厂商模型，请填写中转站后台显示的完整模型 ID。")).not.toBeNull();
+    expect((screen.getByLabelText("API Base") as HTMLInputElement).value).toBe("");
+
+    await user.type(screen.getByLabelText("中转站模型名"), "deepseek/deepseek-chat");
+    await user.clear(screen.getByLabelText("API Base"));
+    await user.type(screen.getByLabelText("API Base"), "https://relay.example.com/v1");
+    await user.clear(screen.getByLabelText("逻辑模型名"));
+    await user.type(screen.getByLabelText("逻辑模型名"), "relay-main");
+    await user.type(screen.getByLabelText("API Key"), "sk-relay-1234");
+    await user.click(screen.getByRole("button", { name: "测试并保存模型" }));
+
+    await screen.findByText("模型已通过可用性测试并保存，Key 引用：secret_created");
+
+    expect(requests[1]).toMatchObject({
+      path: "/api/v1/admin/models",
+      method: "POST",
+      body: {
+        provider: "openai-compatible",
+        api_base: "https://relay.example.com/v1",
+        upstream_model: "deepseek/deepseek-chat",
+        logical_model: "relay-main",
       },
     });
   });
