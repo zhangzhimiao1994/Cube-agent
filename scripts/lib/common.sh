@@ -2,6 +2,7 @@
 
 # Sourced by installer modules; shellcheck checks files independently.
 # shellcheck disable=SC2034
+AGENT_HUB_SOURCE_DIR="${AGENT_HUB_SOURCE_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}"
 INSTALL_ROOT="${AGENT_HUB_INSTALL_ROOT:-/opt/agent-hub}"
 STATE_DIR="${AGENT_HUB_STATE_DIR:-/var/lib/agent-hub}"
 CONFIG_DIR="${AGENT_HUB_CONFIG_DIR:-/etc/agent-hub}"
@@ -89,8 +90,8 @@ explain_installer_failure() {
 }
 
 run_doctor() {
-  if [[ -x "$SCRIPT_DIR/scripts/agent-hub" ]]; then
-    "$SCRIPT_DIR/scripts/agent-hub" doctor || return 0
+  if [[ -f "$AGENT_HUB_SOURCE_DIR/scripts/agent-hub" ]]; then
+    bash "$AGENT_HUB_SOURCE_DIR/scripts/agent-hub" doctor || return 0
   else
     check_port 80 || true
     check_port 443 || true

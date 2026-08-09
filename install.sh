@@ -3,6 +3,23 @@ set -Eeuo pipefail
 umask 077
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+AGENT_HUB_SOURCE_DIR="$SCRIPT_DIR"
+export AGENT_HUB_SOURCE_DIR
+
+normalize_installer_tree() {
+  find "$SCRIPT_DIR" -type f \( \
+    -name '*.sh' \
+    -o -name '*.service' \
+    -o -name '*.target' \
+    -o -name '*.socket' \
+    -o -name '*.timer' \
+    -o -name 'Caddyfile' \
+  \) -exec sed -i 's/\r$//' {} + 2>/dev/null || true
+  find "$SCRIPT_DIR" -type f \( -name '*.sh' -o -path '*/scripts/agent-hub' \) \
+    -exec chmod 0755 {} + 2>/dev/null || true
+}
+
+normalize_installer_tree
 
 require_installer_files() {
   local file missing

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+AGENT_HUB_SOURCE_DIR="${AGENT_HUB_SOURCE_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}"
+
 native_python() {
   if command -v uv >/dev/null 2>&1; then
     native_uv_env uv python find 3.12
@@ -285,6 +287,8 @@ normalize_native_release_line_endings() {
     -o -name '*.timer' \
     -o -name 'Caddyfile' \
   \) -exec sed -i 's/\r$//' {} +
+  find "$release" -type f \( -name '*.sh' -o -path '*/scripts/agent-hub' \) \
+    -exec chmod 0755 {} +
 }
 
 normalize_native_systemd_units() {
@@ -297,7 +301,7 @@ normalize_native_systemd_units() {
 }
 
 install_native_systemd_units() {
-  install -m 0644 "$SCRIPT_DIR"/deploy/native/systemd/* /etc/systemd/system/
+  install -m 0644 "$AGENT_HUB_SOURCE_DIR"/deploy/native/systemd/* /etc/systemd/system/
   normalize_native_systemd_units
 }
 
@@ -345,7 +349,7 @@ deploy_native_release() {
     --exclude='.pytest_cache' \
     --exclude='.mypy_cache' \
     --exclude='.ruff_cache' \
-    -cf - -C "$SCRIPT_DIR" . | tar -xf - -C "$release"
+    -cf - -C "$AGENT_HUB_SOURCE_DIR" . | tar -xf - -C "$release"
   normalize_native_release_line_endings "$release"
 
   (
@@ -488,10 +492,10 @@ run_native_bootstrap_seed() {
 }
 
 install_native_mode() {
-  "$SCRIPT_DIR/deploy/native/install-packages.sh" --local-db --local-redis
+  bash "$AGENT_HUB_SOURCE_DIR/deploy/native/install-packages.sh" --local-db --local-redis
   mkdir -p "$INSTALL_ROOT/releases" "$STATE_DIR"
-  install -m 0644 "$SCRIPT_DIR/deploy/native/agent-hub.sysusers" /usr/lib/sysusers.d/agent-hub.conf 2>/dev/null || true
-  install -m 0644 "$SCRIPT_DIR/deploy/native/agent-hub.tmpfiles" /usr/lib/tmpfiles.d/agent-hub.conf 2>/dev/null || true
+  install -m 0644 "$AGENT_HUB_SOURCE_DIR/deploy/native/agent-hub.sysusers" /usr/lib/sysusers.d/agent-hub.conf 2>/dev/null || true
+  install -m 0644 "$AGENT_HUB_SOURCE_DIR/deploy/native/agent-hub.tmpfiles" /usr/lib/tmpfiles.d/agent-hub.conf 2>/dev/null || true
   if command -v systemd-sysusers >/dev/null 2>&1; then
     systemd-sysusers /usr/lib/sysusers.d/agent-hub.conf
   fi

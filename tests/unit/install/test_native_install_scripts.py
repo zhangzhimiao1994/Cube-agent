@@ -36,7 +36,15 @@ def test_installer_failure_output_includes_context_and_hints() -> None:
 
 def test_installer_preflights_required_support_files_before_sourcing() -> None:
     install = read("install.sh")
+    common = read("scripts/lib/common.sh")
+    docker = read("scripts/lib/install_docker.sh")
 
+    assert "AGENT_HUB_SOURCE_DIR" in install
+    assert "AGENT_HUB_SOURCE_DIR" in common
+    assert "AGENT_HUB_SOURCE_DIR" in docker
+    assert "normalize_installer_tree" in install
+    assert "sed -i 's/\\r$//'" in install
+    assert "chmod 0755" in install
     assert "require_installer_files" in install
     assert "installation package is incomplete" in install
     assert install.index("require_installer_files") < install.index(
@@ -44,6 +52,8 @@ def test_installer_preflights_required_support_files_before_sourcing() -> None:
     )
     assert '"$SCRIPT_DIR/scripts/lib/install_docker.sh"' in install
     assert '"$SCRIPT_DIR/scripts/lib/install_native.sh"' in install
+    assert 'bash "$AGENT_HUB_SOURCE_DIR/scripts/agent-hub" doctor' in common
+    assert 'cp -R "$AGENT_HUB_SOURCE_DIR/deploy/compose"' in docker
 
 
 def test_readme_archive_install_extracts_into_isolated_source_directory() -> None:
@@ -106,6 +116,7 @@ def test_native_installer_normalizes_release_and_systemd_line_endings() -> None:
     assert "normalize_native_release_line_endings" in script
     assert "normalize_native_systemd_units" in script
     assert "sed -i 's/\\r$//'" in script
+    assert "chmod 0755" in script
     assert "-name '*.sh'" in script
     assert "-name '*.service'" in script
 
@@ -162,6 +173,9 @@ def test_native_install_packages_installs_uv_runtime_dependencies() -> None:
     packages = read("deploy/native/install-packages.sh")
     installer = read("scripts/lib/install_native.sh")
 
+    assert "AGENT_HUB_SOURCE_DIR" in installer
+    assert 'bash "$AGENT_HUB_SOURCE_DIR/deploy/native/install-packages.sh"' in installer
+    assert '"$SCRIPT_DIR/deploy/native/install-packages.sh"' not in installer
     assert "python3-venv" in packages
     assert "nodejs" in packages
     assert "npm" in packages

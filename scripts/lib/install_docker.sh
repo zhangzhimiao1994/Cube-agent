@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+AGENT_HUB_SOURCE_DIR="${AGENT_HUB_SOURCE_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}"
+
 docker_compose_up() {
   docker compose -f "$INSTALL_ROOT/compose/docker-compose.yml" --env-file "$INSTALL_ROOT/compose/.env" up -d
 }
@@ -77,7 +79,7 @@ install_docker_mode() {
     die "automatic Docker Engine installation is intentionally not performed without distro-specific package trust setup"
   fi
   mkdir -p "$INSTALL_ROOT"
-  cp -R "$SCRIPT_DIR/deploy/compose" "$INSTALL_ROOT/compose"
+  cp -R "$AGENT_HUB_SOURCE_DIR/deploy/compose" "$INSTALL_ROOT/compose"
   cp "$SECRETS_FILE" "$INSTALL_ROOT/compose/.env"
   write_litellm_config
   local postgres_password
