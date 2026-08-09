@@ -154,6 +154,24 @@ export function ConfigPage() {
         </article>
       </div>
 
+      <div className="status-grid" aria-label="核心能力设置">
+        <article className="status-card">
+          <span>实时调度</span>
+          <p>默认模式：{settings.default_mode}。可在下方“运行默认值”里调整自动、直接、派单、讨论或混合模式。</p>
+        </article>
+        <article className="status-card">
+          <span>工具防护</span>
+          <p>
+            {settings.safe_tools_enabled ? "已允许非危险工具" : "未允许非危险工具"}；
+            {settings.require_approval_for_tools ? "高风险工具必须审批" : "高风险工具未强制审批"}。
+          </p>
+        </article>
+        <article className="status-card">
+          <span>Hermes 学习</span>
+          <p>{settings.hermes_enabled ? "已启用经验沉淀，但不绕过审批。" : "已关闭经验沉淀。"}</p>
+        </article>
+      </div>
+
       <div className="settings-shortcuts">
         <Link to="/models">配置模型与 API Key</Link>
         <Link to="/agents">配置 Agent 角色</Link>

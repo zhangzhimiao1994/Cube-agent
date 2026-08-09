@@ -13,6 +13,7 @@ function jsonResponse(payload: unknown, init: ResponseInit = {}) {
 
 describe("AppShell presentation", () => {
   beforeEach(() => {
+    window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
@@ -24,35 +25,42 @@ describe("AppShell presentation", () => {
             role: "super_admin",
           });
         }
-        if (path === "/api/v1/admin/runs") {
-          return jsonResponse([]);
+        if (path === "/api/v1/admin/runs") return jsonResponse([]);
+        if (path === "/api/v1/admin/agents") return jsonResponse([]);
+        if (path === "/api/v1/admin/workflows") return jsonResponse([]);
+        if (path === "/api/v1/admin/settings") {
+          return jsonResponse({
+            default_mode: "auto",
+            default_workflow_id: null,
+            default_agent_ids: [],
+            log_level: "warning",
+            hermes_enabled: true,
+            safe_tools_enabled: true,
+            require_approval_for_tools: true,
+            channel_entry: "web",
+          });
         }
-        if (path.startsWith("/api/v1/admin/logs")) {
-          return jsonResponse([]);
-        }
-        return jsonResponse({ error: "not_found" }, { status: 404 });
+        if (path.startsWith("/api/v1/admin/logs")) return jsonResponse([]);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
       }),
     );
   });
 
   afterEach(() => {
+    window.sessionStorage.clear();
     vi.unstubAllGlobals();
   });
 
-  it("renders a polished operations console shell", async () => {
+  it("renders the operations shell without global capability cards above every page", async () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByText("Agent 编排控制台")).not.toBeNull();
     expect(screen.getByText("控制中枢")).not.toBeNull();
-    expect(screen.getByText("实时调度")).not.toBeNull();
-    expect(screen.getByText("工具防护")).not.toBeNull();
-    expect(screen.getByRole("link", { name: "对话任务" })).not.toBeNull();
-    expect(screen.getByRole("link", { name: "记忆" })).not.toBeNull();
-    expect(screen.getByRole("link", { name: "技能" })).not.toBeNull();
-    expect(screen.getByRole("link", { name: "通道连接" })).not.toBeNull();
-    expect(screen.getByRole("link", { name: "系统设置" })).not.toBeNull();
-    expect(screen.getByRole("link", { name: "日志" })).not.toBeNull();
-    expect(screen.queryByRole("link", { name: "审计日志" })).toBeNull();
-    expect(screen.getAllByText("Hermes 学习").length).toBeGreaterThan(0);
+    expect(screen.getByRole("link", { name: "对话" })).not.toBeNull();
+    expect(screen.getByRole("link", { name: "设置" })).not.toBeNull();
+    expect(screen.getByRole("link", { name: "Hermes 学习" })).not.toBeNull();
+    expect(screen.queryByText("实时调度")).toBeNull();
+    expect(screen.queryByText("工具防护")).toBeNull();
+    expect(screen.queryByText("沉淀经验，但不绕过审批")).toBeNull();
   });
 });

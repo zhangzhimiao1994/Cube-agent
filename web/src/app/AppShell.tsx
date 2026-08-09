@@ -17,12 +17,6 @@ const NAVIGATION = [
   { to: "/logs", label: "日志", permission: "audit:read" },
 ];
 
-const HEALTH_CARDS = [
-  ["实时调度", "自动、直接、派单、讨论、混合模式"],
-  ["工具防护", "Skill 与 MCP 均经过权限边界"],
-  ["Hermes 学习", "沉淀经验，但不绕过审批"],
-] as const;
-
 export function AppShell() {
   const auth = useAuth();
   return (
@@ -58,14 +52,6 @@ export function AppShell() {
             </button>
           </div>
         </header>
-        <section className="status-grid" aria-label="Console status">
-          {HEALTH_CARDS.map(([title, detail]) => (
-            <article className="status-card" key={title}>
-              <span>{title}</span>
-              <p>{detail}</p>
-            </article>
-          ))}
-        </section>
         <main className="page-surface">
           <Outlet />
         </main>
