@@ -8,8 +8,9 @@ Create Date: 2026-08-09
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-from alembic import op
 from sqlalchemy.dialects import postgresql
+
+from alembic import op
 
 revision = "0011_admin_resources"
 down_revision = "0010_channel_tenant_msg"
