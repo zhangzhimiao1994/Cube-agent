@@ -46,6 +46,16 @@ def test_installer_preflights_required_support_files_before_sourcing() -> None:
     assert '"$SCRIPT_DIR/scripts/lib/install_native.sh"' in install
 
 
+def test_readme_archive_install_extracts_into_isolated_source_directory() -> None:
+    readme = read("README.md")
+
+    assert "mktemp -d /tmp/agent-hub-install" in readme
+    assert 'mkdir -p "$tmp/source"' in readme
+    assert 'tar -xzf "$tmp/source.tar.gz" --strip-components=1 -C "$tmp/source"' in readme
+    assert 'cd "$tmp/source"' in readme
+    assert "Do not extract the archive directly into `/root`" in readme
+
+
 def test_install_verification_uses_public_url_for_docker_mode() -> None:
     verify = read("scripts/lib/verify.sh")
 

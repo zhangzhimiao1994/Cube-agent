@@ -10,6 +10,22 @@ cd mix-agent
 sudo bash install.sh --mode auto --yes
 ```
 
+If the server does not have `git`, install from the GitHub archive into an isolated
+temporary source directory:
+
+```bash
+tmp="$(mktemp -d /tmp/agent-hub-install.XXXXXX)"
+curl -fL https://github.com/zhangzhimiao1994/mix-agent/archive/refs/heads/main.tar.gz -o "$tmp/source.tar.gz"
+mkdir -p "$tmp/source"
+tar -xzf "$tmp/source.tar.gz" --strip-components=1 -C "$tmp/source"
+cd "$tmp/source"
+sudo bash install.sh --mode auto --yes
+```
+
+Do not extract the archive directly into `/root` with `--strip-components=1`.
+That flattens `mix-agent-main/install.sh` into `/root/install.sh` and leaves later
+commands looking in the wrong directory.
+
 For China-region servers without stable access to official package registries:
 
 ```bash
