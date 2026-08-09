@@ -414,7 +414,21 @@ def test_skill_upload_approve_mcp_memory_and_audit_are_safe() -> None:
         headers=headers(),
     )
     skills = api.get("/api/v1/admin/skills", headers=headers())
+    created_mcp = api.post(
+        "/api/v1/admin/mcp",
+        headers=headers(),
+        json={"id": "browser", "name": "Browser MCP", "allowed_tools": ["open_page"]},
+    )
     mcp = api.get("/api/v1/admin/mcp", headers=headers())
+    created_memory = api.post(
+        "/api/v1/admin/memory",
+        headers=headers(),
+        json={
+            "id": "logging-policy",
+            "scope": "tenant",
+            "value": "Default production log collection level is warning.",
+        },
+    )
     memory = api.get("/api/v1/admin/memory", headers=headers())
     updated_memory = api.patch(
         f"/api/v1/admin/memory/{memory.json()[0]['id']}",
@@ -426,7 +440,10 @@ def test_skill_upload_approve_mcp_memory_and_audit_are_safe() -> None:
     assert uploaded.json()["status"] == "quarantined"
     assert approved.json()["status"] == "enabled"
     assert skills.json()[0]["requested_permissions"] == ["filesystem:read"]
-    assert mcp.json()[0]["health"] == "healthy"
+    assert created_mcp.json()["health"] == "configured"
+    assert any(item["id"] == "browser" for item in mcp.json())
+    assert created_memory.json()["id"] == "logging-policy"
+    assert any(item["id"] == "logging-policy" for item in memory.json())
     assert updated_memory.json()["value"] == "Updated non-dangerous operation policy."
     assert audit.json()[0]["action"] == "config.publish"
     serialized = uploaded.text + approved.text + skills.text + mcp.text + memory.text + audit.text

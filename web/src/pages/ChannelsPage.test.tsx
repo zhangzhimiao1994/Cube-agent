@@ -143,7 +143,7 @@ describe("ChannelsPage", () => {
     render(<TestApp initialPath="/channels" />);
 
     expect(await screen.findByRole("heading", { name: "通道连接" })).not.toBeNull();
-    expect(screen.getByLabelText("通道")).not.toBeNull();
+    expect(screen.getByLabelText("选择接入通道")).not.toBeNull();
     expect(
       screen.getAllByText("https://agent.example.com/channels/feishu/events").length,
     ).toBeGreaterThan(0);
@@ -163,7 +163,8 @@ describe("ChannelsPage", () => {
     }
     expect(screen.getAllByText("已接通").length).toBeGreaterThan(0);
     expect(screen.getAllByText("待配置").length).toBeGreaterThan(0);
-    expect(screen.getByText(/消息会归一化提交到主 Agent 的运行队列/)).not.toBeNull();
-    expect(screen.getByText(/缺失配置会返回明确错误/)).not.toBeNull();
+    expect(screen.getByRole("heading", { name: "配置内容" })).not.toBeNull();
+    expect(screen.getByRole("heading", { name: "部署配置模板" })).not.toBeNull();
+    expect(screen.getByText(/校验失败会返回明确错误/)).not.toBeNull();
   });
 });

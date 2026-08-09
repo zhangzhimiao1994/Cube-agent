@@ -5,11 +5,11 @@ import { formatApiError } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
 
 const INSTALL_STEPS = [
-  ["Install packages", "System packages, Python runtime, Node build toolchain, Redis and PostgreSQL."],
-  ["Deploy release", "Code is copied into /opt/agent-hub/releases and current is updated."],
-  ["Run migrations", "Database schema is upgraded before API services accept traffic."],
-  ["Start services", "Caddy, API, worker, LiteLLM and isolated skill services are started."],
-  ["Create administrator account", "Use the printed one-time setup code to create the first admin."],
+  ["安装依赖", "安装系统包、Python 运行时、Node 构建工具、Redis 和 PostgreSQL。"],
+  ["部署版本", "代码复制到 /opt/agent-hub/releases，并更新 current 指向。"],
+  ["执行迁移", "API 接收流量前先升级数据库结构。"],
+  ["启动服务", "启动 Caddy、API、worker、LiteLLM 和隔离 Skill 服务。"],
+  ["创建管理员", "使用安装器打印的一次性设置码创建第一个管理员账号。"],
 ] as const;
 
 export function SetupPage() {
@@ -27,7 +27,7 @@ export function SetupPage() {
       await auth.setup(code, username, password);
       navigate("/", { replace: true });
     } catch (caught) {
-      setError(formatApiError(caught, "Setup failed"));
+      setError(formatApiError(caught, "初始化失败"));
     }
   }
 
@@ -35,9 +35,9 @@ export function SetupPage() {
     <section className="auth-layout setup-layout">
       <div className="auth-hero">
         <span className="eyebrow">Secure first-run setup</span>
-        <h1>Initialize Agent Hub</h1>
-        <p>Use the one-time code printed by the installer.</p>
-        <p>The code opens the first administrator account and then becomes unusable.</p>
+        <h1>初始化 Agent Hub</h1>
+        <p>使用安装脚本打印的一次性设置码创建第一个管理员账号。</p>
+        <p>设置码使用后会立即失效。如果失败，页面会显示后端错误码和错误 ID。</p>
         <div className="setup-timeline" aria-label="Installation flow">
           {INSTALL_STEPS.map(([title, detail], index) => (
             <article key={title} className="timeline-step">
@@ -53,10 +53,10 @@ export function SetupPage() {
       <form className="auth-card" onSubmit={(event) => void submit(event)}>
         <div>
           <span className="eyebrow">Administrator</span>
-          <h2>Create first account</h2>
+          <h2>创建第一个账号</h2>
         </div>
         <label>
-          Setup code
+          一次性设置码
           <input
             aria-label="Setup code"
             value={code}
@@ -65,7 +65,7 @@ export function SetupPage() {
           />
         </label>
         <label>
-          Username
+          用户名
           <input
             aria-label="Username"
             value={username}
@@ -74,7 +74,7 @@ export function SetupPage() {
           />
         </label>
         <label>
-          Password
+          密码
           <input
             aria-label="Password"
             value={password}
@@ -84,7 +84,7 @@ export function SetupPage() {
           />
         </label>
         {error && <p role="alert">{error}</p>}
-        <button type="submit">Create admin</button>
+        <button type="submit">创建管理员</button>
       </form>
     </section>
   );

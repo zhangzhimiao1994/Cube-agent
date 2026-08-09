@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 
 import { api, formatApiError } from "../api/client";
 
@@ -23,59 +23,100 @@ export function RunDetailPage() {
     },
   });
 
-  if (run.isLoading) return <p>Loading run...</p>;
+  if (run.isLoading) return <p>正在加载运行详情...</p>;
   if (run.isError || !run.data) {
-    return <p role="alert">{formatApiError(run.error, "Failed to load run")}</p>;
+    return <p role="alert">{formatApiError(run.error, "运行详情加载失败")}</p>;
   }
 
   return (
     <section>
-      <h2>Run detail</h2>
-      <p>Status: {run.data.status}</p>
-      <p>Mode: {run.data.mode}</p>
-      <p>Queue wait: {run.data.queue_wait_ms} ms</p>
-      <p>Capacity wait: {run.data.capacity_wait_ms} ms</p>
-      <p>Cost: ${run.data.cost_usd}</p>
-      <p>Request: {run.data.request}</p>
-      <div>
-        <button type="button" onClick={() => control.mutate("pause")}>
-          Pause
-        </button>
-        <button type="button" onClick={() => control.mutate("resume")}>
-          Resume
-        </button>
-        <button type="button" onClick={() => control.mutate("cancel")}>
-          Cancel
-        </button>
+      <p className="eyebrow">Run detail</p>
+      <h2>运行详情</h2>
+      <p>
+        <Link to="/">返回任务列表</Link>
+      </p>
+
+      <div className="detail-grid">
+        <article>
+          <span className="eyebrow">状态</span>
+          <h3>{run.data.status}</h3>
+        </article>
+        <article>
+          <span className="eyebrow">模式</span>
+          <h3>{run.data.mode}</h3>
+        </article>
+        <article>
+          <span className="eyebrow">排队等待</span>
+          <h3>{run.data.queue_wait_ms} ms</h3>
+        </article>
+        <article>
+          <span className="eyebrow">成本</span>
+          <h3>${run.data.cost_usd}</h3>
+        </article>
       </div>
-      {control.isError ? (
-        <p role="alert">{formatApiError(control.error, "Run control failed")}</p>
-      ) : null}
-      <h3>Events</h3>
-      <ol>
-        {run.data.events.map((event) => (
-          <li key={event.sequence}>
-            {event.kind}: {event.message}
-          </li>
-        ))}
-      </ol>
-      <h3>Artifacts</h3>
-      <ul>
-        {run.data.artifacts.map((artifact) => (
-          <li key={artifact.id}>
-            {artifact.kind}: {artifact.title}
-          </li>
-        ))}
-      </ul>
-      <h3>Explicit details</h3>
-      <dl>
-        {Object.entries(run.data.explicit_details).map(([key, value]) => (
-          <div key={key}>
-            <dt>{key}</dt>
-            <dd>{value}</dd>
-          </div>
-        ))}
-      </dl>
+
+      <article>
+        <h3>原始请求</h3>
+        <p>{run.data.request}</p>
+        <div className="toolbar">
+          <button type="button" onClick={() => control.mutate("pause")}>
+            暂停
+          </button>
+          <button type="button" onClick={() => control.mutate("resume")}>
+            恢复
+          </button>
+          <button type="button" onClick={() => control.mutate("cancel")}>
+            取消
+          </button>
+        </div>
+        {control.isError ? <p role="alert">{formatApiError(control.error, "运行控制失败")}</p> : null}
+      </article>
+
+      <article>
+        <h3>事件日志</h3>
+        {run.data.events.length === 0 ? (
+          <p>暂无事件。</p>
+        ) : (
+          <ol>
+            {run.data.events.map((event) => (
+              <li key={event.sequence}>
+                <strong>{event.kind}</strong>：{event.message}
+              </li>
+            ))}
+          </ol>
+        )}
+      </article>
+
+      <article>
+        <h3>产物</h3>
+        {run.data.artifacts.length === 0 ? (
+          <p>暂无产物。</p>
+        ) : (
+          <ul>
+            {run.data.artifacts.map((artifact) => (
+              <li key={artifact.id}>
+                {artifact.kind}：{artifact.title}
+              </li>
+            ))}
+          </ul>
+        )}
+      </article>
+
+      <article>
+        <h3>显式决策详情</h3>
+        {Object.keys(run.data.explicit_details).length === 0 ? (
+          <p>暂无显式详情。</p>
+        ) : (
+          <dl>
+            {Object.entries(run.data.explicit_details).map(([key, value]) => (
+              <div key={key}>
+                <dt>{key}</dt>
+                <dd>{value}</dd>
+              </div>
+            ))}
+          </dl>
+        )}
+      </article>
     </section>
   );
 }

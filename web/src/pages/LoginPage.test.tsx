@@ -92,9 +92,9 @@ describe("LoginPage", () => {
     render(<TestApp initialPath="/login" />);
     await userEvent.type(screen.getByLabelText("Username"), "owner");
     await userEvent.type(screen.getByLabelText("Password"), "correct horse battery staple");
-    await userEvent.click(screen.getByRole("button", { name: "Login" }));
+    await userEvent.click(screen.getByRole("button", { name: "登录" }));
 
-    expect(await screen.findByRole("heading", { name: "Run operations" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话任务" })).not.toBeNull();
   });
 
   it("shows invalid credentials without storing browser tokens", async () => {
@@ -102,29 +102,27 @@ describe("LoginPage", () => {
     render(<TestApp initialPath="/login" />);
     await userEvent.type(screen.getByLabelText("Username"), "owner");
     await userEvent.type(screen.getByLabelText("Password"), "wrong");
-    await userEvent.click(screen.getByRole("button", { name: "Login" }));
+    await userEvent.click(screen.getByRole("button", { name: "登录" }));
 
-    expect((await screen.findByRole("alert")).textContent).toBe(
-      "Invalid username or password",
-    );
+    expect((await screen.findByRole("alert")).textContent).toBe("用户名或密码错误");
     expect(setItem).not.toHaveBeenCalled();
   });
 
   it("creates the first admin through setup", async () => {
     render(<TestApp initialPath="/setup" />);
     expect(await screen.findByText("Secure first-run setup")).not.toBeNull();
-    expect(screen.getByText("Use the one-time code printed by the installer.")).not.toBeNull();
-    expect(screen.getByText("Install packages")).not.toBeNull();
-    expect(screen.getByText("Deploy release")).not.toBeNull();
-    expect(screen.getByText("Run migrations")).not.toBeNull();
-    expect(screen.getByText("Start services")).not.toBeNull();
-    expect(screen.getByText("Create administrator account")).not.toBeNull();
+    expect(screen.getByText("使用安装脚本打印的一次性设置码创建第一个管理员账号。")).not.toBeNull();
+    expect(screen.getByText("安装依赖")).not.toBeNull();
+    expect(screen.getByText("部署版本")).not.toBeNull();
+    expect(screen.getByText("执行迁移")).not.toBeNull();
+    expect(screen.getByText("启动服务")).not.toBeNull();
+    expect(screen.getByRole("heading", { name: "创建管理员" })).not.toBeNull();
     await userEvent.type(screen.getByLabelText("Setup code"), "setup-code");
     await userEvent.type(screen.getByLabelText("Username"), "owner");
     await userEvent.type(screen.getByLabelText("Password"), "correct horse battery staple");
-    await userEvent.click(screen.getByRole("button", { name: "Create admin" }));
+    await userEvent.click(screen.getByRole("button", { name: "创建管理员" }));
 
-    expect(await screen.findByRole("heading", { name: "Run operations" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话任务" })).not.toBeNull();
   });
 
   it("shows the setup failure reason returned by the API", async () => {
@@ -132,17 +130,17 @@ describe("LoginPage", () => {
     await userEvent.type(await screen.findByLabelText("Setup code"), "wrong-code");
     await userEvent.type(screen.getByLabelText("Username"), "owner");
     await userEvent.type(screen.getByLabelText("Password"), "correct horse battery staple");
-    await userEvent.click(screen.getByRole("button", { name: "Create admin" }));
+    await userEvent.click(screen.getByRole("button", { name: "创建管理员" }));
 
     expect((await screen.findByRole("alert")).textContent).toBe(
-      "Setup failed: invalid bootstrap code (invalid_bootstrap, HTTP 401)",
+      "初始化失败: invalid bootstrap code (invalid_bootstrap, HTTP 401)",
     );
   });
 
   it("protects the dashboard while session is missing", async () => {
     render(<TestApp initialPath="/" />);
 
-    await waitFor(() => expect(screen.getByRole("heading", { name: "Login" })).not.toBeNull());
+    await waitFor(() => expect(screen.getByRole("heading", { name: "登录控制台" })).not.toBeNull());
   });
 
   it("shows navigation only for returned permissions", async () => {

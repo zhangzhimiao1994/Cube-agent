@@ -63,7 +63,7 @@ describe("UsersPage", () => {
 
     expect(await screen.findByRole("heading", { name: "用户管理" })).not.toBeNull();
     expect(await screen.findByText("owner")).not.toBeNull();
-    await userEvent.click(screen.getByRole("button", { name: "设为管理员" }));
+    await userEvent.selectOptions(screen.getByLabelText("修改 owner 的角色"), "admin");
 
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/v1/users/11111111-1111-4111-8111-111111111111/role",

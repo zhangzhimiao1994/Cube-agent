@@ -186,6 +186,18 @@ const RunListItemSchema = z.object({
 
 export type RunListItem = z.infer<typeof RunListItemSchema>;
 
+const SubmittedRunSchema = z.object({
+  id: z.string(),
+  tenant_id: z.string(),
+  status: z.string(),
+  mode: z.string().nullable(),
+  decision_token: z.string().nullable(),
+  version: z.number(),
+  clarification_reason: z.string().nullable(),
+});
+
+export type SubmittedRun = z.infer<typeof SubmittedRunSchema>;
+
 const RunEventSchema = z.object({
   sequence: z.number(),
   kind: z.string(),
@@ -530,6 +542,20 @@ export const api = {
       z.array(NamedResourceSchema),
     );
   },
+  createWorkflow(payload: NamedResource): Promise<NamedResource> {
+    return request(
+      "/api/v1/admin/workflows",
+      { method: "POST", body: JSON.stringify(payload) },
+      NamedResourceSchema,
+    );
+  },
+  createRun(payload: { message: string; mode: "auto" | "direct" | "dispatch" | "discuss" | "hybrid" }): Promise<SubmittedRun> {
+    return request(
+      "/api/v1/runs",
+      { method: "POST", body: JSON.stringify(payload) },
+      SubmittedRunSchema,
+    );
+  },
   runs(): Promise<RunListItem[]> {
     return request("/api/v1/admin/runs", { method: "GET" }, z.array(RunListItemSchema));
   },
@@ -575,11 +601,25 @@ export const api = {
   mcpServers(): Promise<McpServer[]> {
     return request("/api/v1/admin/mcp", { method: "GET" }, z.array(McpServerSchema));
   },
+  createMcpServer(payload: { id: string; name: string; allowed_tools: string[] }): Promise<McpServer> {
+    return request(
+      "/api/v1/admin/mcp",
+      { method: "POST", body: JSON.stringify(payload) },
+      McpServerSchema,
+    );
+  },
   channels(): Promise<ChannelStatus[]> {
     return request("/api/v1/admin/channels", { method: "GET" }, z.array(ChannelStatusSchema));
   },
   memory(): Promise<MemoryRecord[]> {
     return request("/api/v1/admin/memory", { method: "GET" }, z.array(MemoryRecordSchema));
+  },
+  createMemory(payload: { id: string; scope: string; value: string }): Promise<MemoryRecord> {
+    return request(
+      "/api/v1/admin/memory",
+      { method: "POST", body: JSON.stringify(payload) },
+      MemoryRecordSchema,
+    );
   },
   updateMemory(id: string, value: string): Promise<MemoryRecord> {
     return request(

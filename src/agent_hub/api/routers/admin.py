@@ -207,6 +207,14 @@ class McpServerResponse(BaseModel):
     allowed_tools: list[str]
 
 
+class McpServerRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=128, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    name: str = Field(min_length=1, max_length=200)
+    allowed_tools: list[str] = Field(default_factory=list, max_length=256)
+
+
 class ChannelStatusResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -329,6 +337,11 @@ class MemoryRecordRequest(BaseModel):
     value: str = Field(min_length=1, max_length=20_000)
 
 
+class MemoryCreateRequest(MemoryRecordRequest):
+    id: str = Field(min_length=1, max_length=128, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    scope: str = Field(default="tenant", min_length=1, max_length=128)
+
+
 class MemoryRecordResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -435,9 +448,13 @@ class AdminResourceService(Protocol):
 
     async def list_mcp_servers(self) -> tuple[McpServerResponse, ...]: ...
 
+    async def upsert_mcp_server(self, request: McpServerRequest) -> McpServerResponse: ...
+
     async def list_channels(self) -> tuple[ChannelStatusResponse, ...]: ...
 
     async def list_memory(self) -> tuple[MemoryRecordResponse, ...]: ...
+
+    async def create_memory(self, request: MemoryCreateRequest) -> MemoryRecordResponse: ...
 
     async def update_memory(self, memory_id: str, request: MemoryRecordRequest) -> MemoryRecordResponse: ...
 
@@ -685,11 +702,26 @@ class InMemoryAdminResourceService:
     async def list_mcp_servers(self) -> tuple[McpServerResponse, ...]:
         return tuple(self.mcp_servers.values())
 
+    async def upsert_mcp_server(self, request: McpServerRequest) -> McpServerResponse:
+        response = McpServerResponse(
+            id=request.id,
+            name=request.name,
+            health="configured",
+            allowed_tools=request.allowed_tools,
+        )
+        self.mcp_servers[response.id] = response
+        return response
+
     async def list_channels(self) -> tuple[ChannelStatusResponse, ...]:
         return _channel_statuses_from_environment()
 
     async def list_memory(self) -> tuple[MemoryRecordResponse, ...]:
         return tuple(self.memory.values())
+
+    async def create_memory(self, request: MemoryCreateRequest) -> MemoryRecordResponse:
+        response = MemoryRecordResponse(id=request.id, scope=request.scope, value=request.value)
+        self.memory[response.id] = response
+        return response
 
     async def update_memory(
         self, memory_id: str, request: MemoryRecordRequest
@@ -1171,11 +1203,32 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             return await super().list_mcp_servers()
         return tuple(McpServerResponse.model_validate(payload) for payload in resources)
 
+    async def upsert_mcp_server(self, request: McpServerRequest) -> McpServerResponse:
+        response = McpServerResponse(
+            id=request.id,
+            name=request.name,
+            health="configured",
+            allowed_tools=request.allowed_tools,
+        )
+        if not await self._upsert_admin_payload("mcp", response.id, response.model_dump(mode="json")):
+            return await super().upsert_mcp_server(request)
+        await self._record_audit("mcp.upsert", f"mcp:{response.id}", {"id": response.id})
+        return response
+
     async def list_memory(self) -> tuple[MemoryRecordResponse, ...]:
         resources = await self._list_admin_payloads("memory")
         if resources is None:
             return await super().list_memory()
         return tuple(MemoryRecordResponse.model_validate(payload) for payload in resources)
+
+    async def create_memory(self, request: MemoryCreateRequest) -> MemoryRecordResponse:
+        response = MemoryRecordResponse(id=request.id, scope=request.scope, value=request.value)
+        if not await self._upsert_admin_payload(
+            "memory", response.id, response.model_dump(mode="json")
+        ):
+            return await super().create_memory(request)
+        await self._record_audit("memory.upsert", f"memory:{response.id}", {"id": response.id})
+        return response
 
     async def update_memory(
         self, memory_id: str, request: MemoryRecordRequest
@@ -1836,6 +1889,16 @@ async def list_mcp_servers(
     return list(await service.list_mcp_servers())
 
 
+@router.post("/mcp", response_model=McpServerResponse, responses=error_responses(401, 403, 422))
+async def upsert_mcp_server(
+    body: McpServerRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> McpServerResponse:
+    _require(principal, "mcp:write")
+    return await service.upsert_mcp_server(body)
+
+
 @router.get("/channels", response_model=list[ChannelStatusResponse], responses=error_responses(401, 403, 422))
 async def list_channels(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -1852,6 +1915,16 @@ async def list_memory(
 ) -> list[MemoryRecordResponse]:
     _require(principal, "memory:read")
     return list(await service.list_memory())
+
+
+@router.post("/memory", response_model=MemoryRecordResponse, responses=error_responses(401, 403, 422))
+async def create_memory(
+    body: MemoryCreateRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> MemoryRecordResponse:
+    _require(principal, "memory:write")
+    return await service.create_memory(body)
 
 
 @router.patch("/memory/{memory_id}", response_model=MemoryRecordResponse, responses=error_responses(401, 403, 404, 422))

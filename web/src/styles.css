@@ -456,6 +456,137 @@ article:hover {
   animation: surface-in 360ms var(--ease);
 }
 
+.two-column {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 0.72fr);
+  margin: 1rem 0;
+}
+
+.card-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+
+.card-grid.compact {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.mini-card {
+  background: rgba(3, 10, 20, 0.42);
+  border: 1px solid var(--line);
+  border-radius: 1rem;
+  padding: 0.9rem;
+}
+
+.mini-card p,
+.field-help {
+  color: var(--muted);
+  font-size: 0.86rem;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.toolbar {
+  align-items: end;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+  margin: 1rem 0;
+}
+
+.toolbar label {
+  min-width: min(340px, 100%);
+}
+
+.inline-check {
+  align-items: center;
+  display: flex;
+  gap: 0.6rem;
+}
+
+.inline-check input {
+  min-height: auto;
+}
+
+.detail-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.form-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.channel-console {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: 280px minmax(0, 1fr);
+  margin: 1rem 0;
+}
+
+.channel-picker {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.055), transparent),
+    rgba(3, 10, 20, 0.42);
+  border: 1px solid var(--line);
+  border-radius: 1.55rem;
+  height: max-content;
+  padding: 1rem;
+  position: sticky;
+  top: 1rem;
+}
+
+.channel-option {
+  align-items: center;
+  background: rgba(3, 10, 20, 0.42);
+  border-color: rgba(123, 225, 255, 0.16);
+  color: var(--ink);
+  display: flex;
+  justify-content: space-between;
+  margin-top: 0.55rem;
+  width: 100%;
+}
+
+.channel-option small {
+  color: var(--accent-2);
+  font-weight: 800;
+}
+
+.channel-option-active {
+  border-color: rgba(125, 255, 189, 0.58);
+  box-shadow:
+    0 0 0 1px rgba(125, 255, 189, 0.18) inset,
+    0 0 32px rgba(125, 255, 189, 0.12);
+}
+
+.channel-detail {
+  min-width: 0;
+}
+
+.code-line,
+.code-block {
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+}
+
+.code-line {
+  overflow-wrap: anywhere;
+}
+
+.code-block {
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid rgba(123, 225, 255, 0.16);
+  border-radius: 1rem;
+  color: var(--accent-2);
+  overflow-x: auto;
+  padding: 1rem;
+  white-space: pre-wrap;
+}
+
 .auth-layout {
   align-items: center;
   display: grid;
@@ -590,6 +721,15 @@ article:hover {
 
   .status-grid {
     grid-template-columns: 1fr;
+  }
+
+  .two-column,
+  .channel-console {
+    grid-template-columns: 1fr;
+  }
+
+  .channel-picker {
+    position: static;
   }
 
   .topbar {

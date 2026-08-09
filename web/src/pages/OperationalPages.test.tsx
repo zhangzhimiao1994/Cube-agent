@@ -181,32 +181,35 @@ describe("operational management pages", () => {
   it("shows run operations and supports pause control", async () => {
     render(<TestApp initialPath={`/runs/${runId}`} />);
 
-    expect(await screen.findByText("Status: running")).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "运行详情" })).not.toBeNull();
+    expect(screen.getByText("running")).not.toBeNull();
     expect(screen.getByText(/Readiness report/)).not.toBeNull();
-    await userEvent.click(screen.getByRole("button", { name: "Pause" }));
+    await userEvent.click(screen.getByRole("button", { name: "暂停" }));
 
-    await waitFor(() => expect(screen.getByText("Status: paused")).not.toBeNull());
+    await waitFor(() => expect(screen.getByText("paused")).not.toBeNull());
   });
 
   it("uploads and approves a skill", async () => {
     render(<TestApp initialPath="/skills" />);
 
-    await screen.findByRole("heading", { name: "Skills governance" });
+    await screen.findByRole("heading", { name: "技能管理" });
     const file = new File(["safe"], "safe-skill.zip", { type: "application/zip" });
     await userEvent.upload(screen.getByLabelText("Skill ZIP"), file);
-    await userEvent.click(screen.getByRole("button", { name: "Upload and scan" }));
+    await userEvent.click(screen.getByRole("button", { name: "上传并扫描" }));
 
-    expect(await screen.findByText("Status: scanned")).not.toBeNull();
-    await userEvent.click(screen.getByRole("button", { name: "Approve and enable" }));
-    expect(await screen.findByText("Status: enabled")).not.toBeNull();
+    expect(await screen.findByText("scanned")).not.toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "审批并启用" }));
+    expect(await screen.findByText("enabled")).not.toBeNull();
   });
 
   it("shows MCP, memory, and audit governance pages", async () => {
     render(<TestApp initialPath="/mcp" />);
-    expect(await screen.findByText("Health: healthy")).not.toBeNull();
+    expect(await screen.findByText("Filesystem MCP")).not.toBeNull();
+    expect(screen.getByText("healthy")).not.toBeNull();
 
     render(<TestApp initialPath="/memory" />);
-    expect(await screen.findByText("Scope: tenant")).not.toBeNull();
+    expect(await screen.findByText("project-policy")).not.toBeNull();
+    expect(screen.getByText("tenant")).not.toBeNull();
 
     render(<TestApp initialPath="/audit" />);
     expect(await screen.findByText("config.publish")).not.toBeNull();
@@ -216,11 +219,11 @@ describe("operational management pages", () => {
   it("shows Hermes recommendations and records safe feedback", async () => {
     render(<TestApp initialPath="/hermes" />);
 
-    expect(await screen.findByRole("heading", { name: "Hermes learning" })).not.toBeNull();
-    await userEvent.click(screen.getByRole("button", { name: "Ask Hermes" }));
-    expect(await screen.findByText("Mode: group_chat")).not.toBeNull();
-    expect(screen.getByText("Model: deepseek-chat")).not.toBeNull();
-    await userEvent.click(screen.getByRole("button", { name: "Record feedback" }));
+    expect(await screen.findByRole("heading", { name: "Hermes 学习" })).not.toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "获取推荐" }));
+    expect(await screen.findByText("模式：group_chat")).not.toBeNull();
+    expect(screen.getByText("模型：deepseek-chat")).not.toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "记录经验" }));
     expect(await screen.findByText("Use dispatch mode when the request has clear deliverables.")).not.toBeNull();
   });
 
@@ -249,7 +252,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect((await screen.findByRole("alert")).textContent).toBe(
-      "Failed to load runs: database is not ready (service_unavailable, HTTP 503, error err_123)",
+      "任务列表加载失败: database is not ready (service_unavailable, HTTP 503, error err_123)",
     );
   });
 });

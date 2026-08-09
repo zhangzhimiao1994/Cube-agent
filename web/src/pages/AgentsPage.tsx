@@ -61,6 +61,69 @@ const ROLE_TEMPLATES: RoleTemplate[] = [
     prompt: "负责把计划拆成可执行步骤，调用允许的非危险工具，并记录结果和错误原因。",
     skills: [],
   },
+  {
+    id: "product-manager",
+    name: "产品经理",
+    role: "产品经理",
+    prompt: "负责梳理用户需求、功能范围、优先级、验收标准和上线风险，避免需求发散。",
+    skills: [],
+  },
+  {
+    id: "engineer",
+    name: "工程师",
+    role: "工程师",
+    prompt: "负责技术实现方案、接口设计、边界条件、部署约束和可维护性评估。",
+    skills: [],
+  },
+  {
+    id: "qa-tester",
+    name: "测试工程师",
+    role: "测试工程师",
+    prompt: "负责设计测试用例、回归范围、故障注入和生产可用性核验清单。",
+    skills: [],
+  },
+  {
+    id: "ops-engineer",
+    name: "运维工程师",
+    role: "运维工程师",
+    prompt: "负责 Linux 部署、服务状态、日志、权限、反向代理、证书和故障恢复方案。",
+    skills: [],
+  },
+  {
+    id: "security-reviewer",
+    name: "安全审查员",
+    role: "安全审查员",
+    prompt: "负责识别密钥泄露、越权、SSRF、命令执行、危险工具调用和审计缺口。",
+    skills: [],
+  },
+  {
+    id: "finance-analyst",
+    name: "财务分析师",
+    role: "财务分析师",
+    prompt: "负责财务指标、现金流、成本结构、预算、利润和风险敏感性分析。",
+    skills: [],
+  },
+  {
+    id: "market-analyst",
+    name: "市场分析师",
+    role: "市场分析师",
+    prompt: "负责市场规模、竞品、用户画像、渠道策略和增长机会分析。",
+    skills: [],
+  },
+  {
+    id: "legal-assistant",
+    name: "合规助理",
+    role: "合规助理",
+    prompt: "负责识别合同、隐私、版权、平台规则和合规风险，但不替代专业法律意见。",
+    skills: [],
+  },
+  {
+    id: "customer-support",
+    name: "客服专家",
+    role: "客服专家",
+    prompt: "负责用户问题分流、回复草稿、故障解释、升级条件和服务体验优化。",
+    skills: [],
+  },
 ];
 
 function parseSkills(value: string) {
@@ -140,6 +203,14 @@ export function AgentsPage() {
         子 Agent 的角色不是写死的。这里提供常用模板，也允许直接改角色、提示词和技能列表；
         保存后会写入生产配置，运行任务时由主 Agent 根据任务模式调度。
       </p>
+      <article>
+        <h3>配置指引</h3>
+        <ol>
+          <li>先配置可用模型，再创建 Agent；每个 Agent 必须绑定一个已通过测试的逻辑模型。</li>
+          <li>角色模板只是起点，可以直接修改角色名称、提示词和允许 Skill。</li>
+          <li>讨论模式下，主 Agent 会按任务临时选择相关角色，并在意见冲突时做最终裁决。</li>
+        </ol>
+      </article>
 
       {modelOptions.length === 0 ? (
         <p role="alert">还没有可用模型。请先到“模型”页面添加模型，并通过 API 可用性测试。</p>
