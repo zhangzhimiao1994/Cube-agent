@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Protocol
+from typing import Protocol, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -324,7 +324,8 @@ async def test_hermes_high_confidence_auto_advice_queues_recommended_mode(
     ]
     assert record.routing_decision is not None
     assert record.routing_decision["reason"] == "hermes_recommendation"
-    assert record.routing_decision["hermes"]["confidence"] == 0.86
+    hermes_payload = cast(dict[str, object], record.routing_decision["hermes"])
+    assert hermes_payload["confidence"] == 0.86
 
 
 async def test_completed_run_records_bounded_hermes_outcome(
