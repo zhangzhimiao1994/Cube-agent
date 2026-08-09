@@ -39,10 +39,15 @@ describe("AppShell presentation", () => {
   it("renders a polished operations console shell", async () => {
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByText("Agent orchestration control plane")).not.toBeNull();
-    expect(screen.getByText("Control console")).not.toBeNull();
-    expect(screen.getByText("Live routing")).not.toBeNull();
-    expect(screen.getByText("Guarded tools")).not.toBeNull();
-    expect(screen.getByText("Hermes learning")).not.toBeNull();
+    expect(await screen.findByText("Agent 编排控制台")).not.toBeNull();
+    expect(screen.getByText("控制中枢")).not.toBeNull();
+    expect(screen.getByText("实时调度")).not.toBeNull();
+    expect(screen.getByText("工具防护")).not.toBeNull();
+    expect(screen.getByRole("link", { name: "对话任务" })).not.toBeNull();
+    expect(screen.getByRole("link", { name: "记忆" })).not.toBeNull();
+    expect(screen.getByRole("link", { name: "技能" })).not.toBeNull();
+    expect(screen.getByRole("link", { name: "通道连接" })).not.toBeNull();
+    expect(screen.getByRole("link", { name: "系统设置" })).not.toBeNull();
+    expect(screen.getAllByText("Hermes 学习").length).toBeGreaterThan(0);
   });
 });

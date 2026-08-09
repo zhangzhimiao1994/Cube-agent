@@ -3,23 +3,24 @@ import { NavLink, Outlet } from "react-router-dom";
 import { useAuth } from "../auth/AuthProvider";
 
 const NAVIGATION = [
-  { to: "/", label: "Runs", permission: "run:read" },
-  { to: "/config", label: "Config", permission: "config:read" },
-  { to: "/models", label: "Models", permission: "config:read" },
-  { to: "/agents", label: "Agents", permission: "agent:read" },
-  { to: "/workflows", label: "Workflows", permission: "agent:read" },
-  { to: "/skills", label: "Skills", permission: "skill:read" },
-  { to: "/mcp", label: "MCP", permission: "mcp:read" },
-  { to: "/memory", label: "Memory", permission: "memory:read" },
-  { to: "/hermes", label: "Hermes", permission: "hermes:read" },
-  { to: "/users", label: "Users", permission: "user:read" },
-  { to: "/audit", label: "Audit", permission: "audit:read" },
+  { to: "/", label: "对话任务", permission: "run:read" },
+  { to: "/config", label: "系统设置", permission: "config:read" },
+  { to: "/models", label: "模型与 API", permission: "config:read" },
+  { to: "/agents", label: "Agent 角色", permission: "agent:read" },
+  { to: "/workflows", label: "工作流", permission: "agent:read" },
+  { to: "/skills", label: "技能", permission: "skill:read" },
+  { to: "/mcp", label: "MCP 工具", permission: "mcp:read" },
+  { to: "/channels", label: "通道连接", permission: "config:read" },
+  { to: "/memory", label: "记忆", permission: "memory:read" },
+  { to: "/hermes", label: "Hermes 学习", permission: "hermes:read" },
+  { to: "/users", label: "用户", permission: "user:read" },
+  { to: "/audit", label: "审计日志", permission: "audit:read" },
 ];
 
 const HEALTH_CARDS = [
-  ["Live routing", "Auto, dispatch, discuss, hybrid"],
-  ["Guarded tools", "Skills and MCP approval gates"],
-  ["Hermes learning", "Experience feedback without bypassing approvals"],
+  ["实时调度", "自动、派单、讨论、混合模式"],
+  ["工具防护", "Skill 与 MCP 均经过权限边界"],
+  ["Hermes 学习", "沉淀经验，但不绕过审批"],
 ] as const;
 
 export function AppShell() {
@@ -29,8 +30,8 @@ export function AppShell() {
       <aside className="sidebar">
         <div className="brand-card">
           <span className="eyebrow">Agent Hub</span>
-          <h1>Control console</h1>
-          <p>Operations console for multi-agent workflows</p>
+          <h1>控制中枢</h1>
+          <p>面向生产环境的多 Agent 调度与配置控制台</p>
         </div>
         <nav aria-label="Main navigation" className="nav-list">
           {NAVIGATION.filter((item) => auth.hasPermission(item.permission)).map((item) => (
@@ -48,12 +49,12 @@ export function AppShell() {
         <header className="topbar">
           <div>
             <p className="eyebrow">Production management</p>
-            <h2>Agent orchestration control plane</h2>
+            <h2>Agent 编排控制台</h2>
           </div>
           <div className="user-chip">
             <span>{auth.user?.username}</span>
             <button type="button" onClick={() => void auth.logout()}>
-              Logout
+              退出
             </button>
           </div>
         </header>

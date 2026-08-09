@@ -1,15 +1,221 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { FormEvent, useMemo, useState } from "react";
 
-import { api } from "../api/client";
+import { api, formatApiError } from "../api/client";
+
+type RoleTemplate = {
+  id: string;
+  name: string;
+  role: string;
+  prompt: string;
+  skills: string[];
+};
+
+const ROLE_TEMPLATES: RoleTemplate[] = [
+  {
+    id: "director",
+    name: "导演",
+    role: "导演",
+    prompt: "负责拆解目标、规划叙事结构、镜头语言、节奏控制和最终质量把关。",
+    skills: [],
+  },
+  {
+    id: "copywriter",
+    name: "文案生成",
+    role: "文案生成",
+    prompt: "负责生成标题、脚本、口播稿、卖点表达和多版本文案，并保持表达清晰可执行。",
+    skills: [],
+  },
+  {
+    id: "editor",
+    name: "剪辑师",
+    role: "剪辑师",
+    prompt: "负责将内容拆解为镜头、转场、字幕、音效和剪辑节奏建议。",
+    skills: [],
+  },
+  {
+    id: "economic-analyst",
+    name: "经济分析师",
+    role: "经济分析师",
+    prompt: "负责宏观经济、行业、公司和数据逻辑分析，必须区分事实、推断和不确定性。",
+    skills: [],
+  },
+  {
+    id: "researcher",
+    name: "研究员",
+    role: "研究员",
+    prompt: "负责收集信息、校验来源、整理证据链，并输出可复核的结论。",
+    skills: [],
+  },
+  {
+    id: "critic",
+    name: "审查员",
+    role: "审查员",
+    prompt: "负责发现逻辑漏洞、风险、遗漏条件和潜在失败路径，不直接替代决策。",
+    skills: [],
+  },
+  {
+    id: "operator",
+    name: "执行官",
+    role: "执行官",
+    prompt: "负责把计划拆成可执行步骤，调用允许的非危险工具，并记录结果和错误原因。",
+    skills: [],
+  },
+];
+
+function parseSkills(value: string) {
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
 
 export function AgentsPage() {
+  const queryClient = useQueryClient();
   const agents = useQuery({ queryKey: ["agents"], queryFn: () => api.agents() });
+  const models = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
+  const [templateId, setTemplateId] = useState(ROLE_TEMPLATES[0].id);
+  const selectedTemplate = useMemo(
+    () => ROLE_TEMPLATES.find((item) => item.id === templateId) ?? ROLE_TEMPLATES[0],
+    [templateId],
+  );
+  const [agentId, setAgentId] = useState(selectedTemplate.id);
+  const [name, setName] = useState(selectedTemplate.name);
+  const [role, setRole] = useState(selectedTemplate.role);
+  const [prompt, setPrompt] = useState(selectedTemplate.prompt);
+  const [model, setModel] = useState("");
+  const [skills, setSkills] = useState("");
+  const [message, setMessage] = useState<string | null>(null);
+
+  const modelOptions = useMemo(
+    () => Array.from(new Set((models.data ?? []).map((item) => item.logical_model))).sort(),
+    [models.data],
+  );
+  const selectedModel = model || modelOptions[0] || "";
+
+  const saveAgent = useMutation({
+    mutationFn: () =>
+      api.createAgent({
+        id: agentId.trim(),
+        name: name.trim(),
+        enabled: true,
+        role: role.trim(),
+        prompt: prompt.trim(),
+        model: selectedModel,
+        skills: parseSkills(skills),
+      }),
+    onSuccess: async () => {
+      setMessage("Agent 已保存，并写入当前生产配置。");
+      await queryClient.invalidateQueries({ queryKey: ["agents"] });
+      await queryClient.invalidateQueries({ queryKey: ["config-current"] });
+    },
+  });
+
+  function changeTemplate(nextId: string) {
+    const next = ROLE_TEMPLATES.find((item) => item.id === nextId) ?? ROLE_TEMPLATES[0];
+    setTemplateId(next.id);
+    setAgentId(next.id);
+    setName(next.name);
+    setRole(next.role);
+    setPrompt(next.prompt);
+    setSkills(next.skills.join(","));
+    setMessage(null);
+  }
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setMessage(null);
+    saveAgent.mutate();
+  }
+
+  if (agents.isLoading || models.isLoading) return <p>正在加载 Agent 配置...</p>;
+  if (agents.isError) return <p role="alert">{formatApiError(agents.error, "Agent 加载失败")}</p>;
+  if (models.isError) return <p role="alert">{formatApiError(models.error, "模型加载失败")}</p>;
+
   return (
     <section>
-      <h2>Agent 角色</h2>
-      {(agents.data ?? []).map((agent) => (
-        <p key={agent.id}>{agent.name}</p>
-      ))}
+      <p className="eyebrow">Role orchestration</p>
+      <h2>Agent 角色编排</h2>
+      <p>
+        子 Agent 的角色不是写死的。这里提供常用模板，也允许直接改角色、提示词和技能列表；
+        保存后会写入生产配置，运行任务时由主 Agent 根据任务模式调度。
+      </p>
+
+      {modelOptions.length === 0 ? (
+        <p role="alert">还没有可用模型。请先到“模型”页面添加模型，并通过 API 可用性测试。</p>
+      ) : null}
+
+      <form onSubmit={submit} aria-label="保存 Agent">
+        <label htmlFor="role-template">角色模板</label>
+        <select id="role-template" value={templateId} onChange={(event) => changeTemplate(event.target.value)}>
+          {ROLE_TEMPLATES.map((item) => (
+            <option key={item.id} value={item.id}>
+              {item.name}
+            </option>
+          ))}
+        </select>
+
+        <label htmlFor="agent-id">Agent ID</label>
+        <input
+          id="agent-id"
+          value={agentId}
+          onChange={(event) => setAgentId(event.target.value)}
+          placeholder="例如 director"
+          required
+        />
+
+        <label htmlFor="agent-name">显示名称</label>
+        <input id="agent-name" value={name} onChange={(event) => setName(event.target.value)} required />
+
+        <label htmlFor="agent-role">角色名称</label>
+        <input id="agent-role" value={role} onChange={(event) => setRole(event.target.value)} required />
+
+        <label htmlFor="agent-model">绑定逻辑模型</label>
+        <select
+          id="agent-model"
+          value={selectedModel}
+          onChange={(event) => setModel(event.target.value)}
+          disabled={modelOptions.length === 0}
+          required
+        >
+          {modelOptions.map((item) => (
+            <option key={item} value={item}>
+              {item}
+            </option>
+          ))}
+        </select>
+
+        <label htmlFor="agent-skills">允许使用的 Skill ID，多个用英文逗号分隔</label>
+        <input
+          id="agent-skills"
+          value={skills}
+          onChange={(event) => setSkills(event.target.value)}
+          placeholder="例如 script_review,safe_search"
+        />
+
+        <label htmlFor="agent-prompt">系统提示词</label>
+        <textarea id="agent-prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} required />
+
+        <button type="submit" disabled={saveAgent.isPending || modelOptions.length === 0}>
+          {saveAgent.isPending ? "正在保存..." : "保存 Agent"}
+        </button>
+        {message ? <p role="status">{message}</p> : null}
+        {saveAgent.isError ? <p role="alert">{formatApiError(saveAgent.error, "Agent 保存失败")}</p> : null}
+      </form>
+
+      <div>
+        {(agents.data ?? []).length === 0 ? <p>当前还没有 Agent。可以从上方模板创建第一个角色。</p> : null}
+        {(agents.data ?? []).map((agent) => (
+          <article key={agent.id}>
+            <h3>{agent.name}</h3>
+            <p>ID：{agent.id}</p>
+            <p>角色：{agent.role ?? agent.name}</p>
+            <p>模型：{agent.model ?? "未绑定"}</p>
+            <p>Skill：{(agent.skills ?? []).join(", ") || "无"}</p>
+            {agent.prompt ? <p>提示词：{agent.prompt}</p> : null}
+          </article>
+        ))}
+      </div>
     </section>
   );
 }

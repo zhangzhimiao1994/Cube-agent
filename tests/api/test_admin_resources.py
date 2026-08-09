@@ -7,6 +7,7 @@ from pydantic import SecretStr
 
 from agent_hub.api.errors import PublicAPIError
 from agent_hub.api.routers.admin import (
+    AgentResourceRequest,
     InMemoryAdminResourceService,
     ModelDeploymentRequest,
     PersistentAdminResourceService,
@@ -273,6 +274,89 @@ def test_agent_and_workflow_crud() -> None:
     )
 
 
+def test_channel_status_exposes_feishu_setup_without_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_live")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "secret-live")
+    monkeypatch.setenv("FEISHU_VERIFICATION_TOKEN", "verify-live")
+    monkeypatch.setenv("FEISHU_ENCRYPT_KEY", "encrypt-live")
+    monkeypatch.setenv("FEISHU_TRANSPORT", "webhook")
+    monkeypatch.setenv("AGENT_HUB_PUBLIC_URL", "https://agent.example.com")
+
+    response = client().get("/api/v1/admin/channels", headers=headers())
+
+    assert response.status_code == 200
+    payload = response.json()
+    by_id = {item["id"]: item for item in payload}
+    assert by_id["feishu"]["status"] == "configured"
+    assert (
+        by_id["feishu"]["public_webhook_url"]
+        == "https://agent.example.com/channels/feishu/events"
+    )
+    assert by_id["feishu"]["missing"] == []
+    assert {
+        "feishu",
+        "dingtalk",
+        "wecom_bot",
+        "wecom_app",
+        "wechat_official",
+        "wechat_customer_service",
+        "telegram",
+        "slack",
+        "qq",
+        "custom_webhook",
+    }.issubset(by_id)
+    assert by_id["wechat_official"]["status"] == "missing_config"
+    assert by_id["custom_webhook"]["status"] == "missing_config"
+    serialized = response.text
+    assert "secret-live" not in serialized
+    assert "verify-live" not in serialized
+    assert "encrypt-live" not in serialized
+
+
+def test_all_channel_statuses_are_configured_when_required_env_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "AGENT_HUB_PUBLIC_URL",
+        "FEISHU_APP_ID",
+        "FEISHU_APP_SECRET",
+        "FEISHU_VERIFICATION_TOKEN",
+        "FEISHU_ENCRYPT_KEY",
+        "DINGTALK_APP_KEY",
+        "DINGTALK_APP_SECRET",
+        "DINGTALK_WEBHOOK_TOKEN",
+        "WECOM_BOT_WEBHOOK_KEY",
+        "WECOM_BOT_WEBHOOK_TOKEN",
+        "WECOM_CORP_ID",
+        "WECOM_AGENT_ID",
+        "WECOM_SECRET",
+        "WECOM_TOKEN",
+        "WECHATMP_APP_ID",
+        "WECHATMP_APP_SECRET",
+        "WECHATMP_TOKEN",
+        "WECHAT_KF_CORP_ID",
+        "WECHAT_KF_SECRET",
+        "WECHAT_KF_TOKEN",
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_WEBHOOK_TOKEN",
+        "SLACK_BOT_TOKEN",
+        "SLACK_SIGNING_SECRET",
+        "QQ_BOT_APP_ID",
+        "QQ_BOT_TOKEN",
+        "QQ_WEBHOOK_TOKEN",
+        "CUSTOM_WEBHOOK_TOKEN",
+    ):
+        monkeypatch.setenv(name, "configured")
+
+    response = client().get("/api/v1/admin/channels", headers=headers())
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload
+    assert {item["status"] for item in payload} == {"configured"}
+    assert all(item["missing"] == [] for item in payload)
+
+
 def test_operational_run_listing_details_and_controls() -> None:
     api = client()
 
@@ -461,6 +545,68 @@ async def test_persistent_admin_models_write_to_published_config() -> None:
         },
         "agents": [],
     }
+
+
+@pytest.mark.asyncio
+async def test_persistent_admin_agents_write_to_published_config() -> None:
+    configs = FakeConfigService()
+    configs.current = ConfigRevision(
+        id=uuid4(),
+        tenant_id=TENANT_ID,
+        version=1,
+        status=ConfigStatus.PUBLISHED,
+        document={
+            "models": {
+                "main": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-chat",
+                            "credential_ref": f"secret://{SECRET_ID}",
+                            "quota_scope_id": "deepseek-account",
+                        }
+                    ]
+                }
+            },
+            "agents": [],
+        },
+        created_by=ACTOR_ID,
+        created_at=datetime.now(UTC),
+    )
+    service = PersistentAdminResourceService(
+        config_service=configs,  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+    )
+
+    created = await service.upsert_agent(
+        AgentResourceRequest(
+            id="director",
+            name="导演",
+            enabled=True,
+            role="短视频导演",
+            prompt="负责拆解选题、镜头语言和成片节奏。",
+            model="main",
+            skills=["script_review"],
+        )
+    )
+    listed = await service.list_agents()
+
+    assert created.id == "director"
+    assert created.role == "短视频导演"
+    assert listed == (created,)
+    assert configs.current is not None
+    assert configs.current.version == 1
+    assert configs.current.document["agents"] == [
+        {
+            "id": "director",
+            "role": "短视频导演",
+            "prompt": "负责拆解选题、镜头语言和成片节奏。",
+            "model": "main",
+            "skills": ["script_review"],
+        }
+    ]
 
 
 @pytest.mark.asyncio

@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Annotated, Protocol, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from fastapi import APIRouter, Depends, Request
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
+from sqlalchemy import delete, select
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.api.dependencies import current_principal
 from agent_hub.api.errors import BASE_ERROR_RESPONSES, PublicAPIError, error_responses
 from agent_hub.auth.models import AuthenticatedPrincipal, Authorizer, PermissionDenied
 from agent_hub.config.schema import PlatformConfig
 from agent_hub.config.service import ConfigService, ConfigValidationError
+from agent_hub.db.models import AdminResourceRow
 from agent_hub.domain.runs import RunStatus
 from agent_hub.models.gateway import ModelTransport
 from agent_hub.models.litellm_client import LiteLLMClient
@@ -123,6 +128,22 @@ class NamedResourceResponse(NamedResourceRequest):
     pass
 
 
+class AgentResourceRequest(NamedResourceRequest):
+    role: str | None = Field(default=None, min_length=1, max_length=256)
+    prompt: str | None = Field(default=None, min_length=1, max_length=100_000)
+    model: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-z0-9][a-z0-9_-]*$",
+    )
+    skills: list[str] = Field(default_factory=list, max_length=128)
+
+
+class AgentResourceResponse(AgentResourceRequest):
+    pass
+
+
 class RunListItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -181,6 +202,122 @@ class McpServerResponse(BaseModel):
     name: str
     health: str
     allowed_tools: list[str]
+
+
+class ChannelStatusResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    name: str
+    status: str
+    transports: list[str]
+    webhook_path: str | None = None
+    public_webhook_url: str | None = None
+    missing: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelDefinition:
+    id: str
+    name: str
+    transports: tuple[str, ...]
+    required_env: tuple[str, ...]
+    webhook_path: str | None
+    notes: tuple[str, ...]
+
+
+CHANNEL_DEFINITIONS: tuple[ChannelDefinition, ...] = (
+    ChannelDefinition(
+        id="feishu",
+        name="飞书",
+        transports=("webhook", "websocket"),
+        required_env=(
+            "FEISHU_APP_ID",
+            "FEISHU_APP_SECRET",
+            "FEISHU_VERIFICATION_TOKEN",
+            "FEISHU_ENCRYPT_KEY",
+            "AGENT_HUB_PUBLIC_URL",
+        ),
+        webhook_path="/channels/feishu/events",
+        notes=(
+            "Webhook 已挂载在主 API 服务，不需要额外暴露 8001。",
+            "飞书已接入运行提交链路。",
+        ),
+    ),
+    ChannelDefinition(
+        id="dingtalk",
+        name="钉钉",
+        transports=("webhook",),
+        required_env=("DINGTALK_APP_KEY", "DINGTALK_APP_SECRET", "DINGTALK_WEBHOOK_TOKEN"),
+        webhook_path="/channels/dingtalk/events",
+        notes=("配置齐全后可通过该 Webhook 接收钉钉消息，并提交到主 Agent。",),
+    ),
+    ChannelDefinition(
+        id="wecom_bot",
+        name="企微智能机器人",
+        transports=("webhook",),
+        required_env=("WECOM_BOT_WEBHOOK_KEY", "WECOM_BOT_WEBHOOK_TOKEN"),
+        webhook_path="/channels/wecom/bot/events",
+        notes=("适合企业微信群机器人场景；配置齐全后可接收消息。",),
+    ),
+    ChannelDefinition(
+        id="wecom_app",
+        name="企业微信自建应用",
+        transports=("callback",),
+        required_env=("WECOM_CORP_ID", "WECOM_AGENT_ID", "WECOM_SECRET", "WECOM_TOKEN"),
+        webhook_path="/channels/wecom/app/events",
+        notes=("适合企业内部审批、任务派发和私聊机器人；配置齐全后可接收回调消息。",),
+    ),
+    ChannelDefinition(
+        id="wechat_official",
+        name="公众号",
+        transports=("callback",),
+        required_env=("WECHATMP_APP_ID", "WECHATMP_APP_SECRET", "WECHATMP_TOKEN"),
+        webhook_path="/channels/wechatmp/events",
+        notes=("适合公众号消息入口；配置齐全后可接收文本消息。",),
+    ),
+    ChannelDefinition(
+        id="wechat_customer_service",
+        name="微信客服",
+        transports=("callback",),
+        required_env=("WECHAT_KF_CORP_ID", "WECHAT_KF_SECRET", "WECHAT_KF_TOKEN"),
+        webhook_path="/channels/wechat-kf/events",
+        notes=("适合微信客服入口；配置齐全后可接收客服消息。",),
+    ),
+    ChannelDefinition(
+        id="telegram",
+        name="Telegram",
+        transports=("webhook",),
+        required_env=("TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_TOKEN", "AGENT_HUB_PUBLIC_URL"),
+        webhook_path="/channels/telegram/events",
+        notes=("适合海外聊天机器人场景；配置齐全后可接收 Bot Webhook。",),
+    ),
+    ChannelDefinition(
+        id="slack",
+        name="Slack",
+        transports=("events_api",),
+        required_env=("SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET"),
+        webhook_path="/channels/slack/events",
+        notes=("适合团队协作空间；配置齐全后可接收事件消息。",),
+    ),
+    ChannelDefinition(
+        id="qq",
+        name="QQ 机器人",
+        transports=("webhook",),
+        required_env=("QQ_BOT_APP_ID", "QQ_BOT_TOKEN", "QQ_WEBHOOK_TOKEN"),
+        webhook_path="/channels/qq/events",
+        notes=("适合 QQ 频道或机器人入口；配置齐全后可接收事件消息。",),
+    ),
+    ChannelDefinition(
+        id="custom_webhook",
+        name="自定义 Webhook",
+        transports=("webhook",),
+        required_env=("CUSTOM_WEBHOOK_TOKEN",),
+        webhook_path="/channels/custom/events",
+        notes=("用于兼容其他支持 HTTP Webhook 的聊天软件；配置共享令牌后可接收 JSON 文本消息。",),
+    ),
+)
 
 
 class MemoryRecordRequest(BaseModel):
@@ -267,9 +404,9 @@ class AdminResourceService(Protocol):
 
     async def rollback(self, version: int) -> PublishResponse: ...
 
-    async def list_agents(self) -> tuple[NamedResourceResponse, ...]: ...
+    async def list_agents(self) -> tuple[AgentResourceResponse, ...]: ...
 
-    async def upsert_agent(self, request: NamedResourceRequest) -> NamedResourceResponse: ...
+    async def upsert_agent(self, request: AgentResourceRequest) -> AgentResourceResponse: ...
 
     async def list_workflows(self) -> tuple[NamedResourceResponse, ...]: ...
 
@@ -292,6 +429,8 @@ class AdminResourceService(Protocol):
     async def approve_skill(self, skill_id: str) -> SkillResponse: ...
 
     async def list_mcp_servers(self) -> tuple[McpServerResponse, ...]: ...
+
+    async def list_channels(self) -> tuple[ChannelStatusResponse, ...]: ...
 
     async def list_memory(self) -> tuple[MemoryRecordResponse, ...]: ...
 
@@ -320,7 +459,7 @@ class InMemoryAdminResourceService:
     draft_yaml: str = ""
     published_yaml: str = ""
     version: int = 0
-    agents: dict[str, NamedResourceResponse] = field(default_factory=dict)
+    agents: dict[str, AgentResourceResponse] = field(default_factory=dict)
     workflows: dict[str, NamedResourceResponse] = field(default_factory=dict)
     runs: dict[UUID, RunDetailResponse] = field(default_factory=dict)
     skills: dict[str, SkillResponse] = field(default_factory=dict)
@@ -454,11 +593,11 @@ class InMemoryAdminResourceService:
         self.version = version
         return PublishResponse(version=self.version, status="rolled_back")
 
-    async def list_agents(self) -> tuple[NamedResourceResponse, ...]:
+    async def list_agents(self) -> tuple[AgentResourceResponse, ...]:
         return tuple(self.agents.values())
 
-    async def upsert_agent(self, request: NamedResourceRequest) -> NamedResourceResponse:
-        response = NamedResourceResponse(**request.model_dump())
+    async def upsert_agent(self, request: AgentResourceRequest) -> AgentResourceResponse:
+        response = AgentResourceResponse(**request.model_dump())
         self.agents[response.id] = response
         return response
 
@@ -524,6 +663,9 @@ class InMemoryAdminResourceService:
 
     async def list_mcp_servers(self) -> tuple[McpServerResponse, ...]:
         return tuple(self.mcp_servers.values())
+
+    async def list_channels(self) -> tuple[ChannelStatusResponse, ...]:
+        return _channel_statuses_from_environment()
 
     async def list_memory(self) -> tuple[MemoryRecordResponse, ...]:
         return tuple(self.memory.values())
@@ -622,6 +764,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         actor_id: UUID,
         model_transport: ModelTransport | None = None,
         run_repository: RunRepository | None = None,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
     ) -> None:
         super().__init__()
         self._config_service = config_service
@@ -630,6 +773,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         self._actor_id = actor_id
         self._model_transport = model_transport or LiteLLMClient()
         self._run_repository = run_repository
+        self._session_factory = session_factory
 
     async def list_runs(self) -> tuple[RunListItem, ...]:
         if self._run_repository is None:
@@ -797,13 +941,18 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 draft.version,
                 self._actor_id,
             )
-        except ConfigValidationError:
+        except (ConfigValidationError, ValidationError):
             raise PublicAPIError(422, "request_validation", "request validation failed") from None
         current = await self._config_service.get_current(self._tenant_id)
         if current is None:
             raise PublicAPIError(503, "service_unavailable", "service unavailable")
         published = PlatformConfig.model_validate(current.document)
         created_definition = published.models[request.logical_model]
+        await self._record_audit(
+            "model.create",
+            f"model:{request.logical_model}",
+            {"provider": request.provider, "model": request.upstream_model},
+        )
         return self._model_response(
             request.logical_model,
             created_definition.fallback_model,
@@ -821,7 +970,332 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         except SecretValidationError:
             raise PublicAPIError(422, "request_validation", "request validation failed") from None
         value = request.value.get_secret_value()
-        return SecretReferenceResponse(ref=reference.reference, last_four=value[-4:])
+        response = SecretReferenceResponse(ref=reference.reference, last_four=value[-4:])
+        await self._record_audit("secret.create", "secret", {"label": request.label})
+        return response
+
+    async def list_agents(self) -> tuple[AgentResourceResponse, ...]:
+        revision = await self._config_service.get_current(self._tenant_id)
+        if revision is None:
+            return ()
+        config = PlatformConfig.model_validate(revision.document)
+        return tuple(
+            AgentResourceResponse(
+                id=agent.id,
+                name=agent.role,
+                enabled=True,
+                role=agent.role,
+                prompt=agent.prompt,
+                model=agent.model,
+                skills=agent.skills,
+            )
+            for agent in config.agents
+        )
+
+    async def upsert_agent(self, request: AgentResourceRequest) -> AgentResourceResponse:
+        if request.model is None:
+            raise PublicAPIError(422, "request_validation", "agent model is required")
+        if request.prompt is None:
+            raise PublicAPIError(422, "request_validation", "agent prompt is required")
+        role = request.role or request.name
+        document = await self._current_document()
+        agents = list(cast(list[object], document.setdefault("agents", [])))
+        replacement = {
+            "id": request.id,
+            "role": role,
+            "prompt": request.prompt,
+            "model": request.model,
+            "skills": request.skills,
+        }
+        replaced = False
+        next_agents: list[object] = []
+        for existing in agents:
+            if isinstance(existing, dict) and existing.get("id") == request.id:
+                next_agents.append(replacement)
+                replaced = True
+            else:
+                next_agents.append(existing)
+        if not replaced:
+            next_agents.append(replacement)
+        document["agents"] = next_agents
+        try:
+            PlatformConfig.model_validate(document)
+            draft = await self._config_service.create_draft(
+                self._tenant_id,
+                self._actor_id,
+                document,
+            )
+            await self._config_service.publish(
+                self._tenant_id,
+                draft.version,
+                self._actor_id,
+            )
+        except (ConfigValidationError, ValidationError):
+            raise PublicAPIError(422, "request_validation", "request validation failed") from None
+        current = await self._config_service.get_current(self._tenant_id)
+        if current is None:
+            raise PublicAPIError(503, "service_unavailable", "service unavailable")
+        config = PlatformConfig.model_validate(current.document)
+        for agent in config.agents:
+            if agent.id == request.id:
+                response = AgentResourceResponse(
+                    id=agent.id,
+                    name=agent.role,
+                    enabled=request.enabled,
+                    role=agent.role,
+                    prompt=agent.prompt,
+                    model=agent.model,
+                    skills=agent.skills,
+                )
+                await self._record_audit("agent.upsert", f"agent:{agent.id}", {"id": agent.id})
+                return response
+        raise PublicAPIError(503, "service_unavailable", "service unavailable")
+
+    async def list_workflows(self) -> tuple[NamedResourceResponse, ...]:
+        resources = await self._list_admin_payloads("workflow")
+        if resources is None:
+            return await super().list_workflows()
+        return tuple(NamedResourceResponse.model_validate(payload) for payload in resources)
+
+    async def upsert_workflow(self, request: NamedResourceRequest) -> NamedResourceResponse:
+        response = NamedResourceResponse(**request.model_dump())
+        if not await self._upsert_admin_payload("workflow", response.id, response.model_dump(mode="json")):
+            return await super().upsert_workflow(request)
+        await self._record_audit("workflow.upsert", f"workflow:{response.id}", {"id": response.id})
+        return response
+
+    async def list_skills(self) -> tuple[SkillResponse, ...]:
+        resources = await self._list_admin_payloads("skill")
+        if resources is None:
+            return await super().list_skills()
+        return tuple(SkillResponse.model_validate(payload) for payload in resources)
+
+    async def upload_skill(self, request: SkillUploadRequest) -> SkillResponse:
+        skill_id = f"skill_{uuid4().hex}"
+        response = SkillResponse(
+            id=skill_id,
+            name=request.filename,
+            status="quarantined",
+            scan_diff=["metadata recorded; package scan requires ZIP upload endpoint"],
+            requested_permissions=["filesystem:read"],
+        )
+        if not await self._upsert_admin_payload("skill", skill_id, response.model_dump(mode="json")):
+            return await super().upload_skill(request)
+        await self._record_audit("skill.upload", f"skill:{skill_id}", {"filename": request.filename})
+        return response
+
+    async def approve_skill(self, skill_id: str) -> SkillResponse:
+        payload = await self._get_admin_payload("skill", skill_id)
+        if payload is None:
+            return await super().approve_skill(skill_id)
+        if not payload:
+            raise KeyError(skill_id)
+        current = SkillResponse.model_validate(payload)
+        response = SkillResponse(
+            **{
+                **current.model_dump(),
+                "status": "enabled",
+                "scan_diff": [*current.scan_diff, "approved by production admin"],
+            }
+        )
+        await self._upsert_admin_payload("skill", skill_id, response.model_dump(mode="json"))
+        await self._record_audit("skill.approve", f"skill:{skill_id}", {"id": skill_id})
+        return response
+
+    async def list_mcp_servers(self) -> tuple[McpServerResponse, ...]:
+        resources = await self._list_admin_payloads("mcp")
+        if resources is None:
+            return await super().list_mcp_servers()
+        return tuple(McpServerResponse.model_validate(payload) for payload in resources)
+
+    async def list_memory(self) -> tuple[MemoryRecordResponse, ...]:
+        resources = await self._list_admin_payloads("memory")
+        if resources is None:
+            return await super().list_memory()
+        return tuple(MemoryRecordResponse.model_validate(payload) for payload in resources)
+
+    async def update_memory(
+        self, memory_id: str, request: MemoryRecordRequest
+    ) -> MemoryRecordResponse:
+        existing = await self._get_admin_payload("memory", memory_id)
+        if existing is None:
+            return await super().update_memory(memory_id, request)
+        if not existing:
+            raise KeyError(memory_id)
+        current = MemoryRecordResponse.model_validate(existing)
+        response = MemoryRecordResponse(id=current.id, scope=current.scope, value=request.value)
+        await self._upsert_admin_payload("memory", memory_id, response.model_dump(mode="json"))
+        await self._record_audit("memory.update", f"memory:{memory_id}", {"id": memory_id})
+        return response
+
+    async def forget_memory(self, memory_id: str) -> None:
+        deleted = await self._delete_admin_payload("memory", memory_id)
+        if deleted is None:
+            await super().forget_memory(memory_id)
+            return
+        if not deleted:
+            raise KeyError(memory_id)
+        await self._record_audit("memory.forget", f"memory:{memory_id}", {"id": memory_id})
+
+    async def list_audit_events(self, action: str | None = None) -> tuple[AuditEventResponse, ...]:
+        resources = await self._list_admin_payloads("audit")
+        if resources is None:
+            return await super().list_audit_events(action)
+        events = tuple(_audit_response_from_payload(payload) for payload in resources)
+        if action is not None:
+            events = tuple(event for event in events if event.action == action)
+        return tuple(sorted(events, key=lambda event: event.created_at, reverse=True))
+
+    async def list_hermes_insights(self) -> tuple[HermesInsightResponse, ...]:
+        resources = await self._list_admin_payloads("hermes")
+        if resources is None:
+            return await super().list_hermes_insights()
+        return tuple(_hermes_response_from_payload(payload) for payload in resources)
+
+    async def record_hermes_feedback(
+        self, request: HermesFeedbackRequest
+    ) -> HermesInsightResponse:
+        if _contains_sensitive_marker(request.lesson):
+            raise ValueError("sensitive content")
+        insight_id = f"hermes_{uuid4().hex}"
+        response = HermesInsightResponse(
+            id=insight_id,
+            outcome=request.outcome,
+            lesson=request.lesson,
+            tags=request.tags,
+            weight=request.weight,
+            created_at=datetime.now(UTC),
+        )
+        if not await self._upsert_admin_payload("hermes", insight_id, response.model_dump(mode="json")):
+            return await super().record_hermes_feedback(request)
+        await self._record_audit("hermes.feedback", f"hermes:{insight_id}", {"id": insight_id})
+        return response
+
+    async def recommend_with_hermes(
+        self, request: HermesRecommendationRequest
+    ) -> HermesRecommendationResponse:
+        if self._session_factory is None:
+            return await super().recommend_with_hermes(request)
+        previous = await self.list_hermes_insights()
+        lowered_task = request.task.lower()
+        matched = [
+            insight
+            for insight in previous
+            if any(tag.lower() in lowered_task for tag in insight.tags)
+            or any(word in lowered_task for word in insight.lesson.lower().split())
+        ]
+        if not matched:
+            return HermesRecommendationResponse(
+                recommended_mode=request.mode_candidates[0] if request.mode_candidates else "dispatch",
+                recommended_model=request.model_candidates[0] if request.model_candidates else None,
+                recommended_skills=request.skill_candidates[:2],
+                confidence=0.35,
+                reasons=["No matching Hermes lesson was found in persistent memory."],
+                requires_approval=True,
+            )
+        best = max(matched, key=lambda insight: insight.weight)
+        recommended_mode = (
+            "group_chat"
+            if "debate" in lowered_task or "review" in lowered_task
+            else (request.mode_candidates[0] if request.mode_candidates else "dispatch")
+        )
+        if recommended_mode not in request.mode_candidates and request.mode_candidates:
+            recommended_mode = request.mode_candidates[0]
+        return HermesRecommendationResponse(
+            recommended_mode=recommended_mode,
+            recommended_model=request.model_candidates[0] if request.model_candidates else None,
+            recommended_skills=request.skill_candidates[:2],
+            confidence=min(0.95, 0.45 + best.weight / 20),
+            reasons=[f"Hermes lesson matched: {best.lesson}"],
+            requires_approval=True,
+        )
+
+    async def _list_admin_payloads(self, kind: str) -> list[dict[str, object]] | None:
+        if self._session_factory is None:
+            return None
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(AdminResourceRow)
+                    .where(AdminResourceRow.tenant_id == self._tenant_id)
+                    .where(AdminResourceRow.kind == kind)
+                    .order_by(AdminResourceRow.created_at)
+                )
+            ).scalars()
+            return [dict(row.payload) for row in rows]
+
+    async def _get_admin_payload(self, kind: str, resource_id: str) -> dict[str, object] | None:
+        if self._session_factory is None:
+            return None
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(AdminResourceRow)
+                    .where(AdminResourceRow.tenant_id == self._tenant_id)
+                    .where(AdminResourceRow.kind == kind)
+                    .where(AdminResourceRow.resource_id == resource_id)
+                )
+            ).scalar_one_or_none()
+            return {} if row is None else dict(row.payload)
+
+    async def _upsert_admin_payload(
+        self, kind: str, resource_id: str, payload: dict[str, object]
+    ) -> bool:
+        if self._session_factory is None:
+            return False
+        statement = (
+            insert(AdminResourceRow)
+            .values(
+                id=uuid4(),
+                tenant_id=self._tenant_id,
+                kind=kind,
+                resource_id=resource_id,
+                payload=payload,
+            )
+            .on_conflict_do_update(
+                index_elements=[
+                    AdminResourceRow.tenant_id,
+                    AdminResourceRow.kind,
+                    AdminResourceRow.resource_id,
+                ],
+                set_={"payload": payload},
+            )
+        )
+        async with self._session_factory() as session, session.begin():
+            await session.execute(statement)
+        return True
+
+    async def _delete_admin_payload(self, kind: str, resource_id: str) -> bool | None:
+        if self._session_factory is None:
+            return None
+        existing = await self._get_admin_payload(kind, resource_id)
+        if not existing:
+            return False
+        async with self._session_factory() as session, session.begin():
+            await session.execute(
+                delete(AdminResourceRow)
+                .where(AdminResourceRow.tenant_id == self._tenant_id)
+                .where(AdminResourceRow.kind == kind)
+                .where(AdminResourceRow.resource_id == resource_id)
+            )
+        return True
+
+    async def _record_audit(
+        self, action: str, resource: str, payload: dict[str, object] | None = None
+    ) -> None:
+        if self._session_factory is None:
+            return
+        event = AuditEventResponse(
+            id=f"audit_{uuid4().hex}",
+            actor=str(self._actor_id),
+            action=action,
+            resource=resource,
+            created_at=datetime.now(UTC),
+        )
+        audit_payload = event.model_dump(mode="json")
+        if payload:
+            audit_payload["details"] = payload
+        await self._upsert_admin_payload("audit", event.id, audit_payload)
 
     async def _verify_model_availability(self, deployment: Deployment) -> None:
         if ModelCapability.TEXT not in deployment.capabilities:
@@ -941,6 +1415,72 @@ def _safe_model_check_reason(error: Exception) -> str:
     return message[:300]
 
 
+def _audit_response_from_payload(payload: dict[str, object]) -> AuditEventResponse:
+    created_at = payload.get("created_at")
+    return AuditEventResponse(
+        id=str(payload.get("id", "")),
+        actor=str(payload.get("actor", "system")),
+        action=str(payload.get("action", "unknown")),
+        resource=str(payload.get("resource", "unknown")),
+        created_at=_datetime_from_json(created_at),
+    )
+
+
+def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightResponse:
+    tags = payload.get("tags")
+    raw_weight = payload.get("weight", 1)
+    return HermesInsightResponse(
+        id=str(payload.get("id", "")),
+        outcome=str(payload.get("outcome", "neutral")),
+        lesson=str(payload.get("lesson", "")),
+        tags=[str(tag) for tag in tags] if isinstance(tags, list) else [],
+        weight=raw_weight if type(raw_weight) is int else 1,
+        created_at=_datetime_from_json(payload.get("created_at")),
+    )
+
+
+def _datetime_from_json(value: object) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return datetime.now(UTC)
+    return datetime.now(UTC)
+
+
+def _channel_statuses_from_environment() -> tuple[ChannelStatusResponse, ...]:
+    public_url = os.environ.get("AGENT_HUB_PUBLIC_URL", "").rstrip("/")
+    statuses: list[ChannelStatusResponse] = []
+    for definition in CHANNEL_DEFINITIONS:
+        missing = [name for name in definition.required_env if not os.environ.get(name)]
+        public_webhook_url = (
+            f"{public_url}{definition.webhook_path}"
+            if public_url and definition.webhook_path is not None
+            else None
+        )
+        transports = list(definition.transports)
+        if definition.id == "feishu":
+            configured_transport = os.environ.get("FEISHU_TRANSPORT")
+            if configured_transport:
+                transports = [configured_transport]
+        status = "missing_config" if missing else "configured"
+        statuses.append(
+            ChannelStatusResponse(
+                id=definition.id,
+                name=definition.name,
+                status=status,
+                transports=transports,
+                webhook_path=definition.webhook_path,
+                public_webhook_url=public_webhook_url,
+                missing=missing,
+                notes=list(definition.notes),
+            )
+        )
+    return tuple(statuses)
+
+
 def _admin_run_event(event: dict[str, object]) -> RunEventResponse:
     sequence = event.get("sequence")
     kind = event.get("kind")
@@ -1051,21 +1591,21 @@ async def rollback(
     return await service.rollback(version)
 
 
-@router.get("/agents", response_model=list[NamedResourceResponse], responses=error_responses(401, 403, 422))
+@router.get("/agents", response_model=list[AgentResourceResponse], responses=error_responses(401, 403, 422))
 async def list_agents(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
-) -> list[NamedResourceResponse]:
+) -> list[AgentResourceResponse]:
     _require(principal, "agent:read")
     return list(await service.list_agents())
 
 
-@router.post("/agents", response_model=NamedResourceResponse, responses=error_responses(401, 403, 422))
+@router.post("/agents", response_model=AgentResourceResponse, responses=error_responses(401, 403, 422))
 async def upsert_agent(
-    body: NamedResourceRequest,
+    body: AgentResourceRequest,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
-) -> NamedResourceResponse:
+) -> AgentResourceResponse:
     _require(principal, "agent:write")
     return await service.upsert_agent(body)
 
@@ -1189,6 +1729,15 @@ async def list_mcp_servers(
 ) -> list[McpServerResponse]:
     _require(principal, "mcp:read")
     return list(await service.list_mcp_servers())
+
+
+@router.get("/channels", response_model=list[ChannelStatusResponse], responses=error_responses(401, 403, 422))
+async def list_channels(
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> list[ChannelStatusResponse]:
+    _require(principal, "config:read")
+    return list(await service.list_channels())
 
 
 @router.get("/memory", response_model=list[MemoryRecordResponse], responses=error_responses(401, 403, 422))

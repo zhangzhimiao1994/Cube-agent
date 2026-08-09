@@ -104,6 +104,15 @@ ensure_native_uv_dirs() {
   chmod 0755 \
     "${AGENT_HUB_UV_PYTHON_INSTALL_DIR:-$INSTALL_ROOT/uv-python}" \
     "${AGENT_HUB_UV_CACHE_DIR:-$INSTALL_ROOT/uv-cache}"
+  fix_native_uv_permissions
+}
+
+fix_native_uv_permissions() {
+  local python_dir cache_dir
+  python_dir="${AGENT_HUB_UV_PYTHON_INSTALL_DIR:-$INSTALL_ROOT/uv-python}"
+  cache_dir="${AGENT_HUB_UV_CACHE_DIR:-$INSTALL_ROOT/uv-cache}"
+  [[ -d "$python_dir" ]] && chmod -R a+rX "$python_dir"
+  [[ -d "$cache_dir" ]] && chmod 0755 "$cache_dir"
 }
 
 install_python_project_from_mirror() {
@@ -336,6 +345,7 @@ deploy_native_release() {
   ensure_native_uv
   ensure_native_uv_dirs
   run_uv_python_install_with_mirror_fallback
+  fix_native_uv_permissions
   python_bin="$(native_python)"
 
   log "deploying native release $release"
@@ -377,6 +387,12 @@ fix_native_web_permissions() {
   chown -R agent-hub:agent-hub "$release" 2>/dev/null || true
   chmod 0755 "$INSTALL_ROOT" "$INSTALL_ROOT/releases"
   chmod 0755 "$release"
+  if [[ -d "$release/.venv" ]]; then
+    chmod -R u+rwX,g+rX,o-rwx "$release/.venv"
+    if [[ -d "$release/.venv/bin" ]]; then
+      find "$release/.venv/bin" -type f -exec chmod u+rx,g+rx,o-rwx {} +
+    fi
+  fi
   if [[ -d "$release/web" ]]; then
     chmod 0755 "$release/web"
   fi
@@ -514,7 +530,8 @@ install_native_mode() {
   run_native_migrations
   run_native_bootstrap_seed
   systemctl daemon-reload
-  systemctl enable --now caddy
+  systemctl enable caddy
+  systemctl reload-or-restart caddy || systemctl restart caddy
   systemctl enable --now agent-hub.target
   mark_stage "native-up"
 }

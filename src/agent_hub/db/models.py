@@ -356,3 +356,32 @@ class ChannelInboundDedupRow(Base):
 
 
 ChannelDedupRow = ChannelInboundDedupRow
+
+
+class AdminResourceRow(Base):
+    __tablename__ = "agent_hub_admin_resources"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "kind",
+            "resource_id",
+            name="uq_agent_hub_admin_resources_tenant_kind_resource",
+        ),
+        CheckConstraint(
+            "kind IN ('workflow', 'skill', 'mcp', 'memory', 'hermes', 'audit')",
+            name="ck_agent_hub_admin_resources_kind",
+        ),
+        Index("ix_agent_hub_admin_resources_tenant_kind", "tenant_id", "kind"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload: Mapped[dict[str, object]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

@@ -1,3 +1,5 @@
+* text=auto eol=lf
+
 *.sh text eol=lf
 install.sh text eol=lf
 *.yml text eol=lf

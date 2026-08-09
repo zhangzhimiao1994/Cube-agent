@@ -9,8 +9,17 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class Channel(StrEnum):
+    CUSTOM_WEBHOOK = "custom_webhook"
+    DINGTALK = "dingtalk"
     FEISHU = "feishu"
+    QQ = "qq"
+    SLACK = "slack"
+    TELEGRAM = "telegram"
     WEB = "web"
+    WECHAT_CUSTOMER_SERVICE = "wechat_customer_service"
+    WECHAT_OFFICIAL = "wechat_official"
+    WECOM_APP = "wecom_app"
+    WECOM_BOT = "wecom_bot"
 
 
 ChannelName = Channel

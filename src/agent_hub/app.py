@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import logging
+import os
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -38,6 +39,7 @@ from agent_hub.channels.feishu.webhook import (
     create_lazy_feishu_webhook_router,
 )
 from agent_hub.channels.gateway import ChannelGateway
+from agent_hub.channels.generic_webhook import create_generic_channel_webhook_router
 from agent_hub.channels.submitter import RunServiceInboundSubmitter, RunSubmissionService
 from agent_hub.config.service import ConfigService
 from agent_hub.db.models import TenantRow
@@ -229,6 +231,7 @@ def create_app(
                     run_repository=RunRepository(active_sessions),
                     tenant_id=configured.bootstrap_tenant_id,
                     actor_id=configured.bootstrap_tenant_id,
+                    session_factory=active_sessions,
                 )
             if run_service is None:
                 assert active_sessions is not None
@@ -336,6 +339,12 @@ def create_app(
     application.router.routes.extend(users.router.routes)
     application.router.routes.extend(
         create_lazy_feishu_webhook_router(
+            gateway_provider=_feishu_gateway_from_request,
+        ).routes
+    )
+    application.router.routes.extend(
+        create_generic_channel_webhook_router(
+            env=os.environ,
             gateway_provider=_feishu_gateway_from_request,
         ).routes
     )

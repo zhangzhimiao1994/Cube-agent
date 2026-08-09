@@ -1,0 +1,319 @@
+from __future__ import annotations
+
+import hmac
+import time
+from hashlib import sha1, sha256
+from uuid import UUID
+
+import pytest
+from fastapi.testclient import TestClient
+
+from agent_hub.app import create_app
+from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
+from agent_hub.channels.base import InboundMessage
+
+TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
+USER_ID = UUID("11111111-1111-4111-8111-111111111111")
+
+
+class StubAuthService:
+    def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
+        if token != "valid-token":
+            raise InvalidCredentials("bad token")
+        return AuthenticatedPrincipal(USER_ID, TENANT_ID, Role.SUPER_ADMIN)
+
+
+class RecordingGateway:
+    def __init__(self) -> None:
+        self.messages: list[InboundMessage] = []
+
+    async def handle(self, message: InboundMessage) -> object:
+        self.messages.append(message)
+        return object()
+
+
+def client(gateway: RecordingGateway) -> TestClient:
+    return TestClient(
+        create_app(
+            auth_service=StubAuthService(),
+            rate_limiter=object(),
+            feishu_gateway=gateway,
+        )
+    )
+
+
+def slack_headers(signing_secret: str, body: bytes) -> dict[str, str]:
+    timestamp = str(int(time.time()))
+    signature = "v0=" + hmac.new(
+        signing_secret.encode(),
+        b"v0:" + timestamp.encode() + b":" + body,
+        sha256,
+    ).hexdigest()
+    return {
+        "Content-Type": "application/json",
+        "X-Slack-Request-Timestamp": timestamp,
+        "X-Slack-Signature": signature,
+    }
+
+
+def sha1_query(token: str, timestamp: str = "1700000000", nonce: str = "nonce") -> str:
+    signature = sha1("".join(sorted((token, timestamp, nonce))).encode()).hexdigest()
+    return f"timestamp={timestamp}&nonce={nonce}&signature={signature}"
+
+
+@pytest.mark.parametrize(
+    ("path", "env", "payload", "channel", "text"),
+    [
+        (
+            "/channels/dingtalk/events",
+            {
+                "DINGTALK_APP_KEY": "app",
+                "DINGTALK_APP_SECRET": "secret",
+                "DINGTALK_WEBHOOK_TOKEN": "token",
+            },
+            {
+                "text": {"content": "DingTalk task"},
+                "senderStaffId": "u1",
+                "conversationId": "c1",
+                "msgId": "m1",
+            },
+            "dingtalk",
+            "DingTalk task",
+        ),
+        (
+            "/channels/wecom/bot/events",
+            {"WECOM_BOT_WEBHOOK_KEY": "key", "WECOM_BOT_WEBHOOK_TOKEN": "token"},
+            {
+                "text": "WeCom bot task",
+                "sender": "u1",
+                "conversation_id": "c1",
+                "message_id": "m1",
+            },
+            "wecom_bot",
+            "WeCom bot task",
+        ),
+        (
+            "/channels/qq/events",
+            {"QQ_BOT_APP_ID": "app", "QQ_BOT_TOKEN": "bot", "QQ_WEBHOOK_TOKEN": "token"},
+            {
+                "content": "QQ task",
+                "user_id": "u1",
+                "conversation_id": "c1",
+                "message_id": "m1",
+            },
+            "qq",
+            "QQ task",
+        ),
+        (
+            "/channels/custom/events",
+            {"CUSTOM_WEBHOOK_TOKEN": "token"},
+            {
+                "text": "Custom task",
+                "sender": "u1",
+                "conversation_id": "c1",
+                "message_id": "m1",
+            },
+            "custom_webhook",
+            "Custom task",
+        ),
+    ],
+)
+def test_token_channel_webhooks_submit_to_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    env: dict[str, str],
+    payload: dict[str, object],
+    channel: str,
+    text: str,
+) -> None:
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    gateway = RecordingGateway()
+
+    response = client(gateway).post(
+        path,
+        headers={"X-Agent-Hub-Channel-Token": "token"},
+        json=payload,
+    )
+
+    assert response.status_code == 202
+    assert response.json() == {"accepted": True, "channel": channel}
+    assert len(gateway.messages) == 1
+    assert gateway.messages[0].channel.value == channel
+    assert gateway.messages[0].text == text
+
+
+def test_telegram_webhook_accepts_official_secret_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bot")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_TOKEN", "telegram-secret")
+    gateway = RecordingGateway()
+
+    response = client(gateway).post(
+        "/channels/telegram/events",
+        headers={"X-Telegram-Bot-Api-Secret-Token": "telegram-secret"},
+        json={
+            "message": {
+                "text": "Telegram task",
+                "from": {"id": "u1"},
+                "chat": {"id": "c1"},
+                "message_id": "m1",
+            },
+            "update_id": "e1",
+        },
+    )
+
+    assert response.status_code == 202
+    assert gateway.messages[0].channel.value == "telegram"
+    assert gateway.messages[0].text == "Telegram task"
+
+
+def test_slack_webhook_accepts_signed_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    signing_secret = "slack-signing-secret"
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "bot")
+    monkeypatch.setenv("SLACK_SIGNING_SECRET", signing_secret)
+    gateway = RecordingGateway()
+    body = (
+        b'{"event":{"text":"Slack task","user":"u1","channel":"c1"},'
+        b'"event_id":"m1","team_id":"team"}'
+    )
+
+    response = client(gateway).post(
+        "/channels/slack/events",
+        headers=slack_headers(signing_secret, body),
+        content=body,
+    )
+
+    assert response.status_code == 202
+    assert gateway.messages[0].channel.value == "slack"
+    assert gateway.messages[0].text == "Slack task"
+
+
+def test_slack_url_verification_uses_signed_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    signing_secret = "slack-signing-secret"
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "bot")
+    monkeypatch.setenv("SLACK_SIGNING_SECRET", signing_secret)
+    gateway = RecordingGateway()
+    body = b'{"type":"url_verification","challenge":"challenge-value"}'
+
+    response = client(gateway).post(
+        "/channels/slack/events",
+        headers=slack_headers(signing_secret, body),
+        content=body,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"challenge": "challenge-value"}
+    assert gateway.messages == []
+
+
+def test_slack_webhook_requires_slack_signature(monkeypatch: pytest.MonkeyPatch) -> None:
+    signing_secret = "slack-signing-secret"
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "bot")
+    monkeypatch.setenv("SLACK_SIGNING_SECRET", signing_secret)
+    gateway = RecordingGateway()
+
+    response = client(gateway).post(
+        "/channels/slack/events",
+        headers={"X-Agent-Hub-Channel-Token": signing_secret},
+        json={"event": {"text": "Slack task"}},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"error": "invalid_channel_token", "channel": "slack"}
+    assert gateway.messages == []
+
+
+def test_wechat_official_webhook_accepts_sha1_signature_and_xml(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "wechat-token"
+    monkeypatch.setenv("WECHATMP_APP_ID", "app")
+    monkeypatch.setenv("WECHATMP_APP_SECRET", "secret")
+    monkeypatch.setenv("WECHATMP_TOKEN", token)
+    gateway = RecordingGateway()
+    body = (
+        b"<xml>"
+        b"<Content>WeChat public account task</Content>"
+        b"<FromUserName>u1</FromUserName>"
+        b"<ToUserName>c1</ToUserName>"
+        b"<MsgId>m1</MsgId>"
+        b"</xml>"
+    )
+
+    response = client(gateway).post(
+        f"/channels/wechatmp/events?{sha1_query(token)}",
+        headers={"Content-Type": "application/xml"},
+        content=body,
+    )
+
+    assert response.status_code == 202
+    assert gateway.messages[0].channel.value == "wechat_official"
+    assert gateway.messages[0].text == "WeChat public account task"
+
+
+def test_wecom_app_url_verification_returns_echo(monkeypatch: pytest.MonkeyPatch) -> None:
+    token = "wecom-token"
+    monkeypatch.setenv("WECOM_CORP_ID", "corp")
+    monkeypatch.setenv("WECOM_AGENT_ID", "agent")
+    monkeypatch.setenv("WECOM_SECRET", "secret")
+    monkeypatch.setenv("WECOM_TOKEN", token)
+    gateway = RecordingGateway()
+
+    response = client(gateway).get(f"/channels/wecom/app/events?{sha1_query(token)}&echostr=ok")
+
+    assert response.status_code == 200
+    assert response.text == "ok"
+    assert gateway.messages == []
+
+
+def test_wechat_customer_service_webhook_accepts_sha1_signature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "wechat-kf-token"
+    monkeypatch.setenv("WECHAT_KF_CORP_ID", "corp")
+    monkeypatch.setenv("WECHAT_KF_SECRET", "secret")
+    monkeypatch.setenv("WECHAT_KF_TOKEN", token)
+    gateway = RecordingGateway()
+
+    response = client(gateway).post(
+        f"/channels/wechat-kf/events?{sha1_query(token)}",
+        json={
+            "Content": "WeChat customer service task",
+            "FromUserName": "u1",
+            "ToUserName": "c1",
+            "MsgId": "m1",
+        },
+    )
+
+    assert response.status_code == 202
+    assert gateway.messages[0].channel.value == "wechat_customer_service"
+    assert gateway.messages[0].text == "WeChat customer service task"
+
+
+def test_generic_channel_webhook_rejects_missing_config() -> None:
+    gateway = RecordingGateway()
+    response = client(gateway).post(
+        "/channels/custom/events",
+        headers={"X-Agent-Hub-Channel-Token": "token"},
+        json={"text": "task"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "channel_not_configured"
+    assert response.json()["missing"] == ["CUSTOM_WEBHOOK_TOKEN"]
+    assert gateway.messages == []
+
+
+def test_generic_channel_webhook_rejects_wrong_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CUSTOM_WEBHOOK_TOKEN", "correct")
+    gateway = RecordingGateway()
+
+    response = client(gateway).post(
+        "/channels/custom/events",
+        headers={"X-Agent-Hub-Channel-Token": "wrong"},
+        json={"text": "task"},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"error": "invalid_channel_token", "channel": "custom_webhook"}
+    assert gateway.messages == []

@@ -152,9 +152,28 @@ const NamedResourceSchema = z.object({
   id: z.string(),
   name: z.string(),
   enabled: z.boolean(),
+  role: z.string().nullable().optional(),
+  prompt: z.string().nullable().optional(),
+  model: z.string().nullable().optional(),
+  skills: z.array(z.string()).optional(),
 });
 
 export type NamedResource = z.infer<typeof NamedResourceSchema>;
+
+const ConfigRevisionSchema = z.object({
+  id: z.string(),
+  version: z.number(),
+  status: z.string(),
+  document: z.object({
+    models: z.record(z.string(), z.unknown()),
+    agents: z.array(z.unknown()),
+  }),
+  created_by: z.string().nullable(),
+  created_at: z.string(),
+  notification_status: z.string().optional(),
+});
+
+export type ConfigRevision = z.infer<typeof ConfigRevisionSchema>;
 
 const RunListItemSchema = z.object({
   id: z.string(),
@@ -207,6 +226,19 @@ const McpServerSchema = z.object({
 });
 
 export type McpServer = z.infer<typeof McpServerSchema>;
+
+const ChannelStatusSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  status: z.string(),
+  transports: z.array(z.string()),
+  webhook_path: z.string().nullable(),
+  public_webhook_url: z.string().nullable(),
+  missing: z.array(z.string()),
+  notes: z.array(z.string()),
+});
+
+export type ChannelStatus = z.infer<typeof ChannelStatusSchema>;
 
 const MemoryRecordSchema = z.object({
   id: z.string(),
@@ -430,8 +462,32 @@ export const api = {
       z.object({ version: z.number(), status: z.string() }),
     );
   },
+  currentConfig(): Promise<ConfigRevision> {
+    return request("/api/v1/config/current", { method: "GET" }, ConfigRevisionSchema);
+  },
+  createConfigDraft(document: { agents: unknown[]; models: Record<string, unknown> }) {
+    return request(
+      "/api/v1/config/drafts",
+      { method: "POST", body: JSON.stringify(document) },
+      ConfigRevisionSchema,
+    );
+  },
+  publishConfigDraft(revisionId: string) {
+    return request(
+      `/api/v1/config/drafts/${revisionId}/publish`,
+      { method: "POST" },
+      ConfigRevisionSchema,
+    );
+  },
   agents(): Promise<NamedResource[]> {
     return request("/api/v1/admin/agents", { method: "GET" }, z.array(NamedResourceSchema));
+  },
+  createAgent(payload: NamedResource): Promise<NamedResource> {
+    return request(
+      "/api/v1/admin/agents",
+      { method: "POST", body: JSON.stringify(payload) },
+      NamedResourceSchema,
+    );
   },
   workflows(): Promise<NamedResource[]> {
     return request(
@@ -470,6 +526,9 @@ export const api = {
   },
   mcpServers(): Promise<McpServer[]> {
     return request("/api/v1/admin/mcp", { method: "GET" }, z.array(McpServerSchema));
+  },
+  channels(): Promise<ChannelStatus[]> {
+    return request("/api/v1/admin/channels", { method: "GET" }, z.array(ChannelStatusSchema));
   },
   memory(): Promise<MemoryRecord[]> {
     return request("/api/v1/admin/memory", { method: "GET" }, z.array(MemoryRecordSchema));

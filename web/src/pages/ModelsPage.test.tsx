@@ -98,8 +98,16 @@ describe("ModelsPage", () => {
   it("shows existing model concurrency and quota policy", async () => {
     render(<TestApp initialPath="/models" />);
 
-    expect(await screen.findByText("最大并发：1")).not.toBeNull();
-    expect(screen.getByText("满载策略：先排队，超时后降级")).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "已保存模型" })).not.toBeNull();
+    expect(screen.getByRole("columnheader", { name: "逻辑模型" })).not.toBeNull();
+    expect(screen.getByRole("columnheader", { name: "服务商" })).not.toBeNull();
+    expect(screen.getByRole("columnheader", { name: "上游模型" })).not.toBeNull();
+    expect(screen.getByRole("columnheader", { name: "有效并发" })).not.toBeNull();
+    expect(screen.getByText("planner")).not.toBeNull();
+    expect(screen.getByText("deepseek")).not.toBeNull();
+    expect(screen.getByText("deepseek-chat")).not.toBeNull();
+    expect(screen.getByText("1")).not.toBeNull();
+    expect(screen.getByText("先排队，超时后降级")).not.toBeNull();
     expect(screen.getByText("同一服务商账号下的多个 Key 可能共享配额，不要把并发设置到跑满额度。")).not.toBeNull();
   });
 

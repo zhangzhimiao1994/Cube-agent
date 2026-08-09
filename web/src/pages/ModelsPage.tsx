@@ -119,6 +119,14 @@ function toOptionalPositiveNumber(value: string) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
+function displayCapability(capability: string) {
+  return ALL_CAPABILITIES.find((item) => item.value === capability)?.label ?? capability;
+}
+
+function displaySaturationPolicy(policy: string) {
+  return policy === "queue_first_then_fallback" ? "先排队，超时后降级" : policy;
+}
+
 export function ModelsPage() {
   const queryClient = useQueryClient();
   const models = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
@@ -223,9 +231,12 @@ export function ModelsPage() {
     return <p role="alert">{formatApiError(models.error, "模型加载失败")}</p>;
   }
 
+  const savedModels = models.data ?? [];
+
   return (
     <section>
-      <h2>模型与并发</h2>
+      <p className="eyebrow">Model control</p>
+      <h2>模型与 API</h2>
       <p>保存模型前系统会自动发起一次最小请求测试；测试失败不会发布该模型配置。</p>
       <p>同一服务商账号下的多个 Key 可能共享配额，不要把并发设置到跑满额度。</p>
 
@@ -360,17 +371,51 @@ export function ModelsPage() {
         ) : null}
       </form>
 
-      {models.data?.map((model) => (
-        <article key={model.id}>
-          <h3>{model.logical_model}</h3>
-          <p>服务商：{model.provider}</p>
-          <p>模型：{model.upstream_model}</p>
-          <p>API Base：{model.api_base}</p>
-          <p>最大并发：{model.effective_slots}</p>
-          <p>满载策略：先排队，超时后降级</p>
-          <p>Quota Scope：{model.quota_scope}</p>
-        </article>
-      ))}
+      <section aria-label="已保存模型">
+        <h3>已保存模型</h3>
+        <p>
+          这里展示当前生产配置中已经保存的模型。Agent 绑定的是“逻辑模型”，实际请求会落到对应的服务商和上游模型。
+        </p>
+        {savedModels.length === 0 ? (
+          <article>
+            <h4>还没有保存模型</h4>
+            <p>先在上方添加模型并通过 API 可用性测试；保存成功后会立即出现在这里。</p>
+          </article>
+        ) : (
+          <table>
+            <thead>
+              <tr>
+                <th>逻辑模型</th>
+                <th>服务商</th>
+                <th>上游模型</th>
+                <th>API Base</th>
+                <th>能力</th>
+                <th>有效并发</th>
+                <th>限流</th>
+                <th>Quota Scope</th>
+                <th>策略</th>
+              </tr>
+            </thead>
+            <tbody>
+              {savedModels.map((model) => (
+                <tr key={model.id}>
+                  <td>{model.logical_model}</td>
+                  <td>{model.provider}</td>
+                  <td>{model.upstream_model}</td>
+                  <td>{model.api_base}</td>
+                  <td>{model.capabilities.map(displayCapability).join("、")}</td>
+                  <td>{model.effective_slots}</td>
+                  <td>
+                    RPM {model.rpm ?? "未设置"} / TPM {model.tpm ?? "未设置"}
+                  </td>
+                  <td>{model.quota_scope}</td>
+                  <td>{displaySaturationPolicy(model.saturation_policy)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
     </section>
   );
 }

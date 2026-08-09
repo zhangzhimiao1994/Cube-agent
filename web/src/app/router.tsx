@@ -5,6 +5,7 @@ import { AppShell } from "./AppShell";
 import { AuthProvider, RequireAuth } from "../auth/AuthProvider";
 import { AgentsPage } from "../pages/AgentsPage";
 import { AuditPage } from "../pages/AuditPage";
+import { ChannelsPage } from "../pages/ChannelsPage";
 import { ConfigPage } from "../pages/ConfigPage";
 import { HermesPage } from "../pages/HermesPage";
 import { LoginPage } from "../pages/LoginPage";
@@ -46,6 +47,7 @@ export function AppRoutes() {
         <Route path="workflows" element={<WorkflowsPage />} />
         <Route path="skills" element={<SkillsPage />} />
         <Route path="mcp" element={<McpPage />} />
+        <Route path="channels" element={<ChannelsPage />} />
         <Route path="memory" element={<MemoryPage />} />
         <Route path="hermes" element={<HermesPage />} />
         <Route path="users" element={<UsersPage />} />

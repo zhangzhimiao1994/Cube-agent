@@ -148,7 +148,11 @@ def test_native_api_stays_private_and_caddy_exposes_management_ui() -> None:
     assert 'chmod 0755 "$release/web"' in installer
     assert 'chmod 0755 "$release/web/dist"' in installer
     assert 'chmod -R a+rX "$release/web/dist"' in installer
+    assert 'chmod -R u+rwX,g+rX,o-rwx "$release/.venv"' in installer
+    assert "fix_native_uv_permissions" in installer
+    assert 'chmod -R a+rX "$python_dir"' in installer
     assert "chown -R agent-hub:agent-hub" in installer
+    assert "systemctl reload-or-restart caddy" in installer
 
 
 def test_doctor_diagnoses_web_asset_permission_failures() -> None:
