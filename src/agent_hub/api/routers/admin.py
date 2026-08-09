@@ -1110,7 +1110,12 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 draft.version,
                 self._actor_id,
             )
-        except (ConfigValidationError, ValidationError):
+        except (ConfigValidationError, ValidationError) as error:
+            await self._record_model_request_failure(
+                request,
+                reason=_safe_model_check_reason(error),
+                stage="model_configuration_validation",
+            )
             raise PublicAPIError(422, "request_validation", "request validation failed") from None
         current = await self._config_service.get_current(self._tenant_id)
         if current is None:
@@ -1638,10 +1643,13 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
 
     async def _verify_model_availability(self, deployment: Deployment) -> None:
         if ModelCapability.TEXT not in deployment.capabilities:
+            reason = "model availability check requires text capability"
+            details = await self._record_model_availability_failure(deployment, reason)
             raise PublicAPIError(
                 422,
                 "model_unavailable",
-                "model availability check requires text capability",
+                reason,
+                details=details,
             )
         try:
             api_key = await self._secret_service.resolve(self._tenant_id, deployment.secret_ref)
@@ -1662,28 +1670,26 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 ),
                 api_key,
             )
-        except PublicAPIError:
-            raise
+        except PublicAPIError as error:
+            details = await self._record_model_availability_failure(
+                deployment,
+                error.public_message,
+                status_code=str(error.status_code),
+            )
+            raise PublicAPIError(
+                error.status_code,
+                error.code,
+                error.public_message,
+                details=details if error.details is None else error.details,
+                headers=error.headers,
+            ) from None
         except Exception as error:  # noqa: BLE001 - redact provider/SDK failures.
             reason = _safe_model_check_reason(error)
             details = _model_check_error_details(deployment, error, reason)
-            _LOGGER.warning(
-                "model_availability_check_failed provider=%s logical_model=%s upstream_model=%s "
-                "api_base=%s status_code=%s reason=%s",
-                details["provider"],
-                details["logical_model"],
-                details["upstream_model"],
-                details["api_base"],
-                details["status_code"],
-                details["reason"],
-            )
-            await self.record_log(
-                category="model_error",
-                level="error",
-                title="模型可用性测试失败",
-                message=reason,
-                source="models.create",
-                details=details,
+            await self._record_model_availability_failure(
+                deployment,
+                reason,
+                status_code=details["status_code"],
             )
             raise PublicAPIError(
                 422,
@@ -1691,6 +1697,59 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 f"model availability check failed: {reason}",
                 details=details,
             ) from None
+
+    async def _record_model_availability_failure(
+        self,
+        deployment: Deployment,
+        reason: str,
+        *,
+        status_code: str = "unknown",
+    ) -> dict[str, str]:
+        details = _model_check_failure_details(deployment, reason, status_code=status_code)
+        _LOGGER.warning(
+            "model_availability_check_failed provider=%s logical_model=%s upstream_model=%s "
+            "api_base=%s status_code=%s reason=%s",
+            details["provider"],
+            details["logical_model"],
+            details["upstream_model"],
+            details["api_base"],
+            details["status_code"],
+            details["reason"],
+        )
+        await self.record_log(
+            category="model_error",
+            level="error",
+            title="模型可用性测试失败",
+            message=reason,
+            source="models.create",
+            details=details,
+        )
+        return details
+
+    async def _record_model_request_failure(
+        self,
+        request: ModelDeploymentRequest,
+        *,
+        reason: str,
+        stage: str,
+    ) -> None:
+        await self.record_log(
+            category="model_error",
+            level="error",
+            title="模型配置错误",
+            message=reason,
+            source="models.create",
+            details={
+                "stage": stage,
+                "provider": request.provider,
+                "api_base": request.api_base,
+                "logical_model": request.logical_model,
+                "upstream_model": request.upstream_model,
+                "status_code": "unknown",
+                "reason": reason,
+                "hint": _MODEL_CHECK_HINT,
+            },
+        )
 
     async def _current_document(self) -> dict[str, object]:
         revision = await self._config_service.get_current(self._tenant_id)
@@ -1804,6 +1863,19 @@ def _model_check_error_details(
     error: Exception,
     reason: str,
 ) -> dict[str, str]:
+    return _model_check_failure_details(
+        deployment,
+        reason,
+        status_code=_model_check_status_code(error) or "unknown",
+    )
+
+
+def _model_check_failure_details(
+    deployment: Deployment,
+    reason: str,
+    *,
+    status_code: str,
+) -> dict[str, str]:
     provider, upstream_model = _deployment_provider_and_model(deployment)
     return {
         "stage": "model_availability_check",
@@ -1811,7 +1883,7 @@ def _model_check_error_details(
         "api_base": _safe_model_check_detail(deployment.api_base),
         "logical_model": _safe_model_check_detail(deployment.logical_model),
         "upstream_model": _safe_model_check_detail(upstream_model),
-        "status_code": _model_check_status_code(error) or "unknown",
+        "status_code": _safe_model_check_detail(status_code),
         "reason": _safe_model_check_detail(reason),
         "hint": _MODEL_CHECK_HINT,
     }

@@ -807,6 +807,56 @@ async def test_persistent_admin_model_is_not_published_when_availability_check_f
     }
     assert "sk-live" not in error.value.public_message
     assert "credential_ref" not in error.value.details
+    model_logs = await service.list_logs("model_error")
+    assert len(model_logs) == 1
+    assert model_logs[0].message == "provider returned status=401"
+    assert model_logs[0].details["provider"] == "deepseek"
+    assert model_logs[0].details["status_code"] == "401"
+    assert configs.drafts == []
+    assert configs.current is None
+
+
+@pytest.mark.asyncio
+async def test_persistent_admin_model_logs_preflight_availability_failures() -> None:
+    configs = FakeConfigService()
+    service = PersistentAdminResourceService(
+        config_service=configs,  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        model_transport=FakeModelTransport(),
+    )
+
+    with pytest.raises(PublicAPIError) as error:
+        await service.create_model(
+            ModelDeploymentRequest(
+                provider="minimax",
+                api_base="https://api.minimax.chat/v1",
+                upstream_model="abab6.5s-chat",
+                logical_model="vision_only",
+                capabilities=["vision"],
+                credential_ref=f"secret://{SECRET_ID}",
+                quota_scope="minimax-account",
+                max_concurrency=4,
+                target_utilization=0.8,
+                reserved_capacity=0,
+                rpm=60,
+                tpm=100000,
+                queue_timeout_seconds=60,
+                fallback=None,
+                weight=100,
+            )
+        )
+
+    assert error.value.code == "model_unavailable"
+    model_logs = await service.list_logs("model_error")
+    assert len(model_logs) == 1
+    assert model_logs[0].message == "model availability check requires text capability"
+    assert model_logs[0].details["provider"] == "minimax"
+    assert model_logs[0].details["logical_model"] == "vision_only"
+    serialized = model_logs[0].model_dump_json()
+    assert "credential_ref" not in serialized
+    assert "secret://" not in serialized
     assert configs.drafts == []
     assert configs.current is None
 
