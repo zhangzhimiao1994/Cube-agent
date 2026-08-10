@@ -256,9 +256,11 @@ async def test_unpriced_but_token_accounted_usage_does_not_block_discussion() ->
     gateway = ScriptedGateway(
         [
             ("analyst", 1, None),
+            ("analyst reply", 1, None),
             ("critic", 1, None),
-            ("analyst again", 1, None),
-            ("critic again", 1, None),
+            ("critic reply", 1, None),
+            ("analyst", 1, None),
+            ("analyst follow-up", 1, None),
         ]
     )
     events = await collect(AutoGenDiscussionRuntime(gateway, plan()), context())
