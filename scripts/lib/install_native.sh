@@ -526,7 +526,7 @@ require_native_service_active() {
     if systemctl is-active --quiet "$unit"; then
       return 0
     fi
-    sleep 1
+    [[ "$attempt" -lt 15 ]] && sleep 1
   done
   systemctl status "$unit" --no-pager -l >&2 || true
   journalctl -u "$unit" -n 120 --no-pager >&2 || true
