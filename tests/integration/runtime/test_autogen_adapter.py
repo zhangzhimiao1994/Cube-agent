@@ -265,7 +265,7 @@ async def test_unpriced_but_token_accounted_usage_does_not_block_discussion() ->
     )
     events = await collect(AutoGenDiscussionRuntime(gateway, plan()), context())
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
-    assert events[-1].reason == "turn_limit"
+    assert events[-1].reason == "max_turns"
     assert len(terminal_events(events)) == 1
 
 
