@@ -286,7 +286,13 @@ const RunDetailSchema = RunListItemSchema.extend({
   decision_token: z.string().nullable().optional(),
 });
 
+const RunDeleteSchema = z.object({
+  id: z.string(),
+  deleted: z.boolean(),
+});
+
 export type RunDetail = z.infer<typeof RunDetailSchema>;
+export type RunDeleteResult = z.infer<typeof RunDeleteSchema>;
 
 const ConversationSchema = z.object({
   conversation_id: z.string(),
@@ -749,6 +755,9 @@ export const api = {
   },
   cancelRun(id: string): Promise<RunDetail> {
     return request(`/api/v1/admin/runs/${id}/cancel`, { method: "POST" }, RunDetailSchema);
+  },
+  deleteRun(id: string): Promise<RunDeleteResult> {
+    return request(`/api/v1/admin/runs/${id}`, { method: "DELETE" }, RunDeleteSchema);
   },
   skills(): Promise<Skill[]> {
     return request("/api/v1/admin/skills", { method: "GET" }, z.array(SkillSchema));

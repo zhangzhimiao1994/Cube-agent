@@ -331,6 +331,18 @@ export function RunsPage() {
     },
   });
 
+  const deleteRun = useMutation({
+    mutationFn: (runId: string) => api.deleteRun(runId),
+    onSuccess: async (result) => {
+      if (selectedRunId === result.id) {
+        setSelectedRunId(null);
+      }
+      queryClient.removeQueries({ queryKey: ["run", result.id] });
+      setSubmitNotice("已删除对话。");
+      await queryClient.invalidateQueries({ queryKey: ["runs"] });
+    },
+  });
+
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setSubmitNotice(null);
@@ -353,6 +365,17 @@ export function RunsPage() {
   const savedAgents = agents.data ?? [];
   const savedWorkflows = workflows.data ?? [];
   const directAnswerer = mode === "direct" && agentIds.length > 0 ? agentIds[0] : "main_agent";
+
+  function deleteConversation(run: (typeof items)[number]) {
+    if (!TERMINAL_STATUSES.has(run.status)) {
+      setSubmitNotice("这条对话仍在运行或等待处理，请先取消后再删除。");
+      return;
+    }
+    if (!window.confirm(`确认删除对话 ${run.id.slice(0, 8)}？删除后运行详情和产物记录也会移除。`)) {
+      return;
+    }
+    deleteRun.mutate(run.id);
+  }
 
   return (
     <section>
@@ -377,19 +400,41 @@ export function RunsPage() {
           {items.length === 0 ? (
             <p className="field-help">还没有任务。可以从右侧输入框发起第一次对话。</p>
           ) : (
-            items.map((run) => (
-              <button
-                type="button"
-                key={run.id}
-                className={`conversation-item${selectedRunId === run.id ? " conversation-item-active" : ""}`}
-                onClick={() => setSelectedRunId(run.id)}
-              >
-                <span>{displayMode(run.mode)}</span>
-                <strong>{run.id.slice(0, 8)}</strong>
-                <small>{run.status}</small>
-              </button>
-            ))
+            items.map((run) => {
+              const canDelete = TERMINAL_STATUSES.has(run.status);
+              return (
+                <div
+                  key={run.id}
+                  className={`conversation-row${selectedRunId === run.id ? " conversation-row-active" : ""}`}
+                >
+                  <button
+                    type="button"
+                    className="conversation-item"
+                    onClick={() => setSelectedRunId(run.id)}
+                  >
+                    <span>{displayMode(run.mode)}</span>
+                    <strong>{run.id.slice(0, 8)}</strong>
+                    <small>{run.status}</small>
+                  </button>
+                  <button
+                    type="button"
+                    className="conversation-delete-button"
+                    aria-label={`Delete conversation ${run.id.slice(0, 8)}`}
+                    title={canDelete ? "删除对话" : "运行中先取消"}
+                    disabled={!canDelete || deleteRun.isPending}
+                    onClick={() => deleteConversation(run)}
+                  >
+                    ×
+                  </button>
+                </div>
+              );
+            })
           )}
+          {deleteRun.isError ? (
+            <p className="form-error" role="alert">
+              {formatApiError(deleteRun.error, "对话删除失败")}
+            </p>
+          ) : null}
         </nav>
 
         <div className={`chat-panel${configOpen ? " chat-panel-config-open" : ""}`}>

@@ -643,6 +643,27 @@ def test_operational_run_listing_details_and_controls() -> None:
     assert cancel.json()["status"] == "cancelled"
 
 
+def test_operational_run_delete_removes_cancelled_conversation() -> None:
+    api = client()
+    run_id = api.get("/api/v1/admin/runs", headers=headers()).json()[0]["id"]
+
+    active_delete = api.delete(f"/api/v1/admin/runs/{run_id}", headers=headers())
+    assert active_delete.status_code == 409
+    assert active_delete.json()["error"]["code"] == "run_conflict"
+
+    cancel = api.post(f"/api/v1/admin/runs/{run_id}/cancel", headers=headers())
+    assert cancel.status_code == 200
+
+    deleted = api.delete(f"/api/v1/admin/runs/{run_id}", headers=headers())
+    assert deleted.status_code == 200
+    assert deleted.json() == {"id": run_id, "deleted": True}
+
+    missing_detail = api.get(f"/api/v1/admin/runs/{run_id}", headers=headers())
+    assert missing_detail.status_code == 404
+    remaining = api.get("/api/v1/admin/runs", headers=headers())
+    assert all(item["id"] != run_id for item in remaining.json())
+
+
 def test_admin_run_artifact_exposes_safe_text_for_chat_reply() -> None:
     artifact = _admin_run_artifact(
         {

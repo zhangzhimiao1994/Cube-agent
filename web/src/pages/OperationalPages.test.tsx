@@ -124,9 +124,16 @@ function jsonResponse(payload: unknown, init: ResponseInit = {}) {
 
 describe("operational management pages", () => {
   const requests: Array<{ body: unknown; method: string; path: string }> = [];
+  let visibleRunListItem = runListItem;
+  let visibleRunDetail = runDetail;
+  let deletedRunIds = new Set<string>();
 
   beforeEach(() => {
     requests.length = 0;
+    visibleRunListItem = runListItem;
+    visibleRunDetail = runDetail;
+    deletedRunIds = new Set<string>();
+    vi.stubGlobal("confirm", vi.fn(() => true));
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
       "fetch",
@@ -135,6 +142,8 @@ describe("operational management pages", () => {
         const method = init?.method ?? "GET";
         if (init?.body && typeof init.body === "string") {
           requests.push({ path, method, body: JSON.parse(init.body) });
+        } else {
+          requests.push({ path, method, body: null });
         }
         if (path === "/api/v1/auth/me") {
           return jsonResponse({
@@ -144,10 +153,17 @@ describe("operational management pages", () => {
           });
         }
         if (path === "/api/v1/admin/runs") {
-          return jsonResponse([runListItem]);
+          return jsonResponse(deletedRunIds.has(runId) ? [] : [visibleRunListItem]);
+        }
+        if (path === `/api/v1/admin/runs/${runId}` && method === "DELETE") {
+          deletedRunIds.add(runId);
+          return jsonResponse({ id: runId, deleted: true });
         }
         if (path === `/api/v1/admin/runs/${runId}`) {
-          return jsonResponse(runDetail);
+          if (deletedRunIds.has(runId)) {
+            return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+          }
+          return jsonResponse(visibleRunDetail);
         }
         if (path === "/api/v1/admin/conversations/conv-previous") {
           return jsonResponse({ conversation_id: "conv-previous", runs: [runDetail] });
@@ -363,6 +379,22 @@ describe("operational management pages", () => {
     const stream = screen.getByRole("region", { name: "主对话内容" });
     expect(within(stream).getByText(/这是最终回复正文/)).not.toBeNull();
     expect(within(stream).queryByText("产物：短视频脚本")).toBeNull();
+  });
+
+  it("deletes a finished conversation from the conversation list", async () => {
+    const user = userEvent.setup();
+    visibleRunListItem = { ...runListItem, status: "cancelled" };
+    visibleRunDetail = { ...runDetail, status: "cancelled" };
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("button", { name: /Delete conversation 22222222/i })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: /Delete conversation 22222222/i }));
+
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === `/api/v1/admin/runs/${runId}` && request.method === "DELETE"))
+        .toBeTruthy(),
+    );
+    await waitFor(() => expect(screen.queryByRole("button", { name: /Delete conversation 22222222/i })).toBeNull());
   });
 
   it("shows temporary agent approval above the composer and lets the user revise it", async () => {

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -147,6 +147,29 @@ class RunRepository:
                 )
             ).all()
             return tuple(self._record(row) for row in rows)
+
+    async def delete_run(self, tenant_id: UUID, run_id: UUID) -> None:
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if row is None:
+                raise RunNotFound("run was not found")
+            status = RunStatus(row.status)
+            if status not in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
+                raise RunConflict("run must be completed, failed, or cancelled before deletion")
+
+            for table in (
+                RunOutboxRow,
+                RunApprovalRow,
+                RunUsageRow,
+                RunCheckpointRow,
+                RunArtifactRow,
+                RunStepRow,
+                RunEventRow,
+            ):
+                await session.execute(
+                    delete(table).where(table.tenant_id == tenant_id, table.run_id == run_id)
+                )
+            await session.execute(delete(RunRow).where(RunRow.tenant_id == tenant_id, RunRow.id == run_id))
 
     async def get_for_update(self, session: AsyncSession, run_id: UUID) -> RunRow:
         row = await session.scalar(select(RunRow).where(RunRow.id == run_id).with_for_update())

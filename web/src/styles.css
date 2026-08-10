@@ -692,15 +692,25 @@ article:hover {
   margin: 0;
 }
 
-.conversation-item {
+.conversation-row {
+  align-items: stretch;
   background: rgba(8, 17, 31, 0.72);
+  border: 1px solid transparent;
   border-radius: 1rem;
+  display: grid;
+  gap: 0.45rem;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.conversation-item {
+  background: transparent;
   color: var(--ink);
   display: grid;
   gap: 0.2rem;
   justify-items: start;
   padding: 0.85rem;
   text-align: left;
+  width: 100%;
 }
 
 .conversation-item span,
@@ -710,9 +720,30 @@ article:hover {
   font-size: 0.8rem;
 }
 
-.conversation-item-active {
+.conversation-row-active {
   border-color: rgba(125, 255, 189, 0.55);
   box-shadow: 0 0 28px rgba(125, 255, 189, 0.12);
+}
+
+.conversation-delete-button {
+  align-self: center;
+  background: rgba(255, 109, 122, 0.12);
+  border: 1px solid rgba(255, 109, 122, 0.36);
+  border-radius: 999px;
+  color: #ffb4bd;
+  cursor: pointer;
+  font-size: 1.1rem;
+  height: 2.1rem;
+  justify-self: end;
+  margin-right: 0.6rem;
+  width: 2.1rem;
+}
+
+.conversation-delete-button:disabled {
+  background: rgba(148, 163, 184, 0.08);
+  border-color: rgba(148, 163, 184, 0.2);
+  color: rgba(148, 163, 184, 0.48);
+  cursor: not-allowed;
 }
 
 .chat-panel {
@@ -1587,7 +1618,7 @@ article:hover {
   }
 
   .conversation-list-header,
-  .conversation-item {
+  .conversation-row {
     scroll-snap-align: start;
   }
 
@@ -1601,7 +1632,7 @@ article:hover {
     padding: 0.8rem;
   }
 
-  .conversation-item {
+  .conversation-row {
     min-height: 5.4rem;
   }
 

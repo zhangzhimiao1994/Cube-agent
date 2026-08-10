@@ -7,11 +7,12 @@ from typing import Protocol, cast
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agent_hub.db.models import RunEventRow
+from agent_hub.db.models import RunArtifactRow, RunEventRow, RunOutboxRow, RunRow
 from agent_hub.domain.runs import RunStatus, TaskMode
-from agent_hub.runs.repository import RunRepository
+from agent_hub.runs.repository import RunConflict, RunNotFound, RunRepository
 from agent_hub.runs.service import (
     HermesRunAdvice,
     HermesRunOutcome,
@@ -830,3 +831,67 @@ async def test_public_events_sanitize_sensitive_persisted_payload_keys(
     assert "api_key" not in serialized
     assert "hidden_reasoning" not in serialized
     assert "sk-should-not-leak" not in serialized
+
+
+async def test_delete_run_removes_terminal_run_and_persisted_children(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    repository = RunRepository(run_session_factory)
+    submitted = await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=uuid4(),
+        request="delete finished conversation",
+        mode=TaskMode.DIRECT,
+        status=RunStatus.CANCELLED,
+        idempotency_key="client-request-delete",
+        enqueue=True,
+    )
+    artifact = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="main",
+        content={"text": "safe terminal response"},
+    )
+    async with run_session_factory() as session, session.begin():
+        await repository.persist_event(
+            session,
+            tenant_id=tenant_id,
+            run_id=submitted.id,
+            event=RunEvent(
+                kind=EventKind.ARTIFACT_CREATED,
+                sequence=1,
+                run_id=submitted.id,
+                artifact=artifact,
+            ),
+        )
+
+    await repository.delete_run(tenant_id, submitted.id)
+
+    async with run_session_factory() as session:
+        for table in (RunRow, RunOutboxRow, RunEventRow, RunArtifactRow):
+            count = await session.scalar(
+                select(func.count()).select_from(table).where(table.tenant_id == tenant_id)
+            )
+            assert count == 0
+    with pytest.raises(RunNotFound):
+        await repository.get(tenant_id, submitted.id)
+
+
+async def test_delete_run_rejects_active_run(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    repository = RunRepository(run_session_factory)
+    submitted = await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=uuid4(),
+        request="active run",
+        mode=TaskMode.DIRECT,
+        status=RunStatus.RUNNING,
+        idempotency_key="client-request-active-delete",
+        enqueue=False,
+    )
+
+    with pytest.raises(RunConflict):
+        await repository.delete_run(tenant_id, submitted.id)

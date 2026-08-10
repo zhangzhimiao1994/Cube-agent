@@ -227,6 +227,13 @@ class RunDetailResponse(RunListItem):
     decision_token: str | None = None
 
 
+class RunDeleteResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    deleted: bool
+
+
 class ConversationResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -600,6 +607,8 @@ class AdminResourceService(Protocol):
 
     async def cancel_run(self, run_id: UUID) -> RunDetailResponse: ...
 
+    async def delete_run(self, run_id: UUID) -> RunDeleteResponse: ...
+
     async def list_skills(self) -> tuple[SkillResponse, ...]: ...
 
     async def upload_skill(self, request: SkillUploadRequest) -> SkillResponse: ...
@@ -905,6 +914,18 @@ class InMemoryAdminResourceService:
 
     async def cancel_run(self, run_id: UUID) -> RunDetailResponse:
         return self._set_run_status(run_id, "cancelled")
+
+    async def delete_run(self, run_id: UUID) -> RunDeleteResponse:
+        current = self.runs[run_id]
+        if current.status not in {"completed", "failed", "cancelled"}:
+            raise PublicAPIError(
+                409,
+                "run_conflict",
+                "run must be completed, failed, or cancelled before deletion",
+                details={"status": current.status},
+            )
+        del self.runs[run_id]
+        return RunDeleteResponse(id=run_id, deleted=True)
 
     def _set_run_status(self, run_id: UUID, status: str) -> RunDetailResponse:
         current = self.runs[run_id]
@@ -1263,6 +1284,23 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 details={"reason": reason, "action": "cancel"},
             ) from None
         return await self._run_detail(record)
+
+    async def delete_run(self, run_id: UUID) -> RunDeleteResponse:
+        if self._run_repository is None:
+            return await super().delete_run(run_id)
+        try:
+            await self._run_repository.delete_run(self._tenant_id, run_id)
+        except RunNotFound:
+            raise KeyError(run_id) from None
+        except RunConflict as error:
+            reason = str(error) or "run state conflict"
+            raise PublicAPIError(
+                409,
+                "run_conflict",
+                reason,
+                details={"reason": reason, "action": "delete"},
+            ) from None
+        return RunDeleteResponse(id=run_id, deleted=True)
 
     async def _run_list_item(self, record: RunRecord) -> RunListItem:
         assert self._run_repository is not None
@@ -3159,6 +3197,23 @@ async def cancel_operational_run(
     _require(principal, "run:cancel")
     try:
         return await service.cancel_run(run_id)
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+
+
+@router.delete(
+    "/runs/{run_id}",
+    response_model=RunDeleteResponse,
+    responses=error_responses(401, 403, 404, 409, 422),
+)
+async def delete_operational_run(
+    run_id: UUID,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> RunDeleteResponse:
+    _require(principal, "run:delete")
+    try:
+        return await service.delete_run(run_id)
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
 
