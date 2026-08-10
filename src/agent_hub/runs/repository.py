@@ -569,6 +569,17 @@ class RunRepository:
             ).all()
             return tuple(rows)
 
+    async def artifacts(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
+        async with self._session_factory() as session:
+            rows = (
+                await session.scalars(
+                    select(RunArtifactRow)
+                    .where(RunArtifactRow.tenant_id == tenant_id, RunArtifactRow.run_id == run_id)
+                    .order_by(RunArtifactRow.created_at, RunArtifactRow.id)
+                )
+            ).all()
+            return tuple(_public_artifact_payload(dict(row.payload)) for row in rows)
+
     async def usage_cost(self, tenant_id: UUID, run_id: UUID) -> Decimal:
         async with self._session_factory() as session:
             rows = (
@@ -781,6 +792,10 @@ class RunRepository:
 
 
 def _public_event_payload(payload: dict[str, object]) -> dict[str, object]:
+    return {key: _sanitize_public_json(value) for key, value in payload.items() if _is_public_key(key)}
+
+
+def _public_artifact_payload(payload: dict[str, object]) -> dict[str, object]:
     return {key: _sanitize_public_json(value) for key, value in payload.items() if _is_public_key(key)}
 
 

@@ -275,6 +275,7 @@ const RunArtifactSchema = z.object({
   id: z.string(),
   kind: z.string(),
   title: z.string(),
+  text: z.string().nullable().optional(),
 });
 
 const RunDetailSchema = RunListItemSchema.extend({

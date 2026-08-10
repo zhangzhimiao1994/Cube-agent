@@ -216,6 +216,17 @@ def test_native_api_stays_private_and_caddy_exposes_management_ui() -> None:
     assert "systemctl reload-or-restart caddy" in installer
 
 
+def test_native_systemd_units_do_not_use_stale_console_script_shebangs() -> None:
+    api_unit = read("deploy/native/systemd/agent-hub-api.service")
+    litellm_unit = read("deploy/native/systemd/agent-hub-litellm.service")
+
+    assert "/opt/agent-hub/current/.venv/bin/python -m uvicorn" in api_unit
+    assert "/opt/agent-hub/current/.venv/bin/uvicorn" not in api_unit
+    assert "/opt/agent-hub/current/.litellm-venv/bin/python" in litellm_unit
+    assert "from litellm import run_server" in litellm_unit
+    assert "/opt/agent-hub/current/.litellm-venv/bin/litellm" not in litellm_unit
+
+
 def test_doctor_diagnoses_web_asset_permission_failures() -> None:
     doctor = read("scripts/commands/doctor.sh")
 

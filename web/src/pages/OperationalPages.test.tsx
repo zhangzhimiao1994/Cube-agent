@@ -26,7 +26,14 @@ const runDetail = {
       created_at: "2026-08-07T00:00:00Z",
     },
   ],
-  artifacts: [{ id: "artifact-1", kind: "markdown", title: "短视频脚本" }],
+  artifacts: [
+    {
+      id: "artifact-1",
+      kind: "markdown",
+      title: "短视频脚本",
+      text: "这是最终回复正文：导演、文案和剪辑师已经汇总出一个短视频脚本方案。",
+    },
+  ],
   explicit_details: {
     workflow_id: "short-video-dispatch",
     workflow_adjustment_policy: "ask_before_apply",
@@ -345,6 +352,17 @@ describe("operational management pages", () => {
         agent_ids: ["copywriter"],
       },
     });
+  });
+
+  it("renders text artifacts as assistant chat replies instead of artifact-only cards", async () => {
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话任务" })).not.toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: /派单式/ }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    expect(within(stream).getByText(/这是最终回复正文/)).not.toBeNull();
+    expect(within(stream).queryByText("产物：短视频脚本")).toBeNull();
   });
 
   it("shows temporary agent approval above the composer and lets the user revise it", async () => {

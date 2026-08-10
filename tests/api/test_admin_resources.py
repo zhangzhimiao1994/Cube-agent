@@ -20,6 +20,7 @@ from agent_hub.api.routers.admin import (
     RunDetailResponse,
     RunEventResponse,
     SecretCreateRequest,
+    _admin_run_artifact,
     _mode_error_log_from_run,
     _model_check_failure_details,
 )
@@ -640,6 +641,34 @@ def test_operational_run_listing_details_and_controls() -> None:
     assert pause.json()["status"] == "paused"
     assert resume.json()["status"] == "running"
     assert cancel.json()["status"] == "cancelled"
+
+
+def test_admin_run_artifact_exposes_safe_text_for_chat_reply() -> None:
+    artifact = _admin_run_artifact(
+        {
+            "id": "artifact-1",
+            "type": "text",
+            "producer": "final_synthesizer",
+            "content": {"text": "这是可以直接显示在对话里的最终回答。"},
+        }
+    )
+
+    assert artifact.kind == "text"
+    assert artifact.title == "final_synthesizer"
+    assert artifact.text == "这是可以直接显示在对话里的最终回答。"
+
+
+def test_admin_run_artifact_does_not_expose_sensitive_text() -> None:
+    artifact = _admin_run_artifact(
+        {
+            "id": "artifact-2",
+            "type": "text",
+            "producer": "final_synthesizer",
+            "content": {"text": "api_key=sk-secret-value"},
+        }
+    )
+
+    assert artifact.text is None
 
 
 def test_conversation_can_be_loaded_by_session_id() -> None:

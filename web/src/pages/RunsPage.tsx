@@ -70,6 +70,30 @@ function modeSelectionFromRunDetail(run: RunDetail | undefined): ModeSelection |
 
 function detailMessages(detail: RunDetail | undefined) {
   if (!detail) return [];
+  const textArtifacts = dedupeTextArtifacts(detail.artifacts);
+  const replyArtifact = preferredReplyArtifact(textArtifacts);
+  const artifactMessages = replyArtifact
+    ? [
+        {
+          id: `artifact-${replyArtifact.id}`,
+          role: "assistant",
+          title: "回复",
+          body:
+            textArtifacts.length > 1
+              ? `${replyArtifact.text?.trim() ?? ""}\n\n（另有 ${
+                  textArtifacts.length - 1
+                } 条角色产物，可点“查看运行详情”查看。）`
+              : replyArtifact.text?.trim() ?? "",
+        },
+      ]
+    : detail.artifacts
+        .filter((artifact) => !artifact.text?.trim())
+        .map((artifact) => ({
+          id: `artifact-${artifact.id}`,
+          role: "assistant",
+          title: `附件：${artifact.title}`,
+          body: artifact.kind,
+        }));
   return [
     {
       id: "request",
@@ -103,13 +127,27 @@ function detailMessages(detail: RunDetail | undefined) {
       title: event.kind,
       body: event.message,
     })),
-    ...detail.artifacts.map((artifact) => ({
-      id: `artifact-${artifact.id}`,
-      role: "assistant",
-      title: `产物：${artifact.title}`,
-      body: artifact.kind,
-    })),
+    ...artifactMessages,
   ];
+}
+
+function dedupeTextArtifacts(artifacts: RunDetail["artifacts"]) {
+  const seen = new Set<string>();
+  return artifacts.filter((artifact) => {
+    const text = artifact.text?.trim();
+    if (!text || seen.has(text)) return false;
+    seen.add(text);
+    return true;
+  });
+}
+
+function preferredReplyArtifact(artifacts: RunDetail["artifacts"]) {
+  const preferredTitles = new Set(["main", "final_synthesizer", "decision_recorder", "domain_expert"]);
+  return (
+    [...artifacts].reverse().find((artifact) => preferredTitles.has(artifact.title)) ??
+    artifacts.at(-1) ??
+    null
+  );
 }
 
 export function RunsPage() {

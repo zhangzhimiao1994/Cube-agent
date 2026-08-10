@@ -216,6 +216,7 @@ class RunArtifactResponse(BaseModel):
     id: str
     kind: str
     title: str
+    text: str | None = None
 
 
 class RunDetailResponse(RunListItem):
@@ -1278,19 +1279,12 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         assert self._run_repository is not None
         list_item = await self._run_list_item(record)
         events = await self._run_repository.events(self._tenant_id, record.id)
-        artifact_ids = await self._run_repository.artifact_ids(self._tenant_id, record.id)
+        artifacts = await self._run_repository.artifacts(self._tenant_id, record.id)
         return RunDetailResponse(
             **list_item.model_dump(),
             request=record.request,
             events=[_admin_run_event(event) for event in events],
-            artifacts=[
-                RunArtifactResponse(
-                    id=str(artifact_id),
-                    kind="artifact",
-                    title=str(artifact_id),
-                )
-                for artifact_id in artifact_ids
-            ],
+            artifacts=[_admin_run_artifact(artifact) for artifact in artifacts],
             explicit_details={
                 "source": "database",
                 "version": str(record.version),
@@ -2810,6 +2804,33 @@ def _admin_run_event(event: dict[str, object]) -> RunEventResponse:
         message=message if type(message) is str else "event recorded",
         created_at=datetime.now(UTC),
     )
+
+
+def _admin_run_artifact(artifact: dict[str, object]) -> RunArtifactResponse:
+    artifact_id = artifact.get("id")
+    artifact_type = artifact.get("type")
+    producer = artifact.get("producer")
+    content = artifact.get("content")
+    title = producer if type(producer) is str and producer else artifact_id
+    text = _artifact_text(content)
+    return RunArtifactResponse(
+        id=artifact_id if type(artifact_id) is str and artifact_id else "artifact",
+        kind=artifact_type if type(artifact_type) is str and artifact_type else "artifact",
+        title=title if type(title) is str and title else "artifact",
+        text=text,
+    )
+
+
+def _artifact_text(content: object) -> str | None:
+    if not isinstance(content, dict):
+        return None
+    text = content.get("text")
+    if type(text) is not str:
+        return None
+    stripped = text.strip()
+    if not stripped or _contains_sensitive_marker(stripped):
+        return None
+    return stripped
 
 
 def _routing_details(routing_decision: dict[str, object] | None) -> dict[str, str]:
