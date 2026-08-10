@@ -373,8 +373,12 @@ async def test_dispatch_gateway_transport_failure_records_safe_diagnostic() -> N
             self.requests.append(request)
             raise ModelTransportError("Authorization: Bearer sk-secret", status_code=401)
 
-    events = await collect(make_runtime(FailingGateway(), one_step_plan()), context())
+    events: list[RunEvent] = []
+    with pytest.raises(RuntimeExecutionError) as caught:
+        async for event in make_runtime(FailingGateway(), one_step_plan()).run(context()):
+            events.append(event)
 
+    assert str(caught.value) == "model gateway failed: model transport failed (status=401)"
     assert events[-1].kind is EventKind.RUNTIME_FAILED
     assert events[-1].reason == "model gateway failed: model transport failed (status=401)"
     assert any(

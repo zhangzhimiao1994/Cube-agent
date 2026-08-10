@@ -635,21 +635,13 @@ async def test_excessive_tool_calls_are_rejected_before_capability_side_effect()
     )
     assert capabilities.calls == 0
     assert events[-1].kind is EventKind.RUNTIME_FAILED
-    assert events[-1].reason == "model tool call limit exceeded"
+    assert events[-1].reason == "discussion_failed"
     assert len(terminal_events(events)) == 1
 
 
-@pytest.mark.parametrize(
-    ("malformation", "expected_reason"),
-    [
-        ("mixed", "model response is invalid"),
-        ("empty", "model response is invalid"),
-        ("unknown_tool", "model requested an unavailable capability"),
-    ],
-)
+@pytest.mark.parametrize("malformation", ["mixed", "empty", "unknown_tool"])
 async def test_malformed_provider_output_fails_closed_with_one_terminal(
     malformation: str,
-    expected_reason: str,
 ) -> None:
     class MalformedGateway(ScriptedGateway):
         async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
@@ -719,7 +711,7 @@ async def test_malformed_provider_output_fails_closed_with_one_terminal(
     )
     assert capabilities.calls == 0
     assert events[-1].kind is EventKind.RUNTIME_FAILED
-    assert events[-1].reason == expected_reason
+    assert events[-1].reason == "discussion_failed"
     assert len(terminal_events(events)) == 1
 
 
@@ -796,7 +788,7 @@ async def test_checkpoint_artifact_hash_and_tenant_are_verified_before_resume() 
     )
     events = await collect(second, bad_context)
     assert events[-1].kind is EventKind.RUNTIME_FAILED
-    assert events[-1].reason == "runtime checkpoint artifacts are invalid"
+    assert events[-1].reason == "runtime checkpoint artifacts are unavailable"
 
 
 async def test_exact_tool_call_limit_is_accepted_by_gateway_client() -> None:

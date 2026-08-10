@@ -67,7 +67,10 @@ from agent_hub.runtime.contracts import (
     RuntimeCheckpoint,
     TaskContext,
 )
-from agent_hub.runtime.failure_reason import safe_runtime_failure_reason
+from agent_hub.runtime.failure_reason import (
+    safe_model_gateway_failure_reason,
+    safe_runtime_failure_reason,
+)
 
 _ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _RUNTIME_TYPE = "autogen"
@@ -228,7 +231,7 @@ class _DiscussionDurability:
         return artifact
 
     def fail_model(self, reason: str | None = None) -> None:
-        if reason:
+        if reason and self.failure_reason is None:
             self.failure_reason = reason
         if self._model_lock.locked():
             self._model_lock.release()
@@ -732,9 +735,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
                 raise
             except Exception as error:
                 if self._durability is not None:
-                    self._durability.fail_model(
-                        safe_runtime_failure_reason(error, fallback="discussion_failed")
-                    )
+                    self._durability.fail_model(safe_model_gateway_failure_reason(error))
                 raise
         response = completion.response
         if completion.cost_usd is None or response.usage is None:
