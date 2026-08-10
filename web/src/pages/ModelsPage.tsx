@@ -291,6 +291,10 @@ export function ModelsPage() {
       setApiKey("");
       await queryClient.invalidateQueries({ queryKey: ["models"] });
     },
+    onError: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["logs"] });
+      await queryClient.invalidateQueries({ queryKey: ["logs", "model_error"] });
+    },
   });
 
   const deleteModel = useMutation({

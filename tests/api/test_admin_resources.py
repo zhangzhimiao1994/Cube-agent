@@ -18,7 +18,9 @@ from agent_hub.api.routers.admin import (
     ModelDeploymentRequest,
     PersistentAdminResourceService,
     RunDetailResponse,
+    RunEventResponse,
     SecretCreateRequest,
+    _mode_error_log_from_run,
     _model_check_failure_details,
 )
 from agent_hub.app import create_app
@@ -161,6 +163,61 @@ def test_run_detail_response_can_expose_mode_decision_token() -> None:
     )
 
     assert response.decision_token == token
+
+
+def test_mode_error_log_includes_runtime_failed_reason_from_events() -> None:
+    run_id = uuid4()
+    response = RunDetailResponse(
+        id=run_id,
+        status="failed",
+        mode="direct",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="hello",
+        events=[
+            RunEventResponse(
+                sequence=1,
+                kind="model.started",
+                message="model request started",
+                created_at=datetime.now(UTC),
+            ),
+            RunEventResponse(
+                sequence=2,
+                kind="runtime.failed",
+                message="model gateway failed",
+                created_at=datetime.now(UTC),
+            ),
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    log = _mode_error_log_from_run(response)
+
+    assert log.message == "direct run failed: model gateway failed"
+    assert log.details["reason"] == "model gateway failed"
+
+
+def test_mode_error_log_explains_missing_legacy_failure_reason() -> None:
+    response = RunDetailResponse(
+        id=uuid4(),
+        status="failed",
+        mode="direct",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="hello",
+        events=[],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    log = _mode_error_log_from_run(response)
+
+    assert log.message == "direct run failed: failure reason was not recorded"
+    assert log.details["reason"] == "failure reason was not recorded"
+    assert "older runs" in log.details["diagnosis"]
 
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")

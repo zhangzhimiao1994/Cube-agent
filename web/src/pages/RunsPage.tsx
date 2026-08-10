@@ -356,7 +356,7 @@ export function RunsPage() {
 
         <div className={`chat-panel${configOpen ? " chat-panel-config-open" : ""}`}>
           {configOpen ? (
-            <>
+              <div className="composer-config-sheet" role="region" aria-label="本次运行更多设置">
           <details className="run-settings-panel" aria-label="本次运行设置" open>
             <summary aria-label="展开或收起本次运行设置">本次运行设置</summary>
             <div className="chat-config-strip" aria-label="本次对话运行设置">
@@ -516,7 +516,7 @@ export function RunsPage() {
               </>
             )}
           </details>
-            </>
+            </div>
           ) : null}
 
           <div className="chat-stream" role="region" aria-label="主对话内容" aria-live="polite">

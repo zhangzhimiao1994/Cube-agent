@@ -4,6 +4,7 @@ import hashlib
 import logging
 import os
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1923,18 +1924,25 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             if record.status is not RunStatus.FAILED:
                 continue
             mode = "unknown" if record.mode is None else record.mode.value
+            events = await self._run_repository.events(self._tenant_id, record.id)
+            reason = _failure_reason_from_event_dicts(events)
+            display_reason = _mode_error_display_reason(reason)
+            details = {
+                "run_id": str(record.id),
+                "mode": mode,
+                "status": record.status.value,
+                "reason": display_reason,
+            }
+            if reason is None:
+                details["diagnosis"] = _MODE_ERROR_REASON_NOT_RECORDED_DIAGNOSIS
             entries.append(
                 self.make_log(
                     category="mode_error",
                     level="error",
                     title="模式运行失败",
-                    message=f"{mode} run failed",
+                    message=_mode_error_message(mode, display_reason),
                     source="runs.execute",
-                    details={
-                        "run_id": str(record.id),
-                        "mode": mode,
-                        "status": record.status.value,
-                    },
+                    details=details,
                 )
             )
         return tuple(entries)
@@ -2427,22 +2435,69 @@ def _audit_log_entry(event: AuditEventResponse) -> LogEntryResponse:
 
 
 def _mode_error_log_from_run(run: RunDetailResponse) -> LogEntryResponse:
+    reason = _failure_reason_from_run_events(run.events)
+    display_reason = _mode_error_display_reason(reason)
+    details = {
+        "run_id": str(run.id),
+        "mode": run.mode,
+        "status": run.status,
+        "reason": display_reason,
+    }
+    if reason is None:
+        details["diagnosis"] = _MODE_ERROR_REASON_NOT_RECORDED_DIAGNOSIS
     return LogEntryResponse(
         id=f"log_run_{run.id}",
         category="mode_error",
         level="error",
         title="模式运行失败",
-        message=f"{run.mode} run failed",
+        message=_mode_error_message(run.mode, display_reason),
         source="runs.execute",
-        details=_safe_log_details(
-            {
-                "run_id": str(run.id),
-                "mode": run.mode,
-                "status": run.status,
-            }
-        ),
+        details=_safe_log_details(details),
         created_at=datetime.now(UTC),
     )
+
+
+_MODE_ERROR_REASON_NOT_RECORDED = "failure reason was not recorded"
+_MODE_ERROR_REASON_NOT_RECORDED_DIAGNOSIS = (
+    "No runtime.failed, step.failed, or tool.failed event reason was recorded for this run. "
+    "For older runs, check the worker/system logs; new runs preserve safe runtime errors."
+)
+
+
+def _mode_error_display_reason(reason: str | None) -> str:
+    return reason if reason else _MODE_ERROR_REASON_NOT_RECORDED
+
+
+def _mode_error_message(mode: str, reason: str) -> str:
+    return f"{mode} run failed: {reason}"
+
+
+def _failure_reason_from_run_events(events: Iterable[RunEventResponse]) -> str | None:
+    for event in sorted(events, key=lambda item: item.sequence, reverse=True):
+        if event.kind in {"runtime.failed", "step.failed", "tool.failed"} and event.message:
+            return _safe_model_check_detail(event.message)
+    return None
+
+
+def _failure_reason_from_event_dicts(events: Iterable[dict[str, object]]) -> str | None:
+    sorted_events = sorted(
+        events,
+        key=_event_sequence,
+        reverse=True,
+    )
+    for event in sorted_events:
+        kind = event.get("kind")
+        if kind not in {"runtime.failed", "step.failed", "tool.failed"}:
+            continue
+        reason = event.get("reason") or event.get("message")
+        if isinstance(reason, str) and reason:
+            return _safe_model_check_detail(reason)
+    return None
+
+
+def _event_sequence(event: dict[str, object]) -> int:
+    sequence = event.get("sequence")
+    return sequence if type(sequence) is int else 0
 
 
 def _log_response_from_payload(payload: dict[str, object]) -> LogEntryResponse:

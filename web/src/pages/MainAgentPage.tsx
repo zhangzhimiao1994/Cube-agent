@@ -331,6 +331,10 @@ export function MainAgentPage() {
       setMessage("主 Agent 配置已保存。");
       await queryClient.invalidateQueries({ queryKey: ["main-agent"] });
     },
+    onError: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["logs"] });
+      await queryClient.invalidateQueries({ queryKey: ["logs", "model_error"] });
+    },
   });
 
   const deleteModel = useMutation({

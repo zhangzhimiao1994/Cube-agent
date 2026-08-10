@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
@@ -16,6 +17,11 @@ from agent_hub.runtime.contracts import EventKind, JsonValue, TaskContext
 from agent_hub.runtime.registry import RuntimeRegistry
 
 _LOGGER = logging.getLogger(__name__)
+_SENSITIVE_RUNTIME_REASON = re.compile(
+    r"(api[_-]?key|authorization|bearer|credential|password|secret|token|sk-[A-Za-z0-9])",
+    re.IGNORECASE,
+)
+_MAX_RUNTIME_REASON_LENGTH = 240
 
 
 @dataclass(frozen=True, slots=True)
@@ -504,7 +510,10 @@ class RunService:
                 run_id,
                 type(error).__name__,
             )
-            failed = await self._repository.fail_run(run_id, reason="runtime_failed")
+            failed = await self._repository.fail_run(
+                run_id,
+                reason=_runtime_failure_reason(error),
+            )
             await self._safe_record_hermes_outcome(
                 tenant_id=failed.tenant_id,
                 actor_id=failed.actor_id,
@@ -723,6 +732,13 @@ def _string_tuple(value: object) -> tuple[str, ...]:
     if isinstance(value, tuple):
         return tuple(item for item in value if isinstance(item, str) and item)
     return ()
+
+
+def _runtime_failure_reason(error: Exception) -> str:
+    reason = " ".join(str(error).strip().split())
+    if not reason or _SENSITIVE_RUNTIME_REASON.search(reason):
+        return "runtime_failed"
+    return reason[:_MAX_RUNTIME_REASON_LENGTH]
 
 
 __all__ = [
