@@ -115,6 +115,8 @@ def build_worker_service(
         router=None,
         task_queue=queue,
         hermes_advisor=PersistentHermesRunAdvisor(database.session_factory),
+        runtime_timeout_seconds=settings.runtime_timeout_seconds,
+        runtime_token_budget=settings.runtime_token_budget,
     )
     return database, redis_client, service, queue
 

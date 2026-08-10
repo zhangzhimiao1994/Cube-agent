@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
@@ -139,6 +140,8 @@ class RunService:
         task_queue: TaskQueue,
         hermes_advisor: HermesAdvisorProtocol | None = None,
         temporary_agent_policy: TemporaryAgentPolicyProtocol | None = None,
+        runtime_timeout_seconds: float = 300.0,
+        runtime_token_budget: int = 1_000_000,
     ) -> None:
         self._repository = repository
         self._runtime_registry = runtime_registry
@@ -146,6 +149,12 @@ class RunService:
         self._queue = task_queue
         self._hermes_advisor = hermes_advisor
         self._temporary_agent_policy = temporary_agent_policy
+        self._runtime_timeout_seconds = _runtime_timeout_seconds(
+            TaskMode.DIRECT, configured_seconds=runtime_timeout_seconds
+        )
+        self._runtime_token_budget = _runtime_token_budget(
+            TaskMode.DIRECT, configured_tokens=runtime_token_budget
+        )
 
     async def submit(
         self,
@@ -470,6 +479,12 @@ class RunService:
                 request=request,
                 checkpoint=checkpoint,
                 routing_decision=cast(Mapping[str, JsonValue], routing_decision),
+                timeout_seconds=_runtime_timeout_seconds(
+                    mode, configured_seconds=self._runtime_timeout_seconds
+                ),
+                token_budget=_runtime_token_budget(
+                    mode, configured_tokens=self._runtime_token_budget
+                ),
             )
             async for event in runtime.run(context):
                 async with await self._repository.run_transaction() as session, session.begin():
@@ -694,6 +709,25 @@ def _submitted(record: RunRecord) -> SubmittedRun:
 
 def _decision_token() -> str:
     return f"decision-{uuid4().hex}{uuid4().hex}"
+
+
+def _runtime_timeout_seconds(mode: TaskMode, *, configured_seconds: float) -> float:
+    del mode
+    if (
+        isinstance(configured_seconds, bool)
+        or not isinstance(configured_seconds, int | float)
+        or not math.isfinite(configured_seconds)
+        or configured_seconds <= 0
+    ):
+        return 300.0
+    return max(1.0, min(float(configured_seconds), 3600.0))
+
+
+def _runtime_token_budget(mode: TaskMode, *, configured_tokens: int) -> int:
+    del mode
+    if type(configured_tokens) is not int or configured_tokens <= 0:
+        return 1_000_000
+    return max(1, min(configured_tokens, 10_000_000))
 
 
 def _usable_hermes_advice(advice: HermesRunAdvice | None) -> bool:

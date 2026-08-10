@@ -153,10 +153,20 @@ class InMemoryArtifactRepository:
             self._reserve_locked(scope, reference, write_id)
 
     @staticmethod
-    def _scope(tenant_id: UUID, run_id: UUID) -> tuple[UUID, UUID]:
-        if type(tenant_id) is not UUID or type(run_id) is not UUID:
+    def _scope(tenant_id: UUID | str, run_id: UUID | str) -> tuple[UUID, UUID]:
+        try:
+            normalized_tenant_id = (
+                tenant_id if type(tenant_id) is UUID else UUID(str(tenant_id))
+            )
+            normalized_run_id = run_id if type(run_id) is UUID else UUID(str(run_id))
+        except (TypeError, ValueError):
             raise ArtifactRepositoryError("artifact scope is invalid")
-        return tenant_id, run_id
+        if (
+            str(normalized_tenant_id) != str(tenant_id)
+            or str(normalized_run_id) != str(run_id)
+        ):
+            raise ArtifactRepositoryError("artifact scope is invalid")
+        return normalized_tenant_id, normalized_run_id
 
     def _encoded_size(self, artifact: Artifact) -> int:
         if type(artifact) is not Artifact:

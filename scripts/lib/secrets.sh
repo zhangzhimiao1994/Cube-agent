@@ -60,10 +60,72 @@ validate_public_url() {
   esac
 }
 
+sanitize_legacy_secrets() {
+  [[ -f "$SECRETS_FILE" ]] || return 0
+  local tmp
+  tmp="$(mktemp "$CONFIG_DIR/secrets.env.sanitized.XXXXXX")"
+  grep -Ev '^(DATABASE_URL|REDIS_URL|JWT_SIGNING_KEY|AGENT_HUB_SECRET_KEY)=' "$SECRETS_FILE" > "$tmp" || true
+  if ! cmp -s "$SECRETS_FILE" "$tmp"; then
+    chmod 0600 "$tmp"
+    mv "$tmp" "$SECRETS_FILE"
+    log "removed legacy unprefixed secrets from $SECRETS_FILE"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+normalize_secret_file_format() {
+  [[ -f "$SECRETS_FILE" ]] || return 0
+  if grep -q 'nAGENT_HUB_' "$SECRETS_FILE"; then
+    sed -i 's/nAGENT_HUB_/\nAGENT_HUB_/g' "$SECRETS_FILE"
+  fi
+  if [[ -s "$SECRETS_FILE" ]] && [[ "$(tail -c 1 "$SECRETS_FILE")" != "" ]]; then
+    printf '\n' >> "$SECRETS_FILE"
+  fi
+  chmod 0600 "$SECRETS_FILE"
+}
+
+ensure_secret_default() {
+  local name="$1" value="$2"
+  [[ -f "$SECRETS_FILE" ]] || return 0
+  if grep -q "^${name}=" "$SECRETS_FILE"; then
+    return 0
+  fi
+  printf '%s=%s\n' "$name" "$value" >> "$SECRETS_FILE"
+  chmod 0600 "$SECRETS_FILE"
+}
+
+ensure_numeric_secret_default() {
+  local name="$1" value="$2" current
+  [[ -f "$SECRETS_FILE" ]] || return 0
+  current="$(grep "^${name}=" "$SECRETS_FILE" | tail -n 1 | cut -d= -f2- || true)"
+  if [[ "$current" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    return 0
+  fi
+  local tmp
+  tmp="$(mktemp "$CONFIG_DIR/secrets.env.${name}.XXXXXX")"
+  grep -v "^${name}=" "$SECRETS_FILE" > "$tmp" || true
+  printf '%s=%s\n' "$name" "$value" >> "$tmp"
+  chmod 0600 "$tmp"
+  mv "$tmp" "$SECRETS_FILE"
+}
+
+ensure_secret_defaults() {
+  normalize_secret_file_format
+  ensure_numeric_secret_default \
+    AGENT_HUB_RUNTIME_TIMEOUT_SECONDS \
+    "${AGENT_HUB_RUNTIME_TIMEOUT_SECONDS:-300}"
+  ensure_numeric_secret_default \
+    AGENT_HUB_RUNTIME_TOKEN_BUDGET \
+    "${AGENT_HUB_RUNTIME_TOKEN_BUDGET:-1000000}"
+}
+
 generate_or_keep_secrets() {
   mkdir -p "$CONFIG_DIR" "$STATE_DIR"
   if [[ -f "$SECRETS_FILE" ]]; then
     log "keeping existing secrets at $SECRETS_FILE"
+    sanitize_legacy_secrets
+    ensure_secret_defaults
     return 0
   fi
   local tmp postgres_password jwt_signing_key public_url
@@ -75,15 +137,12 @@ generate_or_keep_secrets() {
     printf 'AGENT_HUB_ENVIRONMENT=production\n'
     printf 'AGENT_HUB_MASTER_KEY=%s\n' "$(openssl rand -base64 32)"
     printf 'AGENT_HUB_JWT_SIGNING_KEY=base64url:%s\n' "$jwt_signing_key"
-    printf 'JWT_SIGNING_KEY=base64url:%s\n' "$jwt_signing_key"
     printf 'POSTGRES_DB=agent_hub\n'
     printf 'POSTGRES_USER=agent_hub\n'
     printf 'POSTGRES_PASSWORD=%s\n' "$postgres_password"
     printf 'AGENT_HUB_DATABASE_URL=postgresql+asyncpg://agent_hub:%s@127.0.0.1:5432/agent_hub\n' "$postgres_password"
     printf 'AGENT_HUB_REDIS_URL=redis://127.0.0.1:6379/0\n'
     printf 'AGENT_HUB_LITELLM_HEALTH_URL=http://127.0.0.1:%s/health/liveliness\n' "${LITELLM_PORT:-4000}"
-    printf 'DATABASE_URL=postgresql+asyncpg://agent_hub:%s@127.0.0.1:5432/agent_hub\n' "$postgres_password"
-    printf 'REDIS_URL=redis://127.0.0.1:6379/0\n'
     printf 'LITELLM_MASTER_KEY=%s\n' "$(rand_secret)"
     printf 'AGENT_HUB_SETUP_CODE=%s\n' "$(rand_secret)"
     printf 'AGENT_HUB_PUBLIC_URL=%s\n' "$public_url"
@@ -96,9 +155,13 @@ generate_or_keep_secrets() {
     printf 'LITELLM_BIND_HOST=%s\n' "${LITELLM_BIND_HOST:-127.0.0.1}"
     printf 'LITELLM_PORT=%s\n' "${LITELLM_PORT:-4000}"
     printf 'AGENT_HUB_LOG_LEVEL=%s\n' "${AGENT_HUB_LOG_LEVEL:-WARNING}"
+    printf 'AGENT_HUB_RUNTIME_TIMEOUT_SECONDS=%s\n' "${AGENT_HUB_RUNTIME_TIMEOUT_SECONDS:-300}"
+    printf 'AGENT_HUB_RUNTIME_TOKEN_BUDGET=%s\n' "${AGENT_HUB_RUNTIME_TOKEN_BUDGET:-1000000}"
   } > "$tmp"
   chmod 0600 "$tmp"
   mv "$tmp" "$SECRETS_FILE"
+  sanitize_legacy_secrets
+  ensure_secret_defaults
   mark_stage "secrets"
   log "generated secrets at $SECRETS_FILE"
 }

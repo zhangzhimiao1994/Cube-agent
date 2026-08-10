@@ -549,6 +549,10 @@ class AdminResourceService(Protocol):
 
     async def create_model(self, request: ModelDeploymentRequest) -> ModelDeploymentResponse: ...
 
+    async def update_model(
+        self, model_id: UUID, request: ModelDeploymentRequest
+    ) -> ModelDeploymentResponse: ...
+
     async def delete_model(self, model_id: UUID) -> None: ...
 
     async def create_secret(self, request: SecretCreateRequest) -> SecretReferenceResponse: ...
@@ -745,6 +749,23 @@ class InMemoryAdminResourceService:
             saturation_policy="queue_first_then_fallback",
         )
         self.models[response.id] = response
+        return response
+
+    async def update_model(
+        self,
+        model_id: UUID,
+        request: ModelDeploymentRequest,
+    ) -> ModelDeploymentResponse:
+        if model_id not in self.models:
+            raise PublicAPIError(404, "model_not_found", "model not found")
+        request = _normalize_model_request_api_base(request)
+        response = ModelDeploymentResponse(
+            **request.model_dump(),
+            id=model_id,
+            effective_slots=max(0, request.max_concurrency - request.reserved_capacity),
+            saturation_policy="queue_first_then_fallback",
+        )
+        self.models[model_id] = response
         return response
 
     async def delete_model(self, model_id: UUID) -> None:
@@ -1308,19 +1329,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             logical_definition["deployments"] = list(
                 cast(list[object], logical_definition.get("deployments", []))
             )
-        deployment = {
-            "provider": request.provider,
-            "model": request.upstream_model,
-            "api_base": request.api_base,
-            "credential_ref": request.credential_ref,
-            "quota_scope_id": request.quota_scope,
-            "max_concurrency": request.max_concurrency,
-            "target_utilization": request.target_utilization,
-            "reserved_slots": request.reserved_capacity,
-            "rpm": request.rpm,
-            "tpm": request.tpm,
-            "capabilities": request.capabilities,
-        }
+        deployment = _deployment_document_from_request(request)
         deployments = cast(list[object], logical_definition["deployments"])
         deployment_index = len(deployments)
         deployments.append(deployment)
@@ -1369,6 +1378,95 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             created_definition.fallback_model,
             deployment_index,
             created_definition.deployments[deployment_index],
+        )
+
+    async def update_model(
+        self, model_id: UUID, request: ModelDeploymentRequest
+    ) -> ModelDeploymentResponse:
+        request = _normalize_model_request_api_base(request)
+        document = await self._current_document()
+        models = cast(dict[str, object], document.setdefault("models", {}))
+        target_logical_model: str | None = None
+        target_index: int | None = None
+
+        for logical_model, raw_definition in list(models.items()):
+            logical_definition = dict(cast(dict[str, object], raw_definition))
+            deployments = list(cast(list[object], logical_definition.get("deployments", [])))
+            fallback_model = cast(str | None, logical_definition.get("fallback_model"))
+            for index, deployment in enumerate(deployments):
+                response = self._model_response(logical_model, fallback_model, index, deployment)
+                if response.id == model_id:
+                    target_logical_model = logical_model
+                    target_index = index
+                    break
+            if target_logical_model is not None:
+                break
+
+        if target_logical_model is None or target_index is None:
+            raise PublicAPIError(404, "model_not_found", "model not found")
+
+        original_definition = dict(cast(dict[str, object], models[target_logical_model]))
+        original_deployments = list(cast(list[object], original_definition.get("deployments", [])))
+        original_deployments.pop(target_index)
+        if original_deployments:
+            original_definition["deployments"] = original_deployments
+            models[target_logical_model] = original_definition
+        else:
+            del models[target_logical_model]
+
+        target_definition_raw = dict(cast(dict[str, object], models.get(request.logical_model, {})))
+        target_deployments = list(cast(list[object], target_definition_raw.get("deployments", [])))
+        target_definition_raw["deployments"] = target_deployments
+        target_deployments.append(_deployment_document_from_request(request))
+        if request.fallback is not None:
+            target_definition_raw["fallback_model"] = request.fallback
+        models[request.logical_model] = target_definition_raw
+        updated_index = len(target_deployments) - 1
+
+        try:
+            checked_deployment = PlatformConfig.model_validate(document).models[
+                request.logical_model
+            ].deployments[updated_index]
+            await self._verify_model_availability(
+                checked_deployment.to_deployment(
+                    deployment_id=f"{request.logical_model}_{updated_index + 1}",
+                    logical_model=request.logical_model,
+                ),
+                source="models.update",
+            )
+            draft = await self._config_service.create_draft(
+                self._tenant_id,
+                self._actor_id,
+                document,
+            )
+            await self._config_service.publish(
+                self._tenant_id,
+                draft.version,
+                self._actor_id,
+            )
+        except (ConfigValidationError, ValidationError) as error:
+            await self._record_model_request_failure(
+                request,
+                reason=_safe_model_check_reason(error),
+                stage="model_configuration_validation",
+                source="models.update",
+            )
+            raise PublicAPIError(422, "request_validation", "request validation failed") from None
+        current = await self._config_service.get_current(self._tenant_id)
+        if current is None:
+            raise PublicAPIError(503, "service_unavailable", "service unavailable")
+        published = PlatformConfig.model_validate(current.document)
+        updated_definition = published.models[request.logical_model]
+        await self._record_audit(
+            "model.update",
+            f"model:{request.logical_model}",
+            {"provider": request.provider, "model": request.upstream_model},
+        )
+        return self._model_response(
+            request.logical_model,
+            updated_definition.fallback_model,
+            updated_index,
+            updated_definition.deployments[updated_index],
         )
 
     async def delete_model(self, model_id: UUID) -> None:
@@ -2140,13 +2238,14 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         *,
         reason: str,
         stage: str,
+        source: str = "models.create",
     ) -> None:
         await self.record_log(
             category="model_error",
             level="error",
             title="模型配置错误",
             message=reason,
-            source="models.create",
+            source=source,
             details={
                 "stage": stage,
                 "provider": request.provider,
@@ -2220,6 +2319,22 @@ def _service(request: Request) -> AdminResourceService:
     if service is None:
         raise PublicAPIError(503, "service_unavailable", "service unavailable")
     return cast(AdminResourceService, service)
+
+
+def _deployment_document_from_request(request: ModelDeploymentRequest) -> dict[str, object]:
+    return {
+        "provider": request.provider,
+        "model": request.upstream_model,
+        "api_base": request.api_base,
+        "credential_ref": request.credential_ref,
+        "quota_scope_id": request.quota_scope,
+        "max_concurrency": request.max_concurrency,
+        "target_utilization": request.target_utilization,
+        "reserved_slots": request.reserved_capacity,
+        "rpm": request.rpm,
+        "tpm": request.tpm,
+        "capabilities": request.capabilities,
+    }
 
 
 def _require(principal: AuthenticatedPrincipal, permission: str) -> None:
@@ -2482,10 +2597,15 @@ def _mode_error_message(mode: str, reason: str) -> str:
 
 
 def _failure_reason_from_run_events(events: Iterable[RunEventResponse]) -> str | None:
+    fallback: str | None = None
     for event in sorted(events, key=lambda item: item.sequence, reverse=True):
         if event.kind in {"runtime.failed", "step.failed", "tool.failed"} and event.message:
-            return _safe_model_check_detail(event.message)
-    return None
+            reason = _safe_model_check_detail(event.message)
+            if fallback is None:
+                fallback = reason
+            if not is_legacy_generic_failure_reason(reason):
+                return reason
+    return fallback
 
 
 def _failure_reason_from_event_dicts(events: Iterable[dict[str, object]]) -> str | None:
@@ -2494,14 +2614,19 @@ def _failure_reason_from_event_dicts(events: Iterable[dict[str, object]]) -> str
         key=_event_sequence,
         reverse=True,
     )
+    fallback: str | None = None
     for event in sorted_events:
         kind = event.get("kind")
         if kind not in {"runtime.failed", "step.failed", "tool.failed"}:
             continue
         reason = event.get("reason") or event.get("message")
         if isinstance(reason, str) and reason:
-            return _safe_model_check_detail(reason)
-    return None
+            safe_reason = _safe_model_check_detail(reason)
+            if fallback is None:
+                fallback = safe_reason
+            if not is_legacy_generic_failure_reason(safe_reason):
+                return safe_reason
+    return fallback
 
 
 def _event_sequence(event: dict[str, object]) -> int:
@@ -2770,6 +2895,21 @@ async def delete_model(
     _require(principal, "config:write")
     await service.delete_model(model_id)
     return OperationStatusResponse(status="deleted")
+
+
+@router.put(
+    "/models/{model_id}",
+    response_model=ModelDeploymentResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def update_model(
+    model_id: UUID,
+    body: ModelDeploymentRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> ModelDeploymentResponse:
+    _require(principal, "config:write")
+    return await service.update_model(model_id, body)
 
 
 @router.post("/models/probe", response_model=ProbeResponse, responses=error_responses(401, 403, 422))

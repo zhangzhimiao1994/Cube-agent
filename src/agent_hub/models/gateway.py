@@ -317,8 +317,10 @@ class ModelGateway:
                 output_per_million_usd=deployment.output_per_million_usd,
             )
         usage = response.usage
-        if pricing is None or usage is None:
+        if usage is None:
             return None
+        if pricing is None:
+            return Decimal(0)
         cost = (
             Decimal(usage.prompt_tokens) * pricing.input_per_million_usd
             + Decimal(usage.completion_tokens) * pricing.output_per_million_usd

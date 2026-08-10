@@ -46,6 +46,8 @@ class Settings(BaseSettings):
     master_key: SecretStr = SecretStr("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
     trusted_proxy_ips: frozenset[str] = Field(default=frozenset(), max_length=32)
     log_level: str = Field(default="WARNING", pattern=r"^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
+    runtime_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
+    runtime_token_budget: int = Field(default=1_000_000, ge=1, le=10_000_000)
     web_dir: Path | None = None
     skill_store_dir: Path = Path("/var/lib/agent-hub/skills")
     litellm_health_url: str | None = None

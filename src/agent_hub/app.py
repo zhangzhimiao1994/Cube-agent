@@ -266,6 +266,8 @@ def create_app(
                     task_queue=queue,
                     hermes_advisor=PersistentHermesRunAdvisor(active_sessions),
                     temporary_agent_policy=AdminResourceTemporaryAgentPolicy(active_sessions),
+                    runtime_timeout_seconds=configured.runtime_timeout_seconds,
+                    runtime_token_budget=configured.runtime_token_budget,
                 )
                 application.state.run_queue = queue
             if (

@@ -33,6 +33,8 @@ _RUNTIME_TYPE = "direct"
 _RUNTIME_VERSION = "1"
 _MAX_OUTPUT_BYTES = 65_536
 _MAX_CONTEXT_BYTES = 196_608
+_MAX_SOURCE_ARTIFACT_TEXT_BYTES = 4_096
+_MAX_DIRECT_OUTPUT_TOKENS = 8_192
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 
@@ -70,6 +72,18 @@ def _raise_execution_error(message: str) -> Never:
 
 def _gateway_failure_reason(error: Exception) -> str:
     return safe_model_gateway_failure_reason(error) or "model gateway failed"
+
+
+def _truncate_prompt_text(value: str, *, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    suffix = f"\n\n[truncated: original_bytes={len(encoded)}]"
+    suffix_bytes = suffix.encode("utf-8")
+    if max_bytes <= len(suffix_bytes):
+        return suffix_bytes[:max_bytes].decode("utf-8", errors="ignore")
+    prefix = encoded[: max_bytes - len(suffix_bytes)].decode("utf-8", errors="ignore")
+    return f"{prefix}{suffix}"
 
 
 class DirectRunStream:
@@ -332,7 +346,10 @@ class DirectRuntime:
             outcome = _RequestOutcome(error_code=prompt.error_code)
             del prompt, context, messages
             return outcome
-        max_output_tokens = min(context.token_budget - prompt.prompt_estimate, 1_000_000)
+        max_output_tokens = min(
+            context.token_budget - prompt.prompt_estimate,
+            _MAX_DIRECT_OUTPUT_TOKENS,
+        )
         if max_output_tokens <= 0:
             del prompt, context, messages
             return _RequestOutcome(error_code="runtime token budget is insufficient")
@@ -383,7 +400,10 @@ class DirectRuntime:
                         "id": str(artifact.id),
                         "producer": artifact.producer,
                         "content_sha256": artifact.content_sha256,
-                        "text": text,
+                        "text": _truncate_prompt_text(
+                            text,
+                            max_bytes=_MAX_SOURCE_ARTIFACT_TEXT_BYTES,
+                        ),
                     }
                 )
                 included_source_ids.append(str(artifact.id))

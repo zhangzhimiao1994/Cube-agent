@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
@@ -108,6 +108,7 @@ class RolePlanningRequest:
     task: str
     mode: TaskMode
     profile: TaskProfile = TaskProfile.GENERAL
+    profiles: tuple[TaskProfile, ...] = ()
     high_risk: bool = False
     requested_skills: tuple[str, ...] = ()
     default_model: str = "main-agent"
@@ -119,6 +120,7 @@ class RolePlanningRequest:
             raise ValueError("mode must be an executable task mode")
         if type(self.profile) is not TaskProfile:
             raise ValueError("task profile is invalid")
+        profiles = _normalize_profiles(self.profile, self.profiles)
         if type(self.high_risk) is not bool:
             raise ValueError("high_risk must be a boolean")
         requested_skills = _normalize_identifier_tuple("requested_skills", self.requested_skills)
@@ -131,6 +133,7 @@ class RolePlanningRequest:
             for role_id, model in self.model_overrides.items()
         })
         object.__setattr__(self, "requested_skills", requested_skills)
+        object.__setattr__(self, "profiles", profiles)
         object.__setattr__(self, "model_overrides", overrides)
 
 
@@ -141,6 +144,7 @@ class RolePlan:
     mode: TaskMode
     profile: TaskProfile
     roles: tuple[RoleAssignment, ...]
+    profiles: tuple[TaskProfile, ...] = ()
     requires_user: bool = False
     reason: str = "ready"
 
@@ -149,6 +153,7 @@ class RolePlan:
             raise ValueError("mode is invalid")
         if type(self.profile) is not TaskProfile:
             raise ValueError("profile is invalid")
+        profiles = _normalize_profiles(self.profile, self.profiles)
         if type(self.requires_user) is not bool:
             raise ValueError("requires_user must be a boolean")
         _require_identifier("reason", self.reason)
@@ -158,6 +163,7 @@ class RolePlan:
         role_ids = [role.id for role in roles]
         if len(role_ids) != len(set(role_ids)):
             raise ValueError("duplicate role id")
+        object.__setattr__(self, "profiles", profiles)
         object.__setattr__(self, "roles", roles)
 
     def role(self, role_id: str) -> RoleAssignment:
@@ -192,22 +198,22 @@ class RolePlanner:
                 reason="ambiguous_high_risk_role_plan",
             )
         if request.mode is TaskMode.DISCUSS:
-            role_specs = _discussion_specs(request.profile, request.high_risk)
+            role_specs = _combined_specs(
+                _discussion_specs(profile, request.high_risk) for profile in request.profiles
+            )
         else:
-            role_specs = _dispatch_specs(request.profile)
-        role_specs = (
-            *role_specs,
-            *(
-                _catalog_spec(role)
-                for role in self._role_catalog.roles_for(
-                    mode=request.mode.value,
-                    profile=request.profile.value,
-                    high_risk=request.high_risk,
-                )
-            ),
-        )
+            role_specs = _combined_specs(
+                _dispatch_specs(profile) for profile in request.profiles
+            )
+        catalog_specs = _catalog_specs_for_request(self._role_catalog, request)
+        role_specs = (*role_specs, *_select_relevant_catalog_specs(request, catalog_specs))
         roles = tuple(_assignment(spec, request) for spec in role_specs)
-        return RolePlan(mode=request.mode, profile=request.profile, roles=roles)
+        return RolePlan(
+            mode=request.mode,
+            profile=request.profile,
+            profiles=request.profiles,
+            roles=roles,
+        )
 
 
 type _RoleSpec = tuple[
@@ -744,6 +750,19 @@ def _dispatch_specs(profile: TaskProfile) -> tuple[_RoleSpec, ...]:
     )
 
 
+def _combined_specs(spec_groups: Iterable[tuple[_RoleSpec, ...]]) -> tuple[_RoleSpec, ...]:
+    combined: list[_RoleSpec] = []
+    seen: set[str] = set()
+    for specs in spec_groups:
+        for spec in specs:
+            role_id = spec[0]
+            if role_id in seen:
+                continue
+            seen.add(role_id)
+            combined.append(spec)
+    return tuple(combined)
+
+
 def _assignment(spec: _RoleSpec, request: RolePlanningRequest) -> RoleAssignment:
     role_id, role, purpose, mission, must_answer, allowed_tools, forbidden, skills, schema = spec
     merged_skills = tuple(dict.fromkeys((*skills, *request.requested_skills)))
@@ -782,6 +801,160 @@ def _catalog_spec(role: RoleDefinition) -> _RoleSpec:
         role.skills,
         role.output_schema,
     )
+
+
+def _catalog_specs_for_request(
+    catalog: RoleCatalog,
+    request: RolePlanningRequest,
+) -> tuple[_RoleSpec, ...]:
+    profiles = tuple(profile.value for profile in request.profiles)
+    specs: list[_RoleSpec] = []
+    seen: set[str] = set()
+    for profile in profiles:
+        for role in catalog.roles_for(
+            mode=request.mode.value,
+            profile=profile,
+            high_risk=request.high_risk,
+        ):
+            if role.id in seen:
+                continue
+            seen.add(role.id)
+            specs.append(_catalog_spec(role))
+    return tuple(specs)
+
+
+def _select_relevant_catalog_specs(
+    request: RolePlanningRequest,
+    specs: tuple[_RoleSpec, ...],
+) -> tuple[_RoleSpec, ...]:
+    if not specs:
+        return ()
+    selected = [
+        spec
+        for spec in specs
+        if _role_matches_task(spec, request)
+    ]
+    if selected:
+        return tuple(selected)
+    if request.requested_skills:
+        return ()
+    return tuple(spec for spec in specs if spec[0] in _BASELINE_CATALOG_ROLE_IDS)
+
+
+_BASELINE_CATALOG_ROLE_IDS = frozenset({"project_manager", "quality_reviewer", "user_advocate"})
+
+_ROLE_TRIGGER_KEYWORDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {
+        "director": ("导演", "镜头", "分镜", "剧情", "短剧", "视频", "叙事", "story", "shot"),
+        "copywriter": ("文案", "脚本", "短剧", "标题", "口播", "广告", "slogan", "copy", "script"),
+        "video_editor": ("剪辑", "字幕", "转场", "视频", "素材", "节奏", "edit", "caption"),
+        "content_editor": ("润色", "校对", "编辑", "文案", "脚本", "改写", "polish", "edit"),
+        "economic_analyst": ("经济", "市场", "需求", "定价", "宏观", "商业回报", "roi", "market"),
+        "finance_analyst": ("预算", "成本", "收入", "财务", "回报", "roi", "budget", "cost"),
+        "marketing_strategist": ("营销", "投放", "渠道", "增长", "转化", "用户", "campaign"),
+        "product_manager": ("产品", "需求", "路线图", "优先级", "里程碑", "交付", "方案", "plan"),
+        "operations_coordinator": ("交付", "清单", "排期", "运营", "协同", "执行", "handoff"),
+        "legal_compliance_reviewer": ("法律", "合规", "版权", "隐私", "许可", "免责声明", "compliance"),
+        "quality_reviewer": ("审核", "验收", "质量", "检查", "校验", "verify", "quality"),
+        "designer": ("设计", "视觉", "海报", "界面", "ui", "品牌", "配色", "layout"),
+        "sales_advisor": ("销售", "话术", "客户", "成交", "异议", "sales"),
+        "market_researcher": ("research", "market", "competitor", "opportunity", "user", "product"),
+    }
+)
+
+
+def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
+    role_id, role, _purpose, mission, must_answer, _tools, _forbidden, skills, _schema = spec
+    requested = set(request.requested_skills)
+    if requested and requested.intersection(skills):
+        return True
+    task = request.task.casefold()
+    haystack = " ".join((role_id, role, mission, " ".join(must_answer), " ".join(skills))).casefold()
+    triggers = _ROLE_TRIGGER_KEYWORDS.get(role_id, ())
+    if any(keyword.casefold() in task for keyword in triggers):
+        return True
+    if role_id == "project_manager" and any(
+        keyword in task
+        for keyword in (
+            "plan",
+            "scope",
+            "milestone",
+            "deadline",
+            "build",
+            "prototype",
+            "deliver",
+            "方案",
+            "交付",
+            "清单",
+        )
+    ):
+        return True
+    if role_id == "quality_reviewer" and any(
+        keyword in task
+        for keyword in (
+            "build",
+            "prototype",
+            "deliver",
+            "verify",
+            "quality",
+            "test",
+            "验收",
+            "质量",
+            "检查",
+            "测试",
+            "交付",
+        )
+    ):
+        return True
+    if role_id == "copywriter" and any(
+        keyword in task for keyword in ("文案", "脚本", "标题", "口播", "短剧", "短视频", "营销", "广告")
+    ):
+        return True
+    if role_id == "economic_analyst" and any(
+        keyword in task for keyword in ("经济", "市场", "需求", "定价", "商业回报", "回报", "预算")
+    ):
+        return True
+    if role_id == "finance_analyst" and any(
+        keyword in task for keyword in ("预算", "成本", "收入", "财务", "回报")
+    ):
+        return True
+    if role_id == "sales_advisor" and any(keyword in task for keyword in ("销售", "话术", "客户")):
+        return True
+    if role_id == "operations_coordinator" and any(
+        keyword in task for keyword in ("交付", "清单", "排期", "协同", "执行")
+    ):
+        return True
+    if role_id == "legal_compliance_reviewer" and any(
+        keyword in task for keyword in ("法律", "合规", "版权", "隐私", "许可")
+    ):
+        return True
+    # Custom catalog roles stay discoverable without hard-coding: if a role's
+    # own short skill/role words appear in the task, it can participate.
+    return any(
+        len(token) >= 2 and token.casefold() in task
+        for token in (*skills, role_id.replace("_", " "), role)
+        if token.casefold() in haystack
+    )
+
+
+def _normalize_profiles(
+    primary: TaskProfile,
+    profiles: tuple[TaskProfile, ...],
+) -> tuple[TaskProfile, ...]:
+    raw = (primary,) if not profiles else profiles
+    normalized: list[TaskProfile] = []
+    for profile in raw:
+        if type(profile) is not TaskProfile:
+            raise ValueError("task profiles are invalid")
+        if profile is TaskProfile.UNKNOWN and len(raw) > 1:
+            continue
+        if profile not in normalized:
+            normalized.append(profile)
+    if not normalized:
+        normalized.append(primary)
+    if TaskProfile.GENERAL not in normalized and TaskProfile.UNKNOWN not in normalized:
+        normalized.append(TaskProfile.GENERAL)
+    return tuple(normalized)
 
 
 def _require_identifier(name: str, value: str) -> str:

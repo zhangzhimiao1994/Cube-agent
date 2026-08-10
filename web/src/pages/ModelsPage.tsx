@@ -1,7 +1,7 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+﻿import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useMemo, useState } from "react";
 
-import { ApiError, api, formatApiError } from "../api/client";
+import { ApiError, api, formatApiError, type ModelDeployment } from "../api/client";
 
 const CUSTOM_PROVIDER = "custom";
 const CUSTOM_MODEL = "__custom_model__";
@@ -19,6 +19,10 @@ type ProviderPreset = {
   apiBase: string;
   apiProtocol: ApiProtocol;
   capabilities: string[];
+  concurrencyHelp?: string;
+  defaultMaxConcurrency?: number;
+  defaultRpm?: number;
+  defaultTpm?: number;
   label: string;
   modelHelp?: string;
   modelEntryMode?: "catalog" | "freeform";
@@ -35,17 +39,10 @@ const PROVIDERS: ProviderPreset[] = [
     apiProtocol: "openai_compatible",
     quotaScope: "openai-account",
     capabilities: ["text", "tool_calling", "structured_output"],
+    concurrencyHelp: "OpenAI 官方通常按项目/模型展示 RPM、TPM 等额度；请以控制台 Limits 为准，生产建议先从 1-4 并发验证。",
     models: [
-      {
-        label: "GPT-5.6 Terra",
-        value: "gpt-5.6-terra",
-        capabilities: ["text", "tool_calling", "structured_output"],
-      },
-      {
-        label: "GPT-5.6 Sol",
-        value: "gpt-5.6-sol",
-        capabilities: ["text", "tool_calling", "structured_output"],
-      },
+      { label: "GPT-5.6 Terra", value: "gpt-5.6-terra", capabilities: ["text", "tool_calling", "structured_output"] },
+      { label: "GPT-5.6 Sol", value: "gpt-5.6-sol", capabilities: ["text", "tool_calling", "structured_output"] },
     ],
   },
   {
@@ -55,9 +52,11 @@ const PROVIDERS: ProviderPreset[] = [
     apiProtocol: "openai_compatible",
     quotaScope: "deepseek-account",
     capabilities: ["text", "tool_calling"],
+    concurrencyHelp: "DeepSeek 官方账号级并发：deepseek-v4-pro 500、deepseek-v4-flash 2500；系统仍建议按成本和业务压力从小并发开始。",
+    defaultMaxConcurrency: 4,
     models: [
-      { label: "DeepSeek Chat", value: "deepseek-chat", capabilities: ["text", "tool_calling"] },
-      { label: "DeepSeek Reasoner", value: "deepseek-reasoner", capabilities: ["text"] },
+      { label: "DeepSeek V4 Flash", value: "deepseek-v4-flash", capabilities: ["text", "tool_calling"] },
+      { label: "DeepSeek V4 Pro", value: "deepseek-v4-pro", capabilities: ["text", "tool_calling"] },
     ],
   },
   {
@@ -67,27 +66,12 @@ const PROVIDERS: ProviderPreset[] = [
     apiProtocol: "anthropic_messages",
     quotaScope: "anthropic-account",
     capabilities: ["text", "tool_calling"],
+    concurrencyHelp: "Anthropic 官方额度通常以组织/工作区的 RPM、TPM、输入/输出 token 限额为准；Claude Code 中转站请以中转后台为准。",
     models: [
-      {
-        label: "Claude Code / Claude Sonnet 4.6",
-        value: "claude-sonnet-4-6",
-        capabilities: ["text", "tool_calling"],
-      },
-      {
-        label: "Claude Code / Claude Sonnet 4",
-        value: "claude-sonnet-4-20250514",
-        capabilities: ["text", "tool_calling"],
-      },
-      {
-        label: "Claude Opus 4",
-        value: "claude-opus-4-20250514",
-        capabilities: ["text", "tool_calling"],
-      },
-      {
-        label: "Claude 3.5 Haiku",
-        value: "claude-3-5-haiku-20241022",
-        capabilities: ["text"],
-      },
+      { label: "Claude Code / Claude Sonnet 5", value: "claude-sonnet-5", capabilities: ["text", "tool_calling"] },
+      { label: "Claude Code / Claude Fable 5", value: "claude-fable-5", capabilities: ["text", "tool_calling"] },
+      { label: "Claude Code / Claude Sonnet 4.6", value: "claude-sonnet-4-6", capabilities: ["text", "tool_calling"] },
+      { label: "Claude Opus 5", value: "claude-opus-5", capabilities: ["text", "tool_calling"] },
     ],
   },
   {
@@ -97,13 +81,33 @@ const PROVIDERS: ProviderPreset[] = [
     apiProtocol: "openai_compatible",
     quotaScope: "kimi-account",
     capabilities: ["text", "tool_calling"],
+    concurrencyHelp: "Kimi 限流按账号共享，具体 RPM/TPM 以控制台和 429 返回为准；建议先从并发 1-2 开始。",
     models: [
-      {
-        label: "Kimi K2 Turbo Preview",
-        value: "kimi-k2-turbo-preview",
-        capabilities: ["text", "tool_calling"],
-      },
-      { label: "Moonshot v1 128K", value: "moonshot-v1-128k", capabilities: ["text"] },
+      { label: "Kimi K2.6", value: "kimi-k2.6", capabilities: ["text", "tool_calling"] },
+      { label: "Kimi K2.5", value: "kimi-k2.5", capabilities: ["text", "tool_calling"] },
+      { label: "Kimi K2.7 Code", value: "kimi-k2.7-code", capabilities: ["text", "tool_calling"] },
+    ],
+  },
+  {
+    label: "阿里百炼 Token Plan / Qwen Code",
+    value: "qwen-token-plan",
+    apiBase: "",
+    apiProtocol: "openai_compatible",
+    quotaScope: "qwen-token-plan-account",
+    capabilities: ["text", "tool_calling"],
+    concurrencyHelp: "Token Plan 请使用控制台“我的订阅 / API Key”里的专属 Base URL；并发 Agent 参考：Lite 1-2、Standard 3-4、Pro 6-8。",
+    modelEntryMode: "freeform",
+    modelHelp: "Token Plan 的 Base URL 不是普通 DashScope /compatible-mode/v1；请复制专属 Base URL。模型名可选官方推荐，也可以填写控制台最新 Model ID。",
+    models: [
+      { label: "Qwen3.8 Max Preview", value: "qwen3.8-max-preview", capabilities: ["text", "tool_calling"] },
+      { label: "Qwen3.7 Max", value: "qwen3.7-max", capabilities: ["text", "tool_calling"] },
+      { label: "Qwen3.7 Plus", value: "qwen3.7-plus", capabilities: ["text", "tool_calling"] },
+      { label: "Qwen3.6 Plus", value: "qwen3.6-plus", capabilities: ["text", "tool_calling"] },
+      { label: "Qwen3.6 Flash", value: "qwen3.6-flash", capabilities: ["text", "tool_calling"] },
+      { label: "Kimi K2.7 Code", value: "kimi-k2.7-code", capabilities: ["text", "tool_calling"] },
+      { label: "Kimi K2.6", value: "kimi-k2.6", capabilities: ["text", "tool_calling"] },
+      { label: "DeepSeek V4 Flash", value: "deepseek-v4-flash", capabilities: ["text", "tool_calling"] },
+      { label: "MiniMax M2.5", value: "MiniMax-M2.5", capabilities: ["text", "tool_calling"] },
     ],
   },
   {
@@ -113,10 +117,12 @@ const PROVIDERS: ProviderPreset[] = [
     apiProtocol: "openai_compatible",
     quotaScope: "qwen-account",
     capabilities: ["text", "tool_calling"],
+    concurrencyHelp: "DashScope/Qwen 不同模型和接口额度不同，常见为 QPS/RPM/TPM 或账号配额；请以百炼控制台额度为准。",
     models: [
-      { label: "Qwen Plus", value: "qwen-plus", capabilities: ["text", "tool_calling"] },
-      { label: "Qwen Max", value: "qwen-max", capabilities: ["text", "tool_calling"] },
-      { label: "Qwen Turbo", value: "qwen-turbo", capabilities: ["text", "tool_calling"] },
+      { label: "Qwen3.7 Max", value: "qwen3.7-max", capabilities: ["text", "tool_calling"] },
+      { label: "Qwen3 Max", value: "qwen3-max", capabilities: ["text", "tool_calling"] },
+      { label: "Qwen3 Max Preview", value: "qwen3-max-preview", capabilities: ["text", "tool_calling"] },
+      { label: "Qwen3 Coder Plus", value: "qwen3-coder-plus", capabilities: ["text", "tool_calling"] },
     ],
   },
   {
@@ -126,9 +132,11 @@ const PROVIDERS: ProviderPreset[] = [
     apiProtocol: "openai_compatible",
     quotaScope: "minimax-account",
     capabilities: ["text"],
+    concurrencyHelp: "MiniMax 官方公开的主要是 RPM/TPM；文本接口常见 500 RPM、20,000,000 TPM，具体以账号额度为准。",
+    defaultRpm: 500,
+    defaultTpm: 20000000,
     models: [
-      { label: "MiniMax M1", value: "minimax-m1", capabilities: ["text"] },
-      { label: "abab6.5s-chat", value: "abab6.5s-chat", capabilities: ["text"] },
+      { label: "MiniMax M3", value: "MiniMax-M3", capabilities: ["text", "tool_calling"] },
     ],
   },
   {
@@ -138,16 +146,21 @@ const PROVIDERS: ProviderPreset[] = [
     apiProtocol: "openai_compatible",
     quotaScope: "relay-account",
     capabilities: ["text", "tool_calling", "structured_output"],
+    concurrencyHelp: "中转站可能混合多个上游模型。请按中转站后台或 CC-Switch 显示的模型、Base URL、协议和限流填写；未知时先设并发 1。",
     modelEntryMode: "freeform",
     modelHelp: "中转站通常会混合多个厂商模型，请填写中转站后台显示的完整模型 ID。",
     models: [
-      { label: "DeepSeek Chat", value: "deepseek-chat", capabilities: ["text", "tool_calling"] },
-      { label: "DeepSeek Reasoner", value: "deepseek-reasoner", capabilities: ["text"] },
-      { label: "Kimi K2 Turbo Preview", value: "kimi-k2-turbo-preview", capabilities: ["text", "tool_calling"] },
-      { label: "Qwen Plus", value: "qwen-plus", capabilities: ["text", "tool_calling"] },
-      { label: "Claude Sonnet 4", value: "claude-sonnet-4-20250514", capabilities: ["text", "tool_calling"] },
+      { label: "DeepSeek V4 Flash", value: "deepseek-v4-flash", capabilities: ["text", "tool_calling"] },
+      { label: "DeepSeek V4 Pro", value: "deepseek-v4-pro", capabilities: ["text", "tool_calling"] },
+      { label: "Kimi K2.6", value: "kimi-k2.6", capabilities: ["text", "tool_calling"] },
+      { label: "Kimi K2.7 Code", value: "kimi-k2.7-code", capabilities: ["text", "tool_calling"] },
+      { label: "Qwen3.8 Max Preview", value: "qwen3.8-max-preview", capabilities: ["text", "tool_calling"] },
+      { label: "Qwen3.7 Max", value: "qwen3.7-max", capabilities: ["text", "tool_calling"] },
+      { label: "Claude Sonnet 5", value: "claude-sonnet-5", capabilities: ["text", "tool_calling"] },
+      { label: "Claude Fable 5", value: "claude-fable-5", capabilities: ["text", "tool_calling"] },
+      { label: "Claude Sonnet 4.6", value: "claude-sonnet-4-6", capabilities: ["text", "tool_calling"] },
       { label: "GPT-5.6 Terra", value: "gpt-5.6-terra", capabilities: ["text", "tool_calling", "structured_output"] },
-      { label: "MiniMax M1", value: "minimax-m1", capabilities: ["text"] },
+      { label: "MiniMax M3", value: "MiniMax-M3", capabilities: ["text", "tool_calling"] },
     ],
   },
   {
@@ -157,12 +170,14 @@ const PROVIDERS: ProviderPreset[] = [
     apiProtocol: "anthropic_messages",
     quotaScope: "claude-code-relay-account",
     capabilities: ["text", "tool_calling"],
+    concurrencyHelp: "Claude Code API 中转站通常遵循 Anthropic Messages 请求格式，但限流由中转站决定；未知时先设并发 1。",
     modelEntryMode: "freeform",
     modelHelp: "如果中转站遵守 CC-Switch / Claude Code 的 Anthropic Messages 规则，请选择此项并填写后台给出的模型 ID。",
     models: [
       { label: "Claude Sonnet 4.6", value: "claude-sonnet-4-6", capabilities: ["text", "tool_calling"] },
-      { label: "Claude Sonnet 4", value: "claude-sonnet-4-20250514", capabilities: ["text", "tool_calling"] },
-      { label: "Claude Opus 4", value: "claude-opus-4-20250514", capabilities: ["text", "tool_calling"] },
+      { label: "Claude Sonnet 5", value: "claude-sonnet-5", capabilities: ["text", "tool_calling"] },
+      { label: "Claude Fable 5", value: "claude-fable-5", capabilities: ["text", "tool_calling"] },
+      { label: "Claude Opus 5", value: "claude-opus-5", capabilities: ["text", "tool_calling"] },
     ],
   },
 ];
@@ -250,6 +265,7 @@ export function ModelsPage() {
   const [rpm, setRpm] = useState("60");
   const [tpm, setTpm] = useState("100000");
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
+  const [editingModel, setEditingModel] = useState<ModelDeployment | null>(null);
 
   const selectedProviderPreset = useMemo(
     () => PROVIDERS.find((item) => item.value === provider),
@@ -265,15 +281,19 @@ export function ModelsPage() {
     mutationFn: async () => {
       const resolvedProvider = isCustomProvider ? customProvider.trim() : provider;
       const resolvedModel = isCustomModel ? customModel.trim() : selectedModel;
-      const secret = await api.createSecret(`${logicalModel.trim()} ${resolvedProvider}`, apiKey);
-      const model = await api.createModel({
+      const credentialRef =
+        apiKey.trim() !== ""
+          ? (await api.createSecret(`${logicalModel.trim()} ${resolvedProvider}`, apiKey)).ref
+          : editingModel?.credential_ref;
+      if (!credentialRef) throw new Error("API Key is required for a new model");
+      const payload = {
         provider: resolvedProvider,
         api_base: normalizeApiBase(apiBase, apiProtocol),
         api_protocol: apiProtocol,
         upstream_model: resolvedModel,
         logical_model: logicalModel.trim(),
         capabilities,
-        credential_ref: secret.ref,
+        credential_ref: credentialRef,
         quota_scope: quotaScope.trim() || `${resolvedProvider}-account`,
         max_concurrency: toPositiveNumber(maxConcurrency, 1),
         target_utilization: 0.8,
@@ -283,12 +303,17 @@ export function ModelsPage() {
         queue_timeout_seconds: 60,
         fallback: null,
         weight: 100,
-      });
-      return { model, secret };
+      };
+      const model =
+        editingModel === null
+          ? await api.createModel(payload)
+          : await api.updateModel(editingModel.id, payload);
+      return { model, credentialRef };
     },
-    onSuccess: async ({ secret }) => {
-      setSaveMessage(`模型已通过可用性测试并保存，Key 引用：${secret.ref}`);
+    onSuccess: async ({ credentialRef }) => {
+      setSaveMessage(`模型已通过可用性测试并${editingModel ? "更新" : "保存"}，Key 引用：${credentialRef}`);
       setApiKey("");
+      setEditingModel(null);
       await queryClient.invalidateQueries({ queryKey: ["models"] });
     },
     onError: async () => {
@@ -314,6 +339,9 @@ export function ModelsPage() {
       setApiProtocol("openai_compatible");
       setQuotaScope("");
       setCapabilities(["text"]);
+      setMaxConcurrency("1");
+      setRpm("60");
+      setTpm("100000");
       return;
     }
     const preset = PROVIDERS.find((item) => item.value === nextProvider) ?? PROVIDERS[0];
@@ -324,6 +352,9 @@ export function ModelsPage() {
     setApiProtocol(preset.apiProtocol);
     setQuotaScope(preset.quotaScope);
     setCapabilities(preset.modelEntryMode === "freeform" ? preset.capabilities : defaultModel.capabilities);
+    setMaxConcurrency(String(preset.defaultMaxConcurrency ?? 1));
+    setRpm(String(preset.defaultRpm ?? 60));
+    setTpm(String(preset.defaultTpm ?? 100000));
   }
 
   function changeModel(nextModel: string) {
@@ -335,6 +366,45 @@ export function ModelsPage() {
     }
     const presetModel = modelOptions.find((model) => model.value === nextModel);
     setCapabilities(presetModel?.capabilities ?? selectedProviderPreset?.capabilities ?? ["text"]);
+  }
+
+  function editSavedModel(model: ModelDeployment) {
+    const preset = PROVIDERS.find((item) => item.value === model.provider);
+    setEditingModel(model);
+    setSaveMessage(null);
+    if (preset) {
+      setProvider(preset.value);
+      setCustomProvider("");
+      const presetModel = preset.models.find((item) => item.value === model.upstream_model);
+      if (preset.modelEntryMode === "freeform" || !presetModel) {
+        setSelectedModel(CUSTOM_MODEL);
+        setCustomModel(model.upstream_model);
+      } else {
+        setSelectedModel(presetModel.value);
+        setCustomModel("");
+      }
+      setApiProtocol(preset.apiProtocol);
+    } else {
+      setProvider(CUSTOM_PROVIDER);
+      setCustomProvider(model.provider);
+      setSelectedModel(CUSTOM_MODEL);
+      setCustomModel(model.upstream_model);
+      setApiProtocol(model.api_protocol);
+    }
+    setApiBase(model.api_base);
+    setLogicalModel(model.logical_model);
+    setQuotaScope(model.quota_scope);
+    setCapabilities(model.capabilities);
+    setMaxConcurrency(String(model.max_concurrency));
+    setRpm(model.rpm === null ? "" : String(model.rpm));
+    setTpm(model.tpm === null ? "" : String(model.tpm));
+    setApiKey("");
+  }
+
+  function cancelEdit() {
+    setEditingModel(null);
+    setSaveMessage(null);
+    setApiKey("");
   }
 
   function toggleCapability(capability: string) {
@@ -359,7 +429,7 @@ export function ModelsPage() {
   const savedModels = models.data ?? [];
   const protocolHint =
     apiProtocol === "anthropic_messages"
-      ? "Claude Code API 管理工具（例如 CC-Switch）里如果显示的是 Anthropic Messages 兼容接口，请把它的根域名、/v1 或完整 /v1/messages 填到这里；保存前会统一为 /v1/messages。"
+      ? "Claude Code API 管理工具（例如 CC-Switch）如果显示 Anthropic Messages 兼容接口，请填写根域名、/v1 或完整 /v1/messages；保存前会统一成 /v1/messages。"
       : "OpenAI-compatible 聚合 API 通常填写根域名或 /v1；如果粘贴 /v1/chat/completions，保存前会自动修正为 /v1。";
 
   return (
@@ -374,7 +444,7 @@ export function ModelsPage() {
         <div className="detail-grid">
           <div>
             <span className="eyebrow">服务商 / 模型</span>
-            <p>普通服务商会显示对应模型；中转站是混合模型池，直接填写中转站后台给出的完整模型 ID。</p>
+            <p>普通服务商只显示其下属模型；中转站是混合模型池，请直接填写中转站后台给出的完整模型 ID。</p>
           </div>
           <div>
             <span className="eyebrow">API Base / Key</span>
@@ -382,7 +452,7 @@ export function ModelsPage() {
           </div>
           <div>
             <span className="eyebrow">逻辑模型名</span>
-            <p>Agent 只引用逻辑模型名，例如 main、planner、critic；以后换供应商不需要改角色配置。</p>
+            <p>Agent 只引用逻辑模型名，例如 main、planner、critic；以后更换供应商时不需要改角色配置。</p>
           </div>
           <div>
             <span className="eyebrow">并发与限流</span>
@@ -391,8 +461,14 @@ export function ModelsPage() {
         </div>
       </article>
 
-      <form onSubmit={submit} aria-label="添加模型配置">
-        <h3>添加模型配置</h3>
+      <form onSubmit={submit} aria-label="添加或编辑模型配置">
+        <h3>{editingModel ? "编辑模型配置" : "添加模型配置"}</h3>
+        {editingModel ? (
+          <p className="field-hint">
+            正在编辑已保存模型：{editingModel.logical_model} / {editingModel.upstream_model}。不填写新 API Key
+            时会复用原 Key 引用；填写新 Key 会替换并重新测试。
+          </p>
+        ) : null}
         <p>选择服务商后，普通服务商只显示其下属模型；中转站支持直接输入任意上游模型名，并会照常做 API 可用性测试。</p>
 
         <label htmlFor="provider">服务商</label>
@@ -496,7 +572,7 @@ export function ModelsPage() {
           value={apiKey}
           onChange={(event) => setApiKey(event.target.value)}
           placeholder="sk-..."
-          required
+          required={!editingModel}
         />
 
         <label htmlFor="logical-model">逻辑模型名</label>
@@ -539,6 +615,10 @@ export function ModelsPage() {
           onChange={(event) => setMaxConcurrency(event.target.value)}
           required
         />
+        <p className="field-hint">
+          {selectedProviderPreset?.concurrencyHelp ??
+            "自定义服务商未提供官方预设；请查服务商控制台，或从并发 1 开始测试。"}
+        </p>
 
         <label htmlFor="rpm">RPM</label>
         <input id="rpm" type="number" min="1" value={rpm} onChange={(event) => setRpm(event.target.value)} />
@@ -547,8 +627,13 @@ export function ModelsPage() {
         <input id="tpm" type="number" min="1" value={tpm} onChange={(event) => setTpm(event.target.value)} />
 
         <button type="submit" disabled={saveModel.isPending}>
-          {saveModel.isPending ? "测试并保存中..." : "测试并保存模型"}
+          {saveModel.isPending ? "测试并保存中..." : editingModel ? "测试并更新模型" : "测试并保存模型"}
         </button>
+        {editingModel ? (
+          <button type="button" onClick={cancelEdit} disabled={saveModel.isPending}>
+            取消编辑
+          </button>
+        ) : null}
         {saveMessage ? <p role="status">{saveMessage}</p> : null}
         {saveModel.isError ? (
           <div role="alert">
@@ -613,6 +698,9 @@ export function ModelsPage() {
                   </td>
                   <td>{model.quota_scope}</td>
                   <td>
+                    <button type="button" data-testid={`edit-model-${model.id}`} onClick={() => editSavedModel(model)}>
+                      编辑模型
+                    </button>
                     <button
                       type="button"
                       data-testid={`delete-model-${model.id}`}
@@ -633,3 +721,4 @@ export function ModelsPage() {
     </section>
   );
 }
+

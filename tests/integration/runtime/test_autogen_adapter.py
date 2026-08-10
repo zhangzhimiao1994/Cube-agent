@@ -252,11 +252,18 @@ async def test_consensus_requires_distinct_participants() -> None:
     assert len(terminal_events(events)) == 1
 
 
-async def test_unpriced_usage_fails_closed() -> None:
-    gateway = ScriptedGateway([("analyst", 1, None)])
+async def test_unpriced_but_token_accounted_usage_does_not_block_discussion() -> None:
+    gateway = ScriptedGateway(
+        [
+            ("analyst", 1, None),
+            ("critic", 1, None),
+            ("analyst again", 1, None),
+            ("critic again", 1, None),
+        ]
+    )
     events = await collect(AutoGenDiscussionRuntime(gateway, plan()), context())
-    assert events[-1].kind is EventKind.RUNTIME_FAILED
-    assert events[-1].reason == "unaccounted_usage"
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].reason == "turn_limit"
     assert len(terminal_events(events)) == 1
 
 

@@ -91,7 +91,7 @@ describe("ConfigPage", () => {
             document: {
               models: {
                 main: {
-                  deployments: [{ provider: "deepseek", model: "deepseek-chat" }],
+                  deployments: [{ provider: "deepseek", model: "deepseek-v4-flash" }],
                 },
               },
               agents: [],

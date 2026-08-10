@@ -15,6 +15,10 @@ def test_generated_secrets_use_agent_hub_prefixed_application_environment() -> N
     assert "AGENT_HUB_REDIS_URL=" in secrets
     assert "AGENT_HUB_JWT_SIGNING_KEY=base64url:" in secrets
     assert "AGENT_HUB_MASTER_KEY=" in secrets
+    assert "AGENT_HUB_RUNTIME_TIMEOUT_SECONDS=" in secrets
+    assert "AGENT_HUB_RUNTIME_TOKEN_BUDGET=" in secrets
+    assert "normalize_secret_file_format" in secrets
+    assert "ensure_numeric_secret_default" in secrets
     assert "AGENT_HUB_SECRET_KEY=" not in secrets
 
 
@@ -23,8 +27,9 @@ def test_generated_secrets_do_not_create_divergent_jwt_keys() -> None:
 
     assert 'jwt_signing_key="$(rand_secret)"' in secrets
     assert 'AGENT_HUB_JWT_SIGNING_KEY=base64url:%s\\n\' "$jwt_signing_key"' in secrets
-    assert 'JWT_SIGNING_KEY=base64url:%s\\n\' "$jwt_signing_key"' in secrets
-    assert secrets.count("JWT_SIGNING_KEY=base64url:%s") == 2
+    assert "\n    printf 'JWT_SIGNING_KEY=base64url:%s\\n' \"$jwt_signing_key\"" not in secrets
+    assert "sanitize_legacy_secrets" in secrets
+    assert secrets.count("JWT_SIGNING_KEY=base64url:%s") == 1
 
 
 def test_docker_install_overrides_container_internal_service_urls() -> None:
@@ -38,6 +43,8 @@ def test_docker_install_overrides_container_internal_service_urls() -> None:
     assert "@127.0.0.1:5432" not in installer
     assert "AGENT_HUB_LITELLM_HEALTH_URL" in installer
     assert "http://litellm:4000/health/liveliness" in installer
+    assert 'set_env_value "$INSTALL_ROOT/compose/.env" \\\n    DATABASE_URL' not in installer
+    assert 'set_env_value "$INSTALL_ROOT/compose/.env" REDIS_URL' not in installer
 
 
 def test_docker_install_prefers_china_mirrors_unless_official_mode() -> None:
@@ -101,6 +108,8 @@ def test_compose_and_native_litellm_use_config_file() -> None:
     assert "--config /etc/agent-hub/litellm.yaml" in native_service
     assert "write_litellm_config" in docker_installer
     assert "write_litellm_config" in native_installer
+    assert 'chown root:agent-hub "$CONFIG_DIR"' in native_installer
+    assert 'chmod 0750 "$CONFIG_DIR"' in native_installer
 
 
 def test_native_litellm_proxy_uses_isolated_verified_virtualenv() -> None:
@@ -144,6 +153,8 @@ def test_compose_env_example_uses_prefixed_application_environment() -> None:
     assert "AGENT_HUB_JWT_SIGNING_KEY=" in example
     assert "AGENT_HUB_MASTER_KEY=" in example
     assert "AGENT_HUB_LITELLM_HEALTH_URL=http://litellm:4000/health/liveliness" in example
+    assert "AGENT_HUB_RUNTIME_TIMEOUT_SECONDS=300" in example
+    assert "AGENT_HUB_RUNTIME_TOKEN_BUDGET=1000000" in example
     assert "\nDATABASE_URL=" not in f"\n{example}"
     assert "\nJWT_SIGNING_KEY=" not in f"\n{example}"
     assert "${POSTGRES_PASSWORD}" not in example

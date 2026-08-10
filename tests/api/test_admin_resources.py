@@ -260,6 +260,46 @@ def test_mode_error_log_explains_legacy_generic_gateway_reason() -> None:
     assert "rerun" in log.details["diagnosis"].lower()
 
 
+def test_mode_error_log_prefers_specific_step_reason_over_generic_terminal() -> None:
+    response = RunDetailResponse(
+        id=uuid4(),
+        status="failed",
+        mode="dispatch",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="hello",
+        events=[
+            RunEventResponse(
+                sequence=3,
+                kind="runtime.failed",
+                message="dispatch execution failed",
+                created_at=datetime.now(UTC),
+            ),
+            RunEventResponse(
+                sequence=2,
+                kind="step.failed",
+                message="CrewAI step execution failed: agent identifier must be a safe identifier",
+                created_at=datetime.now(UTC),
+            ),
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    log = _mode_error_log_from_run(response)
+
+    assert (
+        log.message
+        == "dispatch run failed: CrewAI step execution failed: agent identifier must be a safe identifier"
+    )
+    assert (
+        log.details["reason"]
+        == "CrewAI step execution failed: agent identifier must be a safe identifier"
+    )
+    assert "diagnosis" not in log.details
+
+
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
 ACTOR_ID = UUID("11111111-1111-4111-8111-111111111111")
 SECRET_ID = UUID("22222222-2222-4222-8222-222222222222")
@@ -967,6 +1007,77 @@ async def test_persistent_admin_normalizes_openai_compatible_root_api_base() -> 
         cast(dict[str, object], configs.current.document["models"])["main"],
     )["deployments"]
     assert cast(list[dict[str, object]], deployment)[0]["api_base"] == "https://gsykj.com/v1"
+
+
+@pytest.mark.asyncio
+async def test_persistent_admin_updates_existing_model_and_rechecks_availability() -> None:
+    configs = FakeConfigService()
+    secrets = FakeSecretService()
+    transport = FakeModelTransport()
+    service = PersistentAdminResourceService(
+        config_service=configs,  # type: ignore[arg-type]
+        secret_service=secrets,  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        model_transport=transport,
+    )
+
+    created = await service.create_model(
+        ModelDeploymentRequest(
+            provider="deepseek",
+            api_base="https://api.deepseek.com/v1",
+            upstream_model="deepseek-chat",
+            logical_model="main",
+            capabilities=["text"],
+            credential_ref=f"secret://{SECRET_ID}",
+            quota_scope="deepseek-account",
+            max_concurrency=1,
+            target_utilization=0.8,
+        )
+    )
+
+    updated = await service.update_model(
+        created.id,
+        ModelDeploymentRequest(
+            provider="openai-compatible",
+            api_base="https://gsykj.com",
+            upstream_model="deepseek-v4-flash",
+            logical_model="planner",
+            capabilities=["text", "tool_calling"],
+            credential_ref=f"secret://{SECRET_ID}",
+            quota_scope="relay-account",
+            max_concurrency=4,
+            target_utilization=0.8,
+            rpm=120,
+            tpm=200000,
+        ),
+    )
+
+    assert updated.logical_model == "planner"
+    assert updated.provider == "openai-compatible"
+    assert updated.api_base == "https://gsykj.com/v1"
+    assert updated.max_concurrency == 4
+    assert len(transport.calls) == 2
+    assert configs.current is not None
+    assert configs.current.document["models"] == {
+        "planner": {
+            "deployments": [
+                {
+                    "provider": "openai-compatible",
+                    "model": "deepseek-v4-flash",
+                    "api_base": "https://gsykj.com/v1",
+                    "credential_ref": f"secret://{SECRET_ID}",
+                    "quota_scope_id": "relay-account",
+                    "max_concurrency": 4,
+                    "target_utilization": 0.8,
+                    "reserved_slots": 0,
+                    "rpm": 120,
+                    "tpm": 200000,
+                    "capabilities": ["text", "tool_calling"],
+                }
+            ]
+        }
+    }
 
 
 @pytest.mark.asyncio

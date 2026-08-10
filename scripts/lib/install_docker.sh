@@ -92,10 +92,6 @@ install_docker_mode() {
   set_env_value "$INSTALL_ROOT/compose/.env" \
     AGENT_HUB_LITELLM_HEALTH_URL \
     "http://litellm:4000/health/liveliness"
-  set_env_value "$INSTALL_ROOT/compose/.env" \
-    DATABASE_URL \
-    "postgresql+asyncpg://agent_hub:${postgres_password}@postgres:5432/agent_hub"
-  set_env_value "$INSTALL_ROOT/compose/.env" REDIS_URL "redis://redis:6379/0"
   configure_docker_build_mirrors
 
   if [[ "${AGENT_HUB_MIRROR_MODE:-auto}" != "official" ]]; then

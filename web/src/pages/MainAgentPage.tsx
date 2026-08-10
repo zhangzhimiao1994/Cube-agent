@@ -16,6 +16,7 @@ type ProviderPreset = {
   apiBase: string;
   apiProtocol: ApiProtocol;
   capabilities: string[];
+  concurrencyHelp?: string;
   label: string;
   modelEntryMode?: "catalog" | "freeform";
   modelHelp?: string;
@@ -37,6 +38,7 @@ const PROVIDERS: ProviderPreset[] = [
     apiBase: "https://api.openai.com/v1",
     apiProtocol: "openai_compatible",
     capabilities: ["text", "tool_calling", "structured_output"],
+    concurrencyHelp: "OpenAI 官方额度以控制台 Limits 为准；主 Agent 建议选稳定、上下文较强的模型。",
     models: [
       { label: "GPT-5.6 Terra", value: "gpt-5.6-terra", capabilities: ["text", "tool_calling", "structured_output"] },
       { label: "GPT-5.6 Sol", value: "gpt-5.6-sol", capabilities: ["text", "tool_calling", "structured_output"] },
@@ -48,9 +50,10 @@ const PROVIDERS: ProviderPreset[] = [
     apiBase: "https://api.deepseek.com/v1",
     apiProtocol: "openai_compatible",
     capabilities: ["text", "tool_calling"],
+    concurrencyHelp: "DeepSeek 官方文档给出账号级并发：deepseek-v4-pro 500、deepseek-v4-flash 2500；主 Agent 仍建议控制并发和成本。",
     models: [
-      { label: "DeepSeek Chat", value: "deepseek-chat", capabilities: ["text", "tool_calling"] },
-      { label: "DeepSeek Reasoner", value: "deepseek-reasoner", capabilities: ["text"] },
+      { label: "DeepSeek V4 Flash", value: "deepseek-v4-flash", capabilities: ["text", "tool_calling"] },
+      { label: "DeepSeek V4 Pro", value: "deepseek-v4-pro", capabilities: ["text", "tool_calling"] },
     ],
   },
   {
@@ -59,11 +62,12 @@ const PROVIDERS: ProviderPreset[] = [
     apiBase: "https://api.anthropic.com/v1/messages",
     apiProtocol: "anthropic_messages",
     capabilities: ["text", "tool_calling"],
+    concurrencyHelp: "Anthropic/Claude 额度以组织或中转站后台为准；Claude Code 中转请确认 Anthropic Messages 协议。",
     models: [
+      { label: "Claude Code / Claude Sonnet 5", value: "claude-sonnet-5", capabilities: ["text", "tool_calling"] },
+      { label: "Claude Code / Claude Fable 5", value: "claude-fable-5", capabilities: ["text", "tool_calling"] },
       { label: "Claude Code / Claude Sonnet 4.6", value: "claude-sonnet-4-6", capabilities: ["text", "tool_calling"] },
-      { label: "Claude Code / Claude Sonnet 4", value: "claude-sonnet-4-20250514", capabilities: ["text", "tool_calling"] },
-      { label: "Claude Opus 4", value: "claude-opus-4-20250514", capabilities: ["text", "tool_calling"] },
-      { label: "Claude 3.5 Haiku", value: "claude-3-5-haiku-20241022", capabilities: ["text"] },
+      { label: "Claude Opus 5", value: "claude-opus-5", capabilities: ["text", "tool_calling"] },
     ],
   },
   {
@@ -72,9 +76,32 @@ const PROVIDERS: ProviderPreset[] = [
     apiBase: "https://api.moonshot.cn/v1",
     apiProtocol: "openai_compatible",
     capabilities: ["text", "tool_calling"],
+    concurrencyHelp: "Kimi 限流按用户级共享，具体额度以控制台和 429 返回为准。",
     models: [
-      { label: "Kimi K2 Turbo Preview", value: "kimi-k2-turbo-preview", capabilities: ["text", "tool_calling"] },
-      { label: "Moonshot v1 128K", value: "moonshot-v1-128k", capabilities: ["text"] },
+      { label: "Kimi K2.6", value: "kimi-k2.6", capabilities: ["text", "tool_calling"] },
+      { label: "Kimi K2.5", value: "kimi-k2.5", capabilities: ["text", "tool_calling"] },
+      { label: "Kimi K2.7 Code", value: "kimi-k2.7-code", capabilities: ["text", "tool_calling"] },
+    ],
+  },
+  {
+    label: "阿里百炼 Token Plan / Qwen Code",
+    value: "qwen-token-plan",
+    apiBase: "",
+    apiProtocol: "openai_compatible",
+    capabilities: ["text", "tool_calling"],
+    concurrencyHelp: "Token Plan 请使用控制台“我的订阅 / API Key”里的专属 Base URL；并发 Agent 参考：Lite 1-2、Standard 3-4、Pro 6-8。",
+    modelEntryMode: "freeform",
+    modelHelp: "Token Plan 的 Base URL 不是普通 DashScope /compatible-mode/v1；请复制专属 Base URL。模型名可选官方推荐，也可以填写控制台最新 Model ID。",
+    models: [
+      { label: "Qwen3.8 Max Preview", value: "qwen3.8-max-preview", capabilities: ["text", "tool_calling"] },
+      { label: "Qwen3.7 Max", value: "qwen3.7-max", capabilities: ["text", "tool_calling"] },
+      { label: "Qwen3.7 Plus", value: "qwen3.7-plus", capabilities: ["text", "tool_calling"] },
+      { label: "Qwen3.6 Plus", value: "qwen3.6-plus", capabilities: ["text", "tool_calling"] },
+      { label: "Qwen3.6 Flash", value: "qwen3.6-flash", capabilities: ["text", "tool_calling"] },
+      { label: "Kimi K2.7 Code", value: "kimi-k2.7-code", capabilities: ["text", "tool_calling"] },
+      { label: "Kimi K2.6", value: "kimi-k2.6", capabilities: ["text", "tool_calling"] },
+      { label: "DeepSeek V4 Flash", value: "deepseek-v4-flash", capabilities: ["text", "tool_calling"] },
+      { label: "MiniMax M2.5", value: "MiniMax-M2.5", capabilities: ["text", "tool_calling"] },
     ],
   },
   {
@@ -83,10 +110,12 @@ const PROVIDERS: ProviderPreset[] = [
     apiBase: "https://dashscope.aliyuncs.com/compatible-mode/v1",
     apiProtocol: "openai_compatible",
     capabilities: ["text", "tool_calling"],
+    concurrencyHelp: "DashScope/Qwen 额度因模型和接口不同，请以百炼控制台 QPS/RPM/TPM 配额为准。",
     models: [
-      { label: "Qwen Plus", value: "qwen-plus", capabilities: ["text", "tool_calling"] },
-      { label: "Qwen Max", value: "qwen-max", capabilities: ["text", "tool_calling"] },
-      { label: "Qwen Turbo", value: "qwen-turbo", capabilities: ["text", "tool_calling"] },
+      { label: "Qwen3.7 Max", value: "qwen3.7-max", capabilities: ["text", "tool_calling"] },
+      { label: "Qwen3 Max", value: "qwen3-max", capabilities: ["text", "tool_calling"] },
+      { label: "Qwen3 Max Preview", value: "qwen3-max-preview", capabilities: ["text", "tool_calling"] },
+      { label: "Qwen3 Coder Plus", value: "qwen3-coder-plus", capabilities: ["text", "tool_calling"] },
     ],
   },
   {
@@ -95,9 +124,9 @@ const PROVIDERS: ProviderPreset[] = [
     apiBase: "https://api.minimax.chat/v1",
     apiProtocol: "openai_compatible",
     capabilities: ["text"],
+    concurrencyHelp: "MiniMax 官方主要公开 RPM/TPM；文本接口常见 500 RPM、20,000,000 TPM，具体以账号额度为准。",
     models: [
-      { label: "MiniMax M1", value: "minimax-m1", capabilities: ["text"] },
-      { label: "abab6.5s-chat", value: "abab6.5s-chat", capabilities: ["text"] },
+      { label: "MiniMax M3", value: "MiniMax-M3", capabilities: ["text", "tool_calling"] },
     ],
   },
   {
@@ -106,15 +135,21 @@ const PROVIDERS: ProviderPreset[] = [
     apiBase: "",
     apiProtocol: "openai_compatible",
     capabilities: ["text", "tool_calling", "structured_output"],
+    concurrencyHelp: "中转站限流由中转站决定；如果 CC-Switch 能用，请按它显示的 Base URL、模型 ID 和协议配置。",
     modelEntryMode: "freeform",
     modelHelp: "中转站通常会混合多个厂商模型，请填写中转站后台显示的完整模型 ID。",
     models: [
-      { label: "DeepSeek Chat", value: "deepseek-chat", capabilities: ["text", "tool_calling"] },
-      { label: "Kimi K2 Turbo Preview", value: "kimi-k2-turbo-preview", capabilities: ["text", "tool_calling"] },
-      { label: "Qwen Plus", value: "qwen-plus", capabilities: ["text", "tool_calling"] },
-      { label: "Claude Sonnet 4", value: "claude-sonnet-4-20250514", capabilities: ["text", "tool_calling"] },
+      { label: "DeepSeek V4 Flash", value: "deepseek-v4-flash", capabilities: ["text", "tool_calling"] },
+      { label: "DeepSeek V4 Pro", value: "deepseek-v4-pro", capabilities: ["text", "tool_calling"] },
+      { label: "Kimi K2.6", value: "kimi-k2.6", capabilities: ["text", "tool_calling"] },
+      { label: "Kimi K2.7 Code", value: "kimi-k2.7-code", capabilities: ["text", "tool_calling"] },
+      { label: "Qwen3.8 Max Preview", value: "qwen3.8-max-preview", capabilities: ["text", "tool_calling"] },
+      { label: "Qwen3.7 Max", value: "qwen3.7-max", capabilities: ["text", "tool_calling"] },
+      { label: "Claude Sonnet 5", value: "claude-sonnet-5", capabilities: ["text", "tool_calling"] },
+      { label: "Claude Fable 5", value: "claude-fable-5", capabilities: ["text", "tool_calling"] },
+      { label: "Claude Sonnet 4.6", value: "claude-sonnet-4-6", capabilities: ["text", "tool_calling"] },
       { label: "GPT-5.6 Terra", value: "gpt-5.6-terra", capabilities: ["text", "tool_calling", "structured_output"] },
-      { label: "MiniMax M1", value: "minimax-m1", capabilities: ["text"] },
+      { label: "MiniMax M3", value: "MiniMax-M3", capabilities: ["text", "tool_calling"] },
     ],
   },
   {
@@ -123,12 +158,14 @@ const PROVIDERS: ProviderPreset[] = [
     apiBase: "",
     apiProtocol: "anthropic_messages",
     capabilities: ["text", "tool_calling"],
+    concurrencyHelp: "Claude Code API 中转站通常使用 Anthropic Messages；并发/限流以中转后台为准。",
     modelEntryMode: "freeform",
     modelHelp: "如果中转站遵守 CC-Switch / Claude Code 的 Anthropic Messages 规则，请选择此项并填写后台给出的模型 ID。",
     models: [
       { label: "Claude Sonnet 4.6", value: "claude-sonnet-4-6", capabilities: ["text", "tool_calling"] },
-      { label: "Claude Sonnet 4", value: "claude-sonnet-4-20250514", capabilities: ["text", "tool_calling"] },
-      { label: "Claude Opus 4", value: "claude-opus-4-20250514", capabilities: ["text", "tool_calling"] },
+      { label: "Claude Sonnet 5", value: "claude-sonnet-5", capabilities: ["text", "tool_calling"] },
+      { label: "Claude Fable 5", value: "claude-fable-5", capabilities: ["text", "tool_calling"] },
+      { label: "Claude Opus 5", value: "claude-opus-5", capabilities: ["text", "tool_calling"] },
     ],
   },
 ];
@@ -496,6 +533,10 @@ export function MainAgentPage() {
               required
             />
           </label>
+          <p className="field-hint">
+            {selectedProviderPreset?.concurrencyHelp ??
+              "自定义服务商未提供官方预设；请以服务商控制台或中转站后台限流说明为准。"}
+          </p>
 
           <label htmlFor="main-agent-api-key">
             API Key（可选，保存后不回显）

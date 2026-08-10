@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import importlib
 import json
+import logging
 import os
 import re
 import sys
@@ -54,10 +55,13 @@ from agent_hub.runtime.contracts import (
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 from agent_hub.runtime.failure_reason import safe_runtime_failure_reason
 
+_LOGGER = logging.getLogger(__name__)
+
 _RUNTIME_TYPE = "crew"
 _RUNTIME_VERSION = "7"
 _MAX_CHECKPOINT_ARTIFACTS = 16_384
 _MAX_PROMPT_BYTES = 196_608
+_MAX_SOURCE_ARTIFACT_TEXT_BYTES = 8_192
 _MAX_OUTPUT_BYTES = 65_536
 _MAX_TOOL_ROUNDS = 8
 _MAX_TOOL_CALLS_PER_RESPONSE = 16
@@ -192,12 +196,58 @@ def _call_in_crewai_scope(storage_path: Path, callback: Any, *args: object) -> A
             del _CREWAI_INVOCATION_THREAD.depth
 
 
+def _default_crewai_storage_dir() -> Path:
+    configured = os.environ.get("AGENT_HUB_CREWAI_STORAGE_DIR")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return Path("/var/lib/agent-hub/crewai").resolve()
+
+
 def _mutable_json(value: object) -> object:
     if isinstance(value, Mapping):
         return {key: _mutable_json(item) for key, item in value.items()}
     if isinstance(value, tuple):
         return [_mutable_json(item) for item in value]
     return value
+
+
+def _truncate_prompt_text(value: str, *, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    suffix = f"\n\n[truncated: original_bytes={len(encoded)}]"
+    suffix_bytes = suffix.encode("utf-8")
+    if max_bytes <= len(suffix_bytes):
+        return suffix_bytes[:max_bytes].decode("utf-8", errors="ignore")
+    prefix = encoded[: max_bytes - len(suffix_bytes)].decode("utf-8", errors="ignore")
+    return f"{prefix}{suffix}"
+
+
+def _bounded_prompt_json(value: object, *, max_text_bytes: int) -> object:
+    if isinstance(value, Mapping):
+        return {
+            key: _bounded_prompt_json(item, max_text_bytes=max_text_bytes)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple | list):
+        return [
+            _bounded_prompt_json(item, max_text_bytes=max_text_bytes) for item in value
+        ]
+    if type(value) is str:
+        return _truncate_prompt_text(value, max_bytes=max_text_bytes)
+    return value
+
+
+def _artifact_prompt_payload(
+    artifact: Artifact,
+    *,
+    max_text_bytes: int = _MAX_SOURCE_ARTIFACT_TEXT_BYTES,
+) -> dict[str, object]:
+    payload = artifact.to_payload()
+    payload["content"] = _bounded_prompt_json(
+        artifact.content, max_text_bytes=max_text_bytes
+    )
+    return payload
 
 
 class RuntimeExecutionError(RuntimeError):
@@ -214,6 +264,11 @@ class RuntimeBusy(RuntimeExecutionError):
 
 def _fail(message: str) -> Never:
     raise RuntimeExecutionError(message) from None
+
+
+def _framework_failure_reason(prefix: str, error: Exception) -> str:
+    reason = safe_runtime_failure_reason(error, fallback=prefix)
+    return prefix if reason == prefix else f"{prefix}: {reason}"
 
 
 class ModelGateway(Protocol):
@@ -435,7 +490,7 @@ class CrewAIObjectFactory:
     """Lazy importer and locked-down builder for the pinned CrewAI runtime."""
 
     def __init__(self, *, storage_dir: Path | None = None) -> None:
-        root = storage_dir or Path.cwd() / ".agent-hub-data" / "crewai"
+        root = storage_dir or _default_crewai_storage_dir()
         self._storage_dir = root.resolve()
 
     def build(
@@ -647,8 +702,9 @@ class CrewDispatchRuntime:
         self._gateway = gateway
         self._plan = plan
         self._capabilities = capability_gateway
-        default_storage = Path.cwd() / ".agent-hub-data" / "crewai"
-        self._factory = crew_factory or CrewAIObjectFactory(storage_dir=default_storage)
+        self._factory = crew_factory or CrewAIObjectFactory(
+            storage_dir=self._default_crewai_storage_dir()
+        )
         self._artifact_repository = (
             artifact_repository if artifact_repository is not None else InMemoryArtifactRepository()
         )
@@ -662,6 +718,10 @@ class CrewDispatchRuntime:
         self._generation = 0
         self._current_token: _RunToken | None = None
         self._cleanup_tasks: set[asyncio.Task[Any]] = set()
+
+    @staticmethod
+    def _default_crewai_storage_dir() -> Path:
+        return _default_crewai_storage_dir()
 
     def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
         context = self._strict_context(context)
@@ -937,7 +997,7 @@ class CrewDispatchRuntime:
                     if not run_open or not self._is_current_run(state):
                         return
                     response_tokens = 0 if response_usage is None else response_usage.total_tokens
-                    response_cost = completion.cost_usd
+                    response_cost = completion.cost_usd if completion.cost_usd is not None else Decimal(0)
                     raw_new_tokens = usage_ledger.tokens + response_tokens
                     raw_step_tokens = usage_ledger.step_tokens.get(step_id, 0) + response_tokens
                     raw_new_cost = usage_ledger.cost_usd + (response_cost or Decimal(0))
@@ -964,9 +1024,7 @@ class CrewDispatchRuntime:
                         or step_cost_overflow
                     ):
                         terminal_phase = "audit_overflow"
-                    elif terminal_phase is None and (
-                        response_usage is None or response_cost is None
-                    ):
+                    elif terminal_phase is None and response_usage is None:
                         terminal_phase = "unaccounted"
                     elif terminal_phase is None and (
                         new_tokens > min(context.token_budget, plan.total_token_budget)
@@ -1546,7 +1604,7 @@ class CrewDispatchRuntime:
         run_state: _RunState,
         step_deadline: float,
     ) -> tuple[GatewayCompletion, tuple[Artifact, ...]]:
-        source_payload = [artifact.to_payload() for artifact in sources]
+        source_payload = [_artifact_prompt_payload(artifact) for artifact in sources]
         user = {
             "request": context.request,
             "task": step.task,
@@ -1604,12 +1662,34 @@ class CrewDispatchRuntime:
             raise
         except RuntimeExecutionError:
             raise
-        except Exception as error:  # noqa: BLE001 - private framework boundary
+        except TimeoutError as error:
+            failure_reason = f"CrewAI step timed out: step={step.id} actor={agent.id}"
+            _LOGGER.warning(
+                "crewai_step_execution_failed step_id=%s agent_id=%s error_type=%s safe_reason=%s",
+                step.id,
+                agent.id,
+                type(error).__name__,
+                failure_reason,
+            )
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None
             del error
-            _fail("CrewAI step execution failed")
+            _fail(failure_reason)
+        except Exception as error:  # noqa: BLE001 - private framework boundary
+            failure_reason = _framework_failure_reason("CrewAI step execution failed", error)
+            _LOGGER.warning(
+                "crewai_step_execution_failed step_id=%s agent_id=%s error_type=%s safe_reason=%s",
+                step.id,
+                agent.id,
+                type(error).__name__,
+                failure_reason,
+            )
+            error.__traceback__ = None
+            error.__context__ = None
+            error.__cause__ = None
+            del error
+            _fail(failure_reason)
         completion = last_completion
         if completion is None:
             _fail("CrewAI bypassed the ModelGateway bridge")

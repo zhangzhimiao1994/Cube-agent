@@ -141,11 +141,10 @@ def test_general_discussion_includes_daily_work_creative_business_and_review_rol
         "marketing_strategist",
         "product_manager",
         "finance_analyst",
-        "legal_compliance_reviewer",
-        "designer",
-        "sales_advisor",
     }.issubset(role_ids)
-    assert len(plan.roles) >= 14
+    assert "legal_compliance_reviewer" not in role_ids
+    assert "sales_advisor" not in role_ids
+    assert len(plan.roles) >= 12
 
 
 def test_general_dispatch_includes_daily_execution_roles() -> None:
@@ -166,11 +165,12 @@ def test_general_dispatch_includes_daily_execution_roles() -> None:
         "content_editor",
         "economic_analyst",
         "finance_analyst",
+        "sales_advisor",
         "operations_coordinator",
-        "legal_compliance_reviewer",
         "quality_reviewer",
     }.issubset(role_ids)
-    assert len(plan.roles) >= 8
+    assert "legal_compliance_reviewer" not in role_ids
+    assert len(plan.roles) >= 10
 
 
 def test_role_catalog_can_be_extended_without_changing_role_planner_code() -> None:
@@ -195,11 +195,32 @@ def test_role_catalog_can_be_extended_without_changing_role_planner_code() -> No
             task="讨论团队招聘方案",
             mode=TaskMode.DISCUSS,
             profile=TaskProfile.GENERAL,
+            requested_skills=("hr",),
         )
     )
 
     assert plan.role("custom_hr_advisor").role == "Custom HR Advisor"
     assert plan.role("custom_hr_advisor").skills == ("hr",)
+
+
+def test_cross_domain_dispatch_can_combine_research_product_and_software_roles() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="Research a product opportunity, define scope, and build a small web prototype.",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.SOFTWARE,
+            profiles=(TaskProfile.SOFTWARE, TaskProfile.RESEARCH, TaskProfile.GENERAL),
+            default_model="main-agent",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "architect" in role_ids
+    assert "implementer" in role_ids
+    assert "product_manager" in role_ids
+    assert "project_manager" in role_ids
+    assert "quality_reviewer" in role_ids
 
 
 def test_unknown_high_risk_role_plan_asks_user_instead_of_guessing() -> None:

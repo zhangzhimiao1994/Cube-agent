@@ -344,6 +344,25 @@ class SecretService:
             raise SecretNotFoundError("secret was not found")
         return self._cipher.open(stored.sealed, context=str(tenant_id))
 
+    async def fingerprint(
+        self, tenant_id: UUID, reference: SecretReference | UUID | str
+    ) -> str:
+        """Return non-secret credential metadata for capacity deduplication.
+
+        The fingerprint is a keyed, tenant-local digest generated when the secret
+        was sealed. It lets the model capacity layer deduplicate shared API keys
+        without decrypting or exposing the key value.
+        """
+
+        secret_id = self._secret_id(tenant_id, reference)
+        async with self._session_factory() as session:
+            stored = await self._repository.get(
+                session, tenant_id=tenant_id, secret_id=secret_id
+            )
+        if stored is None:
+            raise SecretNotFoundError("secret was not found")
+        return stored.sealed.fingerprint
+
     @staticmethod
     def _secret_id(
         tenant_id: UUID, reference: SecretReference | UUID | str

@@ -740,7 +740,7 @@ async def test_completion_cost_is_zero_when_validated_usage_is_missing() -> None
     assert completion.cost_usd is None
 
 
-async def test_missing_pricing_is_unaccounted_but_explicit_free_pricing_is_zero() -> None:
+async def test_missing_pricing_records_zero_cost_when_usage_is_accounted() -> None:
     selected = deployment("selected")
     response = ModelResponse(
         text="ok",
@@ -767,7 +767,7 @@ async def test_missing_pricing_is_unaccounted_but_explicit_free_pricing_is_zero(
         },
     )
 
-    assert (await missing.complete_with_context(request())).cost_usd is None
+    assert (await missing.complete_with_context(request())).cost_usd == Decimal(0)
     assert (await explicitly_free.complete_with_context(request())).cost_usd == Decimal(0)
 
 

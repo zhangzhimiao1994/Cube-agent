@@ -36,6 +36,41 @@ async def test_repository_round_trips_only_inside_tenant_run_scope() -> None:
         await repository.get_many(TENANT_ID, uuid4(), (reference,))
 
 
+async def test_repository_accepts_canonical_uuid_strings_at_runtime_boundaries() -> None:
+    repository = InMemoryArtifactRepository()
+    stored = artifact("safe")
+    reference = ArtifactReference(id=stored.id, sha256=stored.content_sha256)
+
+    await repository.put(str(TENANT_ID), str(RUN_ID), stored)  # type: ignore[arg-type]
+
+    assert await repository.get_many(str(TENANT_ID), str(RUN_ID), (reference,)) == (  # type: ignore[arg-type]
+        stored,
+    )
+    with pytest.raises(ArtifactRepositoryError, match="scope"):
+        await repository.get_many("not-a-uuid", str(RUN_ID), (reference,))  # type: ignore[arg-type]
+
+
+async def test_repository_accepts_uuid_like_database_values_at_runtime_boundaries() -> None:
+    class DatabaseUUID:
+        def __init__(self, value: UUID) -> None:
+            self._value = value
+
+        def __str__(self) -> str:
+            return str(self._value)
+
+    repository = InMemoryArtifactRepository()
+    stored = artifact("safe")
+    reference = ArtifactReference(id=stored.id, sha256=stored.content_sha256)
+
+    await repository.put(DatabaseUUID(TENANT_ID), DatabaseUUID(RUN_ID), stored)  # type: ignore[arg-type]
+
+    assert await repository.get_many(
+        DatabaseUUID(TENANT_ID),  # type: ignore[arg-type]
+        DatabaseUUID(RUN_ID),  # type: ignore[arg-type]
+        (reference,),
+    ) == (stored,)
+
+
 async def test_repository_rejects_hash_mismatch_without_returning_content() -> None:
     repository = InMemoryArtifactRepository()
     stored = artifact("safe")

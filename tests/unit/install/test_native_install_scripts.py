@@ -21,6 +21,22 @@ def test_native_installer_deploys_release_before_starting_services() -> None:
     assert deploy < start
 
 
+def test_native_installer_prunes_old_releases_after_successful_deploy() -> None:
+    script = read("scripts/lib/install_native.sh")
+
+    assert "prune_native_releases" in script
+    assert "AGENT_HUB_RELEASES_TO_KEEP" in script
+    assert "readlink -f \"$INSTALL_ROOT/current\"" in script
+    assert 'resolved_release="$(readlink -f "$release"' in script
+    assert 'case "$resolved_release" in' in script
+    assert '"$INSTALL_ROOT/releases/"*)' in script
+    assert 'rm -rf -- "$resolved_release"' in script
+
+    link_current = script.index('ln -sfn "$release" "$INSTALL_ROOT/current"')
+    prune = script.index("prune_native_releases")
+    assert link_current < prune
+
+
 def test_installer_failure_output_includes_context_and_hints() -> None:
     common = read("scripts/lib/common.sh")
     install = read("install.sh")
@@ -116,8 +132,13 @@ def test_native_installer_starts_local_dependencies_and_writes_runtime_urls() ->
     script = read("scripts/lib/install_native.sh")
     secrets = read("scripts/lib/secrets.sh")
 
-    assert "DATABASE_URL=" in secrets
-    assert "REDIS_URL=" in secrets
+    assert "AGENT_HUB_DATABASE_URL=" in secrets
+    assert "AGENT_HUB_REDIS_URL=" in secrets
+    assert "\nDATABASE_URL=" not in f"\n{secrets}"
+    assert "\nREDIS_URL=" not in f"\n{secrets}"
+    assert "sanitize_legacy_secrets" in secrets
+    assert "DATABASE_URL|REDIS_URL|JWT_SIGNING_KEY|AGENT_HUB_SECRET_KEY" in secrets
+    assert 'database_url="$(native_secret_value AGENT_HUB_DATABASE_URL)"' in script
     assert "systemctl enable --now postgresql" in script
     assert "systemctl enable --now redis" in script
     assert "createdb" in script
@@ -188,6 +209,15 @@ def test_doctor_diagnoses_web_asset_permission_failures() -> None:
     assert "chmod -R a+rX" in doctor
 
 
+def test_doctor_accepts_caddy_owned_public_ports_after_native_install() -> None:
+    doctor = read("scripts/commands/doctor.sh")
+
+    assert "port_available_or_expected_proxy" in doctor
+    assert "systemd_unit_active caddy.service" in doctor
+    assert "port 80 free or served by Caddy" in doctor
+    assert "port 443 free or served by Caddy" in doctor
+
+
 def test_doctor_diagnoses_runtime_services_and_litellm_proxy_environment() -> None:
     doctor = read("scripts/commands/doctor.sh")
 
@@ -200,6 +230,14 @@ def test_doctor_diagnoses_runtime_services_and_litellm_proxy_environment() -> No
     assert "litellm.proxy.proxy_server" in doctor
     assert "journalctl -u agent-hub-litellm" in doctor
     assert "model gateway failed" in doctor
+
+
+def test_doctor_does_not_require_docker_when_native_stack_is_installed() -> None:
+    doctor = read("scripts/commands/doctor.sh")
+
+    assert "docker_available_or_native_installed" in doctor
+    assert "native_stack_installed" in doctor
+    assert "docker available for docker install path" in doctor
 
 
 def test_native_caddy_supports_user_supplied_tls_certificate() -> None:
@@ -260,6 +298,8 @@ def test_native_installer_falls_back_from_locked_uv_sync_to_mirror_pip_install()
     script = read("scripts/lib/install_native.sh")
 
     assert "sync_python_project_with_lock_or_mirror" in script
+    assert "run_with_timeout" in script
+    assert "${AGENT_HUB_UV_SYNC_TIMEOUT_SECONDS:-900}" in script
     assert "uv sync --frozen --no-dev" in script
     assert "uv pip install --python .venv/bin/python" in script
     assert "verify_litellm_proxy_venv" in script

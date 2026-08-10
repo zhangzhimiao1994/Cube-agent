@@ -577,6 +577,13 @@ export const api = {
       ModelDeploymentSchema,
     );
   },
+  updateModel(id: string, payload: Omit<ModelDeployment, "id" | "effective_slots" | "saturation_policy">) {
+    return request(
+      `/api/v1/admin/models/${encodeURIComponent(id)}`,
+      { method: "PUT", body: JSON.stringify(payload) },
+      ModelDeploymentSchema,
+    );
+  },
   async deleteModel(id: string): Promise<void> {
     await requestNoContent(`/api/v1/admin/models/${encodeURIComponent(id)}`, { method: "DELETE" });
   },

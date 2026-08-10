@@ -247,6 +247,26 @@ def test_plan_rejects_unknown_agent_budget_overflow_and_construct_bypass() -> No
         DispatchPlan.revalidate(unsafe)
 
 
+def test_plan_allows_shared_total_token_budget_across_sequential_steps() -> None:
+    plan = DispatchPlan(
+        agents=(agent("x"),),
+        steps=(
+            DispatchStep(id="draft", agent="x", task="Draft", token_budget=100),
+            DispatchStep(
+                id="final",
+                agent="x",
+                task="Final",
+                depends_on=("draft",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=100,
+    )
+
+    assert plan.total_token_budget == 100
+
+
 def test_plan_rejects_aggregate_oversized_text() -> None:
     with pytest.raises(ValidationError, match="size"):
         DispatchPlan(

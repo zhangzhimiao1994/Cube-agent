@@ -61,3 +61,10 @@ def test_safe_runtime_failure_reason_redacts_unknown_sensitive_errors() -> None:
         safe_runtime_failure_reason(RuntimeError("Authorization: Bearer sk-secret failed"))
         == "runtime_failed"
     )
+
+
+def test_safe_runtime_failure_reason_keeps_non_secret_token_diagnostics() -> None:
+    assert (
+        safe_runtime_failure_reason(RuntimeError("max_tokens exceeded provider limit"))
+        == "max_tokens exceeded provider limit"
+    )

@@ -41,7 +41,7 @@ describe("AgentsPage", () => {
               id: "11111111-1111-4111-8111-111111111111",
               provider: "deepseek",
               api_base: "https://api.deepseek.com/v1",
-              upstream_model: "deepseek-chat",
+              upstream_model: "deepseek-v4-flash",
               logical_model: "main",
               capabilities: ["text", "tool_calling"],
               credential_ref: "secret://live",

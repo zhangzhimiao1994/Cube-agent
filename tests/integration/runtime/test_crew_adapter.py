@@ -2286,7 +2286,7 @@ async def test_restored_step_usage_prevents_cost_cap_bypass_without_replay() -> 
     assert exhausted.state["step_usage"] == {"final": {"tokens": 4, "cost_usd": "0.16"}}
 
 
-async def test_unaccounted_gateway_completion_fails_closed_with_audit_checkpoint() -> None:
+async def test_unknown_cost_with_token_usage_does_not_fail_dispatch_accounting() -> None:
     class UnknownCostGateway(FakeGateway):
         async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             completion = await super().complete_with_context(request)
@@ -2320,14 +2320,56 @@ async def test_unaccounted_gateway_completion_fails_closed_with_audit_checkpoint
         total_token_budget=100,
     )
     runtime = make_runtime(UnknownCostGateway(), single_plan)
+    events = await collect(runtime, context())
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    checkpoint = await runtime.save_checkpoint()
+
+    assert checkpoint.state["terminal"] is True
+    assert checkpoint.state["phase"] == "completed"
+    assert checkpoint.state["usage"] == {"tokens": 2, "cost_usd": "0"}
+    assert checkpoint.state["step_usage"] == {"final": {"tokens": 2, "cost_usd": "0"}}
+
+
+async def test_missing_gateway_usage_still_fails_closed_with_audit_checkpoint() -> None:
+    class MissingUsageGateway(FakeGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            completion = await super().complete_with_context(request)
+            return GatewayCompletion(
+                response=ModelResponse(text=completion.response.text, usage=None),
+                deployment_id=completion.deployment_id,
+                logical_model=completion.logical_model,
+                provider_id=completion.provider_id,
+                provider_model=completion.provider_model,
+                cost_usd=Decimal(0),
+            )
+
+    single_plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=100,
+    )
+    runtime = make_runtime(MissingUsageGateway(), single_plan)
     with pytest.raises(RuntimeExecutionError):
         await collect(runtime, context())
     checkpoint = await runtime.save_checkpoint()
 
     assert checkpoint.state["terminal"] is True
     assert checkpoint.state["phase"] == "unaccounted"
-    assert checkpoint.state["usage"] == {"tokens": 2, "cost_usd": "0"}
-    assert checkpoint.state["step_usage"] == {"final": {"tokens": 2, "cost_usd": "0"}}
 
 
 async def test_private_factory_receives_locked_down_framework_generation() -> None:

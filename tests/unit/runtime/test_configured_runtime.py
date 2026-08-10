@@ -4,7 +4,9 @@ from uuid import UUID, uuid4
 
 import pytest
 
+import agent_hub.runtime.defaults as defaults_module
 from agent_hub.config.repository import ConfigRevision, ConfigStatus
+from agent_hub.config.schema import PlatformConfig
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.capacity import CapacityLease
 from agent_hub.models.gateway import CapacityController
@@ -17,6 +19,7 @@ from agent_hub.runtime.defaults import (
     ConfigBackedHybridRuntime,
     UnavailableRuntime,
     _discussion_plan,
+    _dispatch_parallelism,
     _dispatch_plan,
     configured_runtime_registry,
 )
@@ -47,17 +50,24 @@ class FakeConfigService:
 class FakeSecretService:
     def __init__(self) -> None:
         self.resolved: list[tuple[UUID, str]] = []
+        self.fingerprinted: list[tuple[UUID, str]] = []
 
     async def resolve(self, tenant_id: UUID, reference: object) -> str:
         assert isinstance(reference, str)
         self.resolved.append((tenant_id, reference))
         return "sk-live"
 
+    async def fingerprint(self, tenant_id: UUID, reference: object) -> str:
+        assert isinstance(reference, str)
+        self.fingerprinted.append((tenant_id, reference))
+        return "a" * 64
+
 
 class ImmediateCapacity:
     def __init__(self, deployments: tuple[Deployment, ...]) -> None:
         self.deployments = deployments
         self.recorded: list[bool] = []
+        self.wait_timeouts: list[float] = []
 
     async def initialize(self) -> None:
         return None
@@ -72,7 +82,7 @@ class ImmediateCapacity:
         *,
         estimated_tokens: int,
     ) -> CapacityLease:
-        del wait_timeout
+        self.wait_timeouts.append(wait_timeout)
         assert estimated_tokens > 0
         candidate = next(iter(candidates))
         assert isinstance(candidate, Deployment)
@@ -149,7 +159,9 @@ async def test_config_backed_direct_runtime_uses_published_model_and_secret() ->
             }
         ),  # type: ignore[arg-type]
         secret_service=secrets,  # type: ignore[arg-type]
-        capacity_factory=lambda deployments: _remember_capacity(capacities, deployments),
+        capacity_factory=lambda tenant_id, deployments: _remember_capacity(
+            capacities, tenant_id, deployments
+        ),
         transport=transport,
     )
 
@@ -175,6 +187,7 @@ async def test_config_backed_direct_runtime_uses_published_model_and_secret() ->
     assert deployment.provider_model == "deepseek/deepseek-chat"
     assert request.logical_model == "main"
     assert api_key == "sk-live"
+    assert capacities[0].wait_timeouts == [60.0]
     assert secrets.resolved == [
         (TENANT_ID, "secret://22222222-2222-4222-8222-222222222222")
     ]
@@ -186,7 +199,9 @@ async def test_config_backed_direct_runtime_fails_explicitly_without_published_c
     runtime = ConfigBackedDirectRuntime(
         config_service=FakeConfigService(None),  # type: ignore[arg-type]
         secret_service=FakeSecretService(),  # type: ignore[arg-type]
-        capacity_factory=lambda deployments: ImmediateCapacity(deployments),
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id, deployments
+        ),
         transport=FakeTransport(),
     )
 
@@ -207,13 +222,94 @@ async def test_config_backed_direct_runtime_fails_explicitly_without_published_c
     ]
 
 
-def _remember_capacity(
+async def _remember_capacity(
     capacities: list[ImmediateCapacity],
+    tenant_id: UUID,
     deployments: tuple[Deployment, ...],
 ) -> CapacityController:
+    assert tenant_id == TENANT_ID
     capacity = ImmediateCapacity(deployments)
     capacities.append(capacity)
     return capacity
+
+
+async def _immediate_capacity(
+    tenant_id: UUID,
+    deployments: tuple[Deployment, ...],
+) -> CapacityController:
+    assert tenant_id == TENANT_ID
+    return ImmediateCapacity(deployments)
+
+
+@pytest.mark.asyncio
+async def test_configured_runtime_registry_supplies_secret_fingerprints_to_capacity_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[object] = []
+    secret_ref = "secret://33333333-3333-4333-8333-333333333333"
+
+    class SpyCapacityPool(ImmediateCapacity):
+        def __init__(
+            self,
+            redis_client: object,
+            *,
+            deployments: tuple[Deployment, ...],
+            credentials: object | None = None,
+        ) -> None:
+            del redis_client
+            if credentials is None:
+                raise AssertionError("configured runtime must pass credential fingerprints")
+            self.credentials = credentials
+            created.append(self)
+            super().__init__(tuple(deployments))
+
+    monkeypatch.setattr(defaults_module, "CapacityPool", SpyCapacityPool)
+    secrets = FakeSecretService()
+    registry = configured_runtime_registry(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "minimax",
+                                "model": "MiniMax-M3",
+                                "api_base": "https://api.minimax.chat/v1",
+                                "credential_ref": secret_ref,
+                                "quota_scope_id": "minimax_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    }
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=secrets,  # type: ignore[arg-type]
+        redis_client=object(),
+        transport=FakeTransport(),
+    )
+
+    events = [
+        event
+        async for event in registry.get(TaskMode.DIRECT).run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DIRECT,
+                request="hello",
+            )
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert secrets.fingerprinted == [(TENANT_ID, secret_ref)]
+    assert len(created) == 1
+    credentials = created[0].credentials  # type: ignore[attr-defined]
+    assert credentials.fingerprint_for(secret_ref) == "a" * 64
 
 
 def test_dispatch_plan_accepts_localized_role_display_names_but_keeps_safe_ids() -> None:
@@ -262,6 +358,134 @@ def test_dispatch_plan_accepts_localized_role_display_names_but_keeps_safe_ids()
         "copywriter",
         "final_synthesizer",
     ]
+    assert plan.max_parallelism == 1
+
+
+def test_dispatch_plan_preserves_selected_roles_and_controls_concurrency() -> None:
+    roles = tuple(
+        RoleAssignment(
+            id=f"role_{index}",
+            role=f"Role {index}",
+            purpose=RolePurpose.EXECUTE,
+            mission=f"Handle slice {index}",
+            must_answer=(f"What did role {index} produce?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        )
+        for index in range(6)
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Answer briefly.",
+        ),
+    )
+
+    assert [agent.id for agent in plan.agents] == [
+        "role_0",
+        "role_1",
+        "role_2",
+        "role_3",
+        "role_4",
+        "role_5",
+        "final_synthesizer",
+    ]
+    assert plan.max_parallelism == 1
+    assert all(step.token_budget == 16_384 for step in plan.steps)
+    assert plan.total_token_budget == 16_384
+
+
+def test_dispatch_plan_reserves_more_time_for_final_synthesis() -> None:
+    roles = tuple(
+        RoleAssignment(
+            id=f"role_{index}",
+            role=f"Role {index}",
+            purpose=RolePurpose.EXECUTE,
+            mission=f"Handle slice {index}",
+            must_answer=(f"What did role {index} produce?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        )
+        for index in range(4)
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Create an execution plan.",
+            timeout_seconds=300,
+        ),
+    )
+
+    role_timeouts = [
+        step.timeout_seconds for step in plan.steps if not step.final_synthesizer
+    ]
+    final_step = next(step for step in plan.steps if step.final_synthesizer)
+    assert min(role_timeouts) >= 45
+    assert final_step.timeout_seconds >= 120
+
+
+def test_dispatch_parallelism_uses_model_capacity_without_unbounded_fanout() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "main": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-v4-flash",
+                            "api_base": "https://api.deepseek.com/v1",
+                            "credential_ref": "deepseek-key",
+                            "quota_scope_id": "deepseek-account",
+                            "max_concurrency": 32,
+                            "target_utilization": 0.75,
+                            "reserved_slots": 2,
+                        }
+                    ]
+                }
+            },
+            "agents": [],
+        }
+    )
+
+    assert _dispatch_parallelism(config, "main") == 16
+
+
+def test_dispatch_parallelism_stays_serial_for_single_slot_model() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "main": {
+                    "deployments": [
+                        {
+                            "provider": "openai-compatible",
+                            "model": "custom-model",
+                            "api_base": "https://example.com/v1",
+                            "credential_ref": "relay-key",
+                            "quota_scope_id": "relay-account",
+                            "max_concurrency": 1,
+                        }
+                    ]
+                }
+            },
+            "agents": [],
+        }
+    )
+
+    assert _dispatch_parallelism(config, "main") == 1
 
 
 def test_discussion_plan_accepts_localized_role_display_names() -> None:

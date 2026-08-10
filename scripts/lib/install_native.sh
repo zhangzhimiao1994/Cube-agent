@@ -40,6 +40,25 @@ native_uv_env() {
     "$@"
 }
 
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$seconds" "$@"
+    return
+  fi
+  "$@"
+}
+
+native_uv_sync_locked() {
+  run_with_timeout \
+    "${AGENT_HUB_UV_SYNC_TIMEOUT_SECONDS:-900}" \
+    env \
+    UV_PYTHON_INSTALL_DIR="${AGENT_HUB_UV_PYTHON_INSTALL_DIR:-$INSTALL_ROOT/uv-python}" \
+    UV_CACHE_DIR="${AGENT_HUB_UV_CACHE_DIR:-$INSTALL_ROOT/uv-cache}" \
+    uv sync --frozen --no-dev
+}
+
 python_mirror_env() {
   native_uv_env env \
     UV_DEFAULT_INDEX="${AGENT_HUB_PYPI_MIRROR:-https://pypi.tuna.tsinghua.edu.cn/simple}" \
@@ -131,7 +150,7 @@ sync_python_project_with_lock_or_mirror() {
     return
   fi
 
-  if native_uv_env uv sync --frozen --no-dev; then
+  if native_uv_sync_locked; then
     return 0
   fi
 
@@ -215,14 +234,12 @@ ensure_native_runtime_urls() {
     AGENT_HUB_DATABASE_URL \
     "postgresql+asyncpg://${postgres_user}:${postgres_password}@127.0.0.1:5432/${postgres_db}"
   append_secret_if_missing AGENT_HUB_REDIS_URL "redis://127.0.0.1:6379/0"
-  append_secret_if_missing \
-    DATABASE_URL \
-    "postgresql+asyncpg://${postgres_user}:${postgres_password}@127.0.0.1:5432/${postgres_db}"
-  append_secret_if_missing REDIS_URL "redis://127.0.0.1:6379/0"
 }
 
 write_litellm_config() {
   mkdir -p "$CONFIG_DIR"
+  chown root:agent-hub "$CONFIG_DIR" 2>/dev/null || true
+  chmod 0750 "$CONFIG_DIR"
   cat > "$CONFIG_DIR/litellm.yaml" <<'EOF'
 model_list: []
 litellm_settings:
@@ -238,7 +255,7 @@ configure_native_database() {
   start_native_dependencies
   ensure_native_runtime_urls
 
-  database_url="$(native_secret_value DATABASE_URL)"
+  database_url="$(native_secret_value AGENT_HUB_DATABASE_URL)"
   case "$database_url" in
     *127.0.0.1*|*localhost*) ;;
     *)
@@ -409,6 +426,7 @@ deploy_native_release() {
 
   ln -sfn "$release" "$INSTALL_ROOT/current"
   fix_native_web_permissions "$release"
+  prune_native_releases
 }
 
 fix_native_web_permissions() {
@@ -438,6 +456,40 @@ fix_native_web_permissions() {
     chmod 0755 "$release/web/dist"
     chmod -R a+rX "$release/web/dist"
   fi
+}
+
+prune_native_releases() {
+  local keep current_release release resolved_release kept
+  keep="${AGENT_HUB_RELEASES_TO_KEEP:-2}"
+  [[ "$keep" =~ ^[0-9]+$ ]] || keep=2
+  (( keep >= 1 )) || keep=1
+  [[ -d "$INSTALL_ROOT/releases" ]] || return 0
+
+  current_release="$(readlink -f "$INSTALL_ROOT/current" 2>/dev/null || true)"
+  kept=0
+  while IFS= read -r release; do
+    [[ -n "$release" ]] || continue
+    resolved_release="$(readlink -f "$release" 2>/dev/null || true)"
+    [[ -n "$resolved_release" && -d "$resolved_release" ]] || continue
+    case "$resolved_release" in
+      "$INSTALL_ROOT/releases/"*) ;;
+      *) continue ;;
+    esac
+    if [[ "$resolved_release" == "$current_release" ]]; then
+      (( kept += 1 ))
+      continue
+    fi
+    if (( kept < keep )); then
+      (( kept += 1 ))
+      continue
+    fi
+    log "pruning old native release $resolved_release"
+    rm -rf -- "$resolved_release"
+  done < <(
+    find "$INSTALL_ROOT/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
+      | sort -rn \
+      | cut -d' ' -f2-
+  )
 }
 
 install_native_tls_assets() {

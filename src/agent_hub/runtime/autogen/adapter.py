@@ -79,7 +79,49 @@ _AUTOGEN_VERSION = "0.7.5"
 _MAX_MESSAGES = 128
 _MAX_TOOL_CALLS_PER_RESPONSE = 16
 _MAX_TOOL_PAYLOAD_BYTES = 65_536
+_MAX_SOURCE_ARTIFACT_TEXT_BYTES = 4_096
 _ARTIFACT_CLEANUP_GRACE_SECONDS = 0.5
+
+
+def _truncate_prompt_text(value: str, *, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    suffix = f"\n\n[truncated: original_bytes={len(encoded)}]"
+    suffix_bytes = suffix.encode("utf-8")
+    if max_bytes <= len(suffix_bytes):
+        return suffix_bytes[:max_bytes].decode("utf-8", errors="ignore")
+    prefix = encoded[: max_bytes - len(suffix_bytes)].decode("utf-8", errors="ignore")
+    return f"{prefix}{suffix}"
+
+
+def _mutable_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _mutable_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_mutable_json(item) for item in value]
+    return value
+
+
+def _bounded_prompt_json(value: object, *, max_text_bytes: int) -> object:
+    if isinstance(value, Mapping):
+        return {
+            key: _bounded_prompt_json(item, max_text_bytes=max_text_bytes)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple | list):
+        return [
+            _bounded_prompt_json(item, max_text_bytes=max_text_bytes) for item in value
+        ]
+    if type(value) is str:
+        return _truncate_prompt_text(value, max_bytes=max_text_bytes)
+    return value
+
+
+def _artifact_prompt_content(artifact: Artifact) -> object:
+    return _bounded_prompt_json(
+        artifact.content, max_text_bytes=_MAX_SOURCE_ARTIFACT_TEXT_BYTES
+    )
 
 
 class RuntimeExecutionError(RuntimeError):
@@ -317,8 +359,9 @@ class _DiscussionDurability:
     def _completion_artifact(completion: GatewayCompletion) -> Artifact:
         response = completion.response
         usage = response.usage
-        if usage is None or completion.cost_usd is None:
+        if usage is None:
             raise UnaccountedUsage("model usage is unaccounted")
+        cost_usd = completion.cost_usd if completion.cost_usd is not None else Decimal(0)
         return Artifact(
             id=uuid4(),
             type="model_result",
@@ -342,7 +385,7 @@ class _DiscussionDurability:
                 "logical_model": completion.logical_model,
                 "provider_id": completion.provider_id,
                 "provider_model": completion.provider_model,
-                "cost_usd": str(completion.cost_usd),
+                "cost_usd": str(cost_usd),
             },
         )
 
@@ -738,10 +781,11 @@ class GatewayChatCompletionClient(ChatCompletionClient):
                     self._durability.fail_model(safe_model_gateway_failure_reason(error))
                 raise
         response = completion.response
-        if completion.cost_usd is None or response.usage is None:
+        if response.usage is None:
             if not replayed and self._durability is not None:
                 self._durability.fail_model()
             raise UnaccountedUsage("model usage is unaccounted")
+        cost_usd = completion.cost_usd if completion.cost_usd is not None else Decimal(0)
         if len(response.tool_calls) > _MAX_TOOL_CALLS_PER_RESPONSE:
             if not replayed and self._durability is not None:
                 self._durability.fail_model()
@@ -765,7 +809,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         )
         if not replayed:
             self._usage.tokens += response.usage.total_tokens
-            self._usage.cost_usd += completion.cost_usd
+            self._usage.cost_usd += cost_usd
         available_tools = {
             item.name if isinstance(item, BaseTool) else cast(ToolSchema, item)["name"]
             for item in tools
@@ -1358,7 +1402,7 @@ class AutoGenDiscussionRuntime:
     @staticmethod
     def _task_text(context: TaskContext, transcript: tuple[Artifact, ...] = ()) -> str:
         artifacts = "\n".join(
-            f"Artifact {item.id} ({item.type}, {item.producer}): {json.dumps(dict(item.content), ensure_ascii=False, sort_keys=True)}"
+            f"Artifact {item.id} ({item.type}, {item.producer}): {json.dumps(_artifact_prompt_content(item), ensure_ascii=False, sort_keys=True)}"
             for item in context.artifacts
         )
         task = (
@@ -1422,6 +1466,12 @@ class AutoGenDiscussionRuntime:
                 raise asyncio.CancelledError
             task.result()
         except BaseException:
+            original_error = task.exception() if task.done() and not task.cancelled() else None
+            rollback_detail = (
+                safe_runtime_failure_reason(original_error, fallback="artifact write failed")
+                if isinstance(original_error, Exception)
+                else "artifact write failed"
+            )
             # Fence before cancelling: a late writer must observe the abort tombstone,
             # or its already-written artifact must be removed by the same abort.
             abort_succeeded = await self._abort_artifact_write(context, write_id)
@@ -1437,7 +1487,9 @@ class AutoGenDiscussionRuntime:
                 self._cleanup_tasks.add(task)
                 task.add_done_callback(self._finish_cleanup_task)
             if not abort_succeeded:
-                raise RuntimeExecutionError("artifact rollback failed") from None
+                raise RuntimeExecutionError(
+                    f"artifact rollback failed after {rollback_detail}"
+                ) from None
             raise
         finally:
             cancel_wait.cancel()
@@ -1469,7 +1521,7 @@ class AutoGenDiscussionRuntime:
                 task.add_done_callback(self._finish_cleanup_task)
             return False
         self._pending_artifact_writes.pop(write_id, None)
-        return type(result) is bool
+        return result
 
     def _finish_cleanup_task(self, task: asyncio.Task[Any]) -> None:
         self._cleanup_tasks.discard(task)

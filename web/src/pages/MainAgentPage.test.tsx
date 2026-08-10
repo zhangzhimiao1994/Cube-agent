@@ -140,7 +140,7 @@ describe("MainAgentPage", () => {
     await user.selectOptions(screen.getByTestId("main-agent-provider"), "deepseek");
 
     expect(screen.getByTestId("main-agent-model")).toBeInstanceOf(HTMLSelectElement);
-    expect((screen.getByTestId("main-agent-model") as HTMLSelectElement).value).toBe("deepseek-chat");
+    expect((screen.getByTestId("main-agent-model") as HTMLSelectElement).value).toBe("deepseek-v4-flash");
     expect((screen.getByTestId("main-agent-api-protocol") as HTMLSelectElement).value).toBe("openai_compatible");
     expect((screen.getByTestId("main-agent-api-base") as HTMLInputElement).value).toBe("https://api.deepseek.com/v1");
 
@@ -160,7 +160,7 @@ describe("MainAgentPage", () => {
         provider: "deepseek",
         api_base: "https://api.deepseek.com/v1",
         api_protocol: "openai_compatible",
-        upstream_model: "deepseek-chat",
+        upstream_model: "deepseek-v4-flash",
         credential_ref: "secret://saved-main-agent",
         capabilities: ["text", "tool_calling"],
       },
@@ -172,7 +172,7 @@ describe("MainAgentPage", () => {
     expect(screen.getAllByText("https://api.deepseek.com/v1").length).toBeGreaterThan(0);
     expect(screen.getByText("可沿用当前已保存 Key")).not.toBeNull();
 
-    await user.selectOptions(screen.getByTestId("main-agent-model"), "deepseek-reasoner");
+    await user.selectOptions(screen.getByTestId("main-agent-model"), "deepseek-v4-pro");
     expect(screen.getByText("可沿用当前已保存 Key")).not.toBeNull();
     expect((screen.getByTestId("main-agent-save") as HTMLButtonElement).disabled).toBe(false);
 
@@ -192,7 +192,7 @@ describe("MainAgentPage", () => {
         provider: "deepseek",
         api_base: "https://api.deepseek.com/v1",
         api_protocol: "openai_compatible",
-        upstream_model: "deepseek-chat",
+        upstream_model: "deepseek-v4-flash",
         credential_ref: "secret://saved-main-agent",
         capabilities: ["text", "tool_calling"],
       },

@@ -352,10 +352,7 @@ class DispatchPlan(_PlanModel):
         }
         if not leaves <= ancestors:
             raise InvalidDispatchPlan("final synthesizer must cover every required leaf")
-        required_tokens = sum(
-            step.token_budget * (1 if step.reviewer is None else 2 + (2 * step.reviewer_retries))
-            for step in self.steps
-        )
+        required_tokens = max(step.token_budget for step in self.steps)
         if required_tokens > self.total_token_budget:
             raise InvalidDispatchPlan("total token budget is insufficient")
         required_timeout = sum(

@@ -19,14 +19,40 @@ port_free() {
   local port="$1"
   ! command -v ss >/dev/null 2>&1 || ! ss -ltn "( sport = :$port )" | grep -q ":$port"
 }
+port_available_or_expected_proxy() {
+  local port="$1"
+  if port_free "$port"; then
+    return 0
+  fi
+  systemd_unit_active caddy.service
+}
 health_live() {
   ! has_command curl || curl -fsS http://127.0.0.1:8000/health/live >/dev/null 2>&1
 }
 systemd_unit_active_if_present() {
   local unit="$1"
   has_command systemctl || return 0
-  systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep -q "^$unit" || return 0
+  systemd_unit_installed "$unit" || return 0
   systemctl is-active --quiet "$unit"
+}
+systemd_unit_installed() {
+  local unit="$1"
+  has_command systemctl || return 1
+  systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep -q "^$unit"
+}
+systemd_unit_active() {
+  local unit="$1"
+  has_command systemctl || return 1
+  systemd_unit_installed "$unit" || return 1
+  systemctl is-active --quiet "$unit"
+}
+native_stack_installed() {
+  systemd_unit_active agent-hub-api.service \
+    && systemd_unit_active agent-hub-worker.service \
+    && systemd_unit_active agent-hub-litellm.service
+}
+docker_available_or_native_installed() {
+  has_command docker || native_stack_installed
 }
 native_current_release() {
   printf '%s/current\n' "${AGENT_HUB_INSTALL_ROOT:-/opt/agent-hub}"
@@ -107,9 +133,9 @@ web_assets_readable() {
 check "linux kernel" test "$(uname -s)" = "Linux"
 check "disk has 2GB free" disk_has_2gb_free
 check "memory has 1GB total" memory_has_1gb_total
-check "port 80 free or deliberately occupied by proxy" port_free 80
-check "port 443 free or deliberately occupied by proxy" port_free 443
-check "docker available for universal install path" has_command docker
+check "port 80 free or served by Caddy" port_available_or_expected_proxy 80
+check "port 443 free or served by Caddy" port_available_or_expected_proxy 443
+check "docker available for docker install path" docker_available_or_native_installed
 check "systemd available for native path" has_command systemctl
 check "curl available for health checks" has_command curl
 check "api live health" health_live

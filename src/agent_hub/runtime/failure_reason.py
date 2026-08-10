@@ -17,7 +17,7 @@ from agent_hub.models.registry import NoCapableDeployment
 
 MAX_FAILURE_REASON_LENGTH = 240
 SENSITIVE_FAILURE_REASON = re.compile(
-    r"(api[_-]?key|authorization|bearer|credential|password|secret|token|sk-[A-Za-z0-9])",
+    r"(api[_-]?key|authorization|bearer|credential|password|secret|(?:access|refresh|session)[_-]?token|sk-[A-Za-z0-9])",
     re.IGNORECASE,
 )
 GENERIC_MODEL_GATEWAY_FAILURE = "model gateway failed"

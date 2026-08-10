@@ -48,7 +48,7 @@ describe("ModelsPage", () => {
               id: "11111111-1111-4111-8111-111111111111",
               provider: "deepseek",
               api_base: "https://api.deepseek.example/v1",
-              upstream_model: "deepseek-chat",
+              upstream_model: "deepseek-v4-flash",
               logical_model: "planner",
               capabilities: ["text"],
               credential_ref: "secret_1",
@@ -85,7 +85,7 @@ describe("ModelsPage", () => {
                     provider: "deepseek",
                     api_base: "https://api.deepseek.com/v1",
                     logical_model: "main",
-                    upstream_model: "deepseek-chat",
+                    upstream_model: "deepseek-v4-flash",
                     status_code: "401",
                     reason: "provider returned status=401",
                     hint: "检查 API Key 是否有效、API Base 是否可从服务器访问、模型名是否属于该服务商账号。",
@@ -98,6 +98,15 @@ describe("ModelsPage", () => {
           const body = JSON.parse(String(init?.body));
           return jsonResponse({
             id: "22222222-2222-4222-8222-222222222222",
+            ...body,
+            effective_slots: body.max_concurrency,
+            saturation_policy: "queue_first_then_fallback",
+          });
+        }
+        if (path === "/api/v1/admin/models/11111111-1111-4111-8111-111111111111" && method === "PUT") {
+          const body = JSON.parse(String(init?.body));
+          return jsonResponse({
+            id: "11111111-1111-4111-8111-111111111111",
             ...body,
             effective_slots: body.max_concurrency,
             saturation_policy: "queue_first_then_fallback",
@@ -123,7 +132,7 @@ describe("ModelsPage", () => {
     expect(screen.getByRole("columnheader", { name: "有效并发" })).not.toBeNull();
     expect(screen.getByText("planner")).not.toBeNull();
     expect(screen.getByText("deepseek")).not.toBeNull();
-    expect(screen.getByText("deepseek-chat")).not.toBeNull();
+    expect(screen.getByText("deepseek-v4-flash")).not.toBeNull();
     expect(screen.getByText("1")).not.toBeNull();
     expect(screen.getByText("先排队，超时后降级")).not.toBeNull();
     expect(screen.getByText("同一服务商账号下的多个 Key 可能共享配额，不要把并发设置到跑满额度。")).not.toBeNull();
@@ -143,6 +152,33 @@ describe("ModelsPage", () => {
     expect(await screen.findByText("还没有保存模型")).not.toBeNull();
   });
 
+  it("edits an existing model without requiring a new api key", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/models" />);
+
+    expect(await screen.findByText("planner")).not.toBeNull();
+    await user.click(screen.getByTestId("edit-model-11111111-1111-4111-8111-111111111111"));
+
+    expect((screen.getByLabelText("逻辑模型名") as HTMLInputElement).value).toBe("planner");
+    expect((screen.getByLabelText("API Base") as HTMLInputElement).value).toBe(
+      "https://api.deepseek.example/v1",
+    );
+    expect((screen.getByLabelText("API Key") as HTMLInputElement).required).toBe(false);
+
+    await user.clear(screen.getByLabelText("最大并发"));
+    await user.type(screen.getByLabelText("最大并发"), "3");
+    await user.click(screen.getByRole("button", { name: "测试并更新模型" }));
+
+    expect(requests.find((request) => request.method === "PUT")).toMatchObject({
+      path: "/api/v1/admin/models/11111111-1111-4111-8111-111111111111",
+      method: "PUT",
+      body: expect.objectContaining({
+        credential_ref: "secret_1",
+        max_concurrency: 3,
+      }),
+    });
+  });
+
   it("limits the model dropdown to the selected provider and saves the api key as a secret", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/models" />);
@@ -152,11 +188,11 @@ describe("ModelsPage", () => {
 
     const modelSelect = screen.getByLabelText("模型") as HTMLSelectElement;
     const optionValues = Array.from(modelSelect.options).map((option) => option.value);
-    expect(optionValues).toContain("deepseek-chat");
+    expect(optionValues).toContain("deepseek-v4-flash");
     expect(optionValues).toContain("__custom_model__");
     expect(optionValues).not.toContain("qwen-plus");
     expect(optionValues).not.toContain("kimi-k2-turbo-preview");
-    expect(modelSelect.value).toBe("deepseek-chat");
+    expect(modelSelect.value).toBe("deepseek-v4-flash");
     expect((screen.getByLabelText("API Base") as HTMLInputElement).value).toBe(
       "https://api.deepseek.com/v1",
     );
@@ -185,7 +221,7 @@ describe("ModelsPage", () => {
         provider: "deepseek",
         api_base: "https://api.deepseek.com/v1",
         api_protocol: "openai_compatible",
-        upstream_model: "deepseek-chat",
+        upstream_model: "deepseek-v4-flash",
         logical_model: "planner",
         capabilities: ["text", "tool_calling"],
         credential_ref: "secret_created",
@@ -211,8 +247,8 @@ describe("ModelsPage", () => {
 
     const modelSelect = screen.getByLabelText("模型") as HTMLSelectElement;
     const optionValues = Array.from(modelSelect.options).map((option) => option.value);
-    expect(optionValues).toContain("claude-sonnet-4-20250514");
-    expect(optionValues).toContain("claude-opus-4-20250514");
+    expect(optionValues).toContain("claude-sonnet-5");
+    expect(optionValues).toContain("claude-opus-5");
     expect(optionValues).toContain("__custom_model__");
     expect(optionValues).not.toContain("deepseek-chat");
     expect((screen.getByLabelText("API Base") as HTMLInputElement).value).toBe(
@@ -312,7 +348,7 @@ describe("ModelsPage", () => {
     expect(screen.getByText("中转站通常会混合多个厂商模型，请填写中转站后台显示的完整模型 ID。")).not.toBeNull();
     expect((screen.getByLabelText("API Base") as HTMLInputElement).value).toBe("");
 
-    await user.type(screen.getByLabelText("中转站模型名"), "deepseek/deepseek-chat");
+    await user.type(screen.getByLabelText("中转站模型名"), "deepseek/deepseek-v4-flash");
     await user.clear(screen.getByLabelText("API Base"));
     await user.type(screen.getByLabelText("API Base"), "https://relay.example.com/v1/chat/completions/");
     await user.clear(screen.getByLabelText("逻辑模型名"));
@@ -329,7 +365,7 @@ describe("ModelsPage", () => {
         provider: "openai-compatible",
         api_base: "https://relay.example.com/v1",
         api_protocol: "openai_compatible",
-        upstream_model: "deepseek/deepseek-chat",
+        upstream_model: "deepseek/deepseek-v4-flash",
         logical_model: "relay-main",
       },
     });
@@ -341,7 +377,7 @@ describe("ModelsPage", () => {
 
     await screen.findByText("添加模型配置");
     await user.selectOptions(screen.getByLabelText("服务商"), "openai-compatible");
-    await user.type(screen.getByLabelText("中转站模型名"), "deepseek-chat");
+    await user.type(screen.getByLabelText("中转站模型名"), "deepseek-v4-flash");
     await user.clear(screen.getByLabelText("API Base"));
     await user.type(screen.getByLabelText("API Base"), "https://gsykj.com");
     await user.clear(screen.getByLabelText("逻辑模型名"));
@@ -357,7 +393,7 @@ describe("ModelsPage", () => {
         provider: "openai-compatible",
         api_base: "https://gsykj.com/v1",
         api_protocol: "openai_compatible",
-        upstream_model: "deepseek-chat",
+        upstream_model: "deepseek-v4-flash",
       },
     });
   });
