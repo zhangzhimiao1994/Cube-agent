@@ -907,6 +907,54 @@ async def test_persistent_admin_verifies_dedicated_main_agent_model() -> None:
 
 
 @pytest.mark.asyncio
+async def test_persistent_admin_logs_dedicated_main_agent_model_failures() -> None:
+    configs = FakeConfigService()
+    service = PersistentAdminResourceService(
+        config_service=configs,  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        model_transport=FakeModelTransport(RuntimeError("provider returned status=401")),
+    )
+
+    with pytest.raises(PublicAPIError) as error:
+        await service.update_main_agent_config(
+            MainAgentConfigRequest(
+                model=MainAgentModelConfig(
+                    provider="claude-code-relay",
+                    api_base="https://bad-relay.example/v1",
+                    api_protocol="anthropic_messages",
+                    upstream_model="claude-sonnet-4-6",
+                    credential_ref=f"secret://{SECRET_ID}",
+                    capabilities=["text", "tool_calling"],
+                ),
+                control_mode="supervisor",
+                hermes_policy="confirm_before_apply",
+                decision_policy="choose mode and role pool; ask before workflow changes",
+                operating_style="control the room and ask before changing a chosen workflow",
+                direct_answerer="main_agent",
+                max_review_rounds=2,
+            )
+        )
+
+    assert error.value.code == "model_unavailable"
+    assert error.value.details is not None
+    assert error.value.details["provider"] == "claude-code-relay"
+    assert error.value.details["logical_model"] == "main_agent"
+    assert error.value.details["api_base"] == "https://bad-relay.example/v1/messages"
+    model_logs = await service.list_logs("model_error")
+    assert len(model_logs) == 1
+    assert model_logs[0].source == "main_agent.update"
+    assert model_logs[0].message == "provider returned status=401"
+    assert model_logs[0].details["provider"] == "claude-code-relay"
+    assert model_logs[0].details["logical_model"] == "main_agent"
+    assert model_logs[0].details["api_base"] == "https://bad-relay.example/v1/messages"
+    serialized = model_logs[0].model_dump_json()
+    assert "credential_ref" not in serialized
+    assert "secret://" not in serialized
+
+
+@pytest.mark.asyncio
 async def test_persistent_admin_agents_write_to_published_config() -> None:
     configs = FakeConfigService()
     configs.current = ConfigRevision(
@@ -1021,6 +1069,47 @@ async def test_persistent_admin_model_is_not_published_when_availability_check_f
     assert model_logs[0].details["status_code"] == "401"
     assert configs.drafts == []
     assert configs.current is None
+
+
+@pytest.mark.asyncio
+async def test_persistent_admin_deletes_model_deployment_and_publishes_config() -> None:
+    configs = FakeConfigService()
+    service = PersistentAdminResourceService(
+        config_service=configs,  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        model_transport=FakeModelTransport(),
+    )
+
+    created = await service.create_model(
+        ModelDeploymentRequest(
+            provider="deepseek",
+            api_base="https://api.deepseek.com/v1",
+            upstream_model="deepseek-chat",
+            logical_model="main",
+            capabilities=["text", "tool_calling"],
+            credential_ref=f"secret://{SECRET_ID}",
+            quota_scope="deepseek-account",
+            max_concurrency=4,
+            target_utilization=0.8,
+            reserved_capacity=0,
+            rpm=60,
+            tpm=100000,
+            queue_timeout_seconds=60,
+            fallback=None,
+            weight=100,
+        )
+    )
+
+    await service.delete_model(created.id)
+
+    assert await service.list_models() == ()
+    assert configs.current is not None
+    assert configs.current.document["models"] == {}
+    model_logs = await service.list_logs("model_error")
+    serialized = "".join(item.model_dump_json() for item in model_logs)
+    assert "secret://" not in serialized
 
 
 @pytest.mark.asyncio

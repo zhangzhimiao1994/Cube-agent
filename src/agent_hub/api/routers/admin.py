@@ -11,7 +11,7 @@ from typing import Annotated, Protocol, cast
 from urllib.parse import urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert
@@ -534,6 +534,8 @@ class AdminResourceService(Protocol):
 
     async def create_model(self, request: ModelDeploymentRequest) -> ModelDeploymentResponse: ...
 
+    async def delete_model(self, model_id: UUID) -> None: ...
+
     async def create_secret(self, request: SecretCreateRequest) -> SecretReferenceResponse: ...
 
     async def get_secret(self, ref: str) -> SecretReferenceResponse: ...
@@ -729,6 +731,10 @@ class InMemoryAdminResourceService:
         )
         self.models[response.id] = response
         return response
+
+    async def delete_model(self, model_id: UUID) -> None:
+        if self.models.pop(model_id, None) is None:
+            raise PublicAPIError(404, "model_not_found", "model not found")
 
     async def get_main_agent_config(self) -> MainAgentConfigResponse:
         return self.main_agent_config
@@ -1347,6 +1353,76 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             created_definition.fallback_model,
             deployment_index,
             created_definition.deployments[deployment_index],
+        )
+
+    async def delete_model(self, model_id: UUID) -> None:
+        document = await self._current_document()
+        models = cast(dict[str, object], document.setdefault("models", {}))
+        target_logical_model: str | None = None
+        target_index: int | None = None
+        target_response: ModelDeploymentResponse | None = None
+
+        for logical_model, raw_definition in list(models.items()):
+            logical_definition = dict(cast(dict[str, object], raw_definition))
+            deployments = list(cast(list[object], logical_definition.get("deployments", [])))
+            fallback_model = cast(str | None, logical_definition.get("fallback_model"))
+            for index, deployment in enumerate(deployments):
+                response = self._model_response(logical_model, fallback_model, index, deployment)
+                if response.id == model_id:
+                    target_logical_model = logical_model
+                    target_index = index
+                    target_response = response
+                    break
+            if target_response is not None:
+                break
+
+        if target_logical_model is None or target_index is None or target_response is None:
+            raise PublicAPIError(404, "model_not_found", "model not found")
+
+        logical_definition = dict(cast(dict[str, object], models[target_logical_model]))
+        deployments = list(cast(list[object], logical_definition.get("deployments", [])))
+        deployments.pop(target_index)
+        if deployments:
+            logical_definition["deployments"] = deployments
+            models[target_logical_model] = logical_definition
+        else:
+            del models[target_logical_model]
+            for raw_definition in models.values():
+                if isinstance(raw_definition, dict) and raw_definition.get("fallback_model") == target_logical_model:
+                    raw_definition.pop("fallback_model", None)
+
+        try:
+            PlatformConfig.model_validate(document)
+            draft = await self._config_service.create_draft(
+                self._tenant_id,
+                self._actor_id,
+                document,
+            )
+            await self._config_service.publish(
+                self._tenant_id,
+                draft.version,
+                self._actor_id,
+            )
+        except (ConfigValidationError, ValidationError) as error:
+            await self.record_log(
+                category="model_error",
+                level="error",
+                title="模型删除失败",
+                message=_safe_model_check_reason(error),
+                source="models.delete",
+                details={
+                    "logical_model": target_logical_model,
+                    "provider": target_response.provider,
+                    "upstream_model": target_response.upstream_model,
+                    "reason": _safe_model_check_reason(error),
+                },
+            )
+            raise PublicAPIError(409, "model_in_use", "model is still referenced") from None
+
+        await self._record_audit(
+            "model.delete",
+            f"model:{target_logical_model}",
+            {"provider": target_response.provider, "model": target_response.upstream_model},
         )
 
     async def create_secret(self, request: SecretCreateRequest) -> SecretReferenceResponse:
@@ -2560,6 +2636,17 @@ async def create_model(
 ) -> ModelDeploymentResponse:
     _require(principal, "config:write")
     return await service.create_model(body)
+
+
+@router.delete("/models/{model_id}", status_code=204, responses=error_responses(401, 403, 404, 409, 422))
+async def delete_model(
+    model_id: UUID,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> Response:
+    _require(principal, "config:write")
+    await service.delete_model(model_id)
+    return Response(status_code=204)
 
 
 @router.post("/models/probe", response_model=ProbeResponse, responses=error_responses(401, 403, 422))

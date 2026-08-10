@@ -561,6 +561,9 @@ export const api = {
       ModelDeploymentSchema,
     );
   },
+  async deleteModel(id: string): Promise<void> {
+    await requestNoContent(`/api/v1/admin/models/${encodeURIComponent(id)}`, { method: "DELETE" });
+  },
   createSecret(label: string, value: string): Promise<SecretReference> {
     return request(
       "/api/v1/admin/secrets",

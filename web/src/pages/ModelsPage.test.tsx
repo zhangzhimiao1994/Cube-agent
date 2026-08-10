@@ -21,10 +21,12 @@ function jsonResponse(payload: unknown, init: ResponseInit = {}) {
 describe("ModelsPage", () => {
   const requests: Array<{ body: unknown; method: string; path: string }> = [];
   let failModelSave = false;
+  let modelDeleted = false;
 
   beforeEach(() => {
     requests.length = 0;
     failModelSave = false;
+    modelDeleted = false;
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
       "fetch",
@@ -34,12 +36,14 @@ describe("ModelsPage", () => {
         expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer owner-token");
         if (init?.body) {
           requests.push({ path, method, body: JSON.parse(String(init.body)) });
+        } else if (method === "DELETE") {
+          requests.push({ path, method, body: null });
         }
         if (path === "/api/v1/auth/me") {
           return jsonResponse(principal);
         }
         if (path === "/api/v1/admin/models" && method === "GET") {
-          return jsonResponse([
+          return jsonResponse(modelDeleted ? [] : [
             {
               id: "11111111-1111-4111-8111-111111111111",
               provider: "deepseek",
@@ -61,6 +65,10 @@ describe("ModelsPage", () => {
               saturation_policy: "queue_first_then_fallback",
             },
           ]);
+        }
+        if (path === "/api/v1/admin/models/11111111-1111-4111-8111-111111111111" && method === "DELETE") {
+          modelDeleted = true;
+          return new Response(null, { status: 204 });
         }
         if (path === "/api/v1/admin/secrets" && method === "POST") {
           return jsonResponse({ ref: "secret_created", last_four: "1234" });
@@ -119,6 +127,20 @@ describe("ModelsPage", () => {
     expect(screen.getByText("1")).not.toBeNull();
     expect(screen.getByText("先排队，超时后降级")).not.toBeNull();
     expect(screen.getByText("同一服务商账号下的多个 Key 可能共享配额，不要把并发设置到跑满额度。")).not.toBeNull();
+  });
+
+  it("deletes an existing model deployment from the saved models table", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/models" />);
+
+    expect(await screen.findByText("planner")).not.toBeNull();
+    await user.click(screen.getByTestId("delete-model-11111111-1111-4111-8111-111111111111"));
+
+    expect(requests.find((request) => request.method === "DELETE")).toMatchObject({
+      path: "/api/v1/admin/models/11111111-1111-4111-8111-111111111111",
+      method: "DELETE",
+    });
+    expect(await screen.findByText("还没有保存模型")).not.toBeNull();
   });
 
   it("limits the model dropdown to the selected provider and saves the api key as a secret", async () => {

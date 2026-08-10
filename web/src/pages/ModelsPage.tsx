@@ -293,6 +293,14 @@ export function ModelsPage() {
     },
   });
 
+  const deleteModel = useMutation({
+    mutationFn: (id: string) => api.deleteModel(id),
+    onSuccess: async () => {
+      setSaveMessage("模型配置已删除。");
+      await queryClient.invalidateQueries({ queryKey: ["models"] });
+    },
+  });
+
   function changeProvider(nextProvider: string) {
     setProvider(nextProvider);
     setSaveMessage(null);
@@ -583,6 +591,7 @@ export function ModelsPage() {
                 <th>有效并发</th>
                 <th>限流</th>
                 <th>Quota Scope</th>
+                <th>操作</th>
                 <th>策略</th>
               </tr>
             </thead>
@@ -599,12 +608,23 @@ export function ModelsPage() {
                     RPM {model.rpm ?? "未设置"} / TPM {model.tpm ?? "未设置"}
                   </td>
                   <td>{model.quota_scope}</td>
+                  <td>
+                    <button
+                      type="button"
+                      data-testid={`delete-model-${model.id}`}
+                      onClick={() => deleteModel.mutate(model.id)}
+                      disabled={deleteModel.isPending}
+                    >
+                      删除模型
+                    </button>
+                  </td>
                   <td>{displaySaturationPolicy(model.saturation_policy)}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         )}
+        {deleteModel.isError ? <p role="alert">{formatApiError(deleteModel.error, "模型删除失败")}</p> : null}
       </section>
     </section>
   );
