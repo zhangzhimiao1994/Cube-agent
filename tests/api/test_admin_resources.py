@@ -165,12 +165,24 @@ def test_run_detail_response_can_expose_mode_decision_token() -> None:
     assert response.decision_token == token
 
 
-def test_mode_error_log_includes_runtime_failed_reason_from_events() -> None:
+@pytest.mark.parametrize(
+    ("mode", "reason"),
+    [
+        ("direct", "model gateway failed"),
+        ("dispatch", "step execution failed"),
+        ("discuss", "discussion_failed"),
+        ("hybrid", "hybrid dispatch failed: model gateway failed"),
+    ],
+)
+def test_mode_error_log_includes_runtime_failed_reason_from_events(
+    mode: str,
+    reason: str,
+) -> None:
     run_id = uuid4()
     response = RunDetailResponse(
         id=run_id,
         status="failed",
-        mode="direct",
+        mode=mode,
         queue_wait_ms=0,
         capacity_wait_ms=0,
         cost_usd="0",
@@ -185,7 +197,7 @@ def test_mode_error_log_includes_runtime_failed_reason_from_events() -> None:
             RunEventResponse(
                 sequence=2,
                 kind="runtime.failed",
-                message="model gateway failed",
+                message=reason,
                 created_at=datetime.now(UTC),
             ),
         ],
@@ -195,8 +207,8 @@ def test_mode_error_log_includes_runtime_failed_reason_from_events() -> None:
 
     log = _mode_error_log_from_run(response)
 
-    assert log.message == "direct run failed: model gateway failed"
-    assert log.details["reason"] == "model gateway failed"
+    assert log.message == f"{mode} run failed: {reason}"
+    assert log.details["reason"] == reason
 
 
 def test_mode_error_log_explains_missing_legacy_failure_reason() -> None:

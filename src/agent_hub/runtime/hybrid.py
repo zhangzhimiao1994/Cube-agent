@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -28,6 +29,11 @@ from agent_hub.runtime.contracts import (
 
 _RUNTIME_TYPE = "hybrid"
 _RUNTIME_VERSION = "1"
+_SENSITIVE_FAILURE_REASON = re.compile(
+    r"(api[_-]?key|authorization|bearer|credential|password|secret|token|sk-[A-Za-z0-9])",
+    re.IGNORECASE,
+)
+_MAX_FAILURE_REASON_LENGTH = 240
 
 
 class RuntimeExecutionError(RuntimeError):
@@ -214,12 +220,12 @@ class HybridRuntime:
                 run_id=context.run_id,
             )
             raise
-        except (ArtifactRepositoryError, RuntimeExecutionError, ValueError, TypeError):
+        except (ArtifactRepositoryError, RuntimeExecutionError, ValueError, TypeError) as error:
             yield RunEvent(
                 kind=EventKind.RUNTIME_FAILED,
                 sequence=sequence,
                 run_id=context.run_id,
-                reason="hybrid_failed",
+                reason=_safe_failure_reason(error, fallback="hybrid_failed"),
             )
         finally:
             self._active_child = None
@@ -286,35 +292,46 @@ class HybridRuntime:
         )
         self._active_child = child
         terminal_seen = False
-        async for item in child.run(child_context):
-            if item.kind is EventKind.RUNTIME_FAILED:
-                raise RuntimeExecutionError("hybrid child failed")
-            if item.kind is EventKind.RUNTIME_CANCELLED:
-                raise asyncio.CancelledError
-            if item.kind is EventKind.RUNTIME_COMPLETED:
-                terminal_seen = True
-                continue
-            if item.kind is EventKind.CHECKPOINT_SAVED:
-                continue
-            if item.kind is EventKind.ARTIFACT_CREATED and item.artifact is not None:
-                yield RunEvent(
-                    kind=EventKind.ARTIFACT_CREATED,
-                    sequence=sequence,
-                    run_id=parent.run_id,
-                    artifact=item.artifact,
-                )
-                sequence += 1
-            elif item.kind is EventKind.MESSAGE_CREATED and item.actor and item.message:
-                yield RunEvent(
-                    kind=EventKind.MESSAGE_CREATED,
-                    sequence=sequence,
-                    run_id=parent.run_id,
-                    actor=item.actor,
-                    session_id=str(parent.run_id),
-                    message=item.message,
-                    inputs=artifacts,
-                )
-                sequence += 1
+        child_failure_reason: str | None = None
+        try:
+            async for item in child.run(child_context):
+                if item.kind in {EventKind.STEP_FAILED, EventKind.TOOL_FAILED} and item.reason:
+                    child_failure_reason = item.reason
+                if item.kind is EventKind.RUNTIME_FAILED:
+                    reason = item.reason or child_failure_reason or "runtime failed"
+                    raise RuntimeExecutionError(f"hybrid {mode.value} failed: {reason}")
+                if item.kind is EventKind.RUNTIME_CANCELLED:
+                    raise asyncio.CancelledError
+                if item.kind is EventKind.RUNTIME_COMPLETED:
+                    terminal_seen = True
+                    continue
+                if item.kind is EventKind.CHECKPOINT_SAVED:
+                    continue
+                if item.kind is EventKind.ARTIFACT_CREATED and item.artifact is not None:
+                    yield RunEvent(
+                        kind=EventKind.ARTIFACT_CREATED,
+                        sequence=sequence,
+                        run_id=parent.run_id,
+                        artifact=item.artifact,
+                    )
+                    sequence += 1
+                elif item.kind is EventKind.MESSAGE_CREATED and item.actor and item.message:
+                    yield RunEvent(
+                        kind=EventKind.MESSAGE_CREATED,
+                        sequence=sequence,
+                        run_id=parent.run_id,
+                        actor=item.actor,
+                        session_id=str(parent.run_id),
+                        message=item.message,
+                        inputs=artifacts,
+                    )
+                    sequence += 1
+        except RuntimeExecutionError:
+            raise
+        except Exception as error:  # noqa: BLE001 - child runtime boundary is normalized.
+            raise RuntimeExecutionError(
+                f"hybrid {mode.value} failed: {_safe_failure_reason(error, fallback='runtime failed')}"
+            ) from None
         self._active_child = None
         if not terminal_seen:
             raise RuntimeExecutionError("hybrid child ended without terminal")
@@ -436,6 +453,13 @@ class HybridRuntime:
         task = self._active_task
         if task is not None and task is not asyncio.current_task():
             task.cancel()
+
+
+def _safe_failure_reason(error: Exception, *, fallback: str) -> str:
+    reason = " ".join(str(error).strip().split())
+    if not reason or _SENSITIVE_FAILURE_REASON.search(reason):
+        return fallback
+    return reason[:_MAX_FAILURE_REASON_LENGTH]
 
 
 __all__ = ["HybridPlan", "HybridRuntime", "HybridUpgrade", "RuntimeExecutionError"]
