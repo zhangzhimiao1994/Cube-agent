@@ -4,6 +4,14 @@ import { Link, useParams } from "react-router-dom";
 import { api, formatApiError } from "../api/client";
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const MANUAL_RUN_MODES = [
+  { value: "direct", label: "直接执行", description: "让主 Agent 或指定角色直接回答。" },
+  { value: "dispatch", label: "派单式", description: "拆分任务并分派给多个角色。" },
+  { value: "discuss", label: "讨论式", description: "让多个角色先讨论，再形成结论。" },
+  { value: "hybrid", label: "混合式", description: "先讨论方案，再分工执行，最后审查。" },
+] as const;
+
+type ManualRunMode = (typeof MANUAL_RUN_MODES)[number]["value"];
 
 export function RunDetailPage() {
   const { runId = "" } = useParams();
@@ -12,6 +20,10 @@ export function RunDetailPage() {
     queryKey: ["run", runId],
     queryFn: () => api.run(runId),
     enabled: runId.length > 0,
+    refetchInterval: (query) => {
+      const data = query.state.data;
+      return data && !TERMINAL_STATUSES.has(data.status) ? 1000 : false;
+    },
   });
   const control = useMutation({
     mutationFn: (action: "pause" | "resume" | "cancel") => {
@@ -24,6 +36,22 @@ export function RunDetailPage() {
       void queryClient.invalidateQueries({ queryKey: ["runs"] });
     },
   });
+  const chooseMode = useMutation({
+    mutationFn: (mode: ManualRunMode) => {
+      if (!run.data?.decision_token) throw new Error("mode decision token is unavailable");
+      const parsedVersion = Number(run.data.explicit_details.version ?? "0");
+      return api.chooseMode(runId, {
+        mode,
+        decision_token: run.data.decision_token,
+        version: Number.isInteger(parsedVersion) && parsedVersion > 0 ? parsedVersion : 0,
+      });
+    },
+    onSuccess: async (updated) => {
+      void updated;
+      await queryClient.invalidateQueries({ queryKey: ["run", runId] });
+      await queryClient.invalidateQueries({ queryKey: ["runs"] });
+    },
+  });
 
   if (run.isLoading) return <p>正在加载运行详情...</p>;
   if (run.isError || !run.data) {
@@ -33,6 +61,7 @@ export function RunDetailPage() {
   const canPause = ["queued", "running"].includes(run.data.status);
   const canResume = run.data.status === "paused";
   const canCancel = !TERMINAL_STATUSES.has(run.data.status);
+  const isWaitingForMode = run.data.status === "waiting_user_mode" && Boolean(run.data.decision_token);
 
   return (
     <section>
@@ -64,21 +93,43 @@ export function RunDetailPage() {
       <article>
         <h3>原始请求</h3>
         <p>{run.data.request}</p>
-        <div className="toolbar">
-          <button type="button" disabled={!canPause || control.isPending} onClick={() => control.mutate("pause")}>
-            暂停
-          </button>
-          <button type="button" disabled={!canResume || control.isPending} onClick={() => control.mutate("resume")}>
-            恢复
-          </button>
-          <button type="button" disabled={!canCancel || control.isPending} onClick={() => control.mutate("cancel")}>
-            取消
-          </button>
-        </div>
-        {!canPause && !canResume && canCancel ? (
+        {isWaitingForMode ? (
+          <div className="composer-approval-popover mode-choice-popover">
+            <span className="eyebrow">等待模式确认</span>
+            <h3>自动检测没有足够把握</h3>
+            <p>请先选择本次运行模式，确认后任务会继续进入队列并开始派单/讨论/执行。</p>
+            <div className="mode-choice-grid">
+              {MANUAL_RUN_MODES.map((item) => (
+                <button
+                  type="button"
+                  key={item.value}
+                  disabled={chooseMode.isPending}
+                  onClick={() => chooseMode.mutate(item.value)}
+                >
+                  <strong>{item.label}</strong>
+                  <small>{item.description}</small>
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <div className="toolbar">
+            <button type="button" disabled={!canPause || control.isPending} onClick={() => control.mutate("pause")}>
+              暂停
+            </button>
+            <button type="button" disabled={!canResume || control.isPending} onClick={() => control.mutate("resume")}>
+              恢复
+            </button>
+            <button type="button" disabled={!canCancel || control.isPending} onClick={() => control.mutate("cancel")}>
+              取消
+            </button>
+          </div>
+        )}
+        {!isWaitingForMode && !canPause && !canResume && canCancel ? (
           <p className="field-help">当前状态不支持暂停或恢复，只能取消。</p>
         ) : null}
         {control.isError ? <p role="alert">{formatApiError(control.error, "运行控制失败")}</p> : null}
+        {chooseMode.isError ? <p role="alert">{formatApiError(chooseMode.error, "运行模式确认失败")}</p> : null}
       </article>
 
       <article>

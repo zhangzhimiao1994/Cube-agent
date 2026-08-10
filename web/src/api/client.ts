@@ -282,6 +282,7 @@ const RunDetailSchema = RunListItemSchema.extend({
   events: z.array(RunEventSchema),
   artifacts: z.array(RunArtifactSchema),
   explicit_details: z.record(z.string(), z.string()),
+  decision_token: z.string().nullable().optional(),
 });
 
 export type RunDetail = z.infer<typeof RunDetailSchema>;
@@ -681,6 +682,20 @@ export const api = {
   }): Promise<SubmittedRun> {
     return request(
       "/api/v1/runs",
+      { method: "POST", body: JSON.stringify(payload) },
+      SubmittedRunSchema,
+    );
+  },
+  chooseMode(
+    id: string,
+    payload: {
+      mode: "direct" | "dispatch" | "discuss" | "hybrid";
+      decision_token: string;
+      version: number;
+    },
+  ): Promise<SubmittedRun> {
+    return request(
+      `/api/v1/runs/${encodeURIComponent(id)}/choose-mode`,
       { method: "POST", body: JSON.stringify(payload) },
       SubmittedRunSchema,
     );

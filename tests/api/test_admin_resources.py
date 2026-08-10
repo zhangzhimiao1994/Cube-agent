@@ -17,7 +17,9 @@ from agent_hub.api.routers.admin import (
     MainAgentModelConfig,
     ModelDeploymentRequest,
     PersistentAdminResourceService,
+    RunDetailResponse,
     SecretCreateRequest,
+    _model_check_failure_details,
 )
 from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
@@ -117,6 +119,48 @@ class FakeModelTransport:
             text="agent-hub-model-check-ok",
             usage=TokenUsage(prompt_tokens=5, completion_tokens=5, total_tokens=10),
         )
+
+
+def test_qwen_dashscope_unauthorized_model_check_returns_provider_specific_hint() -> None:
+    deployment = Deployment(
+        id="qwen_1",
+        logical_model="qwen",
+        provider_model="qwen/qwen-max",
+        request_model="qwen-max",
+        api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    )
+
+    details = _model_check_failure_details(
+        deployment,
+        "provider returned status=401",
+        status_code="401",
+    )
+
+    assert details["provider"] == "qwen"
+    assert details["upstream_model"] == "qwen-max"
+    assert "DashScope" in details["hint"]
+    assert "AccessKey" in details["hint"]
+    assert "Bearer" in details["hint"]
+
+
+def test_run_detail_response_can_expose_mode_decision_token() -> None:
+    token = "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234"
+
+    response = RunDetailResponse(
+        id=uuid4(),
+        status="waiting_user_mode",
+        mode="auto",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="ambiguous task",
+        events=[],
+        artifacts=[],
+        explicit_details={"version": "1"},
+        decision_token=token,
+    )
+
+    assert response.decision_token == token
 
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")

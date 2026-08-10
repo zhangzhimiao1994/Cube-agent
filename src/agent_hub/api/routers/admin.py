@@ -36,6 +36,16 @@ router = APIRouter(prefix="/api/v1/admin", tags=["admin"], responses=BASE_ERROR_
 _LOGGER = logging.getLogger(__name__)
 _MODEL_CHECK_STATUS_RE = re.compile(r"\bstatus[=_: ](?P<status>[1-5][0-9]{2})\b")
 _MODEL_CHECK_HINT = "检查 API Key 是否有效、API Base 是否可从服务器访问、模型名是否属于该服务商账号。"
+_DASHSCOPE_AUTH_HINT = (
+    "DashScope/Qwen 返回 401 通常表示鉴权失败：请使用阿里云百炼/DashScope API Key，"
+    "不要使用阿里云 AccessKey/Secret；确认该 Key 已开通对应模型权限；API Base 使用 "
+    "https://dashscope.aliyuncs.com/compatible-mode/v1；API Key 输入框只填写 sk-... 原文，"
+    "不要带 Bearer 前缀。"
+)
+_OPENAI_COMPATIBLE_AUTH_HINT = (
+    "OpenAI 兼容中转站返回 401/403 通常表示鉴权失败：请确认 API Key 属于该中转站账号，"
+    "API Base 是否需要带 /v1，并且 API Key 输入框只填写 token 原文，不要带 Bearer 前缀。"
+)
 
 
 class ModelDeploymentRequest(BaseModel):
@@ -211,6 +221,7 @@ class RunDetailResponse(RunListItem):
     events: list[RunEventResponse]
     artifacts: list[RunArtifactResponse]
     explicit_details: dict[str, str]
+    decision_token: str | None = None
 
 
 class ConversationResponse(BaseModel):
@@ -1262,6 +1273,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 "version": str(record.version),
                 **_routing_details(record.routing_decision),
             },
+            decision_token=_waiting_mode_decision_token(record),
         )
 
     async def list_models(self) -> tuple[ModelDeploymentResponse, ...]:
@@ -2337,8 +2349,40 @@ def _model_check_failure_details(
         "upstream_model": _safe_model_check_detail(upstream_model),
         "status_code": _safe_model_check_detail(status_code),
         "reason": _safe_model_check_detail(reason),
-        "hint": _MODEL_CHECK_HINT,
+        "hint": _model_check_hint(provider, deployment.api_base, status_code),
     }
+
+
+def _model_check_hint(provider: str, api_base: str, status_code: str) -> str:
+    normalized_provider = provider.strip().lower()
+    normalized_base = api_base.strip().lower()
+    if _is_dashscope_provider(normalized_provider, normalized_base) and status_code in {"401", "403"}:
+        return _DASHSCOPE_AUTH_HINT
+    if status_code in {"401", "403"} and not _is_known_official_provider(
+        normalized_provider, normalized_base
+    ):
+        return _OPENAI_COMPATIBLE_AUTH_HINT
+    if _is_dashscope_provider(normalized_provider, normalized_base):
+        return (
+            "DashScope/Qwen 配置请确认：API Base 为 "
+            "https://dashscope.aliyuncs.com/compatible-mode/v1，上游模型名使用 qwen-max、"
+            "qwen-plus 等百炼控制台可用模型，API Key 只填写 sk-... 原文。"
+        )
+    return _MODEL_CHECK_HINT
+
+
+def _is_dashscope_provider(provider: str, api_base: str) -> bool:
+    return provider in {"qwen", "dashscope", "aliyun", "alibaba"} or "dashscope.aliyuncs.com" in api_base
+
+
+def _is_known_official_provider(provider: str, api_base: str) -> bool:
+    return (
+        (provider == "deepseek" and "api.deepseek.com" in api_base)
+        or (provider == "openai" and "api.openai.com" in api_base)
+        or (provider == "anthropic" and "api.anthropic.com" in api_base)
+        or (provider == "moonshot" and "api.moonshot.cn" in api_base)
+        or (provider == "minimax" and "api.minimax" in api_base)
+    )
 
 
 def _deployment_provider_and_model(deployment: Deployment) -> tuple[str, str]:
@@ -2619,6 +2663,15 @@ def _routing_details(routing_decision: dict[str, object] | None) -> dict[str, st
             if safe_reasons:
                 details["hermes_reasons"] = " | ".join(safe_reasons)
     return details
+
+
+def _waiting_mode_decision_token(record: RunRecord) -> str | None:
+    if record.status is not RunStatus.WAITING_USER_MODE or not record.routing_decision:
+        return None
+    token = record.routing_decision.get("decision_token")
+    if isinstance(token, str) and token:
+        return token
+    return None
 
 
 @router.get("/models", response_model=list[ModelDeploymentResponse], responses=error_responses(401, 403, 422))

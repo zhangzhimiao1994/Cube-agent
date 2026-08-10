@@ -722,9 +722,13 @@ article:hover {
   border: 1px solid var(--line);
   border-radius: 1.55rem;
   display: grid;
-  grid-template-rows: auto auto minmax(280px, 1fr) auto;
+  grid-template-rows: minmax(280px, 1fr) auto;
   min-width: 0;
   overflow: hidden;
+}
+
+.chat-panel-config-open {
+  grid-template-rows: auto auto minmax(280px, 1fr) auto;
 }
 
 .run-settings-panel {
@@ -788,6 +792,11 @@ article:hover {
 
 .chat-message p {
   white-space: pre-wrap;
+}
+
+.streaming-status {
+  border-color: rgba(85, 215, 255, 0.38);
+  box-shadow: 0 0 26px rgba(85, 215, 255, 0.1);
 }
 
 .chat-detail-action {
@@ -859,6 +868,18 @@ article:hover {
   min-height: 5.6rem;
 }
 
+.composer-plus-button {
+  align-items: center;
+  border-radius: 999px;
+  display: inline-flex;
+  flex: 0 0 auto;
+  font-size: 1.25rem;
+  height: 2.5rem;
+  justify-content: center;
+  min-width: 2.5rem;
+  padding: 0;
+}
+
 .composer-approval-popover {
   background:
     radial-gradient(circle at 12% 0%, rgba(125, 255, 189, 0.18), transparent 32%),
@@ -886,6 +907,27 @@ article:hover {
 
 .composer-approval-popover textarea {
   min-height: 4.2rem;
+}
+
+.mode-choice-grid {
+  display: grid;
+  gap: 0.7rem;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+.mode-choice-grid button {
+  align-items: flex-start;
+  border-radius: 1rem;
+  display: grid;
+  gap: 0.35rem;
+  justify-items: start;
+  min-height: 6.4rem;
+  text-align: left;
+}
+
+.mode-choice-grid small {
+  color: rgba(226, 247, 255, 0.68);
+  line-height: 1.35;
 }
 
 .run-compose form {
@@ -1524,6 +1566,10 @@ article:hover {
 
   .chat-panel {
     border-radius: 1.15rem;
+    grid-template-rows: minmax(42dvh, 1fr) auto;
+  }
+
+  .chat-panel-config-open {
     grid-template-rows: auto auto minmax(42dvh, 1fr) auto;
   }
 
@@ -1579,13 +1625,28 @@ article:hover {
 
   .composer-actions {
     align-items: stretch;
-    flex-direction: column;
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+
+  .composer-actions span {
+    flex: 1 1 100%;
   }
 
   .composer-actions button,
   .secondary-action {
     text-align: center;
     width: 100%;
+  }
+
+  .composer-actions .composer-plus-button {
+    flex: 0 0 2.75rem;
+    width: 2.75rem;
+  }
+
+  .composer-actions button[type="submit"] {
+    flex: 1 1 10rem;
+    width: auto;
   }
 }
 

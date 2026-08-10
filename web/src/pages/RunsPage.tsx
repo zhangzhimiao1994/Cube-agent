@@ -13,8 +13,16 @@ const RUN_MODES = [
 ] as const;
 
 type RunMode = (typeof RUN_MODES)[number]["value"];
+type ManualRunMode = Exclude<RunMode, "auto">;
+type ModeSelection = {
+  runId: string;
+  decisionToken: string;
+  version: number;
+  reason: string | null;
+};
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const MANUAL_RUN_MODES = RUN_MODES.filter((item) => item.value !== "auto");
 
 function newConversationId() {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -37,6 +45,27 @@ function explainActualMode(run: { status: string; mode: string | null }) {
   }
   if (!run.mode) return "本次任务尚未确定运行模式。";
   return `本次任务实际使用：${displayMode(run.mode)}。`;
+}
+
+function modeSelectionFromSubmittedRun(run: SubmittedRun): ModeSelection | null {
+  if (run.status !== "waiting_user_mode" || !run.decision_token) return null;
+  return {
+    runId: run.id,
+    decisionToken: run.decision_token,
+    version: run.version,
+    reason: run.clarification_reason,
+  };
+}
+
+function modeSelectionFromRunDetail(run: RunDetail | undefined): ModeSelection | null {
+  if (!run || run.status !== "waiting_user_mode" || !run.decision_token) return null;
+  const parsedVersion = Number(run.explicit_details.version ?? "0");
+  return {
+    runId: run.id,
+    decisionToken: run.decision_token,
+    version: Number.isInteger(parsedVersion) && parsedVersion > 0 ? parsedVersion : 0,
+    reason: run.explicit_details.routing_reason ?? null,
+  };
 }
 
 function detailMessages(detail: RunDetail | undefined) {
@@ -97,6 +126,8 @@ export function RunsPage() {
   const [referenceConversationId, setReferenceConversationId] = useState("");
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [submitNotice, setSubmitNotice] = useState<string | null>(null);
+  const [configOpen, setConfigOpen] = useState(false);
+  const [modeSelection, setModeSelection] = useState<ModeSelection | null>(null);
   const [temporaryApproval, setTemporaryApproval] = useState<{
     runId: string;
     decisionToken: string;
@@ -118,7 +149,7 @@ export function RunsPage() {
     enabled: Boolean(selectedRunId),
     refetchInterval: (query) => {
       const data = query.state.data;
-      return data && !TERMINAL_STATUSES.has(data.status) ? 2000 : false;
+      return data && !TERMINAL_STATUSES.has(data.status) ? 1000 : false;
     },
   });
 
@@ -141,6 +172,15 @@ export function RunsPage() {
     setAgentIds(selectedWorkflow.agent_ids ?? []);
   }, [selectedWorkflow]);
 
+  useEffect(() => {
+    const selection = modeSelectionFromRunDetail(selectedRun.data);
+    if (selection) {
+      setModeSelection(selection);
+    } else if (selectedRun.data && selectedRun.data.status !== "waiting_user_mode") {
+      setModeSelection(null);
+    }
+  }, [selectedRun.data]);
+
   const createRun = useMutation({
     mutationFn: () =>
       api.createRun({
@@ -155,7 +195,9 @@ export function RunsPage() {
     onSuccess: async (run) => {
       setSelectedRunId(run.id);
       if (run.conversation_id) setConversationId(run.conversation_id);
+      const selection = modeSelectionFromSubmittedRun(run);
       if (run.temporary_agent_proposal && run.decision_token) {
+        setModeSelection(null);
         setTemporaryApproval({
           runId: run.id,
           decisionToken: run.decision_token,
@@ -165,11 +207,34 @@ export function RunsPage() {
         });
         setTemporaryFeedback("");
         setSubmitNotice("主 Agent 发现当前角色池能力不足，已暂停并等待你确认是否临时加入新子 Agent。");
+      } else if (selection) {
+        setTemporaryApproval(null);
+        setModeSelection(selection);
+        setSubmitNotice("主 Agent 对本次任务的模式判断不够确定，请在输入框上方选择运行模式后继续。");
       } else {
         setTemporaryApproval(null);
+        setModeSelection(null);
         setSubmitNotice(explainActualMode(run));
       }
       setMessage("");
+      await queryClient.invalidateQueries({ queryKey: ["runs"] });
+      await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
+    },
+  });
+
+  const chooseMode = useMutation({
+    mutationFn: (chosenMode: ManualRunMode) => {
+      if (!modeSelection) throw new Error("mode selection is unavailable");
+      return api.chooseMode(modeSelection.runId, {
+        mode: chosenMode,
+        decision_token: modeSelection.decisionToken,
+        version: modeSelection.version,
+      });
+    },
+    onSuccess: async (run) => {
+      setModeSelection(null);
+      if (run.mode) setMode(run.mode as RunMode);
+      setSubmitNotice(explainActualMode(run));
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
       await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
     },
@@ -289,7 +354,9 @@ export function RunsPage() {
           )}
         </nav>
 
-        <div className="chat-panel">
+        <div className={`chat-panel${configOpen ? " chat-panel-config-open" : ""}`}>
+          {configOpen ? (
+            <>
           <details className="run-settings-panel" aria-label="本次运行设置" open>
             <summary aria-label="展开或收起本次运行设置">本次运行设置</summary>
             <div className="chat-config-strip" aria-label="本次对话运行设置">
@@ -449,6 +516,8 @@ export function RunsPage() {
               </>
             )}
           </details>
+            </>
+          ) : null}
 
           <div className="chat-stream" role="region" aria-label="主对话内容" aria-live="polite">
             {selectedRun.isLoading ? <p>正在加载会话...</p> : null}
@@ -467,6 +536,21 @@ export function RunsPage() {
                 <p>{item.body}</p>
               </article>
             ))}
+            {selectedRun.data && !TERMINAL_STATUSES.has(selectedRun.data.status) ? (
+              <article className="chat-message assistant streaming-status">
+                <span className="eyebrow">LIVE</span>
+                <h3>
+                  {selectedRun.data.status === "waiting_user_mode"
+                    ? "等待你选择运行模式"
+                    : "正在实时刷新运行状态"}
+                </h3>
+                <p>
+                  {selectedRun.data.status === "waiting_user_mode"
+                    ? "主 Agent 判断不够确定，请在下方确认本次走直接、派单、讨论或混合模式。"
+                    : "后端事件会持续同步到这里；生成、派单、讨论和产物状态会按时间追加。"}
+                </p>
+              </article>
+            ) : null}
             {selectedRunId ? (
               <div className="chat-detail-action">
                 <Link to={`/runs/${selectedRunId}`} className="secondary-action">
@@ -534,6 +618,34 @@ export function RunsPage() {
                 ) : null}
               </aside>
             ) : null}
+            {modeSelection ? (
+              <aside className="composer-approval-popover mode-choice-popover" role="dialog" aria-label="运行模式确认">
+                <div>
+                  <span className="eyebrow">主 Agent 需要你确认</span>
+                  <h3>本次任务应该怎么运行？</h3>
+                  <p>
+                    自动检测没有足够把握，原因：{modeSelection.reason ?? "routing_requires_user_choice"}。
+                    选择后任务会继续进入队列，并按对应模式派给角色池。
+                  </p>
+                </div>
+                <div className="mode-choice-grid">
+                  {MANUAL_RUN_MODES.map((item) => (
+                    <button
+                      type="button"
+                      key={item.value}
+                      disabled={chooseMode.isPending}
+                      onClick={() => chooseMode.mutate(item.value as ManualRunMode)}
+                    >
+                      <strong>{item.label}</strong>
+                      <small>{item.description}</small>
+                    </button>
+                  ))}
+                </div>
+                {chooseMode.isError ? (
+                  <p role="alert">{formatApiError(chooseMode.error, "运行模式确认失败")}</p>
+                ) : null}
+              </aside>
+            ) : null}
             <textarea
               value={message}
               onChange={(event) => setMessage(event.target.value)}
@@ -541,6 +653,15 @@ export function RunsPage() {
               required
             />
             <div className="composer-actions">
+              <button
+                type="button"
+                className="composer-plus-button"
+                aria-label={configOpen ? "收起本次运行配置" : "打开本次运行配置"}
+                aria-pressed={configOpen}
+                onClick={() => setConfigOpen((current) => !current)}
+              >
+                +
+              </button>
               <span>
                 {mode === "auto" ? "自动检测模式" : `手动模式：${displayMode(mode)}`}
                 {agentIds.length > 0 ? ` · 角色 ${agentIds.length} 个` : " · 未固定角色"}
