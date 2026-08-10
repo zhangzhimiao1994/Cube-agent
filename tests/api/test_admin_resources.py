@@ -232,6 +232,34 @@ def test_mode_error_log_explains_missing_legacy_failure_reason() -> None:
     assert "older runs" in log.details["diagnosis"]
 
 
+def test_mode_error_log_explains_legacy_generic_gateway_reason() -> None:
+    response = RunDetailResponse(
+        id=uuid4(),
+        status="failed",
+        mode="direct",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="hello",
+        events=[
+            RunEventResponse(
+                sequence=1,
+                kind="runtime.failed",
+                message="model gateway failed",
+                created_at=datetime.now(UTC),
+            )
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    log = _mode_error_log_from_run(response)
+
+    assert log.message == "direct run failed: model gateway failed"
+    assert log.details["reason"] == "model gateway failed"
+    assert "rerun" in log.details["diagnosis"].lower()
+
+
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
 ACTOR_ID = UUID("11111111-1111-4111-8111-111111111111")
 SECRET_ID = UUID("22222222-2222-4222-8222-222222222222")

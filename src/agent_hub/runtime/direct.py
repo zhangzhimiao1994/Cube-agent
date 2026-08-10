@@ -11,8 +11,7 @@ from typing import Never, Protocol, cast
 from uuid import UUID, uuid4
 
 from agent_hub.domain.runs import TaskMode
-from agent_hub.models.gateway import GatewayCompletion, ModelGatewayError
-from agent_hub.models.litellm_client import ModelTransportError
+from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import (
     ModelCapability,
     ModelMessage,
@@ -28,6 +27,7 @@ from agent_hub.runtime.contracts import (
     RuntimeCheckpoint,
     TaskContext,
 )
+from agent_hub.runtime.failure_reason import safe_model_gateway_failure_reason
 
 _RUNTIME_TYPE = "direct"
 _RUNTIME_VERSION = "1"
@@ -35,13 +35,6 @@ _MAX_OUTPUT_BYTES = 65_536
 _MAX_CONTEXT_BYTES = 196_608
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
-_SAFE_GATEWAY_FAILURES = {
-    "model capacity unavailable",
-    "model transport failed",
-    "model outcome recording failed",
-    "model capacity release failed",
-    "model gateway completed without a response",
-}
 
 
 class Gateway(Protocol):
@@ -76,17 +69,7 @@ def _raise_execution_error(message: str) -> Never:
 
 
 def _gateway_failure_reason(error: Exception) -> str:
-    if isinstance(error, ModelTransportError):
-        if error.status_code is not None:
-            return f"model gateway failed: model transport failed (status={error.status_code})"
-        return "model gateway failed: model transport failed"
-    if isinstance(error, ModelGatewayError):
-        message = " ".join(str(error).strip().split())
-        if message == "model credential resolution failed":
-            return "model gateway failed: model configuration failed"
-        if message in _SAFE_GATEWAY_FAILURES:
-            return f"model gateway failed: {message}"
-    return "model gateway failed"
+    return safe_model_gateway_failure_reason(error) or "model gateway failed"
 
 
 class DirectRunStream:

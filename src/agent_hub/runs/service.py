@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
@@ -14,14 +13,10 @@ from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.routing.types import RouteDecision
 from agent_hub.runs.repository import RunAlreadyActive, RunRecord, RunRepository
 from agent_hub.runtime.contracts import EventKind, JsonValue, TaskContext
+from agent_hub.runtime.failure_reason import safe_runtime_failure_reason
 from agent_hub.runtime.registry import RuntimeRegistry
 
 _LOGGER = logging.getLogger(__name__)
-_SENSITIVE_RUNTIME_REASON = re.compile(
-    r"(api[_-]?key|authorization|bearer|credential|password|secret|token|sk-[A-Za-z0-9])",
-    re.IGNORECASE,
-)
-_MAX_RUNTIME_REASON_LENGTH = 240
 
 
 @dataclass(frozen=True, slots=True)
@@ -735,10 +730,7 @@ def _string_tuple(value: object) -> tuple[str, ...]:
 
 
 def _runtime_failure_reason(error: Exception) -> str:
-    reason = " ".join(str(error).strip().split())
-    if not reason or _SENSITIVE_RUNTIME_REASON.search(reason):
-        return "runtime_failed"
-    return reason[:_MAX_RUNTIME_REASON_LENGTH]
+    return safe_runtime_failure_reason(error)
 
 
 __all__ = [

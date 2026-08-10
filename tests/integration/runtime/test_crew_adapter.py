@@ -18,6 +18,7 @@ from agent_hub.domain.runs import TaskMode
 from agent_hub.models.capacity import CapacityLease
 from agent_hub.models.gateway import DeploymentPricing, GatewayCompletion
 from agent_hub.models.gateway import ModelGateway as LeasedModelGateway
+from agent_hub.models.litellm_client import ModelTransportError
 from agent_hub.models.registry import ModelRegistry
 from agent_hub.models.types import (
     Deployment,
@@ -364,6 +365,23 @@ async def test_ready_steps_execute_in_parallel_and_emit_framework_neutral_events
     final = artifacts[-1]
     assert final is not None and len(final.source_ids) == 3
     assert all("crewai" not in type(event).__module__ for event in events)
+
+
+async def test_dispatch_gateway_transport_failure_records_safe_diagnostic() -> None:
+    class FailingGateway(FakeGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            raise ModelTransportError("Authorization: Bearer sk-secret", status_code=401)
+
+    events = await collect(make_runtime(FailingGateway(), one_step_plan()), context())
+
+    assert events[-1].kind is EventKind.RUNTIME_FAILED
+    assert events[-1].reason == "model gateway failed: model transport failed (status=401)"
+    assert any(
+        event.kind is EventKind.STEP_FAILED
+        and event.reason == "model gateway failed: model transport failed (status=401)"
+        for event in events
+    )
 
 
 async def test_plan_parallelism_caps_fanout_even_when_gateway_has_capacity() -> None:

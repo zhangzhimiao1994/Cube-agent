@@ -52,6 +52,7 @@ from agent_hub.runtime.contracts import (
     TaskContext,
 )
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
+from agent_hub.runtime.failure_reason import safe_runtime_failure_reason
 
 _RUNTIME_TYPE = "crew"
 _RUNTIME_VERSION = "7"
@@ -1302,6 +1303,7 @@ class CrewDispatchRuntime:
                 emit_error.__cause__ = None
                 del emit_error
         except RuntimeExecutionError as error:
+            failure_reason = safe_runtime_failure_reason(error, fallback="dispatch execution failed")
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None
@@ -1309,22 +1311,23 @@ class CrewDispatchRuntime:
             if hydrating_restored and protected_checkpoint is not None:
                 self._publish_checkpoint(state, protected_checkpoint)
             try:
-                await emit(kind=EventKind.RUNTIME_FAILED, reason="dispatch execution failed")
+                await emit(kind=EventKind.RUNTIME_FAILED, reason=failure_reason)
             except Exception as emit_error:  # noqa: BLE001
                 emit_error.__traceback__ = None
                 emit_error.__context__ = None
                 emit_error.__cause__ = None
                 del emit_error
         except Exception as error:  # noqa: BLE001 - redact all plugin/gateway failures
+            failure_reason = safe_runtime_failure_reason(error, fallback="dispatch execution failed")
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None
             del error
-            terminal_item = _Terminal(RuntimeExecutionError("dispatch execution failed"))
+            terminal_item = _Terminal(RuntimeExecutionError(failure_reason))
             if hydrating_restored and protected_checkpoint is not None:
                 self._publish_checkpoint(state, protected_checkpoint)
             try:
-                await emit(kind=EventKind.RUNTIME_FAILED, reason="dispatch execution failed")
+                await emit(kind=EventKind.RUNTIME_FAILED, reason=failure_reason)
             except Exception as emit_error:  # noqa: BLE001
                 emit_error.__traceback__ = None
                 emit_error.__context__ = None
@@ -1504,24 +1507,26 @@ class CrewDispatchRuntime:
                 return _StepResult(step=step, artifact=artifact, retries=retries)
             except asyncio.CancelledError:
                 raise
-            except RuntimeExecutionError:
+            except RuntimeExecutionError as error:
+                failure_reason = safe_runtime_failure_reason(error, fallback="step execution failed")
                 await event(
                     kind=EventKind.STEP_FAILED,
                     step_id=step.id,
                     actor=step.agent,
-                    reason="step execution failed",
+                    reason=failure_reason,
                 )
                 raise
             except Exception as error:  # noqa: BLE001
+                failure_reason = safe_runtime_failure_reason(error, fallback="step execution failed")
                 error.__traceback__ = None
                 del error
                 await event(
                     kind=EventKind.STEP_FAILED,
                     step_id=step.id,
                     actor=step.agent,
-                    reason="step execution failed",
+                    reason=failure_reason,
                 )
-                _fail("step execution failed")
+                _fail(failure_reason)
 
     async def _complete_agent(
         self,
@@ -1705,8 +1710,20 @@ class CrewDispatchRuntime:
                 running = dict(existing)
                 running["status"] = "running"
                 await model_state_boundary(key, running)
-                async with asyncio.timeout(self._remaining_timeout(run_state, step_deadline)):
-                    completion = await self._gateway.complete_with_context(request)
+                try:
+                    async with asyncio.timeout(self._remaining_timeout(run_state, step_deadline)):
+                        completion = await self._gateway.complete_with_context(request)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:  # noqa: BLE001 - normalize the model gateway boundary
+                    failure_reason = safe_runtime_failure_reason(
+                        error, fallback="model gateway failed"
+                    )
+                    error.__traceback__ = None
+                    error.__context__ = None
+                    error.__cause__ = None
+                    del error
+                    _fail(failure_reason)
                 response = self._valid_response(completion)
                 model_artifact = self._model_artifact(
                     completion,

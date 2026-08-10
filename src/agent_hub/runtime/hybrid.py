@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import re
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -26,14 +25,10 @@ from agent_hub.runtime.contracts import (
     RuntimeCheckpoint,
     TaskContext,
 )
+from agent_hub.runtime.failure_reason import safe_runtime_failure_reason
 
 _RUNTIME_TYPE = "hybrid"
 _RUNTIME_VERSION = "1"
-_SENSITIVE_FAILURE_REASON = re.compile(
-    r"(api[_-]?key|authorization|bearer|credential|password|secret|token|sk-[A-Za-z0-9])",
-    re.IGNORECASE,
-)
-_MAX_FAILURE_REASON_LENGTH = 240
 
 
 class RuntimeExecutionError(RuntimeError):
@@ -456,10 +451,7 @@ class HybridRuntime:
 
 
 def _safe_failure_reason(error: Exception, *, fallback: str) -> str:
-    reason = " ".join(str(error).strip().split())
-    if not reason or _SENSITIVE_FAILURE_REASON.search(reason):
-        return fallback
-    return reason[:_MAX_FAILURE_REASON_LENGTH]
+    return safe_runtime_failure_reason(error, fallback=fallback)
 
 
 __all__ = ["HybridPlan", "HybridRuntime", "HybridUpgrade", "RuntimeExecutionError"]

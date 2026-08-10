@@ -13,6 +13,7 @@ from opentelemetry import trace
 
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.gateway import GatewayCompletion
+from agent_hub.models.litellm_client import ModelTransportError
 from agent_hub.models.types import ModelCapability, ModelRequest, ModelResponse, TokenUsage
 from agent_hub.models.types import ToolCall as GatewayToolCall
 from agent_hub.runtime.artifacts import (
@@ -158,6 +159,18 @@ async def test_real_selector_group_chat_uses_gateway_for_shared_roles() -> None:
     assert len(gateway.requests) == 4
     assert {request.logical_model for request in gateway.requests} == {"shared"}
     assert all("reasoning" not in repr(request).casefold() for request in gateway.requests)
+
+
+async def test_discussion_gateway_transport_failure_records_safe_diagnostic() -> None:
+    class FailingGateway(ScriptedGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            raise ModelTransportError("Authorization: Bearer sk-secret", status_code=401)
+
+    events = await collect(AutoGenDiscussionRuntime(FailingGateway([]), plan()), context())
+
+    assert events[-1].kind is EventKind.RUNTIME_FAILED
+    assert events[-1].reason == "model gateway failed: model transport failed (status=401)"
 
 
 async def test_participants_can_use_different_logical_models() -> None:
@@ -622,13 +635,21 @@ async def test_excessive_tool_calls_are_rejected_before_capability_side_effect()
     )
     assert capabilities.calls == 0
     assert events[-1].kind is EventKind.RUNTIME_FAILED
-    assert events[-1].reason == "discussion_failed"
+    assert events[-1].reason == "model tool call limit exceeded"
     assert len(terminal_events(events)) == 1
 
 
-@pytest.mark.parametrize("malformation", ["mixed", "empty", "unknown_tool"])
+@pytest.mark.parametrize(
+    ("malformation", "expected_reason"),
+    [
+        ("mixed", "model response is invalid"),
+        ("empty", "model response is invalid"),
+        ("unknown_tool", "model requested an unavailable capability"),
+    ],
+)
 async def test_malformed_provider_output_fails_closed_with_one_terminal(
     malformation: str,
+    expected_reason: str,
 ) -> None:
     class MalformedGateway(ScriptedGateway):
         async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
@@ -698,7 +719,7 @@ async def test_malformed_provider_output_fails_closed_with_one_terminal(
     )
     assert capabilities.calls == 0
     assert events[-1].kind is EventKind.RUNTIME_FAILED
-    assert events[-1].reason == "discussion_failed"
+    assert events[-1].reason == expected_reason
     assert len(terminal_events(events)) == 1
 
 
@@ -775,7 +796,7 @@ async def test_checkpoint_artifact_hash_and_tenant_are_verified_before_resume() 
     )
     events = await collect(second, bad_context)
     assert events[-1].kind is EventKind.RUNTIME_FAILED
-    assert events[-1].reason == "discussion_failed"
+    assert events[-1].reason == "runtime checkpoint artifacts are invalid"
 
 
 async def test_exact_tool_call_limit_is_accepted_by_gateway_client() -> None:

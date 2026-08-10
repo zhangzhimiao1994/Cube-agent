@@ -67,6 +67,7 @@ from agent_hub.runtime.contracts import (
     RuntimeCheckpoint,
     TaskContext,
 )
+from agent_hub.runtime.failure_reason import safe_runtime_failure_reason
 
 _ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _RUNTIME_TYPE = "autogen"
@@ -226,7 +227,9 @@ class _DiscussionDurability:
         self._model_lock.release()
         return artifact
 
-    def fail_model(self) -> None:
+    def fail_model(self, reason: str | None = None) -> None:
+        if reason:
+            self.failure_reason = reason
         if self._model_lock.locked():
             self._model_lock.release()
 
@@ -723,9 +726,15 @@ class GatewayChatCompletionClient(ChatCompletionClient):
                 cancellation_token.link_future(task)
             try:
                 completion = await task
-            except BaseException:
+            except asyncio.CancelledError:
                 if self._durability is not None:
                     self._durability.fail_model()
+                raise
+            except Exception as error:
+                if self._durability is not None:
+                    self._durability.fail_model(
+                        safe_runtime_failure_reason(error, fallback="discussion_failed")
+                    )
                 raise
         response = completion.response
         if completion.cost_usd is None or response.usage is None:
@@ -1323,6 +1332,11 @@ class AutoGenDiscussionRuntime:
             )
             raise
         except Exception as error:  # noqa: BLE001 - AutoGen wraps participant failures
+            failure_reason = (
+                durability.failure_reason
+                if durability is not None and durability.failure_reason is not None
+                else safe_runtime_failure_reason(error, fallback="discussion_failed")
+            )
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None
@@ -1331,11 +1345,7 @@ class AutoGenDiscussionRuntime:
                 kind=EventKind.RUNTIME_FAILED,
                 sequence=sequence,
                 run_id=context.run_id,
-                reason=(
-                    durability.failure_reason
-                    if durability is not None and durability.failure_reason is not None
-                    else "discussion_failed"
-                ),
+                reason=failure_reason,
             )
         finally:
             if wall_handle is not None:

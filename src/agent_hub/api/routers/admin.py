@@ -29,6 +29,7 @@ from agent_hub.models.gateway import ModelTransport
 from agent_hub.models.litellm_client import LiteLLMClient, ModelTransportError
 from agent_hub.models.types import Deployment, ModelCapability, ModelMessage, ModelRequest
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRecord, RunRepository
+from agent_hub.runtime.failure_reason import is_legacy_generic_failure_reason
 from agent_hub.security.secrets import SecretService, SecretValidationError
 from agent_hub.skills.package import InvalidSkillPackage
 from agent_hub.skills.scanner import SkillScanner
@@ -1935,6 +1936,8 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             }
             if reason is None:
                 details["diagnosis"] = _MODE_ERROR_REASON_NOT_RECORDED_DIAGNOSIS
+            elif is_legacy_generic_failure_reason(reason):
+                details["diagnosis"] = _MODE_ERROR_LEGACY_GENERIC_DIAGNOSIS
             entries.append(
                 self.make_log(
                     category="mode_error",
@@ -2445,6 +2448,8 @@ def _mode_error_log_from_run(run: RunDetailResponse) -> LogEntryResponse:
     }
     if reason is None:
         details["diagnosis"] = _MODE_ERROR_REASON_NOT_RECORDED_DIAGNOSIS
+    elif is_legacy_generic_failure_reason(reason):
+        details["diagnosis"] = _MODE_ERROR_LEGACY_GENERIC_DIAGNOSIS
     return LogEntryResponse(
         id=f"log_run_{run.id}",
         category="mode_error",
@@ -2461,6 +2466,10 @@ _MODE_ERROR_REASON_NOT_RECORDED = "failure reason was not recorded"
 _MODE_ERROR_REASON_NOT_RECORDED_DIAGNOSIS = (
     "No runtime.failed, step.failed, or tool.failed event reason was recorded for this run. "
     "For older runs, check the worker/system logs; new runs preserve safe runtime errors."
+)
+_MODE_ERROR_LEGACY_GENERIC_DIAGNOSIS = (
+    "This run only recorded a legacy generic failure reason. Rerun the task after this update "
+    "to capture safe diagnostics such as HTTP status, deployment availability, and capacity state."
 )
 
 
