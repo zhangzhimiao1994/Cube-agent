@@ -165,6 +165,8 @@ const WorkflowResourceSchema = NamedResourceSchema.extend({
   mode: z.enum(["auto", "direct", "dispatch", "discuss", "hybrid"]).nullable().optional(),
   task_type: z.string().nullable().optional(),
   allow_main_agent_override: z.boolean().default(false),
+  allow_temporary_agents: z.boolean().default(false),
+  temporary_agent_policy: z.string().nullable().optional(),
   role_selection_policy: z.string().nullable().optional(),
   agent_ids: z.array(z.string()).optional(),
   objective: z.string().nullable().optional(),
@@ -245,6 +247,19 @@ const SubmittedRunSchema = z.object({
   clarification_reason: z.string().nullable(),
   conversation_id: z.string().nullable().optional(),
   reference_conversation_id: z.string().nullable().optional(),
+  temporary_agent_proposal: z
+    .object({
+      id: z.string(),
+      name: z.string(),
+      role: z.string(),
+      prompt: z.string(),
+      reason: z.string(),
+      missing_capability: z.string(),
+      suggested_skills: z.array(z.string()),
+      permanentizable: z.boolean(),
+    })
+    .nullable()
+    .optional(),
 });
 
 export type SubmittedRun = z.infer<typeof SubmittedRunSchema>;
@@ -666,6 +681,26 @@ export const api = {
   }): Promise<SubmittedRun> {
     return request(
       "/api/v1/runs",
+      { method: "POST", body: JSON.stringify(payload) },
+      SubmittedRunSchema,
+    );
+  },
+  approveTemporaryAgent(
+    id: string,
+    payload: { decision_token: string; version: number },
+  ): Promise<SubmittedRun> {
+    return request(
+      `/api/v1/runs/${encodeURIComponent(id)}/approve-temporary-agent`,
+      { method: "POST", body: JSON.stringify(payload) },
+      SubmittedRunSchema,
+    );
+  },
+  reviseTemporaryAgent(
+    id: string,
+    payload: { decision_token: string; version: number; feedback: string },
+  ): Promise<SubmittedRun> {
+    return request(
+      `/api/v1/runs/${encodeURIComponent(id)}/revise-temporary-agent`,
       { method: "POST", body: JSON.stringify(payload) },
       SubmittedRunSchema,
     );

@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Protocol
+from typing import Protocol, cast
 from uuid import UUID, uuid4
 
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.routing.types import RouteDecision
 from agent_hub.runs.repository import RunAlreadyActive, RunRecord, RunRepository
-from agent_hub.runtime.contracts import EventKind, TaskContext
+from agent_hub.runtime.contracts import EventKind, JsonValue, TaskContext
 from agent_hub.runtime.registry import RuntimeRegistry
 
 _LOGGER = logging.getLogger(__name__)
@@ -28,6 +29,7 @@ class SubmittedRun:
     clarification_reason: str | None = None
     conversation_id: str | None = None
     reference_conversation_id: str | None = None
+    temporary_agent_proposal: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +50,44 @@ class TaskQueue(Protocol):
 
 class ModeRouterProtocol(Protocol):
     async def route(self, task_text: object) -> RouteDecision: ...
+
+
+@dataclass(frozen=True, slots=True)
+class TemporaryAgentProposal:
+    id: str
+    name: str
+    role: str
+    prompt: str
+    reason: str
+    missing_capability: str
+    suggested_skills: tuple[str, ...] = ()
+    permanentizable: bool = True
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "role": self.role,
+            "prompt": self.prompt,
+            "reason": self.reason,
+            "missing_capability": self.missing_capability,
+            "suggested_skills": list(self.suggested_skills),
+            "permanentizable": self.permanentizable,
+        }
+
+
+class TemporaryAgentPolicyProtocol(Protocol):
+    async def propose(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        message: str,
+        mode: TaskMode,
+        agent_ids: tuple[str, ...],
+        workflow_id: str | None,
+        allow_workflow_adjustment: bool,
+    ) -> TemporaryAgentProposal | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,12 +137,14 @@ class RunService:
         router: ModeRouterProtocol | None,
         task_queue: TaskQueue,
         hermes_advisor: HermesAdvisorProtocol | None = None,
+        temporary_agent_policy: TemporaryAgentPolicyProtocol | None = None,
     ) -> None:
         self._repository = repository
         self._runtime_registry = runtime_registry
         self._router = router
         self._queue = task_queue
         self._hermes_advisor = hermes_advisor
+        self._temporary_agent_policy = temporary_agent_policy
 
     async def submit(
         self,
@@ -135,6 +177,29 @@ class RunService:
                 decision = await self._router.route(message)
             if decision is not None and decision.status == "ready":
                 assert decision.mode is not None
+                proposal = await self._safe_temporary_agent_proposal(
+                    tenant_id=tenant_id,
+                    actor_id=actor_id,
+                    message=message,
+                    mode=decision.mode,
+                    agent_ids=agent_ids,
+                    workflow_id=workflow_id,
+                    allow_workflow_adjustment=allow_workflow_adjustment,
+                )
+                routing_payload = {
+                    **decision.model_dump(mode="json"),
+                    **operator_selection,
+                }
+                if proposal is not None:
+                    return await self._create_temporary_agent_approval_run(
+                        tenant_id=tenant_id,
+                        actor_id=actor_id,
+                        message=message,
+                        mode=decision.mode,
+                        proposal=proposal,
+                        idempotency_key=idempotency_key,
+                        operator_selection=routing_payload,
+                    )
                 record = await self._repository.create_run(
                     tenant_id=tenant_id,
                     actor_id=actor_id,
@@ -142,10 +207,7 @@ class RunService:
                     mode=decision.mode,
                     status=RunStatus.QUEUED,
                     idempotency_key=idempotency_key,
-                    routing_decision={
-                        **decision.model_dump(mode="json"),
-                        **operator_selection,
-                    },
+                    routing_decision=routing_payload,
                     enqueue=True,
                 )
                 return _submitted(record)
@@ -160,6 +222,30 @@ class RunService:
             )
             if _usable_hermes_advice(hermes_advice):
                 assert hermes_advice is not None
+                routing_payload = {
+                    "reason": "hermes_recommendation",
+                    "hermes": _hermes_advice_payload(hermes_advice),
+                    **operator_selection,
+                }
+                proposal = await self._safe_temporary_agent_proposal(
+                    tenant_id=tenant_id,
+                    actor_id=actor_id,
+                    message=message,
+                    mode=hermes_advice.recommended_mode,
+                    agent_ids=agent_ids,
+                    workflow_id=workflow_id,
+                    allow_workflow_adjustment=allow_workflow_adjustment,
+                )
+                if proposal is not None:
+                    return await self._create_temporary_agent_approval_run(
+                        tenant_id=tenant_id,
+                        actor_id=actor_id,
+                        message=message,
+                        mode=hermes_advice.recommended_mode,
+                        proposal=proposal,
+                        idempotency_key=idempotency_key,
+                        operator_selection=routing_payload,
+                    )
                 record = await self._repository.create_run(
                     tenant_id=tenant_id,
                     actor_id=actor_id,
@@ -167,11 +253,7 @@ class RunService:
                     mode=hermes_advice.recommended_mode,
                     status=RunStatus.QUEUED,
                     idempotency_key=idempotency_key,
-                    routing_decision={
-                        "reason": "hermes_recommendation",
-                        "hermes": _hermes_advice_payload(hermes_advice),
-                        **operator_selection,
-                    },
+                    routing_decision=routing_payload,
                     enqueue=True,
                 )
                 return _submitted(record)
@@ -217,6 +299,26 @@ class RunService:
                 clarification_reason=clarification_reason,
             )
 
+        proposal = await self._safe_temporary_agent_proposal(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            message=message,
+            mode=mode,
+            agent_ids=agent_ids,
+            workflow_id=workflow_id,
+            allow_workflow_adjustment=allow_workflow_adjustment,
+        )
+        if proposal is not None:
+            return await self._create_temporary_agent_approval_run(
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                message=message,
+                mode=mode,
+                proposal=proposal,
+                idempotency_key=idempotency_key,
+                operator_selection=operator_selection,
+            )
+
         record = await self._repository.create_run(
             tenant_id=tenant_id,
             actor_id=actor_id,
@@ -226,6 +328,47 @@ class RunService:
             idempotency_key=idempotency_key,
             routing_decision=operator_selection,
             enqueue=True,
+        )
+        return _submitted(record)
+
+    async def approve_temporary_agent(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        decision_token: str,
+        version: int,
+    ) -> SubmittedRun:
+        del actor_id
+        record = await self._repository.approve_temporary_agent_and_enqueue(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            decision_token=decision_token,
+            version=version,
+        )
+        return _submitted(record)
+
+    async def revise_temporary_agent(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        decision_token: str,
+        version: int,
+        feedback: str,
+    ) -> SubmittedRun:
+        del actor_id
+        cleaned_feedback = feedback.strip()
+        if not cleaned_feedback:
+            raise ValueError("temporary agent feedback must not be blank")
+        record = await self._repository.revise_temporary_agent_and_enqueue(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            decision_token=decision_token,
+            version=version,
+            feedback=cleaned_feedback[:2000],
         )
         return _submitted(record)
 
@@ -325,6 +468,7 @@ class RunService:
                 mode=mode,
                 request=request,
                 checkpoint=checkpoint,
+                routing_decision=cast(Mapping[str, JsonValue], routing_decision),
             )
             async for event in runtime.run(context):
                 async with await self._repository.run_transaction() as session, session.begin():
@@ -429,6 +573,66 @@ class RunService:
             _LOGGER.exception("hermes_advice_failed tenant_id=%s", tenant_id)
             return None
 
+    async def _safe_temporary_agent_proposal(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        message: str,
+        mode: TaskMode,
+        agent_ids: tuple[str, ...],
+        workflow_id: str | None,
+        allow_workflow_adjustment: bool,
+    ) -> TemporaryAgentProposal | None:
+        if self._temporary_agent_policy is None:
+            return None
+        if mode not in {TaskMode.DISPATCH, TaskMode.HYBRID}:
+            return None
+        try:
+            return await self._temporary_agent_policy.propose(
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                message=message,
+                mode=mode,
+                agent_ids=agent_ids,
+                workflow_id=workflow_id,
+                allow_workflow_adjustment=allow_workflow_adjustment,
+            )
+        except Exception:
+            _LOGGER.exception("temporary_agent_policy_failed tenant_id=%s", tenant_id)
+            return None
+
+    async def _create_temporary_agent_approval_run(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        message: str,
+        mode: TaskMode,
+        proposal: TemporaryAgentProposal,
+        idempotency_key: str | None,
+        operator_selection: dict[str, object],
+    ) -> SubmittedRun:
+        token = _decision_token()
+        proposal_payload = proposal.to_payload()
+        record = await self._repository.create_run(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            request=message,
+            mode=mode,
+            status=RunStatus.WAITING_APPROVAL,
+            idempotency_key=idempotency_key,
+            routing_decision={
+                **operator_selection,
+                "reason": "temporary_agent_requires_user_approval",
+                "decision_token": token,
+                "approval_kind": "temporary_agent_creation",
+                "temporary_agent_proposal": proposal_payload,
+            },
+            enqueue=False,
+        )
+        return _submitted(record)
+
     async def _safe_record_hermes_outcome(
         self,
         *,
@@ -462,20 +666,25 @@ class RunService:
 def _submitted(record: RunRecord) -> SubmittedRun:
     decision = record.routing_decision or {}
     reason = str(decision.get("reason", "routing_requires_user_choice"))
+    proposal = decision.get("temporary_agent_proposal")
     return SubmittedRun(
         id=record.id,
         tenant_id=record.tenant_id,
         status=record.status,
         mode=record.mode,
-        decision_token=None
-        if record.status is not RunStatus.WAITING_USER_MODE
-        else str(decision.get("decision_token", "")),
+        decision_token=str(decision.get("decision_token", ""))
+        if record.status in {RunStatus.WAITING_USER_MODE, RunStatus.WAITING_APPROVAL}
+        and decision.get("decision_token") is not None
+        else None,
         version=record.version,
         clarification_reason=None
-        if record.status is not RunStatus.WAITING_USER_MODE
+        if record.status not in {RunStatus.WAITING_USER_MODE, RunStatus.WAITING_APPROVAL}
         else reason,
         conversation_id=_string_or_none(decision.get("conversation_id")) or f"conv-{record.id}",
         reference_conversation_id=_string_or_none(decision.get("reference_conversation_id")),
+        temporary_agent_proposal=cast(dict[str, object], proposal)
+        if isinstance(proposal, dict)
+        else None,
     )
 
 

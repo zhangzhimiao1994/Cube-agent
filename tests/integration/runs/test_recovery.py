@@ -12,7 +12,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from agent_hub.db.models import RunEventRow
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import RunRepository
-from agent_hub.runs.service import HermesRunAdvice, HermesRunOutcome, RunService
+from agent_hub.runs.service import (
+    HermesRunAdvice,
+    HermesRunOutcome,
+    RunService,
+    TemporaryAgentProposal,
+)
 from agent_hub.runs.tasks import CeleryRunQueue
 from agent_hub.runtime.contracts import (
     Artifact,
@@ -88,6 +93,36 @@ class FakeRuntime:
 
     async def cancel(self) -> None:
         raise AssertionError("not used")
+
+
+class RecordingTemporaryAgentPolicy:
+    def __init__(self, proposal: TemporaryAgentProposal | None) -> None:
+        self.proposal = proposal
+        self.calls: list[dict[str, object]] = []
+
+    async def propose(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        message: str,
+        mode: TaskMode,
+        agent_ids: tuple[str, ...],
+        workflow_id: str | None,
+        allow_workflow_adjustment: bool,
+    ) -> TemporaryAgentProposal | None:
+        self.calls.append(
+            {
+                "tenant_id": tenant_id,
+                "actor_id": actor_id,
+                "message": message,
+                "mode": mode,
+                "agent_ids": agent_ids,
+                "workflow_id": workflow_id,
+                "allow_workflow_adjustment": allow_workflow_adjustment,
+            }
+        )
+        return self.proposal
 
 
 class AccountingRuntime:
@@ -273,6 +308,81 @@ async def test_worker_resumes_from_latest_safe_checkpoint_without_duplicate_arti
     assert sum(event["kind"] == "artifact.created" for event in events) == 1
     assert runtime.calls == 2
     assert len(runtime.restored) == 1
+
+
+async def test_dispatch_waits_for_user_before_creating_temporary_agent(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    user_id = uuid4()
+    queue = RecordingQueue([])
+    policy = RecordingTemporaryAgentPolicy(
+        TemporaryAgentProposal(
+            id="temp-web-engineer",
+            name="Temporary Web Engineer",
+            role="Web Engineer",
+            prompt="Implement the landing page requested by the user.",
+            reason="selected workflow has no engineering-capable agent",
+            missing_capability="software_engineering",
+            suggested_skills=("frontend",),
+            permanentizable=True,
+        )
+    )
+    service = RunService(
+        RunRepository(run_session_factory),
+        runtime_registry=RuntimeRegistry((FakeRuntime(),)),
+        router=None,
+        task_queue=queue,
+        temporary_agent_policy=policy,
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        message="把这个艺术设计方案落成一个网页",
+        mode=TaskMode.DISPATCH,
+        agent_ids=("director",),
+        workflow_id="creative-design-discuss",
+        allow_workflow_adjustment=True,
+        idempotency_key="needs-temp-agent",
+    )
+
+    assert submitted.status is RunStatus.WAITING_APPROVAL
+    assert submitted.mode is TaskMode.DISPATCH
+    assert submitted.decision_token is not None
+    assert submitted.clarification_reason == "temporary_agent_requires_user_approval"
+    assert submitted.temporary_agent_proposal == {
+        "id": "temp-web-engineer",
+        "name": "Temporary Web Engineer",
+        "role": "Web Engineer",
+        "prompt": "Implement the landing page requested by the user.",
+        "reason": "selected workflow has no engineering-capable agent",
+        "missing_capability": "software_engineering",
+        "suggested_skills": ["frontend"],
+        "permanentizable": True,
+    }
+    assert queue.enqueued == []
+    record = await RunRepository(run_session_factory).get(tenant_id, submitted.id)
+    assert record.routing_decision is not None
+    assert record.routing_decision["approval_kind"] == "temporary_agent_creation"
+
+    approved = await service.approve_temporary_agent(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        run_id=submitted.id,
+        decision_token=submitted.decision_token,
+        version=submitted.version,
+    )
+
+    assert approved.status is RunStatus.QUEUED
+    assert queue.enqueued == []
+    approved_record = await RunRepository(run_session_factory).get(tenant_id, submitted.id)
+    assert approved_record.routing_decision is not None
+    assert approved_record.routing_decision["selected_agent_ids"] == [
+        "director",
+        "temp-web-engineer",
+    ]
+    assert approved_record.routing_decision["temporary_agent_approved"] is True
 
 
 async def test_hermes_high_confidence_auto_advice_queues_recommended_mode(

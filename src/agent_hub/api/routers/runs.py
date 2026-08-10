@@ -50,6 +50,27 @@ class RunServiceProtocol(Protocol):
         version: int,
     ) -> SubmittedRun: ...
 
+    async def approve_temporary_agent(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        decision_token: str,
+        version: int,
+    ) -> SubmittedRun: ...
+
+    async def revise_temporary_agent(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        decision_token: str,
+        version: int,
+        feedback: str,
+    ) -> SubmittedRun: ...
+
     async def get(self, tenant_id: UUID, run_id: UUID) -> RunSummary: ...
 
     async def events(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]: ...
@@ -77,6 +98,15 @@ class ChooseModeRequest(BaseModel):
     version: int = Field(ge=1)
 
 
+class ApproveTemporaryAgentRequest(BaseModel):
+    decision_token: str = Field(min_length=32, max_length=160)
+    version: int = Field(ge=1)
+
+
+class ReviseTemporaryAgentRequest(ApproveTemporaryAgentRequest):
+    feedback: str = Field(min_length=1, max_length=2000)
+
+
 class SubmittedRunResponse(BaseModel):
     id: UUID
     tenant_id: UUID
@@ -87,6 +117,7 @@ class SubmittedRunResponse(BaseModel):
     clarification_reason: str | None = None
     conversation_id: str | None = None
     reference_conversation_id: str | None = None
+    temporary_agent_proposal: dict[str, object] | None = None
 
     @classmethod
     def from_submitted(cls, run: SubmittedRun) -> SubmittedRunResponse:
@@ -100,6 +131,7 @@ class SubmittedRunResponse(BaseModel):
             clarification_reason=run.clarification_reason,
             conversation_id=run.conversation_id,
             reference_conversation_id=run.reference_conversation_id,
+            temporary_agent_proposal=run.temporary_agent_proposal,
         )
 
 
@@ -204,6 +236,80 @@ async def choose_mode(
         raise _run_not_found() from error
     except RunConflict as error:
         raise _run_conflict(error) from error
+    except ValueError as error:
+        raise PublicAPIError(
+            422,
+            "request_validation",
+            str(error),
+            details={"reason": str(error)},
+        ) from error
+    return SubmittedRunResponse.from_submitted(submitted)
+
+
+@router.post(
+    "/{run_id}/approve-temporary-agent",
+    response_model=SubmittedRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def approve_temporary_agent(
+    run_id: UUID,
+    body: ApproveTemporaryAgentRequest,
+    service: Annotated[RunServiceProtocol, Depends(_run_service)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:create"))],
+) -> SubmittedRunResponse:
+    try:
+        submitted = await service.approve_temporary_agent(
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+            run_id=run_id,
+            decision_token=body.decision_token,
+            version=body.version,
+        )
+    except RunNotFound as error:
+        raise _run_not_found() from error
+    except RunConflict as error:
+        raise _run_conflict(error) from error
+    except ValueError as error:
+        raise PublicAPIError(
+            422,
+            "request_validation",
+            str(error),
+            details={"reason": str(error)},
+        ) from error
+    return SubmittedRunResponse.from_submitted(submitted)
+
+
+@router.post(
+    "/{run_id}/revise-temporary-agent",
+    response_model=SubmittedRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def revise_temporary_agent(
+    run_id: UUID,
+    body: ReviseTemporaryAgentRequest,
+    service: Annotated[RunServiceProtocol, Depends(_run_service)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:create"))],
+) -> SubmittedRunResponse:
+    try:
+        submitted = await service.revise_temporary_agent(
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+            run_id=run_id,
+            decision_token=body.decision_token,
+            version=body.version,
+            feedback=body.feedback,
+        )
+    except RunNotFound as error:
+        raise _run_not_found() from error
+    except RunConflict as error:
+        raise _run_conflict(error) from error
+    except ValueError as error:
+        raise PublicAPIError(
+            422,
+            "request_validation",
+            str(error),
+            details={"reason": str(error)},
+        ) from error
     return SubmittedRunResponse.from_submitted(submitted)
 
 

@@ -211,6 +211,103 @@ class RunRepository:
             await session.flush()
             return self._record(row)
 
+    async def approve_temporary_agent_and_enqueue(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        decision_token: str,
+        version: int,
+    ) -> RunRecord:
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if row is None:
+                raise RunNotFound("run was not found")
+            if RunStatus(row.status) is not RunStatus.WAITING_APPROVAL:
+                raise RunConflict("run is not waiting for temporary agent approval")
+            routing_decision = {} if row.routing_decision is None else dict(row.routing_decision)
+            if routing_decision.get("approval_kind") != "temporary_agent_creation":
+                raise RunConflict("run is waiting for a different approval")
+            if routing_decision.get("decision_token") != decision_token:
+                raise RunConflict("temporary agent approval token is invalid")
+            if row.version != version:
+                raise RunConflict("run version is stale")
+            proposal = routing_decision.get("temporary_agent_proposal")
+            if not isinstance(proposal, dict) or not isinstance(proposal.get("id"), str):
+                raise RunConflict("temporary agent proposal is invalid")
+            selected = routing_decision.get("selected_agent_ids")
+            selected_agent_ids = [item for item in selected if isinstance(item, str)] if isinstance(selected, list) else []
+            proposal_id = proposal["id"]
+            if proposal_id not in selected_agent_ids:
+                selected_agent_ids.append(proposal_id)
+            row.routing_decision = {
+                **routing_decision,
+                "selected_agent_ids": selected_agent_ids,
+                "temporary_agents": [proposal],
+                "temporary_agent_approved": True,
+            }
+            row.status = RunStatus.QUEUED.value
+            row.version += 1
+            await session.flush()
+            session.add(
+                RunOutboxRow(
+                    id=uuid4(),
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    task_name="agent_hub.runs.execute",
+                    idempotency_key=f"{tenant_id}:{run_id}:temporary-agent:{version}",
+                    payload={"run_id": str(run_id)},
+                )
+            )
+            await session.flush()
+            return self._record(row)
+
+    async def revise_temporary_agent_and_enqueue(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        decision_token: str,
+        version: int,
+        feedback: str,
+    ) -> RunRecord:
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if row is None:
+                raise RunNotFound("run was not found")
+            if RunStatus(row.status) is not RunStatus.WAITING_APPROVAL:
+                raise RunConflict("run is not waiting for temporary agent approval")
+            routing_decision = {} if row.routing_decision is None else dict(row.routing_decision)
+            if routing_decision.get("approval_kind") != "temporary_agent_creation":
+                raise RunConflict("run is waiting for a different approval")
+            if routing_decision.get("decision_token") != decision_token:
+                raise RunConflict("temporary agent revision token is invalid")
+            if row.version != version:
+                raise RunConflict("run version is stale")
+            row.request = f"{row.request}\n\nUser feedback for temporary agent proposal: {feedback}"
+            row.routing_decision = {
+                **routing_decision,
+                "temporary_agent_rejected": True,
+                "temporary_agent_feedback": feedback,
+                "temporary_agents": [],
+                "workflow_adjustment_policy": "ask_before_apply",
+            }
+            row.status = RunStatus.QUEUED.value
+            row.version += 1
+            await session.flush()
+            session.add(
+                RunOutboxRow(
+                    id=uuid4(),
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    task_name="agent_hub.runs.execute",
+                    idempotency_key=f"{tenant_id}:{run_id}:temporary-agent-revision:{version}",
+                    payload={"run_id": str(run_id)},
+                )
+            )
+            await session.flush()
+            return self._record(row)
+
     async def enqueue_existing_run(
         self,
         *,

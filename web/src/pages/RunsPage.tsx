@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
-import { api, formatApiError, type RunDetail } from "../api/client";
+import { api, formatApiError, type RunDetail, type SubmittedRun } from "../api/client";
 
 const RUN_MODES = [
   { value: "auto", label: "自动检测", description: "主 Agent 会判断应使用直接、派单、讨论或混合模式；不确定时应询问用户。" },
@@ -97,6 +97,14 @@ export function RunsPage() {
   const [referenceConversationId, setReferenceConversationId] = useState("");
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [submitNotice, setSubmitNotice] = useState<string | null>(null);
+  const [temporaryApproval, setTemporaryApproval] = useState<{
+    runId: string;
+    decisionToken: string;
+    version: number;
+    proposal: NonNullable<SubmittedRun["temporary_agent_proposal"]>;
+    approved: boolean;
+  } | null>(null);
+  const [temporaryFeedback, setTemporaryFeedback] = useState("");
   const trimmedReferenceConversationId = referenceConversationId.trim();
 
   const selectedWorkflow = useMemo(
@@ -147,8 +155,74 @@ export function RunsPage() {
     onSuccess: async (run) => {
       setSelectedRunId(run.id);
       if (run.conversation_id) setConversationId(run.conversation_id);
-      setSubmitNotice(explainActualMode(run));
+      if (run.temporary_agent_proposal && run.decision_token) {
+        setTemporaryApproval({
+          runId: run.id,
+          decisionToken: run.decision_token,
+          version: run.version,
+          proposal: run.temporary_agent_proposal,
+          approved: false,
+        });
+        setTemporaryFeedback("");
+        setSubmitNotice("主 Agent 发现当前角色池能力不足，已暂停并等待你确认是否临时加入新子 Agent。");
+      } else {
+        setTemporaryApproval(null);
+        setSubmitNotice(explainActualMode(run));
+      }
       setMessage("");
+      await queryClient.invalidateQueries({ queryKey: ["runs"] });
+      await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
+    },
+  });
+
+  const approveTemporaryAgent = useMutation({
+    mutationFn: () => {
+      if (!temporaryApproval) throw new Error("temporary approval is unavailable");
+      return api.approveTemporaryAgent(temporaryApproval.runId, {
+        decision_token: temporaryApproval.decisionToken,
+        version: temporaryApproval.version,
+      });
+    },
+    onSuccess: async (run) => {
+      setTemporaryApproval((current) => (current ? { ...current, approved: true } : current));
+      setSubmitNotice("已确认临时子 Agent，本次任务已重新进入执行队列。任务完成后你可以决定是否永久保存该 Agent。");
+      await queryClient.invalidateQueries({ queryKey: ["runs"] });
+      await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
+    },
+  });
+
+  const promoteTemporaryAgent = useMutation({
+    mutationFn: () => {
+      if (!temporaryApproval) throw new Error("temporary approval is unavailable");
+      return api.createAgent({
+        id: temporaryApproval.proposal.id,
+        name: temporaryApproval.proposal.name,
+        enabled: true,
+        role: temporaryApproval.proposal.role,
+        prompt: temporaryApproval.proposal.prompt,
+        model: null,
+        skills: temporaryApproval.proposal.suggested_skills,
+      });
+    },
+    onSuccess: async () => {
+      setSubmitNotice("临时子 Agent 已保存为永久 Agent。请到 Agent 页面为它绑定已测试模型后投入常规工作流。");
+      await queryClient.invalidateQueries({ queryKey: ["agents"] });
+    },
+  });
+
+  const reviseTemporaryAgent = useMutation({
+    mutationFn: () => {
+      if (!temporaryApproval) throw new Error("temporary approval is unavailable");
+      return api.reviseTemporaryAgent(temporaryApproval.runId, {
+        decision_token: temporaryApproval.decisionToken,
+        version: temporaryApproval.version,
+        feedback: temporaryFeedback.trim(),
+      });
+    },
+    onSuccess: async (run) => {
+      setTemporaryApproval(null);
+      setTemporaryFeedback("");
+      setSubmitNotice("已收到你的新意见，主 Agent 会按反馈重新规划本次任务。");
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
       await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
     },
@@ -404,6 +478,62 @@ export function RunsPage() {
           </div>
 
           <form onSubmit={submit} aria-label="发送对话任务" className="chat-composer">
+            {temporaryApproval ? (
+              <aside className="composer-approval-popover" role="dialog" aria-label="临时 Agent 确认提醒">
+                <div>
+                  <span className="eyebrow">主 Agent 请求确认</span>
+                  <h3>{temporaryApproval.proposal.name}</h3>
+                  <p>{temporaryApproval.proposal.reason}</p>
+                  <p>
+                    缺少能力：{temporaryApproval.proposal.missing_capability}；角色边界：
+                    {temporaryApproval.proposal.prompt}
+                  </p>
+                </div>
+                <label htmlFor="temporary-agent-feedback">
+                  提出新的意见
+                  <textarea
+                    id="temporary-agent-feedback"
+                    value={temporaryFeedback}
+                    onChange={(event) => setTemporaryFeedback(event.target.value)}
+                    placeholder="例如：不要加工程师，先让产品经理重新拆需求。"
+                  />
+                </label>
+                <div className="composer-actions">
+                  <button
+                    type="button"
+                    disabled={temporaryApproval.approved || approveTemporaryAgent.isPending}
+                    onClick={() => approveTemporaryAgent.mutate()}
+                  >
+                    {temporaryApproval.approved ? "已临时加入" : "接受并临时加入"}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-action"
+                    disabled={temporaryFeedback.trim().length === 0 || reviseTemporaryAgent.isPending}
+                    onClick={() => reviseTemporaryAgent.mutate()}
+                  >
+                    按我的意见重规
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-action"
+                    disabled={!temporaryApproval.approved || promoteTemporaryAgent.isPending}
+                    onClick={() => promoteTemporaryAgent.mutate()}
+                  >
+                    保存为永久 Agent
+                  </button>
+                </div>
+                {approveTemporaryAgent.isError ? (
+                  <p role="alert">{formatApiError(approveTemporaryAgent.error, "临时 Agent 确认失败")}</p>
+                ) : null}
+                {reviseTemporaryAgent.isError ? (
+                  <p role="alert">{formatApiError(reviseTemporaryAgent.error, "临时 Agent 重规失败")}</p>
+                ) : null}
+                {promoteTemporaryAgent.isError ? (
+                  <p role="alert">{formatApiError(promoteTemporaryAgent.error, "永久化 Agent 失败")}</p>
+                ) : null}
+              </aside>
+            ) : null}
             <textarea
               value={message}
               onChange={(event) => setMessage(event.target.value)}

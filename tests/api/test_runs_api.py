@@ -107,6 +107,49 @@ class StubRunService:
             clarification_reason=None,
         )
 
+    async def approve_temporary_agent(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        decision_token: str,
+        version: int,
+    ) -> SubmittedRun:
+        del actor_id, decision_token, version
+        return SubmittedRun(
+            id=run_id,
+            tenant_id=tenant_id,
+            status=RunStatus.QUEUED,
+            mode=TaskMode.DISPATCH,
+            decision_token=None,
+            version=2,
+            clarification_reason=None,
+            temporary_agent_proposal=None,
+        )
+
+    async def revise_temporary_agent(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        decision_token: str,
+        version: int,
+        feedback: str,
+    ) -> SubmittedRun:
+        del actor_id, decision_token, version, feedback
+        return SubmittedRun(
+            id=run_id,
+            tenant_id=tenant_id,
+            status=RunStatus.QUEUED,
+            mode=TaskMode.DISPATCH,
+            decision_token=None,
+            version=2,
+            clarification_reason=None,
+            temporary_agent_proposal=None,
+        )
+
     async def get(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
         return RunSummary(
             id=run_id,
@@ -247,6 +290,43 @@ def test_choose_mode_enqueues_waiting_run_safely() -> None:
             "mode": "dispatch",
             "decision_token": "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
             "version": 1,
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "queued"
+    assert response.json()["mode"] == "dispatch"
+
+
+def test_approve_temporary_agent_queues_confirmed_run_safely() -> None:
+    client, _, _ = _client()
+    run_id = uuid4()
+
+    response = client.post(
+        f"/api/v1/runs/{run_id}/approve-temporary-agent",
+        headers=bearer(),
+        json={
+            "decision_token": "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+            "version": 1,
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "queued"
+    assert response.json()["mode"] == "dispatch"
+
+
+def test_revise_temporary_agent_accepts_user_feedback_and_queues_run() -> None:
+    client, _, _ = _client()
+    run_id = uuid4()
+
+    response = client.post(
+        f"/api/v1/runs/{run_id}/revise-temporary-agent",
+        headers=bearer(),
+        json={
+            "decision_token": "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+            "version": 1,
+            "feedback": "不要加工程师，先让产品经理重新拆任务。",
         },
     )
 

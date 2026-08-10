@@ -4,8 +4,9 @@ import { FormEvent, useState } from "react";
 import { api, formatApiError, type WorkflowResource } from "../api/client";
 
 const WORKFLOW_PRESETS: Array<
-  Omit<WorkflowResource, "allow_main_agent_override"> & {
+  Omit<WorkflowResource, "allow_main_agent_override" | "allow_temporary_agents"> & {
     allow_main_agent_override?: boolean;
+    allow_temporary_agents?: boolean;
     description: string;
     suggested_roles: string[];
   }
@@ -130,9 +131,16 @@ export function WorkflowsPage() {
   const [allowMainAgentOverride, setAllowMainAgentOverride] = useState<boolean>(
     preset.allow_main_agent_override ?? false,
   );
+  const [allowTemporaryAgents, setAllowTemporaryAgents] = useState<boolean>(
+    preset.allow_temporary_agents ?? false,
+  );
   const [taskType, setTaskType] = useState<string>(preset.task_type ?? "");
   const [agentIds, setAgentIds] = useState<string[]>([]);
   const [objective, setObjective] = useState<string>(preset.objective ?? "");
+  const [temporaryAgentPolicy, setTemporaryAgentPolicy] = useState<string>(
+    preset.temporary_agent_policy ??
+      "当主 Agent 判断当前角色池缺少完成任务所需的专业能力时，先说明缺口、拟创建的临时 Agent 角色、边界和原因；得到用户确认后才临时加入，任务完成后询问是否永久保存。",
+  );
   const [roleSelectionPolicy, setRoleSelectionPolicy] = useState<string>(preset.role_selection_policy ?? "");
   const [steps, setSteps] = useState<string>(listToLines(preset.steps));
   const [deliverables, setDeliverables] = useState<string>(listToLines(preset.deliverables));
@@ -147,6 +155,8 @@ export function WorkflowsPage() {
         enabled,
         mode,
         allow_main_agent_override: allowMainAgentOverride,
+        allow_temporary_agents: allowTemporaryAgents,
+        temporary_agent_policy: temporaryAgentPolicy.trim(),
         task_type: taskType.trim(),
         role_selection_policy: roleSelectionPolicy.trim(),
         agent_ids: agentIds,
@@ -169,9 +179,14 @@ export function WorkflowsPage() {
     setEnabled(next.enabled);
     setMode(next.mode ?? "dispatch");
     setAllowMainAgentOverride(next.allow_main_agent_override ?? false);
+    setAllowTemporaryAgents(next.allow_temporary_agents ?? false);
     setTaskType(next.task_type ?? "");
     setAgentIds([]);
     setObjective(next.objective ?? "");
+    setTemporaryAgentPolicy(
+      next.temporary_agent_policy ??
+        "当主 Agent 判断当前角色池缺少完成任务所需的专业能力时，先说明缺口、拟创建的临时 Agent 角色、边界和原因；得到用户确认后才临时加入，任务完成后询问是否永久保存。",
+    );
     setRoleSelectionPolicy(next.role_selection_policy ?? "");
     setSteps(listToLines(next.steps));
     setDeliverables(listToLines(next.deliverables));
@@ -263,6 +278,27 @@ export function WorkflowsPage() {
             开启后，如果主 Agent 认为当前任务需要改步骤、换角色或增加交付物，它只能先说明原因并请求确认；
             确认前仍按原工作流预设执行。关闭后，主 Agent 只提示风险，不改工作流。
           </p>
+
+          <label className="inline-check">
+            <input
+              type="checkbox"
+              checked={allowTemporaryAgents}
+              onChange={(event) => setAllowTemporaryAgents(event.target.checked)}
+            />
+            允许主 Agent 在角色能力不足时申请临时子 Agent
+          </label>
+          <p className="field-help">
+            开启后，派单/混合模式如果发现当前角色池缺少必要能力，主 Agent 会先向你说明缺口和拟创建的临时 Agent；
+            只有你确认后才会临时加入执行。任务完成后，你可以再决定是否把这个临时 Agent 保存为永久角色。
+          </p>
+          <label htmlFor="workflow-temporary-agent-policy">
+            临时 Agent 补位规则
+            <textarea
+              id="workflow-temporary-agent-policy"
+              value={temporaryAgentPolicy}
+              onChange={(event) => setTemporaryAgentPolicy(event.target.value)}
+            />
+          </label>
 
           <label htmlFor="workflow-objective">
             工作流目标

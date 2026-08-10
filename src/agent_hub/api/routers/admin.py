@@ -11,7 +11,7 @@ from typing import Annotated, Protocol, cast
 from urllib.parse import urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert
@@ -148,6 +148,8 @@ class WorkflowResourceRequest(NamedResourceRequest):
     )
     task_type: str | None = Field(default=None, max_length=256)
     allow_main_agent_override: bool = False
+    allow_temporary_agents: bool = False
+    temporary_agent_policy: str | None = Field(default=None, max_length=10_000)
     role_selection_policy: str | None = Field(default=None, max_length=10_000)
     agent_ids: list[str] = Field(default_factory=list, max_length=64)
     objective: str | None = Field(default=None, max_length=10_000)
@@ -2638,15 +2640,19 @@ async def create_model(
     return await service.create_model(body)
 
 
-@router.delete("/models/{model_id}", status_code=204, responses=error_responses(401, 403, 404, 409, 422))
+@router.delete(
+    "/models/{model_id}",
+    response_model=OperationStatusResponse,
+    responses=error_responses(401, 403, 404, 409, 422),
+)
 async def delete_model(
     model_id: UUID,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
-) -> Response:
+) -> OperationStatusResponse:
     _require(principal, "config:write")
     await service.delete_model(model_id)
-    return Response(status_code=204)
+    return OperationStatusResponse(status="deleted")
 
 
 @router.post("/models/probe", response_model=ProbeResponse, responses=error_responses(401, 403, 422))

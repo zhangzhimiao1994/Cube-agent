@@ -893,6 +893,7 @@ class TaskContext(_RuntimeContractModel):
     request: str = Field(repr=False)
     artifacts: tuple[Artifact, ...] = Field(default=(), max_length=64)
     checkpoint: RuntimeCheckpoint | None = Field(default=None, repr=False)
+    routing_decision: Mapping[str, JsonValue] = Field(default_factory=dict, repr=False)
     timeout_seconds: float = Field(default=60.0, gt=0, le=3600, allow_inf_nan=False)
     token_budget: int = Field(default=16_384, ge=1, le=10_000_000)
 
@@ -914,6 +915,11 @@ class TaskContext(_RuntimeContractModel):
         if not isinstance(value, list | tuple):
             raise TypeError("artifacts must be a list or tuple")
         return tuple(value)
+
+    @field_validator("routing_decision", mode="before")
+    @classmethod
+    def validate_routing_decision(cls, value: object) -> object:
+        return _strict_json_input(_freeze_object(value, name="routing decision"))
 
     @field_validator("timeout_seconds")
     @classmethod
@@ -949,6 +955,7 @@ class TaskContext(_RuntimeContractModel):
             "mode": self.mode.value,
             "request": self.request,
             "artifacts": [Artifact.to_payload(item) for item in self.artifacts],
+            "routing_decision": _mutable_json(cast(JsonValue, self.routing_decision)),
             "checkpoint": None
             if self.checkpoint is None
             else RuntimeCheckpoint.to_payload(self.checkpoint),

@@ -50,6 +50,7 @@ from agent_hub.observability.logging import configure_logging
 from agent_hub.observability.metrics import default_metrics_registry
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import ModeRouterProtocol, RunService, TaskQueue
+from agent_hub.runs.temporary_agents import AdminResourceTemporaryAgentPolicy
 from agent_hub.runtime.defaults import configured_runtime_registry
 from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.security.secrets import SecretCipher, SecretService
@@ -264,6 +265,7 @@ def create_app(
                     router=mode_router,
                     task_queue=queue,
                     hermes_advisor=PersistentHermesRunAdvisor(active_sessions),
+                    temporary_agent_policy=AdminResourceTemporaryAgentPolicy(active_sessions),
                 )
                 application.state.run_queue = queue
             if (

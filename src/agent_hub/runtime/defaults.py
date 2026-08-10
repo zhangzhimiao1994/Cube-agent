@@ -212,7 +212,8 @@ class ConfigBackedDispatchRuntime:
                 default_model=logical_model,
             )
         )
-        return CrewDispatchRuntime(gateway, _dispatch_plan(role_plan.roles, context))
+        roles = (*role_plan.roles, *_temporary_role_assignments(context, logical_model))
+        return CrewDispatchRuntime(gateway, _dispatch_plan(roles, context))
 
 
 class ConfigBackedDiscussionRuntime:
@@ -357,6 +358,7 @@ class ConfigBackedHybridRuntime:
                 default_model=logical_model,
             )
         ).roles
+        dispatch_roles = (*dispatch_roles, *_temporary_role_assignments(context, logical_model))
         return HybridRuntime(
             CrewDispatchRuntime(gateway, _dispatch_plan(dispatch_roles, context)),
             AutoGenDiscussionRuntime(gateway, _discussion_plan(discussion_roles, logical_model)),
@@ -482,6 +484,50 @@ def _dispatch_plan(
         total_timeout_seconds=sum(step.timeout_seconds for step in (*role_steps, final_step)),
         total_cost_usd=Decimal(0),
     )
+
+
+def _temporary_role_assignments(
+    context: TaskContext,
+    logical_model: str,
+) -> tuple[RoleAssignment, ...]:
+    if context.routing_decision.get("temporary_agent_approved") is not True:
+        return ()
+    raw_agents = context.routing_decision.get("temporary_agents")
+    if not isinstance(raw_agents, tuple):
+        return ()
+    assignments: list[RoleAssignment] = []
+    for raw in raw_agents[:4]:
+        if not isinstance(raw, dict):
+            continue
+        identifier = raw.get("id")
+        role = raw.get("role") or raw.get("name")
+        mission = raw.get("prompt") or raw.get("reason")
+        if not isinstance(identifier, str) or not isinstance(role, str) or not isinstance(mission, str):
+            continue
+        skills = raw.get("suggested_skills")
+        skill_tuple = tuple(item for item in skills if isinstance(item, str)) if isinstance(skills, tuple) else ()
+        try:
+            assignments.append(
+                RoleAssignment(
+                    id=identifier,
+                    role=role,
+                    purpose=RolePurpose.EXECUTE,
+                    mission=mission,
+                    must_answer=("What did this temporary agent contribute?",),
+                    allowed_tools=(),
+                    forbidden_actions=("Do not perform dangerous operations without approval.",),
+                    skills=skill_tuple,
+                    output_schema={
+                        "status": "done | blocked | needs_user",
+                        "summary": "string",
+                        "evidence": "string[]",
+                    },
+                    model=logical_model,
+                )
+            )
+        except ValueError:
+            continue
+    return tuple(assignments)
 
 
 def _discussion_plan(

@@ -149,6 +149,29 @@ describe("operational management pages", () => {
           return jsonResponse({ ...runDetail, status: "paused" });
         }
         if (path === "/api/v1/runs" && method === "POST") {
+          const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
+          const message = String(body.message ?? "");
+          if (message.includes("网页") || message.toLowerCase().includes("web page")) {
+            return jsonResponse({
+              id: runId,
+              tenant_id: "33333333-3333-4333-8333-333333333333",
+              status: "waiting_approval",
+              mode: "dispatch",
+              decision_token: "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+              version: 1,
+              clarification_reason: "temporary_agent_requires_user_approval",
+              temporary_agent_proposal: {
+                id: "temp-web-engineer",
+                name: "Temporary Web Engineer",
+                role: "Web Engineer",
+                prompt: "把方案落成网页并说明验证步骤。",
+                reason: "当前角色池缺少 software_engineering 能力。",
+                missing_capability: "software_engineering",
+                suggested_skills: ["frontend"],
+                permanentizable: true,
+              },
+            });
+          }
           return jsonResponse({
             id: runId,
             tenant_id: "33333333-3333-4333-8333-333333333333",
@@ -159,8 +182,34 @@ describe("operational management pages", () => {
             clarification_reason: null,
           });
         }
+        if (path === `/api/v1/runs/${runId}/approve-temporary-agent` && method === "POST") {
+          return jsonResponse({
+            id: runId,
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            status: "queued",
+            mode: "dispatch",
+            decision_token: null,
+            version: 2,
+            clarification_reason: null,
+          });
+        }
+        if (path === `/api/v1/runs/${runId}/revise-temporary-agent` && method === "POST") {
+          return jsonResponse({
+            id: runId,
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            status: "queued",
+            mode: "dispatch",
+            decision_token: null,
+            version: 2,
+            clarification_reason: null,
+          });
+        }
         if (path === "/api/v1/admin/settings") {
           return jsonResponse(settings);
+        }
+        if (path === "/api/v1/admin/agents" && method === "POST") {
+          const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
+          return jsonResponse(body);
         }
         if (path === "/api/v1/admin/agents") {
           return jsonResponse(agents);
@@ -290,6 +339,65 @@ describe("operational management pages", () => {
         agent_ids: ["copywriter"],
       },
     });
+  });
+
+  it("shows temporary agent approval above the composer and lets the user revise it", async () => {
+    const user = userEvent.setup();
+    const view = render(<TestApp initialPath="/" />);
+
+    await waitFor(() => expect(view.container.querySelector(".chat-composer")).not.toBeNull());
+    await user.selectOptions(screen.getAllByRole("combobox")[1], "short-video-dispatch");
+    const composer = view.container.querySelector(".chat-composer") as HTMLFormElement;
+    await user.type(composer.querySelector("textarea") as HTMLTextAreaElement, "make this into a web page");
+    await user.click(composer.querySelector('button[type="submit"]') as HTMLButtonElement);
+
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog.closest("form")?.className).toContain("chat-composer");
+    expect(within(dialog).getByText("Temporary Web Engineer")).not.toBeNull();
+    await user.type(within(dialog).getByLabelText(/意见|feedback|opinion/i), "do not add an engineer yet");
+    await user.click(within(dialog).getByRole("button", { name: /重规|revise|意见/i }));
+
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === `/api/v1/runs/${runId}/revise-temporary-agent`)).toMatchObject({
+        method: "POST",
+        body: {
+          decision_token: "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+          version: 1,
+          feedback: "do not add an engineer yet",
+        },
+      }),
+    );
+  });
+
+  it("accepts a temporary agent and can persist it as a normal agent", async () => {
+    const user = userEvent.setup();
+    const view = render(<TestApp initialPath="/" />);
+
+    await waitFor(() => expect(view.container.querySelector(".chat-composer")).not.toBeNull());
+    await user.selectOptions(screen.getAllByRole("combobox")[1], "short-video-dispatch");
+    const composer = view.container.querySelector(".chat-composer") as HTMLFormElement;
+    await user.type(composer.querySelector("textarea") as HTMLTextAreaElement, "make this into a web page");
+    await user.click(composer.querySelector('button[type="submit"]') as HTMLButtonElement);
+
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: /接受|accept|加入/i }));
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === `/api/v1/runs/${runId}/approve-temporary-agent`)).toBeTruthy(),
+    );
+    await user.click(within(dialog).getByRole("button", { name: /保存|permanent/i }));
+
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === "/api/v1/admin/agents" && request.method === "POST")).toMatchObject({
+        body: {
+          id: "temp-web-engineer",
+          name: "Temporary Web Engineer",
+          role: "Web Engineer",
+          prompt: "把方案落成网页并说明验证步骤。",
+          model: null,
+          skills: ["frontend"],
+        },
+      }),
+    );
   });
 
   it("keeps a clear mobile hierarchy for chat sessions, content, and run settings", async () => {
