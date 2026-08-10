@@ -783,20 +783,20 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         response = completion.response
         if response.usage is None:
             if not replayed and self._durability is not None:
-                self._durability.fail_model()
+                self._durability.fail_model("unaccounted_usage")
             raise UnaccountedUsage("model usage is unaccounted")
         cost_usd = completion.cost_usd if completion.cost_usd is not None else Decimal(0)
         if len(response.tool_calls) > _MAX_TOOL_CALLS_PER_RESPONSE:
             if not replayed and self._durability is not None:
-                self._durability.fail_model()
+                self._durability.fail_model("discussion_failed")
             raise RuntimeExecutionError("model tool call limit exceeded")
         if response.text is not None and response.tool_calls:
             if not replayed and self._durability is not None:
-                self._durability.fail_model()
+                self._durability.fail_model("discussion_failed")
             raise RuntimeExecutionError("model response is invalid")
         if response.text is None and not response.tool_calls:
             if not replayed and self._durability is not None:
-                self._durability.fail_model()
+                self._durability.fail_model("discussion_failed")
             raise RuntimeExecutionError("model response is invalid")
         usage = RequestUsage(
             prompt_tokens=response.usage.prompt_tokens,
@@ -816,7 +816,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         }
         if any(call.name not in available_tools for call in response.tool_calls):
             if not replayed and self._durability is not None:
-                self._durability.fail_model()
+                self._durability.fail_model("discussion_failed")
             raise RuntimeExecutionError("model requested an unavailable capability")
         if not replayed and self._durability is not None:
             await self._durability.succeed_model(request, completion)

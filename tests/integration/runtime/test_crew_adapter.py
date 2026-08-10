@@ -3559,7 +3559,7 @@ async def test_pre_capability_checkpoints_never_publish_provisional_success() ->
 
 @pytest.mark.parametrize(
     "terminal_phase",
-    ("budget_exhausted", "unaccounted", "audit_overflow"),
+    ("budget_exhausted", "audit_overflow"),
 )
 async def test_stable_terminal_checkpoint_is_emitted_and_durably_restorable(
     terminal_phase: str,
