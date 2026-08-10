@@ -37,10 +37,10 @@ detect_existing_install() {
 
 choose_mode() {
   if [[ -z "$MODE" || "$MODE" == "auto" ]]; then
-    if [[ "$HAS_DOCKER" -eq 1 || "$HOST_MANAGER" == "unknown" ]]; then
-      MODE="docker"
-    elif [[ "$HAS_SYSTEMD" -eq 1 ]]; then
+    if [[ "$HAS_SYSTEMD" -eq 1 && "$HOST_MANAGER" != "unknown" ]]; then
       MODE="native"
+    elif [[ "$HAS_DOCKER" -eq 1 || "$HOST_MANAGER" == "unknown" ]]; then
+      MODE="docker"
     else
       MODE="docker"
     fi

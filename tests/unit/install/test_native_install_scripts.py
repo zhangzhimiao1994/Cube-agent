@@ -21,6 +21,22 @@ def test_native_installer_deploys_release_before_starting_services() -> None:
     assert deploy < start
 
 
+def test_auto_mode_prefers_native_on_supported_systemd_hosts() -> None:
+    detect = read("scripts/lib/detect.sh")
+    install = read("install.sh")
+    readme = read("README.md")
+    installation = read("docs/installation.md")
+
+    assert (
+        'if [[ "$HAS_SYSTEMD" -eq 1 && "$HOST_MANAGER" != "unknown" ]]; then\n'
+        '      MODE="native"'
+    ) in detect
+    assert 'elif [[ "$HAS_DOCKER" -eq 1 || "$HOST_MANAGER" == "unknown" ]]; then' in detect
+    assert "chooses native on supported systemd apt/dnf hosts" in install
+    assert "prefers native mode" in readme
+    assert "Native mode when systemd plus apt/dnf support are detected" in installation
+
+
 def test_native_installer_prunes_old_releases_after_successful_deploy() -> None:
     script = read("scripts/lib/install_native.sh")
 

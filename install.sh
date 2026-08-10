@@ -72,7 +72,7 @@ Usage:
   sudo bash install.sh [--mode docker|native|auto] [--config file] [--dry-run] [--yes]
 
 Defaults:
-  --mode auto chooses Docker for broad Linux compatibility, and native only on supported apt/dnf hosts.
+  --mode auto chooses native on supported systemd apt/dnf hosts, then Docker as fallback.
   New servers are bootstrapped from zero: dependencies, secrets, database, services, health, setup code.
   Existing installs are repaired or upgraded; data and secrets are never overwritten.
 EOF

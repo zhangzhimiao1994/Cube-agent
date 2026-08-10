@@ -10,6 +10,9 @@ cd mix-agent
 sudo bash install.sh --mode auto --yes
 ```
 
+`auto` prefers native mode on supported systemd Linux servers (Ubuntu/Debian/Rocky/Alma).
+Docker remains a fallback for unsupported distributions or explicitly requested Docker installs.
+
 If the server does not have `git`, install from the GitHub archive into an isolated
 temporary source directory:
 
@@ -43,7 +46,7 @@ sudo env AGENT_HUB_PUBLIC_URL=https://agent.example.com \
   bash install.sh --mode auto --yes
 ```
 
-The installer detects the host, chooses Docker for broad Linux compatibility, generates secrets, starts services, runs health checks, and prints:
+The installer detects the host, chooses native mode on supported systemd Linux servers, generates secrets, starts services, runs health checks, and prints:
 
 - `Management URL: .../setup`
 - `One-time setup code: ...`
@@ -58,8 +61,8 @@ scripts/agent-hub doctor
 
 ## Deployment modes
 
-- Docker mode: recommended for new cloud servers and unknown Linux distributions.
-- Native mode: supported on Ubuntu 22.04/24.04, Debian 12/13, Rocky Linux 9, and AlmaLinux 9.
+- Native mode: recommended for supported systemd Linux servers: Ubuntu 22.04/24.04, Debian 12/13, Rocky Linux 9, and AlmaLinux 9.
+- Docker mode: optional fallback for unknown Linux distributions or explicitly requested container deployments.
 
 The installer does not modify cloud security groups. Open ports in your cloud console deliberately after confirming the management URL and TLS choice. Caddy is the public entry point; the API, LiteLLM, database, and Redis stay on private local/internal networks by default.
 

@@ -10,8 +10,8 @@ sudo bash install.sh --mode auto --yes
 
 `--mode auto` selects:
 
-1. Docker mode when Docker exists or the Linux distribution is unknown.
-2. Native mode only when systemd plus apt/dnf support are detected.
+1. Native mode when systemd plus apt/dnf support are detected.
+2. Docker mode only when native is unsupported or Docker is explicitly requested.
 
 ## Network-limited servers
 
