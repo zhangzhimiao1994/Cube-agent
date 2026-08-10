@@ -103,6 +103,23 @@ def test_compose_and_native_litellm_use_config_file() -> None:
     assert "write_litellm_config" in native_installer
 
 
+def test_native_litellm_proxy_uses_isolated_verified_virtualenv() -> None:
+    native_service = read("deploy/native/systemd/agent-hub-litellm.service")
+    native_installer = read("scripts/lib/install_native.sh")
+
+    assert "/opt/agent-hub/current/.litellm-venv/bin/litellm" in native_service
+    assert "/opt/agent-hub/current/.venv/bin/litellm" not in native_service
+    assert "install_litellm_proxy_venv" in native_installer
+    assert "verify_litellm_proxy_venv" in native_installer
+    assert "--exclude='.litellm-venv'" in native_installer
+    assert "uv pip install" in native_installer
+    assert "--python .litellm-venv/bin/python" in native_installer
+    assert "'litellm[proxy]>=1.75,<2'" in native_installer
+    assert "litellm.proxy.proxy_server" in native_installer
+    assert ".litellm-venv/bin/litellm --help" in native_installer
+    assert "proxy_server module is missing" in native_installer
+
+
 def test_compose_litellm_is_health_checked_and_can_reach_provider_apis() -> None:
     compose = read("deploy/compose/docker-compose.yml")
 

@@ -140,6 +140,37 @@ sync_python_project_with_lock_or_mirror() {
   install_python_project_from_mirror "$mirror"
 }
 
+install_litellm_proxy_venv() {
+  local python_bin="$1"
+  log "installing LiteLLM proxy into isolated virtualenv"
+  run_python_with_mirror_fallback uv venv --python "$python_bin" .litellm-venv
+  run_python_with_mirror_fallback uv pip install \
+    --python .litellm-venv/bin/python \
+    'litellm[proxy]>=1.75,<2'
+  verify_litellm_proxy_venv
+}
+
+verify_litellm_proxy_venv() {
+  [[ -x .litellm-venv/bin/litellm ]] \
+    || die "LiteLLM proxy install failed: .litellm-venv/bin/litellm is missing or not executable"
+
+  if ! .litellm-venv/bin/python - <<'PY'
+import importlib.util
+
+required_modules = ("litellm", "litellm.proxy.proxy_server")
+missing = [name for name in required_modules if importlib.util.find_spec(name) is None]
+if missing:
+    raise SystemExit("missing modules: " + ", ".join(missing))
+PY
+  then
+    die "LiteLLM proxy install failed: proxy_server module is missing; ensure litellm[proxy] installed successfully"
+  fi
+
+  if ! .litellm-venv/bin/litellm --help >/dev/null; then
+    die "LiteLLM proxy install failed: litellm CLI cannot start"
+  fi
+}
+
 postgres_exec() {
   if command -v sudo >/dev/null 2>&1; then
     sudo -u postgres "$@"
@@ -353,6 +384,7 @@ deploy_native_release() {
   tar \
     --exclude='.git' \
     --exclude='.venv' \
+    --exclude='.litellm-venv' \
     --exclude='.worktrees' \
     --exclude='web/node_modules' \
     --exclude='web/dist' \
@@ -366,7 +398,7 @@ deploy_native_release() {
     cd "$release" || exit
     run_python_with_mirror_fallback uv venv --python "$python_bin" .venv
     sync_python_project_with_lock_or_mirror
-    run_python_with_mirror_fallback uv pip install --python .venv/bin/python 'litellm[proxy]>=1.75,<2'
+    install_litellm_proxy_venv "$python_bin"
     if command -v npm >/dev/null 2>&1; then
       run_npm_with_mirror_fallback
       npm --prefix web run build
@@ -391,6 +423,12 @@ fix_native_web_permissions() {
     chmod -R u+rwX,g+rX,o-rwx "$release/.venv"
     if [[ -d "$release/.venv/bin" ]]; then
       find "$release/.venv/bin" -type f -exec chmod u+rx,g+rx,o-rwx {} +
+    fi
+  fi
+  if [[ -d "$release/.litellm-venv" ]]; then
+    chmod -R u+rwX,g+rX,o-rwx "$release/.litellm-venv"
+    if [[ -d "$release/.litellm-venv/bin" ]]; then
+      find "$release/.litellm-venv/bin" -type f -exec chmod u+rx,g+rx,o-rwx {} +
     fi
   fi
   if [[ -d "$release/web" ]]; then
@@ -480,6 +518,21 @@ EOF
   chmod 0644 "$caddyfile"
 }
 
+require_native_service_active() {
+  local unit="$1"
+  local attempt
+  command -v systemctl >/dev/null 2>&1 || return 0
+  for attempt in {1..15}; do
+    if systemctl is-active --quiet "$unit"; then
+      return 0
+    fi
+    sleep 1
+  done
+  systemctl status "$unit" --no-pager -l >&2 || true
+  journalctl -u "$unit" -n 120 --no-pager >&2 || true
+  die "$unit did not become active after install; inspect the logs above"
+}
+
 run_native_migrations() {
   log "running native database migrations"
   (
@@ -533,5 +586,9 @@ install_native_mode() {
   systemctl enable caddy
   systemctl reload-or-restart caddy || systemctl restart caddy
   systemctl enable --now agent-hub.target
+  require_native_service_active caddy.service
+  require_native_service_active agent-hub-api.service
+  require_native_service_active agent-hub-worker.service
+  require_native_service_active agent-hub-litellm.service
   mark_stage "native-up"
 }

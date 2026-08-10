@@ -72,6 +72,12 @@ def test_install_verification_uses_public_url_for_docker_mode() -> None:
     assert "installation_health_base_url" in verify
     assert '[[ "${MODE:-}" == "docker" ]]' in verify
     assert "AGENT_HUB_PUBLIC_URL" in verify
+    assert "verify_native_service agent-hub-api.service" in verify
+    assert "verify_native_service agent-hub-worker.service" in verify
+    assert "verify_native_service agent-hub-litellm.service" in verify
+    assert "verify_native_litellm_proxy" in verify
+    assert ".litellm-venv/bin/litellm" in verify
+    assert "litellm.proxy.proxy_server" in verify
     assert 'verify_url "$base_url/health/live"' in verify
     assert 'verify_url "$base_url/health/ready"' in verify
 
@@ -87,6 +93,23 @@ def test_native_installer_creates_runtime_dirs_and_migrates_before_services() ->
     assert tmpfiles < start
     assert database < migrations
     assert migrations < start
+
+
+def test_native_installer_fails_fast_when_core_services_do_not_become_active() -> None:
+    script = read("scripts/lib/install_native.sh")
+
+    assert "require_native_service_active" in script
+    assert "systemctl status \"$unit\" --no-pager -l" in script
+    assert "journalctl -u \"$unit\" -n 120 --no-pager" in script
+    assert "did not become active after install" in script
+    assert "require_native_service_active caddy.service" in script
+    assert "require_native_service_active agent-hub-api.service" in script
+    assert "require_native_service_active agent-hub-worker.service" in script
+    assert "require_native_service_active agent-hub-litellm.service" in script
+    start = script.index("systemctl enable --now agent-hub.target")
+    litellm_check = script.index("require_native_service_active agent-hub-litellm.service")
+    mark = script.index('mark_stage "native-up"')
+    assert start < litellm_check < mark
 
 
 def test_native_installer_starts_local_dependencies_and_writes_runtime_urls() -> None:
@@ -149,6 +172,7 @@ def test_native_api_stays_private_and_caddy_exposes_management_ui() -> None:
     assert 'chmod 0755 "$release/web/dist"' in installer
     assert 'chmod -R a+rX "$release/web/dist"' in installer
     assert 'chmod -R u+rwX,g+rX,o-rwx "$release/.venv"' in installer
+    assert 'chmod -R u+rwX,g+rX,o-rwx "$release/.litellm-venv"' in installer
     assert "fix_native_uv_permissions" in installer
     assert 'chmod -R a+rX "$python_dir"' in installer
     assert "chown -R agent-hub:agent-hub" in installer
@@ -162,6 +186,20 @@ def test_doctor_diagnoses_web_asset_permission_failures() -> None:
     assert "Caddy cannot read Web UI asset" in doctor
     assert "namei -l" in doctor
     assert "chmod -R a+rX" in doctor
+
+
+def test_doctor_diagnoses_runtime_services_and_litellm_proxy_environment() -> None:
+    doctor = read("scripts/commands/doctor.sh")
+
+    assert "systemd_unit_active_if_present" in doctor
+    assert "api systemd service active when installed" in doctor
+    assert "worker systemd service active when installed" in doctor
+    assert "litellm systemd service active when installed" in doctor
+    assert "native LiteLLM proxy environment" in doctor
+    assert ".litellm-venv/bin/litellm" in doctor
+    assert "litellm.proxy.proxy_server" in doctor
+    assert "journalctl -u agent-hub-litellm" in doctor
+    assert "model gateway failed" in doctor
 
 
 def test_native_caddy_supports_user_supplied_tls_certificate() -> None:
@@ -210,9 +248,11 @@ def test_native_installer_uses_mirror_install_without_locked_wheel_urls_in_china
     script = read("scripts/lib/install_native.sh")
 
     assert "sync_python_project_with_lock_or_mirror" in script
+    assert "install_litellm_proxy_venv" in script
     assert 'if [[ "$mode" == "china" ]]; then\n    install_python_project_from_mirror "$mirror"\n    return\n  fi' in script
     assert "locked uv sync is skipped in China mirror mode" in script
     assert "uv pip install --python .venv/bin/python" in script
+    assert "uv pip install \\\n    --python .litellm-venv/bin/python" in script
     assert "--index-url" in script
 
 
@@ -222,5 +262,7 @@ def test_native_installer_falls_back_from_locked_uv_sync_to_mirror_pip_install()
     assert "sync_python_project_with_lock_or_mirror" in script
     assert "uv sync --frozen --no-dev" in script
     assert "uv pip install --python .venv/bin/python" in script
+    assert "verify_litellm_proxy_venv" in script
+    assert "litellm.proxy.proxy_server" in script
     assert "--index-url" in script
     assert "official locked uv sync failed" in script
