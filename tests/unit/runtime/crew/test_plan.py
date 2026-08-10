@@ -21,6 +21,37 @@ def agent(agent_id: str, *, tools: tuple[str, ...] = ()) -> AgentSpec:
     )
 
 
+def test_agent_role_is_display_text_while_machine_fields_stay_safe_identifiers() -> None:
+    spec = AgentSpec(
+        id="director",
+        role="导演",
+        goal="负责拆解目标、镜头语言和最终质量把关。",
+        logical_model="general",
+    )
+
+    assert spec.role == "导演"
+    assert AgentSpec(
+        id="final_synthesizer",
+        role="Final Synthesizer",
+        goal="Merge role outputs.",
+        logical_model="general",
+    ).role == "Final Synthesizer"
+    with pytest.raises(ValidationError, match="agent identifier"):
+        AgentSpec(
+            id="导演",
+            role="导演",
+            goal="Invalid machine id",
+            logical_model="general",
+        )
+    with pytest.raises(ValidationError, match="agent identifier"):
+        AgentSpec(
+            id="director",
+            role="导演",
+            goal="Invalid logical model",
+            logical_model="main model",
+        )
+
+
 def test_valid_plan_has_deterministic_layers_and_round_trip() -> None:
     plan = DispatchPlan(
         agents=(agent("researcher", tools=("web.search",)), agent("writer")),

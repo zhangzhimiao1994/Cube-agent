@@ -13,7 +13,8 @@ import pytest
 from pydantic import ValidationError
 
 from agent_hub.domain.runs import TaskMode
-from agent_hub.models.gateway import GatewayCompletion
+from agent_hub.models.gateway import GatewayCompletion, ModelGatewayError
+from agent_hub.models.litellm_client import ModelTransportError
 from agent_hub.models.types import (
     ModelCapability,
     ModelRequest,
@@ -784,6 +785,33 @@ async def test_gateway_failure_is_redacted() -> None:
     assert sentinel not in str(caught.value)
     assert sentinel not in repr(caught.value)
     assert sentinel not in exception_graph_text(caught.value)
+
+
+async def test_gateway_transport_failure_keeps_safe_status_for_logs() -> None:
+    runtime = DirectRuntime(
+        FakeGateway(ModelTransportError("Authorization: Bearer sk-secret", status_code=401)),
+        logical_model="general",
+    )
+
+    with pytest.raises(RuntimeExecutionError) as caught:
+        await collect(runtime, context(request="safe request"))
+
+    assert str(caught.value) == "model gateway failed: model transport failed (status=401)"
+    assert "sk-secret" not in exception_graph_text(caught.value)
+    assert "Authorization" not in exception_graph_text(caught.value)
+
+
+async def test_gateway_configuration_failure_uses_safe_diagnostic() -> None:
+    runtime = DirectRuntime(
+        FakeGateway(ModelGatewayError("model credential resolution failed")),
+        logical_model="general",
+    )
+
+    with pytest.raises(RuntimeExecutionError) as caught:
+        await collect(runtime, context(request="safe request"))
+
+    assert str(caught.value) == "model gateway failed: model configuration failed"
+    assert "credential" not in str(caught.value)
 
 
 async def test_invalid_model_text_is_redacted() -> None:

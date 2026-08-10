@@ -11,7 +11,8 @@ from typing import Never, Protocol, cast
 from uuid import UUID, uuid4
 
 from agent_hub.domain.runs import TaskMode
-from agent_hub.models.gateway import GatewayCompletion
+from agent_hub.models.gateway import GatewayCompletion, ModelGatewayError
+from agent_hub.models.litellm_client import ModelTransportError
 from agent_hub.models.types import (
     ModelCapability,
     ModelMessage,
@@ -34,6 +35,13 @@ _MAX_OUTPUT_BYTES = 65_536
 _MAX_CONTEXT_BYTES = 196_608
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
+_SAFE_GATEWAY_FAILURES = {
+    "model capacity unavailable",
+    "model transport failed",
+    "model outcome recording failed",
+    "model capacity release failed",
+    "model gateway completed without a response",
+}
 
 
 class Gateway(Protocol):
@@ -65,6 +73,20 @@ class RuntimeBusy(RuntimeExecutionError):
 
 def _raise_execution_error(message: str) -> Never:
     raise RuntimeExecutionError(message) from None
+
+
+def _gateway_failure_reason(error: Exception) -> str:
+    if isinstance(error, ModelTransportError):
+        if error.status_code is not None:
+            return f"model gateway failed: model transport failed (status={error.status_code})"
+        return "model gateway failed: model transport failed"
+    if isinstance(error, ModelGatewayError):
+        message = " ".join(str(error).strip().split())
+        if message == "model credential resolution failed":
+            return "model gateway failed: model configuration failed"
+        if message in _SAFE_GATEWAY_FAILURES:
+            return f"model gateway failed: {message}"
+    return "model gateway failed"
 
 
 class DirectRunStream:
@@ -182,12 +204,14 @@ class DirectRuntime:
             self._active_task = gateway_task
             yield RunEvent(kind=EventKind.MODEL_STARTED, sequence=1, run_id=context.run_id)
             gateway_failed = False
+            gateway_failure_reason = "model gateway failed"
             completion: GatewayCompletion | None = None
             try:
                 completion = await gateway_task
             except asyncio.CancelledError:
                 raise
             except Exception as error:  # noqa: BLE001 - redact the gateway boundary
+                gateway_failure_reason = _gateway_failure_reason(error)
                 error.__traceback__ = None
                 error.__context__ = None
                 error.__cause__ = None
@@ -198,7 +222,7 @@ class DirectRuntime:
                 self._active_task = None
                 gateway_task = None
                 del completion, request, included_source_ids, context
-                _raise_execution_error("model gateway failed")
+                _raise_execution_error(gateway_failure_reason)
 
             validated_completion = self._strict_completion(completion)
             del completion

@@ -131,10 +131,15 @@ class AgentSpec(_PlanModel):
     allowed_tools: tuple[str, ...] = ()
     max_output_tokens: int = Field(default=4096, ge=1, le=1_000_000)
 
-    @field_validator("id", "role", "logical_model")
+    @field_validator("id", "logical_model")
     @classmethod
     def identifiers(cls, value: str) -> str:
         return _identifier(value, "agent identifier")
+
+    @field_validator("role")
+    @classmethod
+    def bounded_role(cls, value: str) -> str:
+        return _text(value, "agent role", limit=512)
 
     @field_validator("goal")
     @classmethod

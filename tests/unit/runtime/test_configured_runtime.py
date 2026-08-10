@@ -16,8 +16,11 @@ from agent_hub.runtime.defaults import (
     ConfigBackedDispatchRuntime,
     ConfigBackedHybridRuntime,
     UnavailableRuntime,
+    _discussion_plan,
+    _dispatch_plan,
     configured_runtime_registry,
 )
+from agent_hub.runtime.role_planner import RoleAssignment, RolePurpose
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
 
@@ -211,6 +214,91 @@ def _remember_capacity(
     capacity = ImmediateCapacity(deployments)
     capacities.append(capacity)
     return capacity
+
+
+def test_dispatch_plan_accepts_localized_role_display_names_but_keeps_safe_ids() -> None:
+    plan = _dispatch_plan(
+        (
+            RoleAssignment(
+                id="director",
+                role="导演",
+                purpose=RolePurpose.EXPERTISE,
+                mission="负责拆解目标、镜头语言和最终质量把关。",
+                must_answer=("故事目标是什么？",),
+                allowed_tools=(),
+                forbidden_actions=("不要执行危险操作。",),
+                skills=(),
+                output_schema={"summary": "string"},
+                model="main",
+            ),
+            RoleAssignment(
+                id="copywriter",
+                role="文案生成",
+                purpose=RolePurpose.EXECUTE,
+                mission="负责生成短剧文案和口播草稿。",
+                must_answer=("文案是什么？",),
+                allowed_tools=(),
+                forbidden_actions=("不要执行危险操作。",),
+                skills=(),
+                output_schema={"summary": "string"},
+                model="main",
+            ),
+        ),
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="写一个玄幻 AI 短剧文案",
+        ),
+    )
+
+    assert [(agent.id, agent.role) for agent in plan.agents] == [
+        ("director", "导演"),
+        ("copywriter", "文案生成"),
+        ("final_synthesizer", "Final Synthesizer"),
+    ]
+    assert [step.agent for step in plan.steps] == [
+        "director",
+        "copywriter",
+        "final_synthesizer",
+    ]
+
+
+def test_discussion_plan_accepts_localized_role_display_names() -> None:
+    plan = _discussion_plan(
+        (
+            RoleAssignment(
+                id="director",
+                role="导演",
+                purpose=RolePurpose.EXPERTISE,
+                mission="负责创意方向。",
+                must_answer=("方向是什么？",),
+                allowed_tools=(),
+                forbidden_actions=("不要执行危险操作。",),
+                skills=(),
+                output_schema={"position": "string"},
+                model="main",
+            ),
+            RoleAssignment(
+                id="critic",
+                role="审查员",
+                purpose=RolePurpose.CRITIQUE,
+                mission="负责审查风险。",
+                must_answer=("风险是什么？",),
+                allowed_tools=(),
+                forbidden_actions=("不要执行危险操作。",),
+                skills=(),
+                output_schema={"position": "string"},
+                model="main",
+            ),
+        ),
+        "main",
+    )
+
+    assert [(participant.id, participant.role) for participant in plan.participants] == [
+        ("director", "导演"),
+        ("critic", "审查员"),
+    ]
 
 
 def test_configured_runtime_registry_registers_all_production_modes() -> None:

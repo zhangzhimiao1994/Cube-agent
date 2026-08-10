@@ -7,6 +7,15 @@ def test_runtime_failure_reason_preserves_safe_runtime_message() -> None:
     assert _runtime_failure_reason(RuntimeError("model gateway failed")) == "model gateway failed"
 
 
+def test_runtime_failure_reason_preserves_safe_gateway_status() -> None:
+    assert (
+        _runtime_failure_reason(
+            RuntimeError("model gateway failed: model transport failed (status=401)")
+        )
+        == "model gateway failed: model transport failed (status=401)"
+    )
+
+
 def test_runtime_failure_reason_redacts_sensitive_provider_message() -> None:
     assert (
         _runtime_failure_reason(RuntimeError("Authorization: Bearer sk-secret-token failed"))
