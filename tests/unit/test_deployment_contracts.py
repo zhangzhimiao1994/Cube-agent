@@ -116,7 +116,9 @@ def test_native_litellm_proxy_uses_isolated_verified_virtualenv() -> None:
     native_service = read("deploy/native/systemd/agent-hub-litellm.service")
     native_installer = read("scripts/lib/install_native.sh")
 
-    assert "/opt/agent-hub/current/.litellm-venv/bin/litellm" in native_service
+    assert "/opt/agent-hub/current/.litellm-venv/bin/python" in native_service
+    assert "from litellm import run_server" in native_service
+    assert "/opt/agent-hub/current/.litellm-venv/bin/litellm" not in native_service
     assert "/opt/agent-hub/current/.venv/bin/litellm" not in native_service
     assert "install_litellm_proxy_venv" in native_installer
     assert "verify_litellm_proxy_venv" in native_installer
