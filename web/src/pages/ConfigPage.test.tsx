@@ -19,6 +19,8 @@ const settings = {
   safe_tools_enabled: true,
   require_approval_for_tools: true,
   channel_entry: "web",
+  attachment_retention_days: 7,
+  attachment_max_mb: 25,
 };
 
 function jsonResponse(payload: unknown, init: ResponseInit = {}) {

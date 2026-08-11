@@ -15,7 +15,13 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
 from agent_hub.api.errors import error_responses
-from agent_hub.channels.base import Channel, ConversationType, InboundMessage
+from agent_hub.channels.base import (
+    AttachmentKind,
+    Channel,
+    ConversationType,
+    InboundAttachment,
+    InboundMessage,
+)
 
 
 class ChannelGatewayProtocol(Protocol):
@@ -357,8 +363,35 @@ def _normalize_message(spec: GenericWebhookSpec, payload: dict[str, Any]) -> Inb
         conversation_type=ConversationType.PRIVATE,
         text=text,
         mentions_bot=True,
+        attachments=_attachments(payload),
         received_at=datetime.now(UTC),
     )
+
+
+def _attachments(payload: dict[str, Any]) -> tuple[InboundAttachment, ...]:
+    raw = payload.get("attachments") or payload.get("files") or payload.get("images")
+    if not isinstance(raw, list):
+        return ()
+    attachments: list[InboundAttachment] = []
+    for item in raw[:16]:
+        if not isinstance(item, dict):
+            continue
+        external_key = item.get("external_key") or item.get("id") or item.get("file_id") or item.get("key")
+        if not isinstance(external_key, str) or not external_key:
+            continue
+        kind_raw = str(item.get("kind") or item.get("type") or "file").lower()
+        kind = AttachmentKind.IMAGE if kind_raw in {"image", "photo", "picture"} else AttachmentKind.FILE
+        filename = item.get("filename") or item.get("name")
+        mime = item.get("declared_mime") or item.get("mime_type") or item.get("content_type")
+        attachments.append(
+            InboundAttachment(
+                kind=kind,
+                external_key=_safe_external_value(external_key),
+                filename=filename if isinstance(filename, str) and filename else None,
+                declared_mime=mime if isinstance(mime, str) and mime else None,
+            )
+        )
+    return tuple(attachments)
 
 
 def _first_text(

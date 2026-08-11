@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     runtime_token_budget: int = Field(default=1_000_000, ge=1, le=10_000_000)
     web_dir: Path | None = None
     skill_store_dir: Path = Path("/var/lib/agent-hub/skills")
+    attachment_store_dir: Path = Path("/var/lib/agent-hub/attachments")
     litellm_health_url: str | None = None
     bootstrap_tenant_id: UUID = UUID("00000000-0000-4000-8000-000000000001")
     bootstrap_tenant_slug: str = Field(

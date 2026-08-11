@@ -5,6 +5,10 @@ import { useAuth } from "../auth/AuthProvider";
 
 export function AppShell() {
   const auth = useAuth();
+  const visibleGroups = MODULE_GROUPS.map((group) => ({
+    ...group,
+    modules: group.modules.filter((module) => hasPermission(auth.user?.permissions ?? [], module.permission)),
+  })).filter((group) => group.modules.length > 0);
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -14,7 +18,7 @@ export function AppShell() {
           <p>面向生产环境的多 Agent 调度与配置控制台</p>
         </div>
         <nav aria-label="Main navigation" className="nav-list">
-          {MODULE_GROUPS.map((item) => (
+          {visibleGroups.map((item) => (
             <NavLink
               key={item.to}
               to={item.to}
@@ -44,4 +48,10 @@ export function AppShell() {
       </div>
     </div>
   );
+}
+
+function hasPermission(grants: string[], permission: string): boolean {
+  if (grants.includes("*") || grants.includes(permission)) return true;
+  const [namespace] = permission.split(":");
+  return grants.includes(`${namespace}:*`);
 }

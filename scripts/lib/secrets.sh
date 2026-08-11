@@ -28,36 +28,89 @@ detect_public_url() {
     return 0
   fi
 
-  local ip
+  local ip detected_url
+  detected_url=""
   if command -v curl >/dev/null 2>&1; then
     ip="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)"
     if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      printf 'http://%s\n' "$ip"
-      return 0
+      if is_private_ipv4 "$ip"; then
+        warn "detected private or loopback address $ip from public IP probe; set AGENT_HUB_PUBLIC_URL=http(s)://your-public-host"
+      else
+        detected_url="http://$ip"
+      fi
     fi
   fi
 
-  if command -v hostname >/dev/null 2>&1; then
+  if [[ -z "$detected_url" ]] && command -v hostname >/dev/null 2>&1; then
     for ip in $(hostname -I 2>/dev/null || true); do
       [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
       if is_private_ipv4 "$ip"; then
         warn "detected private or loopback address $ip; set AGENT_HUB_PUBLIC_URL=http(s)://your-public-host for external access"
         continue
       fi
-      printf 'http://%s\n' "$ip"
-      return 0
+      detected_url="http://$ip"
+      break
     done
   fi
 
-  printf 'http://127.0.0.1\n'
+  prompt_public_url "$detected_url"
+}
+
+prompt_public_url() {
+  local default_url="${1:-}" prompt answer
+  if [[ "${ASSUME_YES:-0}" -eq 1 || "${AGENT_HUB_TEST:-0}" == "1" || ! -t 0 ]]; then
+    if [[ -n "$default_url" ]]; then
+      validate_public_url "$default_url"
+      printf '%s\n' "$default_url"
+      return 0
+    fi
+    die "unable to detect a public Agent Hub URL; set AGENT_HUB_PUBLIC_URL=http(s)://your-public-host[:port] before installing"
+  fi
+  prompt="Enter Agent Hub external access URL, including forwarded public port when needed"
+  if [[ -n "$default_url" ]]; then
+    read -r -p "$prompt [$default_url]: " answer
+    answer="${answer:-$default_url}"
+  else
+    read -r -p "$prompt: " answer
+  fi
+  validate_public_url "$answer"
+  printf '%s\n' "$answer"
 }
 
 validate_public_url() {
-  local url="$1"
+  local url="$1" host
   case "$url" in
     http://*|https://*) ;;
     *) die "AGENT_HUB_PUBLIC_URL must start with http:// or https://" ;;
   esac
+  host="${url#http://}"
+  host="${host#https://}"
+  host="${host%%/*}"
+  host="${host%%:*}"
+  case "$host" in
+    ""|localhost|127.*|0.0.0.0|::1|\[::1\])
+      die "AGENT_HUB_PUBLIC_URL must be externally reachable; got $url"
+      ;;
+  esac
+  if is_private_ipv4 "$host"; then
+    die "AGENT_HUB_PUBLIC_URL must use a public address for Web UI and webhook callbacks; got private address $host"
+  fi
+}
+
+ensure_public_url_secret() {
+  [[ -f "$SECRETS_FILE" ]] || return 0
+  local current public_url tmp
+  current="$(grep '^AGENT_HUB_PUBLIC_URL=' "$SECRETS_FILE" | tail -n 1 | cut -d= -f2- || true)"
+  public_url="${AGENT_HUB_PUBLIC_URL:-$current}"
+  validate_public_url "$public_url"
+  if [[ "$current" == "$public_url" ]]; then
+    return 0
+  fi
+  tmp="$(mktemp "$CONFIG_DIR/secrets.env.public-url.XXXXXX")"
+  grep -v '^AGENT_HUB_PUBLIC_URL=' "$SECRETS_FILE" > "$tmp" || true
+  printf 'AGENT_HUB_PUBLIC_URL=%s\n' "$public_url" >> "$tmp"
+  chmod 0600 "$tmp"
+  mv "$tmp" "$SECRETS_FILE"
 }
 
 sanitize_legacy_secrets() {
@@ -126,6 +179,7 @@ generate_or_keep_secrets() {
     log "keeping existing secrets at $SECRETS_FILE"
     sanitize_legacy_secrets
     ensure_secret_defaults
+    ensure_public_url_secret
     return 0
   fi
   local tmp postgres_password jwt_signing_key public_url

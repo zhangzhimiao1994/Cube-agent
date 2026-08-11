@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
@@ -35,6 +36,7 @@ class StubRunService:
             bool,
             str | None,
             str | None,
+            tuple[str, ...],
         ]
     ]
     enqueue_count: int = 0
@@ -51,6 +53,7 @@ class StubRunService:
         allow_workflow_adjustment: bool = False,
         conversation_id: str | None = None,
         reference_conversation_id: str | None = None,
+        attachment_ids: tuple[str, ...] = (),
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         del idempotency_key
@@ -65,6 +68,7 @@ class StubRunService:
                 allow_workflow_adjustment,
                 conversation_id,
                 reference_conversation_id,
+                attachment_ids,
             )
         )
         status = RunStatus.WAITING_USER_MODE if mode is TaskMode.AUTO else RunStatus.QUEUED
@@ -196,6 +200,8 @@ class StubRunService:
 
 def _client(
     role: Role = Role.OPERATOR,
+    *,
+    attachment_store_dir: Path | None = None,
 ) -> tuple[TestClient, StubRunService, AuthenticatedPrincipal]:
     principal = AuthenticatedPrincipal(uuid4(), uuid4(), role)
     service = StubRunService([])
@@ -205,6 +211,8 @@ def _client(
         config_service=object(),
         run_service=service,
     )
+    if attachment_store_dir is not None:
+        app.state.attachment_store_dir = attachment_store_dir
     return TestClient(app), service, principal
 
 
@@ -239,6 +247,7 @@ def test_low_confidence_submission_returns_202_waiting_user_mode_and_does_not_en
             False,
             None,
             None,
+            (),
         )
     ]
     assert service.enqueue_count == 0
@@ -275,6 +284,61 @@ def test_submission_forwards_selected_workflow_and_agents() -> None:
             True,
             "conv-short-video",
             "conv-previous",
+            (),
+        )
+    ]
+
+
+def test_attachment_upload_stores_image_without_exposing_server_path(tmp_path: Path) -> None:
+    client, _, _ = _client(attachment_store_dir=tmp_path)
+
+    response = client.post(
+        "/api/v1/runs/attachments/upload",
+        headers={
+            **bearer(),
+            "X-Agent-Hub-Filename": "screen.png",
+            "Content-Type": "image/png",
+        },
+        content=b"\x89PNG\r\n\x1a\nimage-bytes",
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["filename"] == "screen.png"
+    assert body["kind"] == "image"
+    assert body["content_type"] == "image/png"
+    assert body["size_bytes"] == len(b"\x89PNG\r\n\x1a\nimage-bytes")
+    assert body["sha256"]
+    assert "path" not in body
+    assert list(tmp_path.rglob("*.bin"))
+
+
+def test_submission_forwards_attachment_ids() -> None:
+    client, service, principal = _client()
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": "review this code package",
+            "mode": "dispatch",
+            "attachment_ids": ["att_0123456789abcdef0123456789abcdef"],
+        },
+    )
+
+    assert response.status_code == 202
+    assert service.submitted == [
+        (
+            principal.tenant_id,
+            principal.user_id,
+            "review this code package",
+            TaskMode.DISPATCH,
+            (),
+            None,
+            False,
+            None,
+            None,
+            ("att_0123456789abcdef0123456789abcdef",),
         )
     ]
 

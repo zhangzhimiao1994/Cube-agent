@@ -5,9 +5,11 @@ from time import monotonic
 from typing import cast
 
 import pytest
+from sqlalchemy import CheckConstraint, Table
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from agent_hub.db.migrations import resolve_database_url
+from agent_hub.db.models import AdminResourceRow
 from agent_hub.db.session import Database, build_database, build_session_factory
 from agent_hub.settings import Settings
 
@@ -77,3 +79,16 @@ def test_migration_url_uses_application_settings_when_not_explicitly_configured(
     )
 
     assert resolve_database_url(None, settings) == "postgresql+asyncpg://app:app@localhost/application"
+
+
+def test_admin_resource_kind_constraint_allows_channel_configuration() -> None:
+    table = cast(Table, AdminResourceRow.__table__)
+    constraints = [
+        constraint
+        for constraint in table.constraints
+        if constraint.name == "ck_agent_hub_admin_resources_kind"
+    ]
+
+    assert constraints
+    constraint = cast(CheckConstraint, constraints[0])
+    assert "channel" in str(constraint.sqltext)

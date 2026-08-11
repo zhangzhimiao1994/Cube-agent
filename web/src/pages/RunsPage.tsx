@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, FormEvent, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
-import { api, formatApiError, type RunDetail, type SubmittedRun } from "../api/client";
+import { ApiError, api, formatApiError, type AttachmentUpload, type RunDetail, type Skill, type SubmittedRun } from "../api/client";
 
 const RUN_MODES = [
   { value: "auto", label: "自动检测", description: "主 Agent 会判断应使用直接、派单、讨论或混合模式；不确定时应询问用户。" },
@@ -19,6 +19,17 @@ type ModeSelection = {
   decisionToken: string;
   version: number;
   reason: string | null;
+};
+type SkillInstallCandidate = {
+  fileName: string;
+  skill: Skill;
+  status: "scanned" | "enabled";
+};
+type ChatAttachmentDraft = {
+  fileName: string;
+  size: number;
+  kind: "code_review" | "image" | "context";
+  attachment?: AttachmentUpload;
 };
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
@@ -248,10 +259,13 @@ export function RunsPage() {
   const [conversationId, setConversationId] = useState(newConversationId);
   const [referenceConversationId, setReferenceConversationId] = useState("");
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [selectedConversationIds, setSelectedConversationIds] = useState<string[]>([]);
   const [submitNotice, setSubmitNotice] = useState<string | null>(null);
   const [configOpen, setConfigOpen] = useState(false);
   const [processOpen, setProcessOpen] = useState(false);
   const [modeSelection, setModeSelection] = useState<ModeSelection | null>(null);
+  const [skillInstallCandidate, setSkillInstallCandidate] = useState<SkillInstallCandidate | null>(null);
+  const [attachmentDraft, setAttachmentDraft] = useState<ChatAttachmentDraft | null>(null);
   const [temporaryApproval, setTemporaryApproval] = useState<{
     runId: string;
     decisionToken: string;
@@ -319,6 +333,7 @@ export function RunsPage() {
         agent_ids: mode === "direct" ? agentIds.slice(0, 1) : agentIds,
         conversation_id: conversationId,
         reference_conversation_id: referenceConversationId.trim() || null,
+        attachment_ids: attachmentDraft?.attachment ? [attachmentDraft.attachment.id] : [],
       }),
     onSuccess: async (run) => {
       setSelectedRunId(run.id);
@@ -345,6 +360,7 @@ export function RunsPage() {
         setSubmitNotice(explainActualMode(run));
       }
       setMessage("");
+      setAttachmentDraft(null);
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
       await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
     },
@@ -427,11 +443,99 @@ export function RunsPage() {
       if (selectedRunId === result.id) {
         setSelectedRunId(null);
       }
+      setSelectedConversationIds((current) => current.filter((id) => id !== result.id));
       queryClient.removeQueries({ queryKey: ["run", result.id] });
       setSubmitNotice("已删除对话。");
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
     },
   });
+
+  const bulkDeleteRuns = useMutation({
+    mutationFn: (ids: string[]) => api.bulkDeleteRuns(ids),
+    onSuccess: async (result) => {
+      const deletedIds = new Set(result.deleted.map((item) => item.id));
+      if (selectedRunId && deletedIds.has(selectedRunId)) {
+        setSelectedRunId(null);
+      }
+      for (const id of deletedIds) {
+        queryClient.removeQueries({ queryKey: ["run", id] });
+      }
+      setSelectedConversationIds((current) => current.filter((id) => !deletedIds.has(id)));
+      setSubmitNotice(
+        result.failed.length > 0
+          ? `Deleted ${result.deleted.length} conversations; ${result.failed.length} failed.`
+          : `Deleted ${result.deleted.length} conversations.`,
+      );
+      await queryClient.invalidateQueries({ queryKey: ["runs"] });
+    },
+  });
+
+  const uploadSkillArchive = useMutation({
+    mutationFn: (file: File) => api.uploadSkillArchive(file),
+    onSuccess: (skill, file) => {
+      setAttachmentDraft(null);
+      setSkillInstallCandidate({ fileName: file.name, skill, status: "scanned" });
+      setSubmitNotice("Skill 包已完成安全扫描，请确认权限后再安装。");
+      void queryClient.invalidateQueries({ queryKey: ["skills"] });
+    },
+    onError: (error, file) => {
+      setSkillInstallCandidate(null);
+      if (file.name.toLowerCase().endsWith(".zip") && error instanceof ApiError && error.code === "invalid_skill_package") {
+        setSubmitNotice(
+          "这个 ZIP 不是有效 Skill 包，正在按代码审查附件上传。",
+        );
+        uploadAttachment.mutate(file);
+      } else {
+        setAttachmentDraft({
+          fileName: file.name,
+          size: file.size,
+          kind: file.name.toLowerCase().endsWith(".zip") ? "code_review" : "context",
+        });
+        setSubmitNotice("Skill 扫描失败。请查看错误详情，确认是否为有效 Skill 包。");
+      }
+    },
+  });
+
+  const approveUploadedSkill = useMutation({
+    mutationFn: () => {
+      if (!skillInstallCandidate) throw new Error("skill install candidate is unavailable");
+      return api.approveSkill(skillInstallCandidate.skill.id);
+    },
+    onSuccess: async (skill) => {
+      setSkillInstallCandidate((current) => (current ? { ...current, skill, status: "enabled" } : current));
+      setSubmitNotice("Skill 已安装并启用。后续 Agent 可以在权限边界内引用它。");
+      await queryClient.invalidateQueries({ queryKey: ["skills"] });
+    },
+  });
+
+  const uploadAttachment = useMutation({
+    mutationFn: (file: File) => api.uploadAttachment(file),
+    onSuccess: (attachment, file) => {
+      const kind = attachment.kind === "image" ? "image" : attachment.kind === "code_archive" ? "code_review" : "context";
+      setSkillInstallCandidate(null);
+      setAttachmentDraft({ fileName: attachment.filename || file.name, size: attachment.size_bytes, kind, attachment });
+      setSubmitNotice(
+        kind === "code_review"
+          ? "代码压缩包已上传。请在输入框说明审查目标，提交后主 Agent 会把附件 ID 带入任务。"
+          : kind === "image"
+            ? "图片已上传。提交任务后会作为附件引用进入运行上下文。"
+            : "附件已上传。提交任务后会作为附件引用进入运行上下文。",
+      );
+    },
+  });
+
+  function handleAttachmentUpload(fileList: FileList | null) {
+    const file = fileList?.item(0);
+    if (!file) return;
+    setSubmitNotice(null);
+    setAttachmentDraft(null);
+    setSkillInstallCandidate(null);
+    if (file.name.toLowerCase().endsWith(".zip")) {
+      uploadSkillArchive.mutate(file);
+      return;
+    }
+    uploadAttachment.mutate(file);
+  }
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -455,6 +559,15 @@ export function RunsPage() {
   const savedAgents = agents.data ?? [];
   const savedWorkflows = workflows.data ?? [];
   const directAnswerer = mode === "direct" && agentIds.length > 0 ? agentIds[0] : "main_agent";
+  const deletableConversationIds = items
+    .filter((run) => TERMINAL_STATUSES.has(run.status))
+    .map((run) => run.id);
+  const selectedDeletableConversationIds = selectedConversationIds.filter((id) =>
+    deletableConversationIds.includes(id),
+  );
+  const allDeletableSelected =
+    deletableConversationIds.length > 0 &&
+    deletableConversationIds.every((id) => selectedConversationIds.includes(id));
 
   function deleteConversation(run: (typeof items)[number]) {
     if (!TERMINAL_STATUSES.has(run.status)) {
@@ -465,6 +578,28 @@ export function RunsPage() {
       return;
     }
     deleteRun.mutate(run.id);
+  }
+
+  function toggleAllConversations() {
+    setSelectedConversationIds((current) => {
+      if (allDeletableSelected) return current.filter((id) => !deletableConversationIds.includes(id));
+      return Array.from(new Set([...current, ...deletableConversationIds]));
+    });
+  }
+
+  function toggleConversation(runId: string) {
+    setSelectedConversationIds((current) => toggle(current, runId));
+  }
+
+  function deleteSelectedConversations() {
+    if (selectedDeletableConversationIds.length === 0) {
+      setSubmitNotice("Please select completed, failed, or cancelled conversations first.");
+      return;
+    }
+    if (!window.confirm(`Delete ${selectedDeletableConversationIds.length} selected conversations?`)) {
+      return;
+    }
+    bulkDeleteRuns.mutate(selectedDeletableConversationIds);
   }
 
   return (
@@ -487,6 +622,29 @@ export function RunsPage() {
             <h3>会话</h3>
             <span>{items.length}</span>
           </div>
+          {items.length > 0 ? (
+            <div className="bulk-action-bar conversation-bulk-actions">
+              <label className="inline-check compact-check">
+                <input
+                  type="checkbox"
+                  aria-label="Select all deletable conversations"
+                  checked={allDeletableSelected}
+                  disabled={deletableConversationIds.length === 0 || bulkDeleteRuns.isPending}
+                  onChange={toggleAllConversations}
+                />
+                全选可删
+              </label>
+              <button
+                type="button"
+                className="secondary-action"
+                disabled={selectedDeletableConversationIds.length === 0 || bulkDeleteRuns.isPending}
+                onClick={deleteSelectedConversations}
+              >
+                {bulkDeleteRuns.isPending ? "删除中..." : "批量删除已选会话"}
+              </button>
+              <small>已选 {selectedDeletableConversationIds.length}</small>
+            </div>
+          ) : null}
           {items.length === 0 ? (
             <p className="field-help">还没有任务。可以从右侧输入框发起第一次对话。</p>
           ) : (
@@ -497,6 +655,14 @@ export function RunsPage() {
                   key={run.id}
                   className={`conversation-row${selectedRunId === run.id ? " conversation-row-active" : ""}`}
                 >
+                  <input
+                    type="checkbox"
+                    className="conversation-select"
+                    aria-label={`Select conversation ${run.id.slice(0, 8)}`}
+                    checked={selectedConversationIds.includes(run.id)}
+                    disabled={!canDelete || bulkDeleteRuns.isPending}
+                    onChange={() => toggleConversation(run.id)}
+                  />
                   <button
                     type="button"
                     className="conversation-item"
@@ -809,6 +975,58 @@ export function RunsPage() {
                 ) : null}
               </aside>
             ) : null}
+            {skillInstallCandidate ? (
+              <aside className="composer-attachment-card" role="status" aria-label="Skill 安装确认">
+                <div>
+                  <span className="eyebrow">
+                    {skillInstallCandidate.status === "enabled" ? "Skill 已安装并启用" : "Skill 包已扫描，等待确认"}
+                  </span>
+                  <strong>{skillInstallCandidate.skill.name}</strong>
+                  <small>{skillInstallCandidate.fileName}</small>
+                </div>
+                {skillInstallCandidate.skill.requested_permissions.length > 0 ? (
+                  <ul>
+                    {skillInstallCandidate.skill.requested_permissions.map((permission) => (
+                      <li key={permission}>{permission}</li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p>未请求额外权限。</p>
+                )}
+                {skillInstallCandidate.status === "scanned" ? (
+                  <button type="button" disabled={approveUploadedSkill.isPending} onClick={() => approveUploadedSkill.mutate()}>
+                    {approveUploadedSkill.isPending ? "安装中..." : "确认安装 Skill"}
+                  </button>
+                ) : null}
+                {approveUploadedSkill.isError ? (
+                  <p className="form-error" role="alert">
+                    {formatApiError(approveUploadedSkill.error, "Skill 安装失败")}
+                  </p>
+                ) : null}
+              </aside>
+            ) : null}
+            {attachmentDraft ? (
+              <aside className="composer-attachment-card" role="status" aria-label="附件草稿">
+                <div>
+                  <span className="eyebrow">
+                    {attachmentDraft.kind === "code_review"
+                      ? "代码审查附件"
+                      : attachmentDraft.kind === "image"
+                        ? "图片附件"
+                        : "上下文附件"}
+                  </span>
+                  <strong>{attachmentDraft.fileName}</strong>
+                  <small>{Math.max(1, Math.ceil(attachmentDraft.size / 1024))} KB</small>
+                </div>
+                <p>
+                  {attachmentDraft.kind === "code_review"
+                    ? "这个 ZIP 不是 Skill 包。请在输入框说明审查目标；后续会接入后端附件存储后让审查 Agent 读取压缩包内容。"
+                    : attachmentDraft.kind === "image"
+                      ? "图片已选中。当前先记录附件，启用多模态链路后可交给视觉模型识别。"
+                      : "附件已选中。当前先记录附件名称，完整内容读取会走后端附件存储。"}
+                </p>
+              </aside>
+            ) : null}
             <textarea
               value={message}
               onChange={(event) => setMessage(event.target.value)}
@@ -816,6 +1034,16 @@ export function RunsPage() {
               required
             />
             <div className="composer-actions">
+              <label className="composer-upload-button">
+                <span>附件</span>
+                <input
+                  aria-label="上传文件或 Skill ZIP"
+                  type="file"
+                  accept=".zip,.txt,.md,.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,image/*"
+                  disabled={uploadSkillArchive.isPending || uploadAttachment.isPending}
+                  onChange={(event) => handleAttachmentUpload(event.currentTarget.files)}
+                />
+              </label>
               <button
                 type="button"
                 className="composer-plus-button"
@@ -835,6 +1063,18 @@ export function RunsPage() {
               </button>
             </div>
             {submitNotice ? <p role="status">{submitNotice}</p> : null}
+            {uploadSkillArchive.isPending ? <p role="status">正在扫描 Skill 包...</p> : null}
+            {uploadAttachment.isPending ? <p role="status">正在上传附件...</p> : null}
+            {uploadSkillArchive.isError ? (
+              <p className="field-help" role="status">
+                {formatApiError(uploadSkillArchive.error, "Skill 扫描失败")}
+              </p>
+            ) : null}
+            {uploadAttachment.isError ? (
+              <p className="form-error" role="alert">
+                {formatApiError(uploadAttachment.error, "附件上传失败")}
+              </p>
+            ) : null}
             {createRun.isError ? <p role="alert">{formatApiError(createRun.error, "任务提交失败")}</p> : null}
           </form>
         </div>

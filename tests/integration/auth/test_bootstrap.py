@@ -11,6 +11,7 @@ from argon2.low_level import Type
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from agent_hub.auth.feishu_oauth import ProtectedUserError
 from agent_hub.auth.models import (
     AuthenticationOperationError,
     AuthenticationPersistenceError,
@@ -23,6 +24,7 @@ from agent_hub.auth.models import (
 from agent_hub.auth.passwords import PasswordService
 from agent_hub.auth.service import AuthService
 from agent_hub.auth.tokens import AccessTokenService, InvalidTokenError, TokenBackendError
+from agent_hub.auth.user_admin import PersistentUserAdminService
 from agent_hub.db.models import BootstrapCodeRow, TenantRow, UserRow
 
 NOW = datetime(2026, 8, 5, 0, 0, tzinfo=UTC)
@@ -513,6 +515,58 @@ async def test_login_with_no_local_password_uses_dummy_verify_and_fails_closed(
     assert len(passwords.verified_hashes) == 1
     assert passwords.verified_hashes[0] == passwords.dummy_hash
     assert "$m=8192,t=1,p=1$" in passwords.dummy_hash
+
+
+@pytest.mark.integration
+async def test_user_admin_creates_disables_and_deletes_local_users(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _tenant(auth_session_factory)
+    issuer = _service(auth_session_factory, tenant_id)
+    code = await issuer.issue_bootstrap_code()
+    owner = await issuer.consume_bootstrap_code(code, "first-admin", "valid password 123")
+    passwords = PasswordService()
+    users = PersistentUserAdminService(auth_session_factory, passwords=passwords)
+
+    created = await users.create_user(
+        owner.principal,
+        username="ops-user",
+        password="valid password 456",
+        role=Role.OPERATOR,
+    )
+    disabled = await users.set_disabled(owner.principal, created.id, True)
+
+    assert created.username == "ops-user"
+    assert created.role is Role.OPERATOR
+    assert disabled.disabled is True
+    with pytest.raises(InvalidCredentials):
+        await issuer.login(tenant_id, "ops-user", "valid password 456")
+
+    enabled = await users.set_disabled(owner.principal, created.id, False)
+    logged_in = await issuer.login(tenant_id, "ops-user", "valid password 456")
+    deleted = await users.delete_user(owner.principal, enabled.id)
+
+    assert logged_in.principal.user_id == created.id
+    assert deleted.id == created.id
+    with pytest.raises(InvalidCredentials):
+        await issuer.login(tenant_id, "ops-user", "valid password 456")
+
+
+@pytest.mark.integration
+async def test_user_admin_protects_last_super_admin_and_current_actor(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = await _tenant(auth_session_factory)
+    issuer = _service(auth_session_factory, tenant_id)
+    code = await issuer.issue_bootstrap_code()
+    owner = await issuer.consume_bootstrap_code(code, "first-admin", "valid password 123")
+    passwords = PasswordService()
+    users = PersistentUserAdminService(auth_session_factory, passwords=passwords)
+
+    with pytest.raises(ProtectedUserError):
+        await users.set_disabled(owner.principal, owner.principal.user_id, True)
+    with pytest.raises(ProtectedUserError):
+        await users.delete_user(owner.principal, owner.principal.user_id)
     assert passwords.needs_rehash(passwords.dummy_hash) is False
 
 

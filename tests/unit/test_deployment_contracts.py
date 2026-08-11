@@ -112,6 +112,25 @@ def test_compose_and_native_litellm_use_config_file() -> None:
     assert 'chmod 0750 "$CONFIG_DIR"' in native_installer
 
 
+def test_installer_prints_external_callback_urls_for_supported_channels() -> None:
+    installer = read("scripts/lib/install_docker.sh")
+
+    assert "Webhook callback URLs for external platforms" in installer
+    for path in (
+        "/channels/feishu/events",
+        "/channels/dingtalk/events",
+        "/channels/wecom/bot/events",
+        "/channels/wecom/app/events",
+        "/channels/wechatmp/events",
+        "/channels/wechat-kf/events",
+        "/channels/telegram/events",
+        "/channels/slack/events",
+        "/channels/qq/events",
+        "/channels/custom/events",
+    ):
+        assert path in installer
+
+
 def test_native_litellm_proxy_uses_isolated_verified_virtualenv() -> None:
     native_service = read("deploy/native/systemd/agent-hub-litellm.service")
     native_installer = read("scripts/lib/install_native.sh")

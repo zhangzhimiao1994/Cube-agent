@@ -56,6 +56,8 @@ class UserRow(Base):
     password_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
     feishu_open_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     role: Mapped[str] = mapped_column(String(32))
+    disabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    protected: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
 
 
 class BootstrapCodeRow(Base):
@@ -368,7 +370,7 @@ class AdminResourceRow(Base):
             name="uq_agent_hub_admin_resources_tenant_kind_resource",
         ),
         CheckConstraint(
-            "kind IN ('workflow', 'agent', 'main_agent', 'skill', 'mcp', 'memory', 'hermes', 'audit', 'log', 'setting')",
+            "kind IN ('workflow', 'agent', 'main_agent', 'skill', 'mcp', 'memory', 'hermes', 'audit', 'log', 'setting', 'channel')",
             name="ck_agent_hub_admin_resources_kind",
         ),
         Index("ix_agent_hub_admin_resources_tenant_kind", "tenant_id", "kind"),

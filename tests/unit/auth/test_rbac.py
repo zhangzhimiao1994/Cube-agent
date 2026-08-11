@@ -16,18 +16,52 @@ EXPECTED_PERMISSIONS = {
         {
             "config:*",
             "agent:*",
-            "skill:*",
-            "mcp:*",
+            "skill:read",
+            "skill:use",
+            "skill:write",
+            "skill:approve",
+            "mcp:read",
+            "mcp:use",
+            "mcp:write",
             "memory:*",
             "hermes:*",
             "run:*",
+            "plugin:read",
+            "plugin:use",
+            "plugin:write",
+            "user:read",
+            "user:write",
             "audit:read",
         }
     ),
     Role.OPERATOR: frozenset(
-        {"run:create", "run:read", "run:pause", "run:resume", "run:cancel", "config:read"}
+        {
+            "run:create",
+            "run:read",
+            "run:pause",
+            "run:resume",
+            "run:cancel",
+            "config:read",
+            "skill:read",
+            "skill:use",
+            "mcp:read",
+            "mcp:use",
+            "plugin:read",
+            "plugin:use",
+        }
     ),
-    Role.VIEWER: frozenset({"run:read", "config:read", "audit:read"}),
+    Role.VIEWER: frozenset(
+        {
+            "run:read",
+            "config:read",
+            "skill:read",
+            "skill:use",
+            "mcp:read",
+            "mcp:use",
+            "plugin:read",
+            "plugin:use",
+        }
+    ),
 }
 
 
@@ -47,12 +81,22 @@ def test_role_values_and_permission_sets_are_stable() -> None:
         (Role.ADMIN, "config:write", True),
         (Role.ADMIN, "memory:write", True),
         (Role.ADMIN, "hermes:write", True),
+        (Role.ADMIN, "skill:write", True),
+        (Role.ADMIN, "skill:disable", False),
+        (Role.ADMIN, "plugin:write", True),
+        (Role.ADMIN, "plugin:disable", False),
+        (Role.ADMIN, "user:write", True),
         (Role.ADMIN, "audit:read", True),
         (Role.ADMIN, "audit:write", False),
         (Role.OPERATOR, "run:create", True),
         (Role.OPERATOR, "run:delete", False),
+        (Role.OPERATOR, "skill:use", True),
+        (Role.OPERATOR, "skill:write", False),
+        (Role.OPERATOR, "plugin:use", True),
+        (Role.OPERATOR, "plugin:write", False),
         (Role.VIEWER, "run:read", True),
         (Role.VIEWER, "run:create", False),
+        (Role.VIEWER, "audit:read", False),
     ],
 )
 def test_authorizer_enforces_the_rbac_matrix(role: Role, permission: str, allowed: bool) -> None:

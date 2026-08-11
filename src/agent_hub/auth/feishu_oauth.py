@@ -5,7 +5,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
 
@@ -19,6 +19,14 @@ class OAuthBindingError(RuntimeError):
 
 
 class LastSuperAdminError(RuntimeError):
+    pass
+
+
+class ProtectedUserError(RuntimeError):
+    pass
+
+
+class UserAlreadyExistsError(RuntimeError):
     pass
 
 
@@ -130,6 +138,7 @@ class ManagedUser:
     role: Role
     disabled: bool = False
     feishu_open_id: str | None = None
+    protected: bool = False
 
 
 class InMemoryUserAdminService:
@@ -148,6 +157,8 @@ class InMemoryUserAdminService:
     ) -> ManagedUser:
         _require_admin(actor)
         user = self._users[user_id]
+        if user.protected and role is not Role.SUPER_ADMIN:
+            raise ProtectedUserError("protected user cannot be demoted")
         if (
             user.role is Role.SUPER_ADMIN
             and role is not Role.SUPER_ADMIN
@@ -160,9 +171,66 @@ class InMemoryUserAdminService:
             role=role,
             disabled=user.disabled,
             feishu_open_id=user.feishu_open_id,
+            protected=user.protected,
         )
         self._users[user_id] = updated
         return updated
+
+    async def create_user(
+        self,
+        actor: AuthenticatedPrincipal,
+        *,
+        username: str,
+        password: str,
+        role: Role,
+    ) -> ManagedUser:
+        del password
+        _require_admin(actor)
+        if any(user.username == username for user in self._users.values()):
+            raise UserAlreadyExistsError("user already exists")
+        user = ManagedUser(id=uuid4(), username=username, role=role)
+        self._users[user.id] = user
+        return user
+
+    async def set_disabled(
+        self,
+        actor: AuthenticatedPrincipal,
+        user_id: UUID,
+        disabled: bool,
+    ) -> ManagedUser:
+        _require_admin(actor)
+        user = self._users[user_id]
+        if user_id == actor.user_id and disabled:
+            raise ProtectedUserError("current user cannot be disabled")
+        if user.protected and disabled:
+            raise ProtectedUserError("protected user cannot be disabled")
+        if user.role is Role.SUPER_ADMIN and disabled and self._super_admin_count(excluding=user_id) == 0:
+            raise LastSuperAdminError("cannot disable last super admin")
+        updated = ManagedUser(
+            id=user.id,
+            username=user.username,
+            role=user.role,
+            disabled=disabled,
+            feishu_open_id=user.feishu_open_id,
+            protected=user.protected,
+        )
+        self._users[user_id] = updated
+        return updated
+
+    async def delete_user(
+        self,
+        actor: AuthenticatedPrincipal,
+        user_id: UUID,
+    ) -> ManagedUser:
+        _require_admin(actor)
+        user = self._users[user_id]
+        if user_id == actor.user_id:
+            raise ProtectedUserError("current user cannot be deleted")
+        if user.protected:
+            raise ProtectedUserError("protected user cannot be deleted")
+        if user.role is Role.SUPER_ADMIN and self._super_admin_count(excluding=user_id) == 0:
+            raise LastSuperAdminError("cannot delete last super admin")
+        return self._users.pop(user_id)
 
     async def bind_feishu_open_id(
         self,
@@ -180,6 +248,7 @@ class InMemoryUserAdminService:
             role=user.role,
             disabled=user.disabled,
             feishu_open_id=profile.open_id,
+            protected=user.protected,
         )
         self._users[user_id] = updated
         return updated
@@ -214,4 +283,6 @@ __all__ = [
     "ManagedUser",
     "OAuthBindingError",
     "OAuthStateError",
+    "ProtectedUserError",
+    "UserAlreadyExistsError",
 ]

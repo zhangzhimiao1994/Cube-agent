@@ -35,6 +35,7 @@ from agent_hub.auth.service import AuthService
 from agent_hub.auth.tokens import AccessTokenService
 from agent_hub.auth.user_admin import PersistentUserAdminService
 from agent_hub.channels.dedup import InboundDedupRepository
+from agent_hub.channels.feishu.reply import FeishuOpenAPIReplySender, FeishuRunReplyDispatcher
 from agent_hub.channels.feishu.webhook import (
     ChannelGatewayProtocol,
     create_lazy_feishu_webhook_router,
@@ -186,8 +187,10 @@ def create_app(
             else None
         )
         try:
+            application.state.settings = configured
             application.state.trusted_proxy_ips = configured.trusted_proxy_ips
             application.state.bootstrap_tenant_id = configured.bootstrap_tenant_id
+            application.state.attachment_store_dir = configured.attachment_store_dir
             needs_sessions = (
                 auth_service is None
                 or config_service is None
@@ -285,6 +288,11 @@ def create_app(
                     ),
                     deduplicator=InboundDedupRepository(active_sessions),
                 )
+            if active_sessions is not None:
+                application.state.feishu_reply_dispatcher = FeishuRunReplyDispatcher(
+                    run_repository=RunRepository(active_sessions),
+                    sender=FeishuOpenAPIReplySender(),
+                )
 
             if rate_limiter is None:
                 assert active_redis is not None
@@ -308,6 +316,7 @@ def create_app(
                 application.state.extra_readiness_checks = extra_checks
             yield
         finally:
+            await _cancel_background_tasks(application.state.feishu_reply_tasks)
             await _cleanup_owned_resources(
                 cleanup_callbacks,
                 primary_error=sys.exception(),
@@ -332,9 +341,11 @@ def create_app(
     application.state.mode_router = mode_router
     application.state.run_queue = task_queue
     application.state.feishu_gateway = feishu_gateway
+    application.state.feishu_reply_dispatcher = None
+    application.state.feishu_reply_tasks = set()
     application.state.metrics_registry = default_metrics_registry()
     application.state.extra_readiness_checks = {}
-    application.state.channel_runtime_config = {}
+    application.state.channel_runtime_config = None
     application.state.trusted_proxy_ips = configured_settings.trusted_proxy_ips
     application.add_exception_handler(PublicAPIError, public_error_handler)
     application.add_exception_handler(StarletteHTTPException, http_exception_handler)
@@ -361,6 +372,7 @@ def create_app(
     application.router.routes.extend(
         create_lazy_feishu_webhook_router(
             gateway_provider=_feishu_gateway_from_request,
+            runtime_config_provider=_channel_runtime_config_from_request,
         ).routes
     )
     application.router.routes.extend(
@@ -387,6 +399,15 @@ def create_app(
         return _web_ui_response(configured.web_dir, path)
 
     return application
+
+
+async def _cancel_background_tasks(tasks: set[asyncio.Task[object]]) -> None:
+    if not tasks:
+        return
+    for task in tuple(tasks):
+        task.cancel()
+    await asyncio.gather(*tuple(tasks), return_exceptions=True)
+    tasks.clear()
 
 
 def _web_ui_response(web_dir: Path, path: str) -> Response:

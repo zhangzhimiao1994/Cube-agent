@@ -21,11 +21,21 @@ PERMISSIONS = MappingProxyType(
             {
                 "config:*",
                 "agent:*",
-                "skill:*",
-                "mcp:*",
+                "skill:read",
+                "skill:use",
+                "skill:write",
+                "skill:approve",
+                "mcp:read",
+                "mcp:use",
+                "mcp:write",
                 "memory:*",
                 "hermes:*",
                 "run:*",
+                "plugin:read",
+                "plugin:use",
+                "plugin:write",
+                "user:read",
+                "user:write",
                 "audit:read",
             }
         ),
@@ -37,9 +47,26 @@ PERMISSIONS = MappingProxyType(
                 "run:resume",
                 "run:cancel",
                 "config:read",
+                "skill:read",
+                "skill:use",
+                "mcp:read",
+                "mcp:use",
+                "plugin:read",
+                "plugin:use",
             }
         ),
-        Role.VIEWER: frozenset({"run:read", "config:read", "audit:read"}),
+        Role.VIEWER: frozenset(
+            {
+                "run:read",
+                "config:read",
+                "skill:read",
+                "skill:use",
+                "mcp:read",
+                "mcp:use",
+                "plugin:read",
+                "plugin:use",
+            }
+        ),
     }
 )
 

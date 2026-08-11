@@ -30,3 +30,4 @@ def test_create_app_mounts_feishu_webhook_on_main_api() -> None:
     paths = {getattr(route, "path", "") for route in application.routes}
 
     assert "/channels/feishu/events" in paths
+    assert application.state.channel_runtime_config is None

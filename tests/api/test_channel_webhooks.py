@@ -12,6 +12,7 @@ from agent_hub.api.routers.admin import InMemoryAdminResourceService
 from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
 from agent_hub.channels.base import InboundMessage
+from agent_hub.channels.feishu.verify import FeishuVerifier
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
 USER_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -142,6 +143,34 @@ def test_token_channel_webhooks_submit_to_gateway(
     assert len(gateway.messages) == 1
     assert gateway.messages[0].channel.value == channel
     assert gateway.messages[0].text == text
+
+
+def test_generic_channel_webhook_preserves_attachment_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CUSTOM_WEBHOOK_TOKEN", "token")
+    gateway = RecordingGateway()
+
+    response = client(gateway).post(
+        "/channels/custom/events",
+        headers={"X-Agent-Hub-Channel-Token": "token"},
+        json={
+            "text": "Review this file",
+            "sender": "u1",
+            "conversation_id": "c1",
+            "message_id": "m1",
+            "attachments": [
+                {
+                    "kind": "image",
+                    "external_key": "att_0123456789abcdef0123456789abcdef",
+                    "filename": "screen.png",
+                    "content_type": "image/png",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 202
+    assert gateway.messages[0].attachments[0].kind.value == "image"
+    assert gateway.messages[0].attachments[0].external_key == "att_0123456789abcdef0123456789abcdef"
 
 
 def test_telegram_webhook_accepts_official_secret_header(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -330,6 +359,109 @@ def test_saved_channel_config_is_used_by_webhook_runtime() -> None:
     assert response.status_code == 202
     assert response.json() == {"accepted": True, "channel": "custom_webhook"}
     assert gateway.messages[0].text == "Runtime channel task"
+
+
+def test_saved_feishu_config_is_used_by_webhook_runtime() -> None:
+    gateway = RecordingGateway()
+    app = create_app(
+        auth_service=StubAuthService(),
+        rate_limiter=object(),
+        feishu_gateway=gateway,
+    )
+    app.state.admin_resource_service = InMemoryAdminResourceService()
+    api = TestClient(app)
+    verifier = FeishuVerifier(
+        app_id="cli_saved_feishu",
+        verification_token="saved-verification-token",
+        encrypt_key="saved-encrypt-key",
+    )
+    body = b'{"token":"saved-verification-token","challenge":"challenge-from-saved-config"}'
+    timestamp = str(int(time.time()))
+    nonce = "nonce"
+
+    saved = api.post(
+        "/api/v1/admin/channels/feishu/config",
+        headers={"Authorization": "Bearer valid-token"},
+        json={
+            "values": {
+                "AGENT_HUB_PUBLIC_URL": "https://agent.example.com",
+                "FEISHU_APP_ID": "cli_saved_feishu",
+                "FEISHU_APP_SECRET": "saved-secret",
+                "FEISHU_VERIFICATION_TOKEN": "saved-verification-token",
+                "FEISHU_ENCRYPT_KEY": "saved-encrypt-key",
+                "FEISHU_TRANSPORT": "webhook",
+            }
+        },
+    )
+    response = api.post(
+        "/channels/feishu/events",
+        headers={
+            "Content-Type": "application/json",
+            "X-Lark-Request-Timestamp": timestamp,
+            "X-Lark-Request-Nonce": nonce,
+            "X-Lark-Signature": verifier.sign(body, timestamp=timestamp, nonce=nonce),
+        },
+        content=body,
+    )
+
+    assert saved.status_code == 200
+    assert response.status_code == 200
+    assert response.json() == {"challenge": "challenge-from-saved-config"}
+    assert gateway.messages == []
+
+
+def test_feishu_webhook_accepts_token_only_event_when_signature_headers_are_absent() -> None:
+    gateway = RecordingGateway()
+    app = create_app(
+        auth_service=StubAuthService(),
+        rate_limiter=object(),
+        feishu_gateway=gateway,
+    )
+    app.state.admin_resource_service = InMemoryAdminResourceService()
+    api = TestClient(app)
+
+    saved = api.post(
+        "/api/v1/admin/channels/feishu/config",
+        headers={"Authorization": "Bearer valid-token"},
+        json={
+            "values": {
+                "AGENT_HUB_PUBLIC_URL": "https://agent.example.com",
+                "FEISHU_APP_ID": "cli_saved_feishu",
+                "FEISHU_APP_SECRET": "saved-secret",
+                "FEISHU_VERIFICATION_TOKEN": "saved-verification-token",
+                "FEISHU_ENCRYPT_KEY": "saved-encrypt-key",
+                "FEISHU_TRANSPORT": "webhook",
+            }
+        },
+    )
+    response = api.post(
+        "/channels/feishu/events",
+        json={
+            "schema": "2.0",
+            "header": {
+                "event_id": "evt_unsigned",
+                "event_type": "im.message.receive_v1",
+                "token": "saved-verification-token",
+                "app_id": "cli_saved_feishu",
+                "tenant_key": "tenant_1",
+                "create_time": str(int(time.time())),
+            },
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou_user"}},
+                "message": {
+                    "message_id": "om_unsigned",
+                    "chat_id": "oc_chat",
+                    "chat_type": "p2p",
+                    "message_type": "text",
+                    "content": "{\"text\":\"/direct hello\"}",
+                },
+            },
+        },
+    )
+
+    assert saved.status_code == 200
+    assert response.status_code == 202
+    assert gateway.messages[0].text == "/direct hello"
 
 
 def test_generic_channel_webhook_rejects_wrong_token(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -14,7 +14,9 @@ from fastapi.testclient import TestClient
 from starlette.types import Message, Receive, Scope, Send
 
 from agent_hub.api.middleware import SafeExceptionMiddleware, StreamAbortedError
+from agent_hub.api.routers.admin import InMemoryAdminResourceService
 from agent_hub.app import _cleanup_owned_resources, create_app
+from agent_hub.auth.feishu_oauth import InMemoryUserAdminService, ManagedUser
 from agent_hub.auth.models import (
     AuthenticatedPrincipal,
     AuthenticationPersistenceError,
@@ -254,13 +256,112 @@ class StubRateLimiter:
 def auth_client(
     auth: StubAuthService | None = None,
     limiter: StubRateLimiter | None = None,
+    user_admin_service: object | None = None,
+    admin_resource_service: object | None = None,
 ) -> TestClient:
     return TestClient(
         create_app(
             auth_service=auth or StubAuthService(),
             rate_limiter=limiter or StubRateLimiter(),
+            user_admin_service=user_admin_service,
+            admin_resource_service=admin_resource_service,
         )
     )
+
+
+def test_user_management_create_disable_enable_delete_endpoints_are_wired() -> None:
+    owner_id = uuid4()
+    tenant_id = uuid4()
+    auth = StubAuthService(AuthenticatedPrincipal(owner_id, tenant_id, Role.SUPER_ADMIN))
+    service = InMemoryUserAdminService(
+        (
+            ManagedUser(
+                id=owner_id,
+                username="owner",
+                role=Role.SUPER_ADMIN,
+                protected=True,
+            ),
+        )
+    )
+    audit = InMemoryAdminResourceService()
+    client = auth_client(auth, user_admin_service=service, admin_resource_service=audit)
+
+    created = client.post(
+        "/api/v1/users",
+        headers={"Authorization": "Bearer valid-token"},
+        json={"username": "ops-user", "password": "valid password 456", "role": "operator"},
+    )
+    assert created.status_code == 200
+    user_id = created.json()["id"]
+
+    disabled = client.patch(
+        f"/api/v1/users/{user_id}/disabled",
+        headers={"Authorization": "Bearer valid-token"},
+        json={"disabled": True},
+    )
+    enabled = client.patch(
+        f"/api/v1/users/{user_id}/disabled",
+        headers={"Authorization": "Bearer valid-token"},
+        json={"disabled": False},
+    )
+    deleted = client.delete(
+        f"/api/v1/users/{user_id}",
+        headers={"Authorization": "Bearer valid-token"},
+    )
+
+    assert disabled.status_code == 200
+    assert disabled.json()["disabled"] is True
+    assert enabled.status_code == 200
+    assert enabled.json()["disabled"] is False
+    assert deleted.status_code == 204
+    user_audit_actions = [
+        event.action for event in audit.audit_events if event.action.startswith("user.")
+    ]
+    assert user_audit_actions == [
+        "user.create",
+        "user.disable",
+        "user.enable",
+        "user.delete",
+    ]
+
+
+def test_user_management_protects_initial_super_admin() -> None:
+    owner_id = uuid4()
+    tenant_id = uuid4()
+    auth = StubAuthService(AuthenticatedPrincipal(owner_id, tenant_id, Role.SUPER_ADMIN))
+    service = InMemoryUserAdminService(
+        (
+            ManagedUser(
+                id=owner_id,
+                username="owner",
+                role=Role.SUPER_ADMIN,
+                protected=True,
+            ),
+        )
+    )
+    client = auth_client(auth, user_admin_service=service)
+
+    disable = client.patch(
+        f"/api/v1/users/{owner_id}/disabled",
+        headers={"Authorization": "Bearer valid-token"},
+        json={"disabled": True},
+    )
+    delete = client.delete(
+        f"/api/v1/users/{owner_id}",
+        headers={"Authorization": "Bearer valid-token"},
+    )
+    demote = client.patch(
+        f"/api/v1/users/{owner_id}/role",
+        headers={"Authorization": "Bearer valid-token"},
+        json={"role": "admin"},
+    )
+
+    assert disable.status_code == 409
+    assert disable.json()["error"]["code"] == "protected_user"
+    assert delete.status_code == 409
+    assert delete.json()["error"]["code"] == "protected_user"
+    assert demote.status_code == 409
+    assert demote.json()["error"]["code"] == "protected_user"
 
 
 def test_setup_and_login_return_only_safe_principal_fields() -> None:
@@ -1235,7 +1336,7 @@ def test_openapi_describes_security_health_and_route_specific_errors() -> None:
                 continue
             responses = operation["responses"]
             assert "405" in responses, (path, method, responses)
-            for status_code in set(responses) - {"200", "201", "202"}:
+            for status_code in set(responses) - {"200", "201", "202", "204"}:
                 content = responses[status_code]["content"]["application/json"]
                 assert content["schema"] == {
                     "$ref": "#/components/schemas/ErrorResponse"

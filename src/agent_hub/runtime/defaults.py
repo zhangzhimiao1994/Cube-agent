@@ -219,6 +219,7 @@ class ConfigBackedDispatchRuntime:
                 profile=_task_profile(context.request),
                 profiles=_task_profiles(context.request),
                 high_risk=_high_risk_task(context.request),
+                requested_skills=_requested_skills(context),
                 default_model=logical_model,
             )
         )
@@ -295,6 +296,7 @@ class ConfigBackedDiscussionRuntime:
                 profile=_task_profile(context.request),
                 profiles=_task_profiles(context.request),
                 high_risk=_high_risk_task(context.request),
+                requested_skills=_requested_skills(context),
                 default_model=logical_model,
             )
         )
@@ -366,6 +368,7 @@ class ConfigBackedHybridRuntime:
                 profile=profile,
                 profiles=profiles,
                 high_risk=high_risk,
+                requested_skills=_requested_skills(context),
                 default_model=logical_model,
             )
         ).roles
@@ -376,6 +379,7 @@ class ConfigBackedHybridRuntime:
                 profile=profile,
                 profiles=profiles,
                 high_risk=high_risk,
+                requested_skills=_requested_skills(context),
                 default_model=logical_model,
             )
         ).roles
@@ -564,6 +568,15 @@ def _temporary_role_assignments(
         except ValueError:
             continue
     return tuple(assignments)
+
+
+def _requested_skills(context: TaskContext) -> tuple[str, ...]:
+    value = context.routing_decision.get("requested_skills")
+    if isinstance(value, str):
+        return tuple(item.strip() for item in value.split(",") if item.strip())
+    if isinstance(value, tuple):
+        return tuple(item for item in value if isinstance(item, str) and item)
+    return ()
 
 
 def _discussion_plan(

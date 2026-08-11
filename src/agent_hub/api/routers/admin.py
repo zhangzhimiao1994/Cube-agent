@@ -13,7 +13,7 @@ from urllib.parse import urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from fastapi import APIRouter, Depends, Request
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -234,6 +234,27 @@ class RunDeleteResponse(BaseModel):
     deleted: bool
 
 
+class BulkFailureResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    code: str
+    message: str
+
+
+class RunBulkDeleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ids: list[UUID] = Field(min_length=1, max_length=100)
+
+
+class RunBulkDeleteResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    deleted: list[RunDeleteResponse]
+    failed: list[BulkFailureResponse]
+
+
 class ConversationResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -264,6 +285,13 @@ class McpServerResponse(BaseModel):
     name: str
     health: str
     allowed_tools: list[str]
+    transport: str = Field(default="streamable_http", pattern=r"^(stdio|sse|streamable_http)$")
+    command: str | None = Field(default=None, max_length=4096)
+    args: list[str] = Field(default_factory=list, max_length=128)
+    url: str | None = Field(default=None, max_length=2048)
+    executable_allowlist: list[str] = Field(default_factory=list, max_length=64)
+    domain_allowlist: list[str] = Field(default_factory=list, max_length=64)
+    timeout_seconds: float = Field(default=10, gt=0, le=120)
 
 
 class McpServerRequest(BaseModel):
@@ -272,6 +300,13 @@ class McpServerRequest(BaseModel):
     id: str = Field(min_length=1, max_length=128, pattern=r"^[a-z0-9][a-z0-9_-]*$")
     name: str = Field(min_length=1, max_length=200)
     allowed_tools: list[str] = Field(default_factory=list, max_length=256)
+    transport: str = Field(default="streamable_http", pattern=r"^(stdio|sse|streamable_http)$")
+    command: str | None = Field(default=None, max_length=4096)
+    args: list[str] = Field(default_factory=list, max_length=128)
+    url: str | None = Field(default=None, max_length=2048)
+    executable_allowlist: list[str] = Field(default_factory=list, max_length=64)
+    domain_allowlist: list[str] = Field(default_factory=list, max_length=64)
+    timeout_seconds: float = Field(default=10, gt=0, le=120)
 
 
 class ChannelStatusResponse(BaseModel):
@@ -462,6 +497,8 @@ class SystemSettingsRequest(BaseModel):
     safe_tools_enabled: bool = True
     require_approval_for_tools: bool = True
     channel_entry: str = Field(default="web", max_length=64)
+    attachment_retention_days: int = Field(default=7, ge=1, le=365)
+    attachment_max_mb: int = Field(default=25, ge=1, le=200)
 
 
 class SystemSettingsResponse(SystemSettingsRequest):
@@ -566,6 +603,32 @@ class HermesRecommendationResponse(BaseModel):
     requires_approval: bool
 
 
+class HermesBulkConfirmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ids: list[str] = Field(min_length=1, max_length=200)
+
+    @field_validator("ids")
+    @classmethod
+    def validate_ids(cls, value: list[str]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in value:
+            if re.fullmatch(r"hermes[-_][a-f0-9-]{1,64}", item) is None:
+                raise ValueError("Hermes ids must be safe learning identifiers")
+            if item not in seen:
+                seen.add(item)
+                result.append(item)
+        return result
+
+
+class HermesBulkConfirmResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirmed: list[HermesInsightResponse]
+    failed: list[BulkFailureResponse]
+
+
 class AdminResourceService(Protocol):
     async def list_models(self) -> tuple[ModelDeploymentResponse, ...]: ...
 
@@ -653,6 +716,15 @@ class AdminResourceService(Protocol):
 
     async def list_audit_events(self, action: str | None = None) -> tuple[AuditEventResponse, ...]: ...
 
+    async def record_audit_event(
+        self,
+        *,
+        actor: str,
+        action: str,
+        resource: str,
+        details: dict[str, object] | None = None,
+    ) -> AuditEventResponse: ...
+
     async def list_logs(self, category: str | None = None) -> tuple[LogEntryResponse, ...]: ...
 
     async def list_hermes_insights(self) -> tuple[HermesInsightResponse, ...]: ...
@@ -732,6 +804,10 @@ class InMemoryAdminResourceService:
                 name="Filesystem MCP",
                 health="healthy",
                 allowed_tools=["read_file", "list_directory"],
+                transport="stdio",
+                command=None,
+                args=[],
+                executable_allowlist=[],
             )
         if not self.memory:
             self.memory["project-policy"] = MemoryRecordResponse(
@@ -1011,6 +1087,13 @@ class InMemoryAdminResourceService:
             name=request.name,
             health="configured",
             allowed_tools=request.allowed_tools,
+            transport=request.transport,
+            command=request.command,
+            args=request.args,
+            url=request.url,
+            executable_allowlist=request.executable_allowlist,
+            domain_allowlist=request.domain_allowlist,
+            timeout_seconds=request.timeout_seconds,
         )
         self.mcp_servers[response.id] = response
         return response
@@ -1061,6 +1144,25 @@ class InMemoryAdminResourceService:
         if action is not None:
             events = [event for event in events if event.action == action]
         return tuple(events)
+
+    async def record_audit_event(
+        self,
+        *,
+        actor: str,
+        action: str,
+        resource: str,
+        details: dict[str, object] | None = None,
+    ) -> AuditEventResponse:
+        del details
+        event = AuditEventResponse(
+            id=f"audit_{uuid4().hex}",
+            actor=actor,
+            action=action,
+            resource=resource,
+            created_at=datetime.now(UTC),
+        )
+        self.audit_events.append(event)
+        return event
 
     def make_log(
         self,
@@ -1892,6 +1994,13 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             name=request.name,
             health="configured",
             allowed_tools=request.allowed_tools,
+            transport=request.transport,
+            command=request.command,
+            args=request.args,
+            url=request.url,
+            executable_allowlist=request.executable_allowlist,
+            domain_allowlist=request.domain_allowlist,
+            timeout_seconds=request.timeout_seconds,
         )
         if not await self._upsert_admin_payload("mcp", response.id, response.model_dump(mode="json")):
             return await super().upsert_mcp_server(request)
@@ -2262,6 +2371,27 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         if payload:
             audit_payload["details"] = payload
         await self._upsert_admin_payload("audit", event.id, audit_payload)
+
+    async def record_audit_event(
+        self,
+        *,
+        actor: str,
+        action: str,
+        resource: str,
+        details: dict[str, object] | None = None,
+    ) -> AuditEventResponse:
+        event = AuditEventResponse(
+            id=f"audit_{uuid4().hex}",
+            actor=actor,
+            action=action,
+            resource=resource,
+            created_at=datetime.now(UTC),
+        )
+        audit_payload = event.model_dump(mode="json")
+        if details:
+            audit_payload["details"] = details
+        await self._upsert_admin_payload("audit", event.id, audit_payload)
+        return event
 
     async def _verify_model_availability(
         self,
@@ -3340,6 +3470,41 @@ async def get_conversation(
     return await service.get_conversation(conversation_id)
 
 
+@router.post(
+    "/runs/bulk-delete",
+    response_model=RunBulkDeleteResponse,
+    responses=error_responses(401, 403, 422),
+)
+async def bulk_delete_operational_runs(
+    body: RunBulkDeleteRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> RunBulkDeleteResponse:
+    _require(principal, "run:delete")
+    deleted: list[RunDeleteResponse] = []
+    failed: list[BulkFailureResponse] = []
+    for run_id in dict.fromkeys(body.ids):
+        try:
+            deleted.append(await service.delete_run(run_id))
+        except PublicAPIError as error:
+            failed.append(
+                BulkFailureResponse(
+                    id=str(run_id),
+                    code=error.code,
+                    message=error.public_message,
+                )
+            )
+        except KeyError:
+            failed.append(
+                BulkFailureResponse(
+                    id=str(run_id),
+                    code="not_found",
+                    message="not found",
+                )
+            )
+    return RunBulkDeleteResponse(deleted=deleted, failed=failed)
+
+
 @router.get("/runs/{run_id}", response_model=RunDetailResponse, responses=error_responses(401, 403, 404, 422))
 async def get_operational_run(
     run_id: UUID,
@@ -3618,6 +3783,33 @@ async def recommend_with_hermes(
 ) -> HermesRecommendationResponse:
     _require(principal, "hermes:read")
     return await service.recommend_with_hermes(body)
+
+
+@router.post(
+    "/hermes/bulk-confirm",
+    response_model=HermesBulkConfirmResponse,
+    responses=error_responses(401, 403, 422),
+)
+async def bulk_confirm_hermes_insights(
+    body: HermesBulkConfirmRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> HermesBulkConfirmResponse:
+    _require(principal, "hermes:write")
+    confirmed: list[HermesInsightResponse] = []
+    failed: list[BulkFailureResponse] = []
+    for insight_id in body.ids:
+        try:
+            confirmed.append(await service.confirm_hermes_insight(insight_id))
+        except KeyError:
+            failed.append(
+                BulkFailureResponse(
+                    id=insight_id,
+                    code="hermes_not_found",
+                    message="Hermes learning record was not found",
+                )
+            )
+    return HermesBulkConfirmResponse(confirmed=confirmed, failed=failed)
 
 
 @router.get("/hermes/{insight_id}", response_model=HermesInsightResponse, responses=error_responses(401, 403, 404, 422))

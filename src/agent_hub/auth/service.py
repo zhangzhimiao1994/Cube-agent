@@ -216,6 +216,7 @@ class AuthService:
                         username=username,
                         password_hash=password_hash,
                         role=Role.SUPER_ADMIN.value,
+                        protected=True,
                     )
                 )
                 await session.flush()
@@ -304,7 +305,7 @@ class AuthService:
                     return _Failure.BUSY
                 except PasswordBackendError:
                     return _Failure.OPERATION
-                if row is None or row.password_hash is None or not verified:
+                if row is None or row.password_hash is None or row.disabled or not verified:
                     return _Failure.INVALID_CREDENTIALS
                 try:
                     role = Role(row.role)

@@ -366,7 +366,7 @@ native_public_url() {
   if [[ -f "$SECRETS_FILE" ]]; then
     native_secret_value AGENT_HUB_PUBLIC_URL
   else
-    printf '%s\n' "${AGENT_HUB_PUBLIC_URL:-http://127.0.0.1}"
+    detect_public_url
   fi
 }
 

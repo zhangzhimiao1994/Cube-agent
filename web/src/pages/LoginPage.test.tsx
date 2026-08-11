@@ -143,7 +143,7 @@ describe("LoginPage", () => {
     await waitFor(() => expect(screen.getByRole("heading", { name: "登录控制台" })).not.toBeNull());
   });
 
-  it("keeps all module groups visible and shows an empty state for unauthorized modules", async () => {
+  it("keeps module groups visible and lets viewers use installed tool capabilities", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
@@ -169,6 +169,7 @@ describe("LoginPage", () => {
     expect(screen.getByRole("link", { name: "工具" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "通道" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "系统" })).not.toBeNull();
-    expect(screen.getByRole("heading", { name: "暂无可访问模块" })).not.toBeNull();
+    expect(screen.getByRole("link", { name: /技能/ })).not.toBeNull();
+    expect(screen.getByRole("link", { name: /MCP 工具/ })).not.toBeNull();
   });
 });

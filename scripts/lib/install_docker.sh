@@ -111,10 +111,23 @@ install_docker_mode() {
 }
 
 print_bootstrap_output() {
-  local url code
-  url="$(grep '^AGENT_HUB_PUBLIC_URL=' "$SECRETS_FILE" | cut -d= -f2-)/setup"
+  local public_url setup_url code
+  public_url="$(grep '^AGENT_HUB_PUBLIC_URL=' "$SECRETS_FILE" | cut -d= -f2-)"
+  setup_url="${public_url%/}/setup"
   code="$(grep '^AGENT_HUB_SETUP_CODE=' "$SECRETS_FILE" | cut -d= -f2-)"
-  printf '\nManagement URL: %s\n' "$url"
+  printf '\nExternal URL: %s\n' "$public_url"
+  printf 'Management URL: %s\n' "$setup_url"
+  printf '\nWebhook callback URLs for external platforms:\n'
+  printf '  Feishu: %s/channels/feishu/events\n' "${public_url%/}"
+  printf '  DingTalk: %s/channels/dingtalk/events\n' "${public_url%/}"
+  printf '  WeCom group bot: %s/channels/wecom/bot/events\n' "${public_url%/}"
+  printf '  WeCom app: %s/channels/wecom/app/events\n' "${public_url%/}"
+  printf '  WeChat official account: %s/channels/wechatmp/events\n' "${public_url%/}"
+  printf '  WeChat customer service: %s/channels/wechat-kf/events\n' "${public_url%/}"
+  printf '  Telegram: %s/channels/telegram/events\n' "${public_url%/}"
+  printf '  Slack: %s/channels/slack/events\n' "${public_url%/}"
+  printf '  QQ bot: %s/channels/qq/events\n' "${public_url%/}"
+  printf '  Custom webhook: %s/channels/custom/events\n' "${public_url%/}"
   printf 'One-time setup code: %s\n' "$code"
   printf 'Run diagnostics: scripts/agent-hub doctor\n'
 }

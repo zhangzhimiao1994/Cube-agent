@@ -168,6 +168,8 @@ class RunService:
         allow_workflow_adjustment: bool = False,
         conversation_id: str | None = None,
         reference_conversation_id: str | None = None,
+        attachment_ids: tuple[str, ...] = (),
+        channel_context: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         effective_conversation_id = conversation_id or f"conv-{uuid4().hex}"
@@ -180,7 +182,10 @@ class RunService:
             else "strict_preset",
             "conversation_id": effective_conversation_id,
             "reference_conversation_id": reference_conversation_id,
+            "attachment_ids": list(attachment_ids),
         }
+        if channel_context:
+            operator_selection.update(_safe_channel_context(channel_context))
         if mode is TaskMode.AUTO:
             decision: RouteDecision | None = None
             if self._router is not None:
@@ -761,6 +766,26 @@ def _string_tuple(value: object) -> tuple[str, ...]:
     if isinstance(value, tuple):
         return tuple(item for item in value if isinstance(item, str) and item)
     return ()
+
+
+def _safe_channel_context(channel_context: Mapping[str, str]) -> dict[str, str]:
+    allowed = {
+        "source_channel",
+        "channel_tenant_external_id",
+        "channel_sender_external_id",
+        "channel_conversation_external_id",
+        "channel_message_id",
+        "channel_event_id",
+        "channel_conversation_type",
+        "requested_skills",
+        "requested_mcp_servers",
+        "requested_plugins",
+    }
+    result: dict[str, str] = {}
+    for key, value in channel_context.items():
+        if key in allowed and isinstance(value, str) and value:
+            result[key] = value[:512]
+    return result
 
 
 def _runtime_failure_reason(error: Exception) -> str:

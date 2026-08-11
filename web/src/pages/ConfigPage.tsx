@@ -289,6 +289,35 @@ export function ConfigPage() {
           </select>
         </label>
 
+        <h3>附件存储</h3>
+        <p className="field-help">
+          网页上传、通道收到的文件和图片都会进入附件存储；请按服务器磁盘容量设置生命周期，避免附件长期堆积。
+        </p>
+        <div className="form-grid">
+          <label htmlFor="attachment-retention-days">
+            附件保留天数
+            <input
+              id="attachment-retention-days"
+              type="number"
+              min={1}
+              max={365}
+              value={settings.attachment_retention_days}
+              onChange={(event) => updateSettings({ attachment_retention_days: Number(event.target.value) })}
+            />
+          </label>
+          <label htmlFor="attachment-max-mb">
+            单个附件最大 MB
+            <input
+              id="attachment-max-mb"
+              type="number"
+              min={1}
+              max={200}
+              value={settings.attachment_max_mb}
+              onChange={(event) => updateSettings({ attachment_max_mb: Number(event.target.value) })}
+            />
+          </label>
+        </div>
+
         <button type="submit" disabled={saveSettings.isPending}>
           {saveSettings.isPending ? "正在保存设置..." : "保存系统设置"}
         </button>

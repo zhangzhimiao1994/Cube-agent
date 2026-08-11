@@ -7,6 +7,7 @@ from uuid import UUID
 
 from agent_hub.channels.base import InboundMessage, should_accept
 from agent_hub.channels.dedup import DedupReservation
+from agent_hub.channels.directives import ChannelDirectiveError
 
 
 class InboundTaskSubmitter(Protocol):
@@ -80,6 +81,15 @@ class ChannelGateway:
                 idempotency_key=reservation.idempotency_key,
             )
             await self._deduplicator.mark_submitted(reservation.reservation_id, run_id)
+        except ChannelDirectiveError as error:
+            with suppress(Exception):
+                await self._deduplicator.release_reservation(reservation.reservation_id)
+            return ChannelGatewayResult(
+                accepted=False,
+                duplicate=False,
+                run_id=None,
+                reason=error.reason,
+            )
         except Exception:
             with suppress(Exception):
                 await self._deduplicator.release_reservation(reservation.reservation_id)

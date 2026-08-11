@@ -32,15 +32,47 @@ const ROLE_PERMISSIONS: Record<string, string[]> = {
   admin: [
     "config:*",
     "agent:*",
-    "skill:*",
-    "mcp:*",
+    "skill:read",
+    "skill:use",
+    "skill:write",
+    "skill:approve",
+    "mcp:read",
+    "mcp:use",
+    "mcp:write",
     "memory:*",
     "hermes:*",
     "run:*",
+    "plugin:read",
+    "plugin:use",
+    "plugin:write",
+    "user:read",
+    "user:write",
     "audit:read",
   ],
-  operator: ["run:create", "run:read", "run:pause", "run:resume", "run:cancel", "config:read"],
-  viewer: ["run:read", "config:read", "audit:read"],
+  operator: [
+    "run:create",
+    "run:read",
+    "run:pause",
+    "run:resume",
+    "run:cancel",
+    "config:read",
+    "skill:read",
+    "skill:use",
+    "mcp:read",
+    "mcp:use",
+    "plugin:read",
+    "plugin:use",
+  ],
+  viewer: [
+    "run:read",
+    "config:read",
+    "skill:read",
+    "skill:use",
+    "mcp:read",
+    "mcp:use",
+    "plugin:read",
+    "plugin:use",
+  ],
 };
 
 function safeSessionGet(key: string): string | null {
@@ -106,6 +138,7 @@ const UserSchema = z.object({
   role: z.string(),
   disabled: z.boolean(),
   feishu_open_id: z.string().nullable(),
+  protected: z.boolean(),
 });
 
 export type ManagedUser = z.infer<typeof UserSchema>;
@@ -186,6 +219,8 @@ const SystemSettingsSchema = z.object({
   safe_tools_enabled: z.boolean(),
   require_approval_for_tools: z.boolean(),
   channel_entry: z.string(),
+  attachment_retention_days: z.number(),
+  attachment_max_mb: z.number(),
 });
 
 export type SystemSettings = z.infer<typeof SystemSettingsSchema>;
@@ -291,8 +326,21 @@ const RunDeleteSchema = z.object({
   deleted: z.boolean(),
 });
 
+const BulkFailureSchema = z.object({
+  id: z.string(),
+  code: z.string(),
+  message: z.string(),
+});
+
+const RunBulkDeleteSchema = z.object({
+  deleted: z.array(RunDeleteSchema),
+  failed: z.array(BulkFailureSchema),
+});
+
 export type RunDetail = z.infer<typeof RunDetailSchema>;
 export type RunDeleteResult = z.infer<typeof RunDeleteSchema>;
+export type BulkFailure = z.infer<typeof BulkFailureSchema>;
+export type RunBulkDeleteResult = z.infer<typeof RunBulkDeleteSchema>;
 
 const ConversationSchema = z.object({
   conversation_id: z.string(),
@@ -311,11 +359,30 @@ const SkillSchema = z.object({
 
 export type Skill = z.infer<typeof SkillSchema>;
 
+const AttachmentUploadSchema = z.object({
+  id: z.string(),
+  filename: z.string(),
+  kind: z.string(),
+  content_type: z.string(),
+  size_bytes: z.number(),
+  sha256: z.string(),
+  expires_at: z.string(),
+});
+
+export type AttachmentUpload = z.infer<typeof AttachmentUploadSchema>;
+
 const McpServerSchema = z.object({
   id: z.string(),
   name: z.string(),
   health: z.string(),
   allowed_tools: z.array(z.string()),
+  transport: z.string().default("streamable_http"),
+  command: z.string().nullable().default(null),
+  args: z.array(z.string()).default([]),
+  url: z.string().nullable().default(null),
+  executable_allowlist: z.array(z.string()).default([]),
+  domain_allowlist: z.array(z.string()).default([]),
+  timeout_seconds: z.number().default(10),
 });
 
 export type McpServer = z.infer<typeof McpServerSchema>;
@@ -386,6 +453,13 @@ const HermesInsightSchema = z.object({
 });
 
 export type HermesInsight = z.infer<typeof HermesInsightSchema>;
+
+const HermesBulkConfirmSchema = z.object({
+  confirmed: z.array(HermesInsightSchema),
+  failed: z.array(BulkFailureSchema),
+});
+
+export type HermesBulkConfirmResult = z.infer<typeof HermesBulkConfirmSchema>;
 
 const HermesRecommendationSchema = z.object({
   recommended_mode: z.string(),
@@ -582,6 +656,23 @@ export const api = {
       UserSchema,
     );
   },
+  createUser(payload: { username: string; password: string; role: string }): Promise<ManagedUser> {
+    return request(
+      "/api/v1/users",
+      { method: "POST", body: JSON.stringify(payload) },
+      UserSchema,
+    );
+  },
+  setUserDisabled(userId: string, disabled: boolean): Promise<ManagedUser> {
+    return request(
+      `/api/v1/users/${userId}/disabled`,
+      { method: "PATCH", body: JSON.stringify({ disabled }) },
+      UserSchema,
+    );
+  },
+  async deleteUser(userId: string): Promise<void> {
+    await requestNoContent(`/api/v1/users/${userId}`, { method: "DELETE" });
+  },
   models(): Promise<ModelDeployment[]> {
     return request("/api/v1/admin/models", { method: "GET" }, z.array(ModelDeploymentSchema));
   },
@@ -701,11 +792,26 @@ export const api = {
     allow_workflow_adjustment?: boolean;
     conversation_id?: string | null;
     reference_conversation_id?: string | null;
+    attachment_ids?: string[];
   }): Promise<SubmittedRun> {
     return request(
       "/api/v1/runs",
       { method: "POST", body: JSON.stringify(payload) },
       SubmittedRunSchema,
+    );
+  },
+  uploadAttachment(file: File): Promise<AttachmentUpload> {
+    return requestBinary(
+      "/api/v1/runs/attachments/upload",
+      {
+        method: "POST",
+        body: file,
+        headers: {
+          "Content-Type": file.type || "application/octet-stream",
+          "X-Agent-Hub-Filename": file.name,
+        },
+      },
+      AttachmentUploadSchema,
     );
   },
   chooseMode(
@@ -767,6 +873,13 @@ export const api = {
   deleteRun(id: string): Promise<RunDeleteResult> {
     return request(`/api/v1/admin/runs/${id}`, { method: "DELETE" }, RunDeleteSchema);
   },
+  bulkDeleteRuns(ids: string[]): Promise<RunBulkDeleteResult> {
+    return request(
+      "/api/v1/admin/runs/bulk-delete",
+      { method: "POST", body: JSON.stringify({ ids }) },
+      RunBulkDeleteSchema,
+    );
+  },
   skills(): Promise<Skill[]> {
     return request("/api/v1/admin/skills", { method: "GET" }, z.array(SkillSchema));
   },
@@ -797,7 +910,18 @@ export const api = {
   mcpServers(): Promise<McpServer[]> {
     return request("/api/v1/admin/mcp", { method: "GET" }, z.array(McpServerSchema));
   },
-  createMcpServer(payload: { id: string; name: string; allowed_tools: string[] }): Promise<McpServer> {
+  createMcpServer(payload: {
+    id: string;
+    name: string;
+    allowed_tools: string[];
+    transport: string;
+    command?: string | null;
+    args?: string[];
+    url?: string | null;
+    executable_allowlist?: string[];
+    domain_allowlist?: string[];
+    timeout_seconds?: number;
+  }): Promise<McpServer> {
     return request(
       "/api/v1/admin/mcp",
       { method: "POST", body: JSON.stringify(payload) },
@@ -850,6 +974,13 @@ export const api = {
   },
   confirmHermesInsight(id: string): Promise<HermesInsight> {
     return request(`/api/v1/admin/hermes/${encodeURIComponent(id)}/confirm`, { method: "POST" }, HermesInsightSchema);
+  },
+  bulkConfirmHermesInsights(ids: string[]): Promise<HermesBulkConfirmResult> {
+    return request(
+      "/api/v1/admin/hermes/bulk-confirm",
+      { method: "POST", body: JSON.stringify({ ids }) },
+      HermesBulkConfirmSchema,
+    );
   },
   recordHermesFeedback(payload: {
     run_id?: string | null;

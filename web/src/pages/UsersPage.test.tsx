@@ -12,6 +12,24 @@ function jsonResponse(payload: unknown, init: ResponseInit = {}) {
   });
 }
 
+const owner = {
+  id: "11111111-1111-4111-8111-111111111111",
+  username: "owner",
+  role: "super_admin",
+  disabled: false,
+  feishu_open_id: "ou_owner",
+  protected: true,
+};
+
+const operator = {
+  id: "22222222-2222-4222-8222-222222222222",
+  username: "ops-user",
+  role: "operator",
+  disabled: false,
+  feishu_open_id: null,
+  protected: false,
+};
+
 describe("UsersPage", () => {
   beforeEach(() => {
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
@@ -22,38 +40,42 @@ describe("UsersPage", () => {
         expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer owner-token");
         if (path === "/api/v1/auth/me") {
           return jsonResponse({
-            user_id: "11111111-1111-4111-8111-111111111111",
+            user_id: owner.id,
             tenant_id: "33333333-3333-4333-8333-333333333333",
             role: "super_admin",
           });
         }
-        if (path === "/api/v1/users") {
-          return jsonResponse([
-            {
-              id: "11111111-1111-4111-8111-111111111111",
-              username: "owner",
-              role: "super_admin",
-              disabled: false,
-              feishu_open_id: "ou_owner",
-            },
-          ]);
+        if (path === "/api/v1/users" && (!init?.method || init.method === "GET")) {
+          return jsonResponse([owner, operator]);
+        }
+        if (path === "/api/v1/users" && init?.method === "POST") {
+          return jsonResponse({
+            id: "44444444-4444-4444-8444-444444444444",
+            username: "new-ops",
+            role: "operator",
+            disabled: false,
+            feishu_open_id: null,
+            protected: false,
+          });
         }
         if (path.endsWith("/role") && init?.method === "PATCH") {
-          return jsonResponse({
-            id: "11111111-1111-4111-8111-111111111111",
-            username: "owner",
-            role: "admin",
-            disabled: false,
-            feishu_open_id: "ou_owner",
-          });
+          return jsonResponse({ ...operator, role: "admin" });
+        }
+        if (path.endsWith("/disabled") && init?.method === "PATCH") {
+          return jsonResponse({ ...operator, disabled: true });
+        }
+        if (path.includes(operator.id) && init?.method === "DELETE") {
+          return new Response(null, { status: 204 });
         }
         return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
       }),
     );
+    vi.spyOn(window, "confirm").mockReturnValue(true);
   });
 
   afterEach(() => {
     window.sessionStorage.clear();
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
 
@@ -63,15 +85,40 @@ describe("UsersPage", () => {
 
     expect(await screen.findByRole("heading", { name: "用户管理" })).not.toBeNull();
     expect(await screen.findByText("owner")).not.toBeNull();
-    await userEvent.selectOptions(screen.getByLabelText("修改 owner 的角色"), "admin");
+    await userEvent.selectOptions(screen.getByLabelText("修改 ops-user 的角色"), "admin");
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/v1/users/11111111-1111-4111-8111-111111111111/role",
+      "/api/v1/users/22222222-2222-4222-8222-222222222222/role",
       expect.objectContaining({
         method: "PATCH",
         credentials: "include",
         headers: expect.objectContaining({ Authorization: "Bearer owner-token" }),
       }),
+    );
+  });
+
+  it("can create, disable, and delete manageable users", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<TestApp initialPath="/users" />);
+
+    await screen.findByRole("heading", { name: "用户管理" });
+    await userEvent.type(screen.getByPlaceholderText("ops-user"), "new-ops");
+    await userEvent.type(screen.getByPlaceholderText("至少 12 位"), "valid password 456");
+    await userEvent.click(screen.getByRole("button", { name: "创建用户" }));
+    await userEvent.click(screen.getAllByRole("button", { name: "禁用" })[1]);
+    await userEvent.click(screen.getAllByRole("button", { name: "删除" })[1]);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/users",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/users/22222222-2222-4222-8222-222222222222/disabled",
+      expect.objectContaining({ method: "PATCH" }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/users/22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({ method: "DELETE" }),
     );
   });
 });

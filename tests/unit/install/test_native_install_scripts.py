@@ -183,12 +183,22 @@ def test_native_installer_normalizes_release_and_systemd_line_endings() -> None:
 
 def test_installer_defaults_management_url_to_external_address() -> None:
     secrets = read("scripts/lib/secrets.sh")
+    installer = read("scripts/lib/install_native.sh")
 
     assert "detect_public_url" in secrets
     assert "api.ipify.org" in secrets
     assert "hostname -I" in secrets
     assert "is_private_ipv4" in secrets
     assert "private or loopback address" in secrets
+    assert "prompt_public_url" in secrets
+    assert "Enter Agent Hub external access URL, including forwarded public port when needed" in secrets
+    assert "unable to detect a public Agent Hub URL" in secrets
+    assert "ensure_public_url_secret" in secrets
+    assert "AGENT_HUB_PUBLIC_URL must be externally reachable" in secrets
+    assert "AGENT_HUB_PUBLIC_URL must use a public address" in secrets
+    assert "printf 'http://127.0.0.1\\n'" not in secrets
+    assert '${AGENT_HUB_PUBLIC_URL:-http://127.0.0.1}' not in installer
+    assert "detect_public_url" in installer
 
 
 def test_native_api_stays_private_and_caddy_exposes_management_ui() -> None:
@@ -200,6 +210,7 @@ def test_native_api_stays_private_and_caddy_exposes_management_ui() -> None:
     assert "reverse_proxy 127.0.0.1:8000" in caddyfile
     assert "AGENT_HUB_WEB_DIR=/opt/agent-hub/current/web/dist" in api_unit
     assert "http://*)\n      printf ':80" in installer
+    assert "hostport=\"${public_url#http://}\"" not in installer
     assert "handle /setup*" in caddyfile
     assert "handle /setup*" in installer
     assert "fix_native_web_permissions" in installer

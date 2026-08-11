@@ -1,20 +1,36 @@
 from __future__ import annotations
 
-from uuid import UUID
+import re
+from uuid import UUID, uuid4
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agent_hub.auth.feishu_oauth import LastSuperAdminError, ManagedUser
-from agent_hub.auth.models import AuthenticatedPrincipal, Role
+from agent_hub.auth.feishu_oauth import (
+    LastSuperAdminError,
+    ManagedUser,
+    ProtectedUserError,
+    UserAlreadyExistsError,
+)
+from agent_hub.auth.models import AuthenticatedPrincipal, Role, UsernameValidationError
+from agent_hub.auth.passwords import PasswordService
 from agent_hub.db.models import UserRow
+
+_USERNAME_PATTERN = re.compile(r"[a-z][a-z0-9_-]{2,63}\Z")
 
 
 class PersistentUserAdminService:
     """Tenant-scoped user administration backed by the production database."""
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        *,
+        passwords: PasswordService | None = None,
+    ) -> None:
         self._session_factory = session_factory
+        self._passwords = passwords or PasswordService()
 
     async def list_users(self, actor: AuthenticatedPrincipal) -> tuple[ManagedUser, ...]:
         _require_admin(actor)
@@ -27,6 +43,41 @@ class PersistentUserAdminService:
                 )
             ).all()
         return tuple(_managed_user_from_row(row) for row in rows)
+
+    async def create_user(
+        self,
+        actor: AuthenticatedPrincipal,
+        *,
+        username: str,
+        password: str,
+        role: Role,
+    ) -> ManagedUser:
+        _require_admin(actor)
+        if actor.role is not Role.SUPER_ADMIN and role is Role.SUPER_ADMIN:
+            raise PermissionError("only super admin can create super admin users")
+        if not _is_valid_username(username):
+            raise UsernameValidationError(
+                "username must be a lowercase safe identifier of 3-64 characters"
+            )
+        password_hash = await self._passwords.hash_async(password)
+        try:
+            async with self._session_factory() as session, session.begin():
+                row = UserRow(
+                    id=uuid4(),
+                    tenant_id=actor.tenant_id,
+                    username=username,
+                    password_hash=password_hash,
+                    role=role.value,
+                    disabled=False,
+                    protected=False,
+                )
+                session.add(row)
+                await session.flush()
+                return _managed_user_from_row(row)
+        except IntegrityError as error:
+            raise UserAlreadyExistsError("user already exists") from error
+        finally:
+            del password, password_hash
 
     async def change_role(
         self,
@@ -43,6 +94,8 @@ class PersistentUserAdminService:
             )
             if row is None:
                 raise KeyError("user not found")
+            if row.protected and role is not Role.SUPER_ADMIN:
+                raise ProtectedUserError("protected user cannot be demoted")
             if row.role == Role.SUPER_ADMIN.value and role is not Role.SUPER_ADMIN:
                 remaining_super_admins = await session.scalar(
                     select(func.count())
@@ -59,20 +112,102 @@ class PersistentUserAdminService:
             await session.flush()
             return _managed_user_from_row(row)
 
+    async def set_disabled(
+        self,
+        actor: AuthenticatedPrincipal,
+        user_id: UUID,
+        disabled: bool,
+    ) -> ManagedUser:
+        _require_admin(actor)
+        if user_id == actor.user_id and disabled:
+            raise ProtectedUserError("current user cannot be disabled")
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(
+                select(UserRow)
+                .where(UserRow.tenant_id == actor.tenant_id, UserRow.id == user_id)
+                .with_for_update()
+            )
+            if row is None:
+                raise KeyError("user not found")
+            if row.protected and disabled:
+                raise ProtectedUserError("protected user cannot be disabled")
+            if row.role == Role.SUPER_ADMIN.value and disabled:
+                remaining_super_admins = await session.scalar(
+                    select(func.count())
+                    .select_from(UserRow)
+                    .where(
+                        UserRow.tenant_id == actor.tenant_id,
+                        UserRow.id != user_id,
+                        UserRow.role == Role.SUPER_ADMIN.value,
+                        UserRow.disabled.is_(False),
+                    )
+                )
+                if int(remaining_super_admins or 0) == 0:
+                    raise LastSuperAdminError("cannot disable last super admin")
+            row.disabled = disabled
+            await session.flush()
+            return _managed_user_from_row(row)
+
+    async def delete_user(
+        self,
+        actor: AuthenticatedPrincipal,
+        user_id: UUID,
+    ) -> ManagedUser:
+        _require_admin(actor)
+        if user_id == actor.user_id:
+            raise ProtectedUserError("current user cannot be deleted")
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(
+                select(UserRow)
+                .where(UserRow.tenant_id == actor.tenant_id, UserRow.id == user_id)
+                .with_for_update()
+            )
+            if row is None:
+                raise KeyError("user not found")
+            if row.protected:
+                raise ProtectedUserError("protected user cannot be deleted")
+            if row.role == Role.SUPER_ADMIN.value:
+                remaining_super_admins = await session.scalar(
+                    select(func.count())
+                    .select_from(UserRow)
+                    .where(
+                        UserRow.tenant_id == actor.tenant_id,
+                        UserRow.id != user_id,
+                        UserRow.role == Role.SUPER_ADMIN.value,
+                        UserRow.disabled.is_(False),
+                    )
+                )
+                if int(remaining_super_admins or 0) == 0:
+                    raise LastSuperAdminError("cannot delete last super admin")
+            deleted = _managed_user_from_row(row)
+            await session.delete(row)
+            return deleted
+
 
 def _managed_user_from_row(row: UserRow) -> ManagedUser:
     return ManagedUser(
         id=row.id,
         username=row.username,
         role=Role(row.role),
-        disabled=False,
+        disabled=row.disabled,
         feishu_open_id=row.feishu_open_id,
+        protected=row.protected,
     )
 
 
 def _require_admin(actor: AuthenticatedPrincipal) -> None:
     if actor.role not in {Role.SUPER_ADMIN, Role.ADMIN}:
         raise PermissionError("administrator required")
+
+
+def _is_valid_username(username: object) -> bool:
+    return (
+        isinstance(username, str)
+        and _USERNAME_PATTERN.fullmatch(username) is not None
+        and ".." not in username
+        and "--" not in username
+        and "__" not in username
+    )
 
 
 __all__ = ["PersistentUserAdminService"]

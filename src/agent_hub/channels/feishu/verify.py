@@ -55,7 +55,8 @@ class FeishuVerifier:
         nonce: str | None,
         signature: str | None,
     ) -> VerifiedFeishuPayload:
-        self._verify_signature(body, timestamp=timestamp, nonce=nonce, signature=signature)
+        if timestamp or nonce or signature:
+            self._verify_signature(body, timestamp=timestamp, nonce=nonce, signature=signature)
         payload = _loads_json_object(body)
         payload = self._decrypt_if_needed(payload)
         return self.verify_payload(payload)
@@ -107,6 +108,9 @@ class FeishuVerifier:
 
     def _verify_token(self, payload: dict[str, Any]) -> None:
         token = payload.get("token")
+        header = payload.get("header")
+        if token is None and isinstance(header, dict):
+            token = header.get("token")
         if token != self._verification_token:
             raise FeishuVerificationError("invalid verification token")
 

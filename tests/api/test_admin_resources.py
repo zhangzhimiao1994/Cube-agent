@@ -15,6 +15,7 @@ from agent_hub.api.routers.admin import (
     InMemoryAdminResourceService,
     MainAgentConfigRequest,
     MainAgentModelConfig,
+    McpServerRequest,
     ModelDeploymentRequest,
     PersistentAdminResourceService,
     RunDetailResponse,
@@ -699,6 +700,33 @@ def test_operational_run_delete_removes_cancelled_conversation() -> None:
     assert all(item["id"] != run_id for item in remaining.json())
 
 
+def test_operational_run_bulk_delete_uses_existing_delete_rules() -> None:
+    api = client()
+    run_id = api.get("/api/v1/admin/runs", headers=headers()).json()[0]["id"]
+
+    blocked = api.post(
+        "/api/v1/admin/runs/bulk-delete",
+        headers=headers(),
+        json={"ids": [run_id]},
+    )
+    assert blocked.status_code == 200
+    assert blocked.json()["deleted"] == []
+    assert blocked.json()["failed"][0]["id"] == run_id
+    assert blocked.json()["failed"][0]["code"] == "run_conflict"
+
+    cancel = api.post(f"/api/v1/admin/runs/{run_id}/cancel", headers=headers())
+    assert cancel.status_code == 200
+    deleted = api.post(
+        "/api/v1/admin/runs/bulk-delete",
+        headers=headers(),
+        json={"ids": [run_id]},
+    )
+
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted"] == [{"id": run_id, "deleted": True}]
+    assert deleted.json()["failed"] == []
+
+
 def test_admin_run_artifact_exposes_safe_text_for_chat_reply() -> None:
     artifact = _admin_run_artifact(
         {
@@ -967,6 +995,44 @@ def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
     )
 
 
+def test_hermes_bulk_confirm_confirms_multiple_learning_records() -> None:
+    api = client()
+    first = api.post(
+        "/api/v1/admin/hermes/feedback",
+        headers=headers(),
+        json={
+            "outcome": "success",
+            "lesson": "Use discussion mode for conflicting design opinions.",
+            "conversation_id": "conv-bulk-1",
+            "tags": ["discussion"],
+            "weight": 4,
+        },
+    ).json()
+    second = api.post(
+        "/api/v1/admin/hermes/feedback",
+        headers=headers(),
+        json={
+            "outcome": "failure",
+            "lesson": "Ask before adding temporary engineering agents.",
+            "conversation_id": "conv-bulk-2",
+            "tags": ["approval"],
+            "weight": 5,
+        },
+    ).json()
+
+    response = api.post(
+        "/api/v1/admin/hermes/bulk-confirm",
+        headers=headers(),
+        json={"ids": [first["id"], second["id"]]},
+    )
+
+    assert response.status_code == 200
+    confirmed = response.json()["confirmed"]
+    assert [item["id"] for item in confirmed] == [first["id"], second["id"]]
+    assert all(item["confirmed_at"] is not None for item in confirmed)
+    assert response.json()["failed"] == []
+
+
 def test_hermes_feedback_rejects_sensitive_content_without_echoing_it() -> None:
     response = client().post(
         "/api/v1/admin/hermes/feedback",
@@ -1049,6 +1115,37 @@ async def test_persistent_admin_models_write_to_published_config() -> None:
         },
         "agents": [],
     }
+
+
+@pytest.mark.asyncio
+async def test_persistent_admin_mcp_preserves_transport_connection_fields() -> None:
+    service = PersistentAdminResourceService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+    )
+
+    created = await service.upsert_mcp_server(
+        McpServerRequest(
+            id="local_mcp",
+            name="Local MCP",
+            transport="stdio",
+            command="/usr/bin/python3",
+            args=["/opt/mcp/server.py"],
+            executable_allowlist=["/usr/bin/python3"],
+            allowed_tools=["echo"],
+            timeout_seconds=5,
+        )
+    )
+    listed = await service.list_mcp_servers()
+
+    assert created.transport == "stdio"
+    assert created.command == "/usr/bin/python3"
+    assert created.args == ["/opt/mcp/server.py"]
+    assert created.executable_allowlist == ["/usr/bin/python3"]
+    assert created.timeout_seconds == 5
+    assert listed[0].transport == "stdio"
 
 
 @pytest.mark.asyncio

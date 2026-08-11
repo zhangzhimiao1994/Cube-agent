@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TestApp } from "../app/router";
 
 const runId = "22222222-2222-4222-8222-222222222222";
+const secondRunId = "33333333-3333-4333-8333-333333333333";
 
 const runListItem = {
   id: runId,
@@ -52,6 +53,15 @@ const settings = {
   safe_tools_enabled: true,
   require_approval_for_tools: true,
   channel_entry: "web",
+  attachment_retention_days: 7,
+  attachment_max_mb: 25,
+};
+
+const secondRunListItem = {
+  ...runListItem,
+  id: secondRunId,
+  status: "completed",
+  mode: "direct",
 };
 
 const hermesInsight = {
@@ -65,6 +75,19 @@ const hermesInsight = {
   tags: ["debate", "review"],
   weight: 5,
   created_at: "2026-08-07T00:04:00Z",
+};
+
+const secondHermesInsight = {
+  ...hermesInsight,
+  id: "hermes-2",
+  outcome: "failure",
+  lesson: "Ask for confirmation before changing the workflow role pool.",
+  summary: "Learned failure pattern: Ask for confirmation before changing the workflow role pool. Tags: workflow, approval. Weight: 4.",
+  conversation_id: "conv-workflow-2",
+  confirmed_at: null,
+  tags: ["workflow", "approval"],
+  weight: 4,
+  created_at: "2026-08-07T00:06:00Z",
 };
 
 const agents = [
@@ -126,12 +149,14 @@ describe("operational management pages", () => {
   const requests: Array<{ body: unknown; method: string; path: string }> = [];
   let visibleRunListItem = runListItem;
   let visibleRunDetail = runDetail;
+  let visibleRunListItems = [runListItem];
   let deletedRunIds = new Set<string>();
 
   beforeEach(() => {
     requests.length = 0;
     visibleRunListItem = runListItem;
     visibleRunDetail = runDetail;
+    visibleRunListItems = [visibleRunListItem];
     deletedRunIds = new Set<string>();
     vi.stubGlobal("confirm", vi.fn(() => true));
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
@@ -153,11 +178,24 @@ describe("operational management pages", () => {
           });
         }
         if (path === "/api/v1/admin/runs") {
-          return jsonResponse(deletedRunIds.has(runId) ? [] : [visibleRunListItem]);
+          return jsonResponse(visibleRunListItems.filter((item) => !deletedRunIds.has(item.id)));
         }
         if (path === `/api/v1/admin/runs/${runId}` && method === "DELETE") {
           deletedRunIds.add(runId);
           return jsonResponse({ id: runId, deleted: true });
+        }
+        if (path === `/api/v1/admin/runs/${secondRunId}` && method === "DELETE") {
+          deletedRunIds.add(secondRunId);
+          return jsonResponse({ id: secondRunId, deleted: true });
+        }
+        if (path === "/api/v1/admin/runs/bulk-delete" && method === "POST") {
+          const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : { ids: [] };
+          const ids = Array.isArray(body.ids) ? body.ids : [];
+          ids.forEach((id: unknown) => deletedRunIds.add(String(id)));
+          return jsonResponse({
+            deleted: ids.map((id: unknown) => ({ id, deleted: true })),
+            failed: [],
+          });
         }
         if (path === `/api/v1/admin/runs/${runId}`) {
           if (deletedRunIds.has(runId)) {
@@ -237,17 +275,69 @@ describe("operational management pages", () => {
         if (path === "/api/v1/admin/agents") {
           return jsonResponse(agents);
         }
+        if (path === "/api/v1/admin/skills/upload" && method === "POST") {
+          return jsonResponse({
+            id: "skill-uploaded-from-chat",
+            name: "uploaded_skill",
+            version: "1.0.0",
+            status: "scanned",
+            requested_permissions: ["tool:filesystem.read"],
+            scan_diff: ["content sha256: abc123", "entry point: main.py"],
+          });
+        }
+        if (path === "/api/v1/admin/skills/skill-uploaded-from-chat/approve" && method === "POST") {
+          return jsonResponse({
+            id: "skill-uploaded-from-chat",
+            name: "uploaded_skill",
+            version: "1.0.0",
+            status: "enabled",
+            requested_permissions: ["tool:filesystem.read"],
+            scan_diff: ["content sha256: abc123", "entry point: main.py", "approved by production admin"],
+          });
+        }
+        if (path === "/api/v1/admin/skills") {
+          return jsonResponse([]);
+        }
+        if (path === "/api/v1/runs/attachments/upload" && method === "POST") {
+          return jsonResponse({
+            id: "att_0123456789abcdef0123456789abcdef",
+            filename: "screen.png",
+            kind: "image",
+            content_type: "image/png",
+            size_bytes: 128,
+            sha256: "a".repeat(64),
+            expires_at: "2026-08-17T00:00:00Z",
+          });
+        }
         if (path === "/api/v1/admin/workflows") {
           return jsonResponse(workflows);
         }
         if (path === "/api/v1/admin/hermes") {
-          return jsonResponse([hermesInsight]);
+          return jsonResponse([hermesInsight, secondHermesInsight]);
         }
         if (path === "/api/v1/admin/hermes/hermes-1") {
           return jsonResponse(hermesInsight);
         }
         if (path === "/api/v1/admin/hermes/hermes-1/confirm" && method === "POST") {
           return jsonResponse({ ...hermesInsight, confirmed_at: "2026-08-07T00:05:00Z" });
+        }
+        if (path === "/api/v1/admin/hermes/hermes-2") {
+          return jsonResponse(secondHermesInsight);
+        }
+        if (path === "/api/v1/admin/hermes/hermes-2/confirm" && method === "POST") {
+          return jsonResponse({ ...secondHermesInsight, confirmed_at: "2026-08-07T00:07:00Z" });
+        }
+        if (path === "/api/v1/admin/hermes/bulk-confirm" && method === "POST") {
+          const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : { ids: [] };
+          const ids = Array.isArray(body.ids) ? body.ids : [];
+          return jsonResponse({
+            confirmed: ids.map((id: unknown) =>
+              id === "hermes-2"
+                ? { ...secondHermesInsight, confirmed_at: "2026-08-07T00:07:00Z" }
+                : { ...hermesInsight, confirmed_at: "2026-08-07T00:05:00Z" },
+            ),
+            failed: [],
+          });
         }
         if (path === "/api/v1/admin/mcp") {
           return jsonResponse([{ id: "filesystem", name: "Filesystem MCP", health: "healthy", allowed_tools: ["read_file"] }]);
@@ -416,9 +506,55 @@ describe("operational management pages", () => {
     });
   });
 
+  it("uploads a skill zip from the chat composer and requires explicit approval", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话任务" })).not.toBeNull();
+    const file = new File(["PK\x03\x04"], "uploaded-skill.zip", { type: "application/zip" });
+    await user.upload(screen.getByLabelText("上传文件或 Skill ZIP"), file);
+
+    expect(await screen.findByText("Skill 包已扫描，等待确认")).not.toBeNull();
+    expect(screen.getByText("uploaded_skill")).not.toBeNull();
+    expect(screen.getByText("tool:filesystem.read")).not.toBeNull();
+    expect(requests.find((request) => request.path === "/api/v1/admin/skills/upload")).toMatchObject({
+      method: "POST",
+    });
+
+    await user.click(screen.getByRole("button", { name: "确认安装 Skill" }));
+    expect(await screen.findByText("Skill 已安装并启用")).not.toBeNull();
+    expect(requests.find((request) => request.path === "/api/v1/admin/skills/skill-uploaded-from-chat/approve")).toMatchObject({
+      method: "POST",
+    });
+  });
+
+  it("uploads an image attachment from chat and submits its attachment id with the run", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话任务" })).not.toBeNull();
+    const file = new File(["image-bytes"], "screen.png", { type: "image/png" });
+    await user.upload(screen.getByLabelText("上传文件或 Skill ZIP"), file);
+    expect(await screen.findByText("图片附件")).not.toBeNull();
+    expect(screen.getByText("screen.png")).not.toBeNull();
+
+    await user.type(screen.getByPlaceholderText(/输入任务/), "请根据图片说明问题");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    await screen.findByRole("link", { name: "查看运行详情" });
+    expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
+      method: "POST",
+      body: {
+        message: "请根据图片说明问题",
+        attachment_ids: ["att_0123456789abcdef0123456789abcdef"],
+      },
+    });
+  });
+
   it("deletes a finished conversation from the conversation list", async () => {
     const user = userEvent.setup();
     visibleRunListItem = { ...runListItem, status: "cancelled" };
+    visibleRunListItems = [visibleRunListItem];
     visibleRunDetail = { ...runDetail, status: "cancelled" };
     render(<TestApp initialPath="/" />);
 
@@ -430,6 +566,28 @@ describe("operational management pages", () => {
         .toBeTruthy(),
     );
     await waitFor(() => expect(screen.queryByRole("button", { name: /Delete conversation 22222222/i })).toBeNull());
+  });
+
+  it("bulk selects finished conversations and deletes them through one batch API call", async () => {
+    const user = userEvent.setup();
+    visibleRunListItems = [
+      { ...runListItem, status: "cancelled" },
+      secondRunListItem,
+    ];
+    visibleRunListItem = visibleRunListItems[0];
+    visibleRunDetail = { ...runDetail, status: "cancelled" };
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("checkbox", { name: "Select all deletable conversations" })).not.toBeNull();
+    await user.click(screen.getByRole("checkbox", { name: "Select all deletable conversations" }));
+    await user.click(screen.getByRole("button", { name: "批量删除已选会话" }));
+
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === "/api/v1/admin/runs/bulk-delete")).toMatchObject({
+        method: "POST",
+        body: { ids: [runId, secondRunId] },
+      }),
+    );
   });
 
   it("shows temporary agent approval above the composer and lets the user revise it", async () => {
@@ -563,6 +721,22 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: /确认/ }));
 
     await waitFor(() => expect(screen.getByText("2026-08-07T00:05:00Z")).not.toBeNull());
+  });
+
+  it("bulk selects Hermes learning records and confirms them through one batch API call", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/hermes" />);
+
+    expect(await screen.findByRole("checkbox", { name: "Select all Hermes learning records" })).not.toBeNull();
+    await user.click(screen.getByRole("checkbox", { name: "Select all Hermes learning records" }));
+    await user.click(screen.getByRole("button", { name: "批量确认已选学习" }));
+
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === "/api/v1/admin/hermes/bulk-confirm")).toMatchObject({
+        method: "POST",
+        body: { ids: ["hermes-2", "hermes-1"] },
+      }),
+    );
   });
 
   it("shows detailed API errors on run list loading failures", async () => {

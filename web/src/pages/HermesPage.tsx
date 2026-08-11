@@ -15,6 +15,10 @@ function statusLabel(confirmedAt: string | null) {
   return confirmedAt ? "已确认" : "待确认";
 }
 
+function toggle(values: string[], value: string) {
+  return values.includes(value) ? values.filter((item) => item !== value) : [...values, value];
+}
+
 export function HermesPage() {
   const { insightId } = useParams();
   if (insightId) return <HermesInsightDetail insightId={insightId} />;
@@ -24,10 +28,13 @@ export function HermesPage() {
 function HermesLearningTable() {
   const queryClient = useQueryClient();
   const [conversationId, setConversationId] = useState("");
-  const [lesson, setLesson] = useState("When agents disagree, ask the main agent to compare evidence, risk, and output quality before deciding.");
+  const [lesson, setLesson] = useState(
+    "When agents disagree, ask the main agent to compare evidence, risk, and output quality before deciding.",
+  );
   const [tags, setTags] = useState("decision,review");
   const [outcome, setOutcome] = useState<"success" | "failure" | "neutral">("success");
   const [weight, setWeight] = useState("5");
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
 
   const insights = useQuery({
     queryKey: ["hermes"],
@@ -47,15 +54,40 @@ function HermesLearningTable() {
       await queryClient.invalidateQueries({ queryKey: ["hermes"] });
     },
   });
+  const bulkConfirm = useMutation({
+    mutationFn: (ids: string[]) => api.bulkConfirmHermesInsights(ids),
+    onSuccess: async () => {
+      setSelectedIds([]);
+      await queryClient.invalidateQueries({ queryKey: ["hermes"] });
+    },
+  });
 
   const sortedInsights = useMemo(
     () => [...(insights.data ?? [])].sort((a, b) => b.created_at.localeCompare(a.created_at)),
     [insights.data],
   );
+  const confirmableIds = sortedInsights
+    .filter((insight) => insight.confirmed_at === null)
+    .map((insight) => insight.id);
+  const selectedConfirmableIds = selectedIds.filter((id) => confirmableIds.includes(id));
+  const allConfirmableSelected =
+    confirmableIds.length > 0 && confirmableIds.every((id) => selectedIds.includes(id));
 
   function submitFeedback(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     feedback.mutate();
+  }
+
+  function toggleAllInsights() {
+    setSelectedIds((current) => {
+      if (allConfirmableSelected) return current.filter((id) => !confirmableIds.includes(id));
+      return Array.from(new Set([...current, ...confirmableIds]));
+    });
+  }
+
+  function confirmSelectedInsights() {
+    if (selectedConfirmableIds.length === 0) return;
+    bulkConfirm.mutate(selectedConfirmableIds);
   }
 
   if (insights.isLoading) return <p>正在加载 Hermes...</p>;
@@ -68,8 +100,8 @@ function HermesLearningTable() {
       <p className="eyebrow">Hermes learning</p>
       <h2>Hermes 学习</h2>
       <p>
-        Hermes 是独立学习模块。它按时间和对话 ID 记录运行经验，外层以表格展示，点击后进入详情查看和确认。
-        学习建议不会直接挤到对话界面，也不会绕过主 Agent 的审批策略。
+        Hermes 是独立学习模块。它按时间和对话 ID 记录运行经验，外层以表格展示，
+        点击后进入详情查看和确认。学习建议不会直接挤到对话界面，也不会绕过主 Agent 的审批策略。
       </p>
 
       <section aria-label="Hermes 学习台账">
@@ -80,41 +112,80 @@ function HermesLearningTable() {
             <p>运行完成或手动记录经验后，Hermes 会按时间和对话 ID 在这里建立台账。</p>
           </article>
         ) : (
-          <div className="table-shell">
-            <table aria-label="Hermes 学习台账">
-              <thead>
-                <tr>
-                  <th>时间</th>
-                  <th>对话 ID</th>
-                  <th>学习总结</th>
-                  <th>结果</th>
-                  <th>确认状态</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {sortedInsights.map((insight) => (
-                  <tr key={insight.id}>
-                    <td>
-                      <time dateTime={insight.created_at}>{insight.created_at}</time>
-                    </td>
-                    <td>{insight.conversation_id ?? "未关联"}</td>
-                    <td>{insight.summary}</td>
-                    <td>{insight.outcome}</td>
-                    <td>{statusLabel(insight.confirmed_at)}</td>
-                    <td>
-                      <Link
-                        to={`/hermes/${encodeURIComponent(insight.id)}`}
-                        aria-label={`查看 ${insight.conversation_id ?? insight.id} 的 Hermes 学习详情`}
-                      >
-                        查看详情
-                      </Link>
-                    </td>
+          <>
+            <div className="bulk-action-bar">
+              <label className="inline-check compact-check">
+                <input
+                  type="checkbox"
+                  aria-label="Select all Hermes learning records"
+                  checked={allConfirmableSelected}
+                  disabled={confirmableIds.length === 0 || bulkConfirm.isPending}
+                  onChange={toggleAllInsights}
+                />
+                全选待确认
+              </label>
+              <button
+                type="button"
+                className="secondary-action"
+                disabled={selectedConfirmableIds.length === 0 || bulkConfirm.isPending}
+                onClick={confirmSelectedInsights}
+              >
+                {bulkConfirm.isPending ? "确认中..." : "批量确认已选学习"}
+              </button>
+              <small>已选 {selectedConfirmableIds.length}</small>
+            </div>
+            {bulkConfirm.isError ? (
+              <p role="alert">{formatApiError(bulkConfirm.error, "Hermes 批量确认失败")}</p>
+            ) : null}
+            <div className="table-shell">
+              <table aria-label="Hermes 学习台账">
+                <thead>
+                  <tr>
+                    <th>选择</th>
+                    <th>时间</th>
+                    <th>对话 ID</th>
+                    <th>学习总结</th>
+                    <th>结果</th>
+                    <th>确认状态</th>
+                    <th>操作</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {sortedInsights.map((insight) => {
+                    const canConfirm = insight.confirmed_at === null;
+                    return (
+                      <tr key={insight.id}>
+                        <td>
+                          <input
+                            type="checkbox"
+                            aria-label={`Select Hermes learning ${insight.id}`}
+                            checked={selectedIds.includes(insight.id)}
+                            disabled={!canConfirm || bulkConfirm.isPending}
+                            onChange={() => setSelectedIds((current) => toggle(current, insight.id))}
+                          />
+                        </td>
+                        <td>
+                          <time dateTime={insight.created_at}>{insight.created_at}</time>
+                        </td>
+                        <td>{insight.conversation_id ?? "未关联"}</td>
+                        <td>{insight.summary}</td>
+                        <td>{insight.outcome}</td>
+                        <td>{statusLabel(insight.confirmed_at)}</td>
+                        <td>
+                          <Link
+                            to={`/hermes/${encodeURIComponent(insight.id)}`}
+                            aria-label={`查看 ${insight.conversation_id ?? insight.id} 的 Hermes 学习详情`}
+                          >
+                            查看详情
+                          </Link>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </>
         )}
       </section>
 
@@ -147,7 +218,13 @@ function HermesLearningTable() {
           </label>
           <label>
             权重 1-10
-            <input type="number" min="1" max="10" value={weight} onChange={(event) => setWeight(event.target.value)} />
+            <input
+              type="number"
+              min="1"
+              max="10"
+              value={weight}
+              onChange={(event) => setWeight(event.target.value)}
+            />
           </label>
           <button type="submit" disabled={feedback.isPending}>
             {feedback.isPending ? "正在记录..." : "记录经验"}
