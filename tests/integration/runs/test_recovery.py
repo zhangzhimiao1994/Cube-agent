@@ -392,6 +392,7 @@ async def test_dispatch_waits_for_user_before_creating_temporary_agent(
         run_id=submitted.id,
         decision_token=submitted.decision_token,
         version=submitted.version,
+        model="coder",
     )
 
     assert approved.status is RunStatus.QUEUED
@@ -403,6 +404,9 @@ async def test_dispatch_waits_for_user_before_creating_temporary_agent(
         "temp-web-engineer",
     ]
     assert approved_record.routing_decision["temporary_agent_approved"] is True
+    assert approved_record.routing_decision["temporary_agents"] == [
+        {**submitted.temporary_agent_proposal, "model": "coder"}
+    ]
 
 
 async def test_hermes_high_confidence_auto_advice_queues_recommended_mode(
@@ -570,7 +574,7 @@ async def test_choose_mode_persists_choice_and_enqueues_waiting_run(
     service = RunService(
         RunRepository(run_session_factory),
         runtime_registry=RuntimeRegistry((FakeRuntime(),)),
-        router=None,
+        router=WaitingModeRouter(),
         task_queue=queue,
     )
 

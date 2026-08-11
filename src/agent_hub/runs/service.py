@@ -446,6 +446,7 @@ class RunService:
         run_id: UUID,
         decision_token: str,
         version: int,
+        model: str,
     ) -> SubmittedRun:
         del actor_id
         record = await self._repository.approve_temporary_agent_and_enqueue(
@@ -453,6 +454,7 @@ class RunService:
             run_id=run_id,
             decision_token=decision_token,
             version=version,
+            model=model,
         )
         return _submitted(record)
 

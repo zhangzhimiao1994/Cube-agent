@@ -241,6 +241,7 @@ class RunRepository:
         run_id: UUID,
         decision_token: str,
         version: int,
+        model: str,
     ) -> RunRecord:
         async with self._session_factory() as session, session.begin():
             row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
@@ -258,6 +259,10 @@ class RunRepository:
             proposal = routing_decision.get("temporary_agent_proposal")
             if not isinstance(proposal, dict) or not isinstance(proposal.get("id"), str):
                 raise RunConflict("temporary agent proposal is invalid")
+            selected_model = model.strip()
+            if not selected_model:
+                raise RunConflict("temporary agent model is required")
+            proposal = {**proposal, "model": selected_model}
             selected = routing_decision.get("selected_agent_ids")
             selected_agent_ids = [item for item in selected if isinstance(item, str)] if isinstance(selected, list) else []
             proposal_id = proposal["id"]

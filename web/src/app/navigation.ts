@@ -55,7 +55,7 @@ export const MODULE_GROUPS: ModuleGroup[] = [
       {
         to: "/workflows",
         label: "工作流配置",
-        description: "任务类型、角色池、步骤、交付物和临场调整核对。",
+        description: "任务类型、默认角色、步骤、交付物和分歧裁决规则。",
         permission: "agent:read",
       },
       {

@@ -842,7 +842,7 @@ export const api = {
   },
   approveTemporaryAgent(
     id: string,
-    payload: { decision_token: string; version: number },
+    payload: { decision_token: string; version: number; model: string },
   ): Promise<SubmittedRun> {
     return request(
       `/api/v1/runs/${encodeURIComponent(id)}/approve-temporary-agent`,

@@ -86,6 +86,7 @@ class FakeRepository:
         run_id: UUID,
         decision_token: str,
         version: int,
+        model: str,
     ) -> RunRecord:
         record = self.records.get(run_id)
         if record is None or record.tenant_id != tenant_id:
@@ -99,6 +100,7 @@ class FakeRepository:
             raise RunConflict("run version is stale")
         proposal = decision["temporary_agent_proposal"]
         assert isinstance(proposal, dict)
+        proposal = {**proposal, "model": model}
         raw_selected = decision.get("selected_agent_ids", [])
         selected = list(raw_selected) if isinstance(raw_selected, list) else []
         selected.append(str(proposal["id"]))
@@ -367,6 +369,7 @@ async def test_dispatch_requires_user_approval_before_temporary_agent_is_queued(
         run_id=submitted.id,
         decision_token=submitted.decision_token,
         version=submitted.version,
+        model="coder",
     )
 
     assert approved.status is RunStatus.QUEUED
@@ -377,6 +380,7 @@ async def test_dispatch_requires_user_approval_before_temporary_agent_is_queued(
     assert decision is not None
     assert decision["temporary_agent_approved"] is True
     assert decision["selected_agent_ids"] == ["director", "temp-web-engineer"]
+    assert decision["temporary_agents"] == [{**submitted.temporary_agent_proposal, "model": "coder"}]
 
 
 @pytest.mark.asyncio

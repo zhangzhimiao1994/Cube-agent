@@ -542,8 +542,10 @@ def _temporary_role_assignments(
         identifier = raw.get("id")
         role = raw.get("role") or raw.get("name")
         mission = raw.get("prompt") or raw.get("reason")
+        selected_model = raw.get("model")
         if not isinstance(identifier, str) or not isinstance(role, str) or not isinstance(mission, str):
             continue
+        logical_model_for_agent = selected_model if isinstance(selected_model, str) and selected_model else logical_model
         skills = raw.get("suggested_skills")
         skill_tuple = tuple(item for item in skills if isinstance(item, str)) if isinstance(skills, tuple) else ()
         try:
@@ -562,7 +564,7 @@ def _temporary_role_assignments(
                         "summary": "string",
                         "evidence": "string[]",
                     },
-                    model=logical_model,
+                    model=logical_model_for_agent,
                 )
             )
         except ValueError:

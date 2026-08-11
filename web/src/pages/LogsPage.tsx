@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
 import { api, formatApiError, type LogEntry } from "../api/client";
@@ -85,6 +86,7 @@ export function LogsPage() {
 }
 
 function LogModulePage({ module }: { module: (typeof LOG_MODULES)[number] }) {
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const logs = useQuery({
     queryKey: ["logs", module.category],
     queryFn: () => api.logs(module.category),
@@ -94,6 +96,17 @@ function LogModulePage({ module }: { module: (typeof LOG_MODULES)[number] }) {
   if (logs.isError) return <p role="alert">{formatApiError(logs.error, `${module.title}加载失败`)}</p>;
 
   const entries = logs.data ?? [];
+  const selectedEntries = entries.filter((entry) => selectedIds.includes(entry.id));
+  const allSelected = entries.length > 0 && entries.every((entry) => selectedIds.includes(entry.id));
+
+  function toggleLog(id: string) {
+    setSelectedIds((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
+  }
+
+  function toggleAllLogs() {
+    setSelectedIds(allSelected ? [] : entries.map((entry) => entry.id));
+  }
+
   return (
     <section>
       <p className="eyebrow">Logs center</p>
@@ -114,37 +127,65 @@ function LogModulePage({ module }: { module: (typeof LOG_MODULES)[number] }) {
           <p>当前模块没有 warning/error；正常运行流水不会写入这里。</p>
         </article>
       ) : (
-        <div className="log-list">
-          {entries.map((entry) => (
-            <article key={entry.id} className="log-entry">
-              <div className="log-entry-header">
-                <span className={`level-pill level-${entry.level}`}>{entry.level}</span>
-                <div>
-                  <h3>{entry.title}</h3>
-                  <p>{entry.message}</p>
-                </div>
-              </div>
-              <dl className="diagnostic-grid">
-                <div className="diagnostic-row">
-                  <dt>来源</dt>
-                  <dd>{entry.source}</dd>
-                </div>
-                <div className="diagnostic-row">
-                  <dt>时间</dt>
-                  <dd>
-                    <time dateTime={entry.created_at}>{entry.created_at}</time>
-                  </dd>
-                </div>
-                {Object.entries(entry.details).map(([key, value]) => (
-                  <div key={key} className="diagnostic-row">
-                    <dt>{key}</dt>
-                    <dd>{value}</dd>
+        <>
+          <div className="bulk-action-bar">
+            <label className="inline-check compact-check">
+              <input
+                type="checkbox"
+                aria-label="Select all logs in current module"
+                checked={allSelected}
+                onChange={toggleAllLogs}
+              />
+              全选当前日志
+            </label>
+            <button
+              type="button"
+              className="secondary-action"
+              disabled={selectedEntries.length === 0}
+              onClick={() => exportLogs(`${module.category}-selected`, selectedEntries)}
+            >
+              导出已选 JSON
+            </button>
+            <small>已选 {selectedEntries.length}</small>
+          </div>
+          <div className="log-list">
+            {entries.map((entry) => (
+              <article key={entry.id} className="log-entry">
+                <div className="log-entry-header">
+                  <input
+                    type="checkbox"
+                    aria-label={`Select log ${entry.id}`}
+                    checked={selectedIds.includes(entry.id)}
+                    onChange={() => toggleLog(entry.id)}
+                  />
+                  <span className={`level-pill level-${entry.level}`}>{entry.level}</span>
+                  <div>
+                    <h3>{entry.title}</h3>
+                    <p>{entry.message}</p>
                   </div>
-                ))}
-              </dl>
-            </article>
-          ))}
-        </div>
+                </div>
+                <dl className="diagnostic-grid">
+                  <div className="diagnostic-row">
+                    <dt>来源</dt>
+                    <dd>{entry.source}</dd>
+                  </div>
+                  <div className="diagnostic-row">
+                    <dt>时间</dt>
+                    <dd>
+                      <time dateTime={entry.created_at}>{entry.created_at}</time>
+                    </dd>
+                  </div>
+                  {Object.entries(entry.details).map(([key, value]) => (
+                    <div key={key} className="diagnostic-row">
+                      <dt>{key}</dt>
+                      <dd>{value}</dd>
+                    </div>
+                  ))}
+                </dl>
+              </article>
+            ))}
+          </div>
+        </>
       )}
     </section>
   );

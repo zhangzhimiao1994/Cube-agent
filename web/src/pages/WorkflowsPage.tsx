@@ -244,8 +244,7 @@ export function WorkflowsPage() {
             </label>
           </div>
           <p className="field-help">
-            工作流配置的是默认步骤、角色池和交付物。主 Agent 临场调整和临时子 Agent 是全局调度策略，
-            请到“系统设置”里统一配置；聊天页只选择并使用这里保存的工作流。
+            工作流只保存这类任务的默认协作模板；聊天页使用它时可以选择本次角色池，但不会改写模板本身。
           </p>
 
           <label htmlFor="workflow-objective">
@@ -256,7 +255,7 @@ export function WorkflowsPage() {
           <fieldset>
             <legend>默认参与角色</legend>
             <p className="field-help">
-              同一个模式可以有不同派单对象。这里选择的是该任务类型默认会派给哪些角色，聊天时还可以临时增删。
+              同一个模式可以有不同派单对象。这里选择的是该任务类型默认会派给哪些角色。
             </p>
             <button type="button" onClick={applySuggestedRoles}>
               使用模板建议角色
@@ -315,7 +314,6 @@ export function WorkflowsPage() {
             <li>模式只定义协作方式；角色由任务类型和工作流决定。</li>
             <li>同样是派单，短视频、代码、财经、艺术设计应配置不同工作流。</li>
             <li>工作流配置后不会自动执行，只有聊天任务选择它时才会使用。</li>
-            <li>主 Agent 临场调整和临时子 Agent 是全局调度策略，请到“系统设置”统一配置；工作流只定义任务模板。</li>
             <li>如果自动检测不确定，主 Agent 应询问用户，而不是猜错模式。</li>
           </ol>
         </article>

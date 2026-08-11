@@ -31,7 +31,9 @@ from agent_hub.api.routers.admin import (
 from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
 from agent_hub.config.repository import ConfigRevision, ConfigStatus
+from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, TokenUsage
+from agent_hub.runs.repository import RunRecord
 from agent_hub.security.secrets import SecretReference
 
 
@@ -867,6 +869,69 @@ def test_conversation_can_be_loaded_by_session_id() -> None:
     assert payload["conversation_id"] == "conv-readiness"
     assert len(payload["runs"]) == 1
     assert payload["runs"][0]["request"] == "Summarize current deployment readiness."
+
+
+@pytest.mark.asyncio
+async def test_persistent_admin_conversation_keeps_chronological_messages() -> None:
+    first_id = UUID("33333333-3333-4333-8333-333333333331")
+    second_id = UUID("33333333-3333-4333-8333-333333333332")
+
+    class FakeRunRepository:
+        async def list_recent(self, tenant_id: UUID, *, limit: int = 100) -> tuple[RunRecord, ...]:
+            assert tenant_id == TENANT_ID
+            assert limit == 200
+            return (
+                RunRecord(
+                    id=second_id,
+                    tenant_id=TENANT_ID,
+                    actor_id=ACTOR_ID,
+                    request="第二轮：继续细化方案",
+                    mode=TaskMode.DISPATCH,
+                    status=RunStatus.COMPLETED,
+                    version=1,
+                    routing_decision={"conversation_id": "conv-multi-turn"},
+                ),
+                RunRecord(
+                    id=first_id,
+                    tenant_id=TENANT_ID,
+                    actor_id=ACTOR_ID,
+                    request="第一轮：先做方案",
+                    mode=TaskMode.DISPATCH,
+                    status=RunStatus.COMPLETED,
+                    version=1,
+                    routing_decision={"conversation_id": "conv-multi-turn"},
+                ),
+            )
+
+        async def usage_cost(self, tenant_id: UUID, run_id: UUID) -> str:
+            assert tenant_id == TENANT_ID
+            assert run_id in {first_id, second_id}
+            return "0"
+
+        async def events(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
+            assert tenant_id == TENANT_ID
+            assert run_id in {first_id, second_id}
+            return ()
+
+        async def artifacts(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
+            assert tenant_id == TENANT_ID
+            assert run_id in {first_id, second_id}
+            return ()
+
+    service = PersistentAdminResourceService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        run_repository=FakeRunRepository(),  # type: ignore[arg-type]
+    )
+
+    conversation = await service.get_conversation("conv-multi-turn")
+
+    assert [run.request for run in conversation.runs] == [
+        "第一轮：先做方案",
+        "第二轮：继续细化方案",
+    ]
 
 
 def test_skill_upload_approve_mcp_memory_and_audit_are_safe() -> None:

@@ -119,8 +119,9 @@ class StubRunService:
         run_id: UUID,
         decision_token: str,
         version: int,
+        model: str,
     ) -> SubmittedRun:
-        del actor_id, decision_token, version
+        del actor_id, decision_token, version, model
         return SubmittedRun(
             id=run_id,
             tenant_id=tenant_id,
@@ -372,6 +373,7 @@ def test_approve_temporary_agent_queues_confirmed_run_safely() -> None:
         json={
             "decision_token": "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
             "version": 1,
+            "model": "coder",
         },
     )
 

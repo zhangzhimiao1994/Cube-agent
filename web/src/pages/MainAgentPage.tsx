@@ -253,7 +253,6 @@ export function MainAgentPage() {
   const [apiKey, setApiKey] = useState("");
   const [controlMode, setControlMode] = useState<MainAgentConfig["control_mode"]>("supervisor");
   const [hermesPolicy, setHermesPolicy] = useState<MainAgentConfig["hermes_policy"]>("observe");
-  const [directAnswerer, setDirectAnswerer] = useState("main_agent");
   const [decisionPolicy, setDecisionPolicy] = useState(DEFAULT_POLICY);
   const [operatingStyle, setOperatingStyle] = useState(DEFAULT_STYLE);
   const [maxReviewRounds, setMaxReviewRounds] = useState("2");
@@ -298,7 +297,6 @@ export function MainAgentPage() {
     setHermesPolicy(config.data.hermes_policy);
     setDecisionPolicy(config.data.decision_policy);
     setOperatingStyle(config.data.operating_style);
-    setDirectAnswerer(config.data.direct_answerer);
     setMaxReviewRounds(String(config.data.max_review_rounds));
   }, [config.data]);
 
@@ -358,7 +356,7 @@ export function MainAgentPage() {
         hermes_policy: hermesPolicy,
         decision_policy: decisionPolicy.trim() || DEFAULT_POLICY,
         operating_style: operatingStyle.trim() || DEFAULT_STYLE,
-        direct_answerer: directAnswerer.trim() || "main_agent",
+        direct_answerer: "manual_selection",
         max_review_rounds: Math.max(1, Math.min(20, Number(maxReviewRounds) || 2)),
       });
       return { result, savedSecret };
@@ -406,8 +404,8 @@ export function MainAgentPage() {
       <p className="eyebrow">Main agent control</p>
       <h2>主 Agent</h2>
       <p>
-        主 Agent 独立配置自己的模型/API，不占用普通子 Agent 的模型绑定。它负责控场：判断模式、选择回答者或角色池、
-        裁决冲突、管控 Hermes 学习和失败复盘。
+        主 Agent 独立配置自己的模型/API，不占用普通子 Agent 的模型绑定。它负责控场：判断模式、提出角色和提示词、
+        裁决冲突、管控 Hermes 学习和失败复盘；具体用哪个模型运行子 Agent 由你在配置或确认时选择。
       </p>
 
       <div className="status-grid" aria-label="主 Agent 当前配置">
@@ -420,8 +418,8 @@ export function MainAgentPage() {
           <p>{savedModel?.api_base ?? "保存后显示主 Agent 专属 API 地址"}</p>
         </article>
         <article className="status-card">
-          <span>直连回答者</span>
-          <p>{config.data?.direct_answerer ?? "main_agent"}</p>
+          <span>直连规则</span>
+          <p>每个新对话指定一次子 Agent</p>
         </article>
       </div>
 
@@ -580,17 +578,6 @@ export function MainAgentPage() {
               ))}
             </select>
           </label>
-          <label htmlFor="main-agent-direct-answerer">
-            直连默认回答者
-            <input
-              id="main-agent-direct-answerer"
-              data-testid="main-agent-direct-answerer"
-              value={directAnswerer}
-              onChange={(event) => setDirectAnswerer(event.target.value)}
-              placeholder="main_agent 或某个 Agent 角色 ID"
-              required
-            />
-          </label>
           <label htmlFor="main-agent-review-rounds">
             复盘轮数
             <input
@@ -636,8 +623,8 @@ export function MainAgentPage() {
         <article className="inline-guide">
           <h4>直连模式怎么决定谁回答？</h4>
           <p>
-            对话页选择 direct 时，如果勾选了角色，角色列表第一个就是本次直连回答者；如果没有勾选角色，
-            主 Agent 使用这里的“直连默认回答者”兜底。填 main_agent 表示由主 Agent 自己回答。
+            主 Agent 不直接替子 Agent 干活。对话页进入直连模式时，由你在本次对话里指定一个子 Agent；
+            后续同一对话会沿用这个回答者，新建对话后再重新选择。
           </p>
         </article>
 

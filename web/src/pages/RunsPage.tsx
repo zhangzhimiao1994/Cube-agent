@@ -5,11 +5,11 @@ import { Link } from "react-router-dom";
 import { ApiError, api, formatApiError, type AttachmentUpload, type RunDetail, type Skill, type SubmittedRun } from "../api/client";
 
 const RUN_MODES = [
-  { value: "auto", label: "自动检测", description: "主 Agent 会判断应使用直接、派单、讨论或混合模式；不确定时应询问用户。" },
-  { value: "direct", label: "直接执行", description: "适合简单问答或单角色、单步骤任务。" },
-  { value: "dispatch", label: "派单式", description: "适合拆成多个专业角色执行的任务；派给谁由工作流或本次选择决定。" },
-  { value: "discuss", label: "讨论式", description: "适合多角色观点冲突、方案评审或需要裁决的任务。" },
-  { value: "hybrid", label: "混合式", description: "先讨论定方案，再派单执行，最后审查收口。" },
+  { value: "auto", label: "自动", description: "主 Agent 判断应使用直连、派单、讨论或混合；不确定时向你确认。" },
+  { value: "direct", label: "直连", description: "由你指定一个子 Agent 回答，主 Agent 只负责控场和记录。" },
+  { value: "dispatch", label: "派单", description: "适合拆成多个专业角色执行；派给谁由工作流或本次选择决定。" },
+  { value: "discuss", label: "讨论", description: "适合多角色观点冲突、方案评审或需要裁决的任务。" },
+  { value: "hybrid", label: "混合", description: "先讨论定方案，再派单执行，最后审查收口。" },
 ] as const;
 
 type RunMode = (typeof RUN_MODES)[number]["value"];
@@ -52,6 +52,7 @@ function displayRoutingReason(reason: string) {
     "workflow selected explicitly": "按你选择的工作流执行",
     routing_requires_user_choice: "自动判断把握不足，需要确认模式",
     main_agent_auto_resolved: "主 Agent 已根据任务现场自动裁决",
+    main_agent_local_fallback: "主 Agent 使用本地安全判断完成路由",
     hermes_recommendation: "Hermes 根据历史经验推荐",
   };
   return labels[normalized] ?? normalized;
@@ -151,6 +152,67 @@ function formatEventPayloadValue(value: unknown): string {
   }
 }
 
+function isNoiseEvent(event: RunDetail["events"][number]) {
+  return new Set([
+    "queued",
+    "run.queued",
+    "model.started",
+    "runtime.started",
+  ]).has(event.kind);
+}
+
+function eventPayloadLabel(key: string) {
+  const labels: Record<string, string> = {
+    summary: "执行摘要",
+    result: "得到结果",
+    output: "输出内容",
+    conclusion: "讨论结论",
+    final_decision: "最终裁决",
+    main_agent_judgement: "主 Agent 判断",
+    main_agent_judgment: "主 Agent 判断",
+    director_opinion: "导演意见",
+    copywriter_opinion: "文案意见",
+    editor_opinion: "剪辑师意见",
+    researcher_opinion: "研究员意见",
+    engineer_opinion: "工程师意见",
+    critic_opinion: "审查员意见",
+    model: "调用模型",
+    deployment: "模型部署",
+    provider: "服务商",
+  };
+  if (labels[key]) return labels[key];
+  if (key.endsWith("_opinion")) {
+    return `${key.replace(/_opinion$/, "").replace(/_/g, " ")} 意见`;
+  }
+  return `详情：${key}`;
+}
+
+function orderedEventPayloadEntries(payload: Record<string, unknown>) {
+  const priority = [
+    "summary",
+    "result",
+    "output",
+    "conclusion",
+    "director_opinion",
+    "copywriter_opinion",
+    "editor_opinion",
+    "researcher_opinion",
+    "engineer_opinion",
+    "critic_opinion",
+    "main_agent_judgement",
+    "main_agent_judgment",
+    "final_decision",
+  ];
+  return Object.entries(payload).sort(([left], [right]) => {
+    const leftIndex = priority.indexOf(left);
+    const rightIndex = priority.indexOf(right);
+    if (leftIndex === -1 && rightIndex === -1) return left.localeCompare(right);
+    if (leftIndex === -1) return 1;
+    if (rightIndex === -1) return -1;
+    return leftIndex - rightIndex;
+  });
+}
+
 function eventDetailRows(event: RunDetail["events"][number], agentNames: Map<string, string>) {
   const rows: Array<{ label: string; value: string }> = [];
   const actor = displayEventActor(event.actor, agentNames);
@@ -161,10 +223,10 @@ function eventDetailRows(event: RunDetail["events"][number], agentNames: Map<str
   if (event.step_id) rows.push({ label: "步骤", value: event.step_id });
   if (event.action) rows.push({ label: "动作", value: event.action });
   if (event.decision) rows.push({ label: "决策", value: event.decision });
-  Object.entries(event.payload).forEach(([key, value]) => {
+  orderedEventPayloadEntries(event.payload).forEach(([key, value]) => {
     const formatted = formatEventPayloadValue(value);
     if (formatted) {
-      rows.push({ label: `详情：${key}`, value: formatted });
+      rows.push({ label: eventPayloadLabel(key), value: formatted });
     }
   });
   return rows;
@@ -176,10 +238,10 @@ function toggle(list: string[], value: string) {
 
 function explainActualMode(run: { status: string; mode: string | null }) {
   if (run.status === "waiting_user_mode") {
-    return "自动检测没有足够把握，本次任务正在等待你确认运行模式。";
+    return "自动检测没有足够把握，这轮回复需要你确认运行模式。";
   }
-  if (!run.mode) return "本次任务尚未确定运行模式。";
-  return `本次任务实际使用：${displayMode(run.mode)}。`;
+  if (!run.mode) return "这轮回复尚未确定运行模式。";
+  return `这轮回复使用：${displayMode(run.mode)}。你可以继续在当前会话里追问。`;
 }
 
 function modeSelectionFromSubmittedRun(run: SubmittedRun): ModeSelection | null {
@@ -250,7 +312,7 @@ function detailMessages(detail: RunDetail | undefined) {
     {
       id: "request",
       role: "user",
-      title: "你的任务",
+      title: "你",
       body: detail.request,
     },
     ...artifactMessages,
@@ -315,7 +377,7 @@ function runProcessSummary(detail: RunDetail, agentNames: Map<string, string>) {
       ? `路由原因：${displayRoutingReason(detail.explicit_details.routing_reason)}`
       : null,
   ].filter(Boolean);
-  return { routing, events: detail.events };
+  return { routing, events: detail.events.filter((event) => !isNoiseEvent(event)) };
 }
 
 function RunProcessSummary({
@@ -331,23 +393,14 @@ function RunProcessSummary({
   const eventCount = summary.events.length;
   const routingCount = summary.routing.length > 0 ? 1 : 0;
   const total = eventCount + routingCount;
-  const preview = [
-    summary.routing[0],
-    ...summary.events.slice(0, 3).map((event) => displayEventTitle(event, agentNames)),
-  ].filter(Boolean);
   if (total === 0) return null;
   return (
     <section className="run-process-summary" aria-label="折叠的运行过程">
       <button type="button" className="run-process-toggle" aria-expanded={false} onClick={onOpen}>
         <span aria-hidden="true">‹/›</span>
-        <strong>已运行 {total} 个动作</strong>
-        <small>点开看详情</small>
+        <strong>已记录 {total} 个关键步骤</strong>
+        <small>查看本轮执行、讨论和裁决</small>
       </button>
-      <ul className="run-process-preview">
-        {preview.map((item) => (
-          <li key={item}>{item}</li>
-        ))}
-      </ul>
     </section>
   );
 }
@@ -426,11 +479,11 @@ function ModeEntryPanel({
   onSelect: (mode: RunMode) => void;
 }) {
   const entryModes = [
-    { value: "auto", label: "快速模式", description: "由主 Agent 判断直连、派单、讨论或混合；普通任务不二次打断。" },
-    { value: "direct", label: "直连模式", description: "指定一个角色直接回答，适合明确的短问答。" },
-    { value: "dispatch", label: "派单模式", description: "按角色拆分任务，再由主 Agent 汇总。" },
-    { value: "discuss", label: "讨论模式", description: "多角色先讨论分歧，再给结论。" },
-    { value: "hybrid", label: "混合模式", description: "先讨论方案，再分工执行。" },
+    { value: "auto", label: "自动", description: "主 Agent 判断该怎么回复；把握不足时才向你确认。" },
+    { value: "direct", label: "直连", description: "指定一个子 Agent 直接回答，主 Agent 只控场。" },
+    { value: "dispatch", label: "派单", description: "把任务拆给合适角色执行，最后汇总成一条回复。" },
+    { value: "discuss", label: "讨论", description: "多角色表达意见，主 Agent 说明取舍。" },
+    { value: "hybrid", label: "混合", description: "先讨论定方案，再派单执行，适合复杂问题。" },
   ] as const;
   const selected = entryModes.find((item) => item.value === selectedMode) ?? entryModes[0];
   return (
@@ -438,13 +491,14 @@ function ModeEntryPanel({
       <span className="mode-entry-logo" aria-hidden="true">
         ✦
       </span>
-      <h3>选择模式开始对话</h3>
+      <h3>新对话</h3>
+      <p>先选一个运行方式，也可以保持自动直接发送。</p>
       <div className="mode-entry-tabs" role="list" aria-label="对话模式入口">
         {entryModes.map((item) => (
           <button
             key={item.value}
             type="button"
-            aria-label={`进入${item.label}`}
+            aria-label={item.label}
             aria-pressed={selectedMode === item.value}
             className={selectedMode === item.value ? "mode-entry-active" : ""}
             onClick={() => onSelect(item.value)}
@@ -462,6 +516,7 @@ export function RunsPage() {
   const queryClient = useQueryClient();
   const runs = useQuery({ queryKey: ["runs"], queryFn: () => api.runs() });
   const agents = useQuery({ queryKey: ["agents"], queryFn: () => api.agents() });
+  const models = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
   const workflows = useQuery({ queryKey: ["workflows"], queryFn: () => api.workflows() });
   const settings = useQuery({ queryKey: ["settings"], queryFn: () => api.settings() });
   const [message, setMessage] = useState("");
@@ -474,6 +529,8 @@ export function RunsPage() {
   const [selectedConversationIds, setSelectedConversationIds] = useState<string[]>([]);
   const [submitNotice, setSubmitNotice] = useState<string | null>(null);
   const [configOpen, setConfigOpen] = useState(false);
+  const [directAnswererPickerOpen, setDirectAnswererPickerOpen] = useState(false);
+  const [showModeEntry, setShowModeEntry] = useState(true);
   const [processDetailRun, setProcessDetailRun] = useState<RunDetail | null>(null);
   const [modeSelection, setModeSelection] = useState<ModeSelection | null>(null);
   const [skillInstallCandidate, setSkillInstallCandidate] = useState<SkillInstallCandidate | null>(null);
@@ -486,6 +543,7 @@ export function RunsPage() {
     approved: boolean;
   } | null>(null);
   const [temporaryFeedback, setTemporaryFeedback] = useState("");
+  const [temporaryAgentModel, setTemporaryAgentModel] = useState("");
   const userSelectedMode = useRef(false);
   const autoModeChoiceKey = useRef<string | null>(null);
   const trimmedReferenceConversationId = referenceConversationId.trim();
@@ -558,19 +616,24 @@ export function RunsPage() {
   }, [selectedRunId]);
 
   const createRun = useMutation({
-    mutationFn: () =>
-      api.createRun({
+    mutationFn: () => {
+      const enabledAgents = (agents.data ?? []).filter((agent) => agent.enabled);
+      const enabledAgentIds = new Set(enabledAgents.map((agent) => agent.id));
+      const directAgentId = agentIds.find((agentId) => enabledAgentIds.has(agentId));
+      return api.createRun({
         message: message.trim(),
         mode,
         workflow_id: workflowId || null,
         allow_workflow_adjustment: mode !== "direct" && (settings.data?.allow_main_agent_override ?? false),
-        agent_ids: mode === "direct" ? agentIds.slice(0, 1) : agentIds,
+        agent_ids: mode === "direct" && directAgentId ? [directAgentId] : agentIds,
         conversation_id: conversationId,
         reference_conversation_id: referenceConversationId.trim() || null,
         attachment_ids: attachmentDraft?.attachment ? [attachmentDraft.attachment.id] : [],
-      }),
+      });
+    },
     onSuccess: async (run) => {
       setSelectedRunId(run.id);
+      setShowModeEntry(false);
       if (run.conversation_id) setConversationId(run.conversation_id);
       const selection = modeSelectionFromSubmittedRun(run);
       if (run.temporary_agent_proposal && run.decision_token) {
@@ -582,14 +645,17 @@ export function RunsPage() {
           proposal: run.temporary_agent_proposal,
           approved: false,
         });
+        setTemporaryAgentModel("");
         setTemporaryFeedback("");
         setSubmitNotice("主 Agent 发现当前角色池能力不足，已暂停并等待你确认是否临时加入新子 Agent。");
       } else if (selection) {
         setTemporaryApproval(null);
+        setTemporaryAgentModel("");
         setModeSelection(selection);
-        setSubmitNotice("主 Agent 对本次任务的模式判断不够确定，请在输入框上方选择运行模式后继续。");
+        setSubmitNotice("主 Agent 对这轮回复的模式判断不够确定，请在输入框上方选择运行模式后继续。");
       } else {
         setTemporaryApproval(null);
+        setTemporaryAgentModel("");
         setModeSelection(null);
         setSubmitNotice(explainActualMode(run));
       }
@@ -636,11 +702,12 @@ export function RunsPage() {
       return api.approveTemporaryAgent(temporaryApproval.runId, {
         decision_token: temporaryApproval.decisionToken,
         version: temporaryApproval.version,
+        model: temporaryAgentModel,
       });
     },
     onSuccess: async (run) => {
       setTemporaryApproval((current) => (current ? { ...current, approved: true } : current));
-      setSubmitNotice("已确认临时子 Agent，本次任务已重新进入执行队列。任务完成后你可以决定是否永久保存该 Agent。");
+      setSubmitNotice("已确认临时子 Agent，这轮对话已继续推进。完成后你可以决定是否永久保存该 Agent。");
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
       await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
     },
@@ -655,12 +722,12 @@ export function RunsPage() {
         enabled: true,
         role: temporaryApproval.proposal.role,
         prompt: temporaryApproval.proposal.prompt,
-        model: null,
+        model: temporaryAgentModel,
         skills: temporaryApproval.proposal.suggested_skills,
       });
     },
     onSuccess: async () => {
-      setSubmitNotice("临时子 Agent 已保存为永久 Agent。请到 Agent 页面为它绑定已测试模型后投入常规工作流。");
+      setSubmitNotice("临时子 Agent 已保存为永久 Agent，并绑定了你选择的已测试模型。");
       await queryClient.invalidateQueries({ queryKey: ["agents"] });
     },
   });
@@ -676,6 +743,7 @@ export function RunsPage() {
     },
     onSuccess: async (run) => {
       setTemporaryApproval(null);
+      setTemporaryAgentModel("");
       setTemporaryFeedback("");
       setSubmitNotice("已收到你的新意见，主 Agent 会按反馈重新规划本次任务。");
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
@@ -791,13 +859,19 @@ export function RunsPage() {
 
   function startNewConversation() {
     setSelectedRunId(null);
+    setShowModeEntry(true);
     setConversationId(newConversationId());
     setReferenceConversationId("");
     setMessage("");
+    userSelectedMode.current = false;
+    setMode(settings.data?.default_mode ?? "auto");
+    setWorkflowId(settings.data?.default_workflow_id ?? "");
+    setAgentIds(settings.data?.default_agent_ids ?? []);
     setTemporaryApproval(null);
+    setTemporaryAgentModel("");
     setModeSelection(null);
     setProcessDetailRun(null);
-    setSubmitNotice("已新建空白对话。请选择模式后开始新的会话。");
+    setSubmitNotice("已新建空白对话。选一个模式或直接发送，主 Agent 会按当前设置处理。");
   }
 
   function startHandoffConversation(sourceRun?: RunDetail | null) {
@@ -807,10 +881,12 @@ export function RunsPage() {
       return;
     }
     setSelectedRunId(null);
+    setShowModeEntry(false);
     setReferenceConversationId(sourceConversationId);
     setConversationId(newConversationId());
     setMessage("");
     setTemporaryApproval(null);
+    setTemporaryAgentModel("");
     setModeSelection(null);
     setProcessDetailRun(null);
     setSubmitNotice(`已按原思路开启新对话：新对话会读取 ${sourceConversationId} 作为参考上下文。`);
@@ -822,19 +898,34 @@ export function RunsPage() {
   }
 
   if (runs.isLoading) {
-    return <p>正在加载对话任务...</p>;
+    return <p>正在加载对话...</p>;
   }
-  if (runs.isError) return <p role="alert">{formatApiError(runs.error, "任务列表加载失败")}</p>;
+  if (runs.isError) return <p role="alert">{formatApiError(runs.error, "会话列表加载失败")}</p>;
 
   const items = runs.data ?? [];
   const selectedMode = RUN_MODES.find((item) => item.value === mode) ?? RUN_MODES[0];
   const savedAgents = agents.data ?? [];
+  const savedModels = models.data ?? [];
+  const enabledAgents = savedAgents.filter((agent) => agent.enabled);
   const savedWorkflows = workflows.data ?? [];
   const agentNameMap = new Map(savedAgents.map((agent) => [agent.id, agent.name]));
   const visibleRuns = activeConversation.data?.runs ?? (selectedRun.data ? [selectedRun.data] : []);
   const messages = conversationMessages(visibleRuns);
   const latestVisibleRun = visibleRuns.at(-1) ?? selectedRun.data;
-  const directAnswerer = mode === "direct" && agentIds.length > 0 ? agentIds[0] : "main_agent";
+  const directAnswerer = mode === "direct" ? (agentIds.find((id) => enabledAgents.some((agent) => agent.id === id)) ?? "") : "";
+  const directAnswererAgent = enabledAgents.find((agent) => agent.id === directAnswerer) ?? null;
+  const directAnswererName = directAnswererAgent?.name ?? "未指定";
+  const registeredModelIds = new Set(savedModels.map((model) => model.logical_model));
+  const directAnswererModel = directAnswererAgent?.model?.trim() ?? "";
+  const directAnswererModelReady = mode !== "direct" || Boolean(directAnswererModel && registeredModelIds.has(directAnswererModel));
+  const directSendBlockedReason =
+    mode !== "direct"
+      ? null
+      : !directAnswerer
+        ? "直连需要先选择本次对话的回答者。"
+        : !directAnswererModelReady
+          ? "回答者绑定的模型/API 未注册或未通过配置，请先到 Agent 或模型页面修正。"
+          : null;
   const deletableConversationIds = items
     .filter((run) => TERMINAL_STATUSES.has(run.status))
     .map((run) => run.id);
@@ -872,6 +963,12 @@ export function RunsPage() {
     setMode(nextMode);
   }
 
+  function openDirectAnswererPicker() {
+    setDirectAnswererPickerOpen((current) => !current);
+    userSelectedMode.current = true;
+    setMode("direct");
+  }
+
   function deleteSelectedConversations() {
     if (selectedDeletableConversationIds.length === 0) {
       setSubmitNotice("Please select completed, failed, or cancelled conversations first.");
@@ -886,9 +983,9 @@ export function RunsPage() {
   return (
     <section>
       <p className="eyebrow">Conversation</p>
-      <h2>对话任务</h2>
+      <h2>对话</h2>
       <p className="compact-page-intro">
-        工作流配置和工作流使用是分开的：这里负责选择本次对话怎么运行，配置请到“工作流配置”页面维护。
+        这里是连续对话窗口。只要不新建对话，后续消息都会沿用当前会话上下文；工作流配置请到“工作流配置”页面维护。
       </p>
 
       <div className="mobile-chat-hierarchy" aria-label="移动端对话层级">
@@ -930,7 +1027,7 @@ export function RunsPage() {
             </div>
           ) : null}
           {items.length === 0 ? (
-            <p className="field-help">还没有任务。可以从右侧输入框发起第一次对话。</p>
+            <p className="field-help">还没有对话。可以从右侧输入框发起第一次交流。</p>
           ) : (
             items.map((run) => {
               const canDelete = TERMINAL_STATUSES.has(run.status);
@@ -951,7 +1048,10 @@ export function RunsPage() {
                     type="button"
                     className="conversation-item"
                     aria-label={`进入会话 ${run.id.slice(0, 8)}`}
-                    onClick={() => setSelectedRunId(run.id)}
+                    onClick={() => {
+                      setShowModeEntry(false);
+                      setSelectedRunId(run.id);
+                    }}
                   >
                     <span>{displayMode(run.mode)}</span>
                     <strong>{run.id.slice(0, 8)}</strong>
@@ -1062,7 +1162,7 @@ export function RunsPage() {
                   </p>
                 </>
               ) : (
-                <p>未选择工作流时，主 Agent 会按任务内容和你勾选的角色进行调度。</p>
+                <p>未选择工作流时，主 Agent 会按消息内容和你勾选的角色进行调度。</p>
               )}
             </div>
             {referenceConversation.data ? (
@@ -1087,25 +1187,21 @@ export function RunsPage() {
             {mode === "direct" ? (
               <>
                 <p className="field-help">
-                  直接执行只会让一个对象回答。选择“主 Agent 自己回答”会提交空角色列表；选择某个角色会提交该角色 ID。
+                  直连模式由主 Agent 控场，但实际回答必须交给一个子 Agent；这里选择本轮直接回答的角色。
                 </p>
                 <label htmlFor="direct-answerer">
                   直连回答者
                   <select
                     id="direct-answerer"
                     value={directAnswerer}
-                    onChange={(event) =>
-                      setAgentIds(event.target.value === "main_agent" ? [] : [event.target.value])
-                    }
+                    onChange={(event) => setAgentIds(event.target.value ? [event.target.value] : [])}
                   >
-                    <option value="main_agent">主 Agent 自己回答</option>
-                    {savedAgents
-                      .filter((agent) => agent.enabled)
-                      .map((agent) => (
-                        <option key={agent.id} value={agent.id}>
-                          {agent.name}（{agent.id}）
-                        </option>
-                      ))}
+                    {enabledAgents.length === 0 ? <option value="">暂无可用子 Agent</option> : null}
+                    {enabledAgents.map((agent) => (
+                      <option key={agent.id} value={agent.id}>
+                        {agent.name}（{agent.id}）
+                      </option>
+                    ))}
                   </select>
                 </label>
                 {agents.isLoading ? <p className="field-help">正在加载 Agent 角色...</p> : null}
@@ -1164,7 +1260,7 @@ export function RunsPage() {
                 </button>
               </div>
             </div>
-            {!selectedRunId ? (
+            {showModeEntry ? (
               <ModeEntryPanel selectedMode={mode} onSelect={chooseRunMode} />
             ) : null}
             {messages.map((item, index) => (
@@ -1200,18 +1296,42 @@ export function RunsPage() {
             />
           ) : null}
 
-          <form onSubmit={submit} aria-label="发送对话任务" className="chat-composer">
+          <form onSubmit={submit} aria-label="发送消息" className="chat-composer">
             {temporaryApproval ? (
               <aside className="composer-approval-popover" role="dialog" aria-label="临时 Agent 确认提醒">
                 <div>
                   <span className="eyebrow">主 Agent 请求确认</span>
                   <h3>{temporaryApproval.proposal.name}</h3>
+                  <p>主 Agent 已生成角色和提示词；请选择本次运行这个临时 Agent 的模型/API。</p>
                   <p>{temporaryApproval.proposal.reason}</p>
                   <p>
                     缺少能力：{temporaryApproval.proposal.missing_capability}；角色边界：
                     {temporaryApproval.proposal.prompt}
                   </p>
                 </div>
+                <label htmlFor="temporary-agent-model">
+                  运行模型
+                  <select
+                    id="temporary-agent-model"
+                    value={temporaryAgentModel}
+                    onChange={(event) => setTemporaryAgentModel(event.target.value)}
+                    disabled={temporaryApproval.approved}
+                  >
+                    <option value="">请选择已测试模型</option>
+                    {savedModels.map((model) => (
+                      <option key={model.id} value={model.logical_model}>
+                        {model.logical_model}（{model.provider} / {model.upstream_model}）
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {models.isLoading ? <p className="field-help">正在加载已保存模型...</p> : null}
+                {models.isError ? <p role="alert">{formatApiError(models.error, "已保存模型加载失败")}</p> : null}
+                {savedModels.length === 0 ? (
+                  <p className="form-error" role="alert">
+                    还没有可绑定的已测试模型。请先到“模型与 API”页面保存并通过可用性测试。
+                  </p>
+                ) : null}
                 <label htmlFor="temporary-agent-feedback">
                   提出新的意见
                   <textarea
@@ -1224,7 +1344,11 @@ export function RunsPage() {
                 <div className="composer-actions">
                   <button
                     type="button"
-                    disabled={temporaryApproval.approved || approveTemporaryAgent.isPending}
+                    disabled={
+                      temporaryApproval.approved ||
+                      approveTemporaryAgent.isPending ||
+                      temporaryAgentModel.trim().length === 0
+                    }
                     onClick={() => approveTemporaryAgent.mutate()}
                   >
                     {temporaryApproval.approved ? "已临时加入" : "接受并临时加入"}
@@ -1240,7 +1364,7 @@ export function RunsPage() {
                   <button
                     type="button"
                     className="secondary-action"
-                    disabled={!temporaryApproval.approved || promoteTemporaryAgent.isPending}
+                    disabled={!temporaryApproval.approved || temporaryAgentModel.trim().length === 0 || promoteTemporaryAgent.isPending}
                     onClick={() => promoteTemporaryAgent.mutate()}
                   >
                     保存为永久 Agent
@@ -1261,7 +1385,7 @@ export function RunsPage() {
               <aside className="composer-approval-popover mode-choice-popover" role="dialog" aria-label="运行模式确认">
                 <div>
                   <span className="eyebrow">主 Agent 需要你确认</span>
-                  <h3>本次任务应该怎么运行？</h3>
+                  <h3>这轮回复应该怎么运行？</h3>
                   <p>
                     自动检测没有足够把握，原因：{modeSelection.reason ?? "routing_requires_user_choice"}。
                     选择后任务会继续进入队列，并按对应模式派给角色池。
@@ -1337,10 +1461,36 @@ export function RunsPage() {
                 </p>
               </aside>
             ) : null}
+            {mode === "direct" && directAnswererPickerOpen ? (
+              <div className="composer-inline-picker" role="region" aria-label="直连回答者设置">
+                <label htmlFor="direct-answerer-inline">
+                  直连回答者
+                  <select
+                    id="direct-answerer-inline"
+                    value={directAnswerer}
+                    onChange={(event) => setAgentIds(event.target.value ? [event.target.value] : [])}
+                  >
+                    <option value="">请选择回答者</option>
+                    {enabledAgents.map((agent) => (
+                      <option key={agent.id} value={agent.id}>
+                        {agent.name}（{agent.model || "未绑定模型"}）
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <p>
+                  {directAnswererAgent
+                    ? directAnswererModelReady
+                      ? `已绑定模型/API：${directAnswererModel}`
+                      : "回答者绑定的模型/API 未注册或未通过配置，请先到 Agent 或模型页面修正。"
+                    : "直连需要先选择本次对话的回答者。"}
+                </p>
+              </div>
+            ) : null}
             <textarea
               value={message}
               onChange={(event) => setMessage(event.target.value)}
-              placeholder="输入消息，继续当前对话；也可以输入任务，例如：让导演、文案和剪辑师讨论一个短视频脚本方案。"
+              placeholder="输入消息，继续当前对话。例如：这个方案继续往更玄幻一点改。"
               required
             />
             <div className="composer-actions">
@@ -1354,13 +1504,25 @@ export function RunsPage() {
                   onChange={(event) => handleAttachmentUpload(event.currentTarget.files)}
                 />
               </label>
+              {mode === "direct" ? (
+                <button
+                  type="button"
+                  className="composer-answerer-button"
+                  aria-label={`回答者：${directAnswererName}`}
+                  onClick={openDirectAnswererPicker}
+                >
+                  回答者：{directAnswererName}
+                </button>
+              ) : null}
               <button
                 type="button"
                 className="composer-handoff-button"
+                aria-label="按原思路"
+                title="按照原思路开启新对话"
                 disabled={!latestVisibleRun}
                 onClick={() => startHandoffConversation(latestVisibleRun)}
               >
-                按照原思路开启新对话
+                按原思路
               </button>
               <button
                 type="button"
@@ -1372,14 +1534,24 @@ export function RunsPage() {
                 +
               </button>
               <span>
-                {mode === "auto" ? "快速模式：主 Agent 判断" : mode === "direct" ? "直连模式" : `手动模式：${displayMode(mode)}`}
-                {agentIds.length > 0 ? ` · 角色 ${agentIds.length} 个` : " · 未固定角色"}
+                {mode === "auto"
+                  ? "自动 · 主 Agent 判断"
+                  : mode === "direct"
+                    ? `直连 · 回答者 ${directAnswererName}`
+                    : `${displayMode(mode)} · 本会话倾向`}
+                {mode !== "direct" && agentIds.length > 0 ? ` · 角色 ${agentIds.length} 个` : ""}
                 {referenceConversationId.trim() ? " · 已引用会话" : ""}
               </span>
-              <button type="submit" disabled={createRun.isPending || message.trim().length === 0}>
+              <button
+                type="submit"
+                disabled={createRun.isPending || message.trim().length === 0 || Boolean(directSendBlockedReason)}
+              >
                 {createRun.isPending ? "发送中..." : "发送"}
               </button>
             </div>
+            {directSendBlockedReason && !directAnswererPickerOpen ? (
+              <p className="field-help" role="status">{directSendBlockedReason}</p>
+            ) : null}
             {submitNotice ? <p role="status">{submitNotice}</p> : null}
             {uploadSkillArchive.isPending ? <p role="status">正在扫描 Skill 包...</p> : null}
             {uploadAttachment.isPending ? <p role="status">正在上传附件...</p> : null}
@@ -1393,7 +1565,7 @@ export function RunsPage() {
                 {formatApiError(uploadAttachment.error, "附件上传失败")}
               </p>
             ) : null}
-            {createRun.isError ? <p role="alert">{formatApiError(createRun.error, "任务提交失败")}</p> : null}
+            {createRun.isError ? <p role="alert">{formatApiError(createRun.error, "消息发送失败")}</p> : null}
           </form>
         </div>
       </div>

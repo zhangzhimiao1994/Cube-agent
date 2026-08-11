@@ -1402,6 +1402,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             details = _routing_details(record.routing_decision)
             if details.get("conversation_id") == conversation_id:
                 runs.append(await self._run_detail(record))
+        runs.reverse()
         return ConversationResponse(conversation_id=conversation_id, runs=runs)
 
     async def pause_run(self, run_id: UUID) -> RunDetailResponse:
