@@ -231,11 +231,38 @@ async def _delete_tenant(database_url: str, tenant_id: UUID) -> None:
 async def _seed_invalid_role(database_url: str) -> UUID:
     database = build_database(database_url)
     tenant_id = uuid4()
+    user_id = uuid4()
     try:
         async with database.session_factory() as session:
-            session.add(TenantRow(id=tenant_id, slug=f"invalid-role-{tenant_id}", name="Invalid"))
-            await session.flush()
-            session.add(UserRow(tenant_id=tenant_id, username="invalid", role="owner"))
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO agent_hub_tenants (id, slug, name)
+                    VALUES (:tenant_id, :slug, :name)
+                    """
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "slug": f"invalid-role-{tenant_id}",
+                    "name": "Invalid",
+                },
+            )
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO agent_hub_users
+                        (id, tenant_id, username, password_hash, feishu_open_id, role)
+                    VALUES
+                        (:user_id, :tenant_id, :username, NULL, NULL, :role)
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "tenant_id": tenant_id,
+                    "username": "invalid",
+                    "role": "owner",
+                },
+            )
             await session.commit()
     finally:
         await database.dispose()
@@ -245,18 +272,37 @@ async def _seed_invalid_role(database_url: str) -> UUID:
 async def _seed_invalid_username(database_url: str) -> UUID:
     database = build_database(database_url)
     tenant_id = uuid4()
+    user_id = uuid4()
     try:
         async with database.session_factory() as session:
-            session.add(
-                TenantRow(
-                    id=tenant_id,
-                    slug=f"invalid-username-{tenant_id}",
-                    name="Invalid",
-                )
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO agent_hub_tenants (id, slug, name)
+                    VALUES (:tenant_id, :slug, :name)
+                    """
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "slug": f"invalid-username-{tenant_id}",
+                    "name": "Invalid",
+                },
             )
-            await session.flush()
-            session.add(
-                UserRow(tenant_id=tenant_id, username="Invalid..Name", role="viewer")
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO agent_hub_users
+                        (id, tenant_id, username, password_hash, feishu_open_id, role)
+                    VALUES
+                        (:user_id, :tenant_id, :username, NULL, NULL, :role)
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "tenant_id": tenant_id,
+                    "username": "Invalid..Name",
+                    "role": "viewer",
+                },
             )
             await session.commit()
     finally:
