@@ -967,6 +967,28 @@ article:hover {
   white-space: pre-wrap;
 }
 
+.run-process-detail dl {
+  display: grid;
+  gap: 0.35rem 0.65rem;
+  grid-template-columns: max-content minmax(0, 1fr);
+  margin: 0.55rem 0 0;
+}
+
+.run-process-detail dt {
+  color: var(--danger);
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.78rem;
+  font-weight: 850;
+}
+
+.run-process-detail dd {
+  color: var(--text);
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
 .run-process-detail small {
   color: rgba(178, 194, 216, 0.72);
 }
@@ -1077,6 +1099,34 @@ article:hover {
 .composer-upload-button:hover {
   border-color: rgba(123, 225, 255, 0.52);
   box-shadow: 0 0 18px rgba(42, 195, 255, 0.16);
+}
+
+.composer-handoff-button {
+  align-items: center;
+  background: rgba(125, 255, 189, 0.11);
+  border: 1px solid rgba(125, 255, 189, 0.28);
+  border-radius: 999px;
+  color: var(--text);
+  cursor: pointer;
+  display: inline-flex;
+  flex: 0 1 auto;
+  font-size: 0.86rem;
+  font-weight: 800;
+  height: 2.5rem;
+  justify-content: center;
+  max-width: 13rem;
+  padding: 0 0.9rem;
+  white-space: nowrap;
+}
+
+.composer-handoff-button:hover:not(:disabled) {
+  border-color: rgba(125, 255, 189, 0.58);
+  box-shadow: 0 0 18px rgba(125, 255, 189, 0.14);
+}
+
+.composer-handoff-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
 }
 
 .composer-upload-button input {
@@ -1980,6 +2030,12 @@ article:hover {
   .composer-actions .composer-plus-button {
     flex: 0 0 2.75rem;
     width: 2.75rem;
+  }
+
+  .composer-actions .composer-handoff-button {
+    flex: 1 1 10rem;
+    max-width: none;
+    width: auto;
   }
 
   .composer-actions button[type="submit"] {

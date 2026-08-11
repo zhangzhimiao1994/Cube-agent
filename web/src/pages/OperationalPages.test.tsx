@@ -26,6 +26,37 @@ const runDetail = {
       message: "Run accepted and queued.",
       created_at: "2026-08-07T00:00:00Z",
     },
+    {
+      sequence: 2,
+      kind: "artifact.created",
+      message: "artifact.created",
+      created_at: "2026-08-07T00:00:01Z",
+      actor: "copywriter",
+      participants: [],
+      tool_name: "artifact_writer",
+      step_id: "write-script",
+      action: null,
+      decision: null,
+      payload: {
+        summary: "写入短视频脚本",
+        api_key: "[redacted]",
+      },
+    },
+    {
+      sequence: 3,
+      kind: "discussion.completed",
+      message: "导演、文案和剪辑师完成讨论，主 Agent 采用可拍摄性最高的方案。",
+      created_at: "2026-08-07T00:00:02Z",
+      actor: "director",
+      participants: ["director", "copywriter", "editor"],
+      tool_name: null,
+      step_id: null,
+      action: null,
+      decision: "adopt",
+      payload: {
+        result: "采用可拍摄性最高的方案",
+      },
+    },
   ],
   artifacts: [
     {
@@ -52,6 +83,9 @@ const settings = {
   hermes_enabled: true,
   safe_tools_enabled: true,
   require_approval_for_tools: true,
+  allow_main_agent_override: true,
+  allow_temporary_agents: true,
+  temporary_agent_policy: "全局策略：缺少专业能力时先询问用户，再临时加入子 Agent。",
   channel_entry: "web",
   attachment_retention_days: 7,
   attachment_max_mb: 25,
@@ -126,7 +160,9 @@ const workflows = [
     name: "短视频派单",
     enabled: true,
     mode: "dispatch",
-    allow_main_agent_override: true,
+    allow_main_agent_override: false,
+    allow_temporary_agents: false,
+    temporary_agent_policy: "旧工作流内策略应被全局设置取代。",
     task_type: "短视频内容生产",
     role_selection_policy: "导演、文案、剪辑师参与；不默认派给程序员。",
     agent_ids: ["director", "copywriter", "editor"],
@@ -204,7 +240,10 @@ describe("operational management pages", () => {
           return jsonResponse(visibleRunDetail);
         }
         if (path === "/api/v1/admin/conversations/conv-previous") {
-          return jsonResponse({ conversation_id: "conv-previous", runs: [runDetail] });
+          return jsonResponse({ conversation_id: "conv-previous", runs: [visibleRunDetail] });
+        }
+        if (path === `/api/v1/admin/conversations/${runDetail.explicit_details.conversation_id}`) {
+          return jsonResponse({ conversation_id: runDetail.explicit_details.conversation_id, runs: [visibleRunDetail] });
         }
         if (path === `/api/v1/admin/runs/${runId}/pause`) {
           return jsonResponse({ ...runDetail, status: "paused" });
@@ -212,6 +251,17 @@ describe("operational management pages", () => {
         if (path === "/api/v1/runs" && method === "POST") {
           const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
           const message = String(body.message ?? "");
+          if (message.includes("二次确认")) {
+            return jsonResponse({
+              id: runId,
+              tenant_id: "33333333-3333-4333-8333-333333333333",
+              status: "waiting_user_mode",
+              mode: null,
+              decision_token: "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+              version: 1,
+              clarification_reason: "routing_requires_user_choice",
+            });
+          }
           if (message.includes("网页") || message.toLowerCase().includes("web page")) {
             return jsonResponse({
               id: runId,
@@ -240,6 +290,20 @@ describe("operational management pages", () => {
             mode: "dispatch",
             decision_token: null,
             version: 1,
+            clarification_reason: null,
+            conversation_id: typeof body.conversation_id === "string" ? body.conversation_id : null,
+            reference_conversation_id:
+              typeof body.reference_conversation_id === "string" ? body.reference_conversation_id : null,
+          });
+        }
+        if (path === `/api/v1/runs/${runId}/choose-mode` && method === "POST") {
+          return jsonResponse({
+            id: runId,
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            status: "queued",
+            mode: "discuss",
+            decision_token: null,
+            version: 2,
             clarification_reason: null,
           });
         }
@@ -417,7 +481,7 @@ describe("operational management pages", () => {
 
     await openRunConfig(user);
     await user.selectOptions(screen.getByLabelText("使用工作流"), "short-video-dispatch");
-    expect(screen.getByText(/执行前必须向你核对/)).not.toBeNull();
+    expect(screen.getByText(/全局临场策略已开启/)).not.toBeNull();
     await user.type(screen.getByPlaceholderText(/输入任务/), "给我做一个短视频脚本方案。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
@@ -435,6 +499,16 @@ describe("operational management pages", () => {
         agent_ids: ["director", "copywriter", "editor"],
       },
     });
+  });
+
+  it("keeps live adjustment and temporary-agent switches out of workflow configuration", async () => {
+    render(<TestApp initialPath="/workflows" />);
+
+    expect(await screen.findByRole("heading", { name: "工作流配置" })).not.toBeNull();
+    expect(screen.queryByText("允许主 Agent 提出工作流临场调整（执行前必须向用户核对）")).toBeNull();
+    expect(screen.queryByText("允许主 Agent 在角色能力不足时申请临时子 Agent")).toBeNull();
+    expect(screen.queryByLabelText("临时 Agent 补位规则")).toBeNull();
+    expect(screen.getAllByText(/主 Agent 临场调整和临时子 Agent 是全局调度策略/).length).toBeGreaterThan(0);
   });
 
   it("uses a single direct answerer when direct mode is selected", async () => {
@@ -464,11 +538,81 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话任务" })).not.toBeNull();
-    await userEvent.click(screen.getByRole("button", { name: /派单式/ }));
+    await userEvent.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
     expect(within(stream).getByText(/这是最终回复正文/)).not.toBeNull();
     expect(within(stream).queryByText("产物：短视频脚本")).toBeNull();
+  });
+
+  it("opens a historical conversation and continues inside the same conversation id", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话任务" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
+    await screen.findByText(/当前会话：conv-previous/);
+    await user.type(screen.getByPlaceholderText(/输入消息/), "继续优化这个脚本。");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(requests.slice().reverse().find((request) => request.path === "/api/v1/runs")).toMatchObject({
+      method: "POST",
+      body: {
+        message: "继续优化这个脚本。",
+        conversation_id: "conv-previous",
+      },
+    });
+  });
+
+  it("starts a continuation branch when context is too long", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话任务" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
+    await screen.findByText(/当前会话：conv-previous/);
+    await user.click(screen.getByRole("button", { name: "按照原思路开启新对话" }));
+    await user.type(screen.getByPlaceholderText(/输入消息/), "接着前面的方向继续。");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    const request = requests.slice().reverse().find((item) => item.path === "/api/v1/runs");
+    expect(request).toMatchObject({
+      method: "POST",
+      body: {
+        message: "接着前面的方向继续。",
+        reference_conversation_id: "conv-previous",
+      },
+    });
+    expect((request?.body as { conversation_id?: string }).conversation_id).not.toBe("conv-previous");
+  });
+
+  it("keeps partial assistant output visible when a run fails after producing artifacts", async () => {
+    visibleRunListItem = { ...runListItem, status: "failed", mode: "hybrid" };
+    visibleRunListItems = [visibleRunListItem];
+    visibleRunDetail = {
+      ...runDetail,
+      ...visibleRunListItem,
+      events: [
+        ...runDetail.events,
+        {
+          sequence: 4,
+          kind: "runtime.failed",
+          message: "hybrid discuss failed: model gateway failed: model transport failed",
+          created_at: "2026-08-07T00:00:03Z",
+        },
+      ],
+    };
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话任务" })).not.toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    expect(within(stream).getByText(/这是最终回复正文/)).not.toBeNull();
+    expect(within(stream).getByText("运行中断")).not.toBeNull();
+    expect(within(stream).getByText(/中断前输出已保留/)).not.toBeNull();
+    expect(within(stream).getByText(/model transport failed/)).not.toBeNull();
   });
 
   it("collapses run process events behind a compact execution summary", async () => {
@@ -476,15 +620,39 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话任务" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: /派单式/ }));
+    await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
     expect(within(stream).getByText(/这是最终回复正文/)).not.toBeNull();
     expect(within(stream).queryByText("Run accepted and queued.")).toBeNull();
 
     expect(within(stream).queryByText("正在实时刷新运行状态")).toBeNull();
-    await user.click(within(stream).getByRole("button", { name: /执行 2 条步骤/ }));
-    expect(within(stream).getByText("Run accepted and queued.")).not.toBeNull();
+    await user.click(within(stream).getByRole("button", { name: /已运行 4 个动作/ }));
+    expect(within(stream).getByText("任务已进入队列，等待 Worker 调度执行。")).not.toBeNull();
+  });
+
+  it("shows localized process summaries with participating roles instead of raw event codes", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话任务" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await user.click(within(stream).getByRole("button", { name: /已运行 4 个动作/ }));
+
+    expect(within(stream).getByText("参与角色：导演、文案生成、剪辑师")).not.toBeNull();
+    expect(within(stream).getByText(/文案生成 生成了结果/)).not.toBeNull();
+    expect(within(stream).getByText(/多角色完成讨论/)).not.toBeNull();
+    expect(within(stream).getAllByText(/采用可拍摄性最高的方案/).length).toBeGreaterThan(0);
+    expect(within(stream).getAllByText("执行者").length).toBeGreaterThan(0);
+    expect(within(stream).getByText("文案生成")).not.toBeNull();
+    expect(within(stream).getByText("工具")).not.toBeNull();
+    expect(within(stream).getByText("artifact_writer")).not.toBeNull();
+    expect(within(stream).getByText("参与者")).not.toBeNull();
+    expect(within(stream).getByText("导演、文案生成、剪辑师")).not.toBeNull();
+    expect(within(stream).getByText("[redacted]")).not.toBeNull();
+    expect(within(stream).queryByText("artifact.created")).toBeNull();
   });
 
   it("selects the chat mode from the compact entry panel before sending", async () => {
@@ -504,6 +672,28 @@ describe("operational management pages", () => {
         mode: "discuss",
       },
     });
+  });
+
+  it("continues with the manually selected mode when the backend asks for mode clarification", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话任务" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "进入讨论模式" }));
+    await user.type(screen.getByPlaceholderText(/输入任务/), "这个任务不应该二次确认。");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === `/api/v1/runs/${runId}/choose-mode`)).toMatchObject({
+        method: "POST",
+        body: {
+          mode: "discuss",
+          decision_token: "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+          version: 1,
+        },
+      }),
+    );
+    expect(screen.queryByRole("dialog", { name: "运行模式确认" })).toBeNull();
   });
 
   it("uploads a skill zip from the chat composer and requires explicit approval", async () => {

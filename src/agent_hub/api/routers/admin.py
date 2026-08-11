@@ -29,6 +29,7 @@ from agent_hub.models.gateway import ModelTransport
 from agent_hub.models.litellm_client import LiteLLMClient, ModelTransportError
 from agent_hub.models.types import Deployment, ModelCapability, ModelMessage, ModelRequest
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRecord, RunRepository
+from agent_hub.runtime.contracts import JsonValue
 from agent_hub.runtime.failure_reason import is_legacy_generic_failure_reason
 from agent_hub.security.secrets import SecretService, SecretValidationError
 from agent_hub.skills.package import InvalidSkillPackage
@@ -208,6 +209,13 @@ class RunEventResponse(BaseModel):
     kind: str
     message: str
     created_at: datetime
+    actor: str | None = None
+    participants: list[str] = Field(default_factory=list)
+    tool_name: str | None = None
+    step_id: str | None = None
+    action: str | None = None
+    decision: str | None = None
+    payload: dict[str, JsonValue] = Field(default_factory=dict)
 
 
 class RunArtifactResponse(BaseModel):
@@ -225,6 +233,33 @@ class RunDetailResponse(RunListItem):
     artifacts: list[RunArtifactResponse]
     explicit_details: dict[str, str]
     decision_token: str | None = None
+
+
+class RunDebugArtifactResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    kind: str
+    title: str
+    has_text: bool
+    text_preview: str | None = None
+
+
+class RunDebugResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: UUID
+    status: str
+    mode: str
+    failed_stage: str | None = None
+    failure_reason: str
+    partial_output_available: bool
+    request_preview: str
+    events: list[RunEventResponse]
+    artifacts: list[RunDebugArtifactResponse]
+    explicit_details: dict[str, str]
+    recommendation: str
+    generated_at: datetime
 
 
 class RunDeleteResponse(BaseModel):
@@ -496,6 +531,12 @@ class SystemSettingsRequest(BaseModel):
     hermes_enabled: bool = True
     safe_tools_enabled: bool = True
     require_approval_for_tools: bool = True
+    allow_main_agent_override: bool = False
+    allow_temporary_agents: bool = False
+    temporary_agent_policy: str = Field(
+        default="主 Agent 发现角色池缺少必要能力时，必须先说明原因并取得用户确认，再临时加入子 Agent。",
+        max_length=10_000,
+    )
     channel_entry: str = Field(default="web", max_length=64)
     attachment_retention_days: int = Field(default=7, ge=1, le=365)
     attachment_max_mb: int = Field(default=25, ge=1, le=200)
@@ -2866,6 +2907,88 @@ def _failure_reason_from_run_events(events: Iterable[RunEventResponse]) -> str |
     return fallback
 
 
+_RUN_DEBUG_MAX_EVENTS = 50
+_RUN_DEBUG_PREVIEW_CHARS = 2000
+
+
+def _run_debug_from_detail(run: RunDetailResponse) -> RunDebugResponse:
+    sorted_events = sorted(run.events, key=lambda item: item.sequence)
+    failure_event = _failure_event_from_run_events(sorted_events)
+    failure_reason = (
+        _safe_model_check_detail(failure_event.message)
+        if failure_event is not None
+        else _mode_error_display_reason(_failure_reason_from_run_events(sorted_events))
+    )
+    artifacts = [_run_debug_artifact(artifact) for artifact in run.artifacts]
+    return RunDebugResponse(
+        run_id=run.id,
+        status=run.status,
+        mode=run.mode,
+        failed_stage=failure_event.kind if failure_event is not None else None,
+        failure_reason=failure_reason,
+        partial_output_available=any(artifact.has_text for artifact in artifacts),
+        request_preview=_safe_debug_preview(run.request, max_chars=1000) or "",
+        events=[_safe_debug_event(event) for event in sorted_events[-_RUN_DEBUG_MAX_EVENTS:]],
+        artifacts=artifacts,
+        explicit_details=dict(run.explicit_details),
+        recommendation=_run_debug_recommendation(failure_reason, run.status),
+        generated_at=datetime.now(UTC),
+    )
+
+
+def _failure_event_from_run_events(events: Iterable[RunEventResponse]) -> RunEventResponse | None:
+    fallback: RunEventResponse | None = None
+    for event in sorted(events, key=lambda item: item.sequence, reverse=True):
+        if event.kind not in {"runtime.failed", "step.failed", "tool.failed"} or not event.message:
+            continue
+        safe_event = event.model_copy(update={"message": _safe_model_check_detail(event.message)})
+        if fallback is None:
+            fallback = safe_event
+        if not is_legacy_generic_failure_reason(safe_event.message):
+            return safe_event
+    return fallback
+
+
+def _safe_debug_event(event: RunEventResponse) -> RunEventResponse:
+    return event.model_copy(update={"payload": _event_payload(event.payload)})
+
+
+def _run_debug_artifact(artifact: RunArtifactResponse) -> RunDebugArtifactResponse:
+    preview = _safe_debug_preview(artifact.text)
+    return RunDebugArtifactResponse(
+        id=artifact.id,
+        kind=artifact.kind,
+        title=artifact.title,
+        has_text=preview is not None,
+        text_preview=preview,
+    )
+
+
+def _safe_debug_preview(value: str | None, *, max_chars: int = _RUN_DEBUG_PREVIEW_CHARS) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped or _contains_sensitive_marker(stripped):
+        return None
+    return stripped[:max_chars]
+
+
+def _run_debug_recommendation(reason: str, status: str) -> str:
+    lowered = reason.lower()
+    if "model gateway" in lowered or "model transport" in lowered or "status=" in lowered:
+        return (
+            "模型服务链路失败：检查主 Agent/子 Agent 绑定的模型、API Base、模型名、API Key、"
+            "LiteLLM 服务状态、上游状态码以及并发/限流配置。"
+        )
+    if "agent identifier" in lowered or "safe identifier" in lowered:
+        return "角色标识不合法：检查 Agent ID/角色 ID，只使用字母、数字、下划线或短横线。"
+    if "tool" in lowered or "mcp" in lowered or "skill" in lowered:
+        return "工具链路失败：检查 Skill/MCP/插件是否已启用、权限是否允许、参数是否完整。"
+    if status == "failed":
+        return "运行已失败：按事件顺序查看最后一条 failed 事件，并保留中断前产物用于复盘。"
+    return "运行未处于失败状态：可查看最近事件确认当前进度。"
+
+
 def _failure_reason_from_event_dicts(events: Iterable[dict[str, object]]) -> str | None:
     sorted_events = sorted(
         events,
@@ -3157,12 +3280,83 @@ def _admin_run_event(event: dict[str, object]) -> RunEventResponse:
     sequence = event.get("sequence")
     kind = event.get("kind")
     message = event.get("reason") or event.get("message") or kind
+    payload = event.get("payload")
     return RunEventResponse(
         sequence=sequence if type(sequence) is int else 1,
         kind=kind if type(kind) is str else "event",
         message=message if type(message) is str else "event recorded",
         created_at=datetime.now(UTC),
+        actor=_optional_event_string(event.get("actor")),
+        participants=_event_string_list(event.get("participants")),
+        tool_name=_optional_event_string(event.get("tool_name")),
+        step_id=_optional_event_string(event.get("step_id")),
+        action=_optional_event_string(event.get("action")),
+        decision=_optional_event_string(event.get("decision")),
+        payload=_event_payload(payload),
     )
+
+
+_SENSITIVE_EVENT_DETAIL_KEYS = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "authorization",
+        "bearer",
+        "credential",
+        "credential_ref",
+        "password",
+        "secret",
+        "secret_ref",
+        "token",
+    }
+)
+
+
+def _optional_event_string(value: object) -> str | None:
+    return value if type(value) is str and value else None
+
+
+def _event_string_list(value: object) -> list[str]:
+    if not isinstance(value, list | tuple):
+        return []
+    return [item for item in value if type(item) is str and item]
+
+
+def _event_payload(value: object) -> dict[str, JsonValue]:
+    if not isinstance(value, Mapping):
+        return {}
+    payload: dict[str, JsonValue] = {}
+    for key, item in value.items():
+        key_text = str(key)
+        payload[key_text] = _safe_event_detail(item, key=key_text)
+    return payload
+
+
+def _safe_event_detail(value: object, *, key: str | None = None, depth: int = 0) -> JsonValue:
+    if key is not None and _is_sensitive_event_detail_key(key):
+        return "[redacted]"
+    if depth >= 6:
+        return "[truncated]"
+    if value is None or type(value) in {str, int, float, bool}:
+        return cast(JsonValue, value)
+    if isinstance(value, Mapping):
+        safe_mapping: dict[str, JsonValue] = {}
+        for nested_key, nested_value in value.items():
+            nested_key_text = str(nested_key)
+            safe_mapping[nested_key_text] = _safe_event_detail(
+                nested_value,
+                key=nested_key_text,
+                depth=depth + 1,
+            )
+        return safe_mapping
+    if isinstance(value, list | tuple):
+        return tuple(_safe_event_detail(item, depth=depth + 1) for item in value)
+    return str(value)
+
+
+def _is_sensitive_event_detail_key(key: str) -> bool:
+    lowered = key.lower()
+    return any(sensitive in lowered for sensitive in _SENSITIVE_EVENT_DETAIL_KEYS)
 
 
 def _admin_run_artifact(artifact: dict[str, object]) -> RunArtifactResponse:
@@ -3514,6 +3708,23 @@ async def get_operational_run(
     _require(principal, "run:read")
     try:
         return await service.get_run(run_id)
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+
+
+@router.get(
+    "/runs/{run_id}/debug",
+    response_model=RunDebugResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def get_operational_run_debug(
+    run_id: UUID,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> RunDebugResponse:
+    _require(principal, "run:read")
+    try:
+        return _run_debug_from_detail(await service.get_run(run_id))
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
 

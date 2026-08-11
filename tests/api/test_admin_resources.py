@@ -18,12 +18,15 @@ from agent_hub.api.routers.admin import (
     McpServerRequest,
     ModelDeploymentRequest,
     PersistentAdminResourceService,
+    RunArtifactResponse,
     RunDetailResponse,
     RunEventResponse,
     SecretCreateRequest,
     _admin_run_artifact,
+    _admin_run_event,
     _mode_error_log_from_run,
     _model_check_failure_details,
+    _run_debug_from_detail,
 )
 from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
@@ -167,6 +170,35 @@ def test_run_detail_response_can_expose_mode_decision_token() -> None:
     assert response.decision_token == token
 
 
+def test_admin_run_event_exposes_safe_process_details_without_secrets() -> None:
+    response = _admin_run_event(
+        {
+            "sequence": 7,
+            "kind": "tool.completed",
+            "message": "read repository summary",
+            "actor": "reviewer",
+            "participants": ["reviewer", "security-reviewer"],
+            "tool_name": "github_reader",
+            "step_id": "collect-context",
+            "action": "inspect",
+            "payload": {
+                "command": "git diff --stat",
+                "api_key": "sk-should-not-leak",
+                "nested": {"token": "secret", "result": "ok"},
+            },
+        }
+    )
+
+    assert response.actor == "reviewer"
+    assert response.participants == ["reviewer", "security-reviewer"]
+    assert response.tool_name == "github_reader"
+    assert response.step_id == "collect-context"
+    assert response.action == "inspect"
+    assert response.payload["command"] == "git diff --stat"
+    assert response.payload["api_key"] == "[redacted]"
+    assert response.payload["nested"] == {"token": "[redacted]", "result": "ok"}
+
+
 @pytest.mark.parametrize(
     ("mode", "reason"),
     [
@@ -300,6 +332,76 @@ def test_mode_error_log_prefers_specific_step_reason_over_generic_terminal() -> 
         == "CrewAI step execution failed: agent identifier must be a safe identifier"
     )
     assert "diagnosis" not in log.details
+
+
+def test_run_debug_snapshot_preserves_partial_output_and_failure_context() -> None:
+    run_id = uuid4()
+    response = RunDetailResponse(
+        id=run_id,
+        status="failed",
+        mode="hybrid",
+        queue_wait_ms=12,
+        capacity_wait_ms=3,
+        cost_usd="0.042",
+        request="生成代码审查报告",
+        events=[
+            RunEventResponse(
+                sequence=1,
+                kind="model.started",
+                message="主 Agent 开始规划",
+                created_at=datetime.now(UTC),
+                actor="main_agent",
+                payload={"credential_ref": "secret://main"},
+            ),
+            RunEventResponse(
+                sequence=2,
+                kind="artifact.created",
+                message="已生成安全审查摘要",
+                created_at=datetime.now(UTC),
+                actor="security_reviewer",
+            ),
+            RunEventResponse(
+                sequence=3,
+                kind="runtime.failed",
+                message="hybrid discuss failed: model gateway failed: model transport failed",
+                created_at=datetime.now(UTC),
+            ),
+        ],
+        artifacts=[
+            RunArtifactResponse(
+                id="artifact_1",
+                kind="text",
+                title="安全审查摘要",
+                text="已经完成静态审查，发现 2 个高风险问题。",
+            )
+        ],
+        explicit_details={"routing_reason": "cross_domain_task"},
+    )
+
+    debug = _run_debug_from_detail(response)
+
+    assert debug.run_id == run_id
+    assert debug.failed_stage == "runtime.failed"
+    assert debug.failure_reason == "hybrid discuss failed: model gateway failed: model transport failed"
+    assert debug.partial_output_available is True
+    assert debug.artifacts[0].text_preview == "已经完成静态审查，发现 2 个高风险问题。"
+    assert debug.events[0].payload["credential_ref"] == "[redacted]"
+    assert "模型服务" in debug.recommendation
+
+
+def test_run_debug_endpoint_exposes_safe_failure_snapshot() -> None:
+    api = client()
+    run_id = "22222222-2222-4222-8222-222222222222"
+
+    response = api.get(f"/api/v1/admin/runs/{run_id}/debug", headers=headers())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["run_id"] == run_id
+    assert body["events"][0]["kind"] == "queued"
+    assert body["partial_output_available"] is False
+    assert body["artifacts"][0]["title"] == "Readiness report"
+    assert body["artifacts"][0]["has_text"] is False
 
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")

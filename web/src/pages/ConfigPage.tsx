@@ -157,7 +157,10 @@ export function ConfigPage() {
       <div className="status-grid" aria-label="核心能力设置">
         <article className="status-card">
           <span>实时调度</span>
-          <p>默认模式：{settings.default_mode}。可在下方“运行默认值”里调整自动、直接、派单、讨论或混合模式。</p>
+          <p>
+            默认模式：{settings.default_mode}；
+            {settings.allow_main_agent_override ? "允许主 Agent 临场调整" : "严格按预设执行"}。
+          </p>
         </article>
         <article className="status-card">
           <span>工具防护</span>
@@ -271,6 +274,42 @@ export function ConfigPage() {
             高风险工具调用必须审批
           </label>
         </fieldset>
+
+        <h3>主 Agent 全局临场策略</h3>
+        <p className="field-help">
+          这里控制所有工作流共用的调度边界。工作流只定义模板；主 Agent 能不能临场调整、能不能申请临时子 Agent，
+          都在这里统一开关。开启后仍必须先向用户核对，不能静默改工作流。
+        </p>
+        <fieldset>
+          <legend>临场调度边界</legend>
+          <label className="inline-check">
+            <input
+              type="checkbox"
+              checked={settings.allow_main_agent_override}
+              onChange={(event) => updateSettings({ allow_main_agent_override: event.target.checked })}
+            />
+            允许主 Agent 提出临场调整，执行前必须向用户核对
+          </label>
+          <label className="inline-check">
+            <input
+              type="checkbox"
+              checked={settings.allow_temporary_agents}
+              onChange={(event) => updateSettings({ allow_temporary_agents: event.target.checked })}
+            />
+            允许主 Agent 在能力不足时申请临时子 Agent
+          </label>
+        </fieldset>
+        <label htmlFor="temporary-agent-policy">
+          临时 Agent 补位规则
+          <textarea
+            id="temporary-agent-policy"
+            value={settings.temporary_agent_policy}
+            onChange={(event) => updateSettings({ temporary_agent_policy: event.target.value })}
+          />
+          <small>
+            建议写清：什么时候可以申请、必须说明哪些信息、是否允许任务后永久化。该规则会写入运行调度说明。
+          </small>
+        </label>
 
         <label htmlFor="channel-entry">
           默认交互入口

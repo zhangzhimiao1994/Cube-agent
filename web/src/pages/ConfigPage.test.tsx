@@ -18,6 +18,10 @@ const settings = {
   hermes_enabled: true,
   safe_tools_enabled: true,
   require_approval_for_tools: true,
+  allow_main_agent_override: false,
+  allow_temporary_agents: false,
+  temporary_agent_policy:
+    "主 Agent 发现角色池缺少必要能力时，必须先说明原因并取得用户确认，再临时加入子 Agent。",
   channel_entry: "web",
   attachment_retention_days: 7,
   attachment_max_mb: 25,
@@ -147,6 +151,11 @@ describe("ConfigPage", () => {
     await user.selectOptions(screen.getByLabelText("默认运行模式"), "dispatch");
     await user.selectOptions(screen.getByLabelText("默认工作流"), "short-video-dispatch");
     await user.click(screen.getByLabelText(/导演/));
+    await user.click(screen.getByLabelText("允许主 Agent 提出临场调整，执行前必须向用户核对"));
+    await user.click(screen.getByLabelText("允许主 Agent 在能力不足时申请临时子 Agent"));
+    fireEvent.change(screen.getByLabelText(/临时 Agent 补位规则/), {
+      target: { value: "缺少专业能力时先申请临时 Agent，任务结束后询问是否永久保存。" },
+    });
     await user.click(screen.getByRole("button", { name: "保存系统设置" }));
 
     expect((await screen.findByRole("status")).textContent).toContain("系统设置已保存");
@@ -157,6 +166,9 @@ describe("ConfigPage", () => {
         default_mode: "dispatch",
         default_workflow_id: "short-video-dispatch",
         default_agent_ids: ["director"],
+        allow_main_agent_override: true,
+        allow_temporary_agents: true,
+        temporary_agent_policy: "缺少专业能力时先申请临时 Agent，任务结束后询问是否永久保存。",
       },
     });
   });

@@ -218,6 +218,11 @@ const SystemSettingsSchema = z.object({
   hermes_enabled: z.boolean(),
   safe_tools_enabled: z.boolean(),
   require_approval_for_tools: z.boolean(),
+  allow_main_agent_override: z.boolean().default(false),
+  allow_temporary_agents: z.boolean().default(false),
+  temporary_agent_policy: z.string().default(
+    "主 Agent 发现角色池缺少必要能力时，必须先说明原因并取得用户确认，再临时加入子 Agent。",
+  ),
   channel_entry: z.string(),
   attachment_retention_days: z.number(),
   attachment_max_mb: z.number(),
@@ -304,6 +309,13 @@ const RunEventSchema = z.object({
   kind: z.string(),
   message: z.string(),
   created_at: z.string(),
+  actor: z.string().nullable().optional(),
+  participants: z.array(z.string()).default([]),
+  tool_name: z.string().nullable().optional(),
+  step_id: z.string().nullable().optional(),
+  action: z.string().nullable().optional(),
+  decision: z.string().nullable().optional(),
+  payload: z.record(z.string(), z.unknown()).default({}),
 });
 
 const RunArtifactSchema = z.object({

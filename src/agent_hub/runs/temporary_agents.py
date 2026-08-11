@@ -120,22 +120,36 @@ class AdminResourceTemporaryAgentPolicy:
         del actor_id
         if mode not in {TaskMode.DISPATCH, TaskMode.HYBRID}:
             return None
-        if not allow_workflow_adjustment or workflow_id is None:
+        if not allow_workflow_adjustment:
             return None
-        workflow = await self._payload(tenant_id, "workflow", workflow_id)
-        if workflow is None or workflow.get("allow_temporary_agents") is not True:
+        workflow = await self._payload(tenant_id, "workflow", workflow_id) if workflow_id else None
+        settings = await self._payload(tenant_id, "setting", "system")
+        global_allows_temporary_agents = (
+            settings is not None
+            and settings.get("allow_main_agent_override") is True
+            and settings.get("allow_temporary_agents") is True
+        )
+        legacy_workflow_allows_temporary_agents = (
+            settings is None
+            and workflow is not None
+            and workflow.get("allow_temporary_agents") is True
+        )
+        if not global_allows_temporary_agents and not legacy_workflow_allows_temporary_agents:
             return None
         spec = _infer_capability(message)
         if spec is None:
             return None
-        selected_ids = agent_ids or _string_tuple(workflow.get("agent_ids"))
+        selected_ids = agent_ids or _string_tuple(workflow.get("agent_ids") if workflow is not None else None)
         selected_agents = await self._agents(tenant_id, selected_ids)
         if _agents_cover(selected_agents, spec):
             return None
-        policy = str(workflow.get("temporary_agent_policy") or "").strip()
+        policy_source = settings if global_allows_temporary_agents else workflow
+        policy = str((policy_source or {}).get("temporary_agent_policy") or "").strip()
+        pool_label = f"工作流 {workflow_id} 的角色池" if workflow_id else "当前角色池"
         reason = (
-            f"当前工作流 {workflow_id} 的角色池缺少 {spec.capability} 能力；"
-            f"规则：{policy}" if policy else f"当前工作流 {workflow_id} 的角色池缺少 {spec.capability} 能力。"
+            f"{pool_label}缺少 {spec.capability} 能力；规则：{policy}"
+            if policy
+            else f"{pool_label}缺少 {spec.capability} 能力。"
         )
         return TemporaryAgentProposal(
             id=spec.role_id,

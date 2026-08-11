@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Fragment, FormEvent, useEffect, useMemo, useState } from "react";
+import { Fragment, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { ApiError, api, formatApiError, type AttachmentUpload, type RunDetail, type Skill, type SubmittedRun } from "../api/client";
@@ -46,6 +46,129 @@ function displayMode(mode: string | null | undefined) {
   return RUN_MODES.find((item) => item.value === mode)?.label ?? mode ?? "等待选择";
 }
 
+function displayRoutingReason(reason: string) {
+  const normalized = reason.trim();
+  const labels: Record<string, string> = {
+    "workflow selected explicitly": "按你选择的工作流执行",
+    routing_requires_user_choice: "自动判断把握不足，需要确认模式",
+    hermes_recommendation: "Hermes 根据历史经验推荐",
+  };
+  return labels[normalized] ?? normalized;
+}
+
+function displayAgentPool(selectedAgentIds: string | undefined, agentNames: Map<string, string>) {
+  if (!selectedAgentIds) return null;
+  const names = selectedAgentIds
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((id) => agentNames.get(id) ?? id);
+  return names.length > 0 ? names.join("、") : null;
+}
+
+function displayEventTitle(event: RunDetail["events"][number], agentNames: Map<string, string>) {
+  const actor = displayEventActor(event.actor, agentNames);
+  const labels: Record<string, string> = {
+    queued: "任务已入队",
+    "run.queued": "任务已入队",
+    "model.started": actor ? `${actor} 开始调用模型` : "开始调用模型",
+    "runtime.started": "开始执行本次对话",
+    "runtime.completed": "完成本次对话",
+    "runtime.failed": "本次对话中断",
+    "message.created": actor ? `${actor} 输出阶段消息` : "输出阶段消息",
+    "artifact.created": actor ? `${actor} 生成了结果` : "生成了结果",
+    "dispatch.started": "主 Agent 开始拆解并派单",
+    "dispatch.completed": "主 Agent 完成派单汇总",
+    "discussion.started": "多角色开始讨论",
+    "discussion.completed": "多角色完成讨论",
+    "decision.started": "主 Agent 开始裁决",
+    "decision.completed": "主 Agent 完成裁决",
+    "step.started": actor ? `${actor} 开始执行` : "开始执行一个步骤",
+    "step.completed": actor ? `${actor} 完成执行` : "完成一个步骤",
+    "step.failed": actor ? `${actor} 执行失败` : "一个步骤执行失败",
+    "tool.started": event.tool_name ? `开始使用工具：${event.tool_name}` : "开始使用工具",
+    "tool.completed": event.tool_name ? `工具执行完成：${event.tool_name}` : "工具执行完成",
+    "tool.failed": event.tool_name ? `工具执行失败：${event.tool_name}` : "工具执行失败",
+    "approval.requested": "等待你确认后继续",
+    "approval.resolved": "确认已处理",
+    "temporary_agent.proposed": "主 Agent 建议临时加入子 Agent",
+  };
+  return labels[event.kind] ?? "执行了一步操作";
+}
+
+function displayEventMessage(event: RunDetail["events"][number]) {
+  const readableMessage =
+    event.message && event.message !== event.kind && !/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(event.message)
+      ? event.message
+      : null;
+  const messages: Record<string, string> = {
+    queued: "任务已进入队列，等待 Worker 调度执行。",
+    "run.queued": "任务已进入队列，等待 Worker 调度执行。",
+    "model.started": "模型请求已开始。",
+    "runtime.started": "运行时已启动，正在按模式执行。",
+    "runtime.completed": "运行完成，已汇总结果。",
+    "runtime.failed": readableMessage ?? "运行失败，请查看日志中心的模式运行错误。",
+    "message.created": readableMessage ?? "运行过程中产生了一条可公开消息。",
+    "artifact.created": "已生成一个可查看的结果或中间产物。",
+    "dispatch.started": "主 Agent 正在拆解任务，并准备派给合适角色。",
+    "dispatch.completed": "派单执行完成，主 Agent 正在汇总结论。",
+    "discussion.started": "多个角色开始讨论方案、分歧和取舍。",
+    "discussion.completed": readableMessage ?? "讨论完成，已形成阶段性结论。",
+    "decision.started": "主 Agent 开始根据目标、证据和风险做裁决。",
+    "decision.completed": readableMessage ?? "主 Agent 已完成裁决并整理最终结论。",
+    "step.started": readableMessage ?? "一个执行步骤已开始。",
+    "step.completed": readableMessage ?? "一个执行步骤已完成。",
+    "step.failed": readableMessage ?? "一个执行步骤失败，已保留失败前的输出。",
+    "tool.started": readableMessage ?? "工具调用已开始。",
+    "tool.completed": readableMessage ?? "工具调用已完成。",
+    "tool.failed": readableMessage ?? "工具调用失败，已记录错误上下文。",
+    "approval.requested": "主 Agent 需要你确认后再继续。",
+    "approval.resolved": "你的确认已处理，任务会继续推进。",
+    "temporary_agent.proposed": "主 Agent 建议临时加入一个子 Agent。",
+  };
+  return messages[event.kind] ?? readableMessage ?? "系统记录了一步运行过程。";
+}
+
+function displayEventActor(actor: string | null | undefined, agentNames: Map<string, string>) {
+  if (!actor) return null;
+  return agentNames.get(actor) ?? actor;
+}
+
+function displayEventParticipants(participants: string[], agentNames: Map<string, string>) {
+  const names = participants.map((id) => agentNames.get(id) ?? id).filter(Boolean);
+  return names.length > 0 ? names.join("、") : null;
+}
+
+function formatEventPayloadValue(value: unknown): string {
+  if (value === null || typeof value === "undefined") return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function eventDetailRows(event: RunDetail["events"][number], agentNames: Map<string, string>) {
+  const rows: Array<{ label: string; value: string }> = [];
+  const actor = displayEventActor(event.actor, agentNames);
+  const participants = displayEventParticipants(event.participants, agentNames);
+  if (actor) rows.push({ label: "执行者", value: actor });
+  if (participants) rows.push({ label: "参与者", value: participants });
+  if (event.tool_name) rows.push({ label: "工具", value: event.tool_name });
+  if (event.step_id) rows.push({ label: "步骤", value: event.step_id });
+  if (event.action) rows.push({ label: "动作", value: event.action });
+  if (event.decision) rows.push({ label: "决策", value: event.decision });
+  Object.entries(event.payload).forEach(([key, value]) => {
+    const formatted = formatEventPayloadValue(value);
+    if (formatted) {
+      rows.push({ label: `详情：${key}`, value: formatted });
+    }
+  });
+  return rows;
+}
+
 function toggle(list: string[], value: string) {
   return list.includes(value) ? list.filter((item) => item !== value) : [...list, value];
 }
@@ -83,6 +206,7 @@ function detailMessages(detail: RunDetail | undefined) {
   if (!detail) return [];
   const textArtifacts = dedupeTextArtifacts(detail.artifacts);
   const replyArtifact = preferredReplyArtifact(textArtifacts);
+  const failureReason = failureReasonFromEvents(detail.events);
   const artifactMessages = replyArtifact
     ? [
         {
@@ -105,6 +229,22 @@ function detailMessages(detail: RunDetail | undefined) {
           title: `附件：${artifact.title}`,
           body: artifact.kind,
         }));
+  const failureMessages =
+    detail.status === "failed"
+      ? [
+          {
+            id: "failed",
+            role: "assistant",
+            title: artifactMessages.length > 0 ? "运行中断" : "运行失败",
+            body:
+              artifactMessages.length > 0
+                ? `中断前输出已保留。错误原因：${failureReason ?? "后端没有记录具体失败原因，请打开运行详情或调试接口排查。"}`
+                : `本次运行没有生成最终回复。错误原因：${
+                    failureReason ?? "后端没有记录具体失败原因，请展开执行摘要或到日志中心查看。"
+                  }`,
+          },
+        ]
+      : [];
   return [
     {
       id: "request",
@@ -113,17 +253,15 @@ function detailMessages(detail: RunDetail | undefined) {
       body: detail.request,
     },
     ...artifactMessages,
-    ...(detail.status === "failed" && artifactMessages.length === 0
-      ? [
-          {
-            id: "failed",
-            role: "assistant",
-            title: "运行失败",
-            body: "本次运行没有生成最终回复。请展开执行摘要查看失败阶段，或到日志中心查看完整错误。",
-          },
-        ]
-      : []),
+    ...failureMessages,
   ];
+}
+
+function failureReasonFromEvents(events: RunDetail["events"]) {
+  const event = [...events]
+    .sort((left, right) => right.sequence - left.sequence)
+    .find((item) => ["runtime.failed", "step.failed", "tool.failed"].includes(item.kind) && item.message);
+  return event?.message ?? null;
 }
 
 function dedupeTextArtifacts(artifacts: RunDetail["artifacts"]) {
@@ -145,7 +283,22 @@ function preferredReplyArtifact(artifacts: RunDetail["artifacts"]) {
   );
 }
 
-function runProcessSummary(detail: RunDetail) {
+function runConversationId(detail: RunDetail | undefined) {
+  return detail?.explicit_details.conversation_id?.trim() || null;
+}
+
+function conversationMessages(runs: RunDetail[]) {
+  return runs.flatMap((run) =>
+    detailMessages(run).map((message) => ({
+      ...message,
+      id: `${run.id}-${message.id}`,
+      run,
+    })),
+  );
+}
+
+function runProcessSummary(detail: RunDetail, agentNames: Map<string, string>) {
+  const agentPool = displayAgentPool(detail.explicit_details.selected_agent_ids, agentNames);
   const routing = [
     `运行模式：${displayMode(detail.mode)}`,
     detail.explicit_details.workflow_id ? `工作流：${detail.explicit_details.workflow_id}` : null,
@@ -156,8 +309,10 @@ function runProcessSummary(detail: RunDetail) {
             : "严格按预设"
         }`
       : null,
-    detail.explicit_details.selected_agent_ids ? `参与角色：${detail.explicit_details.selected_agent_ids}` : null,
-    detail.explicit_details.routing_reason ? `路由原因：${detail.explicit_details.routing_reason}` : null,
+    agentPool ? `参与角色：${agentPool}` : null,
+    detail.explicit_details.routing_reason
+      ? `路由原因：${displayRoutingReason(detail.explicit_details.routing_reason)}`
+      : null,
   ].filter(Boolean);
   return { routing, events: detail.events };
 }
@@ -166,12 +321,14 @@ function RunProcessSummary({
   detail,
   open,
   onToggle,
+  agentNames,
 }: {
   detail: RunDetail;
   open: boolean;
   onToggle: () => void;
+  agentNames: Map<string, string>;
 }) {
-  const summary = runProcessSummary(detail);
+  const summary = runProcessSummary(detail, agentNames);
   const eventCount = summary.events.length;
   const routingCount = summary.routing.length > 0 ? 1 : 0;
   const total = eventCount + routingCount;
@@ -180,8 +337,8 @@ function RunProcessSummary({
     <section className="run-process-summary" aria-label="折叠的运行过程">
       <button type="button" className="run-process-toggle" aria-expanded={open} onClick={onToggle}>
         <span aria-hidden="true">‹/›</span>
-        <strong>执行 {total} 条步骤</strong>
-        <small>{open ? "点击收起" : "点击查看详情"}</small>
+        <strong>已运行 {total} 个动作</strong>
+        <small>{open ? "点击收起" : "展开执行轨迹"}</small>
       </button>
       {open ? (
         <div className="run-process-detail">
@@ -193,13 +350,28 @@ function RunProcessSummary({
               ))}
             </article>
           ) : null}
-          {summary.events.map((event) => (
-            <article key={event.sequence}>
-              <span className="eyebrow">{event.kind}</span>
-              <p>{event.message}</p>
-              <small>{event.created_at}</small>
-            </article>
-          ))}
+          {summary.events.map((event) => {
+            const detailRows = eventDetailRows(event, agentNames);
+            return (
+              <article key={event.sequence}>
+                <span className="eyebrow">
+                  动作 {event.sequence} · {displayEventTitle(event, agentNames)}
+                </span>
+                <p>{displayEventMessage(event)}</p>
+                {detailRows.length > 0 ? (
+                  <dl>
+                    {detailRows.map((row) => (
+                      <Fragment key={`${event.sequence}-${row.label}`}>
+                        <dt>{row.label}</dt>
+                        <dd>{row.value}</dd>
+                      </Fragment>
+                    ))}
+                  </dl>
+                ) : null}
+                <small>{event.created_at}</small>
+              </article>
+            );
+          })}
         </div>
       ) : null}
     </section>
@@ -274,6 +446,8 @@ export function RunsPage() {
     approved: boolean;
   } | null>(null);
   const [temporaryFeedback, setTemporaryFeedback] = useState("");
+  const userSelectedMode = useRef(false);
+  const autoModeChoiceKey = useRef<string | null>(null);
   const trimmedReferenceConversationId = referenceConversationId.trim();
 
   const selectedWorkflow = useMemo(
@@ -297,16 +471,30 @@ export function RunsPage() {
     enabled: false,
   });
 
+  const selectedRunConversationId = runConversationId(selectedRun.data);
+  const activeConversation = useQuery({
+    queryKey: ["conversation", selectedRunConversationId],
+    queryFn: () => api.conversation(selectedRunConversationId ?? ""),
+    enabled: Boolean(selectedRunConversationId),
+    refetchInterval: (query) => {
+      const data = query.state.data;
+      return data?.runs.some((run) => !TERMINAL_STATUSES.has(run.status)) ? 1000 : false;
+    },
+  });
+
   useEffect(() => {
     if (!settings.data) return;
-    setMode(settings.data.default_mode);
+    if (!userSelectedMode.current) setMode(settings.data.default_mode);
     setWorkflowId(settings.data.default_workflow_id ?? "");
     setAgentIds(settings.data.default_agent_ids);
   }, [settings.data]);
 
   useEffect(() => {
     if (!selectedWorkflow) return;
-    if (selectedWorkflow.mode) setMode(selectedWorkflow.mode);
+    if (selectedWorkflow.mode) {
+      userSelectedMode.current = true;
+      setMode(selectedWorkflow.mode);
+    }
     setAgentIds(selectedWorkflow.agent_ids ?? []);
   }, [selectedWorkflow]);
 
@@ -316,6 +504,10 @@ export function RunsPage() {
       setModeSelection(selection);
     } else if (selectedRun.data && selectedRun.data.status !== "waiting_user_mode") {
       setModeSelection(null);
+    }
+    const selectedConversationId = runConversationId(selectedRun.data);
+    if (selectedConversationId) {
+      setConversationId(selectedConversationId);
     }
   }, [selectedRun.data]);
 
@@ -329,7 +521,7 @@ export function RunsPage() {
         message: message.trim(),
         mode,
         workflow_id: workflowId || null,
-        allow_workflow_adjustment: selectedWorkflow?.allow_main_agent_override ?? false,
+        allow_workflow_adjustment: mode !== "direct" && (settings.data?.allow_main_agent_override ?? false),
         agent_ids: mode === "direct" ? agentIds.slice(0, 1) : agentIds,
         conversation_id: conversationId,
         reference_conversation_id: referenceConversationId.trim() || null,
@@ -363,6 +555,9 @@ export function RunsPage() {
       setAttachmentDraft(null);
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
       await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
+      if (run.conversation_id) {
+        await queryClient.invalidateQueries({ queryKey: ["conversation", run.conversation_id] });
+      }
     },
   });
 
@@ -383,6 +578,15 @@ export function RunsPage() {
       await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
     },
   });
+
+  useEffect(() => {
+    if (!modeSelection || mode === "auto" || chooseMode.isPending) return;
+    const key = `${modeSelection.runId}:${modeSelection.version}:${mode}`;
+    if (autoModeChoiceKey.current === key) return;
+    autoModeChoiceKey.current = key;
+    setSubmitNotice(`已按你选择的“${displayMode(mode)}”继续执行，不再重复确认模式。`);
+    chooseMode.mutate(mode as ManualRunMode);
+  }, [modeSelection, mode, chooseMode]);
 
   const approveTemporaryAgent = useMutation({
     mutationFn: () => {
@@ -543,6 +747,33 @@ export function RunsPage() {
     createRun.mutate();
   }
 
+  function startNewConversation() {
+    setSelectedRunId(null);
+    setConversationId(newConversationId());
+    setReferenceConversationId("");
+    setMessage("");
+    setTemporaryApproval(null);
+    setModeSelection(null);
+    setProcessOpen(false);
+    setSubmitNotice("已新建空白对话。请选择模式后开始新的会话。");
+  }
+
+  function startHandoffConversation() {
+    const sourceConversationId = runConversationId(selectedRun.data) ?? conversationId;
+    if (!sourceConversationId) {
+      setSubmitNotice("当前没有可 Handoff 的会话。");
+      return;
+    }
+    setSelectedRunId(null);
+    setReferenceConversationId(sourceConversationId);
+    setConversationId(newConversationId());
+    setMessage("");
+    setTemporaryApproval(null);
+    setModeSelection(null);
+    setProcessOpen(false);
+    setSubmitNotice(`已按原思路开启新对话：新对话会读取 ${sourceConversationId} 作为参考上下文。`);
+  }
+
   function loadReferenceConversation() {
     if (!trimmedReferenceConversationId) return;
     void referenceConversation.refetch();
@@ -555,9 +786,12 @@ export function RunsPage() {
 
   const items = runs.data ?? [];
   const selectedMode = RUN_MODES.find((item) => item.value === mode) ?? RUN_MODES[0];
-  const messages = detailMessages(selectedRun.data);
   const savedAgents = agents.data ?? [];
   const savedWorkflows = workflows.data ?? [];
+  const agentNameMap = new Map(savedAgents.map((agent) => [agent.id, agent.name]));
+  const visibleRuns = activeConversation.data?.runs ?? (selectedRun.data ? [selectedRun.data] : []);
+  const messages = conversationMessages(visibleRuns);
+  const latestVisibleRun = visibleRuns.at(-1) ?? selectedRun.data;
   const directAnswerer = mode === "direct" && agentIds.length > 0 ? agentIds[0] : "main_agent";
   const deletableConversationIds = items
     .filter((run) => TERMINAL_STATUSES.has(run.status))
@@ -591,6 +825,11 @@ export function RunsPage() {
     setSelectedConversationIds((current) => toggle(current, runId));
   }
 
+  function chooseRunMode(nextMode: RunMode) {
+    userSelectedMode.current = true;
+    setMode(nextMode);
+  }
+
   function deleteSelectedConversations() {
     if (selectedDeletableConversationIds.length === 0) {
       setSubmitNotice("Please select completed, failed, or cancelled conversations first.");
@@ -622,6 +861,9 @@ export function RunsPage() {
             <h3>会话</h3>
             <span>{items.length}</span>
           </div>
+          <button type="button" className="secondary-action conversation-new-button" onClick={startNewConversation}>
+            新建对话
+          </button>
           {items.length > 0 ? (
             <div className="bulk-action-bar conversation-bulk-actions">
               <label className="inline-check compact-check">
@@ -666,6 +908,7 @@ export function RunsPage() {
                   <button
                     type="button"
                     className="conversation-item"
+                    aria-label={`进入会话 ${run.id.slice(0, 8)}`}
                     onClick={() => setSelectedRunId(run.id)}
                   >
                     <span>{displayMode(run.mode)}</span>
@@ -701,7 +944,7 @@ export function RunsPage() {
             <div className="chat-config-strip" aria-label="本次对话运行设置">
             <label htmlFor="run-mode">
               模式
-              <select id="run-mode" value={mode} onChange={(event) => setMode(event.target.value as RunMode)}>
+              <select id="run-mode" value={mode} onChange={(event) => chooseRunMode(event.target.value as RunMode)}>
                 {RUN_MODES.map((item) => (
                   <option key={item.value} value={item.value}>
                     {item.label}
@@ -764,10 +1007,16 @@ export function RunsPage() {
                     {selectedWorkflow.task_type ? `；适用场景：${selectedWorkflow.task_type}` : ""}
                   </p>
                   <p>
-                    工作流临场调整：
-                    {selectedWorkflow.allow_main_agent_override
-                      ? "主 Agent 可以提出改步骤、换角色或加交付物，但执行前必须向你核对。"
-                      : "关闭；主 Agent 会按该工作流预设执行，只提示明显不匹配风险。"}
+                    全局临场策略：
+                    {settings.data?.allow_main_agent_override
+                      ? "全局临场策略已开启；主 Agent 可以提出改步骤、换角色或加交付物，但执行前必须向你核对。"
+                      : "关闭；主 Agent 会按预设执行，只提示明显不匹配风险。"}
+                  </p>
+                  <p>
+                    临时子 Agent：
+                    {settings.data?.allow_temporary_agents
+                      ? "允许在能力不足时提出申请，用户确认后才加入。"
+                      : "关闭；不会临时扩充角色池。"}
                   </p>
                 </>
               ) : (
@@ -861,8 +1110,13 @@ export function RunsPage() {
           <div className="chat-stream" role="region" aria-label="主对话内容" aria-live="polite">
             {selectedRun.isLoading ? <p>正在加载会话...</p> : null}
             {selectedRun.isError ? <p role="alert">{formatApiError(selectedRun.error, "会话加载失败")}</p> : null}
+            {activeConversation.isLoading ? <p>正在读取当前会话...</p> : null}
+            {activeConversation.isError ? (
+              <p role="alert">{formatApiError(activeConversation.error, "当前会话读取失败")}</p>
+            ) : null}
+            <p className="chat-conversation-status">当前会话：{conversationId}</p>
             {!selectedRunId ? (
-              <ModeEntryPanel selectedMode={mode} onSelect={(value) => setMode(value)} />
+              <ModeEntryPanel selectedMode={mode} onSelect={chooseRunMode} />
             ) : null}
             {messages.map((item, index) => (
               <Fragment key={item.id}>
@@ -871,18 +1125,19 @@ export function RunsPage() {
                   <h3>{item.title}</h3>
                   <p>{item.body}</p>
                 </article>
-                {index === 0 && selectedRun.data ? (
+                {index === 0 && item.run ? (
                   <RunProcessSummary
-                    detail={selectedRun.data}
+                    detail={item.run}
                     open={processOpen}
                     onToggle={() => setProcessOpen((current) => !current)}
+                    agentNames={agentNameMap}
                   />
                 ) : null}
               </Fragment>
             ))}
-            {selectedRunId ? (
+            {latestVisibleRun ? (
               <div className="chat-detail-action">
-                <Link to={`/runs/${selectedRunId}`} className="secondary-action">
+                <Link to={`/runs/${latestVisibleRun.id}`} className="secondary-action">
                   查看运行详情
                 </Link>
                 <span>打开完整事件、产物、错误和运行控制。</span>
@@ -947,7 +1202,7 @@ export function RunsPage() {
                 ) : null}
               </aside>
             ) : null}
-            {modeSelection ? (
+            {modeSelection && mode === "auto" ? (
               <aside className="composer-approval-popover mode-choice-popover" role="dialog" aria-label="运行模式确认">
                 <div>
                   <span className="eyebrow">主 Agent 需要你确认</span>
@@ -1030,7 +1285,7 @@ export function RunsPage() {
             <textarea
               value={message}
               onChange={(event) => setMessage(event.target.value)}
-              placeholder="输入任务，例如：让导演、文案和剪辑师讨论一个短视频脚本方案。"
+              placeholder="输入消息，继续当前对话；也可以输入任务，例如：让导演、文案和剪辑师讨论一个短视频脚本方案。"
               required
             />
             <div className="composer-actions">
@@ -1044,6 +1299,14 @@ export function RunsPage() {
                   onChange={(event) => handleAttachmentUpload(event.currentTarget.files)}
                 />
               </label>
+              <button
+                type="button"
+                className="composer-handoff-button"
+                disabled={!selectedRun.data}
+                onClick={startHandoffConversation}
+              >
+                按照原思路开启新对话
+              </button>
               <button
                 type="button"
                 className="composer-plus-button"

@@ -33,6 +33,14 @@ def test_valid_skill_package_is_inspected() -> None:
     )
 
 
+def test_declared_tool_capability_prefix_is_not_duplicated() -> None:
+    archive = skill_zip(tools=("tool:filesystem.read",))
+
+    inspection = SkillPackageInspector().inspect(archive)
+
+    assert inspection.requested_capabilities == ("tool:filesystem.read",)
+
+
 @pytest.mark.parametrize("name", ["../escape", "/absolute", "a/../../escape", "C:/escape"])
 def test_zip_path_traversal_is_rejected(name: str) -> None:
     with pytest.raises(InvalidSkillPackage):

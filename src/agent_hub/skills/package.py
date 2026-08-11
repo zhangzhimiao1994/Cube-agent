@@ -231,7 +231,7 @@ def _validate_pinned_dependencies(dependency_bytes: bytes) -> None:
 
 def _requested_capabilities(manifest: SkillManifest) -> tuple[str, ...]:
     capabilities: list[str] = []
-    capabilities.extend(f"tool:{tool}" for tool in manifest.declared_tools)
+    capabilities.extend(tool if tool.startswith("tool:") else f"tool:{tool}" for tool in manifest.declared_tools)
     if manifest.network_policy.mode == "allowlist":
         capabilities.extend(f"network:{host}" for host in manifest.network_policy.allow_hosts)
     capabilities.extend(f"write:{path}" for path in manifest.writable_paths)
