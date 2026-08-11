@@ -204,6 +204,7 @@ class RunRepository:
         mode: TaskMode,
         decision_token: str,
         version: int,
+        operator_note: str | None = None,
     ) -> RunRecord:
         async with self._session_factory() as session, session.begin():
             row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
@@ -218,6 +219,11 @@ class RunRepository:
                 raise RunConflict("run version is stale")
 
             row.mode = mode.value
+            row.routing_decision = {
+                **routing_decision,
+                "selected_mode": mode.value,
+                **({"operator_note": operator_note} if operator_note else {}),
+            }
             row.status = RunStatus.QUEUED.value
             row.version += 1
             await session.flush()

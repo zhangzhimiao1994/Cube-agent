@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from decimal import Decimal
 from typing import Protocol
 from uuid import UUID
@@ -144,7 +144,7 @@ class ConfigBackedDirectRuntime:
         config = PlatformConfig.model_validate(current.document)
         if not config.models:
             return UnavailableRuntime(TaskMode.DIRECT)
-        logical_model = _direct_logical_model(config)
+        logical_model = _direct_logical_model(config, context.routing_decision)
         deployments = _deployments(config)
         gateway = ModelGateway(
             ModelRegistry(deployments),
@@ -700,7 +700,14 @@ def _high_risk_task(task: object) -> bool:
     )
 
 
-def _direct_logical_model(config: PlatformConfig) -> str:
+def _direct_logical_model(
+    config: PlatformConfig,
+    routing_decision: object | None = None,
+) -> str:
+    if isinstance(routing_decision, Mapping):
+        requested = routing_decision.get("direct_model")
+        if isinstance(requested, str) and requested:
+            return requested
     if "main" in config.models:
         return "main"
     if "direct" in config.models:

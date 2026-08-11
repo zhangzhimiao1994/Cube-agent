@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
@@ -20,6 +21,7 @@ from agent_hub.runtime.registry import RuntimeRegistry
 _LOGGER = logging.getLogger(__name__)
 _AUTO_RESOLVE_MAX_SINGLE_COST_USD = Decimal("0.50")
 _AUTO_RESOLVE_MAX_TOTAL_COST_USD = Decimal("0.75")
+_SAFE_MODEL_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,10 +173,14 @@ class RunService:
         conversation_id: str | None = None,
         reference_conversation_id: str | None = None,
         attachment_ids: tuple[str, ...] = (),
+        direct_model: str | None = None,
         channel_context: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         effective_conversation_id = conversation_id or f"conv-{uuid4().hex}"
+        cleaned_direct_model = direct_model.strip() if direct_model else None
+        if cleaned_direct_model and _SAFE_MODEL_ID.fullmatch(cleaned_direct_model) is None:
+            raise ValueError("direct_model must be a safe logical model identifier")
         operator_selection: dict[str, object] = {
             "selected_agent_ids": list(agent_ids),
             "workflow_id": workflow_id,
@@ -186,6 +192,8 @@ class RunService:
             "reference_conversation_id": reference_conversation_id,
             "attachment_ids": list(attachment_ids),
         }
+        if cleaned_direct_model:
+            operator_selection["direct_model"] = cleaned_direct_model
         if channel_context:
             operator_selection.update(_safe_channel_context(channel_context))
         if mode is TaskMode.AUTO:
@@ -490,14 +498,17 @@ class RunService:
         mode: TaskMode,
         decision_token: str,
         version: int,
+        operator_note: str | None = None,
     ) -> SubmittedRun:
         del actor_id
+        cleaned_operator_note = operator_note.strip() if operator_note else None
         record = await self._repository.choose_mode_and_enqueue(
             tenant_id=tenant_id,
             run_id=run_id,
             mode=mode,
             decision_token=decision_token,
             version=version,
+            operator_note=cleaned_operator_note[:2000] if cleaned_operator_note else None,
         )
         return _submitted(record)
 

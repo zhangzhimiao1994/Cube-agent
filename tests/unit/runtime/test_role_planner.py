@@ -173,6 +173,24 @@ def test_general_dispatch_includes_daily_execution_roles() -> None:
     assert len(plan.roles) >= 10
 
 
+def test_video_prompt_dispatch_selects_creative_prompt_roles() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="我想用即梦来生成 AI 视频，给我生成一段可直接使用的提示词。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "copywriter" in role_ids
+    assert "director" in role_ids
+    assert "video_editor" in role_ids
+    assert "quality_reviewer" in role_ids
+
+
 def test_role_catalog_can_be_extended_without_changing_role_planner_code() -> None:
     catalog = default_role_catalog().with_role(
         RoleDefinition(

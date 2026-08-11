@@ -31,7 +31,7 @@ const runDetail = {
       kind: "model.started",
       message: "model.started",
       created_at: "2026-08-07T00:00:00.500Z",
-      actor: "main_agent",
+      actor: "copywriter",
       participants: [],
       tool_name: null,
       step_id: null,
@@ -115,8 +115,8 @@ const mainAgent = {
   model: null,
   control_mode: "supervisor",
   decision_policy: "按证据、风险和产物质量裁决。",
-  operating_style: "控场优先，直连时选择明确的子 Agent 回答。",
-  direct_answerer: "copywriter",
+  operating_style: "控场优先，直连时选择明确的模型/API回答。",
+  direct_answerer: "",
   hermes_policy: "confirm_before_apply",
   max_review_rounds: 2,
 };
@@ -271,6 +271,7 @@ describe("operational management pages", () => {
   let visibleRunDetail = runDetail;
   let visibleConversationRuns = [runDetail];
   let visibleRunListItems = [runListItem];
+  let visibleModels = models;
   let deletedRunIds = new Set<string>();
 
   beforeEach(() => {
@@ -279,6 +280,7 @@ describe("operational management pages", () => {
     visibleRunDetail = runDetail;
     visibleConversationRuns = [visibleRunDetail];
     visibleRunListItems = [visibleRunListItem];
+    visibleModels = models;
     deletedRunIds = new Set<string>();
     vi.stubGlobal("confirm", vi.fn(() => true));
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
@@ -429,7 +431,7 @@ describe("operational management pages", () => {
           return jsonResponse(agents);
         }
         if (path === "/api/v1/admin/models") {
-          return jsonResponse(models);
+          return jsonResponse(visibleModels);
         }
         if (path === "/api/v1/admin/skills/upload" && method === "POST") {
           return jsonResponse({
@@ -602,7 +604,7 @@ describe("operational management pages", () => {
     expect(screen.queryByLabelText("临时 Agent 补位规则")).toBeNull();
   });
 
-  it("uses a single direct answerer when direct mode is selected", async () => {
+  it("uses a selected direct model instead of a child agent when direct mode is selected", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
@@ -613,10 +615,9 @@ describe("operational management pages", () => {
     expect(screen.queryByRole("button", { name: "选择直连模式" })).toBeNull();
     expect(screen.queryByRole("button", { name: "选择直连" })).toBeNull();
     await user.click(screen.getByRole("button", { name: "直连" }));
-    expect(await screen.findByRole("button", { name: /回答者：未指定/ })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: /回答者：未指定/ }));
-    await user.selectOptions(screen.getByLabelText("直连回答者"), "director");
-    await user.type(screen.getByPlaceholderText(/输入消息/), "帮我写一段口播。");
+    expect(await screen.findByText(/直连会由主 Agent 控场/)).not.toBeNull();
+    expect(screen.getByText(/1\. main/)).not.toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "1 帮我写一段口播。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     await screen.findByRole("link", { name: "查看运行详情" });
@@ -626,21 +627,26 @@ describe("operational management pages", () => {
         message: "帮我写一段口播。",
         mode: "direct",
         allow_workflow_adjustment: false,
-        agent_ids: ["director"],
+        direct_model: "main",
+        agent_ids: [],
       },
     });
   });
 
-  it("does not let direct mode silently fall back to the main agent", async () => {
+  it("does not let direct mode silently fall back before a direct model is selected", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: "直连" }));
-    expect((screen.getByRole("button", { name: "发送" }) as HTMLButtonElement).disabled).toBe(true);
-    await user.click(screen.getByRole("button", { name: /回答者：未指定/ }));
-    await user.selectOptions(screen.getByLabelText("直连回答者"), "copywriter");
+    expect(screen.getByText(/直连需要先选择本次对话使用的模型\/API/)).not.toBeNull();
     await user.type(screen.getByPlaceholderText(/输入消息/), "直接回答这句话。");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+    expect(screen.getByText(/请先回复模型编号/)).not.toBeNull();
+    expect(requests.filter((request) => request.path === "/api/v1/runs" && request.method === "POST")).toHaveLength(0);
+
+    await user.clear(screen.getByPlaceholderText(/输入消息/));
+    await user.type(screen.getByPlaceholderText(/输入消息/), "coder 直接回答这句话。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
@@ -648,22 +654,23 @@ describe("operational management pages", () => {
       body: {
         message: "直接回答这句话。",
         mode: "direct",
-        agent_ids: ["copywriter"],
+        direct_model: "coder",
+        agent_ids: [],
       },
     });
   });
 
-  it("requires the selected direct answerer to have a registered model before sending", async () => {
+  it("shows an actionable empty state when direct mode has no configured models", async () => {
     const user = userEvent.setup();
+    visibleRunListItems = [];
+    visibleModels = [];
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: "直连" }));
-    await user.click(screen.getByRole("button", { name: /回答者：未指定/ }));
-    await user.selectOptions(screen.getByLabelText("直连回答者"), "analyst-unbound");
     await user.type(screen.getByPlaceholderText(/输入消息/), "请直接分析一下这个问题。");
 
-    expect(screen.getByText(/回答者绑定的模型\/API 未注册或未通过配置/)).not.toBeNull();
+    expect(screen.getAllByText(/还没有可用于直连的已测试模型/).length).toBeGreaterThan(0);
     expect((screen.getByRole("button", { name: "发送" }) as HTMLButtonElement).disabled).toBe(true);
     expect(requests.filter((request) => request.path === "/api/v1/runs" && request.method === "POST")).toHaveLength(0);
   });
@@ -677,6 +684,29 @@ describe("operational management pages", () => {
     const stream = screen.getByRole("region", { name: "主对话内容" });
     expect(within(stream).getByText(/这是最终回复正文/)).not.toBeNull();
     expect(within(stream).queryByText("产物：短视频脚本")).toBeNull();
+  });
+
+  it("does not show internal decision-review artifacts as the final assistant reply", async () => {
+    visibleRunDetail = {
+      ...runDetail,
+      artifacts: [
+        {
+          id: "artifact-internal-review",
+          kind: "markdown",
+          title: "decision_recorder",
+          text: "Result: 未满足用户目标。Evidence: 这是内部裁决记录，不应该直接展示成最终回复。",
+        },
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    expect(within(stream).queryByText(/Result: 未满足用户目标/)).toBeNull();
+    expect(within(stream).getByText(/这轮只生成了内部审查或裁决内容/)).not.toBeNull();
   });
 
   it("keeps older conversation messages when a later run is appended", async () => {
@@ -824,13 +854,18 @@ describe("operational management pages", () => {
     expect(within(stream).queryByText("model.started")).toBeNull();
 
     expect(within(stream).queryByText("正在实时刷新运行状态")).toBeNull();
-    await user.click(within(stream).getByRole("button", { name: /已记录 3 个关键步骤/ }));
+    expect(within(stream).queryByRole("button", { name: /已记录 3 个关键步骤/ })).toBeNull();
+    expect(within(stream).getByRole("button", { name: /文案生成生成了结果/ })).not.toBeNull();
+    expect(within(stream).getByRole("button", { name: /多角色完成讨论/ })).not.toBeNull();
+    await user.click(within(stream).getByRole("button", { name: /文案生成生成了结果/ }));
     expect(within(stream).queryByText("任务已进入队列，等待 Worker 调度执行。")).toBeNull();
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     expect(within(drawer).queryByText("任务已进入队列，等待 Worker 调度执行。")).toBeNull();
     expect(within(drawer).queryByText("model.started")).toBeNull();
     expect(within(drawer).queryByText("模型请求已开始。")).toBeNull();
     expect(within(drawer).getByText("得到一版可拍摄脚本文案")).not.toBeNull();
+    expect(within(drawer).getByText("调用模型")).not.toBeNull();
+    expect(within(drawer).getByText("qwen-max")).not.toBeNull();
   });
 
   it("shows localized process summaries with participating roles instead of raw event codes", async () => {
@@ -841,24 +876,21 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    await user.click(within(stream).getByRole("button", { name: /已记录 3 个关键步骤/ }));
+    await user.click(within(stream).getByRole("button", { name: /多角色完成讨论/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
 
-    expect(within(drawer).getByText("参与角色：导演、文案生成、剪辑师")).not.toBeNull();
-    expect(within(drawer).getByText(/文案生成 生成了结果/)).not.toBeNull();
-    expect(within(drawer).getByText(/多角色完成讨论/)).not.toBeNull();
+    expect(within(drawer).getByText("参与者")).not.toBeNull();
+    expect(within(drawer).getByText("导演、文案生成、剪辑师")).not.toBeNull();
+    expect(within(drawer).queryByText(/文案生成 生成了结果/)).toBeNull();
+    expect(within(drawer).getAllByText(/多角色完成讨论/).length).toBeGreaterThan(0);
     expect(within(drawer).getAllByText(/采用可拍摄性最高的方案/).length).toBeGreaterThan(0);
     expect(within(drawer).getByText("导演认为要优先可拍摄性。")).not.toBeNull();
     expect(within(drawer).getByText("文案建议强化开头钩子。")).not.toBeNull();
     expect(within(drawer).getByText("剪辑师建议三段式节奏。")).not.toBeNull();
     expect(within(drawer).getByText("主 Agent 选择可拍摄性最高且风险最低的方案。")).not.toBeNull();
     expect(within(drawer).getAllByText("执行者").length).toBeGreaterThan(0);
-    expect(within(drawer).getByText("文案生成")).not.toBeNull();
-    expect(within(drawer).getByText("工具")).not.toBeNull();
-    expect(within(drawer).getByText("artifact_writer")).not.toBeNull();
     expect(within(drawer).getByText("参与者")).not.toBeNull();
     expect(within(drawer).getByText("导演、文案生成、剪辑师")).not.toBeNull();
-    expect(within(drawer).getByText("[redacted]")).not.toBeNull();
     expect(within(drawer).queryByText("artifact.created")).toBeNull();
   });
 
@@ -899,6 +931,30 @@ describe("operational management pages", () => {
     });
   });
 
+  it("uses a mode keyword from the new-chat input without requiring numeric choices", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(screen.getByRole("button", { name: "自动" })).not.toBeNull();
+    expect(screen.getByRole("button", { name: "直连" })).not.toBeNull();
+    expect(screen.getByRole("button", { name: "派单" })).not.toBeNull();
+    expect(screen.getByRole("button", { name: "讨论" })).not.toBeNull();
+    expect(screen.getByRole("button", { name: "混合" })).not.toBeNull();
+
+    await user.type(screen.getByPlaceholderText(/输入消息/), "讨论 请让多个角色评审这个方案。");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    await screen.findByRole("link", { name: "查看运行详情" });
+    expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
+      method: "POST",
+      body: {
+        message: "请让多个角色评审这个方案。",
+        mode: "discuss",
+      },
+    });
+  });
+
   it("continues with the manually selected mode when the backend asks for mode clarification", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
@@ -908,6 +964,17 @@ describe("operational management pages", () => {
     await user.type(screen.getByPlaceholderText(/输入消息/), "这个任务不应该二次确认。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
+    expect(screen.queryByRole("dialog", { name: "运行模式确认" })).toBeNull();
+    expect(await screen.findByText(/请在当前输入框回复编号或关键词/)).not.toBeNull();
+    expect(
+      within(screen.getByLabelText("运行模式确认")).getByText(
+        (_, node) => node?.tagName === "LI" && (node.textContent?.includes("3. 讨论") ?? false),
+      ),
+    ).not.toBeNull();
+
+    await user.type(screen.getByPlaceholderText(/输入消息/), "讨论 补充：让每个角色先给出不同意见。");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
     await waitFor(() =>
       expect(requests.find((request) => request.path === `/api/v1/runs/${runId}/choose-mode`)).toMatchObject({
         method: "POST",
@@ -915,10 +982,10 @@ describe("operational management pages", () => {
           mode: "discuss",
           decision_token: "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
           version: 1,
+          operator_note: "补充：让每个角色先给出不同意见。",
         },
       }),
     );
-    expect(screen.queryByRole("dialog", { name: "运行模式确认" })).toBeNull();
   });
 
   it("uploads a skill zip from the chat composer and requires explicit approval", async () => {
@@ -1047,8 +1114,10 @@ describe("operational management pages", () => {
 
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText(/主 Agent 已生成角色和提示词/)).not.toBeNull();
-    expect((within(dialog).getByRole("button", { name: /接受|accept|加入/i }) as HTMLButtonElement).disabled).toBe(true);
-    await user.selectOptions(within(dialog).getByLabelText("运行模型"), "coder");
+    expect(within(dialog).getByText(/建议模型\/API：coder/)).not.toBeNull();
+    expect(within(dialog).getByText(/匹配缺少能力 software_engineering/)).not.toBeNull();
+    expect((within(dialog).getByLabelText("运行模型") as HTMLSelectElement).value).toBe("coder");
+    expect((within(dialog).getByRole("button", { name: /接受|accept|加入/i }) as HTMLButtonElement).disabled).toBe(false);
     await user.click(within(dialog).getByRole("button", { name: /接受|accept|加入/i }));
     await waitFor(() =>
       expect(requests.find((request) => request.path === `/api/v1/runs/${runId}/approve-temporary-agent`)).toMatchObject({

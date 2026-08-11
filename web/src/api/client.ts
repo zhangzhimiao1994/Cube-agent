@@ -800,6 +800,7 @@ export const api = {
     message: string;
     mode: "auto" | "direct" | "dispatch" | "discuss" | "hybrid";
     agent_ids?: string[];
+    direct_model?: string | null;
     workflow_id?: string | null;
     allow_workflow_adjustment?: boolean;
     conversation_id?: string | null;
@@ -832,6 +833,7 @@ export const api = {
       mode: "direct" | "dispatch" | "discuss" | "hybrid";
       decision_token: string;
       version: number;
+      operator_note?: string;
     },
   ): Promise<SubmittedRun> {
     return request(

@@ -2,11 +2,11 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
-import { ApiError, api, formatApiError, type AttachmentUpload, type RunDetail, type Skill, type SubmittedRun } from "../api/client";
+import { ApiError, api, formatApiError, type AttachmentUpload, type ModelDeployment, type RunDetail, type Skill, type SubmittedRun } from "../api/client";
 
 const RUN_MODES = [
   { value: "auto", label: "自动", description: "主 Agent 判断应使用直连、派单、讨论或混合；不确定时向你确认。" },
-  { value: "direct", label: "直连", description: "由你指定一个子 Agent 回答，主 Agent 只负责控场和记录。" },
+  { value: "direct", label: "直连", description: "由你指定一个模型/API回答，主 Agent 负责控场、提示词和记录。" },
   { value: "dispatch", label: "派单", description: "适合拆成多个专业角色执行；派给谁由工作流或本次选择决定。" },
   { value: "discuss", label: "讨论", description: "适合多角色观点冲突、方案评审或需要裁决的任务。" },
   { value: "hybrid", label: "混合", description: "先讨论定方案，再派单执行，最后审查收口。" },
@@ -30,6 +30,12 @@ type ChatAttachmentDraft = {
   size: number;
   kind: "code_review" | "image" | "context";
   attachment?: AttachmentUpload;
+};
+type TemporaryAgentProposal = NonNullable<SubmittedRun["temporary_agent_proposal"]>;
+type RunSubmissionOverride = {
+  message?: string;
+  directModel?: string;
+  mode?: RunMode;
 };
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
@@ -56,6 +62,74 @@ function displayRoutingReason(reason: string) {
     hermes_recommendation: "Hermes 根据历史经验推荐",
   };
   return labels[normalized] ?? normalized;
+}
+
+function parseChoiceText(
+  text: string,
+  options: Array<{ value: string; label: string; aliases?: string[] }>,
+) {
+  const raw = text.trim();
+  if (!raw || options.length === 0) return null;
+  const numbered = raw.match(/^([1-9])(?:[\s.、:：-]+)?([\s\S]*)$/);
+  if (numbered) {
+    const index = Number(numbered[1]) - 1;
+    if (index >= 0 && index < options.length) {
+      return { option: options[index], note: (numbered[2] ?? "").trim() };
+    }
+  }
+  const lower = raw.toLowerCase();
+  const candidates = options.flatMap((option) =>
+    [option.label, option.value, ...(option.aliases ?? [])]
+      .filter(Boolean)
+      .map((alias) => ({ option, alias, lowerAlias: alias.toLowerCase() })),
+  );
+  const matched = candidates
+    .sort((left, right) => right.lowerAlias.length - left.lowerAlias.length)
+    .find((candidate) => lower === candidate.lowerAlias || lower.includes(candidate.lowerAlias));
+  if (!matched) return null;
+  const index = lower.indexOf(matched.lowerAlias);
+  const note =
+    index < 0
+      ? raw
+      : `${raw.slice(0, index)} ${raw.slice(index + matched.alias.length)}`
+          .replace(/^[\s.、:：-]+|[\s.、:：-]+$/g, "")
+          .trim();
+  return { option: matched.option, note };
+}
+
+function parseLeadingKeywordChoiceText(
+  text: string,
+  options: Array<{ value: string; label: string; aliases?: string[] }>,
+) {
+  const raw = text.trim();
+  if (!raw || options.length === 0) return null;
+  const candidates = options
+    .flatMap((option) =>
+      [option.label, option.value, ...(option.aliases ?? [])]
+        .filter(Boolean)
+        .map((alias) => ({ option, alias, lowerAlias: alias.toLowerCase() })),
+    )
+    .sort((left, right) => right.lowerAlias.length - left.lowerAlias.length);
+  const lower = raw.toLowerCase();
+  const matched = candidates.find(
+    (candidate) =>
+      lower === candidate.lowerAlias ||
+      lower.startsWith(`${candidate.lowerAlias} `) ||
+      lower.startsWith(`${candidate.lowerAlias}：`) ||
+      lower.startsWith(`${candidate.lowerAlias}:`) ||
+      lower.startsWith(`${candidate.lowerAlias}，`) ||
+      lower.startsWith(`${candidate.lowerAlias},`) ||
+      lower.startsWith(`${candidate.lowerAlias}。`) ||
+      lower.startsWith(`${candidate.lowerAlias}.`) ||
+      lower.startsWith(`${candidate.lowerAlias}、`) ||
+      lower.startsWith(`${candidate.lowerAlias}-`),
+  );
+  if (!matched) return null;
+  const note = raw
+    .slice(matched.alias.length)
+    .replace(/^[\s.、:：,，-]+/, "")
+    .trim();
+  return { option: matched.option, note };
 }
 
 function displayAgentPool(selectedAgentIds: string | undefined, agentNames: Map<string, string>) {
@@ -232,6 +306,14 @@ function eventDetailRows(event: RunDetail["events"][number], agentNames: Map<str
   return rows;
 }
 
+type ProcessDetailTarget = {
+  id: string;
+  title: string;
+  message: string;
+  rows: Array<{ label: string; value: string }>;
+  createdAt: string | null;
+};
+
 function toggle(list: string[], value: string) {
   return list.includes(value) ? list.filter((item) => item !== value) : [...list, value];
 }
@@ -269,6 +351,7 @@ function detailMessages(detail: RunDetail | undefined) {
   if (!detail) return [];
   const textArtifacts = dedupeTextArtifacts(detail.artifacts);
   const replyArtifact = preferredReplyArtifact(textArtifacts);
+  const internalNotice = internalArtifactNotice(detail);
   const failureReason = failureReasonFromEvents(detail.events);
   const artifactMessages = replyArtifact
     ? [
@@ -315,6 +398,7 @@ function detailMessages(detail: RunDetail | undefined) {
       title: "你",
       body: detail.request,
     },
+    ...(internalNotice ? [internalNotice] : []),
     ...artifactMessages,
     ...failureMessages,
   ];
@@ -338,10 +422,11 @@ function dedupeTextArtifacts(artifacts: RunDetail["artifacts"]) {
 }
 
 function preferredReplyArtifact(artifacts: RunDetail["artifacts"]) {
-  const preferredTitles = new Set(["main", "final_synthesizer", "decision_recorder", "domain_expert"]);
+  const preferredTitles = new Set(["main", "final_synthesizer", "domain_expert", "copywriter"]);
+  const internalTitles = new Set(["decision_recorder", "quality_reviewer", "reviewer"]);
   return (
     [...artifacts].reverse().find((artifact) => preferredTitles.has(artifact.title)) ??
-    artifacts.at(-1) ??
+    [...artifacts].reverse().find((artifact) => !internalTitles.has(artifact.title)) ??
     null
   );
 }
@@ -360,24 +445,156 @@ function conversationMessages(runs: RunDetail[]) {
   );
 }
 
-function runProcessSummary(detail: RunDetail, agentNames: Map<string, string>) {
+function internalArtifactNotice(detail: RunDetail) {
+  const textArtifacts = dedupeTextArtifacts(detail.artifacts);
+  if (textArtifacts.length === 0) return null;
+  if (preferredReplyArtifact(textArtifacts)) return null;
+  return {
+    id: "internal-artifacts",
+    role: "assistant",
+    title: "回复待生成",
+    body: "这轮只生成了内部审查或裁决内容，没有生成可直接交付给你的正式回复。请点运行过程查看原因，或继续补充要求让主 Agent 重新生成。",
+  };
+}
+
+function processRoutingRows(detail: RunDetail, agentNames: Map<string, string>) {
   const agentPool = displayAgentPool(detail.explicit_details.selected_agent_ids, agentNames);
-  const routing = [
-    `运行模式：${displayMode(detail.mode)}`,
-    detail.explicit_details.workflow_id ? `工作流：${detail.explicit_details.workflow_id}` : null,
+  return [
+    { label: "运行模式", value: displayMode(detail.mode) },
+    detail.explicit_details.workflow_id ? { label: "工作流", value: detail.explicit_details.workflow_id } : null,
     detail.explicit_details.workflow_adjustment_policy
-      ? `工作流调整：${
-          detail.explicit_details.workflow_adjustment_policy === "ask_before_apply"
-            ? "允许提出，执行前核对"
-            : "严格按预设"
-        }`
+      ? {
+          label: "工作流调整",
+          value:
+            detail.explicit_details.workflow_adjustment_policy === "ask_before_apply"
+              ? "允许提出，执行前核对"
+              : "严格按预设",
+        }
       : null,
-    agentPool ? `参与角色：${agentPool}` : null,
+    agentPool ? { label: "参与角色", value: agentPool } : null,
     detail.explicit_details.routing_reason
-      ? `路由原因：${displayRoutingReason(detail.explicit_details.routing_reason)}`
+      ? { label: "路由原因", value: displayRoutingReason(detail.explicit_details.routing_reason) }
       : null,
-  ].filter(Boolean);
-  return { routing, events: detail.events.filter((event) => !isNoiseEvent(event)) };
+  ].filter((item): item is { label: string; value: string } => Boolean(item));
+}
+
+function eventSummaryText(event: RunDetail["events"][number], agentNames: Map<string, string>) {
+  const title = displayEventTitle(event, agentNames).replace(/\s+/g, "");
+  if (event.kind === "runtime.failed") {
+    return title;
+  }
+  const payloadResult =
+    formatEventPayloadValue(event.payload.result) ||
+    formatEventPayloadValue(event.payload.conclusion) ||
+    formatEventPayloadValue(event.payload.summary) ||
+    formatEventPayloadValue(event.payload.final_decision) ||
+    formatEventPayloadValue(event.payload.main_agent_judgement) ||
+    formatEventPayloadValue(event.payload.main_agent_judgment);
+  const message = displayEventMessage(event);
+  const detail = payloadResult || (message !== "系统记录了一步运行过程。" ? message : "");
+  return detail ? `${title}：${detail}` : title;
+}
+
+function modelRowsForEvent(
+  event: RunDetail["events"][number],
+  events: RunDetail["events"],
+  agentNames: Map<string, string>,
+) {
+  const rows: Array<{ label: string; value: string }> = [];
+  const eventModel = formatEventPayloadValue(event.payload.model || event.payload.logical_model);
+  if (eventModel) rows.push({ label: "调用模型", value: eventModel });
+  if (!eventModel && event.actor) {
+    const modelEvent = [...events]
+      .filter((candidate) => candidate.kind === "model.started" && candidate.actor === event.actor && candidate.sequence <= event.sequence)
+      .sort((left, right) => right.sequence - left.sequence)
+      .at(0);
+    const model = modelEvent ? formatEventPayloadValue(modelEvent.payload.model || modelEvent.payload.logical_model) : "";
+    if (model) rows.push({ label: "调用模型", value: model });
+  }
+  const actor = displayEventActor(event.actor, agentNames);
+  if (actor && rows.length > 0) rows.unshift({ label: "模型使用者", value: actor });
+  return rows;
+}
+
+function recommendTemporaryAgentModel(
+  proposal: TemporaryAgentProposal,
+  models: ModelDeployment[],
+) {
+  if (models.length === 0) return null;
+  const text = [
+    proposal.id,
+    proposal.name,
+    proposal.role,
+    proposal.prompt,
+    proposal.reason,
+    proposal.missing_capability,
+    ...(proposal.suggested_skills ?? []),
+  ]
+    .join(" ")
+    .toLowerCase();
+  const scored = models.map((model) => {
+    const haystack = [
+      model.logical_model,
+      model.provider,
+      model.upstream_model,
+      model.api_protocol,
+      ...model.capabilities,
+    ]
+      .join(" ")
+      .toLowerCase();
+    let score = Math.max(0, model.effective_slots);
+    const reasons: string[] = [];
+    if (/software|code|工程|网页|前端|后端|backend|frontend|program/.test(text)) {
+      if (/code|coder|claude|sonnet|qwen|kimi/.test(haystack)) {
+        score += 8;
+        reasons.push(`匹配缺少能力 ${proposal.missing_capability || "software_engineering"}`);
+      }
+    }
+    if (/copy|文案|脚本|提示词|prompt|视频|导演|creative/.test(text)) {
+      if (/chat|text|qwen|kimi|deepseek|claude|sonnet/.test(haystack)) {
+        score += 5;
+        reasons.push("适合生成文案、脚本或提示词");
+      }
+    }
+    if (/analysis|finance|经济|研究|research/.test(text)) {
+      if (/reason|analysis|max|sonnet|qwen|deepseek/.test(haystack)) {
+        score += 4;
+        reasons.push("适合分析和审查");
+      }
+    }
+    return { model, score, reason: reasons[0] ?? "综合模型能力、并发槽位和角色需求预选" };
+  });
+  return scored.sort((left, right) => right.score - left.score || left.model.logical_model.localeCompare(right.model.logical_model))[0];
+}
+
+function runProcessItems(detail: RunDetail, agentNames: Map<string, string>): ProcessDetailTarget[] {
+  const routingRows = processRoutingRows(detail, agentNames);
+  const routingAgentPool = displayAgentPool(detail.explicit_details.selected_agent_ids, agentNames);
+  const routingItem =
+    routingRows.length > 0
+      ? [
+          {
+            id: `${detail.id}-routing`,
+            title: "主 Agent 调度判断",
+            message: `主 Agent 选择${displayMode(detail.mode)}${routingAgentPool ? `：${routingAgentPool}` : ""}`,
+            rows: routingRows,
+            createdAt: null,
+          },
+        ]
+      : [];
+  const eventItems = detail.events
+    .filter((event) => !isNoiseEvent(event))
+    .map((event, index) => {
+      const rows = [...modelRowsForEvent(event, detail.events, agentNames), ...eventDetailRows(event, agentNames)];
+      return {
+        id: `${detail.id}-event-${event.sequence}-${index}`,
+        title: displayEventTitle(event, agentNames),
+        message: eventSummaryText(event, agentNames),
+        rows,
+        createdAt: event.created_at,
+      };
+    });
+  return [...routingItem, ...eventItems];
 }
 
 function RunProcessSummary({
@@ -386,35 +603,30 @@ function RunProcessSummary({
   agentNames,
 }: {
   detail: RunDetail;
-  onOpen: () => void;
+  onOpen: (target: ProcessDetailTarget) => void;
   agentNames: Map<string, string>;
 }) {
-  const summary = runProcessSummary(detail, agentNames);
-  const eventCount = summary.events.length;
-  const routingCount = summary.routing.length > 0 ? 1 : 0;
-  const total = eventCount + routingCount;
-  if (total === 0) return null;
+  const items = runProcessItems(detail, agentNames);
+  if (items.length === 0) return null;
   return (
     <section className="run-process-summary" aria-label="折叠的运行过程">
-      <button type="button" className="run-process-toggle" aria-expanded={false} onClick={onOpen}>
-        <span aria-hidden="true">‹/›</span>
-        <strong>已记录 {total} 个关键步骤</strong>
-        <small>查看本轮执行、讨论和裁决</small>
-      </button>
+      {items.map((item) => (
+        <button key={item.id} type="button" className="run-process-toggle" onClick={() => onOpen(item)}>
+          <span aria-hidden="true">‹/›</span>
+          <strong>{item.message}</strong>
+        </button>
+      ))}
     </section>
   );
 }
 
 function RunProcessDrawer({
-  detail,
+  target,
   onClose,
-  agentNames,
 }: {
-  detail: RunDetail;
+  target: ProcessDetailTarget;
   onClose: () => void;
-  agentNames: Map<string, string>;
 }) {
-  const summary = runProcessSummary(detail, agentNames);
   return (
     <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
       <section
@@ -428,43 +640,27 @@ function RunProcessDrawer({
         <div className="process-drawer-header">
           <div>
             <span className="eyebrow">运行过程</span>
-            <h3>这轮对话执行了什么</h3>
+            <h3>{target.title}</h3>
           </div>
           <button type="button" className="secondary-action" onClick={onClose}>
             关闭
           </button>
         </div>
         <div className="run-process-detail">
-          {summary.routing.length > 0 ? (
-            <article>
-              <span className="eyebrow">调度概况</span>
-              {summary.routing.map((item) => (
-                <p key={item}>{item}</p>
-              ))}
-            </article>
-          ) : null}
-          {summary.events.map((event) => {
-            const detailRows = eventDetailRows(event, agentNames);
-            return (
-              <article key={event.sequence}>
-                <span className="eyebrow">
-                  动作 {event.sequence} · {displayEventTitle(event, agentNames)}
-                </span>
-                <p>{displayEventMessage(event)}</p>
-                {detailRows.length > 0 ? (
-                  <dl>
-                    {detailRows.map((row) => (
-                      <Fragment key={`${event.sequence}-${row.label}`}>
-                        <dt>{row.label}</dt>
-                        <dd>{row.value}</dd>
-                      </Fragment>
-                    ))}
-                  </dl>
-                ) : null}
-                <small>{event.created_at}</small>
-              </article>
-            );
-          })}
+          <article>
+            <p>{target.message}</p>
+            {target.rows.length > 0 ? (
+              <dl>
+                {target.rows.map((row) => (
+                  <Fragment key={`${target.id}-${row.label}`}>
+                    <dt>{row.label}</dt>
+                    <dd>{row.value}</dd>
+                  </Fragment>
+                ))}
+              </dl>
+            ) : null}
+            {target.createdAt ? <small>{target.createdAt}</small> : null}
+          </article>
         </div>
       </section>
     </div>
@@ -480,7 +676,7 @@ function ModeEntryPanel({
 }) {
   const entryModes = [
     { value: "auto", label: "自动", description: "主 Agent 判断该怎么回复；把握不足时才向你确认。" },
-    { value: "direct", label: "直连", description: "指定一个子 Agent 直接回答，主 Agent 只控场。" },
+    { value: "direct", label: "直连", description: "指定一个模型/API直接回答，主 Agent 负责控场和提示词。" },
     { value: "dispatch", label: "派单", description: "把任务拆给合适角色执行，最后汇总成一条回复。" },
     { value: "discuss", label: "讨论", description: "多角色表达意见，主 Agent 说明取舍。" },
     { value: "hybrid", label: "混合", description: "先讨论定方案，再派单执行，适合复杂问题。" },
@@ -529,9 +725,9 @@ export function RunsPage() {
   const [selectedConversationIds, setSelectedConversationIds] = useState<string[]>([]);
   const [submitNotice, setSubmitNotice] = useState<string | null>(null);
   const [configOpen, setConfigOpen] = useState(false);
-  const [directAnswererPickerOpen, setDirectAnswererPickerOpen] = useState(false);
+  const [directModel, setDirectModel] = useState("");
   const [showModeEntry, setShowModeEntry] = useState(true);
-  const [processDetailRun, setProcessDetailRun] = useState<RunDetail | null>(null);
+  const [processDetailTarget, setProcessDetailTarget] = useState<ProcessDetailTarget | null>(null);
   const [modeSelection, setModeSelection] = useState<ModeSelection | null>(null);
   const [skillInstallCandidate, setSkillInstallCandidate] = useState<SkillInstallCandidate | null>(null);
   const [attachmentDraft, setAttachmentDraft] = useState<ChatAttachmentDraft | null>(null);
@@ -545,7 +741,6 @@ export function RunsPage() {
   const [temporaryFeedback, setTemporaryFeedback] = useState("");
   const [temporaryAgentModel, setTemporaryAgentModel] = useState("");
   const userSelectedMode = useRef(false);
-  const autoModeChoiceKey = useRef<string | null>(null);
   const trimmedReferenceConversationId = referenceConversationId.trim();
 
   const selectedWorkflow = useMemo(
@@ -601,31 +796,52 @@ export function RunsPage() {
   useEffect(() => {
     const selection = modeSelectionFromRunDetail(selectedRun.data);
     if (selection) {
-      setModeSelection(selection);
-    } else if (selectedRun.data && selectedRun.data.status !== "waiting_user_mode") {
+      if (
+        !modeSelection ||
+        modeSelection.runId !== selection.runId ||
+        modeSelection.version !== selection.version ||
+        modeSelection.decisionToken !== selection.decisionToken
+      ) {
+        setModeSelection(selection);
+      }
+    } else if (
+      selectedRun.data &&
+      selectedRun.data.status !== "waiting_user_mode" &&
+      modeSelection &&
+      modeSelection.runId !== selectedRun.data.id
+    ) {
       setModeSelection(null);
     }
     const selectedConversationId = runConversationId(selectedRun.data);
     if (selectedConversationId) {
       setConversationId(selectedConversationId);
     }
-  }, [selectedRun.data]);
+  }, [modeSelection, selectedRun.data]);
 
   useEffect(() => {
-    setProcessDetailRun(null);
+    setProcessDetailTarget(null);
   }, [selectedRunId]);
 
+  useEffect(() => {
+    if (!temporaryApproval || temporaryApproval.approved || temporaryAgentModel) return;
+    const recommended = recommendTemporaryAgentModel(temporaryApproval.proposal, models.data ?? []);
+    if (recommended) {
+      setTemporaryAgentModel(recommended.model.logical_model);
+    }
+  }, [temporaryApproval, temporaryAgentModel, models.data]);
+
   const createRun = useMutation({
-    mutationFn: () => {
-      const enabledAgents = (agents.data ?? []).filter((agent) => agent.enabled);
-      const enabledAgentIds = new Set(enabledAgents.map((agent) => agent.id));
-      const directAgentId = agentIds.find((agentId) => enabledAgentIds.has(agentId));
+    mutationFn: (override?: RunSubmissionOverride) => {
+      const runMessage = (override?.message ?? message).trim();
+      const runMode = override?.mode ?? mode;
+      const selectedDirectModel = (override?.directModel ?? directModel).trim();
       return api.createRun({
-        message: message.trim(),
-        mode,
+        message: runMessage,
+        mode: runMode,
         workflow_id: workflowId || null,
-        allow_workflow_adjustment: mode !== "direct" && (settings.data?.allow_main_agent_override ?? false),
-        agent_ids: mode === "direct" && directAgentId ? [directAgentId] : agentIds,
+        allow_workflow_adjustment: runMode !== "direct" && (settings.data?.allow_main_agent_override ?? false),
+        agent_ids: runMode === "direct" ? [] : agentIds,
+        direct_model: runMode === "direct" ? selectedDirectModel : null,
         conversation_id: conversationId,
         reference_conversation_id: referenceConversationId.trim() || null,
         attachment_ids: attachmentDraft?.attachment ? [attachmentDraft.attachment.id] : [],
@@ -652,7 +868,7 @@ export function RunsPage() {
         setTemporaryApproval(null);
         setTemporaryAgentModel("");
         setModeSelection(selection);
-        setSubmitNotice("主 Agent 对这轮回复的模式判断不够确定，请在输入框上方选择运行模式后继续。");
+        setSubmitNotice("主 Agent 对这轮回复的模式判断不够确定，请直接在输入框回复编号或关键词继续。");
       } else {
         setTemporaryApproval(null);
         setTemporaryAgentModel("");
@@ -670,12 +886,13 @@ export function RunsPage() {
   });
 
   const chooseMode = useMutation({
-    mutationFn: (chosenMode: ManualRunMode) => {
+    mutationFn: ({ chosenMode, operatorNote }: { chosenMode: ManualRunMode; operatorNote?: string }) => {
       if (!modeSelection) throw new Error("mode selection is unavailable");
       return api.chooseMode(modeSelection.runId, {
         mode: chosenMode,
         decision_token: modeSelection.decisionToken,
         version: modeSelection.version,
+        operator_note: operatorNote,
       });
     },
     onSuccess: async (run) => {
@@ -686,15 +903,6 @@ export function RunsPage() {
       await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
     },
   });
-
-  useEffect(() => {
-    if (!modeSelection || mode === "auto" || chooseMode.isPending) return;
-    const key = `${modeSelection.runId}:${modeSelection.version}:${mode}`;
-    if (autoModeChoiceKey.current === key) return;
-    autoModeChoiceKey.current = key;
-    setSubmitNotice(`已按你选择的“${displayMode(mode)}”继续执行，不再重复确认模式。`);
-    chooseMode.mutate(mode as ManualRunMode);
-  }, [modeSelection, mode, chooseMode]);
 
   const approveTemporaryAgent = useMutation({
     mutationFn: () => {
@@ -854,7 +1062,85 @@ export function RunsPage() {
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setSubmitNotice(null);
-    createRun.mutate();
+    const trimmed = message.trim();
+    if (!trimmed) return;
+    if (modeSelection) {
+      const choice = parseChoiceText(
+        trimmed,
+        MANUAL_RUN_MODES.map((item) => ({
+          value: item.value,
+          label: item.label,
+          aliases: [item.value, item.description],
+        })),
+      );
+      if (!choice) {
+        setSubmitNotice("请回复 1-4 的编号，或回复“直连 / 派单 / 讨论 / 混合”这类关键词；后面可以继续补充你的想法。");
+        return;
+      }
+      setMessage("");
+      setSubmitNotice(`已选择“${choice.option.label}”，正在按你的选择继续。`);
+      setMode(choice.option.value as RunMode);
+      chooseMode.mutate({
+        chosenMode: choice.option.value as ManualRunMode,
+        operatorNote: choice.note || undefined,
+      });
+      return;
+    }
+    const initialModeChoice =
+      showModeEntry && !selectedRunId
+        ? parseLeadingKeywordChoiceText(
+            trimmed,
+            RUN_MODES.map((item) => ({
+              value: item.value,
+              label: item.label,
+              aliases: [item.value],
+            })),
+          )
+        : null;
+    const effectiveMode = (initialModeChoice?.option.value as RunMode | undefined) ?? mode;
+    const effectiveMessage = initialModeChoice?.note || trimmed;
+    if (initialModeChoice) {
+      userSelectedMode.current = true;
+      setMode(effectiveMode);
+      if (!effectiveMessage) {
+        setMessage("");
+        setSubmitNotice(`已切换到“${initialModeChoice.option.label}”。现在输入你的问题即可继续。`);
+        return;
+      }
+    }
+    if (effectiveMode === "direct") {
+      if (savedModels.length === 0) {
+        setSubmitNotice("还没有可用于直连的已测试模型。请先到“模型与 API”页面保存并通过可用性测试。");
+        return;
+      }
+      const choice = parseChoiceText(
+        effectiveMessage,
+        savedModels.map((model) => ({
+          value: model.logical_model,
+          label: model.logical_model,
+          aliases: [model.upstream_model, model.provider],
+        })),
+      );
+      const selectedModel = choice?.option.value ?? directModel;
+      if (!selectedModel) {
+        setSubmitNotice("请先回复模型编号或模型关键词，例如“1”或“qwen-max”；也可以写成“2 帮我写一段口播”。");
+        return;
+      }
+      if (!registeredModelIds.has(selectedModel)) {
+        setSubmitNotice("所选直连模型/API 未注册或未通过配置，请先到模型页面修正。");
+        return;
+      }
+      setDirectModel(selectedModel);
+      const nextMessage = (choice?.note || (!choice ? effectiveMessage : "")).trim();
+      if (!nextMessage) {
+        setMessage("");
+        setSubmitNotice(`已选择直连模型/API：${selectedModel}。现在输入你的问题即可发送。`);
+        return;
+      }
+      createRun.mutate({ message: nextMessage, directModel: selectedModel, mode: effectiveMode });
+      return;
+    }
+    createRun.mutate({ message: effectiveMessage, mode: effectiveMode });
   }
 
   function startNewConversation() {
@@ -867,10 +1153,11 @@ export function RunsPage() {
     setMode(settings.data?.default_mode ?? "auto");
     setWorkflowId(settings.data?.default_workflow_id ?? "");
     setAgentIds(settings.data?.default_agent_ids ?? []);
+    setDirectModel("");
     setTemporaryApproval(null);
     setTemporaryAgentModel("");
     setModeSelection(null);
-    setProcessDetailRun(null);
+    setProcessDetailTarget(null);
     setSubmitNotice("已新建空白对话。选一个模式或直接发送，主 Agent 会按当前设置处理。");
   }
 
@@ -885,10 +1172,11 @@ export function RunsPage() {
     setReferenceConversationId(sourceConversationId);
     setConversationId(newConversationId());
     setMessage("");
+    setDirectModel("");
     setTemporaryApproval(null);
     setTemporaryAgentModel("");
     setModeSelection(null);
-    setProcessDetailRun(null);
+    setProcessDetailTarget(null);
     setSubmitNotice(`已按原思路开启新对话：新对话会读取 ${sourceConversationId} 作为参考上下文。`);
   }
 
@@ -906,25 +1194,24 @@ export function RunsPage() {
   const selectedMode = RUN_MODES.find((item) => item.value === mode) ?? RUN_MODES[0];
   const savedAgents = agents.data ?? [];
   const savedModels = models.data ?? [];
+  const temporaryModelRecommendation =
+    temporaryApproval ? recommendTemporaryAgentModel(temporaryApproval.proposal, savedModels) : null;
   const enabledAgents = savedAgents.filter((agent) => agent.enabled);
   const savedWorkflows = workflows.data ?? [];
   const agentNameMap = new Map(savedAgents.map((agent) => [agent.id, agent.name]));
   const visibleRuns = activeConversation.data?.runs ?? (selectedRun.data ? [selectedRun.data] : []);
   const messages = conversationMessages(visibleRuns);
   const latestVisibleRun = visibleRuns.at(-1) ?? selectedRun.data;
-  const directAnswerer = mode === "direct" ? (agentIds.find((id) => enabledAgents.some((agent) => agent.id === id)) ?? "") : "";
-  const directAnswererAgent = enabledAgents.find((agent) => agent.id === directAnswerer) ?? null;
-  const directAnswererName = directAnswererAgent?.name ?? "未指定";
   const registeredModelIds = new Set(savedModels.map((model) => model.logical_model));
-  const directAnswererModel = directAnswererAgent?.model?.trim() ?? "";
-  const directAnswererModelReady = mode !== "direct" || Boolean(directAnswererModel && registeredModelIds.has(directAnswererModel));
+  const directModelDeployment = savedModels.find((model) => model.logical_model === directModel) ?? null;
+  const directModelName = directModelDeployment?.logical_model ?? (directModel || "未指定");
   const directSendBlockedReason =
     mode !== "direct"
       ? null
-      : !directAnswerer
-        ? "直连需要先选择本次对话的回答者。"
-        : !directAnswererModelReady
-          ? "回答者绑定的模型/API 未注册或未通过配置，请先到 Agent 或模型页面修正。"
+      : savedModels.length === 0
+        ? "还没有可用于直连的已测试模型。请先到“模型与 API”页面保存并通过可用性测试。"
+        : directModel && !registeredModelIds.has(directModel)
+            ? "所选直连模型/API 未注册或未通过配置，请先到模型页面修正。"
           : null;
   const deletableConversationIds = items
     .filter((run) => TERMINAL_STATUSES.has(run.status))
@@ -961,12 +1248,6 @@ export function RunsPage() {
   function chooseRunMode(nextMode: RunMode) {
     userSelectedMode.current = true;
     setMode(nextMode);
-  }
-
-  function openDirectAnswererPicker() {
-    setDirectAnswererPickerOpen((current) => !current);
-    userSelectedMode.current = true;
-    setMode("direct");
   }
 
   function deleteSelectedConversations() {
@@ -1183,32 +1464,35 @@ export function RunsPage() {
           </details>
 
           <details className="inline-guide" open={mode === "direct"}>
-            <summary>{mode === "direct" ? "选择直连回答者" : "选择本次参与角色池"}</summary>
+            <summary>{mode === "direct" ? "选择直连模型/API" : "选择本次参与角色池"}</summary>
             {mode === "direct" ? (
               <>
                 <p className="field-help">
-                  直连模式由主 Agent 控场，但实际回答必须交给一个子 Agent；这里选择本轮直接回答的角色。
+                  直连模式由主 Agent 控场和组织提示词，但实际生成由这里选择的模型/API完成。
                 </p>
-                <label htmlFor="direct-answerer">
-                  直连回答者
+                <label htmlFor="direct-model">
+                  直连模型/API
                   <select
-                    id="direct-answerer"
-                    value={directAnswerer}
-                    onChange={(event) => setAgentIds(event.target.value ? [event.target.value] : [])}
+                    id="direct-model"
+                    value={directModel}
+                    onChange={(event) => setDirectModel(event.target.value)}
                   >
-                    {enabledAgents.length === 0 ? <option value="">暂无可用子 Agent</option> : null}
-                    {enabledAgents.map((agent) => (
-                      <option key={agent.id} value={agent.id}>
-                        {agent.name}（{agent.id}）
+                    <option value="">请选择直连模型/API</option>
+                    {savedModels.map((model) => (
+                      <option key={model.id} value={model.logical_model}>
+                        {model.logical_model}（{model.provider} / {model.upstream_model}）
                       </option>
                     ))}
                   </select>
                 </label>
-                {agents.isLoading ? <p className="field-help">正在加载 Agent 角色...</p> : null}
-                {agents.isError ? (
+                {models.isLoading ? <p className="field-help">正在加载已测试模型...</p> : null}
+                {models.isError ? (
                   <p className="field-help" role="alert">
-                    {formatApiError(agents.error, "Agent 列表加载失败")}
+                    {formatApiError(models.error, "模型列表加载失败")}
                   </p>
+                ) : null}
+                {savedModels.length === 0 ? (
+                  <p className="field-help">还没有可用于直连的已测试模型，请先到“模型与 API”页面配置。</p>
                 ) : null}
               </>
             ) : (
@@ -1263,6 +1547,51 @@ export function RunsPage() {
             {showModeEntry ? (
               <ModeEntryPanel selectedMode={mode} onSelect={chooseRunMode} />
             ) : null}
+            {mode === "direct" && messages.length === 0 ? (
+              <article className="chat-message assistant" aria-label="直连模型选择">
+                <span className="eyebrow">Agent Hub</span>
+                <h3>直连准备</h3>
+                {savedModels.length > 0 ? (
+                  <>
+                    <p>
+                      直连会由主 Agent 控场、组织提示词和记录过程；实际生成由你选择的模型/API完成。请回复编号或模型关键词，
+                      后面可以直接补充任务内容。
+                    </p>
+                    <ol className="choice-list">
+                      {savedModels.map((model, index) => (
+                        <li key={model.id}>
+                          {index + 1}. {model.logical_model}（{model.provider} / {model.upstream_model}）
+                        </li>
+                      ))}
+                    </ol>
+                    <p>
+                      {directModel
+                        ? `已选：${directModelName}。现在直接输入任务即可发送。`
+                        : "直连需要先选择本次对话使用的模型/API。例如：1 帮我写一段口播。"}
+                    </p>
+                  </>
+                ) : (
+                  <p>还没有可用于直连的已测试模型。请先到“模型与 API”页面保存并通过可用性测试。</p>
+                )}
+              </article>
+            ) : null}
+            {modeSelection ? (
+              <article className="chat-message assistant" aria-label="运行模式确认">
+                <span className="eyebrow">Agent Hub</span>
+                <h3>主 Agent 需要你确认运行方式</h3>
+                <p>
+                  自动检测没有足够把握，原因：{modeSelection.reason ?? "routing_requires_user_choice"}。
+                  请在当前输入框回复编号或关键词；后面可以继续补充你的想法。
+                </p>
+                <ol className="choice-list">
+                  {MANUAL_RUN_MODES.map((item, index) => (
+                    <li key={item.value}>
+                      {index + 1}. {item.label}：{item.description}
+                    </li>
+                  ))}
+                </ol>
+              </article>
+            ) : null}
             {messages.map((item, index) => (
               <Fragment key={item.id}>
                 <article className={`chat-message ${item.role}`}>
@@ -1273,7 +1602,7 @@ export function RunsPage() {
                 {item.id.endsWith("-request") && item.run ? (
                   <RunProcessSummary
                     detail={item.run}
-                    onOpen={() => setProcessDetailRun(item.run)}
+                    onOpen={setProcessDetailTarget}
                     agentNames={agentNameMap}
                   />
                 ) : null}
@@ -1288,11 +1617,10 @@ export function RunsPage() {
               </div>
             ) : null}
           </div>
-          {processDetailRun ? (
+          {processDetailTarget ? (
             <RunProcessDrawer
-              detail={processDetailRun}
-              onClose={() => setProcessDetailRun(null)}
-              agentNames={agentNameMap}
+              target={processDetailTarget}
+              onClose={() => setProcessDetailTarget(null)}
             />
           ) : null}
 
@@ -1308,6 +1636,12 @@ export function RunsPage() {
                     缺少能力：{temporaryApproval.proposal.missing_capability}；角色边界：
                     {temporaryApproval.proposal.prompt}
                   </p>
+                  {temporaryModelRecommendation ? (
+                    <p>
+                      建议模型/API：{temporaryModelRecommendation.model.logical_model}；
+                      {temporaryModelRecommendation.reason}。
+                    </p>
+                  ) : null}
                 </div>
                 <label htmlFor="temporary-agent-model">
                   运行模型
@@ -1381,33 +1715,8 @@ export function RunsPage() {
                 ) : null}
               </aside>
             ) : null}
-            {modeSelection && mode === "auto" ? (
-              <aside className="composer-approval-popover mode-choice-popover" role="dialog" aria-label="运行模式确认">
-                <div>
-                  <span className="eyebrow">主 Agent 需要你确认</span>
-                  <h3>这轮回复应该怎么运行？</h3>
-                  <p>
-                    自动检测没有足够把握，原因：{modeSelection.reason ?? "routing_requires_user_choice"}。
-                    选择后任务会继续进入队列，并按对应模式派给角色池。
-                  </p>
-                </div>
-                <div className="mode-choice-grid">
-                  {MANUAL_RUN_MODES.map((item) => (
-                    <button
-                      type="button"
-                      key={item.value}
-                      disabled={chooseMode.isPending}
-                      onClick={() => chooseMode.mutate(item.value as ManualRunMode)}
-                    >
-                      <strong>{item.label}</strong>
-                      <small>{item.description}</small>
-                    </button>
-                  ))}
-                </div>
-                {chooseMode.isError ? (
-                  <p role="alert">{formatApiError(chooseMode.error, "运行模式确认失败")}</p>
-                ) : null}
-              </aside>
+            {chooseMode.isError ? (
+              <p role="alert">{formatApiError(chooseMode.error, "运行模式确认失败")}</p>
             ) : null}
             {skillInstallCandidate ? (
               <aside className="composer-attachment-card" role="status" aria-label="Skill 安装确认">
@@ -1461,32 +1770,6 @@ export function RunsPage() {
                 </p>
               </aside>
             ) : null}
-            {mode === "direct" && directAnswererPickerOpen ? (
-              <div className="composer-inline-picker" role="region" aria-label="直连回答者设置">
-                <label htmlFor="direct-answerer-inline">
-                  直连回答者
-                  <select
-                    id="direct-answerer-inline"
-                    value={directAnswerer}
-                    onChange={(event) => setAgentIds(event.target.value ? [event.target.value] : [])}
-                  >
-                    <option value="">请选择回答者</option>
-                    {enabledAgents.map((agent) => (
-                      <option key={agent.id} value={agent.id}>
-                        {agent.name}（{agent.model || "未绑定模型"}）
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <p>
-                  {directAnswererAgent
-                    ? directAnswererModelReady
-                      ? `已绑定模型/API：${directAnswererModel}`
-                      : "回答者绑定的模型/API 未注册或未通过配置，请先到 Agent 或模型页面修正。"
-                    : "直连需要先选择本次对话的回答者。"}
-                </p>
-              </div>
-            ) : null}
             <textarea
               value={message}
               onChange={(event) => setMessage(event.target.value)}
@@ -1504,16 +1787,6 @@ export function RunsPage() {
                   onChange={(event) => handleAttachmentUpload(event.currentTarget.files)}
                 />
               </label>
-              {mode === "direct" ? (
-                <button
-                  type="button"
-                  className="composer-answerer-button"
-                  aria-label={`回答者：${directAnswererName}`}
-                  onClick={openDirectAnswererPicker}
-                >
-                  回答者：{directAnswererName}
-                </button>
-              ) : null}
               <button
                 type="button"
                 className="composer-handoff-button"
@@ -1537,7 +1810,7 @@ export function RunsPage() {
                 {mode === "auto"
                   ? "自动 · 主 Agent 判断"
                   : mode === "direct"
-                    ? `直连 · 回答者 ${directAnswererName}`
+                    ? `直连 · 模型 ${directModelName}`
                     : `${displayMode(mode)} · 本会话倾向`}
                 {mode !== "direct" && agentIds.length > 0 ? ` · 角色 ${agentIds.length} 个` : ""}
                 {referenceConversationId.trim() ? " · 已引用会话" : ""}
@@ -1549,7 +1822,7 @@ export function RunsPage() {
                 {createRun.isPending ? "发送中..." : "发送"}
               </button>
             </div>
-            {directSendBlockedReason && !directAnswererPickerOpen ? (
+            {directSendBlockedReason && !(mode === "direct" && savedModels.length === 0) ? (
               <p className="field-help" role="status">{directSendBlockedReason}</p>
             ) : null}
             {submitNotice ? <p role="status">{submitNotice}</p> : null}

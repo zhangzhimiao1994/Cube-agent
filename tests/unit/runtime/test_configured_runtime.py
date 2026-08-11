@@ -195,6 +195,72 @@ async def test_config_backed_direct_runtime_uses_published_model_and_secret() ->
 
 
 @pytest.mark.asyncio
+async def test_config_backed_direct_runtime_uses_per_run_direct_model_override() -> None:
+    transport = FakeTransport()
+    runtime = ConfigBackedDirectRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                    "coder": {
+                        "deployments": [
+                            {
+                                "provider": "qwen",
+                                "model": "qwen-max",
+                                "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                                "credential_ref": "secret://coder",
+                                "quota_scope_id": "qwen_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id, deployments
+        ),
+        transport=transport,
+    )
+
+    [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DIRECT,
+                request="直接回答",
+                routing_decision={"direct_model": "coder"},
+            )
+        )
+    ]
+
+    deployment, request, _api_key = transport.calls[0]
+    assert request.logical_model == "coder"
+    assert deployment.provider_model == "qwen/qwen-max"
+
+
+@pytest.mark.asyncio
 async def test_config_backed_direct_runtime_fails_explicitly_without_published_config() -> None:
     runtime = ConfigBackedDirectRuntime(
         config_service=FakeConfigService(None),  # type: ignore[arg-type]

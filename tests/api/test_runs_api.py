@@ -40,6 +40,7 @@ class StubRunService:
         ]
     ]
     enqueue_count: int = 0
+    direct_models: list[str | None] | None = None
 
     async def submit(
         self,
@@ -54,9 +55,12 @@ class StubRunService:
         conversation_id: str | None = None,
         reference_conversation_id: str | None = None,
         attachment_ids: tuple[str, ...] = (),
+        direct_model: str | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         del idempotency_key
+        if self.direct_models is not None:
+            self.direct_models.append(direct_model)
         self.submitted.append(
             (
                 tenant_id,
@@ -99,8 +103,9 @@ class StubRunService:
         mode: TaskMode,
         decision_token: str,
         version: int,
+        operator_note: str | None = None,
     ) -> SubmittedRun:
-        del actor_id, decision_token, version
+        del actor_id, decision_token, version, operator_note
         return SubmittedRun(
             id=run_id,
             tenant_id=tenant_id,
@@ -252,6 +257,34 @@ def test_low_confidence_submission_returns_202_waiting_user_mode_and_does_not_en
         )
     ]
     assert service.enqueue_count == 0
+
+
+def test_direct_submission_forwards_selected_model_without_agent_ids() -> None:
+    client, service, principal = _client()
+    service.direct_models = []
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={"message": "answer directly", "mode": "direct", "direct_model": "coder"},
+    )
+
+    assert response.status_code == 202
+    assert service.direct_models == ["coder"]
+    assert service.submitted == [
+        (
+            principal.tenant_id,
+            principal.user_id,
+            "answer directly",
+            TaskMode.DIRECT,
+            (),
+            None,
+            False,
+            None,
+            None,
+            (),
+        )
+    ]
 
 
 def test_submission_forwards_selected_workflow_and_agents() -> None:

@@ -845,9 +845,9 @@ _BASELINE_CATALOG_ROLE_IDS = frozenset({"project_manager", "quality_reviewer", "
 
 _ROLE_TRIGGER_KEYWORDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
     {
-        "director": ("导演", "镜头", "分镜", "剧情", "短剧", "视频", "叙事", "story", "shot"),
-        "copywriter": ("文案", "脚本", "短剧", "标题", "口播", "广告", "slogan", "copy", "script"),
-        "video_editor": ("剪辑", "字幕", "转场", "视频", "素材", "节奏", "edit", "caption"),
+        "director": ("导演", "镜头", "分镜", "剧情", "短剧", "视频", "叙事", "即梦", "文生视频", "图生视频", "story", "shot"),
+        "copywriter": ("文案", "脚本", "短剧", "标题", "口播", "广告", "提示词", "prompt", "即梦", "slogan", "copy", "script"),
+        "video_editor": ("剪辑", "字幕", "转场", "视频", "素材", "节奏", "即梦", "文生视频", "图生视频", "edit", "caption"),
         "content_editor": ("润色", "校对", "编辑", "文案", "脚本", "改写", "polish", "edit"),
         "economic_analyst": ("经济", "市场", "需求", "定价", "宏观", "商业回报", "roi", "market"),
         "finance_analyst": ("预算", "成本", "收入", "财务", "回报", "roi", "budget", "cost"),
@@ -895,19 +895,24 @@ def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
             "build",
             "prototype",
             "deliver",
+            "generate",
             "verify",
             "quality",
             "test",
+            "prompt",
+            "生成",
             "验收",
             "质量",
             "检查",
             "测试",
             "交付",
+            "提示词",
+            "可直接使用",
         )
     ):
         return True
     if role_id == "copywriter" and any(
-        keyword in task for keyword in ("文案", "脚本", "标题", "口播", "短剧", "短视频", "营销", "广告")
+        keyword in task for keyword in ("文案", "脚本", "标题", "口播", "短剧", "短视频", "营销", "广告", "提示词", "prompt", "即梦")
     ):
         return True
     if role_id == "economic_analyst" and any(

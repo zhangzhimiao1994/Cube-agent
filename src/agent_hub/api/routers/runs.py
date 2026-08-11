@@ -43,6 +43,7 @@ class RunServiceProtocol(Protocol):
         conversation_id: str | None = None,
         reference_conversation_id: str | None = None,
         attachment_ids: tuple[str, ...] = (),
+        direct_model: str | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun: ...
 
@@ -55,6 +56,7 @@ class RunServiceProtocol(Protocol):
         mode: TaskMode,
         decision_token: str,
         version: int,
+        operator_note: str | None = None,
     ) -> SubmittedRun: ...
 
     async def approve_temporary_agent(
@@ -94,6 +96,11 @@ class CreateRunRequest(BaseModel):
     message: str = Field(min_length=1, max_length=65_536)
     mode: TaskMode = TaskMode.AUTO
     agent_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=64)
+    direct_model: str | None = Field(
+        default=None,
+        max_length=128,
+        pattern=r"^[a-z0-9][a-z0-9_-]*$",
+    )
     workflow_id: str | None = Field(default=None, max_length=128)
     allow_workflow_adjustment: bool = False
     conversation_id: str | None = Field(default=None, min_length=4, max_length=128)
@@ -122,6 +129,7 @@ class ChooseModeRequest(BaseModel):
     mode: TaskMode
     decision_token: str = Field(min_length=32, max_length=160)
     version: int = Field(ge=1)
+    operator_note: str | None = Field(default=None, max_length=2000)
 
 
 class ApproveTemporaryAgentRequest(BaseModel):
@@ -360,6 +368,7 @@ async def create_run(
         conversation_id=body.conversation_id,
         reference_conversation_id=body.reference_conversation_id,
         attachment_ids=body.attachment_ids,
+        direct_model=body.direct_model,
         idempotency_key=idempotency_key,
     )
     return SubmittedRunResponse.from_submitted(submitted)
@@ -386,6 +395,7 @@ async def choose_mode(
             mode=body.mode,
             decision_token=body.decision_token,
             version=body.version,
+            operator_note=body.operator_note,
         )
     except RunNotFound as error:
         raise _run_not_found() from error
