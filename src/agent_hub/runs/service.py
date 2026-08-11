@@ -11,13 +11,15 @@ from typing import Protocol, cast
 from uuid import UUID, uuid4
 
 from agent_hub.domain.runs import RunStatus, TaskMode
-from agent_hub.routing.types import RouteDecision
+from agent_hub.routing.types import RiskLevel, RouteAssessment, RouteDecision
 from agent_hub.runs.repository import RunAlreadyActive, RunRecord, RunRepository
 from agent_hub.runtime.contracts import EventKind, JsonValue, TaskContext
 from agent_hub.runtime.failure_reason import safe_runtime_failure_reason
 from agent_hub.runtime.registry import RuntimeRegistry
 
 _LOGGER = logging.getLogger(__name__)
+_AUTO_RESOLVE_MAX_SINGLE_COST_USD = Decimal("0.50")
+_AUTO_RESOLVE_MAX_TOTAL_COST_USD = Decimal("0.75")
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,6 +268,96 @@ class RunService:
                     actor_id=actor_id,
                     request=message,
                     mode=hermes_advice.recommended_mode,
+                    status=RunStatus.QUEUED,
+                    idempotency_key=idempotency_key,
+                    routing_decision=routing_payload,
+                    enqueue=True,
+                )
+                return _submitted(record)
+
+            if _auto_resolvable_route_decision(decision):
+                assert decision is not None
+                selected = _select_auto_route_assessment(decision.assessments)
+                proposal = await self._safe_temporary_agent_proposal(
+                    tenant_id=tenant_id,
+                    actor_id=actor_id,
+                    message=message,
+                    mode=selected.mode,
+                    agent_ids=agent_ids,
+                    workflow_id=workflow_id,
+                    allow_workflow_adjustment=allow_workflow_adjustment,
+                )
+                routing_payload = {
+                    "reason": "main_agent_auto_resolved",
+                    "auto_resolution_reason": decision.clarification_reason
+                    or "routing_requires_user_choice",
+                    "auto_resolution_selected_mode": selected.mode.value,
+                    "auto_resolution_selected_confidence": selected.confidence,
+                    "auto_resolution_source_modes": [
+                        item.mode.value for item in decision.assessments
+                    ],
+                    "decision": decision.model_dump(mode="json"),
+                    **operator_selection,
+                }
+                if hermes_advice is not None:
+                    routing_payload["hermes"] = _hermes_advice_payload(hermes_advice)
+                if proposal is not None:
+                    return await self._create_temporary_agent_approval_run(
+                        tenant_id=tenant_id,
+                        actor_id=actor_id,
+                        message=message,
+                        mode=selected.mode,
+                        proposal=proposal,
+                        idempotency_key=idempotency_key,
+                        operator_selection=routing_payload,
+                    )
+                record = await self._repository.create_run(
+                    tenant_id=tenant_id,
+                    actor_id=actor_id,
+                    request=message,
+                    mode=selected.mode,
+                    status=RunStatus.QUEUED,
+                    idempotency_key=idempotency_key,
+                    routing_decision=routing_payload,
+                    enqueue=True,
+                )
+                return _submitted(record)
+
+            if decision is None:
+                fallback_mode = _local_main_agent_auto_mode(message, attachment_ids)
+                proposal = await self._safe_temporary_agent_proposal(
+                    tenant_id=tenant_id,
+                    actor_id=actor_id,
+                    message=message,
+                    mode=fallback_mode,
+                    agent_ids=agent_ids,
+                    workflow_id=workflow_id,
+                    allow_workflow_adjustment=allow_workflow_adjustment,
+                )
+                routing_payload = {
+                    "reason": "main_agent_local_fallback",
+                    "auto_resolution_reason": "router_unavailable",
+                    "auto_resolution_selected_mode": fallback_mode.value,
+                    "decision": None,
+                    **operator_selection,
+                }
+                if hermes_advice is not None:
+                    routing_payload["hermes"] = _hermes_advice_payload(hermes_advice)
+                if proposal is not None:
+                    return await self._create_temporary_agent_approval_run(
+                        tenant_id=tenant_id,
+                        actor_id=actor_id,
+                        message=message,
+                        mode=fallback_mode,
+                        proposal=proposal,
+                        idempotency_key=idempotency_key,
+                        operator_selection=routing_payload,
+                    )
+                record = await self._repository.create_run(
+                    tenant_id=tenant_id,
+                    actor_id=actor_id,
+                    request=message,
+                    mode=fallback_mode,
                     status=RunStatus.QUEUED,
                     idempotency_key=idempotency_key,
                     routing_decision=routing_payload,
@@ -742,6 +834,95 @@ def _usable_hermes_advice(advice: HermesRunAdvice | None) -> bool:
         and advice.confidence >= 0.75
         and advice.recommended_mode is not TaskMode.AUTO
     )
+
+
+def _auto_resolvable_route_decision(decision: RouteDecision | None) -> bool:
+    if decision is None:
+        return False
+    if decision.status != "waiting_user_mode":
+        return False
+    if decision.clarification_reason != "routing_requires_user_choice":
+        return False
+    if not decision.assessments:
+        return False
+    if decision.risk is RiskLevel.HIGH or decision.requires_approval:
+        return False
+    if any(
+        item.estimated_cost_usd > _AUTO_RESOLVE_MAX_SINGLE_COST_USD
+        for item in decision.assessments
+    ):
+        return False
+    return (
+        sum((item.estimated_cost_usd for item in decision.assessments), Decimal(0))
+        <= _AUTO_RESOLVE_MAX_TOTAL_COST_USD
+    )
+
+
+def _select_auto_route_assessment(assessments: tuple[RouteAssessment, ...]) -> RouteAssessment:
+    return max(assessments, key=lambda item: item.confidence)
+
+
+def _local_main_agent_auto_mode(message: str, attachment_ids: tuple[str, ...]) -> TaskMode:
+    text = message.lower()
+    if any(
+        marker in text
+        for marker in (
+            "先讨论",
+            "再执行",
+            "完整流程",
+            "端到端",
+            "调研",
+            "代码",
+            "开发",
+            "落地",
+            "审查",
+            "github",
+            "仓库",
+            "跨领域",
+            "multi-step",
+            "end-to-end",
+            "code review",
+        )
+    ):
+        return TaskMode.HYBRID
+    if any(
+        marker in text
+        for marker in (
+            "讨论",
+            "评审",
+            "争论",
+            "分歧",
+            "决策",
+            "裁决",
+            "对比",
+            "优缺点",
+            "review",
+            "debate",
+        )
+    ):
+        return TaskMode.DISCUSS
+    if attachment_ids or any(
+        marker in text
+        for marker in (
+            "文案",
+            "脚本",
+            "剪辑",
+            "导演",
+            "设计",
+            "报告",
+            "方案",
+            "计划",
+            "生成",
+            "制作",
+            "分析",
+            "整理",
+            "撰写",
+            "spreadsheet",
+            "presentation",
+        )
+    ):
+        return TaskMode.DISPATCH
+    return TaskMode.DIRECT
 
 
 def _hermes_advice_payload(advice: HermesRunAdvice) -> dict[str, object]:

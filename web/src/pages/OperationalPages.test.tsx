@@ -628,7 +628,9 @@ describe("operational management pages", () => {
 
     expect(within(stream).queryByText("正在实时刷新运行状态")).toBeNull();
     await user.click(within(stream).getByRole("button", { name: /已运行 4 个动作/ }));
-    expect(within(stream).getByText("任务已进入队列，等待 Worker 调度执行。")).not.toBeNull();
+    expect(within(stream).queryByText("任务已进入队列，等待 Worker 调度执行。")).toBeNull();
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).getByText("任务已进入队列，等待 Worker 调度执行。")).not.toBeNull();
   });
 
   it("shows localized process summaries with participating roles instead of raw event codes", async () => {
@@ -640,19 +642,38 @@ describe("operational management pages", () => {
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
     await user.click(within(stream).getByRole("button", { name: /已运行 4 个动作/ }));
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
 
-    expect(within(stream).getByText("参与角色：导演、文案生成、剪辑师")).not.toBeNull();
-    expect(within(stream).getByText(/文案生成 生成了结果/)).not.toBeNull();
-    expect(within(stream).getByText(/多角色完成讨论/)).not.toBeNull();
-    expect(within(stream).getAllByText(/采用可拍摄性最高的方案/).length).toBeGreaterThan(0);
-    expect(within(stream).getAllByText("执行者").length).toBeGreaterThan(0);
-    expect(within(stream).getByText("文案生成")).not.toBeNull();
-    expect(within(stream).getByText("工具")).not.toBeNull();
-    expect(within(stream).getByText("artifact_writer")).not.toBeNull();
-    expect(within(stream).getByText("参与者")).not.toBeNull();
-    expect(within(stream).getByText("导演、文案生成、剪辑师")).not.toBeNull();
-    expect(within(stream).getByText("[redacted]")).not.toBeNull();
-    expect(within(stream).queryByText("artifact.created")).toBeNull();
+    expect(within(drawer).getByText("参与角色：导演、文案生成、剪辑师")).not.toBeNull();
+    expect(within(drawer).getByText(/文案生成 生成了结果/)).not.toBeNull();
+    expect(within(drawer).getByText(/多角色完成讨论/)).not.toBeNull();
+    expect(within(drawer).getAllByText(/采用可拍摄性最高的方案/).length).toBeGreaterThan(0);
+    expect(within(drawer).getAllByText("执行者").length).toBeGreaterThan(0);
+    expect(within(drawer).getByText("文案生成")).not.toBeNull();
+    expect(within(drawer).getByText("工具")).not.toBeNull();
+    expect(within(drawer).getByText("artifact_writer")).not.toBeNull();
+    expect(within(drawer).getByText("参与者")).not.toBeNull();
+    expect(within(drawer).getByText("导演、文案生成、剪辑师")).not.toBeNull();
+    expect(within(drawer).getByText("[redacted]")).not.toBeNull();
+    expect(within(drawer).queryByText("artifact.created")).toBeNull();
+  });
+
+  it("keeps quick mode under main-agent auto routing without forcing direct", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话任务" })).not.toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "你好，直接回复我。");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
+      method: "POST",
+      body: {
+        message: "你好，直接回复我。",
+        mode: "auto",
+      },
+    });
+    expect(screen.queryByRole("dialog", { name: "运行模式确认" })).toBeNull();
   });
 
   it("selects the chat mode from the compact entry panel before sending", async () => {

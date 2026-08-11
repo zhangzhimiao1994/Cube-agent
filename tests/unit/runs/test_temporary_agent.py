@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
 
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.routing.types import (
+    EXECUTABLE_MODES,
+    RiskLevel,
+    RouteAssessment,
+    RouteDecision,
+    RouteSource,
+)
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRecord
 from agent_hub.runs.service import RunService, TemporaryAgentProposal
 from agent_hub.runtime.contracts import RunEvent, RuntimeCheckpoint, TaskContext
@@ -178,6 +186,149 @@ class FakeTemporaryAgentPolicy:
             suggested_skills=("frontend",),
             permanentizable=True,
         )
+
+
+class WaitingRouter:
+    def __init__(self, decision: RouteDecision) -> None:
+        self.decision = decision
+
+    async def route(self, task_text: object) -> RouteDecision:
+        del task_text
+        return self.decision
+
+
+def assessment(
+    mode: TaskMode,
+    *,
+    confidence: float,
+    risk: RiskLevel = RiskLevel.LOW,
+    cost: Decimal = Decimal("0.01"),
+) -> RouteAssessment:
+    return RouteAssessment(
+        mode=mode,
+        confidence=confidence,
+        reason=f"{mode.value}_assessment",
+        roles=(f"{mode.value}_agent",),
+        estimated_seconds=30,
+        estimated_cost_usd=cost,
+        risk=risk,
+        source=RouteSource.CLASSIFIER,
+        logical_model="test_model",
+        deployment_id="test_deployment",
+        provider_id="test_provider",
+    )
+
+
+def waiting_decision(
+    *assessments: RouteAssessment,
+    risk: RiskLevel = RiskLevel.LOW,
+    requires_approval: bool = False,
+) -> RouteDecision:
+    return RouteDecision(
+        mode=None,
+        needs_user_choice=True,
+        status="waiting_user_mode",
+        assessments=assessments,
+        clarification_reason="routing_requires_user_choice",
+        options=EXECUTABLE_MODES,
+        decision_token="safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+        version=1,
+        risk=risk,
+        requires_approval=requires_approval,
+        permissions_still_apply=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_resolves_low_risk_router_uncertainty_through_main_agent() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    queue = RecordingQueue()
+    decision = waiting_decision(
+        assessment(TaskMode.DISPATCH, confidence=0.62),
+        assessment(TaskMode.DISCUSS, confidence=0.91),
+    )
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=WaitingRouter(decision),
+        task_queue=queue,
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="分析一下方案，然后给出建议",
+        mode=TaskMode.AUTO,
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DISCUSS
+    assert submitted.decision_token is None
+    assert repository.outbox == [(submitted.id, f"{tenant_id}:{submitted.id}")]
+    routing = repository.records[submitted.id].routing_decision
+    assert routing is not None
+    assert routing["reason"] == "main_agent_auto_resolved"
+    assert routing["auto_resolution_reason"] == "routing_requires_user_choice"
+    assert routing["auto_resolution_source_modes"] == ["dispatch", "discuss"]
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_uses_local_main_agent_fallback_when_router_is_unavailable() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="用一句中文回答：烟测 auto 快速模式。",
+        mode=TaskMode.AUTO,
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DIRECT
+    routing = repository.records[submitted.id].routing_decision
+    assert routing is not None
+    assert routing["reason"] == "main_agent_local_fallback"
+    assert routing["auto_resolution_selected_mode"] == "direct"
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_still_requires_user_choice_for_high_risk_router_decision() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    decision = waiting_decision(
+        assessment(TaskMode.DISPATCH, confidence=0.92, risk=RiskLevel.HIGH),
+        risk=RiskLevel.HIGH,
+        requires_approval=True,
+    )
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=WaitingRouter(decision),
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="执行高风险操作",
+        mode=TaskMode.AUTO,
+    )
+
+    assert submitted.status is RunStatus.WAITING_USER_MODE
+    assert submitted.mode is None
+    assert submitted.decision_token is not None
+    assert repository.outbox == []
 
 
 @pytest.mark.asyncio

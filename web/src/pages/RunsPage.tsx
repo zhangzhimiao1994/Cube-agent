@@ -51,6 +51,7 @@ function displayRoutingReason(reason: string) {
   const labels: Record<string, string> = {
     "workflow selected explicitly": "按你选择的工作流执行",
     routing_requires_user_choice: "自动判断把握不足，需要确认模式",
+    main_agent_auto_resolved: "主 Agent 已根据任务现场自动裁决",
     hermes_recommendation: "Hermes 根据历史经验推荐",
   };
   return labels[normalized] ?? normalized;
@@ -319,28 +320,67 @@ function runProcessSummary(detail: RunDetail, agentNames: Map<string, string>) {
 
 function RunProcessSummary({
   detail,
-  open,
-  onToggle,
+  onOpen,
   agentNames,
 }: {
   detail: RunDetail;
-  open: boolean;
-  onToggle: () => void;
+  onOpen: () => void;
   agentNames: Map<string, string>;
 }) {
   const summary = runProcessSummary(detail, agentNames);
   const eventCount = summary.events.length;
   const routingCount = summary.routing.length > 0 ? 1 : 0;
   const total = eventCount + routingCount;
+  const preview = [
+    summary.routing[0],
+    ...summary.events.slice(0, 3).map((event) => displayEventTitle(event, agentNames)),
+  ].filter(Boolean);
   if (total === 0) return null;
   return (
     <section className="run-process-summary" aria-label="折叠的运行过程">
-      <button type="button" className="run-process-toggle" aria-expanded={open} onClick={onToggle}>
+      <button type="button" className="run-process-toggle" aria-expanded={false} onClick={onOpen}>
         <span aria-hidden="true">‹/›</span>
         <strong>已运行 {total} 个动作</strong>
-        <small>{open ? "点击收起" : "展开执行轨迹"}</small>
+        <small>点开看详情</small>
       </button>
-      {open ? (
+      <ul className="run-process-preview">
+        {preview.map((item) => (
+          <li key={item}>{item}</li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function RunProcessDrawer({
+  detail,
+  onClose,
+  agentNames,
+}: {
+  detail: RunDetail;
+  onClose: () => void;
+  agentNames: Map<string, string>;
+}) {
+  const summary = runProcessSummary(detail, agentNames);
+  return (
+    <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
+      <section
+        className="process-drawer"
+        role="dialog"
+        aria-label="运行过程详情"
+        aria-modal="true"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="process-drawer-handle" aria-hidden="true" />
+        <div className="process-drawer-header">
+          <div>
+            <span className="eyebrow">运行过程</span>
+            <h3>这轮对话执行了什么</h3>
+          </div>
+          <button type="button" className="secondary-action" onClick={onClose}>
+            关闭
+          </button>
+        </div>
         <div className="run-process-detail">
           {summary.routing.length > 0 ? (
             <article>
@@ -373,8 +413,8 @@ function RunProcessSummary({
             );
           })}
         </div>
-      ) : null}
-    </section>
+      </section>
+    </div>
   );
 }
 
@@ -386,8 +426,8 @@ function ModeEntryPanel({
   onSelect: (mode: RunMode) => void;
 }) {
   const entryModes = [
-    { value: "auto", label: "快速模式", description: "主 Agent 自动判断直接、派单、讨论或混合。" },
-    { value: "direct", label: "直连模式", description: "一个回答者直接回复，适合短问答。" },
+    { value: "auto", label: "快速模式", description: "由主 Agent 判断直连、派单、讨论或混合；普通任务不二次打断。" },
+    { value: "direct", label: "直连模式", description: "指定一个角色直接回答，适合明确的短问答。" },
     { value: "dispatch", label: "派单模式", description: "按角色拆分任务，再由主 Agent 汇总。" },
     { value: "discuss", label: "讨论模式", description: "多角色先讨论分歧，再给结论。" },
     { value: "hybrid", label: "混合模式", description: "先讨论方案，再分工执行。" },
@@ -434,7 +474,7 @@ export function RunsPage() {
   const [selectedConversationIds, setSelectedConversationIds] = useState<string[]>([]);
   const [submitNotice, setSubmitNotice] = useState<string | null>(null);
   const [configOpen, setConfigOpen] = useState(false);
-  const [processOpen, setProcessOpen] = useState(false);
+  const [processDetailRun, setProcessDetailRun] = useState<RunDetail | null>(null);
   const [modeSelection, setModeSelection] = useState<ModeSelection | null>(null);
   const [skillInstallCandidate, setSkillInstallCandidate] = useState<SkillInstallCandidate | null>(null);
   const [attachmentDraft, setAttachmentDraft] = useState<ChatAttachmentDraft | null>(null);
@@ -484,7 +524,9 @@ export function RunsPage() {
 
   useEffect(() => {
     if (!settings.data) return;
-    if (!userSelectedMode.current) setMode(settings.data.default_mode);
+    if (!userSelectedMode.current) {
+      setMode(settings.data.default_mode);
+    }
     setWorkflowId(settings.data.default_workflow_id ?? "");
     setAgentIds(settings.data.default_agent_ids);
   }, [settings.data]);
@@ -512,7 +554,7 @@ export function RunsPage() {
   }, [selectedRun.data]);
 
   useEffect(() => {
-    setProcessOpen(false);
+    setProcessDetailRun(null);
   }, [selectedRunId]);
 
   const createRun = useMutation({
@@ -754,12 +796,12 @@ export function RunsPage() {
     setMessage("");
     setTemporaryApproval(null);
     setModeSelection(null);
-    setProcessOpen(false);
+    setProcessDetailRun(null);
     setSubmitNotice("已新建空白对话。请选择模式后开始新的会话。");
   }
 
-  function startHandoffConversation() {
-    const sourceConversationId = runConversationId(selectedRun.data) ?? conversationId;
+  function startHandoffConversation(sourceRun?: RunDetail | null) {
+    const sourceConversationId = runConversationId(sourceRun ?? selectedRun.data) ?? conversationId;
     if (!sourceConversationId) {
       setSubmitNotice("当前没有可 Handoff 的会话。");
       return;
@@ -770,7 +812,7 @@ export function RunsPage() {
     setMessage("");
     setTemporaryApproval(null);
     setModeSelection(null);
-    setProcessOpen(false);
+    setProcessDetailRun(null);
     setSubmitNotice(`已按原思路开启新对话：新对话会读取 ${sourceConversationId} 作为参考上下文。`);
   }
 
@@ -1114,7 +1156,14 @@ export function RunsPage() {
             {activeConversation.isError ? (
               <p role="alert">{formatApiError(activeConversation.error, "当前会话读取失败")}</p>
             ) : null}
-            <p className="chat-conversation-status">当前会话：{conversationId}</p>
+            <div className="chat-session-toolbar" aria-label="当前对话操作">
+              <p className="chat-conversation-status">当前会话：{conversationId}</p>
+              <div>
+                <button type="button" className="secondary-action" onClick={startNewConversation}>
+                  新建对话
+                </button>
+              </div>
+            </div>
             {!selectedRunId ? (
               <ModeEntryPanel selectedMode={mode} onSelect={chooseRunMode} />
             ) : null}
@@ -1125,11 +1174,10 @@ export function RunsPage() {
                   <h3>{item.title}</h3>
                   <p>{item.body}</p>
                 </article>
-                {index === 0 && item.run ? (
+                {item.id.endsWith("-request") && item.run ? (
                   <RunProcessSummary
                     detail={item.run}
-                    open={processOpen}
-                    onToggle={() => setProcessOpen((current) => !current)}
+                    onOpen={() => setProcessDetailRun(item.run)}
                     agentNames={agentNameMap}
                   />
                 ) : null}
@@ -1144,6 +1192,13 @@ export function RunsPage() {
               </div>
             ) : null}
           </div>
+          {processDetailRun ? (
+            <RunProcessDrawer
+              detail={processDetailRun}
+              onClose={() => setProcessDetailRun(null)}
+              agentNames={agentNameMap}
+            />
+          ) : null}
 
           <form onSubmit={submit} aria-label="发送对话任务" className="chat-composer">
             {temporaryApproval ? (
@@ -1302,8 +1357,8 @@ export function RunsPage() {
               <button
                 type="button"
                 className="composer-handoff-button"
-                disabled={!selectedRun.data}
-                onClick={startHandoffConversation}
+                disabled={!latestVisibleRun}
+                onClick={() => startHandoffConversation(latestVisibleRun)}
               >
                 按照原思路开启新对话
               </button>
@@ -1317,7 +1372,7 @@ export function RunsPage() {
                 +
               </button>
               <span>
-                {mode === "auto" ? "自动检测模式" : `手动模式：${displayMode(mode)}`}
+                {mode === "auto" ? "快速模式：主 Agent 判断" : mode === "direct" ? "直连模式" : `手动模式：${displayMode(mode)}`}
                 {agentIds.length > 0 ? ` · 角色 ${agentIds.length} 个` : " · 未固定角色"}
                 {referenceConversationId.trim() ? " · 已引用会话" : ""}
               </span>
