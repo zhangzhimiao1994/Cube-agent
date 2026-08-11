@@ -4,7 +4,7 @@ import hashlib
 import logging
 import os
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -285,6 +285,20 @@ class ChannelStatusResponse(BaseModel):
     public_webhook_url: str | None = None
     missing: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+
+
+class ChannelConfigRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    values: dict[str, str] = Field(default_factory=dict, max_length=64)
+
+
+class ChannelConfigSaveResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    saved: list[str]
+    status: ChannelStatusResponse
 
 
 @dataclass(frozen=True, slots=True)
@@ -623,6 +637,12 @@ class AdminResourceService(Protocol):
 
     async def list_channels(self) -> tuple[ChannelStatusResponse, ...]: ...
 
+    async def save_channel_config(
+        self, channel_id: str, request: ChannelConfigRequest
+    ) -> ChannelConfigSaveResponse: ...
+
+    async def channel_runtime_config(self) -> dict[str, str]: ...
+
     async def list_memory(self) -> tuple[MemoryRecordResponse, ...]: ...
 
     async def create_memory(self, request: MemoryCreateRequest) -> MemoryRecordResponse: ...
@@ -665,6 +685,7 @@ class InMemoryAdminResourceService:
     runs: dict[UUID, RunDetailResponse] = field(default_factory=dict)
     skills: dict[str, SkillResponse] = field(default_factory=dict)
     mcp_servers: dict[str, McpServerResponse] = field(default_factory=dict)
+    channel_config: dict[str, dict[str, str]] = field(default_factory=dict)
     memory: dict[str, MemoryRecordResponse] = field(default_factory=dict)
     audit_events: list[AuditEventResponse] = field(default_factory=list)
     logs: list[LogEntryResponse] = field(default_factory=list)
@@ -995,7 +1016,26 @@ class InMemoryAdminResourceService:
         return response
 
     async def list_channels(self) -> tuple[ChannelStatusResponse, ...]:
-        return _channel_statuses_from_environment()
+        return _channel_statuses_from_configuration(self.channel_config)
+
+    async def save_channel_config(
+        self, channel_id: str, request: ChannelConfigRequest
+    ) -> ChannelConfigSaveResponse:
+        definition = _channel_definition(channel_id)
+        cleaned = _clean_channel_config_values(definition, request.values)
+        if not cleaned:
+            raise PublicAPIError(422, "request_validation", "at least one channel field is required")
+        existing = dict(self.channel_config.get(channel_id, {}))
+        existing.update(cleaned)
+        self.channel_config[channel_id] = existing
+        return ChannelConfigSaveResponse(
+            id=channel_id,
+            saved=_ordered_channel_saved_fields(definition, cleaned),
+            status=_channel_status_from_definition(definition, self.channel_config),
+        )
+
+    async def channel_runtime_config(self) -> dict[str, str]:
+        return _flatten_channel_config(self.channel_config)
 
     async def list_memory(self) -> tuple[MemoryRecordResponse, ...]:
         return tuple(self.memory.values())
@@ -1070,7 +1110,7 @@ class InMemoryAdminResourceService:
             *(_audit_log_entry(event) for event in self.audit_events),
             *self.logs,
             *(_mode_error_log_from_run(run) for run in self.runs.values() if run.status == "failed"),
-            *_channel_error_logs_from_environment(),
+            *_channel_error_logs_from_configuration(self.channel_config),
         ]
         if category is not None:
             entries = [entry for entry in entries if entry.category == category]
@@ -1858,6 +1898,45 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         await self._record_audit("mcp.upsert", f"mcp:{response.id}", {"id": response.id})
         return response
 
+    async def list_channels(self) -> tuple[ChannelStatusResponse, ...]:
+        config = await self._channel_config_values()
+        if config is None:
+            return await super().list_channels()
+        return _channel_statuses_from_configuration(config)
+
+    async def save_channel_config(
+        self, channel_id: str, request: ChannelConfigRequest
+    ) -> ChannelConfigSaveResponse:
+        config = await self._channel_config_values()
+        if config is None:
+            return await super().save_channel_config(channel_id, request)
+        definition = _channel_definition(channel_id)
+        cleaned = _clean_channel_config_values(definition, request.values)
+        if not cleaned:
+            raise PublicAPIError(422, "request_validation", "at least one channel field is required")
+        existing = dict(config.get(channel_id, {}))
+        existing.update(cleaned)
+        config[channel_id] = existing
+        payload: dict[str, object] = {"id": channel_id, "values": existing}
+        if not await self._upsert_admin_payload("channel", channel_id, payload):
+            return await super().save_channel_config(channel_id, request)
+        await self._record_audit(
+            "channel.update",
+            f"channel:{channel_id}",
+            {"saved": ",".join(_ordered_channel_saved_fields(definition, cleaned))},
+        )
+        return ChannelConfigSaveResponse(
+            id=channel_id,
+            saved=_ordered_channel_saved_fields(definition, cleaned),
+            status=_channel_status_from_definition(definition, config),
+        )
+
+    async def channel_runtime_config(self) -> dict[str, str]:
+        config = await self._channel_config_values()
+        if config is None:
+            return await super().channel_runtime_config()
+        return _flatten_channel_config(config)
+
     async def list_memory(self) -> tuple[MemoryRecordResponse, ...]:
         resources = await self._list_admin_payloads("memory")
         if resources is None:
@@ -1944,7 +2023,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             *(_audit_log_entry(event) for event in await self.list_audit_events()),
             *(_log_response_from_payload(payload) for payload in resources),
             *(await self._mode_error_logs_from_repository()),
-            *_channel_error_logs_from_environment(),
+            *_channel_error_logs_from_configuration(await self._channel_config_values() or {}),
         ]
         if category is not None:
             entries = [entry for entry in entries if entry.category == category]
@@ -2093,6 +2172,23 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 )
             ).scalars()
             return [dict(row.payload) for row in rows]
+
+    async def _channel_config_values(self) -> dict[str, dict[str, str]] | None:
+        resources = await self._list_admin_payloads("channel")
+        if resources is None:
+            return None
+        config: dict[str, dict[str, str]] = {}
+        for payload in resources:
+            channel_id = payload.get("id")
+            values = payload.get("values")
+            if not isinstance(channel_id, str) or not isinstance(values, dict):
+                continue
+            config[channel_id] = {
+                str(name): str(value)
+                for name, value in values.items()
+                if isinstance(name, str) and isinstance(value, str)
+            }
+        return config
 
     async def _get_admin_payload(self, kind: str, resource_id: str) -> dict[str, object] | None:
         if self._session_factory is None:
@@ -2775,40 +2871,131 @@ def _uuid_from_json(value: object) -> UUID | None:
     return None
 
 
-def _channel_statuses_from_environment() -> tuple[ChannelStatusResponse, ...]:
-    public_url = os.environ.get("AGENT_HUB_PUBLIC_URL", "").rstrip("/")
+def _channel_definition(channel_id: str) -> ChannelDefinition:
+    for definition in CHANNEL_DEFINITIONS:
+        if definition.id == channel_id:
+            return definition
+    raise PublicAPIError(404, "channel_not_found", "channel not found")
+
+
+def _channel_config_value(
+    name: str,
+    channel_id: str,
+    config: Mapping[str, Mapping[str, str]],
+) -> str:
+    channel_value = config.get(channel_id, {}).get(name)
+    if channel_value:
+        return channel_value
+    for values in config.values():
+        shared_value = values.get(name)
+        if shared_value:
+            return shared_value
+    return os.environ.get(name, "")
+
+
+def _channel_status_from_definition(
+    definition: ChannelDefinition,
+    config: Mapping[str, Mapping[str, str]],
+) -> ChannelStatusResponse:
+    public_url = _channel_config_value("AGENT_HUB_PUBLIC_URL", definition.id, config).rstrip("/")
+    missing = [
+        name
+        for name in definition.required_env
+        if not _channel_config_value(name, definition.id, config)
+    ]
+    public_webhook_url = (
+        f"{public_url}{definition.webhook_path}"
+        if public_url and definition.webhook_path is not None
+        else None
+    )
+    transports = list(definition.transports)
+    if definition.id == "feishu":
+        configured_transport = _channel_config_value("FEISHU_TRANSPORT", definition.id, config)
+        if configured_transport:
+            transports = [configured_transport]
+    status = "missing_config" if missing else "configured"
+    return ChannelStatusResponse(
+        id=definition.id,
+        name=definition.name,
+        status=status,
+        transports=transports,
+        webhook_path=definition.webhook_path,
+        public_webhook_url=public_webhook_url,
+        missing=missing,
+        notes=list(definition.notes),
+    )
+
+
+def _channel_statuses_from_configuration(
+    config: Mapping[str, Mapping[str, str]] | None = None,
+) -> tuple[ChannelStatusResponse, ...]:
+    channel_config = config or {}
     statuses: list[ChannelStatusResponse] = []
     for definition in CHANNEL_DEFINITIONS:
-        missing = [name for name in definition.required_env if not os.environ.get(name)]
-        public_webhook_url = (
-            f"{public_url}{definition.webhook_path}"
-            if public_url and definition.webhook_path is not None
-            else None
-        )
-        transports = list(definition.transports)
-        if definition.id == "feishu":
-            configured_transport = os.environ.get("FEISHU_TRANSPORT")
-            if configured_transport:
-                transports = [configured_transport]
-        status = "missing_config" if missing else "configured"
-        statuses.append(
-            ChannelStatusResponse(
-                id=definition.id,
-                name=definition.name,
-                status=status,
-                transports=transports,
-                webhook_path=definition.webhook_path,
-                public_webhook_url=public_webhook_url,
-                missing=missing,
-                notes=list(definition.notes),
-            )
-        )
+        statuses.append(_channel_status_from_definition(definition, channel_config))
     return tuple(statuses)
 
 
-def _channel_error_logs_from_environment() -> tuple[LogEntryResponse, ...]:
+def _channel_statuses_from_environment() -> tuple[ChannelStatusResponse, ...]:
+    return _channel_statuses_from_configuration({})
+
+
+def _channel_config_allowed_names(definition: ChannelDefinition) -> set[str]:
+    allowed = set(definition.required_env)
+    if definition.id == "feishu":
+        allowed.add("FEISHU_TRANSPORT")
+    return allowed
+
+
+def _clean_channel_config_values(
+    definition: ChannelDefinition, values: Mapping[str, str]
+) -> dict[str, str]:
+    allowed = _channel_config_allowed_names(definition)
+    cleaned: dict[str, str] = {}
+    for name, raw_value in values.items():
+        if name not in allowed:
+            raise PublicAPIError(
+                422,
+                "request_validation",
+                "channel field is not allowed for this channel",
+                details={"field": name, "channel": definition.id},
+            )
+        value = raw_value.strip()
+        if not value:
+            continue
+        if len(value) > 4096:
+            raise PublicAPIError(
+                422,
+                "request_validation",
+                "channel field value is too long",
+                details={"field": name, "channel": definition.id},
+            )
+        cleaned[name] = value
+    return cleaned
+
+
+def _ordered_channel_saved_fields(
+    definition: ChannelDefinition, values: Mapping[str, str]
+) -> list[str]:
+    ordered = [name for name in definition.required_env if name in values]
+    extras = sorted(name for name in values if name not in set(definition.required_env))
+    return [*ordered, *extras]
+
+
+def _flatten_channel_config(config: Mapping[str, Mapping[str, str]]) -> dict[str, str]:
+    flattened: dict[str, str] = {}
+    for channel_id in [definition.id for definition in CHANNEL_DEFINITIONS]:
+        for name, value in config.get(channel_id, {}).items():
+            if value:
+                flattened[name] = value
+    return flattened
+
+
+def _channel_error_logs_from_configuration(
+    config: Mapping[str, Mapping[str, str]] | None = None,
+) -> tuple[LogEntryResponse, ...]:
     entries: list[LogEntryResponse] = []
-    for status in _channel_statuses_from_environment():
+    for status in _channel_statuses_from_configuration(config or {}):
         if status.status == "configured":
             continue
         entries.append(
@@ -2830,6 +3017,10 @@ def _channel_error_logs_from_environment() -> tuple[LogEntryResponse, ...]:
             )
         )
     return tuple(entries)
+
+
+def _channel_error_logs_from_environment() -> tuple[LogEntryResponse, ...]:
+    return _channel_error_logs_from_configuration({})
 
 
 def _admin_run_event(event: dict[str, object]) -> RunEventResponse:
@@ -3293,6 +3484,24 @@ async def list_channels(
 ) -> list[ChannelStatusResponse]:
     _require(principal, "config:read")
     return list(await service.list_channels())
+
+
+@router.post(
+    "/channels/{channel_id}/config",
+    response_model=ChannelConfigSaveResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def save_channel_config(
+    channel_id: str,
+    body: ChannelConfigRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+    request: Request,
+) -> ChannelConfigSaveResponse:
+    _require(principal, "config:write")
+    response = await service.save_channel_config(channel_id, body)
+    request.app.state.channel_runtime_config = await service.channel_runtime_config()
+    return response
 
 
 @router.get("/memory", response_model=list[MemoryRecordResponse], responses=error_responses(401, 403, 422))

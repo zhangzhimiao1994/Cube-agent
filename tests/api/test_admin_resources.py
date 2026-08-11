@@ -575,6 +575,41 @@ def test_channel_status_exposes_feishu_setup_without_secrets(monkeypatch: pytest
     assert "encrypt-live" not in serialized
 
 
+def test_channel_config_can_be_saved_without_exposing_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DINGTALK_APP_KEY", raising=False)
+    monkeypatch.delenv("DINGTALK_APP_SECRET", raising=False)
+    monkeypatch.delenv("DINGTALK_WEBHOOK_TOKEN", raising=False)
+
+    api = client()
+    response = api.post(
+        "/api/v1/admin/channels/dingtalk/config",
+        headers=headers(),
+        json={
+            "values": {
+                "DINGTALK_APP_KEY": "ding-app-key",
+                "DINGTALK_APP_SECRET": "ding-secret",
+                "DINGTALK_WEBHOOK_TOKEN": "ding-token",
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["saved"] == [
+        "DINGTALK_APP_KEY",
+        "DINGTALK_APP_SECRET",
+        "DINGTALK_WEBHOOK_TOKEN",
+    ]
+    assert response.json()["status"]["status"] == "configured"
+    assert response.json()["status"]["missing"] == []
+    assert "ding-secret" not in response.text
+    channels = api.get("/api/v1/admin/channels", headers=headers())
+    by_id = {item["id"]: item for item in channels.json()}
+    assert by_id["dingtalk"]["status"] == "configured"
+    assert by_id["dingtalk"]["missing"] == []
+
+
 def test_all_channel_statuses_are_configured_when_required_env_exists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

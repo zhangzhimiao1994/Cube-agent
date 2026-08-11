@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useMemo, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { api, formatApiError, type ChannelStatus } from "../api/client";
 
@@ -254,14 +254,34 @@ function envTemplate(channel: ChannelStatus, guide: ChannelGuide) {
 }
 
 export function ChannelsPage() {
+  const queryClient = useQueryClient();
   const channels = useQuery({ queryKey: ["channels"], queryFn: () => api.channels() });
   const [selectedId, setSelectedId] = useState("feishu");
+  const [draftValues, setDraftValues] = useState<Record<string, string>>({});
+  const [saveNotice, setSaveNotice] = useState<string | null>(null);
 
   const selected = useMemo(() => {
     const items = channels.data ?? [];
     return items.find((item) => item.id === selectedId) ?? items[0] ?? null;
   }, [channels.data, selectedId]);
   const guide = selected ? CHANNEL_GUIDES[selected.id] : null;
+
+  useEffect(() => {
+    setDraftValues({});
+    setSaveNotice(null);
+  }, [selectedId]);
+
+  const saveConfig = useMutation({
+    mutationFn: () => {
+      if (!selected) throw new Error("channel is not selected");
+      return api.saveChannelConfig(selected.id, { values: draftValues });
+    },
+    onSuccess: async () => {
+      setDraftValues({});
+      setSaveNotice("通道配置已保存。");
+      await queryClient.invalidateQueries({ queryKey: ["channels"] });
+    },
+  });
 
   if (channels.isLoading) return <p>正在加载通道状态...</p>;
   if (channels.isError) {
@@ -347,21 +367,49 @@ export function ChannelsPage() {
 
             <article>
               <h3>配置内容</h3>
+              <p className="field-help">
+                可直接在这里填写并保存；已配置的密钥不会回显。留空的字段不会覆盖服务器已有配置。
+              </p>
               <div className="form-grid">
                 {guide.fields.map((field) => (
                   <label key={field.env}>
                     {field.label}
                     <input
-                      readOnly
                       type={field.secret ? "password" : "text"}
-                      value={selected.missing.includes(field.env) ? "" : "<已配置>"}
-                      placeholder={field.placeholder}
+                      autoComplete="off"
+                      value={draftValues[field.env] ?? ""}
+                      onChange={(event) =>
+                        setDraftValues((current) => ({
+                          ...current,
+                          [field.env]: event.target.value,
+                        }))
+                      }
+                      placeholder={
+                        selected.missing.includes(field.env)
+                          ? field.placeholder
+                          : `已配置，留空不覆盖；如需更换请输入新的 ${field.label}`
+                      }
                     />
                     <span className="field-help">{field.env}</span>
                     <span className="field-help">来源：{field.source}</span>
                   </label>
                 ))}
               </div>
+              <div className="composer-actions">
+                <button
+                  type="button"
+                  disabled={saveConfig.isPending || Object.values(draftValues).every((value) => value.trim() === "")}
+                  onClick={() => saveConfig.mutate()}
+                >
+                  {saveConfig.isPending ? "保存中..." : "保存通道配置"}
+                </button>
+                {saveNotice ? <span role="status">{saveNotice}</span> : null}
+              </div>
+              {saveConfig.isError ? (
+                <p className="form-error" role="alert">
+                  {formatApiError(saveConfig.error, "通道配置保存失败")}
+                </p>
+              ) : null}
             </article>
 
             <article>

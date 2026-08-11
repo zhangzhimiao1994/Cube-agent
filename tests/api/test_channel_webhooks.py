@@ -8,6 +8,7 @@ from uuid import UUID
 import pytest
 from fastapi.testclient import TestClient
 
+from agent_hub.api.routers.admin import InMemoryAdminResourceService
 from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
 from agent_hub.channels.base import InboundMessage
@@ -302,6 +303,33 @@ def test_generic_channel_webhook_rejects_missing_config() -> None:
     assert response.json()["error"] == "channel_not_configured"
     assert response.json()["missing"] == ["CUSTOM_WEBHOOK_TOKEN"]
     assert gateway.messages == []
+
+
+def test_saved_channel_config_is_used_by_webhook_runtime() -> None:
+    gateway = RecordingGateway()
+    app = create_app(
+        auth_service=StubAuthService(),
+        rate_limiter=object(),
+        feishu_gateway=gateway,
+    )
+    app.state.admin_resource_service = InMemoryAdminResourceService()
+    api = TestClient(app)
+
+    saved = api.post(
+        "/api/v1/admin/channels/custom_webhook/config",
+        headers={"Authorization": "Bearer valid-token"},
+        json={"values": {"CUSTOM_WEBHOOK_TOKEN": "saved-token"}},
+    )
+    response = api.post(
+        "/channels/custom/events",
+        headers={"X-Agent-Hub-Channel-Token": "saved-token"},
+        json={"text": "Runtime channel task", "sender": "u1", "conversation_id": "c1"},
+    )
+
+    assert saved.status_code == 200
+    assert response.status_code == 202
+    assert response.json() == {"accepted": True, "channel": "custom_webhook"}
+    assert gateway.messages[0].text == "Runtime channel task"
 
 
 def test_generic_channel_webhook_rejects_wrong_token(monkeypatch: pytest.MonkeyPatch) -> None:

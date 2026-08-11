@@ -1,4 +1,5 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TestApp } from "../app/router";
@@ -121,14 +122,34 @@ const channelPayload = [
 ];
 
 describe("ChannelsPage", () => {
+  const requests: Array<{ body: unknown; method: string; path: string }> = [];
+
   beforeEach(() => {
+    requests.length = 0;
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (input: RequestInfo | URL) => {
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const path = String(input);
+        const method = init?.method ?? "GET";
+        requests.push({
+          path,
+          method,
+          body: init?.body && typeof init.body === "string" ? JSON.parse(init.body) : null,
+        });
         if (path === "/api/v1/auth/me") return jsonResponse(principal);
         if (path === "/api/v1/admin/channels") return jsonResponse(channelPayload);
+        if (path === "/api/v1/admin/channels/dingtalk/config" && method === "POST") {
+          return jsonResponse({
+            id: "dingtalk",
+            saved: ["DINGTALK_APP_KEY", "DINGTALK_APP_SECRET", "DINGTALK_WEBHOOK_TOKEN"],
+            status: {
+              ...channelPayload[1],
+              status: "configured",
+              missing: [],
+            },
+          });
+        }
         return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
       }),
     );
@@ -174,5 +195,30 @@ describe("ChannelsPage", () => {
     expect(screen.getByText("开发者后台 → 我的应用 → 选择应用 → 凭证与基础信息")).not.toBeNull();
     expect(screen.getByText("来源：凭证与基础信息 → App ID")).not.toBeNull();
     expect(screen.getByText(/校验失败会返回明确错误/)).not.toBeNull();
+  });
+
+  it("lets operators type and save channel configuration values", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/channels" />);
+
+    await user.click(await screen.findByRole("button", { name: /钉钉/ }));
+    await user.type(screen.getByLabelText(/App Key/), "ding-app-key");
+    await user.type(screen.getByLabelText(/App Secret/), "ding-secret");
+    await user.type(screen.getByLabelText(/Webhook Token/), "ding-token");
+    await user.click(screen.getByRole("button", { name: "保存通道配置" }));
+
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === "/api/v1/admin/channels/dingtalk/config")).toMatchObject({
+        method: "POST",
+        body: {
+          values: {
+            DINGTALK_APP_KEY: "ding-app-key",
+            DINGTALK_APP_SECRET: "ding-secret",
+            DINGTALK_WEBHOOK_TOKEN: "ding-token",
+          },
+        },
+      }),
+    );
+    expect(await screen.findByText("通道配置已保存。")).not.toBeNull();
   });
 });

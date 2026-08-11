@@ -381,6 +381,41 @@ describe("operational management pages", () => {
     expect(within(stream).queryByText("产物：短视频脚本")).toBeNull();
   });
 
+  it("collapses run process events behind a compact execution summary", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话任务" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: /派单式/ }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    expect(within(stream).getByText(/这是最终回复正文/)).not.toBeNull();
+    expect(within(stream).queryByText("Run accepted and queued.")).toBeNull();
+
+    expect(within(stream).queryByText("正在实时刷新运行状态")).toBeNull();
+    await user.click(within(stream).getByRole("button", { name: /执行 2 条步骤/ }));
+    expect(within(stream).getByText("Run accepted and queued.")).not.toBeNull();
+  });
+
+  it("selects the chat mode from the compact entry panel before sending", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话任务" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "进入讨论模式" }));
+    await user.type(screen.getByPlaceholderText(/输入任务/), "请让多个角色评审这个方案。");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    await screen.findByRole("link", { name: "查看运行详情" });
+    expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
+      method: "POST",
+      body: {
+        message: "请让多个角色评审这个方案。",
+        mode: "discuss",
+      },
+    });
+  });
+
   it("deletes a finished conversation from the conversation list", async () => {
     const user = userEvent.setup();
     visibleRunListItem = { ...runListItem, status: "cancelled" };

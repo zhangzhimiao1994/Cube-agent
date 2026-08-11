@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { Fragment, FormEvent, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { api, formatApiError, type RunDetail, type SubmittedRun } from "../api/client";
@@ -101,33 +101,17 @@ function detailMessages(detail: RunDetail | undefined) {
       title: "你的任务",
       body: detail.request,
     },
-    {
-      id: "routing",
-      role: "assistant",
-      title: "模式与角色",
-      body: [
-        `运行模式：${displayMode(detail.mode)}`,
-        detail.explicit_details.workflow_id ? `工作流：${detail.explicit_details.workflow_id}` : null,
-        detail.explicit_details.workflow_adjustment_policy
-          ? `工作流调整：${
-              detail.explicit_details.workflow_adjustment_policy === "ask_before_apply"
-                ? "允许提出，执行前核对"
-                : "严格按预设"
-            }`
-          : null,
-        detail.explicit_details.selected_agent_ids ? `参与角色：${detail.explicit_details.selected_agent_ids}` : null,
-        detail.explicit_details.routing_reason ? `路由原因：${detail.explicit_details.routing_reason}` : null,
-      ]
-        .filter(Boolean)
-        .join("\n"),
-    },
-    ...detail.events.map((event) => ({
-      id: `event-${event.sequence}`,
-      role: "assistant",
-      title: event.kind,
-      body: event.message,
-    })),
     ...artifactMessages,
+    ...(detail.status === "failed" && artifactMessages.length === 0
+      ? [
+          {
+            id: "failed",
+            role: "assistant",
+            title: "运行失败",
+            body: "本次运行没有生成最终回复。请展开执行摘要查看失败阶段，或到日志中心查看完整错误。",
+          },
+        ]
+      : []),
   ];
 }
 
@@ -150,6 +134,107 @@ function preferredReplyArtifact(artifacts: RunDetail["artifacts"]) {
   );
 }
 
+function runProcessSummary(detail: RunDetail) {
+  const routing = [
+    `运行模式：${displayMode(detail.mode)}`,
+    detail.explicit_details.workflow_id ? `工作流：${detail.explicit_details.workflow_id}` : null,
+    detail.explicit_details.workflow_adjustment_policy
+      ? `工作流调整：${
+          detail.explicit_details.workflow_adjustment_policy === "ask_before_apply"
+            ? "允许提出，执行前核对"
+            : "严格按预设"
+        }`
+      : null,
+    detail.explicit_details.selected_agent_ids ? `参与角色：${detail.explicit_details.selected_agent_ids}` : null,
+    detail.explicit_details.routing_reason ? `路由原因：${detail.explicit_details.routing_reason}` : null,
+  ].filter(Boolean);
+  return { routing, events: detail.events };
+}
+
+function RunProcessSummary({
+  detail,
+  open,
+  onToggle,
+}: {
+  detail: RunDetail;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  const summary = runProcessSummary(detail);
+  const eventCount = summary.events.length;
+  const routingCount = summary.routing.length > 0 ? 1 : 0;
+  const total = eventCount + routingCount;
+  if (total === 0) return null;
+  return (
+    <section className="run-process-summary" aria-label="折叠的运行过程">
+      <button type="button" className="run-process-toggle" aria-expanded={open} onClick={onToggle}>
+        <span aria-hidden="true">‹/›</span>
+        <strong>执行 {total} 条步骤</strong>
+        <small>{open ? "点击收起" : "点击查看详情"}</small>
+      </button>
+      {open ? (
+        <div className="run-process-detail">
+          {summary.routing.length > 0 ? (
+            <article>
+              <span className="eyebrow">调度概况</span>
+              {summary.routing.map((item) => (
+                <p key={item}>{item}</p>
+              ))}
+            </article>
+          ) : null}
+          {summary.events.map((event) => (
+            <article key={event.sequence}>
+              <span className="eyebrow">{event.kind}</span>
+              <p>{event.message}</p>
+              <small>{event.created_at}</small>
+            </article>
+          ))}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function ModeEntryPanel({
+  selectedMode,
+  onSelect,
+}: {
+  selectedMode: RunMode;
+  onSelect: (mode: RunMode) => void;
+}) {
+  const entryModes = [
+    { value: "auto", label: "快速模式", description: "主 Agent 自动判断直接、派单、讨论或混合。" },
+    { value: "direct", label: "直连模式", description: "一个回答者直接回复，适合短问答。" },
+    { value: "dispatch", label: "派单模式", description: "按角色拆分任务，再由主 Agent 汇总。" },
+    { value: "discuss", label: "讨论模式", description: "多角色先讨论分歧，再给结论。" },
+    { value: "hybrid", label: "混合模式", description: "先讨论方案，再分工执行。" },
+  ] as const;
+  const selected = entryModes.find((item) => item.value === selectedMode) ?? entryModes[0];
+  return (
+    <article className="mode-entry-panel">
+      <span className="mode-entry-logo" aria-hidden="true">
+        ✦
+      </span>
+      <h3>选择模式开始对话</h3>
+      <div className="mode-entry-tabs" role="list" aria-label="对话模式入口">
+        {entryModes.map((item) => (
+          <button
+            key={item.value}
+            type="button"
+            aria-label={`进入${item.label}`}
+            aria-pressed={selectedMode === item.value}
+            className={selectedMode === item.value ? "mode-entry-active" : ""}
+            onClick={() => onSelect(item.value)}
+          >
+            {item.label}
+          </button>
+        ))}
+      </div>
+      <p>{selected.description}</p>
+    </article>
+  );
+}
+
 export function RunsPage() {
   const queryClient = useQueryClient();
   const runs = useQuery({ queryKey: ["runs"], queryFn: () => api.runs() });
@@ -165,6 +250,7 @@ export function RunsPage() {
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [submitNotice, setSubmitNotice] = useState<string | null>(null);
   const [configOpen, setConfigOpen] = useState(false);
+  const [processOpen, setProcessOpen] = useState(false);
   const [modeSelection, setModeSelection] = useState<ModeSelection | null>(null);
   const [temporaryApproval, setTemporaryApproval] = useState<{
     runId: string;
@@ -218,6 +304,10 @@ export function RunsPage() {
       setModeSelection(null);
     }
   }, [selectedRun.data]);
+
+  useEffect(() => {
+    setProcessOpen(false);
+  }, [selectedRunId]);
 
   const createRun = useMutation({
     mutationFn: () =>
@@ -606,34 +696,24 @@ export function RunsPage() {
             {selectedRun.isLoading ? <p>正在加载会话...</p> : null}
             {selectedRun.isError ? <p role="alert">{formatApiError(selectedRun.error, "会话加载失败")}</p> : null}
             {!selectedRunId ? (
-              <article className="chat-message assistant">
-                <span className="eyebrow">主 Agent</span>
-                <h3>选择模式、工作流和角色，然后发送任务。</h3>
-                <p>如果选择“自动检测”，提交后这里会显示主 Agent 最终采用的模式；如果无法判断，会等待你确认。</p>
-              </article>
+              <ModeEntryPanel selectedMode={mode} onSelect={(value) => setMode(value)} />
             ) : null}
-            {messages.map((item) => (
-              <article key={item.id} className={`chat-message ${item.role}`}>
-                <span className="eyebrow">{item.role === "user" ? "你" : "Agent Hub"}</span>
-                <h3>{item.title}</h3>
-                <p>{item.body}</p>
-              </article>
+            {messages.map((item, index) => (
+              <Fragment key={item.id}>
+                <article className={`chat-message ${item.role}`}>
+                  <span className="eyebrow">{item.role === "user" ? "你" : "Agent Hub"}</span>
+                  <h3>{item.title}</h3>
+                  <p>{item.body}</p>
+                </article>
+                {index === 0 && selectedRun.data ? (
+                  <RunProcessSummary
+                    detail={selectedRun.data}
+                    open={processOpen}
+                    onToggle={() => setProcessOpen((current) => !current)}
+                  />
+                ) : null}
+              </Fragment>
             ))}
-            {selectedRun.data && !TERMINAL_STATUSES.has(selectedRun.data.status) ? (
-              <article className="chat-message assistant streaming-status">
-                <span className="eyebrow">LIVE</span>
-                <h3>
-                  {selectedRun.data.status === "waiting_user_mode"
-                    ? "等待你选择运行模式"
-                    : "正在实时刷新运行状态"}
-                </h3>
-                <p>
-                  {selectedRun.data.status === "waiting_user_mode"
-                    ? "主 Agent 判断不够确定，请在下方确认本次走直接、派单、讨论或混合模式。"
-                    : "后端事件会持续同步到这里；生成、派单、讨论和产物状态会按时间追加。"}
-                </p>
-              </article>
-            ) : null}
             {selectedRunId ? (
               <div className="chat-detail-action">
                 <Link to={`/runs/${selectedRunId}`} className="secondary-action">

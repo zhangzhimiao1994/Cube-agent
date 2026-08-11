@@ -333,6 +333,14 @@ const ChannelStatusSchema = z.object({
 
 export type ChannelStatus = z.infer<typeof ChannelStatusSchema>;
 
+const ChannelConfigSaveSchema = z.object({
+  id: z.string(),
+  saved: z.array(z.string()),
+  status: ChannelStatusSchema,
+});
+
+export type ChannelConfigSave = z.infer<typeof ChannelConfigSaveSchema>;
+
 const MemoryRecordSchema = z.object({
   id: z.string(),
   scope: z.string(),
@@ -798,6 +806,13 @@ export const api = {
   },
   channels(): Promise<ChannelStatus[]> {
     return request("/api/v1/admin/channels", { method: "GET" }, z.array(ChannelStatusSchema));
+  },
+  saveChannelConfig(id: string, payload: { values: Record<string, string> }): Promise<ChannelConfigSave> {
+    return request(
+      `/api/v1/admin/channels/${encodeURIComponent(id)}/config`,
+      { method: "POST", body: JSON.stringify(payload) },
+      ChannelConfigSaveSchema,
+    );
   },
   memory(): Promise<MemoryRecord[]> {
     return request("/api/v1/admin/memory", { method: "GET" }, z.array(MemoryRecordSchema));

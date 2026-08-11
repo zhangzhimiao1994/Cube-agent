@@ -5,7 +5,7 @@ import hashlib
 import logging
 import os
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -334,6 +334,7 @@ def create_app(
     application.state.feishu_gateway = feishu_gateway
     application.state.metrics_registry = default_metrics_registry()
     application.state.extra_readiness_checks = {}
+    application.state.channel_runtime_config = {}
     application.state.trusted_proxy_ips = configured_settings.trusted_proxy_ips
     application.add_exception_handler(PublicAPIError, public_error_handler)
     application.add_exception_handler(StarletteHTTPException, http_exception_handler)
@@ -366,6 +367,7 @@ def create_app(
         create_generic_channel_webhook_router(
             env=os.environ,
             gateway_provider=_feishu_gateway_from_request,
+            runtime_config_provider=_channel_runtime_config_from_request,
         ).routes
     )
 
@@ -405,6 +407,23 @@ def _feishu_gateway_from_request(request: Request) -> ChannelGatewayProtocol | N
     if gateway is None:
         return None
     return cast(ChannelGatewayProtocol, gateway)
+
+
+async def _channel_runtime_config_from_request(request: Request) -> Mapping[str, str]:
+    cached = getattr(request.app.state, "channel_runtime_config", None)
+    if isinstance(cached, dict):
+        return cast(dict[str, str], cached)
+    service = getattr(request.app.state, "admin_resource_service", None)
+    if service is None:
+        return {}
+    provider = getattr(service, "channel_runtime_config", None)
+    if provider is None:
+        return {}
+    config = await provider()
+    if isinstance(config, dict):
+        request.app.state.channel_runtime_config = config
+        return cast(dict[str, str], config)
+    return {}
 
 
 def _database_probe(

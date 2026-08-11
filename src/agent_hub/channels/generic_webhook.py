@@ -3,7 +3,7 @@ from __future__ import annotations
 import hmac
 import json
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha1, sha256
@@ -102,6 +102,7 @@ def create_generic_channel_webhook_router(
     *,
     env: Mapping[str, str],
     gateway_provider: Callable[[Request], ChannelGatewayProtocol | None],
+    runtime_config_provider: Callable[[Request], Awaitable[Mapping[str, str]]] | None = None,
 ) -> APIRouter:
     router = APIRouter(
         tags=["channels"],
@@ -109,7 +110,13 @@ def create_generic_channel_webhook_router(
     )
 
     for spec in GENERIC_WEBHOOK_SPECS:
-        _add_generic_route(router, spec, env=env, gateway_provider=gateway_provider)
+        _add_generic_route(
+            router,
+            spec,
+            env=env,
+            gateway_provider=gateway_provider,
+            runtime_config_provider=runtime_config_provider,
+        )
 
     return router
 
@@ -120,16 +127,18 @@ def _add_generic_route(
     *,
     env: Mapping[str, str],
     gateway_provider: Callable[[Request], ChannelGatewayProtocol | None],
+    runtime_config_provider: Callable[[Request], Awaitable[Mapping[str, str]]] | None,
 ) -> None:
     @router.post(spec.path, response_model=None, status_code=202)
     async def receive_event(request: Request) -> Response:
-        missing = [name for name in spec.required_env if not env.get(name)]
+        runtime_env = await _effective_env(request, env, runtime_config_provider)
+        missing = [name for name in spec.required_env if not runtime_env.get(name)]
         if missing:
             return JSONResponse(
                 status_code=503,
                 content={"error": "channel_not_configured", "channel": spec.id, "missing": missing},
             )
-        expected_token = env[spec.token_env]
+        expected_token = runtime_env[spec.token_env]
         body = await request.body()
         if not _request_is_authorized(spec, request, body, expected_token):
             return JSONResponse(
@@ -155,13 +164,14 @@ def _add_generic_route(
 
     @router.get(spec.path, response_model=None)
     async def verify_endpoint(request: Request) -> Response:
-        missing = [name for name in spec.required_env if not env.get(name)]
+        runtime_env = await _effective_env(request, env, runtime_config_provider)
+        missing = [name for name in spec.required_env if not runtime_env.get(name)]
         if missing:
             return JSONResponse(
                 status_code=503,
                 content={"error": "channel_not_configured", "channel": spec.id, "missing": missing},
             )
-        expected_token = env[spec.token_env]
+        expected_token = runtime_env[spec.token_env]
         if not _request_is_authorized(spec, request, b"", expected_token):
             return JSONResponse(
                 status_code=401,
@@ -171,6 +181,20 @@ def _add_generic_route(
         if echostr is not None:
             return Response(content=echostr, media_type="text/plain")
         return JSONResponse(content={"configured": True, "channel": spec.id})
+
+
+async def _effective_env(
+    request: Request,
+    env: Mapping[str, str],
+    runtime_config_provider: Callable[[Request], Awaitable[Mapping[str, str]]] | None,
+) -> Mapping[str, str]:
+    if runtime_config_provider is None:
+        runtime_config = getattr(request.app.state, "channel_runtime_config", {})
+    else:
+        runtime_config = await runtime_config_provider(request)
+    if not runtime_config:
+        return env
+    return {**env, **runtime_config}
 
 
 def _request_is_authorized(
