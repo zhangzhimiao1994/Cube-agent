@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.db.models import RunArtifactRow, RunEventRow, RunOutboxRow, RunRow
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteDecision
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRepository
 from agent_hub.runs.service import (
     HermesRunAdvice,
@@ -94,6 +95,24 @@ class FakeRuntime:
 
     async def cancel(self) -> None:
         raise AssertionError("not used")
+
+
+class WaitingModeRouter:
+    async def route(self, task_text: object) -> RouteDecision:
+        del task_text
+        return RouteDecision(
+            mode=None,
+            needs_user_choice=True,
+            status="waiting_user_mode",
+            assessments=(),
+            clarification_reason="classification_unavailable",
+            options=EXECUTABLE_MODES,
+            decision_token="safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+            version=1,
+            risk=RiskLevel.LOW,
+            requires_approval=False,
+            permissions_still_apply=True,
+        )
 
 
 class RecordingTemporaryAgentPolicy:
@@ -516,7 +535,7 @@ async def test_submission_writes_run_and_outbox_atomically_then_publisher_delive
     service = RunService(
         RunRepository(run_session_factory),
         runtime_registry=RuntimeRegistry((FakeRuntime(),)),
-        router=None,
+        router=WaitingModeRouter(),
         task_queue=queue,
     )
 
