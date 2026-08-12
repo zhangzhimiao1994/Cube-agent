@@ -60,6 +60,13 @@ export function McpPage() {
       await queryClient.invalidateQueries({ queryKey: ["mcp"] });
     },
   });
+  const deleteServer = useMutation({
+    mutationFn: (id: string) => api.deleteMcpServer(id),
+    onSuccess: async () => {
+      setMessage("MCP 配置已删除。");
+      await queryClient.invalidateQueries({ queryKey: ["mcp"] });
+    },
+  });
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -80,6 +87,11 @@ export function McpPage() {
     setAllowedTools(next.allowedTools);
     setTimeoutSeconds(next.timeoutSeconds);
     setMessage(`已载入 ${server.name}，修改后点击保存。`);
+  }
+
+  function confirmDelete(server: McpServer) {
+    if (!window.confirm(`确定删除 MCP「${server.name}」吗？删除后 Agent 不能再调用它的工具。`)) return;
+    deleteServer.mutate(server.id);
   }
 
   if (servers.isLoading) return <p>正在加载 MCP 工具...</p>;
@@ -188,6 +200,7 @@ export function McpPage() {
           </button>
           {message ? <p role="status">{message}</p> : null}
           {saveServer.isError ? <p role="alert">{formatApiError(saveServer.error, "MCP 保存失败")}</p> : null}
+          {deleteServer.isError ? <p role="alert">{formatApiError(deleteServer.error, "MCP 删除失败")}</p> : null}
         </form>
 
         <article>
@@ -220,6 +233,14 @@ export function McpPage() {
                 <p>允许工具：{server.allowed_tools.join(", ") || "未配置"}</p>
                 <button type="button" onClick={() => edit(server)}>
                   编辑
+                </button>
+                <button
+                  type="button"
+                  className="danger-action"
+                  disabled={deleteServer.isPending}
+                  onClick={() => confirmDelete(server)}
+                >
+                  删除
                 </button>
               </article>
             ))}

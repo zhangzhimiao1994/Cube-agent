@@ -1394,6 +1394,35 @@ class AutoGenDiscussionRuntime:
             error.__context__ = None
             error.__cause__ = None
             del error
+            if _can_complete_with_partial_discussion(message_artifacts, failure_reason):
+                checkpoint = self._checkpoint(
+                    context,
+                    next_sequence=sequence + 2,
+                    terminal=True,
+                    reason="partial_discussion_after_model_failure",
+                    artifacts=tuple(message_artifacts)
+                    + (durability.artifacts if durability is not None else ()),
+                    usage=usage,
+                    model_ledger=(
+                        tuple(durability.model_entries) if durability is not None else ()
+                    ),
+                    tool_ledger=(tuple(durability.tool_entries) if durability is not None else ()),
+                )
+                self._last_checkpoint = checkpoint
+                yield RunEvent(
+                    kind=EventKind.CHECKPOINT_SAVED,
+                    sequence=sequence,
+                    run_id=context.run_id,
+                    checkpoint=checkpoint,
+                )
+                sequence += 1
+                yield RunEvent(
+                    kind=EventKind.RUNTIME_COMPLETED,
+                    sequence=sequence,
+                    run_id=context.run_id,
+                    reason="partial_discussion_after_model_failure",
+                )
+                return
             yield RunEvent(
                 kind=EventKind.RUNTIME_FAILED,
                 sequence=sequence,
@@ -1708,6 +1737,22 @@ class AutoGenDiscussionRuntime:
             cancel_event.set()
         if task is not None and task is not asyncio.current_task():
             task.cancel()
+
+
+def _can_complete_with_partial_discussion(
+    message_artifacts: Sequence[Artifact],
+    failure_reason: str,
+) -> bool:
+    if not message_artifacts:
+        return False
+    if not failure_reason.startswith("model gateway failed"):
+        return False
+    return any(
+        isinstance(artifact.content, Mapping)
+        and isinstance(artifact.content.get("text"), str)
+        and bool(cast(str, artifact.content["text"]).strip())
+        for artifact in message_artifacts
+    )
 
 
 __all__ = [

@@ -1,5 +1,6 @@
 import asyncio
 import io
+import tarfile
 import zipfile
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -470,6 +471,28 @@ def skill_archive() -> bytes:
     return buffer.getvalue()
 
 
+def skill_tar_archive() -> bytes:
+    manifest = (
+        "name: safe_tar_skill\n"
+        "version: 1.0.0\n"
+        "entry_point: main.py\n"
+        "compatible_runtime: python3.12\n"
+        "declared_tools: []\n"
+        "dependency_lock_hash: "
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+    )
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for name, content in {
+            "skill.yaml": manifest.encode("utf-8"),
+            "main.py": b"print('ok')\n",
+        }.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+    return buffer.getvalue()
+
+
 def test_model_pool_reports_serial_slot_and_queue_policy() -> None:
     response = client().post("/api/v1/admin/models", headers=headers(), json=model_payload())
 
@@ -937,6 +960,33 @@ async def test_persistent_admin_conversation_keeps_chronological_messages() -> N
 def test_skill_upload_approve_mcp_memory_and_audit_are_safe() -> None:
     api = client()
 
+    created_agent = api.post(
+        "/api/v1/admin/agents",
+        headers=headers(),
+        json={
+            "id": "smoke-agent",
+            "name": "Smoke Agent",
+            "role": "reviewer",
+            "prompt": "Review safely.",
+            "model": "planner",
+            "skills": [],
+        },
+    )
+    deleted_agent = api.delete("/api/v1/admin/agents/smoke-agent", headers=headers())
+    agents = api.get("/api/v1/admin/agents", headers=headers())
+    created_workflow = api.post(
+        "/api/v1/admin/workflows",
+        headers=headers(),
+        json={
+            "id": "smoke-workflow",
+            "name": "Smoke Workflow",
+            "mode": "dispatch",
+            "agent_ids": ["planner"],
+            "objective": "Smoke test workflow.",
+        },
+    )
+    deleted_workflow = api.delete("/api/v1/admin/workflows/smoke-workflow", headers=headers())
+    workflows = api.get("/api/v1/admin/workflows", headers=headers())
     uploaded = api.post(
         "/api/v1/admin/skills",
         headers=headers(),
@@ -946,12 +996,17 @@ def test_skill_upload_approve_mcp_memory_and_audit_are_safe() -> None:
         f"/api/v1/admin/skills/{uploaded.json()['id']}/approve",
         headers=headers(),
     )
+    deleted_skill = api.delete(
+        f"/api/v1/admin/skills/{uploaded.json()['id']}",
+        headers=headers(),
+    )
     skills = api.get("/api/v1/admin/skills", headers=headers())
     created_mcp = api.post(
         "/api/v1/admin/mcp",
         headers=headers(),
         json={"id": "browser", "name": "Browser MCP", "allowed_tools": ["open_page"]},
     )
+    deleted_mcp = api.delete("/api/v1/admin/mcp/browser", headers=headers())
     mcp = api.get("/api/v1/admin/mcp", headers=headers())
     created_memory = api.post(
         "/api/v1/admin/memory",
@@ -970,11 +1025,19 @@ def test_skill_upload_approve_mcp_memory_and_audit_are_safe() -> None:
     )
     audit = api.get("/api/v1/admin/audit?action=config.publish", headers=headers())
 
+    assert created_agent.status_code == 200
+    assert deleted_agent.json()["status"] == "deleted"
+    assert all(item["id"] != "smoke-agent" for item in agents.json())
+    assert created_workflow.status_code == 200
+    assert deleted_workflow.json()["status"] == "deleted"
+    assert all(item["id"] != "smoke-workflow" for item in workflows.json())
     assert uploaded.json()["status"] == "quarantined"
     assert approved.json()["status"] == "enabled"
-    assert skills.json()[0]["requested_permissions"] == ["filesystem:read"]
+    assert deleted_skill.json()["status"] == "deleted"
+    assert all(item["id"] != uploaded.json()["id"] for item in skills.json())
     assert created_mcp.json()["health"] == "configured"
-    assert any(item["id"] == "browser" for item in mcp.json())
+    assert deleted_mcp.json()["status"] == "deleted"
+    assert all(item["id"] != "browser" for item in mcp.json())
     assert created_memory.json()["id"] == "logging-policy"
     assert any(item["id"] == "logging-policy" for item in memory.json())
     assert updated_memory.json()["value"] == "Updated non-dangerous operation policy."
@@ -1080,6 +1143,23 @@ def test_skill_archive_upload_scans_real_zip_package() -> None:
     assert body["requested_permissions"] == ["tool:filesystem.read"]
     assert any("content sha256" in item for item in body["scan_diff"])
     assert skills.json()[0]["id"] == body["id"]
+
+
+def test_skill_archive_upload_accepts_real_tar_gz_package() -> None:
+    api = client()
+
+    uploaded = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-tar-skill.tar.gz"},
+        content=skill_tar_archive(),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert uploaded.status_code == 200
+    body = uploaded.json()
+    assert body["name"] == "safe_tar_skill"
+    assert body["status"] == "scanned"
+    assert any(item["id"] == body["id"] for item in skills.json())
 
 
 def test_skill_archive_upload_rejects_invalid_zip_without_saving_metadata() -> None:

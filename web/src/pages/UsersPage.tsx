@@ -45,6 +45,8 @@ export function UsersPage() {
   const [password, setPassword] = useState("");
   const [role, setRole] = useState("operator");
   const [message, setMessage] = useState<string | null>(null);
+  const [resetTarget, setResetTarget] = useState<ManagedUser | null>(null);
+  const [resetPassword, setResetPassword] = useState("");
   const permissions = auth.user?.permissions ?? [];
   const canWriteUsers = can("user:write", permissions);
   const currentUserId = auth.user?.user_id ?? "";
@@ -84,9 +86,23 @@ export function UsersPage() {
       refreshUsers();
     },
   });
+  const resetUserPassword = useMutation({
+    mutationFn: ({ userId, nextPassword }: { userId: string; nextPassword: string }) =>
+      api.resetUserPassword(userId, nextPassword),
+    onSuccess: (user) => {
+      setResetTarget(null);
+      setResetPassword("");
+      setMessage(`已重置 ${user.username} 的密码`);
+      refreshUsers();
+    },
+  });
 
   const operationError =
-    createUser.error ?? changeRole.error ?? setDisabled.error ?? deleteUser.error;
+    createUser.error ??
+    changeRole.error ??
+    setDisabled.error ??
+    resetUserPassword.error ??
+    deleteUser.error;
 
   if (users.isLoading) return <p>正在加载用户...</p>;
   if (users.isError) {
@@ -170,6 +186,51 @@ export function UsersPage() {
       {message ? <p role="status">{message}</p> : null}
       {operationError ? <p role="alert">{formatApiError(operationError, "用户操作失败")}</p> : null}
 
+      {resetTarget ? (
+        <article>
+          <h3>重置密码</h3>
+          <p>
+            正在为 <strong>{resetTarget.username}</strong> 设置新密码。保存后旧密码立即失效，密码明文不会写入页面或日志。
+          </p>
+          <form
+            className="form-grid"
+            onSubmit={(event) => {
+              event.preventDefault();
+              setMessage(null);
+              resetUserPassword.mutate({ userId: resetTarget.id, nextPassword: resetPassword });
+            }}
+          >
+            <label htmlFor="reset-password">
+              新密码
+              <input
+                id="reset-password"
+                aria-label="新密码"
+                type="password"
+                value={resetPassword}
+                onChange={(event) => setResetPassword(event.target.value)}
+                placeholder="至少 12 位"
+                autoComplete="new-password"
+                required
+                minLength={12}
+              />
+              <small>建议使用 16 位以上随机密码；保存后请通过安全渠道交给用户。</small>
+            </label>
+            <button type="submit" disabled={resetUserPassword.isPending}>
+              {resetUserPassword.isPending ? "保存中..." : "保存新密码"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setResetTarget(null);
+                setResetPassword("");
+              }}
+            >
+              取消
+            </button>
+          </form>
+        </article>
+      ) : null}
+
       <article>
         <h3>用户列表</h3>
         <table>
@@ -212,6 +273,17 @@ export function UsersPage() {
                   <td>{user.disabled ? "已禁用" : "正常"}</td>
                   <td>{user.feishu_open_id ?? "未绑定"}</td>
                   <td className="table-actions">
+                    <button
+                      type="button"
+                      disabled={locked}
+                      onClick={() => {
+                        setMessage(null);
+                        setResetPassword("");
+                        setResetTarget(user);
+                      }}
+                    >
+                      重置密码
+                    </button>
                     <button
                       type="button"
                       disabled={locked}

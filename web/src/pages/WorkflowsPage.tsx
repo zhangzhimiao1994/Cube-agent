@@ -159,6 +159,14 @@ export function WorkflowsPage() {
     },
   });
 
+  const deleteWorkflow = useMutation({
+    mutationFn: (id: string) => api.deleteWorkflow(id),
+    onSuccess: async () => {
+      setMessage("工作流已删除。");
+      await queryClient.invalidateQueries({ queryKey: ["workflows"] });
+    },
+  });
+
   function changePreset(nextId: string) {
     const next = WORKFLOW_PRESETS.find((item) => item.id === nextId) ?? WORKFLOW_PRESETS[0];
     setPresetId(next.id);
@@ -185,6 +193,14 @@ export function WorkflowsPage() {
     event.preventDefault();
     setMessage(null);
     saveWorkflow.mutate();
+  }
+
+  function confirmDelete(workflow: { id: string; name: string }) {
+    if (!window.confirm(`确定删除工作流「${workflow.name}」吗？历史对话不会删除，但后续不能再选择它。`)) {
+      return;
+    }
+    setMessage(null);
+    deleteWorkflow.mutate(workflow.id);
   }
 
   if (workflows.isLoading || agents.isLoading) return <p>正在加载工作流配置...</p>;
@@ -337,10 +353,19 @@ export function WorkflowsPage() {
                 <p>默认模式：{workflow.mode ?? "auto"}</p>
                 <p>默认角色：{(workflow.agent_ids ?? []).join(", ") || "未固定"}</p>
                 {workflow.objective ? <p>{workflow.objective}</p> : null}
+                <button
+                  type="button"
+                  className="danger-action"
+                  onClick={() => confirmDelete({ id: workflow.id, name: workflow.name })}
+                  disabled={deleteWorkflow.isPending}
+                >
+                  删除工作流
+                </button>
               </article>
             ))}
           </div>
         )}
+        {deleteWorkflow.isError ? <p role="alert">{formatApiError(deleteWorkflow.error, "工作流删除失败")}</p> : null}
       </section>
     </section>
   );

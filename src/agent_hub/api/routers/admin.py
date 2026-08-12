@@ -202,6 +202,15 @@ class RunListItem(BaseModel):
     cost_usd: str
 
 
+class RunArtifactResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    kind: str
+    title: str
+    text: str | None = None
+
+
 class RunEventResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -216,15 +225,7 @@ class RunEventResponse(BaseModel):
     action: str | None = None
     decision: str | None = None
     payload: dict[str, JsonValue] = Field(default_factory=dict)
-
-
-class RunArtifactResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    kind: str
-    title: str
-    text: str | None = None
+    artifact: RunArtifactResponse | None = None
 
 
 class RunDetailResponse(RunListItem):
@@ -700,9 +701,13 @@ class AdminResourceService(Protocol):
 
     async def upsert_agent(self, request: AgentResourceRequest) -> AgentResourceResponse: ...
 
+    async def delete_agent(self, agent_id: str) -> None: ...
+
     async def list_workflows(self) -> tuple[WorkflowResourceResponse, ...]: ...
 
     async def upsert_workflow(self, request: WorkflowResourceRequest) -> WorkflowResourceResponse: ...
+
+    async def delete_workflow(self, workflow_id: str) -> None: ...
 
     async def get_settings(self) -> SystemSettingsResponse: ...
 
@@ -736,9 +741,13 @@ class AdminResourceService(Protocol):
 
     async def approve_skill(self, skill_id: str) -> SkillResponse: ...
 
+    async def delete_skill(self, skill_id: str) -> None: ...
+
     async def list_mcp_servers(self) -> tuple[McpServerResponse, ...]: ...
 
     async def upsert_mcp_server(self, request: McpServerRequest) -> McpServerResponse: ...
+
+    async def delete_mcp_server(self, server_id: str) -> None: ...
 
     async def list_channels(self) -> tuple[ChannelStatusResponse, ...]: ...
 
@@ -1003,6 +1012,11 @@ class InMemoryAdminResourceService:
         self.agents[response.id] = response
         return response
 
+    async def delete_agent(self, agent_id: str) -> None:
+        if agent_id not in self.agents:
+            raise KeyError(agent_id)
+        del self.agents[agent_id]
+
     async def list_workflows(self) -> tuple[WorkflowResourceResponse, ...]:
         return tuple(self.workflows.values())
 
@@ -1010,6 +1024,11 @@ class InMemoryAdminResourceService:
         response = WorkflowResourceResponse(**request.model_dump())
         self.workflows[response.id] = response
         return response
+
+    async def delete_workflow(self, workflow_id: str) -> None:
+        if workflow_id not in self.workflows:
+            raise KeyError(workflow_id)
+        del self.workflows[workflow_id]
 
     async def get_settings(self) -> SystemSettingsResponse:
         return self.settings
@@ -1120,6 +1139,9 @@ class InMemoryAdminResourceService:
         self.skills[skill_id] = updated
         return updated
 
+    async def delete_skill(self, skill_id: str) -> None:
+        del self.skills[skill_id]
+
     async def list_mcp_servers(self) -> tuple[McpServerResponse, ...]:
         return tuple(self.mcp_servers.values())
 
@@ -1139,6 +1161,9 @@ class InMemoryAdminResourceService:
         )
         self.mcp_servers[response.id] = response
         return response
+
+    async def delete_mcp_server(self, server_id: str) -> None:
+        del self.mcp_servers[server_id]
 
     async def list_channels(self) -> tuple[ChannelStatusResponse, ...]:
         return _channel_statuses_from_configuration(self.channel_config)
@@ -1864,6 +1889,33 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 return response
         raise PublicAPIError(503, "service_unavailable", "service unavailable")
 
+    async def delete_agent(self, agent_id: str) -> None:
+        document = await self._current_document()
+        agents = list(cast(list[object], document.setdefault("agents", [])))
+        next_agents = [
+            existing
+            for existing in agents
+            if not (isinstance(existing, dict) and existing.get("id") == agent_id)
+        ]
+        if len(next_agents) == len(agents):
+            raise KeyError(agent_id)
+        document["agents"] = next_agents
+        try:
+            PlatformConfig.model_validate(document)
+            draft = await self._config_service.create_draft(
+                self._tenant_id,
+                self._actor_id,
+                document,
+            )
+            await self._config_service.publish(
+                self._tenant_id,
+                draft.version,
+                self._actor_id,
+            )
+        except (ConfigValidationError, ValidationError):
+            raise PublicAPIError(422, "request_validation", "request validation failed") from None
+        await self._record_audit("agent.delete", f"agent:{agent_id}", {"id": agent_id})
+
     async def list_workflows(self) -> tuple[WorkflowResourceResponse, ...]:
         resources = await self._list_admin_payloads("workflow")
         if resources is None:
@@ -1876,6 +1928,14 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             return await super().upsert_workflow(request)
         await self._record_audit("workflow.upsert", f"workflow:{response.id}", {"id": response.id})
         return response
+
+    async def delete_workflow(self, workflow_id: str) -> None:
+        deleted = await self._delete_admin_payload("workflow", workflow_id)
+        if deleted is None:
+            return await super().delete_workflow(workflow_id)
+        if not deleted:
+            raise KeyError(workflow_id)
+        await self._record_audit("workflow.delete", f"workflow:{workflow_id}", {"id": workflow_id})
 
     async def get_settings(self) -> SystemSettingsResponse:
         payload = await self._get_admin_payload("setting", "system")
@@ -2017,6 +2077,26 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         await self._record_audit("skill.approve", f"skill:{skill_id}", {"id": skill_id})
         return response
 
+    async def delete_skill(self, skill_id: str) -> None:
+        deleted = await self._delete_admin_payload("skill", skill_id)
+        if deleted is None:
+            await super().delete_skill(skill_id)
+            return
+        if not deleted:
+            raise KeyError(skill_id)
+        try:
+            self._skill_archive_path(skill_id).unlink(missing_ok=True)
+        except OSError:
+            await self.record_log(
+                category="feature_error",
+                level="warning",
+                title="主要功能运行错误",
+                message="skill archive could not be removed",
+                source="skills.delete",
+                details={"feature": "skills", "skill_id": skill_id},
+            )
+        await self._record_audit("skill.delete", f"skill:{skill_id}", {"id": skill_id})
+
     def _skill_archive_path(self, skill_id: str) -> Path:
         if not _is_safe_admin_identifier(skill_id):
             raise PublicAPIError(422, "request_validation", "invalid skill id")
@@ -2050,6 +2130,15 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             return await super().upsert_mcp_server(request)
         await self._record_audit("mcp.upsert", f"mcp:{response.id}", {"id": response.id})
         return response
+
+    async def delete_mcp_server(self, server_id: str) -> None:
+        deleted = await self._delete_admin_payload("mcp", server_id)
+        if deleted is None:
+            await super().delete_mcp_server(server_id)
+            return
+        if not deleted:
+            raise KeyError(server_id)
+        await self._record_audit("mcp.delete", f"mcp:{server_id}", {"id": server_id})
 
     async def list_channels(self) -> tuple[ChannelStatusResponse, ...]:
         config = await self._channel_config_values()
@@ -2666,16 +2755,21 @@ def _safe_skill_upload_filename(value: str | None) -> str:
     if value is None:
         raise PublicAPIError(422, "request_validation", "skill filename is required")
     filename = value.strip()
+    lowered = filename.lower()
     if (
         not filename
         or len(filename) > 255
         or "/" in filename
         or "\\" in filename
         or filename in {".", ".."}
-        or not filename.lower().endswith(".zip")
+        or not lowered.endswith((".zip", ".tar", ".tar.gz", ".tgz"))
         or any(ord(character) < 32 or ord(character) == 127 for character in filename)
     ):
-        raise PublicAPIError(422, "request_validation", "skill filename must be a safe .zip name")
+        raise PublicAPIError(
+            422,
+            "request_validation",
+            "skill filename must be a safe .zip, .tar, .tar.gz, or .tgz name",
+        )
     return filename
 
 
@@ -3284,6 +3378,7 @@ def _admin_run_event(event: dict[str, object]) -> RunEventResponse:
     kind = event.get("kind")
     message = event.get("reason") or event.get("message") or kind
     payload = event.get("payload")
+    artifact = event.get("artifact")
     return RunEventResponse(
         sequence=sequence if type(sequence) is int else 1,
         kind=kind if type(kind) is str else "event",
@@ -3296,6 +3391,7 @@ def _admin_run_event(event: dict[str, object]) -> RunEventResponse:
         action=_optional_event_string(event.get("action")),
         decision=_optional_event_string(event.get("decision")),
         payload=_event_payload(payload),
+        artifact=_admin_run_artifact(artifact) if isinstance(artifact, dict) else None,
     )
 
 
@@ -3607,6 +3703,24 @@ async def upsert_agent(
     return await service.upsert_agent(body)
 
 
+@router.delete(
+    "/agents/{agent_id}",
+    response_model=OperationStatusResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def delete_agent(
+    agent_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> OperationStatusResponse:
+    _require(principal, "agent:write")
+    try:
+        await service.delete_agent(agent_id)
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+    return OperationStatusResponse(status="deleted")
+
+
 @router.get("/workflows", response_model=list[WorkflowResourceResponse], responses=error_responses(401, 403, 422))
 async def list_workflows(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -3624,6 +3738,24 @@ async def upsert_workflow(
 ) -> WorkflowResourceResponse:
     _require(principal, "agent:write")
     return await service.upsert_workflow(body)
+
+
+@router.delete(
+    "/workflows/{workflow_id}",
+    response_model=OperationStatusResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def delete_workflow(
+    workflow_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> OperationStatusResponse:
+    _require(principal, "agent:write")
+    try:
+        await service.delete_workflow(workflow_id)
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+    return OperationStatusResponse(status="deleted")
 
 
 @router.get("/settings", response_model=SystemSettingsResponse, responses=error_responses(401, 403, 422))
@@ -3857,6 +3989,24 @@ async def approve_skill(
         raise PublicAPIError(404, "not_found", "not found") from None
 
 
+@router.delete(
+    "/skills/{skill_id}",
+    response_model=OperationStatusResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def delete_skill(
+    skill_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> OperationStatusResponse:
+    _require(principal, "skill:approve")
+    try:
+        await service.delete_skill(skill_id)
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+    return OperationStatusResponse(status="deleted")
+
+
 @router.get("/mcp", response_model=list[McpServerResponse], responses=error_responses(401, 403, 422))
 async def list_mcp_servers(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -3874,6 +4024,24 @@ async def upsert_mcp_server(
 ) -> McpServerResponse:
     _require(principal, "mcp:write")
     return await service.upsert_mcp_server(body)
+
+
+@router.delete(
+    "/mcp/{server_id}",
+    response_model=OperationStatusResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def delete_mcp_server(
+    server_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> OperationStatusResponse:
+    _require(principal, "mcp:write")
+    try:
+        await service.delete_mcp_server(server_id)
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+    return OperationStatusResponse(status="deleted")
 
 
 @router.get("/channels", response_model=list[ChannelStatusResponse], responses=error_responses(401, 403, 422))

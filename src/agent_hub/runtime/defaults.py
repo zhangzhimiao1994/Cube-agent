@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import keyword
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import replace
 from decimal import Decimal
@@ -56,6 +57,25 @@ CapacityFactory = Callable[
     [UUID, tuple[Deployment, ...]],
     Awaitable[CapacityController | CapacityPool],
 ]
+_DISPATCH_OUTPUT_SCHEMA: Mapping[str, str] = {
+    "status": "done | blocked | needs_user",
+    "summary": "string",
+    "evidence": "string[]",
+    "risks": "string[]",
+    "artifacts": "string[]",
+    "verification": "string[]",
+}
+_DISCUSSION_OUTPUT_SCHEMA: Mapping[str, str] = {
+    "position": "approve | reject | needs_user",
+    "recommended_option": "string | null",
+    "confidence": "0.0-1.0",
+    "claims": "string[]",
+    "evidence": "string[]",
+    "objections": "string[]",
+    "risks": "string[]",
+    "questions_for_user": "string[]",
+    "verification_needed": "string[]",
+}
 
 
 class UnavailableRuntime:
@@ -213,19 +233,28 @@ class ConfigBackedDispatchRuntime:
             capacity_factory=self._capacity_factory,
             transport=self._transport,
         )
-        role_plan = self._role_planner.plan(
-            RolePlanningRequest(
-                task=str(context.request),
-                mode=TaskMode.DISPATCH,
-                profile=_task_profile(context.request),
-                profiles=_task_profiles(context.request),
-                high_risk=_high_risk_task(context.request),
-                requested_skills=_requested_skills(context),
-                default_model=logical_model,
-            )
+        selected_roles = _selected_config_role_assignments(
+            context,
+            config,
+            purpose=RolePurpose.EXECUTE,
+            output_schema=_DISPATCH_OUTPUT_SCHEMA,
         )
+        if selected_roles:
+            planned_roles = selected_roles
+        else:
+            planned_roles = self._role_planner.plan(
+                RolePlanningRequest(
+                    task=str(context.request),
+                    mode=TaskMode.DISPATCH,
+                    profile=_task_profile(context.request),
+                    profiles=_task_profiles(context.request),
+                    high_risk=_high_risk_task(context.request),
+                    requested_skills=_requested_skills(context),
+                    default_model=logical_model,
+                )
+            ).roles
         roles = _assign_models_to_roles(
-            (*role_plan.roles, *_temporary_role_assignments(context, logical_model)),
+            (*planned_roles, *_temporary_role_assignments(context, logical_model)),
             config,
             default_model=logical_model,
             task=context.request,
@@ -236,7 +265,7 @@ class ConfigBackedDispatchRuntime:
                 roles,
                 context,
                 max_parallelism=_dispatch_parallelism(config, logical_model),
-            ),
+            )
         )
 
 
@@ -295,19 +324,28 @@ class ConfigBackedDiscussionRuntime:
             capacity_factory=self._capacity_factory,
             transport=self._transport,
         )
-        role_plan = self._role_planner.plan(
-            RolePlanningRequest(
-                task=str(context.request),
-                mode=TaskMode.DISCUSS,
-                profile=_task_profile(context.request),
-                profiles=_task_profiles(context.request),
-                high_risk=_high_risk_task(context.request),
-                requested_skills=_requested_skills(context),
-                default_model=logical_model,
-            )
+        selected_roles = _selected_config_role_assignments(
+            context,
+            config,
+            purpose=RolePurpose.EXPERTISE,
+            output_schema=_DISCUSSION_OUTPUT_SCHEMA,
         )
+        if len(selected_roles) >= 2:
+            planned_roles = selected_roles
+        else:
+            planned_roles = self._role_planner.plan(
+                RolePlanningRequest(
+                    task=str(context.request),
+                    mode=TaskMode.DISCUSS,
+                    profile=_task_profile(context.request),
+                    profiles=_task_profiles(context.request),
+                    high_risk=_high_risk_task(context.request),
+                    requested_skills=_requested_skills(context),
+                    default_model=logical_model,
+                )
+            ).roles
         roles = _assign_models_to_roles(
-            role_plan.roles,
+            planned_roles,
             config,
             default_model=logical_model,
             task=context.request,
@@ -373,28 +411,56 @@ class ConfigBackedHybridRuntime:
         profile = _task_profile(context.request)
         profiles = _task_profiles(context.request)
         high_risk = _high_risk_task(context.request)
-        dispatch_roles = self._role_planner.plan(
-            RolePlanningRequest(
-                task=str(context.request),
-                mode=TaskMode.DISPATCH,
-                profile=profile,
-                profiles=profiles,
-                high_risk=high_risk,
-                requested_skills=_requested_skills(context),
-                default_model=logical_model,
+        selected_dispatch_roles = _selected_config_role_assignments(
+            context,
+            config,
+            purpose=RolePurpose.EXECUTE,
+            output_schema=_DISPATCH_OUTPUT_SCHEMA,
+        )
+        selected_discussion_roles = _selected_config_role_assignments(
+            context,
+            config,
+            purpose=RolePurpose.EXPERTISE,
+            output_schema=_DISCUSSION_OUTPUT_SCHEMA,
+        )
+        if selected_dispatch_roles:
+            dispatch_roles = selected_dispatch_roles
+        else:
+            dispatch_roles = self._role_planner.plan(
+                RolePlanningRequest(
+                    task=str(context.request),
+                    mode=TaskMode.DISPATCH,
+                    profile=profile,
+                    profiles=profiles,
+                    high_risk=high_risk,
+                    requested_skills=_requested_skills(context),
+                    default_model=logical_model,
+                )
+            ).roles
+        if len(selected_discussion_roles) >= 2:
+            discussion_roles = selected_discussion_roles
+        elif len(selected_dispatch_roles) >= 2:
+            discussion_roles = tuple(
+                replace(
+                    role,
+                    purpose=RolePurpose.EXPERTISE,
+                    must_answer=("What is this agent's position and evidence?",),
+                    output_schema=_DISCUSSION_OUTPUT_SCHEMA,
+                )
+                for role in selected_dispatch_roles
             )
-        ).roles
-        discussion_roles = self._role_planner.plan(
-            RolePlanningRequest(
-                task=str(context.request),
-                mode=TaskMode.DISCUSS,
-                profile=profile,
-                profiles=profiles,
-                high_risk=high_risk,
-                requested_skills=_requested_skills(context),
-                default_model=logical_model,
-            )
-        ).roles
+        else:
+            discussion_roles = self._role_planner.plan(
+                RolePlanningRequest(
+                    task=str(context.request),
+                    mode=TaskMode.DISCUSS,
+                    profile=profile,
+                    profiles=profiles,
+                    high_risk=high_risk,
+                    requested_skills=_requested_skills(context),
+                    default_model=logical_model,
+                )
+            ).roles
         dispatch_roles = _assign_models_to_roles(
             (*dispatch_roles, *_temporary_role_assignments(context, logical_model)),
             config,
@@ -552,6 +618,42 @@ def _dispatch_plan(
     )
 
 
+def _selected_config_role_assignments(
+    context: TaskContext,
+    config: PlatformConfig,
+    *,
+    purpose: RolePurpose,
+    output_schema: Mapping[str, str],
+) -> tuple[RoleAssignment, ...]:
+    raw_ids = context.routing_decision.get("selected_agent_ids")
+    if not isinstance(raw_ids, (list, tuple)):
+        return ()
+    requested_ids = tuple(item for item in raw_ids if isinstance(item, str) and item)
+    if not requested_ids:
+        return ()
+    agents_by_id = {agent.id: agent for agent in config.agents}
+    assignments: list[RoleAssignment] = []
+    for agent_id in requested_ids:
+        agent = agents_by_id.get(agent_id)
+        if agent is None:
+            continue
+        assignments.append(
+            RoleAssignment(
+                id=agent.id,
+                role=agent.role,
+                purpose=purpose,
+                mission=agent.prompt,
+                must_answer=("What did this agent contribute and what evidence supports it?",),
+                allowed_tools=(),
+                forbidden_actions=("Do not perform dangerous operations without approval.",),
+                skills=tuple(agent.skills),
+                output_schema=output_schema,
+                model=agent.model,
+            )
+        )
+    return tuple(assignments)
+
+
 def _temporary_role_assignments(
     context: TaskContext,
     logical_model: str,
@@ -559,7 +661,7 @@ def _temporary_role_assignments(
     if context.routing_decision.get("temporary_agent_approved") is not True:
         return ()
     raw_agents = context.routing_decision.get("temporary_agents")
-    if not isinstance(raw_agents, tuple):
+    if not isinstance(raw_agents, (list, tuple)):
         return ()
     assignments: list[RoleAssignment] = []
     for raw in raw_agents[:4]:
@@ -573,7 +675,7 @@ def _temporary_role_assignments(
             continue
         logical_model_for_agent = selected_model if isinstance(selected_model, str) and selected_model else identifier
         skills = raw.get("suggested_skills")
-        skill_tuple = tuple(item for item in skills if isinstance(item, str)) if isinstance(skills, tuple) else ()
+        skill_tuple = tuple(item for item in skills if isinstance(item, str)) if isinstance(skills, (list, tuple)) else ()
         try:
             assignments.append(
                 RoleAssignment(
@@ -735,16 +837,17 @@ def _discussion_plan(
                 model=default_model,
             ),
         )
+    participant_ids = _autogen_participant_ids(selected_roles)
     participants = tuple(
         DiscussionParticipant(
-            id=role.id,
+            id=participant_id,
             role=role.role,
             goal=role.mission,
             logical_model=role.model,
             allowed_tools=(),
             max_output_tokens=1536,
         )
-        for role in selected_roles
+        for role, participant_id in zip(selected_roles, participant_ids, strict=True)
     )
     return DiscussionPlan(
         participants=participants,
@@ -756,6 +859,23 @@ def _discussion_plan(
         cost_budget_usd=Decimal(10),
         consensus_votes=min(2, len(participants)),
     )
+
+
+def _autogen_participant_ids(roles: tuple[RoleAssignment, ...]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    identifiers: list[str] = []
+    for index, role in enumerate(roles, start=1):
+        candidate = role.id.replace("-", "_").replace(".", "_")
+        if not candidate.isidentifier() or keyword.iskeyword(candidate):
+            candidate = f"agent_{index}"
+        base = candidate
+        suffix = 2
+        while candidate in seen:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        seen.add(candidate)
+        identifiers.append(candidate)
+    return tuple(identifiers)
 
 
 def _task_profile(task: object) -> TaskProfile:

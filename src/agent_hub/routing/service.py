@@ -32,12 +32,15 @@ from agent_hub.routing.types import (
 @dataclass(frozen=True, slots=True)
 class RoutingPolicy:
     confidence_threshold: float = 0.85
+    conflict_decision_margin: float = 0.15
     max_single_cost_usd: Decimal = Decimal("0.50")
     max_total_cost_usd: Decimal = Decimal("0.75")
     classifier_timeout_seconds: float = 20
     classifier_cleanup_grace_seconds: float = 0.1
     max_detached_classifier_tasks: int = 32
     confirmation_ttl_seconds: float = 300
+    parallel_classifiers: bool = True
+    allow_single_classifier_decision: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -47,6 +50,13 @@ class RoutingPolicy:
             or not 0 <= self.confidence_threshold <= 1
         ):
             raise ValueError("confidence threshold must be finite and between zero and one")
+        if (
+            isinstance(self.conflict_decision_margin, bool)
+            or not isinstance(self.conflict_decision_margin, int | float)
+            or not math.isfinite(self.conflict_decision_margin)
+            or not 0 <= self.conflict_decision_margin <= 1
+        ):
+            raise ValueError("conflict decision margin must be finite and between zero and one")
         for name in ("max_single_cost_usd", "max_total_cost_usd"):
             value = getattr(self, name)
             if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
@@ -79,6 +89,10 @@ class RoutingPolicy:
             or self.confirmation_ttl_seconds <= 0
         ):
             raise ValueError("confirmation TTL must be positive and finite")
+        if not isinstance(self.parallel_classifiers, bool):
+            raise ValueError("parallel_classifiers must be a boolean")
+        if not isinstance(self.allow_single_classifier_decision, bool):
+            raise ValueError("allow_single_classifier_decision must be a boolean")
 
 
 class ModeRouter:
@@ -186,9 +200,25 @@ class ModeRouter:
             )
         highest_risk = max((item.risk for item in assessments), key=_risk_rank)
         requires_approval = highest_risk is RiskLevel.HIGH
+        sorted_assessments = tuple(
+            sorted(assessments, key=lambda item: item.confidence, reverse=True)
+        )
+        mode_conflict = any(item.mode is not assessments[0].mode for item in assessments[1:])
+        clear_conflict_winner = (
+            mode_conflict
+            and sorted_assessments[0].confidence >= self._policy.confidence_threshold
+            and (
+                len(sorted_assessments) == 1
+                or sorted_assessments[0].confidence - sorted_assessments[1].confidence
+                >= self._policy.conflict_decision_margin
+            )
+        )
         if (
-            any(item.confidence < self._policy.confidence_threshold for item in assessments)
-            or any(item.mode is not assessments[0].mode for item in assessments[1:])
+            (
+                any(item.confidence < self._policy.confidence_threshold for item in assessments)
+                and not clear_conflict_winner
+            )
+            or (mode_conflict and not clear_conflict_winner)
             or highest_risk is RiskLevel.HIGH
             or any(
                 item.estimated_cost_usd > self._policy.max_single_cost_usd for item in assessments
@@ -202,6 +232,13 @@ class ModeRouter:
                 risk=highest_risk,
                 requires_approval=requires_approval,
                 confirmation_subject=confirmation_subject,
+            )
+        if clear_conflict_winner:
+            return self._ready(
+                sorted_assessments[0].mode,
+                (sorted_assessments[0],),
+                risk=highest_risk,
+                requires_approval=requires_approval,
             )
         return self._ready(
             assessments[0].mode,
@@ -224,6 +261,17 @@ class ModeRouter:
         raise cancellation from None
 
     async def _classify_with_text(self, task_text: str) -> tuple[RouteAssessment, ...] | None:
+        if not self._policy.parallel_classifiers:
+            try:
+                primary = await self._classifier.classify(task_text)
+                if self._policy.allow_single_classifier_decision:
+                    return (primary,)
+                return (primary, await self._verifier.classify(task_text))
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001
+                _clear_exception(error)
+                return None
         if self._classifier_task_slots + 2 > self._policy.max_detached_classifier_tasks:
             return None
         classifiers = (self._classifier, self._verifier)

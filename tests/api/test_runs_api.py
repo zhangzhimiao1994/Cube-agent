@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import io
+import json
+import tarfile
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -344,6 +347,42 @@ def test_attachment_upload_stores_image_without_exposing_server_path(tmp_path: P
     assert body["sha256"]
     assert "path" not in body
     assert list(tmp_path.rglob("*.bin"))
+
+
+def test_attachment_upload_extracts_common_archive_manifest_safely(tmp_path: Path) -> None:
+    client, _, _ = _client(attachment_store_dir=tmp_path)
+    archive_buffer = io.BytesIO()
+    with tarfile.open(fileobj=archive_buffer, mode="w:gz") as archive:
+        for name, content in {
+            "src/main.py": b"print('hello')\n",
+            "README.md": b"# demo\n",
+        }.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            info.mode = 0o644
+            archive.addfile(info, io.BytesIO(content))
+
+    response = client.post(
+        "/api/v1/runs/attachments/upload",
+        headers={
+            **bearer(),
+            "X-Agent-Hub-Filename": "source-package.tar.gz",
+            "Content-Type": "application/gzip",
+        },
+        content=archive_buffer.getvalue(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["filename"] == "source-package.tar.gz"
+    assert body["kind"] == "archive"
+    assert body["content_type"] == "application/gzip"
+    assert "path" not in body
+    manifest_path = next(tmp_path.rglob(f"{body['id']}.manifest.json"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["archive"]["extracted"] is True
+    assert [item["path"] for item in manifest["files"]] == ["src/main.py", "README.md"]
+    assert (manifest_path.parent / body["id"] / "src" / "main.py").is_file()
 
 
 def test_submission_forwards_attachment_ids() -> None:

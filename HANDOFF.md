@@ -43,3 +43,188 @@ Remaining risks / TODOs:
 - Local integration runtime tests that require the project’s local test PostgreSQL fixture were not used as the final local gate on this Windows machine because the fixture connection timed out on `127.0.0.1:54329`. Equivalent runtime paths were verified against the deployed server with the real PostgreSQL/Redis/model configuration.
 - The frontend bundle remains above Vite’s 500 kB warning threshold; not a functional blocker, but code-splitting should be considered later.
 - PowerShell output may show Chinese text as mojibake; source files themselves are UTF-8 and were verified by Python reads.
+
+## 2026-08-12 Process Timeline Follow-up
+
+Current state:
+
+- Local source has been updated for Kimi/Codex-style process timeline rendering.
+- Debug server `103.236.98.133` has been synced with the latest changed source files and rebuilt `web/dist`.
+- Server UI is reachable from the external forwarded address `http://113.142.217.42:21015/` and the served `index.html` points to `/assets/index-CyNxpLNi.js`.
+- No GitHub push has been performed for this follow-up yet because authenticated production-flow verification is still blocked by lack of normal login credentials/session.
+
+Changes made:
+
+- Admin run event responses now include nested `artifact` data when an event carries it, so the web UI can show the concrete output tied to that exact event instead of guessing from the global artifact list.
+- Frontend API schema accepts `event.artifact`.
+- Conversation process rows now preserve event order and no longer deduplicate repeated-looking action messages. This keeps `main dispatch -> subagent task -> model call -> output -> discussion -> decision` as separate chronological rows.
+- `discussion.completed` is split into a discussion summary row, per-role `*_opinion` rows, and a separate `主 Agent 裁决` row when judgement data exists.
+- Process row details now include available model/provider, executor, participants, tool/step, instruction/payload, and concrete artifact output.
+- Artifact fallback is stricter: it only uses explicit artifact IDs or actor-title matches, avoiding accidental use of the final assistant reply as a process-row output.
+- Added UI regression coverage that verifies old conversation messages are restored after starting a new chat and then reopening the old conversation.
+- Fixed the local sync packaging mistake: `web/dist` must be copied with wildcard expansion (`Copy-Item -Path web\dist\*`) or the server will get an empty dist directory.
+
+Verification performed:
+
+- Local targeted UI tests:
+  - `npm.cmd test -- --run src/pages/OperationalPages.test.tsx -t "restores historical conversation messages"` → passed.
+  - `npm.cmd test -- --run src/pages/OperationalPages.test.tsx -t "ordered timeline"` → passed.
+- Local full UI tests: `npm.cmd test -- --run` → 64 passed.
+- Local frontend build: `npm.cmd run build` → success; Vite chunk-size warning only.
+- Local backend API tests with project-local temp/cache dirs: `uv run pytest tests/api -q` → 148 passed.
+- Local lint/type checks:
+  - `uv run ruff check src tests` → passed.
+  - `uv run mypy --strict src tests` → passed.
+- Server sync:
+  - Uploaded minimal package containing changed source files and `web/dist`.
+  - Cleared server `web/dist` before extraction to avoid stale assets.
+  - Restarted `agent-hub-api` and `agent-hub-worker`, reloaded Caddy.
+  - `systemctl is-active agent-hub-api agent-hub-worker caddy` → all active.
+  - Internal GET `/` returned the new index after startup wait.
+  - External GET `http://113.142.217.42:21015/` returned HTTP 200 and references `/assets/index-CyNxpLNi.js`.
+  - Server bundle check: `main_decision=True`, `opinion_line=True`, `vague_result=False`, `asset_count=1`.
+
+Remaining risks / TODOs:
+
+- Authenticated admin/run API verification was not completed in this follow-up. Attempting to mint a super-admin token from `AGENT_HUB_JWT_SIGNING_KEY` was rejected by safety review, and should not be bypassed. Use a normal username/password login flow or have the user trigger a run in the UI, then inspect logs/results.
+- Need user-side validation of the actual chat screen after login: the server has the new bundle, but browser cache may need refresh if old JS is cached.
+- Do not push until the user confirms authenticated server behavior or provides normal login credentials/session for verification.
+
+## 2026-08-12 Feishu Channel Debugging
+
+Current state:
+
+- User reported that the Feishu channel was configured but still unusable.
+- Server being debugged: `103.236.98.133`; public forwarded UI/base URL: `http://113.142.217.42:21015`.
+- No code changes were kept for this investigation; temporary local `.tmp` probe files were created and removed.
+
+Evidence gathered:
+
+- FastAPI route exists and is registered: `POST /channels/feishu/events`.
+- Server-local route probe returned `401 {"error":"invalid_feishu_event"}` for an empty JSON body, which confirms the route is reached and Feishu verification runs.
+- Caddy route probe on server-local port 80 returned the same `401`, confirming Caddy proxies `/channels/*` to API.
+- External forwarded probe to `http://113.142.217.42:21015/channels/feishu/events` returned the same `401`, confirming the public callback path is reachable from outside.
+- Database channel config for `feishu` exists with keys:
+  - `AGENT_HUB_PUBLIC_URL`
+  - `FEISHU_APP_ID`
+  - `FEISHU_APP_SECRET`
+  - `FEISHU_VERIFICATION_TOKEN`
+  - `FEISHU_ENCRYPT_KEY`
+  - `FEISHU_TRANSPORT`
+- Saved `AGENT_HUB_PUBLIC_URL` is `http://113.142.217.42:21015`.
+- Field lengths were non-zero for all Feishu fields checked.
+- Feishu tenant access token probe using saved App ID/App Secret returned `http_status=200 feishu_code=0 msg=ok` and `has_tenant_access_token=True`.
+- Internal simulated Feishu message event using saved App ID/Verification Token returned `202 {"accepted":true}`, proving Agent Hub can accept and submit a Feishu inbound message when the event reaches the API.
+- The simulated event then logged `feishu_reply_failed ... reply request failed status=400`, which is expected because the probe used a fake Feishu `message_id`; it does not indicate real-user reply failure.
+- Recent API/Caddy logs did not show real Feishu platform message events hitting `/channels/feishu/events`; only local/external probes were visible.
+
+Working hypothesis:
+
+- Agent Hub server-side webhook route, Caddy proxy, public forwarding, saved channel config, and App Secret are functional.
+- The remaining likely break is Feishu Open Platform configuration: callback URL, event subscription (`im.message.receive_v1`), app publish/version activation, or bot installation/chat trigger. The server has not received a real Feishu message callback during the inspected window.
+
+Next verification needed:
+
+- In Feishu Open Platform, configure request URL exactly as:
+  `http://113.142.217.42:21015/channels/feishu/events`
+- Add/enable the message receive event: `im.message.receive_v1`.
+- Save/verify the request URL, then publish/release the app configuration if Feishu requires publishing for the app type.
+- Send a private message to the bot, or in a group chat mention the bot.
+- Immediately check:
+  `journalctl -u agent-hub-api --since=-5min --no-pager | grep -i feishu`
+  Expected result after a real callback is either a `202 Accepted` route log or a specific `feishu_verification_failed` reason.
+
+Follow-up note:
+
+- User provided a Feishu OpenAPI log for:
+  `/open-apis/im/v1/messages/om_probe_41f87395f5d8458aa6463cd20bf53774/reply`
+- That `om_probe_*` ID was generated by the internal server-side probe, not by a real Feishu user message.
+- Feishu returned `errCode=99992354` / invalid `open_message_id`, which is expected for the fake probe message ID and should not be treated as the production failure.
+- Rechecked service logs after `2026-08-12 04:40:00`; only the Feishu callback URL verification request is present:
+  `POST /channels/feishu/events HTTP/1.1" 200 OK`.
+- No real `im.message.receive_v1` callback has reached Agent Hub yet. The next required evidence is Feishu Open Platform **事件日志检索** for a real user message, not the OpenAPI reply-call log.
+
+## 2026-08-12 Refactor Handoff Index
+
+Created a dedicated refactor handoff document:
+
+- `REFACTOR_HANDOFF.md`
+
+Purpose:
+
+- Keep long-term architecture/refactor direction separate from short-term hotfix handoffs.
+- Track the recommended module boundaries before adding larger capabilities such as vibe coding and OpenClaw.
+- Record the CowAgent-level usability target: not UI-only prototypes, but deployable, channel-capable, observable, multi-agent usable behavior.
+- Future refactor-related decisions should update `REFACTOR_HANDOFF.md` promptly, not only this general handoff file.
+
+## 2026-08-12 Runtime / Main Agent Routing Stabilization
+
+Current state:
+
+- Local code and server `/opt/agent-hub/current` were updated incrementally.
+- Server services after deployment:
+  - `agent-hub-api`: active
+  - `agent-hub-worker`: active
+  - Caddy reloaded after latest `web/dist` upload
+- Server public UI returned HTML from `http://113.142.217.42:21015/`.
+
+Changes made:
+
+- Main Agent auto routing now uses the separately configured Main Agent model instead of an unavailable/injected-only router path.
+- Main Agent routing merges matching registered-model capabilities and quota/capacity metadata when the Main Agent reuses an already registered provider/base/model/key. This avoids capacity fingerprint quota conflicts such as one key being registered under both `main-agent` and `deepseek-account`.
+- Main Agent routing now uses provider-compatible plain JSON classification for the Main Agent path. This avoids repeated failures from providers/intermediaries that reject `response_format=json_schema`, while still strictly parsing the returned JSON.
+- Main Agent routing runs as a single low-cost classifier call for automatic mode selection. It no longer launches classifier/verifier concurrently against a one-slot model key.
+- Generic routing still supports the existing stricter dual-classifier path. Added policy flags:
+  - `parallel_classifiers`
+  - `allow_single_classifier_decision`
+  - `conflict_decision_margin`
+- Low-risk classifier/verifier disagreement can now resolve to the clearly higher-confidence assessment instead of always forcing user mode selection.
+- AutoGen discussion now completes with `partial_discussion_after_model_failure` when a late model-gateway failure happens after a usable discussion text artifact was already produced.
+- Hybrid mode now completes with `partial_hybrid_after_discussion_failure` when dispatch already produced artifacts and the later discussion stage fails due to model gateway failure. Dispatch-stage failures still fail the run.
+- Selected configured agents are resolved from `selected_agent_ids` for dispatch/discuss/hybrid without expanding to unrelated planner/reviewer roles.
+- AutoGen participant IDs are normalized for framework compatibility so configured IDs with `-`/`.` do not crash AutoGen.
+
+Server verification performed:
+
+- Real server five-mode smoke passed with configured model:
+  - direct: completed
+  - auto: completed
+  - dispatch: completed
+  - discuss: completed
+  - hybrid: completed
+- Server capability smoke passed:
+  - health
+  - login
+  - user create/reset/delete
+  - agent/workflow create/delete
+  - archive upload/extract
+  - skill upload/approve/delete
+  - MCP create/delete
+  - memory create/update/delete
+  - Hermes feedback/confirm/recommend
+  - channel list
+  - direct model run completed
+- Feishu status in capability smoke is `configured`; real Feishu user-message callback still needs platform-side event-log verification as described in the Feishu section above.
+
+Local verification performed:
+
+- Backend/runtime/routing focused tests:
+  - `uv run pytest tests/unit/runtime/test_hybrid.py tests/unit/routing/test_router.py tests/unit/test_app_wiring.py tests/unit/runtime/test_autogen_artifact_rollback.py tests/unit/runtime/test_configured_runtime.py -q`
+  - Result: 154 passed
+- Backend API/Skill/Run tests:
+  - `uv run pytest tests/api/test_admin_resources.py tests/api/test_foundation_api.py tests/api/test_runs_api.py tests/unit/skills/test_package.py -q`
+  - Result: 158 passed
+- Frontend tests:
+  - `npm test -- --run src/pages/OperationalPages.test.tsx src/pages/UsersPage.test.tsx` from `web/`
+  - Result: 39 passed
+- Frontend production build:
+  - `npm.cmd run build` from `web/`
+  - Result: passed; Vite emitted only a chunk-size warning.
+- `git diff --check`:
+  - No whitespace errors; only CRLF normalization warnings in the Windows working tree.
+
+Remaining risks / TODOs:
+
+- Feishu real reply still needs a real Feishu event callback to reach `/channels/feishu/events`; synthetic `om_probe_*` reply failures are expected and not proof of production reply failure.
+- Server Main Agent was switched from MiniMax to the already working DeepSeek registered model during verification because MiniMax pure text and structured-output calls failed through the current server gateway. The code now handles such provider incompatibility better, but a bad Main Agent key/model will still correctly ask for user choice instead of silently falling back.
+- UI behavior still needs user-side browser validation for the exact mobile interaction details: process-line layout, handoff button placement, and no history overwrite.

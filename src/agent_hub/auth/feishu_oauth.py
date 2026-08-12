@@ -217,6 +217,19 @@ class InMemoryUserAdminService:
         self._users[user_id] = updated
         return updated
 
+    async def reset_password(
+        self,
+        actor: AuthenticatedPrincipal,
+        user_id: UUID,
+        password: str,
+    ) -> ManagedUser:
+        del password
+        _require_admin(actor)
+        user = self._users[user_id]
+        if user.protected:
+            raise ProtectedUserError("protected user password cannot be reset")
+        return user
+
     async def delete_user(
         self,
         actor: AuthenticatedPrincipal,

@@ -19,6 +19,7 @@ from agent_hub.runtime.autogen.adapter import (
     DiscussionParticipant,
     DiscussionPlan,
     RuntimeExecutionError,
+    _can_complete_with_partial_discussion,
 )
 from agent_hub.runtime.contracts import Artifact, TaskContext
 
@@ -67,6 +68,18 @@ def _context() -> TaskContext:
 
 def _artifact() -> Artifact:
     return Artifact(id=uuid4(), type="text", producer="analyst", content={"text": "safe"})
+
+
+def test_partial_discussion_can_complete_after_late_model_gateway_failure() -> None:
+    artifact = _artifact()
+
+    assert _can_complete_with_partial_discussion(
+        (artifact,), "model gateway failed: model transport failed"
+    )
+    assert not _can_complete_with_partial_discussion(
+        (), "model gateway failed: model transport failed"
+    )
+    assert not _can_complete_with_partial_discussion((artifact,), "discussion_failed")
 
 
 async def test_autogen_abort_artifact_write_returns_repository_result() -> None:

@@ -175,6 +175,15 @@ export function AgentsPage() {
     },
   });
 
+  const deleteAgent = useMutation({
+    mutationFn: (id: string) => api.deleteAgent(id),
+    onSuccess: async () => {
+      setMessage("Agent 已删除。");
+      await queryClient.invalidateQueries({ queryKey: ["agents"] });
+      await queryClient.invalidateQueries({ queryKey: ["config-current"] });
+    },
+  });
+
   function changeTemplate(nextId: string) {
     const next = ROLE_TEMPLATES.find((item) => item.id === nextId) ?? ROLE_TEMPLATES[0];
     setTemplateId(next.id);
@@ -190,6 +199,14 @@ export function AgentsPage() {
     event.preventDefault();
     setMessage(null);
     saveAgent.mutate();
+  }
+
+  function confirmDelete(agent: { id: string; name: string }) {
+    if (!window.confirm(`确定删除 Agent「${agent.name}」吗？已使用它的历史对话不会被删除，但新任务不能再派给它。`)) {
+      return;
+    }
+    setMessage(null);
+    deleteAgent.mutate(agent.id);
   }
 
   if (agents.isLoading || models.isLoading) return <p>正在加载 Agent 配置...</p>;
@@ -303,9 +320,18 @@ export function AgentsPage() {
               <p>模型：{agent.model ?? "未绑定"}</p>
               <p>Skill：{(agent.skills ?? []).join(", ") || "无"}</p>
               {agent.prompt ? <p>提示词：{agent.prompt}</p> : null}
+              <button
+                type="button"
+                className="danger-action"
+                onClick={() => confirmDelete({ id: agent.id, name: agent.name })}
+                disabled={deleteAgent.isPending}
+              >
+                删除 Agent
+              </button>
             </article>
           ))}
         </div>
+        {deleteAgent.isError ? <p role="alert">{formatApiError(deleteAgent.error, "Agent 删除失败")}</p> : null}
       </section>
     </section>
   );

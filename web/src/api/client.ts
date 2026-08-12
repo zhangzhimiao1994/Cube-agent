@@ -316,6 +316,15 @@ const RunEventSchema = z.object({
   action: z.string().nullable().optional(),
   decision: z.string().nullable().optional(),
   payload: z.record(z.string(), z.unknown()).default({}),
+  artifact: z
+    .object({
+      id: z.string(),
+      kind: z.string(),
+      title: z.string(),
+      text: z.string().nullable().optional(),
+    })
+    .nullable()
+    .optional(),
 });
 
 const RunArtifactSchema = z.object({
@@ -683,6 +692,13 @@ export const api = {
       UserSchema,
     );
   },
+  resetUserPassword(userId: string, password: string): Promise<ManagedUser> {
+    return request(
+      `/api/v1/users/${userId}/password`,
+      { method: "PATCH", body: JSON.stringify({ password }) },
+      UserSchema,
+    );
+  },
   async deleteUser(userId: string): Promise<void> {
     await requestNoContent(`/api/v1/users/${userId}`, { method: "DELETE" });
   },
@@ -761,6 +777,13 @@ export const api = {
       NamedResourceSchema,
     );
   },
+  deleteAgent(id: string): Promise<{ status: string }> {
+    return request(
+      `/api/v1/admin/agents/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+      z.object({ status: z.string() }),
+    );
+  },
   workflows(): Promise<WorkflowResource[]> {
     return request(
       "/api/v1/admin/workflows",
@@ -773,6 +796,13 @@ export const api = {
       "/api/v1/admin/workflows",
       { method: "POST", body: JSON.stringify(payload) },
       WorkflowResourceSchema,
+    );
+  },
+  deleteWorkflow(id: string): Promise<{ status: string }> {
+    return request(
+      `/api/v1/admin/workflows/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+      z.object({ status: z.string() }),
     );
   },
   settings(): Promise<SystemSettings> {
@@ -922,6 +952,13 @@ export const api = {
   approveSkill(id: string): Promise<Skill> {
     return request(`/api/v1/admin/skills/${id}/approve`, { method: "POST" }, SkillSchema);
   },
+  deleteSkill(id: string): Promise<{ status: string }> {
+    return request(
+      `/api/v1/admin/skills/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+      z.object({ status: z.string() }),
+    );
+  },
   mcpServers(): Promise<McpServer[]> {
     return request("/api/v1/admin/mcp", { method: "GET" }, z.array(McpServerSchema));
   },
@@ -941,6 +978,13 @@ export const api = {
       "/api/v1/admin/mcp",
       { method: "POST", body: JSON.stringify(payload) },
       McpServerSchema,
+    );
+  },
+  deleteMcpServer(id: string): Promise<{ status: string }> {
+    return request(
+      `/api/v1/admin/mcp/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+      z.object({ status: z.string() }),
     );
   },
   channels(): Promise<ChannelStatus[]> {

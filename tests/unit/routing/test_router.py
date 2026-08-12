@@ -13,6 +13,7 @@ from pydantic import ValidationError
 
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.gateway import GatewayCompletion
+from agent_hub.models.litellm_client import ModelTransportError
 from agent_hub.models.types import ModelCapability, ModelRequest, ModelResponse
 from agent_hub.routing.classifier import GatewayRouteClassifier, RouteClassificationError
 from agent_hub.routing.service import ModeRouter, RoutingPolicy
@@ -253,10 +254,62 @@ async def test_classifier_agreement_at_threshold_is_ready() -> None:
     assert len(result.assessments) == 2
 
 
+async def test_sequential_classifier_policy_avoids_parallel_classifier_calls() -> None:
+    primary = FakeClassifier(assessment(TaskMode.DISPATCH))
+    verifier = FakeClassifier(assessment(TaskMode.DISPATCH, source=RouteSource.VERIFIER))
+    selected_router = router(
+        primary,
+        verifier,
+        policy=RoutingPolicy(parallel_classifiers=False),
+    )
+
+    result = await selected_router.route("ambiguous architecture request")
+
+    assert result.mode is TaskMode.DISPATCH
+    assert primary.calls == ["ambiguous architecture request"]
+    assert verifier.calls == ["ambiguous architecture request"]
+    assert selected_router._classifier_task_slots == 0
+
+
+async def test_single_classifier_policy_skips_verifier_for_low_cost_auto_routing() -> None:
+    primary = FakeClassifier(assessment(TaskMode.DISPATCH, confidence=0.7))
+    verifier = FakeClassifier(RuntimeError("verifier should not run"))
+    selected_router = router(
+        primary,
+        verifier,
+        policy=RoutingPolicy(
+            confidence_threshold=0.65,
+            parallel_classifiers=False,
+            allow_single_classifier_decision=True,
+        ),
+    )
+
+    result = await selected_router.route("ambiguous architecture request")
+
+    assert result.mode is TaskMode.DISPATCH
+    assert len(result.assessments) == 1
+    assert primary.calls == ["ambiguous architecture request"]
+    assert verifier.calls == []
+
+
+async def test_conflicting_low_risk_assessments_choose_clear_highest_confidence() -> None:
+    result = await router(
+        FakeClassifier(assessment(TaskMode.DISPATCH, confidence=0.62)),
+        FakeClassifier(assessment(TaskMode.DIRECT, confidence=0.9, source=RouteSource.VERIFIER)),
+    ).route("ambiguous architecture request")
+
+    assert result.status == "ready"
+    assert result.mode is TaskMode.DIRECT
+    assert len(result.assessments) == 1
+
+
 @pytest.mark.parametrize(
     "primary,verifier",
     [
-        (assessment(TaskMode.DISPATCH), assessment(TaskMode.DISCUSS, source=RouteSource.VERIFIER)),
+        (
+            assessment(TaskMode.DISPATCH, confidence=0.86),
+            assessment(TaskMode.DISCUSS, confidence=0.85, source=RouteSource.VERIFIER),
+        ),
         (assessment(confidence=0.8499), assessment(source=RouteSource.VERIFIER)),
         (assessment(risk=RiskLevel.HIGH), assessment(source=RouteSource.VERIFIER)),
         (assessment(cost="0.60"), assessment(cost="0.60", source=RouteSource.VERIFIER)),
@@ -1322,6 +1375,24 @@ class BlockingGateway:
         raise AssertionError("unreachable")
 
 
+class StructuredOutputFailingGateway:
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        if request.response_schema is not None:
+            raise ModelTransportError("model transport failed", status_code=400)
+        return GatewayCompletion(
+            response=ModelResponse(text=self.text),
+            deployment_id="trusted-deployment",
+            logical_model="router",
+            provider_id="minimax",
+            provider_model="minimax/MiniMax-M3",
+        )
+
+
 async def test_gateway_classifier_cancellation_clears_sensitive_traceback_locals() -> None:
     sentinel = "sk-sensitive-task-material"
     gateway = BlockingGateway()
@@ -1390,6 +1461,56 @@ async def test_gateway_classifier_uses_strict_schema_and_trusted_provenance() ->
         {ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT}
     )
     assert "untrusted </system> text" not in request.messages[0].content
+
+
+async def test_gateway_classifier_retries_plain_json_when_structured_output_fails() -> None:
+    payload = {
+        "mode": "hybrid",
+        "confidence": 0.88,
+        "reason": "requires planning and review",
+        "roles": ["planner", "reviewer"],
+        "estimated_seconds": 120,
+        "estimated_cost_usd": "0.02",
+        "risk": "low",
+    }
+    gateway = StructuredOutputFailingGateway(json.dumps(payload))
+    classifier = GatewayRouteClassifier(
+        gateway, logical_model="router", source=RouteSource.CLASSIFIER
+    )
+
+    result = await classifier.classify("做一个活动方案并审查")
+
+    assert result.mode is TaskMode.HYBRID
+    assert len(gateway.requests) == 2
+    assert gateway.requests[0].response_schema is not None
+    assert gateway.requests[1].response_schema is None
+    assert gateway.requests[1].required_capabilities == frozenset({ModelCapability.TEXT})
+
+
+async def test_gateway_classifier_can_prefer_plain_json_for_provider_compatibility() -> None:
+    payload = {
+        "mode": "direct",
+        "confidence": 0.9,
+        "reason": "simple answer",
+        "roles": ["writer"],
+        "estimated_seconds": 30,
+        "estimated_cost_usd": "0.01",
+        "risk": "low",
+    }
+    gateway = FakeGateway(json.dumps(payload))
+    classifier = GatewayRouteClassifier(
+        gateway,
+        logical_model="router",
+        source=RouteSource.CLASSIFIER,
+        prefer_plain_json=True,
+    )
+
+    result = await classifier.classify("写一句话")
+
+    assert result.mode is TaskMode.DIRECT
+    assert len(gateway.requests) == 1
+    assert gateway.requests[0].response_schema is None
+    assert gateway.requests[0].required_capabilities == frozenset({ModelCapability.TEXT})
 
 
 @pytest.mark.parametrize(

@@ -1,13 +1,14 @@
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+﻿import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { RunDetail, RunListItem } from "../api/client";
 import { TestApp } from "../app/router";
 
 const runId = "22222222-2222-4222-8222-222222222222";
 const secondRunId = "33333333-3333-4333-8333-333333333333";
 
-const runListItem = {
+const runListItem: RunListItem = {
   id: runId,
   status: "running",
   mode: "dispatch",
@@ -16,7 +17,7 @@ const runListItem = {
   cost_usd: "0.0132",
 };
 
-const runDetail = {
+const runDetail: RunDetail = {
   ...runListItem,
   request: "给我做一个短视频脚本方案。",
   events: [
@@ -25,6 +26,8 @@ const runDetail = {
       kind: "queued",
       message: "Run accepted and queued.",
       created_at: "2026-08-07T00:00:00Z",
+      participants: [],
+      payload: {},
     },
     {
       sequence: 2,
@@ -121,7 +124,7 @@ const mainAgent = {
   max_review_rounds: 2,
 };
 
-const secondRunListItem = {
+const secondRunListItem: RunListItem = {
   ...runListItem,
   id: secondRunId,
   status: "completed",
@@ -457,11 +460,15 @@ describe("operational management pages", () => {
           return jsonResponse([]);
         }
         if (path === "/api/v1/runs/attachments/upload" && method === "POST") {
+          const headers = init?.headers instanceof Headers ? init.headers : new Headers(init?.headers);
+          const filename = headers.get("X-Agent-Hub-Filename") ?? "screen.png";
+          const contentType = headers.get("Content-Type") ?? "image/png";
+          const archive = /\.(?:zip|tar|tgz|gz|bz2|xz|zst|rar|7z|cab|iso|jar|war|ear|apk|ipa)$/i.test(filename);
           return jsonResponse({
             id: "att_0123456789abcdef0123456789abcdef",
-            filename: "screen.png",
-            kind: "image",
-            content_type: "image/png",
+            filename,
+            kind: archive ? "archive" : contentType.startsWith("image/") ? "image" : "context",
+            content_type: contentType,
             size_bytes: 128,
             sha256: "a".repeat(64),
             expires_at: "2026-08-17T00:00:00Z",
@@ -682,7 +689,7 @@ describe("operational management pages", () => {
     await userEvent.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    expect(within(stream).getByText(/这是最终回复正文/)).not.toBeNull();
+    expect(within(stream).getAllByText(/这是最终回复正文/).length).toBeGreaterThan(0);
     expect(within(stream).queryByText("产物：短视频脚本")).toBeNull();
   });
 
@@ -705,7 +712,12 @@ describe("operational management pages", () => {
     await userEvent.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    expect(within(stream).queryByText(/Result: 未满足用户目标/)).toBeNull();
+    const assistantReplies = within(stream).getAllByRole("article").filter((article) =>
+      article.className.includes("assistant"),
+    );
+    expect(
+      assistantReplies.some((article) => article.textContent?.includes("Result: 未满足用户目标")),
+    ).toBe(false);
     expect(within(stream).getByText(/这轮只生成了内部审查或裁决内容/)).not.toBeNull();
   });
 
@@ -734,9 +746,29 @@ describe("operational management pages", () => {
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
     expect(within(stream).getByText("给我做一个短视频脚本方案。")).not.toBeNull();
-    expect(within(stream).getByText(/这是最终回复正文/)).not.toBeNull();
+    expect(within(stream).getAllByText(/这是最终回复正文/).length).toBeGreaterThan(0);
     expect(await within(stream).findByText("再给我一个更强的开头。")).not.toBeNull();
-    expect(await within(stream).findByText(/这是第二轮回复正文/)).not.toBeNull();
+    expect((await within(stream).findAllByText(/这是第二轮回复正文/)).length).toBeGreaterThan(0);
+  });
+
+  it("restores historical conversation messages after starting a new chat", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    expect(await within(stream).findByText("给我做一个短视频脚本方案。")).not.toBeNull();
+    expect(within(stream).getAllByText(/这是最终回复正文/).length).toBeGreaterThan(0);
+
+    await user.click(screen.getAllByRole("button", { name: "新建对话" }).at(-1) as HTMLElement);
+    expect(within(stream).queryByText("给我做一个短视频脚本方案。")).toBeNull();
+    expect(screen.getByRole("button", { name: "自动" })).not.toBeNull();
+
+    await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
+    expect(await within(stream).findByText("给我做一个短视频脚本方案。")).not.toBeNull();
+    expect(within(stream).getAllByText(/这是最终回复正文/).length).toBeGreaterThan(0);
+    expect(screen.getByText(/当前会话：conv-previous/)).not.toBeNull();
   });
 
   it("opens a historical conversation and continues inside the same conversation id", async () => {
@@ -785,6 +817,39 @@ describe("operational management pages", () => {
     ]);
   });
 
+  it("keeps cached conversation history when a fresh conversation fetch is temporarily incomplete", async () => {
+    const user = userEvent.setup();
+    const secondRunDetail = {
+      ...runDetail,
+      id: secondRunId,
+      request: "再给我一个更强的开头。",
+      artifacts: [
+        {
+          id: "artifact-2",
+          kind: "markdown",
+          title: "短视频脚本二稿",
+          text: "这是第二轮回复正文：已经把开头改得更强。",
+        },
+      ],
+    };
+    visibleConversationRuns = [runDetail, secondRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    expect(await within(stream).findByText("给我做一个短视频脚本方案。")).not.toBeNull();
+    expect((await within(stream).findAllByText(/这是第二轮回复正文/)).length).toBeGreaterThan(0);
+
+    visibleConversationRuns = [secondRunDetail];
+    await user.type(screen.getByPlaceholderText(/输入消息/), "继续。");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(await within(stream).findByText("给我做一个短视频脚本方案。")).not.toBeNull();
+    expect((await within(stream).findAllByText(/这是第二轮回复正文/)).length).toBeGreaterThan(0);
+  });
+
   it("starts a continuation branch when context is too long", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
@@ -822,6 +887,8 @@ describe("operational management pages", () => {
           kind: "runtime.failed",
           message: "hybrid discuss failed: model gateway failed: model transport failed",
           created_at: "2026-08-07T00:00:03Z",
+          participants: [],
+          payload: {},
         },
       ],
     };
@@ -833,7 +900,7 @@ describe("operational management pages", () => {
     await userEvent.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    expect(within(stream).getByText(/这是最终回复正文/)).not.toBeNull();
+    expect(within(stream).getAllByText(/这是最终回复正文/).length).toBeGreaterThan(0);
     expect(within(stream).getByText("运行中断")).not.toBeNull();
     expect(within(stream).getByText(/中断前输出已保留/)).not.toBeNull();
     expect(within(stream).getByText(/model transport failed/)).not.toBeNull();
@@ -847,7 +914,7 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    expect(within(stream).getByText(/这是最终回复正文/)).not.toBeNull();
+    expect(within(stream).getAllByText(/这是最终回复正文/).length).toBeGreaterThan(0);
     expect(within(stream).queryByText("Run accepted and queued.")).toBeNull();
     expect(within(stream).queryByText(/模式与角色/)).toBeNull();
     expect(within(stream).queryByText(/运行模式：/)).toBeNull();
@@ -858,9 +925,9 @@ describe("operational management pages", () => {
     expect(within(stream).getByRole("status", { name: /Agent 集群/ })).not.toBeNull();
     expect(within(stream).queryByRole("button", { name: /生成了结果/ })).toBeNull();
     expect(within(stream).getByRole("button", { name: /文案生成 调用模型：qwen-max/ })).not.toBeNull();
-    expect(within(stream).getByRole("button", { name: /文案生成 产出：得到一版可拍摄脚本文案/ })).not.toBeNull();
+    expect(within(stream).getByRole("button", { name: /文案生成 输出：得到一版可拍摄脚本文案/ })).not.toBeNull();
     expect(within(stream).getByRole("button", { name: /讨论结论：.*采用可拍摄性最高的方案/ })).not.toBeNull();
-    await user.click(within(stream).getByRole("button", { name: /文案生成 产出：得到一版可拍摄脚本文案/ }));
+    await user.click(within(stream).getByRole("button", { name: /文案生成 输出：得到一版可拍摄脚本文案/ }));
     expect(within(stream).queryByText("任务已进入队列，等待 Worker 调度执行。")).toBeNull();
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     expect(within(drawer).queryByText("任务已进入队列，等待 Worker 调度执行。")).toBeNull();
@@ -869,6 +936,273 @@ describe("operational management pages", () => {
     expect(within(drawer).getByText("得到一版可拍摄脚本文案")).not.toBeNull();
     expect(within(drawer).getByText("调用模型")).not.toBeNull();
     expect(within(drawer).getByText("qwen-max")).not.toBeNull();
+  });
+
+  it("renders agent process steps as an ordered timeline with concrete per-step details", async () => {
+    const user = userEvent.setup();
+    const timelineRunDetail = {
+      ...runDetail,
+      mode: "hybrid",
+      events: [
+        {
+          sequence: 1,
+          kind: "dispatch.started",
+          message: "主 Agent 已拆解任务并派单。",
+          created_at: "2026-08-07T00:00:00Z",
+          actor: "main",
+          participants: ["copywriter", "director"],
+          tool_name: null,
+          step_id: null,
+          action: "dispatch",
+          decision: null,
+          payload: {
+            instruction: "把中秋活动方案拆给文案生成和导演；文案负责活动文案，导演负责流程审查。",
+          },
+        },
+        {
+          sequence: 2,
+          kind: "step.started",
+          message: "文案生成开始处理活动文案。",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "copywriter",
+          participants: [],
+          tool_name: null,
+          step_id: "copywriting_step",
+          action: null,
+          decision: null,
+          payload: {
+            task: "输出中秋节活动主题、流程和宣传文案。",
+          },
+        },
+        {
+          sequence: 3,
+          kind: "model.started",
+          message: "model.started",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "copywriter",
+          participants: [],
+          tool_name: null,
+          step_id: "copywriting_step",
+          action: null,
+          decision: null,
+          payload: {
+            model: "qwen-max",
+            provider: "qwen",
+          },
+        },
+        {
+          sequence: 4,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: "2026-08-07T00:00:03Z",
+          actor: "copywriter",
+          participants: [],
+          tool_name: null,
+          step_id: "copywriting_step",
+          action: null,
+          decision: null,
+          payload: {},
+          artifact: {
+            id: "artifact-copywriter",
+            kind: "markdown",
+            title: "copywriter",
+            text: "文案生成输出：中秋灯谜游园会，包含主题、流程、预算和宣传文案。",
+          },
+        },
+        {
+          sequence: 5,
+          kind: "step.started",
+          message: "导演开始审查流程。",
+          created_at: "2026-08-07T00:00:04Z",
+          actor: "director",
+          participants: [],
+          tool_name: null,
+          step_id: "director_review_step",
+          action: null,
+          decision: null,
+          payload: {
+            task: "审查活动动线、安全和现场节奏。",
+          },
+        },
+        {
+          sequence: 6,
+          kind: "discussion.completed",
+          message: "文案生成和导演完成讨论。",
+          created_at: "2026-08-07T00:00:05Z",
+          actor: "director",
+          participants: ["copywriter", "director"],
+          tool_name: null,
+          step_id: null,
+          action: null,
+          decision: "adopt",
+          payload: {
+            copywriter_opinion: "文案建议主打灯谜游园会。",
+            director_opinion: "导演建议压缩签到环节，避免排队。",
+            main_agent_judgement: "主 Agent 采纳灯谜游园会方案，并保留导演对动线的调整。",
+            result: "采用灯谜游园会，压缩签到流程。",
+          },
+        },
+      ],
+      artifacts: [
+        ...runDetail.artifacts,
+        {
+          id: "artifact-copywriter",
+          kind: "markdown",
+          title: "copywriter",
+          text: "文案生成输出：中秋灯谜游园会，包含主题、流程、预算和宣传文案。",
+        },
+      ],
+    };
+    visibleRunListItem = { ...runListItem, mode: "hybrid" };
+    visibleRunDetail = timelineRunDetail;
+    visibleConversationRuns = [timelineRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const dispatch = within(stream).getByRole("button", { name: /主 Agent 派单给文案生成、导演/ });
+    const copywriterStart = within(stream).getByRole("button", { name: /文案生成 接收任务：输出中秋节活动主题/ });
+    const copywriterModel = within(stream).getByRole("button", { name: /文案生成 调用模型：qwen-max/ });
+    const copywriterOutput = within(stream).getByRole("button", { name: /文案生成 输出：文案生成输出：中秋灯谜游园会/ });
+    const directorStart = within(stream).getByRole("button", { name: /导演 接收任务：审查活动动线/ });
+    const copywriterOpinion = within(stream).getByRole("button", { name: /文案生成 意见：文案建议主打灯谜游园会/ });
+    const directorOpinion = within(stream).getByRole("button", { name: /导演 意见：导演建议压缩签到环节/ });
+    const decision = within(stream).getByRole("button", { name: /主 Agent 裁决：主 Agent 采纳灯谜游园会方案/ });
+    const ordered = [
+      dispatch,
+      copywriterStart,
+      copywriterModel,
+      copywriterOutput,
+      directorStart,
+      copywriterOpinion,
+      directorOpinion,
+      decision,
+    ];
+    ordered.reduce((previous, current) => {
+      expect(previous.compareDocumentPosition(current) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      return current;
+    });
+
+    expect(within(stream).queryByRole("button", { name: /生成了结果/ })).toBeNull();
+
+    await user.click(copywriterOutput);
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).getByText("执行者")).not.toBeNull();
+    expect(within(drawer).getAllByText("文案生成").length).toBeGreaterThan(0);
+    expect(within(drawer).getByText("调用模型")).not.toBeNull();
+    expect(within(drawer).getByText("qwen-max")).not.toBeNull();
+    expect(within(drawer).getByText("输出内容")).not.toBeNull();
+    expect(within(drawer).getAllByText(/中秋灯谜游园会/).length).toBeGreaterThan(0);
+
+    await user.click(within(drawer).getByRole("button", { name: "关闭" }));
+    await user.click(directorOpinion);
+    const opinionDrawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(opinionDrawer).getByText("发言角色")).not.toBeNull();
+    expect(within(opinionDrawer).getAllByText("导演").length).toBeGreaterThan(0);
+    expect(within(opinionDrawer).getByText("导演意见")).not.toBeNull();
+    expect(within(opinionDrawer).getByText("导演建议压缩签到环节，避免排队。")).not.toBeNull();
+  });
+
+  it("uses ordered artifacts for process rows instead of vague generated-result summaries", async () => {
+    const user = userEvent.setup();
+    const processRunDetail = {
+      ...runDetail,
+      events: [
+        {
+          sequence: 1,
+          kind: "model.started",
+          message: "model.started",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "copywriter",
+          participants: [],
+          tool_name: null,
+          step_id: "copywriting_step",
+          action: null,
+          decision: null,
+          payload: { model: "qwen-max" },
+        },
+        {
+          sequence: 2,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "copywriter",
+          participants: [],
+          tool_name: null,
+          step_id: "copywriting_step",
+          action: null,
+          decision: null,
+          payload: {},
+        },
+        {
+          sequence: 3,
+          kind: "model.started",
+          message: "model.started",
+          created_at: "2026-08-07T00:00:03Z",
+          actor: "director",
+          participants: [],
+          tool_name: null,
+          step_id: "director_step",
+          action: null,
+          decision: null,
+          payload: { model: "deepseek-v4-flash" },
+        },
+        {
+          sequence: 4,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: "2026-08-07T00:00:04Z",
+          actor: "director",
+          participants: [],
+          tool_name: null,
+          step_id: "director_step",
+          action: null,
+          decision: null,
+          payload: {},
+        },
+      ],
+      artifacts: [
+        {
+          id: "artifact-copy",
+          kind: "markdown",
+          title: "script-draft",
+          text: "文案生成输出：中秋活动脚本包含开场、互动和收尾。",
+        },
+        {
+          id: "artifact-director",
+          kind: "markdown",
+          title: "director-review",
+          text: "导演输出：压缩主持人串场，保留抽奖互动。",
+        },
+      ],
+    };
+    visibleRunDetail = processRunDetail;
+    visibleConversationRuns = [processRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const copywriterOutput = within(stream).getByRole("button", {
+      name: /文案生成 输出：文案生成输出：中秋活动脚本包含开场、互动和收尾/,
+    });
+    const directorOutput = within(stream).getByRole("button", {
+      name: /导演 输出：导演输出：压缩主持人串场，保留抽奖互动/,
+    });
+    expect(within(stream).queryByRole("button", { name: /完成阶段输出|生成了结果/ })).toBeNull();
+    expect(copywriterOutput.compareDocumentPosition(directorOutput) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    await user.click(directorOutput);
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).getByText("执行者")).not.toBeNull();
+    expect(within(drawer).getAllByText("导演").length).toBeGreaterThan(0);
+    expect(within(drawer).getByText("调用模型")).not.toBeNull();
+    expect(within(drawer).getByText("deepseek-v4-flash")).not.toBeNull();
+    expect(within(drawer).getByText("输出内容")).not.toBeNull();
+    expect(within(drawer).getByText("导演输出：压缩主持人串场，保留抽奖互动。")).not.toBeNull();
   });
 
   it("shows localized process summaries with participating roles instead of raw event codes", async () => {
@@ -1033,6 +1367,27 @@ describe("operational management pages", () => {
         message: "请根据图片说明问题",
         attachment_ids: ["att_0123456789abcdef0123456789abcdef"],
       },
+    });
+  });
+
+  it("allows common archive and document attachments from chat", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    const uploadInput = screen.getByLabelText("上传文件或 Skill ZIP");
+    const accept = uploadInput.getAttribute("accept") ?? "";
+    expect(accept).toContain(".rar");
+    expect(accept).toContain(".7z");
+    expect(accept).toContain(".tar.gz");
+
+    const file = new File(["archive-bytes"], "project-source.rar", { type: "application/vnd.rar" });
+    await user.upload(uploadInput, file);
+
+    expect(await screen.findByText("压缩包附件")).not.toBeNull();
+    expect(screen.getByText("project-source.rar")).not.toBeNull();
+    expect(requests.find((request) => request.path === "/api/v1/runs/attachments/upload")).toMatchObject({
+      method: "POST",
     });
   });
 

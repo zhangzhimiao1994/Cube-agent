@@ -5,6 +5,7 @@ import io
 import json
 import re
 import stat
+import tarfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -54,17 +55,66 @@ class SkillPackageInspector:
         if len(archive_bytes) > self._max_archive_bytes:
             raise InvalidSkillPackage("skill archive exceeds size limit")
         content_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+        if zipfile.is_zipfile(io.BytesIO(archive_bytes)):
+            return self._inspect_zip(archive_bytes, content_sha256)
+        return self._inspect_tar(archive_bytes, content_sha256)
+
+    def _inspect_zip(self, archive_bytes: bytes, content_sha256: str) -> SkillPackageInspection:
         try:
             with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
                 infos = archive.infolist()
                 if len(infos) > self._max_files:
                     raise InvalidSkillPackage("skill archive contains too many files")
                 files = self._inspect_members(infos)
-                manifest = self._read_manifest(archive)
+                names = archive.namelist()
+                manifest_name = _manifest_name(names)
+                if manifest_name is None:
+                    raise InvalidSkillPackage("skill archive is missing skill manifest")
+                manifest = self._read_manifest_bytes(manifest_name, archive.read(manifest_name))
                 self._validate_manifest_references(manifest, files)
-                self._validate_dependencies(archive, manifest)
+                dependency_bytes = b""
+                dependency_name = _dependency_file_name(names)
+                if dependency_name is not None:
+                    dependency_bytes = archive.read(dependency_name)
+                    _validate_pinned_dependencies(dependency_bytes)
+                self._validate_dependency_hash(dependency_bytes, manifest)
         except zipfile.BadZipFile as exc:
             raise InvalidSkillPackage("skill archive must be a valid zip file") from exc
+        return SkillPackageInspection(
+            content_sha256=content_sha256,
+            manifest=manifest,
+            files=files,
+            requested_capabilities=_requested_capabilities(manifest),
+            dependency_lock_hash=manifest.dependency_lock_hash,
+        )
+
+    def _inspect_tar(self, archive_bytes: bytes, content_sha256: str) -> SkillPackageInspection:
+        try:
+            with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
+                members = archive.getmembers()
+                if len(members) > self._max_files:
+                    raise InvalidSkillPackage("skill archive contains too many files")
+                files = self._inspect_tar_members(members, len(archive_bytes))
+                names = [member.name for member in members]
+                manifest_name = _manifest_name(names)
+                if manifest_name is None:
+                    raise InvalidSkillPackage("skill archive is missing skill manifest")
+                manifest_file = archive.extractfile(manifest_name)
+                if manifest_file is None:
+                    raise InvalidSkillPackage("skill manifest cannot be read")
+                manifest = self._read_manifest_bytes(manifest_name, manifest_file.read())
+                self._validate_manifest_references(manifest, files)
+                dependency_bytes = b""
+                dependency_name = _dependency_file_name(names)
+                if dependency_name is not None:
+                    dependency_file = archive.extractfile(dependency_name)
+                    if dependency_file is None:
+                        raise InvalidSkillPackage("dependency file cannot be read")
+                    dependency_bytes = dependency_file.read()
+                    _validate_pinned_dependencies(dependency_bytes)
+                self._validate_dependency_hash(dependency_bytes, manifest)
+        except tarfile.TarError as exc:
+            raise InvalidSkillPackage("skill archive must be a valid zip or tar archive") from exc
         return SkillPackageInspection(
             content_sha256=content_sha256,
             manifest=manifest,
@@ -112,14 +162,47 @@ class SkillPackageInspector:
             raise InvalidSkillPackage("skill archive compression ratio is excessive")
         return tuple(files)
 
-    def _read_manifest(self, archive: zipfile.ZipFile) -> SkillManifest:
-        manifest_name = _manifest_name(archive.namelist())
-        if manifest_name is None:
-            raise InvalidSkillPackage("skill archive is missing skill manifest")
-        try:
-            manifest_bytes = archive.read(manifest_name)
-        except KeyError as exc:
-            raise InvalidSkillPackage("skill manifest cannot be read") from exc
+    def _inspect_tar_members(
+        self,
+        members: list[tarfile.TarInfo],
+        archive_size: int,
+    ) -> tuple[SkillPackageFile, ...]:
+        seen: set[str] = set()
+        files: list[SkillPackageFile] = []
+        total_size = 0
+        for member in members:
+            normalized = _normalize_zip_path(member.name)
+            if normalized in seen:
+                raise InvalidSkillPackage("skill archive contains duplicate paths")
+            seen.add(normalized)
+            if member.isdir():
+                continue
+            if member.issym() or member.islnk() or member.ischr() or member.isblk() or member.isfifo():
+                raise InvalidSkillPackage("skill archive contains links or device files")
+            if not member.isfile():
+                raise InvalidSkillPackage("skill archive contains unsupported file types")
+            suffix = PurePosixPath(normalized).suffix.lower()
+            if suffix in _FORBIDDEN_EXTENSIONS:
+                raise InvalidSkillPackage("skill archive contains forbidden file extensions")
+            if suffix in _NESTED_ARCHIVE_EXTENSIONS:
+                raise InvalidSkillPackage("skill archive contains nested archives")
+            total_size += member.size
+            if total_size > self._max_uncompressed_bytes:
+                raise InvalidSkillPackage("skill archive exceeds uncompressed size limit")
+            executable = bool(member.mode & 0o111)
+            files.append(
+                SkillPackageFile(
+                    path=normalized,
+                    size=member.size,
+                    compressed_size=0,
+                    executable=executable,
+                )
+            )
+        if total_size > max(archive_size, 1) * self._max_compression_ratio:
+            raise InvalidSkillPackage("skill archive compression ratio is excessive")
+        return tuple(files)
+
+    def _read_manifest_bytes(self, manifest_name: str, manifest_bytes: bytes) -> SkillManifest:
         try:
             if manifest_name.endswith(".json"):
                 raw = json.loads(manifest_bytes.decode("utf-8"))
@@ -149,12 +232,7 @@ class SkillPackageInspector:
             if file.executable and file.path != manifest.entry_point:
                 raise InvalidSkillPackage("skill archive contains undeclared executables")
 
-    def _validate_dependencies(self, archive: zipfile.ZipFile, manifest: SkillManifest) -> None:
-        dependency_name = _dependency_file_name(archive.namelist())
-        dependency_bytes = b""
-        if dependency_name is not None:
-            dependency_bytes = archive.read(dependency_name)
-            _validate_pinned_dependencies(dependency_bytes)
+    def _validate_dependency_hash(self, dependency_bytes: bytes, manifest: SkillManifest) -> None:
         actual_hash = hashlib.sha256(dependency_bytes).hexdigest()
         if actual_hash != manifest.dependency_lock_hash:
             raise InvalidSkillPackage("dependency lock hash does not match package contents")

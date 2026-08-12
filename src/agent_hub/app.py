@@ -46,13 +46,22 @@ from agent_hub.channels.submitter import RunServiceInboundSubmitter, RunSubmissi
 from agent_hub.config.service import ConfigService
 from agent_hub.db.models import TenantRow
 from agent_hub.db.session import build_database
+from agent_hub.domain.runs import TaskMode
 from agent_hub.hermes import PersistentHermesRunAdvisor
+from agent_hub.models.capacity import CapacityPool, CredentialDescriptor, CredentialRegistry
+from agent_hub.models.gateway import CapacityController, ModelGateway, ModelTransport
+from agent_hub.models.litellm_client import LiteLLMClient
+from agent_hub.models.registry import ModelRegistry
+from agent_hub.models.types import Deployment, ModelCapability
 from agent_hub.observability.logging import configure_logging
 from agent_hub.observability.metrics import default_metrics_registry
+from agent_hub.routing.classifier import GatewayRouteClassifier
+from agent_hub.routing.service import ModeRouter, RoutingPolicy
+from agent_hub.routing.types import InMemoryDecisionTokenStore, RiskLevel, RouteDecision, RouteSource
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import ModeRouterProtocol, RunService, TaskQueue
 from agent_hub.runs.temporary_agents import AdminResourceTemporaryAgentPolicy
-from agent_hub.runtime.defaults import configured_runtime_registry
+from agent_hub.runtime.defaults import TenantSecretResolver, configured_runtime_registry
 from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.security.secrets import SecretCipher, SecretService
 from agent_hub.settings import Settings, get_settings
@@ -80,6 +89,153 @@ class RedisResource(Protocol):
     async def aclose(self) -> None: ...
 
     def ping(self, **kwargs: Any) -> Any: ...
+
+
+RouterCapacityFactory = Callable[
+    [tuple[Deployment, ...]],
+    Awaitable[CapacityController | CapacityPool],
+]
+MainAgentConfigGetter = Callable[[], Awaitable[admin.MainAgentConfigResponse]]
+RegisteredModelListGetter = Callable[[], Awaitable[tuple[admin.ModelDeploymentResponse, ...]]]
+
+
+class _MainAgentModeRouter:
+    """Lazy production router backed by the separately configured main Agent model."""
+
+    def __init__(
+        self,
+        *,
+        get_config: MainAgentConfigGetter,
+        list_models: RegisteredModelListGetter | None = None,
+        secret_service: SecretService,
+        tenant_id: UUID,
+        redis_client: object,
+        transport: ModelTransport | None = None,
+        capacity_factory: RouterCapacityFactory | None = None,
+    ) -> None:
+        self._get_config = get_config
+        self._list_models = list_models
+        self._secret_service = secret_service
+        self._tenant_id = tenant_id
+        self._redis_client = redis_client
+        self._transport = transport or LiteLLMClient()
+        self._capacity_factory = capacity_factory
+
+    async def route(self, task_text: object) -> RouteDecision:
+        try:
+            config = await self._get_config()
+            if config.model is None:
+                return _waiting_route_decision("main_agent_not_configured")
+            deployment = await self._deployment_from_config(config.model)
+            capacity = (
+                await self._capacity_factory((deployment,))
+                if self._capacity_factory is not None
+                else await self._default_capacity((deployment,))
+            )
+            gateway = ModelGateway(
+                ModelRegistry((deployment,)),
+                capacity,
+                TenantSecretResolver(self._secret_service, self._tenant_id),
+                self._transport,
+                capacity_wait_timeout=60,
+            )
+            router = ModeRouter(
+                GatewayRouteClassifier(
+                    gateway,
+                    logical_model="main_agent",
+                    source=RouteSource.CLASSIFIER,
+                    prefer_plain_json=True,
+                ),
+                GatewayRouteClassifier(
+                    gateway,
+                    logical_model="main_agent",
+                    source=RouteSource.VERIFIER,
+                    prefer_plain_json=True,
+                ),
+                token_store=InMemoryDecisionTokenStore(),
+                policy=RoutingPolicy(
+                    confidence_threshold=0.65,
+                    parallel_classifiers=False,
+                    allow_single_classifier_decision=True,
+                ),
+            )
+            return await router.route(task_text)
+        except Exception as error:  # noqa: BLE001 - auto routing must degrade safely.
+            _LOGGER.warning("main_agent_router_unavailable error_type=%s", type(error).__name__)
+            return _waiting_route_decision("main_agent_router_unavailable")
+
+    async def _deployment_from_config(self, model: admin.MainAgentModelConfig) -> Deployment:
+        if self._list_models is None:
+            return admin._main_agent_model_deployment(model)
+        matched: admin.ModelDeploymentResponse | None = None
+        try:
+            for registered in await self._list_models():
+                if (
+                    registered.provider == model.provider
+                    and registered.api_base == model.api_base
+                    and registered.api_protocol == model.api_protocol
+                    and registered.upstream_model == model.upstream_model
+                    and registered.credential_ref == model.credential_ref
+                ):
+                    matched = registered
+                    break
+        except Exception as error:  # noqa: BLE001 - routing should still use explicit config.
+            _LOGGER.warning(
+                "main_agent_model_capability_lookup_failed error_type=%s",
+                type(error).__name__,
+            )
+        if matched is None:
+            return admin._main_agent_model_deployment(model)
+        capabilities = set(model.capabilities)
+        capabilities.update(matched.capabilities)
+        parsed_capabilities = frozenset(ModelCapability(item) for item in capabilities)
+        return Deployment(
+            id="main_agent_1",
+            logical_model="main_agent",
+            provider_model=f"{model.provider}/{model.upstream_model}",
+            request_model=model.upstream_model,
+            api_base=model.api_base,
+            secret_ref=model.credential_ref,
+            quota_scope_id=matched.quota_scope,
+            max_concurrency=matched.max_concurrency,
+            target_utilization=matched.target_utilization,
+            reserved_slots=matched.reserved_capacity,
+            rpm=matched.rpm,
+            tpm=matched.tpm,
+            weight=matched.weight,
+            capabilities=parsed_capabilities,
+        )
+
+    async def _default_capacity(
+        self,
+        deployments: tuple[Deployment, ...],
+    ) -> CapacityPool:
+        credentials = CredentialRegistry(
+            [
+                CredentialDescriptor(
+                    deployment.secret_ref,
+                    await self._secret_service.fingerprint(self._tenant_id, deployment.secret_ref),
+                )
+                for deployment in deployments
+            ]
+        )
+        return CapacityPool(self._redis_client, deployments=deployments, credentials=credentials)
+
+
+def _waiting_route_decision(reason: str) -> RouteDecision:
+    return RouteDecision(
+        mode=None,
+        needs_user_choice=True,
+        status="waiting_user_mode",
+        assessments=(),
+        clarification_reason=reason,
+        options=(TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID),
+        decision_token=None,
+        version=1,
+        risk=RiskLevel.LOW,
+        requires_approval=False,
+        permissions_still_apply=True,
+    )
 
 
 class InProcessRunQueue:
@@ -180,6 +336,7 @@ def create_app(
         active_database = database
         active_redis = redis_client
         active_sessions = session_factory
+        active_mode_router = mode_router
         cleanup_callbacks: list[CleanupCallback] = []
         token_service = (
             AccessTokenService(configured.jwt_signing_key_value())
@@ -261,11 +418,26 @@ def create_app(
                         secret_service=active_secret_service,
                         redis_client=active_redis,
                     )
+                if active_mode_router is None and active_secret_service is not None:
+                    assert active_redis is not None
+                    admin_service_for_router = cast(
+                        admin.AdminResourceService,
+                        admin_resource_service
+                        if admin_resource_service is not None
+                        else application.state.admin_resource_service,
+                    )
+                    active_mode_router = _MainAgentModeRouter(
+                        get_config=admin_service_for_router.get_main_agent_config,
+                        list_models=admin_service_for_router.list_models,
+                        secret_service=active_secret_service,
+                        tenant_id=configured.bootstrap_tenant_id,
+                        redis_client=active_redis,
+                    )
                 queue = task_queue if task_queue is not None else InProcessRunQueue()
                 application.state.run_service = RunService(
                     RunRepository(active_sessions),
                     runtime_registry=active_runtime_registry,
-                    router=mode_router,
+                    router=active_mode_router,
                     task_queue=queue,
                     hermes_advisor=PersistentHermesRunAdvisor(active_sessions),
                     temporary_agent_policy=AdminResourceTemporaryAgentPolicy(active_sessions),
@@ -273,6 +445,7 @@ def create_app(
                     runtime_token_budget=configured.runtime_token_budget,
                 )
                 application.state.run_queue = queue
+                application.state.mode_router = active_mode_router
             if (
                 feishu_gateway is None
                 and active_sessions is not None

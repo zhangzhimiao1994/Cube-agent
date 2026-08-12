@@ -4,7 +4,7 @@ from typing import Annotated, Protocol, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from agent_hub.api.dependencies import current_principal
 from agent_hub.api.errors import BASE_ERROR_RESPONSES, PublicAPIError, error_responses
@@ -51,6 +51,13 @@ class UserAdminServiceProtocol(Protocol):
         actor: AuthenticatedPrincipal,
         user_id: UUID,
         disabled: bool,
+    ) -> ManagedUser: ...
+
+    async def reset_password(
+        self,
+        actor: AuthenticatedPrincipal,
+        user_id: UUID,
+        password: str,
     ) -> ManagedUser: ...
 
     async def delete_user(
@@ -100,6 +107,12 @@ class SetDisabledRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     disabled: bool
+
+
+class ResetPasswordRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    password: SecretStr = Field(min_length=12, max_length=1024, repr=False)
 
 
 def _user_service(request: Request) -> UserAdminServiceProtocol:
@@ -221,6 +234,47 @@ async def set_disabled(
         action="user.disable" if user.disabled else "user.enable",
         resource=f"user:{user.id}",
         details={"username": user.username, "disabled": str(user.disabled).lower()},
+    )
+    return UserResponse.from_user(user)
+
+
+@router.patch(
+    "/{user_id}/password",
+    response_model=UserResponse,
+    responses=error_responses(400, 401, 403, 404, 409, 422, 503),
+)
+async def reset_password(
+    user_id: UUID,
+    body: ResetPasswordRequest,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[UserAdminServiceProtocol, Depends(_user_service)],
+) -> UserResponse:
+    _require(principal, "user:write")
+    try:
+        user = await service.reset_password(
+            principal,
+            user_id,
+            body.password.get_secret_value(),
+        )
+    except PermissionError:
+        raise PublicAPIError(403, "permission_denied", "permission denied") from None
+    except KeyError:
+        raise PublicAPIError(404, "user_not_found", "user not found") from None
+    except PasswordValidationError as error:
+        raise PublicAPIError(422, "invalid_password", str(error)) from None
+    except AuthenticationBusy:
+        raise PublicAPIError(503, "authentication_busy", "password worker is busy") from None
+    except PasswordBackendError:
+        raise PublicAPIError(503, "password_backend_failed", "password backend failed") from None
+    except ProtectedUserError as error:
+        raise PublicAPIError(409, "protected_user", str(error)) from None
+    await _record_user_audit(
+        request,
+        principal,
+        action="user.password",
+        resource=f"user:{user.id}",
+        details={"username": user.username, "role": user.role.value},
     )
     return UserResponse.from_user(user)
 

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import re
+import tarfile
+import zipfile
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Protocol, cast
 from uuid import UUID, uuid4
 
@@ -27,6 +30,32 @@ router = APIRouter(
     tags=["runs"],
     responses=error_responses(401, 403, 404, 405, 409, 413, 422, 500, 503),
 )
+
+ARCHIVE_EXTENSIONS = (
+    ".tar.gz",
+    ".tar.bz2",
+    ".tar.xz",
+    ".tar.zst",
+    ".zip",
+    ".rar",
+    ".7z",
+    ".tar",
+    ".tgz",
+    ".tbz2",
+    ".txz",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".zst",
+    ".cab",
+    ".iso",
+    ".jar",
+    ".war",
+    ".ear",
+    ".apk",
+    ".ipa",
+)
+ARCHIVE_MANIFEST_MAX_FILES = 512
 
 
 class RunServiceProtocol(Protocol):
@@ -258,13 +287,144 @@ def _safe_attachment_filename(value: str | None) -> str:
     return cleaned or "attachment.bin"
 
 
+def _is_archive_filename(filename: str) -> bool:
+    lowered = filename.lower()
+    return any(lowered.endswith(extension) for extension in ARCHIVE_EXTENSIONS)
+
+
 def _attachment_kind(filename: str, content_type: str) -> str:
     lowered = filename.lower()
     if content_type.startswith("image/"):
         return "image"
-    if lowered.endswith(".zip"):
-        return "code_archive"
+    if _is_archive_filename(lowered):
+        return "archive"
     return "context"
+
+
+def _safe_archive_member_path(name: str) -> str | None:
+    normalized = name.replace("\\", "/").strip()
+    if not normalized:
+        return None
+    path = PurePosixPath(normalized)
+    if path.is_absolute():
+        return None
+    parts = tuple(part for part in path.parts if part not in ("", "."))
+    if not parts or any(part == ".." for part in parts):
+        return None
+    return "/".join(parts)
+
+
+def _write_archive_member(root: Path, relative_path: str, content: bytes) -> Path:
+    target = (root / Path(*relative_path.split("/"))).resolve()
+    if not target.is_relative_to(root):
+        raise ValueError("archive member escapes extraction root")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    return target
+
+
+def _archive_member_entry(relative_path: str, size: int, *, extracted: bool) -> dict[str, object]:
+    return {"path": relative_path, "size_bytes": size, "extracted": extracted}
+
+
+def _extract_zip_manifest(
+    *,
+    body: bytes,
+    extract_dir: Path,
+    max_bytes: int,
+) -> tuple[list[dict[str, object]], bool]:
+    files: list[dict[str, object]] = []
+    total_bytes = 0
+    with zipfile.ZipFile(io.BytesIO(body)) as archive:
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            relative_path = _safe_archive_member_path(info.filename)
+            if relative_path is None:
+                continue
+            total_bytes += max(0, info.file_size)
+            if total_bytes > max_bytes or len(files) >= ARCHIVE_MANIFEST_MAX_FILES:
+                files.append(_archive_member_entry(relative_path, info.file_size, extracted=False))
+                return files, False
+            content = archive.read(info)
+            _write_archive_member(extract_dir, relative_path, content)
+            files.append(_archive_member_entry(relative_path, len(content), extracted=True))
+    return files, True
+
+
+def _extract_tar_manifest(
+    *,
+    body: bytes,
+    extract_dir: Path,
+    max_bytes: int,
+) -> tuple[list[dict[str, object]], bool]:
+    files: list[dict[str, object]] = []
+    total_bytes = 0
+    with tarfile.open(fileobj=io.BytesIO(body), mode="r:*") as archive:
+        for member in archive.getmembers():
+            if not member.isfile():
+                continue
+            relative_path = _safe_archive_member_path(member.name)
+            if relative_path is None:
+                continue
+            total_bytes += max(0, member.size)
+            if total_bytes > max_bytes or len(files) >= ARCHIVE_MANIFEST_MAX_FILES:
+                files.append(_archive_member_entry(relative_path, member.size, extracted=False))
+                return files, False
+            member_file = archive.extractfile(member)
+            if member_file is None:
+                files.append(_archive_member_entry(relative_path, member.size, extracted=False))
+                continue
+            content = member_file.read()
+            _write_archive_member(extract_dir, relative_path, content)
+            files.append(_archive_member_entry(relative_path, len(content), extracted=True))
+    return files, True
+
+
+def _write_archive_manifest(
+    *,
+    attachment_id: str,
+    filename: str,
+    body: bytes,
+    tenant_dir: Path,
+    max_bytes: int,
+) -> None:
+    if not _is_archive_filename(filename):
+        return
+
+    extract_dir = (tenant_dir / attachment_id).resolve()
+    if not extract_dir.is_relative_to(tenant_dir):
+        raise ValueError("archive extraction root escaped tenant directory")
+    manifest: dict[str, object] = {
+        "archive": {
+            "filename": filename,
+            "extracted": False,
+            "format": "unsupported",
+        },
+        "files": [],
+    }
+
+    try:
+        if zipfile.is_zipfile(io.BytesIO(body)):
+            files, complete = _extract_zip_manifest(body=body, extract_dir=extract_dir, max_bytes=max_bytes)
+            manifest["archive"] = {"filename": filename, "extracted": complete, "format": "zip"}
+            manifest["files"] = files
+        else:
+            files, complete = _extract_tar_manifest(body=body, extract_dir=extract_dir, max_bytes=max_bytes)
+            manifest["archive"] = {"filename": filename, "extracted": complete, "format": "tar"}
+            manifest["files"] = files
+    except (tarfile.TarError, zipfile.BadZipFile, RuntimeError, OSError, ValueError) as exc:
+        manifest["archive"] = {
+            "filename": filename,
+            "extracted": False,
+            "format": "unsupported",
+            "error": str(exc),
+        }
+
+    (tenant_dir / f"{attachment_id}.manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 @router.post(
@@ -300,13 +460,21 @@ async def upload_attachment(
     tenant_dir.mkdir(parents=True, exist_ok=True)
     data_path = tenant_dir / f"{attachment_id}.bin"
     meta_path = tenant_dir / f"{attachment_id}.json"
+    kind = _attachment_kind(filename, media_type)
     data_path.write_bytes(body)
+    _write_archive_manifest(
+        attachment_id=attachment_id,
+        filename=filename,
+        body=body,
+        tenant_dir=tenant_dir,
+        max_bytes=max_bytes,
+    )
     meta_path.write_text(
         json.dumps(
             {
                 "id": attachment_id,
                 "filename": filename,
-                "kind": _attachment_kind(filename, media_type),
+                "kind": kind,
                 "content_type": media_type,
                 "size_bytes": len(body),
                 "sha256": digest,
@@ -322,7 +490,7 @@ async def upload_attachment(
     return AttachmentUploadResponse(
         id=attachment_id,
         filename=filename,
-        kind=_attachment_kind(filename, media_type),
+        kind=kind,
         content_type=media_type,
         size_bytes=len(body),
         sha256=digest,

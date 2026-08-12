@@ -154,6 +154,36 @@ async def test_hybrid_runtime_preserves_dispatch_child_failure_reason() -> None:
 
 
 @pytest.mark.asyncio
+async def test_hybrid_runtime_completes_partial_when_discussion_gateway_fails_after_dispatch() -> None:
+    run_id = uuid4()
+    dispatch_output = artifact("planner", "dispatch result")
+    runtime = HybridRuntime(
+        MultiArtifactRuntime(TaskMode.DISPATCH, (dispatch_output,)),
+        FailingRuntime(TaskMode.DISCUSS, "model gateway failed: model transport failed"),
+        UnusedRuntime(TaskMode.DIRECT, "unused"),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=run_id,
+                tenant_id=uuid4(),
+                mode=TaskMode.HYBRID,
+                request="build a plan",
+            )
+        )
+    ]
+
+    assert any(
+        event.kind is EventKind.ARTIFACT_CREATED and event.artifact == dispatch_output
+        for event in events
+    )
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].reason == "partial_hybrid_after_discussion_failure"
+
+
+@pytest.mark.asyncio
 async def test_hybrid_runtime_redacts_sensitive_child_failure_reason() -> None:
     run_id = uuid4()
     runtime = HybridRuntime(

@@ -64,6 +64,9 @@ describe("UsersPage", () => {
         if (path.endsWith("/disabled") && init?.method === "PATCH") {
           return jsonResponse({ ...operator, disabled: true });
         }
+        if (path.endsWith("/password") && init?.method === "PATCH") {
+          return jsonResponse(operator);
+        }
         if (path.includes(operator.id) && init?.method === "DELETE") {
           return new Response(null, { status: 204 });
         }
@@ -120,5 +123,24 @@ describe("UsersPage", () => {
       "/api/v1/users/22222222-2222-4222-8222-222222222222",
       expect.objectContaining({ method: "DELETE" }),
     );
+  });
+
+  it("can reset a manageable user's password without exposing the password in the table", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<TestApp initialPath="/users" />);
+
+    await screen.findByRole("heading", { name: "用户管理" });
+    await userEvent.click(screen.getAllByRole("button", { name: "重置密码" })[1]);
+    await userEvent.type(screen.getByLabelText("新密码"), "new valid password 789");
+    await userEvent.click(screen.getByRole("button", { name: "保存新密码" }));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/users/22222222-2222-4222-8222-222222222222/password",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ password: "new valid password 789" }),
+      }),
+    );
+    expect(screen.queryByText("new valid password 789")).toBeNull();
   });
 });

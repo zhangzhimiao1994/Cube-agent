@@ -21,6 +21,15 @@ export function SkillsPage() {
     mutationFn: (id: string) => api.approveSkill(id),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["skills"] }),
   });
+  const deleteSkill = useMutation({
+    mutationFn: (id: string) => api.deleteSkill(id),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["skills"] }),
+  });
+
+  function confirmDeleteSkill(id: string, name: string) {
+    if (!window.confirm(`确定删除 Skill「${name}」吗？删除后不会再分发给主 Agent 或子 Agent。`)) return;
+    deleteSkill.mutate(id);
+  }
 
   if (skills.isLoading) return <p>正在加载 Skill...</p>;
   if (skills.isError) {
@@ -42,22 +51,23 @@ export function SkillsPage() {
         <article>
           <h3>上传并扫描 Skill</h3>
           <label>
-            Skill ZIP
+            Skill 包
             <input
-              aria-label="Skill ZIP"
+              aria-label="Skill 包"
               type="file"
-              accept=".zip"
+              accept=".zip,.tar.gz,.tgz"
               onChange={(event) => setFile(event.currentTarget.files?.[0] ?? null)}
             />
           </label>
           <p className="field-help">
-            只接受 `.zip`。后端会读取真实压缩包内容、解析清单、计算哈希并保存归档。
+            接受 `.zip`、`.tar.gz`、`.tgz`。后端会读取真实压缩包内容、解析清单、计算哈希并保存归档。
           </p>
           <button type="button" disabled={!file || upload.isPending} onClick={() => upload.mutate()}>
             {upload.isPending ? "正在扫描..." : "上传并扫描"}
           </button>
           {upload.isError ? <p role="alert">{formatApiError(upload.error, "Skill 上传失败")}</p> : null}
           {approve.isError ? <p role="alert">{formatApiError(approve.error, "Skill 审批失败")}</p> : null}
+          {deleteSkill.isError ? <p role="alert">{formatApiError(deleteSkill.error, "Skill 删除失败")}</p> : null}
         </article>
 
         <article>
@@ -92,6 +102,14 @@ export function SkillsPage() {
                   onClick={() => approve.mutate(skill.id)}
                 >
                   {skill.status === "enabled" ? "已启用" : "审批并启用"}
+                </button>
+                <button
+                  type="button"
+                  className="danger-action"
+                  disabled={deleteSkill.isPending}
+                  onClick={() => confirmDeleteSkill(skill.id, skill.name)}
+                >
+                  删除
                 </button>
               </article>
             ))}

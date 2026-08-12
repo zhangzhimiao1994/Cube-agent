@@ -148,6 +148,31 @@ class PersistentUserAdminService:
             await session.flush()
             return _managed_user_from_row(row)
 
+    async def reset_password(
+        self,
+        actor: AuthenticatedPrincipal,
+        user_id: UUID,
+        password: str,
+    ) -> ManagedUser:
+        _require_admin(actor)
+        password_hash = await self._passwords.hash_async(password)
+        try:
+            async with self._session_factory() as session, session.begin():
+                row = await session.scalar(
+                    select(UserRow)
+                    .where(UserRow.tenant_id == actor.tenant_id, UserRow.id == user_id)
+                    .with_for_update()
+                )
+                if row is None:
+                    raise KeyError("user not found")
+                if row.protected:
+                    raise ProtectedUserError("protected user password cannot be reset")
+                row.password_hash = password_hash
+                await session.flush()
+                return _managed_user_from_row(row)
+        finally:
+            del password, password_hash
+
     async def delete_user(
         self,
         actor: AuthenticatedPrincipal,

@@ -216,11 +216,36 @@ class HybridRuntime:
             )
             raise
         except (ArtifactRepositoryError, RuntimeExecutionError, ValueError, TypeError) as error:
+            failure_reason = _safe_failure_reason(error, fallback="hybrid_failed")
+            if _can_complete_with_partial_hybrid(artifacts, failure_reason):
+                checkpoint = self._checkpoint(
+                    context,
+                    artifacts=tuple(artifacts),
+                    next_sequence=sequence + 1,
+                    next_stage=len(self._stages()),
+                    terminal=True,
+                    reason="partial_hybrid_after_discussion_failure",
+                )
+                self._last_checkpoint = checkpoint
+                yield RunEvent(
+                    kind=EventKind.CHECKPOINT_SAVED,
+                    sequence=sequence,
+                    run_id=context.run_id,
+                    checkpoint=checkpoint,
+                )
+                sequence += 1
+                yield RunEvent(
+                    kind=EventKind.RUNTIME_COMPLETED,
+                    sequence=sequence,
+                    run_id=context.run_id,
+                    reason="partial_hybrid_after_discussion_failure",
+                )
+                return
             yield RunEvent(
                 kind=EventKind.RUNTIME_FAILED,
                 sequence=sequence,
                 run_id=context.run_id,
-                reason=_safe_failure_reason(error, fallback="hybrid_failed"),
+                reason=failure_reason,
             )
         finally:
             self._active_child = None
@@ -473,6 +498,15 @@ def _discussion_handoff_artifacts(artifacts: tuple[Artifact, ...]) -> tuple[Arti
         for artifact in artifacts
         if not (artifact.type == "model_response" and str(artifact.id) in wrapped_source_ids)
     )
+
+
+def _can_complete_with_partial_hybrid(
+    artifacts: list[Artifact],
+    failure_reason: str,
+) -> bool:
+    if not artifacts:
+        return False
+    return failure_reason.startswith("hybrid discuss failed: model gateway failed")
 
 
 __all__ = ["HybridPlan", "HybridRuntime", "HybridUpgrade", "RuntimeExecutionError"]

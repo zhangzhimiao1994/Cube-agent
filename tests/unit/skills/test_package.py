@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import stat
+import tarfile
 import zipfile
 
 import pytest
@@ -31,6 +32,16 @@ def test_valid_skill_package_is_inspected() -> None:
         "write:tmp/output",
         "secret:deepseek_api_key",
     )
+
+
+def test_valid_tar_gz_skill_package_is_inspected() -> None:
+    archive = skill_tar_gz()
+
+    inspection = SkillPackageInspector().inspect(archive)
+
+    assert inspection.manifest.name == "demo_skill"
+    assert inspection.manifest.entry_point == "main.py"
+    assert {file.path for file in inspection.files} == {"skill.yaml", "main.py"}
 
 
 def test_declared_tool_capability_prefix_is_not_duplicated() -> None:
@@ -185,6 +196,21 @@ def skill_zip(
             archive.writestr(name, content)
         for info, content in (extra_infos or {}).items():
             archive.writestr(info, content)
+    return buffer.getvalue()
+
+
+def skill_tar_gz() -> bytes:
+    manifest = valid_manifest()
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for name, content in {
+            "skill.yaml": manifest.encode(),
+            "main.py": b"print('ok')\n",
+        }.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            info.mode = 0o644
+            archive.addfile(info, io.BytesIO(content))
     return buffer.getvalue()
 
 

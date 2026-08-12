@@ -325,6 +325,45 @@ def test_user_management_create_disable_enable_delete_endpoints_are_wired() -> N
     ]
 
 
+def test_user_management_reset_password_endpoint_is_wired_and_audited() -> None:
+    owner_id = uuid4()
+    tenant_id = uuid4()
+    auth = StubAuthService(AuthenticatedPrincipal(owner_id, tenant_id, Role.SUPER_ADMIN))
+    service = InMemoryUserAdminService(
+        (
+            ManagedUser(
+                id=owner_id,
+                username="owner",
+                role=Role.SUPER_ADMIN,
+                protected=True,
+            ),
+        )
+    )
+    audit = InMemoryAdminResourceService()
+    client = auth_client(auth, user_admin_service=service, admin_resource_service=audit)
+
+    created = client.post(
+        "/api/v1/users",
+        headers={"Authorization": "Bearer valid-token"},
+        json={"username": "ops-user", "password": "valid password 456", "role": "operator"},
+    )
+    user_id = created.json()["id"]
+
+    reset = client.patch(
+        f"/api/v1/users/{user_id}/password",
+        headers={"Authorization": "Bearer valid-token"},
+        json={"password": "new valid password 789"},
+    )
+
+    assert reset.status_code == 200
+    assert reset.json()["username"] == "ops-user"
+    assert "new valid password 789" not in reset.text
+    user_audit_actions = [
+        event.action for event in audit.audit_events if event.action.startswith("user.")
+    ]
+    assert user_audit_actions == ["user.create", "user.password"]
+
+
 def test_user_management_protects_initial_super_admin() -> None:
     owner_id = uuid4()
     tenant_id = uuid4()
@@ -355,6 +394,11 @@ def test_user_management_protects_initial_super_admin() -> None:
         headers={"Authorization": "Bearer valid-token"},
         json={"role": "admin"},
     )
+    reset_password = client.patch(
+        f"/api/v1/users/{owner_id}/password",
+        headers={"Authorization": "Bearer valid-token"},
+        json={"password": "new valid password 789"},
+    )
 
     assert disable.status_code == 409
     assert disable.json()["error"]["code"] == "protected_user"
@@ -362,6 +406,8 @@ def test_user_management_protects_initial_super_admin() -> None:
     assert delete.json()["error"]["code"] == "protected_user"
     assert demote.status_code == 409
     assert demote.json()["error"]["code"] == "protected_user"
+    assert reset_password.status_code == 409
+    assert reset_password.json()["error"]["code"] == "protected_user"
 
 
 def test_setup_and_login_return_only_safe_principal_fields() -> None:

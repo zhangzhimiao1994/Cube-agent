@@ -21,6 +21,7 @@ from agent_hub.runtime.defaults import (
     _discussion_plan,
     _dispatch_parallelism,
     _dispatch_plan,
+    _selected_config_role_assignments,
     _select_logical_model_for_role,
     configured_runtime_registry,
 )
@@ -723,6 +724,43 @@ def test_discussion_plan_accepts_localized_role_display_names() -> None:
     ]
 
 
+def test_discussion_plan_normalizes_hyphenated_ids_for_autogen() -> None:
+    plan = _discussion_plan(
+        (
+            RoleAssignment(
+                id="content-writer",
+                role="文案",
+                purpose=RolePurpose.EXPERTISE,
+                mission="输出脚本。",
+                must_answer=("脚本是什么？",),
+                allowed_tools=(),
+                forbidden_actions=("不要执行危险操作。",),
+                skills=(),
+                output_schema={"position": "string"},
+                model="main",
+            ),
+            RoleAssignment(
+                id="risk-reviewer",
+                role="风险审查",
+                purpose=RolePurpose.CRITIQUE,
+                mission="检查风险。",
+                must_answer=("风险是什么？",),
+                allowed_tools=(),
+                forbidden_actions=("不要执行危险操作。",),
+                skills=(),
+                output_schema={"position": "string"},
+                model="main",
+            ),
+        ),
+        "main",
+    )
+
+    assert [participant.id for participant in plan.participants] == [
+        "content_writer",
+        "risk_reviewer",
+    ]
+
+
 def test_discussion_plan_uses_bounded_generation_limits() -> None:
     plan = _discussion_plan(
         (
@@ -756,6 +794,87 @@ def test_discussion_plan_uses_bounded_generation_limits() -> None:
 
     assert all(participant.max_output_tokens <= 1536 for participant in plan.participants)
     assert plan.selector_max_output_tokens <= 512
+
+
+def test_selected_agent_ids_are_resolved_from_config_without_extra_roles() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "creative": {
+                    "deployments": [
+                        {
+                            "provider": "kimi",
+                            "model": "kimi-k2-latest",
+                            "api_base": "https://api.moonshot.cn/v1",
+                            "credential_ref": "secret://creative",
+                            "quota_scope_id": "kimi",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text"],
+                        }
+                    ]
+                },
+                "review": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-v4-flash",
+                            "api_base": "https://api.deepseek.com/v1",
+                            "credential_ref": "secret://review",
+                            "quota_scope_id": "deepseek",
+                            "max_concurrency": 4,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text"],
+                        }
+                    ]
+                },
+            },
+            "agents": [
+                {
+                    "id": "copywriter",
+                    "role": "文案生成",
+                    "prompt": "负责活动文案和脚本。",
+                    "model": "creative",
+                    "skills": ["docx"],
+                },
+                {
+                    "id": "reviewer",
+                    "role": "质量审查",
+                    "prompt": "负责检查风险和遗漏。",
+                    "model": "review",
+                    "skills": [],
+                },
+                {
+                    "id": "unused_director",
+                    "role": "导演",
+                    "prompt": "不应被本次选择带入。",
+                    "model": "creative",
+                    "skills": [],
+                },
+            ],
+        }
+    )
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=TENANT_ID,
+        mode=TaskMode.HYBRID,
+        request="写一个中秋活动方案。",
+        routing_decision={"selected_agent_ids": ["copywriter", "reviewer"]},
+    )
+
+    roles = _selected_config_role_assignments(
+        context,
+        config,
+        purpose=RolePurpose.EXPERTISE,
+        output_schema={"position": "string"},
+    )
+
+    assert [(role.id, role.role, role.model, role.skills) for role in roles] == [
+        ("copywriter", "文案生成", "creative", ("docx",)),
+        ("reviewer", "质量审查", "review", ()),
+    ]
 
 
 def test_configured_runtime_registry_registers_all_production_modes() -> None:

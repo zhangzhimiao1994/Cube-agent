@@ -28,7 +28,7 @@ type SkillInstallCandidate = {
 type ChatAttachmentDraft = {
   fileName: string;
   size: number;
-  kind: "code_review" | "image" | "context";
+  kind: "archive" | "image" | "context";
   attachment?: AttachmentUpload;
 };
 type TemporaryAgentProposal = NonNullable<SubmittedRun["temporary_agent_proposal"]>;
@@ -40,6 +40,53 @@ type RunSubmissionOverride = {
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
 const MANUAL_RUN_MODES = RUN_MODES.filter((item) => item.value !== "auto");
+const ARCHIVE_EXTENSIONS = [
+  ".zip",
+  ".rar",
+  ".7z",
+  ".tar",
+  ".tar.gz",
+  ".tgz",
+  ".tar.bz2",
+  ".tbz2",
+  ".tar.xz",
+  ".txz",
+  ".tar.zst",
+  ".gz",
+  ".bz2",
+  ".xz",
+  ".zst",
+  ".cab",
+  ".iso",
+  ".jar",
+  ".war",
+  ".ear",
+  ".apk",
+  ".ipa",
+];
+const ATTACHMENT_ACCEPT = [
+  ...ARCHIVE_EXTENSIONS,
+  ".txt",
+  ".md",
+  ".pdf",
+  ".doc",
+  ".docx",
+  ".ppt",
+  ".pptx",
+  ".xls",
+  ".xlsx",
+  "image/*",
+].join(",");
+
+function isArchiveFileName(fileName: string) {
+  const lower = fileName.toLowerCase();
+  return ARCHIVE_EXTENSIONS.some((extension) => lower.endsWith(extension));
+}
+
+function mayBeSkillArchive(fileName: string) {
+  const lower = fileName.toLowerCase();
+  return [".zip", ".tar.gz", ".tgz"].some((extension) => lower.endsWith(extension));
+}
 
 function newConversationId() {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -233,6 +280,9 @@ function formatEventPayloadValue(value: unknown): string {
   }
 }
 
+type RunEvent = RunDetail["events"][number];
+type RunArtifact = RunDetail["artifacts"][number];
+
 function conciseProcessText(value: string, fallback: string) {
   const normalized = value
     .replace(/```[\s\S]*?```/g, "")
@@ -267,7 +317,7 @@ function hasUsefulPayload(event: RunDetail["events"][number]) {
 function isActionEvent(event: RunDetail["events"][number]) {
   if (isNoiseEvent(event)) return false;
   if (event.kind === "artifact.created") {
-    return hasUsefulPayload(event);
+    return true;
   }
   if (["step.started", "step.completed"].includes(event.kind)) {
     return Boolean(event.actor || event.action || event.tool_name || event.decision || hasUsefulPayload(event));
@@ -539,6 +589,35 @@ function conversationMessages(runs: RunDetail[]) {
   );
 }
 
+function sameRunSnapshot(left: RunDetail, right: RunDetail) {
+  return (
+    left.id === right.id &&
+    left.status === right.status &&
+    left.mode === right.mode &&
+    left.request === right.request &&
+    left.events.length === right.events.length &&
+    left.artifacts.length === right.artifacts.length
+  );
+}
+
+function mergeConversationRuns(previous: RunDetail[] | undefined, incoming: RunDetail[]) {
+  if (!previous || previous.length === 0) return incoming;
+  if (incoming.length === 0) return previous;
+  const incomingById = new Map(incoming.map((run) => [run.id, run]));
+  const previousIds = new Set(previous.map((run) => run.id));
+  const merged = previous.map((run) => incomingById.get(run.id) ?? run);
+  for (const run of incoming) {
+    if (!previousIds.has(run.id)) merged.push(run);
+  }
+  if (
+    merged.length === previous.length &&
+    merged.every((run, index) => sameRunSnapshot(run, previous[index]))
+  ) {
+    return previous;
+  }
+  return merged;
+}
+
 function internalArtifactNotice(detail: RunDetail) {
   const textArtifacts = dedupeTextArtifacts(detail.artifacts);
   if (textArtifacts.length === 0) return null;
@@ -578,36 +657,132 @@ function processRoutingRows(
   ].filter((item): item is { label: string; value: string } => Boolean(item));
 }
 
-function eventSummaryText(event: RunDetail["events"][number], agentNames: Map<string, string>) {
+function eventArtifactText(artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null | undefined) {
+  return artifact?.text?.trim() || "";
+}
+
+function eventArtifactRows(artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null | undefined) {
+  const rows: Array<{ label: string; value: string }> = [];
+  if (!artifact) return rows;
+  if (artifact.title) rows.push({ label: "产出者", value: artifact.title });
+  if (artifact.kind) rows.push({ label: "产物类型", value: artifact.kind });
+  const text = eventArtifactText(artifact);
+  if (text) rows.push({ label: "输出内容", value: text });
+  return rows;
+}
+
+function fallbackArtifactForEvent(
+  event: RunEvent,
+  artifacts: RunArtifact[],
+  consumedArtifactIds: Set<string>,
+) {
+  if (event.artifact) return event.artifact;
+  const explicitArtifactId =
+    formatEventPayloadValue(event.payload.artifact_id) ||
+    formatEventPayloadValue(event.payload.artifactId) ||
+    formatEventPayloadValue(event.payload.id);
+  if (explicitArtifactId) {
+    const matched = artifacts.find((artifact) => artifact.id === explicitArtifactId);
+    if (matched) {
+      consumedArtifactIds.add(matched.id);
+      return matched;
+    }
+  }
+  if (event.kind !== "artifact.created" && event.kind !== "message.created") return null;
+  const byActor = event.actor
+    ? artifacts.find((artifact) => artifact.title === event.actor && !consumedArtifactIds.has(artifact.id))
+    : null;
+  const byOrder = artifacts.find((artifact) => !consumedArtifactIds.has(artifact.id));
+  const matched = byActor ?? byOrder ?? null;
+  if (matched) consumedArtifactIds.add(matched.id);
+  return matched;
+}
+
+function eventInstructionSignal(event: RunEvent) {
+  const readableMessage =
+    event.message && event.message !== event.kind && !/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(event.message)
+      ? event.message
+      : "";
+  return (
+    formatEventPayloadValue(event.payload.instruction) ||
+    formatEventPayloadValue(event.payload.instructions) ||
+    formatEventPayloadValue(event.payload.task) ||
+    formatEventPayloadValue(event.payload.prompt) ||
+    readableMessage
+  );
+}
+
+function eventOutputSignal(event: RunEvent, artifact?: RunArtifact | NonNullable<RunEvent["artifact"]> | null) {
+  const readableMessage =
+    event.message && event.message !== event.kind && !/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(event.message)
+      ? event.message
+      : "";
+  return (
+    formatEventPayloadValue(event.payload.result) ||
+    formatEventPayloadValue(event.payload.output) ||
+    formatEventPayloadValue(event.payload.summary) ||
+    eventArtifactText(artifact) ||
+    readableMessage
+  );
+}
+
+function eventDecisionSignal(event: RunEvent) {
+  const readableMessage =
+    event.message && event.message !== event.kind && !/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(event.message)
+      ? event.message
+      : "";
+  return (
+    formatEventPayloadValue(event.payload.final_decision) ||
+    formatEventPayloadValue(event.payload.main_agent_judgement) ||
+    formatEventPayloadValue(event.payload.main_agent_judgment) ||
+    formatEventPayloadValue(event.payload.decision) ||
+    event.decision ||
+    readableMessage
+  );
+}
+
+function humanizeEventIdentifier(value: string) {
+  return value
+    .split("_")
+    .filter(Boolean)
+    .map((part) => part.slice(0, 1).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function eventOpinionEntries(event: RunEvent, agentNames: Map<string, string>) {
+  return Object.entries(event.payload)
+    .filter(([key, value]) => key.endsWith("_opinion") && Boolean(formatEventPayloadValue(value)))
+    .map(([key, value]) => {
+      const actorId = key.replace(/_opinion$/, "");
+      return {
+        actor: agentNames.get(actorId) ?? humanizeEventIdentifier(actorId),
+        label: eventPayloadLabel(key),
+        value: formatEventPayloadValue(value),
+      };
+    });
+}
+
+function eventSummaryText(
+  event: RunDetail["events"][number],
+  agentNames: Map<string, string>,
+  artifact?: RunArtifact | NonNullable<RunEvent["artifact"]> | null,
+) {
   const actor = displayEventActor(event.actor, agentNames);
   const participants = displayEventParticipants(event.participants, agentNames);
   const readableMessage =
     event.message && event.message !== event.kind && !/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(event.message)
       ? event.message
       : "";
-  const instructionSignal =
-    formatEventPayloadValue(event.payload.instruction) ||
-    formatEventPayloadValue(event.payload.instructions) ||
-    formatEventPayloadValue(event.payload.task) ||
-    formatEventPayloadValue(event.payload.prompt) ||
-    readableMessage;
-  const outputSignal =
-    formatEventPayloadValue(event.payload.result) ||
-    formatEventPayloadValue(event.payload.output) ||
-    formatEventPayloadValue(event.payload.summary);
+  const instructionSignal = eventInstructionSignal(event);
+  const outputSignal = eventOutputSignal(event, artifact);
   const discussionSignal =
     formatEventPayloadValue(event.payload.conclusion) ||
+    formatEventPayloadValue(event.payload.result) ||
     formatEventPayloadValue(event.payload.discussion) ||
     formatEventPayloadValue(event.payload.opinions) ||
     formatEventPayloadValue(event.payload.summary) ||
     readableMessage;
-  const decisionSignal =
-    formatEventPayloadValue(event.payload.final_decision) ||
-    formatEventPayloadValue(event.payload.main_agent_judgement) ||
-    formatEventPayloadValue(event.payload.main_agent_judgment) ||
-    formatEventPayloadValue(event.payload.decision) ||
-    event.decision ||
-    readableMessage;
+  const decisionSignal = eventDecisionSignal(event);
   const modelSignal =
     formatEventPayloadValue(event.payload.model) ||
     formatEventPayloadValue(event.payload.logical_model) ||
@@ -624,10 +799,10 @@ function eventSummaryText(event: RunDetail["events"][number], agentNames: Map<st
     return `${subject} 调用模型${modelSignal ? `：${conciseProcessText(modelSignal, "模型")}` : ""}`;
   }
   if (event.kind === "step.started") {
-    return `${subject} 收到指令：${conciseProcessText(instructionSignal, "开始执行")}`;
+    return `${subject} 接收任务：${conciseProcessText(instructionSignal, "开始执行")}`;
   }
   if (["step.completed", "artifact.created", "message.created", "review.completed"].includes(event.kind)) {
-    return `${subject} 产出：${conciseProcessText(outputSignal || readableMessage, "完成阶段输出")}`;
+    return `${subject} 输出：${conciseProcessText(outputSignal || readableMessage, "完成阶段输出")}`;
   }
   if (event.kind === "discussion.started") {
     return `${participants || "多角色"} 开始讨论`;
@@ -642,7 +817,8 @@ function eventSummaryText(event: RunDetail["events"][number], agentNames: Map<st
     return `主 Agent 决策：${conciseProcessText(decisionSignal, "完成裁决")}`;
   }
   if (event.kind === "dispatch.started") {
-    return `主 Agent 派单：${conciseProcessText(instructionSignal, "拆解任务并安排角色")}`;
+    const assignees = participants ? `给${participants}` : "";
+    return `主 Agent 派单${assignees}：${conciseProcessText(instructionSignal, "拆解任务并安排角色")}`;
   }
   if (event.kind === "dispatch.completed") {
     return `派单汇总：${conciseProcessText(outputSignal || discussionSignal, "完成派单汇总")}`;
@@ -690,6 +866,54 @@ function modelRowsForEvent(
   return rows;
 }
 
+function processItemsForEvent(
+  detail: RunDetail,
+  event: RunEvent,
+  index: number,
+  agentNames: Map<string, string>,
+  artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null,
+): ProcessDetailTarget[] {
+  const baseRows = [
+    ...modelRowsForEvent(event, detail.events, agentNames),
+    ...eventDetailRows(event, agentNames),
+    ...eventArtifactRows(artifact),
+  ];
+  const baseItem: ProcessDetailTarget = {
+    id: `${detail.id}-event-${event.sequence}-${index}`,
+    title: displayEventTitle(event, agentNames),
+    message: eventSummaryText(event, agentNames, artifact),
+    rows: baseRows,
+    createdAt: event.created_at,
+  };
+  if (event.kind !== "discussion.completed") return [baseItem];
+
+  const opinionItems = eventOpinionEntries(event, agentNames).map((opinion, opinionIndex) => ({
+    id: `${detail.id}-event-${event.sequence}-${index}-opinion-${opinionIndex}`,
+    title: `${opinion.actor} 给出讨论意见`,
+    message: `${opinion.actor} 意见：${conciseProcessText(opinion.value, "给出意见")}`,
+    rows: [
+      ...modelRowsForEvent(event, detail.events, agentNames),
+      { label: "发言角色", value: opinion.actor },
+      { label: opinion.label, value: opinion.value },
+    ],
+    createdAt: event.created_at,
+  }));
+
+  const judgement = eventDecisionSignal(event);
+  if (!judgement) return [baseItem, ...opinionItems];
+  return [
+    baseItem,
+    ...opinionItems,
+    {
+      id: `${detail.id}-event-${event.sequence}-${index}-decision`,
+      title: "主 Agent 完成裁决",
+      message: `主 Agent 裁决：${conciseProcessText(judgement, "完成裁决")}`,
+      rows: baseRows,
+      createdAt: event.created_at,
+    },
+  ];
+}
+
 function runProcessItems(
   detail: RunDetail,
   agentNames: Map<string, string>,
@@ -709,25 +933,13 @@ function runProcessItems(
           },
         ]
       : [];
-  const seenActionMessages = new Set<string>();
+  const consumedArtifactIds = new Set<string>();
   const eventItems = detail.events
     .filter(isActionEvent)
-    .map((event, index) => {
-      const rows = [...modelRowsForEvent(event, detail.events, agentNames), ...eventDetailRows(event, agentNames)];
-      return {
-        id: `${detail.id}-event-${event.sequence}-${index}`,
-        title: displayEventTitle(event, agentNames),
-        message: eventSummaryText(event, agentNames),
-        rows,
-        createdAt: event.created_at,
-      };
-    })
-    .filter((item) => {
-      if (seenActionMessages.has(item.message)) {
-        return false;
-      }
-      seenActionMessages.add(item.message);
-      return true;
+    .flatMap((event, index) => {
+      const artifact = fallbackArtifactForEvent(event, detail.artifacts, consumedArtifactIds);
+      if (event.kind === "artifact.created" && !artifact && !hasUsefulPayload(event)) return [];
+      return processItemsForEvent(detail, event, index, agentNames, artifact);
     });
   return [...routingItem, ...eventItems];
 }
@@ -876,6 +1088,7 @@ export function RunsPage() {
   const [modeSelection, setModeSelection] = useState<ModeSelection | null>(null);
   const [skillInstallCandidate, setSkillInstallCandidate] = useState<SkillInstallCandidate | null>(null);
   const [attachmentDraft, setAttachmentDraft] = useState<ChatAttachmentDraft | null>(null);
+  const [conversationRunCache, setConversationRunCache] = useState<Record<string, RunDetail[]>>({});
   const [temporaryApproval, setTemporaryApproval] = useState<{
     runId: string;
     decisionToken: string;
@@ -977,6 +1190,34 @@ export function RunsPage() {
   useEffect(() => {
     setProcessDetailTarget(null);
   }, [selectedRunId]);
+
+  useEffect(() => {
+    if (!activeConversation.data) return;
+    setConversationRunCache((current) => {
+      const conversationRuns = mergeConversationRuns(
+        current[activeConversation.data.conversation_id],
+        activeConversation.data.runs,
+      );
+      if (conversationRuns === current[activeConversation.data.conversation_id]) return current;
+      return {
+        ...current,
+        [activeConversation.data.conversation_id]: conversationRuns,
+      };
+    });
+  }, [activeConversation.data]);
+
+  useEffect(() => {
+    const selectedConversationId = runConversationId(selectedRun.data);
+    if (!selectedRun.data || !selectedConversationId) return;
+    setConversationRunCache((current) => {
+      const conversationRuns = mergeConversationRuns(current[selectedConversationId], [selectedRun.data]);
+      if (conversationRuns === current[selectedConversationId]) return current;
+      return {
+        ...current,
+        [selectedConversationId]: conversationRuns,
+      };
+    });
+  }, [selectedRun.data]);
 
   const createRun = useMutation({
     mutationFn: (override?: RunSubmissionOverride) => {
@@ -1109,6 +1350,17 @@ export function RunsPage() {
         setSelectedRunId(null);
       }
       setSelectedConversationIds((current) => current.filter((id) => id !== result.id));
+      setConversationRunCache((current) => {
+        let changed = false;
+        const next = Object.fromEntries(
+          Object.entries(current).map(([conversationKey, runs]) => {
+            const filteredRuns = runs.filter((run) => run.id !== result.id);
+            if (filteredRuns.length !== runs.length) changed = true;
+            return [conversationKey, filteredRuns];
+          }),
+        );
+        return changed ? next : current;
+      });
       queryClient.removeQueries({ queryKey: ["run", result.id] });
       setSubmitNotice("已删除对话。");
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
@@ -1126,6 +1378,17 @@ export function RunsPage() {
         queryClient.removeQueries({ queryKey: ["run", id] });
       }
       setSelectedConversationIds((current) => current.filter((id) => !deletedIds.has(id)));
+      setConversationRunCache((current) => {
+        let changed = false;
+        const next = Object.fromEntries(
+          Object.entries(current).map(([conversationKey, runs]) => {
+            const filteredRuns = runs.filter((run) => !deletedIds.has(run.id));
+            if (filteredRuns.length !== runs.length) changed = true;
+            return [conversationKey, filteredRuns];
+          }),
+        );
+        return changed ? next : current;
+      });
       setSubmitNotice(
         result.failed.length > 0
           ? `Deleted ${result.deleted.length} conversations; ${result.failed.length} failed.`
@@ -1145,16 +1408,16 @@ export function RunsPage() {
     },
     onError: (error, file) => {
       setSkillInstallCandidate(null);
-      if (file.name.toLowerCase().endsWith(".zip") && error instanceof ApiError && error.code === "invalid_skill_package") {
+      if (isArchiveFileName(file.name) && error instanceof ApiError && error.code === "invalid_skill_package") {
         setSubmitNotice(
-          "这个 ZIP 不是有效 Skill 包，正在按代码审查附件上传。",
+          "这个压缩包不是有效 Skill 包，正在按普通压缩包附件上传。是否用于代码审查，由你在对话中说明。",
         );
         uploadAttachment.mutate(file);
       } else {
         setAttachmentDraft({
           fileName: file.name,
           size: file.size,
-          kind: file.name.toLowerCase().endsWith(".zip") ? "code_review" : "context",
+          kind: isArchiveFileName(file.name) ? "archive" : "context",
         });
         setSubmitNotice("Skill 扫描失败。请查看错误详情，确认是否为有效 Skill 包。");
       }
@@ -1176,12 +1439,17 @@ export function RunsPage() {
   const uploadAttachment = useMutation({
     mutationFn: (file: File) => api.uploadAttachment(file),
     onSuccess: (attachment, file) => {
-      const kind = attachment.kind === "image" ? "image" : attachment.kind === "code_archive" ? "code_review" : "context";
+      const kind =
+        attachment.kind === "image"
+          ? "image"
+          : attachment.kind === "archive" || attachment.kind === "code_archive" || isArchiveFileName(attachment.filename || file.name)
+            ? "archive"
+            : "context";
       setSkillInstallCandidate(null);
       setAttachmentDraft({ fileName: attachment.filename || file.name, size: attachment.size_bytes, kind, attachment });
       setSubmitNotice(
-        kind === "code_review"
-          ? "代码压缩包已上传。请在输入框说明审查目标，提交后主 Agent 会把附件 ID 带入任务。"
+        kind === "archive"
+          ? "压缩包已上传。请在输入框说明它是 Skill、代码审查材料，还是普通任务附件。"
           : kind === "image"
             ? "图片已上传。提交任务后会作为附件引用进入运行上下文。"
             : "附件已上传。提交任务后会作为附件引用进入运行上下文。",
@@ -1195,7 +1463,7 @@ export function RunsPage() {
     setSubmitNotice(null);
     setAttachmentDraft(null);
     setSkillInstallCandidate(null);
-    if (file.name.toLowerCase().endsWith(".zip")) {
+    if (mayBeSkillArchive(file.name)) {
       uploadSkillArchive.mutate(file);
       return;
     }
@@ -1381,7 +1649,8 @@ export function RunsPage() {
   const enabledAgents = savedAgents.filter((agent) => agent.enabled);
   const savedWorkflows = workflows.data ?? [];
   const agentNameMap = new Map(savedAgents.map((agent) => [agent.id, agent.name]));
-  const visibleRuns = activeConversation.data?.runs ?? (selectedRun.data ? [selectedRun.data] : []);
+  const cachedConversationRuns = selectedRunConversationId ? conversationRunCache[selectedRunConversationId] : undefined;
+  const visibleRuns = cachedConversationRuns ?? activeConversation.data?.runs ?? (selectedRun.data ? [selectedRun.data] : []);
   const messages = conversationMessages(visibleRuns);
   const temporaryApprovalVisibleInMessages =
     !!temporaryApproval &&
@@ -1852,8 +2121,8 @@ export function RunsPage() {
               <aside className="composer-attachment-card" role="status" aria-label="附件草稿">
                 <div>
                   <span className="eyebrow">
-                    {attachmentDraft.kind === "code_review"
-                      ? "代码审查附件"
+                    {attachmentDraft.kind === "archive"
+                      ? "压缩包附件"
                       : attachmentDraft.kind === "image"
                         ? "图片附件"
                         : "上下文附件"}
@@ -1862,8 +2131,8 @@ export function RunsPage() {
                   <small>{Math.max(1, Math.ceil(attachmentDraft.size / 1024))} KB</small>
                 </div>
                 <p>
-                  {attachmentDraft.kind === "code_review"
-                    ? "这个 ZIP 不是 Skill 包。请在输入框说明审查目标；后续会接入后端附件存储后让审查 Agent 读取压缩包内容。"
+                  {attachmentDraft.kind === "archive"
+                    ? "压缩包已作为附件保存。请在对话里说明它是 Skill、代码审查材料，还是普通任务文件。"
                     : attachmentDraft.kind === "image"
                       ? "图片已选中。当前先记录附件，启用多模态链路后可交给视觉模型识别。"
                       : "附件已选中。当前先记录附件名称，完整内容读取会走后端附件存储。"}
@@ -1882,7 +2151,7 @@ export function RunsPage() {
                 <input
                   aria-label="上传文件或 Skill ZIP"
                   type="file"
-                  accept=".zip,.txt,.md,.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,image/*"
+                  accept={ATTACHMENT_ACCEPT}
                   disabled={uploadSkillArchive.isPending || uploadAttachment.isPending}
                   onChange={(event) => handleAttachmentUpload(event.currentTarget.files)}
                 />
