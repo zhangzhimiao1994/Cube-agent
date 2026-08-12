@@ -1650,7 +1650,8 @@ class CrewDispatchRuntime:
                             actor=step.reviewer,
                             inputs=(artifact,),
                             payload={
-                                "verdict": "skipped",
+                                "verdict": "approve",
+                                "review_status": "skipped",
                                 "warning": review_failure,
                                 "role": reviewer.role,
                                 "logical_model": reviewer.logical_model,
@@ -1987,6 +1988,7 @@ class CrewDispatchRuntime:
                     async with asyncio.timeout(self._remaining_timeout(run_state, step_deadline)):
                         completion = await self._gateway.complete_with_context(request)
                     completion = _map_completion_tool_names(completion, tool_mapping)
+                    response = self._valid_response(completion)
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:  # noqa: BLE001 - normalize the model gateway boundary
@@ -2027,7 +2029,6 @@ class CrewDispatchRuntime:
                     run_state,
                 )
                 evidence.append(model_artifact)
-                response = self._valid_response(completion)
             assert response is not None
             if not response.tool_calls:
                 return completion

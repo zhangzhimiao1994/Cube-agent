@@ -441,3 +441,41 @@ Remaining risks / TODOs:
 - The real hybrid smoke can take close to the diagnostic script timeout because it performs full dispatch plus discussion. The application completes, but future smoke scripts should use a longer timeout or per-stage polling output.
 - Server logs still contain older pre-fix errors from earlier runs. Latest post-deploy health is clean; do not interpret old journal tail entries as new failures without checking timestamps.
 - Local integration tests that require PostgreSQL were blocked by the local Windows database not being available. Production-like behavior was verified on the Linux server using its real PostgreSQL/Redis/services.
+
+## 2026-08-13 CI Root-Cause Follow-up: Reviewer Event Contract and Tool-Call Limit Ordering
+
+User requirement:
+
+- Do not adjust model/role weights as a workaround.
+- Find the root cause and fix the runtime behavior.
+
+Root causes found:
+
+- Reviewer skip handling emitted `review.completed` with `payload.verdict="skipped"`, but the runtime event contract only allows reviewer verdicts `approve`, `revise`, or `reject`. This made the event invalid before dispatch completion.
+- Step model responses were persisted into artifacts before `_valid_response()` checked the per-response tool-call count. With very large tool-call batches, artifact lineage validation could fail first, hiding the real root cause (`model response exceeds tool call limit`).
+
+Changes made:
+
+- Reviewer skip is now encoded as a contract-valid `verdict="approve"` plus `review_status="skipped"` and the existing warning payload.
+- Step gateway responses are now validated immediately after the model gateway returns and tool-call names are mapped, before model artifacts, usage, checkpoints, or tool placeholder artifacts are written. This preserves the true failure reason and avoids polluting run state with invalid model responses.
+- Updated the integration test assertion to match the stable reviewer event contract.
+
+Verification performed:
+
+- Local static/backend checks:
+  - `uv run ruff check src tests` -> passed.
+  - `uv run mypy src tests` -> passed, no issues in 241 source files.
+  - `uv run pytest tests\unit tests\contracts -q --tb=short` -> 1127 passed, 13 skipped.
+- Local targeted integration tests could not run because the Windows local PostgreSQL integration database was unavailable (`Database did not become ready within 30 seconds`). The targeted tests are expected to run in GitHub Actions' Linux/PostgreSQL environment.
+- Server deployment:
+  - Copied `src/agent_hub/runtime/crew/adapter.py` to `/opt/agent-hub/current/src/agent_hub/runtime/crew/adapter.py`.
+  - Restarted `agent-hub-api` and `agent-hub-worker`.
+  - `/health` and `/health/ready` returned `{"status":"ok"}`.
+- Server real smoke:
+  - dispatch run `9ef5de3f-23c0-41d8-a0d1-bd10ab6ff720`: completed.
+  - hybrid run `007b4f08-3fb4-4ea6-b4a6-47cef893c91d`: completed. The SSH smoke process timed out before printing completion, but querying `/api/v1/admin/runs` showed the run completed.
+
+Remaining risks / TODOs:
+
+- The GitHub Actions integration suite must be checked after push because local Windows does not have the integration PostgreSQL service.
+- Temporary server validation scripts/tokens under `/tmp` should be deleted after CI confirmation.

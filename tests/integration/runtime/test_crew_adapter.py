@@ -514,7 +514,8 @@ async def test_invalid_reviewer_response_is_recorded_without_failing_dispatch() 
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     review = next(event for event in events if event.kind is EventKind.REVIEW_COMPLETED)
     assert review.actor == "critic"
-    assert review.payload["verdict"] == "skipped"
+    assert review.payload["verdict"] == "approve"
+    assert review.payload["review_status"] == "skipped"
     assert review.payload["warning"] == "model response text is empty"
 
 
