@@ -1346,8 +1346,10 @@ class AutoGenDiscussionRuntime:
                     kind="runtime.cleanup_degraded",
                     sequence=sequence,
                     run_id=context.run_id,
-                    message="AutoGen runtime cleanup failed after usable discussion output.",
-                    payload={"phase": "autogen_shutdown"},
+                    payload={
+                        "phase": "autogen_shutdown",
+                        "summary": "AutoGen runtime cleanup failed after usable discussion output.",
+                    },
                 )
                 sequence += 1
             if wall_expired.is_set():

@@ -533,6 +533,15 @@ Verification performed:
   - dispatch run `22a3a79c-56d7-449c-89e1-52e1bb2bc0f0`: completed, 65 events, 14 artifacts.
   - discuss run `f92070ae-6132-4e89-af4d-740fcfb213ec`: completed, 7 events, 1 artifact.
   - hybrid run `900f458f-7206-4a53-8239-288783d8efd3`: completed, 22 events, 15 artifacts.
+- CI follow-up:
+  - GitHub run `31625489844` failed because `runtime.cleanup_degraded` carried `message`, violating the RunEvent contract that only `message.created` may carry message text.
+  - Fixed by moving the cleanup summary into `payload.summary`.
+  - Local `ruff` and AutoGen unit regression passed after the fix.
+  - Server re-smoke after this fix:
+    - direct run `2ddfeeb1-fc8f-4ffe-861d-30c114ec5032`: completed.
+    - dispatch run `4961bba5-4a69-43ad-abe2-1985093ed42e`: completed.
+    - discuss run `395086ee-2224-4ee6-a5b7-bd0e9b18e72f`: completed.
+    - hybrid run `129436e1-1134-4dd2-b3f2-8841ba6bd998`: completed.
 
 Remaining risks / TODOs:
 
