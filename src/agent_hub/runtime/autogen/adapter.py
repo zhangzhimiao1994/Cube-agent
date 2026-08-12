@@ -1887,6 +1887,8 @@ def _discussion_has_enough_distinct_outputs(
     participant_count: int,
     consensus_votes: int,
 ) -> bool:
+    if participant_count < 3:
+        return False
     required = min(participant_count, max(2, consensus_votes + 1))
     speakers: set[str] = set()
     for artifact in message_artifacts:

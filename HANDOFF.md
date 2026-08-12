@@ -542,6 +542,13 @@ Verification performed:
     - dispatch run `4961bba5-4a69-43ad-abe2-1985093ed42e`: completed.
     - discuss run `395086ee-2224-4ee6-a5b7-bd0e9b18e72f`: completed.
     - hybrid run `129436e1-1134-4dd2-b3f2-8841ba6bd998`: completed.
+  - GitHub run `31626370339` then failed because two-participant integration tests expected AutoGen's native reasons (`explicit_completion`, `consensus`, `max_turns`), while the new soft-completion fallback returned `sufficient_discussion`.
+  - Fixed by restricting soft completion to 3+ participant discussions. Two-participant discussions now preserve AutoGen/native termination semantics.
+  - Server re-smoke after the scope fix:
+    - direct run `392e2e24-d8df-4943-a33c-f7790f8452bc`: completed.
+    - dispatch run `01045063-55cc-4e66-b201-78c413fedc9e`: completed.
+    - discuss run `fa0de888-d641-4f7d-add3-b7de87c30605`: completed.
+    - hybrid run `2de0f33b-e5ba-4509-8d9e-b752a3b7a505`: completed.
 
 Remaining risks / TODOs:
 

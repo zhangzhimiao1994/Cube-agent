@@ -85,7 +85,7 @@ def test_partial_discussion_can_complete_after_late_model_gateway_failure() -> N
 
 
 def test_discussion_soft_completion_requires_distinct_participants() -> None:
-    assert _discussion_has_enough_distinct_outputs(
+    assert not _discussion_has_enough_distinct_outputs(
         (
             Artifact(id=uuid4(), type="text", producer="analyst", content={"text": "A"}),
             Artifact(id=uuid4(), type="text", producer="critic", content={"text": "B"}),
