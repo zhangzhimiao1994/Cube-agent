@@ -38,6 +38,9 @@ class PersistentHermesRunAdvisor:
         del actor_id, mode, agent_ids
         if not await self._enabled(tenant_id):
             return None
+        policy = await self._main_agent_hermes_policy(tenant_id)
+        if policy in {"off", "observe"}:
+            return None
         lessons = await self._lessons(tenant_id)
         if not lessons:
             return None
@@ -46,7 +49,7 @@ class PersistentHermesRunAdvisor:
         matched = [
             lesson
             for lesson in lessons
-            if _lesson_matches(lowered, lesson, workflow_id)
+            if _lesson_is_confirmed(lesson) and _lesson_matches(lowered, lesson, workflow_id)
         ]
         if not matched:
             return None
@@ -59,7 +62,7 @@ class PersistentHermesRunAdvisor:
             confidence=confidence,
             reasons=(f"Hermes matched stored lesson {best.get('id', 'unknown')}",),
             recommended_skills=(),
-            requires_approval=confidence < 0.75,
+            requires_approval=policy in {"suggest", "confirm_before_apply"} or confidence < 0.75,
         )
 
     async def record_outcome(self, outcome: HermesRunOutcome) -> None:
@@ -104,6 +107,23 @@ class PersistentHermesRunAdvisor:
         if row is None:
             return True
         return dict(row.payload).get("hermes_enabled", True) is True
+
+    async def _main_agent_hermes_policy(self, tenant_id: UUID) -> str:
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(AdminResourceRow)
+                    .where(AdminResourceRow.tenant_id == tenant_id)
+                    .where(AdminResourceRow.kind == "main_agent")
+                    .where(AdminResourceRow.resource_id == "default")
+                )
+            ).scalar_one_or_none()
+        if row is None:
+            return "observe"
+        policy = dict(row.payload).get("hermes_policy")
+        if policy in {"off", "observe", "suggest", "confirm_before_apply"}:
+            return str(policy)
+        return "observe"
 
     async def _lessons(self, tenant_id: UUID) -> list[dict[str, object]]:
         async with self._session_factory() as session:
@@ -153,6 +173,11 @@ def _lesson_matches(lowered_message: str, lesson: dict[str, object], workflow_id
     if not isinstance(text, str):
         return False
     return any(word and len(word) >= 4 and word in lowered_message for word in text.lower().split())
+
+
+def _lesson_is_confirmed(lesson: dict[str, object]) -> bool:
+    confirmed_at = lesson.get("confirmed_at")
+    return isinstance(confirmed_at, str) and bool(confirmed_at.strip())
 
 
 def _lesson_weight(lesson: dict[str, object]) -> int:

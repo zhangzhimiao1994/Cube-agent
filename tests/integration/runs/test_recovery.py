@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Protocol, cast
 from uuid import UUID, uuid4
@@ -10,8 +11,9 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agent_hub.db.models import RunArtifactRow, RunEventRow, RunOutboxRow, RunRow
+from agent_hub.db.models import AdminResourceRow, RunArtifactRow, RunEventRow, RunOutboxRow, RunRow
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.hermes import PersistentHermesRunAdvisor
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteDecision
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRepository
 from agent_hub.runs.service import (
@@ -501,6 +503,148 @@ async def test_completed_run_records_bounded_hermes_outcome(
             agent_ids=("director", "copywriter"),
         )
     ]
+
+
+async def test_persistent_hermes_runtime_advice_uses_only_confirmed_lessons(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    advisor = PersistentHermesRunAdvisor(run_session_factory)
+    lesson_payload = {
+        "id": "hermes_unconfirmed_dispatch",
+        "outcome": "success",
+        "lesson": "Use dispatch for smoke approval planning tasks.",
+        "summary": "Learned success pattern: dispatch for planning.",
+        "tags": ["planning", "dispatch"],
+        "weight": 10,
+        "created_at": datetime.now(UTC).isoformat(),
+        "run_id": None,
+        "conversation_id": "conv-hermes-runtime",
+        "confirmed_at": None,
+    }
+    async with run_session_factory() as session, session.begin():
+        session.add(
+            AdminResourceRow(
+                tenant_id=tenant_id,
+                kind="hermes",
+                resource_id="hermes_unconfirmed_dispatch",
+                payload=lesson_payload,
+            )
+        )
+        session.add(
+            AdminResourceRow(
+                tenant_id=tenant_id,
+                kind="main_agent",
+                resource_id="default",
+                payload={"hermes_policy": "suggest"},
+            )
+        )
+
+    unconfirmed = await advisor.advise(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="planning task should not use unconfirmed lesson",
+        mode=TaskMode.AUTO,
+        agent_ids=(),
+        workflow_id=None,
+    )
+    assert unconfirmed is None
+
+    confirmed_at = datetime.now(UTC).isoformat()
+    async with run_session_factory() as session, session.begin():
+        row = (
+            await session.execute(
+                select(AdminResourceRow)
+                .where(AdminResourceRow.tenant_id == tenant_id)
+                .where(AdminResourceRow.kind == "hermes")
+                .where(AdminResourceRow.resource_id == "hermes_unconfirmed_dispatch")
+            )
+        ).scalar_one()
+        row.payload = {**lesson_payload, "confirmed_at": confirmed_at}
+
+    confirmed = await advisor.advise(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="planning task should use confirmed lesson",
+        mode=TaskMode.AUTO,
+        agent_ids=(),
+        workflow_id=None,
+    )
+
+    assert confirmed is not None
+    assert confirmed.recommended_mode is TaskMode.DISPATCH
+
+
+async def test_persistent_hermes_runtime_advice_respects_main_agent_policy(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    advisor = PersistentHermesRunAdvisor(run_session_factory)
+    confirmed_lesson = {
+        "id": "hermes_confirmed_policy",
+        "outcome": "success",
+        "lesson": "Use dispatch for planning tasks.",
+        "summary": "Learned success pattern: dispatch for planning.",
+        "tags": ["planning", "dispatch"],
+        "weight": 10,
+        "created_at": datetime.now(UTC).isoformat(),
+        "run_id": None,
+        "conversation_id": "conv-hermes-policy",
+        "confirmed_at": datetime.now(UTC).isoformat(),
+    }
+    async with run_session_factory() as session, session.begin():
+        session.add(
+            AdminResourceRow(
+                tenant_id=tenant_id,
+                kind="hermes",
+                resource_id="hermes_confirmed_policy",
+                payload=confirmed_lesson,
+            )
+        )
+        session.add(
+            AdminResourceRow(
+                tenant_id=tenant_id,
+                kind="main_agent",
+                resource_id="default",
+                payload={"hermes_policy": "observe"},
+            )
+        )
+
+    observe = await advisor.advise(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="planning task",
+        mode=TaskMode.AUTO,
+        agent_ids=(),
+        workflow_id=None,
+    )
+    assert observe is None
+
+    async with run_session_factory() as session, session.begin():
+        row = (
+            await session.execute(
+                select(AdminResourceRow)
+                .where(AdminResourceRow.tenant_id == tenant_id)
+                .where(AdminResourceRow.kind == "main_agent")
+                .where(AdminResourceRow.resource_id == "default")
+            )
+        ).scalar_one()
+        row.payload = {"hermes_policy": "suggest"}
+
+    suggest = await advisor.advise(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="planning task",
+        mode=TaskMode.AUTO,
+        agent_ids=(),
+        workflow_id=None,
+    )
+
+    assert suggest is not None
+    assert suggest.recommended_mode is TaskMode.DISPATCH
+    assert suggest.requires_approval is True
 
 
 async def test_recovery_fails_safe_when_side_effect_event_has_no_checkpoint(

@@ -556,3 +556,57 @@ Remaining risks / TODOs:
 - Old frontend asset files remain in `web/dist/assets` on the server. Current `index.html` points to the latest assets and works, but the deploy script should later replace `web/dist` atomically or clean old hashed assets.
 - Old pre-fix failed runs remain in the database and logs. Diagnose only by timestamp/run id when comparing future failures.
 - Continue plan order: finish remaining P1.5 UI/admin closure, then P2 Hermes learning loop, then full module verification, then P3 channel intelligent-agent mode/multimodal/vibe coding.
+
+## 2026-08-13 P2 Hermes Runtime Policy Closure
+
+User directive:
+
+- Continue strictly by plan priority.
+- Do not let Hermes make the system "smarter" by silently bypassing review/confirmation.
+- Verify on the real Linux server before pushing.
+
+Root causes found:
+
+- `PersistentHermesRunAdvisor` considered all stored Hermes lessons, including entries whose `confirmed_at` was still empty. That meant an unconfirmed learning record could affect runtime routing.
+- The runtime advisor ignored the main Agent `hermes_policy` stored by the management UI. As a result, `off` / `observe` did not reliably prevent Hermes advice from entering dispatch decisions.
+
+Changes made:
+
+- Runtime Hermes advice now only uses confirmed learning records.
+- Runtime Hermes advice now reads the main Agent policy from `AdminResourceRow(kind="main_agent", resource_id="default")`.
+- Policy behavior:
+  - `off` and `observe`: no runtime routing advice is returned.
+  - `suggest` and `confirm_before_apply`: advice may be returned, but it is marked `requires_approval=True`.
+  - Missing or invalid policy defaults to `observe`, so Hermes is passive unless explicitly enabled for advice.
+- Added integration coverage for:
+  - unconfirmed Hermes records being ignored;
+  - confirmed Hermes records being usable;
+  - main Agent `observe` policy blocking runtime advice;
+  - main Agent `suggest` policy returning approval-required advice.
+
+Verification performed:
+
+- Server real checks on `103.236.98.133`:
+  - `server_hermes_policy_check.py` -> `PASS: unconfirmed ignored; confirmed used mode=dispatch`.
+  - `server_hermes_main_policy_check.py` -> `PASS: observe ignored; suggest requires approval mode=dispatch`.
+  - P1 runtime smoke after this change:
+    - direct: completed, 4 events, 1 artifact.
+    - dispatch: completed, 65 events, 14 artifacts.
+    - discuss: completed, 7 events, 1 artifact.
+    - hybrid: completed, 24 events, 17 artifacts.
+  - P1.5 admin smoke:
+    - users, models, agents, workflows, settings, main-agent, runs, skills, MCP, channels, memory, audit, logs, Hermes all returned HTTP 200.
+    - user create/role/disable/enable/password/delete passed.
+    - agent/workflow/MCP/memory/skill/archive/attachment/log category flows passed.
+- Local checks:
+  - `uv run ruff check src tests` -> passed.
+  - `uv run mypy src` -> passed.
+  - `uv run pytest tests\api\test_admin_resources.py tests\unit\runs\test_temporary_agent.py tests\unit\runs\test_temporary_agent_policy.py tests\unit\runtime\test_autogen_artifact_rollback.py tests\unit\runtime\test_configured_runtime.py tests\unit\runtime\test_hybrid.py -q --tb=short` -> 88 passed.
+  - `npm.cmd test -- src/pages/OperationalPages.test.tsx src/pages/ChannelsPage.test.tsx -- --runInBand` -> 39 passed.
+  - `npm.cmd run build` -> passed; Vite emitted only the existing chunk-size warning.
+
+Remaining risks / TODOs:
+
+- Local integration tests still require a PostgreSQL test service; the Hermes DB policy behavior was verified against the real server DB instead.
+- Temporary validation scripts remain under server `/tmp` and local `.tmp/`; they are not part of production code and should not be committed.
+- P3 is still pending and must not start until the user accepts P2/full verification as complete: multimodal APIs, channel "Agent/智能体" integration mode, and vibe coding/OpenClaw-style expansion.
