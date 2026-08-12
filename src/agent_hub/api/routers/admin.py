@@ -3456,7 +3456,7 @@ def _temporary_agent_proposal(
         if isinstance(key, str) and isinstance(value, str | int | float | bool):
             safe[key] = value
         elif isinstance(key, str) and isinstance(value, list):
-            safe[key] = [item for item in value if isinstance(item, str)]
+            safe[key] = tuple(item for item in value if isinstance(item, str))
     return safe or None
 
 
