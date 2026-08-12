@@ -610,3 +610,37 @@ Remaining risks / TODOs:
 - Local integration tests still require a PostgreSQL test service; the Hermes DB policy behavior was verified against the real server DB instead.
 - Temporary validation scripts remain under server `/tmp` and local `.tmp/`; they are not part of production code and should not be committed.
 - P3 is still pending and must not start until the user accepts P2/full verification as complete: multimodal APIs, channel "Agent/智能体" integration mode, and vibe coding/OpenClaw-style expansion.
+
+## 2026-08-13 CI Migration Downgrade Fix
+
+Context:
+
+- GitHub run `31630569668` failed in `uv run pytest -q`.
+- Failure was in migration round-trip tests, not in the Hermes runtime path:
+  - downgrade from `0013_agent_admin_resources` attempted to restore an older `agent_hub_admin_resources.kind` check constraint.
+  - existing rows with newer kinds such as `agent` / `main_agent` violated the old constraint.
+
+Root cause:
+
+- Migrations `0012`, `0013`, and `0014` widened the allowed admin resource kinds but their downgrade paths recreated the previous constraint without first removing rows that no longer fit the previous version.
+
+Changes made:
+
+- `0012_admin_resource_logs.downgrade()` now deletes `log` and `setting` resources before restoring the pre-0012 constraint.
+- `0013_agent_admin_resources.downgrade()` now deletes `agent` and `main_agent` resources before restoring the pre-0013 constraint.
+- `0014_channel_admin_resources.downgrade()` now deletes `channel` resources before restoring the pre-0014 constraint.
+- Expanded the admin resource constraint unit test to assert all current persistent admin resource kinds are present.
+
+Verification performed:
+
+- Local:
+  - `uv run ruff check alembic tests/unit/test_database_resources.py src tests` -> passed.
+  - `uv run mypy src tests` -> passed.
+  - `uv run pytest tests\unit\test_database_resources.py tests\api\test_admin_resources.py::test_main_agent_config_saves_dedicated_model_api_and_control_policy tests\api\test_admin_resources.py::test_channel_config_can_be_saved_without_exposing_secrets -q --tb=short` -> 9 passed.
+- Server:
+  - Synced the three Alembic migration files into `/opt/agent-hub/current/alembic/versions`.
+  - Ran `python -m py_compile` on those migration files.
+
+Important note:
+
+- Do not run downgrade verification on the production server DB; it intentionally deletes newer admin resource rows when moving to older schema versions. CI's isolated PostgreSQL environment is the correct place to verify downgrade/upgrade round trips.

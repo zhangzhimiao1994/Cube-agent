@@ -81,7 +81,7 @@ def test_migration_url_uses_application_settings_when_not_explicitly_configured(
     assert resolve_database_url(None, settings) == "postgresql+asyncpg://app:app@localhost/application"
 
 
-def test_admin_resource_kind_constraint_allows_channel_configuration() -> None:
+def test_admin_resource_kind_constraint_allows_all_persistent_admin_resources() -> None:
     table = cast(Table, AdminResourceRow.__table__)
     constraints = [
         constraint
@@ -91,4 +91,18 @@ def test_admin_resource_kind_constraint_allows_channel_configuration() -> None:
 
     assert constraints
     constraint = cast(CheckConstraint, constraints[0])
-    assert "channel" in str(constraint.sqltext)
+    sqltext = str(constraint.sqltext)
+    for kind in (
+        "workflow",
+        "agent",
+        "main_agent",
+        "skill",
+        "mcp",
+        "memory",
+        "hermes",
+        "audit",
+        "log",
+        "setting",
+        "channel",
+    ):
+        assert kind in sqltext

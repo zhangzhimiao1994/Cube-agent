@@ -34,6 +34,7 @@ def downgrade() -> None:
         "agent_hub_admin_resources",
         type_="check",
     )
+    op.execute("DELETE FROM agent_hub_admin_resources WHERE kind = 'channel'")
     op.create_check_constraint(
         "ck_agent_hub_admin_resources_kind",
         "agent_hub_admin_resources",
