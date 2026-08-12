@@ -20,6 +20,8 @@ from agent_hub.runtime.autogen.adapter import (
     DiscussionPlan,
     RuntimeExecutionError,
     _can_complete_with_partial_discussion,
+    _discussion_has_enough_distinct_outputs,
+    _should_fail_on_autogen_cleanup,
 )
 from agent_hub.runtime.contracts import Artifact, TaskContext
 
@@ -80,6 +82,55 @@ def test_partial_discussion_can_complete_after_late_model_gateway_failure() -> N
         (), "model gateway failed: model transport failed"
     )
     assert not _can_complete_with_partial_discussion((artifact,), "discussion_failed")
+
+
+def test_discussion_soft_completion_requires_distinct_participants() -> None:
+    assert _discussion_has_enough_distinct_outputs(
+        (
+            Artifact(id=uuid4(), type="text", producer="analyst", content={"text": "A"}),
+            Artifact(id=uuid4(), type="text", producer="critic", content={"text": "B"}),
+        ),
+        participant_count=2,
+        consensus_votes=2,
+    )
+    assert _discussion_has_enough_distinct_outputs(
+        (
+            Artifact(id=uuid4(), type="text", producer="analyst", content={"text": "A"}),
+            Artifact(id=uuid4(), type="text", producer="critic", content={"text": "B"}),
+            Artifact(id=uuid4(), type="text", producer="moderator", content={"text": "C"}),
+        ),
+        participant_count=6,
+        consensus_votes=2,
+    )
+    assert not _discussion_has_enough_distinct_outputs(
+        (
+            Artifact(id=uuid4(), type="text", producer="analyst", content={"text": "A"}),
+            Artifact(id=uuid4(), type="text", producer="analyst", content={"text": "B"}),
+        ),
+        participant_count=2,
+        consensus_votes=2,
+    )
+
+
+def test_autogen_cleanup_failure_does_not_override_usable_discussion_output() -> None:
+    assert not _should_fail_on_autogen_cleanup(
+        cleanup_failed=True,
+        framework_failed=False,
+        framework_timed_out=False,
+        message_artifacts=(_artifact(),),
+    )
+    assert _should_fail_on_autogen_cleanup(
+        cleanup_failed=True,
+        framework_failed=False,
+        framework_timed_out=False,
+        message_artifacts=(),
+    )
+    assert not _should_fail_on_autogen_cleanup(
+        cleanup_failed=True,
+        framework_failed=True,
+        framework_timed_out=False,
+        message_artifacts=(),
+    )
 
 
 async def test_autogen_abort_artifact_write_returns_repository_result() -> None:

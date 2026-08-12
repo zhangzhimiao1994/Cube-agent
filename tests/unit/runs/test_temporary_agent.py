@@ -13,7 +13,12 @@ from agent_hub.routing.types import (
     RouteDecision,
     RouteSource,
 )
-from agent_hub.runs.repository import RunConflict, RunNotFound, RunRecord
+from agent_hub.runs.repository import (
+    RunConflict,
+    RunNotFound,
+    RunRecord,
+    _safe_temporary_agent_model,
+)
 from agent_hub.runs.service import RunService, TemporaryAgentProposal
 from agent_hub.runtime.contracts import RunEvent, RuntimeCheckpoint, TaskContext
 from agent_hub.runtime.registry import RuntimeRegistry
@@ -99,7 +104,7 @@ class FakeRepository:
             raise RunConflict("run version is stale")
         proposal = decision["temporary_agent_proposal"]
         assert isinstance(proposal, dict)
-        proposal = {**proposal, "model": str(proposal["id"])}
+        proposal = {**proposal, "model": _safe_temporary_agent_model(proposal)}
         raw_selected = decision.get("selected_agent_ids", [])
         selected = list(raw_selected) if isinstance(raw_selected, list) else []
         selected.append(str(proposal["id"]))
@@ -184,6 +189,7 @@ class FakeTemporaryAgentPolicy:
             prompt="Implement the landing page requested by the user.",
             reason="selected workflow has no engineering-capable agent",
             missing_capability="software_engineering",
+            recommended_model="deepseek",
             suggested_skills=("frontend",),
             permanentizable=True,
         )
@@ -489,6 +495,7 @@ async def test_dispatch_requires_user_approval_before_temporary_agent_is_queued(
     assert submitted.decision_token is not None
     assert submitted.temporary_agent_proposal is not None
     assert submitted.temporary_agent_proposal["id"] == "temp-web-engineer"
+    assert submitted.temporary_agent_proposal["recommended_model"] == "deepseek"
     assert repository.outbox == []
 
     approved = await service.approve_temporary_agent(
@@ -508,8 +515,13 @@ async def test_dispatch_requires_user_approval_before_temporary_agent_is_queued(
     assert decision["temporary_agent_approved"] is True
     assert decision["selected_agent_ids"] == ["director", "temp-web-engineer"]
     assert decision["temporary_agents"] == [
-        {**submitted.temporary_agent_proposal, "model": "temp-web-engineer"}
+        {**submitted.temporary_agent_proposal, "model": "deepseek"}
     ]
+
+
+def test_temporary_agent_model_never_falls_back_to_agent_id() -> None:
+    with pytest.raises(RunConflict, match="no safe model"):
+        _safe_temporary_agent_model({"id": "temp-web-engineer"})
 
 
 @pytest.mark.asyncio

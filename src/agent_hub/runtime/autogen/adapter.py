@@ -1312,6 +1312,15 @@ class AutoGenDiscussionRuntime:
                             checkpoint=checkpoint,
                         )
                         sequence += 1
+                        if _discussion_has_enough_distinct_outputs(
+                            message_artifacts,
+                            participant_count=len(self._plan.participants),
+                            consensus_votes=self._plan.consensus_votes,
+                        ):
+                            reason = "sufficient_discussion"
+                            if self._cancel_token is not None:
+                                self._cancel_token.cancel()
+                            break
                     elif isinstance(item, TaskResult):
                         reason = termination.reason or self._normalize_stop_reason(item.stop_reason)
             except BaseException:
@@ -1325,8 +1334,22 @@ class AutoGenDiscussionRuntime:
                     cleanup_failed = True
                 if not await self._await_autogen_cleanup(framework_runtime.close()):
                     cleanup_failed = True
-                if cleanup_failed and not framework_failed and not framework_timed_out:
+                if _should_fail_on_autogen_cleanup(
+                    cleanup_failed=cleanup_failed,
+                    framework_failed=framework_failed,
+                    framework_timed_out=framework_timed_out,
+                    message_artifacts=message_artifacts,
+                ):
                     raise RuntimeExecutionError("AutoGen runtime cleanup failed") from None
+            if cleanup_failed and not framework_failed and not framework_timed_out:
+                yield RunEvent(
+                    kind="runtime.cleanup_degraded",
+                    sequence=sequence,
+                    run_id=context.run_id,
+                    message="AutoGen runtime cleanup failed after usable discussion output.",
+                    payload={"phase": "autogen_shutdown"},
+                )
+                sequence += 1
             if wall_expired.is_set():
                 reason = "wall_time"
             reason = reason or termination.reason or "max_turns"
@@ -1849,6 +1872,42 @@ def _can_complete_with_partial_discussion(
     if not failure_reason.startswith("model gateway failed"):
         return False
     return any(
+        isinstance(artifact.content, Mapping)
+        and isinstance(artifact.content.get("text"), str)
+        and bool(cast(str, artifact.content["text"]).strip())
+        for artifact in message_artifacts
+    )
+
+
+def _discussion_has_enough_distinct_outputs(
+    message_artifacts: Sequence[Artifact],
+    *,
+    participant_count: int,
+    consensus_votes: int,
+) -> bool:
+    required = min(participant_count, max(2, consensus_votes + 1))
+    speakers: set[str] = set()
+    for artifact in message_artifacts:
+        if not isinstance(artifact.content, Mapping):
+            continue
+        text = artifact.content.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if artifact.producer:
+            speakers.add(artifact.producer)
+    return len(speakers) >= required
+
+
+def _should_fail_on_autogen_cleanup(
+    *,
+    cleanup_failed: bool,
+    framework_failed: bool,
+    framework_timed_out: bool,
+    message_artifacts: Sequence[Artifact],
+) -> bool:
+    if not cleanup_failed or framework_failed or framework_timed_out:
+        return False
+    return not any(
         isinstance(artifact.content, Mapping)
         and isinstance(artifact.content.get("text"), str)
         and bool(cast(str, artifact.content["text"]).strip())

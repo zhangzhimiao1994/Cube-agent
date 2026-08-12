@@ -479,3 +479,64 @@ Remaining risks / TODOs:
 
 - The GitHub Actions integration suite must be checked after push because local Windows does not have the integration PostgreSQL service.
 - Temporary server validation scripts/tokens under `/tmp` should be deleted after CI confirmation.
+
+## 2026-08-13 P1/P1.5 Stabilization: Temporary Agent Model Selection and AutoGen Cleanup Degradation
+
+User directive:
+
+- Continue by plan priority even if new feature requests arrive.
+- Finish P1/P1.5 first, verify on the Linux server, then push and check CI.
+- Do not work around reviewer/model failures by lowering weights; fix the root cause.
+
+Current state:
+
+- Local branch: `main`.
+- Server: `103.236.98.133`, deploy path `/opt/agent-hub/current`.
+- `agent-hub-api` and `agent-hub-worker` are active.
+- `/health/ready` returns `{"status":"ok"}`.
+- Caddy serves the current frontend build:
+  - `/` returns HTTP 200.
+  - `/assets/index-4KGtXJcp.js` returns HTTP 200.
+
+Root causes found:
+
+- Temporary Agent persistence could fall back to the proposal `id` when no explicit model was supplied. This was wrong: the main Agent must select an actual registered model according to task capability, not use an Agent identifier as a model.
+- The temporary Agent policy did not recommend a model from the published model configuration, so dispatch/hybrid approval flows could create proposals without a safe executable model.
+- AutoGen discussion could produce usable participant output, then fail during `team.reset()` / runtime stop / runtime close cleanup. That cleanup failure overrode the successful discussion output and marked the run failed.
+- Generic artifact strings such as `text: reviewer` / `model_response: reviewer` could leak into UI summaries instead of concrete artifact titles or user-readable content.
+
+Changes made:
+
+- Added `recommended_model` to `TemporaryAgentProposal`.
+- `AdminResourceTemporaryAgentPolicy` now selects a recommended text model from the published platform config using task capability hints and provider/model characteristics.
+- Temporary Agent approval no longer falls back to proposal IDs as model names. Missing safe model now raises a clear conflict.
+- AutoGen cleanup failure now fails the run only when there is no usable discussion output. If usable discussion output exists, the runtime records `runtime.cleanup_degraded` and continues to `runtime.completed`.
+- Added filtering so generic artifact wrapper text is not shown as a meaningful UI result.
+- Channel configuration UI keeps editable input fields for channel secrets/parameters.
+
+Verification performed:
+
+- Local backend:
+  - `uv run ruff check src tests` -> passed.
+  - `uv run pytest tests\unit\runtime\test_autogen_artifact_rollback.py tests\unit\runtime\test_configured_runtime.py tests\unit\runtime\test_hybrid.py -q --tb=short` -> 26 passed.
+  - `uv run pytest tests\api\test_admin_resources.py tests\unit\runs\test_temporary_agent.py tests\unit\runs\test_temporary_agent_policy.py tests\unit\runtime\test_autogen_artifact_rollback.py tests\unit\runtime\test_configured_runtime.py tests\unit\runtime\test_hybrid.py -q --tb=short` -> 88 passed, 1 warning.
+- Local frontend:
+  - `npm.cmd test -- src/pages/OperationalPages.test.tsx src/pages/ChannelsPage.test.tsx -- --runInBand` -> 39 passed.
+  - `npm.cmd run build` -> passed; Vite emitted only the existing chunk-size warning.
+- Server deployment:
+  - Uploaded incremental package `.tmp/deploy-p1p15-current.tgz` to `/tmp/agent-hub-p1p15-current.tgz`.
+  - Extracted into `/opt/agent-hub/current`.
+  - Fixed ownership and static file permissions.
+  - Restarted `agent-hub-api` and `agent-hub-worker`; reloaded Caddy.
+- Server real smoke after final sync:
+  - direct run `d1400dbe-ef7e-491c-902a-5bb80009f9f2`: completed, 4 events, 1 artifact.
+  - dispatch run `22a3a79c-56d7-449c-89e1-52e1bb2bc0f0`: completed, 65 events, 14 artifacts.
+  - discuss run `f92070ae-6132-4e89-af4d-740fcfb213ec`: completed, 7 events, 1 artifact.
+  - hybrid run `900f458f-7206-4a53-8239-288783d8efd3`: completed, 22 events, 15 artifacts.
+
+Remaining risks / TODOs:
+
+- P1/P1.5 runtime chain is server-verified, but the user still needs to visually validate the mobile conversation UI details in browser because screenshot-level UX cannot be fully proven from CLI tests.
+- Old frontend asset files remain in `web/dist/assets` on the server. Current `index.html` points to the latest assets and works, but the deploy script should later replace `web/dist` atomically or clean old hashed assets.
+- Old pre-fix failed runs remain in the database and logs. Diagnose only by timestamp/run id when comparing future failures.
+- Continue plan order: finish remaining P1.5 UI/admin closure, then P2 Hermes learning loop, then full module verification, then P3 channel intelligent-agent mode/multimodal/vibe coding.

@@ -68,11 +68,12 @@ class TemporaryAgentProposal:
     prompt: str
     reason: str
     missing_capability: str
+    recommended_model: str | None = None
     suggested_skills: tuple[str, ...] = ()
     permanentizable: bool = True
 
     def to_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "id": self.id,
             "name": self.name,
             "role": self.role,
@@ -82,6 +83,9 @@ class TemporaryAgentProposal:
             "suggested_skills": list(self.suggested_skills),
             "permanentizable": self.permanentizable,
         }
+        if self.recommended_model is not None:
+            payload["recommended_model"] = self.recommended_model
+        return payload
 
 
 class TemporaryAgentPolicyProtocol(Protocol):

@@ -1205,6 +1205,58 @@ describe("operational management pages", () => {
     expect(within(drawer).getByText("导演输出：压缩主持人串场，保留抽奖互动。")).not.toBeNull();
   });
 
+  it("falls back to concrete artifact titles when upstream artifact text is generic", async () => {
+    const user = userEvent.setup();
+    const processRunDetail = {
+      ...runDetail,
+      events: [
+        {
+          sequence: 1,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "copywriter",
+          participants: [],
+          tool_name: null,
+          step_id: "copywriting_step",
+          action: null,
+          decision: null,
+          payload: {},
+          artifact: {
+            id: "artifact-generic-copy",
+            kind: "markdown",
+            title: "中秋活动文案初稿",
+            text: "已生成一个可查看的结果或中间产物。",
+          },
+        },
+      ],
+      artifacts: [
+        {
+          id: "artifact-generic-copy",
+          kind: "markdown",
+          title: "中秋活动文案初稿",
+          text: "已生成一个可查看的结果或中间产物。",
+        },
+      ],
+    };
+    visibleRunDetail = processRunDetail;
+    visibleConversationRuns = [processRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const outputRow = within(stream).getByRole("button", { name: /文案生成 输出：中秋活动文案初稿/ });
+    expect(within(stream).queryByText(/已生成一个可查看的结果或中间产物/)).toBeNull();
+
+    await user.click(outputRow);
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).getByText("产物标题")).not.toBeNull();
+    expect(within(drawer).getAllByText("中秋活动文案初稿").length).toBeGreaterThan(0);
+    expect(within(drawer).queryByText(/已生成一个可查看的结果或中间产物/)).toBeNull();
+  });
+
   it("shows localized process summaries with participating roles instead of raw event codes", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);

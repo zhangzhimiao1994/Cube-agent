@@ -344,6 +344,7 @@ async def test_dispatch_waits_for_user_before_creating_temporary_agent(
             prompt="Implement the landing page requested by the user.",
             reason="selected workflow has no engineering-capable agent",
             missing_capability="software_engineering",
+            recommended_model="deepseek",
             suggested_skills=("frontend",),
             permanentizable=True,
         )
@@ -378,6 +379,7 @@ async def test_dispatch_waits_for_user_before_creating_temporary_agent(
         "prompt": "Implement the landing page requested by the user.",
         "reason": "selected workflow has no engineering-capable agent",
         "missing_capability": "software_engineering",
+        "recommended_model": "deepseek",
         "suggested_skills": ["frontend"],
         "permanentizable": True,
     }
@@ -404,7 +406,7 @@ async def test_dispatch_waits_for_user_before_creating_temporary_agent(
     ]
     assert approved_record.routing_decision["temporary_agent_approved"] is True
     assert approved_record.routing_decision["temporary_agents"] == [
-        {**submitted.temporary_agent_proposal, "model": "temp-web-engineer"}
+        {**submitted.temporary_agent_proposal, "model": "deepseek"}
     ]
 
 

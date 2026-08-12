@@ -301,6 +301,17 @@ function formatEventPayloadValue(value: unknown): string {
 type RunEvent = RunDetail["events"][number];
 type RunArtifact = RunDetail["artifacts"][number];
 
+function isGenericArtifactText(value: string | null | undefined) {
+  const normalized = value?.replace(/\s+/g, " ").trim();
+  if (!normalized) return false;
+  return new Set([
+    "已生成一个可查看的结果或中间产物。",
+    "已生成一个可查看的结果或中间产物",
+    "artifact.created",
+    "message.created",
+  ]).has(normalized);
+}
+
 function conciseProcessText(value: string, fallback: string) {
   const normalized = value
     .replace(/```[\s\S]*?```/g, "")
@@ -608,7 +619,7 @@ function dedupeTextArtifacts(artifacts: RunDetail["artifacts"]) {
   const seen = new Set<string>();
   return artifacts.filter((artifact) => {
     const text = artifact.text?.trim();
-    if (!text || seen.has(text)) return false;
+    if (!text || isGenericArtifactText(text) || seen.has(text)) return false;
     seen.add(text);
     return true;
   });
@@ -707,13 +718,14 @@ function processRoutingRows(
 }
 
 function eventArtifactText(artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null | undefined) {
-  return artifact?.text?.trim() || "";
+  const text = artifact?.text?.trim() || "";
+  return isGenericArtifactText(text) ? "" : text;
 }
 
 function eventArtifactRows(artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null | undefined) {
   const rows: Array<{ label: string; value: string }> = [];
   if (!artifact) return rows;
-  if (artifact.title) rows.push({ label: "产出者", value: artifact.title });
+  if (artifact.title) rows.push({ label: "产物标题", value: artifact.title });
   if (artifact.kind) rows.push({ label: "产物类型", value: artifact.kind });
   const text = eventArtifactText(artifact);
   if (text) rows.push({ label: "输出内容", value: text });
@@ -768,11 +780,16 @@ function eventOutputSignal(event: RunEvent, artifact?: RunArtifact | NonNullable
       ? event.message
       : "";
   return (
-    formatEventPayloadValue(event.payload.result) ||
-    formatEventPayloadValue(event.payload.output) ||
-    formatEventPayloadValue(event.payload.summary) ||
-    eventArtifactText(artifact) ||
-    readableMessage
+    [
+      formatEventPayloadValue(event.payload.result),
+      formatEventPayloadValue(event.payload.output),
+      formatEventPayloadValue(event.payload.summary),
+      eventArtifactText(artifact),
+      artifact?.title ?? "",
+      readableMessage,
+    ]
+      .map((item) => item.trim())
+      .find((item) => item && !isGenericArtifactText(item)) ?? ""
   );
 }
 

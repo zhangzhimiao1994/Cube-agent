@@ -420,11 +420,11 @@ CHANNEL_DEFINITIONS: tuple[ChannelDefinition, ...] = (
     ),
     ChannelDefinition(
         id="wecom_app",
-        name="企业微信自建应用",
+        name="企业微信 Agent",
         transports=("callback",),
         required_env=("WECOM_CORP_ID", "WECOM_AGENT_ID", "WECOM_SECRET", "WECOM_TOKEN"),
         webhook_path="/channels/wecom/app/events",
-        notes=("适合企业内部审批、任务派发和私聊机器人；配置齐全后可接收回调消息。",),
+        notes=("适合把企业微信私聊、审批入口和内部任务流接入主 Agent；配置齐全后可接收回调消息。",),
     ),
     ChannelDefinition(
         id="wechat_official",

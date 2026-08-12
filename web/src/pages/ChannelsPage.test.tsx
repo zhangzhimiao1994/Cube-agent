@@ -51,7 +51,7 @@ const channelPayload = [
   },
   {
     id: "wecom_app",
-    name: "企业微信自建应用",
+    name: "企业微信 Agent",
     status: "missing_config",
     transports: ["callback"],
     webhook_path: "/channels/wecom/app/events",
@@ -172,7 +172,7 @@ describe("ChannelsPage", () => {
       "飞书",
       "钉钉",
       "企微智能机器人",
-      "企业微信自建应用",
+      "企业微信 Agent",
       "公众号",
       "微信客服",
       "Telegram",
@@ -186,13 +186,16 @@ describe("ChannelsPage", () => {
     expect(screen.getAllByText("待配置").length).toBeGreaterThan(0);
     expect(screen.getByRole("heading", { name: "配置内容" })).not.toBeNull();
     expect(screen.getByRole("heading", { name: "部署配置模板" })).not.toBeNull();
+    expect(screen.getAllByText(/消息连接到主 Agent/).length).toBeGreaterThan(0);
+    expect(screen.getByRole("heading", { name: "选择要连接 Agent 的通道" })).not.toBeNull();
+    expect(screen.queryByText(/企业微信自建应用/)).toBeNull();
     expect(screen.getByRole("link", { name: "打开飞书官方文档" }).getAttribute("href")).toBe(
       "https://open.feishu.cn/document/server-docs/event-subscription-guide/overview?lang=zh-CN",
     );
     expect(screen.getByRole("link", { name: "打开飞书控制台" }).getAttribute("href")).toBe(
       "https://open.feishu.cn/app",
     );
-    expect(screen.getByText("开发者后台 → 我的应用 → 选择应用 → 凭证与基础信息")).not.toBeNull();
+    expect(screen.getByText("开发者后台 → 我的应用 → 选择机器人入口对应的应用 → 凭证与基础信息")).not.toBeNull();
     expect(screen.getByText("来源：凭证与基础信息 → App ID")).not.toBeNull();
     expect(screen.getByText(/校验失败会返回明确错误/)).not.toBeNull();
   });

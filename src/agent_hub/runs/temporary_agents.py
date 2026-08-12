@@ -6,10 +6,12 @@ import re
 from dataclasses import dataclass
 from uuid import UUID
 
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agent_hub.db.models import AdminResourceRow
+from agent_hub.config.schema import PlatformConfig
+from agent_hub.db.models import AdminResourceRow, ConfigRevisionRow
 from agent_hub.domain.runs import TaskMode
 from agent_hub.runs.service import TemporaryAgentProposal
 
@@ -141,6 +143,9 @@ class AdminResourceTemporaryAgentPolicy:
         selected_agents = await self._agents(tenant_id, selected_ids)
         if _agents_cover(selected_agents, spec):
             return None
+        recommended_model = await self._recommended_model(tenant_id, spec)
+        if recommended_model is None:
+            return None
         policy_source = settings if global_allows_temporary_agents else workflow
         policy = str((policy_source or {}).get("temporary_agent_policy") or "").strip()
         pool_label = f"工作流 {workflow_id} 的角色池" if workflow_id else "当前角色池"
@@ -156,6 +161,7 @@ class AdminResourceTemporaryAgentPolicy:
             prompt=spec.prompt,
             reason=reason,
             missing_capability=spec.capability,
+            recommended_model=recommended_model,
             suggested_skills=spec.skills,
             permanentizable=True,
         )
@@ -195,6 +201,27 @@ class AdminResourceTemporaryAgentPolicy:
             ).scalars()
             return tuple(dict(row.payload) for row in rows)
 
+    async def _recommended_model(
+        self,
+        tenant_id: UUID,
+        spec: _CapabilitySpec,
+    ) -> str | None:
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(ConfigRevisionRow)
+                    .where(ConfigRevisionRow.tenant_id == tenant_id)
+                    .where(ConfigRevisionRow.status == "published")
+                )
+            ).scalar_one_or_none()
+        if row is None:
+            return None
+        try:
+            config = PlatformConfig.model_validate(row.document)
+        except ValidationError:
+            return None
+        return _choose_recommended_model(config, spec)
+
 
 def _infer_capability(message: str) -> _CapabilitySpec | None:
     normalized = message.casefold()
@@ -226,6 +253,64 @@ def _string_tuple(value: object) -> tuple[str, ...]:
     if not isinstance(value, list | tuple):
         return ()
     return tuple(item for item in value if isinstance(item, str))
+
+
+def _choose_recommended_model(
+    config: PlatformConfig,
+    spec: _CapabilitySpec,
+) -> str | None:
+    best: tuple[int, int, str] | None = None
+    for index, (logical_model, definition) in enumerate(config.models.items()):
+        score = _model_score(logical_model, definition.model_dump(mode="python"), spec)
+        if score <= 0:
+            continue
+        candidate = (score, -index, logical_model)
+        if best is None or candidate > best:
+            best = candidate
+    return None if best is None else best[2]
+
+
+def _model_score(
+    logical_model: str,
+    definition: dict[str, object],
+    spec: _CapabilitySpec,
+) -> int:
+    deployments = definition.get("deployments")
+    if not isinstance(deployments, list) or not deployments:
+        return 0
+    searchable_parts = [logical_model]
+    capability_names: set[str] = set()
+    for deployment in deployments:
+        if not isinstance(deployment, dict):
+            continue
+        searchable_parts.append(str(deployment.get("provider") or ""))
+        searchable_parts.append(str(deployment.get("model") or ""))
+        capabilities = deployment.get("capabilities")
+        if isinstance(capabilities, set | list | tuple):
+            capability_names.update(str(item) for item in capabilities)
+    if "text" not in capability_names:
+        return 0
+    searchable = " ".join(searchable_parts).casefold()
+    score = 10
+    if "structured_output" in capability_names:
+        score += 2
+    if "tool_calling" in capability_names:
+        score += 2
+    for weight, token in enumerate(reversed(_MODEL_PREFERENCES.get(spec.capability, ())), start=1):
+        if token in searchable:
+            score += weight
+    return score
+
+
+_MODEL_PREFERENCES: dict[str, tuple[str, ...]] = {
+    "software_engineering": ("claude", "sonnet", "coder", "code", "qwen", "deepseek", "kimi", "gpt"),
+    "operations": ("claude", "sonnet", "qwen", "deepseek", "kimi", "gpt"),
+    "financial_analysis": ("deepseek", "qwen", "claude", "sonnet", "kimi", "gpt"),
+    "video_editing": ("minimax", "qwen", "kimi", "claude", "sonnet", "deepseek"),
+    "copywriting": ("claude", "sonnet", "kimi", "qwen", "deepseek", "minimax", "gpt"),
+    "compliance_review": ("claude", "sonnet", "qwen", "deepseek", "kimi", "gpt"),
+    "research": ("claude", "sonnet", "deepseek", "qwen", "kimi", "gpt"),
+}
 
 
 __all__ = ["AdminResourceTemporaryAgentPolicy"]

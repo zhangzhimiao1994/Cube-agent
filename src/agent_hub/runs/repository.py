@@ -79,11 +79,11 @@ _SAFE_MODEL_ID = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 
 def _safe_temporary_agent_model(proposal: dict[object, object]) -> str:
-    for key in ("model", "recommended_model", "id"):
+    for key in ("model", "recommended_model"):
         value = proposal.get(key)
         if isinstance(value, str) and _SAFE_MODEL_ID.fullmatch(value):
             return value
-    raise RunConflict("temporary agent proposal has no safe model fallback")
+    raise RunConflict("temporary agent proposal has no safe model")
 
 
 class RunRepository:

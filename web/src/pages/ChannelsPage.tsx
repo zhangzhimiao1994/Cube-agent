@@ -21,12 +21,12 @@ const STATUS_LABELS: Record<string, string> = {
 
 const CHANNEL_GUIDES: Record<string, ChannelGuide> = {
   feishu: {
-    purpose: "用于飞书机器人、群聊和私聊入口，支持事件订阅进入主 Agent。",
+    purpose: "把飞书机器人、群聊和私聊消息连接到主 Agent；底层仍使用飞书开放平台凭证完成验签和回复。",
     auth: "飞书签名 + verification token + encrypt key",
     docUrl: "https://open.feishu.cn/document/server-docs/event-subscription-guide/overview?lang=zh-CN",
     consoleUrl: "https://open.feishu.cn/app",
     consolePath: [
-      "开发者后台 → 我的应用 → 选择应用 → 凭证与基础信息",
+      "开发者后台 → 我的应用 → 选择机器人入口对应的应用 → 凭证与基础信息",
       "事件与回调 → 事件订阅 → 将事件发送至开发者服务器",
       "事件与回调 → 加密策略 → 复制 Verification Token 和 Encrypt Key",
     ],
@@ -38,7 +38,7 @@ const CHANNEL_GUIDES: Record<string, ChannelGuide> = {
       { env: "AGENT_HUB_PUBLIC_URL", label: "公网访问地址", placeholder: "https://agent.example.com", source: "你的服务器域名，必须能被飞书公网访问" },
     ],
     steps: [
-      "在飞书开放平台创建企业自建应用并启用机器人能力。",
+      "在飞书开放平台准备一个机器人入口，并启用机器人能力。",
       "把事件订阅 Request URL 设置为本页 Webhook 地址。",
       "把本页列出的环境变量写入服务器配置后重启 API 服务。",
       "在飞书里给机器人发送一条文本消息，任务页应出现新运行记录。",
@@ -89,24 +89,24 @@ const CHANNEL_GUIDES: Record<string, ChannelGuide> = {
     verify: ["群内发送测试消息", "任务页出现企微机器人来源的新任务", "失败时检查 key 与 token 是否同时配置"],
   },
   wecom_app: {
-    purpose: "用于企业微信自建应用，适合内部私聊机器人和审批入口。",
+    purpose: "把企业微信内部私聊、审批入口和任务流连接到主 Agent；底层使用企业微信应用凭证完成回调校验。",
     auth: "企业微信 SHA1 回调签名",
     docUrl: "https://developer.work.weixin.qq.com/document/path/90238",
     consoleUrl: "https://work.weixin.qq.com/wework_admin/frame",
     consolePath: [
-      "企业微信管理后台 → 应用管理 → 自建 → 选择应用",
+      "企业微信管理后台 → 应用管理 → 选择要连接 Agent 的内部应用",
       "应用详情 → 复制 AgentId 和 Secret",
       "我的企业 → 企业信息 → 复制企业 ID",
       "应用详情 → 接收消息 → 设置 API 接收 → 填写 URL / Token",
     ],
     fields: [
       { env: "WECOM_CORP_ID", label: "Corp ID", placeholder: "wwxxxx", source: "我的企业 → 企业信息 → 企业 ID" },
-      { env: "WECOM_AGENT_ID", label: "Agent ID", placeholder: "1000002", source: "应用管理 → 自建应用详情 → AgentId" },
-      { env: "WECOM_SECRET", label: "Secret", secret: true, placeholder: "自建应用 secret", source: "应用管理 → 自建应用详情 → Secret" },
+      { env: "WECOM_AGENT_ID", label: "Agent ID", placeholder: "1000002", source: "应用管理 → 应用详情 → AgentId" },
+      { env: "WECOM_SECRET", label: "Secret", secret: true, placeholder: "企业微信应用 secret", source: "应用管理 → 应用详情 → Secret" },
       { env: "WECOM_TOKEN", label: "Token", secret: true, placeholder: "回调 token", source: "接收消息 → 设置 API 接收 → Token" },
     ],
     steps: [
-      "在企业微信管理后台创建自建应用。",
+      "在企业微信管理后台准备一个内部应用作为 Agent 入口。",
       "把接收消息服务器 URL 设置为本页 Webhook。",
       "保存 token 和 secret 后重启服务，并用企业微信发送文本消息测试。",
     ],
@@ -296,12 +296,13 @@ export function ChannelsPage() {
       <h2>通道连接</h2>
       <p>
         通道用于把飞书、钉钉、企业微信、微信、Telegram、Slack、QQ 或自定义 Webhook
-        的消息接入主 Agent。每个通道都会做平台校验，校验失败会返回明确错误。
+        的消息连接到主 Agent。每个通道本质上都是“把一个 Agent 接到聊天入口”，底层平台凭证只用于验签、收消息和回复。
+        校验失败会返回明确错误。
       </p>
 
       <div className="channel-console">
         <aside className="channel-picker" aria-label="选择接入通道">
-          <h3>选择要接入的通道</h3>
+          <h3>选择要连接 Agent 的通道</h3>
           {items.map((channel) => (
             <button
               key={channel.id}

@@ -697,7 +697,9 @@ def test_channel_status_exposes_feishu_setup_without_secrets(monkeypatch: pytest
     }.issubset(by_id)
     assert by_id["wechat_official"]["status"] == "missing_config"
     assert by_id["custom_webhook"]["status"] == "missing_config"
+    assert by_id["wecom_app"]["name"] == "企业微信 Agent"
     serialized = response.text
+    assert "自建应用" not in serialized
     assert "secret-live" not in serialized
     assert "verify-live" not in serialized
     assert "encrypt-live" not in serialized
