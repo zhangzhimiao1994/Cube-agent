@@ -1,5 +1,33 @@
 # Agent Hub Handoff
 
+## 2026-08-12 CI Static Check Follow-up
+
+Current state:
+
+- `main` has been fast-forwarded and pushed to GitHub at commit `89d3e37` (`Fix CI static checks`).
+- The latest GitHub Actions run for `main` is green: `quality` run `31584869891` completed successfully.
+- Local working tree still has untracked `.tmp/` smoke/debug files from prior server probes; they were intentionally not committed.
+
+Changes made:
+
+- Fixed ruff import formatting in `src/agent_hub/app.py`, `tests/unit/runtime/test_configured_runtime.py`, and `tests/unit/test_app_wiring.py`.
+- Changed two invalid-type routing policy validation errors from `ValueError` to `TypeError` in `src/agent_hub/routing/service.py`, matching the repository ruff rule.
+- Made the sequential route-classifier path validate classifier results before returning them, matching the existing parallel path and satisfying mypy without weakening defensive checks.
+- Tightened test typing for the main-agent capacity helper and JSON routing fixture.
+
+Verification performed:
+
+- Local: `uv run ruff check src tests` → all checks passed.
+- Local: `uv run mypy --strict src tests` → success, no issues in 239 source files.
+- Local: `uv run pytest tests/unit tests/api -q` → 1143 passed, 13 skipped.
+- Local full `uv run pytest -q` was attempted but integration tests timed out because the Windows machine did not have the test PostgreSQL fixture reachable at `127.0.0.1:54329`; this was environmental and CI later ran the compose-backed integration suite successfully.
+- GitHub Actions `quality` run `31584869891` passed all stages: ruff, mypy, docker compose test DB startup, full pytest, frontend lint/test/build, install script syntax/shellcheck/bats, and compose config.
+
+Remaining risks / TODOs:
+
+- Continue feature/server validation work from the Feishu/channel and conversation-process backlog below.
+- Feishu real platform callback still needs a real event from Feishu after callback URL and event subscription are confirmed in the Feishu console; synthetic route probes only prove Agent Hub and Caddy accept the path.
+
 ## 2026-08-12
 
 Current state:
