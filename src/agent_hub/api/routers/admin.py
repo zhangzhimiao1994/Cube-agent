@@ -197,6 +197,7 @@ class RunListItem(BaseModel):
     id: UUID
     status: str
     mode: str
+    conversation_id: str | None = None
     queue_wait_ms: int = Field(ge=0)
     capacity_wait_ms: int = Field(ge=0)
     cost_usd: str
@@ -1044,6 +1045,7 @@ class InMemoryAdminResourceService:
                 id=run.id,
                 status=run.status,
                 mode=run.mode,
+                conversation_id=run.explicit_details.get("conversation_id"),
                 queue_wait_ms=run.queue_wait_ms,
                 capacity_wait_ms=run.capacity_wait_ms,
                 cost_usd=run.cost_usd,
@@ -1518,6 +1520,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             id=record.id,
             status=record.status.value,
             mode="auto" if record.mode is None else record.mode.value,
+            conversation_id=_routing_details(record.routing_decision).get("conversation_id"),
             queue_wait_ms=0,
             capacity_wait_ms=0,
             cost_usd=str(await self._run_repository.usage_cost(self._tenant_id, record.id)),

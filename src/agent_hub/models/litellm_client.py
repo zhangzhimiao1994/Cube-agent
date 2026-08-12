@@ -18,6 +18,7 @@ from agent_hub.models.types import (
     ModelResponse,
     TokenUsage,
     ToolCall,
+    ToolDefinition,
     _freeze_json,
 )
 
@@ -129,6 +130,20 @@ def _messages(request: ModelRequest) -> list[dict[str, object]]:
             ]
         normalized.append({"role": message.role, "content": content})
     return normalized
+
+
+def _tools(tools: Sequence[ToolDefinition]) -> list[dict[str, object]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": _json_mutable(cast(JsonValue, tool.parameters)),
+            },
+        }
+        for tool in tools
+    ]
 
 
 def _contains_sensitive(value: str, sensitive_values: Sequence[str]) -> bool:
@@ -402,6 +417,10 @@ class LiteLLMClient:
             ModelCapability.STRUCTURED_OUTPUT not in deployment.capabilities
         ):
             return ValueError("deployment lacks structured_output capability")
+        if request.tools and ModelCapability.TOOL_CALLING not in deployment.capabilities:
+            return ValueError("deployment lacks tool_calling capability")
+        if request.tools and _is_messages_endpoint(deployment.api_base):
+            return ValueError("messages endpoint tool definitions are not supported")
         if _is_messages_endpoint(deployment.api_base):
             return await self._messages_outcome(deployment, request, api_key)
 
@@ -433,6 +452,9 @@ class LiteLLMClient:
                         "strict": True,
                     },
                 }
+            if request.tools:
+                create_kwargs["tools"] = _tools(request.tools)
+                create_kwargs["tool_choice"] = "auto"
             response = await client.chat.completions.create(**create_kwargs)
             parsed = _parse_response(response, deployment.id, sensitive_values)
         except asyncio.CancelledError:

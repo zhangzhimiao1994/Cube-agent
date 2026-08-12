@@ -811,22 +811,20 @@ class RunEvent(_RuntimeContractModel):
             and present - allowed_by_kind[self.kind]
         ):
             raise ValueError("event carries fields unrelated to its kind")
-        direct_kinds = {
-            EventKind.MODEL_STARTED,
-            EventKind.ARTIFACT_CREATED,
-            EventKind.CHECKPOINT_SAVED,
-            EventKind.RUNTIME_COMPLETED,
-            EventKind.RUNTIME_FAILED,
-            EventKind.RUNTIME_CANCELLED,
+        direct_allowed_by_kind: dict[EventKind, frozenset[str]] = {
+            EventKind.MODEL_STARTED: frozenset({"actor", "message", "payload"}),
+            EventKind.ARTIFACT_CREATED: frozenset({"artifact", "actor", "message", "payload"}),
+            EventKind.CHECKPOINT_SAVED: frozenset({"checkpoint"}),
+            EventKind.RUNTIME_COMPLETED: frozenset({"actor", "message", "payload", "inputs", "reason"}),
+            EventKind.RUNTIME_FAILED: frozenset({"reason"}),
+            EventKind.RUNTIME_CANCELLED: frozenset(),
         }
-        if self.kind in direct_kinds and (
-            self.step_id is not None
-            or self.actor is not None
-            or self.message is not None
-            or self.payload
-            or specialized_present
+        if (
+            isinstance(self.kind, EventKind)
+            and self.kind in direct_allowed_by_kind
+            and present - direct_allowed_by_kind[self.kind]
         ):
-            raise ValueError("direct runtime events forbid extension fields")
+            raise ValueError("direct runtime event carries fields unrelated to its kind")
         if self.artifact is not None and self.kind not in {
             EventKind.ARTIFACT_CREATED,
             EventKind.TOOL_COMPLETED,
@@ -834,7 +832,12 @@ class RunEvent(_RuntimeContractModel):
             raise ValueError("only artifact.created may carry an artifact")
         if self.checkpoint is not None and self.kind is not EventKind.CHECKPOINT_SAVED:
             raise ValueError("only checkpoint.saved may carry a checkpoint")
-        if self.message is not None and self.kind is not EventKind.MESSAGE_CREATED:
+        if self.message is not None and self.kind not in {
+            EventKind.MESSAGE_CREATED,
+            EventKind.MODEL_STARTED,
+            EventKind.ARTIFACT_CREATED,
+            EventKind.RUNTIME_COMPLETED,
+        }:
             raise ValueError("only message.created may carry a message")
         if (
             isinstance(self.kind, str)

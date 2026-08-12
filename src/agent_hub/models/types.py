@@ -237,6 +237,22 @@ class StructuredResponseSchema:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolDefinition:
+    name: str
+    description: str
+    parameters: Mapping[str, JsonValue] = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if len(self.name) > 64 or _SAFE_SCHEMA_NAME.fullmatch(self.name) is None:
+            raise ValueError("tool name must be 1-64 safe characters")
+        _require_unpadded("tool description", self.description, max_length=1024)
+        frozen = _freeze_json(self.parameters)
+        if not isinstance(frozen, Mapping):  # pragma: no cover - guaranteed by annotation
+            raise TypeError("tool parameters must be a JSON object")
+        object.__setattr__(self, "parameters", frozen)
+
+
+@dataclass(frozen=True, slots=True)
 class ModelRequest:
     logical_model: str
     messages: tuple[ModelMessage, ...] = field(repr=False)
@@ -245,6 +261,7 @@ class ModelRequest:
     allow_fallback: bool = True
     max_output_tokens: int = 4096
     response_schema: StructuredResponseSchema | None = field(default=None, repr=False)
+    tools: tuple[ToolDefinition, ...] = field(default_factory=tuple, repr=False)
 
     def __post_init__(self) -> None:
         _require_safe_identifier("logical_model", self.logical_model)
@@ -269,7 +286,11 @@ class ModelRequest:
         messages = tuple(self.messages)
         if not all(isinstance(message, ModelMessage) for message in messages):
             raise ValueError("messages must contain only ModelMessage values")
+        tools = tuple(self.tools)
+        if not all(isinstance(tool, ToolDefinition) for tool in tools):
+            raise ValueError("tools must contain only ToolDefinition values")
         object.__setattr__(self, "messages", messages)
+        object.__setattr__(self, "tools", tools)
         object.__setattr__(
             self,
             "required_capabilities",
@@ -280,6 +301,8 @@ class ModelRequest:
             and ModelCapability.STRUCTURED_OUTPUT not in self.required_capabilities
         ):
             raise ValueError("response schema requires structured_output capability")
+        if self.tools and ModelCapability.TOOL_CALLING not in self.required_capabilities:
+            raise ValueError("tool definitions require tool_calling capability")
 
 
 @dataclass(frozen=True, slots=True)
@@ -351,6 +374,7 @@ class ModelResponse:
 
 ModelMessage.__hash__ = None  # type: ignore[assignment]
 StructuredResponseSchema.__hash__ = None  # type: ignore[assignment]
+ToolDefinition.__hash__ = None  # type: ignore[assignment]
 ModelRequest.__hash__ = None  # type: ignore[assignment]
 ToolCall.__hash__ = None  # type: ignore[assignment]
 ModelResponse.__hash__ = None  # type: ignore[assignment]

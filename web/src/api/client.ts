@@ -270,6 +270,7 @@ const RunListItemSchema = z.object({
   id: z.string(),
   status: z.string(),
   mode: z.string(),
+  conversation_id: z.string().nullable().optional(),
   queue_wait_ms: z.number(),
   capacity_wait_ms: z.number(),
   cost_usd: z.string(),

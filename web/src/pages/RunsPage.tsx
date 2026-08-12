@@ -269,6 +269,24 @@ function displayEventParticipants(participants: string[], agentNames: Map<string
   return names.length > 0 ? names.join("、") : null;
 }
 
+function displayPayloadParticipants(payload: Record<string, unknown>, agentNames: Map<string, string>) {
+  const participants = payload.participants;
+  if (!Array.isArray(participants)) return null;
+  const names = participants
+    .filter((item): item is string => typeof item === "string" && item.length > 0)
+    .map((id) => agentNames.get(id) ?? id);
+  return names.length > 0 ? names.join("、") : null;
+}
+
+function displayPayloadParticipantModels(payload: Record<string, unknown>, agentNames: Map<string, string>) {
+  const participantModels = payload.participant_models;
+  if (!participantModels || typeof participantModels !== "object" || Array.isArray(participantModels)) return null;
+  const rows = Object.entries(participantModels)
+    .filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].length > 0)
+    .map(([agentId, model]) => `${agentNames.get(agentId) ?? agentId}：${model}`);
+  return rows.length > 0 ? rows.join("；") : null;
+}
+
 function formatEventPayloadValue(value: unknown): string {
   if (value === null || typeof value === "undefined") return "";
   if (typeof value === "string") return value;
@@ -290,7 +308,7 @@ function conciseProcessText(value: string, fallback: string) {
     .trim();
   if (!normalized) return fallback;
   const sentence = normalized.split(/(?<=[。！？.!?])\s+/)[0]?.trim() || normalized;
-  return sentence.length > 42 ? `${sentence.slice(0, 42)}...` : sentence;
+  return sentence.length > 34 ? `${sentence.slice(0, 34)}...` : sentence;
 }
 
 function isNoiseEvent(event: RunDetail["events"][number]) {
@@ -317,7 +335,14 @@ function hasUsefulPayload(event: RunDetail["events"][number]) {
 function isActionEvent(event: RunDetail["events"][number]) {
   if (isNoiseEvent(event)) return false;
   if (event.kind === "artifact.created") {
-    return true;
+    return Boolean(
+      event.actor ||
+        event.step_id ||
+        event.tool_name ||
+        event.artifact ||
+        formatEventPayloadValue(event.payload.output) ||
+        formatEventPayloadValue(event.payload.result),
+    );
   }
   if (["step.started", "step.completed"].includes(event.kind)) {
     return Boolean(event.actor || event.action || event.tool_name || event.decision || hasUsefulPayload(event));
@@ -330,8 +355,10 @@ function eventPayloadLabel(key: string) {
     instruction: "下发指令",
     instructions: "下发指令",
     task: "下发指令",
+    assigned_task: "下发任务",
     prompt: "提示词/指令",
     input: "输入内容",
+    role_message: "角色发言",
     summary: "执行摘要",
     result: "得到结果",
     output: "输出内容",
@@ -347,7 +374,6 @@ function eventPayloadLabel(key: string) {
     critic_opinion: "审查员意见",
     model: "调用模型",
     logical_model: "逻辑模型",
-    upstream_model: "上游模型",
     model_used: "调用模型",
     model_provider: "模型服务商",
     model_deployment: "模型部署",
@@ -355,6 +381,13 @@ function eventPayloadLabel(key: string) {
     provider: "服务商",
     role: "角色",
     agent: "Agent",
+    artifact_id: "产物 ID",
+    tools: "可用工具",
+    attempts: "执行次数",
+    attempt: "第几次尝试",
+    missing_capability: "缺少能力",
+    reason: "原因",
+    upstream_model: "上游模型",
   };
   if (labels[key]) return labels[key];
   if (key.endsWith("_opinion")) {
@@ -365,6 +398,18 @@ function eventPayloadLabel(key: string) {
 
 function orderedEventPayloadEntries(payload: Record<string, unknown>) {
   const priority = [
+    "logical_model",
+    "model",
+    "upstream_model",
+    "provider",
+    "deployment",
+    "role",
+    "agent",
+    "task",
+    "assigned_task",
+    "instruction",
+    "instructions",
+    "prompt",
     "summary",
     "result",
     "output",
@@ -398,13 +443,17 @@ function eventDetailRows(event: RunDetail["events"][number], agentNames: Map<str
       ? event.message
       : "";
   if (actor) rows.push({ label: "执行者", value: actor });
-  if (participants) rows.push({ label: "参与者", value: participants });
+  const payloadParticipants = displayPayloadParticipants(event.payload, agentNames);
+  if (participants || payloadParticipants) rows.push({ label: "参与者", value: participants ?? payloadParticipants ?? "" });
+  const participantModels = displayPayloadParticipantModels(event.payload, agentNames);
+  if (participantModels) rows.push({ label: "模型分配", value: participantModels });
   if (event.tool_name) rows.push({ label: "工具", value: event.tool_name });
   if (event.step_id) rows.push({ label: "步骤", value: event.step_id });
   if (event.action) rows.push({ label: "动作", value: event.action });
   if (event.decision) rows.push({ label: "决策", value: event.decision });
   if (readableMessage) rows.push({ label: "事件内容", value: readableMessage });
   orderedEventPayloadEntries(event.payload).forEach(([key, value]) => {
+    if (key === "participants" || key === "participant_models") return;
     const formatted = formatEventPayloadValue(value);
     if (formatted) {
       rows.push({ label: eventPayloadLabel(key), value: formatted });
@@ -692,7 +741,8 @@ function fallbackArtifactForEvent(
   const byActor = event.actor
     ? artifacts.find((artifact) => artifact.title === event.actor && !consumedArtifactIds.has(artifact.id))
     : null;
-  const byOrder = artifacts.find((artifact) => !consumedArtifactIds.has(artifact.id));
+  const canUseOrderedFallback = Boolean(event.actor || event.step_id || event.tool_name);
+  const byOrder = canUseOrderedFallback ? artifacts.find((artifact) => !consumedArtifactIds.has(artifact.id)) : null;
   const matched = byActor ?? byOrder ?? null;
   if (matched) consumedArtifactIds.add(matched.id);
   return matched;
@@ -768,7 +818,7 @@ function eventSummaryText(
   artifact?: RunArtifact | NonNullable<RunEvent["artifact"]> | null,
 ) {
   const actor = displayEventActor(event.actor, agentNames);
-  const participants = displayEventParticipants(event.participants, agentNames);
+  const participants = displayEventParticipants(event.participants, agentNames) ?? displayPayloadParticipants(event.payload, agentNames);
   const readableMessage =
     event.message && event.message !== event.kind && !/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(event.message)
       ? event.message
@@ -801,7 +851,11 @@ function eventSummaryText(
   if (event.kind === "step.started") {
     return `${subject} 接收任务：${conciseProcessText(instructionSignal, "开始执行")}`;
   }
-  if (["step.completed", "artifact.created", "message.created", "review.completed"].includes(event.kind)) {
+  if (event.kind === "artifact.created") {
+    const producer = actor || artifact?.title || subject;
+    return `${producer} 输出：${conciseProcessText(outputSignal || readableMessage, "阶段结果")}`;
+  }
+  if (["step.completed", "message.created", "review.completed"].includes(event.kind)) {
     return `${subject} 输出：${conciseProcessText(outputSignal || readableMessage, "完成阶段输出")}`;
   }
   if (event.kind === "discussion.started") {
@@ -849,8 +903,10 @@ function modelRowsForEvent(
   const rows: Array<{ label: string; value: string }> = [];
   const eventModel = formatEventPayloadValue(event.payload.model || event.payload.logical_model);
   if (eventModel) rows.push({ label: "调用模型", value: eventModel });
+  const upstreamModel = formatEventPayloadValue(event.payload.upstream_model);
   const provider = formatEventPayloadValue(event.payload.provider);
   const deployment = formatEventPayloadValue(event.payload.deployment);
+  if (upstreamModel && upstreamModel !== eventModel) rows.push({ label: "上游模型", value: upstreamModel });
   if (provider) rows.push({ label: "模型服务商", value: provider });
   if (deployment) rows.push({ label: "模型部署", value: deployment });
   if (!eventModel && event.actor) {
@@ -878,6 +934,7 @@ function processItemsForEvent(
     ...eventDetailRows(event, agentNames),
     ...eventArtifactRows(artifact),
   ];
+  if (baseRows.length === 0 && !event.message) return [];
   const baseItem: ProcessDetailTarget = {
     id: `${detail.id}-event-${event.sequence}-${index}`,
     title: displayEventTitle(event, agentNames),
@@ -1067,6 +1124,7 @@ function ModeEntryPanel({
 export function RunsPage() {
   const queryClient = useQueryClient();
   const runs = useQuery({ queryKey: ["runs"], queryFn: () => api.runs() });
+  const runListItems = runs.data ?? [];
   const agents = useQuery({ queryKey: ["agents"], queryFn: () => api.agents() });
   const models = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
   const workflows = useQuery({ queryKey: ["workflows"], queryFn: () => api.workflows() });
@@ -1122,10 +1180,15 @@ export function RunsPage() {
   });
 
   const selectedRunConversationId = runConversationId(selectedRun.data);
+  const activeConversationId = conversationId.trim();
+  const activeConversationKnown =
+    Boolean(selectedRun.data) ||
+    Boolean(conversationRunCache[activeConversationId]) ||
+    runListItems.some((run) => run.conversation_id === activeConversationId);
   const activeConversation = useQuery({
-    queryKey: ["conversation", selectedRunConversationId],
-    queryFn: () => api.conversation(selectedRunConversationId ?? ""),
-    enabled: Boolean(selectedRunConversationId),
+    queryKey: ["conversation", activeConversationId],
+    queryFn: () => api.conversation(activeConversationId),
+    enabled: Boolean(activeConversationId && activeConversationKnown),
     refetchInterval: (query) => {
       const data = query.state.data;
       return data?.runs.some((run) => !TERMINAL_STATUSES.has(run.status)) ? 1000 : false;
@@ -1236,11 +1299,32 @@ export function RunsPage() {
         attachment_ids: attachmentDraft?.attachment ? [attachmentDraft.attachment.id] : [],
       });
     },
-    onSuccess: async (run) => {
+    onSuccess: async (run, override) => {
       setSelectedRunId(run.id);
       setShowModeEntry(false);
       if (run.conversation_id) setConversationId(run.conversation_id);
       const selection = modeSelectionFromSubmittedRun(run);
+      const submittedMode = override?.mode ?? mode;
+      if (selection && submittedMode !== "auto") {
+        setTemporaryApproval(null);
+        setModeSelection(null);
+        setSubmitNotice(`已按你选择的“${displayMode(submittedMode)}”继续，不再重复确认模式。`);
+        const continued = await api.chooseMode(run.id, {
+          mode: submittedMode as ManualRunMode,
+          decision_token: selection.decisionToken,
+          version: selection.version,
+          operator_note: "用户已在新对话入口明确选择该模式。",
+        });
+        if (continued.conversation_id) setConversationId(continued.conversation_id);
+        await queryClient.invalidateQueries({ queryKey: ["runs"] });
+        await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
+        if (continued.conversation_id) {
+          await queryClient.invalidateQueries({ queryKey: ["conversation", continued.conversation_id] });
+        }
+        setMessage("");
+        setAttachmentDraft(null);
+        return;
+      }
       if (run.temporary_agent_proposal && run.decision_token) {
         setModeSelection(null);
         setTemporaryApproval({
@@ -1642,14 +1726,14 @@ export function RunsPage() {
   }
   if (runs.isError) return <p role="alert">{formatApiError(runs.error, "会话列表加载失败")}</p>;
 
-  const items = runs.data ?? [];
+  const items = runListItems;
   const selectedMode = RUN_MODES.find((item) => item.value === mode) ?? RUN_MODES[0];
   const savedAgents = agents.data ?? [];
   const savedModels = models.data ?? [];
   const enabledAgents = savedAgents.filter((agent) => agent.enabled);
   const savedWorkflows = workflows.data ?? [];
   const agentNameMap = new Map(savedAgents.map((agent) => [agent.id, agent.name]));
-  const cachedConversationRuns = selectedRunConversationId ? conversationRunCache[selectedRunConversationId] : undefined;
+  const cachedConversationRuns = activeConversationId ? conversationRunCache[activeConversationId] : undefined;
   const visibleRuns = cachedConversationRuns ?? activeConversation.data?.runs ?? (selectedRun.data ? [selectedRun.data] : []);
   const messages = conversationMessages(visibleRuns);
   const temporaryApprovalVisibleInMessages =
@@ -1709,10 +1793,10 @@ export function RunsPage() {
 
   function deleteSelectedConversations() {
     if (selectedDeletableConversationIds.length === 0) {
-      setSubmitNotice("Please select completed, failed, or cancelled conversations first.");
+      setSubmitNotice("请先选择已完成、失败或已取消的会话。");
       return;
     }
-    if (!window.confirm(`Delete ${selectedDeletableConversationIds.length} selected conversations?`)) {
+    if (!window.confirm(`确认删除 ${selectedDeletableConversationIds.length} 条已选会话？删除后运行详情和产物记录也会移除。`)) {
       return;
     }
     bulkDeleteRuns.mutate(selectedDeletableConversationIds);
@@ -1788,6 +1872,7 @@ export function RunsPage() {
                     aria-label={`进入会话 ${run.id.slice(0, 8)}`}
                     onClick={() => {
                       setShowModeEntry(false);
+                      if (run.conversation_id) setConversationId(run.conversation_id);
                       setSelectedRunId(run.id);
                     }}
                   >

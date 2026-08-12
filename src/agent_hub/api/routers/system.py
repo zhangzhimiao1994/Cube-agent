@@ -20,6 +20,13 @@ async def health_live() -> HealthResponse:
     return HealthResponse()
 
 
+@router.get("/health", response_model=HealthResponse)
+async def health() -> HealthResponse:
+    """Compatibility liveness endpoint for installers and external monitors."""
+
+    return HealthResponse()
+
+
 @router.get(
     "/health/ready",
     response_model=HealthResponse,

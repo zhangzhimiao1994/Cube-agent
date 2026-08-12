@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -11,7 +11,7 @@ from agent_hub.domain.runs import TaskMode
 from agent_hub.models.capacity import CapacityLease
 from agent_hub.models.gateway import CapacityController
 from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, TokenUsage
-from agent_hub.runtime.contracts import EventKind, TaskContext
+from agent_hub.runtime.contracts import EventKind, JsonValue, TaskContext
 from agent_hub.runtime.defaults import (
     ConfigBackedDirectRuntime,
     ConfigBackedDiscussionRuntime,
@@ -63,6 +63,31 @@ class FakeSecretService:
         assert isinstance(reference, str)
         self.fingerprinted.append((tenant_id, reference))
         return "a" * 64
+
+
+class FakeCapabilityAvailability:
+    def __init__(self, available: set[str]) -> None:
+        self.available = available
+
+    def is_replay_safe(self, name: str) -> bool:
+        return name in {"read_context", "calculator", "calculator_evaluate", "workspace_read"}
+
+    def is_available(self, tenant_id: UUID, name: str) -> bool:
+        assert tenant_id == TENANT_ID
+        return name in self.available
+
+    async def execute(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        del tenant_id, run_id, actor, name, arguments, idempotency_key
+        return {}
 
 
 class ImmediateCapacity:
@@ -468,6 +493,74 @@ def test_dispatch_plan_preserves_selected_roles_and_controls_concurrency() -> No
     assert plan.max_parallelism == 1
     assert all(step.token_budget == 16_384 for step in plan.steps)
     assert plan.total_token_budget == 16_384
+
+
+def test_dispatch_plan_exposes_only_available_role_tools_and_skills() -> None:
+    roles = (
+        RoleAssignment(
+            id="writer",
+            role="Writer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Draft the response.",
+            must_answer=("What did the writer produce?",),
+            allowed_tools=("read_context",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=("docx",),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Draft a document.",
+        ),
+        capability_gateway=FakeCapabilityAvailability({"docx"}),
+    )
+
+    writer = next(agent for agent in plan.agents if agent.id == "writer")
+    writer_step = next(step for step in plan.steps if step.agent == "writer")
+    assert writer.allowed_tools == ("read_context", "docx")
+    assert writer_step.tools == ("read_context", "docx")
+    assert set(plan.allowed_tools) >= {"read_context", "docx"}
+
+
+def test_dispatch_plan_filters_unavailable_skills_from_executable_steps() -> None:
+    roles = (
+        RoleAssignment(
+            id="writer",
+            role="Writer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Draft the response.",
+            must_answer=("What did the writer produce?",),
+            allowed_tools=("read_context",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=("docx",),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Draft a document.",
+        ),
+        capability_gateway=FakeCapabilityAvailability(set()),
+    )
+
+    writer = next(agent for agent in plan.agents if agent.id == "writer")
+    writer_step = next(step for step in plan.steps if step.agent == "writer")
+    assert writer.allowed_tools == ("read_context",)
+    assert writer_step.tools == ("read_context",)
+    assert plan.allowed_tools == ("read_context",)
 
 
 def test_dispatch_plan_reserves_more_time_for_final_synthesis() -> None:

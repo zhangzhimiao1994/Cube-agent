@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
@@ -62,8 +63,7 @@ def _execute_archive(
     workdir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="skill-", dir=workdir) as temp_dir:
         package_dir = Path(temp_dir)
-        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
-            archive.extractall(package_dir)
+        _extract_archive(archive_bytes, package_dir)
         process = subprocess.run(
             (sys.executable, str(package_dir / entry_point)),
             input=stdin_bytes,
@@ -77,15 +77,39 @@ def _execute_archive(
         return int(process.returncode)
 
 
+def _extract_archive(archive_bytes: bytes, package_dir: Path) -> None:
+    if zipfile.is_zipfile(io.BytesIO(archive_bytes)):
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+            archive.extractall(package_dir)
+        return
+    with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
+        archive.extractall(package_dir, filter="data")
+
+
 def _reject_runtime_dependency_install(archive_bytes: bytes) -> None:
-    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
-        for name in archive.namelist():
-            normalized = name.replace("\\", "/").rsplit("/", 1)[-1]
-            if normalized in _DEPENDENCY_FILES and archive.read(name).strip():
-                raise SkillRunnerError(
-                    "skill dependencies are not installed by the base runner; "
-                    "publish a self-contained skill or use a configured dependency sandbox"
-                )
+    for name, content in _archive_members(archive_bytes):
+        normalized = name.replace("\\", "/").rsplit("/", 1)[-1]
+        if normalized in _DEPENDENCY_FILES and content.strip():
+            raise SkillRunnerError(
+                "skill dependencies are not installed by the base runner; "
+                "publish a self-contained skill or use a configured dependency sandbox"
+            )
+
+
+def _archive_members(archive_bytes: bytes) -> tuple[tuple[str, bytes], ...]:
+    if zipfile.is_zipfile(io.BytesIO(archive_bytes)):
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+            return tuple((name, archive.read(name)) for name in archive.namelist())
+    with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
+        members: list[tuple[str, bytes]] = []
+        for member in archive.getmembers():
+            if not member.isfile():
+                continue
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                continue
+            members.append((member.name, extracted.read()))
+        return tuple(members)
 
 
 def _validate_json_stdin(value: bytes) -> None:

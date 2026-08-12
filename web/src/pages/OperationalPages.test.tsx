@@ -1292,7 +1292,7 @@ describe("operational management pages", () => {
     });
   });
 
-  it("continues with the manually selected mode when the backend asks for mode clarification", async () => {
+  it("does not ask again when a manually selected mode is returned as backend clarification", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
@@ -1302,15 +1302,7 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(screen.queryByRole("dialog", { name: "运行模式确认" })).toBeNull();
-    expect(await screen.findByText(/请在当前输入框回复编号或关键词/)).not.toBeNull();
-    expect(
-      within(screen.getByLabelText("运行模式确认")).getByText(
-        (_, node) => node?.tagName === "LI" && (node.textContent?.includes("3. 讨论") ?? false),
-      ),
-    ).not.toBeNull();
-
-    await user.type(screen.getByPlaceholderText(/输入消息/), "讨论 补充：让每个角色先给出不同意见。");
-    await user.click(screen.getByRole("button", { name: "发送" }));
+    expect(await screen.findByText(/不再重复确认模式/)).not.toBeNull();
 
     await waitFor(() =>
       expect(requests.find((request) => request.path === `/api/v1/runs/${runId}/choose-mode`)).toMatchObject({
@@ -1319,7 +1311,7 @@ describe("operational management pages", () => {
           mode: "discuss",
           decision_token: "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
           version: 1,
-          operator_note: "补充：让每个角色先给出不同意见。",
+          operator_note: "用户已在新对话入口明确选择该模式。",
         },
       }),
     );

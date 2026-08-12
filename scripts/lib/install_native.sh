@@ -97,6 +97,78 @@ run_npm_with_mirror_fallback() {
   npm --prefix web ci --registry="${AGENT_HUB_NPM_MIRROR:-https://registry.npmmirror.com}"
 }
 
+native_node_version_ok() {
+  local version major minor
+  version="$(node -v 2>/dev/null || true)"
+  version="${version#v}"
+  major="${version%%.*}"
+  minor="${version#*.}"
+  minor="${minor%%.*}"
+  [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
+  (( major > 20 )) && return 0
+  (( major == 20 && minor >= 19 )) && return 0
+  return 1
+}
+
+native_node_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf 'x64\n' ;;
+    aarch64|arm64) printf 'arm64\n' ;;
+    *)
+      die "unsupported CPU architecture for bundled Node.js: $(uname -m)"
+      ;;
+  esac
+}
+
+native_node_env() {
+  local node_home
+  node_home="${AGENT_HUB_NODE_HOME:-$INSTALL_ROOT/node}"
+  env PATH="$node_home/bin:$PATH" "$@"
+}
+
+download_native_node() {
+  local version arch node_home archive tmp_dir url mirror_url
+  version="${AGENT_HUB_NODE_VERSION:-22.12.0}"
+  arch="$(native_node_arch)"
+  node_home="${AGENT_HUB_NODE_HOME:-$INSTALL_ROOT/node}"
+  tmp_dir="$(mktemp -d)"
+  archive="$tmp_dir/node.tar.xz"
+  url="https://nodejs.org/dist/v${version}/node-v${version}-linux-${arch}.tar.xz"
+  mirror_url="${AGENT_HUB_NODE_MIRROR:-https://npmmirror.com/mirrors/node}/v${version}/node-v${version}-linux-${arch}.tar.xz"
+
+  mkdir -p "$node_home"
+  if [[ "$(native_mirror_mode)" == "china" ]]; then
+    curl -fsSL "$mirror_url" -o "$archive"
+  elif ! curl -fsSL "$url" -o "$archive"; then
+    [[ "$(native_mirror_mode)" == "official" ]] && return 1
+    warn "official Node.js download failed; retrying with China Node.js mirror"
+    curl -fsSL "$mirror_url" -o "$archive"
+  fi
+
+  rm -rf "${node_home:?}/"*
+  tar -xJf "$archive" -C "$node_home" --strip-components=1
+  rm -rf "$tmp_dir"
+  chmod -R a+rX "$node_home"
+}
+
+ensure_native_nodejs() {
+  local node_home
+  node_home="${AGENT_HUB_NODE_HOME:-$INSTALL_ROOT/node}"
+  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && native_node_version_ok; then
+    return 0
+  fi
+  if [[ -x "$node_home/bin/node" && -x "$node_home/bin/npm" ]] && native_node_env bash -lc 'node -v >/dev/null && npm -v >/dev/null'; then
+    export PATH="$node_home/bin:$PATH"
+    if native_node_version_ok; then
+      return 0
+    fi
+  fi
+  warn "Node.js 20.19+ is required for the Web UI build; installing bundled Node.js"
+  download_native_node
+  export PATH="$node_home/bin:$PATH"
+  native_node_version_ok || die "bundled Node.js still does not satisfy version requirement"
+}
+
 run_uv_python_install_with_mirror_fallback() {
   local mode
   mode="$(native_mirror_mode)"
@@ -416,12 +488,10 @@ deploy_native_release() {
     run_python_with_mirror_fallback uv venv --python "$python_bin" .venv
     sync_python_project_with_lock_or_mirror
     install_litellm_proxy_venv "$python_bin"
-    if command -v npm >/dev/null 2>&1; then
-      run_npm_with_mirror_fallback
-      npm --prefix web run build
-    else
-      warn "npm not found; Web UI assets were not built"
-    fi
+    ensure_native_nodejs
+    chown -R agent-hub:agent-hub web/node_modules 2>/dev/null || true
+    run_npm_with_mirror_fallback
+    npm --prefix web run build
   )
 
   ln -sfn "$release" "$INSTALL_ROOT/current"

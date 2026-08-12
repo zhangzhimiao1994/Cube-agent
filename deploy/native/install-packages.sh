@@ -62,7 +62,7 @@ fi
 manager="$(detect_manager /etc/os-release)"
 packages=(ca-certificates curl openssl tar gzip coreutils nodejs npm)
 if [[ "$manager" == "apt" ]]; then
-  packages+=(python3 python3-venv python3-pip build-essential)
+  packages+=(python3 python3-venv python3-pip build-essential xz-utils)
   if [[ "$LOCAL_DB" -eq 1 ]]; then
     packages+=(postgresql postgresql-client)
   else
@@ -73,7 +73,7 @@ if [[ "$manager" == "apt" ]]; then
   fi
   packages+=(caddy)
 elif [[ "$manager" == "dnf" ]]; then
-  packages+=(python3 python3-pip gcc gcc-c++ make)
+  packages+=(python3 python3-pip gcc gcc-c++ make xz)
   if [[ "$LOCAL_DB" -eq 1 ]]; then
     packages+=(postgresql-server postgresql)
   else

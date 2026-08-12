@@ -5,10 +5,13 @@ import io
 import stat
 import tarfile
 import zipfile
+from pathlib import Path
 
 import pytest
+from _pytest.capture import CaptureFixture
 
 from agent_hub.skills.package import InvalidSkillPackage, SkillPackageInspector
+from agent_hub.skills.runner import _execute_archive
 
 
 def test_valid_skill_package_is_inspected() -> None:
@@ -42,6 +45,25 @@ def test_valid_tar_gz_skill_package_is_inspected() -> None:
     assert inspection.manifest.name == "demo_skill"
     assert inspection.manifest.entry_point == "main.py"
     assert {file.path for file in inspection.files} == {"skill.yaml", "main.py"}
+
+
+def test_tar_gz_skill_package_can_be_executed_by_runner(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+) -> None:
+    archive = skill_tar_gz()
+
+    result = _execute_archive(
+        archive,
+        entry_point="main.py",
+        workdir=tmp_path,
+        stdin_bytes=b'{"task":"ping"}',
+        timeout_seconds=10,
+    )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert captured.out.strip() == "ok"
 
 
 def test_declared_tool_capability_prefix_is_not_duplicated() -> None:

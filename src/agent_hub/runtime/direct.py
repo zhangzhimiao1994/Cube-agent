@@ -74,6 +74,14 @@ def _gateway_failure_reason(error: Exception) -> str:
     return safe_model_gateway_failure_reason(error) or "model gateway failed"
 
 
+def _event_text_preview(value: object, *, max_chars: int = 240) -> str:
+    text = str(value).strip() if value is not None else ""
+    text = re.sub(r"\s+", " ", text)
+    if len(text) <= max_chars:
+        return text
+    return f"{text[: max_chars - 1].rstrip()}…"
+
+
 def _truncate_prompt_text(value: str, *, max_bytes: int) -> str:
     encoded = value.encode("utf-8")
     if len(encoded) <= max_bytes:
@@ -199,7 +207,19 @@ class DirectRuntime:
                 gateway_task.cancel()
                 raise RuntimeExecutionError("runtime ownership changed")
             self._active_task = gateway_task
-            yield RunEvent(kind=EventKind.MODEL_STARTED, sequence=1, run_id=context.run_id)
+            yield RunEvent(
+                kind=EventKind.MODEL_STARTED,
+                sequence=1,
+                run_id=context.run_id,
+                actor="main_agent",
+                message=f"主 Agent 调用模型 {self._logical_model} 处理直连请求。",
+                payload={
+                    "logical_model": self._logical_model,
+                    "model": self._logical_model,
+                    "task": _event_text_preview(context.request),
+                    "instruction": _event_text_preview(context.request),
+                },
+            )
             gateway_failed = False
             gateway_failure_reason = "model gateway failed"
             completion: GatewayCompletion | None = None
@@ -287,6 +307,11 @@ class DirectRuntime:
                 gateway_task = None
                 del artifact, text, response, completion, request, included_source_ids, context
                 _raise_execution_error("model response is invalid")
+            completion_logical_model = completion.logical_model
+            completion_deployment_id = completion.deployment_id
+            completion_provider_id = completion.provider_id
+            completion_provider_model = completion.provider_model
+            artifact_text_preview = _event_text_preview(artifact.content.get("text"))
             await self._consume_task_terminal(gateway_task)
             self._active_task = None
             gateway_task = None
@@ -295,6 +320,18 @@ class DirectRuntime:
                 kind=EventKind.ARTIFACT_CREATED,
                 sequence=2,
                 run_id=context.run_id,
+                actor="main_agent",
+                message="模型已返回直连回答。",
+                payload={
+                    "logical_model": completion_logical_model,
+                    "model": completion_logical_model,
+                    "deployment": completion_deployment_id,
+                    "provider": completion_provider_id,
+                    "upstream_model": completion_provider_model,
+                    "artifact_id": str(artifact.id),
+                    "output": artifact_text_preview,
+                    "result": artifact_text_preview,
+                },
                 artifact=artifact,
             )
             checkpoint = RuntimeCheckpoint(
@@ -322,6 +359,14 @@ class DirectRuntime:
                 kind=EventKind.RUNTIME_COMPLETED,
                 sequence=4,
                 run_id=context.run_id,
+                actor="main_agent",
+                message="本次直连对话已完成。",
+                payload={
+                    "logical_model": completion_logical_model,
+                    "model": completion_logical_model,
+                    "artifact_id": str(artifact.id),
+                    "summary": artifact_text_preview,
+                },
                 inputs=(artifact,),
             )
         finally:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
@@ -21,6 +22,7 @@ from agent_hub.runtime.registry import RuntimeRegistry
 _LOGGER = logging.getLogger(__name__)
 _AUTO_RESOLVE_MAX_SINGLE_COST_USD = Decimal("0.50")
 _AUTO_RESOLVE_MAX_TOTAL_COST_USD = Decimal("0.75")
+_AUTO_ROUTER_TIMEOUT_SECONDS = 8
 _SAFE_MODEL_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 
 
@@ -199,20 +201,32 @@ class RunService:
         if mode is TaskMode.AUTO:
             decision: RouteDecision | None = None
             if self._router is not None:
-                decision = await self._router.route(message)
+                decision = await _safe_route(
+                    self._router,
+                    message,
+                    timeout_seconds=_AUTO_ROUTER_TIMEOUT_SECONDS,
+                )
             if decision is not None and decision.status == "ready":
                 assert decision.mode is not None
+                selected_mode = _main_agent_adjusted_ready_mode(
+                    decision.mode,
+                    message=message,
+                    attachment_ids=attachment_ids,
+                )
                 proposal = await self._safe_temporary_agent_proposal(
                     tenant_id=tenant_id,
                     actor_id=actor_id,
                     message=message,
-                    mode=decision.mode,
+                    mode=selected_mode,
                     agent_ids=agent_ids,
                     workflow_id=workflow_id,
                     allow_workflow_adjustment=allow_workflow_adjustment,
                 )
                 routing_payload = {
                     **decision.model_dump(mode="json"),
+                    "router_selected_mode": decision.mode.value,
+                    "main_agent_selected_mode": selected_mode.value,
+                    "main_agent_adjusted": selected_mode is not decision.mode,
                     **operator_selection,
                 }
                 if proposal is not None:
@@ -220,7 +234,7 @@ class RunService:
                         tenant_id=tenant_id,
                         actor_id=actor_id,
                         message=message,
-                        mode=decision.mode,
+                        mode=selected_mode,
                         proposal=proposal,
                         idempotency_key=idempotency_key,
                         operator_selection=routing_payload,
@@ -229,13 +243,53 @@ class RunService:
                     tenant_id=tenant_id,
                     actor_id=actor_id,
                     request=message,
-                    mode=decision.mode,
+                    mode=selected_mode,
                     status=RunStatus.QUEUED,
                     idempotency_key=idempotency_key,
                     routing_decision=routing_payload,
                     enqueue=True,
                 )
                 return _submitted(record)
+
+            if decision is None:
+                local_mode = _local_main_agent_auto_mode(message, attachment_ids)
+                if local_mode is not TaskMode.DIRECT:
+                    routing_payload = {
+                        "reason": "main_agent_local_resolution",
+                        "main_agent_selected_mode": local_mode.value,
+                        "router_unavailable": self._router is None,
+                        **operator_selection,
+                    }
+                    proposal = await self._safe_temporary_agent_proposal(
+                        tenant_id=tenant_id,
+                        actor_id=actor_id,
+                        message=message,
+                        mode=local_mode,
+                        agent_ids=agent_ids,
+                        workflow_id=workflow_id,
+                        allow_workflow_adjustment=allow_workflow_adjustment,
+                    )
+                    if proposal is not None:
+                        return await self._create_temporary_agent_approval_run(
+                            tenant_id=tenant_id,
+                            actor_id=actor_id,
+                            message=message,
+                            mode=local_mode,
+                            proposal=proposal,
+                            idempotency_key=idempotency_key,
+                            operator_selection=routing_payload,
+                        )
+                    record = await self._repository.create_run(
+                        tenant_id=tenant_id,
+                        actor_id=actor_id,
+                        request=message,
+                        mode=local_mode,
+                        status=RunStatus.QUEUED,
+                        idempotency_key=idempotency_key,
+                        routing_decision=routing_payload,
+                        enqueue=True,
+                    )
+                    return _submitted(record)
 
             hermes_advice = await self._safe_hermes_advice(
                 tenant_id=tenant_id,
@@ -282,6 +336,49 @@ class RunService:
                     enqueue=True,
                 )
                 return _submitted(record)
+
+            if _local_resolvable_unavailable_route_decision(decision):
+                assert decision is not None
+                local_mode = _local_main_agent_auto_mode(message, attachment_ids)
+                if local_mode is not TaskMode.DIRECT:
+                    routing_payload = {
+                        "reason": "main_agent_local_resolution",
+                        "main_agent_selected_mode": local_mode.value,
+                        "router_unavailable": False,
+                        "router_clarification_reason": decision.clarification_reason,
+                        "decision": decision.model_dump(mode="json"),
+                        **operator_selection,
+                    }
+                    proposal = await self._safe_temporary_agent_proposal(
+                        tenant_id=tenant_id,
+                        actor_id=actor_id,
+                        message=message,
+                        mode=local_mode,
+                        agent_ids=agent_ids,
+                        workflow_id=workflow_id,
+                        allow_workflow_adjustment=allow_workflow_adjustment,
+                    )
+                    if proposal is not None:
+                        return await self._create_temporary_agent_approval_run(
+                            tenant_id=tenant_id,
+                            actor_id=actor_id,
+                            message=message,
+                            mode=local_mode,
+                            proposal=proposal,
+                            idempotency_key=idempotency_key,
+                            operator_selection=routing_payload,
+                        )
+                    record = await self._repository.create_run(
+                        tenant_id=tenant_id,
+                        actor_id=actor_id,
+                        request=message,
+                        mode=local_mode,
+                        status=RunStatus.QUEUED,
+                        idempotency_key=idempotency_key,
+                        routing_decision=routing_payload,
+                        enqueue=True,
+                    )
+                    return _submitted(record)
 
             if _auto_resolvable_route_decision(decision):
                 assert decision is not None
@@ -887,8 +984,51 @@ def _auto_resolvable_route_decision(decision: RouteDecision | None) -> bool:
     )
 
 
+def _local_resolvable_unavailable_route_decision(decision: RouteDecision | None) -> bool:
+    if decision is None:
+        return False
+    if decision.status != "waiting_user_mode":
+        return False
+    if decision.clarification_reason not in {
+        "classification_unavailable",
+        "main_agent_router_unavailable",
+        "router_unavailable",
+    }:
+        return False
+    return decision.risk is not RiskLevel.HIGH and not decision.requires_approval
+
+
 def _select_auto_route_assessment(assessments: tuple[RouteAssessment, ...]) -> RouteAssessment:
     return max(assessments, key=lambda item: item.confidence)
+
+
+async def _safe_route(
+    router: ModeRouterProtocol,
+    message: str,
+    *,
+    timeout_seconds: int,
+) -> RouteDecision | None:
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            return await router.route(message)
+    except TimeoutError:
+        _LOGGER.warning("auto_router_timed_out timeout_seconds=%s", timeout_seconds)
+        return None
+    except Exception as error:  # noqa: BLE001 - auto routing must not block submission.
+        _LOGGER.warning("auto_router_failed error_type=%s", type(error).__name__)
+        return None
+
+
+def _main_agent_adjusted_ready_mode(
+    router_mode: TaskMode,
+    *,
+    message: str,
+    attachment_ids: tuple[str, ...],
+) -> TaskMode:
+    local_mode = _local_main_agent_auto_mode(message, attachment_ids)
+    if router_mode is TaskMode.DIRECT and local_mode is not TaskMode.DIRECT:
+        return local_mode
+    return router_mode
 
 
 def _local_main_agent_auto_mode(message: str, attachment_ids: tuple[str, ...]) -> TaskMode:
@@ -941,6 +1081,8 @@ def _local_main_agent_auto_mode(message: str, attachment_ids: tuple[str, ...]) -
             "报告",
             "方案",
             "计划",
+            "策划",
+            "活动",
             "生成",
             "制作",
             "分析",

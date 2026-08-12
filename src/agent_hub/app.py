@@ -34,6 +34,7 @@ from agent_hub.auth.rate_limit import RedisAuthRateLimiter
 from agent_hub.auth.service import AuthService
 from agent_hub.auth.tokens import AccessTokenService
 from agent_hub.auth.user_admin import PersistentUserAdminService
+from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
 from agent_hub.channels.dedup import InboundDedupRepository
 from agent_hub.channels.feishu.reply import FeishuOpenAPIReplySender, FeishuRunReplyDispatcher
 from agent_hub.channels.feishu.webhook import (
@@ -418,10 +419,15 @@ def create_app(
                 if active_runtime_registry is None:
                     assert active_redis is not None
                     assert active_secret_service is not None
+                    runtime_capabilities = RuntimeCapabilityGateway(
+                        skill_store_dir=configured.skill_store_dir,
+                        workspace_root=configured.attachment_store_dir,
+                    )
                     active_runtime_registry = configured_runtime_registry(
                         config_service=ConfigService(active_sessions),
                         secret_service=active_secret_service,
                         redis_client=active_redis,
+                        capability_gateway=runtime_capabilities,
                     )
                 if active_mode_router is None and active_secret_service is not None:
                     assert active_redis is not None

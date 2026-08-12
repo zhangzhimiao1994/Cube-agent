@@ -8,6 +8,7 @@ from uuid import UUID
 
 from redis.asyncio import Redis
 
+from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
 from agent_hub.config.service import ConfigService
 from agent_hub.db.session import Database, build_database
 from agent_hub.hermes import PersistentHermesRunAdvisor
@@ -111,6 +112,10 @@ def build_worker_service(
             config_service=ConfigService(database.session_factory),
             secret_service=secret_service,
             redis_client=redis_client,
+            capability_gateway=RuntimeCapabilityGateway(
+                skill_store_dir=settings.skill_store_dir,
+                workspace_root=settings.attachment_store_dir,
+            ),
         ),
         router=None,
         task_queue=queue,

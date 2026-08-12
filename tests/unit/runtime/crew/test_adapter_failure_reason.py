@@ -7,7 +7,7 @@ import pytest
 
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.gateway import GatewayCompletion
-from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage
+from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
 from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent, TaskContext
 from agent_hub.runtime.crew.adapter import (
     CrewAgentDefinition,
@@ -16,6 +16,7 @@ from agent_hub.runtime.crew.adapter import (
     CrewObjectFactory,
     CrewTaskDefinition,
     RuntimeExecutionError,
+    _artifact_final_synthesis_payload,
     _artifact_prompt_payload,
 )
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
@@ -118,6 +119,39 @@ def _context() -> TaskContext:
     )
 
 
+def test_openai_tool_call_response_can_have_empty_text() -> None:
+    completion = GatewayCompletion(
+        response=ModelResponse(
+            text="",
+            tool_calls=(ToolCall(id="call_1", name="read_context", arguments={"query": "x"}),),
+            usage=TokenUsage(10, 1, 11),
+        ),
+        deployment_id="primary",
+        logical_model="general",
+        provider_id="deepseek",
+        provider_model="deepseek/deepseek-v4-flash",
+        cost_usd=Decimal(0),
+    )
+
+    response = CrewDispatchRuntime._valid_response(completion)
+
+    assert response.tool_calls[0].name == "read_context"
+
+
+def test_text_only_empty_model_response_still_fails() -> None:
+    completion = GatewayCompletion(
+        response=ModelResponse(text="", usage=TokenUsage(10, 0, 10)),
+        deployment_id="primary",
+        logical_model="general",
+        provider_id="deepseek",
+        provider_model="deepseek/deepseek-v4-flash",
+        cost_usd=Decimal(0),
+    )
+
+    with pytest.raises(RuntimeExecutionError, match="model response text is empty"):
+        CrewDispatchRuntime._valid_response(completion)
+
+
 async def _collect(runtime: CrewDispatchRuntime) -> list[RunEvent]:
     return [event async for event in runtime.run(_context())]
 
@@ -181,4 +215,28 @@ def test_artifact_prompt_payload_truncates_large_text_without_mutating_artifact(
     assert isinstance(text, str)
     assert len(text.encode("utf-8")) <= 256
     assert "[truncated:" in text
+    assert artifact.content["text"] == original_text
+
+
+def test_final_synthesis_payload_uses_smaller_summary_without_mutating_artifact() -> None:
+    original_text = "final synthesis source " * 2_000
+    artifact = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="planner",
+        content={"text": original_text},
+    )
+
+    payload = _artifact_final_synthesis_payload(artifact)
+
+    content = payload["content"]
+    assert isinstance(content, dict)
+    text = content["text"]
+    assert isinstance(text, str)
+    assert len(text.encode("utf-8")) <= 2_048
+    assert "[truncated:" in text
+    assert payload["synthesis_input"] == {
+        "mode": "summary",
+        "note": "Full artifact is stored separately; this final synthesis input is bounded to keep production model calls reliable.",
+    }
     assert artifact.content["text"] == original_text

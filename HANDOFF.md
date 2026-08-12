@@ -382,3 +382,62 @@ Verification performed:
 Backlog / deferred:
 
 - Feishu currently supports enterprise self-built app style channel integration. The user wants future support for configuring Feishu as a native Feishu intelligent agent. This is intentionally deferred until after the current UI/Agent flow work stabilizes.
+
+## 2026-08-12 Runtime Root-Cause Fix: Capability Exposure and Final Synthesis Timeout
+
+Current state:
+
+- The server at `103.236.98.133` was updated incrementally in `/opt/agent-hub/current`.
+- `agent-hub-api` and `agent-hub-worker` are active.
+- `/health` and `/health/ready` return `{"status":"ok"}`.
+- Production smoke runs on the server completed for direct, auto, dispatch, discuss, and hybrid modes.
+
+Root causes found:
+
+- Dispatch role plans exposed unavailable skills/tools as callable capabilities. Models then called tools such as role-named pseudo-tools, and the runtime failed with `CapabilityOutcomeUncertain`.
+- OpenAI-compatible providers can return tool-call-only messages with empty assistant text. The runtime treated those as invalid text responses even when valid tool calls were present.
+- The final dispatch synthesizer received every upstream role output as full text. For larger multi-role tasks this produced very large prompts, and the final synthesizer timed out even though reviewer and prior role outputs had already persisted successfully.
+- AutoGen discussion streams could remain stuck after the wall-time cancellation signal if the framework stream did not yield again. The runtime needed a hard polling boundary around `run_stream()`.
+
+Changes made:
+
+- Added production runtime capability availability gateway:
+  - replay-safe tools stay available;
+  - installed skill packages are available;
+  - unavailable skill/tool names are filtered before reaching model prompts.
+- Updated default dispatch/discussion/hybrid planning to expose only available capabilities to child agents.
+- Allowed tool-call-only model responses with empty text while still rejecting empty text-only responses.
+- Persisted model responses before later validation paths so failures keep the output produced before the break point.
+- Added bounded final-synthesis input payloads. Full child-agent artifacts are still stored, but the final synthesizer receives concise bounded summaries/references instead of all role outputs in full.
+- Added a hard polling/cleanup boundary for AutoGen `run_stream()` so wall-time expiry can terminate the run path instead of leaving runs stuck as `running`.
+
+Verification performed:
+
+- Local backend:
+  - `uv run pytest tests\unit tests\contracts -q --tb=short`
+  - Result: 1127 passed, 13 skipped, 2 warnings.
+  - `uv run mypy src tests`
+  - Result: success, no issues in 241 source files.
+- Local frontend:
+  - `npm test -- --run`
+  - Result: 68 passed.
+  - `npm.cmd run build`
+  - Result: passed; only the existing Vite chunk-size warning.
+- Server deployment:
+  - Uploaded `.tmp/agent-hub-incremental.tar` to `/tmp/agent-hub-incremental.tar`.
+  - Extracted into `/opt/agent-hub/current`.
+  - Restarted `agent-hub-api` and `agent-hub-worker`.
+  - `curl -fsS http://127.0.0.1:8000/health` returned `{"status":"ok"}`.
+  - `curl -fsS http://127.0.0.1:8000/health/ready` returned `{"status":"ok"}`.
+- Server real mode smoke evidence:
+  - direct run `1c04dd17-cd27-440a-9be1-da0073a27002`: completed.
+  - auto run `2ae8dfca-2f25-4a7d-a59b-8511c7a55da9`: completed as dispatch.
+  - dispatch run `e6fb8327-6e2c-44fb-b987-2a897cf04204`: completed; final synthesizer produced result after input bounding.
+  - discuss run `9fd5f1c0-72fd-4908-bba9-806f8eff453b`: completed with discussion and decision output.
+  - hybrid run `44c20a5f-b9d9-4828-86c3-aac71795d5fc`: completed with dispatch outputs and discussion completion.
+
+Remaining risks / TODOs:
+
+- The real hybrid smoke can take close to the diagnostic script timeout because it performs full dispatch plus discussion. The application completes, but future smoke scripts should use a longer timeout or per-stage polling output.
+- Server logs still contain older pre-fix errors from earlier runs. Latest post-deploy health is clean; do not interpret old journal tail entries as new failures without checking timestamps.
+- Local integration tests that require PostgreSQL were blocked by the local Windows database not being available. Production-like behavior was verified on the Linux server using its real PostgreSQL/Redis/services.

@@ -198,6 +198,12 @@ class WaitingRouter:
         return self.decision
 
 
+class FailingRouter:
+    async def route(self, task_text: object) -> RouteDecision:
+        del task_text
+        raise TimeoutError
+
+
 def assessment(
     mode: TaskMode,
     *,
@@ -238,6 +244,127 @@ def waiting_decision(
         requires_approval=requires_approval,
         permissions_still_apply=True,
     )
+
+
+def waiting_unavailable_decision(reason: str = "classification_unavailable") -> RouteDecision:
+    return RouteDecision(
+        mode=None,
+        needs_user_choice=True,
+        status="waiting_user_mode",
+        assessments=(),
+        clarification_reason=reason,
+        options=EXECUTABLE_MODES,
+        decision_token="safe-unavailable-token-abcdefghijklmnopqrstuvwxyz12",
+        version=1,
+        risk=RiskLevel.LOW,
+        requires_approval=False,
+        permissions_still_apply=True,
+    )
+
+
+def ready_decision(mode: TaskMode) -> RouteDecision:
+    return RouteDecision(
+        mode=mode,
+        needs_user_choice=False,
+        status="ready",
+        assessments=(
+            assessment(mode, confidence=0.95),
+        ),
+        clarification_reason=None,
+        options=(),
+        decision_token=None,
+        version=1,
+        risk=RiskLevel.LOW,
+        requires_approval=False,
+        permissions_still_apply=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_ready_direct_is_promoted_for_generation_work() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    queue = RecordingQueue()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=WaitingRouter(ready_decision(TaskMode.DIRECT)),
+        task_queue=queue,
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="写一个国庆活动方案",
+        mode=TaskMode.AUTO,
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DISPATCH
+    routing = repository.records[submitted.id].routing_decision
+    assert routing is not None
+    assert routing["router_selected_mode"] == "direct"
+    assert routing["main_agent_selected_mode"] == "dispatch"
+    assert routing["main_agent_adjusted"] is True
+
+
+@pytest.mark.asyncio
+async def test_auto_router_timeout_uses_local_main_agent_for_generation_work() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    queue = RecordingQueue()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=FailingRouter(),
+        task_queue=queue,
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="请生成一个中秋活动方案",
+        mode=TaskMode.AUTO,
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DISPATCH
+    routing = repository.records[submitted.id].routing_decision
+    assert routing is not None
+    assert routing["reason"] == "main_agent_local_resolution"
+    assert routing["main_agent_selected_mode"] == "dispatch"
+
+
+@pytest.mark.asyncio
+async def test_auto_router_classification_unavailable_uses_local_main_agent() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    queue = RecordingQueue()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=WaitingRouter(waiting_unavailable_decision()),
+        task_queue=queue,
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="给我写一个新年活动策划方案",
+        mode=TaskMode.AUTO,
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DISPATCH
+    assert repository.outbox == [(submitted.id, f"{tenant_id}:{submitted.id}")]
+    routing = repository.records[submitted.id].routing_decision
+    assert routing is not None
+    assert routing["reason"] == "main_agent_local_resolution"
+    assert routing["main_agent_selected_mode"] == "dispatch"
+    assert routing["router_clarification_reason"] == "classification_unavailable"
 
 
 @pytest.mark.asyncio

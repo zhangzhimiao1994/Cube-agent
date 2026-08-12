@@ -33,7 +33,7 @@ _CAPABILITIES: tuple[_CapabilitySpec, ...] = (
         name="Temporary Web Engineer",
         role="Web Engineer",
         prompt="把当前方案落成可交付的网页、前端实现或工程方案，并标注验证步骤。",
-        keywords=("网页", "前端", "落地页", "网站", "html", "css", "react", "vue", "代码", "开发", "web"),
+        keywords=("网页", "前端", "落地页", "网站", "html", "css", "react", "vue", "代码", "开发", "web", "github", "仓库"),
         coverage=("工程", "程序", "代码", "开发", "前端", "后端", "engineer", "developer", "software", "web", "react"),
         skills=("frontend", "software-engineering"),
     ),
@@ -43,7 +43,7 @@ _CAPABILITIES: tuple[_CapabilitySpec, ...] = (
         name="Temporary Ops Engineer",
         role="Ops Engineer",
         prompt="检查部署、服务、权限、回滚和生产运维风险，并给出可执行处理步骤。",
-        keywords=("部署", "服务器", "systemd", "docker", "caddy", "nginx", "运维", "上线", "生产环境"),
+        keywords=("部署", "服务器", "systemd", "docker", "caddy", "nginx", "运维", "上线", "生产环境", "权限"),
         coverage=("运维", "部署", "ops", "devops", "sre", "服务器", "systemd", "docker"),
         skills=("ops",),
     ),
@@ -63,7 +63,7 @@ _CAPABILITIES: tuple[_CapabilitySpec, ...] = (
         name="Temporary Video Editor",
         role="Video Editor",
         prompt="补充剪辑结构、节奏、镜头、字幕、转场和成片交付建议。",
-        keywords=("剪辑", "镜头", "成片", "短视频", "字幕", "转场", "video", "edit"),
+        keywords=("剪辑", "镜头", "成片", "短视频", "字幕", "转场", "视频", "video", "edit"),
         coverage=("剪辑", "视频", "editor", "video", "镜头", "成片"),
         skills=("editing",),
     ),
@@ -73,7 +73,7 @@ _CAPABILITIES: tuple[_CapabilitySpec, ...] = (
         name="Temporary Copywriter",
         role="Copywriter",
         prompt="补充标题、脚本、正文、口播、卖点和不同版本文案。",
-        keywords=("文案", "脚本", "标题", "口播", "广告语", "copy", "script"),
+        keywords=("文案", "脚本", "标题", "口播", "广告语", "提示词", "prompt", "copy", "script"),
         coverage=("文案", "脚本", "copy", "copywriter", "标题", "口播"),
         skills=("copywriting",),
     ),
@@ -120,8 +120,6 @@ class AdminResourceTemporaryAgentPolicy:
         del actor_id
         if mode not in {TaskMode.DISPATCH, TaskMode.HYBRID}:
             return None
-        if not allow_workflow_adjustment:
-            return None
         workflow = await self._payload(tenant_id, "workflow", workflow_id) if workflow_id else None
         settings = await self._payload(tenant_id, "setting", "system")
         global_allows_temporary_agents = (
@@ -130,7 +128,7 @@ class AdminResourceTemporaryAgentPolicy:
             and settings.get("allow_temporary_agents") is True
         )
         legacy_workflow_allows_temporary_agents = (
-            settings is None
+            allow_workflow_adjustment
             and workflow is not None
             and workflow.get("allow_temporary_agents") is True
         )

@@ -319,6 +319,49 @@ def test_event_kind_cross_field_invariants() -> None:
         RunEvent(kind=EventKind.MODEL_STARTED, sequence=True, run_id=RUN_ID)
 
 
+def test_direct_runtime_events_allow_safe_observability_fields() -> None:
+    artifact = Artifact(id=uuid4(), type="text", producer="main", content={"text": "ok"})
+    model_event = RunEvent(
+        kind=EventKind.MODEL_STARTED,
+        sequence=1,
+        run_id=RUN_ID,
+        actor="main_agent",
+        message="主 Agent 调用模型 main 处理直连请求。",
+        payload={"logical_model": "main", "task": "hello"},
+    )
+    artifact_event = RunEvent(
+        kind=EventKind.ARTIFACT_CREATED,
+        sequence=2,
+        run_id=RUN_ID,
+        actor="main_agent",
+        message="模型已返回直连回答。",
+        payload={"logical_model": "main", "output": "ok"},
+        artifact=artifact,
+    )
+    completed_event = RunEvent(
+        kind=EventKind.RUNTIME_COMPLETED,
+        sequence=3,
+        run_id=RUN_ID,
+        actor="main_agent",
+        message="本次直连对话已完成。",
+        payload={"summary": "ok"},
+        inputs=(artifact,),
+    )
+
+    assert model_event.payload["logical_model"] == "main"
+    assert artifact_event.artifact == artifact
+    assert completed_event.inputs == (artifact,)
+    with pytest.raises(ValidationError, match="unrelated"):
+        RunEvent(
+            kind=EventKind.MODEL_STARTED,
+            sequence=4,
+            run_id=RUN_ID,
+            actor="main_agent",
+            tool_name="http_read",
+            payload={"logical_model": "main"},
+        )
+
+
 def test_event_and_context_serializers_thaw_recursive_json() -> None:
     artifact = Artifact(
         id=uuid4(),

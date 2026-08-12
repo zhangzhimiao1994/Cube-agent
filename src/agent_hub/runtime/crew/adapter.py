@@ -36,6 +36,7 @@ from agent_hub.models.types import (
     ModelResponse,
     TokenUsage,
     ToolCall,
+    ToolDefinition,
 )
 from agent_hub.runtime.artifacts import (
     ArtifactReference,
@@ -62,6 +63,7 @@ _RUNTIME_VERSION = "7"
 _MAX_CHECKPOINT_ARTIFACTS = 16_384
 _MAX_PROMPT_BYTES = 196_608
 _MAX_SOURCE_ARTIFACT_TEXT_BYTES = 8_192
+_MAX_FINAL_SOURCE_ARTIFACT_TEXT_BYTES = 2_048
 _MAX_OUTPUT_BYTES = 65_536
 _MAX_TOOL_ROUNDS = 8
 _MAX_TOOL_CALLS_PER_RESPONSE = 16
@@ -211,6 +213,75 @@ def _mutable_json(value: object) -> object:
     return value
 
 
+def _model_tool_name(internal_name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", internal_name).strip("_")
+    if not safe:
+        _fail("capability tool name is invalid")
+    if safe[0].isdigit():
+        safe = f"tool_{safe}"
+    return safe[:64]
+
+
+def _tool_name_mapping(internal_names: tuple[str, ...]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    reverse: dict[str, str] = {}
+    for internal_name in internal_names:
+        external_name = _model_tool_name(internal_name)
+        if external_name in reverse and reverse[external_name] != internal_name:
+            suffix = hashlib.sha256(internal_name.encode("utf-8")).hexdigest()[:8]
+            external_name = f"{external_name[:55]}_{suffix}"
+        mapping[external_name] = internal_name
+        reverse[external_name] = internal_name
+    return mapping
+
+
+def _tool_definitions(internal_names: tuple[str, ...]) -> tuple[ToolDefinition, ...]:
+    mapping = _tool_name_mapping(internal_names)
+    return tuple(
+        ToolDefinition(
+            name=external_name,
+            description=f"Approved Agent Hub capability: {internal_name}",
+            parameters={"type": "object", "additionalProperties": True},
+        )
+        for external_name, internal_name in sorted(mapping.items())
+    )
+
+
+def _map_completion_tool_names(
+    completion: GatewayCompletion,
+    external_to_internal: Mapping[str, str],
+) -> GatewayCompletion:
+    if not external_to_internal or not completion.response.tool_calls:
+        return completion
+    mapped_calls: list[ToolCall] = []
+    changed = False
+    for tool_call in completion.response.tool_calls:
+        mapped_name = external_to_internal.get(tool_call.name, tool_call.name)
+        changed = changed or mapped_name != tool_call.name
+        mapped_calls.append(
+            ToolCall(
+                id=tool_call.id,
+                name=mapped_name,
+                arguments=tool_call.arguments,
+            )
+        )
+    if not changed:
+        return completion
+    return GatewayCompletion(
+        response=ModelResponse(
+            text=completion.response.text,
+            tool_calls=tuple(mapped_calls),
+            usage=completion.response.usage,
+            provider_metadata=completion.response.provider_metadata,
+        ),
+        deployment_id=completion.deployment_id,
+        logical_model=completion.logical_model,
+        provider_id=completion.provider_id,
+        provider_model=completion.provider_model,
+        cost_usd=completion.cost_usd,
+    )
+
+
 def _truncate_prompt_text(value: str, *, max_bytes: int) -> str:
     encoded = value.encode("utf-8")
     if len(encoded) <= max_bytes:
@@ -248,6 +319,39 @@ def _artifact_prompt_payload(
         artifact.content, max_text_bytes=max_text_bytes
     )
     return payload
+
+
+def _artifact_final_synthesis_payload(artifact: Artifact) -> dict[str, object]:
+    payload = artifact.to_payload()
+    content = artifact.content
+    text = content.get("text")
+    if type(text) is str:
+        payload["content"] = {
+            "text": _truncate_prompt_text(
+                text,
+                max_bytes=_MAX_FINAL_SOURCE_ARTIFACT_TEXT_BYTES,
+            )
+        }
+    else:
+        payload["content"] = _bounded_prompt_json(
+            content,
+            max_text_bytes=_MAX_FINAL_SOURCE_ARTIFACT_TEXT_BYTES,
+        )
+    payload["synthesis_input"] = {
+        "mode": "summary",
+        "note": "Full artifact is stored separately; this final synthesis input is bounded to keep production model calls reliable.",
+    }
+    return payload
+
+
+def _artifact_text_preview(artifact: Artifact, *, max_bytes: int = 2_000) -> str | None:
+    text = artifact.content.get("text")
+    if type(text) is not str:
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+    return _truncate_prompt_text(stripped, max_bytes=max_bytes)
 
 
 class RuntimeExecutionError(RuntimeError):
@@ -1475,7 +1579,13 @@ class CrewDispatchRuntime:
                 step_id=step.id,
                 actor=step.agent,
                 inputs=attempt_sources,
-                payload={"attempt": retries + 1},
+                payload={
+                    "attempt": retries + 1,
+                    "task": step.task,
+                    "role": agent.role,
+                    "logical_model": agent.logical_model,
+                    "tools": tuple(step.tools),
+                },
             )
             try:
                 completion, evidence = await self._complete_agent(
@@ -1501,66 +1611,123 @@ class CrewDispatchRuntime:
                     self._ordered_artifacts((*attempt_sources, *evidence)),
                     version=retries + 1,
                 )
-                await event(kind=EventKind.ARTIFACT_CREATED, artifact=artifact)
+                await event(
+                    kind=EventKind.ARTIFACT_CREATED,
+                    artifact=artifact,
+                    actor=step.agent,
+                    message=f"{agent.role} 已产出结果。",
+                    payload={
+                        "role": agent.role,
+                        "task": step.task,
+                        "logical_model": agent.logical_model,
+                        "artifact_id": str(artifact.id),
+                        "output": _artifact_text_preview(artifact) or "角色已完成本步骤输出。",
+                    },
+                )
                 if step.reviewer is not None:
-                    verdict, feedback, review_evidence = await self._review(
-                        context,
-                        step,
-                        agents[step.reviewer],
-                        artifact,
-                        event,
-                        checkpoint_boundary,
-                        model_state_boundary,
-                        usage_boundary,
-                        model_ledger,
-                        retries,
-                        run_state,
-                        step_deadline,
-                    )
-                    await event(
-                        kind=EventKind.REVIEW_COMPLETED,
-                        actor=step.reviewer,
-                        inputs=(artifact,),
-                        payload={"verdict": verdict},
-                    )
-                    await checkpoint_boundary(step.id, retries)
-                    if verdict == "reject":
-                        _fail("dispatch review rejected a step")
-                    if verdict == "revise":
-                        if retries >= step.reviewer_retries:
-                            _fail("dispatch review retry budget exhausted")
-                        if feedback is None:
-                            _fail("dispatch review feedback is unavailable")
-                        feedback_artifact = Artifact(
-                            id=uuid4(),
-                            type="review_feedback",
-                            producer=step.reviewer,
-                            content={"feedback": feedback},
-                            source_ids=tuple(
-                                str(item.id)
-                                for item in self._ordered_artifacts((artifact, *review_evidence))
-                            ),
+                    reviewer = agents[step.reviewer]
+                    try:
+                        verdict, feedback, review_evidence = await self._review(
+                            context,
+                            step,
+                            reviewer,
+                            artifact,
+                            event,
+                            checkpoint_boundary,
+                            model_state_boundary,
+                            usage_boundary,
+                            model_ledger,
+                            retries,
+                            run_state,
+                            step_deadline,
+                        )
+                    except RuntimeExecutionError as error:
+                        review_failure = safe_runtime_failure_reason(
+                            error, fallback="reviewer model failed"
                         )
                         await event(
-                            kind=EventKind.ARTIFACT_CREATED,
-                            artifact=feedback_artifact,
+                            kind=EventKind.REVIEW_COMPLETED,
+                            actor=step.reviewer,
+                            inputs=(artifact,),
+                            payload={
+                                "verdict": "skipped",
+                                "warning": review_failure,
+                                "role": reviewer.role,
+                                "logical_model": reviewer.logical_model,
+                                "candidate_artifact_id": str(artifact.id),
+                                "candidate_output": _artifact_text_preview(artifact)
+                                or "角色已完成本步骤输出。",
+                            },
                         )
-                        retries += 1
-                        await checkpoint_boundary(step.id, retries, feedback_artifact)
+                        await checkpoint_boundary(step.id, retries)
+                    else:
                         await event(
-                            kind=EventKind.STEP_RETRYING,
-                            step_id=step.id,
-                            actor=step.agent,
-                            reason="review requested revision",
-                            payload={"attempt": retries + 1},
+                            kind=EventKind.REVIEW_COMPLETED,
+                            actor=step.reviewer,
+                            inputs=(artifact,),
+                            payload={
+                                "verdict": verdict,
+                                "role": reviewer.role,
+                                "logical_model": reviewer.logical_model,
+                                "candidate_artifact_id": str(artifact.id),
+                                **({"feedback": feedback} if feedback is not None else {}),
+                            },
                         )
-                        continue
+                        await checkpoint_boundary(step.id, retries)
+                        if verdict == "reject":
+                            _fail("dispatch review rejected a step")
+                        if verdict == "revise":
+                            if retries >= step.reviewer_retries:
+                                _fail("dispatch review retry budget exhausted")
+                            if feedback is None:
+                                _fail("dispatch review feedback is unavailable")
+                            feedback_artifact = Artifact(
+                                id=uuid4(),
+                                type="review_feedback",
+                                producer=step.reviewer,
+                                content={"feedback": feedback},
+                                source_ids=tuple(
+                                    str(item.id)
+                                    for item in self._ordered_artifacts(
+                                        (artifact, *review_evidence)
+                                    )
+                                ),
+                            )
+                            await event(
+                                kind=EventKind.ARTIFACT_CREATED,
+                                artifact=feedback_artifact,
+                                actor=step.reviewer,
+                                message=f"{reviewer.role} 要求修订。",
+                                payload={
+                                    "role": reviewer.role,
+                                    "logical_model": reviewer.logical_model,
+                                    "feedback": feedback,
+                                    "artifact_id": str(feedback_artifact.id),
+                                },
+                            )
+                            retries += 1
+                            await checkpoint_boundary(step.id, retries, feedback_artifact)
+                            await event(
+                                kind=EventKind.STEP_RETRYING,
+                                step_id=step.id,
+                                actor=step.agent,
+                                reason="review requested revision",
+                                payload={"attempt": retries + 1, "feedback": feedback},
+                            )
+                            continue
                 await event(
                     kind=EventKind.STEP_COMPLETED,
                     step_id=step.id,
                     actor=step.agent,
                     inputs=(artifact,),
-                    payload={"attempts": retries + 1},
+                    payload={
+                        "attempts": retries + 1,
+                        "task": step.task,
+                        "role": agent.role,
+                        "logical_model": agent.logical_model,
+                        "artifact_id": str(artifact.id),
+                        "output": _artifact_text_preview(artifact) or "step completed",
+                    },
                 )
                 return _StepResult(step=step, artifact=artifact, retries=retries)
             except asyncio.CancelledError:
@@ -1604,7 +1771,14 @@ class CrewDispatchRuntime:
         run_state: _RunState,
         step_deadline: float,
     ) -> tuple[GatewayCompletion, tuple[Artifact, ...]]:
-        source_payload = [_artifact_prompt_payload(artifact) for artifact in sources]
+        source_payload = [
+            (
+                _artifact_final_synthesis_payload(artifact)
+                if step.final_synthesizer
+                else _artifact_prompt_payload(artifact)
+            )
+            for artifact in sources
+        ]
         user = {
             "request": context.request,
             "task": step.task,
@@ -1731,14 +1905,33 @@ class CrewDispatchRuntime:
         step_deadline: float,
     ) -> GatewayCompletion:
         messages = list(self._normalize_crewai_messages(crew_messages))
+        tool_mapping = _tool_name_mapping(step.tools)
+        request_tools = _tool_definitions(step.tools)
+        required_capabilities = frozenset(
+            {ModelCapability.TEXT, ModelCapability.TOOL_CALLING}
+            if request_tools
+            else {ModelCapability.TEXT}
+        )
         for _round in range(_MAX_TOOL_ROUNDS + 1):
-            await emit(kind=EventKind.MODEL_STARTED)
+            await emit(
+                kind=EventKind.MODEL_STARTED,
+                actor=agent.id,
+                message=f"{agent.role} 调用模型 {agent.logical_model}。",
+                payload={
+                    "role": agent.role,
+                    "logical_model": agent.logical_model,
+                    "task": step.task,
+                    "attempt": retries + 1,
+                    "tools": tuple(step.tools),
+                },
+            )
             request = ModelRequest(
                 logical_model=agent.logical_model,
                 messages=tuple(messages),
-                required_capabilities=frozenset({ModelCapability.TEXT}),
+                required_capabilities=required_capabilities,
                 timeout_seconds=self._remaining_timeout(run_state, step_deadline),
                 max_output_tokens=min(agent.max_output_tokens, step.token_budget),
+                tools=request_tools,
             )
             call_index = call_cursor.value
             call_cursor.value += 1
@@ -1793,6 +1986,7 @@ class CrewDispatchRuntime:
                 try:
                     async with asyncio.timeout(self._remaining_timeout(run_state, step_deadline)):
                         completion = await self._gateway.complete_with_context(request)
+                    completion = _map_completion_tool_names(completion, tool_mapping)
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:  # noqa: BLE001 - normalize the model gateway boundary
@@ -1804,7 +1998,6 @@ class CrewDispatchRuntime:
                     error.__cause__ = None
                     del error
                     _fail(failure_reason)
-                response = self._valid_response(completion)
                 model_artifact = self._model_artifact(
                     completion,
                     agent.id,
@@ -1834,6 +2027,7 @@ class CrewDispatchRuntime:
                     run_state,
                 )
                 evidence.append(model_artifact)
+                response = self._valid_response(completion)
             assert response is not None
             if not response.tool_calls:
                 return completion
@@ -2247,7 +2441,17 @@ class CrewDispatchRuntime:
         class ReviewBridge:
             async def complete(self, crew_messages: object) -> str:
                 nonlocal completion
-                await emit(kind=EventKind.MODEL_STARTED)
+                await emit(
+                    kind=EventKind.MODEL_STARTED,
+                    actor=reviewer.id,
+                    message=f"{reviewer.role} 调用模型 {reviewer.logical_model} 审查结果。",
+                    payload={
+                        "role": reviewer.role,
+                        "logical_model": reviewer.logical_model,
+                        "task": step.task,
+                        "candidate_artifact_id": str(artifact.id),
+                    },
+                )
                 request = ModelRequest(
                     logical_model=reviewer.logical_model,
                     messages=runtime._normalize_crewai_messages(crew_messages),
@@ -2305,7 +2509,6 @@ class CrewDispatchRuntime:
                         runtime._remaining_timeout(run_state, step_deadline)
                     ):
                         completion = await runtime._gateway.complete_with_context(request)
-                    runtime._valid_response(completion)
                     model_artifact = runtime._model_artifact(
                         completion,
                         reviewer.id,
@@ -2335,9 +2538,14 @@ class CrewDispatchRuntime:
                         run_state,
                     )
                     evidence.append(model_artifact)
+                    runtime._valid_response(completion)
                 response = runtime._valid_response(completion)
-                if response.text is None or response.tool_calls:
-                    _fail("review response is invalid")
+                if response.text is None and response.tool_calls:
+                    _fail("reviewer returned tool calls instead of JSON")
+                if response.text is None:
+                    _fail("reviewer returned empty response")
+                if response.tool_calls:
+                    _fail("reviewer returned tool calls instead of JSON")
                 return response.text
 
         prompt = (
@@ -2354,41 +2562,43 @@ class CrewDispatchRuntime:
             )
         if completion is None:
             _fail("CrewAI bypassed the ModelGateway bridge")
-        if text is None or len(text.encode("utf-8")) > 16_384:
-            _fail("review response is invalid")
+        if text is None:
+            _fail("reviewer returned empty response")
+        if len(text.encode("utf-8")) > 16_384:
+            _fail("review response exceeds output limit")
         try:
             value = json.loads(text)
         except (TypeError, ValueError):
-            _fail("review response is invalid")
+            _fail("reviewer returned non-json response")
         if type(value) is not dict or not set(value) <= {"verdict", "feedback"}:
-            _fail("review response is invalid")
+            _fail("reviewer returned unsupported JSON schema")
         verdict = value.get("verdict")
         feedback = value.get("feedback")
         if verdict not in {"approve", "revise", "reject"}:
-            _fail("review response is invalid")
+            _fail("reviewer returned unsupported verdict")
         if feedback is not None and (
             type(feedback) is not str
             or not feedback.strip()
             or len(feedback.encode("utf-8")) > 8192
         ):
-            _fail("review response is invalid")
+            _fail("reviewer returned invalid feedback")
         return cast(str, verdict), feedback, tuple(evidence)
 
     @staticmethod
     def _valid_response(completion: GatewayCompletion) -> ModelResponse:
         if not isinstance(completion, GatewayCompletion):
-            _fail("model response is invalid")
+            _fail("model gateway returned invalid completion")
         response = completion.response
         if not isinstance(response, ModelResponse):
-            _fail("model response is invalid")
+            _fail("model gateway returned invalid response object")
         if len(response.tool_calls) > _MAX_TOOL_CALLS_PER_RESPONSE:
             _fail("model response exceeds tool call limit")
-        if response.text is not None and (
-            not response.text.strip() or len(response.text.encode("utf-8")) > _MAX_OUTPUT_BYTES
-        ):
-            _fail("model response is invalid")
+        if response.text is not None and not response.text.strip() and not response.tool_calls:
+            _fail("model response text is empty")
+        if response.text is not None and len(response.text.encode("utf-8")) > _MAX_OUTPUT_BYTES:
+            _fail("model response exceeds output limit")
         if response.text is None and not response.tool_calls:
-            _fail("model response is invalid")
+            _fail("model response is empty")
         return response
 
     async def _run_commit(

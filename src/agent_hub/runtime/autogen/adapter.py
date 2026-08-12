@@ -12,7 +12,7 @@ import json
 import math
 import re
 import unicodedata
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Literal, Protocol, cast
@@ -81,6 +81,8 @@ _MAX_TOOL_CALLS_PER_RESPONSE = 16
 _MAX_TOOL_PAYLOAD_BYTES = 65_536
 _MAX_SOURCE_ARTIFACT_TEXT_BYTES = 4_096
 _ARTIFACT_CLEANUP_GRACE_SECONDS = 0.5
+_AUTOGEN_STREAM_POLL_SECONDS = 1.0
+_AUTOGEN_SHUTDOWN_GRACE_SECONDS = 2.0
 
 
 def _truncate_prompt_text(value: str, *, max_bytes: int) -> str:
@@ -122,6 +124,16 @@ def _artifact_prompt_content(artifact: Artifact) -> object:
     return _bounded_prompt_json(
         artifact.content, max_text_bytes=_MAX_SOURCE_ARTIFACT_TEXT_BYTES
     )
+
+
+def _artifact_text_preview(artifact: Artifact, *, max_bytes: int = 2_000) -> str | None:
+    text = artifact.content.get("text")
+    if type(text) is not str:
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+    return _truncate_prompt_text(stripped, max_bytes=max_bytes)
 
 
 class RuntimeExecutionError(RuntimeError):
@@ -1114,6 +1126,10 @@ class AutoGenDiscussionRuntime:
                 )
                 for participant in self._plan.participants
             }
+            participant_models = {
+                participant.id: participant.logical_model
+                for participant in self._plan.participants
+            }
             selector = GatewayChatCompletionClient(
                 self._gateway,
                 self._plan.selector_model,
@@ -1179,11 +1195,47 @@ class AutoGenDiscussionRuntime:
             wall_handle = asyncio.get_running_loop().call_later(wall_seconds, expire_wall_time)
             framework_runtime.start()
             framework_failed = False
+            framework_timed_out = False
             try:
-                async for item in team.run_stream(
+                stream = team.run_stream(
                     task=self._task_text(context, tuple(message_artifacts)),
                     cancellation_token=self._cancel_token,
-                ):
+                )
+                deadline = asyncio.get_running_loop().time() + wall_seconds
+                while True:
+                    item_task: asyncio.Task[Any] = asyncio.create_task(anext(stream))
+                    while not item_task.done():
+                        remaining = deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            framework_timed_out = True
+                            expire_wall_time()
+                            item_task.cancel()
+                            done, pending = await asyncio.wait(
+                                (item_task,),
+                                timeout=_AUTOGEN_SHUTDOWN_GRACE_SECONDS,
+                            )
+                            if pending:
+                                self._cleanup_tasks.add(item_task)
+                                item_task.add_done_callback(self._finish_cleanup_task)
+                            else:
+                                for done_task in done:
+                                    try:
+                                        done_task.result()
+                                    except BaseException as error:  # noqa: BLE001 - timeout identity wins
+                                        error.__traceback__ = None
+                                        del error
+                            break
+                        await asyncio.wait(
+                            (item_task,),
+                            timeout=min(_AUTOGEN_STREAM_POLL_SECONDS, remaining),
+                        )
+                    if framework_timed_out:
+                        reason = "wall_time"
+                        break
+                    try:
+                        item = item_task.result()
+                    except StopAsyncIteration:
+                        break
                     while tool_records:
                         record = tool_records.pop(0)
                         yield RunEvent(
@@ -1232,6 +1284,10 @@ class AutoGenDiscussionRuntime:
                             session_id=str(context.run_id),
                             message=text,
                             inputs=context.artifacts,
+                            payload={
+                                "logical_model": participant_models.get(item.source, ""),
+                                "role_message": _truncate_prompt_text(text, max_bytes=2_000),
+                            },
                         )
                         sequence += 1
                         yield RunEvent(
@@ -1255,29 +1311,40 @@ class AutoGenDiscussionRuntime:
                 raise
             finally:
                 cleanup_failed = False
-                try:
-                    await team.reset()
-                except BaseException as error:  # noqa: BLE001 - preserve primary identity
-                    error.__traceback__ = None
-                    del error
+                if not await self._await_autogen_cleanup(team.reset()):
                     cleanup_failed = True
-                try:
-                    await framework_runtime.stop_when_idle()
-                except BaseException as error:  # noqa: BLE001 - preserve primary identity
-                    error.__traceback__ = None
-                    del error
+                if not await self._await_autogen_cleanup(framework_runtime.stop_when_idle()):
                     cleanup_failed = True
-                try:
-                    await framework_runtime.close()
-                except BaseException as error:  # noqa: BLE001 - preserve primary identity
-                    error.__traceback__ = None
-                    del error
+                if not await self._await_autogen_cleanup(framework_runtime.close()):
                     cleanup_failed = True
-                if cleanup_failed and not framework_failed:
+                if cleanup_failed and not framework_failed and not framework_timed_out:
                     raise RuntimeExecutionError("AutoGen runtime cleanup failed") from None
             if wall_expired.is_set():
                 reason = "wall_time"
             reason = reason or termination.reason or "max_turns"
+            last_discussion = next(
+                (
+                    preview
+                    for preview in (
+                        _artifact_text_preview(artifact)
+                        for artifact in reversed(message_artifacts)
+                    )
+                    if preview
+                ),
+                "讨论结束，但没有可公开的阶段摘要。",
+            )
+            yield RunEvent(
+                kind="discussion.completed",
+                sequence=sequence,
+                run_id=context.run_id,
+                payload={
+                    "participants": tuple(participant.id for participant in self._plan.participants),
+                    "participant_models": participant_models,
+                    "summary": last_discussion,
+                    "reason": reason,
+                },
+            )
+            sequence += 1
             checkpoint = self._checkpoint(
                 context,
                 next_sequence=sequence + 1,
@@ -1567,6 +1634,32 @@ class AutoGenDiscussionRuntime:
         except BaseException as error:  # noqa: BLE001 - detached task is consumed
             error.__traceback__ = None
             del error
+
+    async def _await_autogen_cleanup(self, awaitable: Coroutine[Any, Any, Any]) -> bool:
+        task = asyncio.create_task(awaitable)
+        done, pending = await asyncio.wait(
+            (task,),
+            timeout=_AUTOGEN_SHUTDOWN_GRACE_SECONDS,
+        )
+        if pending:
+            task.cancel()
+            done_after_cancel, pending_after_cancel = await asyncio.wait(
+                (task,),
+                timeout=_AUTOGEN_SHUTDOWN_GRACE_SECONDS,
+            )
+            if pending_after_cancel:
+                self._cleanup_tasks.add(task)
+                task.add_done_callback(self._finish_cleanup_task)
+                return False
+            done = done_after_cancel
+        for done_task in done:
+            try:
+                done_task.result()
+            except BaseException as error:  # noqa: BLE001 - cleanup failure is reported safely
+                error.__traceback__ = None
+                del error
+                return False
+        return True
 
     def _checkpoint(
         self,

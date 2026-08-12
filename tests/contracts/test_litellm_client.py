@@ -18,6 +18,7 @@ from agent_hub.models.types import (
     ModelRequest,
     ModelResponse,
     StructuredResponseSchema,
+    ToolDefinition,
     ToolCall,
 )
 
@@ -226,6 +227,60 @@ async def test_sends_current_json_schema_response_format() -> None:
             "strict": True,
         },
     }
+
+
+async def test_sends_openai_compatible_tool_definitions_when_requested() -> None:
+    transport, _, create, _ = mock_transport()
+    tool = ToolDefinition(
+        name="lookup",
+        description="Look up approved internal context.",
+        parameters={
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ("query",),
+            "additionalProperties": False,
+        },
+    )
+
+    await transport.complete(
+        deployment(capabilities={ModelCapability.TEXT, ModelCapability.TOOL_CALLING}),
+        request(tools=[tool], required_capabilities={ModelCapability.TOOL_CALLING}),
+        API_KEY,
+    )
+
+    assert create.await_args is not None
+    assert create.await_args.kwargs["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Look up approved internal context.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+    assert create.await_args.kwargs["tool_choice"] == "auto"
+
+
+def test_tool_definitions_require_safe_schema_and_tool_capability() -> None:
+    with pytest.raises(ValueError, match="tool name"):
+        ToolDefinition(name="bad.tool", description="bad", parameters={})
+    with pytest.raises(ValueError, match="tool_calling capability"):
+        request(
+            tools=[
+                ToolDefinition(
+                    name="lookup",
+                    description="Look up approved internal context.",
+                    parameters={"type": "object", "properties": {}},
+                )
+            ],
+            required_capabilities={ModelCapability.TEXT},
+        )
 
 
 def test_structured_schema_requires_capability_and_safe_name() -> None:

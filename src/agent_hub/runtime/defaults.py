@@ -30,6 +30,7 @@ from agent_hub.runtime.autogen.adapter import (
 from agent_hub.runtime.contracts import (
     EventKind,
     ExecutionRuntime,
+    JsonValue,
     RunEvent,
     RuntimeCheckpoint,
     TaskContext,
@@ -51,6 +52,21 @@ from agent_hub.security.secrets import SecretService
 
 class SecretResolver(Protocol):
     async def resolve(self, secret_ref: str) -> str: ...
+
+
+class RuntimeCapabilityGatewayProtocol(Protocol):
+    async def execute(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]: ...
+
+    def is_replay_safe(self, name: str) -> bool: ...
 
 
 CapacityFactory = Callable[
@@ -191,12 +207,14 @@ class ConfigBackedDispatchRuntime:
         capacity_factory: CapacityFactory,
         transport: ModelTransport | None = None,
         role_planner: RolePlanner | None = None,
+        capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
     ) -> None:
         self._config_service = config_service
         self._secret_service = secret_service
         self._capacity_factory = capacity_factory
         self._transport = transport or LiteLLMClient()
         self._role_planner = role_planner or RolePlanner()
+        self._capability_gateway = capability_gateway
         self._pending_checkpoints: dict[UUID, RuntimeCheckpoint] = {}
         self._active: dict[UUID, ExecutionRuntime] = {}
 
@@ -265,7 +283,9 @@ class ConfigBackedDispatchRuntime:
                 roles,
                 context,
                 max_parallelism=_dispatch_parallelism(config, logical_model),
-            )
+                capability_gateway=self._capability_gateway,
+            ),
+            capability_gateway=self._capability_gateway,
         )
 
 
@@ -282,12 +302,14 @@ class ConfigBackedDiscussionRuntime:
         capacity_factory: CapacityFactory,
         transport: ModelTransport | None = None,
         role_planner: RolePlanner | None = None,
+        capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
     ) -> None:
         self._config_service = config_service
         self._secret_service = secret_service
         self._capacity_factory = capacity_factory
         self._transport = transport or LiteLLMClient()
         self._role_planner = role_planner or RolePlanner()
+        self._capability_gateway = capability_gateway
         self._pending_checkpoints: dict[UUID, RuntimeCheckpoint] = {}
         self._active: dict[UUID, ExecutionRuntime] = {}
 
@@ -350,7 +372,16 @@ class ConfigBackedDiscussionRuntime:
             default_model=logical_model,
             task=context.request,
         )
-        return AutoGenDiscussionRuntime(gateway, _discussion_plan(roles, logical_model))
+        return AutoGenDiscussionRuntime(
+            gateway,
+            _discussion_plan(
+                roles,
+                logical_model,
+                context,
+                capability_gateway=self._capability_gateway,
+            ),
+            capability_gateway=self._capability_gateway,
+        )
 
 
 class ConfigBackedHybridRuntime:
@@ -366,12 +397,14 @@ class ConfigBackedHybridRuntime:
         capacity_factory: CapacityFactory,
         transport: ModelTransport | None = None,
         role_planner: RolePlanner | None = None,
+        capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
     ) -> None:
         self._config_service = config_service
         self._secret_service = secret_service
         self._capacity_factory = capacity_factory
         self._transport = transport or LiteLLMClient()
         self._role_planner = role_planner or RolePlanner()
+        self._capability_gateway = capability_gateway
         self._pending_checkpoints: dict[UUID, RuntimeCheckpoint] = {}
         self._active: dict[UUID, ExecutionRuntime] = {}
 
@@ -480,9 +513,20 @@ class ConfigBackedHybridRuntime:
                     dispatch_roles,
                     context,
                     max_parallelism=_dispatch_parallelism(config, logical_model),
+                    capability_gateway=self._capability_gateway,
                 ),
+                capability_gateway=self._capability_gateway,
             ),
-            AutoGenDiscussionRuntime(gateway, _discussion_plan(discussion_roles, logical_model)),
+            AutoGenDiscussionRuntime(
+                gateway,
+                _discussion_plan(
+                    discussion_roles,
+                    logical_model,
+                    context,
+                    capability_gateway=self._capability_gateway,
+                ),
+                capability_gateway=self._capability_gateway,
+            ),
             DirectRuntime(gateway, logical_model=logical_model),
         )
 
@@ -526,6 +570,7 @@ def _dispatch_plan(
     context: TaskContext,
     *,
     max_parallelism: int = 1,
+    capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
 ) -> DispatchPlan:
     selected_roles = tuple(roles)
     if not selected_roles:
@@ -543,13 +588,22 @@ def _dispatch_plan(
                 model="main",
             ),
         )
+    plan_allowed_tools = _plan_allowed_tools(
+        selected_roles,
+        context,
+        capability_gateway=capability_gateway,
+    )
     agents = [
         AgentSpec(
             id=role.id,
             role=role.role,
             goal=role.mission,
             logical_model=role.model,
-            allowed_tools=(),
+            allowed_tools=_role_allowed_tools(
+                role,
+                context,
+                capability_gateway=capability_gateway,
+            ),
         )
         for role in selected_roles
     ]
@@ -585,7 +639,11 @@ def _dispatch_plan(
                 "Return only the role-specific result, evidence, risks, and verification."
             ),
             depends_on=(),
-            tools=(),
+            tools=_role_allowed_tools(
+                role,
+                context,
+                capability_gateway=capability_gateway,
+            ),
             token_budget=role_token_budget,
             timeout_seconds=role_step_timeout,
             cost_budget_usd=Decimal(0),
@@ -610,12 +668,50 @@ def _dispatch_plan(
     return DispatchPlan(
         agents=tuple(agents),
         steps=(*role_steps, final_step),
-        allowed_tools=(),
+        allowed_tools=plan_allowed_tools,
         max_parallelism=max(1, min(max_parallelism, len(role_steps) or 1)),
         total_token_budget=context.token_budget,
         total_timeout_seconds=sum(step.timeout_seconds for step in (*role_steps, final_step)),
         total_cost_usd=Decimal(0),
     )
+
+
+def _role_allowed_tools(
+    role: RoleAssignment,
+    context: TaskContext | None,
+    *,
+    capability_gateway: RuntimeCapabilityGatewayProtocol | None,
+) -> tuple[str, ...]:
+    requested = tuple(dict.fromkeys((*role.allowed_tools, *role.skills)))
+    if not requested or context is None or capability_gateway is None:
+        return ()
+    is_available = getattr(capability_gateway, "is_available", None)
+    filtered: list[str] = []
+    for name in requested:
+        if capability_gateway.is_replay_safe(name):
+            filtered.append(name)
+            continue
+        if callable(is_available) and is_available(context.tenant_id, name):
+            filtered.append(name)
+    return tuple(dict.fromkeys(filtered))
+
+
+def _plan_allowed_tools(
+    roles: tuple[RoleAssignment, ...],
+    context: TaskContext,
+    *,
+    capability_gateway: RuntimeCapabilityGatewayProtocol | None,
+) -> tuple[str, ...]:
+    tools: list[str] = []
+    for role in roles:
+        tools.extend(
+            _role_allowed_tools(
+                role,
+                context,
+                capability_gateway=capability_gateway,
+            )
+        )
+    return tuple(dict.fromkeys(tools))
 
 
 def _selected_config_role_assignments(
@@ -808,6 +904,9 @@ def _requested_skills(context: TaskContext) -> tuple[str, ...]:
 def _discussion_plan(
     roles: tuple[RoleAssignment, ...],
     default_model: str,
+    context: TaskContext | None = None,
+    *,
+    capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
 ) -> DiscussionPlan:
     selected_roles = tuple(roles[:6])
     if len(selected_roles) < 2:
@@ -844,7 +943,11 @@ def _discussion_plan(
             role=role.role,
             goal=role.mission,
             logical_model=role.model,
-            allowed_tools=(),
+            allowed_tools=_role_allowed_tools(
+                role,
+                context,
+                capability_gateway=capability_gateway,
+            ),
             max_output_tokens=1536,
         )
         for role, participant_id in zip(selected_roles, participant_ids, strict=True)
@@ -992,6 +1095,7 @@ def configured_runtime_registry(
     secret_service: SecretService,
     redis_client: object,
     transport: ModelTransport | None = None,
+    capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
 ) -> RuntimeRegistry:
     async def capacity_factory(
         tenant_id: UUID,
@@ -1020,18 +1124,21 @@ def configured_runtime_registry(
                 secret_service=secret_service,
                 capacity_factory=capacity_factory,
                 transport=transport,
+                capability_gateway=capability_gateway,
             ),
             ConfigBackedDiscussionRuntime(
                 config_service=config_service,
                 secret_service=secret_service,
                 capacity_factory=capacity_factory,
                 transport=transport,
+                capability_gateway=capability_gateway,
             ),
             ConfigBackedHybridRuntime(
                 config_service=config_service,
                 secret_service=secret_service,
                 capacity_factory=capacity_factory,
                 transport=transport,
+                capability_gateway=capability_gateway,
             ),
         )
     )

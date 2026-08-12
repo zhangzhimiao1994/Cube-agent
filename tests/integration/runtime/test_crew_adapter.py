@@ -22,6 +22,7 @@ from agent_hub.models.litellm_client import ModelTransportError
 from agent_hub.models.registry import ModelRegistry
 from agent_hub.models.types import (
     Deployment,
+    ModelCapability,
     ModelRequest,
     ModelResponse,
     TokenUsage,
@@ -129,11 +130,12 @@ class FakeGateway:
 class ToolGateway(FakeGateway):
     async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
         self.requests.append(request)
+        tool_name = request.tools[0].name if request.tools else "web.search"
         response = (
             ModelResponse(
                 text=None,
                 tool_calls=(
-                    ToolCall(id="provider-call", name="web.search", arguments={"q": "safe"}),
+                    ToolCall(id="provider-call", name=tool_name, arguments={"q": "safe"}),
                 ),
                 usage=TokenUsage(1, 1, 2),
             )
@@ -503,6 +505,17 @@ async def test_reviewer_feedback_causes_only_bounded_retry() -> None:
     )
     assert events[review_index + 1].kind is EventKind.CHECKPOINT_SAVED
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_invalid_reviewer_response_is_recorded_without_failing_dispatch() -> None:
+    gateway = FakeGateway(reviews=[""])
+    events = await collect(make_runtime(gateway, plan(review=True)), context())
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    review = next(event for event in events if event.kind is EventKind.REVIEW_COMPLETED)
+    assert review.actor == "critic"
+    assert review.payload["verdict"] == "skipped"
+    assert review.payload["warning"] == "model response text is empty"
 
 
 async def test_reviewer_feedback_artifact_survives_crash_resume() -> None:
@@ -1525,11 +1538,16 @@ async def test_tool_calls_only_cross_the_capability_gateway() -> None:
         total_token_budget=100,
     )
     capabilities = FakeCapabilities()
+    gateway = ToolGateway()
     events = await collect(
-        make_runtime(ToolGateway(), tool_plan, capability_gateway=capabilities),
+        make_runtime(gateway, tool_plan, capability_gateway=capabilities),
         context(),
     )
     assert capabilities.calls == [("writer", "web.search")]
+    assert gateway.requests[0].required_capabilities == frozenset(
+        {ModelCapability.TEXT, ModelCapability.TOOL_CALLING}
+    )
+    assert [tool.name for tool in gateway.requests[0].tools] == ["web_search"]
     assert [event.kind for event in events if str(event.kind).startswith("tool.")] == [
         EventKind.TOOL_STARTED,
         EventKind.TOOL_COMPLETED,
