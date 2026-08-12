@@ -86,7 +86,6 @@ class FakeRepository:
         run_id: UUID,
         decision_token: str,
         version: int,
-        model: str,
     ) -> RunRecord:
         record = self.records.get(run_id)
         if record is None or record.tenant_id != tenant_id:
@@ -100,7 +99,7 @@ class FakeRepository:
             raise RunConflict("run version is stale")
         proposal = decision["temporary_agent_proposal"]
         assert isinstance(proposal, dict)
-        proposal = {**proposal, "model": model}
+        proposal = {**proposal, "model": str(proposal["id"])}
         raw_selected = decision.get("selected_agent_ids", [])
         selected = list(raw_selected) if isinstance(raw_selected, list) else []
         selected.append(str(proposal["id"]))
@@ -277,7 +276,7 @@ async def test_auto_mode_resolves_low_risk_router_uncertainty_through_main_agent
 
 
 @pytest.mark.asyncio
-async def test_auto_mode_uses_local_main_agent_fallback_when_router_is_unavailable() -> None:
+async def test_auto_mode_waits_for_user_choice_when_router_is_unavailable() -> None:
     tenant_id = uuid4()
     actor_id = uuid4()
     repository = FakeRepository()
@@ -295,12 +294,14 @@ async def test_auto_mode_uses_local_main_agent_fallback_when_router_is_unavailab
         mode=TaskMode.AUTO,
     )
 
-    assert submitted.status is RunStatus.QUEUED
-    assert submitted.mode is TaskMode.DIRECT
+    assert submitted.status is RunStatus.WAITING_USER_MODE
+    assert submitted.mode is None
+    assert submitted.decision_token is not None
+    assert repository.outbox == []
     routing = repository.records[submitted.id].routing_decision
     assert routing is not None
-    assert routing["reason"] == "main_agent_local_fallback"
-    assert routing["auto_resolution_selected_mode"] == "direct"
+    assert routing["reason"] == "router_unavailable"
+    assert routing["decision_token"] == submitted.decision_token
 
 
 @pytest.mark.asyncio
@@ -369,7 +370,6 @@ async def test_dispatch_requires_user_approval_before_temporary_agent_is_queued(
         run_id=submitted.id,
         decision_token=submitted.decision_token,
         version=submitted.version,
-        model="coder",
     )
 
     assert approved.status is RunStatus.QUEUED
@@ -380,7 +380,9 @@ async def test_dispatch_requires_user_approval_before_temporary_agent_is_queued(
     assert decision is not None
     assert decision["temporary_agent_approved"] is True
     assert decision["selected_agent_ids"] == ["director", "temp-web-engineer"]
-    assert decision["temporary_agents"] == [{**submitted.temporary_agent_proposal, "model": "coder"}]
+    assert decision["temporary_agents"] == [
+        {**submitted.temporary_agent_proposal, "model": "temp-web-engineer"}
+    ]
 
 
 @pytest.mark.asyncio

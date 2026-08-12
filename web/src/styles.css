@@ -940,23 +940,41 @@ article:hover {
   align-self: flex-start;
   color: var(--muted);
   display: grid;
-  gap: 0.45rem;
+  gap: 0.35rem;
   max-width: min(760px, 92%);
 }
 
-.run-process-preview {
-  display: grid;
-  gap: 0.25rem;
-  list-style: none;
-  margin: 0;
-  padding: 0 0 0 1.55rem;
+.agent-cluster-status {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(123, 225, 255, 0.14);
+  border-radius: 999px;
+  display: inline-flex;
+  gap: 0.48rem;
+  padding: 0.35rem 0.72rem;
+  width: fit-content;
 }
 
-.run-process-preview li {
-  color: rgba(178, 194, 216, 0.78);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.agent-cluster-status span {
+  color: var(--accent);
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-weight: 950;
+}
+
+.agent-cluster-status strong {
+  color: var(--text);
+  font-weight: 900;
+}
+
+.agent-cluster-status small {
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.agent-cluster-actions {
+  display: grid;
+  gap: 0.12rem;
+  padding-left: 0.55rem;
 }
 
 .run-process-toggle {
@@ -967,7 +985,8 @@ article:hover {
   display: inline-flex;
   gap: 0.45rem;
   justify-content: flex-start;
-  padding: 0.2rem 0;
+  max-width: min(720px, 100%);
+  padding: 0.24rem 0;
   text-align: left;
 }
 
@@ -979,6 +998,9 @@ article:hover {
 .run-process-toggle strong {
   color: var(--muted);
   font-weight: 850;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .run-process-toggle small {
@@ -1413,11 +1435,7 @@ article:hover {
 }
 
 .inline-guide {
-  background: rgba(3, 10, 20, 0.36);
-  border: 1px solid rgba(123, 225, 255, 0.16);
-  border-radius: 1rem;
-  color: var(--muted);
-  padding: 0.85rem;
+  display: none;
 }
 
 .inline-guide summary {

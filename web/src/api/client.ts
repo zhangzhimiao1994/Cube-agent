@@ -277,6 +277,18 @@ const RunListItemSchema = z.object({
 
 export type RunListItem = z.infer<typeof RunListItemSchema>;
 
+const TemporaryAgentProposalSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  role: z.string(),
+  prompt: z.string(),
+  reason: z.string(),
+  missing_capability: z.string(),
+  model: z.string().optional(),
+  suggested_skills: z.array(z.string()),
+  permanentizable: z.boolean(),
+});
+
 const SubmittedRunSchema = z.object({
   id: z.string(),
   tenant_id: z.string(),
@@ -287,19 +299,7 @@ const SubmittedRunSchema = z.object({
   clarification_reason: z.string().nullable(),
   conversation_id: z.string().nullable().optional(),
   reference_conversation_id: z.string().nullable().optional(),
-  temporary_agent_proposal: z
-    .object({
-      id: z.string(),
-      name: z.string(),
-      role: z.string(),
-      prompt: z.string(),
-      reason: z.string(),
-      missing_capability: z.string(),
-      suggested_skills: z.array(z.string()),
-      permanentizable: z.boolean(),
-    })
-    .nullable()
-    .optional(),
+  temporary_agent_proposal: TemporaryAgentProposalSchema.nullable().optional(),
 });
 
 export type SubmittedRun = z.infer<typeof SubmittedRunSchema>;
@@ -331,6 +331,7 @@ const RunDetailSchema = RunListItemSchema.extend({
   artifacts: z.array(RunArtifactSchema),
   explicit_details: z.record(z.string(), z.string()),
   decision_token: z.string().nullable().optional(),
+  temporary_agent_proposal: TemporaryAgentProposalSchema.nullable().optional(),
 });
 
 const RunDeleteSchema = z.object({
@@ -844,7 +845,7 @@ export const api = {
   },
   approveTemporaryAgent(
     id: string,
-    payload: { decision_token: string; version: number; model: string },
+    payload: { decision_token: string; version: number },
   ): Promise<SubmittedRun> {
     return request(
       `/api/v1/runs/${encodeURIComponent(id)}/approve-temporary-agent`,

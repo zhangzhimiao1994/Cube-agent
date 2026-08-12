@@ -246,6 +246,7 @@ class HybridRuntime:
         artifacts: tuple[Artifact, ...],
         sequence: int,
     ) -> AsyncIterator[RunEvent]:
+        handoff_artifacts = _discussion_handoff_artifacts(artifacts)
         participants = getattr(self._discussion, "participant_ids", ("main", "reviewer"))
         if not isinstance(participants, tuple) or not 2 <= len(participants) <= 8:
             raise RuntimeExecutionError("discussion participants are invalid")
@@ -256,10 +257,10 @@ class HybridRuntime:
             actor=participants[0],
             session_id=str(parent.run_id),
             participants=participants,
-            inputs=artifacts,
+            inputs=handoff_artifacts,
         )
         async for event in self._run_child(
-            self._discussion, parent, TaskMode.DISCUSS, artifacts, sequence + 1
+            self._discussion, parent, TaskMode.DISCUSS, handoff_artifacts, sequence + 1
         ):
             # The composite owns the normalized discussion.started event.
             if event.kind is EventKind.DISCUSSION_STARTED:
@@ -452,6 +453,26 @@ class HybridRuntime:
 
 def _safe_failure_reason(error: Exception, *, fallback: str) -> str:
     return safe_runtime_failure_reason(error, fallback=fallback)
+
+
+def _discussion_handoff_artifacts(artifacts: tuple[Artifact, ...]) -> tuple[Artifact, ...]:
+    """Keep discussion inputs compact and user-readable.
+
+    Dispatch runtimes often emit a raw model_response followed by a text artifact
+    whose source_ids point at that raw model_response. Passing both into the
+    discussion stage doubles prompt size without adding information and can make
+    real provider calls time out. Keep the text wrapper and drop the wrapped raw
+    model_response.
+    """
+
+    wrapped_source_ids = {
+        source_id for artifact in artifacts for source_id in artifact.source_ids
+    }
+    return tuple(
+        artifact
+        for artifact in artifacts
+        if not (artifact.type == "model_response" and str(artifact.id) in wrapped_source_ids)
+    )
 
 
 __all__ = ["HybridPlan", "HybridRuntime", "HybridUpgrade", "RuntimeExecutionError"]

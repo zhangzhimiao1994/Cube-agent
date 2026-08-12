@@ -233,6 +233,7 @@ class RunDetailResponse(RunListItem):
     artifacts: list[RunArtifactResponse]
     explicit_details: dict[str, str]
     decision_token: str | None = None
+    temporary_agent_proposal: dict[str, JsonValue] | None = None
 
 
 class RunDebugArtifactResponse(BaseModel):
@@ -1513,6 +1514,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 **_routing_details(record.routing_decision),
             },
             decision_token=_waiting_mode_decision_token(record),
+            temporary_agent_proposal=_temporary_agent_proposal(record.routing_decision),
         )
 
     async def list_models(self) -> tuple[ModelDeploymentResponse, ...]:
@@ -3430,12 +3432,32 @@ def _routing_details(routing_decision: dict[str, object] | None) -> dict[str, st
 
 
 def _waiting_mode_decision_token(record: RunRecord) -> str | None:
-    if record.status is not RunStatus.WAITING_USER_MODE or not record.routing_decision:
+    if (
+        record.status not in {RunStatus.WAITING_USER_MODE, RunStatus.WAITING_APPROVAL}
+        or not record.routing_decision
+    ):
         return None
     token = record.routing_decision.get("decision_token")
     if isinstance(token, str) and token:
         return token
     return None
+
+
+def _temporary_agent_proposal(
+    routing_decision: dict[str, object] | None,
+) -> dict[str, JsonValue] | None:
+    if not routing_decision:
+        return None
+    proposal = routing_decision.get("temporary_agent_proposal")
+    if not isinstance(proposal, dict):
+        return None
+    safe: dict[str, JsonValue] = {}
+    for key, value in proposal.items():
+        if isinstance(key, str) and isinstance(value, str | int | float | bool):
+            safe[key] = value
+        elif isinstance(key, str) and isinstance(value, list):
+            safe[key] = [item for item in value if isinstance(item, str)]
+    return safe or None
 
 
 @router.get("/models", response_model=list[ModelDeploymentResponse], responses=error_responses(401, 403, 422))

@@ -58,7 +58,8 @@ function displayRoutingReason(reason: string) {
     "workflow selected explicitly": "按你选择的工作流执行",
     routing_requires_user_choice: "自动判断把握不足，需要确认模式",
     main_agent_auto_resolved: "主 Agent 已根据任务现场自动裁决",
-    main_agent_local_fallback: "主 Agent 使用本地安全判断完成路由",
+    router_unavailable: "主 Agent 暂时无法可靠判断，需要你确认运行方式",
+    main_agent_local_fallback: "旧版本回退记录：需要重新提交后由主 Agent 判断",
     hermes_recommendation: "Hermes 根据历史经验推荐",
   };
   return labels[normalized] ?? normalized;
@@ -152,7 +153,7 @@ function displayEventTitle(event: RunDetail["events"][number], agentNames: Map<s
     "runtime.completed": "完成本次对话",
     "runtime.failed": "本次对话中断",
     "message.created": actor ? `${actor} 输出阶段消息` : "输出阶段消息",
-    "artifact.created": actor ? `${actor} 生成了结果` : "生成了结果",
+    "artifact.created": actor ? `${actor} 产出阶段内容` : "产出阶段内容",
     "dispatch.started": "主 Agent 开始拆解并派单",
     "dispatch.completed": "主 Agent 完成派单汇总",
     "discussion.started": "多角色开始讨论",
@@ -162,12 +163,15 @@ function displayEventTitle(event: RunDetail["events"][number], agentNames: Map<s
     "step.started": actor ? `${actor} 开始执行` : "开始执行一个步骤",
     "step.completed": actor ? `${actor} 完成执行` : "完成一个步骤",
     "step.failed": actor ? `${actor} 执行失败` : "一个步骤执行失败",
+    "step.retrying": actor ? `${actor} 重试执行` : "重试一个步骤",
+    "review.completed": actor ? `${actor} 完成审查` : "完成审查",
     "tool.started": event.tool_name ? `开始使用工具：${event.tool_name}` : "开始使用工具",
     "tool.completed": event.tool_name ? `工具执行完成：${event.tool_name}` : "工具执行完成",
     "tool.failed": event.tool_name ? `工具执行失败：${event.tool_name}` : "工具执行失败",
     "approval.requested": "等待你确认后继续",
     "approval.resolved": "确认已处理",
     "temporary_agent.proposed": "主 Agent 建议临时加入子 Agent",
+    "cost.recorded": "记录成本",
   };
   return labels[event.kind] ?? "执行了一步操作";
 }
@@ -195,12 +199,15 @@ function displayEventMessage(event: RunDetail["events"][number]) {
     "step.started": readableMessage ?? "一个执行步骤已开始。",
     "step.completed": readableMessage ?? "一个执行步骤已完成。",
     "step.failed": readableMessage ?? "一个执行步骤失败，已保留失败前的输出。",
+    "step.retrying": readableMessage ?? "步骤执行失败后正在重试。",
+    "review.completed": readableMessage ?? "审查完成，已记录风险、证据或结论。",
     "tool.started": readableMessage ?? "工具调用已开始。",
     "tool.completed": readableMessage ?? "工具调用已完成。",
     "tool.failed": readableMessage ?? "工具调用失败，已记录错误上下文。",
     "approval.requested": "主 Agent 需要你确认后再继续。",
     "approval.resolved": "你的确认已处理，任务会继续推进。",
     "temporary_agent.proposed": "主 Agent 建议临时加入一个子 Agent。",
+    "cost.recorded": readableMessage ?? "已记录本轮模型调用成本。",
   };
   return messages[event.kind] ?? readableMessage ?? "系统记录了一步运行过程。";
 }
@@ -226,17 +233,55 @@ function formatEventPayloadValue(value: unknown): string {
   }
 }
 
+function conciseProcessText(value: string, fallback: string) {
+  const normalized = value
+    .replace(/```[\s\S]*?```/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return fallback;
+  const sentence = normalized.split(/(?<=[。！？.!?])\s+/)[0]?.trim() || normalized;
+  return sentence.length > 42 ? `${sentence.slice(0, 42)}...` : sentence;
+}
+
 function isNoiseEvent(event: RunDetail["events"][number]) {
   return new Set([
     "queued",
     "run.queued",
-    "model.started",
     "runtime.started",
+    "runtime.completed",
+    "checkpoint.saved",
+    "cost.recorded",
   ]).has(event.kind);
+}
+
+function hasUsefulPayload(event: RunDetail["events"][number]) {
+  return Object.values(event.payload).some((value) => {
+    if (value === null || typeof value === "undefined") return false;
+    if (typeof value === "string") return value.trim().length > 0;
+    if (Array.isArray(value)) return value.length > 0;
+    if (typeof value === "object") return Object.keys(value).length > 0;
+    return true;
+  });
+}
+
+function isActionEvent(event: RunDetail["events"][number]) {
+  if (isNoiseEvent(event)) return false;
+  if (event.kind === "artifact.created") {
+    return hasUsefulPayload(event);
+  }
+  if (["step.started", "step.completed"].includes(event.kind)) {
+    return Boolean(event.actor || event.action || event.tool_name || event.decision || hasUsefulPayload(event));
+  }
+  return true;
 }
 
 function eventPayloadLabel(key: string) {
   const labels: Record<string, string> = {
+    instruction: "下发指令",
+    instructions: "下发指令",
+    task: "下发指令",
+    prompt: "提示词/指令",
+    input: "输入内容",
     summary: "执行摘要",
     result: "得到结果",
     output: "输出内容",
@@ -251,8 +296,15 @@ function eventPayloadLabel(key: string) {
     engineer_opinion: "工程师意见",
     critic_opinion: "审查员意见",
     model: "调用模型",
+    logical_model: "逻辑模型",
+    upstream_model: "上游模型",
+    model_used: "调用模型",
+    model_provider: "模型服务商",
+    model_deployment: "模型部署",
     deployment: "模型部署",
     provider: "服务商",
+    role: "角色",
+    agent: "Agent",
   };
   if (labels[key]) return labels[key];
   if (key.endsWith("_opinion")) {
@@ -291,12 +343,17 @@ function eventDetailRows(event: RunDetail["events"][number], agentNames: Map<str
   const rows: Array<{ label: string; value: string }> = [];
   const actor = displayEventActor(event.actor, agentNames);
   const participants = displayEventParticipants(event.participants, agentNames);
+  const readableMessage =
+    event.message && event.message !== event.kind && !/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(event.message)
+      ? event.message
+      : "";
   if (actor) rows.push({ label: "执行者", value: actor });
   if (participants) rows.push({ label: "参与者", value: participants });
   if (event.tool_name) rows.push({ label: "工具", value: event.tool_name });
   if (event.step_id) rows.push({ label: "步骤", value: event.step_id });
   if (event.action) rows.push({ label: "动作", value: event.action });
   if (event.decision) rows.push({ label: "决策", value: event.decision });
+  if (readableMessage) rows.push({ label: "事件内容", value: readableMessage });
   orderedEventPayloadEntries(event.payload).forEach(([key, value]) => {
     const formatted = formatEventPayloadValue(value);
     if (formatted) {
@@ -345,6 +402,33 @@ function modeSelectionFromRunDetail(run: RunDetail | undefined): ModeSelection |
     version: Number.isInteger(parsedVersion) && parsedVersion > 0 ? parsedVersion : 0,
     reason: run.explicit_details.routing_reason ?? null,
   };
+}
+
+function temporaryApprovalFromRunDetail(run: RunDetail | undefined) {
+  if (!run || run.status !== "waiting_approval" || !run.decision_token || !run.temporary_agent_proposal) {
+    return null;
+  }
+  const parsedVersion = Number(run.explicit_details.version ?? "0");
+  return {
+    runId: run.id,
+    decisionToken: run.decision_token,
+    version: Number.isInteger(parsedVersion) && parsedVersion > 0 ? parsedVersion : 0,
+    proposal: run.temporary_agent_proposal,
+    approved: false,
+  };
+}
+
+function temporaryAgentApprovalBody(proposal: TemporaryAgentProposal) {
+  const skills =
+    proposal.suggested_skills.length > 0 ? `\n建议 Skill：${proposal.suggested_skills.join("、")}` : "";
+  return [
+    "主 Agent 判断当前角色池缺少一个临时子 Agent。主 Agent 已生成角色和提示词；模型/API 不需要你选，主 Agent 会按角色能力、任务要求和模型并发情况自动选择模型/API。",
+    `拟加入：${proposal.name}（${proposal.id}）`,
+    `缺少能力：${proposal.missing_capability}`,
+    `加入原因：${proposal.reason}`,
+    `角色边界：${proposal.prompt}${skills}`,
+    "请直接回复：\n1 同意临时加入\n2 不加入，按现有角色继续\n3 你的修改意见\n4 保存为永久 Agent（需先同意并运行过）",
+  ].join("\n\n");
 }
 
 function detailMessages(detail: RunDetail | undefined) {
@@ -398,6 +482,16 @@ function detailMessages(detail: RunDetail | undefined) {
       title: "你",
       body: detail.request,
     },
+    ...(detail.status === "waiting_approval" && detail.temporary_agent_proposal
+      ? [
+          {
+            id: "temporary-agent-approval",
+            role: "assistant",
+            title: detail.temporary_agent_proposal.name,
+            body: temporaryAgentApprovalBody(detail.temporary_agent_proposal),
+          },
+        ]
+      : []),
     ...(internalNotice ? [internalNotice] : []),
     ...artifactMessages,
     ...failureMessages,
@@ -457,10 +551,16 @@ function internalArtifactNotice(detail: RunDetail) {
   };
 }
 
-function processRoutingRows(detail: RunDetail, agentNames: Map<string, string>) {
+function processRoutingRows(
+  detail: RunDetail,
+  agentNames: Map<string, string>,
+  mainAgentModelName?: string,
+) {
   const agentPool = displayAgentPool(detail.explicit_details.selected_agent_ids, agentNames);
   return [
     { label: "运行模式", value: displayMode(detail.mode) },
+    mainAgentModelName && mainAgentModelName !== "未配置" ? { label: "主 Agent 模型", value: mainAgentModelName } : null,
+    detail.explicit_details.direct_model ? { label: "直连模型", value: detail.explicit_details.direct_model } : null,
     detail.explicit_details.workflow_id ? { label: "工作流", value: detail.explicit_details.workflow_id } : null,
     detail.explicit_details.workflow_adjustment_policy
       ? {
@@ -479,20 +579,90 @@ function processRoutingRows(detail: RunDetail, agentNames: Map<string, string>) 
 }
 
 function eventSummaryText(event: RunDetail["events"][number], agentNames: Map<string, string>) {
-  const title = displayEventTitle(event, agentNames).replace(/\s+/g, "");
-  if (event.kind === "runtime.failed") {
-    return title;
-  }
-  const payloadResult =
+  const actor = displayEventActor(event.actor, agentNames);
+  const participants = displayEventParticipants(event.participants, agentNames);
+  const readableMessage =
+    event.message && event.message !== event.kind && !/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(event.message)
+      ? event.message
+      : "";
+  const instructionSignal =
+    formatEventPayloadValue(event.payload.instruction) ||
+    formatEventPayloadValue(event.payload.instructions) ||
+    formatEventPayloadValue(event.payload.task) ||
+    formatEventPayloadValue(event.payload.prompt) ||
+    readableMessage;
+  const outputSignal =
     formatEventPayloadValue(event.payload.result) ||
+    formatEventPayloadValue(event.payload.output) ||
+    formatEventPayloadValue(event.payload.summary);
+  const discussionSignal =
     formatEventPayloadValue(event.payload.conclusion) ||
+    formatEventPayloadValue(event.payload.discussion) ||
+    formatEventPayloadValue(event.payload.opinions) ||
     formatEventPayloadValue(event.payload.summary) ||
+    readableMessage;
+  const decisionSignal =
     formatEventPayloadValue(event.payload.final_decision) ||
     formatEventPayloadValue(event.payload.main_agent_judgement) ||
-    formatEventPayloadValue(event.payload.main_agent_judgment);
-  const message = displayEventMessage(event);
-  const detail = payloadResult || (message !== "系统记录了一步运行过程。" ? message : "");
-  return detail ? `${title}：${detail}` : title;
+    formatEventPayloadValue(event.payload.main_agent_judgment) ||
+    formatEventPayloadValue(event.payload.decision) ||
+    event.decision ||
+    readableMessage;
+  const modelSignal =
+    formatEventPayloadValue(event.payload.model) ||
+    formatEventPayloadValue(event.payload.logical_model) ||
+    formatEventPayloadValue(event.payload.model_used) ||
+    formatEventPayloadValue(event.payload.upstream_model);
+  const subject =
+    event.kind === "discussion.completed"
+      ? participants || "多角色"
+      : event.kind === "dispatch.started" || event.kind === "dispatch.completed" || event.kind.startsWith("decision.")
+        ? "主 Agent"
+        : actor || (event.tool_name ? "工具" : "系统");
+
+  if (event.kind === "model.started") {
+    return `${subject} 调用模型${modelSignal ? `：${conciseProcessText(modelSignal, "模型")}` : ""}`;
+  }
+  if (event.kind === "step.started") {
+    return `${subject} 收到指令：${conciseProcessText(instructionSignal, "开始执行")}`;
+  }
+  if (["step.completed", "artifact.created", "message.created", "review.completed"].includes(event.kind)) {
+    return `${subject} 产出：${conciseProcessText(outputSignal || readableMessage, "完成阶段输出")}`;
+  }
+  if (event.kind === "discussion.started") {
+    return `${participants || "多角色"} 开始讨论`;
+  }
+  if (event.kind === "discussion.completed") {
+    return `讨论结论：${conciseProcessText(discussionSignal, "完成讨论")}`;
+  }
+  if (event.kind === "decision.started") {
+    return `主 Agent 开始决策${instructionSignal ? `：${conciseProcessText(instructionSignal, "开始裁决")}` : ""}`;
+  }
+  if (event.kind === "decision.completed") {
+    return `主 Agent 决策：${conciseProcessText(decisionSignal, "完成裁决")}`;
+  }
+  if (event.kind === "dispatch.started") {
+    return `主 Agent 派单：${conciseProcessText(instructionSignal, "拆解任务并安排角色")}`;
+  }
+  if (event.kind === "dispatch.completed") {
+    return `派单汇总：${conciseProcessText(outputSignal || discussionSignal, "完成派单汇总")}`;
+  }
+  if (event.kind === "tool.started") {
+    return `${subject} 使用工具：${event.tool_name ?? "工具"}`;
+  }
+  if (event.kind === "tool.completed") {
+    return `${subject} 工具结果：${conciseProcessText(outputSignal || readableMessage, event.tool_name ?? "工具完成")}`;
+  }
+  if (event.kind === "tool.failed" || event.kind === "step.failed" || event.kind === "runtime.failed") {
+    return `${subject} 失败：${conciseProcessText(readableMessage || outputSignal, "执行失败")}`;
+  }
+  if (event.kind === "approval.requested") {
+    return `等待确认：${conciseProcessText(instructionSignal, "需要你确认后继续")}`;
+  }
+  if (event.kind === "temporary_agent.proposed") {
+    return `主 Agent 建议临时加入子 Agent：${conciseProcessText(instructionSignal, "补齐缺失能力")}`;
+  }
+  return `${subject} 执行：${conciseProcessText(readableMessage || outputSignal || instructionSignal, "记录了一步过程")}`;
 }
 
 function modelRowsForEvent(
@@ -503,6 +673,10 @@ function modelRowsForEvent(
   const rows: Array<{ label: string; value: string }> = [];
   const eventModel = formatEventPayloadValue(event.payload.model || event.payload.logical_model);
   if (eventModel) rows.push({ label: "调用模型", value: eventModel });
+  const provider = formatEventPayloadValue(event.payload.provider);
+  const deployment = formatEventPayloadValue(event.payload.deployment);
+  if (provider) rows.push({ label: "模型服务商", value: provider });
+  if (deployment) rows.push({ label: "模型部署", value: deployment });
   if (!eventModel && event.actor) {
     const modelEvent = [...events]
       .filter((candidate) => candidate.kind === "model.started" && candidate.actor === event.actor && candidate.sequence <= event.sequence)
@@ -516,59 +690,12 @@ function modelRowsForEvent(
   return rows;
 }
 
-function recommendTemporaryAgentModel(
-  proposal: TemporaryAgentProposal,
-  models: ModelDeployment[],
-) {
-  if (models.length === 0) return null;
-  const text = [
-    proposal.id,
-    proposal.name,
-    proposal.role,
-    proposal.prompt,
-    proposal.reason,
-    proposal.missing_capability,
-    ...(proposal.suggested_skills ?? []),
-  ]
-    .join(" ")
-    .toLowerCase();
-  const scored = models.map((model) => {
-    const haystack = [
-      model.logical_model,
-      model.provider,
-      model.upstream_model,
-      model.api_protocol,
-      ...model.capabilities,
-    ]
-      .join(" ")
-      .toLowerCase();
-    let score = Math.max(0, model.effective_slots);
-    const reasons: string[] = [];
-    if (/software|code|工程|网页|前端|后端|backend|frontend|program/.test(text)) {
-      if (/code|coder|claude|sonnet|qwen|kimi/.test(haystack)) {
-        score += 8;
-        reasons.push(`匹配缺少能力 ${proposal.missing_capability || "software_engineering"}`);
-      }
-    }
-    if (/copy|文案|脚本|提示词|prompt|视频|导演|creative/.test(text)) {
-      if (/chat|text|qwen|kimi|deepseek|claude|sonnet/.test(haystack)) {
-        score += 5;
-        reasons.push("适合生成文案、脚本或提示词");
-      }
-    }
-    if (/analysis|finance|经济|研究|research/.test(text)) {
-      if (/reason|analysis|max|sonnet|qwen|deepseek/.test(haystack)) {
-        score += 4;
-        reasons.push("适合分析和审查");
-      }
-    }
-    return { model, score, reason: reasons[0] ?? "综合模型能力、并发槽位和角色需求预选" };
-  });
-  return scored.sort((left, right) => right.score - left.score || left.model.logical_model.localeCompare(right.model.logical_model))[0];
-}
-
-function runProcessItems(detail: RunDetail, agentNames: Map<string, string>): ProcessDetailTarget[] {
-  const routingRows = processRoutingRows(detail, agentNames);
+function runProcessItems(
+  detail: RunDetail,
+  agentNames: Map<string, string>,
+  mainAgentModelName?: string,
+): ProcessDetailTarget[] {
+  const routingRows = processRoutingRows(detail, agentNames, mainAgentModelName);
   const routingAgentPool = displayAgentPool(detail.explicit_details.selected_agent_ids, agentNames);
   const routingItem =
     routingRows.length > 0
@@ -582,8 +709,9 @@ function runProcessItems(detail: RunDetail, agentNames: Map<string, string>): Pr
           },
         ]
       : [];
+  const seenActionMessages = new Set<string>();
   const eventItems = detail.events
-    .filter((event) => !isNoiseEvent(event))
+    .filter(isActionEvent)
     .map((event, index) => {
       const rows = [...modelRowsForEvent(event, detail.events, agentNames), ...eventDetailRows(event, agentNames)];
       return {
@@ -593,6 +721,13 @@ function runProcessItems(detail: RunDetail, agentNames: Map<string, string>): Pr
         rows,
         createdAt: event.created_at,
       };
+    })
+    .filter((item) => {
+      if (seenActionMessages.has(item.message)) {
+        return false;
+      }
+      seenActionMessages.add(item.message);
+      return true;
     });
   return [...routingItem, ...eventItems];
 }
@@ -601,21 +736,30 @@ function RunProcessSummary({
   detail,
   onOpen,
   agentNames,
+  mainAgentModelName,
 }: {
   detail: RunDetail;
   onOpen: (target: ProcessDetailTarget) => void;
   agentNames: Map<string, string>;
+  mainAgentModelName?: string;
 }) {
-  const items = runProcessItems(detail, agentNames);
+  const items = runProcessItems(detail, agentNames, mainAgentModelName);
   if (items.length === 0) return null;
   return (
-    <section className="run-process-summary" aria-label="折叠的运行过程">
-      {items.map((item) => (
-        <button key={item.id} type="button" className="run-process-toggle" onClick={() => onOpen(item)}>
-          <span aria-hidden="true">‹/›</span>
-          <strong>{item.message}</strong>
-        </button>
-      ))}
+    <section className="run-process-summary" aria-label="Agent 集群动作">
+      <div className="agent-cluster-status" role="status" aria-label={`Agent 集群，${items.length} 个关键动作`}>
+        <span aria-hidden="true">⌘</span>
+        <strong>Agent 集群</strong>
+        <small>{items.length} 个关键动作</small>
+      </div>
+      <div className="agent-cluster-actions">
+        {items.map((item) => (
+          <button key={item.id} type="button" className="run-process-toggle" onClick={() => onOpen(item)}>
+            <span aria-hidden="true">›</span>
+            <strong>{item.message}</strong>
+          </button>
+        ))}
+      </div>
     </section>
   );
 }
@@ -651,8 +795,8 @@ function RunProcessDrawer({
             <p>{target.message}</p>
             {target.rows.length > 0 ? (
               <dl>
-                {target.rows.map((row) => (
-                  <Fragment key={`${target.id}-${row.label}`}>
+                {target.rows.map((row, index) => (
+                  <Fragment key={`${target.id}-${row.label}-${index}`}>
                     <dt>{row.label}</dt>
                     <dd>{row.value}</dd>
                   </Fragment>
@@ -715,6 +859,7 @@ export function RunsPage() {
   const models = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
   const workflows = useQuery({ queryKey: ["workflows"], queryFn: () => api.workflows() });
   const settings = useQuery({ queryKey: ["settings"], queryFn: () => api.settings() });
+  const mainAgent = useQuery({ queryKey: ["main-agent"], queryFn: () => api.mainAgent() });
   const [message, setMessage] = useState("");
   const [mode, setMode] = useState<RunMode>("auto");
   const [workflowId, setWorkflowId] = useState("");
@@ -739,7 +884,6 @@ export function RunsPage() {
     approved: boolean;
   } | null>(null);
   const [temporaryFeedback, setTemporaryFeedback] = useState("");
-  const [temporaryAgentModel, setTemporaryAgentModel] = useState("");
   const userSelectedMode = useRef(false);
   const trimmedReferenceConversationId = referenceConversationId.trim();
 
@@ -816,19 +960,23 @@ export function RunsPage() {
     if (selectedConversationId) {
       setConversationId(selectedConversationId);
     }
-  }, [modeSelection, selectedRun.data]);
+    const approval = temporaryApprovalFromRunDetail(selectedRun.data);
+    if (approval) {
+      setModeSelection(null);
+      setTemporaryApproval((current) =>
+        current &&
+        current.runId === approval.runId &&
+        current.version === approval.version &&
+        current.decisionToken === approval.decisionToken
+          ? current
+          : approval,
+      );
+    }
+  }, [modeSelection, selectedRun.data, temporaryApproval]);
 
   useEffect(() => {
     setProcessDetailTarget(null);
   }, [selectedRunId]);
-
-  useEffect(() => {
-    if (!temporaryApproval || temporaryApproval.approved || temporaryAgentModel) return;
-    const recommended = recommendTemporaryAgentModel(temporaryApproval.proposal, models.data ?? []);
-    if (recommended) {
-      setTemporaryAgentModel(recommended.model.logical_model);
-    }
-  }, [temporaryApproval, temporaryAgentModel, models.data]);
 
   const createRun = useMutation({
     mutationFn: (override?: RunSubmissionOverride) => {
@@ -861,17 +1009,14 @@ export function RunsPage() {
           proposal: run.temporary_agent_proposal,
           approved: false,
         });
-        setTemporaryAgentModel("");
         setTemporaryFeedback("");
         setSubmitNotice("主 Agent 发现当前角色池能力不足，已暂停并等待你确认是否临时加入新子 Agent。");
       } else if (selection) {
         setTemporaryApproval(null);
-        setTemporaryAgentModel("");
         setModeSelection(selection);
         setSubmitNotice("主 Agent 对这轮回复的模式判断不够确定，请直接在输入框回复编号或关键词继续。");
       } else {
         setTemporaryApproval(null);
-        setTemporaryAgentModel("");
         setModeSelection(null);
         setSubmitNotice(explainActualMode(run));
       }
@@ -910,7 +1055,6 @@ export function RunsPage() {
       return api.approveTemporaryAgent(temporaryApproval.runId, {
         decision_token: temporaryApproval.decisionToken,
         version: temporaryApproval.version,
-        model: temporaryAgentModel,
       });
     },
     onSuccess: async (run) => {
@@ -930,28 +1074,27 @@ export function RunsPage() {
         enabled: true,
         role: temporaryApproval.proposal.role,
         prompt: temporaryApproval.proposal.prompt,
-        model: temporaryAgentModel,
+        model: temporaryApproval.proposal.model ?? (savedModels.find((model) => model.logical_model === "main")?.logical_model ?? savedModels[0]?.logical_model ?? "main"),
         skills: temporaryApproval.proposal.suggested_skills,
       });
     },
     onSuccess: async () => {
-      setSubmitNotice("临时子 Agent 已保存为永久 Agent，并绑定了你选择的已测试模型。");
+      setSubmitNotice("临时子 Agent 已保存为永久 Agent；后续运行仍由主 Agent 按任务自动匹配模型。");
       await queryClient.invalidateQueries({ queryKey: ["agents"] });
     },
   });
 
   const reviseTemporaryAgent = useMutation({
-    mutationFn: () => {
+    mutationFn: (feedbackOverride?: string) => {
       if (!temporaryApproval) throw new Error("temporary approval is unavailable");
       return api.reviseTemporaryAgent(temporaryApproval.runId, {
         decision_token: temporaryApproval.decisionToken,
         version: temporaryApproval.version,
-        feedback: temporaryFeedback.trim(),
+        feedback: (feedbackOverride ?? temporaryFeedback).trim(),
       });
     },
     onSuccess: async (run) => {
       setTemporaryApproval(null);
-      setTemporaryAgentModel("");
       setTemporaryFeedback("");
       setSubmitNotice("已收到你的新意见，主 Agent 会按反馈重新规划本次任务。");
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
@@ -1064,6 +1207,49 @@ export function RunsPage() {
     setSubmitNotice(null);
     const trimmed = message.trim();
     if (!trimmed) return;
+    if (temporaryApproval) {
+      const choice = parseChoiceText(trimmed, [
+        { value: "approve", label: "同意临时加入", aliases: ["同意", "接受", "加入", "approve", "yes"] },
+        { value: "reject", label: "不加入，按现有角色继续", aliases: ["不加入", "拒绝", "不要", "reject", "no"] },
+        { value: "revise", label: "提出新的意见", aliases: ["意见", "修改", "重规", "调整", "revise", "feedback"] },
+        { value: "persist", label: "保存为永久 Agent", aliases: ["保存", "永久", "persist", "permanent"] },
+      ]);
+      if (!choice) {
+        setSubmitNotice("请回复 1/同意、2/不加入、3 加上你的修改意见，或 4/保存为永久 Agent。");
+        return;
+      }
+      setMessage("");
+      if (choice.option.value === "approve") {
+        if (temporaryApproval.approved) {
+          setSubmitNotice("这个临时 Agent 已经加入。本轮完成后可回复“4”保存为永久 Agent。");
+          return;
+        }
+        setSubmitNotice("已选择同意临时加入，正在继续这轮对话。");
+        approveTemporaryAgent.mutate();
+        return;
+      }
+      if (choice.option.value === "persist") {
+        if (!temporaryApproval.approved) {
+          setSubmitNotice("保存为永久 Agent 前，需要先回复 1 同意临时加入并完成本轮运行。");
+          return;
+        }
+        setSubmitNotice("正在把这个临时 Agent 保存为永久 Agent。");
+        promoteTemporaryAgent.mutate();
+        return;
+      }
+      const feedback =
+        choice.option.value === "reject"
+          ? choice.note || "不加入临时子 Agent，按现有角色继续。"
+          : choice.note;
+      if (!feedback) {
+        setSubmitNotice("选择“提出新的意见”时，请在编号后写清楚你的意见，例如：3 不要加工程师，先让产品经理重拆。");
+        return;
+      }
+      setTemporaryFeedback(feedback);
+      setSubmitNotice("已收到你的反馈，正在让主 Agent 重新规划。");
+      reviseTemporaryAgent.mutate(feedback);
+      return;
+    }
     if (modeSelection) {
       const choice = parseChoiceText(
         trimmed,
@@ -1155,7 +1341,6 @@ export function RunsPage() {
     setAgentIds(settings.data?.default_agent_ids ?? []);
     setDirectModel("");
     setTemporaryApproval(null);
-    setTemporaryAgentModel("");
     setModeSelection(null);
     setProcessDetailTarget(null);
     setSubmitNotice("已新建空白对话。选一个模式或直接发送，主 Agent 会按当前设置处理。");
@@ -1174,7 +1359,6 @@ export function RunsPage() {
     setMessage("");
     setDirectModel("");
     setTemporaryApproval(null);
-    setTemporaryAgentModel("");
     setModeSelection(null);
     setProcessDetailTarget(null);
     setSubmitNotice(`已按原思路开启新对话：新对话会读取 ${sourceConversationId} 作为参考上下文。`);
@@ -1194,17 +1378,21 @@ export function RunsPage() {
   const selectedMode = RUN_MODES.find((item) => item.value === mode) ?? RUN_MODES[0];
   const savedAgents = agents.data ?? [];
   const savedModels = models.data ?? [];
-  const temporaryModelRecommendation =
-    temporaryApproval ? recommendTemporaryAgentModel(temporaryApproval.proposal, savedModels) : null;
   const enabledAgents = savedAgents.filter((agent) => agent.enabled);
   const savedWorkflows = workflows.data ?? [];
   const agentNameMap = new Map(savedAgents.map((agent) => [agent.id, agent.name]));
   const visibleRuns = activeConversation.data?.runs ?? (selectedRun.data ? [selectedRun.data] : []);
   const messages = conversationMessages(visibleRuns);
+  const temporaryApprovalVisibleInMessages =
+    !!temporaryApproval &&
+    messages.some((item) => item.id === `${temporaryApproval.runId}-temporary-agent-approval`);
   const latestVisibleRun = visibleRuns.at(-1) ?? selectedRun.data;
   const registeredModelIds = new Set(savedModels.map((model) => model.logical_model));
   const directModelDeployment = savedModels.find((model) => model.logical_model === directModel) ?? null;
   const directModelName = directModelDeployment?.logical_model ?? (directModel || "未指定");
+  const mainAgentModelName = mainAgent.data?.model
+    ? `${mainAgent.data.model.provider}/${mainAgent.data.model.upstream_model}`
+    : "未配置";
   const directSendBlockedReason =
     mode !== "direct"
       ? null
@@ -1463,28 +1651,13 @@ export function RunsPage() {
             </div>
           </details>
 
-          <details className="inline-guide" open={mode === "direct"}>
-            <summary>{mode === "direct" ? "选择直连模型/API" : "选择本次参与角色池"}</summary>
+          <details className="inline-guide" open={mode !== "direct"}>
+            <summary>{mode === "direct" ? "直连说明" : "选择本次参与角色池"}</summary>
             {mode === "direct" ? (
               <>
                 <p className="field-help">
-                  直连模式由主 Agent 控场和组织提示词，但实际生成由这里选择的模型/API完成。
+                  直连模型不在这里下拉选择。请回到主对话，按编号或模型关键词选择本次对话使用的模型/API。
                 </p>
-                <label htmlFor="direct-model">
-                  直连模型/API
-                  <select
-                    id="direct-model"
-                    value={directModel}
-                    onChange={(event) => setDirectModel(event.target.value)}
-                  >
-                    <option value="">请选择直连模型/API</option>
-                    {savedModels.map((model) => (
-                      <option key={model.id} value={model.logical_model}>
-                        {model.logical_model}（{model.provider} / {model.upstream_model}）
-                      </option>
-                    ))}
-                  </select>
-                </label>
                 {models.isLoading ? <p className="field-help">正在加载已测试模型...</p> : null}
                 {models.isError ? (
                   <p className="field-help" role="alert">
@@ -1592,6 +1765,13 @@ export function RunsPage() {
                 </ol>
               </article>
             ) : null}
+            {temporaryApproval && !temporaryApprovalVisibleInMessages ? (
+              <article className="chat-message assistant" aria-label="临时 Agent 文字确认">
+                <span className="eyebrow">Agent Hub</span>
+                <h3>{temporaryApproval.proposal.name}</h3>
+                <p>{temporaryAgentApprovalBody(temporaryApproval.proposal)}</p>
+              </article>
+            ) : null}
             {messages.map((item, index) => (
               <Fragment key={item.id}>
                 <article className={`chat-message ${item.role}`}>
@@ -1604,6 +1784,7 @@ export function RunsPage() {
                     detail={item.run}
                     onOpen={setProcessDetailTarget}
                     agentNames={agentNameMap}
+                    mainAgentModelName={mainAgentModelName}
                   />
                 ) : null}
               </Fragment>
@@ -1625,98 +1806,17 @@ export function RunsPage() {
           ) : null}
 
           <form onSubmit={submit} aria-label="发送消息" className="chat-composer">
-            {temporaryApproval ? (
-              <aside className="composer-approval-popover" role="dialog" aria-label="临时 Agent 确认提醒">
-                <div>
-                  <span className="eyebrow">主 Agent 请求确认</span>
-                  <h3>{temporaryApproval.proposal.name}</h3>
-                  <p>主 Agent 已生成角色和提示词；请选择本次运行这个临时 Agent 的模型/API。</p>
-                  <p>{temporaryApproval.proposal.reason}</p>
-                  <p>
-                    缺少能力：{temporaryApproval.proposal.missing_capability}；角色边界：
-                    {temporaryApproval.proposal.prompt}
-                  </p>
-                  {temporaryModelRecommendation ? (
-                    <p>
-                      建议模型/API：{temporaryModelRecommendation.model.logical_model}；
-                      {temporaryModelRecommendation.reason}。
-                    </p>
-                  ) : null}
-                </div>
-                <label htmlFor="temporary-agent-model">
-                  运行模型
-                  <select
-                    id="temporary-agent-model"
-                    value={temporaryAgentModel}
-                    onChange={(event) => setTemporaryAgentModel(event.target.value)}
-                    disabled={temporaryApproval.approved}
-                  >
-                    <option value="">请选择已测试模型</option>
-                    {savedModels.map((model) => (
-                      <option key={model.id} value={model.logical_model}>
-                        {model.logical_model}（{model.provider} / {model.upstream_model}）
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                {models.isLoading ? <p className="field-help">正在加载已保存模型...</p> : null}
-                {models.isError ? <p role="alert">{formatApiError(models.error, "已保存模型加载失败")}</p> : null}
-                {savedModels.length === 0 ? (
-                  <p className="form-error" role="alert">
-                    还没有可绑定的已测试模型。请先到“模型与 API”页面保存并通过可用性测试。
-                  </p>
-                ) : null}
-                <label htmlFor="temporary-agent-feedback">
-                  提出新的意见
-                  <textarea
-                    id="temporary-agent-feedback"
-                    value={temporaryFeedback}
-                    onChange={(event) => setTemporaryFeedback(event.target.value)}
-                    placeholder="例如：不要加工程师，先让产品经理重新拆需求。"
-                  />
-                </label>
-                <div className="composer-actions">
-                  <button
-                    type="button"
-                    disabled={
-                      temporaryApproval.approved ||
-                      approveTemporaryAgent.isPending ||
-                      temporaryAgentModel.trim().length === 0
-                    }
-                    onClick={() => approveTemporaryAgent.mutate()}
-                  >
-                    {temporaryApproval.approved ? "已临时加入" : "接受并临时加入"}
-                  </button>
-                  <button
-                    type="button"
-                    className="secondary-action"
-                    disabled={temporaryFeedback.trim().length === 0 || reviseTemporaryAgent.isPending}
-                    onClick={() => reviseTemporaryAgent.mutate()}
-                  >
-                    按我的意见重规
-                  </button>
-                  <button
-                    type="button"
-                    className="secondary-action"
-                    disabled={!temporaryApproval.approved || temporaryAgentModel.trim().length === 0 || promoteTemporaryAgent.isPending}
-                    onClick={() => promoteTemporaryAgent.mutate()}
-                  >
-                    保存为永久 Agent
-                  </button>
-                </div>
-                {approveTemporaryAgent.isError ? (
-                  <p role="alert">{formatApiError(approveTemporaryAgent.error, "临时 Agent 确认失败")}</p>
-                ) : null}
-                {reviseTemporaryAgent.isError ? (
-                  <p role="alert">{formatApiError(reviseTemporaryAgent.error, "临时 Agent 重规失败")}</p>
-                ) : null}
-                {promoteTemporaryAgent.isError ? (
-                  <p role="alert">{formatApiError(promoteTemporaryAgent.error, "永久化 Agent 失败")}</p>
-                ) : null}
-              </aside>
-            ) : null}
             {chooseMode.isError ? (
               <p role="alert">{formatApiError(chooseMode.error, "运行模式确认失败")}</p>
+            ) : null}
+            {approveTemporaryAgent.isError ? (
+              <p role="alert">{formatApiError(approveTemporaryAgent.error, "临时 Agent 确认失败")}</p>
+            ) : null}
+            {reviseTemporaryAgent.isError ? (
+              <p role="alert">{formatApiError(reviseTemporaryAgent.error, "临时 Agent 重规失败")}</p>
+            ) : null}
+            {promoteTemporaryAgent.isError ? (
+              <p role="alert">{formatApiError(promoteTemporaryAgent.error, "永久化 Agent 失败")}</p>
             ) : null}
             {skillInstallCandidate ? (
               <aside className="composer-attachment-card" role="status" aria-label="Skill 安装确认">
@@ -1790,12 +1890,12 @@ export function RunsPage() {
               <button
                 type="button"
                 className="composer-handoff-button"
-                aria-label="按原思路"
+                aria-label="按照原思路"
                 title="按照原思路开启新对话"
                 disabled={!latestVisibleRun}
                 onClick={() => startHandoffConversation(latestVisibleRun)}
               >
-                按原思路
+                按照原思路
               </button>
               <button
                 type="button"
@@ -1813,6 +1913,7 @@ export function RunsPage() {
                     ? `直连 · 模型 ${directModelName}`
                     : `${displayMode(mode)} · 本会话倾向`}
                 {mode !== "direct" && agentIds.length > 0 ? ` · 角色 ${agentIds.length} 个` : ""}
+                {mainAgent.data?.model ? ` · 主 Agent ${mainAgent.data.model.upstream_model}` : " · 主 Agent 未配置"}
                 {referenceConversationId.trim() ? " · 已引用会话" : ""}
               </span>
               <button

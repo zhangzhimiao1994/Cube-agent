@@ -14,7 +14,7 @@ from uuid import UUID, uuid4
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.routing.types import RiskLevel, RouteAssessment, RouteDecision
 from agent_hub.runs.repository import RunAlreadyActive, RunRecord, RunRepository
-from agent_hub.runtime.contracts import EventKind, JsonValue, TaskContext
+from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext
 from agent_hub.runtime.failure_reason import safe_runtime_failure_reason
 from agent_hub.runtime.registry import RuntimeRegistry
 
@@ -332,44 +332,26 @@ class RunService:
                 return _submitted(record)
 
             if decision is None:
-                fallback_mode = _local_main_agent_auto_mode(message, attachment_ids)
-                proposal = await self._safe_temporary_agent_proposal(
-                    tenant_id=tenant_id,
-                    actor_id=actor_id,
-                    message=message,
-                    mode=fallback_mode,
-                    agent_ids=agent_ids,
-                    workflow_id=workflow_id,
-                    allow_workflow_adjustment=allow_workflow_adjustment,
-                )
-                routing_payload = {
-                    "reason": "main_agent_local_fallback",
-                    "auto_resolution_reason": "router_unavailable",
-                    "auto_resolution_selected_mode": fallback_mode.value,
-                    "decision": None,
-                    **operator_selection,
-                }
-                if hermes_advice is not None:
-                    routing_payload["hermes"] = _hermes_advice_payload(hermes_advice)
-                if proposal is not None:
-                    return await self._create_temporary_agent_approval_run(
-                        tenant_id=tenant_id,
-                        actor_id=actor_id,
-                        message=message,
-                        mode=fallback_mode,
-                        proposal=proposal,
-                        idempotency_key=idempotency_key,
-                        operator_selection=routing_payload,
-                    )
+                token = _decision_token()
                 record = await self._repository.create_run(
                     tenant_id=tenant_id,
                     actor_id=actor_id,
                     request=message,
-                    mode=fallback_mode,
-                    status=RunStatus.QUEUED,
+                    mode=None,
+                    status=RunStatus.WAITING_USER_MODE,
                     idempotency_key=idempotency_key,
-                    routing_decision=routing_payload,
-                    enqueue=True,
+                    routing_decision={
+                        "reason": "router_unavailable",
+                        "decision_token": token,
+                        "decision": None,
+                        **(
+                            {"hermes": _hermes_advice_payload(hermes_advice)}
+                            if hermes_advice is not None
+                            else {}
+                        ),
+                        **operator_selection,
+                    },
+                    enqueue=False,
                 )
                 return _submitted(record)
 
@@ -403,16 +385,7 @@ class RunService:
                 },
                 enqueue=False,
             )
-            stored_decision = record.routing_decision or {}
-            return SubmittedRun(
-                id=record.id,
-                tenant_id=record.tenant_id,
-                status=record.status,
-                mode=record.mode,
-                decision_token=str(stored_decision.get("decision_token", token)),
-                version=record.version,
-                clarification_reason=clarification_reason,
-            )
+            return _submitted(record)
 
         proposal = await self._safe_temporary_agent_proposal(
             tenant_id=tenant_id,
@@ -454,7 +427,6 @@ class RunService:
         run_id: UUID,
         decision_token: str,
         version: int,
-        model: str,
     ) -> SubmittedRun:
         del actor_id
         record = await self._repository.approve_temporary_agent_and_enqueue(
@@ -462,7 +434,6 @@ class RunService:
             run_id=run_id,
             decision_token=decision_token,
             version=version,
-            model=model,
         )
         return _submitted(record)
 
@@ -587,6 +558,11 @@ class RunService:
                 tenant_id=tenant_id,
                 mode=mode,
                 request=request,
+                artifacts=await self._conversation_artifacts(
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    routing_decision=routing_decision,
+                ),
                 checkpoint=checkpoint,
                 routing_decision=cast(Mapping[str, JsonValue], routing_decision),
                 timeout_seconds=_runtime_timeout_seconds(
@@ -675,6 +651,46 @@ class RunService:
             ),
             artifact_ids=await self._repository.artifact_ids(record.tenant_id, record.id),
             usage_cost_usd=await self._repository.usage_cost(record.tenant_id, record.id),
+        )
+
+    async def _conversation_artifacts(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        routing_decision: Mapping[str, object],
+    ) -> tuple[Artifact, ...]:
+        conversation_id = _string_or_none(routing_decision.get("conversation_id"))
+        if conversation_id is None:
+            return ()
+        try:
+            context_items = await self._repository.conversation_context(
+                tenant_id,
+                conversation_id,
+                before_run_id=run_id,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "conversation_context_load_failed tenant_id=%s run_id=%s conversation_id=%s",
+                tenant_id,
+                run_id,
+                conversation_id,
+            )
+            return ()
+        history_text = _conversation_history_text(context_items)
+        if not history_text:
+            return ()
+        return (
+            Artifact(
+                id=uuid4(),
+                type="text",
+                producer="conversation_history",
+                content={
+                    "text": history_text,
+                    "conversation_id": conversation_id,
+                    "trust": "internal_conversation_summary",
+                },
+            ),
         )
 
     async def _safe_hermes_advice(
@@ -960,6 +976,35 @@ def _string_tuple(value: object) -> tuple[str, ...]:
     if isinstance(value, tuple):
         return tuple(item for item in value if isinstance(item, str) and item)
     return ()
+
+
+def _conversation_history_text(items: tuple[object, ...]) -> str:
+    lines: list[str] = []
+    for index, item in enumerate(items, start=1):
+        request = getattr(item, "request", "")
+        if isinstance(request, str) and request.strip():
+            lines.append(f"第 {index} 轮用户：{_bounded_history_text(request)}")
+        artifacts = getattr(item, "artifacts", ())
+        if not isinstance(artifacts, tuple):
+            continue
+        for artifact in artifacts[:4]:
+            if not isinstance(artifact, dict):
+                continue
+            producer = artifact.get("producer") or artifact.get("title") or "agent"
+            content = artifact.get("content")
+            text = content.get("text") if isinstance(content, dict) else artifact.get("text")
+            if isinstance(text, str) and text.strip():
+                lines.append(
+                    f"第 {index} 轮 {str(producer)[:80]}：{_bounded_history_text(text)}"
+                )
+    return "\n".join(lines[-18:])
+
+
+def _bounded_history_text(value: str, *, max_chars: int = 1800) -> str:
+    normalized = re.sub(r"\s+", " ", value).strip()
+    if len(normalized) <= max_chars:
+        return normalized
+    return f"{normalized[:max_chars].rstrip()}…"
 
 
 def _safe_channel_context(channel_context: Mapping[str, str]) -> dict[str, str]:

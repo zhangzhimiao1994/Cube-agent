@@ -21,6 +21,7 @@ from agent_hub.runtime.defaults import (
     _discussion_plan,
     _dispatch_parallelism,
     _dispatch_plan,
+    _select_logical_model_for_role,
     configured_runtime_registry,
 )
 from agent_hub.runtime.role_planner import RoleAssignment, RolePurpose
@@ -504,6 +505,137 @@ def test_dispatch_plan_reserves_more_time_for_final_synthesis() -> None:
     assert final_step.timeout_seconds >= 120
 
 
+def test_role_model_selection_uses_role_and_task_capabilities_not_user_choice() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "main": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-v4-flash",
+                            "api_base": "https://api.deepseek.com/v1",
+                            "credential_ref": "secret://main",
+                            "quota_scope_id": "deepseek",
+                            "max_concurrency": 4,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text"],
+                        }
+                    ]
+                },
+                "coder": {
+                    "deployments": [
+                        {
+                            "provider": "qwen",
+                            "model": "qwen-coder-plus",
+                            "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                            "credential_ref": "secret://coder",
+                            "quota_scope_id": "qwen",
+                            "max_concurrency": 8,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 1,
+                            "capabilities": ["text", "tool_calling"],
+                        }
+                    ]
+                },
+                "creative": {
+                    "deployments": [
+                        {
+                            "provider": "kimi",
+                            "model": "kimi-k2-latest",
+                            "api_base": "https://api.moonshot.cn/v1",
+                            "credential_ref": "secret://creative",
+                            "quota_scope_id": "kimi",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text"],
+                        }
+                    ]
+                },
+                "analyst": {
+                    "deployments": [
+                        {
+                            "provider": "anthropic",
+                            "model": "claude-sonnet-4-5",
+                            "api_base": "https://api.anthropic.com/v1/messages",
+                            "credential_ref": "secret://analyst",
+                            "quota_scope_id": "claude",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "structured_output"],
+                        }
+                    ]
+                },
+            },
+            "agents": [],
+        }
+    )
+
+    assert (
+        _select_logical_model_for_role(
+            RoleAssignment(
+                id="web_engineer",
+                role="网页工程师",
+                purpose=RolePurpose.EXECUTE,
+                mission="把调研结论落地成可部署网页代码。",
+                must_answer=("实现了什么？",),
+                allowed_tools=(),
+                forbidden_actions=("不要执行危险操作。",),
+                skills=(),
+                output_schema={},
+                model="main",
+            ),
+            config,
+            default_model="main",
+            task="调研产品并制作一个网页原型。",
+        )
+        == "coder"
+    )
+    assert (
+        _select_logical_model_for_role(
+            RoleAssignment(
+                id="copywriter",
+                role="文案生成",
+                purpose=RolePurpose.EXECUTE,
+                mission="生成短视频口播脚本和即梦提示词。",
+                must_answer=("文案是什么？",),
+                allowed_tools=(),
+                forbidden_actions=("不要执行危险操作。",),
+                skills=(),
+                output_schema={},
+                model="main",
+            ),
+            config,
+            default_model="main",
+            task="生成玄幻 AI 短剧提示词。",
+        )
+        == "creative"
+    )
+    assert (
+        _select_logical_model_for_role(
+            RoleAssignment(
+                id="economic_analyst",
+                role="经济分析师",
+                purpose=RolePurpose.EXPERTISE,
+                mission="分析市场、成本和风险。",
+                must_answer=("风险是什么？",),
+                allowed_tools=(),
+                forbidden_actions=("不要执行危险操作。",),
+                skills=(),
+                output_schema={},
+                model="main",
+            ),
+            config,
+            default_model="main",
+            task="调研产品机会并给出市场分析。",
+        )
+        == "analyst"
+    )
+
+
 def test_dispatch_parallelism_uses_model_capacity_without_unbounded_fanout() -> None:
     config = PlatformConfig.model_validate(
         {
@@ -589,6 +721,41 @@ def test_discussion_plan_accepts_localized_role_display_names() -> None:
         ("director", "导演"),
         ("critic", "审查员"),
     ]
+
+
+def test_discussion_plan_uses_bounded_generation_limits() -> None:
+    plan = _discussion_plan(
+        (
+            RoleAssignment(
+                id="director",
+                role="导演",
+                purpose=RolePurpose.EXPERTISE,
+                mission="负责创意方向。",
+                must_answer=("方向是什么？",),
+                allowed_tools=(),
+                forbidden_actions=("不要执行危险操作。",),
+                skills=(),
+                output_schema={"position": "string"},
+                model="creative",
+            ),
+            RoleAssignment(
+                id="reviewer",
+                role="审查员",
+                purpose=RolePurpose.CRITIQUE,
+                mission="负责审查风险。",
+                must_answer=("风险是什么？",),
+                allowed_tools=(),
+                forbidden_actions=("不要执行危险操作。",),
+                skills=(),
+                output_schema={"position": "string"},
+                model="review",
+            ),
+        ),
+        "main",
+    )
+
+    assert all(participant.max_output_tokens <= 1536 for participant in plan.participants)
+    assert plan.selector_max_output_tokens <= 512
 
 
 def test_configured_runtime_registry_registers_all_production_modes() -> None:

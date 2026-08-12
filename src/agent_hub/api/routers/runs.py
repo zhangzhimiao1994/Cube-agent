@@ -67,7 +67,6 @@ class RunServiceProtocol(Protocol):
         run_id: UUID,
         decision_token: str,
         version: int,
-        model: str,
     ) -> SubmittedRun: ...
 
     async def revise_temporary_agent(
@@ -135,7 +134,6 @@ class ChooseModeRequest(BaseModel):
 class ApproveTemporaryAgentRequest(BaseModel):
     decision_token: str = Field(min_length=32, max_length=160)
     version: int = Field(ge=1)
-    model: str = Field(min_length=1, max_length=128, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
 
 
 class ReviseTemporaryAgentRequest(BaseModel):
@@ -429,7 +427,6 @@ async def approve_temporary_agent(
             run_id=run_id,
             decision_token=body.decision_token,
             version=body.version,
-            model=body.model,
         )
     except RunNotFound as error:
         raise _run_not_found() from error

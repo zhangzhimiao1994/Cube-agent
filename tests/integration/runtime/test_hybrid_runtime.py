@@ -55,9 +55,18 @@ class RecordingRuntime:
         self.cancelled = True
 
 
-def artifact(producer: str, text: str, *, sources: tuple[str, ...] = ()) -> Artifact:
+def artifact(
+    producer: str,
+    text: str,
+    *,
+    sources: tuple[str, ...] = (),
+) -> Artifact:
     return Artifact(
-        id=uuid4(), type="text", producer=producer, content={"text": text}, source_ids=sources
+        id=uuid4(),
+        type="text",
+        producer=producer,
+        content={"text": text},
+        source_ids=sources,
     )
 
 

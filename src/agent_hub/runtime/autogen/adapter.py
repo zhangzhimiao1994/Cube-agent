@@ -486,6 +486,7 @@ class DiscussionParticipant:
 class DiscussionPlan:
     participants: tuple[DiscussionParticipant, ...]
     selector_model: str
+    selector_max_output_tokens: int = 512
     max_turns: int = 16
     wall_time_seconds: float = 300.0
     token_budget: int = 65_536
@@ -502,6 +503,11 @@ class DiscussionPlan:
         if len(set(ids)) != len(ids):
             raise ValueError("participant ids must be unique")
         _safe_id(self.selector_model, "selector model")
+        if (
+            type(self.selector_max_output_tokens) is not int
+            or not 1 <= self.selector_max_output_tokens <= 1_000_000
+        ):
+            raise ValueError("selector output limit is invalid")
         if type(self.max_turns) is not int or not 1 <= self.max_turns <= 64:
             raise ValueError("max turns is invalid")
         if (
@@ -540,6 +546,7 @@ class DiscussionPlan:
                 for item in self.participants
             ],
             "selector_model": self.selector_model,
+            "selector_max_output_tokens": self.selector_max_output_tokens,
             "max_turns": self.max_turns,
             "wall_time_seconds": self.wall_time_seconds,
             "token_budget": self.token_budget,
@@ -1111,6 +1118,7 @@ class AutoGenDiscussionRuntime:
                 self._gateway,
                 self._plan.selector_model,
                 usage,
+                max_output_tokens=self._plan.selector_max_output_tokens,
                 durability=durability,
             )
             tool_records: list[_ToolRecord] = []

@@ -792,7 +792,7 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
     await screen.findByText(/当前会话：conv-previous/);
-    await user.click(screen.getByRole("button", { name: "按原思路" }));
+    await user.click(screen.getByRole("button", { name: "按照原思路" }));
     expect(screen.queryByRole("button", { name: "自动" })).toBeNull();
     expect(screen.queryByRole("button", { name: "直连" })).toBeNull();
     await user.type(screen.getByPlaceholderText(/输入消息/), "接着前面的方向继续。");
@@ -839,7 +839,7 @@ describe("operational management pages", () => {
     expect(within(stream).getByText(/model transport failed/)).not.toBeNull();
   });
 
-  it("collapses run process events behind a compact execution summary", async () => {
+  it("shows Codex-style chat replies with Kimi-style inline cluster actions", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
@@ -855,9 +855,12 @@ describe("operational management pages", () => {
 
     expect(within(stream).queryByText("正在实时刷新运行状态")).toBeNull();
     expect(within(stream).queryByRole("button", { name: /已记录 3 个关键步骤/ })).toBeNull();
-    expect(within(stream).getByRole("button", { name: /文案生成生成了结果/ })).not.toBeNull();
-    expect(within(stream).getByRole("button", { name: /多角色完成讨论/ })).not.toBeNull();
-    await user.click(within(stream).getByRole("button", { name: /文案生成生成了结果/ }));
+    expect(within(stream).getByRole("status", { name: /Agent 集群/ })).not.toBeNull();
+    expect(within(stream).queryByRole("button", { name: /生成了结果/ })).toBeNull();
+    expect(within(stream).getByRole("button", { name: /文案生成 调用模型：qwen-max/ })).not.toBeNull();
+    expect(within(stream).getByRole("button", { name: /文案生成 产出：得到一版可拍摄脚本文案/ })).not.toBeNull();
+    expect(within(stream).getByRole("button", { name: /讨论结论：.*采用可拍摄性最高的方案/ })).not.toBeNull();
+    await user.click(within(stream).getByRole("button", { name: /文案生成 产出：得到一版可拍摄脚本文案/ }));
     expect(within(stream).queryByText("任务已进入队列，等待 Worker 调度执行。")).toBeNull();
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     expect(within(drawer).queryByText("任务已进入队列，等待 Worker 调度执行。")).toBeNull();
@@ -876,12 +879,12 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    await user.click(within(stream).getByRole("button", { name: /多角色完成讨论/ }));
+    await user.click(within(stream).getByRole("button", { name: /讨论结论：.*采用可拍摄性最高的方案/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
 
     expect(within(drawer).getByText("参与者")).not.toBeNull();
     expect(within(drawer).getByText("导演、文案生成、剪辑师")).not.toBeNull();
-    expect(within(drawer).queryByText(/文案生成 生成了结果/)).toBeNull();
+    expect(within(drawer).queryByText(/生成了结果/)).toBeNull();
     expect(within(drawer).getAllByText(/多角色完成讨论/).length).toBeGreaterThan(0);
     expect(within(drawer).getAllByText(/采用可拍摄性最高的方案/).length).toBeGreaterThan(0);
     expect(within(drawer).getByText("导演认为要优先可拍摄性。")).not.toBeNull();
@@ -1083,11 +1086,12 @@ describe("operational management pages", () => {
     await user.type(composer.querySelector("textarea") as HTMLTextAreaElement, "make this into a web page");
     await user.click(composer.querySelector('button[type="submit"]') as HTMLButtonElement);
 
-    const dialog = await screen.findByRole("dialog");
-    expect(dialog.closest("form")?.className).toContain("chat-composer");
-    expect(within(dialog).getByText("Temporary Web Engineer")).not.toBeNull();
-    await user.type(within(dialog).getByLabelText(/意见|feedback|opinion/i), "do not add an engineer yet");
-    await user.click(within(dialog).getByRole("button", { name: /重规|revise|意见/i }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    expect(within(stream).getByText("Temporary Web Engineer")).not.toBeNull();
+    expect(screen.queryByRole("dialog", { name: "临时 Agent 确认提醒" })).toBeNull();
+    await user.clear(composer.querySelector("textarea") as HTMLTextAreaElement);
+    await user.type(composer.querySelector("textarea") as HTMLTextAreaElement, "3 do not add an engineer yet");
+    await user.click(composer.querySelector('button[type="submit"]') as HTMLButtonElement);
 
     await waitFor(() =>
       expect(requests.find((request) => request.path === `/api/v1/runs/${runId}/revise-temporary-agent`)).toMatchObject({
@@ -1112,23 +1116,25 @@ describe("operational management pages", () => {
     await user.type(composer.querySelector("textarea") as HTMLTextAreaElement, "make this into a web page");
     await user.click(composer.querySelector('button[type="submit"]') as HTMLButtonElement);
 
-    const dialog = await screen.findByRole("dialog");
-    expect(within(dialog).getByText(/主 Agent 已生成角色和提示词/)).not.toBeNull();
-    expect(within(dialog).getByText(/建议模型\/API：coder/)).not.toBeNull();
-    expect(within(dialog).getByText(/匹配缺少能力 software_engineering/)).not.toBeNull();
-    expect((within(dialog).getByLabelText("运行模型") as HTMLSelectElement).value).toBe("coder");
-    expect((within(dialog).getByRole("button", { name: /接受|accept|加入/i }) as HTMLButtonElement).disabled).toBe(false);
-    await user.click(within(dialog).getByRole("button", { name: /接受|accept|加入/i }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    expect(within(stream).getByText(/主 Agent 已生成角色和提示词/)).not.toBeNull();
+    expect(within(stream).getByText(/主 Agent 会按角色能力、任务要求和模型并发情况自动选择模型/)).not.toBeNull();
+    expect(within(stream).queryByLabelText("运行模型")).toBeNull();
+    expect(within(stream).queryByText(/建议模型\/API：coder/)).toBeNull();
+    await user.clear(composer.querySelector("textarea") as HTMLTextAreaElement);
+    await user.type(composer.querySelector("textarea") as HTMLTextAreaElement, "1");
+    await user.click(composer.querySelector('button[type="submit"]') as HTMLButtonElement);
     await waitFor(() =>
       expect(requests.find((request) => request.path === `/api/v1/runs/${runId}/approve-temporary-agent`)).toMatchObject({
         body: {
           decision_token: "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
           version: 1,
-          model: "coder",
         },
       }),
     );
-    await user.click(within(dialog).getByRole("button", { name: /保存|permanent/i }));
+    await user.clear(composer.querySelector("textarea") as HTMLTextAreaElement);
+    await user.type(composer.querySelector("textarea") as HTMLTextAreaElement, "保存");
+    await user.click(composer.querySelector('button[type="submit"]') as HTMLButtonElement);
 
     await waitFor(() =>
       expect(requests.find((request) => request.path === "/api/v1/admin/agents" && request.method === "POST")).toMatchObject({
@@ -1137,7 +1143,7 @@ describe("operational management pages", () => {
           name: "Temporary Web Engineer",
           role: "Web Engineer",
           prompt: "把方案落成网页并说明验证步骤。",
-          model: "coder",
+          model: "main",
           skills: ["frontend"],
         },
       }),

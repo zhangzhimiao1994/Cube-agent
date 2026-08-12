@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal
@@ -44,6 +45,13 @@ class PendingOutbox:
     idempotency_key: str
 
 
+@dataclass(frozen=True, slots=True)
+class ConversationContextItem:
+    run_id: UUID
+    request: str
+    artifacts: tuple[dict[str, object], ...]
+
+
 class RunNotFound(RuntimeError):
     """Stable missing-run error."""
 
@@ -67,6 +75,15 @@ _SENSITIVE_PUBLIC_KEYS = frozenset(
         "chain_of_thought",
     }
 )
+_SAFE_MODEL_ID = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def _safe_temporary_agent_model(proposal: dict[object, object]) -> str:
+    for key in ("model", "recommended_model", "id"):
+        value = proposal.get(key)
+        if isinstance(value, str) and _SAFE_MODEL_ID.fullmatch(value):
+            return value
+    raise RunConflict("temporary agent proposal has no safe model fallback")
 
 
 class RunRepository:
@@ -247,7 +264,6 @@ class RunRepository:
         run_id: UUID,
         decision_token: str,
         version: int,
-        model: str,
     ) -> RunRecord:
         async with self._session_factory() as session, session.begin():
             row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
@@ -265,9 +281,7 @@ class RunRepository:
             proposal = routing_decision.get("temporary_agent_proposal")
             if not isinstance(proposal, dict) or not isinstance(proposal.get("id"), str):
                 raise RunConflict("temporary agent proposal is invalid")
-            selected_model = model.strip()
-            if not selected_model:
-                raise RunConflict("temporary agent model is required")
+            selected_model = _safe_temporary_agent_model(proposal)
             proposal = {**proposal, "model": selected_model}
             selected = routing_decision.get("selected_agent_ids")
             selected_agent_ids = [item for item in selected if isinstance(item, str)] if isinstance(selected, list) else []
@@ -613,6 +627,58 @@ class RunRepository:
                 )
             ).all()
             return tuple(_public_artifact_payload(dict(row.payload)) for row in rows)
+
+    async def conversation_context(
+        self,
+        tenant_id: UUID,
+        conversation_id: str,
+        *,
+        before_run_id: UUID,
+        limit: int = 6,
+    ) -> tuple[ConversationContextItem, ...]:
+        async with self._session_factory() as session:
+            current = await session.scalar(
+                select(RunRow.created_at)
+                .where(RunRow.tenant_id == tenant_id, RunRow.id == before_run_id)
+            )
+            if current is None:
+                raise RunNotFound("run was not found")
+            rows = (
+                await session.scalars(
+                    select(RunRow)
+                    .where(RunRow.tenant_id == tenant_id)
+                    .where(RunRow.id != before_run_id)
+                    .where(RunRow.routing_decision["conversation_id"].astext == conversation_id)
+                    .where(RunRow.created_at <= current)
+                    .order_by(RunRow.created_at.desc(), RunRow.id.desc())
+                    .limit(limit)
+                )
+            ).all()
+            ordered_rows = tuple(reversed(rows))
+            if not ordered_rows:
+                return ()
+            run_ids = [row.id for row in ordered_rows]
+            artifact_rows = (
+                await session.scalars(
+                    select(RunArtifactRow)
+                    .where(RunArtifactRow.tenant_id == tenant_id)
+                    .where(RunArtifactRow.run_id.in_(run_ids))
+                    .order_by(RunArtifactRow.created_at, RunArtifactRow.id)
+                )
+            ).all()
+            artifacts_by_run: dict[UUID, list[dict[str, object]]] = {run_id: [] for run_id in run_ids}
+            for artifact in artifact_rows:
+                artifacts_by_run.setdefault(artifact.run_id, []).append(
+                    _public_artifact_payload(dict(artifact.payload))
+                )
+            return tuple(
+                ConversationContextItem(
+                    run_id=row.id,
+                    request=row.request,
+                    artifacts=tuple(artifacts_by_run.get(row.id, ())),
+                )
+                for row in ordered_rows
+            )
 
     async def usage_cost(self, tenant_id: UUID, run_id: UUID) -> Decimal:
         async with self._session_factory() as session:

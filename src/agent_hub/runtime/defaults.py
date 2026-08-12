@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from dataclasses import replace
 from decimal import Decimal
 from typing import Protocol
 from uuid import UUID
@@ -223,7 +224,12 @@ class ConfigBackedDispatchRuntime:
                 default_model=logical_model,
             )
         )
-        roles = (*role_plan.roles, *_temporary_role_assignments(context, logical_model))
+        roles = _assign_models_to_roles(
+            (*role_plan.roles, *_temporary_role_assignments(context, logical_model)),
+            config,
+            default_model=logical_model,
+            task=context.request,
+        )
         return CrewDispatchRuntime(
             gateway,
             _dispatch_plan(
@@ -300,7 +306,13 @@ class ConfigBackedDiscussionRuntime:
                 default_model=logical_model,
             )
         )
-        return AutoGenDiscussionRuntime(gateway, _discussion_plan(role_plan.roles, logical_model))
+        roles = _assign_models_to_roles(
+            role_plan.roles,
+            config,
+            default_model=logical_model,
+            task=context.request,
+        )
+        return AutoGenDiscussionRuntime(gateway, _discussion_plan(roles, logical_model))
 
 
 class ConfigBackedHybridRuntime:
@@ -383,7 +395,18 @@ class ConfigBackedHybridRuntime:
                 default_model=logical_model,
             )
         ).roles
-        dispatch_roles = (*dispatch_roles, *_temporary_role_assignments(context, logical_model))
+        dispatch_roles = _assign_models_to_roles(
+            (*dispatch_roles, *_temporary_role_assignments(context, logical_model)),
+            config,
+            default_model=logical_model,
+            task=context.request,
+        )
+        discussion_roles = _assign_models_to_roles(
+            discussion_roles,
+            config,
+            default_model=logical_model,
+            task=context.request,
+        )
         return HybridRuntime(
             CrewDispatchRuntime(
                 gateway,
@@ -470,7 +493,10 @@ def _dispatch_plan(
                 id="final_synthesizer",
                 role="Final Synthesizer",
                 goal="Merge role outputs into one concise, evidence-aware final answer.",
-                logical_model=selected_roles[0].model,
+                logical_model=_string_or_default(
+                    context.routing_decision.get("main_agent_model"),
+                    selected_roles[0].model,
+                ),
                 allowed_tools=(),
             )
     )
@@ -479,8 +505,8 @@ def _dispatch_plan(
     role_token_budget = step_token_budget
     final_token_budget = step_token_budget
     role_step_timeout = min(
-        max(context.timeout_seconds / max(2, len(selected_roles) + 2), 45.0),
-        180.0,
+        max(context.timeout_seconds / max(2, len(selected_roles)), 120.0),
+        300.0,
     )
     final_step_timeout = min(max(context.timeout_seconds * 0.45, 90.0), 300.0)
     role_steps = tuple(
@@ -545,7 +571,7 @@ def _temporary_role_assignments(
         selected_model = raw.get("model")
         if not isinstance(identifier, str) or not isinstance(role, str) or not isinstance(mission, str):
             continue
-        logical_model_for_agent = selected_model if isinstance(selected_model, str) and selected_model else logical_model
+        logical_model_for_agent = selected_model if isinstance(selected_model, str) and selected_model else identifier
         skills = raw.get("suggested_skills")
         skill_tuple = tuple(item for item in skills if isinstance(item, str)) if isinstance(skills, tuple) else ()
         try:
@@ -570,6 +596,102 @@ def _temporary_role_assignments(
         except ValueError:
             continue
     return tuple(assignments)
+
+
+def _assign_models_to_roles(
+    roles: tuple[RoleAssignment, ...],
+    config: PlatformConfig,
+    *,
+    default_model: str,
+    task: object,
+) -> tuple[RoleAssignment, ...]:
+    return tuple(
+        replace(
+            role,
+            model=_select_logical_model_for_role(
+                role,
+                config,
+                default_model=default_model,
+                task=task,
+            ),
+        )
+        for role in roles
+    )
+
+
+def _string_or_default(value: object, default: str) -> str:
+    return value if isinstance(value, str) and value else default
+
+
+def _select_logical_model_for_role(
+    role: RoleAssignment,
+    config: PlatformConfig,
+    *,
+    default_model: str,
+    task: object,
+) -> str:
+    if not config.models:
+        return default_model
+    text = " ".join(
+        (
+            str(task),
+            role.id,
+            role.role,
+            role.mission,
+            " ".join(role.skills),
+            " ".join(role.must_answer),
+        )
+    ).lower()
+    preferred = role.model if role.model in config.models and role.model != default_model else ""
+    scored: list[tuple[int, int, str]] = []
+    for logical_model, definition in config.models.items():
+        haystack = " ".join(
+            (
+                logical_model,
+                " ".join(
+                    " ".join(
+                        (
+                            deployment.provider,
+                            deployment.model,
+                            " ".join(sorted(deployment.capabilities)),
+                        )
+                    )
+                    for deployment in definition.deployments
+                ),
+            )
+        ).lower()
+        score = 0
+        if logical_model == preferred:
+            score += 12
+        if logical_model == default_model:
+            score += 1
+        score += min(8, sum(deployment.max_concurrency for deployment in definition.deployments) // 2)
+        if any(keyword in text for keyword in ("code", "代码", "网页", "web", "前端", "后端", "api", "github", "测试", "部署")):
+            if any(keyword in haystack for keyword in ("coder", "code", "qwen", "program")):
+                score += 30
+            if "tool_calling" in haystack:
+                score += 4
+        if any(keyword in text for keyword in ("文案", "脚本", "短剧", "视频", "导演", "剪辑", "prompt", "提示词", "creative", "story")):
+            if any(keyword in haystack for keyword in ("creative", "kimi", "qwen", "deepseek", "chat", "text")):
+                score += 24
+            if any(keyword in haystack for keyword in ("creative", "kimi", "story")):
+                score += 10
+            if any(keyword in haystack for keyword in ("coder", "code")):
+                score -= 4
+        if any(keyword in text for keyword in ("分析", "调研", "研究", "经济", "金融", "市场", "竞品", "风险", "review", "audit")):
+            if any(keyword in haystack for keyword in ("analyst", "analysis", "reason", "max", "sonnet", "claude", "deepseek")):
+                score += 22
+            if "structured_output" in haystack:
+                score += 3
+        if any(keyword in text for keyword in ("图片", "识图", "视觉", "image", "vision")) and "vision" in haystack:
+            score += 28
+        if any(
+            keyword in text for keyword in ("合规", "法律", "隐私", "版权", "资质", "compliance")
+        ) and any(keyword in haystack for keyword in ("analyst", "review", "sonnet", "claude", "max")):
+            score += 18
+        scored.append((score, -len(logical_model), logical_model))
+    scored.sort(reverse=True)
+    return scored[0][2] if scored else default_model
 
 
 def _requested_skills(context: TaskContext) -> tuple[str, ...]:
@@ -620,13 +742,14 @@ def _discussion_plan(
             goal=role.mission,
             logical_model=role.model,
             allowed_tools=(),
-            max_output_tokens=4096,
+            max_output_tokens=1536,
         )
         for role in selected_roles
     )
     return DiscussionPlan(
         participants=participants,
         selector_model=default_model,
+        selector_max_output_tokens=512,
         max_turns=min(12, max(4, len(participants) * 2)),
         wall_time_seconds=300.0,
         token_budget=65_536,
