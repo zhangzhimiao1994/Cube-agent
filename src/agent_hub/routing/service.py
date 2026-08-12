@@ -90,9 +90,9 @@ class RoutingPolicy:
         ):
             raise ValueError("confirmation TTL must be positive and finite")
         if not isinstance(self.parallel_classifiers, bool):
-            raise ValueError("parallel_classifiers must be a boolean")
+            raise TypeError("parallel_classifiers must be a boolean")
         if not isinstance(self.allow_single_classifier_decision, bool):
-            raise ValueError("allow_single_classifier_decision must be a boolean")
+            raise TypeError("allow_single_classifier_decision must be a boolean")
 
 
 class ModeRouter:
@@ -263,10 +263,21 @@ class ModeRouter:
     async def _classify_with_text(self, task_text: str) -> tuple[RouteAssessment, ...] | None:
         if not self._policy.parallel_classifiers:
             try:
-                primary = await self._classifier.classify(task_text)
+                primary = self._validate_assessment(
+                    await self._classifier.classify(task_text),
+                    RouteSource.CLASSIFIER,
+                )
+                if primary is None:
+                    return None
                 if self._policy.allow_single_classifier_decision:
                     return (primary,)
-                return (primary, await self._verifier.classify(task_text))
+                verifier = self._validate_assessment(
+                    await self._verifier.classify(task_text),
+                    RouteSource.VERIFIER,
+                )
+                if verifier is None:
+                    return None
+                return (primary, verifier)
             except asyncio.CancelledError:
                 raise
             except Exception as error:  # noqa: BLE001

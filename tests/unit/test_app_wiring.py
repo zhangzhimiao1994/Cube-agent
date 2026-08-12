@@ -1,5 +1,6 @@
-from pathlib import Path
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
@@ -12,9 +13,9 @@ from agent_hub.api.routers.admin import (
 )
 from agent_hub.app import _MainAgentModeRouter, _web_ui_response, create_app
 from agent_hub.models.capacity import CapacityLease
+from agent_hub.models.gateway import CapacityController
 from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, TokenUsage
 from agent_hub.routing.types import RiskLevel
-
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
 
@@ -63,12 +64,12 @@ class ImmediateCapacity:
     async def initialize(self) -> None:
         return None
 
-    def validate_configuration(self, deployments: tuple[Deployment, ...]) -> None:
+    def validate_configuration(self, deployments: Sequence[Deployment]) -> None:
         assert len(deployments) == 1
 
     async def acquire(
         self,
-        candidates: tuple[Deployment, ...],
+        candidates: Sequence[Deployment],
         wait_timeout: float,
         *,
         estimated_tokens: int,
@@ -140,7 +141,7 @@ async def test_main_agent_mode_router_uses_configured_main_agent_model() -> None
             )
         )
 
-    async def capacity_factory(_deployments: tuple[Deployment, ...]) -> ImmediateCapacity:
+    async def capacity_factory(_deployments: tuple[Deployment, ...]) -> CapacityController:
         return ImmediateCapacity()
 
     router = _MainAgentModeRouter(
@@ -155,6 +156,7 @@ async def test_main_agent_mode_router_uses_configured_main_agent_model() -> None
     decision = await router.route("写一个活动策划，需要分工。")
 
     assert decision.status == "ready"
+    assert decision.mode is not None
     assert decision.mode.value == "dispatch"
     assert decision.risk is RiskLevel.LOW
     assert len(transport.requests) == 1
@@ -197,7 +199,7 @@ async def test_main_agent_mode_router_inherits_registered_model_capabilities() -
             ),
         )
 
-    async def capacity_factory(_deployments: tuple[Deployment, ...]) -> ImmediateCapacity:
+    async def capacity_factory(_deployments: tuple[Deployment, ...]) -> CapacityController:
         assert _deployments[0].quota_scope_id == "minimax-account"
         assert _deployments[0].max_concurrency == 1
         return ImmediateCapacity()
@@ -215,5 +217,6 @@ async def test_main_agent_mode_router_inherits_registered_model_capabilities() -
     decision = await router.route("写一份活动方案，需要策划和审核。")
 
     assert decision.status == "ready"
+    assert decision.mode is not None
     assert decision.mode.value == "dispatch"
     assert len(transport.requests) == 1

@@ -57,7 +57,12 @@ from agent_hub.observability.logging import configure_logging
 from agent_hub.observability.metrics import default_metrics_registry
 from agent_hub.routing.classifier import GatewayRouteClassifier
 from agent_hub.routing.service import ModeRouter, RoutingPolicy
-from agent_hub.routing.types import InMemoryDecisionTokenStore, RiskLevel, RouteDecision, RouteSource
+from agent_hub.routing.types import (
+    InMemoryDecisionTokenStore,
+    RiskLevel,
+    RouteDecision,
+    RouteSource,
+)
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import ModeRouterProtocol, RunService, TaskQueue
 from agent_hub.runs.temporary_agents import AdminResourceTemporaryAgentPolicy

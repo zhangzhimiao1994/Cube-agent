@@ -21,8 +21,8 @@ from agent_hub.runtime.defaults import (
     _discussion_plan,
     _dispatch_parallelism,
     _dispatch_plan,
-    _selected_config_role_assignments,
     _select_logical_model_for_role,
+    _selected_config_role_assignments,
     configured_runtime_registry,
 )
 from agent_hub.runtime.role_planner import RoleAssignment, RolePurpose
@@ -861,7 +861,7 @@ def test_selected_agent_ids_are_resolved_from_config_without_extra_roles() -> No
         tenant_id=TENANT_ID,
         mode=TaskMode.HYBRID,
         request="写一个中秋活动方案。",
-        routing_decision={"selected_agent_ids": ["copywriter", "reviewer"]},
+        routing_decision={"selected_agent_ids": ("copywriter", "reviewer")},
     )
 
     roles = _selected_config_role_assignments(
