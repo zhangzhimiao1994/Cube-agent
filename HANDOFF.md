@@ -1,5 +1,32 @@
 # Agent Hub Handoff
 
+## 2026-08-12 Feishu 204 Ack Fix
+
+Current state:
+
+- Feishu event log showed `success=fail` with `httpCode=204` for `im.chat.access_event.bot_p2p_chat_entered_v1`.
+- Root cause: Agent Hub treated valid-but-unsupported Feishu platform events as ignored and returned HTTP 204. Feishu event subscriptions expect HTTP 200 within the timeout window, so the platform marked delivery as failed even though the request reached the server.
+- Debug server `103.236.98.133` has been updated incrementally with the backend fix and `agent-hub-api` was restarted.
+
+Changes made:
+
+- `src/agent_hub/channels/feishu/webhook.py`: valid Feishu events that do not normalize into user messages now return `200 {"accepted": true, "ignored": true}` instead of HTTP 204.
+- Added API regression coverage for `im.chat.access_event.bot_p2p_chat_entered_v1` so this behavior does not regress.
+
+Verification performed:
+
+- TDD red: new test first failed with `assert 204 == 200`.
+- Local: `uv run pytest tests/api/test_channel_webhooks.py -q` → 18 passed.
+- Local: `uv run ruff check src tests/api/test_channel_webhooks.py` → all checks passed.
+- Local: `uv run mypy --strict src tests` → success, no issues in 239 source files.
+- Server: `systemctl restart agent-hub-api`, then `/health/ready` returned `{"status":"ok"}`.
+- Server local Feishu probe using the saved Feishu channel config returned `status=200 body={"accepted":true,"ignored":true}` for the same event class.
+
+Remaining risks / TODOs:
+
+- `bot_p2p_chat_entered` is only an entry/access event; it is expected to be acknowledged but not answered by the Agent.
+- To get a bot reply, Feishu must deliver `im.message.receive_v1` events to the same callback URL, and the app must have the matching message receive permissions/events enabled and published.
+
 ## 2026-08-12 CI Static Check Follow-up
 
 Current state:

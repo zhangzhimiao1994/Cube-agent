@@ -464,6 +464,55 @@ def test_feishu_webhook_accepts_token_only_event_when_signature_headers_are_abse
     assert gateway.messages[0].text == "/direct hello"
 
 
+def test_feishu_webhook_acks_supported_platform_events_even_when_no_message() -> None:
+    gateway = RecordingGateway()
+    app = create_app(
+        auth_service=StubAuthService(),
+        rate_limiter=object(),
+        feishu_gateway=gateway,
+    )
+    app.state.admin_resource_service = InMemoryAdminResourceService()
+    api = TestClient(app)
+
+    saved = api.post(
+        "/api/v1/admin/channels/feishu/config",
+        headers={"Authorization": "Bearer valid-token"},
+        json={
+            "values": {
+                "AGENT_HUB_PUBLIC_URL": "https://agent.example.com",
+                "FEISHU_APP_ID": "cli_saved_feishu",
+                "FEISHU_APP_SECRET": "saved-secret",
+                "FEISHU_VERIFICATION_TOKEN": "saved-verification-token",
+                "FEISHU_ENCRYPT_KEY": "saved-encrypt-key",
+                "FEISHU_TRANSPORT": "webhook",
+            }
+        },
+    )
+    response = api.post(
+        "/channels/feishu/events",
+        json={
+            "schema": "2.0",
+            "header": {
+                "event_id": "evt_p2p_entered",
+                "event_type": "im.chat.access_event.bot_p2p_chat_entered_v1",
+                "token": "saved-verification-token",
+                "app_id": "cli_saved_feishu",
+                "tenant_key": "tenant_1",
+                "create_time": str(int(time.time())),
+            },
+            "event": {
+                "operator_id": {"open_id": "ou_user"},
+                "chat_id": "oc_chat",
+            },
+        },
+    )
+
+    assert saved.status_code == 200
+    assert response.status_code == 200
+    assert response.json() == {"accepted": True, "ignored": True}
+    assert gateway.messages == []
+
+
 def test_generic_channel_webhook_rejects_wrong_token(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CUSTOM_WEBHOOK_TOKEN", "correct")
     gateway = RecordingGateway()

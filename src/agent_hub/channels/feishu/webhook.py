@@ -118,7 +118,7 @@ def create_feishu_webhook_router(
         if result.challenge is not None:
             return JSONResponse(content={"challenge": result.challenge})
         if result.message is None:
-            return Response(status_code=204)
+            return JSONResponse(content={"accepted": True, "ignored": True})
         return JSONResponse(status_code=202, content={"accepted": True})
 
     return router
@@ -162,7 +162,7 @@ def create_lazy_feishu_webhook_router(
         if result.challenge is not None:
             return JSONResponse(content={"challenge": result.challenge})
         if result.message is None:
-            return Response(status_code=204)
+            return JSONResponse(content={"accepted": True, "ignored": True})
         _schedule_feishu_reply(request, settings, result)
         return JSONResponse(status_code=202, content={"accepted": True})
 
