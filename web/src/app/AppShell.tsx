@@ -9,12 +9,13 @@ export function AppShell() {
     ...group,
     modules: group.modules.filter((module) => hasPermission(auth.user?.permissions ?? [], module.permission)),
   })).filter((group) => group.modules.length > 0);
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand-card">
           <span className="eyebrow">Agent Hub</span>
-          <h1>控制中枢</h1>
+          <h1>控制台</h1>
           <p>面向生产环境的多 Agent 调度与配置控制台</p>
         </div>
         <nav aria-label="Main navigation" className="nav-list">

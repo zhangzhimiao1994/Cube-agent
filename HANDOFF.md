@@ -283,3 +283,53 @@ Remaining risks / TODOs:
 - Feishu real reply still needs a real Feishu event callback to reach `/channels/feishu/events`; synthetic `om_probe_*` reply failures are expected and not proof of production reply failure.
 - Server Main Agent was switched from MiniMax to the already working DeepSeek registered model during verification because MiniMax pure text and structured-output calls failed through the current server gateway. The code now handles such provider incompatibility better, but a bad Main Agent key/model will still correctly ask for user choice instead of silently falling back.
 - UI behavior still needs user-side browser validation for the exact mobile interaction details: process-line layout, handoff button placement, and no history overwrite.
+
+## 2026-08-12 Navigation Consolidation
+
+Current state:
+
+- Local code and server `/opt/agent-hub/current` were updated incrementally.
+- Public UI entry `http://113.142.217.42:21015/` returned HTTP 200.
+- Current frontend assets returned HTTP 200:
+  - `/assets/index-BKz7GAiS.js`
+  - `/assets/index-DWQw7Ted.css`
+
+Changes made:
+
+- Consolidated the left navigation into 6 top-level categories:
+  - 对话
+  - 编排
+  - 资源
+  - 工具
+  - 通道
+  - 系统
+- Kept all existing functional pages reachable through module hub cards instead of deleting routes.
+- Updated module hub labels/descriptions so users enter specific pages through colored module cards.
+- Fixed AppShell, module hub, login page, first-run setup page, and related tests to use stable UTF-8 Chinese copy.
+- Kept permission filtering in the navigation unchanged: modules still only appear when the current user has the required permission.
+
+Verification performed:
+
+- Frontend focused test:
+  - `npm.cmd test -- --run src/app/AppShell.test.tsx`
+  - Result: 2 passed
+- Frontend type check:
+  - `npm.cmd run lint`
+  - Result: passed
+- Full frontend test suite:
+  - `npm.cmd test -- --run`
+  - Result: 68 passed
+- Frontend production build:
+  - `npm.cmd run build`
+  - Result: passed; Vite emitted only the existing chunk-size warning.
+- Server deployment:
+  - Uploaded incremental package `.tmp/nav-consolidation-web.tar.gz` to `/tmp/agent-hub-nav-consolidation.tar.gz`.
+  - Extracted in `/opt/agent-hub/current`.
+  - Reloaded Caddy.
+  - `curl -fsS http://127.0.0.1:8000/health/ready` returned `{"status":"ok"}`.
+  - External HTML and asset HEAD checks returned HTTP 200.
+
+Remaining risks / TODOs:
+
+- Browser-side visual acceptance still depends on user checking the exact mobile sidebar/header feel.
+- This change intentionally did not refactor the underlying route tree; old direct routes remain available so bookmarks and internal links keep working.

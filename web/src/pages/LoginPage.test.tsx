@@ -7,7 +7,9 @@ import { TestApp } from "../app/router";
 const principal = {
   user_id: "11111111-1111-4111-8111-111111111111",
   tenant_id: "33333333-3333-4333-8333-333333333333",
+  username: "owner",
   role: "super_admin",
+  permissions: ["*"],
 };
 
 const ownerToken = {
@@ -116,7 +118,7 @@ describe("LoginPage", () => {
     expect(screen.getByText("部署版本")).not.toBeNull();
     expect(screen.getByText("执行迁移")).not.toBeNull();
     expect(screen.getByText("启动服务")).not.toBeNull();
-    expect(screen.getByRole("heading", { name: "创建管理员" })).not.toBeNull();
+    expect(screen.getByRole("heading", { name: "创建第一个账号" })).not.toBeNull();
     await userEvent.type(screen.getByLabelText("Setup code"), "setup-code");
     await userEvent.type(screen.getByLabelText("Username"), "owner");
     await userEvent.type(screen.getByLabelText("Password"), "correct horse battery staple");
@@ -151,7 +153,9 @@ describe("LoginPage", () => {
           return jsonResponse({
             user_id: "44444444-4444-4444-8444-444444444444",
             tenant_id: principal.tenant_id,
+            username: "viewer",
             role: "viewer",
+            permissions: ["run:read", "agent:read", "config:read", "skill:read", "mcp:read", "audit:read"],
           });
         }
         if (String(input) === "/api/v1/admin/runs") {
@@ -163,13 +167,13 @@ describe("LoginPage", () => {
 
     render(<TestApp initialPath="/extensions" />);
 
-    expect(await screen.findByRole("link", { name: "工作台" })).not.toBeNull();
+    expect(await screen.findByRole("link", { name: "对话" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "编排" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "资源" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "工具" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "通道" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "系统" })).not.toBeNull();
-    expect(screen.getByRole("link", { name: /技能/ })).not.toBeNull();
-    expect(screen.getByRole("link", { name: /MCP 工具/ })).not.toBeNull();
+    expect(screen.getByRole("link", { name: /Skill/ })).not.toBeNull();
+    expect(screen.getByRole("link", { name: /MCP/ })).not.toBeNull();
   });
 });

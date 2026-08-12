@@ -1,7 +1,7 @@
 import { Link } from "react-router-dom";
 
-import { useAuth } from "../auth/AuthProvider";
 import type { ModuleGroup } from "../app/navigation";
+import { useAuth } from "../auth/AuthProvider";
 
 export function ModuleHubPage({ group }: { group: ModuleGroup }) {
   const auth = useAuth();
