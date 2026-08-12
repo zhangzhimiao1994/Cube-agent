@@ -18,8 +18,8 @@ from agent_hub.models.types import (
     ModelRequest,
     ModelResponse,
     StructuredResponseSchema,
-    ToolDefinition,
     ToolCall,
+    ToolDefinition,
 )
 
 API_KEY = "runtime-" + "sentinel-secret"

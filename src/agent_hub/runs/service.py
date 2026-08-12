@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import re
-import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal

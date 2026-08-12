@@ -12,7 +12,15 @@ import json
 import math
 import re
 import unicodedata
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Literal, Protocol, cast
