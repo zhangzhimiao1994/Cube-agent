@@ -295,25 +295,46 @@ article:hover {
 
 .app-shell {
   display: grid;
-  grid-template-columns: 304px minmax(0, 1fr);
+  grid-template-columns: 112px minmax(0, 1fr);
   min-height: 100dvh;
 }
 
 .sidebar {
+  color: var(--ink);
+  height: 100dvh;
+  padding: 1rem 0 1rem 0.75rem;
+  position: sticky;
+  top: 0;
+  z-index: 30;
+}
+
+.floating-sidebar {
+  align-self: start;
+  display: grid;
+  grid-template-columns: 86px auto;
+  pointer-events: none;
+}
+
+.floating-nav-rail,
+.nav-drawer {
+  pointer-events: auto;
+}
+
+.floating-nav-rail {
   background:
     radial-gradient(circle at 18% 8%, rgba(85, 215, 255, 0.24), transparent 28%),
     radial-gradient(circle at 88% 2%, rgba(157, 124, 255, 0.2), transparent 24%),
     linear-gradient(180deg, rgba(255, 255, 255, 0.055), transparent 24%),
-    var(--panel-dark);
-  border-right: 1px solid var(--line);
-  color: var(--ink);
+    rgba(5, 12, 24, 0.82);
+  border: 1px solid var(--line);
+  border-radius: 1.35rem;
+  box-shadow:
+    0 24px 80px rgba(0, 0, 0, 0.38),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
   display: grid;
-  grid-template-rows: auto 1fr;
-  gap: 1.25rem;
-  height: 100dvh;
-  padding: 1.25rem;
-  position: sticky;
-  top: 0;
+  gap: 0.85rem;
+  max-height: calc(100dvh - 2rem);
+  padding: 0.65rem;
 }
 
 .brand-card {
@@ -327,6 +348,20 @@ article:hover {
     inset 0 1px 0 rgba(255, 255, 255, 0.08),
     0 0 36px rgba(85, 215, 255, 0.09);
   padding: 1.25rem;
+}
+
+.compact-brand-card {
+  border-radius: 1rem;
+  padding: 0.75rem;
+}
+
+.compact-brand-card h1 {
+  font-size: 1.05rem;
+  letter-spacing: -0.04em;
+}
+
+.compact-brand-card p {
+  display: none;
 }
 
 .brand-card h1,
@@ -361,16 +396,19 @@ article:hover {
 .nav-list {
   align-content: start;
   display: grid;
-  gap: 0.35rem;
+  gap: 0.45rem;
   overflow-y: auto;
-  padding-right: 0.2rem;
 }
 
 .nav-link {
   border: 1px solid transparent;
-  border-radius: 1rem;
+  border-radius: 999px;
   color: var(--muted);
-  padding: 0.82rem 0.95rem;
+  font-size: 0.92rem;
+  font-weight: 850;
+  min-width: 4rem;
+  padding: 0.72rem 0.5rem;
+  text-align: center;
   text-decoration: none;
   transition:
     background 160ms var(--ease),
@@ -384,7 +422,91 @@ article:hover {
   background: rgba(85, 215, 255, 0.08);
   border-color: rgba(85, 215, 255, 0.22);
   color: var(--ink);
+  transform: translateX(2px) scale(1.01);
+}
+
+.nav-drawer {
+  --drawer-accent: 85, 215, 255;
+  align-self: start;
+  background:
+    radial-gradient(circle at 16% 4%, rgba(var(--drawer-accent), 0.18), transparent 30%),
+    linear-gradient(145deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.025)),
+    rgba(5, 12, 24, 0.9);
+  border: 1px solid rgba(var(--drawer-accent), 0.22);
+  border-radius: 1.35rem;
+  box-shadow:
+    0 28px 90px rgba(0, 0, 0, 0.42),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  display: grid;
+  gap: 1rem;
+  margin-left: 0.75rem;
+  max-width: 20rem;
+  min-width: 18rem;
+  padding: 1rem;
+}
+
+.nav-drawer-green {
+  --drawer-accent: 111, 255, 173;
+}
+
+.nav-drawer-amber {
+  --drawer-accent: 255, 196, 87;
+}
+
+.nav-drawer-violet {
+  --drawer-accent: 178, 136, 255;
+}
+
+.nav-drawer-blue {
+  --drawer-accent: 98, 166, 255;
+}
+
+.nav-drawer-slate {
+  --drawer-accent: 178, 190, 205;
+}
+
+.nav-drawer-title {
+  display: block;
+  font-size: 1.35rem;
+  letter-spacing: -0.04em;
+  margin: 0.25rem 0;
+}
+
+.nav-drawer p {
+  color: var(--muted);
+  line-height: 1.5;
+  margin: 0;
+}
+
+.nav-drawer-links {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.nav-drawer-link {
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 1rem;
+  color: var(--ink);
+  display: grid;
+  gap: 0.28rem;
+  padding: 0.82rem;
+  text-decoration: none;
+  transition:
+    border-color 160ms var(--ease),
+    transform 160ms var(--ease);
+}
+
+.nav-drawer-link:hover,
+.nav-drawer-link:focus-visible {
+  border-color: rgba(var(--drawer-accent), 0.42);
   transform: translateX(2px);
+}
+
+.nav-drawer-link span {
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.45;
 }
 
 .module-hub {
@@ -1943,8 +2065,22 @@ article:hover {
 
   .sidebar {
     height: auto;
-    padding: 0.85rem;
+    padding: 0.65rem;
     position: static;
+  }
+
+  .floating-sidebar {
+    display: grid;
+    gap: 0.65rem;
+    grid-template-columns: 1fr;
+    pointer-events: auto;
+  }
+
+  .floating-nav-rail {
+    display: grid;
+    gap: 0.55rem;
+    max-height: none;
+    padding: 0.6rem;
   }
 
   .brand-card {
@@ -1958,6 +2094,10 @@ article:hover {
 
   .brand-card p {
     margin: 0.35rem 0 0;
+  }
+
+  .compact-brand-card {
+    display: none;
   }
 
   .nav-list {
@@ -1978,6 +2118,16 @@ article:hover {
   .nav-link:hover,
   .nav-link-active {
     transform: translateY(-1px);
+  }
+
+  .nav-drawer {
+    margin-left: 0;
+    max-width: none;
+    min-width: 0;
+  }
+
+  .nav-drawer-links {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .module-card-grid {
@@ -2037,6 +2187,15 @@ article:hover {
     font-size: 0.92rem;
     min-width: 4rem;
     padding: 0.62rem 0.8rem;
+  }
+
+  .nav-drawer {
+    border-radius: 1.15rem;
+    padding: 0.85rem;
+  }
+
+  .nav-drawer-links {
+    grid-template-columns: 1fr;
   }
 
   .module-card-grid {

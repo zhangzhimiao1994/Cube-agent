@@ -84,5 +84,9 @@ describe("AppShell presentation", () => {
     expect(within(moduleGrid).getByRole("link", { name: /Agent 角色/ })).not.toBeNull();
     expect(within(moduleGrid).getByRole("link", { name: /工作流配置/ })).not.toBeNull();
     expect(within(moduleGrid).getByRole("link", { name: /Hermes 学习/ })).not.toBeNull();
+
+    const drawer = screen.getByLabelText("编排二级导航");
+    expect(within(drawer).getByRole("link", { name: /主 Agent/ })).not.toBeNull();
+    expect(within(drawer).getByRole("link", { name: /工作流配置/ })).not.toBeNull();
   });
 });

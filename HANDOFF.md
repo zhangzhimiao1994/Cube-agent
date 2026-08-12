@@ -333,3 +333,52 @@ Remaining risks / TODOs:
 
 - Browser-side visual acceptance still depends on user checking the exact mobile sidebar/header feel.
 - This change intentionally did not refactor the underlying route tree; old direct routes remain available so bookmarks and internal links keep working.
+
+## 2026-08-12 Floating Navigation Drawer
+
+Current state:
+
+- The console still uses 6 top-level navigation groups, but the visual frame was changed from a wide left sidebar to a compact floating left rail with a second-level drawer.
+- Server `/opt/agent-hub/current` was updated incrementally, not through a full release upload.
+- Public UI entry `http://113.142.217.42:21015/` returned HTTP 200 after deployment.
+- Current frontend assets returned HTTP 200:
+  - `/assets/index-DDQyvCTw.js`
+  - `/assets/index-CXTG4MI5.css`
+
+Changes made:
+
+- `AppShell` now renders:
+  - compact floating navigation rail;
+  - 6 top-level groups;
+  - second-level drawer for the active or hovered group;
+  - drawer links filtered by the current user's permissions.
+- Drawer title no longer uses a page-level heading. This avoids confusing tests and assistive navigation with actual page headings such as the chat page title.
+- Desktop layout uses a narrow left rail and floating drawer.
+- Mobile layout keeps the top-level groups horizontally scrollable and places the drawer below it.
+- Tests now cover that the drawer exposes second-level module links.
+- Login-page navigation test was adjusted for duplicated module links intentionally appearing both in drawer and hub content.
+
+Verification performed:
+
+- Focused drawer test:
+  - `npm.cmd test -- --run src/app/AppShell.test.tsx`
+  - Result: 2 passed
+- Frontend type check:
+  - `npm.cmd run lint`
+  - Result: passed
+- Full frontend test suite:
+  - `npm.cmd test -- --run`
+  - Result: 68 passed
+- Frontend production build:
+  - `npm.cmd run build`
+  - Result: passed; Vite emitted only the existing chunk-size warning.
+- Server deployment:
+  - Uploaded `.tmp/nav-floating-drawer-web.tar.gz` to `/tmp/agent-hub-nav-floating-drawer.tar.gz`.
+  - Extracted in `/opt/agent-hub/current`.
+  - Reloaded Caddy.
+  - `curl -fsS http://127.0.0.1:8000/health/ready` returned `{"status":"ok"}`.
+  - External HTML and asset HEAD checks returned HTTP 200.
+
+Backlog / deferred:
+
+- Feishu currently supports enterprise self-built app style channel integration. The user wants future support for configuring Feishu as a native Feishu intelligent agent. This is intentionally deferred until after the current UI/Agent flow work stabilizes.

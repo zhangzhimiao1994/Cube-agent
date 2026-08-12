@@ -173,7 +173,7 @@ describe("LoginPage", () => {
     expect(screen.getByRole("link", { name: "工具" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "通道" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "系统" })).not.toBeNull();
-    expect(screen.getByRole("link", { name: /Skill/ })).not.toBeNull();
-    expect(screen.getByRole("link", { name: /MCP/ })).not.toBeNull();
+    expect(screen.getAllByRole("link", { name: /Skill/ }).length).toBeGreaterThan(0);
+    expect(screen.getAllByRole("link", { name: /MCP/ }).length).toBeGreaterThan(0);
   });
 });
