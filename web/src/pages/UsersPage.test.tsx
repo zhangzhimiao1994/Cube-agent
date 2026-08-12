@@ -64,6 +64,14 @@ describe("UsersPage", () => {
         if (path.endsWith("/disabled") && init?.method === "PATCH") {
           return jsonResponse({ ...operator, disabled: true });
         }
+        if (path === `/api/v1/users/${operator.id}` && init?.method === "PATCH") {
+          return jsonResponse({
+            ...operator,
+            username: "ops-renamed",
+            role: "admin",
+            disabled: true,
+          });
+        }
         if (path.endsWith("/password") && init?.method === "PATCH") {
           return jsonResponse(operator);
         }
@@ -142,5 +150,29 @@ describe("UsersPage", () => {
       }),
     );
     expect(screen.queryByText("new valid password 789")).toBeNull();
+  });
+
+  it("opens an explicit edit panel and saves username, role, and disabled state together", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<TestApp initialPath="/users" />);
+
+    await screen.findByRole("heading", { name: "用户管理" });
+    await userEvent.click(screen.getAllByRole("button", { name: "编辑" })[1]);
+    expect(screen.getByRole("heading", { name: "编辑用户" })).not.toBeNull();
+
+    const usernameInput = screen.getByLabelText("用户名（编辑）");
+    await userEvent.clear(usernameInput);
+    await userEvent.type(usernameInput, "ops-renamed");
+    await userEvent.selectOptions(screen.getByLabelText("角色（编辑）"), "admin");
+    await userEvent.click(screen.getByLabelText("禁用该用户"));
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/users/22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ username: "ops-renamed", role: "admin", disabled: true }),
+      }),
+    );
   });
 });

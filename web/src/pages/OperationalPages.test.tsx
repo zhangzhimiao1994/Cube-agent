@@ -1369,13 +1369,22 @@ describe("operational management pages", () => {
     );
   });
 
-  it("uploads a skill zip from the chat composer and requires explicit approval", async () => {
+  it("uploads an archive as a normal attachment first and installs it as a skill only after explicit action", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     const file = new File(["PK\x03\x04"], "uploaded-skill.zip", { type: "application/zip" });
     await user.upload(screen.getByLabelText("上传文件或 Skill ZIP"), file);
+
+    expect(await screen.findByText("压缩包附件")).not.toBeNull();
+    expect(screen.getByText("uploaded-skill.zip")).not.toBeNull();
+    expect(requests.find((request) => request.path === "/api/v1/runs/attachments/upload")).toMatchObject({
+      method: "POST",
+    });
+    expect(requests.find((request) => request.path === "/api/v1/admin/skills/upload")).toBeUndefined();
+
+    await user.click(screen.getByRole("button", { name: "作为 Skill 安装" }));
 
     expect(await screen.findByText("Skill 包已扫描，等待确认")).not.toBeNull();
     expect(screen.getByText("uploaded_skill")).not.toBeNull();

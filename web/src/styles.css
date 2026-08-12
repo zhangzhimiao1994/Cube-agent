@@ -20,6 +20,8 @@
   --accent-dark: #0a6f91;
   --danger: #ff6d7a;
   --good: #7dffbd;
+  --success: #7dffbd;
+  --text: #e8fbff;
   --warning: #ffd166;
   --shadow: 0 28px 90px rgba(0, 0, 0, 0.42);
   --glow: 0 0 38px rgba(85, 215, 255, 0.2);
@@ -102,6 +104,12 @@ button {
     border-color 180ms var(--ease),
     box-shadow 180ms var(--ease),
     opacity 180ms var(--ease);
+}
+
+.page-surface button,
+.page-surface .button-link {
+  min-height: 2.25rem;
+  padding: 0.5rem 0.78rem;
 }
 
 button:hover {
@@ -299,6 +307,10 @@ article:hover {
   min-height: 100dvh;
 }
 
+.app-shell.nav-pinned {
+  grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
+}
+
 .sidebar {
   color: var(--ink);
   height: 100dvh;
@@ -313,6 +325,11 @@ article:hover {
   display: grid;
   grid-template-columns: 86px auto;
   pointer-events: none;
+}
+
+.nav-pinned .floating-sidebar {
+  grid-template-columns: 84px minmax(0, 1fr);
+  width: 100%;
 }
 
 .floating-nav-rail,
@@ -362,6 +379,29 @@ article:hover {
 
 .compact-brand-card p {
   display: none;
+}
+
+.nav-layout-toggle {
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(85, 215, 255, 0.18);
+  border-radius: 999px;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 0.74rem;
+  font-weight: 850;
+  min-height: 2rem;
+  padding: 0.42rem 0.5rem;
+  transition:
+    background 160ms var(--ease),
+    border-color 160ms var(--ease),
+    color 160ms var(--ease);
+}
+
+.nav-layout-toggle:hover,
+.nav-layout-toggle:focus-visible {
+  background: rgba(85, 215, 255, 0.09);
+  border-color: rgba(85, 215, 255, 0.34);
+  color: var(--ink);
 }
 
 .brand-card h1,
@@ -443,6 +483,15 @@ article:hover {
   max-width: 20rem;
   min-width: 18rem;
   padding: 1rem;
+}
+
+.nav-floating .nav-drawer {
+  position: relative;
+}
+
+.nav-pinned .nav-drawer {
+  max-width: none;
+  min-width: 0;
 }
 
 .nav-drawer-green {
@@ -730,7 +779,7 @@ article:hover {
 .table-shell th,
 .table-shell td {
   border-bottom: 1px solid rgba(123, 225, 255, 0.12);
-  padding: 0.85rem;
+  padding: 0.68rem 0.72rem;
   text-align: left;
   vertical-align: top;
 }
@@ -1260,7 +1309,7 @@ article:hover {
   border-radius: 999px;
   color: var(--text);
   font-weight: 900;
-  padding: 0.55rem 0.85rem;
+  padding: 0.48rem 0.74rem;
   text-decoration: none;
   transition:
     border-color 160ms var(--ease),
@@ -1698,22 +1747,62 @@ article:hover {
   white-space: nowrap;
 }
 
-.table-actions {
+.bulk-action-bar {
+  align-items: center;
+  background: rgba(3, 10, 20, 0.36);
+  border: 1px solid rgba(123, 225, 255, 0.16);
+  border-radius: 1rem;
   display: flex;
   flex-wrap: wrap;
   gap: 0.5rem;
+  margin: 0.75rem 0;
+  padding: 0.62rem 0.72rem;
+}
+
+.bulk-action-bar small {
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.table-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.38rem;
 }
 
 .table-actions button {
-  padding: 0.55rem 0.82rem;
+  min-height: 2.05rem;
+  padding: 0.42rem 0.66rem;
 }
 
-.danger-button {
+.danger-button,
+.danger-action {
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.12), transparent),
     linear-gradient(135deg, rgba(255, 109, 122, 0.92), rgba(120, 35, 66, 0.92));
   border-color: rgba(255, 109, 122, 0.42);
   color: #fff2f4;
+}
+
+.modal-backdrop {
+  align-items: center;
+  background: rgba(0, 0, 0, 0.58);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  padding: 1rem;
+  position: fixed;
+  z-index: 80;
+}
+
+.modal-card {
+  background:
+    linear-gradient(180deg, rgba(15, 30, 52, 0.96), rgba(6, 13, 25, 0.98));
+  border: 1px solid var(--line-strong);
+  border-radius: 1.35rem;
+  box-shadow: var(--shadow), var(--glow);
+  max-width: min(560px, 100%);
+  padding: clamp(1rem, 3vw, 1.4rem);
 }
 
 .link-actions {

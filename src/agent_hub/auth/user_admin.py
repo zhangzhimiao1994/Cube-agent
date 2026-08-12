@@ -86,6 +86,8 @@ class PersistentUserAdminService:
         role: Role,
     ) -> ManagedUser:
         _require_admin(actor)
+        if actor.role is not Role.SUPER_ADMIN and role is Role.SUPER_ADMIN:
+            raise PermissionError("only super admin can assign super admin role")
         async with self._session_factory() as session, session.begin():
             row = await session.scalar(
                 select(UserRow)
@@ -111,6 +113,65 @@ class PersistentUserAdminService:
             row.role = role.value
             await session.flush()
             return _managed_user_from_row(row)
+
+    async def update_user(
+        self,
+        actor: AuthenticatedPrincipal,
+        user_id: UUID,
+        *,
+        username: str | None = None,
+        role: Role | None = None,
+        disabled: bool | None = None,
+    ) -> ManagedUser:
+        _require_admin(actor)
+        if username is not None and not _is_valid_username(username):
+            raise UsernameValidationError(
+                "username must be a lowercase safe identifier of 3-64 characters"
+            )
+        if actor.role is not Role.SUPER_ADMIN and role is Role.SUPER_ADMIN:
+            raise PermissionError("only super admin can assign super admin role")
+        if user_id == actor.user_id and disabled is True:
+            raise ProtectedUserError("current user cannot be disabled")
+        try:
+            async with self._session_factory() as session, session.begin():
+                row = await session.scalar(
+                    select(UserRow)
+                    .where(UserRow.tenant_id == actor.tenant_id, UserRow.id == user_id)
+                    .with_for_update()
+                )
+                if row is None:
+                    raise KeyError("user not found")
+                next_username = username if username is not None else row.username
+                next_role = role.value if role is not None else row.role
+                next_disabled = disabled if disabled is not None else row.disabled
+                if row.protected and next_username != row.username:
+                    raise ProtectedUserError("protected user cannot be renamed")
+                if row.protected and next_role != Role.SUPER_ADMIN.value:
+                    raise ProtectedUserError("protected user cannot be demoted")
+                if row.protected and next_disabled:
+                    raise ProtectedUserError("protected user cannot be disabled")
+                if row.role == Role.SUPER_ADMIN.value and (
+                    next_role != Role.SUPER_ADMIN.value or next_disabled
+                ):
+                    remaining_super_admins = await session.scalar(
+                        select(func.count())
+                        .select_from(UserRow)
+                        .where(
+                            UserRow.tenant_id == actor.tenant_id,
+                            UserRow.id != user_id,
+                            UserRow.role == Role.SUPER_ADMIN.value,
+                            UserRow.disabled.is_(False),
+                        )
+                    )
+                    if int(remaining_super_admins or 0) == 0:
+                        raise LastSuperAdminError("cannot modify last super admin")
+                row.username = next_username
+                row.role = next_role
+                row.disabled = next_disabled
+                await session.flush()
+                return _managed_user_from_row(row)
+        except IntegrityError as error:
+            raise UserAlreadyExistsError("user already exists") from error
 
     async def set_disabled(
         self,

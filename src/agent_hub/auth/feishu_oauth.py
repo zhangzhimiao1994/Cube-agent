@@ -156,6 +156,8 @@ class InMemoryUserAdminService:
         role: Role,
     ) -> ManagedUser:
         _require_admin(actor)
+        if actor.role is not Role.SUPER_ADMIN and role is Role.SUPER_ADMIN:
+            raise PermissionError("only super admin can assign super admin role")
         user = self._users[user_id]
         if user.protected and role is not Role.SUPER_ADMIN:
             raise ProtectedUserError("protected user cannot be demoted")
@@ -170,6 +172,51 @@ class InMemoryUserAdminService:
             username=user.username,
             role=role,
             disabled=user.disabled,
+            feishu_open_id=user.feishu_open_id,
+            protected=user.protected,
+        )
+        self._users[user_id] = updated
+        return updated
+
+    async def update_user(
+        self,
+        actor: AuthenticatedPrincipal,
+        user_id: UUID,
+        *,
+        username: str | None = None,
+        role: Role | None = None,
+        disabled: bool | None = None,
+    ) -> ManagedUser:
+        _require_admin(actor)
+        user = self._users[user_id]
+        next_username = username if username is not None else user.username
+        next_role = role if role is not None else user.role
+        next_disabled = disabled if disabled is not None else user.disabled
+        if actor.role is not Role.SUPER_ADMIN and next_role is Role.SUPER_ADMIN:
+            raise PermissionError("only super admin can assign super admin role")
+        if user.protected and next_username != user.username:
+            raise ProtectedUserError("protected user cannot be renamed")
+        if user.protected and next_role is not Role.SUPER_ADMIN:
+            raise ProtectedUserError("protected user cannot be demoted")
+        if user.protected and next_disabled:
+            raise ProtectedUserError("protected user cannot be disabled")
+        if user_id == actor.user_id and next_disabled:
+            raise ProtectedUserError("current user cannot be disabled")
+        if (
+            user.role is Role.SUPER_ADMIN
+            and (next_role is not Role.SUPER_ADMIN or next_disabled)
+            and self._super_admin_count(excluding=user_id) == 0
+        ):
+            raise LastSuperAdminError("cannot modify last super admin")
+        if next_username != user.username and any(
+            existing.username == next_username for existing in self._users.values()
+        ):
+            raise UserAlreadyExistsError("user already exists")
+        updated = ManagedUser(
+            id=user.id,
+            username=next_username,
+            role=next_role,
+            disabled=next_disabled,
             feishu_open_id=user.feishu_open_id,
             protected=user.protected,
         )

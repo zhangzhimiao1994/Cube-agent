@@ -83,11 +83,6 @@ function isArchiveFileName(fileName: string) {
   return ARCHIVE_EXTENSIONS.some((extension) => lower.endsWith(extension));
 }
 
-function mayBeSkillArchive(fileName: string) {
-  const lower = fileName.toLowerCase();
-  return [".zip", ".tar.gz", ".tgz"].some((extension) => lower.endsWith(extension));
-}
-
 function newConversationId() {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
     return `conv-${crypto.randomUUID()}`;
@@ -1163,6 +1158,7 @@ export function RunsPage() {
   const [modeSelection, setModeSelection] = useState<ModeSelection | null>(null);
   const [skillInstallCandidate, setSkillInstallCandidate] = useState<SkillInstallCandidate | null>(null);
   const [attachmentDraft, setAttachmentDraft] = useState<ChatAttachmentDraft | null>(null);
+  const [archiveInstallFile, setArchiveInstallFile] = useState<File | null>(null);
   const [conversationRunCache, setConversationRunCache] = useState<Record<string, RunDetail[]>>({});
   const [temporaryApproval, setTemporaryApproval] = useState<{
     runId: string;
@@ -1340,6 +1336,7 @@ export function RunsPage() {
         }
         setMessage("");
         setAttachmentDraft(null);
+        setArchiveInstallFile(null);
         return;
       }
       if (run.temporary_agent_proposal && run.decision_token) {
@@ -1364,6 +1361,7 @@ export function RunsPage() {
       }
       setMessage("");
       setAttachmentDraft(null);
+      setArchiveInstallFile(null);
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
       await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
       if (run.conversation_id) {
@@ -1502,26 +1500,25 @@ export function RunsPage() {
   const uploadSkillArchive = useMutation({
     mutationFn: (file: File) => api.uploadSkillArchive(file),
     onSuccess: (skill, file) => {
-      setAttachmentDraft(null);
+      setArchiveInstallFile(null);
       setSkillInstallCandidate({ fileName: file.name, skill, status: "scanned" });
       setSubmitNotice("Skill 包已完成安全扫描，请确认权限后再安装。");
       void queryClient.invalidateQueries({ queryKey: ["skills"] });
     },
     onError: (error, file) => {
       setSkillInstallCandidate(null);
-      if (isArchiveFileName(file.name) && error instanceof ApiError && error.code === "invalid_skill_package") {
-        setSubmitNotice(
-          "这个压缩包不是有效 Skill 包，正在按普通压缩包附件上传。是否用于代码审查，由你在对话中说明。",
-        );
-        uploadAttachment.mutate(file);
-      } else {
-        setAttachmentDraft({
+      setAttachmentDraft((current) =>
+        current ?? {
           fileName: file.name,
           size: file.size,
           kind: isArchiveFileName(file.name) ? "archive" : "context",
-        });
-        setSubmitNotice("Skill 扫描失败。请查看错误详情，确认是否为有效 Skill 包。");
-      }
+        },
+      );
+      setSubmitNotice(
+        error instanceof ApiError && error.code === "invalid_skill_package"
+          ? "这个压缩包不是有效 Skill 包，已保留为普通附件；如果它用于代码审查或普通任务，请直接在对话里说明。"
+          : "Skill 扫描失败。压缩包仍保留为附件，请查看错误详情后决定是否重新上传。",
+      );
     },
   });
 
@@ -1548,6 +1545,7 @@ export function RunsPage() {
             : "context";
       setSkillInstallCandidate(null);
       setAttachmentDraft({ fileName: attachment.filename || file.name, size: attachment.size_bytes, kind, attachment });
+      setArchiveInstallFile(kind === "archive" ? file : null);
       setSubmitNotice(
         kind === "archive"
           ? "压缩包已上传。请在输入框说明它是 Skill、代码审查材料，还是普通任务附件。"
@@ -1564,10 +1562,7 @@ export function RunsPage() {
     setSubmitNotice(null);
     setAttachmentDraft(null);
     setSkillInstallCandidate(null);
-    if (mayBeSkillArchive(file.name)) {
-      uploadSkillArchive.mutate(file);
-      return;
-    }
+    setArchiveInstallFile(isArchiveFileName(file.name) ? file : null);
     uploadAttachment.mutate(file);
   }
 
@@ -2239,6 +2234,11 @@ export function RunsPage() {
                       ? "图片已选中。当前先记录附件，启用多模态链路后可交给视觉模型识别。"
                       : "附件已选中。当前先记录附件名称，完整内容读取会走后端附件存储。"}
                 </p>
+                {attachmentDraft.kind === "archive" && archiveInstallFile ? (
+                  <button type="button" disabled={uploadSkillArchive.isPending} onClick={() => uploadSkillArchive.mutate(archiveInstallFile)}>
+                    {uploadSkillArchive.isPending ? "扫描中..." : "作为 Skill 安装"}
+                  </button>
+                ) : null}
               </aside>
             ) : null}
             <textarea

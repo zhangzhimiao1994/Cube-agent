@@ -37,6 +37,16 @@ class UserAdminServiceProtocol(Protocol):
         role: Role,
     ) -> ManagedUser: ...
 
+    async def update_user(
+        self,
+        actor: AuthenticatedPrincipal,
+        user_id: UUID,
+        *,
+        username: str | None = None,
+        role: Role | None = None,
+        disabled: bool | None = None,
+    ) -> ManagedUser: ...
+
     async def create_user(
         self,
         actor: AuthenticatedPrincipal,
@@ -101,6 +111,14 @@ class CreateUserRequest(BaseModel):
     username: str = Field(min_length=3, max_length=64)
     password: str = Field(min_length=12, max_length=1024)
     role: Role
+
+
+class UpdateUserRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: str | None = Field(default=None, min_length=3, max_length=64)
+    role: Role | None = None
+    disabled: bool | None = None
 
 
 class SetDisabledRequest(BaseModel):
@@ -168,6 +186,53 @@ async def create_user(
         action="user.create",
         resource=f"user:{user.id}",
         details={"username": user.username, "role": user.role.value},
+    )
+    return UserResponse.from_user(user)
+
+
+@router.patch(
+    "/{user_id}",
+    response_model=UserResponse,
+    responses=error_responses(400, 401, 403, 404, 409, 422, 503),
+)
+async def update_user(
+    user_id: UUID,
+    body: UpdateUserRequest,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[UserAdminServiceProtocol, Depends(_user_service)],
+) -> UserResponse:
+    _require(principal, "user:write")
+    try:
+        user = await service.update_user(
+            principal,
+            user_id,
+            username=body.username,
+            role=body.role,
+            disabled=body.disabled,
+        )
+    except PermissionError:
+        raise PublicAPIError(403, "permission_denied", "permission denied") from None
+    except KeyError:
+        raise PublicAPIError(404, "user_not_found", "user not found") from None
+    except UsernameValidationError as error:
+        raise PublicAPIError(422, "invalid_username", str(error)) from None
+    except UserAlreadyExistsError:
+        raise PublicAPIError(409, "user_exists", "user already exists") from None
+    except LastSuperAdminError:
+        raise PublicAPIError(409, "last_super_admin", "cannot modify last super admin") from None
+    except ProtectedUserError as error:
+        raise PublicAPIError(409, "protected_user", str(error)) from None
+    await _record_user_audit(
+        request,
+        principal,
+        action="user.update",
+        resource=f"user:{user.id}",
+        details={
+            "username": user.username,
+            "role": user.role.value,
+            "disabled": str(user.disabled).lower(),
+        },
     )
     return UserResponse.from_user(user)
 

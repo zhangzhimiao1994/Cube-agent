@@ -644,3 +644,142 @@ Verification performed:
 Important note:
 
 - Do not run downgrade verification on the production server DB; it intentionally deletes newer admin resource rows when moving to older schema versions. CI's isolated PostgreSQL environment is the correct place to verify downgrade/upgrade round trips.
+
+## 2026-08-13 P3 Gap Inventory / Priority Guardrail
+
+Context:
+
+- User sent `54123`; treated as non-actionable input and continued the agreed priority plan.
+- P1 / P1.5 / P2 are considered closed from prior server verification:
+  - direct / dispatch / discuss / hybrid runtime smoke completed on the server.
+  - admin resource surfaces returned healthy and CRUD flows passed.
+  - Hermes runtime advice is gated by confirmation and main-Agent policy.
+  - GitHub Actions was checked after push and is green at run `31631051122`.
+
+Current implementation facts verified from source:
+
+- Navigation is already consolidated into 6 top-level groups in `web/src/app/navigation.ts`: 对话、编排、资源、工具、通道、系统.
+- User management is not only a display page anymore; `web/src/pages/UsersPage.tsx` includes create user, role changes, disable/enable, password reset, and protected-account semantics via backend permissions.
+- Skill upload and lifecycle are real:
+  - `/api/v1/admin/skills/upload` exists.
+  - ZIP and tar/tar.gz skill package inspection is covered by tests.
+  - `RuntimeCapabilityGateway` can invoke approved skill packages via `SystemdSkillSandbox`.
+- MCP is not a mock-only shell:
+  - admin list/upsert/delete endpoints exist.
+  - `McpService` handles discovery, projection, invoke, denial, timeout, and audit.
+  - `McpClient` implements stdio, SSE, and streamable HTTP JSON-RPC clients.
+- Attachments are persisted with retention and safe extraction manifest:
+  - image/context/archive classification exists.
+  - ZIP and tar archive manifests/extraction exist.
+  - unsupported archive formats are marked unsupported instead of silently pretending success.
+- Conversation continuity has backend and frontend paths:
+  - `conversation_id` and `reference_conversation_id` are accepted by run submission.
+  - `/api/v1/admin/conversations/{conversation_id}` exists.
+  - frontend tests cover keeping old conversation messages, starting new chat, handoff/reference loading, and bulk conversation deletion.
+- Feishu basic callback/reply path exists:
+  - `/channels/feishu/events` is mounted on the main API.
+  - events are normalized, deduplicated, submitted to the run gateway, and replied when terminal.
+  - reply failures are recorded under `channel_error`.
+- Generic webhooks exist for DingTalk, WeCom bot/app, WeChat Official/KF, Telegram, Slack, QQ, and custom webhook.
+- Multimodal currently covers image/OCR/vision analysis. It does not yet cover video understanding, image/video generation, ASR/TTS, or per-capability model routing beyond current text/vision paths.
+
+P3 gaps to handle next, in priority order:
+
+1. Runtime process event quality:
+   - Current UI has compact process rows and detail drawer, but backend events are still not granular enough for the user's required Kimi/Codex hybrid UX.
+   - Need one chronological row per meaningful action: main Agent routing, role selection, task assignment, each child Agent receiving work, model used, child Agent output, discussion opinion, decision, final synthesis.
+   - Remove vague rows like "生成了结果" unless details include actor, model, instruction, output summary, and artifact reference.
+2. Channel hardening:
+   - Current Feishu integration is enterprise self-built app callback style. Target P3 goal is channel-as-Agent / Feishu intelligent-agent style where supported.
+   - Do not block P3 on native intelligent-agent mode; first harden current callback mode, attachment retrieval/delivery, command grammar, and diagnostic logs.
+3. Skill/MCP real E2E:
+   - Admin and runtime plumbing exists, but needs server-side end-to-end validation through an actual uploaded skill and a real MCP server invocation from an agent run.
+4. Attachment coverage:
+   - ZIP/tar are implemented. Other common archive formats such as 7z/rar need explicit supported/unsupported behavior, preferably safe rejection with clear UI guidance unless a safe extractor is introduced.
+5. Multimodal P3 expansion:
+   - Add provider/model capability routing for image understanding, video understanding, image generation, video generation, ASR/TTS, and embeddings.
+   - Keep multimodal optional, not part of base model config.
+6. Vibe coding / OpenClaw-style workflows:
+   - Make code review and coding workflows first-class: repo/zip intake, multiple model reviewers, model-attributed findings, synthesis by main Agent, and artifact/report output.
+7. CowAgent-level parity decisions:
+   - Memory/Hermes should evolve toward stronger long-term memory/retrieval/experience distillation.
+   - Skill install sources should grow beyond upload to GitHub/URL/curated hub/conversational skill authoring.
+
+Guardrail:
+
+- Do not jump to P3 feature work before closing P3-0 verification tasks above.
+- User wants every change synced to the server first, verified on the server, then pushed to GitHub only after validation.
+- After any push, check GitHub Actions and fix until green or report a concrete external blocker.
+
+## 2026-08-13 P1/P1.5 Polish Pass: Users, Skills, Navigation, Archive Attachments
+
+Current state:
+
+- This pass is still P1/P1.5/P2 stabilization work, not P3 feature expansion.
+- User clarified the execution rule: finish and server-verify P1/P1.5/P2 first; only then start P3.
+- Before implementing Vibe Coding / OpenClaw-level capabilities, do a module-unification refactor. Treat Vibe Coding / OpenClaw as system-level capabilities, not workflow presets.
+- Server sync and server validation are still pending for this pass; do not push this pass before server validation.
+
+Changes made locally:
+
+- User management:
+  - Added backend `PATCH /api/v1/users/{user_id}` for editing username, role, and disabled/enabled state in one operation.
+  - Preserved protected initial-admin safeguards and last-super-admin/current-user disable protections.
+  - Blocked non-super-admin operators from assigning `super_admin`.
+  - Frontend user page now has an explicit edit panel.
+  - Password reset now opens a modal instead of occupying persistent page space.
+- Skill management:
+  - Added multi-select, select-all, batch approve, and batch delete.
+  - Kept per-skill approve/delete actions.
+- Chat attachment handling:
+  - Archive uploads no longer auto-scan as Skill and no longer fall back silently.
+  - Archive uploads now default to normal attachments so the same archive can be used for code review, task files, normal context, or Skill install depending on user intent.
+  - Added explicit `作为 Skill 安装` action on archive attachment cards; only that action calls the Skill upload/scanning API.
+- Navigation:
+  - Top-level grouped navigation enters the default module directly instead of forcing an intermediate hub page.
+  - Added a persistent `悬浮导航栏` / `固定导航栏` toggle using `localStorage`.
+  - Added compact styles for the new toggle and pinned layout.
+- UI density:
+  - Existing compact button/table styling from this pass remains in place for users, skills, and table action areas.
+
+Verification performed locally:
+
+- Frontend targeted red/green:
+  - New archive behavior test failed first because ZIP was still auto-scanned as Skill.
+  - New navigation toggle test failed first because no toggle existed.
+  - After implementation: `npm.cmd test -- src/app/AppShell.test.tsx src/pages/OperationalPages.test.tsx -t "archive as a normal attachment|switch the navigation"` -> passed.
+- Frontend regression:
+  - `npm.cmd test -- src/app/AppShell.test.tsx src/pages/UsersPage.test.tsx src/pages/SkillsPage.test.tsx src/pages/OperationalPages.test.tsx -t "AppShell presentation|user|Skill|archive|image attachment|conversation"` -> 4 files passed, 23 tests passed.
+- Frontend production build:
+  - `npm.cmd run build` -> passed; only existing Vite chunk-size warning.
+- Backend API:
+  - `.venv\Scripts\python.exe -m pytest tests/api/test_foundation_api.py -q` -> 72 passed.
+- Local integration DB note:
+  - `tests/integration/auth/test_bootstrap.py::test_user_admin_creates_disables_and_deletes_local_users` timed out waiting for a local PostgreSQL fixture at `127.0.0.1:54329`; this is an environment readiness issue on the Windows dev box, not a failed assertion in the new user-management code.
+
+Server validation performed for this pass:
+
+- Synced the incremental source and `web/dist` package to `103.236.98.133:/opt/agent-hub/current` without uploading a full release directory.
+- Restarted `agent-hub-api` and `agent-hub-worker`; reloaded Caddy.
+- Verified `/health/live` and `/health/ready` returned `{"status":"ok"}`.
+- Verified Caddy served the web UI root over the forwarded public UI path.
+- Verified deployed frontend assets contain the new Skill, batch-delete, and navigation-toggle strings.
+- Ran real HTTP smoke against the deployed API with a short-lived super-admin token generated from the server's configured signing key:
+  - `GET /api/v1/users` -> 200.
+  - `POST /api/v1/users` -> 200.
+  - `PATCH /api/v1/users/{id}` -> 200.
+  - `PATCH /api/v1/users/{id}/disabled` -> 200.
+  - `PATCH /api/v1/users/{id}/password` -> 200.
+  - protected initial admin update rejection -> 409.
+  - `DELETE /api/v1/users/{id}` -> 204.
+  - `POST /api/v1/runs/attachments/upload` with `.tar.gz` ordinary archive -> 200, `kind=archive`.
+  - `POST /api/v1/admin/skills/upload` with a valid Skill ZIP -> 200.
+  - `POST /api/v1/admin/skills/{id}/approve` -> 200.
+  - `DELETE /api/v1/admin/skills/{id}` -> 200.
+
+Remaining before stopping:
+
+- Commit this pass.
+- Push to GitHub.
+- Check GitHub Actions for the pushed `main` run and fix if red.
+- Then stop and provide the P3 handoff; do not start P3 in this thread.

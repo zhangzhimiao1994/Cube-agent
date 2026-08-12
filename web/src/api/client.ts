@@ -686,6 +686,16 @@ export const api = {
       UserSchema,
     );
   },
+  updateUser(
+    userId: string,
+    payload: { username?: string; role?: string; disabled?: boolean },
+  ): Promise<ManagedUser> {
+    return request(
+      `/api/v1/users/${userId}`,
+      { method: "PATCH", body: JSON.stringify(payload) },
+      UserSchema,
+    );
+  },
   setUserDisabled(userId: string, disabled: boolean): Promise<ManagedUser> {
     return request(
       `/api/v1/users/${userId}/disabled`,

@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TestApp } from "./router";
@@ -49,6 +49,7 @@ describe("AppShell presentation", () => {
   });
 
   afterEach(() => {
+    window.localStorage.clear();
     window.sessionStorage.clear();
     vi.unstubAllGlobals();
   });
@@ -88,5 +89,33 @@ describe("AppShell presentation", () => {
     const drawer = screen.getByLabelText("编排二级导航");
     expect(within(drawer).getByRole("link", { name: /主 Agent/ })).not.toBeNull();
     expect(within(drawer).getByRole("link", { name: /工作流配置/ })).not.toBeNull();
+  });
+
+  it("makes top-level navigation enter the default module directly while keeping drawer links", async () => {
+    render(<TestApp initialPath="/skills" />);
+
+    expect(await screen.findByText("Agent 编排控制台")).not.toBeNull();
+    const navigation = screen.getByRole("navigation", { name: "Main navigation" });
+    expect(within(navigation).getByRole("link", { name: "对话" }).getAttribute("href")).toBe("/");
+    expect(within(navigation).getByRole("link", { name: "编排" }).getAttribute("href")).toBe("/main-agent");
+    expect(within(navigation).getByRole("link", { name: "资源" }).getAttribute("href")).toBe("/models");
+    expect(within(navigation).getByRole("link", { name: "工具" }).getAttribute("href")).toBe("/skills");
+    expect(within(navigation).getByRole("link", { name: "通道" }).getAttribute("href")).toBe("/channels");
+    expect(within(navigation).getByRole("link", { name: "系统" }).getAttribute("href")).toBe("/config");
+    expect(screen.getByLabelText("工具二级导航")).not.toBeNull();
+  });
+
+  it("lets operators switch the navigation between floating and pinned layouts", async () => {
+    render(<TestApp initialPath="/models" />);
+
+    expect(await screen.findByText("Agent 编排控制台")).not.toBeNull();
+    const toggle = screen.getByRole("button", { name: "固定导航栏" });
+    expect(document.querySelector(".app-shell")?.className).toContain("nav-floating");
+
+    fireEvent.click(toggle);
+
+    expect(document.querySelector(".app-shell")?.className).toContain("nav-pinned");
+    expect(window.localStorage.getItem("agent_hub_nav_layout")).toBe("pinned");
+    expect(screen.getByRole("button", { name: "悬浮导航栏" })).not.toBeNull();
   });
 });

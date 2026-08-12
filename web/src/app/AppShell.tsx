@@ -8,6 +8,10 @@ export function AppShell() {
   const auth = useAuth();
   const location = useLocation();
   const [hoveredGroupId, setHoveredGroupId] = useState<string | null>(null);
+  const [navLayout, setNavLayout] = useState<"floating" | "pinned">(() => {
+    if (typeof window === "undefined") return "floating";
+    return window.localStorage.getItem("agent_hub_nav_layout") === "pinned" ? "pinned" : "floating";
+  });
   const visibleGroups = MODULE_GROUPS.map((group) => ({
     ...group,
     modules: group.modules.filter((module) => hasPermission(auth.user?.permissions ?? [], module.permission)),
@@ -23,19 +27,30 @@ export function AppShell() {
   );
   const drawerGroup = visibleGroups.find((group) => group.id === hoveredGroupId) ?? activeGroup;
 
+  function toggleNavLayout() {
+    setNavLayout((current) => {
+      const next = current === "floating" ? "pinned" : "floating";
+      window.localStorage.setItem("agent_hub_nav_layout", next);
+      return next;
+    });
+  }
+
   return (
-    <div className="app-shell">
+    <div className={`app-shell nav-${navLayout}`}>
       <aside className="sidebar floating-sidebar" onMouseLeave={() => setHoveredGroupId(null)}>
         <div className="floating-nav-rail">
           <div className="brand-card compact-brand-card">
             <span className="eyebrow">Agent Hub</span>
             <h1>控制台</h1>
           </div>
+          <button type="button" className="nav-layout-toggle" onClick={toggleNavLayout}>
+            {navLayout === "floating" ? "固定导航栏" : "悬浮导航栏"}
+          </button>
           <nav aria-label="Main navigation" className="nav-list">
             {visibleGroups.map((item) => (
               <NavLink
                 key={item.to}
-                to={item.to}
+                to={item.modules[0]?.to ?? item.to}
                 onFocus={() => setHoveredGroupId(item.id)}
                 onMouseEnter={() => setHoveredGroupId(item.id)}
                 className={({ isActive }) =>

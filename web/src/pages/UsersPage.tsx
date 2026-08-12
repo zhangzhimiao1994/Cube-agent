@@ -45,6 +45,10 @@ export function UsersPage() {
   const [password, setPassword] = useState("");
   const [role, setRole] = useState("operator");
   const [message, setMessage] = useState<string | null>(null);
+  const [editTarget, setEditTarget] = useState<ManagedUser | null>(null);
+  const [editUsername, setEditUsername] = useState("");
+  const [editRole, setEditRole] = useState("operator");
+  const [editDisabled, setEditDisabled] = useState(false);
   const [resetTarget, setResetTarget] = useState<ManagedUser | null>(null);
   const [resetPassword, setResetPassword] = useState("");
   const permissions = auth.user?.permissions ?? [];
@@ -68,6 +72,24 @@ export function UsersPage() {
       api.changeUserRole(userId, nextRole),
     onSuccess: (user) => {
       setMessage(`已将 ${user.username} 调整为 ${roleLabel(user.role)}`);
+      refreshUsers();
+    },
+  });
+  const updateUser = useMutation({
+    mutationFn: () => {
+      if (!editTarget) throw new Error("未选择要编辑的用户");
+      return api.updateUser(editTarget.id, {
+        username: editUsername.trim(),
+        role: editRole,
+        disabled: editDisabled,
+      });
+    },
+    onSuccess: (user) => {
+      setEditTarget(null);
+      setEditUsername("");
+      setEditRole("operator");
+      setEditDisabled(false);
+      setMessage(`已更新用户 ${user.username}`);
       refreshUsers();
     },
   });
@@ -99,6 +121,7 @@ export function UsersPage() {
 
   const operationError =
     createUser.error ??
+    updateUser.error ??
     changeRole.error ??
     setDisabled.error ??
     resetUserPassword.error ??
@@ -186,49 +209,121 @@ export function UsersPage() {
       {message ? <p role="status">{message}</p> : null}
       {operationError ? <p role="alert">{formatApiError(operationError, "用户操作失败")}</p> : null}
 
-      {resetTarget ? (
+      {editTarget ? (
         <article>
-          <h3>重置密码</h3>
+          <h3>编辑用户</h3>
           <p>
-            正在为 <strong>{resetTarget.username}</strong> 设置新密码。保存后旧密码立即失效，密码明文不会写入页面或日志。
+            正在编辑 <strong>{editTarget.username}</strong>。用户名、角色和启用状态会一起保存；密码重置仍使用独立入口。
           </p>
           <form
             className="form-grid"
             onSubmit={(event) => {
               event.preventDefault();
               setMessage(null);
-              resetUserPassword.mutate({ userId: resetTarget.id, nextPassword: resetPassword });
+              updateUser.mutate();
             }}
           >
-            <label htmlFor="reset-password">
-              新密码
+            <label htmlFor="edit-username">
+              用户名（编辑）
               <input
-                id="reset-password"
-                aria-label="新密码"
-                type="password"
-                value={resetPassword}
-                onChange={(event) => setResetPassword(event.target.value)}
-                placeholder="至少 12 位"
-                autoComplete="new-password"
+                id="edit-username"
+                aria-label="用户名（编辑）"
+                value={editUsername}
+                onChange={(event) => setEditUsername(event.target.value)}
+                autoComplete="username"
                 required
-                minLength={12}
               />
-              <small>建议使用 16 位以上随机密码；保存后请通过安全渠道交给用户。</small>
+              <small>修改用户名会影响后续登录名；受保护的初始管理员不能改名。</small>
             </label>
-            <button type="submit" disabled={resetUserPassword.isPending}>
-              {resetUserPassword.isPending ? "保存中..." : "保存新密码"}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setResetTarget(null);
-                setResetPassword("");
-              }}
-            >
-              取消
-            </button>
+            <label htmlFor="edit-role">
+              角色（编辑）
+              <select id="edit-role" aria-label="角色（编辑）" value={editRole} onChange={(event) => setEditRole(event.target.value)}>
+                {ROLES.map((item) => (
+                  <option key={item.value} value={item.value}>
+                    {item.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="inline-check compact-check" htmlFor="edit-disabled">
+              <input
+                id="edit-disabled"
+                type="checkbox"
+                checked={editDisabled}
+                onChange={(event) => setEditDisabled(event.target.checked)}
+              />
+              禁用该用户
+            </label>
+            <div className="table-actions">
+              <button type="submit" disabled={updateUser.isPending}>
+                {updateUser.isPending ? "保存中..." : "保存修改"}
+              </button>
+              <button
+                type="button"
+                className="secondary-action"
+                onClick={() => {
+                  setEditTarget(null);
+                  setEditUsername("");
+                  setEditRole("operator");
+                  setEditDisabled(false);
+                }}
+              >
+                取消
+              </button>
+            </div>
           </form>
         </article>
+      ) : null}
+
+      {resetTarget ? (
+        <div className="modal-backdrop" role="presentation">
+          <section className="modal-card" role="dialog" aria-modal="true" aria-labelledby="reset-password-title">
+            <h3 id="reset-password-title">重置密码</h3>
+            <p>
+              正在为 <strong>{resetTarget.username}</strong> 设置新密码。保存后旧密码立即失效，密码明文不会写入页面或日志。
+            </p>
+            <form
+              className="form-grid"
+              onSubmit={(event) => {
+                event.preventDefault();
+                setMessage(null);
+                resetUserPassword.mutate({ userId: resetTarget.id, nextPassword: resetPassword });
+              }}
+            >
+              <label htmlFor="reset-password">
+                新密码
+                <input
+                  id="reset-password"
+                  aria-label="新密码"
+                  type="password"
+                  value={resetPassword}
+                  onChange={(event) => setResetPassword(event.target.value)}
+                  placeholder="至少 12 位"
+                  autoComplete="new-password"
+                  required
+                  minLength={12}
+                  autoFocus
+                />
+                <small>建议使用 16 位以上随机密码；保存后请通过安全渠道交给用户。</small>
+              </label>
+              <div className="table-actions">
+                <button type="submit" disabled={resetUserPassword.isPending}>
+                  {resetUserPassword.isPending ? "保存中..." : "保存新密码"}
+                </button>
+                <button
+                  type="button"
+                  className="secondary-action"
+                  onClick={() => {
+                    setResetTarget(null);
+                    setResetPassword("");
+                  }}
+                >
+                  取消
+                </button>
+              </div>
+            </form>
+          </section>
+        </div>
       ) : null}
 
       <article>
@@ -273,6 +368,21 @@ export function UsersPage() {
                   <td>{user.disabled ? "已禁用" : "正常"}</td>
                   <td>{user.feishu_open_id ?? "未绑定"}</td>
                   <td className="table-actions">
+                    <button
+                      type="button"
+                      disabled={locked}
+                      onClick={() => {
+                        setMessage(null);
+                        setResetTarget(null);
+                        setResetPassword("");
+                        setEditTarget(user);
+                        setEditUsername(user.username);
+                        setEditRole(user.role);
+                        setEditDisabled(user.disabled);
+                      }}
+                    >
+                      编辑
+                    </button>
                     <button
                       type="button"
                       disabled={locked}

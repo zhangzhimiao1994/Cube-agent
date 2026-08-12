@@ -304,6 +304,11 @@ def test_user_management_create_disable_enable_delete_endpoints_are_wired() -> N
         headers={"Authorization": "Bearer valid-token"},
         json={"disabled": False},
     )
+    updated = client.patch(
+        f"/api/v1/users/{user_id}",
+        headers={"Authorization": "Bearer valid-token"},
+        json={"username": "ops-renamed", "role": "admin", "disabled": True},
+    )
     deleted = client.delete(
         f"/api/v1/users/{user_id}",
         headers={"Authorization": "Bearer valid-token"},
@@ -313,6 +318,10 @@ def test_user_management_create_disable_enable_delete_endpoints_are_wired() -> N
     assert disabled.json()["disabled"] is True
     assert enabled.status_code == 200
     assert enabled.json()["disabled"] is False
+    assert updated.status_code == 200
+    assert updated.json()["username"] == "ops-renamed"
+    assert updated.json()["role"] == "admin"
+    assert updated.json()["disabled"] is True
     assert deleted.status_code == 204
     user_audit_actions = [
         event.action for event in audit.audit_events if event.action.startswith("user.")
@@ -321,6 +330,7 @@ def test_user_management_create_disable_enable_delete_endpoints_are_wired() -> N
         "user.create",
         "user.disable",
         "user.enable",
+        "user.update",
         "user.delete",
     ]
 
@@ -394,6 +404,11 @@ def test_user_management_protects_initial_super_admin() -> None:
         headers={"Authorization": "Bearer valid-token"},
         json={"role": "admin"},
     )
+    update = client.patch(
+        f"/api/v1/users/{owner_id}",
+        headers={"Authorization": "Bearer valid-token"},
+        json={"username": "renamed-owner", "role": "admin", "disabled": True},
+    )
     reset_password = client.patch(
         f"/api/v1/users/{owner_id}/password",
         headers={"Authorization": "Bearer valid-token"},
@@ -406,6 +421,8 @@ def test_user_management_protects_initial_super_admin() -> None:
     assert delete.json()["error"]["code"] == "protected_user"
     assert demote.status_code == 409
     assert demote.json()["error"]["code"] == "protected_user"
+    assert update.status_code == 409
+    assert update.json()["error"]["code"] == "protected_user"
     assert reset_password.status_code == 409
     assert reset_password.json()["error"]["code"] == "protected_user"
 
