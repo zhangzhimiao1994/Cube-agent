@@ -69,6 +69,8 @@ from agent_hub.multimodal.generation import (
     MultimediaGenerationKind,
     MultimediaGenerationResult,
 )
+from agent_hub.multimodal.minimax import MiniMaxVideoGenerationClient
+from agent_hub.multimodal.video_providers import TextToVideoProvider, TextToVideoProviderRouter
 from agent_hub.observability.logging import configure_logging
 from agent_hub.observability.metrics import default_metrics_registry
 from agent_hub.routing.classifier import GatewayRouteClassifier
@@ -273,6 +275,8 @@ class _ConfigBackedMultimediaGenerationExecutor:
         redis_client: object,
         transport: ModelTransport | None = None,
         capacity_factory: MultimediaCapacityFactory | None = None,
+        media_store_dir: Path | None = None,
+        video_provider_router: TextToVideoProviderRouter | None = None,
     ) -> None:
         self._list_models = list_models
         self._secret_service = secret_service
@@ -280,6 +284,10 @@ class _ConfigBackedMultimediaGenerationExecutor:
         self._redis_client = redis_client
         self._transport = transport or LiteLLMClient()
         self._capacity_factory = capacity_factory
+        self._media_store_dir = (media_store_dir or Path("/var/lib/agent-hub/media")).resolve()
+        self._video_provider_router = video_provider_router or TextToVideoProviderRouter(
+            (("minimax", MiniMaxVideoGenerationClient()),)
+        )
         self._daily_usage: dict[tuple[date, str, str], int] = {}
 
     async def generate(
@@ -305,6 +313,13 @@ class _ConfigBackedMultimediaGenerationExecutor:
             logical_model=logical_model,
             daily_limit=daily_limit,
         )
+        direct_result = await self._generate_with_direct_provider(
+            kind=kind,
+            prompt=prompt,
+            candidates=candidates,
+        )
+        if direct_result is not None:
+            return direct_result
         capacity = (
             await self._capacity_factory(deployments)
             if self._capacity_factory is not None
@@ -321,6 +336,41 @@ class _ConfigBackedMultimediaGenerationExecutor:
             kind=kind,
             logical_model=logical_model,
             prompt=prompt,
+        )
+
+    async def _generate_with_direct_provider(
+        self,
+        *,
+        kind: MultimediaGenerationKind,
+        prompt: str,
+        candidates: tuple[Deployment, ...],
+    ) -> MultimediaGenerationResult | None:
+        if kind is not MultimediaGenerationKind.VIDEO:
+            return None
+        selected: tuple[Deployment, TextToVideoProvider] | None = None
+        for candidate in candidates:
+            provider = self._video_provider_router.provider_for(candidate)
+            if provider is not None:
+                selected = (candidate, provider)
+                break
+        if selected is None:
+            return None
+        deployment, provider = selected
+        api_key = await self._secret_service.resolve(self._tenant_id, deployment.secret_ref)
+        artifact = await provider.generate_text_to_video(
+            api_key=api_key,
+            api_base=deployment.api_base,
+            model=deployment.request_model or deployment.provider_model,
+            prompt=prompt,
+            output_dir=self._media_store_dir / str(self._tenant_id),
+            duration=6,
+            resolution="768P",
+        )
+        return MultimediaGenerationResult(
+            kind=kind,
+            logical_model=deployment.logical_model,
+            deployment_id=deployment.id,
+            text=artifact.uri,
         )
 
     def _claim_daily_slot(

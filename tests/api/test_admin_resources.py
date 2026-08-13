@@ -49,6 +49,7 @@ from agent_hub.multimodal.generation import (
     MultimediaDailyLimitExceeded,
     MultimediaGenerationExecutor,
 )
+from agent_hub.multimodal.video_providers import VideoProviderGenerationError
 from agent_hub.runs.repository import RunRecord
 from agent_hub.security.secrets import SecretReference
 
@@ -973,6 +974,35 @@ def test_multimedia_generation_daily_limit_returns_429() -> None:
 
     assert response.status_code == 429
     assert response.json()["error"]["code"] == "multimedia_daily_limit_exceeded"
+
+
+def test_multimedia_generation_provider_failure_returns_502() -> None:
+    api = client()
+    settings_response = api.get("/api/v1/admin/settings", headers=headers())
+    payload = settings_response.json()
+    payload["multimedia_generation_enabled"] = True
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+    gateway = FakeGenerationGateway(
+        error=VideoProviderGenerationError("MiniMax video submit failed: invalid api key", provider_code="2049")
+    )
+    cast(Any, api.app).state.multimedia_generation_executor = MultimediaGenerationExecutor(gateway)
+
+    response = api.post(
+        "/api/v1/admin/multimedia/generate",
+        headers=headers(),
+        json={
+            "kind": "video",
+            "logical_model": "video_primary",
+            "prompt": "make a 5 second product video",
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "multimedia_provider_failed"
+    assert response.json()["error"]["details"] == {
+        "provider_code": "2049",
+        "reason": "MiniMax video submit failed: invalid api key",
+    }
 
 
 def test_main_agent_config_saves_dedicated_model_api_and_control_policy() -> None:

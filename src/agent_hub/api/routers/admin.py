@@ -39,6 +39,7 @@ from agent_hub.multimodal.generation import (
     MultimediaGenerationKind,
     MultimediaGenerationResult,
 )
+from agent_hub.multimodal.video_providers import VideoProviderGenerationError
 from agent_hub.openclaw.executor import (
     OpenClawCommandResult,
     openclaw_command_allowed,
@@ -4488,6 +4489,16 @@ async def generate_multimedia(
             429,
             "multimedia_daily_limit_exceeded",
             "daily multimedia generation limit exceeded",
+        ) from error
+    except VideoProviderGenerationError as error:
+        raise PublicAPIError(
+            502,
+            "multimedia_provider_failed",
+            "multimedia provider generation failed",
+            details={
+                "provider_code": error.provider_code or "unknown",
+                "reason": str(error),
+            },
         ) from error
     return MultimediaGenerationResponse(
         kind=result.kind.value,

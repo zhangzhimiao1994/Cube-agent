@@ -32,6 +32,8 @@ from agent_hub.models.gateway import CapacityController
 from agent_hub.models.registry import NoCapableDeployment
 from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, TokenUsage
 from agent_hub.multimodal.generation import MultimediaGenerationKind
+from agent_hub.multimodal.minimax import MiniMaxGeneratedVideo
+from agent_hub.multimodal.video_providers import TextToVideoProviderRouter
 from agent_hub.routing.types import RiskLevel
 from agent_hub.settings import Settings
 
@@ -277,8 +279,9 @@ async def test_multimedia_executor_rejects_unknown_video_model_even_if_declared(
 
 
 @pytest.mark.asyncio
-async def test_multimedia_executor_limits_minimax_video_to_three_daily_requests() -> None:
+async def test_multimedia_executor_limits_minimax_video_to_three_daily_requests(tmp_path: Path) -> None:
     transport = FakeTransport()
+    video_provider = FakeTextToVideoProvider(tmp_path / "limited-output.mp4")
 
     async def list_models() -> tuple[ModelDeploymentResponse, ...]:
         return (
@@ -310,6 +313,8 @@ async def test_multimedia_executor_limits_minimax_video_to_three_daily_requests(
         redis_client=object(),
         transport=transport,
         capacity_factory=capacity_factory,
+        media_store_dir=tmp_path / "media",
+        video_provider_router=TextToVideoProviderRouter((("minimax", video_provider),)),
     )
 
     for index in range(3):
@@ -326,7 +331,121 @@ async def test_multimedia_executor_limits_minimax_video_to_three_daily_requests(
             prompt="make minimax video 4",
         )
 
-    assert len(transport.requests) == 3
+    assert len(video_provider.calls) == 3
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_multimedia_executor_uses_minimax_video_client_for_hailuo_files(tmp_path: Path) -> None:
+    transport = FakeTransport()
+    video_provider = FakeTextToVideoProvider(tmp_path / "provider-output.mp4")
+
+    async def list_models() -> tuple[ModelDeploymentResponse, ...]:
+        return (
+            ModelDeploymentResponse(
+                provider="minimax",
+                api_base="https://api.minimax.io/v1",
+                api_protocol="openai_compatible",
+                upstream_model="MiniMax-Hailuo-02",
+                logical_model="video_primary",
+                capabilities=["video_generation"],
+                credential_ref="secret://main-agent",
+                quota_scope="minimax-account",
+                max_concurrency=1,
+                target_utilization=0.8,
+                reserved_capacity=0,
+                id=uuid4(),
+                effective_slots=1,
+                saturation_policy="queue_first_then_fallback",
+            ),
+        )
+
+    async def capacity_factory(_deployments: tuple[Deployment, ...]) -> CapacityController:
+        return ImmediateCapacity()
+
+    executor = _ConfigBackedMultimediaGenerationExecutor(
+        list_models=list_models,
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        redis_client=object(),
+        transport=transport,
+        capacity_factory=capacity_factory,
+        media_store_dir=tmp_path / "media",
+        video_provider_router=TextToVideoProviderRouter((("minimax", video_provider),)),
+    )
+
+    result = await executor.generate(
+        kind=MultimediaGenerationKind.VIDEO,
+        logical_model="video_primary",
+        prompt="make a real minimax video",
+    )
+
+    assert result.deployment_id
+    assert result.text is not None
+    assert result.text.startswith("file://")
+    assert (tmp_path / "media" / str(TENANT_ID) / "provider-output.mp4").read_bytes() == b"video"
+    assert video_provider.calls == [
+        {
+            "api_key": "sk-live",
+            "api_base": "https://api.minimax.io/v1",
+            "model": "MiniMax-Hailuo-02",
+            "prompt": "make a real minimax video",
+            "output_dir": tmp_path / "media" / str(TENANT_ID),
+            "duration": 6,
+            "resolution": "768P",
+        }
+    ]
+    assert transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_multimedia_executor_does_not_send_other_video_models_to_minimax(tmp_path: Path) -> None:
+    transport = FakeTransport()
+    video_provider = FakeTextToVideoProvider(tmp_path / "provider-output.mp4")
+
+    async def list_models() -> tuple[ModelDeploymentResponse, ...]:
+        return (
+            ModelDeploymentResponse(
+                provider="runway",
+                api_base="https://api.runwayml.com/v1",
+                api_protocol="openai_compatible",
+                upstream_model="gen4-turbo",
+                logical_model="video_primary",
+                capabilities=["video_generation"],
+                credential_ref="secret://main-agent",
+                quota_scope="runway-account",
+                max_concurrency=1,
+                target_utilization=0.8,
+                reserved_capacity=0,
+                id=uuid4(),
+                effective_slots=1,
+                saturation_policy="queue_first_then_fallback",
+            ),
+        )
+
+    async def capacity_factory(_deployments: tuple[Deployment, ...]) -> CapacityController:
+        return ImmediateCapacity()
+
+    executor = _ConfigBackedMultimediaGenerationExecutor(
+        list_models=list_models,
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        redis_client=object(),
+        transport=transport,
+        capacity_factory=capacity_factory,
+        media_store_dir=tmp_path / "media",
+        video_provider_router=TextToVideoProviderRouter((("minimax", video_provider),)),
+    )
+
+    with pytest.raises(NoCapableDeployment, match="supported video generation"):
+        await executor.generate(
+            kind=MultimediaGenerationKind.VIDEO,
+            logical_model="video_primary",
+            prompt="make a runway video",
+        )
+
+    assert video_provider.calls == []
+    assert transport.requests == []
 
 
 class FakeSecretService:
@@ -403,6 +522,48 @@ class FakeTransport:
                 '"estimated_cost_usd":"0.01","risk":"low"}'
             ),
             usage=TokenUsage(prompt_tokens=10, completion_tokens=6, total_tokens=16),
+        )
+
+
+class FakeTextToVideoProvider:
+    def __init__(self, output_path: Path) -> None:
+        self.output_path = output_path
+        self.deployment_id = "video-deployment"
+        self.calls: list[dict[str, object]] = []
+
+    async def generate_text_to_video(
+        self,
+        *,
+        api_key: str,
+        api_base: str,
+        model: str,
+        prompt: str,
+        output_dir: Path,
+        duration: int,
+        resolution: str,
+    ) -> MiniMaxGeneratedVideo:
+        self.calls.append(
+            {
+                "api_key": api_key,
+                "api_base": api_base,
+                "model": model,
+                "prompt": prompt,
+                "output_dir": output_dir,
+                "duration": duration,
+                "resolution": resolution,
+            }
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stored = output_dir / self.output_path.name
+        stored.write_bytes(b"video")
+        return MiniMaxGeneratedVideo(
+            path=stored,
+            uri=stored.as_uri(),
+            provider="minimax",
+            model=model,
+            task_id="task-1",
+            file_id="file-1",
+            mime_type="video/mp4",
         )
 
 

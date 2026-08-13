@@ -1,4 +1,84 @@
 
+## 2026-08-13 P3 Real MiniMax Hailuo Video Generation
+
+Current state:
+
+- Multimedia video generation now has a system-level provider adapter contract:
+  - `TextToVideoProviderRouter` selects a provider adapter by configured model deployment/provider.
+  - `TextToVideoProvider` defines the common system flow: submit text-to-video job, poll provider status, retrieve/download the generated file, store it, and return a file artifact URI.
+  - MiniMax/Hailuo is the first concrete adapter.
+- MiniMax/Hailuo video generation no longer goes through the generic chat/model gateway.
+- The production multimedia executor still starts from registered model configuration:
+  - requires `video_generation`;
+  - rejects unsupported video models before provider dispatch;
+  - uses the model deployment `api_base`, `upstream_model`, and `credential_ref`;
+  - keeps the MiniMax daily video cap of 3 requests.
+- Generated videos are stored under `/var/lib/agent-hub/media/{tenant_id}/`.
+- Provider returned filenames are made unique before storing, so repeated Hailuo downloads do not overwrite `output_aigc.mp4`.
+- Provider failures now return `502 multimedia_provider_failed` with safe details such as provider code and message, instead of surfacing as an internal 500.
+- Frontend MiniMax Hailuo and MiniMax Audio presets now default to `https://api.minimaxi.com/v1`, because the server's existing MiniMax key succeeds on `api.minimaxi.com` and returns `invalid api key` on `api.minimax.io`.
+
+Changes made:
+
+- Added `src/agent_hub/multimodal/video_providers.py`
+  - `GeneratedVideoArtifact`.
+  - `VideoProviderGenerationError`.
+  - `TextToVideoProvider`.
+  - `TextToVideoProviderRouter`.
+- Added `src/agent_hub/multimodal/minimax.py`
+  - `MiniMaxVideoGenerationClient`.
+  - MiniMax text-to-video submit, query, retrieve, download, and unique local file storage.
+- Updated `src/agent_hub/app.py`
+  - Injects a generic video provider router into `_ConfigBackedMultimediaGenerationExecutor`.
+  - Uses direct provider generation for video deployments that have a registered adapter.
+  - Leaves unsupported video providers blocked instead of sending them to MiniMax or the generic text gateway.
+- Updated `src/agent_hub/api/routers/admin.py`
+  - Converts `VideoProviderGenerationError` to `502 multimedia_provider_failed`.
+- Updated `web/src/pages/ModelsPage.tsx`
+  - MiniMax Hailuo/Audio presets use `https://api.minimaxi.com/v1`.
+- Tests:
+  - Added MiniMax adapter unit coverage with `httpx.MockTransport`.
+  - Added executor routing coverage for MiniMax provider files and unsupported-provider blocking.
+  - Added API coverage for provider failure returning 502 instead of 500.
+
+Verification performed:
+
+- TDD red:
+  - `uv run pytest tests/unit/multimodal/test_minimax_generation.py -q --tb=short` first failed because `agent_hub.multimodal.minimax` did not exist.
+  - `uv run pytest tests/unit/test_app_wiring.py::test_multimedia_executor_uses_minimax_video_client_for_hailuo_files -q --tb=short` first failed because the config-backed executor did not accept/use a video provider.
+- Green/local:
+  - `uv run pytest tests/unit/multimodal/test_minimax_generation.py tests/unit/test_app_wiring.py::test_multimedia_executor_uses_minimax_video_client_for_hailuo_files tests/unit/test_app_wiring.py::test_multimedia_executor_does_not_send_other_video_models_to_minimax tests/unit/test_app_wiring.py::test_multimedia_executor_rejects_unknown_video_model_even_if_declared tests/unit/test_app_wiring.py::test_multimedia_executor_limits_minimax_video_to_three_daily_requests -q --tb=short` -> 5 passed.
+  - `uv run pytest tests/unit/multimodal/test_generation.py tests/unit/multimodal/test_minimax_generation.py tests/unit/test_app_wiring.py tests/api/test_admin_resources.py -q --tb=short` -> 90 passed.
+  - `uv run pytest tests/api/test_admin_resources.py::test_multimedia_generation_provider_failure_returns_502 tests/api/test_admin_resources.py::test_multimedia_generation_daily_limit_returns_429 tests/unit/multimodal/test_minimax_generation.py -q --tb=short` -> 3 passed.
+  - `uv run ruff check src tests` -> passed.
+  - `uv run mypy --strict src tests` -> passed.
+  - `npm.cmd run lint` -> passed.
+  - `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+- Server deployment and real verification:
+  - Uploaded incremental package to `103.236.98.133:/tmp/agent-hub-p3-minimax-video-provider.tgz`.
+  - Deployed incrementally into `/opt/agent-hub/current`.
+  - Restarted `agent-hub-api` and `agent-hub-worker`; reloaded Caddy.
+  - Verified `agent-hub-api`, `agent-hub-worker`, and `caddy` were active.
+  - Ran `/tmp/server_minimax_submit_probe.py` with the real server MiniMax credential:
+    - `https://api.minimax.io/v1` returned provider `status_code=2049`, `status_msg=invalid api key`.
+    - `https://api.minimaxi.com/v1` successfully returned real MiniMax `task_id` values for `MiniMax-Hailuo-02` and `MiniMax-Hailuo-2.3`.
+  - Ran `/tmp/server_minimax_video_generation_check.py` through the real local HTTP API:
+    - reused the existing MiniMax credential reference;
+    - created a temporary Hailuo video model using `https://api.minimaxi.com`;
+    - enabled the multimedia generation switch;
+    - submitted a real `POST /api/v1/admin/multimedia/generate` video request;
+    - waited for MiniMax generation completion;
+    - retrieved and downloaded the generated video;
+    - verified the resulting file exists and is non-empty at `/var/lib/agent-hub/media/00000000-0000-4000-8000-000000000001/output_aigc.mp4`;
+    - restored original settings and deleted the temporary model afterward.
+  - After adding unique filename storage, redeployed the code and verified Python compilation plus the previously generated real file still exists and is non-empty. The real generation was not repeated to avoid consuming another MiniMax daily video quota.
+
+Remaining risks / TODOs:
+
+- The real generated file was produced before the unique-filename patch; the patch is covered by unit tests and deployed, but not re-tested with another real generation to avoid spending another daily video quota.
+- Add provider adapters for Alibaba/Token Plan, Seedance, Runway, Kling, Veo, and other configured video providers under the same `TextToVideoProvider` contract.
+- Continue adapting multimedia generation to temporary/executor agent scheduling so planning can delegate generation jobs to dedicated media executor agents and return artifacts to the main Agent automatically.
+
 ## 2026-08-13 P3 OpenClaw Adapter Status Matrix
 
 Current state:
