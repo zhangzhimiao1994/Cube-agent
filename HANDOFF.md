@@ -18,6 +18,7 @@ Current state:
   - admin run detail exposes `conversation_id`, `vibe_coding=enabled`, and `capability=vibe_coding`;
   - original system settings are restored afterward.
 - Server frontend bundle contains the Vibe Coding settings toggle and composer button markers.
+- Server-side feature verification requirement is now explicit: do not use mocks for server acceptance checks. Server checks must exercise the deployed service, production-like settings, real HTTP/API boundaries, real persistence, and actual provider/tool paths where the feature depends on them. Local unit/UI tests may still use mocks for development regression coverage, but they are not sufficient for server acceptance.
 - GitHub recovery archive was created before pushing:
   - local ignored bundle `.local-archives/github-pushes/mutilagent-main-before-20260813-140950-d8ce1b4.bundle`;
   - GitHub tag `archive/mutilagent-main-before-20260813-140950-d8ce1b4`.
