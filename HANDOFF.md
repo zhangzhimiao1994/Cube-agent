@@ -1250,3 +1250,56 @@ Remaining before stopping:
 - Push to GitHub.
 - Check GitHub Actions for the pushed `main` run and fix if red.
 - Then stop and provide the P3 handoff; do not start P3 in this thread.
+
+## 2026-08-13 P3 Feishu Multimedia Factory Wiring
+
+Current state:
+
+- P3 Feishu production media factory wiring is complete.
+- The Feishu webhook now respects the system-level `multimedia_generation_enabled` switch.
+- When the switch is disabled and a Feishu image message arrives, Agent Hub replies with a temporary unsupported-image message and does not submit the image to the agent gateway.
+- Vibe coding remains planned as a conversation-integrated system capability, not a separate module.
+- OpenClaw remains planned as a long-running computer-control feature switch.
+- Multimedia generation should be implemented as one system switch covering image/video processing and generation. Future video generation execution must validate model capability before dispatch.
+
+Changes made:
+
+- Added `multimedia_generation_enabled` to admin system settings.
+- Added `src/agent_hub/channels/feishu/media_factory.py` with production Feishu media service factory wiring.
+- Wired `build_feishu_media_service_factory` into the FastAPI app lifespan when secret service and Redis are available.
+- Added webhook gating so image attachments are blocked and replied to when multimedia generation is disabled.
+- Added tests for disabled-image reply/no-submit behavior and production factory wiring.
+
+Local verification:
+
+- `uv run pytest tests/api/test_channel_webhooks.py tests/unit/test_app_wiring.py tests/api/test_admin_resources.py tests/contracts/feishu/test_receivers.py tests/unit/channels/feishu/test_media_client.py tests/e2e/feishu/test_conversation.py tests/unit/channels/test_submitter.py -q --tb=short` -> 106 passed.
+- `uv run ruff check src tests/api/test_channel_webhooks.py tests/unit/test_app_wiring.py tests/api/test_admin_resources.py tests/contracts/feishu/test_receivers.py tests/unit/channels/feishu/test_media_client.py tests/e2e/feishu/test_conversation.py tests/unit/channels/test_submitter.py` -> passed.
+- `uv run mypy --strict src tests` -> passed.
+
+Server deployment and verification:
+
+- Uploaded incremental package to `103.236.98.133:/tmp/agent-hub-p3-feishu-multimedia-factory.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`.
+- Restarted `agent-hub-api` and `agent-hub-worker`; reloaded Caddy.
+- Verified `agent-hub-api`, `agent-hub-worker`, and `caddy` were active.
+- Verified `/health/live` and `/health/ready` returned `{"status":"ok"}`.
+- Verified deployed OpenAPI includes `multimedia_generation_enabled`.
+- Verified deployed source compiles with `py_compile`.
+- Ran a server-side source-path Feishu multimedia check covering disabled image reply/no-submit and enabled image analysis/gateway submission -> passed.
+- Note: the production virtualenv does not include `pytest`, so full pytest was not run on the server.
+
+GitHub push and recovery:
+
+- Commit: `d16cef9 feat: gate feishu media by multimedia setting`.
+- Local ignored recovery bundle: `.local-archives/github-pushes/mutilagent-main-before-20260813-120200-d53657e.bundle`.
+- GitHub recovery tag: `archive/mutilagent-main-before-20260813-120200-d53657e`.
+- Pushed with `git push --force-with-lease mutilagent main`.
+- GitHub Actions run `31665754005` for `d16cef9` completed successfully.
+
+Next:
+
+- Continue P3 with model capability recognition and multimedia execution guardrails:
+  - built-in known model capability registry,
+  - admin override support,
+  - execution-time enforcement so video tasks never dispatch to models without `video_generation`,
+  - executor role/button path for multimedia generation after planning.
