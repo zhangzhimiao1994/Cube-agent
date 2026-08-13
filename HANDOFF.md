@@ -1,4 +1,69 @@
 
+## 2026-08-13 P3 Multimedia Job Dispatch API
+
+Current state:
+
+- Multimedia generation now has an explicit job handoff API for main-agent planning and dedicated media executor agents:
+  - `POST /api/v1/admin/multimedia/jobs` queues a generation job and returns `media_*` job metadata.
+  - `POST /api/v1/admin/multimedia/jobs/{job_id}/run` lets a media executor such as `multimedia_generator` claim and run the queued job.
+  - `GET /api/v1/admin/multimedia/jobs/{job_id}` lets the main agent or UI read back the completed/failed artifacts.
+- The production config-backed multimedia executor now owns an in-process job store, not only synchronous `generate()`.
+- Completed artifacts are written back into the job record as `kind`, `uri`, and `text`, so the main agent has a stable handoff point for generated media.
+- Competing executor agents cannot run the same job twice; non-queued jobs return `409 multimedia_job_not_queued`.
+- The existing synchronous `POST /api/v1/admin/multimedia/generate` endpoint remains available for direct/manual generation.
+
+Changes made:
+
+- Updated `src/agent_hub/multimodal/generation.py`
+  - Added `get_job()`.
+  - Added queued-state enforcement in `InMemoryMultimediaGenerationJobStore.start()`.
+- Updated `src/agent_hub/app.py`
+  - Added `submit()`, `get_job()`, and `run_job()` to `_ConfigBackedMultimediaGenerationExecutor`.
+  - Reuses existing model configuration, provider routing, capability checks, daily limits, and artifact storage when a media executor runs a job.
+- Updated `src/agent_hub/api/routers/admin.py`
+  - Added job request/response schemas.
+  - Added submit/get/run multimedia job endpoints.
+  - Reused existing disabled-switch, capability, daily-limit, and provider failure errors.
+- Updated tests:
+  - API coverage for queue -> executor run -> main-agent readback.
+  - Unit coverage preventing duplicate executor agents from rerunning the same job.
+
+Verification performed:
+
+- TDD red:
+  - `uv run pytest tests/api/test_admin_resources.py::test_multimedia_generation_job_can_be_run_by_executor_agent_and_read_by_main_agent -q --tb=short` first failed with `405`.
+  - `uv run pytest tests/unit/multimodal/test_generation.py::test_generation_job_cannot_be_run_twice_by_competing_executor_agents -q --tb=short` first failed because a second executor could rerun the job.
+- Green/local:
+  - `uv run pytest tests/unit/multimodal/test_generation.py tests/api/test_admin_resources.py::test_multimedia_generation_job_can_be_run_by_executor_agent_and_read_by_main_agent -q --tb=short` -> 7 passed.
+  - `uv run pytest tests/api/test_admin_resources.py tests/unit/multimodal/test_generation.py tests/unit/test_app_wiring.py -q --tb=short` -> 93 passed.
+  - `uv run ruff check src tests` -> passed.
+  - `uv run mypy --strict src tests` -> passed.
+- GitHub Actions follow-up:
+  - Run `31698443823` failed in full `uv run pytest -q` because `GET /api/v1/admin/multimedia/jobs/{job_id}` did not declare a 422 response, causing FastAPI to re-add the default `HTTPValidationError` OpenAPI schema.
+  - Updated the route metadata to use the project-wide `ErrorResponse` for 422.
+  - `uv run pytest tests/api/test_foundation_api.py::test_openapi_describes_security_health_and_route_specific_errors tests/api/test_admin_resources.py::test_multimedia_generation_job_can_be_run_by_executor_agent_and_read_by_main_agent -q --tb=short` -> 2 passed.
+  - `uv run ruff check src tests` -> passed.
+  - `uv run mypy --strict src tests` -> passed.
+- Server deployment and real verification:
+  - Uploaded incremental package to `103.236.98.133:/tmp/agent-hub-p3-multimedia-job-dispatch.tgz`.
+  - Deployed incrementally into `/opt/agent-hub/current`.
+  - Restarted `agent-hub-api` and `agent-hub-worker`; verified `agent-hub-api`, `agent-hub-worker`, and `caddy` were active.
+  - Ran `/tmp/server_multimedia_job_dispatch_check.py` through the real local HTTP API with the server's actual service environment loaded:
+    - enabled the multimedia generation switch for the test and restored it afterward;
+    - queued a real job with `POST /api/v1/admin/multimedia/jobs`;
+    - ran it through `multimedia_generator`;
+    - verified the expected capability failure was captured into the job record;
+    - queried the job successfully for main-agent readback;
+    - verified a competing executor receives `409 multimedia_job_not_queued`.
+  - Uploaded incremental package to `103.236.98.133:/tmp/agent-hub-p3-multimedia-job-openapi-fix.tgz`.
+  - Deployed the OpenAPI metadata fix and restarted `agent-hub-api` / `agent-hub-worker`.
+  - Verified the real server `/openapi.json` response no longer includes `HTTPValidationError`.
+
+Remaining risks / TODOs:
+
+- This is an API-level executor handoff/inbox. A persistent cross-process queue and background media-worker pool can now be layered on top of the same job contract.
+- Continue P3 with additional video/audio/image provider adapters, channel command grammar, and the final GitHub usage README.
+
 ## 2026-08-13 P3 Wrapped Skill Tar Bundle Upload
 
 Current state:

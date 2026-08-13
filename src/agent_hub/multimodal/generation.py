@@ -90,6 +90,8 @@ class InMemoryMultimediaGenerationJobStore:
 
     def start(self, job_id: str, *, executor_id: str) -> MultimediaGenerationJob:
         job = self.get(job_id)
+        if job.status is not MultimediaGenerationJobStatus.QUEUED:
+            raise RuntimeError("multimedia generation job is not queued")
         running = MultimediaGenerationJob(
             id=job.id,
             kind=job.kind,
@@ -180,6 +182,9 @@ class MultimediaGenerationExecutor:
             logical_model=logical_model,
             prompt=prompt,
         )
+
+    def get_job(self, job_id: str) -> MultimediaGenerationJob:
+        return self._job_store.get(job_id)
 
     async def run_job(
         self,

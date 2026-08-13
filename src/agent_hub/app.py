@@ -64,8 +64,11 @@ from agent_hub.models.litellm_client import LiteLLMClient
 from agent_hub.models.registry import ModelRegistry, NoCapableDeployment
 from agent_hub.models.types import Deployment, ModelCapability
 from agent_hub.multimodal.generation import (
+    InMemoryMultimediaGenerationJobStore,
+    MultimediaArtifact,
     MultimediaDailyLimitExceeded,
     MultimediaGenerationExecutor,
+    MultimediaGenerationJob,
     MultimediaGenerationKind,
     MultimediaGenerationResult,
 )
@@ -289,6 +292,50 @@ class _ConfigBackedMultimediaGenerationExecutor:
             (("minimax", MiniMaxVideoGenerationClient()),)
         )
         self._daily_usage: dict[tuple[date, str, str], int] = {}
+        self._job_store = InMemoryMultimediaGenerationJobStore()
+
+    def submit(
+        self,
+        *,
+        kind: MultimediaGenerationKind,
+        logical_model: str,
+        prompt: str,
+    ) -> MultimediaGenerationJob:
+        return self._job_store.create(
+            kind=kind,
+            logical_model=logical_model,
+            prompt=prompt.strip(),
+        )
+
+    def get_job(self, job_id: str) -> MultimediaGenerationJob:
+        return self._job_store.get(job_id)
+
+    async def run_job(
+        self,
+        job_id: str,
+        *,
+        executor_id: str,
+    ) -> MultimediaGenerationJob:
+        job = self._job_store.start(job_id, executor_id=executor_id)
+        try:
+            result = await self.generate(
+                kind=job.kind,
+                logical_model=job.logical_model,
+                prompt=job.prompt,
+            )
+        except Exception as error:
+            self._job_store.fail(job_id, error=str(error))
+            raise
+        return self._job_store.succeed(
+            job_id,
+            artifacts=(
+                MultimediaArtifact(
+                    kind=result.kind,
+                    uri=result.text,
+                    text=result.text,
+                ),
+            ),
+        )
 
     async def generate(
         self,

@@ -35,7 +35,9 @@ from agent_hub.models.litellm_client import LiteLLMClient, ModelTransportError
 from agent_hub.models.registry import NoCapableDeployment
 from agent_hub.models.types import Deployment, ModelCapability, ModelMessage, ModelRequest
 from agent_hub.multimodal.generation import (
+    MultimediaArtifact,
     MultimediaDailyLimitExceeded,
+    MultimediaGenerationJob,
     MultimediaGenerationKind,
     MultimediaGenerationResult,
 )
@@ -673,7 +675,51 @@ class MultimediaGenerationResponse(BaseModel):
     text: str | None
 
 
+class MultimediaGenerationJobRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    executor_id: str = Field(min_length=1, max_length=128)
+
+
+class MultimediaArtifactResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+    uri: str | None
+    text: str | None
+
+
+class MultimediaGenerationJobResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    kind: str
+    logical_model: str
+    prompt: str
+    status: str
+    artifacts: list[MultimediaArtifactResponse]
+    executor_id: str | None
+    error: str | None
+
+
 class MultimediaGenerationExecutorProtocol(Protocol):
+    def submit(
+        self,
+        *,
+        kind: MultimediaGenerationKind,
+        logical_model: str,
+        prompt: str,
+    ) -> MultimediaGenerationJob: ...
+
+    def get_job(self, job_id: str) -> MultimediaGenerationJob: ...
+
+    async def run_job(
+        self,
+        job_id: str,
+        *,
+        executor_id: str,
+    ) -> MultimediaGenerationJob: ...
+
     async def generate(
         self,
         *,
@@ -3362,13 +3408,35 @@ def _service(request: Request) -> AdminResourceService:
 
 def _multimedia_generation_executor(request: Request) -> MultimediaGenerationExecutorProtocol:
     executor = getattr(request.app.state, "multimedia_generation_executor", None)
-    if executor is None or not hasattr(executor, "generate"):
+    required_methods = ("submit", "get_job", "run_job", "generate")
+    if executor is None or any(not hasattr(executor, method) for method in required_methods):
         raise PublicAPIError(
             503,
             "multimedia_generation_unavailable",
             "multimedia generation executor is unavailable",
         )
     return cast(MultimediaGenerationExecutorProtocol, executor)
+
+
+def _multimedia_job_response(job: MultimediaGenerationJob) -> MultimediaGenerationJobResponse:
+    return MultimediaGenerationJobResponse(
+        id=job.id,
+        kind=job.kind.value,
+        logical_model=job.logical_model,
+        prompt=job.prompt,
+        status=job.status.value,
+        artifacts=[_multimedia_artifact_response(artifact) for artifact in job.artifacts],
+        executor_id=job.executor_id,
+        error=job.error,
+    )
+
+
+def _multimedia_artifact_response(artifact: MultimediaArtifact) -> MultimediaArtifactResponse:
+    return MultimediaArtifactResponse(
+        kind=artifact.kind.value,
+        uri=artifact.uri,
+        text=artifact.text,
+    )
 
 
 def _deployment_document_from_request(request: ModelDeploymentRequest) -> dict[str, object]:
@@ -4459,6 +4527,95 @@ async def update_settings(
 
 
 @router.post(
+    "/multimedia/jobs",
+    response_model=MultimediaGenerationJobResponse,
+    status_code=202,
+    responses=error_responses(401, 403, 409, 422, 503),
+)
+async def submit_multimedia_job(
+    body: MultimediaGenerationRequest,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> MultimediaGenerationJobResponse:
+    _require(principal, "run:create")
+    await _require_multimedia_generation_enabled(service)
+    executor = _multimedia_generation_executor(request)
+    job = executor.submit(
+        kind=MultimediaGenerationKind(body.kind),
+        logical_model=body.logical_model,
+        prompt=body.prompt,
+    )
+    return _multimedia_job_response(job)
+
+
+@router.get(
+    "/multimedia/jobs/{job_id}",
+    response_model=MultimediaGenerationJobResponse,
+    responses=error_responses(401, 403, 404, 422, 503),
+)
+async def get_multimedia_job(
+    job_id: str,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+) -> MultimediaGenerationJobResponse:
+    _require(principal, "run:read")
+    executor = _multimedia_generation_executor(request)
+    try:
+        return _multimedia_job_response(executor.get_job(job_id))
+    except KeyError as error:
+        raise PublicAPIError(404, "multimedia_job_not_found", "multimedia generation job not found") from error
+
+
+@router.post(
+    "/multimedia/jobs/{job_id}/run",
+    response_model=MultimediaGenerationJobResponse,
+    status_code=202,
+    responses=error_responses(401, 403, 404, 409, 422, 429, 502, 503),
+)
+async def run_multimedia_job(
+    job_id: str,
+    body: MultimediaGenerationJobRunRequest,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> MultimediaGenerationJobResponse:
+    _require(principal, "run:create")
+    await _require_multimedia_generation_enabled(service)
+    executor = _multimedia_generation_executor(request)
+    try:
+        job = await executor.run_job(job_id, executor_id=body.executor_id)
+    except KeyError as error:
+        raise PublicAPIError(404, "multimedia_job_not_found", "multimedia generation job not found") from error
+    except RuntimeError as error:
+        raise PublicAPIError(409, "multimedia_job_not_queued", "multimedia generation job is not queued") from error
+    except NoCapableDeployment as error:
+        raise PublicAPIError(
+            422,
+            "model_capability_unavailable",
+            "no configured model can satisfy the requested multimedia capability",
+            details={"reason": str(error)},
+        ) from error
+    except MultimediaDailyLimitExceeded as error:
+        raise PublicAPIError(
+            429,
+            "multimedia_daily_limit_exceeded",
+            "daily multimedia generation limit exceeded",
+        ) from error
+    except VideoProviderGenerationError as error:
+        raise PublicAPIError(
+            502,
+            "multimedia_provider_failed",
+            "multimedia provider generation failed",
+            details={
+                "provider_code": error.provider_code or "unknown",
+                "reason": str(error),
+            },
+        ) from error
+    return _multimedia_job_response(job)
+
+
+@router.post(
     "/multimedia/generate",
     response_model=MultimediaGenerationResponse,
     status_code=202,
@@ -4471,13 +4628,7 @@ async def generate_multimedia(
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> MultimediaGenerationResponse:
     _require(principal, "run:create")
-    settings = await service.get_settings()
-    if not settings.multimedia_generation_enabled:
-        raise PublicAPIError(
-            409,
-            "multimedia_generation_disabled",
-            "multimedia generation is disabled",
-        )
+    await _require_multimedia_generation_enabled(service)
     executor = _multimedia_generation_executor(request)
     try:
         result = await executor.generate(
@@ -4514,6 +4665,16 @@ async def generate_multimedia(
         deployment_id=result.deployment_id,
         text=result.text,
     )
+
+
+async def _require_multimedia_generation_enabled(service: AdminResourceService) -> None:
+    settings = await service.get_settings()
+    if not settings.multimedia_generation_enabled:
+        raise PublicAPIError(
+            409,
+            "multimedia_generation_disabled",
+            "multimedia generation is disabled",
+        )
 
 
 @router.post(

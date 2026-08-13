@@ -90,6 +90,23 @@ async def test_generation_job_store_receives_executor_artifacts_for_main_agent()
     assert store.get(queued.id) == completed
 
 
+async def test_generation_job_cannot_be_run_twice_by_competing_executor_agents() -> None:
+    gateway = GatewayStub()
+    executor = MultimediaGenerationExecutor(gateway)
+    queued = executor.submit(
+        kind=MultimediaGenerationKind.VIDEO,
+        logical_model="video-primary",
+        prompt="generate a short product video",
+    )
+
+    await executor.run_job(queued.id, executor_id="media-agent-1")
+
+    with pytest.raises(RuntimeError, match="not queued"):
+        await executor.run_job(queued.id, executor_id="media-agent-2")
+
+    assert len(gateway.requests) == 1
+
+
 async def test_generation_prompt_is_required() -> None:
     executor = MultimediaGenerationExecutor(GatewayStub())
 

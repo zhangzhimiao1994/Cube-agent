@@ -1040,6 +1040,55 @@ def test_multimedia_generation_provider_failure_returns_502() -> None:
     }
 
 
+def test_multimedia_generation_job_can_be_run_by_executor_agent_and_read_by_main_agent() -> None:
+    api = client()
+    settings_response = api.get("/api/v1/admin/settings", headers=headers())
+    payload = settings_response.json()
+    payload["multimedia_generation_enabled"] = True
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+    cast(Any, api.app).state.multimedia_generation_executor = MultimediaGenerationExecutor(FakeGenerationGateway())
+
+    submitted = api.post(
+        "/api/v1/admin/multimedia/jobs",
+        headers=headers(),
+        json={
+            "kind": "video",
+            "logical_model": "video_primary",
+            "prompt": "make a 5 second product video",
+        },
+    )
+
+    assert submitted.status_code == 202
+    queued = submitted.json()
+    assert queued["id"].startswith("media_")
+    assert queued["status"] == "queued"
+    assert queued["executor_id"] is None
+    assert queued["artifacts"] == []
+
+    completed = api.post(
+        f"/api/v1/admin/multimedia/jobs/{queued['id']}/run",
+        headers=headers(),
+        json={"executor_id": "multimedia_generator"},
+    )
+
+    assert completed.status_code == 202
+    body = completed.json()
+    assert body["status"] == "succeeded"
+    assert body["executor_id"] == "multimedia_generator"
+    assert body["artifacts"] == [
+        {
+            "kind": "video",
+            "uri": "artifact://generated-media",
+            "text": "artifact://generated-media",
+        }
+    ]
+
+    readable = api.get(f"/api/v1/admin/multimedia/jobs/{queued['id']}", headers=headers())
+
+    assert readable.status_code == 200
+    assert readable.json() == body
+
+
 def test_main_agent_config_saves_dedicated_model_api_and_control_policy() -> None:
     api = client()
 
