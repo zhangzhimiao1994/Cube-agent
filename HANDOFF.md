@@ -1,4 +1,66 @@
 
+## 2026-08-13 P3 Feishu Production Media Factory Wiring Slice
+
+Current state:
+
+- P3 Feishu image pipeline now has production app wiring after the webhook factory hook slice.
+- `create_app()` wires `app.state.feishu_media_service_factory` during lifespan when production secret/redis resources are available.
+- The factory reuses app-level resources for vision analysis and creates a Feishu OpenAPI media client from the runtime `FeishuSettings` for each webhook request.
+- Feishu image webhook flow can now use saved Feishu channel config to download user images, analyze them through `VisionService`, append image context, and submit the enriched text to the main Agent.
+- System settings now include the merged `multimedia_generation_enabled` switch, defaulting to `false`.
+- When `multimedia_generation_enabled` is disabled, Feishu image messages are acknowledged but not submitted to the Agent and not analyzed; the channel replies that image handling is temporarily unavailable until multimedia processing is enabled.
+- When `multimedia_generation_enabled` is enabled, Feishu image messages follow the production media analysis path.
+- Development/test environments use `MemoryImageStore`; non-local POSIX deployments use `FilesystemImageStore` under `attachment_store_dir / "vision"`.
+- Vision cleanup recovery items are recorded through admin `channel_error` logs when a log service is available.
+- Server incremental deployment to `103.236.98.133:/opt/agent-hub/current` was performed with `/tmp/agent-hub-p3-feishu-multimedia-factory.tgz` before GitHub push.
+- Server services `agent-hub-api`, `agent-hub-worker`, and `caddy` are active after restart/reload.
+- Server health checks passed on API port `8000`: `GET /health/live` -> `{"status":"ok"}`, `GET /health/ready` -> `{"status":"ok"}`.
+- Server OpenAPI contains the deployed `multimedia_generation_enabled` system setting.
+- Server syntax check passed with `.venv/bin/python -m py_compile src/agent_hub/api/routers/admin.py src/agent_hub/app.py src/agent_hub/channels/feishu/webhook.py src/agent_hub/channels/feishu/media_factory.py tests/api/test_channel_webhooks.py tests/unit/test_app_wiring.py`.
+- Server function check passed with `PYTHONPATH=src .venv/bin/python /tmp/feishu_multimedia_check.py`, covering both disabled image reply/no-submit behavior and enabled image analysis/gateway submission behavior.
+- User clarified two follow-up P3 design requirements:
+  - Feishu-side skill installation is feasible, but must be a permission-protected channel admin command with audit logs and source validation.
+  - Multimedia generation should be a single system-level button/switch, not separate workflow-local switches.
+  - Image/video generation should be performed by dedicated executor roles after planning.
+  - Video generation must never be submitted to a model that lacks a `video_generation` capability. The later design should combine automatic capability inference with manual admin confirmation/override, and enforce capability checks at execution time.
+
+Changes made locally:
+
+- `src/agent_hub/channels/feishu/media_factory.py`
+  - Added `FeishuMediaServiceFactory`, `ConfigBackedVisionGateway`, and `AdminLogImageCleanupRecoverySink`.
+  - Added production builder for `FeishuOpenAPIMediaClient + VisionService + ModelGateway`.
+- `src/agent_hub/api/routers/admin.py`
+  - Added `multimedia_generation_enabled` to system settings, defaulting off.
+- `src/agent_hub/channels/feishu/webhook.py`
+  - Added system-setting gating before Feishu image analysis/gateway submission.
+  - Added direct Feishu reply behavior for image messages while multimedia generation is disabled.
+- `src/agent_hub/app.py`
+  - Wires the production Feishu media service factory during lifespan and closes owned image store resources on shutdown.
+- `tests/api/test_channel_webhooks.py`
+  - Added TDD coverage that Feishu image messages are not submitted to the Agent when multimedia generation is disabled and receive a channel reply instead.
+  - Updated image analysis tests to explicitly enable `multimedia_generation_enabled`.
+- `tests/unit/test_app_wiring.py`
+  - Added TDD coverage for app lifespan wiring of `feishu_media_service_factory`.
+  - Added coverage that development builds use an in-memory image store.
+
+Verification performed locally:
+
+- TDD red: `uv run pytest tests/unit/test_app_wiring.py::test_create_app_wires_production_feishu_media_service_factory -q --tb=short` first failed because `feishu_media_service_factory` was missing from app state.
+- Green: the same targeted test passed after app wiring and factory builder were added.
+- TDD red: `uv run pytest tests/unit/test_app_wiring.py::test_feishu_media_factory_uses_memory_store_in_development -q --tb=short` first failed because the builder had no environment switch.
+- Green: the targeted app wiring and environment store tests passed after adding the `environment` parameter.
+- TDD red: `uv run pytest tests/api/test_channel_webhooks.py::test_feishu_webhook_replies_when_image_arrives_with_multimodal_disabled -q --tb=short` first failed because the image was still submitted to the gateway.
+- Green: the targeted disabled/enabled Feishu image webhook tests passed after adding `multimedia_generation_enabled` gating.
+- `uv run pytest tests/api/test_channel_webhooks.py tests/unit/test_app_wiring.py tests/api/test_admin_resources.py tests/contracts/feishu/test_receivers.py tests/unit/channels/feishu/test_media_client.py tests/e2e/feishu/test_conversation.py tests/unit/channels/test_submitter.py -q --tb=short` -> 106 passed.
+- `uv run ruff check src tests/api/test_channel_webhooks.py tests/unit/test_app_wiring.py tests/api/test_admin_resources.py tests/contracts/feishu/test_receivers.py tests/unit/channels/feishu/test_media_client.py tests/e2e/feishu/test_conversation.py tests/unit/channels/test_submitter.py` -> passed.
+- `uv run mypy --strict src tests` -> passed.
+
+Remaining risks / TODOs:
+
+- Server incremental deployment and server-side function checks are complete for this slice.
+- GitHub recovery archive, full push, and Actions verification are pending for this slice.
+- Next P3 slices should design the multimedia executor roles/capability checks and protected Feishu admin commands such as skill installation.
+
 ## 2026-08-13 P3 Feishu Media Service Factory Hook Slice
 
 Current state:

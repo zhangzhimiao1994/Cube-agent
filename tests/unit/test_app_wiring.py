@@ -1,23 +1,81 @@
+import base64
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Self
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi.responses import FileResponse
+from fastapi.testclient import TestClient
 
 from agent_hub.api.routers.admin import (
+    InMemoryAdminResourceService,
     MainAgentConfigResponse,
     MainAgentModelConfig,
     ModelDeploymentResponse,
 )
 from agent_hub.app import _MainAgentModeRouter, _web_ui_response, create_app
+from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
+from agent_hub.channels.feishu.media import FeishuMediaService
+from agent_hub.channels.feishu.media_factory import build_feishu_media_service_factory
+from agent_hub.channels.feishu.settings import FeishuSettings
 from agent_hub.models.capacity import CapacityLease
 from agent_hub.models.gateway import CapacityController
 from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, TokenUsage
 from agent_hub.routing.types import RiskLevel
+from agent_hub.settings import Settings
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
+
+
+class StubAuthService:
+    def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
+        if token != "valid-token":
+            raise InvalidCredentials("bad token")
+        return AuthenticatedPrincipal(uuid4(), TENANT_ID, Role.SUPER_ADMIN)
+
+
+class StubRateLimiter:
+    pass
+
+
+class StubConfigService:
+    async def get_current(self, tenant_id: UUID) -> None:
+        assert tenant_id == TENANT_ID
+
+
+class FakeSession:
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+
+class FakeDatabase:
+    def __init__(self) -> None:
+        self.session_factory = FakeSession
+
+    async def dispose(self) -> None:
+        return None
+
+
+class FakeRedis:
+    async def aclose(self) -> None:
+        return None
+
+    async def ping(self, **kwargs: object) -> bool:
+        del kwargs
+        return True
+
+
+def valid_settings(attachment_store_dir: Path | None = None) -> Settings:
+    key = base64.urlsafe_b64encode(b"x" * 32).decode("ascii").rstrip("=")
+    values: dict[str, object] = {"jwt_signing_key": "base64url:" + key}
+    if attachment_store_dir is not None:
+        values["attachment_store_dir"] = attachment_store_dir
+    return Settings.model_validate(values)
 
 
 def test_web_ui_rejects_sibling_path_with_shared_prefix(tmp_path: Path) -> None:
@@ -46,6 +104,50 @@ def test_create_app_mounts_feishu_webhook_on_main_api() -> None:
 
     assert "/channels/feishu/events" in paths
     assert application.state.channel_runtime_config is None
+
+
+def test_create_app_wires_production_feishu_media_service_factory(tmp_path: Path) -> None:
+    application = create_app(
+        settings=valid_settings(tmp_path),
+        database=FakeDatabase(),
+        redis_client=FakeRedis(),
+        auth_service=StubAuthService(),
+        rate_limiter=StubRateLimiter(),
+        config_service=StubConfigService(),
+        admin_resource_service=InMemoryAdminResourceService(),
+        user_admin_service=object(),
+        run_service=object(),
+    )
+
+    with TestClient(application):
+        factory = getattr(application.state, "feishu_media_service_factory", None)
+        assert callable(factory)
+        service = factory(
+            FeishuSettings.model_validate(
+                {
+                    "app_id": "cli_runtime",
+                    "app_secret": "secret",
+                    "verification_token": "token",
+                    "encrypt_key": "encrypt-key",
+                    "transport": "webhook",
+                }
+            )
+        )
+
+    assert isinstance(service, FeishuMediaService)
+
+
+def test_feishu_media_factory_uses_memory_store_in_development(tmp_path: Path) -> None:
+    factory = build_feishu_media_service_factory(
+        config_service=StubConfigService(),
+        secret_service=FakeSecretService(),
+        redis_client=FakeRedis(),
+        tenant_id=TENANT_ID,
+        attachment_store_dir=tmp_path,
+        environment="development",
+    )
+
+    assert factory.object_store.store_id == "memory-image-store"
 
 
 class FakeSecretService:

@@ -37,6 +37,20 @@ class RecordingGateway:
         return object()
 
 
+class RecordingFeishuReplySender:
+    def __init__(self) -> None:
+        self.replies: list[tuple[FeishuSettings, str, str]] = []
+
+    async def reply_text(
+        self,
+        *,
+        settings: FeishuSettings,
+        message_id: str,
+        text: str,
+    ) -> None:
+        self.replies.append((settings, message_id, text))
+
+
 @dataclass(frozen=True, slots=True)
 class StubVisionArtifact:
     summary: str
@@ -514,12 +528,16 @@ def test_feishu_webhook_accepts_token_only_event_when_signature_headers_are_abse
 
 def test_feishu_webhook_appends_image_analysis_context() -> None:
     gateway = RecordingGateway()
+    service = InMemoryAdminResourceService()
+    service.settings = service.settings.model_copy(
+        update={"multimedia_generation_enabled": True}
+    )
     app = create_app(
         auth_service=StubAuthService(),
         rate_limiter=object(),
         feishu_gateway=gateway,
     )
-    app.state.admin_resource_service = InMemoryAdminResourceService()
+    app.state.admin_resource_service = service
     media_service = StubFeishuMediaService()
     app.state.feishu_media_service = media_service
     api = TestClient(app)
@@ -576,14 +594,81 @@ def test_feishu_webhook_appends_image_analysis_context() -> None:
     )
 
 
-def test_feishu_webhook_uses_media_service_factory_with_runtime_settings() -> None:
+def test_feishu_webhook_replies_when_image_arrives_with_multimodal_disabled() -> None:
     gateway = RecordingGateway()
+    service = InMemoryAdminResourceService()
+    media_service = StubFeishuMediaService()
+    reply_sender = RecordingFeishuReplySender()
     app = create_app(
         auth_service=StubAuthService(),
         rate_limiter=object(),
         feishu_gateway=gateway,
     )
-    app.state.admin_resource_service = InMemoryAdminResourceService()
+    app.state.admin_resource_service = service
+    app.state.feishu_media_service = media_service
+    app.state.feishu_reply_sender = reply_sender
+    api = TestClient(app)
+
+    saved = api.post(
+        "/api/v1/admin/channels/feishu/config",
+        headers={"Authorization": "Bearer valid-token"},
+        json={
+            "values": {
+                "AGENT_HUB_PUBLIC_URL": "https://agent.example.com",
+                "FEISHU_APP_ID": "cli_saved_feishu",
+                "FEISHU_APP_SECRET": "saved-secret",
+                "FEISHU_VERIFICATION_TOKEN": "saved-verification-token",
+                "FEISHU_ENCRYPT_KEY": "saved-encrypt-key",
+                "FEISHU_TRANSPORT": "webhook",
+            }
+        },
+    )
+    response = api.post(
+        "/channels/feishu/events",
+        json={
+            "schema": "2.0",
+            "header": {
+                "event_id": "evt_image_disabled",
+                "event_type": "im.message.receive_v1",
+                "token": "saved-verification-token",
+                "app_id": "cli_saved_feishu",
+                "tenant_key": "tenant_1",
+                "create_time": str(int(time.time())),
+            },
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou_user"}},
+                "message": {
+                    "message_id": "om_image_disabled",
+                    "chat_id": "oc_chat",
+                    "chat_type": "p2p",
+                    "message_type": "image",
+                    "content": "{\"image_key\":\"img_123\",\"mime_type\":\"image/png\"}",
+                },
+            },
+        },
+    )
+
+    assert saved.status_code == 200
+    assert response.status_code == 202
+    assert gateway.messages == []
+    assert media_service.messages == []
+    assert len(reply_sender.replies) == 1
+    assert reply_sender.replies[0][1] == "om_image_disabled"
+    assert "暂时无法处理图片" in reply_sender.replies[0][2]
+
+
+def test_feishu_webhook_uses_media_service_factory_with_runtime_settings() -> None:
+    gateway = RecordingGateway()
+    service = InMemoryAdminResourceService()
+    service.settings = service.settings.model_copy(
+        update={"multimedia_generation_enabled": True}
+    )
+    app = create_app(
+        auth_service=StubAuthService(),
+        rate_limiter=object(),
+        feishu_gateway=gateway,
+    )
+    app.state.admin_resource_service = service
     media_service = StubFeishuMediaService()
     settings_seen: list[str] = []
 
@@ -643,6 +728,9 @@ def test_feishu_webhook_uses_media_service_factory_with_runtime_settings() -> No
 def test_feishu_webhook_logs_media_failure_and_submits_original_message() -> None:
     gateway = RecordingGateway()
     service = InMemoryAdminResourceService()
+    service.settings = service.settings.model_copy(
+        update={"multimedia_generation_enabled": True}
+    )
     app = create_app(
         auth_service=StubAuthService(),
         rate_limiter=object(),

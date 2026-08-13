@@ -36,6 +36,7 @@ from agent_hub.auth.tokens import AccessTokenService
 from agent_hub.auth.user_admin import PersistentUserAdminService
 from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
 from agent_hub.channels.dedup import InboundDedupRepository
+from agent_hub.channels.feishu.media_factory import build_feishu_media_service_factory
 from agent_hub.channels.feishu.reply import FeishuOpenAPIReplySender, FeishuRunReplyDispatcher
 from agent_hub.channels.feishu.webhook import (
     ChannelGatewayProtocol,
@@ -476,6 +477,20 @@ def create_app(
                 application.state.feishu_reply_dispatcher = FeishuRunReplyDispatcher(
                     run_repository=RunRepository(active_sessions),
                     sender=FeishuOpenAPIReplySender(),
+                )
+            if active_secret_service is not None and active_redis is not None:
+                media_factory = build_feishu_media_service_factory(
+                    config_service=cast(ConfigService, application.state.config_service),
+                    secret_service=active_secret_service,
+                    redis_client=active_redis,
+                    tenant_id=configured.bootstrap_tenant_id,
+                    attachment_store_dir=configured.attachment_store_dir,
+                    log_service=application.state.admin_resource_service,
+                    environment=configured.environment,
+                )
+                application.state.feishu_media_service_factory = media_factory
+                cleanup_callbacks.append(
+                    ("feishu_media_service_factory", media_factory.aclose)
                 )
 
             if rate_limiter is None:

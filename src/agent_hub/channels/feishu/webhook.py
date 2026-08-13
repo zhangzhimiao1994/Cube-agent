@@ -20,6 +20,7 @@ from agent_hub.channels.feishu.normalize import (
     normalize_feishu_event,
 )
 from agent_hub.channels.feishu.reply import (
+    FeishuReplySender,
     FeishuRunReplyDispatcher,
     log_feishu_reply_failure,
 )
@@ -30,6 +31,7 @@ from agent_hub.channels.feishu.verify import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_MULTIMODAL_DISABLED_TEXT = "暂时无法处理图片，请在系统设置中开启多模态处理后再发送图片。"
 
 
 class ChannelGatewayProtocol(Protocol):
@@ -195,6 +197,8 @@ def create_lazy_feishu_webhook_router(
         if result.message is None:
             await _record_feishu_ignored_event(request, result)
             return JSONResponse(content={"accepted": True, "ignored": True})
+        if await _reply_if_multimedia_disabled(request, settings, result):
+            return JSONResponse(status_code=202, content={"accepted": True})
         result = await _append_feishu_media_context(request, settings, result)
         message = result.message
         if message is None:
@@ -204,6 +208,58 @@ def create_lazy_feishu_webhook_router(
         return JSONResponse(status_code=202, content={"accepted": True})
 
     return router
+
+
+async def _reply_if_multimedia_disabled(
+    request: Request,
+    settings: FeishuSettings,
+    result: FeishuWebhookResult,
+) -> bool:
+    message = result.message
+    if message is None or not message.attachments:
+        return False
+    if await _multimedia_generation_enabled(request):
+        return False
+    reply_sender = _feishu_reply_sender(request)
+    if reply_sender is None:
+        return True
+    try:
+        await reply_sender.reply_text(
+            settings=settings,
+            message_id=message.message_id,
+            text=_MULTIMODAL_DISABLED_TEXT,
+        )
+    except Exception as error:  # noqa: BLE001 - best-effort channel delivery boundary
+        await log_feishu_reply_failure(
+            log_service=getattr(request.app.state, "admin_resource_service", None),
+            run_id=None,
+            message_id=message.message_id,
+            error=error,
+        )
+    return True
+
+
+async def _multimedia_generation_enabled(request: Request) -> bool:
+    service = getattr(request.app.state, "admin_resource_service", None)
+    getter = getattr(service, "get_settings", None)
+    if getter is None:
+        return False
+    try:
+        settings = await getter()
+    except Exception:
+        _LOGGER.exception("multimedia_generation_settings_failed")
+        return False
+    return bool(getattr(settings, "multimedia_generation_enabled", False))
+
+
+def _feishu_reply_sender(request: Request) -> FeishuReplySender | None:
+    sender = getattr(request.app.state, "feishu_reply_sender", None)
+    if sender is not None and getattr(sender, "reply_text", None) is not None:
+        return cast(FeishuReplySender, sender)
+    dispatcher = getattr(request.app.state, "feishu_reply_dispatcher", None)
+    if isinstance(dispatcher, FeishuRunReplyDispatcher):
+        return dispatcher.sender
+    return None
 
 
 def _feishu_settings_from_runtime_config(
