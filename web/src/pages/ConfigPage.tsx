@@ -2,7 +2,14 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
-import { ApiError, api, formatApiError, type ConfigRevision, type SystemSettings } from "../api/client";
+import {
+  ApiError,
+  api,
+  formatApiError,
+  type ConfigRevision,
+  type OpenClawOperation,
+  type SystemSettings,
+} from "../api/client";
 
 type EditableConfig = {
   models: Record<string, unknown>;
@@ -49,6 +56,34 @@ function toggle(list: string[], value: string) {
   return list.includes(value) ? list.filter((item) => item !== value) : [...list, value];
 }
 
+function formatJson(value: unknown) {
+  return JSON.stringify(value, null, 2);
+}
+
+function parseStringList(value: string, fieldName: string) {
+  const parsed: unknown = JSON.parse(value);
+  if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string" || item.trim() === "")) {
+    throw new Error(`${fieldName} must be a JSON string array.`);
+  }
+  return parsed;
+}
+
+function parseCommandList(value: string) {
+  const parsed: unknown = JSON.parse(value);
+  if (
+    !Array.isArray(parsed) ||
+    parsed.some(
+      (command) =>
+        !Array.isArray(command) ||
+        command.length === 0 ||
+        command.some((item) => typeof item !== "string" || item.trim() === ""),
+    )
+  ) {
+    throw new Error("OpenClaw allowed commands must be a JSON array of argv arrays.");
+  }
+  return parsed;
+}
+
 export function ConfigPage() {
   const queryClient = useQueryClient();
   const current = useQuery({ queryKey: ["config-current"], queryFn: () => api.currentConfig() });
@@ -64,23 +99,90 @@ export function ConfigPage() {
   const [localError, setLocalError] = useState<string | null>(null);
   const [published, setPublished] = useState<string | null>(null);
   const [settings, setSettings] = useState<SystemSettings | null>(null);
+  const [settingsLocalError, setSettingsLocalError] = useState<string | null>(null);
+  const [openClawAllowedCommandsText, setOpenClawAllowedCommandsText] = useState("[]");
+  const [openClawArgvText, setOpenClawArgvText] = useState("[\"python\", \"--version\"]");
+  const [openClawReason, setOpenClawReason] = useState("Manual OpenClaw operation from settings console");
+  const [openClawOperation, setOpenClawOperation] = useState<OpenClawOperation | null>(null);
+  const [openClawExecutionOutput, setOpenClawExecutionOutput] = useState<string | null>(null);
 
   useEffect(() => {
     if (document) setJson(formatDocument(document));
   }, [document]);
 
   useEffect(() => {
-    if (settingsQuery.data) setSettings(settingsQuery.data);
+    if (settingsQuery.data) {
+      setSettings(settingsQuery.data);
+      setOpenClawAllowedCommandsText(formatJson(settingsQuery.data.openclaw_allowed_commands));
+    }
   }, [settingsQuery.data]);
 
   const saveSettings = useMutation({
     mutationFn: async () => {
       if (!settings) throw new Error("设置尚未加载完成");
-      return api.updateSettings(settings);
+      setSettingsLocalError(null);
+      return api.updateSettings({
+        ...settings,
+        openclaw_allowed_commands: parseCommandList(openClawAllowedCommandsText),
+      });
     },
     onSuccess: async (saved) => {
       setSettings(saved);
+      setOpenClawAllowedCommandsText(formatJson(saved.openclaw_allowed_commands));
       await queryClient.invalidateQueries({ queryKey: ["settings"] });
+    },
+    onError: (error) => {
+      if (error instanceof Error && !(error instanceof ApiError)) {
+        setSettingsLocalError(error.message);
+      }
+    },
+  });
+
+  const createOpenClawOperation = useMutation({
+    mutationFn: async () => {
+      setSettingsLocalError(null);
+      setOpenClawExecutionOutput(null);
+      return api.createOpenClawOperation({
+        platform: "linux",
+        kind: "server_command",
+        target: "agent-hub-server",
+        argv: parseStringList(openClawArgvText, "OpenClaw argv"),
+        risk_level: "low",
+        reason: openClawReason,
+      });
+    },
+    onSuccess: (operation) => setOpenClawOperation(operation),
+    onError: (error) => {
+      if (error instanceof Error && !(error instanceof ApiError)) {
+        setSettingsLocalError(error.message);
+      }
+    },
+  });
+
+  const approveOpenClawOperation = useMutation({
+    mutationFn: async () => {
+      if (!openClawOperation) throw new Error("OpenClaw operation is not ready.");
+      return api.resolveOpenClawOperation(openClawOperation.id, "approve");
+    },
+    onSuccess: (operation) => setOpenClawOperation(operation),
+  });
+
+  const rejectOpenClawOperation = useMutation({
+    mutationFn: async () => {
+      if (!openClawOperation) throw new Error("OpenClaw operation is not ready.");
+      return api.resolveOpenClawOperation(openClawOperation.id, "reject");
+    },
+    onSuccess: (operation) => setOpenClawOperation(operation),
+  });
+
+  const executeOpenClawOperation = useMutation({
+    mutationFn: async () => {
+      if (!openClawOperation) throw new Error("OpenClaw operation is not ready.");
+      return api.executeOpenClawOperation(openClawOperation.id);
+    },
+    onSuccess: (execution) => {
+      setOpenClawOperation(execution.operation);
+      setOpenClawExecutionOutput(execution.stdout || execution.stderr || `exit_code=${execution.exit_code}`);
     },
   });
 
@@ -312,6 +414,90 @@ export function ConfigPage() {
               <option value="trusted_auto">受信环境自动执行</option>
             </select>
           </label>
+          <label htmlFor="openclaw-allowed-commands">
+            OpenClaw allowed commands JSON
+            <textarea
+              id="openclaw-allowed-commands"
+              data-testid="openclaw-allowed-commands"
+              value={openClawAllowedCommandsText}
+              onChange={(event) => setOpenClawAllowedCommandsText(event.target.value)}
+              spellCheck={false}
+            />
+            <small>Only exact argv matches can execute after approval. Shell wrappers remain blocked.</small>
+          </label>
+          <div className="inline-guide" aria-label="OpenClaw operation console">
+            <h4>OpenClaw operation console</h4>
+            <label htmlFor="openclaw-operation-argv">
+              Operation argv JSON
+              <textarea
+                id="openclaw-operation-argv"
+                data-testid="openclaw-operation-argv"
+                value={openClawArgvText}
+                onChange={(event) => setOpenClawArgvText(event.target.value)}
+                spellCheck={false}
+              />
+            </label>
+            <label htmlFor="openclaw-operation-reason">
+              Reason
+              <input
+                id="openclaw-operation-reason"
+                value={openClawReason}
+                onChange={(event) => setOpenClawReason(event.target.value)}
+              />
+            </label>
+            <div className="action-row">
+              <button
+                type="button"
+                data-testid="openclaw-create-operation"
+                disabled={createOpenClawOperation.isPending}
+                onClick={() => createOpenClawOperation.mutate()}
+              >
+                Request approval
+              </button>
+              <button
+                type="button"
+                data-testid="openclaw-approve-operation"
+                disabled={!openClawOperation || openClawOperation.status !== "waiting_user_approval" || approveOpenClawOperation.isPending}
+                onClick={() => approveOpenClawOperation.mutate()}
+              >
+                Approve
+              </button>
+              <button
+                type="button"
+                data-testid="openclaw-reject-operation"
+                disabled={!openClawOperation || openClawOperation.status !== "waiting_user_approval" || rejectOpenClawOperation.isPending}
+                onClick={() => rejectOpenClawOperation.mutate()}
+              >
+                Reject
+              </button>
+              <button
+                type="button"
+                data-testid="openclaw-execute-operation"
+                disabled={!openClawOperation || openClawOperation.status !== "approved" || executeOpenClawOperation.isPending}
+                onClick={() => executeOpenClawOperation.mutate()}
+              >
+                Execute
+              </button>
+            </div>
+            {openClawOperation ? (
+              <p role="status">
+                OpenClaw operation {openClawOperation.id}: {openClawOperation.status}
+              </p>
+            ) : null}
+            {openClawExecutionOutput ? <pre data-testid="openclaw-execution-output">{openClawExecutionOutput}</pre> : null}
+            {createOpenClawOperation.isError ? (
+              <p role="alert">{formatApiError(createOpenClawOperation.error, "OpenClaw request failed")}</p>
+            ) : null}
+            {approveOpenClawOperation.isError ? (
+              <p role="alert">{formatApiError(approveOpenClawOperation.error, "OpenClaw approval failed")}</p>
+            ) : null}
+            {rejectOpenClawOperation.isError ? (
+              <p role="alert">{formatApiError(rejectOpenClawOperation.error, "OpenClaw rejection failed")}</p>
+            ) : null}
+            {executeOpenClawOperation.isError ? (
+              <p role="alert">{formatApiError(executeOpenClawOperation.error, "OpenClaw execution failed")}</p>
+            ) : null}
+          </div>
         </fieldset>
 
         <h3>主 Agent 全局临场策略</h3>
@@ -396,10 +582,11 @@ export function ConfigPage() {
           </label>
         </div>
 
-        <button type="submit" disabled={saveSettings.isPending}>
+        <button type="submit" data-testid="save-system-settings" disabled={saveSettings.isPending}>
           {saveSettings.isPending ? "正在保存设置..." : "保存系统设置"}
         </button>
         {saveSettings.isSuccess ? <p role="status">系统设置已保存，并会在后续任务提交时作为默认值使用。</p> : null}
+        {settingsLocalError ? <p role="alert">{settingsLocalError}</p> : null}
         {saveSettings.isError ? <p role="alert">{formatApiError(saveSettings.error, "系统设置保存失败")}</p> : null}
       </form>
 

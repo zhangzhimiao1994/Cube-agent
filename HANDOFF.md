@@ -1490,3 +1490,45 @@ Next:
 - Push `main` with `git push --force-with-lease mutilagent main`.
 - Check GitHub Actions and fix/redeploy/repush if red.
 - Continue P3 with the OpenClaw approval UI/operation console and then conversation-integrated Vibe Coding.
+
+## 2026-08-13 P3 OpenClaw Settings Console UI
+
+Current state:
+
+- The system settings page now exposes OpenClaw allowlist editing and a small operation console.
+- Admins can save `openclaw_allowed_commands` as JSON argv arrays from the UI.
+- Admins can create a Linux `server_command` approval request from the UI, then approve/reject it, then execute after approval.
+- The UI displays the latest operation status and command output from the execution response.
+- The backend safety boundary remains unchanged: execution still requires approval and exact allowlist match, and shell wrappers remain blocked.
+
+Changes made:
+
+- Added frontend API schemas and methods for OpenClaw operation create/resolve/execute.
+- Added OpenClaw allowlist textarea to Config page.
+- Added OpenClaw operation console controls: request approval, approve, reject, execute, status, and execution output.
+- Added Config page regression test for saving allowlist and running the UI approval/execution flow.
+
+Local verification:
+
+- TDD red check was added first; ConfigPage failed because OpenClaw console controls did not exist.
+- `npm.cmd test -- --run src/pages/ConfigPage.test.tsx` -> 3 passed.
+- `npm.cmd run lint` -> passed.
+- `npm.cmd test -- --run src/pages/ConfigPage.test.tsx src/app/AppShell.test.tsx src/pages/OperationalPages.test.tsx` -> 46 passed.
+- `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+
+Server deployment and verification:
+
+- Uploaded incremental package to `103.236.98.133:/tmp/agent-hub-p3-openclaw-console.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`.
+- Reloaded Caddy and verified `agent-hub-api`, `agent-hub-worker`, and `caddy` were active.
+- Verified server `web/dist/index.html` points to the new JS bundle `index-rd35pJsw.js`.
+- Verified current server frontend bundle contains `openclaw-create-operation` and `openclaw-execution-output`.
+- Re-ran `/tmp/openclaw_executor_functional_check.py` through the real local HTTP API; it passed the approved execution path and guardrail checks.
+
+Next:
+
+- Commit this UI slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue P3 with conversation-integrated Vibe Coding and richer multi-system OpenClaw adapters.

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -59,6 +59,88 @@ describe("ConfigPage", () => {
         if (path === "/api/v1/admin/settings") {
           if (method === "PUT") return jsonResponse(JSON.parse(String(init?.body)));
           return jsonResponse(settings);
+        }
+        if (path === "/api/v1/admin/openclaw/operations" && method === "POST") {
+          const body = JSON.parse(String(init?.body));
+          return jsonResponse(
+            {
+              id: "openclaw_ui_test",
+              status: "waiting_user_approval",
+              approval_id: "openclaw_ui_test_approval",
+              requires_user_approval: true,
+              platform: body.platform,
+              kind: body.kind,
+              operation: body,
+              approval_summary: "OpenClaw linux server_command on agent-hub-server",
+              requested_by: principal.user_id,
+              created_at: "2026-08-13T00:00:00Z",
+              resolved_by: null,
+              resolved_at: null,
+              execution: null,
+            },
+            { status: 202 },
+          );
+        }
+        if (path === "/api/v1/admin/openclaw/operations/openclaw_ui_test" && method === "PATCH") {
+          return jsonResponse({
+            id: "openclaw_ui_test",
+            status: "approved",
+            approval_id: "openclaw_ui_test_approval",
+            requires_user_approval: false,
+            platform: "linux",
+            kind: "server_command",
+            operation: {
+              platform: "linux",
+              kind: "server_command",
+              target: "agent-hub-server",
+              argv: ["python", "-c", "print('ui-openclaw-ok')"],
+              risk_level: "low",
+              reason: "UI smoke",
+            },
+            approval_summary: "OpenClaw linux server_command on agent-hub-server",
+            requested_by: principal.user_id,
+            created_at: "2026-08-13T00:00:00Z",
+            resolved_by: principal.user_id,
+            resolved_at: "2026-08-13T00:01:00Z",
+            execution: null,
+          });
+        }
+        if (path === "/api/v1/admin/openclaw/operations/openclaw_ui_test/execute" && method === "POST") {
+          return jsonResponse({
+            operation: {
+              id: "openclaw_ui_test",
+              status: "executed",
+              approval_id: "openclaw_ui_test_approval",
+              requires_user_approval: false,
+              platform: "linux",
+              kind: "server_command",
+              operation: {
+                platform: "linux",
+                kind: "server_command",
+                target: "agent-hub-server",
+                argv: ["python", "-c", "print('ui-openclaw-ok')"],
+                risk_level: "low",
+                reason: "UI smoke",
+              },
+              approval_summary: "OpenClaw linux server_command on agent-hub-server",
+              requested_by: principal.user_id,
+              created_at: "2026-08-13T00:00:00Z",
+              resolved_by: principal.user_id,
+              resolved_at: "2026-08-13T00:01:00Z",
+              execution: {
+                exit_code: 0,
+                stdout: "ui-openclaw-ok\n",
+                stderr: "",
+                truncated: false,
+                executed_by: principal.user_id,
+                executed_at: "2026-08-13T00:02:00Z",
+              },
+            },
+            exit_code: 0,
+            stdout: "ui-openclaw-ok\n",
+            stderr: "",
+            truncated: false,
+          });
         }
         if (path === "/api/v1/admin/agents") {
           return jsonResponse([
@@ -196,5 +278,35 @@ describe("ConfigPage", () => {
     await user.click(screen.getByRole("button", { name: "创建草稿并发布" }));
 
     expect((await screen.findByRole("alert")).textContent).toContain("JSON 解析失败");
+  });
+  it("runs the OpenClaw approval and execution console from settings", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/config" />);
+
+    const allowedCommands = await screen.findByTestId("openclaw-allowed-commands");
+    fireEvent.change(allowedCommands, { target: { value: `[["python","-c","print('ui-openclaw-ok')"]]` } });
+    await user.click(screen.getByTestId("save-system-settings"));
+
+    await waitFor(() => {
+      expect(requests.find((request) => request.path === "/api/v1/admin/settings")).toMatchObject({
+        method: "PUT",
+        body: {
+          ...settings,
+          openclaw_allowed_commands: [["python", "-c", "print('ui-openclaw-ok')"]],
+        },
+      });
+    });
+
+    fireEvent.change(screen.getByTestId("openclaw-operation-argv"), {
+      target: { value: `["python","-c","print('ui-openclaw-ok')"]` },
+    });
+    await user.click(screen.getByTestId("openclaw-create-operation"));
+    expect(await screen.findByText(/waiting_user_approval/)).not.toBeNull();
+
+    await user.click(screen.getByTestId("openclaw-approve-operation"));
+    expect(await screen.findByText(/approved/)).not.toBeNull();
+
+    await user.click(screen.getByTestId("openclaw-execute-operation"));
+    expect((await screen.findByTestId("openclaw-execution-output")).textContent).toContain("ui-openclaw-ok");
   });
 });

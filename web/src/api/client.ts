@@ -234,6 +234,45 @@ const SystemSettingsSchema = z.object({
 
 export type SystemSettings = z.infer<typeof SystemSettingsSchema>;
 
+const OpenClawOperationRequestSchema = z.object({
+  platform: z.enum(["linux", "windows", "macos"]),
+  kind: z.enum(["server_command", "desktop_action", "screen_read", "file_read"]),
+  target: z.string(),
+  argv: z.array(z.string()),
+  risk_level: z.enum(["low", "medium", "high"]),
+  reason: z.string(),
+});
+
+export type OpenClawOperationRequest = z.infer<typeof OpenClawOperationRequestSchema>;
+
+const OpenClawOperationSchema = z.object({
+  id: z.string(),
+  status: z.enum(["waiting_user_approval", "approved", "rejected", "executed"]),
+  approval_id: z.string(),
+  requires_user_approval: z.boolean(),
+  platform: z.string(),
+  kind: z.string(),
+  operation: z.record(z.string(), z.unknown()),
+  approval_summary: z.string(),
+  requested_by: z.string(),
+  created_at: z.string(),
+  resolved_by: z.string().nullable().optional(),
+  resolved_at: z.string().nullable().optional(),
+  execution: z.record(z.string(), z.unknown()).nullable().optional(),
+});
+
+export type OpenClawOperation = z.infer<typeof OpenClawOperationSchema>;
+
+const OpenClawExecutionSchema = z.object({
+  operation: OpenClawOperationSchema,
+  exit_code: z.number(),
+  stdout: z.string(),
+  stderr: z.string(),
+  truncated: z.boolean(),
+});
+
+export type OpenClawExecution = z.infer<typeof OpenClawExecutionSchema>;
+
 const MainAgentModelConfigSchema = z.object({
   provider: z.string(),
   api_base: z.string(),
@@ -828,6 +867,27 @@ export const api = {
       "/api/v1/admin/settings",
       { method: "PUT", body: JSON.stringify(payload) },
       SystemSettingsSchema,
+    );
+  },
+  createOpenClawOperation(payload: OpenClawOperationRequest): Promise<OpenClawOperation> {
+    return request(
+      "/api/v1/admin/openclaw/operations",
+      { method: "POST", body: JSON.stringify(payload) },
+      OpenClawOperationSchema,
+    );
+  },
+  resolveOpenClawOperation(id: string, decision: "approve" | "reject"): Promise<OpenClawOperation> {
+    return request(
+      `/api/v1/admin/openclaw/operations/${encodeURIComponent(id)}`,
+      { method: "PATCH", body: JSON.stringify({ decision }) },
+      OpenClawOperationSchema,
+    );
+  },
+  executeOpenClawOperation(id: string): Promise<OpenClawExecution> {
+    return request(
+      `/api/v1/admin/openclaw/operations/${encodeURIComponent(id)}/execute`,
+      { method: "POST" },
+      OpenClawExecutionSchema,
     );
   },
   mainAgent(): Promise<MainAgentConfig> {
