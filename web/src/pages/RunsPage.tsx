@@ -2260,63 +2260,69 @@ export function RunsPage() {
               required
             />
             <div className="composer-actions">
-              <label className="composer-upload-button">
-                <span>附件</span>
-                <input
-                  aria-label="上传文件或 Skill ZIP"
-                  type="file"
-                  accept={ATTACHMENT_ACCEPT}
-                  disabled={uploadSkillArchive.isPending || uploadAttachment.isPending}
-                  onChange={(event) => handleAttachmentUpload(event.currentTarget.files)}
-                />
-              </label>
-              <button
-                type="button"
-                className={`composer-handoff-button${handoffActive ? " composer-toggle-active" : ""}`}
-                aria-label="按照原思路"
-                aria-pressed={handoffActive}
-                title="按照原思路开启新对话"
-                disabled={!latestVisibleRun && !handoffActive}
-                onClick={() => startHandoffConversation(latestVisibleRun)}
-              >
-                按照原思路
-              </button>
-              <button
-                type="button"
-                className={`composer-handoff-button${vibeCoding ? " composer-toggle-active" : ""}`}
-                aria-label="Vibe Coding"
-                aria-pressed={vibeCoding}
-                title={settings.data?.vibe_coding_enabled ? "在当前对话中启用代码协作上下文" : "系统设置未启用 Vibe Coding"}
-                disabled={!settings.data?.vibe_coding_enabled}
-                onClick={() => setVibeCoding((current) => !current)}
-              >
-                Vibe Coding
-              </button>
-              <button
-                type="button"
-                className="composer-plus-button"
-                aria-label={configOpen ? "收起本次运行配置" : "打开本次运行配置"}
-                aria-pressed={configOpen}
-                onClick={() => setConfigOpen((current) => !current)}
-              >
-                +
-              </button>
-              <span>
-                {mode === "auto"
-                  ? "自动 · 主 Agent 判断"
-                  : mode === "direct"
-                    ? `直连 · 模型 ${directModelName}`
-                    : `${displayMode(mode)} · 本会话倾向`}
-                {mode !== "direct" && agentIds.length > 0 ? ` · 角色 ${agentIds.length} 个` : ""}
-                {mainAgent.data?.model ? ` · 主 Agent ${mainAgent.data.model.upstream_model}` : " · 主 Agent 未配置"}
-                {referenceConversationId.trim() ? " · 已引用会话" : ""}
-              </span>
-              <button
-                type="submit"
-                disabled={createRun.isPending || message.trim().length === 0 || Boolean(directSendBlockedReason)}
-              >
-                {createRun.isPending ? "发送中..." : "发送"}
-              </button>
+              <div className="composer-tool-row" aria-label="消息工具">
+                <label className="composer-upload-button">
+                  <span>附件</span>
+                  <input
+                    aria-label="上传文件或 Skill ZIP"
+                    type="file"
+                    accept={ATTACHMENT_ACCEPT}
+                    disabled={uploadSkillArchive.isPending || uploadAttachment.isPending}
+                    onChange={(event) => handleAttachmentUpload(event.currentTarget.files)}
+                  />
+                </label>
+                <button
+                  type="button"
+                  className={`composer-handoff-button${handoffActive ? " composer-toggle-active" : ""}`}
+                  aria-label="按照原思路"
+                  aria-pressed={handoffActive}
+                  title="按照原思路开启新对话"
+                  disabled={!latestVisibleRun && !handoffActive}
+                  onClick={() => startHandoffConversation(latestVisibleRun)}
+                >
+                  按照原思路
+                </button>
+                <button
+                  type="button"
+                  className={`composer-handoff-button${vibeCoding ? " composer-toggle-active" : ""}`}
+                  aria-label="Vibe Coding"
+                  aria-pressed={vibeCoding}
+                  title={settings.data?.vibe_coding_enabled ? "在当前对话中启用代码协作上下文" : "系统设置未启用 Vibe Coding"}
+                  disabled={!settings.data?.vibe_coding_enabled}
+                  onClick={() => setVibeCoding((current) => !current)}
+                >
+                  Vibe Coding
+                </button>
+                <button
+                  type="button"
+                  className="composer-plus-button"
+                  aria-label={configOpen ? "收起本次运行配置" : "打开本次运行配置"}
+                  aria-pressed={configOpen}
+                  onClick={() => setConfigOpen((current) => !current)}
+                >
+                  +
+                </button>
+              </div>
+              <div className="composer-status-line" role="status">
+                <span>
+                  {mode === "auto"
+                    ? "自动 · 主 Agent 判断"
+                    : mode === "direct"
+                      ? `直连 · 模型 ${directModelName}`
+                      : `${displayMode(mode)} · 本会话倾向`}
+                  {mode !== "direct" && agentIds.length > 0 ? ` · 角色 ${agentIds.length} 个` : ""}
+                  {mainAgent.data?.model ? ` · 主 Agent ${mainAgent.data.model.upstream_model}` : " · 主 Agent 未配置"}
+                  {referenceConversationId.trim() ? " · 已引用会话" : ""}
+                </span>
+              </div>
+              <div className="composer-send-row">
+                <button
+                  type="submit"
+                  disabled={createRun.isPending || message.trim().length === 0 || Boolean(directSendBlockedReason)}
+                >
+                  {createRun.isPending ? "发送中..." : "发送"}
+                </button>
+              </div>
             </div>
             {directSendBlockedReason && !(mode === "direct" && savedModels.length === 0) ? (
               <p className="field-help" role="status">{directSendBlockedReason}</p>

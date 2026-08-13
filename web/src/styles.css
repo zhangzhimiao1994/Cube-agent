@@ -833,8 +833,7 @@ article:hover {
   padding: 1rem;
 }
 
-.conversation-list-header,
-.composer-actions {
+.conversation-list-header {
   align-items: center;
   display: flex;
   justify-content: space-between;
@@ -868,7 +867,7 @@ article:hover {
 
 .conversation-item span,
 .conversation-item small,
-.composer-actions span {
+.composer-status-line span {
   color: var(--muted);
   font-size: 0.8rem;
 }
@@ -1344,9 +1343,45 @@ article:hover {
 }
 
 .chat-composer .composer-actions {
+  display: grid;
+  gap: 0.55rem;
   justify-self: center;
   max-width: 780px;
   width: 100%;
+}
+
+.composer-tool-row,
+.composer-send-row {
+  align-items: center;
+  display: flex;
+  gap: 0.55rem;
+}
+
+.composer-tool-row {
+  flex-wrap: wrap;
+}
+
+.composer-status-line {
+  background: rgba(8, 17, 35, 0.48);
+  border: 1px solid rgba(123, 225, 255, 0.12);
+  border-radius: 0.8rem;
+  min-width: 0;
+  padding: 0.45rem 0.65rem;
+}
+
+.composer-status-line span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-send-row {
+  justify-content: flex-end;
+}
+
+.composer-send-row button[type="submit"] {
+  min-width: 7.5rem;
 }
 
 .composer-plus-button {
@@ -2718,45 +2753,45 @@ article:hover {
   }
 
   .composer-actions {
-    align-items: stretch;
-    flex-direction: row;
-    flex-wrap: wrap;
+    gap: 0.5rem;
   }
 
-  .composer-actions span {
-    flex: 1 1 100%;
+  .composer-tool-row {
+    display: grid;
+    gap: 0.45rem;
+    grid-template-columns: minmax(4.2rem, 0.85fr) minmax(0, 1fr) minmax(0, 1fr) 2.75rem;
   }
 
-  .composer-actions button,
   .secondary-action {
     text-align: center;
     width: 100%;
   }
 
-  .composer-actions .composer-upload-button {
-    flex: 0 0 auto;
+  .composer-status-line span {
+    white-space: normal;
   }
 
-  .composer-actions .composer-plus-button {
-    flex: 0 0 2.75rem;
+  .composer-tool-row .composer-upload-button,
+  .composer-tool-row .composer-handoff-button,
+  .composer-tool-row .composer-plus-button {
+    min-width: 0;
     width: 2.75rem;
   }
 
-  .composer-actions .composer-handoff-button {
-    flex: 1 1 8rem;
+  .composer-tool-row .composer-upload-button,
+  .composer-tool-row .composer-handoff-button {
     max-width: none;
-    width: auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    width: 100%;
   }
 
-  .composer-actions .composer-answerer-button {
-    flex: 1 1 9rem;
-    max-width: none;
-    width: auto;
+  .composer-send-row {
+    justify-content: stretch;
   }
 
-  .composer-actions button[type="submit"] {
-    flex: 1 1 10rem;
-    width: auto;
+  .composer-send-row button[type="submit"] {
+    width: 100%;
   }
 
   .mode-choice-popover {

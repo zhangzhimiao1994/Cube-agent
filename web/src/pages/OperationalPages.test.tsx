@@ -815,6 +815,17 @@ describe("operational management pages", () => {
     });
   });
 
+  it("separates composer tools, status, and send controls so actions do not crowd each other", async () => {
+    const view = render(<TestApp initialPath="/" />);
+
+    await waitFor(() => expect(view.container.querySelector(".chat-composer")).not.toBeNull());
+    const composer = view.container.querySelector(".chat-composer") as HTMLFormElement;
+
+    expect(composer.querySelector(".composer-tool-row")).not.toBeNull();
+    expect(composer.querySelector(".composer-status-line")).not.toBeNull();
+    expect(composer.querySelector(".composer-send-row")).not.toBeNull();
+  });
+
   it("submits handoff context and Vibe Coding together when both toggles are enabled", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);

@@ -1,4 +1,45 @@
 
+## 2026-08-13 Chat Composer Layout Fix
+
+Current state:
+
+- Chat composer actions are split into three layout rows:
+  - `.composer-tool-row` for attachment, handoff, Vibe Coding, and config toggle controls.
+  - `.composer-status-line` for the current mode/model/session status.
+  - `.composer-send-row` for the submit action.
+- This prevents mobile composer controls from crowding the status text and send button.
+- Handoff and Vibe Coding remain independent toggles and can still be enabled together.
+- Mobile CSS now uses a fixed grid for tool controls and a full-width send row, so the buttons do not collapse into the status line.
+- Server incremental deployment to `103.236.98.133:/opt/agent-hub/current` was performed with `/tmp/agent-hub-chat-composer-layout.tgz`.
+- Caddy was reloaded after the frontend bundle was deployed.
+- Server real HTTP check passed with `/tmp/server_frontend_layout_check.py`:
+  - fetched `http://127.0.0.1/` from the server;
+  - confirmed the served `index.html` matches `/opt/agent-hub/current/web/dist/index.html`;
+  - confirmed served JS/CSS assets match deployed files;
+  - confirmed served bundle contains `composer-tool-row`, `composer-status-line`, and `composer-send-row`.
+
+Changes made:
+
+- `web/src/pages/RunsPage.tsx`
+  - Added semantic wrappers for composer tool controls, status, and send action.
+- `web/src/styles.css`
+  - Replaced the old shared flex layout with grid/flex rows scoped to the composer.
+  - Added mobile-specific grid sizing so tool buttons, status, and send action remain separated.
+- `web/src/pages/OperationalPages.test.tsx`
+  - Added coverage proving the composer renders the separated tool/status/send structure.
+
+Verification performed:
+
+- TDD red:
+  - `npm.cmd test -- --run src/pages/OperationalPages.test.tsx -t "separates composer tools"` failed before implementation because `.composer-tool-row` did not exist.
+- Green:
+  - `npm.cmd test -- --run src/pages/OperationalPages.test.tsx -t "separates composer tools"` -> 1 passed.
+  - `npm.cmd test -- --run src/pages/OperationalPages.test.tsx -t "Vibe Coding|handoff|composer|direct mode"` -> 9 passed.
+  - `npm.cmd test -- --run src/pages/OperationalPages.test.tsx` -> 43 passed.
+  - `npm.cmd run lint` -> passed.
+  - `npm.cmd run build` -> passed; Vite reported the existing chunk-size warning.
+  - Server HTTP bundle check -> passed.
+
 ## 2026-08-13 System Context Auto-Compaction Slice
 
 Current state:
