@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TestApp } from "./router";
@@ -58,7 +59,7 @@ describe("AppShell presentation", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByText("Agent 编排控制台")).not.toBeNull();
-    expect(screen.getByText("控制台")).not.toBeNull();
+    expect(screen.getAllByText("控制台").length).toBeGreaterThan(0);
     expect(screen.getByRole("link", { name: "对话" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "编排" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "系统" })).not.toBeNull();
@@ -105,17 +106,46 @@ describe("AppShell presentation", () => {
     expect(screen.getByLabelText("工具二级导航")).not.toBeNull();
   });
 
-  it("lets operators switch the navigation between floating and pinned layouts", async () => {
+  it("does not expose fixed navigation controls", async () => {
     render(<TestApp initialPath="/models" />);
 
     expect(await screen.findByText("Agent 编排控制台")).not.toBeNull();
-    const toggle = screen.getByRole("button", { name: "固定导航栏" });
     expect(document.querySelector(".app-shell")?.className).toContain("nav-floating");
+    expect(document.querySelector(".app-shell")?.className).not.toContain("nav-pinned");
+    expect(screen.queryByRole("button", { name: "固定导航栏" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "悬浮导航栏" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "固定" })).toBeNull();
+  });
 
-    fireEvent.click(toggle);
+  it("opens the floating navigation as a mobile drawer with expandable second-level modules", async () => {
+    render(<TestApp initialPath="/models" />);
 
-    expect(document.querySelector(".app-shell")?.className).toContain("nav-pinned");
-    expect(window.localStorage.getItem("agent_hub_nav_layout")).toBe("pinned");
-    expect(screen.getByRole("button", { name: "悬浮导航栏" })).not.toBeNull();
+    expect(await screen.findByText("Agent 编排控制台")).not.toBeNull();
+    const shell = document.querySelector(".app-shell");
+    const mobileTrigger = screen.getByRole("button", { name: "打开导航栏" });
+
+    fireEvent.click(mobileTrigger);
+
+    expect(shell?.className).toContain("mobile-nav-open");
+    const mobileNavigation = screen.getByRole("navigation", { name: "手机版主导航" });
+    const orchestrationTrigger = within(mobileNavigation).getByRole("button", { name: "展开编排二级导航" });
+
+    fireEvent.click(orchestrationTrigger);
+
+    expect(orchestrationTrigger.getAttribute("aria-expanded")).toBe("true");
+    expect(within(mobileNavigation).getByRole("link", { name: /主 Agent/ })).not.toBeNull();
+    expect(within(mobileNavigation).getByRole("link", { name: /工作流配置/ })).not.toBeNull();
+
+    fireEvent.click(screen.getAllByRole("button", { name: "关闭导航栏" })[0]);
+
+    expect(shell?.className).not.toContain("mobile-nav-open");
+  });
+
+  it("keeps mobile floating navigation as an overlay drawer", () => {
+    const stylesCss = readFileSync("src/styles.css", "utf8");
+    expect(stylesCss).not.toContain("nav-pinned");
+    expect(stylesCss).toMatch(/@media \(max-width: 980px\)[\s\S]*\.nav-floating \.floating-nav-panel\s*{[\s\S]*position:\s*fixed;[\s\S]*transform:\s*translateX\(-105%\);/);
+    expect(stylesCss).toMatch(/@media \(max-width: 980px\)[\s\S]*\.nav-floating \.nav-list,[\s\S]*\.nav-floating \.nav-drawer\s*{[\s\S]*display:\s*none;/);
+    expect(stylesCss).toMatch(/@media \(max-width: 980px\)[\s\S]*\.nav-floating \.mobile-nav-groups\s*{[\s\S]*display:\s*grid;/);
   });
 });

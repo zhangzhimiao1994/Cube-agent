@@ -1,5 +1,6 @@
 .worktrees/
 .tmp/
+.local-archives/
 .venv/
 __pycache__/
 .pytest_cache/

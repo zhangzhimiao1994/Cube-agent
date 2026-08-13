@@ -1,5 +1,5 @@
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { MODULE_GROUPS } from "./navigation";
 import { useAuth } from "../auth/AuthProvider";
@@ -8,10 +8,8 @@ export function AppShell() {
   const auth = useAuth();
   const location = useLocation();
   const [hoveredGroupId, setHoveredGroupId] = useState<string | null>(null);
-  const [navLayout, setNavLayout] = useState<"floating" | "pinned">(() => {
-    if (typeof window === "undefined") return "floating";
-    return window.localStorage.getItem("agent_hub_nav_layout") === "pinned" ? "pinned" : "floating";
-  });
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [expandedMobileGroupId, setExpandedMobileGroupId] = useState<string | null>(null);
   const visibleGroups = MODULE_GROUPS.map((group) => ({
     ...group,
     modules: group.modules.filter((module) => hasPermission(auth.user?.permissions ?? [], module.permission)),
@@ -27,58 +25,121 @@ export function AppShell() {
   );
   const drawerGroup = visibleGroups.find((group) => group.id === hoveredGroupId) ?? activeGroup;
 
-  function toggleNavLayout() {
-    setNavLayout((current) => {
-      const next = current === "floating" ? "pinned" : "floating";
-      window.localStorage.setItem("agent_hub_nav_layout", next);
-      return next;
-    });
-  }
+  useEffect(() => {
+    setMobileNavOpen(false);
+    setExpandedMobileGroupId(activeGroup?.id ?? null);
+  }, [activeGroup?.id, location.pathname]);
 
   return (
-    <div className={`app-shell nav-${navLayout}`}>
-      <aside className="sidebar floating-sidebar" onMouseLeave={() => setHoveredGroupId(null)}>
-        <div className="floating-nav-rail">
-          <div className="brand-card compact-brand-card">
-            <span className="eyebrow">Agent Hub</span>
-            <h1>控制台</h1>
-          </div>
-          <button type="button" className="nav-layout-toggle" onClick={toggleNavLayout}>
-            {navLayout === "floating" ? "固定导航栏" : "悬浮导航栏"}
+    <div className={`app-shell nav-floating${mobileNavOpen ? " mobile-nav-open" : ""}`}>
+      <aside className="sidebar floating-sidebar">
+        <div className="mobile-nav-bar">
+          <button
+            type="button"
+            className="mobile-nav-trigger"
+            aria-label={mobileNavOpen ? "关闭导航栏" : "打开导航栏"}
+            aria-expanded={mobileNavOpen}
+            onClick={() => setMobileNavOpen((open) => !open)}
+          >
+            <span className="mobile-nav-trigger-icon" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </span>
           </button>
-          <nav aria-label="Main navigation" className="nav-list">
-            {visibleGroups.map((item) => (
-              <NavLink
-                key={item.to}
-                to={item.modules[0]?.to ?? item.to}
-                onFocus={() => setHoveredGroupId(item.id)}
-                onMouseEnter={() => setHoveredGroupId(item.id)}
-                className={({ isActive }) =>
-                  `nav-link${isActive || item.id === activeGroup?.id ? " nav-link-active" : ""}`
-                }
-              >
-                {item.label}
-              </NavLink>
-            ))}
-          </nav>
+          <div className="mobile-nav-title">
+            <span>Agent Hub</span>
+            <strong>控制台</strong>
+          </div>
         </div>
-        {drawerGroup ? (
-          <section className={`nav-drawer nav-drawer-${drawerGroup.tone}`} aria-label={`${drawerGroup.label}二级导航`}>
-            <div>
-              <p className="eyebrow">{drawerGroup.eyebrow}</p>
-              <strong className="nav-drawer-title">{drawerGroup.label}</strong>
-              <p>{drawerGroup.description}</p>
+        <button
+          type="button"
+          className="mobile-nav-backdrop"
+          aria-label="关闭导航栏"
+          onClick={() => setMobileNavOpen(false)}
+        />
+        <div className="floating-nav-panel" onMouseLeave={() => setHoveredGroupId(null)}>
+          <div className="floating-nav-rail">
+            <div className="mobile-drawer-header">
+              <strong>Agent Hub</strong>
+              <button type="button" aria-label="关闭导航栏" onClick={() => setMobileNavOpen(false)}>
+                ×
+              </button>
             </div>
-            <div className="nav-drawer-links" role="list">
-              {drawerGroup.modules.map((module) => (
-                <Link key={module.to} to={module.to} className="nav-drawer-link">
-                  <strong>{module.label}</strong>
-                  <span>{module.description}</span>
-                </Link>
+            <div className="brand-card compact-brand-card">
+              <span className="eyebrow">Agent Hub</span>
+              <h1>控制台</h1>
+            </div>
+            <nav aria-label="Main navigation" className="nav-list">
+              {visibleGroups.map((item) => (
+                <NavLink
+                  key={item.to}
+                  to={item.modules[0]?.to ?? item.to}
+                  onFocus={() => setHoveredGroupId(item.id)}
+                  onMouseEnter={() => setHoveredGroupId(item.id)}
+                  className={({ isActive }) =>
+                    `nav-link${isActive || item.id === activeGroup?.id ? " nav-link-active" : ""}`
+                  }
+                >
+                  {item.label}
+                </NavLink>
               ))}
-            </div>
-          </section>
-        ) : null}
+            </nav>
+            <nav aria-label="手机版主导航" className="mobile-nav-groups">
+              {visibleGroups.map((group) => {
+                const expanded = expandedMobileGroupId === group.id;
+                const submenuId = `mobile-nav-submenu-${group.id}`;
+                return (
+                  <section key={group.id} className="mobile-nav-group">
+                    <button
+                      type="button"
+                      className={`mobile-nav-group-trigger${group.id === activeGroup?.id ? " mobile-nav-group-active" : ""}`}
+                      aria-expanded={expanded}
+                      aria-controls={submenuId}
+                      aria-label={`${expanded ? "收起" : "展开"}${group.label}二级导航`}
+                      onClick={() => setExpandedMobileGroupId(expanded ? null : group.id)}
+                    >
+                      <span>{group.label}</span>
+                      <span className="mobile-nav-chevron" aria-hidden="true">
+                        ›
+                      </span>
+                    </button>
+                    <div id={submenuId} className="mobile-nav-submenu" hidden={!expanded}>
+                      {group.modules.map((module) => (
+                        <Link
+                          key={module.to}
+                          to={module.to}
+                          className="mobile-nav-submenu-link"
+                          onClick={() => setMobileNavOpen(false)}
+                        >
+                          <strong>{module.label}</strong>
+                          <span>{module.description}</span>
+                        </Link>
+                      ))}
+                    </div>
+                  </section>
+                );
+              })}
+            </nav>
+          </div>
+          {drawerGroup ? (
+            <section className={`nav-drawer nav-drawer-${drawerGroup.tone}`} aria-label={`${drawerGroup.label}二级导航`}>
+              <div>
+                <p className="eyebrow">{drawerGroup.eyebrow}</p>
+                <strong className="nav-drawer-title">{drawerGroup.label}</strong>
+                <p>{drawerGroup.description}</p>
+              </div>
+              <div className="nav-drawer-links" role="list">
+                {drawerGroup.modules.map((module) => (
+                  <Link key={module.to} to={module.to} className="nav-drawer-link">
+                    <strong>{module.label}</strong>
+                    <span>{module.description}</span>
+                  </Link>
+                ))}
+              </div>
+            </section>
+          ) : null}
+        </div>
       </aside>
       <div className="workspace">
         <header className="topbar">

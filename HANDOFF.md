@@ -1,4 +1,50 @@
 
+## 2026-08-13 Mobile Floating Navigation Fix
+
+Current state:
+
+- Mobile console navigation no longer exposes a fixed-navigation mode or any fixed/floating toggle.
+- Desktop keeps the existing floating rail plus secondary drawer behavior.
+- Mobile uses a GitHub/Cloudflare-style overlay drawer: the top bar has a compact open button, the drawer slides over the page, and the workspace is not squeezed or resized.
+- Mobile secondary modules are now expandable rows inside the drawer, matching the requested dropdown-style navigation.
+- The mobile drawer closes after selecting a second-level module link.
+- User confirmed the standing release workflow: every change should be synced to the server incrementally and verified first, then fully pushed to GitHub.
+- User also requires a recovery archive for every GitHub push. Keep both a local ignored `git bundle` under `.local-archives/github-pushes/` and a GitHub archive tag such as `archive/mutilagent-main-before-YYYYMMDD-HHMMSS` pointing at the previous remote `main`.
+
+Changes made locally:
+
+- `web/src/app/AppShell.tsx`
+  - Removed `navLayout`, `agent_hub_nav_layout`, and fixed-navigation toggle behavior.
+  - Added mobile drawer state and mobile-only expandable module groups.
+- `web/src/styles.css`
+  - Removed pinned-navigation CSS branches from the active UI.
+  - Added overlay drawer styling for mobile floating navigation.
+  - Hid desktop navigation/drawer content inside the mobile overlay and rendered compact expandable module rows instead.
+- `web/src/app/AppShell.test.tsx`
+  - Updated navigation tests for the no-fixed-nav requirement.
+  - Added mobile drawer and expandable second-level module coverage.
+- `.gitignore`
+  - Added `.local-archives/` so local recovery bundles are never committed.
+
+Verification performed locally:
+
+- `npm.cmd test -- src/app/AppShell.test.tsx -- --runInBand` -> passed, 6 tests.
+- Playwright mobile smoke at 390x844 with mocked API/login:
+  - Closed state: `scrollWidth=390`, `innerWidth=390`.
+  - Open drawer state: `scrollWidth=390`, `innerWidth=390`, drawer width about `296px`, workspace width stays `390px`.
+  - Expanded `编排` second-level dropdown and clicked `主 Agent`; route changed to `/main-agent` and drawer closed.
+  - Console/page errors: none.
+- `npm.cmd run lint` -> passed.
+- `npm.cmd run build` -> passed; existing Vite chunk-size warning only.
+- `git diff --check` -> passed.
+- Temporary Vite dev server used for validation was closed after testing.
+
+Remaining risks / TODOs:
+
+- This UI fix has been committed locally but has not yet been server-synced or pushed to GitHub.
+- Before pushing this UI fix to GitHub, archive the current GitHub `mutilagent/main` both locally and as a GitHub tag.
+- If the mobile drawer needs iconography like GitHub/Cloudflare, add an icon set later; this pass intentionally kept the change scoped to layout and interaction.
+
 ## 2026-08-13 P3 Runtime Process Observability Slice
 
 Current state:
