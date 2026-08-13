@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
-from typing import Protocol
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
+from typing import Protocol, cast
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from agent_hub.api.errors import error_responses
 from agent_hub.channels.base import InboundMessage
 from agent_hub.channels.directives import directive_summary, parse_channel_directives
+from agent_hub.channels.feishu.media import FeishuMediaError, log_feishu_media_failure
 from agent_hub.channels.feishu.normalize import (
     UnsupportedFeishuEvent,
     normalize_feishu_event,
@@ -33,6 +34,18 @@ _LOGGER = logging.getLogger(__name__)
 
 class ChannelGatewayProtocol(Protocol):
     async def handle(self, message: InboundMessage) -> object: ...
+
+
+class FeishuImageAnalysisLike(Protocol):
+    result: object
+    channel_metadata: dict[str, str]
+
+
+class FeishuMediaServiceProtocol(Protocol):
+    async def analyze_images(
+        self,
+        message: InboundMessage,
+    ) -> Sequence[FeishuImageAnalysisLike]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,7 +178,7 @@ def create_lazy_feishu_webhook_router(
         gateway = gateway_provider(request)
         if gateway is None:
             return JSONResponse(status_code=503, content={"error": "feishu_not_configured"})
-        receiver = build_feishu_webhook_receiver(settings, gateway=gateway)
+        receiver = build_feishu_webhook_receiver(settings, gateway=None)
         body = await request.body()
         headers = {key.lower(): value for key, value in request.headers.items()}
         try:
@@ -178,6 +191,11 @@ def create_lazy_feishu_webhook_router(
         if result.message is None:
             await _record_feishu_ignored_event(request, result)
             return JSONResponse(content={"accepted": True, "ignored": True})
+        result = await _append_feishu_media_context(request, result)
+        message = result.message
+        if message is None:
+            return JSONResponse(content={"accepted": True, "ignored": True})
+        result = replace(result, submission=await gateway.handle(message))
         _schedule_feishu_reply(request, settings, result)
         return JSONResponse(status_code=202, content={"accepted": True})
 
@@ -324,6 +342,62 @@ async def _record_feishu_ignored_event(
         )
     except Exception:
         _LOGGER.exception("feishu_ignored_event_log_failed")
+
+
+async def _append_feishu_media_context(
+    request: Request,
+    result: FeishuWebhookResult,
+) -> FeishuWebhookResult:
+    message = result.message
+    if message is None or not message.attachments:
+        return result
+    media_service = getattr(request.app.state, "feishu_media_service", None)
+    analyzer = getattr(media_service, "analyze_images", None)
+    if analyzer is None:
+        return result
+    log_service = getattr(request.app.state, "admin_resource_service", None)
+    try:
+        analyses = await cast(FeishuMediaServiceProtocol, media_service).analyze_images(message)
+    except FeishuMediaError as error:
+        await log_feishu_media_failure(log_service=log_service, error=error)
+        return result
+    if not analyses:
+        return result
+    enriched = message.model_copy(
+        update={"text": _message_text_with_image_analysis(message.text, analyses)}
+    )
+    return FeishuWebhookResult(
+        message=enriched,
+        challenge=result.challenge,
+        submission=result.submission,
+        ignored_reason=result.ignored_reason,
+        ignored_event_type=result.ignored_event_type,
+        ignored_event_id=result.ignored_event_id,
+        ignored_tenant_key=result.ignored_tenant_key,
+    )
+
+
+def _message_text_with_image_analysis(
+    text: str,
+    analyses: Sequence[FeishuImageAnalysisLike],
+) -> str:
+    lines = ["", "Channel image analysis:"]
+    for analysis in analyses:
+        resource_key = analysis.channel_metadata.get("resource_key") or "unknown"
+        lines.append(
+            "- "
+            f"resource_key={_diagnostic_text(resource_key) or 'unknown'}; "
+            f"summary={_analysis_summary(analysis)}"
+        )
+    return text + "\n" + "\n".join(lines)
+
+
+def _analysis_summary(analysis: FeishuImageAnalysisLike) -> str:
+    artifact = getattr(analysis.result, "artifact", None)
+    summary = getattr(artifact, "summary", None)
+    if not isinstance(summary, str) or not summary.strip():
+        return "analysis available"
+    return summary.strip()[:2000]
 
 
 def _diagnostic_text(value: object) -> str | None:

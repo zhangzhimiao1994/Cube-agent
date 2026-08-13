@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import time
+from dataclasses import dataclass
 from hashlib import sha1, sha256
 from uuid import UUID
 
@@ -12,6 +13,7 @@ from agent_hub.api.routers.admin import InMemoryAdminResourceService
 from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
 from agent_hub.channels.base import InboundMessage
+from agent_hub.channels.feishu.media import FeishuMediaError
 from agent_hub.channels.feishu.verify import FeishuVerifier
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
@@ -32,6 +34,51 @@ class RecordingGateway:
     async def handle(self, message: InboundMessage) -> object:
         self.messages.append(message)
         return object()
+
+
+@dataclass(frozen=True, slots=True)
+class StubVisionArtifact:
+    summary: str
+
+
+@dataclass(frozen=True, slots=True)
+class StubVisionResult:
+    artifact: StubVisionArtifact
+
+
+@dataclass(frozen=True, slots=True)
+class StubFeishuImageAnalysis:
+    result: StubVisionResult
+    channel_metadata: dict[str, str]
+
+
+class StubFeishuMediaService:
+    def __init__(self) -> None:
+        self.messages: list[InboundMessage] = []
+
+    async def analyze_images(self, message: InboundMessage) -> tuple[StubFeishuImageAnalysis, ...]:
+        self.messages.append(message)
+        return (
+            StubFeishuImageAnalysis(
+                result=StubVisionResult(StubVisionArtifact("whiteboard architecture diagram")),
+                channel_metadata={"resource_key": "img_123"},
+            ),
+        )
+
+
+class FailingFeishuMediaService:
+    async def analyze_images(self, message: InboundMessage) -> tuple[StubFeishuImageAnalysis, ...]:
+        raise FeishuMediaError(
+            "image MIME mismatch",
+            diagnostics={
+                "channel": message.channel.value,
+                "message_id": message.message_id,
+                "resource_key": message.attachments[0].external_key,
+                "tenant_key": message.tenant_external_id,
+                "attachment_kind": message.attachments[0].kind.value,
+                "reason": "image MIME mismatch",
+            },
+        )
 
 
 def client(gateway: RecordingGateway) -> TestClient:
@@ -462,6 +509,138 @@ def test_feishu_webhook_accepts_token_only_event_when_signature_headers_are_abse
     assert saved.status_code == 200
     assert response.status_code == 202
     assert gateway.messages[0].text == "/direct hello"
+
+
+def test_feishu_webhook_appends_image_analysis_context() -> None:
+    gateway = RecordingGateway()
+    app = create_app(
+        auth_service=StubAuthService(),
+        rate_limiter=object(),
+        feishu_gateway=gateway,
+    )
+    app.state.admin_resource_service = InMemoryAdminResourceService()
+    media_service = StubFeishuMediaService()
+    app.state.feishu_media_service = media_service
+    api = TestClient(app)
+
+    saved = api.post(
+        "/api/v1/admin/channels/feishu/config",
+        headers={"Authorization": "Bearer valid-token"},
+        json={
+            "values": {
+                "AGENT_HUB_PUBLIC_URL": "https://agent.example.com",
+                "FEISHU_APP_ID": "cli_saved_feishu",
+                "FEISHU_APP_SECRET": "saved-secret",
+                "FEISHU_VERIFICATION_TOKEN": "saved-verification-token",
+                "FEISHU_ENCRYPT_KEY": "saved-encrypt-key",
+                "FEISHU_TRANSPORT": "webhook",
+            }
+        },
+    )
+    response = api.post(
+        "/channels/feishu/events",
+        json={
+            "schema": "2.0",
+            "header": {
+                "event_id": "evt_image",
+                "event_type": "im.message.receive_v1",
+                "token": "saved-verification-token",
+                "app_id": "cli_saved_feishu",
+                "tenant_key": "tenant_1",
+                "create_time": str(int(time.time())),
+            },
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou_user"}},
+                "message": {
+                    "message_id": "om_image",
+                    "chat_id": "oc_chat",
+                    "chat_type": "p2p",
+                    "message_type": "image",
+                    "content": (
+                        "{\"image_key\":\"img_123\",\"mime_type\":\"image/png\","
+                        "\"file_name\":\"diagram.png\"}"
+                    ),
+                },
+            },
+        },
+    )
+
+    assert saved.status_code == 200
+    assert response.status_code == 202
+    assert len(media_service.messages) == 1
+    assert len(gateway.messages) == 1
+    assert gateway.messages[0].text == (
+        "[image]\n\nChannel image analysis:\n"
+        "- resource_key=img_123; summary=whiteboard architecture diagram"
+    )
+
+
+def test_feishu_webhook_logs_media_failure_and_submits_original_message() -> None:
+    gateway = RecordingGateway()
+    service = InMemoryAdminResourceService()
+    app = create_app(
+        auth_service=StubAuthService(),
+        rate_limiter=object(),
+        feishu_gateway=gateway,
+    )
+    app.state.admin_resource_service = service
+    app.state.feishu_media_service = FailingFeishuMediaService()
+    api = TestClient(app)
+
+    saved = api.post(
+        "/api/v1/admin/channels/feishu/config",
+        headers={"Authorization": "Bearer valid-token"},
+        json={
+            "values": {
+                "AGENT_HUB_PUBLIC_URL": "https://agent.example.com",
+                "FEISHU_APP_ID": "cli_saved_feishu",
+                "FEISHU_APP_SECRET": "saved-secret",
+                "FEISHU_VERIFICATION_TOKEN": "saved-verification-token",
+                "FEISHU_ENCRYPT_KEY": "saved-encrypt-key",
+                "FEISHU_TRANSPORT": "webhook",
+            }
+        },
+    )
+    response = api.post(
+        "/channels/feishu/events",
+        json={
+            "schema": "2.0",
+            "header": {
+                "event_id": "evt_bad_image",
+                "event_type": "im.message.receive_v1",
+                "token": "saved-verification-token",
+                "app_id": "cli_saved_feishu",
+                "tenant_key": "tenant_1",
+                "create_time": str(int(time.time())),
+            },
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou_user"}},
+                "message": {
+                    "message_id": "om_bad_image",
+                    "chat_id": "oc_chat",
+                    "chat_type": "p2p",
+                    "message_type": "image",
+                    "content": "{\"image_key\":\"img_bad\",\"mime_type\":\"image/png\"}",
+                },
+            },
+        },
+    )
+    logs = api.get(
+        "/api/v1/admin/logs?category=channel_error",
+        headers={"Authorization": "Bearer valid-token"},
+    )
+
+    assert saved.status_code == 200
+    assert response.status_code == 202
+    assert gateway.messages[0].text == "[image]"
+    matching = [
+        item
+        for item in logs.json()
+        if item["source"] == "channels.feishu.media"
+        and item["details"].get("message_id") == "om_bad_image"
+    ]
+    assert matching
+    assert matching[0]["details"]["resource_key"] == "img_bad"
 
 
 def test_feishu_webhook_acks_supported_platform_events_even_when_no_message() -> None:

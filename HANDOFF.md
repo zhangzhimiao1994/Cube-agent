@@ -1,4 +1,45 @@
 
+## 2026-08-13 P3 Feishu Webhook Media Context Hook Slice
+
+Current state:
+
+- P3 channel hardening continued after the Feishu OpenAPI media client slice.
+- Lazy Feishu webhook handling now checks `request.app.state.feishu_media_service` before submitting inbound messages to the channel gateway.
+- When the media service is present and returns image analyses, the webhook appends a `Channel image analysis:` section to the text submitted to the main Agent.
+- If Feishu media analysis raises `FeishuMediaError`, the webhook records the existing `channel_error` diagnostics and still submits the original message text, so a transient media download/analysis failure does not drop the inbound message.
+- Default behavior remains unchanged when no `feishu_media_service` is configured.
+- Server incremental deployment to `103.236.98.133:/opt/agent-hub/current` was performed with `/tmp/agent-hub-p3-feishu-webhook-media-hook.tgz`.
+- Server services `agent-hub-api`, `agent-hub-worker`, and `caddy` are active after restart/reload.
+- Server health checks passed on API port `8000`: `GET /health/live` -> `{"status":"ok"}`, `GET /health/ready` -> `{"status":"ok"}`.
+- Server source contains the deployed marker `_append_feishu_media_context`.
+- Server syntax check passed with `.venv/bin/python -m py_compile src/agent_hub/channels/feishu/webhook.py tests/api/test_channel_webhooks.py`.
+- GitHub push is pending for this slice.
+
+Changes made locally:
+
+- `src/agent_hub/channels/feishu/webhook.py`
+  - Reordered lazy Feishu webhook handling so gateway submission occurs after optional media-context enrichment.
+  - Added `_append_feishu_media_context()` and safe summary rendering for image analysis results.
+  - Reused `log_feishu_media_failure()` for media-analysis failures.
+- `tests/api/test_channel_webhooks.py`
+  - Added TDD coverage that Feishu image analysis summaries are appended before gateway submission.
+  - Added coverage that media failures are logged and the original message is still submitted.
+
+Verification performed locally:
+
+- TDD red: `uv run pytest tests/api/test_channel_webhooks.py::test_feishu_webhook_appends_image_analysis_context -q --tb=short` first failed because `feishu_media_service` was never called.
+- Intermediate red: after adding the hook, the same test failed because the gateway had already received the original text before media context was appended; this exposed the submission-order bug.
+- Green: the same targeted test passed after moving lazy gateway submission after media enrichment.
+- `uv run pytest tests/api/test_channel_webhooks.py::test_feishu_webhook_logs_media_failure_and_submits_original_message -q --tb=short` -> passed.
+- `uv run pytest tests/api/test_channel_webhooks.py tests/contracts/feishu/test_receivers.py tests/unit/channels/feishu/test_media_client.py tests/e2e/feishu/test_conversation.py tests/unit/channels/test_submitter.py -q --tb=short` -> 47 passed.
+- `uv run ruff check src tests/api/test_channel_webhooks.py tests/contracts/feishu/test_receivers.py tests/unit/channels/feishu/test_media_client.py tests/e2e/feishu/test_conversation.py tests/unit/channels/test_submitter.py` -> passed.
+- `uv run mypy --strict src tests` -> passed.
+
+Remaining risks / TODOs:
+
+- Recovery archive creation, GitHub full push, and GitHub Actions verification remain to be completed before this slice is closed.
+- The next slice should construct a real production `feishu_media_service` from saved Feishu channel config, `FeishuOpenAPIMediaClient`, and the configured vision model gateway.
+
 ## 2026-08-13 P3 Feishu OpenAPI Media Client Slice
 
 Current state:
