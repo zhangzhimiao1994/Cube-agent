@@ -60,6 +60,21 @@ describe("SkillsPage", () => {
         if (path === "/api/v1/admin/skills" && (!init?.method || init.method === "GET")) {
           return jsonResponse(skills);
         }
+        if (path === "/api/v1/admin/skills/upload" && init?.method === "POST") {
+          return jsonResponse({
+            filename: "all-skills.tar.gz",
+            bundle: true,
+            items: [
+              {
+                id: "research-writer",
+                name: "research-writer",
+                status: "scanned",
+                scan_diff: ["SKILL.md detected"],
+                requested_permissions: [],
+              },
+            ],
+          });
+        }
         if (path.endsWith("/approve") && init?.method === "POST") {
           const id = path.split("/").at(-2) ?? "";
           return jsonResponse({ ...skills.find((skill) => skill.id === id), status: "enabled" });
@@ -118,6 +133,30 @@ describe("SkillsPage", () => {
       expect(fetchMock).toHaveBeenCalledWith(
         "/api/v1/admin/skills/pdf",
         expect.objectContaining({ method: "DELETE" }),
+      );
+    });
+  });
+
+  it("uploads tar.gz skill archives with the matching archive content type", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/skills" />);
+
+    await screen.findByRole("heading", { name: "技能管理" });
+    const file = new File(["skill-bytes"], "all-skills.tar.gz", { type: "application/gzip" });
+    await user.upload(screen.getByLabelText("Skill 压缩包"), file);
+    await user.click(screen.getByRole("button", { name: "上传并扫描" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/admin/skills/upload",
+        expect.objectContaining({
+          method: "POST",
+          headers: expect.objectContaining({
+            "Content-Type": "application/gzip",
+            "X-Agent-Hub-Skill-Filename": "all-skills.tar.gz",
+          }),
+        }),
       );
     });
   });

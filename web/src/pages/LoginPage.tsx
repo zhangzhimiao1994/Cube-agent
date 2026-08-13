@@ -21,8 +21,8 @@ export function LoginPage() {
     } catch (caught) {
       setError(
         caught instanceof ApiError && caught.code === "invalid_credentials"
-          ? "用户名或密码错误"
-          : formatApiError(caught, "登录失败"),
+          ? "账号或密码不对，请再检查一次。"
+          : formatApiError(caught, "登录工作台失败"),
       );
     }
   }
@@ -32,13 +32,13 @@ export function LoginPage() {
       <div className="auth-hero">
         <img className="auth-brand-logo" src={APP_BRAND_LOGO_SRC} alt={APP_BRAND_NAME} />
         <span className="eyebrow">{APP_BRAND_NAME}</span>
-        <h1>登录控制台</h1>
-        <p>在受保护的生产控制台里管理模型路由、Agent 角色、Skill、记忆、通道和审计日志。</p>
+        <h1>魔方 Agent 工作台</h1>
+        <p>统一管理模型、Agent、工具、通道和审批策略，把复杂任务拆成可追踪、可确认、可复用的执行流程。</p>
       </div>
       <form className="auth-card" onSubmit={(event) => void submit(event)}>
         <div>
-          <span className="eyebrow">Session</span>
-          <h2>账号登录</h2>
+          <span className="eyebrow">Workspace sign in</span>
+          <h2>登录工作台</h2>
         </div>
         <label>
           用户名
@@ -60,7 +60,7 @@ export function LoginPage() {
           />
         </label>
         {error && <p role="alert">{error}</p>}
-        <button type="submit">登录</button>
+        <button type="submit">登录魔方 Agent</button>
       </form>
     </section>
   );

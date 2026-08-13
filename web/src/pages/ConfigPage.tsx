@@ -621,7 +621,7 @@ export function ConfigPage() {
             value={settings.channel_entry}
             onChange={(event) => updateSettings({ channel_entry: event.target.value })}
           >
-            <option value="web">网页控制台</option>
+            <option value="web">网页工作台</option>
             <option value="feishu">飞书</option>
             <option value="dingtalk">钉钉</option>
             <option value="wecom_bot">企业微信机器人</option>

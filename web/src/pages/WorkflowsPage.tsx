@@ -189,6 +189,22 @@ export function WorkflowsPage() {
     setAgentIds(preset.suggested_roles.filter((id) => available.has(id)));
   }
 
+  function editWorkflow(workflow: WorkflowResource) {
+    setPresetId("custom-workflow");
+    setWorkflowId(workflow.id);
+    setName(workflow.name);
+    setEnabled(workflow.enabled);
+    setMode(workflow.mode ?? "auto");
+    setTaskType(workflow.task_type ?? "");
+    setAgentIds(workflow.agent_ids ?? []);
+    setObjective(workflow.objective ?? "");
+    setRoleSelectionPolicy(workflow.role_selection_policy ?? "");
+    setSteps(listToLines(workflow.steps));
+    setDeliverables(listToLines(workflow.deliverables));
+    setDecisionPolicy(workflow.decision_policy ?? "");
+    setMessage(`已载入 ${workflow.name}，修改后点击保存。`);
+  }
+
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setMessage(null);
@@ -346,13 +362,16 @@ export function WorkflowsPage() {
           <div className="card-grid">
             {savedWorkflows.map((workflow) => (
               <article key={workflow.id}>
-                <span className="eyebrow">{workflow.enabled ? "enabled" : "disabled"}</span>
+                <span className="eyebrow">{workflow.enabled ? "已启用" : "已停用"}</span>
                 <h3>{workflow.name}</h3>
                 <p>ID：{workflow.id}</p>
                 <p>任务类型：{workflow.task_type || "未设置"}</p>
                 <p>默认模式：{workflow.mode ?? "auto"}</p>
                 <p>默认角色：{(workflow.agent_ids ?? []).join(", ") || "未固定"}</p>
                 {workflow.objective ? <p>{workflow.objective}</p> : null}
+                <button type="button" onClick={() => editWorkflow(workflow)}>
+                  编辑工作流
+                </button>
                 <button
                   type="button"
                   className="danger-action"

@@ -71,7 +71,7 @@ class FeishuSkillCommandHandler:
         if attachment is None:
             return FeishuSkillCommandResult(
                 handled=True,
-                reply_text="请附加一个 .zip、.tar.gz 或 .tgz Skill 压缩包后再发送 /skill install。",
+                reply_text="请附加一个 .zip、.tar、.tar.gz 或 .tgz Skill 压缩包后再发送 /skill install。",
             )
         try:
             archive_bytes = await self._download_file(settings, message, attachment)

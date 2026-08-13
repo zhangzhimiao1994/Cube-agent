@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tarfile
 import zipfile
 from collections.abc import AsyncIterator
 from io import BytesIO
@@ -84,6 +85,21 @@ def skill_archive() -> bytes:
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("skill.yaml", manifest)
         archive.writestr("main.py", "print('ok')\n")
+    return buffer.getvalue()
+
+
+def instruction_skill_bundle_archive() -> bytes:
+    docs = {
+        "writer": "---\nname: feishu-writer-skill\ndescription: Writer skill.\n---\n\nWrite drafts.\n",
+        "reviewer": "---\nname: feishu-reviewer-skill\ndescription: Reviewer skill.\n---\n\nReview drafts.\n",
+    }
+    buffer = BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for folder, content in docs.items():
+            data = content.encode("utf-8")
+            info = tarfile.TarInfo(f"all-skills/{folder}/SKILL.md")
+            info.size = len(data)
+            archive.addfile(info, BytesIO(data))
     return buffer.getvalue()
 
 
@@ -206,6 +222,28 @@ async def test_feishu_skill_install_uploads_attached_archive_for_scan_only() -> 
     assert len(skills) == 1
     assert skills[0].name == "feishu_writer"
     assert skills[0].status == "scanned"
+
+
+async def test_feishu_skill_install_uploads_instruction_bundle_for_scan_only() -> None:
+    service = InMemoryAdminResourceService()
+    file_client = FakeFeishuFileClient(instruction_skill_bundle_archive())
+    handler = FeishuSkillCommandHandler(
+        admin_service=service,
+        media_client_factory=lambda _settings: file_client,
+    )
+
+    result = await handler.handle(
+        inbound_skill_file_message("/skill install", filename="all-skills.tar.gz"),
+        settings=FeishuSettings(),
+    )
+
+    assert result is not None
+    assert result.handled is True
+    assert "feishu-writer-skill" in result.reply_text
+    assert "feishu-reviewer-skill" in result.reply_text
+    skills = await service.list_skills()
+    assert [skill.name for skill in skills] == ["feishu-writer-skill", "feishu-reviewer-skill"]
+    assert all(skill.status == "scanned" for skill in skills)
 
 
 async def test_feishu_skill_install_requires_file_attachment() -> None:

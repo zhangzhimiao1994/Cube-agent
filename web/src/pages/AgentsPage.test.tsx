@@ -20,9 +20,11 @@ function jsonResponse(payload: unknown, init: ResponseInit = {}) {
 
 describe("AgentsPage", () => {
   const requests: Array<{ body: unknown; method: string; path: string }> = [];
+  let visibleAgents: unknown[] = [];
 
   beforeEach(() => {
     requests.length = 0;
+    visibleAgents = [];
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
       "fetch",
@@ -60,7 +62,7 @@ describe("AgentsPage", () => {
           ]);
         }
         if (path === "/api/v1/admin/agents" && method === "GET") {
-          return jsonResponse([]);
+          return jsonResponse(visibleAgents);
         }
         if (path === "/api/v1/admin/agents" && method === "POST") {
           return jsonResponse(JSON.parse(String(init?.body)));
@@ -99,6 +101,47 @@ describe("AgentsPage", () => {
         prompt: "负责选题、分镜、节奏和最终把关。",
         model: "main",
         skills: [],
+      },
+    });
+  });
+
+  it("loads an existing agent into the form for editing", async () => {
+    const user = userEvent.setup();
+    visibleAgents = [
+      {
+        id: "critic",
+        name: "审查员",
+        enabled: true,
+        role: "审查员",
+        prompt: "检查风险和遗漏。",
+        model: "main",
+        skills: ["risk_review"],
+      },
+    ];
+    render(<TestApp initialPath="/agents" />);
+
+    expect(await screen.findByText("Agent 角色编排")).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "编辑 Agent" }));
+
+    expect(screen.getByRole("status").textContent).toContain("已载入 审查员");
+    expect((screen.getByLabelText("Agent ID") as HTMLInputElement).value).toBe("critic");
+    expect((screen.getByLabelText("允许使用的 Skill ID") as HTMLInputElement).value).toBe("risk_review");
+
+    await user.clear(screen.getByLabelText("系统提示词"));
+    await user.type(screen.getByLabelText("系统提示词"), "检查风险、遗漏和执行边界。");
+    await user.click(screen.getByRole("button", { name: "保存 Agent" }));
+
+    expect(requests.find((request) => request.method === "POST" && request.path === "/api/v1/admin/agents")).toEqual({
+      path: "/api/v1/admin/agents",
+      method: "POST",
+      body: {
+        id: "critic",
+        name: "审查员",
+        enabled: true,
+        role: "审查员",
+        prompt: "检查风险、遗漏和执行边界。",
+        model: "main",
+        skills: ["risk_review"],
       },
     });
   });

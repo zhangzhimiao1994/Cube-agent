@@ -50,15 +50,21 @@ async function mockAdminApi(page: Page) {
       });
       return;
     }
-    if (path === "/api/v1/admin/skills" && request.method() === "POST") {
-      skillStatus = "quarantined";
+    if (path === "/api/v1/admin/skills/upload" && request.method() === "POST") {
+      skillStatus = "scanned";
       await route.fulfill({
         json: {
-          id: "safe-skill",
-          name: "safe-skill",
-          status: "quarantined",
-          scan_diff: ["added SKILL.md"],
-          requested_permissions: ["filesystem:read"],
+          filename: "safe-skill.zip",
+          bundle: false,
+          items: [
+            {
+              id: "safe-skill",
+              name: "safe-skill",
+              status: "scanned",
+              scan_diff: ["added SKILL.md"],
+              requested_permissions: ["filesystem:read"],
+            },
+          ],
         },
       });
       return;
@@ -138,11 +144,11 @@ async function mockAdminApi(page: Page) {
 test("administrator uploads and approves a skill", async ({ page }) => {
   await mockAdminApi(page);
   await page.goto("/skills");
-  await page.getByLabel("Skill ZIP").setInputFiles("e2e/fixtures/safe-skill.zip");
-  await page.getByRole("button", { name: "Upload" }).click();
-  await expect(page.getByText("Status: quarantined")).toBeVisible();
-  await page.getByRole("button", { name: "Approve and enable" }).click();
-  await expect(page.getByText("Status: enabled")).toBeVisible();
+  await page.getByLabel("Skill 压缩包").setInputFiles("e2e/fixtures/safe-skill.zip");
+  await page.getByRole("button", { name: "上传并扫描" }).click();
+  await expect(page.getByText("scanned")).toBeVisible();
+  await page.getByRole("button", { name: "审批启用" }).click();
+  await expect(page.getByText("enabled")).toBeVisible();
 });
 
 test("administrator can inspect MCP and export safe audit view", async ({ page }) => {

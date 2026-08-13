@@ -14,7 +14,7 @@ export function SkillsPage() {
   const skills = useQuery({ queryKey: ["skills"], queryFn: () => api.skills() });
   const upload = useMutation({
     mutationFn: () => {
-      if (!file) throw new Error("请选择 Skill ZIP 文件");
+      if (!file) throw new Error("请选择 Skill 压缩包");
       return api.uploadSkillArchive(file);
     },
     onSuccess: () => {
@@ -88,7 +88,7 @@ export function SkillsPage() {
       <p className="eyebrow">Skill governance</p>
       <h2>技能管理</h2>
       <p>
-        Skill 必须上传 ZIP 包并经过扫描，只有审批启用后才会进入可用列表。
+        Skill 必须上传压缩包并经过扫描，只有审批启用后才会进入可用列表。
         主 Agent 可以按任务分发给子 Agent，但不会绕过权限边界。
       </p>
 
@@ -96,16 +96,16 @@ export function SkillsPage() {
         <article>
           <h3>上传并扫描 Skill</h3>
           <label>
-            Skill 包
+            Skill 压缩包
             <input
-              aria-label="Skill 包"
+              aria-label="Skill 压缩包"
               type="file"
-              accept=".zip,.tar.gz,.tgz"
+              accept=".zip,.tar,.tar.gz,.tgz"
               onChange={(event) => setFile(event.currentTarget.files?.[0] ?? null)}
             />
           </label>
           <p className="field-help">
-            接受 `.zip`、`.tar.gz`、`.tgz`。后端会读取真实压缩包内容、解析清单、计算哈希并保存归档。
+            接受 `.zip`、`.tar`、`.tar.gz`、`.tgz`。可以上传单个可执行 Skill，也可以上传包含多个 Skill 目录的归档；指令型 Skill 目录需包含 `SKILL.md`。
           </p>
           <button type="button" disabled={!file || upload.isPending} onClick={() => upload.mutate()}>
             {upload.isPending ? "正在扫描..." : "上传并扫描"}
@@ -120,8 +120,9 @@ export function SkillsPage() {
         <article>
           <h3>配置指引</h3>
           <ol>
-            <li>上传前确认 ZIP 中包含有效的 Skill 清单和入口文件。</li>
-            <li>扫描结果会显示新增内容、入口和请求权限。</li>
+            <li>可执行 Skill 需包含 `skill.yaml`/`skill.json` 和入口文件；指令型 Skill 需包含 `SKILL.md`。</li>
+            <li>多 Skill 归档请把每个 Skill 放在独立目录中，系统会逐个扫描并入库。</li>
+            <li>扫描结果会显示包类型、入口或 `SKILL.md`、内容哈希和请求权限。</li>
             <li>审批前重点检查 requested permissions，危险权限不要直接启用。</li>
           </ol>
         </article>
@@ -132,7 +133,7 @@ export function SkillsPage() {
         {items.length === 0 ? (
           <article>
             <h4>还没有 Skill</h4>
-            <p>从上方上传 ZIP 包，扫描成功后会显示在这里。</p>
+            <p>从上方上传 Skill 压缩包，扫描成功后会显示在这里。</p>
           </article>
         ) : (
           <>

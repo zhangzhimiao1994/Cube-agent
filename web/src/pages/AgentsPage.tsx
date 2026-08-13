@@ -195,6 +195,24 @@ export function AgentsPage() {
     setMessage(null);
   }
 
+  function editAgent(agent: {
+    id: string;
+    name: string;
+    role?: string | null;
+    prompt?: string | null;
+    model?: string | null;
+    skills?: string[];
+  }) {
+    setTemplateId("custom-agent");
+    setAgentId(agent.id);
+    setName(agent.name);
+    setRole(agent.role ?? agent.name);
+    setPrompt(agent.prompt ?? "");
+    setModel(agent.model ?? "");
+    setSkills((agent.skills ?? []).join(","));
+    setMessage(`已载入 ${agent.name}，修改后点击保存。`);
+  }
+
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setMessage(null);
@@ -313,13 +331,16 @@ export function AgentsPage() {
         <div className="card-grid">
           {(agents.data ?? []).map((agent) => (
             <article key={agent.id}>
-              <span className="eyebrow">{agent.enabled ? "enabled" : "disabled"}</span>
+              <span className="eyebrow">{agent.enabled ? "已启用" : "已停用"}</span>
               <h3>{agent.name}</h3>
               <p>ID：{agent.id}</p>
               <p>角色：{agent.role ?? agent.name}</p>
               <p>模型：{agent.model ?? "未绑定"}</p>
               <p>Skill：{(agent.skills ?? []).join(", ") || "无"}</p>
               {agent.prompt ? <p>提示词：{agent.prompt}</p> : null}
+              <button type="button" onClick={() => editAgent(agent)}>
+                编辑 Agent
+              </button>
               <button
                 type="button"
                 className="danger-action"

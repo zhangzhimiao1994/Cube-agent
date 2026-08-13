@@ -50,7 +50,7 @@ export function AppShell() {
           </button>
           <div className="mobile-nav-title">
             <span>{APP_BRAND_NAME}</span>
-            <strong>控制台</strong>
+            <strong>工作台</strong>
           </div>
         </div>
         <button
@@ -73,7 +73,7 @@ export function AppShell() {
             <div className="brand-card compact-brand-card">
               <img src={APP_BRAND_LOGO_SRC} alt={APP_BRAND_NAME} />
               <span className="eyebrow">{APP_BRAND_NAME}</span>
-              <h1>控制台</h1>
+              <h1>工作台</h1>
             </div>
             <nav aria-label="Main navigation" className="nav-list">
               {visibleGroups.map((item) => (
@@ -126,6 +126,12 @@ export function AppShell() {
                 );
               })}
             </nav>
+            <div className="nav-session">
+              <span>{auth.user?.username}</span>
+              <button type="button" onClick={() => void auth.logout()}>
+                退出登录
+              </button>
+            </div>
           </div>
           {drawerGroup ? (
             <section className={`nav-drawer nav-drawer-${drawerGroup.tone}`} aria-label={`${drawerGroup.label}二级导航`}>
@@ -150,13 +156,10 @@ export function AppShell() {
         <header className="topbar">
           <div>
             <p className="eyebrow">Production management</p>
-            <h2>Agent 编排控制台</h2>
+            <h2>魔方 Agent 工作台</h2>
           </div>
           <div className="user-chip">
             <span>{auth.user?.username}</span>
-            <button type="button" onClick={() => void auth.logout()}>
-              退出
-            </button>
           </div>
         </header>
         <main className="page-surface">

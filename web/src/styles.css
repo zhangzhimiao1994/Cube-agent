@@ -355,6 +355,7 @@ article:hover {
   display: grid;
   gap: 0.85rem;
   max-height: calc(100dvh - 2rem);
+  min-height: min(42rem, calc(100dvh - 2rem));
   padding: 0.65rem;
 }
 
@@ -488,6 +489,37 @@ article:hover {
   border-color: rgba(85, 215, 255, 0.22);
   color: var(--ink);
   transform: translateX(2px) scale(1.01);
+}
+
+.nav-session {
+  align-self: end;
+  border-top: 1px solid rgba(123, 225, 255, 0.16);
+  display: grid;
+  gap: 0.45rem;
+  margin-top: auto;
+  padding-top: 0.65rem;
+}
+
+.nav-session span {
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 900;
+  overflow: hidden;
+  padding: 0 0.35rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nav-session button {
+  background: rgba(255, 109, 122, 0.1);
+  border: 1px solid rgba(255, 109, 122, 0.28);
+  border-radius: 0.7rem;
+  color: #ffb4bd;
+  cursor: pointer;
+  font-size: 0.86rem;
+  font-weight: 900;
+  min-height: 2.25rem;
+  padding: 0.52rem 0.45rem;
 }
 
 .nav-drawer {
@@ -857,39 +889,54 @@ article:hover {
 .chat-console {
   display: grid;
   gap: 1rem;
-  grid-template-columns: minmax(220px, 0.34fr) minmax(0, 1fr);
+  grid-template-columns: minmax(190px, 0.28fr) minmax(0, 1fr);
   min-height: 68vh;
 }
 
 .conversation-list {
   background: rgba(3, 10, 20, 0.42);
   border: 1px solid var(--line);
-  border-radius: 1.55rem;
+  border-radius: 0.95rem;
   display: grid;
-  gap: 0.65rem;
+  gap: 0.48rem;
   grid-auto-rows: max-content;
-  padding: 1rem;
+  padding: 0.72rem;
 }
 
 .conversation-list-header {
   align-items: center;
   display: flex;
   justify-content: space-between;
-  gap: 0.75rem;
+  gap: 0.5rem;
 }
 
 .conversation-list-header h3 {
+  font-size: 0.98rem;
   margin: 0;
 }
 
+.conversation-list-header span {
+  color: var(--muted);
+  font-size: 0.74rem;
+  font-weight: 850;
+}
+
+.conversation-new-button {
+  border-radius: 0.65rem;
+  flex: 0 0 auto;
+  min-height: 2rem;
+  padding: 0.42rem 0.62rem;
+}
+
 .conversation-row {
-  align-items: stretch;
+  align-items: center;
   background: rgba(8, 17, 31, 0.72);
   border: 1px solid transparent;
-  border-radius: 1rem;
+  border-radius: 0.72rem;
   display: grid;
-  gap: 0.45rem;
-  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.35rem;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  padding: 0.42rem;
 }
 
 .conversation-item {
@@ -898,7 +945,8 @@ article:hover {
   display: grid;
   gap: 0.2rem;
   justify-items: start;
-  padding: 0.85rem;
+  min-width: 0;
+  padding: 0.28rem 0.2rem;
   text-align: left;
   width: 100%;
 }
@@ -919,14 +967,15 @@ article:hover {
   align-self: center;
   background: rgba(255, 109, 122, 0.12);
   border: 1px solid rgba(255, 109, 122, 0.36);
-  border-radius: 999px;
+  border-radius: 0.55rem;
   color: #ffb4bd;
   cursor: pointer;
-  font-size: 1.1rem;
-  height: 2.1rem;
+  font-size: 0.78rem;
+  font-weight: 900;
+  min-height: 1.85rem;
   justify-self: end;
-  margin-right: 0.6rem;
-  width: 2.1rem;
+  padding: 0.32rem 0.48rem;
+  width: auto;
 }
 
 .conversation-delete-button:disabled {
@@ -2389,6 +2438,7 @@ article:hover {
     display: grid;
     gap: 0.55rem;
     max-height: none;
+    min-height: calc(100dvh - 1.4rem);
     min-width: 0;
     padding: 0.6rem;
     width: 100%;
@@ -2482,6 +2532,31 @@ article:hover {
     display: grid;
     gap: 0.15rem;
     padding: 0.3rem 0 0.75rem;
+  }
+
+  .nav-session {
+    border-color: rgba(31, 35, 40, 0.12);
+    padding-top: 0.65rem;
+  }
+
+  .nav-session span {
+    color: #57606a;
+    padding: 0 0.15rem;
+  }
+
+  .nav-session button {
+    background: transparent;
+    border: 0;
+    border-radius: 0.55rem;
+    box-shadow: none;
+    color: #cf222e;
+    min-height: 2.45rem;
+    text-align: left;
+  }
+
+  .nav-session button:hover,
+  .nav-session button:focus-visible {
+    background: rgba(207, 34, 46, 0.08);
   }
 
   .mobile-nav-group {
@@ -2735,33 +2810,21 @@ article:hover {
   }
 
   .conversation-list {
-    border-radius: 1.15rem;
-    display: grid;
-    grid-auto-flow: column;
-    grid-auto-columns: minmax(10.5rem, 68vw);
-    grid-template-columns: minmax(7rem, max-content);
-    overflow-x: auto;
+    border-radius: 0.85rem;
+    max-height: 14.5rem;
+    overflow-y: auto;
     padding: 0.75rem;
-    scroll-snap-type: x proximity;
-  }
-
-  .conversation-list-header,
-  .conversation-row {
-    scroll-snap-align: start;
   }
 
   .conversation-list-header {
-    align-content: center;
     background: rgba(85, 215, 255, 0.08);
     border: 1px solid rgba(85, 215, 255, 0.18);
-    border-radius: 1rem;
-    display: grid;
-    justify-items: start;
-    padding: 0.8rem;
+    border-radius: 0.7rem;
+    padding: 0.5rem;
   }
 
   .conversation-row {
-    min-height: 5.4rem;
+    min-height: 3.2rem;
   }
 
   .chat-panel {

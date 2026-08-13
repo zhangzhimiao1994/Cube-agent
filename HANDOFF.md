@@ -1,4 +1,46 @@
 
+## 2026-08-14 Skill Archive Upload and Current UI Copy Slice
+
+Current state:
+
+- Skill archive upload now accepts executable Skill manifests and instruction-only `SKILL.md` packages.
+- Multi-Skill bundles can be uploaded as `.zip`, `.tar`, `.tar.gz`, or `.tgz`; each Skill can live in its own directory.
+- Instruction-only Skill packages are scanned and saved without requesting executable permissions; unsafe file types, nested archives, links, and device entries are rejected.
+- Feishu Skill installation copy now tells users the same archive formats are accepted.
+- Skill upload UI no longer says ZIP-only and now uses `Skill 压缩包`.
+- Login and shell copy for the current slice use `魔方 Agent 工作台`; logout was moved into the floating navigation drawer/session area.
+- Conversation history was made more compact, with the new-chat action in the history header.
+- Agent and Workflow cards now have edit actions that load existing records back into the form.
+- Hermes per-record quick confirm is intentionally moved earlier in the next batch, but was not inserted into this current deployment slice.
+
+Verification performed:
+
+- Local checks:
+  - `npm.cmd run test -- --run` from `web` -> 13 files passed, 99 tests passed.
+  - `npm.cmd run build` from `web` -> passed, with the existing Vite chunk-size warning.
+  - Playwright rendered smoke check against local preview -> verified login copy, mobile nav logout, and Skill archive copy.
+  - `uv run pytest tests/api/test_admin_resources.py -q -k "skill_archive_upload" --tb=short` -> 7 passed, 73 deselected.
+  - `uv run pytest tests/unit/channels/feishu/test_commands.py -q -k "skill" --tb=short` -> 5 passed, 11 deselected.
+  - `uv run ruff check src\agent_hub\api\routers\admin.py src\agent_hub\channels\feishu\skill_install.py tests\api\test_admin_resources.py tests\unit\channels\feishu\test_commands.py` -> passed.
+  - `uv run mypy --strict src\agent_hub\api\routers\admin.py src\agent_hub\channels\feishu\skill_install.py tests\api\test_admin_resources.py tests\unit\channels\feishu\test_commands.py` -> passed.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-ui-skill-archive-fix.tgz` to `103.236.98.133`.
+  - Deployed `src/agent_hub/api/routers/admin.py`, `src/agent_hub/channels/feishu/skill_install.py`, and rebuilt `web/dist` into `/opt/agent-hub/current`.
+  - Restarted `agent-hub-api` and `agent-hub-worker`; reloaded Caddy.
+- Server real environment verification:
+  - Ran `/tmp/server_instruction_skill_archive_ui_check.py` against the deployed HTTP API and served frontend.
+  - The script uploaded a real `all-skills.tar.gz` containing two separate `SKILL.md` instruction Skills, verified `bundle=true`, verified both records were listed, and cleaned both probe records.
+  - The script verified served frontend markers for `魔方 Agent 工作台`, `登录魔方 Agent`, `退出登录`, `Skill 压缩包`, and `上传并扫描`.
+  - Final output: `{"status": "ok", "checked": ["instruction_skill_tar_gz_bundle_upload", "instruction_skill_records_listed", "served_ui_skill_archive_copy", "served_ui_logout_nav_copy"], "skill_ids_cleaned": 2}`.
+
+Remaining risks / TODOs:
+
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Next batch should include Hermes per-record quick confirm, then continue the existing P3 plan without expanding into the final full UI text/layout audit yet.
+
 ## 2026-08-13 Login and Setup Brand/Mojibake Fix
 
 Current state:

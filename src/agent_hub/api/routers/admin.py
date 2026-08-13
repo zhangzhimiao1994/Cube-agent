@@ -16,6 +16,7 @@ from typing import Annotated, Any, Protocol, cast
 from urllib.parse import urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
+import yaml
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
 from sqlalchemy import delete, select
@@ -1251,6 +1252,13 @@ class AdminResourceService(Protocol):
 
 
 _SKILL_MANIFEST_NAMES = frozenset({"skill.yaml", "skill.yml", "skill.json"})
+_SKILL_INSTRUCTION_NAMES = frozenset({"skill.md"})
+_INSTRUCTION_SKILL_FORBIDDEN_EXTENSIONS = frozenset(
+    {".exe", ".dll", ".dylib", ".so", ".pyc", ".pyo", ".bat", ".cmd", ".ps1", ".sh"}
+)
+_INSTRUCTION_SKILL_NESTED_ARCHIVE_EXTENSIONS = frozenset(
+    {".zip", ".tar", ".tgz", ".gz", ".bz2", ".xz", ".7z", ".rar", ".whl"}
+)
 _MAX_SKILL_BUNDLE_ITEMS = 64
 
 
@@ -1258,7 +1266,9 @@ _MAX_SKILL_BUNDLE_ITEMS = 64
 class _ScannedSkillArchive:
     filename: str
     archive_bytes: bytes
-    scan_report: SkillScanReport
+    scan_report: SkillScanReport | None
+    instruction_name: str | None = None
+    instruction_sha256: str | None = None
 
 
 def _scan_skill_archive_upload(filename: str, archive_bytes: bytes) -> tuple[bool, tuple[_ScannedSkillArchive, ...]]:
@@ -1272,18 +1282,131 @@ def _scan_skill_archive_upload(filename: str, archive_bytes: bytes) -> tuple[boo
             ),
         )
     except InvalidSkillPackage:
+        instruction_scan = _scan_instruction_skill_archive(filename, archive_bytes)
+        if instruction_scan is not None:
+            return False, (instruction_scan,)
         split_archives = _split_skill_bundle_archive(filename, archive_bytes)
         if not split_archives:
             raise
-        scanned = tuple(
-            _ScannedSkillArchive(
-                filename=item_filename,
-                archive_bytes=item_bytes,
-                scan_report=scanner.scan(item_bytes),
-            )
-            for item_filename, item_bytes in split_archives
-        )
-        return len(scanned) > 1, scanned
+        scanned: list[_ScannedSkillArchive] = []
+        for item_filename, item_bytes in split_archives:
+            try:
+                scanned.append(
+                    _ScannedSkillArchive(
+                        filename=item_filename,
+                        archive_bytes=item_bytes,
+                        scan_report=scanner.scan(item_bytes),
+                    )
+                )
+            except InvalidSkillPackage:
+                instruction_item = _scan_instruction_skill_archive(item_filename, item_bytes)
+                if instruction_item is None:
+                    raise
+                scanned.append(instruction_item)
+        return len(scanned) > 1, tuple(scanned)
+
+
+def _scan_instruction_skill_archive(filename: str, archive_bytes: bytes) -> _ScannedSkillArchive | None:
+    members = _instruction_skill_members(archive_bytes)
+    if members is None:
+        return None
+    _skill_md_path, skill_md_bytes = members
+    name = _instruction_skill_name(skill_md_bytes, fallback=PurePosixPath(filename).stem)
+    return _ScannedSkillArchive(
+        filename=filename,
+        archive_bytes=archive_bytes,
+        scan_report=None,
+        instruction_name=name,
+        instruction_sha256=hashlib.sha256(skill_md_bytes).hexdigest(),
+    )
+
+
+def _instruction_skill_members(archive_bytes: bytes) -> tuple[str, bytes] | None:
+    if zipfile.is_zipfile(io.BytesIO(archive_bytes)):
+        try:
+            with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+                normalized_to_original: dict[str, str] = {}
+                for info in archive.infolist():
+                    if info.is_dir() or info.filename.replace("\\", "/").endswith("/"):
+                        continue
+                    mode = (info.external_attr >> 16) & 0o777777
+                    if _skill_bundle_mode_is_unsafe(mode):
+                        raise InvalidSkillPackage("instruction skill contains links or device files")
+                    path = _safe_skill_bundle_path(info.filename)
+                    _validate_instruction_skill_file(path)
+                    normalized_to_original[path] = info.filename
+                if len(normalized_to_original) > _MAX_SKILL_BUNDLE_ITEMS:
+                    raise InvalidSkillPackage("instruction skill contains too many files")
+                candidates = [
+                    name
+                    for name in normalized_to_original
+                    if PurePosixPath(name).name.lower() in _SKILL_INSTRUCTION_NAMES
+                ]
+                if len(candidates) != 1:
+                    return None
+                return candidates[0], archive.read(normalized_to_original[candidates[0]])
+        except zipfile.BadZipFile as exc:
+            raise InvalidSkillPackage("skill archive must be a valid zip file") from exc
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
+            files = []
+            for member in archive.getmembers():
+                if member.isdir():
+                    continue
+                if member.issym() or member.islnk() or member.ischr() or member.isblk() or member.isfifo():
+                    raise InvalidSkillPackage("instruction skill contains links or device files")
+                if not member.isfile():
+                    raise InvalidSkillPackage("instruction skill contains unsupported file types")
+                path = _safe_skill_bundle_path(member.name)
+                _validate_instruction_skill_file(path)
+                if PurePosixPath(path).name.lower() in _SKILL_INSTRUCTION_NAMES:
+                    files.append((path, member))
+            if len(archive.getmembers()) > _MAX_SKILL_BUNDLE_ITEMS:
+                raise InvalidSkillPackage("instruction skill contains too many files")
+            if len(files) != 1:
+                return None
+            path, member = files[0]
+            source = archive.extractfile(member)
+            if source is None:
+                raise InvalidSkillPackage("skill instruction file cannot be read")
+            return path, source.read()
+    except tarfile.TarError as exc:
+        raise InvalidSkillPackage("skill archive must be a valid zip or tar archive") from exc
+
+
+def _instruction_skill_name(skill_md_bytes: bytes, *, fallback: str) -> str:
+    try:
+        text = skill_md_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise InvalidSkillPackage("SKILL.md must be utf-8") from exc
+    raw_name = ""
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            try:
+                front_matter = yaml.safe_load(text[3:end]) or {}
+            except yaml.YAMLError as exc:
+                raise InvalidSkillPackage("SKILL.md front matter cannot be parsed") from exc
+            if isinstance(front_matter, dict):
+                value = front_matter.get("name")
+                if isinstance(value, str):
+                    raw_name = value
+    return _skill_name_slug(raw_name or fallback)
+
+
+def _skill_name_slug(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9_-]+", "-", value.strip().lower()).strip("-_")
+    if not slug:
+        raise InvalidSkillPackage("instruction skill name is invalid")
+    return slug[:128]
+
+
+def _validate_instruction_skill_file(path: str) -> None:
+    suffix = PurePosixPath(path).suffix.lower()
+    if suffix in _INSTRUCTION_SKILL_FORBIDDEN_EXTENSIONS:
+        raise InvalidSkillPackage("instruction skill contains forbidden file extensions")
+    if suffix in _INSTRUCTION_SKILL_NESTED_ARCHIVE_EXTENSIONS:
+        raise InvalidSkillPackage("instruction skill contains nested archives")
 
 
 def _skill_response_from_scan(filename: str, skill_id: str, scan_report: SkillScanReport) -> SkillResponse:
@@ -1298,6 +1421,23 @@ def _skill_response_from_scan(filename: str, skill_id: str, scan_report: SkillSc
             f"content sha256: {inspection.content_sha256}",
         ],
         requested_permissions=list(inspection.requested_capabilities),
+    )
+
+
+def _skill_response_from_scanned_archive(scanned: _ScannedSkillArchive, skill_id: str) -> SkillResponse:
+    if scanned.scan_report is not None:
+        return _skill_response_from_scan(scanned.filename, skill_id, scanned.scan_report)
+    return SkillResponse(
+        id=skill_id,
+        name=scanned.instruction_name or _skill_name_slug(PurePosixPath(scanned.filename).stem),
+        status="scanned",
+        scan_diff=[
+            f"instruction package {scanned.filename} scanned",
+            "SKILL.md detected",
+            "no executable entry point; available as an instruction skill",
+            f"content sha256: {scanned.instruction_sha256}",
+        ],
+        requested_permissions=[],
     )
 
 
@@ -1372,7 +1512,7 @@ def _skill_bundle_groups[T](entries: list[tuple[str, T]]) -> tuple[tuple[str, li
     roots: dict[str, None] = {}
     for path, _entry in entries:
         parts = PurePosixPath(path).parts
-        if len(parts) >= 2 and parts[-1] in _SKILL_MANIFEST_NAMES:
+        if len(parts) >= 2 and (parts[-1] in _SKILL_MANIFEST_NAMES or parts[-1].lower() in _SKILL_INSTRUCTION_NAMES):
             roots[PurePosixPath(*parts[:-1]).as_posix()] = None
     groups: list[tuple[str, list[tuple[str, T]]]] = []
     for root in roots:
@@ -1760,7 +1900,7 @@ class InMemoryAdminResourceService:
             raise
         items: list[SkillResponse] = []
         for scanned in scanned_archives:
-            response = _skill_response_from_scan(scanned.filename, f"skill_{uuid4().hex}", scanned.scan_report)
+            response = _skill_response_from_scanned_archive(scanned, f"skill_{uuid4().hex}")
             self.skills[response.id] = response
             items.append(response)
         return SkillArchiveUploadResponse(filename=filename, bundle=bundle, items=items)
@@ -2831,7 +2971,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 archive_path = self._skill_archive_path(skill_id)
                 archive_path.parent.mkdir(parents=True, exist_ok=True)
                 archive_path.write_bytes(scanned.archive_bytes)
-                items.append(_skill_response_from_scan(scanned.filename, skill_id, scanned.scan_report))
+                items.append(_skill_response_from_scanned_archive(scanned, skill_id))
         except OSError:
             await self.record_log(
                 category="feature_error",

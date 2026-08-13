@@ -642,6 +642,35 @@ describe("operational management pages", () => {
     expect(screen.queryByLabelText("临时 Agent 补位规则")).toBeNull();
   });
 
+  it("loads an existing workflow into the form for editing", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/workflows" />);
+
+    expect(await screen.findByRole("heading", { name: "工作流配置" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "编辑工作流" }));
+
+    expect(screen.getByRole("status").textContent).toContain("已载入 短视频派单");
+    expect((screen.getByLabelText("工作流 ID") as HTMLInputElement).value).toBe("short-video-dispatch");
+    expect((screen.getByLabelText("执行步骤（每行一个）") as HTMLTextAreaElement).value).toBe(
+      "拆解需求\n角色分工\n汇总产物",
+    );
+
+    await user.clear(screen.getByLabelText("工作流目标"));
+    await user.type(screen.getByLabelText("工作流目标"), "更新后的短视频脚本方案");
+    await user.click(screen.getByRole("button", { name: "保存工作流配置" }));
+
+    expect(
+      requests.find((request) => request.path === "/api/v1/admin/workflows" && request.method === "POST"),
+    ).toMatchObject({
+      body: {
+        id: "short-video-dispatch",
+        name: "短视频派单",
+        objective: "更新后的短视频脚本方案",
+        agent_ids: ["director", "copywriter", "editor"],
+      },
+    });
+  });
+
   it("uses a selected direct model instead of a child agent when direct mode is selected", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
@@ -1559,7 +1588,7 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     const file = new File(["PK\x03\x04"], "uploaded-skill.zip", { type: "application/zip" });
-    await user.upload(screen.getByLabelText("上传文件或 Skill ZIP"), file);
+    await user.upload(screen.getByLabelText("上传文件或 Skill 压缩包"), file);
 
     expect(await screen.findByText("压缩包附件")).not.toBeNull();
     expect(screen.getByText("uploaded-skill.zip")).not.toBeNull();
@@ -1570,7 +1599,7 @@ describe("operational management pages", () => {
 
     await user.click(screen.getByRole("button", { name: "作为 Skill 安装" }));
 
-    expect(await screen.findByText("Skill 包已扫描，等待确认")).not.toBeNull();
+    expect(await screen.findByText("Skill 压缩包已扫描，等待确认")).not.toBeNull();
     expect(screen.getByText("uploaded_skill")).not.toBeNull();
     expect(screen.getByText(/tool:filesystem\.read/)).not.toBeNull();
     expect(requests.find((request) => request.path === "/api/v1/admin/skills/upload")).toMatchObject({
@@ -1590,7 +1619,7 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     const file = new File(["image-bytes"], "screen.png", { type: "image/png" });
-    await user.upload(screen.getByLabelText("上传文件或 Skill ZIP"), file);
+    await user.upload(screen.getByLabelText("上传文件或 Skill 压缩包"), file);
     expect(await screen.findByText("图片附件")).not.toBeNull();
     expect(screen.getByText("screen.png")).not.toBeNull();
 
@@ -1612,7 +1641,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    const uploadInput = screen.getByLabelText("上传文件或 Skill ZIP");
+    const uploadInput = screen.getByLabelText("上传文件或 Skill 压缩包");
     const accept = uploadInput.getAttribute("accept") ?? "";
     expect(accept).toContain(".rar");
     expect(accept).toContain(".7z");

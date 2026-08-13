@@ -1066,6 +1066,31 @@ def wrapped_skill_tar_bundle_archive() -> bytes:
     return buffer.getvalue()
 
 
+def instruction_skill_archive() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "SKILL.md",
+            "---\nname: codex-writer\ndescription: Draft structured research notes.\n---\n\nWrite concise notes.\n",
+        )
+    return buffer.getvalue()
+
+
+def instruction_skill_bundle_archive() -> bytes:
+    skill_docs = {
+        "research": "---\nname: research-writer\ndescription: Research writing.\n---\n\nWrite research notes.\n",
+        "reviewer": "---\nname: reviewer-checklist\ndescription: Review checklist.\n---\n\nReview outputs.\n",
+    }
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for folder, content in skill_docs.items():
+            data = content.encode("utf-8")
+            info = tarfile.TarInfo(f"all-skills/{folder}/SKILL.md")
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
+
 def test_model_pool_reports_serial_slot_and_queue_policy() -> None:
     response = client().post("/api/v1/admin/models", headers=headers(), json=model_payload())
 
@@ -1954,6 +1979,43 @@ def test_skill_archive_upload_scans_wrapped_tar_gz_bundle_with_multiple_skill_di
     assert [item["name"] for item in body["items"]] == ["wrapped_writer_skill", "wrapped_reviewer_skill"]
     assert body["items"][0]["requested_permissions"] == ["tool:filesystem.read"]
     assert {item["name"] for item in skills.json()} == {"wrapped_writer_skill", "wrapped_reviewer_skill"}
+
+
+def test_skill_archive_upload_accepts_instruction_only_skill_package() -> None:
+    api = client()
+
+    uploaded = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "codex-writer-skill.zip"},
+        content=instruction_skill_archive(),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert uploaded.status_code == 200
+    body = uploaded.json()
+    assert body["bundle"] is False
+    assert body["items"][0]["name"] == "codex-writer"
+    assert body["items"][0]["requested_permissions"] == []
+    assert "SKILL.md detected" in body["items"][0]["scan_diff"]
+    assert any(item["name"] == "codex-writer" for item in skills.json())
+
+
+def test_skill_archive_upload_accepts_instruction_skill_tar_gz_bundle() -> None:
+    api = client()
+
+    uploaded = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "all-skills.tar.gz"},
+        content=instruction_skill_bundle_archive(),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert uploaded.status_code == 200
+    body = uploaded.json()
+    assert body["bundle"] is True
+    assert [item["name"] for item in body["items"]] == ["research-writer", "reviewer-checklist"]
+    assert all("SKILL.md detected" in item["scan_diff"] for item in body["items"])
+    assert {item["name"] for item in skills.json()} == {"research-writer", "reviewer-checklist"}
 
 
 def test_skill_archive_upload_rejects_invalid_zip_without_saving_metadata() -> None:

@@ -115,6 +115,14 @@ function principalToCurrentUser(principal: Principal): CurrentUser {
   };
 }
 
+function archiveContentType(filename: string): string {
+  const lowered = filename.toLowerCase();
+  if (lowered.endsWith(".zip")) return "application/zip";
+  if (lowered.endsWith(".tar")) return "application/x-tar";
+  if (lowered.endsWith(".tar.gz") || lowered.endsWith(".tgz")) return "application/gzip";
+  return "application/octet-stream";
+}
+
 function rememberSession(token: string, principal: Principal): CurrentUser {
   accessToken = token;
   safeSessionSet(TOKEN_STORAGE_KEY, token);
@@ -1168,7 +1176,7 @@ export const api = {
         method: "POST",
         body: file,
         headers: {
-          "Content-Type": "application/zip",
+          "Content-Type": archiveContentType(file.name),
           "X-Agent-Hub-Skill-Filename": file.name,
         },
       },

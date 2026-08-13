@@ -1509,7 +1509,7 @@ export function RunsPage() {
     onSuccess: (result, file) => {
       setArchiveInstallFile(null);
       setSkillInstallCandidate({ fileName: file.name, skills: result.items, status: "scanned" });
-      setSubmitNotice("Skill 包已完成安全扫描，请确认权限后再安装。");
+      setSubmitNotice("Skill 压缩包已完成安全扫描，请确认权限后再安装。");
       void queryClient.invalidateQueries({ queryKey: ["skills"] });
     },
     onError: (error, file) => {
@@ -1523,7 +1523,7 @@ export function RunsPage() {
       );
       setSubmitNotice(
         error instanceof ApiError && error.code === "invalid_skill_package"
-          ? "这个压缩包不是有效 Skill 包，已保留为普通附件；如果它用于代码审查或普通任务，请直接在对话里说明。"
+          ? "这个压缩包不是有效 Skill 压缩包，已保留为普通附件；如果它用于代码审查或普通任务，请直接在对话里说明。"
           : "Skill 扫描失败。压缩包仍保留为附件，请查看错误详情后决定是否重新上传。",
       );
     },
@@ -1844,12 +1844,14 @@ export function RunsPage() {
       <div className="chat-console">
         <nav className="conversation-list" aria-label="手机版会话导航">
           <div className="conversation-list-header">
-            <h3>会话</h3>
-            <span>{items.length}</span>
+            <div>
+              <h3>历史会话</h3>
+              <span>{items.length} 条</span>
+            </div>
+            <button type="button" className="secondary-action conversation-new-button" onClick={startNewConversation}>
+              新建对话
+            </button>
           </div>
-          <button type="button" className="secondary-action conversation-new-button" onClick={startNewConversation}>
-            新建对话
-          </button>
           {items.length > 0 ? (
             <div className="bulk-action-bar conversation-bulk-actions">
               <label className="inline-check compact-check">
@@ -1913,7 +1915,7 @@ export function RunsPage() {
                     disabled={!canDelete || deleteRun.isPending}
                     onClick={() => deleteConversation(run)}
                   >
-                    ×
+                    删除
                   </button>
                 </div>
               );
@@ -2201,7 +2203,7 @@ export function RunsPage() {
               <aside className="composer-attachment-card" role="status" aria-label="Skill 安装确认">
                 <div>
                   <span className="eyebrow">
-                    {skillInstallCandidate.status === "enabled" ? "Skill 已安装并启用" : "Skill 包已扫描，等待确认"}
+                    {skillInstallCandidate.status === "enabled" ? "Skill 已安装并启用" : "Skill 压缩包已扫描，等待确认"}
                   </span>
                   <strong>{skillInstallCandidate.skills.map((skill) => skill.name).join(", ")}</strong>
                   <small>
@@ -2271,7 +2273,7 @@ export function RunsPage() {
                 <label className="composer-upload-button">
                   <span>附件</span>
                   <input
-                    aria-label="上传文件或 Skill ZIP"
+                    aria-label="上传文件或 Skill 压缩包"
                     type="file"
                     accept={ATTACHMENT_ACCEPT}
                     disabled={uploadSkillArchive.isPending || uploadAttachment.isPending}
@@ -2335,7 +2337,7 @@ export function RunsPage() {
               <p className="field-help" role="status">{directSendBlockedReason}</p>
             ) : null}
             {submitNotice ? <p role="status">{submitNotice}</p> : null}
-            {uploadSkillArchive.isPending ? <p role="status">正在扫描 Skill 包...</p> : null}
+            {uploadSkillArchive.isPending ? <p role="status">正在扫描 Skill 压缩包...</p> : null}
             {uploadAttachment.isPending ? <p role="status">正在上传附件...</p> : null}
             {uploadSkillArchive.isError ? (
               <p className="field-help" role="status">
