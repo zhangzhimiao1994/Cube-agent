@@ -18,6 +18,11 @@ Current state:
   - admin run detail exposes `conversation_id`, `vibe_coding=enabled`, and `capability=vibe_coding`;
   - original system settings are restored afterward.
 - Server frontend bundle contains the Vibe Coding settings toggle and composer button markers.
+- GitHub recovery archive was created before pushing:
+  - local ignored bundle `.local-archives/github-pushes/mutilagent-main-before-20260813-140950-d8ce1b4.bundle`;
+  - GitHub tag `archive/mutilagent-main-before-20260813-140950-d8ce1b4`.
+- Commit `c5b10a4 feat: gate vibe coding in conversations` was pushed with `git push --force-with-lease mutilagent main`.
+- GitHub Actions run `31672859925` passed. The only annotation was GitHub's non-failing Node.js 20 deprecation warning for actions.
 
 Changes made:
 
@@ -46,10 +51,6 @@ Local verification:
 
 Next:
 
-- Commit this slice.
-- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
-- Push `main` with `git push --force-with-lease mutilagent main`.
-- Check GitHub Actions and fix/redeploy/repush if red.
 - Continue P3 with richer Vibe Coding behavior inside runtime prompts/artifact handling and multi-system OpenClaw adapters.
 
 ## 2026-08-13 P3 Feishu Production Media Factory Wiring Slice
