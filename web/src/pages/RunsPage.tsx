@@ -3,6 +3,7 @@ import { Fragment, FormEvent, useEffect, useMemo, useRef, useState } from "react
 import { Link } from "react-router-dom";
 
 import { ApiError, api, formatApiError, type AttachmentUpload, type ModelDeployment, type RunDetail, type Skill, type SubmittedRun } from "../api/client";
+import { APP_BRAND_NAME } from "../app/brand";
 
 const RUN_MODES = [
   { value: "auto", label: "自动", description: "主 Agent 判断应使用直连、派单、讨论或混合；不确定时向你确认。" },
@@ -2100,7 +2101,7 @@ export function RunsPage() {
             ) : null}
             {mode === "direct" && messages.length === 0 ? (
               <article className="chat-message assistant" aria-label="直连模型选择">
-                <span className="eyebrow">Agent Hub</span>
+                <span className="eyebrow">{APP_BRAND_NAME}</span>
                 <h3>直连准备</h3>
                 {savedModels.length > 0 ? (
                   <>
@@ -2128,7 +2129,7 @@ export function RunsPage() {
             ) : null}
             {modeSelection ? (
               <article className="chat-message assistant" aria-label="运行模式确认">
-                <span className="eyebrow">Agent Hub</span>
+                <span className="eyebrow">{APP_BRAND_NAME}</span>
                 <h3>主 Agent 需要你确认运行方式</h3>
                 <p>
                   自动检测没有足够把握，原因：{modeSelection.reason ?? "routing_requires_user_choice"}。
@@ -2145,7 +2146,7 @@ export function RunsPage() {
             ) : null}
             {temporaryApproval && !temporaryApprovalVisibleInMessages ? (
               <article className="chat-message assistant" aria-label="临时 Agent 文字确认">
-                <span className="eyebrow">Agent Hub</span>
+                <span className="eyebrow">{APP_BRAND_NAME}</span>
                 <h3>{temporaryApproval.proposal.name}</h3>
                 <p>{temporaryAgentApprovalBody(temporaryApproval.proposal)}</p>
               </article>
@@ -2153,7 +2154,7 @@ export function RunsPage() {
             {messages.map((item, index) => (
               <Fragment key={item.id}>
                 <article className={`chat-message ${item.role}`}>
-                  <span className="eyebrow">{item.role === "user" ? "你" : "Agent Hub"}</span>
+                  <span className="eyebrow">{item.role === "user" ? "你" : APP_BRAND_NAME}</span>
                   <h3>{item.title}</h3>
                   <p>{item.body}</p>
                 </article>

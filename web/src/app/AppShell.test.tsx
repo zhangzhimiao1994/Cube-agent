@@ -58,6 +58,9 @@ describe("AppShell presentation", () => {
   it("renders the operations shell without global capability cards above every page", async () => {
     render(<TestApp initialPath="/" />);
 
+    expect(await screen.findAllByText("魔方agent")).not.toHaveLength(0);
+    expect(screen.getAllByAltText("魔方agent")).not.toHaveLength(0);
+
     expect(await screen.findByText("Agent 编排控制台")).not.toBeNull();
     expect(screen.getAllByText("控制台").length).toBeGreaterThan(0);
     expect(screen.getByRole("link", { name: "对话" })).not.toBeNull();

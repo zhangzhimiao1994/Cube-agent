@@ -2,6 +2,7 @@ import { FormEvent, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { formatApiError } from "../api/client";
+import { APP_BRAND_NAME } from "../app/brand";
 import { useAuth } from "../auth/AuthProvider";
 
 const INSTALL_STEPS = [
@@ -34,8 +35,8 @@ export function SetupPage() {
   return (
     <section className="auth-layout setup-layout">
       <div className="auth-hero">
-        <span className="eyebrow">Secure first-run setup</span>
-        <h1>初始化 Agent Hub</h1>
+        <span className="eyebrow">{APP_BRAND_NAME}</span>
+        <h1>初始化 {APP_BRAND_NAME}</h1>
         <p>使用安装脚本打印的一次性设置码创建第一个管理员账号。</p>
         <p>设置码使用后会立即失效。如果失败，页面会显示后端错误码和错误 ID。</p>
         <div className="setup-timeline" aria-label="Installation flow">

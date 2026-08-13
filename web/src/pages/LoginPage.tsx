@@ -2,6 +2,7 @@ import { FormEvent, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { ApiError, formatApiError } from "../api/client";
+import { APP_BRAND_NAME } from "../app/brand";
 import { useAuth } from "../auth/AuthProvider";
 
 export function LoginPage() {
@@ -29,7 +30,7 @@ export function LoginPage() {
   return (
     <section className="auth-layout">
       <div className="auth-hero">
-        <span className="eyebrow">Agent Hub</span>
+        <span className="eyebrow">{APP_BRAND_NAME}</span>
         <h1>登录控制台</h1>
         <p>
           在一个受保护的生产控制台里管理模型路由、Agent 角色、Skill、记忆、通道和审计日志。

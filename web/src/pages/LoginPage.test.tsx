@@ -112,7 +112,7 @@ describe("LoginPage", () => {
 
   it("creates the first admin through setup", async () => {
     render(<TestApp initialPath="/setup" />);
-    expect(await screen.findByText("Secure first-run setup")).not.toBeNull();
+    expect(await screen.findByText("魔方agent")).not.toBeNull();
     expect(screen.getByText("使用安装脚本打印的一次性设置码创建第一个管理员账号。")).not.toBeNull();
     expect(screen.getByText("安装依赖")).not.toBeNull();
     expect(screen.getByText("部署版本")).not.toBeNull();

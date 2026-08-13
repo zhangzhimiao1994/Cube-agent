@@ -1,4 +1,37 @@
 
+## 2026-08-13 P3 UI Branding to 魔方agent
+
+Current state:
+
+- UI-visible product branding is now `魔方agent` instead of `Agent Hub`.
+- Added a shared frontend brand constant so shell, login/setup, run assistant labels, tests, and future pages use one source of truth.
+- Added the provided cube logo asset at `web/public/brand/mofang-agent.jpg`.
+- Mobile shell now shows the logo in the drawer brand lockup and sidebar brand card.
+- Channel setup copy and frontend fixtures were updated to use the new visible product name.
+
+Verification performed:
+
+- Searched frontend source for visible `Agent Hub` remnants after the change.
+- `npm.cmd run test -- --run` from `web` -> 94 passed.
+- `npm.cmd run build` from `web` -> passed, with the existing Vite chunk-size warning.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-brand-mofang-ui.tgz` to `103.236.98.133`.
+  - Deployed only the rebuilt `web/dist` into `/opt/agent-hub/current`.
+  - Reloaded Caddy.
+- Server real environment verification:
+  - Ran `/tmp/server_brand_mofang_check.py` against the deployed HTTP entrypoint.
+  - Verified served `/`, `/index.html`, JS/CSS bundle, and `/brand/mofang-agent.jpg`.
+  - Compared served static files with server disk files.
+  - Final output: `{"status": "ok", "brand": "魔方agent", "verified": ["served_index_brand_title", "served_bundle_brand_markers", "served_brand_image_bytes", "asset_disk_http_content_match"], "assets": ["assets/index-CjCQQVxK.js", "assets/index-ijdsA6vs.css"], "image_size": 90878}`.
+
+Remaining risks / TODOs:
+
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue P3 with the larger remaining track: schedule calendar/alarm-style UX, OpenClaw hardening/adapters, command grammar polish, final GitHub usage README, and Docker deployment readiness later.
+
 ## 2026-08-13 P3 Hermes Large Bulk and Chat Toggle Fix
 
 Current state:

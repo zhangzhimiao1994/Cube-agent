@@ -153,7 +153,7 @@ describe("ConfigPage", () => {
               execution_host: "agent-hub-server",
               requires_user_approval: true,
               supports_read_only: false,
-              description: "Runs exact allowlisted argv commands on the Agent Hub Linux server after approval.",
+              description: "Runs exact allowlisted argv commands on the 魔方agent Linux server after approval.",
             },
             {
               platform: "windows",

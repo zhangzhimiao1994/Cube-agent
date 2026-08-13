@@ -1,6 +1,7 @@
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import { useEffect, useMemo, useState } from "react";
 
+import { APP_BRAND_LOGO_SRC, APP_BRAND_NAME } from "./brand";
 import { MODULE_GROUPS } from "./navigation";
 import { useAuth } from "../auth/AuthProvider";
 
@@ -48,7 +49,7 @@ export function AppShell() {
             </span>
           </button>
           <div className="mobile-nav-title">
-            <span>Agent Hub</span>
+            <span>{APP_BRAND_NAME}</span>
             <strong>控制台</strong>
           </div>
         </div>
@@ -61,13 +62,17 @@ export function AppShell() {
         <div className="floating-nav-panel" onMouseLeave={() => setHoveredGroupId(null)}>
           <div className="floating-nav-rail">
             <div className="mobile-drawer-header">
-              <strong>Agent Hub</strong>
+              <span className="brand-lockup">
+                <img src={APP_BRAND_LOGO_SRC} alt={APP_BRAND_NAME} />
+                <strong>{APP_BRAND_NAME}</strong>
+              </span>
               <button type="button" aria-label="关闭导航栏" onClick={() => setMobileNavOpen(false)}>
                 ×
               </button>
             </div>
             <div className="brand-card compact-brand-card">
-              <span className="eyebrow">Agent Hub</span>
+              <img src={APP_BRAND_LOGO_SRC} alt={APP_BRAND_NAME} />
+              <span className="eyebrow">{APP_BRAND_NAME}</span>
               <h1>控制台</h1>
             </div>
             <nav aria-label="Main navigation" className="nav-list">

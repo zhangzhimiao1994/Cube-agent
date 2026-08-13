@@ -58,7 +58,7 @@ const CHANNEL_GUIDES: Record<string, ChannelGuide> = {
     fields: [
       { env: "DINGTALK_APP_KEY", label: "App Key", placeholder: "ding app key", source: "应用信息 → AppKey / Client ID" },
       { env: "DINGTALK_APP_SECRET", label: "App Secret", secret: true, placeholder: "ding app secret", source: "应用信息 → AppSecret / Client Secret" },
-      { env: "DINGTALK_WEBHOOK_TOKEN", label: "Webhook Token", secret: true, placeholder: "自定义高强度 token", source: "Agent Hub 自生成共享 token，并同步填入回调 URL token 参数或请求头" },
+      { env: "DINGTALK_WEBHOOK_TOKEN", label: "Webhook Token", secret: true, placeholder: "自定义高强度 token", source: "魔方agent 自生成共享 token，并同步填入回调 URL token 参数或请求头" },
     ],
     steps: [
       "在钉钉开放平台或机器人配置中创建事件回调。",
@@ -75,11 +75,11 @@ const CHANNEL_GUIDES: Record<string, ChannelGuide> = {
     consolePath: [
       "企业微信群 → 群设置 → 群机器人 → 添加机器人",
       "复制机器人 Webhook 地址中的 key 参数",
-      "Agent Hub 中生成共享 Webhook Token 后写入服务器环境",
+      "魔方agent 中生成共享 Webhook Token 后写入服务器环境",
     ],
     fields: [
       { env: "WECOM_BOT_WEBHOOK_KEY", label: "Webhook Key", secret: true, placeholder: "企微机器人 key", source: "群机器人 Webhook URL 中的 key" },
-      { env: "WECOM_BOT_WEBHOOK_TOKEN", label: "Webhook Token", secret: true, placeholder: "自定义高强度 token", source: "Agent Hub 自生成共享 token，用于保护入站 Webhook" },
+      { env: "WECOM_BOT_WEBHOOK_TOKEN", label: "Webhook Token", secret: true, placeholder: "自定义高强度 token", source: "魔方agent 自生成共享 token，用于保护入站 Webhook" },
     ],
     steps: [
       "在企业微信群添加机器人并取得 Webhook Key。",
@@ -213,7 +213,7 @@ const CHANNEL_GUIDES: Record<string, ChannelGuide> = {
     fields: [
       { env: "QQ_BOT_APP_ID", label: "App ID", placeholder: "QQ bot app id", source: "QQ 机器人平台 → 开发设置 → App ID" },
       { env: "QQ_BOT_TOKEN", label: "Bot Token", secret: true, placeholder: "QQ bot token", source: "QQ 机器人平台 → 开发设置 → Token" },
-      { env: "QQ_WEBHOOK_TOKEN", label: "Webhook Token", secret: true, placeholder: "自定义高强度 token", source: "Agent Hub 自生成共享 token，用于保护入站 Webhook" },
+      { env: "QQ_WEBHOOK_TOKEN", label: "Webhook Token", secret: true, placeholder: "自定义高强度 token", source: "魔方agent 自生成共享 token，用于保护入站 Webhook" },
     ],
     steps: [
       "在 QQ 机器人平台创建应用并启用事件。",
@@ -232,7 +232,7 @@ const CHANNEL_GUIDES: Record<string, ChannelGuide> = {
       "Header 填 x-agent-hub-channel-token，值为 CUSTOM_WEBHOOK_TOKEN",
     ],
     fields: [
-      { env: "CUSTOM_WEBHOOK_TOKEN", label: "Webhook Token", secret: true, placeholder: "自定义高强度 token", source: "Agent Hub 自生成共享 token，第三方系统请求时放到请求头" },
+      { env: "CUSTOM_WEBHOOK_TOKEN", label: "Webhook Token", secret: true, placeholder: "自定义高强度 token", source: "魔方agent 自生成共享 token，第三方系统请求时放到请求头" },
     ],
     steps: [
       "调用本页 Webhook 地址，Body 使用 JSON 对象。",
