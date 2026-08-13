@@ -22,7 +22,11 @@ class ContextCompactor:
             protected_text = "\n".join(protected)
             remaining_chars = max(0, max_summary_tokens * 4 - len(protected_text) - 1)
             tail = "\n".join(item for item in preserved if item not in protected)
-            summary = protected_text if not tail else f"{protected_text}\n{tail[:remaining_chars]}"
+            tail_excerpt = tail[-remaining_chars:] if remaining_chars else ""
+            if protected_text and tail_excerpt:
+                summary = f"{protected_text}\n{tail_excerpt}"
+            else:
+                summary = protected_text or tail_excerpt
         return Artifact(
             id=uuid4(),
             version=1,

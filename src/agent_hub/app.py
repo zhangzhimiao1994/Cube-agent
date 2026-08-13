@@ -229,6 +229,33 @@ class _MainAgentModeRouter:
         return CapacityPool(self._redis_client, deployments=deployments, credentials=credentials)
 
 
+class _MainAgentContextWindowGetter:
+    def __init__(self, get_config: MainAgentConfigGetter) -> None:
+        self._get_config = get_config
+
+    async def __call__(self) -> int | None:
+        config = await self._get_config()
+        if config.model is None:
+            return None
+        return _infer_main_agent_context_window_tokens(
+            config.model.provider,
+            config.model.upstream_model,
+        )
+
+
+def _infer_main_agent_context_window_tokens(provider: str, upstream_model: str) -> int:
+    normalized = f"{provider}/{upstream_model}".casefold()
+    if "gemini" in normalized:
+        return 1_000_000
+    if "gpt-5" in normalized or "gpt-4.1" in normalized:
+        return 400_000
+    if "claude" in normalized:
+        return 200_000
+    if any(marker in normalized for marker in ("deepseek", "qwen", "kimi", "gpt-4o")):
+        return 128_000
+    return 32_768
+
+
 def _waiting_route_decision(reason: str) -> RouteDecision:
     return RouteDecision(
         mode=None,
@@ -455,6 +482,14 @@ def create_app(
                     temporary_agent_policy=AdminResourceTemporaryAgentPolicy(active_sessions),
                     runtime_timeout_seconds=configured.runtime_timeout_seconds,
                     runtime_token_budget=configured.runtime_token_budget,
+                    main_agent_context_window_getter=_MainAgentContextWindowGetter(
+                        cast(
+                            admin.AdminResourceService,
+                            admin_resource_service
+                            if admin_resource_service is not None
+                            else application.state.admin_resource_service,
+                        ).get_main_agent_config
+                    ),
                 )
                 application.state.run_queue = queue
                 application.state.mode_router = active_mode_router

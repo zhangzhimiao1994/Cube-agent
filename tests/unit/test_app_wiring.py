@@ -15,7 +15,13 @@ from agent_hub.api.routers.admin import (
     MainAgentModelConfig,
     ModelDeploymentResponse,
 )
-from agent_hub.app import _MainAgentModeRouter, _web_ui_response, create_app
+from agent_hub.app import (
+    _infer_main_agent_context_window_tokens,
+    _MainAgentContextWindowGetter,
+    _MainAgentModeRouter,
+    _web_ui_response,
+    create_app,
+)
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
 from agent_hub.channels.feishu.media import FeishuMediaService
 from agent_hub.channels.feishu.media_factory import build_feishu_media_service_factory
@@ -322,3 +328,27 @@ async def test_main_agent_mode_router_inherits_registered_model_capabilities() -
     assert decision.mode is not None
     assert decision.mode.value == "dispatch"
     assert len(transport.requests) == 1
+
+
+def test_main_agent_context_window_is_inferred_from_model_family() -> None:
+    assert _infer_main_agent_context_window_tokens("deepseek", "deepseek-v4-flash") == 128_000
+    assert _infer_main_agent_context_window_tokens("anthropic", "claude-sonnet-4") == 200_000
+    assert _infer_main_agent_context_window_tokens("openai", "gpt-5") == 400_000
+    assert _infer_main_agent_context_window_tokens("custom", "unknown-small") == 32_768
+
+
+@pytest.mark.asyncio
+async def test_main_agent_context_window_getter_reads_configured_model() -> None:
+    async def get_main_agent_config() -> MainAgentConfigResponse:
+        return MainAgentConfigResponse(
+            model=MainAgentModelConfig(
+                provider="deepseek",
+                api_base="https://api.deepseek.com/v1",
+                api_protocol="openai_compatible",
+                upstream_model="deepseek-v4-flash",
+                credential_ref="secret://main-agent",
+                capabilities=["text"],
+            )
+        )
+
+    assert await _MainAgentContextWindowGetter(get_main_agent_config)() == 128_000

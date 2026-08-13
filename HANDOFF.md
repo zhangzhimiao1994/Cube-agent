@@ -1,4 +1,60 @@
 
+## 2026-08-13 System Context Auto-Compaction Slice
+
+Current state:
+
+- Conversation history compaction is now a system/runtime feature in `RunService`, not a Vibe-only behavior and not a channel/UI rule.
+- Before runtime execution, conversation history is converted into a context artifact using a history token budget derived from:
+  - the configured runtime token budget;
+  - the Main Agent model context window when available;
+  - explicit routing metadata such as `main_agent_context_window_tokens` for tests/diagnostics.
+- Short history remains a `conversation_history` artifact with `context_policy=full_history`.
+- Long history becomes `conversation_history_compacted` with `context_policy=auto_compacted`, preserving recent turns after compaction.
+- Production app wiring now injects a Main Agent context-window getter into `RunService`.
+- Main Agent context window inference is conservative by model family:
+  - Gemini: 1,000,000;
+  - GPT-5 / GPT-4.1: 400,000;
+  - Claude: 200,000;
+  - DeepSeek / Qwen / Kimi / GPT-4o: 128,000;
+  - unknown: 32,768.
+- Server incremental deployment to `103.236.98.133:/opt/agent-hub/current` was performed with `/tmp/agent-hub-context-compaction.tgz`.
+- Server services `agent-hub-api`, `agent-hub-worker`, and `caddy` were active after restart/reload.
+- Server real environment check passed with `/tmp/server_context_compaction_check.py` after loading `/etc/agent-hub/secrets.env`:
+  - used production settings and real database connection;
+  - created real Run rows in a unique conversation;
+  - called deployed `RunService` conversation-context artifact construction;
+  - confirmed long history produced `conversation_history_compacted`;
+  - confirmed the latest decision survived compaction;
+  - verified the current run through the local HTTP admin API;
+  - cleaned up the test runs afterward.
+
+Changes made:
+
+- `src/agent_hub/runs/service.py`
+  - Added system-level conversation history budget and artifact policy helpers.
+  - Added optional Main Agent context-window getter.
+  - Added auto-compacted history artifact generation before runtime execution.
+- `src/agent_hub/app.py`
+  - Added Main Agent model-family context-window inference.
+  - Injected the context-window getter into production `RunService`.
+- `src/agent_hub/context/compaction.py`
+  - Changed over-budget compaction to preserve the recent tail of transcript content instead of the oldest tail candidate.
+- Tests:
+  - Added budget, full-history, compacted-history, model-window inference, and getter wiring coverage.
+
+Verification performed:
+
+- TDD red:
+  - `_conversation_history_artifact` / `_conversation_history_token_budget` imports failed before implementation.
+  - `_MainAgentContextWindowGetter` import failed before production wiring was implemented.
+- Green:
+  - `uv run pytest tests/unit/runs/test_runtime_context_policy.py -q --tb=short` -> 7 passed.
+  - `uv run pytest tests/unit/test_app_wiring.py -q -k "context_window" --tb=short` -> 2 passed.
+  - `uv run pytest tests/unit/test_app_wiring.py tests/unit/runs/test_runtime_context_policy.py tests/api/test_runs_api.py -q --tb=short` -> 28 passed.
+  - `uv run pytest tests/unit/test_app_wiring.py tests/unit/runs/test_runtime_context_policy.py tests/api/test_runs_api.py tests/api/test_admin_resources.py -q --tb=short` -> 90 passed.
+  - `uv run ruff check src tests` -> passed.
+  - `uv run mypy src` -> passed.
+
 ## 2026-08-13 Model Save Form Refresh Fix
 
 Current state:
