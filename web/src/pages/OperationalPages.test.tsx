@@ -946,6 +946,32 @@ describe("operational management pages", () => {
       events: [
         {
           sequence: 1,
+          kind: "step.started",
+          message: "step.started",
+          created_at: "2026-08-07T00:00:00Z",
+          actor: "main_agent",
+          participants: [],
+          tool_name: null,
+          step_id: "main_agent_plan",
+          action: null,
+          decision: null,
+          payload: {
+            mode: "hybrid",
+            main_agent_model: "main",
+            logical_model: "main",
+            task: "选择运行模式、角色和模型。",
+            roles: [
+              { id: "copywriter", role: "文案生成", purpose: "execute", logical_model: "qwen-max", tools: [] },
+              { id: "director", role: "导演", purpose: "expertise", logical_model: "deepseek-v4-flash", tools: [] },
+            ],
+            steps: [
+              { id: "copywriting_step", agent: "copywriter", depends_on: [], final_synthesizer: false, tools: [] },
+              { id: "discussion", agent: "director", depends_on: [], final_synthesizer: false, tools: [] },
+            ],
+          },
+        },
+        {
+          sequence: 2,
           kind: "dispatch.started",
           message: "主 Agent 已拆解任务并派单。",
           created_at: "2026-08-07T00:00:00Z",
@@ -960,7 +986,7 @@ describe("operational management pages", () => {
           },
         },
         {
-          sequence: 2,
+          sequence: 3,
           kind: "step.started",
           message: "文案生成开始处理活动文案。",
           created_at: "2026-08-07T00:00:01Z",
@@ -975,7 +1001,7 @@ describe("operational management pages", () => {
           },
         },
         {
-          sequence: 3,
+          sequence: 4,
           kind: "model.started",
           message: "model.started",
           created_at: "2026-08-07T00:00:02Z",
@@ -991,7 +1017,7 @@ describe("operational management pages", () => {
           },
         },
         {
-          sequence: 4,
+          sequence: 5,
           kind: "artifact.created",
           message: "artifact.created",
           created_at: "2026-08-07T00:00:03Z",
@@ -1010,7 +1036,7 @@ describe("operational management pages", () => {
           },
         },
         {
-          sequence: 5,
+          sequence: 6,
           kind: "step.started",
           message: "导演开始审查流程。",
           created_at: "2026-08-07T00:00:04Z",
@@ -1025,7 +1051,7 @@ describe("operational management pages", () => {
           },
         },
         {
-          sequence: 6,
+          sequence: 7,
           kind: "discussion.completed",
           message: "文案生成和导演完成讨论。",
           created_at: "2026-08-07T00:00:05Z",
@@ -1062,6 +1088,7 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
+    const mainPlan = within(stream).getByRole("button", { name: /主 Agent 接收任务：选择运行模式、角色和模型/ });
     const dispatch = within(stream).getByRole("button", { name: /主 Agent 派单给文案生成、导演/ });
     const copywriterStart = within(stream).getByRole("button", { name: /文案生成 接收任务：输出中秋节活动主题/ });
     const copywriterModel = within(stream).getByRole("button", { name: /文案生成 调用模型：qwen-max/ });
@@ -1071,6 +1098,7 @@ describe("operational management pages", () => {
     const directorOpinion = within(stream).getByRole("button", { name: /导演 意见：导演建议压缩签到环节/ });
     const decision = within(stream).getByRole("button", { name: /主 Agent 裁决：主 Agent 采纳灯谜游园会方案/ });
     const ordered = [
+      mainPlan,
       dispatch,
       copywriterStart,
       copywriterModel,
@@ -1086,6 +1114,14 @@ describe("operational management pages", () => {
     });
 
     expect(within(stream).queryByRole("button", { name: /生成了结果/ })).toBeNull();
+
+    await user.click(mainPlan);
+    const planDrawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(planDrawer).getByText("执行者")).not.toBeNull();
+    expect(within(planDrawer).getAllByText("主 Agent").length).toBeGreaterThan(0);
+    expect(within(planDrawer).getByText("逻辑模型")).not.toBeNull();
+    expect(within(planDrawer).getAllByText("main").length).toBeGreaterThan(0);
+    await user.click(within(planDrawer).getByRole("button", { name: "关闭" }));
 
     await user.click(copywriterOutput);
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });

@@ -1,3 +1,63 @@
+
+## 2026-08-13 P3 Runtime Process Observability Slice
+
+Current state:
+
+- P3-1 local implementation is complete for runtime process-event quality.
+- Local commit is prepared on `main`; check `git rev-parse --short HEAD` for the latest hash because the commit may be amended before push while handoff/deploy status is finalized.
+- Server incremental deployment to `103.236.98.133:/opt/agent-hub/current` was performed after user authorization.
+- Server services `agent-hub-api`, `agent-hub-worker`, and `caddy` are active after restart.
+- Server health checks passed after startup completed: `GET /health/live` -> `{"status":"ok"}`, `GET /health/ready` -> `{"status":"ok"}`.
+- Config-backed dispatch, discussion, and hybrid runtimes now emit a first-class `step.started` planning event from `main_agent` before child execution.
+- The planning event uses `step_id=main_agent_plan` and includes structured, safe payload fields for mode, main-agent logical model, selected roles, selected models, and planned steps.
+- Hybrid runtime now preserves safe child process events instead of collapsing child execution down to only artifacts/messages. Forwarded child events include step, model, message, review, and tool events, while still filtering child checkpoints and terminal events.
+- Frontend conversation process rows now render `main_agent` / `main` as `主 Agent`, so the new planning row reads as a user-facing main-Agent action.
+- Added `docs/superpowers/plans/2026-08-13-p3-runtime-observability.md` to lock the P3 slice scope and guardrails.
+
+Changes made locally:
+
+- `src/agent_hub/runtime/defaults.py`
+  - Added `_PlannedRuntime` wrapper and event payload helpers.
+  - Wrapped configured dispatch/discussion/hybrid runtimes with the planning event.
+- `src/agent_hub/runtime/hybrid.py`
+  - Added safe forwarding for child process events.
+- `web/src/pages/RunsPage.tsx`
+  - Localizes main-agent actor IDs to `主 Agent`.
+- Tests updated:
+  - `tests/unit/runtime/test_configured_runtime.py`
+  - `tests/unit/runtime/test_hybrid.py`
+  - `web/src/pages/OperationalPages.test.tsx`
+- Planning docs updated:
+  - `docs/superpowers/plans/2026-08-13-p3-runtime-observability.md`
+  - `REFACTOR_HANDOFF.md`
+- `.gitignore` now ignores `.tmp/` so local deployment packages are not accidentally pushed.
+
+Verification performed locally:
+
+- TDD red/green:
+  - Dispatch planning event test first failed because the first event was child `runtime.completed`.
+  - Discussion planning event test first failed for the same missing planning-event reason.
+  - Hybrid planning event test first failed for the same missing planning-event reason after fixing the test probe signature.
+  - Hybrid child-process preservation test first failed because `step.started` was not forwarded.
+  - Frontend timeline test first failed because `main_agent` rendered raw instead of `主 Agent`.
+- Local backend:
+  - `uv run ruff check src tests` -> passed.
+  - `uv run mypy src tests` -> passed.
+  - `uv run pytest tests/unit/runtime/test_configured_runtime.py tests/unit/runtime/test_hybrid.py -q --tb=short` -> 25 passed.
+- Local frontend:
+  - `npm.cmd test -- src/pages/OperationalPages.test.tsx -- --runInBand` -> 37 passed.
+  - `npm.cmd run build` -> passed; existing Vite chunk-size warning only.
+
+Remaining risks / TODOs:
+
+- Server sync and server validation have been performed for this P3 slice. The first immediate health check ran too early while Uvicorn was still starting; a follow-up check passed once application startup completed.
+- This pass has been committed locally but not pushed to GitHub yet.
+- Normal push to `zhangzhimiao1994/mutilagent main` is blocked by non-fast-forward remote history. Remote-only commits at the time of checking were `4f02862 refactor run process timeline` and `094e56c docs update handoff after push`; completing the requested GitHub full sync requires explicit approval to overwrite the remote `main` ref, for example with `git push --force-with-lease mutilagent main`.
+- After push, GitHub Actions must be checked and fixed until green or a concrete external blocker is identified.
+- P3 channel hardening, Skill/MCP real E2E, attachment edge formats, multimodal expansion, Vibe Coding, and OpenClaw remain pending.
+- Vibe Coding must be integrated into the conversation experience, not implemented as a standalone system module and not as a workflow preset.
+- OpenClaw should be a system-level feature switch, off by default, for long-lived controlled computer-operation sessions. It needs explicit administrator configuration for allowed operation scope, session timeout, human-confirmation policy, audit level, and emergency-stop behavior.
+
 # Agent Hub Handoff
 
 ## 2026-08-12 Feishu 204 Ack Fix

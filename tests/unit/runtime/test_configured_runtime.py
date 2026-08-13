@@ -1,5 +1,6 @@
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+from typing import ClassVar, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -11,7 +12,13 @@ from agent_hub.domain.runs import TaskMode
 from agent_hub.models.capacity import CapacityLease
 from agent_hub.models.gateway import CapacityController
 from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, TokenUsage
-from agent_hub.runtime.contracts import EventKind, JsonValue, TaskContext
+from agent_hub.runtime.contracts import (
+    EventKind,
+    JsonValue,
+    RunEvent,
+    RuntimeCheckpoint,
+    TaskContext,
+)
 from agent_hub.runtime.defaults import (
     ConfigBackedDirectRuntime,
     ConfigBackedDiscussionRuntime,
@@ -157,6 +164,57 @@ class FakeTransport:
         )
 
 
+class ProbeDispatchRuntime:
+    instances: ClassVar[list["ProbeDispatchRuntime"]] = []
+
+    def __init__(
+        self,
+        gateway: object,
+        plan: object,
+        *,
+        capability_gateway: object | None = None,
+    ) -> None:
+        del gateway, capability_gateway
+        self.plan = plan
+        self.contexts: list[TaskContext] = []
+        self.instances.append(self)
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        self.contexts.append(context)
+        yield RunEvent(
+            kind=EventKind.RUNTIME_COMPLETED,
+            sequence=1,
+            run_id=context.run_id,
+            reason="probe_complete",
+        )
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        raise AssertionError(f"not used: {checkpoint.id}")
+
+    async def cancel(self) -> None:
+        return None
+
+
+class ProbeDiscussionRuntime(ProbeDispatchRuntime):
+    instances: ClassVar[list["ProbeDispatchRuntime"]] = []
+
+    @property
+    def participant_ids(self) -> tuple[str, ...]:
+        return tuple(participant.id for participant in self.plan.participants)  # type: ignore[attr-defined]
+
+
+class ProbeHybridRuntime(ProbeDispatchRuntime):
+    instances: ClassVar[list["ProbeDispatchRuntime"]] = []
+
+    def __init__(self, dispatch: object, discussion: object, direct: object) -> None:
+        del dispatch, discussion, direct
+        self.contexts: list[TaskContext] = []
+        self.instances.append(self)
+
+
 @pytest.mark.asyncio
 async def test_config_backed_direct_runtime_uses_published_model_and_secret() -> None:
     transport = FakeTransport()
@@ -219,6 +277,352 @@ async def test_config_backed_direct_runtime_uses_published_model_and_secret() ->
         (TENANT_ID, "secret://22222222-2222-4222-8222-222222222222")
     ]
     assert capacities[0].recorded == [True]
+
+
+@pytest.mark.asyncio
+async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                    "creative": {
+                        "deployments": [
+                            {
+                                "provider": "kimi",
+                                "model": "kimi-k2-latest",
+                                "api_base": "https://api.moonshot.cn/v1",
+                                "credential_ref": "secret://creative",
+                                "quota_scope_id": "kimi_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [
+                    {
+                        "id": "copywriter",
+                        "role": "Copywriter",
+                        "prompt": "Draft campaign copy.",
+                        "model": "creative",
+                        "skills": [],
+                    }
+                ],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id, deployments
+        ),
+        transport=FakeTransport(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request="Draft a launch campaign.",
+                routing_decision={
+                    "selected_agent_ids": ("copywriter",),
+                    "main_agent_model": "main",
+                },
+            )
+        )
+    ]
+
+    assert events[0].kind is EventKind.STEP_STARTED
+    assert events[0].actor == "main_agent"
+    assert events[0].step_id == "main_agent_plan"
+    assert events[0].payload["mode"] == "dispatch"
+    assert events[0].payload["main_agent_model"] == "main"
+    assert events[0].payload["roles"] == (
+        {
+            "id": "copywriter",
+            "role": "Copywriter",
+            "purpose": "execute",
+            "logical_model": "creative",
+            "tools": (),
+        },
+        {
+            "id": "final_synthesizer",
+            "role": "Final Synthesizer",
+            "purpose": "synthesize",
+            "logical_model": "main",
+            "tools": (),
+        },
+    )
+    assert events[0].payload["steps"] == (
+        {
+            "id": "copywriter_step",
+            "agent": "copywriter",
+            "depends_on": (),
+            "final_synthesizer": False,
+            "tools": (),
+        },
+        {
+            "id": "final_response_step",
+            "agent": "final_synthesizer",
+            "depends_on": ("copywriter_step",),
+            "final_synthesizer": True,
+            "tools": (),
+        },
+    )
+    assert events[1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[1].sequence == 2
+
+
+@pytest.mark.asyncio
+async def test_config_backed_hybrid_runtime_emits_main_agent_role_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeHybridRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "HybridRuntime", ProbeHybridRuntime)
+    runtime = ConfigBackedHybridRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                    "creative": {
+                        "deployments": [
+                            {
+                                "provider": "kimi",
+                                "model": "kimi-k2-latest",
+                                "api_base": "https://api.moonshot.cn/v1",
+                                "credential_ref": "secret://creative",
+                                "quota_scope_id": "kimi_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [
+                    {
+                        "id": "copywriter",
+                        "role": "Copywriter",
+                        "prompt": "Draft copy.",
+                        "model": "creative",
+                        "skills": [],
+                    },
+                    {
+                        "id": "reviewer",
+                        "role": "Reviewer",
+                        "prompt": "Review copy.",
+                        "model": "main",
+                        "skills": [],
+                    },
+                ],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id, deployments
+        ),
+        transport=FakeTransport(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.HYBRID,
+                request="Draft and review a campaign.",
+                routing_decision={
+                    "selected_agent_ids": ("copywriter", "reviewer"),
+                    "main_agent_model": "main",
+                },
+            )
+        )
+    ]
+
+    assert events[0].kind is EventKind.STEP_STARTED
+    assert events[0].actor == "main_agent"
+    assert events[0].step_id == "main_agent_plan"
+    assert events[0].payload["mode"] == "hybrid"
+    roles = events[0].payload["roles"]
+    assert isinstance(roles, tuple)
+    roles = cast(tuple[Mapping[str, JsonValue], ...], roles)
+    assert {role["id"] for role in roles} >= {"copywriter", "reviewer", "final_synthesizer"}
+    assert any(
+        role["id"] == "copywriter"
+        and role["purpose"] == "execute"
+        and isinstance(role["logical_model"], str)
+        and role["logical_model"]
+        for role in roles
+    )
+    assert any(
+        role["id"] == "reviewer"
+        and role["purpose"] == "expertise"
+        and isinstance(role["logical_model"], str)
+        and role["logical_model"]
+        for role in roles
+    )
+    assert events[1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[1].sequence == 2
+
+
+@pytest.mark.asyncio
+async def test_config_backed_discussion_runtime_emits_main_agent_role_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDiscussionRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
+    runtime = ConfigBackedDiscussionRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                    "review": {
+                        "deployments": [
+                            {
+                                "provider": "qwen",
+                                "model": "qwen-max",
+                                "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                                "credential_ref": "secret://review",
+                                "quota_scope_id": "qwen_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [
+                    {
+                        "id": "strategist",
+                        "role": "Strategist",
+                        "prompt": "Find the strongest option.",
+                        "model": "main",
+                        "skills": [],
+                    },
+                    {
+                        "id": "reviewer",
+                        "role": "Reviewer",
+                        "prompt": "Review risk and gaps.",
+                        "model": "review",
+                        "skills": [],
+                    },
+                ],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id, deployments
+        ),
+        transport=FakeTransport(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISCUSS,
+                request="Compare two launch options.",
+                routing_decision={
+                    "selected_agent_ids": ("strategist", "reviewer"),
+                    "main_agent_model": "main",
+                },
+            )
+        )
+    ]
+
+    assert events[0].kind is EventKind.STEP_STARTED
+    assert events[0].actor == "main_agent"
+    assert events[0].step_id == "main_agent_plan"
+    assert events[0].payload["mode"] == "discuss"
+    assert events[0].payload["roles"] == (
+        {
+            "id": "strategist",
+            "role": "Strategist",
+            "purpose": "expertise",
+            "logical_model": "main",
+            "tools": (),
+        },
+        {
+            "id": "reviewer",
+            "role": "Reviewer",
+            "purpose": "expertise",
+            "logical_model": "review",
+            "tools": (),
+        },
+    )
+    assert events[0].payload["steps"] == (
+        {
+            "id": "discussion",
+            "agent": "strategist",
+            "depends_on": (),
+            "final_synthesizer": False,
+            "tools": (),
+        },
+        {
+            "id": "discussion",
+            "agent": "reviewer",
+            "depends_on": (),
+            "final_synthesizer": False,
+            "tools": (),
+        },
+    )
+    assert events[1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[1].sequence == 2
 
 
 @pytest.mark.asyncio

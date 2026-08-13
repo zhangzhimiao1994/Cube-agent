@@ -131,6 +131,60 @@ class TenantSecretResolver:
         return await self._secret_service.resolve(self._tenant_id, secret_ref)
 
 
+class _PlannedRuntime:
+    """Add the main-Agent planning decision before a configured child runtime starts."""
+
+    def __init__(
+        self,
+        child: ExecutionRuntime,
+        *,
+        mode: TaskMode,
+        main_agent_model: str,
+        roles: tuple[Mapping[str, JsonValue], ...],
+        steps: tuple[Mapping[str, JsonValue], ...],
+    ) -> None:
+        self.mode = mode
+        self._child = child
+        self._main_agent_model = main_agent_model
+        self._roles = roles
+        self._steps = steps
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        sequence_offset = 1
+        if context.checkpoint is None:
+            yield RunEvent(
+                kind=EventKind.STEP_STARTED,
+                sequence=1,
+                run_id=context.run_id,
+                actor="main_agent",
+                step_id="main_agent_plan",
+                payload={
+                    "mode": self.mode.value,
+                    "main_agent_model": self._main_agent_model,
+                    "logical_model": self._main_agent_model,
+                    "task": "选择运行模式、角色和模型。",
+                    "summary": "Main Agent selected the runtime mode, roles, and models.",
+                    "roles": self._roles,
+                    "steps": self._steps,
+                },
+            )
+        async for event in self._child.run(context):
+            yield _renumber_event(event, sequence_offset, run_id=context.run_id)
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        return await self._child.save_checkpoint()
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        await self._child.restore_checkpoint(checkpoint)
+
+    async def cancel(self) -> None:
+        await self._child.cancel()
+
+
+def _renumber_event(event: RunEvent, offset: int, *, run_id: UUID) -> RunEvent:
+    return event.model_copy(update={"sequence": event.sequence + offset, "run_id": run_id})
+
+
 class ConfigBackedDirectRuntime:
     """Build a fresh DirectRuntime from the published model config for each run."""
 
@@ -277,15 +331,22 @@ class ConfigBackedDispatchRuntime:
             default_model=logical_model,
             task=context.request,
         )
-        return CrewDispatchRuntime(
-            gateway,
-            _dispatch_plan(
-                roles,
-                context,
-                max_parallelism=_dispatch_parallelism(config, logical_model),
+        plan = _dispatch_plan(
+            roles,
+            context,
+            max_parallelism=_dispatch_parallelism(config, logical_model),
+            capability_gateway=self._capability_gateway,
+        )
+        return _PlannedRuntime(
+            CrewDispatchRuntime(
+                gateway,
+                plan,
                 capability_gateway=self._capability_gateway,
             ),
-            capability_gateway=self._capability_gateway,
+            mode=TaskMode.DISPATCH,
+            main_agent_model=logical_model,
+            roles=_dispatch_role_payload(plan),
+            steps=_dispatch_step_payload(plan),
         )
 
 
@@ -372,15 +433,22 @@ class ConfigBackedDiscussionRuntime:
             default_model=logical_model,
             task=context.request,
         )
-        return AutoGenDiscussionRuntime(
-            gateway,
-            _discussion_plan(
-                roles,
-                logical_model,
-                context,
+        plan = _discussion_plan(
+            roles,
+            logical_model,
+            context,
+            capability_gateway=self._capability_gateway,
+        )
+        return _PlannedRuntime(
+            AutoGenDiscussionRuntime(
+                gateway,
+                plan,
                 capability_gateway=self._capability_gateway,
             ),
-            capability_gateway=self._capability_gateway,
+            mode=TaskMode.DISCUSS,
+            main_agent_model=logical_model,
+            roles=_discussion_role_payload(plan),
+            steps=_discussion_step_payload(plan),
         )
 
 
@@ -506,28 +574,46 @@ class ConfigBackedHybridRuntime:
             default_model=logical_model,
             task=context.request,
         )
-        return HybridRuntime(
-            CrewDispatchRuntime(
-                gateway,
-                _dispatch_plan(
-                    dispatch_roles,
-                    context,
-                    max_parallelism=_dispatch_parallelism(config, logical_model),
+        dispatch_plan = _dispatch_plan(
+            dispatch_roles,
+            context,
+            max_parallelism=_dispatch_parallelism(config, logical_model),
+            capability_gateway=self._capability_gateway,
+        )
+        discussion_plan = _discussion_plan(
+            discussion_roles,
+            logical_model,
+            context,
+            capability_gateway=self._capability_gateway,
+        )
+        return _PlannedRuntime(
+            HybridRuntime(
+                CrewDispatchRuntime(
+                    gateway,
+                    dispatch_plan,
                     capability_gateway=self._capability_gateway,
                 ),
-                capability_gateway=self._capability_gateway,
-            ),
-            AutoGenDiscussionRuntime(
-                gateway,
-                _discussion_plan(
-                    discussion_roles,
-                    logical_model,
-                    context,
+                AutoGenDiscussionRuntime(
+                    gateway,
+                    discussion_plan,
                     capability_gateway=self._capability_gateway,
                 ),
-                capability_gateway=self._capability_gateway,
+                DirectRuntime(gateway, logical_model=logical_model),
             ),
-            DirectRuntime(gateway, logical_model=logical_model),
+            mode=TaskMode.HYBRID,
+            main_agent_model=logical_model,
+            roles=_hybrid_role_payload(dispatch_plan, discussion_plan),
+            steps=(
+                *_dispatch_step_payload(dispatch_plan),
+                *_discussion_step_payload(discussion_plan),
+                {
+                    "id": "final_synthesis",
+                    "agent": "main_agent",
+                    "depends_on": ("discussion",),
+                    "final_synthesizer": True,
+                    "tools": (),
+                },
+            ),
         )
 
 
@@ -673,6 +759,72 @@ def _dispatch_plan(
         total_token_budget=context.token_budget,
         total_timeout_seconds=sum(step.timeout_seconds for step in (*role_steps, final_step)),
         total_cost_usd=Decimal(0),
+    )
+
+
+def _dispatch_role_payload(plan: DispatchPlan) -> tuple[Mapping[str, JsonValue], ...]:
+    step_purposes = {
+        step.agent: ("synthesize" if step.final_synthesizer else "execute")
+        for step in plan.steps
+    }
+    return tuple(
+        {
+            "id": agent.id,
+            "role": agent.role,
+            "purpose": step_purposes.get(agent.id, "execute"),
+            "logical_model": agent.logical_model,
+            "tools": agent.allowed_tools,
+        }
+        for agent in plan.agents
+    )
+
+
+def _dispatch_step_payload(plan: DispatchPlan) -> tuple[Mapping[str, JsonValue], ...]:
+    return tuple(
+        {
+            "id": step.id,
+            "agent": step.agent,
+            "depends_on": step.depends_on,
+            "final_synthesizer": step.final_synthesizer,
+            "tools": step.tools,
+        }
+        for step in plan.steps
+    )
+
+
+def _discussion_role_payload(plan: DiscussionPlan) -> tuple[Mapping[str, JsonValue], ...]:
+    return tuple(
+        {
+            "id": participant.id,
+            "role": participant.role,
+            "purpose": "expertise",
+            "logical_model": participant.logical_model,
+            "tools": participant.allowed_tools,
+        }
+        for participant in plan.participants
+    )
+
+
+def _discussion_step_payload(plan: DiscussionPlan) -> tuple[Mapping[str, JsonValue], ...]:
+    return tuple(
+        {
+            "id": "discussion",
+            "agent": participant.id,
+            "depends_on": (),
+            "final_synthesizer": False,
+            "tools": participant.allowed_tools,
+        }
+        for participant in plan.participants
+    )
+
+
+def _hybrid_role_payload(
+    dispatch_plan: DispatchPlan,
+    discussion_plan: DiscussionPlan,
+) -> tuple[Mapping[str, JsonValue], ...]:
+    return (
+        *_dispatch_role_payload(dispatch_plan),
+        *_discussion_role_payload(discussion_plan),
     )
 
 

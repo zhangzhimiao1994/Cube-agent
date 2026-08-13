@@ -251,8 +251,8 @@
 
 1. 先稳定现有功能链路。
 2. 做模块边界重构。
-3. 接 OpenClaw：作为 Runtime 或 Tool Provider，不要揉进主 Agent 核心。
-4. 做 vibe coding：作为单独大模块，依赖 Conversation、Attachment、Runtime、ModelGateway、Trace、Git 操作、代码审查能力。
+3. 接 OpenClaw：作为系统级功能开关和受控长会话/session provider，不揉进 main Agent 核心。
+4. 做 Vibe Coding：集成在 Conversation 对话能力中，依赖 Attachments、Runtime、ModelGateway、Trace、Git/代码审查能力和权限控制，不做 standalone 模块或 workflow preset。
 
 ## 新项目/新会话接手时的第一步
 
@@ -261,3 +261,11 @@
 3. 跑本地测试，确认当前 main 是否健康。
 4. 先盘点 UI 上“有按钮但未闭环”的功能。
 5. 按模块逐个拆，而不是一次性大改。
+
+## 2026-08-13 P3 Feature Boundary Update
+
+- Vibe Coding 后续不作为单独系统模块，也不作为 workflow 预设；它应集成在对话能力中，由 Conversation 入口承载，并复用 Attachments、Runtime、Model Gateway、Trace、Git/代码审查能力和权限控制。
+- OpenClaw 目标是长时间调用、随时操作电脑，因此不能只按一次性短调用 Tool 处理。
+- OpenClaw 后续应作为系统级功能开关管理，默认关闭，由管理员显式开启。
+- OpenClaw 开启项至少要包含：允许操作范围、会话超时、人工确认策略、审计级别、紧急停止行为。
+- OpenClaw 底层应是受控长会话/session provider，具备 start/pause/resume/stop/audit/permission/timeout/emergency-stop；对 Agent 暴露时可以是 tool-call 风格能力，但生命周期和电脑控制状态不能塞进 main Agent 核心。

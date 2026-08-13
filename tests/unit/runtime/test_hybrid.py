@@ -50,6 +50,60 @@ class MultiArtifactRuntime:
         return None
 
 
+class ProcessRuntime:
+    def __init__(self, mode: TaskMode, output: Artifact) -> None:
+        self.mode = mode
+        self.output = output
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        yield RunEvent(
+            kind=EventKind.STEP_STARTED,
+            sequence=1,
+            run_id=context.run_id,
+            actor="planner",
+            step_id="planner_step",
+            payload={"task": "Plan the work.", "logical_model": "main"},
+        )
+        yield RunEvent(
+            kind=EventKind.MODEL_STARTED,
+            sequence=2,
+            run_id=context.run_id,
+            actor="planner",
+            payload={"logical_model": "main", "task": "Plan the work."},
+        )
+        yield RunEvent(
+            kind=EventKind.MESSAGE_CREATED,
+            sequence=3,
+            run_id=context.run_id,
+            actor="planner",
+            session_id=str(context.run_id),
+            message="Planner received the work.",
+        )
+        yield RunEvent(
+            kind=EventKind.ARTIFACT_CREATED,
+            sequence=4,
+            run_id=context.run_id,
+            actor="planner",
+            artifact=self.output,
+            payload={"artifact_id": str(self.output.id), "output": "dispatch result"},
+        )
+        yield RunEvent(
+            kind=EventKind.RUNTIME_COMPLETED,
+            sequence=5,
+            run_id=context.run_id,
+            reason="explicit_completion",
+        )
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        raise AssertionError(f"not used: {checkpoint.id}")
+
+    async def cancel(self) -> None:
+        return None
+
+
 class FailingRuntime:
     def __init__(self, mode: TaskMode, reason: str) -> None:
         self.mode = mode
@@ -126,6 +180,47 @@ async def test_hybrid_discussion_handoff_drops_wrapped_model_response_duplicates
     assert discussion.contexts[0].artifacts == (text_output,)
     started = next(event for event in events if event.kind is EventKind.DISCUSSION_STARTED)
     assert started.inputs == (text_output,)
+
+
+@pytest.mark.asyncio
+async def test_hybrid_runtime_preserves_child_process_events() -> None:
+    dispatch_output = artifact("planner", "dispatch result")
+    discussion_output = artifact("critic", "review")
+    final_output = artifact("main", "answer")
+    runtime = HybridRuntime(
+        ProcessRuntime(TaskMode.DISPATCH, dispatch_output),
+        MultiArtifactRuntime(TaskMode.DISCUSS, (discussion_output,)),
+        MultiArtifactRuntime(TaskMode.DIRECT, (final_output,)),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=uuid4(),
+                mode=TaskMode.HYBRID,
+                request="build a plan",
+            )
+        )
+    ]
+
+    kinds = [event.kind for event in events]
+    assert EventKind.STEP_STARTED in kinds
+    assert EventKind.MODEL_STARTED in kinds
+    assert EventKind.MESSAGE_CREATED in kinds
+    assert [event.sequence for event in events] == list(range(1, len(events) + 1))
+    step = next(event for event in events if event.kind is EventKind.STEP_STARTED)
+    model = next(event for event in events if event.kind is EventKind.MODEL_STARTED)
+    message = next(event for event in events if event.kind is EventKind.MESSAGE_CREATED)
+    assert step.actor == "planner"
+    assert step.payload["logical_model"] == "main"
+    assert model.actor == "planner"
+    assert message.message == "Planner received the work."
+    assert any(
+        event.kind is EventKind.ARTIFACT_CREATED and event.artifact == dispatch_output
+        for event in events
+    )
 
 
 @pytest.mark.asyncio

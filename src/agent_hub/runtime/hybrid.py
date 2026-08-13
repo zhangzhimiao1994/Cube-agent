@@ -328,24 +328,12 @@ class HybridRuntime:
                     continue
                 if item.kind is EventKind.CHECKPOINT_SAVED:
                     continue
-                if item.kind is EventKind.ARTIFACT_CREATED and item.artifact is not None:
-                    yield RunEvent(
-                        kind=EventKind.ARTIFACT_CREATED,
-                        sequence=sequence,
-                        run_id=parent.run_id,
-                        artifact=item.artifact,
-                    )
-                    sequence += 1
-                elif item.kind is EventKind.MESSAGE_CREATED and item.actor and item.message:
-                    yield RunEvent(
-                        kind=EventKind.MESSAGE_CREATED,
-                        sequence=sequence,
-                        run_id=parent.run_id,
-                        actor=item.actor,
-                        session_id=str(parent.run_id),
-                        message=item.message,
-                        inputs=artifacts,
-                    )
+                if (
+                    item.kind is EventKind.ARTIFACT_CREATED
+                    and item.artifact is not None
+                    or _is_forwardable_child_event(item)
+                ):
+                    yield _renumber_child_event(item, sequence, parent.run_id, inputs=artifacts)
                     sequence += 1
         except RuntimeExecutionError:
             raise
@@ -478,6 +466,36 @@ class HybridRuntime:
 
 def _safe_failure_reason(error: Exception, *, fallback: str) -> str:
     return safe_runtime_failure_reason(error, fallback=fallback)
+
+
+def _is_forwardable_child_event(event: RunEvent) -> bool:
+    return event.kind in {
+        EventKind.STEP_STARTED,
+        EventKind.STEP_COMPLETED,
+        EventKind.STEP_FAILED,
+        EventKind.STEP_RETRYING,
+        EventKind.MODEL_STARTED,
+        EventKind.MESSAGE_CREATED,
+        EventKind.REVIEW_COMPLETED,
+        EventKind.TOOL_STARTED,
+        EventKind.TOOL_COMPLETED,
+        EventKind.TOOL_FAILED,
+    }
+
+
+def _renumber_child_event(
+    event: RunEvent,
+    sequence: int,
+    run_id: UUID,
+    *,
+    inputs: tuple[Artifact, ...],
+) -> RunEvent:
+    updates: dict[str, object] = {"sequence": sequence, "run_id": run_id}
+    if event.kind is EventKind.MESSAGE_CREATED:
+        updates["session_id"] = str(run_id)
+        if not event.inputs:
+            updates["inputs"] = inputs
+    return event.model_copy(update=updates)
 
 
 def _discussion_handoff_artifacts(artifacts: tuple[Artifact, ...]) -> tuple[Artifact, ...]:

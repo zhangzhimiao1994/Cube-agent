@@ -256,6 +256,7 @@ function displayEventMessage(event: RunDetail["events"][number]) {
 
 function displayEventActor(actor: string | null | undefined, agentNames: Map<string, string>) {
   if (!actor) return null;
+  if (actor === "main_agent" || actor === "main") return "主 Agent";
   return agentNames.get(actor) ?? actor;
 }
 
