@@ -428,4 +428,32 @@ describe("ModelsPage", () => {
       },
     });
   });
+
+  it("lets admins declare image and video generation model capabilities", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/models" />);
+
+    await screen.findByText("添加模型配置");
+    await user.selectOptions(screen.getByLabelText("服务商"), "custom");
+    await user.type(screen.getByLabelText("自定义服务商"), "media-provider");
+    await user.type(screen.getByLabelText("自定义模型"), "media-video-1");
+    await user.clear(screen.getByLabelText("API Base"));
+    await user.type(screen.getByLabelText("API Base"), "https://media.example.com");
+    await user.clear(screen.getByLabelText("逻辑模型名"));
+    await user.type(screen.getByLabelText("逻辑模型名"), "media_generator");
+    await user.type(screen.getByLabelText("API Key"), "sk-media-1234");
+    await user.click(screen.getByLabelText("图片生成"));
+    await user.click(screen.getByLabelText("视频生成"));
+    await user.click(screen.getByRole("button", { name: "测试并保存模型" }));
+
+    await screen.findByText("模型已通过可用性测试并保存，Key 引用：secret_created");
+    expect(requests[1]).toMatchObject({
+      path: "/api/v1/admin/models",
+      method: "POST",
+      body: expect.objectContaining({
+        logical_model: "media_generator",
+        capabilities: ["text", "image_generation", "video_generation"],
+      }),
+    });
+  });
 });

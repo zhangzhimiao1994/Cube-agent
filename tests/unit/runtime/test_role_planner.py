@@ -191,6 +191,23 @@ def test_video_prompt_dispatch_selects_creative_prompt_roles() -> None:
     assert "quality_reviewer" in role_ids
 
 
+def test_multimedia_generation_dispatch_adds_dedicated_executor_role() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="Generate a product image and then generate a short video from the approved plan.",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    executor = plan.role("multimedia_generator")
+
+    assert executor.purpose is RolePurpose.EXECUTE
+    assert "generate_multimedia" in executor.allowed_tools
+    assert "submit_video_to_text_only_model" in executor.forbidden_actions
+
+
 def test_role_catalog_can_be_extended_without_changing_role_planner_code() -> None:
     catalog = default_role_catalog().with_role(
         RoleDefinition(

@@ -1303,3 +1303,53 @@ Next:
   - admin override support,
   - execution-time enforcement so video tasks never dispatch to models without `video_generation`,
   - executor role/button path for multimedia generation after planning.
+
+## 2026-08-13 P3 Multimedia Capability Registry and Guardrails
+
+Current state:
+
+- Model capability recognition and multimedia execution guardrails are implemented.
+- `multimedia_generation_enabled` is exposed in the frontend settings page as a system-level switch.
+- Model configuration supports `image_generation` and `video_generation`.
+- Known image/video generation model families are inferred conservatively; unknown models do not receive video capability unless an admin explicitly declares it.
+- Runtime multimedia generation requests go through a dedicated executor that asks the model gateway for `image_generation` or `video_generation`, so the existing registry/capacity path blocks unsupported models.
+- Dynamic role planning now includes a `multimedia_generator` executor role for image/video generation tasks after planning.
+
+Changes made:
+
+- Added `agent_hub.models.capabilities.infer_model_capabilities`.
+- Extended `ModelCapability` and config schema with `image_generation` and `video_generation`.
+- Normalized admin model create/update requests to merge declared and inferred capabilities.
+- Added `agent_hub.multimodal.generation.MultimediaGenerationExecutor`.
+- Added a catalog-backed `multimedia_generator` dispatch/hybrid role with `generate_multimedia` permission and a `submit_video_to_text_only_model` forbidden action.
+- Added frontend settings UI for the multimedia generation switch.
+- Added frontend model capability checkboxes for image and video generation.
+
+Local verification:
+
+- TDD red checks were added first for model inference, schema acceptance, generation executor dispatch requirements, role planning, API auto-inference, and frontend controls.
+- `uv run pytest tests/unit/models/test_registry.py tests/unit/models/test_gateway.py tests/unit/config/test_schema.py tests/unit/multimodal/test_generation.py tests/unit/multimodal/test_images.py tests/unit/runtime/test_role_planner.py tests/api/test_admin_resources.py -q --tb=short` -> 334 passed, 12 skipped.
+- `uv run ruff check src tests/unit/models/test_registry.py tests/unit/config/test_schema.py tests/unit/multimodal/test_generation.py tests/unit/runtime/test_role_planner.py tests/api/test_admin_resources.py` -> passed.
+- `uv run mypy --strict src tests/unit/models/test_registry.py tests/unit/config/test_schema.py tests/unit/multimodal/test_generation.py tests/unit/runtime/test_role_planner.py tests/api/test_admin_resources.py` -> passed.
+- `npm.cmd test -- --run src/pages/ConfigPage.test.tsx src/pages/ModelsPage.test.tsx src/pages/MainAgentPage.test.tsx src/pages/OperationalPages.test.tsx` -> 56 passed.
+- `npm.cmd run lint` -> passed.
+- `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+
+Server deployment and verification:
+
+- Uploaded incremental package to `103.236.98.133:/tmp/agent-hub-p3-multimedia-capabilities.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`.
+- Restarted `agent-hub-api` and `agent-hub-worker`; reloaded Caddy.
+- Verified `agent-hub-api`, `agent-hub-worker`, and `caddy` were active.
+- Verified `/health/live` and `/health/ready` returned `{"status":"ok"}`.
+- Verified deployed Python files compile with `py_compile`.
+- Ran `/tmp/multimedia_capability_check.py` with `PYTHONPATH=src`; it passed capability inference, API model-create auto-inference, unsupported-video registry blocking, and executor video-capability dispatch checks.
+- Verified deployed `web/dist` contains the new multimedia switch and video generation capability UI.
+
+Next:
+
+- Commit this P3 slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue P3 toward OpenClaw feature switch wiring and conversation-integrated vibe coding after CI is green.

@@ -31,6 +31,8 @@ class ModelCapability(StrEnum):
     VISION = "vision"
     TOOL_CALLING = "tool_calling"
     STRUCTURED_OUTPUT = "structured_output"
+    IMAGE_GENERATION = "image_generation"
+    VIDEO_GENERATION = "video_generation"
 
 
 def _require_safe_identifier(name: str, value: str) -> None:

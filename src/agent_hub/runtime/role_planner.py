@@ -848,6 +848,7 @@ _ROLE_TRIGGER_KEYWORDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
         "director": ("导演", "镜头", "分镜", "剧情", "短剧", "视频", "叙事", "即梦", "文生视频", "图生视频", "story", "shot"),
         "copywriter": ("文案", "脚本", "短剧", "标题", "口播", "广告", "提示词", "prompt", "即梦", "slogan", "copy", "script"),
         "video_editor": ("剪辑", "字幕", "转场", "视频", "素材", "节奏", "即梦", "文生视频", "图生视频", "edit", "caption"),
+        "multimedia_generator": ("generate", "generation", "image", "video", "media", "multimedia", "文生视频", "图生视频", "生成图片", "生成视频"),
         "content_editor": ("润色", "校对", "编辑", "文案", "脚本", "改写", "polish", "edit"),
         "economic_analyst": ("经济", "市场", "需求", "定价", "宏观", "商业回报", "roi", "market"),
         "finance_analyst": ("预算", "成本", "收入", "财务", "回报", "roi", "budget", "cost"),

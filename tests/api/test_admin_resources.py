@@ -503,6 +503,21 @@ def test_model_pool_reports_serial_slot_and_queue_policy() -> None:
     assert body["saturation_policy"] == "queue_first_then_fallback"
 
 
+def test_model_create_auto_infers_known_video_generation_capability() -> None:
+    payload = {
+        **model_payload(),
+        "provider": "minimax",
+        "upstream_model": "MiniMax-Hailuo-02",
+        "logical_model": "video_primary",
+        "capabilities": ["text"],
+    }
+
+    response = client().post("/api/v1/admin/models", headers=headers(), json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["capabilities"] == ["text", "video_generation"]
+
+
 def test_main_agent_config_saves_dedicated_model_api_and_control_policy() -> None:
     api = client()
 

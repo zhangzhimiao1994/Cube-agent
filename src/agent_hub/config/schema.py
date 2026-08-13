@@ -8,7 +8,14 @@ from agent_hub.models.types import Deployment, ModelCapability
 
 SAFE_IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 MAX_IDENTIFIER_LENGTH = 128
-Capability = Literal["text", "vision", "tool_calling", "structured_output"]
+Capability = Literal[
+    "text",
+    "vision",
+    "tool_calling",
+    "structured_output",
+    "image_generation",
+    "video_generation",
+]
 
 
 def _default_capabilities() -> set[Capability]:
@@ -43,7 +50,7 @@ class DeploymentDefinition(StrictConfigModel):
     input_per_million_usd: Decimal | None = None
     output_per_million_usd: Decimal | None = None
     capabilities: set[Capability] = Field(
-        default_factory=_default_capabilities, min_length=1, max_length=4
+        default_factory=_default_capabilities, min_length=1, max_length=6
     )
 
     @field_validator("provider", "model", "api_base", "secret_ref", "quota_scope_id")

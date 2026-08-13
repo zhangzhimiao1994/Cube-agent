@@ -3,6 +3,7 @@ from math import inf, nan
 
 import pytest
 
+from agent_hub.models.capabilities import infer_model_capabilities
 from agent_hub.models.registry import ModelRegistry, NoCapableDeployment
 from agent_hub.models.types import (
     Deployment,
@@ -36,6 +37,45 @@ def test_registry_filters_by_all_required_capabilities() -> None:
 
     assert registry.candidates("primary", {ModelCapability.VISION}) == (vision,)
     assert registry.candidates("primary", frozenset()) == (text, vision)
+
+
+def test_known_video_generation_models_are_inferred_conservatively() -> None:
+    inferred = infer_model_capabilities(
+        provider="minimax",
+        upstream_model="MiniMax-Hailuo-02",
+        declared={"text"},
+    )
+
+    assert inferred == (
+        ModelCapability.TEXT,
+        ModelCapability.VIDEO_GENERATION,
+    )
+
+
+def test_unknown_models_do_not_gain_video_generation_without_admin_override() -> None:
+    inferred = infer_model_capabilities(
+        provider="deepseek",
+        upstream_model="deepseek-v4-flash",
+        declared={"text", "tool_calling"},
+    )
+
+    assert inferred == (
+        ModelCapability.TEXT,
+        ModelCapability.TOOL_CALLING,
+    )
+
+
+def test_admin_video_generation_override_is_preserved() -> None:
+    inferred = infer_model_capabilities(
+        provider="custom",
+        upstream_model="private-video-model",
+        declared={"text", "video_generation"},
+    )
+
+    assert inferred == (
+        ModelCapability.TEXT,
+        ModelCapability.VIDEO_GENERATION,
+    )
 
 
 def test_registry_returns_the_same_deployment_for_repeated_agent_role_lookups() -> None:

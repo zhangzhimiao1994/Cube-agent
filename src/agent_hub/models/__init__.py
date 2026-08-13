@@ -1,5 +1,6 @@
 """Model registry and transport contracts."""
 
+from agent_hub.models.capabilities import infer_model_capabilities
 from agent_hub.models.capacity import (
     CapacityBackendError,
     CapacityConfigurationError,
@@ -66,5 +67,6 @@ __all__ = [
     "TokenEstimator",
     "TokenUsage",
     "ToolCall",
+    "infer_model_capabilities",
     "safe_operational_limit",
 ]

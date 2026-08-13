@@ -25,6 +25,7 @@ from agent_hub.config.schema import PlatformConfig
 from agent_hub.config.service import ConfigService, ConfigValidationError
 from agent_hub.db.models import AdminResourceRow
 from agent_hub.domain.runs import RunStatus
+from agent_hub.models.capabilities import infer_model_capabilities
 from agent_hub.models.gateway import ModelTransport
 from agent_hub.models.litellm_client import LiteLLMClient, ModelTransportError
 from agent_hub.models.types import Deployment, ModelCapability, ModelMessage, ModelRequest
@@ -2779,9 +2780,17 @@ def _safe_skill_upload_filename(value: str | None) -> str:
 
 def _normalize_model_request_api_base(request: ModelDeploymentRequest) -> ModelDeploymentRequest:
     normalized = _normalized_model_api_base(request.api_protocol, request.api_base)
-    if normalized == request.api_base:
+    capabilities = [
+        capability.value
+        for capability in infer_model_capabilities(
+            provider=request.provider,
+            upstream_model=request.upstream_model,
+            declared=request.capabilities,
+        )
+    ]
+    if normalized == request.api_base and capabilities == request.capabilities:
         return request
-    return request.model_copy(update={"api_base": normalized})
+    return request.model_copy(update={"api_base": normalized, "capabilities": capabilities})
 
 
 def _normalize_main_agent_config(request: MainAgentConfigRequest) -> MainAgentConfigRequest:

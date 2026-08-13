@@ -1,5 +1,11 @@
 """Secure image intake and model-mediated vision analysis."""
 
+from agent_hub.multimodal.generation import (
+    MultimediaGenerationExecutor,
+    MultimediaGenerationGateway,
+    MultimediaGenerationKind,
+    MultimediaGenerationResult,
+)
 from agent_hub.multimodal.images import (
     FilesystemImageStore,
     ImageStoreCommitUncertain,
@@ -33,6 +39,10 @@ __all__ = [
     "ImageStoreCommitUncertain",
     "InvalidImage",
     "MemoryImageStore",
+    "MultimediaGenerationExecutor",
+    "MultimediaGenerationGateway",
+    "MultimediaGenerationKind",
+    "MultimediaGenerationResult",
     "OCRObservation",
     "SanitizedImage",
     "SignedImageReference",

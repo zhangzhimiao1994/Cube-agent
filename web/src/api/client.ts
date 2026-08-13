@@ -220,6 +220,7 @@ const SystemSettingsSchema = z.object({
   require_approval_for_tools: z.boolean(),
   allow_main_agent_override: z.boolean().default(false),
   allow_temporary_agents: z.boolean().default(false),
+  multimedia_generation_enabled: z.boolean().default(false),
   temporary_agent_policy: z.string().default(
     "主 Agent 发现角色池缺少必要能力时，必须先说明原因并取得用户确认，再临时加入子 Agent。",
   ),

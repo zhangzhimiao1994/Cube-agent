@@ -148,6 +148,18 @@ def test_capabilities_are_non_empty_and_known(capabilities: set[str]) -> None:
         deployment(capabilities=capabilities)
 
 
+def test_deployment_accepts_generation_capabilities() -> None:
+    definition = deployment(capabilities={"text", "image_generation", "video_generation"})
+    runtime = definition.to_deployment(deployment_id="primary-1", logical_model="primary")
+
+    assert definition.capabilities == {"text", "image_generation", "video_generation"}
+    assert {str(capability) for capability in runtime.capabilities} == {
+        "text",
+        "image_generation",
+        "video_generation",
+    }
+
+
 @pytest.mark.parametrize(
     "skills",
     [

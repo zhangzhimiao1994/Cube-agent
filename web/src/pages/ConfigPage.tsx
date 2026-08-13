@@ -173,6 +173,10 @@ export function ConfigPage() {
           <span>Hermes 学习</span>
           <p>{settings.hermes_enabled ? "已启用经验沉淀，但不绕过审批。" : "已关闭经验沉淀。"}</p>
         </article>
+        <article className="status-card">
+          <span>多媒体生成</span>
+          <p>{settings.multimedia_generation_enabled ? "已允许图片和视频处理/生成。" : "已关闭图片和视频处理/生成。"}</p>
+        </article>
       </div>
 
       <div className="settings-shortcuts">
@@ -272,6 +276,15 @@ export function ConfigPage() {
               onChange={(event) => updateSettings({ require_approval_for_tools: event.target.checked })}
             />
             高风险工具调用必须审批
+          </label>
+          <label className="inline-check">
+            <input
+              type="checkbox"
+              data-testid="multimedia-generation-toggle"
+              checked={settings.multimedia_generation_enabled}
+              onChange={(event) => updateSettings({ multimedia_generation_enabled: event.target.checked })}
+            />
+            多媒体生成开关
           </label>
         </fieldset>
 

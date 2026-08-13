@@ -186,6 +186,8 @@ const ALL_CAPABILITIES = [
   { label: "文本", value: "text" },
   { label: "工具调用", value: "tool_calling" },
   { label: "结构化输出", value: "structured_output" },
+  { label: "图片生成", value: "image_generation" },
+  { label: "视频生成", value: "video_generation" },
 ];
 
 const API_PROTOCOL_LABELS: Record<ApiProtocol, string> = {
