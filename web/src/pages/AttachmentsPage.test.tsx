@@ -111,4 +111,20 @@ describe("AttachmentsPage", () => {
       );
     });
   });
+
+  it("clears the bulk selection when select all is clicked again", async () => {
+    render(<TestApp initialPath="/attachments" />);
+
+    const selectAll = await screen.findByRole("checkbox", { name: "Select all attachments" });
+    const bulkDelete = screen.getByRole("button", { name: "批量删除已选附件" }) as HTMLButtonElement;
+
+    expect(bulkDelete.disabled).toBe(true);
+    await userEvent.click(selectAll);
+    expect(screen.getByText("已选 2")).not.toBeNull();
+    expect(bulkDelete.disabled).toBe(false);
+    await userEvent.click(selectAll);
+
+    expect(screen.getByText("已选 0")).not.toBeNull();
+    expect(bulkDelete.disabled).toBe(true);
+  });
 });

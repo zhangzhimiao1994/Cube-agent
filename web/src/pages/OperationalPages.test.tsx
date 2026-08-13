@@ -1844,6 +1844,27 @@ describe("operational management pages", () => {
     );
   });
 
+  it("clears Hermes bulk selection when select all is clicked again", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/hermes" />);
+
+    const selectAll = await screen.findByRole("checkbox", { name: "Select all Hermes learning records" });
+    const confirmButton = screen.getByRole("button", { name: "批量确认已选学习" }) as HTMLButtonElement;
+    const deleteButton = screen.getByRole("button", { name: "批量删除已选学习" }) as HTMLButtonElement;
+
+    expect(confirmButton.disabled).toBe(true);
+    expect(deleteButton.disabled).toBe(true);
+    await user.click(selectAll);
+    expect(screen.getByText("已选 2")).not.toBeNull();
+    expect(confirmButton.disabled).toBe(false);
+    expect(deleteButton.disabled).toBe(false);
+    await user.click(selectAll);
+
+    expect(screen.getByText("已选 0")).not.toBeNull();
+    expect(confirmButton.disabled).toBe(true);
+    expect(deleteButton.disabled).toBe(true);
+  });
+
   it("bulk deletes selected Hermes learning records through one batch API call", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/hermes" />);

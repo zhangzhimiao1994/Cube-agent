@@ -542,6 +542,22 @@ def test_attachment_management_bulk_deletes_uploaded_attachments(tmp_path: Path)
     assert listed.json()["items"] == []
 
 
+def test_attachment_management_bulk_delete_accepts_large_selection(tmp_path: Path) -> None:
+    client, _, _ = _client(attachment_store_dir=tmp_path)
+    ids = [f"att_{index:032x}" for index in range(201)]
+
+    response = client.post(
+        "/api/v1/runs/attachments/bulk-delete",
+        headers=bearer(),
+        json={"ids": ids},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["deleted"] == []
+    assert [item["id"] for item in response.json()["failed"]] == ids
+    assert {item["code"] for item in response.json()["failed"]} == {"attachment_not_found"}
+
+
 def test_submission_forwards_attachment_ids() -> None:
     client, service, principal = _client()
 

@@ -309,7 +309,7 @@ class BulkFailureResponse(BaseModel):
 class RunBulkDeleteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    ids: list[UUID] = Field(min_length=1, max_length=100)
+    ids: list[UUID] = Field(min_length=1, max_length=1000)
 
 
 class RunBulkDeleteResponse(BaseModel):

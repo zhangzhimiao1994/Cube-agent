@@ -1592,6 +1592,22 @@ def test_operational_run_bulk_delete_uses_existing_delete_rules() -> None:
     assert deleted.json()["failed"] == []
 
 
+def test_operational_run_bulk_delete_accepts_large_selection() -> None:
+    api = client()
+    ids = [str(uuid4()) for _ in range(101)]
+
+    response = api.post(
+        "/api/v1/admin/runs/bulk-delete",
+        headers=headers(),
+        json={"ids": ids},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["deleted"] == []
+    assert [item["id"] for item in response.json()["failed"]] == ids
+    assert {item["code"] for item in response.json()["failed"]} == {"not_found"}
+
+
 def test_admin_run_artifact_exposes_safe_text_for_chat_reply() -> None:
     artifact = _admin_run_artifact(
         {

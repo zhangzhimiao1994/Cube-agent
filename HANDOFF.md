@@ -2747,3 +2747,54 @@ Next:
 - Push `main` with `git push --force-with-lease mutilagent main`.
 - Check GitHub Actions and fix/redeploy/repush if red.
 - Continue P3 with conversation-integrated Vibe Coding, richer multi-system OpenClaw adapters, channel command grammar, and final GitHub usage README.
+
+## 2026-08-13 P3 Batch Action Limits and Toggle Regression
+
+Current state:
+
+- Hermes bulk confirm/delete already accepted large mobile selections with `maxItems=1000`.
+- Run bulk delete and attachment bulk delete now use the same `maxItems=1000` request limit instead of the older 100/200 limits.
+- This prevents long-list mobile "select all" actions from failing at request validation with HTTP 422 before reaching business logic.
+- Frontend regression tests now verify bulk select-all can be clicked again to clear selection for:
+  - attachment bulk delete;
+  - Hermes bulk confirm/delete.
+
+Changes made:
+
+- Raised `RunBulkDeleteRequest.ids` from 100 to 1000.
+- Raised `AttachmentBulkDeleteRequest.ids` from 200 to 1000.
+- Added backend regression tests for:
+  - 101 run IDs reaching bulk-delete business logic instead of 422;
+  - 201 attachment IDs reaching bulk-delete business logic instead of 422.
+- Added frontend regression tests for clearing attachment and Hermes bulk selections.
+
+Local verification:
+
+- `uv run pytest tests/api/test_admin_resources.py -k "hermes_bulk or run_bulk"` -> 5 passed.
+- `uv run pytest tests/api/test_runs_api.py -k "attachment_management_bulk"` -> 2 passed.
+- `npm.cmd run test -- --run src/pages/AttachmentsPage.test.tsx src/pages/OperationalPages.test.tsx` -> 49 passed.
+- `npm.cmd run test -- --run` -> 96 passed.
+- `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+- `uv run ruff check .` -> passed.
+- `uv run mypy src` -> passed.
+- `uv run pytest` collected 1897 tests and ran unit/API suites, but local integration tests failed at setup because the local PostgreSQL test database on `127.0.0.1:54329` did not become ready within 30 seconds. This is an environment dependency failure; targeted backend tests for this change passed.
+
+Server deployment and verification:
+
+- Uploaded incremental package to `103.236.98.133:/tmp/agent-hub-bulk-limits-fix.tgz`.
+- Deployed into `/opt/agent-hub/current`.
+- Restarted `agent-hub-api.service`; the API listened on `127.0.0.1:8000` after startup.
+- Ran `/tmp/server_bulk_limits_check.py` with `/etc/agent-hub/secrets.env` loaded so it used the same runtime secrets as systemd.
+- Server real API check passed:
+  - OpenAPI reports `maxItems=1000` for Hermes confirm/delete, run bulk delete, and attachment bulk delete;
+  - posting 101 non-existent run IDs reaches business logic and returns `not_found` failures, not 422;
+  - posting 201 non-existent attachment IDs reaches business logic and returns `attachment_not_found` failures, not 422.
+
+Remaining risks / next:
+
+- Full local integration test suite still requires a ready local PostgreSQL test database.
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue P3 with the remaining project-completion items and final GitHub usage README.
