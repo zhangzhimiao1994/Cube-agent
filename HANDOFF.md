@@ -54,6 +54,12 @@ Verification performed:
   - `uv run mypy --strict src tests` -> passed.
   - `npm.cmd run lint` -> passed.
   - `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+- GitHub Actions follow-up:
+  - Run `31694188337` failed in `python-web-shell` because `web/src/pages/ModelsPage.test.tsx` still expected the old MiniMax preset base URL `https://api.minimax.io/v1`.
+  - Updated the frontend test expectations to `https://api.minimaxi.com/v1`, matching the runtime preset and the real server provider verification.
+  - `npm.cmd test -- --run src/pages/ModelsPage.test.tsx` -> 14 passed.
+  - `npm.cmd run lint` -> passed.
+  - `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
 - Server deployment and real verification:
   - Uploaded incremental package to `103.236.98.133:/tmp/agent-hub-p3-minimax-video-provider.tgz`.
   - Deployed incrementally into `/opt/agent-hub/current`.
@@ -2203,7 +2209,7 @@ Server deployment and verification:
   - reused the existing MiniMax M3 credential reference `secret://a023b083-bb9d-4fb5-9d4d-e61e22cc814b`;
   - created a MiniMax Hailuo video model with `video_generation`;
   - created a MiniMax speech model with `audio_generation`;
-  - verified API Base normalization to `https://api.minimax.io/v1`;
+  - verified API Base normalization to the MiniMax preset base URL;
   - verified both created models appeared in list models;
   - deleted both temporary models after the check.
 

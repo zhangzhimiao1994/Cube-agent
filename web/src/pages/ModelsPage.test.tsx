@@ -504,7 +504,7 @@ describe("ModelsPage", () => {
       "__custom_model__",
     ]);
     expect((view.container.querySelector("#api-base") as HTMLInputElement).value).toBe(
-      "https://api.minimax.io/v1",
+      "https://api.minimaxi.com/v1",
     );
     expect((view.container.querySelector("#logical-model") as HTMLInputElement).value).toBe(
       "video_primary",
@@ -523,7 +523,7 @@ describe("ModelsPage", () => {
       method: "POST",
       body: {
         provider: "minimax",
-        api_base: "https://api.minimax.io/v1",
+        api_base: "https://api.minimaxi.com/v1",
         api_protocol: "openai_compatible",
         upstream_model: "MiniMax-Hailuo-02",
         logical_model: "video_primary",
@@ -566,7 +566,7 @@ describe("ModelsPage", () => {
       method: "POST",
       body: expect.objectContaining({
         provider: "minimax",
-        api_base: "https://api.minimax.io/v1",
+        api_base: "https://api.minimaxi.com/v1",
         upstream_model: "speech-2.8-turbo",
         logical_model: "audio_primary",
         capabilities: ["audio_generation"],
