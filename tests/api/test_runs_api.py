@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import tarfile
+import zipfile
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -446,6 +447,59 @@ def test_attachment_upload_extracts_common_archive_manifest_safely(tmp_path: Pat
     assert manifest["archive"]["extracted"] is True
     assert [item["path"] for item in manifest["files"]] == ["src/main.py", "README.md"]
     assert (manifest_path.parent / body["id"] / "src" / "main.py").is_file()
+
+
+def test_attachment_management_lists_uploaded_metadata(tmp_path: Path) -> None:
+    client, _, _ = _client(attachment_store_dir=tmp_path)
+
+    uploaded = client.post(
+        "/api/v1/runs/attachments/upload",
+        headers={
+            **bearer(),
+            "X-Agent-Hub-Filename": "notes.txt",
+            "Content-Type": "text/plain",
+        },
+        content=b"hello",
+    )
+    listed = client.get("/api/v1/runs/attachments", headers=bearer())
+
+    assert uploaded.status_code == 200
+    assert listed.status_code == 200
+    assert listed.json()["items"] == [uploaded.json()]
+
+
+def test_attachment_management_deletes_data_metadata_manifest_and_extract_dir(tmp_path: Path) -> None:
+    client, _, _ = _client(attachment_store_dir=tmp_path)
+    archive_buffer = io.BytesIO()
+    with zipfile.ZipFile(archive_buffer, "w") as archive:
+        archive.writestr("src/main.py", "print('hello')\n")
+
+    uploaded = client.post(
+        "/api/v1/runs/attachments/upload",
+        headers={
+            **bearer(),
+            "X-Agent-Hub-Filename": "source.zip",
+            "Content-Type": "application/zip",
+        },
+        content=archive_buffer.getvalue(),
+    )
+    attachment_id = uploaded.json()["id"]
+    tenant_dir = next(tmp_path.iterdir())
+    assert (tenant_dir / f"{attachment_id}.bin").is_file()
+    assert (tenant_dir / f"{attachment_id}.json").is_file()
+    assert (tenant_dir / f"{attachment_id}.manifest.json").is_file()
+    assert (tenant_dir / attachment_id / "src" / "main.py").is_file()
+
+    deleted = client.delete(f"/api/v1/runs/attachments/{attachment_id}", headers=bearer())
+    listed = client.get("/api/v1/runs/attachments", headers=bearer())
+
+    assert deleted.status_code == 200
+    assert deleted.json() == {"id": attachment_id, "deleted": True}
+    assert listed.json()["items"] == []
+    assert not (tenant_dir / f"{attachment_id}.bin").exists()
+    assert not (tenant_dir / f"{attachment_id}.json").exists()
+    assert not (tenant_dir / f"{attachment_id}.manifest.json").exists()
+    assert not (tenant_dir / attachment_id).exists()
 
 
 def test_submission_forwards_attachment_ids() -> None:

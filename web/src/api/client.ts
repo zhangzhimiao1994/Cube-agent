@@ -446,6 +446,15 @@ const AttachmentUploadSchema = z.object({
 
 export type AttachmentUpload = z.infer<typeof AttachmentUploadSchema>;
 
+const AttachmentListSchema = z.object({
+  items: z.array(AttachmentUploadSchema),
+});
+
+const AttachmentDeleteSchema = z.object({
+  id: z.string(),
+  deleted: z.boolean(),
+});
+
 const McpServerSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -947,6 +956,16 @@ export const api = {
         },
       },
       AttachmentUploadSchema,
+    );
+  },
+  attachments(): Promise<AttachmentUpload[]> {
+    return request("/api/v1/runs/attachments", { method: "GET" }, AttachmentListSchema).then((result) => result.items);
+  },
+  deleteAttachment(id: string): Promise<{ id: string; deleted: boolean }> {
+    return request(
+      `/api/v1/runs/attachments/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+      AttachmentDeleteSchema,
     );
   },
   chooseMode(

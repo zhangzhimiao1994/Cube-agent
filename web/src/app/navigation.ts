@@ -86,6 +86,12 @@ export const MODULE_GROUPS: ModuleGroup[] = [
         description: "管理可被 Agent 参考的长期记忆、会话摘要和上下文资源。",
         permission: "memory:read",
       },
+      {
+        to: "/attachments",
+        label: "附件",
+        description: "查看和删除从对话页上传的图片、文档、压缩包和上下文文件。",
+        permission: "run:read",
+      },
     ],
   },
   {

@@ -1,4 +1,63 @@
 
+## 2026-08-13 Attachment Manager Slice
+
+Current state:
+
+- Uploaded chat attachments now have a management surface.
+- Backend APIs:
+  - `GET /api/v1/runs/attachments` lists current-tenant uploaded attachments from stored metadata.
+  - `DELETE /api/v1/runs/attachments/{attachment_id}` deletes the attachment `.bin`, `.json`, optional `.manifest.json`, and optional extracted archive directory.
+- Attachment IDs are validated as `att_` plus 32 lowercase hex characters before any filesystem operation.
+- The frontend has a new `/attachments` page titled `附件管理`.
+- The navigation now exposes `附件` under the `资源` module group.
+- Server incremental deployment to `103.236.98.133:/opt/agent-hub/current` was performed with `/tmp/agent-hub-attachment-manager.tgz`.
+- Server services `agent-hub-api` and `agent-hub-worker` were restarted and active afterward; Caddy was reloaded for the rebuilt frontend.
+- Server real HTTP check passed with `/tmp/server_attachment_manager_check.py`:
+  - loaded `/etc/agent-hub/secrets.env` and used deployed code from `/opt/agent-hub/current`;
+  - uploaded a real ZIP attachment through `POST /api/v1/runs/attachments/upload`;
+  - verified the `.bin`, `.json`, `.manifest.json`, and extracted file existed on disk;
+  - verified `GET /api/v1/runs/attachments` listed the uploaded attachment;
+  - deleted it through `DELETE /api/v1/runs/attachments/{id}`;
+  - verified the list no longer contained it and all related files/directories were removed.
+
+Changes made:
+
+- `src/agent_hub/api/routers/runs.py`
+  - Added attachment list/delete response models.
+  - Added tenant-scoped attachment list and delete endpoints.
+  - Reused tenant attachment directory calculation for upload/list/delete.
+- `tests/api/test_runs_api.py`
+  - Added regression coverage for listing uploaded metadata.
+  - Added deletion coverage for archive data, metadata, manifest, and extracted directory cleanup.
+- `web/src/api/client.ts`
+  - Added attachment list/delete client methods.
+- `web/src/pages/AttachmentsPage.tsx`
+  - Added attachment management UI.
+- `web/src/pages/AttachmentsPage.test.tsx`
+  - Added page regression coverage for list and delete.
+- `web/src/app/router.tsx`, `web/src/app/navigation.ts`
+  - Added route and resource navigation entry.
+
+Verification performed:
+
+- TDD red:
+  - `uv run pytest tests/api/test_runs_api.py::test_attachment_management_lists_uploaded_metadata tests/api/test_runs_api.py::test_attachment_management_deletes_data_metadata_manifest_and_extract_dir -q --tb=short` first failed with 422/405 because list/delete APIs did not exist.
+  - `npm test -- --run src/pages/AttachmentsPage.test.tsx` first failed because `/attachments` rendered the existing run page fallback instead of an attachment page.
+- Green/local:
+  - `uv run pytest tests/api/test_runs_api.py::test_attachment_management_lists_uploaded_metadata tests/api/test_runs_api.py::test_attachment_management_deletes_data_metadata_manifest_and_extract_dir -q --tb=short` -> 2 passed.
+  - `uv run pytest tests/api/test_runs_api.py -q --tb=short` -> 15 passed.
+  - `uv run ruff check src tests` -> passed.
+  - `uv run mypy --strict src tests` -> passed.
+  - `npm test -- --run src/pages/AttachmentsPage.test.tsx src/app/AppShell.test.tsx` -> 7 passed.
+  - `npm run build` -> passed; Vite still reports the existing chunk-size warning.
+- Green/server:
+  - `/tmp/server_attachment_manager_check.py` -> `PASS: server attachment upload, list, delete, and file cleanup verified`.
+
+Remaining risks / TODOs:
+
+- Continue remaining P3 items: deeper Vibe runtime integration, OpenClaw multi-system adapters and permission modes, multimedia generation executor/capability enforcement, protected Feishu Skill install commands, and final usage README.
+- Attachment manager currently deletes individual attachments. Bulk selection/delete can be added later if the list grows large.
+
 ## 2026-08-13 Skill Bundle Upload Slice
 
 Current state:

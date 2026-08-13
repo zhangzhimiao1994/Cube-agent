@@ -4,6 +4,7 @@ import { BrowserRouter, MemoryRouter, Navigate, Route, Routes } from "react-rout
 import { AppShell } from "./AppShell";
 import { AuthProvider, RequireAuth } from "../auth/AuthProvider";
 import { AgentsPage } from "../pages/AgentsPage";
+import { AttachmentsPage } from "../pages/AttachmentsPage";
 import { ChannelsPage } from "../pages/ChannelsPage";
 import { ConfigPage } from "../pages/ConfigPage";
 import { HermesPage } from "../pages/HermesPage";
@@ -50,6 +51,7 @@ export function AppRoutes() {
         <Route path="config" element={<ConfigPage />} />
         <Route path="main-agent" element={<MainAgentPage />} />
         <Route path="models" element={<ModelsPage />} />
+        <Route path="attachments" element={<AttachmentsPage />} />
         <Route path="agents" element={<AgentsPage />} />
         <Route path="workflows" element={<WorkflowsPage />} />
         <Route path="skills" element={<SkillsPage />} />

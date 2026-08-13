@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import re
+import shutil
 import tarfile
 import zipfile
 from datetime import UTC, datetime, timedelta
@@ -241,6 +242,19 @@ class AttachmentUploadResponse(BaseModel):
     expires_at: datetime
 
 
+class AttachmentListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[AttachmentUploadResponse]
+
+
+class AttachmentDeleteResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    deleted: bool
+
+
 def _run_service(request: Request) -> RunServiceProtocol:
     service = getattr(request.app.state, "run_service", None)
     if service is None:
@@ -267,6 +281,16 @@ def _attachment_store_dir(request: Request) -> Path:
     if settings is not None and hasattr(settings, "attachment_store_dir"):
         return cast(Path, settings.attachment_store_dir)
     return Path("/var/lib/agent-hub/attachments")
+
+
+def _tenant_attachment_dir(request: Request, principal: AuthenticatedPrincipal) -> Path:
+    return (_attachment_store_dir(request) / str(principal.tenant_id)).resolve()
+
+
+def _safe_attachment_id(value: str) -> str:
+    if re.fullmatch(r"att_[a-f0-9]{32}", value) is None:
+        raise PublicAPIError(422, "request_validation", "invalid attachment id")
+    return value
 
 
 def _attachment_limits(request: Request) -> tuple[int, int]:
@@ -469,7 +493,7 @@ async def upload_attachment(
     attachment_id = f"att_{uuid4().hex}"
     digest = hashlib.sha256(body).hexdigest()
     expires_at = datetime.now(UTC) + timedelta(days=retention_days)
-    tenant_dir = (_attachment_store_dir(request) / str(principal.tenant_id)).resolve()
+    tenant_dir = _tenant_attachment_dir(request, principal)
     tenant_dir.mkdir(parents=True, exist_ok=True)
     data_path = tenant_dir / f"{attachment_id}.bin"
     meta_path = tenant_dir / f"{attachment_id}.json"
@@ -509,6 +533,71 @@ async def upload_attachment(
         sha256=digest,
         expires_at=expires_at,
     )
+
+
+def _read_attachment_metadata(path: Path) -> AttachmentUploadResponse | None:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            raw = {key: raw[key] for key in AttachmentUploadResponse.model_fields if key in raw}
+        return AttachmentUploadResponse.model_validate(raw)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+@router.get(
+    "/attachments",
+    response_model=AttachmentListResponse,
+    responses=error_responses(401, 403, 500),
+)
+async def list_attachments(
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:read"))],
+) -> AttachmentListResponse:
+    tenant_dir = _tenant_attachment_dir(request, principal)
+    if not tenant_dir.is_dir():
+        return AttachmentListResponse(items=[])
+    metadata: list[tuple[float, AttachmentUploadResponse]] = []
+    for path in tenant_dir.glob("att_*.json"):
+        if path.name.endswith(".manifest.json"):
+            continue
+        item = _read_attachment_metadata(path)
+        if item is not None:
+            metadata.append((path.stat().st_mtime, item))
+    metadata.sort(key=lambda item: item[0], reverse=True)
+    return AttachmentListResponse(items=[item for _, item in metadata])
+
+
+@router.delete(
+    "/attachments/{attachment_id}",
+    response_model=AttachmentDeleteResponse,
+    responses=error_responses(401, 403, 404, 422, 500),
+)
+async def delete_attachment(
+    attachment_id: str,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:create"))],
+) -> AttachmentDeleteResponse:
+    safe_id = _safe_attachment_id(attachment_id)
+    tenant_dir = _tenant_attachment_dir(request, principal)
+    deleted = False
+    for path in (
+        tenant_dir / f"{safe_id}.bin",
+        tenant_dir / f"{safe_id}.json",
+        tenant_dir / f"{safe_id}.manifest.json",
+    ):
+        if path.exists():
+            path.unlink()
+            deleted = True
+    extract_dir = tenant_dir / safe_id
+    if extract_dir.exists():
+        if not extract_dir.is_dir():
+            raise PublicAPIError(500, "attachment_store_error", "attachment store is inconsistent")
+        shutil.rmtree(extract_dir)
+        deleted = True
+    if not deleted:
+        raise PublicAPIError(404, "attachment_not_found", "attachment was not found")
+    return AttachmentDeleteResponse(id=safe_id, deleted=True)
 
 
 def _run_not_found() -> PublicAPIError:
