@@ -3,6 +3,7 @@ import io
 import sys
 import tarfile
 import zipfile
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -51,6 +52,8 @@ from agent_hub.multimodal.generation import (
 )
 from agent_hub.multimodal.video_providers import VideoProviderGenerationError
 from agent_hub.runs.repository import RunRecord
+from agent_hub.scheduler.service import SchedulerService
+from agent_hub.scheduler.types import TaskRequest
 from agent_hub.security.secrets import SecretReference
 
 
@@ -791,6 +794,56 @@ def headers() -> dict[str, str]:
     return {"Authorization": "Bearer valid-token"}
 
 
+@dataclass(frozen=True, slots=True)
+class SubmittedScheduleRun:
+    id: UUID
+
+
+class RecordingScheduleSubmitter:
+    def __init__(self) -> None:
+        self.calls: list[TaskRequest] = []
+
+    async def submit(self, request: TaskRequest) -> SubmittedScheduleRun:
+        self.calls.append(request)
+        return SubmittedScheduleRun(uuid4())
+
+
+class PersistentScheduleResourceService(InMemoryAdminResourceService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.payloads: dict[tuple[str, str], dict[str, object]] = {}
+
+    async def _list_admin_payloads(self, kind: str) -> list[dict[str, object]]:
+        return [
+            payload
+            for (stored_kind, _resource_id), payload in sorted(self.payloads.items())
+            if stored_kind == kind
+        ]
+
+    async def _upsert_admin_payload(
+        self, kind: str, resource_id: str, payload: dict[str, object]
+    ) -> bool:
+        self.payloads[(kind, resource_id)] = payload
+        return True
+
+    async def _delete_admin_payload(self, kind: str, resource_id: str) -> bool:
+        return self.payloads.pop((kind, resource_id), None) is not None
+
+
+def scheduler_client(
+    submitter: RecordingScheduleSubmitter,
+    *,
+    resource_service: InMemoryAdminResourceService | None = None,
+) -> TestClient:
+    app = create_app(
+        auth_service=StubAuthService(),
+        rate_limiter=object(),
+    )
+    app.state.admin_resource_service = resource_service or InMemoryAdminResourceService()
+    app.state.schedule_service = SchedulerService(submitter.submit)
+    return TestClient(app)
+
+
 def model_payload() -> dict[str, object]:
     return {
         "provider": "deepseek",
@@ -809,6 +862,103 @@ def model_payload() -> dict[str, object]:
         "fallback": "planner_backup",
         "weight": 100,
     }
+
+
+def test_schedule_api_creates_lists_and_ticks_user_visible_tasks() -> None:
+    submitter = RecordingScheduleSubmitter()
+    api = scheduler_client(submitter)
+    run_at = "2026-08-13T09:00:00+08:00"
+
+    created = api.post(
+        "/api/v1/admin/schedules",
+        headers=headers(),
+        json={
+            "name": "daily-report-fill",
+            "message": "Open the report system and fill today's report",
+            "mode": "dispatch",
+            "workflow_id": "daily_report",
+            "kind": "one_time",
+            "run_at": run_at,
+            "timezone": "Asia/Shanghai",
+            "misfire_policy": "fire_once",
+            "budget": 4096,
+            "metadata": {"openclaw": "windows_desktop_report"},
+        },
+    )
+
+    assert created.status_code == 201
+    schedule = created.json()
+    assert schedule["name"] == "daily-report-fill"
+    assert schedule["status"] == "active"
+    assert schedule["kind"] == "one_time"
+    assert schedule["next_fire_at"] == "2026-08-13T01:00:00Z"
+
+    listed = api.get("/api/v1/admin/schedules", headers=headers())
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()] == [schedule["id"]]
+
+    ticked = api.post(
+        "/api/v1/admin/schedules/tick",
+        headers=headers(),
+        json={"now": run_at},
+    )
+
+    assert ticked.status_code == 200
+    assert ticked.json() == {"fired": [schedule["id"]]}
+    assert len(submitter.calls) == 1
+    request = submitter.calls[0]
+    assert request.tenant_id == TENANT_ID
+    assert request.actor_id == USER_ID
+    assert request.message == "Open the report system and fill today's report"
+    assert request.mode.value == "dispatch"
+    assert request.workflow == "daily_report"
+    assert request.budget == 4096
+    assert request.metadata["schedule_id"] == schedule["id"]
+    assert request.metadata["openclaw"] == "windows_desktop_report"
+
+
+def test_schedule_api_persists_restores_and_deletes_tasks() -> None:
+    resource_service = PersistentScheduleResourceService()
+    api = scheduler_client(RecordingScheduleSubmitter(), resource_service=resource_service)
+    run_at = "2026-08-14T09:00:00+08:00"
+
+    created = api.post(
+        "/api/v1/admin/schedules",
+        headers=headers(),
+        json={
+            "name": "restart-safe-report-fill",
+            "message": "Open the report system after restart",
+            "mode": "dispatch",
+            "workflow_id": "daily_report",
+            "kind": "one_time",
+            "run_at": run_at,
+            "timezone": "Asia/Shanghai",
+            "misfire_policy": "fire_once",
+            "budget": 4096,
+            "metadata": {"openclaw": "windows_desktop_report"},
+        },
+    )
+
+    assert created.status_code == 201
+    schedule_id = created.json()["id"]
+    assert ("schedule", schedule_id) in resource_service.payloads
+
+    restarted_api = scheduler_client(
+        RecordingScheduleSubmitter(),
+        resource_service=resource_service,
+    )
+    restored = restarted_api.get("/api/v1/admin/schedules", headers=headers())
+    assert restored.status_code == 200
+    assert [item["id"] for item in restored.json()] == [schedule_id]
+
+    deleted = restarted_api.delete(f"/api/v1/admin/schedules/{schedule_id}", headers=headers())
+    assert deleted.status_code == 200
+    assert deleted.json() == {"id": schedule_id, "deleted": True}
+    assert ("schedule", schedule_id) not in resource_service.payloads
+
+    listed_after_delete = restarted_api.get("/api/v1/admin/schedules", headers=headers())
+    assert listed_after_delete.status_code == 200
+    assert listed_after_delete.json() == []
 
 
 def skill_archive() -> bytes:

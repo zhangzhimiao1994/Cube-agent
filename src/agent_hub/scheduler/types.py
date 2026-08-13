@@ -223,8 +223,10 @@ def deterministic_idempotency_key(
     if fire_time.tzinfo is None:
         raise ValueError("fire_time must be timezone-aware")
     normalized_fire_time = fire_time.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
-    base_digest = hashlib.sha256(base_key.encode("utf-8")).hexdigest()[:16]
-    return f"schedule:{tenant_id}:{schedule_id}:{normalized_fire_time}:{base_digest}"
+    digest = hashlib.sha256(
+        f"{tenant_id}:{schedule_id}:{normalized_fire_time}:{base_key}".encode()
+    ).hexdigest()[:32]
+    return f"schedule:{digest}"
 
 
 def _safe_idempotency_key(value: str) -> str:

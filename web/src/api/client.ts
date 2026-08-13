@@ -482,6 +482,39 @@ const MultimediaGenerationSchema = z.object({
 
 export type MultimediaGeneration = z.infer<typeof MultimediaGenerationSchema>;
 
+const ScheduleSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  status: z.string(),
+  kind: z.enum(["one_time", "cron"]),
+  mode: z.enum(["auto", "direct", "dispatch", "discuss", "hybrid"]),
+  workflow_id: z.string(),
+  message: z.string(),
+  timezone: z.string(),
+  next_fire_at: z.string().nullable(),
+  run_at: z.string().nullable(),
+  cron: z.string().nullable(),
+  misfire_policy: z.enum(["fire_once", "skip"]),
+  budget: z.number(),
+  metadata: z.record(z.string(), z.string()),
+});
+
+export type Schedule = z.infer<typeof ScheduleSchema>;
+
+export type ScheduleCreatePayload = {
+  name: string;
+  message: string;
+  mode: "auto" | "direct" | "dispatch" | "discuss" | "hybrid";
+  workflow_id: string;
+  kind: "one_time" | "cron";
+  run_at?: string | null;
+  cron?: string | null;
+  timezone: string;
+  misfire_policy: "fire_once" | "skip";
+  budget: number;
+  metadata: Record<string, string>;
+};
+
 const McpServerSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -1025,6 +1058,30 @@ export const api = {
       "/api/v1/admin/multimedia/generate",
       { method: "POST", body: JSON.stringify(payload) },
       MultimediaGenerationSchema,
+    );
+  },
+  schedules(): Promise<Schedule[]> {
+    return request("/api/v1/admin/schedules", { method: "GET" }, z.array(ScheduleSchema));
+  },
+  createSchedule(payload: ScheduleCreatePayload): Promise<Schedule> {
+    return request(
+      "/api/v1/admin/schedules",
+      { method: "POST", body: JSON.stringify(payload) },
+      ScheduleSchema,
+    );
+  },
+  tickSchedules(now: string): Promise<{ fired: string[] }> {
+    return request(
+      "/api/v1/admin/schedules/tick",
+      { method: "POST", body: JSON.stringify({ now }) },
+      z.object({ fired: z.array(z.string()) }),
+    );
+  },
+  deleteSchedule(id: string): Promise<{ id: string; deleted: boolean }> {
+    return request(
+      `/api/v1/admin/schedules/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+      z.object({ id: z.string(), deleted: z.boolean() }),
     );
   },
   chooseMode(

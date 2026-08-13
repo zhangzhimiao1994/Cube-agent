@@ -89,6 +89,8 @@ from agent_hub.runs.service import ModeRouterProtocol, RunService, TaskQueue
 from agent_hub.runs.temporary_agents import AdminResourceTemporaryAgentPolicy
 from agent_hub.runtime.defaults import TenantSecretResolver, configured_runtime_registry
 from agent_hub.runtime.registry import RuntimeRegistry
+from agent_hub.scheduler.service import SchedulerService
+from agent_hub.scheduler.types import TaskRequest
 from agent_hub.security.secrets import SecretCipher, SecretService
 from agent_hub.settings import Settings, get_settings
 
@@ -788,6 +790,13 @@ def create_app(
                 application.state.run_queue = queue
                 application.state.mode_router = active_mode_router
             if (
+                getattr(application.state, "schedule_service", None) is None
+                and getattr(application.state, "run_service", None) is not None
+            ):
+                application.state.schedule_service = SchedulerService(
+                    lambda task: _submit_scheduled_task(application, task)
+                )
+            if (
                 feishu_gateway is None
                 and active_sessions is not None
                 and getattr(application.state, "run_service", None) is not None
@@ -899,6 +908,7 @@ def create_app(
     application.state.runtime_registry = active_runtime_registry
     application.state.mode_router = mode_router
     application.state.run_queue = task_queue
+    application.state.schedule_service = None
     application.state.feishu_gateway = feishu_gateway
     application.state.feishu_reply_dispatcher = None
     application.state.feishu_reply_tasks = set()
@@ -988,6 +998,22 @@ def _feishu_gateway_from_request(request: Request) -> ChannelGatewayProtocol | N
     if gateway is None:
         return None
     return cast(ChannelGatewayProtocol, gateway)
+
+
+async def _submit_scheduled_task(application: FastAPI, request: TaskRequest) -> object:
+    run_service = getattr(application.state, "run_service", None)
+    if run_service is None or not hasattr(run_service, "submit"):
+        raise RuntimeError("run service is unavailable")
+    metadata = {str(key): str(value) for key, value in request.metadata.items()}
+    return await cast(Any, run_service).submit(
+        tenant_id=request.tenant_id,
+        actor_id=request.actor_id,
+        message=request.message,
+        mode=request.mode,
+        workflow_id=request.workflow,
+        channel_context=metadata,
+        idempotency_key=request.idempotency_key,
+    )
 
 
 async def _channel_runtime_config_from_request(request: Request) -> Mapping[str, str]:

@@ -94,8 +94,13 @@ class SchedulerService:
         if now.tzinfo is None:
             raise ValueError("now must be timezone-aware")
         assert schedule.spec is not None
-        next_fire_at = schedule.next_fire_at or schedule.spec.first_fire_after(now)
-        stored = replace(schedule, next_fire_at=next_fire_at.astimezone(UTC))
+        next_fire_at = schedule.next_fire_at
+        if next_fire_at is None and schedule.status is ScheduleStatus.ACTIVE:
+            next_fire_at = schedule.spec.first_fire_after(now)
+        if next_fire_at is None:
+            stored = replace(schedule, next_fire_at=None)
+        else:
+            stored = replace(schedule, next_fire_at=next_fire_at.astimezone(UTC))
         async with self._lock:
             key = (stored.tenant_id, stored.id)
             if key in self._schedules:
@@ -117,6 +122,18 @@ class SchedulerService:
                 for key, schedule in self._schedules.items()
                 if key[0] == tenant_id
             )
+
+    async def delete_schedule(self, *, tenant_id: UUID, schedule_id: UUID) -> None:
+        async with self._lock:
+            try:
+                del self._schedules[(tenant_id, schedule_id)]
+            except KeyError:
+                raise KeyError("schedule not found") from None
+            self._submitted_fires = {
+                key
+                for key in self._submitted_fires
+                if key[0] != tenant_id or key[1] != schedule_id
+            }
 
     async def next_fire(self, schedule_id: UUID, *, tenant_id: UUID) -> datetime | None:
         async with self._lock:

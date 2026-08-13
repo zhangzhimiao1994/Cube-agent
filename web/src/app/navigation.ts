@@ -59,6 +59,12 @@ export const MODULE_GROUPS: ModuleGroup[] = [
         permission: "agent:read",
       },
       {
+        to: "/schedules",
+        label: "计划任务",
+        description: "按指定时间提交任务，可用于报表填写、提醒和需要 OpenClaw 审批的本机操作。",
+        permission: "run:create",
+      },
+      {
         to: "/hermes",
         label: "Hermes 学习",
         description: "按时间和会话 ID 查看学习沉淀，确认后再应用到系统行为。",

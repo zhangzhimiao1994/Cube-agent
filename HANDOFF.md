@@ -1,4 +1,83 @@
 
+## 2026-08-13 P3 Scheduled Task Mode
+
+Current state:
+
+- Added the first system-level scheduled task mode.
+  - Admin API can create/list/tick/delete schedules under `/api/v1/admin/schedules`.
+  - Schedules submit ordinary run requests through the normal run service path; they do not bypass routing, capacity, approval, OpenClaw safety, or audit boundaries.
+  - Schedule definitions are persisted through the existing `admin_resource` table using kind `schedule`, restored into the scheduler after process restart, and written back after ticks so completed one-time schedules are not re-fired.
+  - UI now has a `计划任务` navigation entry and page for creating a report-fill style OpenClaw task, checking due tasks, listing schedules, and deleting schedules.
+
+Changes made:
+
+- Updated `src/agent_hub/api/routers/admin.py`
+  - Added schedule request/response schemas, create/list/tick/delete routes, persistence serialization, restore, and state write-back helpers.
+- Updated `src/agent_hub/app.py`
+  - Wires a default scheduler service to ordinary run submission when the run service is available.
+- Updated `src/agent_hub/scheduler/service.py`
+  - Added schedule deletion and fixed restore behavior so completed schedules with no next fire time stay completed.
+- Updated `src/agent_hub/db/models.py`
+  - Allows `schedule` in the persistent admin resource kind constraint.
+- Updated frontend API/router/navigation and added `web/src/pages/SchedulesPage.tsx`.
+- Added backend and frontend regression tests for create/list/tick, persistence across scheduler restart, and delete.
+
+Verification performed:
+
+- `uv run pytest tests/api/test_admin_resources.py::test_schedule_api_creates_lists_and_ticks_user_visible_tasks tests/api/test_admin_resources.py::test_schedule_api_persists_restores_and_deletes_tasks tests/unit/test_database_resources.py::test_admin_resource_kind_constraint_allows_all_persistent_admin_resources tests/unit/test_app_wiring.py -q --tb=short` -> 17 passed.
+- `uv run pytest tests/api/test_admin_resources.py tests/unit/test_database_resources.py tests/unit/test_app_wiring.py -q --tb=short` -> 97 passed.
+- `uv run pytest tests/unit/test_scheduler_types.py -q --tb=short` -> passed; verifies schedule idempotency keys fit the run outbox prefix length limit.
+- `uv run ruff check src tests` -> passed.
+- `uv run mypy --strict src tests` -> passed.
+- `npm.cmd run test -- --run` -> 93 passed.
+- `npm.cmd run build` -> passed.
+- Local scheduler integration tests that require a local Postgres fixture were not counted as a code failure because the local DB fixture timed out.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-p3-schedules.tgz`, then `/tmp/agent-hub-p3-schedules-fix.tgz`, then `/tmp/agent-hub-p3-schedules-key-fix.tgz` to `103.236.98.133`.
+  - Deployed incrementally into `/opt/agent-hub/current`.
+  - Ran `PYTHONPATH=/opt/agent-hub/current/src .venv/bin/python -m alembic upgrade head`; migration `0017_schedule_admin_resources` applied.
+  - Restarted `agent-hub-api` and `agent-hub-worker`; verified `agent-hub-api`, `agent-hub-worker`, and `caddy` active.
+- Server real environment verification:
+  - `/tmp/server_schedules_check.py` first exposed that the production DB check constraint did not allow `schedule`; fixed with Alembic 0017 and by making schedule persistence failures return `schedule_persistence_unavailable` instead of a false 201.
+  - The next run exposed a real outbox `idempotency_key` length failure during tick; fixed by shortening scheduler deterministic idempotency keys to `schedule:<32-hex>`.
+  - Final `/tmp/server_schedules_check.py` passed through the real local HTTP API with server env loaded:
+    - created a schedule;
+    - restarted `agent-hub-api`;
+    - verified persisted schedule restoration after restart;
+    - ticked the schedule and verified a visible run was created;
+    - deleted the schedule and verified cleanup.
+  - Final output: `{"status": "ok", "checked": ["create_schedule", "persist_restore_after_api_restart", "tick_creates_visible_run", "delete_schedule_cleanup"], "schedule_id": "ed8ac934-9beb-4619-8255-3cab0706dce1", "run_id": "e654f192-9043-4615-a14a-47a4d74cced8"}`.
+
+Remaining risks / TODOs:
+
+- Final Docker acceptance must build the image on this Windows machine, start it in the local Docker service, and run the same real feature verification suite against that local Docker stack.
+- UI copy in `SchedulesPage.tsx` currently follows existing console encoding; later UI branding cleanup should normalize visible Chinese copy and rename the product to `魔方agent`.
+
+## 2026-08-13 Final Delivery Requirements Update
+
+Current state:
+
+- User added final acceptance requirements after the admin batch/log slice was pushed:
+  - Final delivery must support two deployment paths:
+    - native/direct deployment;
+    - Docker image deployment built on this Windows machine, then started and verified in this machine's local Docker service.
+  - The Docker deployment path must run the same real feature verification suite against the local Docker stack; do not only verify image build or container health.
+  - OpenClaw terminal execution and server operation must be treated as system-level capabilities, with switches, approval modes, audit logs, and execution boundaries.
+  - A scheduled-task mode is required so the system can execute planned work at a specific time, including local Windows OpenClaw computer operation such as filling reports.
+  - The UI brand should be renamed from `Agent Hub` to `魔方agent`; the provided cube/orbit image should be used as the brand visual in a later UI branding slice.
+
+Verification performed:
+
+- GitHub push for commit `7a352e9 feat: add admin batch operations and log filters` completed.
+- GitHub Actions `quality` run `31702677060` passed all checks.
+- Recovery archive before that push:
+  - local bundle: `.local-archives/github-pushes/mutilagent-main-before-20260813-205849-bf55ed6.bundle`;
+  - GitHub tag: `archive/mutilagent-main-before-20260813-205849-bf55ed6`.
+
+Remaining risks / TODOs:
+
+- Continue P3 with scheduled-task API/UI integration, OpenClaw terminal/server execution hardening, additional multimedia providers, channel command grammar, UI branding to `魔方agent`, final usage README, and final native+Docker deployment verification.
+
 ## 2026-08-13 P3 Admin Batch Delete and Log Filtering
 
 Current state:
@@ -80,8 +159,8 @@ Verification performed:
 
 Pending next steps:
 
-- Create recovery archives, force-with-lease push GitHub, and verify Actions.
-- Continue the remaining P3 plan after this admin-management slice is deployed and green.
+- This slice has been deployed, pushed, archived, and verified green in GitHub Actions.
+- Continue the remaining P3 plan.
 
 ## 2026-08-13 P3 Multimedia Job Dispatch API
 

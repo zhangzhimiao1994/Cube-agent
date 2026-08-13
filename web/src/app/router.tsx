@@ -18,6 +18,7 @@ import { ModuleHubPage } from "../pages/ModuleHubPage";
 import { MultimediaPage } from "../pages/MultimediaPage";
 import { RunDetailPage } from "../pages/RunDetailPage";
 import { RunsPage } from "../pages/RunsPage";
+import { SchedulesPage } from "../pages/SchedulesPage";
 import { SetupPage } from "../pages/SetupPage";
 import { SkillsPage } from "../pages/SkillsPage";
 import { UsersPage } from "../pages/UsersPage";
@@ -56,6 +57,7 @@ export function AppRoutes() {
         <Route path="attachments" element={<AttachmentsPage />} />
         <Route path="agents" element={<AgentsPage />} />
         <Route path="workflows" element={<WorkflowsPage />} />
+        <Route path="schedules" element={<SchedulesPage />} />
         <Route path="skills" element={<SkillsPage />} />
         <Route path="mcp" element={<McpPage />} />
         <Route path="channels" element={<ChannelsPage />} />

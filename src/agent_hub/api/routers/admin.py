@@ -12,7 +12,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Protocol, cast
+from typing import Annotated, Any, Protocol, cast
 from urllib.parse import urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -28,7 +28,7 @@ from agent_hub.auth.models import AuthenticatedPrincipal, Authorizer, Permission
 from agent_hub.config.schema import PlatformConfig
 from agent_hub.config.service import ConfigService, ConfigValidationError
 from agent_hub.db.models import AdminResourceRow
-from agent_hub.domain.runs import RunStatus
+from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.models.capabilities import infer_model_capabilities
 from agent_hub.models.gateway import ModelTransport
 from agent_hub.models.litellm_client import LiteLLMClient, ModelTransportError
@@ -50,6 +50,13 @@ from agent_hub.openclaw.executor import (
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRecord, RunRepository
 from agent_hub.runtime.contracts import JsonValue
 from agent_hub.runtime.failure_reason import is_legacy_generic_failure_reason
+from agent_hub.scheduler.types import (
+    CronScheduleSpec,
+    OneTimeScheduleSpec,
+    ScheduleDefinition,
+    ScheduleMisfirePolicy,
+    ScheduleStatus,
+)
 from agent_hub.security.secrets import SecretService, SecretValidationError
 from agent_hub.skills.package import InvalidSkillPackage
 from agent_hub.skills.scanner import SkillScanner, SkillScanReport
@@ -703,6 +710,59 @@ class MultimediaGenerationJobResponse(BaseModel):
     error: str | None
 
 
+class ScheduleCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=128)
+    message: str = Field(min_length=1, max_length=65_536)
+    mode: str = Field(default="auto", pattern=r"^(auto|direct|dispatch|discuss|hybrid)$")
+    workflow_id: str = Field(default="scheduled_task", pattern=r"^[a-z0-9][a-z0-9_.-]{0,127}$")
+    kind: str = Field(pattern=r"^(one_time|cron)$")
+    run_at: datetime | None = None
+    cron: str | None = Field(default=None, max_length=64)
+    timezone: str = Field(default="UTC", min_length=1, max_length=128)
+    misfire_policy: str = Field(default="fire_once", pattern=r"^(fire_once|skip)$")
+    budget: int = Field(default=16_384, ge=1, le=10_000_000)
+    idempotency_key: str | None = Field(default=None, max_length=256)
+    metadata: dict[str, str] = Field(default_factory=dict, max_length=32)
+
+    @field_validator("metadata")
+    @classmethod
+    def validate_metadata(cls, value: dict[str, str]) -> dict[str, str]:
+        return _safe_log_details(value)
+
+
+class ScheduleResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    name: str
+    status: str
+    kind: str
+    mode: str
+    workflow_id: str
+    message: str
+    timezone: str
+    next_fire_at: datetime | None
+    run_at: datetime | None
+    cron: str | None
+    misfire_policy: str
+    budget: int
+    metadata: dict[str, str]
+
+
+class ScheduleTickRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    now: datetime
+
+
+class ScheduleTickResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    fired: list[UUID]
+
+
 class MultimediaGenerationExecutorProtocol(Protocol):
     def submit(
         self,
@@ -728,6 +788,43 @@ class MultimediaGenerationExecutorProtocol(Protocol):
         logical_model: str,
         prompt: str,
     ) -> MultimediaGenerationResult: ...
+
+
+class SchedulerServiceProtocol(Protocol):
+    async def add_schedule(
+        self,
+        schedule: ScheduleDefinition,
+        *,
+        now: datetime,
+    ) -> ScheduleDefinition: ...
+
+    async def create_schedule(
+        self,
+        *,
+        tenant_id: UUID,
+        owner_id: UUID,
+        name: str,
+        message: str,
+        mode: TaskMode,
+        workflow: str,
+        budget: int,
+        spec: OneTimeScheduleSpec | CronScheduleSpec,
+        idempotency_key: str,
+        now: datetime,
+        user_visible: bool = False,
+        metadata: Mapping[str, object] | None = None,
+    ) -> ScheduleDefinition: ...
+
+    async def list_schedules(self, *, tenant_id: UUID) -> tuple[ScheduleDefinition, ...]: ...
+
+    async def delete_schedule(self, *, tenant_id: UUID, schedule_id: UUID) -> None: ...
+
+    async def tick(
+        self,
+        tenant_id: UUID | None = None,
+        *,
+        now: datetime,
+    ) -> tuple[UUID, ...]: ...
 
 
 def _openclaw_operation_response(
@@ -3426,6 +3523,173 @@ def _multimedia_generation_executor(request: Request) -> MultimediaGenerationExe
     return cast(MultimediaGenerationExecutorProtocol, executor)
 
 
+def _scheduler_service(request: Request) -> SchedulerServiceProtocol:
+    service = getattr(request.app.state, "schedule_service", None)
+    required_methods = ("add_schedule", "create_schedule", "delete_schedule", "list_schedules", "tick")
+    if service is None or any(not hasattr(service, method) for method in required_methods):
+        raise PublicAPIError(503, "scheduler_unavailable", "scheduler service is unavailable")
+    return cast(SchedulerServiceProtocol, service)
+
+
+def _schedule_to_payload(schedule: ScheduleDefinition) -> dict[str, object]:
+    response = _schedule_response(schedule).model_dump(mode="json")
+    response["tenant_id"] = str(schedule.tenant_id)
+    response["owner_id"] = str(schedule.owner_id)
+    response["idempotency_key"] = schedule.idempotency_key
+    return response
+
+
+def _schedule_from_payload(payload: Mapping[str, object]) -> ScheduleDefinition:
+    kind = str(payload["kind"])
+    misfire_policy = ScheduleMisfirePolicy(str(payload.get("misfire_policy", "fire_once")))
+    timezone = str(payload["timezone"])
+    if kind == "one_time":
+        raw_run_at = payload.get("run_at")
+        if not isinstance(raw_run_at, str):
+            raise ValueError("one-time schedule payload requires run_at")
+        spec: OneTimeScheduleSpec | CronScheduleSpec = OneTimeScheduleSpec(
+            run_at=datetime.fromisoformat(raw_run_at),
+            timezone=timezone,
+            misfire_policy=misfire_policy,
+        )
+    else:
+        raw_cron = payload.get("cron")
+        if not isinstance(raw_cron, str):
+            raise ValueError("cron schedule payload requires cron")
+        spec = CronScheduleSpec(
+            expression=raw_cron,
+            timezone=timezone,
+            misfire_policy=misfire_policy,
+        )
+    raw_next_fire_at = payload.get("next_fire_at")
+    next_fire_at = (
+        None
+        if not isinstance(raw_next_fire_at, str)
+        else datetime.fromisoformat(raw_next_fire_at)
+    )
+    raw_metadata = payload.get("metadata")
+    metadata = cast(Mapping[str, object], raw_metadata) if isinstance(raw_metadata, dict) else {}
+    raw_budget = payload.get("budget", 16_384)
+    if type(raw_budget) is not int and not isinstance(raw_budget, str):
+        raise ValueError("schedule payload budget is invalid")
+    return ScheduleDefinition(
+        id=UUID(str(payload["id"])),
+        tenant_id=UUID(str(payload["tenant_id"])),
+        owner_id=UUID(str(payload["owner_id"])),
+        name=str(payload["name"]),
+        message=str(payload["message"]),
+        mode=TaskMode(str(payload["mode"])),
+        workflow=str(payload["workflow_id"]),
+        budget=int(raw_budget),
+        spec=spec,
+        idempotency_key=str(payload.get("idempotency_key") or payload["name"]),
+        next_fire_at=next_fire_at,
+        status=ScheduleStatus(str(payload.get("status", "active"))),
+        user_visible=True,
+        metadata=metadata,
+    )
+
+
+async def _restore_persisted_schedules(
+    service: SchedulerServiceProtocol,
+    resources: AdminResourceService,
+    *,
+    tenant_id: UUID,
+) -> None:
+    if not hasattr(resources, "_list_admin_payloads"):
+        return
+    payloads = await cast(Any, resources)._list_admin_payloads("schedule")
+    if payloads is None:
+        return
+    existing_ids = {
+        schedule.id for schedule in await service.list_schedules(tenant_id=tenant_id)
+    }
+    for payload in payloads:
+        try:
+            schedule = _schedule_from_payload(payload)
+        except (KeyError, TypeError, ValueError):
+            _LOGGER.warning("skipping invalid persisted schedule payload")
+            continue
+        if schedule.tenant_id != tenant_id or schedule.id in existing_ids:
+            continue
+        try:
+            await service.add_schedule(schedule, now=datetime.now(UTC))
+            existing_ids.add(schedule.id)
+        except ValueError:
+            _LOGGER.warning("skipping duplicate persisted schedule %s", schedule.id)
+
+
+async def _persist_schedules(
+    service: SchedulerServiceProtocol,
+    resources: AdminResourceService,
+    *,
+    tenant_id: UUID,
+) -> None:
+    if not hasattr(resources, "_upsert_admin_payload"):
+        return
+    for schedule in await service.list_schedules(tenant_id=tenant_id):
+        await cast(Any, resources)._upsert_admin_payload(
+            "schedule",
+            str(schedule.id),
+            _schedule_to_payload(schedule),
+        )
+
+
+def _schedule_spec_from_request(
+    body: ScheduleCreateRequest,
+) -> OneTimeScheduleSpec | CronScheduleSpec:
+    try:
+        misfire_policy = ScheduleMisfirePolicy(body.misfire_policy)
+        if body.kind == "one_time":
+            if body.run_at is None:
+                raise ValueError("one-time schedules require run_at")
+            return OneTimeScheduleSpec(
+                run_at=body.run_at,
+                timezone=body.timezone,
+                misfire_policy=misfire_policy,
+            )
+        if body.cron is None or not body.cron.strip():
+            raise ValueError("cron schedules require cron")
+        return CronScheduleSpec(
+            expression=body.cron.strip(),
+            timezone=body.timezone,
+            misfire_policy=misfire_policy,
+        )
+    except ValueError as error:
+        raise PublicAPIError(
+            422,
+            "request_validation",
+            "request validation failed",
+            details={"reason": str(error)},
+        ) from error
+
+
+def _schedule_response(schedule: ScheduleDefinition) -> ScheduleResponse:
+    assert schedule.spec is not None
+    run_at: datetime | None = None
+    cron: str | None = None
+    if isinstance(schedule.spec, OneTimeScheduleSpec):
+        run_at = schedule.spec.run_at
+    else:
+        cron = schedule.spec.expression
+    return ScheduleResponse(
+        id=schedule.id,
+        name=schedule.name,
+        status=schedule.status.value,
+        kind=schedule.schedule_kind.value,
+        mode=schedule.mode.value,
+        workflow_id=schedule.workflow,
+        message=schedule.message,
+        timezone=schedule.timezone_name,
+        next_fire_at=schedule.next_fire_at,
+        run_at=run_at,
+        cron=cron,
+        misfire_policy=schedule.misfire_policy.value,
+        budget=schedule.budget,
+        metadata=_safe_audit_details(schedule.metadata),
+    )
+
+
 def _multimedia_job_response(job: MultimediaGenerationJob) -> MultimediaGenerationJobResponse:
     return MultimediaGenerationJobResponse(
         id=job.id,
@@ -4541,6 +4805,149 @@ async def update_settings(
 ) -> SystemSettingsResponse:
     _require(principal, "config:write")
     return await service.update_settings(body)
+
+
+@router.post(
+    "/schedules",
+    response_model=ScheduleResponse,
+    status_code=201,
+    responses=error_responses(401, 403, 422, 503),
+)
+async def create_schedule(
+    body: ScheduleCreateRequest,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    resources: Annotated[AdminResourceService, Depends(_service)],
+) -> ScheduleResponse:
+    _require(principal, "run:create")
+    service = _scheduler_service(request)
+    try:
+        schedule = await service.create_schedule(
+            tenant_id=principal.tenant_id,
+            owner_id=principal.user_id,
+            name=body.name,
+            message=body.message,
+            mode=TaskMode(body.mode),
+            workflow=body.workflow_id,
+            budget=body.budget,
+            spec=_schedule_spec_from_request(body),
+            idempotency_key=body.idempotency_key or body.name,
+            now=datetime.now(UTC),
+            user_visible=True,
+            metadata=body.metadata,
+        )
+    except ValueError as error:
+        raise PublicAPIError(
+            422,
+            "request_validation",
+            "request validation failed",
+            details={"reason": str(error)},
+        ) from error
+    if hasattr(resources, "_upsert_admin_payload"):
+        try:
+            persisted = await cast(Any, resources)._upsert_admin_payload(
+                "schedule",
+                str(schedule.id),
+                _schedule_to_payload(schedule),
+            )
+        except Exception as error:
+            _LOGGER.exception("failed to persist schedule %s", schedule.id)
+            raise PublicAPIError(
+                503,
+                "schedule_persistence_unavailable",
+                "schedule persistence is unavailable",
+            ) from error
+        if not persisted:
+            raise PublicAPIError(
+                503,
+                "schedule_persistence_unavailable",
+                "schedule persistence is unavailable",
+            )
+    try:
+        await resources.record_audit_event(
+            actor=str(principal.user_id),
+            action="schedule.create",
+            resource=f"schedule:{schedule.id}",
+            details={"name": schedule.name, "kind": schedule.schedule_kind.value},
+        )
+    except Exception:
+        _LOGGER.exception("failed to record schedule create audit %s", schedule.id)
+    return _schedule_response(schedule)
+
+
+@router.get(
+    "/schedules",
+    response_model=list[ScheduleResponse],
+    responses=error_responses(401, 403, 503),
+)
+async def list_schedules(
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    resources: Annotated[AdminResourceService, Depends(_service)],
+) -> list[ScheduleResponse]:
+    _require(principal, "run:read")
+    service = _scheduler_service(request)
+    await _restore_persisted_schedules(service, resources, tenant_id=principal.tenant_id)
+    return [
+        _schedule_response(schedule)
+        for schedule in await service.list_schedules(tenant_id=principal.tenant_id)
+    ]
+
+
+@router.post(
+    "/schedules/tick",
+    response_model=ScheduleTickResponse,
+    responses=error_responses(401, 403, 422, 503),
+)
+async def tick_schedules(
+    body: ScheduleTickRequest,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    resources: Annotated[AdminResourceService, Depends(_service)],
+) -> ScheduleTickResponse:
+    _require(principal, "run:create")
+    service = _scheduler_service(request)
+    await _restore_persisted_schedules(service, resources, tenant_id=principal.tenant_id)
+    try:
+        fired = await service.tick(tenant_id=principal.tenant_id, now=body.now)
+    except ValueError as error:
+        raise PublicAPIError(
+            422,
+            "request_validation",
+            "request validation failed",
+            details={"reason": str(error)},
+        ) from error
+    await _persist_schedules(service, resources, tenant_id=principal.tenant_id)
+    return ScheduleTickResponse(fired=list(fired))
+
+
+@router.delete(
+    "/schedules/{schedule_id}",
+    response_model=RunDeleteResponse,
+    responses=error_responses(401, 403, 404, 503),
+)
+async def delete_schedule(
+    schedule_id: UUID,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    resources: Annotated[AdminResourceService, Depends(_service)],
+) -> RunDeleteResponse:
+    _require(principal, "run:create")
+    service = _scheduler_service(request)
+    await _restore_persisted_schedules(service, resources, tenant_id=principal.tenant_id)
+    try:
+        await service.delete_schedule(tenant_id=principal.tenant_id, schedule_id=schedule_id)
+    except KeyError:
+        raise PublicAPIError(404, "schedule_not_found", "schedule not found") from None
+    if hasattr(resources, "_delete_admin_payload"):
+        await cast(Any, resources)._delete_admin_payload("schedule", str(schedule_id))
+    await resources.record_audit_event(
+        actor=str(principal.user_id),
+        action="schedule.delete",
+        resource=f"schedule:{schedule_id}",
+        details={"id": str(schedule_id)},
+    )
+    return RunDeleteResponse(id=schedule_id, deleted=True)
 
 
 @router.post(
