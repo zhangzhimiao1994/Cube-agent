@@ -39,11 +39,29 @@ class AuthenticationService(Protocol):
     async def login(self, tenant_id: object, username: str, password: str) -> AuthResult: ...
 
 
+class AuditRecorder(Protocol):
+    async def record_audit_event(
+        self,
+        *,
+        actor: str,
+        action: str,
+        resource: str,
+        details: dict[str, object] | None = None,
+    ) -> object: ...
+
+
 def _auth_service(request: Request) -> AuthenticationService:
     service = getattr(request.app.state, "auth_service", None)
     if service is None:
         raise PublicAPIError(503, "service_unavailable", "service unavailable")
     return cast(AuthenticationService, service)
+
+
+def _audit_recorder(request: Request) -> AuditRecorder | None:
+    service = getattr(request.app.state, "admin_resource_service", None)
+    if service is None or not hasattr(service, "record_audit_event"):
+        return None
+    return cast(AuditRecorder, service)
 
 
 def _client_ip(request: Request) -> str:
@@ -106,6 +124,33 @@ def _token_response(result: AuthResult) -> TokenResponse:
     )
 
 
+async def _record_login_audit(
+    request: Request,
+    *,
+    action: str,
+    tenant_id: object,
+    username: str,
+    principal: AuthenticatedPrincipal | None = None,
+) -> None:
+    recorder = _audit_recorder(request)
+    if recorder is None:
+        return
+    actor = str(principal.user_id) if principal is not None else username
+    try:
+        await recorder.record_audit_event(
+            actor=actor,
+            action=action,
+            resource=f"tenant:{tenant_id}",
+            details={
+                "username": username,
+                "tenant_id": str(tenant_id),
+                "client_ip": _client_ip(request),
+            },
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return
+
+
 @router.post(
     "/setup",
     response_model=TokenResponse,
@@ -163,6 +208,12 @@ async def login(
             body.password.get_secret_value(),
         )
     except InvalidCredentials:
+        await _record_login_audit(
+            request,
+            action="auth.login_failed",
+            tenant_id=tenant_id,
+            username=body.username,
+        )
         raise PublicAPIError(
             401,
             "invalid_credentials",
@@ -175,6 +226,13 @@ async def login(
         ) from None
     except (AuthenticationOperationError, AuthenticationPersistenceError):
         raise PublicAPIError(503, "service_unavailable", "service unavailable") from None
+    await _record_login_audit(
+        request,
+        action="auth.login",
+        tenant_id=tenant_id,
+        username=body.username,
+        principal=result.principal,
+    )
     return _token_response(result)
 
 

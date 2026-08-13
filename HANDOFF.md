@@ -1,4 +1,88 @@
 
+## 2026-08-13 P3 Admin Batch Delete and Log Filtering
+
+Current state:
+
+- Hermes learning records now support batch deletion through `POST /api/v1/admin/hermes/bulk-delete`.
+  - Existing bulk confirmation remains unchanged.
+  - Table selection now applies to both confirmation and deletion; confirmation still only acts on unconfirmed records.
+- Attachment management now supports batch deletion through `POST /api/v1/runs/attachments/bulk-delete`.
+  - The endpoint uses the same file cleanup path as single delete and removes data, metadata, archive manifests, and extracted archive directories.
+  - The frontend now has all/select-per-row controls and one batch delete action.
+- Login attempts are now written into audit logs:
+  - successful login -> `auth.login`;
+  - invalid credentials -> `auth.login_failed`;
+  - audit details include username, tenant id, and client IP, but not passwords or tokens.
+- Audit entries now preserve safe `details` into the unified logs view, so login logs can be searched/filtered by username and other safe metadata.
+- Every log module page now has:
+  - a search box that filters title, message, source, id, category, timestamp, and details;
+  - a level filter for `all`, `info`, `warning`, and `error`;
+  - selection/export scoped to the currently visible filtered entries.
+- MCP batch operations were intentionally not added per user direction.
+
+Changes made:
+
+- Updated `src/agent_hub/api/routers/admin.py`
+  - Added Hermes bulk-delete request/response schemas and route.
+  - Added safe audit event details persistence and unified log detail propagation.
+- Updated `src/agent_hub/api/routers/runs.py`
+  - Added attachment bulk-delete request/response schemas and route.
+  - Extracted shared attachment file cleanup helper used by both single and batch delete.
+- Updated `src/agent_hub/api/routers/auth.py`
+  - Added best-effort audit recording for successful and failed login attempts.
+- Updated `web/src/api/client.ts`
+  - Added `bulkDeleteHermesInsights` and `bulkDeleteAttachments`.
+- Updated `web/src/pages/HermesPage.tsx`
+  - Added batch delete action and adjusted selection semantics.
+- Updated `web/src/pages/AttachmentsPage.tsx`
+  - Added multi-select and batch delete controls.
+- Updated `web/src/pages/LogsPage.tsx`
+  - Added search and level filtering across all log modules.
+- Updated tests:
+  - Hermes batch delete API and UI coverage.
+  - Attachment batch delete API and UI coverage.
+  - Login audit coverage with secret/token non-exposure assertions.
+  - Unified audit log coverage for login username details.
+  - Log search and level filter UI coverage.
+
+Verification performed:
+
+- TDD red:
+  - Hermes batch delete API first failed with `405`.
+  - Hermes batch delete UI first failed because the batch delete button did not exist.
+  - Attachment batch delete API first failed with `405`.
+  - Attachment batch delete UI first failed because the select-all checkbox did not exist.
+  - Login audit test first failed because only the seeded `config.publish` audit existed.
+  - Server verification then exposed that unified audit logs dropped `details.username`; the new regression first failed with `KeyError: 'username'`.
+  - Log filter UI test first failed because the searchbox did not exist.
+- Green/local:
+  - `uv run pytest tests/api/test_runs_api.py -q -k "attachment" --tb=short` -> 6 passed.
+  - `uv run pytest tests/api/test_foundation_api.py::test_login_attempts_are_recorded_in_audit_logs_without_secrets tests/api/test_foundation_api.py::test_login_invalid_credentials_is_generic_401_with_challenge tests/api/test_foundation_api.py::test_setup_and_login_return_only_safe_principal_fields -q --tb=short` -> 3 passed.
+  - `uv run pytest tests/api/test_admin_resources.py -q -k "hermes or logs" --tb=short` -> 8 passed.
+  - `uv run pytest tests/api/test_foundation_api.py::test_login_audit_logs_preserve_safe_username_details -q --tb=short` -> passed after the audit details fix.
+  - `uv run pytest tests/api/test_runs_api.py tests/api/test_foundation_api.py tests/api/test_admin_resources.py -q --tb=short` -> 164 passed.
+  - `uv run ruff check src tests` -> passed.
+  - `uv run mypy --strict src tests` -> passed.
+  - `npm.cmd run test -- --run src/pages/AttachmentsPage.test.tsx src/pages/OperationalPages.test.tsx` -> 46 passed.
+  - `npm.cmd run test -- --run` -> 92 passed.
+- Server deployment and real verification:
+  - Uploaded and deployed `agent-hub-p3-admin-batch-logs.tgz` incrementally to `103.236.98.133`.
+  - Server real HTTP verification initially failed because successful login audit logs could not be found by username.
+  - Uploaded and deployed `agent-hub-p3-admin-audit-fix.tgz` incrementally.
+  - Restarted `agent-hub-api` and `agent-hub-worker`; both reported `active`.
+  - Ran `/tmp/server_admin_batch_logs_check.py` through the real local HTTP API with the server environment loaded:
+    - created two Hermes lessons and deleted them via `POST /api/v1/admin/hermes/bulk-delete`;
+    - uploaded two attachments and deleted them via `POST /api/v1/runs/attachments/bulk-delete`;
+    - created a temporary user, performed real successful login and real failed login, then verified `auth.login` and `auth.login_failed` audit logs by username;
+    - verified no test password or access token appeared in serialized logs;
+    - deleted the temporary user.
+  - Verified deployed frontend build markers for `批量删除已选附件`, `搜索日志`, and `批量删除已选学习`.
+
+Pending next steps:
+
+- Create recovery archives, force-with-lease push GitHub, and verify Actions.
+- Continue the remaining P3 plan after this admin-management slice is deployed and green.
+
 ## 2026-08-13 P3 Multimedia Job Dispatch API
 
 Current state:

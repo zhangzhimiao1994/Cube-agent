@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
 import { api, formatApiError, type LogEntry } from "../api/client";
@@ -59,6 +59,25 @@ function exportLogs(moduleTitle: string, entries: LogEntry[]) {
   URL.revokeObjectURL(url);
 }
 
+function logMatchesFilters(entry: LogEntry, searchTerm: string, levelFilter: "all" | LogEntry["level"]) {
+  if (levelFilter !== "all" && entry.level !== levelFilter) return false;
+  const query = searchTerm.trim().toLowerCase();
+  if (!query) return true;
+  const haystack = [
+    entry.id,
+    entry.category,
+    entry.level,
+    entry.title,
+    entry.message,
+    entry.source,
+    entry.created_at,
+    ...Object.entries(entry.details).flatMap(([key, value]) => [key, value]),
+  ]
+    .join(" ")
+    .toLowerCase();
+  return haystack.includes(query);
+}
+
 export function LogsPage() {
   const { module } = useParams();
   const selected = moduleByPath(module);
@@ -87,24 +106,33 @@ export function LogsPage() {
 
 function LogModulePage({ module }: { module: (typeof LOG_MODULES)[number] }) {
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [searchTerm, setSearchTerm] = useState("");
+  const [levelFilter, setLevelFilter] = useState<"all" | LogEntry["level"]>("all");
   const logs = useQuery({
     queryKey: ["logs", module.category],
     queryFn: () => api.logs(module.category),
   });
+  const entries = logs.data ?? [];
+  const visibleEntries = useMemo(
+    () => entries.filter((entry) => logMatchesFilters(entry, searchTerm, levelFilter)),
+    [entries, searchTerm, levelFilter],
+  );
+  const selectedEntries = visibleEntries.filter((entry) => selectedIds.includes(entry.id));
+  const allSelected = visibleEntries.length > 0 && visibleEntries.every((entry) => selectedIds.includes(entry.id));
 
   if (logs.isLoading) return <p>正在加载{module.title}...</p>;
   if (logs.isError) return <p role="alert">{formatApiError(logs.error, `${module.title}加载失败`)}</p>;
-
-  const entries = logs.data ?? [];
-  const selectedEntries = entries.filter((entry) => selectedIds.includes(entry.id));
-  const allSelected = entries.length > 0 && entries.every((entry) => selectedIds.includes(entry.id));
 
   function toggleLog(id: string) {
     setSelectedIds((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
   }
 
   function toggleAllLogs() {
-    setSelectedIds(allSelected ? [] : entries.map((entry) => entry.id));
+    const visibleIds = visibleEntries.map((entry) => entry.id);
+    setSelectedIds((current) => {
+      if (allSelected) return current.filter((id) => !visibleIds.includes(id));
+      return Array.from(new Set([...current, ...visibleIds]));
+    });
   }
 
   return (
@@ -120,11 +148,36 @@ function LogModulePage({ module }: { module: (typeof LOG_MODULES)[number] }) {
           导出安全 JSON
         </button>
       </div>
+      <div className="toolbar">
+        <label>
+          搜索日志
+          <input
+            type="search"
+            aria-label="搜索日志"
+            value={searchTerm}
+            onChange={(event) => setSearchTerm(event.target.value)}
+            placeholder="搜索标题、消息、来源或详情"
+          />
+        </label>
+        <label>
+          日志级别
+          <select
+            aria-label="日志级别"
+            value={levelFilter}
+            onChange={(event) => setLevelFilter(event.target.value as typeof levelFilter)}
+          >
+            <option value="all">全部级别</option>
+            <option value="info">info</option>
+            <option value="warning">warning</option>
+            <option value="error">error</option>
+          </select>
+        </label>
+      </div>
 
-      {entries.length === 0 ? (
+      {visibleEntries.length === 0 ? (
         <article>
           <h3>暂无日志</h3>
-          <p>当前模块没有 warning/error；正常运行流水不会写入这里。</p>
+          <p>当前筛选条件下没有匹配日志。</p>
         </article>
       ) : (
         <>
@@ -149,7 +202,7 @@ function LogModulePage({ module }: { module: (typeof LOG_MODULES)[number] }) {
             <small>已选 {selectedEntries.length}</small>
           </div>
           <div className="log-list">
-            {entries.map((entry) => (
+            {visibleEntries.map((entry) => (
               <article key={entry.id} className="log-entry">
                 <div className="log-entry-header">
                   <input

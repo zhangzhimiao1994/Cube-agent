@@ -255,6 +255,40 @@ class AttachmentDeleteResponse(BaseModel):
     deleted: bool
 
 
+class AttachmentBulkDeleteFailure(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    code: str
+    message: str
+
+
+class AttachmentBulkDeleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ids: list[str] = Field(min_length=1, max_length=200)
+
+    @field_validator("ids")
+    @classmethod
+    def validate_ids(cls, value: list[str]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in value:
+            if re.fullmatch(r"att_[a-f0-9]{32}", item) is None:
+                raise ValueError("attachment ids must be safe attachment identifiers")
+            if item not in seen:
+                seen.add(item)
+                result.append(item)
+        return result
+
+
+class AttachmentBulkDeleteResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    deleted: list[str]
+    failed: list[AttachmentBulkDeleteFailure]
+
+
 def _run_service(request: Request) -> RunServiceProtocol:
     service = getattr(request.app.state, "run_service", None)
     if service is None:
@@ -568,6 +602,52 @@ async def list_attachments(
     return AttachmentListResponse(items=[item for _, item in metadata])
 
 
+def _delete_attachment_files(tenant_dir: Path, attachment_id: str) -> bool:
+    deleted = False
+    for path in (
+        tenant_dir / f"{attachment_id}.bin",
+        tenant_dir / f"{attachment_id}.json",
+        tenant_dir / f"{attachment_id}.manifest.json",
+    ):
+        if path.exists():
+            path.unlink()
+            deleted = True
+    extract_dir = tenant_dir / attachment_id
+    if extract_dir.exists():
+        if not extract_dir.is_dir():
+            raise PublicAPIError(500, "attachment_store_error", "attachment store is inconsistent")
+        shutil.rmtree(extract_dir)
+        deleted = True
+    return deleted
+
+
+@router.post(
+    "/attachments/bulk-delete",
+    response_model=AttachmentBulkDeleteResponse,
+    responses=error_responses(401, 403, 422, 500),
+)
+async def bulk_delete_attachments(
+    body: AttachmentBulkDeleteRequest,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:create"))],
+) -> AttachmentBulkDeleteResponse:
+    tenant_dir = _tenant_attachment_dir(request, principal)
+    deleted: list[str] = []
+    failed: list[AttachmentBulkDeleteFailure] = []
+    for attachment_id in body.ids:
+        if _delete_attachment_files(tenant_dir, attachment_id):
+            deleted.append(attachment_id)
+        else:
+            failed.append(
+                AttachmentBulkDeleteFailure(
+                    id=attachment_id,
+                    code="attachment_not_found",
+                    message="attachment was not found",
+                )
+            )
+    return AttachmentBulkDeleteResponse(deleted=deleted, failed=failed)
+
+
 @router.delete(
     "/attachments/{attachment_id}",
     response_model=AttachmentDeleteResponse,
@@ -580,22 +660,7 @@ async def delete_attachment(
 ) -> AttachmentDeleteResponse:
     safe_id = _safe_attachment_id(attachment_id)
     tenant_dir = _tenant_attachment_dir(request, principal)
-    deleted = False
-    for path in (
-        tenant_dir / f"{safe_id}.bin",
-        tenant_dir / f"{safe_id}.json",
-        tenant_dir / f"{safe_id}.manifest.json",
-    ):
-        if path.exists():
-            path.unlink()
-            deleted = True
-    extract_dir = tenant_dir / safe_id
-    if extract_dir.exists():
-        if not extract_dir.is_dir():
-            raise PublicAPIError(500, "attachment_store_error", "attachment store is inconsistent")
-        shutil.rmtree(extract_dir)
-        deleted = True
-    if not deleted:
+    if not _delete_attachment_files(tenant_dir, safe_id):
         raise PublicAPIError(404, "attachment_not_found", "attachment was not found")
     return AttachmentDeleteResponse(id=safe_id, deleted=True)
 

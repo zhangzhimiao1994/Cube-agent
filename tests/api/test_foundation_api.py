@@ -504,6 +504,84 @@ def test_login_invalid_credentials_is_generic_401_with_challenge() -> None:
     assert "database username" not in response.text
 
 
+def test_login_attempts_are_recorded_in_audit_logs_without_secrets() -> None:
+    auth = StubAuthService()
+    audit = InMemoryAdminResourceService()
+    client = auth_client(auth, admin_resource_service=audit)
+
+    success = client.post(
+        "/api/v1/auth/login",
+        json={
+            "tenant_id": str(auth.principal.tenant_id),
+            "username": "owner",
+            "password": "correct horse battery staple",
+        },
+    )
+    auth.login_error = InvalidCredentials("database username leaked")
+    failure = client.post(
+        "/api/v1/auth/login",
+        json={
+            "tenant_id": str(auth.principal.tenant_id),
+            "username": "owner",
+            "password": "wrong password",
+        },
+    )
+
+    assert success.status_code == 200
+    assert failure.status_code == 401
+    actions = [event.action for event in audit.audit_events if event.action.startswith("auth.")]
+    assert actions == ["auth.login", "auth.login_failed"]
+    serialized = "".join(event.model_dump_json() for event in audit.audit_events)
+    assert "correct horse battery staple" not in serialized
+    assert "wrong password" not in serialized
+    assert "login-access-token" not in serialized
+
+
+def test_login_audit_logs_preserve_safe_username_details() -> None:
+    auth = StubAuthService()
+    audit = InMemoryAdminResourceService()
+    client = auth_client(auth, admin_resource_service=audit)
+
+    client.post(
+        "/api/v1/auth/login",
+        json={
+            "tenant_id": str(auth.principal.tenant_id),
+            "username": "owner",
+            "password": "correct horse battery staple",
+        },
+    )
+    auth.login_error = InvalidCredentials("invalid credentials")
+    client.post(
+        "/api/v1/auth/login",
+        json={
+            "tenant_id": str(auth.principal.tenant_id),
+            "username": "owner",
+            "password": "wrong password",
+        },
+    )
+
+    response = client.get(
+        "/api/v1/admin/logs?category=audit",
+        headers={"Authorization": "Bearer valid-token"},
+    )
+
+    assert response.status_code == 200
+    auth_logs = [
+        entry
+        for entry in response.json()
+        if entry["message"] in {"auth.login", "auth.login_failed"}
+    ]
+    assert {entry["message"] for entry in auth_logs} == {
+        "auth.login",
+        "auth.login_failed",
+    }
+    assert all(entry["details"]["username"] == "owner" for entry in auth_logs)
+    serialized = response.text
+    assert "correct horse battery staple" not in serialized
+    assert "wrong password" not in serialized
+    assert "login-access-token" not in serialized
+
+
 @pytest.mark.parametrize(
     "authorization",
     [None, "Basic abc", "Bearer", "Bearer a b", "Bearer " + "a" * 8193],

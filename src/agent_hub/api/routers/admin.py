@@ -530,6 +530,7 @@ class AuditEventResponse(BaseModel):
     actor: str
     action: str
     resource: str
+    details: dict[str, str] = Field(default_factory=dict)
     created_at: datetime
 
 
@@ -986,6 +987,17 @@ class HermesBulkConfirmResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     confirmed: list[HermesInsightResponse]
+    failed: list[BulkFailureResponse]
+
+
+class HermesBulkDeleteRequest(HermesBulkConfirmRequest):
+    pass
+
+
+class HermesBulkDeleteResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    deleted: list[str]
     failed: list[BulkFailureResponse]
 
 
@@ -1740,12 +1752,12 @@ class InMemoryAdminResourceService:
         resource: str,
         details: dict[str, object] | None = None,
     ) -> AuditEventResponse:
-        del details
         event = AuditEventResponse(
             id=f"audit_{uuid4().hex}",
             actor=actor,
             action=action,
             resource=resource,
+            details=_safe_audit_details(details),
             created_at=datetime.now(UTC),
         )
         self.audit_events.append(event)
@@ -3184,12 +3196,10 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             actor=str(self._actor_id),
             action=action,
             resource=resource,
+            details=_safe_audit_details(payload),
             created_at=datetime.now(UTC),
         )
-        audit_payload = event.model_dump(mode="json")
-        if payload:
-            audit_payload["details"] = payload
-        await self._upsert_admin_payload("audit", event.id, audit_payload)
+        await self._upsert_admin_payload("audit", event.id, event.model_dump(mode="json"))
 
     async def record_audit_event(
         self,
@@ -3204,12 +3214,10 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             actor=actor,
             action=action,
             resource=resource,
+            details=_safe_audit_details(details),
             created_at=datetime.now(UTC),
         )
-        audit_payload = event.model_dump(mode="json")
-        if details:
-            audit_payload["details"] = details
-        await self._upsert_admin_payload("audit", event.id, audit_payload)
+        await self._upsert_admin_payload("audit", event.id, event.model_dump(mode="json"))
         return event
 
     async def _verify_model_availability(
@@ -3664,6 +3672,12 @@ def _safe_log_details(details: dict[str, str]) -> dict[str, str]:
     return safe
 
 
+def _safe_audit_details(details: Mapping[str, object] | None) -> dict[str, str]:
+    if not details:
+        return {}
+    return _safe_log_details({str(key): str(value) for key, value in details.items()})
+
+
 def _audit_log_entry(event: AuditEventResponse) -> LogEntryResponse:
     return LogEntryResponse(
         id=f"log_{event.id}",
@@ -3674,6 +3688,7 @@ def _audit_log_entry(event: AuditEventResponse) -> LogEntryResponse:
         source="admin.audit",
         details=_safe_log_details(
             {
+                **event.details,
                 "actor": event.actor,
                 "resource": event.resource,
                 "action": event.action,
@@ -3876,11 +3891,13 @@ def _model_check_status_code(error: Exception) -> str | None:
 
 def _audit_response_from_payload(payload: dict[str, object]) -> AuditEventResponse:
     created_at = payload.get("created_at")
+    raw_details = payload.get("details")
     return AuditEventResponse(
         id=str(payload.get("id", "")),
         actor=str(payload.get("actor", "system")),
         action=str(payload.get("action", "unknown")),
         resource=str(payload.get("resource", "unknown")),
+        details=_safe_audit_details(raw_details if isinstance(raw_details, Mapping) else None),
         created_at=_datetime_from_json(created_at),
     )
 
@@ -5204,6 +5221,35 @@ async def bulk_confirm_hermes_insights(
                 )
             )
     return HermesBulkConfirmResponse(confirmed=confirmed, failed=failed)
+
+
+@router.post(
+    "/hermes/bulk-delete",
+    response_model=HermesBulkDeleteResponse,
+    responses=error_responses(401, 403, 422),
+)
+async def bulk_delete_hermes_insights(
+    body: HermesBulkDeleteRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> HermesBulkDeleteResponse:
+    _require(principal, "hermes:write")
+    deleted: list[str] = []
+    failed: list[BulkFailureResponse] = []
+    for insight_id in body.ids:
+        try:
+            await service.delete_hermes_insight(insight_id)
+        except KeyError:
+            failed.append(
+                BulkFailureResponse(
+                    id=insight_id,
+                    code="hermes_not_found",
+                    message="Hermes learning record was not found",
+                )
+            )
+        else:
+            deleted.append(insight_id)
+    return HermesBulkDeleteResponse(deleted=deleted, failed=failed)
 
 
 @router.get("/hermes/{insight_id}", response_model=HermesInsightResponse, responses=error_responses(401, 403, 404, 422))

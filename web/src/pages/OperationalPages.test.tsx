@@ -517,6 +517,14 @@ describe("operational management pages", () => {
             failed: [],
           });
         }
+        if (path === "/api/v1/admin/hermes/bulk-delete" && method === "POST") {
+          const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : { ids: [] };
+          const ids = Array.isArray(body.ids) ? body.ids : [];
+          ids.forEach((id: unknown) => {
+            if (typeof id === "string") deletedHermesIds.add(id);
+          });
+          return jsonResponse({ deleted: ids, failed: [] });
+        }
         if (path === "/api/v1/admin/mcp") {
           return jsonResponse([{ id: "filesystem", name: "Filesystem MCP", health: "healthy", allowed_tools: ["read_file"] }]);
         }
@@ -534,6 +542,16 @@ describe("operational management pages", () => {
               source: "models.create",
               details: { provider: "deepseek", status_code: "401" },
               created_at: "2026-08-07T00:01:00Z",
+            },
+            {
+              id: "model-warning-1",
+              category: "model_error",
+              level: "warning",
+              title: "模型配置与调用警告",
+              message: "anthropic preflight latency is high",
+              source: "models.probe",
+              details: { provider: "anthropic", status_code: "slow" },
+              created_at: "2026-08-07T00:01:30Z",
             },
             {
               id: "mode-error-1",
@@ -1729,6 +1747,8 @@ describe("operational management pages", () => {
 
 
   it("shows MCP, memory, and modular log pages", async () => {
+    const user = userEvent.setup();
+
     render(<TestApp initialPath="/mcp" />);
     expect(await screen.findByText("Filesystem MCP")).not.toBeNull();
     expect(screen.getByText("healthy")).not.toBeNull();
@@ -1750,9 +1770,19 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/logs/model" />);
     expect(await screen.findByRole("heading", { name: "模型配置与调用错误", level: 2 })).not.toBeNull();
     expect(await screen.findByText("provider returned status=401")).not.toBeNull();
+    expect(screen.getByText("anthropic preflight latency is high")).not.toBeNull();
     expect(screen.getByRole("checkbox", { name: "Select all logs in current module" })).not.toBeNull();
     expect(screen.getByRole("checkbox", { name: "Select log model-error-1" })).not.toBeNull();
     expect(screen.queryByText("dispatch runtime failed")).toBeNull();
+
+    await user.type(screen.getByRole("searchbox", { name: "搜索日志" }), "anthropic");
+    expect(screen.queryByText("provider returned status=401")).toBeNull();
+    expect(screen.getByText("anthropic preflight latency is high")).not.toBeNull();
+
+    await user.clear(screen.getByRole("searchbox", { name: "搜索日志" }));
+    await user.selectOptions(screen.getByRole("combobox", { name: "日志级别" }), "error");
+    expect(screen.getByText("provider returned status=401")).not.toBeNull();
+    expect(screen.queryByText("anthropic preflight latency is high")).toBeNull();
   });
 
   it("shows Hermes learning by time and conversation id with detail confirmation", async () => {
@@ -1787,6 +1817,24 @@ describe("operational management pages", () => {
         body: { ids: ["hermes-2", "hermes-1"] },
       }),
     );
+  });
+
+  it("bulk deletes selected Hermes learning records through one batch API call", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/hermes" />);
+
+    expect(await screen.findByRole("checkbox", { name: "Select all Hermes learning records" })).not.toBeNull();
+    await user.click(screen.getByRole("checkbox", { name: "Select all Hermes learning records" }));
+    await user.click(screen.getByRole("button", { name: "批量删除已选学习" }));
+
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === "/api/v1/admin/hermes/bulk-delete")).toMatchObject({
+        method: "POST",
+        body: { ids: ["hermes-2", "hermes-1"] },
+      }),
+    );
+    await waitFor(() => expect(screen.queryByText("conv-architecture-1")).toBeNull());
+    expect(screen.queryByText("conv-workflow-2")).toBeNull();
   });
 
   it("deletes a Hermes learning record from the table", async () => {

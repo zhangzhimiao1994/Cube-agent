@@ -1908,6 +1908,51 @@ def test_hermes_bulk_confirm_confirms_multiple_learning_records() -> None:
     assert response.json()["failed"] == []
 
 
+def test_hermes_bulk_delete_removes_multiple_learning_records() -> None:
+    api = client()
+    first = api.post(
+        "/api/v1/admin/hermes/feedback",
+        headers=headers(),
+        json={
+            "outcome": "success",
+            "lesson": "Delete old Hermes lessons in batches during cleanup.",
+            "conversation_id": "conv-bulk-delete-1",
+            "tags": ["cleanup"],
+            "weight": 3,
+        },
+    ).json()
+    second = api.post(
+        "/api/v1/admin/hermes/feedback",
+        headers=headers(),
+        json={
+            "outcome": "neutral",
+            "lesson": "Remove obsolete confirmed Hermes guidance as a batch.",
+            "conversation_id": "conv-bulk-delete-2",
+            "tags": ["cleanup"],
+            "weight": 2,
+        },
+    ).json()
+    api.post(f"/api/v1/admin/hermes/{second['id']}/confirm", headers=headers())
+
+    response = api.post(
+        "/api/v1/admin/hermes/bulk-delete",
+        headers=headers(),
+        json={"ids": [first["id"], second["id"], "hermes_deadbeef"]},
+    )
+    remaining = api.get("/api/v1/admin/hermes", headers=headers())
+
+    assert response.status_code == 200
+    assert response.json()["deleted"] == [first["id"], second["id"]]
+    assert response.json()["failed"] == [
+        {
+            "id": "hermes_deadbeef",
+            "code": "hermes_not_found",
+            "message": "Hermes learning record was not found",
+        }
+    ]
+    assert all(item["id"] not in {first["id"], second["id"]} for item in remaining.json())
+
+
 def test_hermes_delete_removes_learning_record() -> None:
     api = client()
     insight = api.post(

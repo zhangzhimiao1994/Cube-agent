@@ -502,6 +502,46 @@ def test_attachment_management_deletes_data_metadata_manifest_and_extract_dir(tm
     assert not (tenant_dir / attachment_id).exists()
 
 
+def test_attachment_management_bulk_deletes_uploaded_attachments(tmp_path: Path) -> None:
+    client, _, _ = _client(attachment_store_dir=tmp_path)
+    first = client.post(
+        "/api/v1/runs/attachments/upload",
+        headers={
+            **bearer(),
+            "X-Agent-Hub-Filename": "first.txt",
+            "Content-Type": "text/plain",
+        },
+        content=b"first",
+    ).json()
+    second = client.post(
+        "/api/v1/runs/attachments/upload",
+        headers={
+            **bearer(),
+            "X-Agent-Hub-Filename": "second.txt",
+            "Content-Type": "text/plain",
+        },
+        content=b"second",
+    ).json()
+
+    deleted = client.post(
+        "/api/v1/runs/attachments/bulk-delete",
+        headers=bearer(),
+        json={"ids": [first["id"], second["id"], "att_deadbeefdeadbeefdeadbeefdeadbeef"]},
+    )
+    listed = client.get("/api/v1/runs/attachments", headers=bearer())
+
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted"] == [first["id"], second["id"]]
+    assert deleted.json()["failed"] == [
+        {
+            "id": "att_deadbeefdeadbeefdeadbeefdeadbeef",
+            "code": "attachment_not_found",
+            "message": "attachment was not found",
+        }
+    ]
+    assert listed.json()["items"] == []
+
+
 def test_submission_forwards_attachment_ids() -> None:
     client, service, principal = _client()
 

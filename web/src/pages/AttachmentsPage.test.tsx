@@ -39,6 +39,15 @@ describe("AttachmentsPage", () => {
                 sha256: "a".repeat(64),
                 expires_at: "2026-08-20T00:00:00Z",
               },
+              {
+                id: "att_fedcba9876543210fedcba9876543210",
+                filename: "old-context.md",
+                kind: "context",
+                content_type: "text/markdown",
+                size_bytes: 1024,
+                sha256: "b".repeat(64),
+                expires_at: "2026-08-21T00:00:00Z",
+              },
             ],
           });
         }
@@ -47,6 +56,10 @@ describe("AttachmentsPage", () => {
           init?.method === "DELETE"
         ) {
           return jsonResponse({ id: "att_0123456789abcdef0123456789abcdef", deleted: true });
+        }
+        if (path === "/api/v1/runs/attachments/bulk-delete" && init?.method === "POST") {
+          const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : { ids: [] };
+          return jsonResponse({ deleted: body.ids, failed: [] });
         }
         return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
       }),
@@ -73,6 +86,28 @@ describe("AttachmentsPage", () => {
       expect(fetchMock).toHaveBeenCalledWith(
         "/api/v1/runs/attachments/att_0123456789abcdef0123456789abcdef",
         expect.objectContaining({ method: "DELETE" }),
+      );
+    });
+  });
+
+  it("bulk deletes selected attachments through one batch request", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<TestApp initialPath="/attachments" />);
+
+    expect(await screen.findByText("broken-skill-pack.zip")).not.toBeNull();
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select all attachments" }));
+    await userEvent.click(screen.getByRole("button", { name: "批量删除已选附件" }));
+
+    expect(window.confirm).toHaveBeenCalledWith("确认删除 2 个已选附件？删除后对话里不能再引用它们。");
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/runs/attachments/bulk-delete",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({
+            ids: ["att_0123456789abcdef0123456789abcdef", "att_fedcba9876543210fedcba9876543210"],
+          }),
+        }),
       );
     });
   });

@@ -61,6 +61,13 @@ function HermesLearningTable() {
       await queryClient.invalidateQueries({ queryKey: ["hermes"] });
     },
   });
+  const bulkDelete = useMutation({
+    mutationFn: (ids: string[]) => api.bulkDeleteHermesInsights(ids),
+    onSuccess: async (_result, ids) => {
+      setSelectedIds((current) => current.filter((item) => !ids.includes(item)));
+      await queryClient.invalidateQueries({ queryKey: ["hermes"] });
+    },
+  });
   const deleteInsight = useMutation({
     mutationFn: (id: string) => api.deleteHermesInsight(id),
     onSuccess: async (_result, id) => {
@@ -73,12 +80,13 @@ function HermesLearningTable() {
     () => [...(insights.data ?? [])].sort((a, b) => b.created_at.localeCompare(a.created_at)),
     [insights.data],
   );
+  const insightIds = sortedInsights.map((insight) => insight.id);
+  const selectedInsightIds = selectedIds.filter((id) => insightIds.includes(id));
   const confirmableIds = sortedInsights
     .filter((insight) => insight.confirmed_at === null)
     .map((insight) => insight.id);
   const selectedConfirmableIds = selectedIds.filter((id) => confirmableIds.includes(id));
-  const allConfirmableSelected =
-    confirmableIds.length > 0 && confirmableIds.every((id) => selectedIds.includes(id));
+  const allInsightsSelected = insightIds.length > 0 && insightIds.every((id) => selectedIds.includes(id));
 
   function submitFeedback(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -87,14 +95,19 @@ function HermesLearningTable() {
 
   function toggleAllInsights() {
     setSelectedIds((current) => {
-      if (allConfirmableSelected) return current.filter((id) => !confirmableIds.includes(id));
-      return Array.from(new Set([...current, ...confirmableIds]));
+      if (allInsightsSelected) return current.filter((id) => !insightIds.includes(id));
+      return Array.from(new Set([...current, ...insightIds]));
     });
   }
 
   function confirmSelectedInsights() {
     if (selectedConfirmableIds.length === 0) return;
     bulkConfirm.mutate(selectedConfirmableIds);
+  }
+
+  function deleteSelectedInsights() {
+    if (selectedInsightIds.length === 0) return;
+    bulkDelete.mutate(selectedInsightIds);
   }
 
   if (insights.isLoading) return <p>正在加载 Hermes...</p>;
@@ -125,24 +138,35 @@ function HermesLearningTable() {
                 <input
                   type="checkbox"
                   aria-label="Select all Hermes learning records"
-                  checked={allConfirmableSelected}
-                  disabled={confirmableIds.length === 0 || bulkConfirm.isPending}
+                  checked={allInsightsSelected}
+                  disabled={insightIds.length === 0 || bulkConfirm.isPending || bulkDelete.isPending}
                   onChange={toggleAllInsights}
                 />
-                全选待确认
+                全选
               </label>
               <button
                 type="button"
                 className="secondary-action"
-                disabled={selectedConfirmableIds.length === 0 || bulkConfirm.isPending}
+                disabled={selectedConfirmableIds.length === 0 || bulkConfirm.isPending || bulkDelete.isPending}
                 onClick={confirmSelectedInsights}
               >
                 {bulkConfirm.isPending ? "确认中..." : "批量确认已选学习"}
               </button>
-              <small>已选 {selectedConfirmableIds.length}</small>
+              <button
+                type="button"
+                className="secondary-action danger-action"
+                disabled={selectedInsightIds.length === 0 || bulkConfirm.isPending || bulkDelete.isPending}
+                onClick={deleteSelectedInsights}
+              >
+                {bulkDelete.isPending ? "正在删除..." : "批量删除已选学习"}
+              </button>
+              <small>已选 {selectedInsightIds.length}</small>
             </div>
             {bulkConfirm.isError ? (
               <p role="alert">{formatApiError(bulkConfirm.error, "Hermes 批量确认失败")}</p>
+            ) : null}
+            {bulkDelete.isError ? (
+              <p role="alert">{formatApiError(bulkDelete.error, "Hermes 批量删除失败")}</p>
             ) : null}
             {deleteInsight.isError ? (
               <p role="alert">{formatApiError(deleteInsight.error, "Hermes 删除失败")}</p>
@@ -162,7 +186,6 @@ function HermesLearningTable() {
                 </thead>
                 <tbody>
                   {sortedInsights.map((insight) => {
-                    const canConfirm = insight.confirmed_at === null;
                     return (
                       <tr key={insight.id}>
                         <td>
@@ -170,7 +193,7 @@ function HermesLearningTable() {
                             type="checkbox"
                             aria-label={`Select Hermes learning ${insight.id}`}
                             checked={selectedIds.includes(insight.id)}
-                            disabled={!canConfirm || bulkConfirm.isPending}
+                            disabled={bulkConfirm.isPending || bulkDelete.isPending}
                             onChange={() => setSelectedIds((current) => toggle(current, insight.id))}
                           />
                         </td>

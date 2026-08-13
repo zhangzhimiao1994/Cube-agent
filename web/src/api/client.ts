@@ -468,6 +468,11 @@ const AttachmentDeleteSchema = z.object({
   deleted: z.boolean(),
 });
 
+const AttachmentBulkDeleteSchema = z.object({
+  deleted: z.array(z.string()),
+  failed: z.array(BulkFailureSchema),
+});
+
 const MultimediaGenerationSchema = z.object({
   kind: z.enum(["image", "video", "audio"]),
   logical_model: z.string(),
@@ -566,6 +571,13 @@ const HermesBulkConfirmSchema = z.object({
 });
 
 export type HermesBulkConfirmResult = z.infer<typeof HermesBulkConfirmSchema>;
+
+const HermesBulkDeleteSchema = z.object({
+  deleted: z.array(z.string()),
+  failed: z.array(BulkFailureSchema),
+});
+
+export type HermesBulkDeleteResult = z.infer<typeof HermesBulkDeleteSchema>;
 
 const OperationStatusSchema = z.object({
   status: z.string(),
@@ -997,6 +1009,13 @@ export const api = {
       AttachmentDeleteSchema,
     );
   },
+  bulkDeleteAttachments(ids: string[]): Promise<{ deleted: string[]; failed: { id: string; code: string; message: string }[] }> {
+    return request(
+      "/api/v1/runs/attachments/bulk-delete",
+      { method: "POST", body: JSON.stringify({ ids }) },
+      AttachmentBulkDeleteSchema,
+    );
+  },
   generateMultimedia(payload: {
     kind: "image" | "video" | "audio";
     logical_model: string;
@@ -1192,6 +1211,13 @@ export const api = {
       "/api/v1/admin/hermes/bulk-confirm",
       { method: "POST", body: JSON.stringify({ ids }) },
       HermesBulkConfirmSchema,
+    );
+  },
+  bulkDeleteHermesInsights(ids: string[]): Promise<HermesBulkDeleteResult> {
+    return request(
+      "/api/v1/admin/hermes/bulk-delete",
+      { method: "POST", body: JSON.stringify({ ids }) },
+      HermesBulkDeleteSchema,
     );
   },
   recordHermesFeedback(payload: {
