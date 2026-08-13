@@ -1873,6 +1873,20 @@ describe("operational management pages", () => {
     );
   });
 
+  it("confirms a Hermes learning record directly from the table", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/hermes" />);
+
+    expect(await screen.findByRole("table", { name: /Hermes/ })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "确认 Hermes 学习 hermes-1" }));
+
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === "/api/v1/admin/hermes/hermes-1/confirm")).toMatchObject({
+        method: "POST",
+      }),
+    );
+  });
+
   it("clears Hermes bulk selection when select all is clicked again", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/hermes" />);

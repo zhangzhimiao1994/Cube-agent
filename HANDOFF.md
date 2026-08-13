@@ -1,4 +1,35 @@
 
+## 2026-08-14 Hermes Row Quick Confirm
+
+Current state:
+
+- Hermes learning table now shows a per-row `确认` button for unconfirmed records.
+- The row action calls the existing single-record `/api/v1/admin/hermes/{id}/confirm` API and refreshes the table after success.
+- Confirmed records no longer show the row confirm action; existing bulk confirm, bulk delete, detail confirm, and row delete flows remain unchanged.
+
+Verification performed:
+
+- Local checks:
+  - `npm.cmd run test -- --run src/pages/OperationalPages.test.tsx` from `web` -> 48 passed.
+  - `npm.cmd run test -- --run` from `web` -> 13 files passed, 100 tests passed.
+  - `npm.cmd run build` from `web` -> passed, with the existing Vite chunk-size warning.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-hermes-quick-confirm.tgz` to `103.236.98.133`.
+  - Deployed rebuilt `web/dist` into `/opt/agent-hub/current`.
+  - Reloaded Caddy.
+- Server real environment verification:
+  - Ran `/tmp/server_hermes_quick_confirm_check.py` against the deployed HTTP API and frontend bundle.
+  - The script created a real Hermes learning record, confirmed it through the single-record API, verified the served bundle contains the row quick-confirm marker, and deleted the probe record.
+  - Final output: `{"status": "ok", "checked": ["hermes_single_confirm_api", "served_hermes_quick_confirm_marker", "probe_record_cleanup"]}`.
+
+Remaining risks / TODOs:
+
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue the existing P3 plan. The final full UI copy/layout audit remains deferred until modules are complete and accepted.
+
 ## 2026-08-14 Skill Archive Upload and Current UI Copy Slice
 
 Current state:

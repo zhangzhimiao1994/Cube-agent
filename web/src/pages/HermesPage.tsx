@@ -68,6 +68,12 @@ function HermesLearningTable() {
       await queryClient.invalidateQueries({ queryKey: ["hermes"] });
     },
   });
+  const confirmInsight = useMutation({
+    mutationFn: (id: string) => api.confirmHermesInsight(id),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["hermes"] });
+    },
+  });
   const deleteInsight = useMutation({
     mutationFn: (id: string) => api.deleteHermesInsight(id),
     onSuccess: async (_result, id) => {
@@ -168,6 +174,9 @@ function HermesLearningTable() {
             {bulkDelete.isError ? (
               <p role="alert">{formatApiError(bulkDelete.error, "Hermes 批量删除失败")}</p>
             ) : null}
+            {confirmInsight.isError ? (
+              <p role="alert">{formatApiError(confirmInsight.error, "Hermes 确认失败")}</p>
+            ) : null}
             {deleteInsight.isError ? (
               <p role="alert">{formatApiError(deleteInsight.error, "Hermes 删除失败")}</p>
             ) : null}
@@ -205,6 +214,17 @@ function HermesLearningTable() {
                         <td>{insight.outcome}</td>
                         <td>{statusLabel(insight.confirmed_at)}</td>
                         <td>
+                          {insight.confirmed_at === null ? (
+                            <button
+                              type="button"
+                              className="secondary-action"
+                              aria-label={`确认 Hermes 学习 ${insight.id}`}
+                              disabled={confirmInsight.isPending || bulkConfirm.isPending}
+                              onClick={() => confirmInsight.mutate(insight.id)}
+                            >
+                              确认
+                            </button>
+                          ) : null}
                           <Link
                             to={`/hermes/${encodeURIComponent(insight.id)}`}
                             aria-label={`查看 ${insight.conversation_id ?? insight.id} 的 Hermes 学习详情`}
