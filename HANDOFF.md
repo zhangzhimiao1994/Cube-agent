@@ -1420,7 +1420,14 @@ Server deployment and verification:
   - original settings are restored at the end.
 - Verified deployed `web/dist` contains `OpenClaw 权限模式` and `openclaw_mode`.
 
+GitHub push and recovery:
+
+- Commit: `af1171f feat: add openclaw feature switch`.
+- Local ignored recovery bundle: `.local-archives/github-pushes/mutilagent-main-before-20260813-130255-3949892.bundle`.
+- GitHub recovery tag: `archive/mutilagent-main-before-20260813-130255-3949892`.
+- Pushed with `git push --force-with-lease mutilagent main`.
+- GitHub Actions run `31669019886` completed successfully.
+
 Next:
 
-- Amend the local OpenClaw commit, then create recovery archive bundle/tag, force-with-lease push GitHub, and check Actions.
 - Continue P3 toward approved executor integration across Linux/Windows/macOS and conversation-integrated vibe coding after CI is green.
