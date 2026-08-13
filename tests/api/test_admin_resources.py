@@ -333,6 +333,70 @@ def test_openclaw_execute_requires_approved_operation() -> None:
     assert response.json()["error"]["code"] == "openclaw_not_approved"
 
 
+def test_openclaw_auto_review_approves_allowlisted_low_risk_linux_command() -> None:
+    api = client()
+    command = [sys.executable, "-c", "print('openclaw-auto-review-ok')"]
+    payload = api.get("/api/v1/admin/settings", headers=headers()).json()
+    payload["openclaw_enabled"] = True
+    payload["openclaw_mode"] = "auto_review"
+    payload["openclaw_allowed_commands"] = [command]
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+
+    created = api.post(
+        "/api/v1/admin/openclaw/operations",
+        headers=headers(),
+        json={
+            "platform": "linux",
+            "kind": "server_command",
+            "target": "agent-hub-server",
+            "argv": command,
+            "risk_level": "low",
+            "reason": "auto review should approve only an allowlisted low-risk probe",
+        },
+    )
+
+    assert created.status_code == 202
+    operation = created.json()
+    assert operation["status"] == "approved"
+    assert operation["requires_user_approval"] is False
+
+    executed = api.post(f"/api/v1/admin/openclaw/operations/{operation['id']}/execute", headers=headers())
+    assert executed.status_code == 200
+    assert executed.json()["stdout"].strip() == "openclaw-auto-review-ok"
+
+
+def test_openclaw_auto_review_keeps_unlisted_command_waiting_for_user_approval() -> None:
+    api = client()
+    command = [sys.executable, "-c", "print('openclaw-auto-review-denied')"]
+    payload = api.get("/api/v1/admin/settings", headers=headers()).json()
+    payload["openclaw_enabled"] = True
+    payload["openclaw_mode"] = "auto_review"
+    payload["openclaw_allowed_commands"] = []
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+
+    created = api.post(
+        "/api/v1/admin/openclaw/operations",
+        headers=headers(),
+        json={
+            "platform": "linux",
+            "kind": "server_command",
+            "target": "agent-hub-server",
+            "argv": command,
+            "risk_level": "low",
+            "reason": "unlisted command still needs a human approval",
+        },
+    )
+
+    assert created.status_code == 202
+    operation = created.json()
+    assert operation["status"] == "waiting_user_approval"
+    assert operation["requires_user_approval"] is True
+
+    executed = api.post(f"/api/v1/admin/openclaw/operations/{operation['id']}/execute", headers=headers())
+    assert executed.status_code == 409
+    assert executed.json()["error"]["code"] == "openclaw_not_approved"
+
+
 def test_openclaw_execute_denies_approved_unlisted_command() -> None:
     api = client()
     payload = api.get("/api/v1/admin/settings", headers=headers()).json()

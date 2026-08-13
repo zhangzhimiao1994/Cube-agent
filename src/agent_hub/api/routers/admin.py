@@ -862,6 +862,16 @@ def _openclaw_audit_details(request: OpenClawOperationRequest, mode: str) -> dic
     }
 
 
+def _openclaw_can_auto_approve(request: OpenClawOperationRequest, settings: SystemSettingsResponse) -> bool:
+    if settings.openclaw_mode not in {"auto_review", "trusted_auto"}:
+        return False
+    if request.risk_level != "low":
+        return False
+    if request.platform != "linux" or request.kind != "server_command":
+        return False
+    return openclaw_command_allowed(request.argv, settings.openclaw_allowed_commands)
+
+
 def _openclaw_adapter_responses() -> tuple[OpenClawAdapterResponse, ...]:
     target_types = {
         "server_command": "server",
@@ -5261,11 +5271,18 @@ async def create_openclaw_operation(
         raise PublicAPIError(409, "openclaw_disabled", "OpenClaw is disabled")
     if settings.openclaw_mode == "read_only" and body.kind not in {"screen_read", "file_read"}:
         raise PublicAPIError(403, "openclaw_read_only", "OpenClaw read-only mode blocks this operation")
-    return await service.create_openclaw_operation(
+    operation = await service.create_openclaw_operation(
         body,
         actor=str(principal.user_id),
         mode=settings.openclaw_mode,
     )
+    if _openclaw_can_auto_approve(body, settings):
+        return await service.resolve_openclaw_operation(
+            operation.id,
+            OpenClawResolveRequest(decision="approve"),
+            actor=str(principal.user_id),
+        )
+    return operation
 
 
 @router.get(

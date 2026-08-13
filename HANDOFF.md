@@ -1,4 +1,41 @@
 
+## 2026-08-14 OpenClaw Auto-Review Approval Semantics
+
+Current state:
+
+- OpenClaw `auto_review` now has concrete Codex-style behavior instead of being only a saved setting.
+- In `auto_review` and `trusted_auto`, the server auto-approves only low-risk Linux `server_command` operations whose exact argv matches the OpenClaw allowlist.
+- Commands that are not allowlisted still create a normal `waiting_user_approval` operation and cannot execute until a user approves.
+- Existing protections remain in place: disabled switch blocks creation, read-only blocks write operations, unapproved execution is rejected, shell wrappers are denied, and Windows/macOS adapters remain unavailable unless a real adapter is connected.
+
+Verification performed:
+
+- TDD red/green:
+  - Added tests for allowlisted low-risk Linux auto-approval and unlisted command staying in manual approval.
+  - Initial red run failed because allowlisted `auto_review` operations still returned `waiting_user_approval`.
+- Local checks:
+  - `uv run pytest tests/api/test_admin_resources.py::test_openclaw_auto_review_approves_allowlisted_low_risk_linux_command tests/api/test_admin_resources.py::test_openclaw_auto_review_keeps_unlisted_command_waiting_for_user_approval -q --tb=short` -> 2 passed.
+  - `uv run pytest tests/api/test_admin_resources.py -q -k "openclaw" --tb=short` -> 12 passed, 70 deselected.
+  - `uv run ruff check src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+  - `uv run mypy --strict src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-openclaw-auto-review.tgz` to `103.236.98.133`.
+  - Deployed `src/agent_hub/api/routers/admin.py` into `/opt/agent-hub/current`.
+  - Restarted `agent-hub-api` and `agent-hub-worker`.
+- Server real environment verification:
+  - Ran `/tmp/server_openclaw_auto_review_check.py` against the deployed HTTP API.
+  - It enabled `auto_review`, configured one exact allowlisted Python command, verified the operation was auto-approved and executed, then removed the allowlist and verified the same command waited for manual approval.
+  - The script restored original system settings in `finally`.
+  - Final output: `{"status": "ok", "checked": ["auto_review_auto_approves_allowlisted_low_risk_command", "auto_review_keeps_unlisted_command_waiting", "settings_restored"]}`.
+
+Remaining risks / TODOs:
+
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue P3 with remaining OpenClaw multi-system adapter work, final usage README, and deferred full UI copy/layout audit after modules are accepted.
+
 ## 2026-08-14 Hermes Row Quick Confirm
 
 Current state:
