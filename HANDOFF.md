@@ -21,6 +21,9 @@ Current state:
 - The CI fix was deployed incrementally to `103.236.98.133:/opt/agent-hub/current` with `/tmp/agent-hub-mobile-nav-ci-fix.tgz`; server dist now contains `运行期调度`.
 - Local recovery bundle for the follow-up CI fix push was created at `.local-archives/github-pushes/mutilagent-main-before-20260813-093300-8d84adc.bundle`, pointing at current GitHub `mutilagent/main` commit `8d84adc`.
 - GitHub recovery archive tag prepared for the follow-up CI fix push: `archive/mutilagent-main-before-20260813-093300-8d84adc`.
+- Follow-up CI fix commit `a05e224` was pushed to GitHub; Actions run `31657918709` passed all quality checks. The only annotation was GitHub's non-failing Node.js 20 deprecation warning for actions.
+- Local recovery bundle for this final handoff-doc push was created at `.local-archives/github-pushes/mutilagent-main-before-20260813-093710-a05e224.bundle`, pointing at current GitHub `mutilagent/main` commit `a05e224`.
+- GitHub recovery archive tag prepared for the final handoff-doc push: `archive/mutilagent-main-before-20260813-093710-a05e224`.
 
 Changes made locally:
 
@@ -52,11 +55,12 @@ Verification performed locally:
 - `npm.cmd run lint` -> passed.
 - `npm.cmd run build` -> passed; existing Vite chunk-size warning only.
 - `git diff --check` -> passed.
+- GitHub Actions `quality` run `31657918709` -> passed.
 - Temporary Vite dev server used for validation was closed after testing.
 
 Remaining risks / TODOs:
 
-- The first UI fix push is on GitHub; the navigation-description CI fix has been deployed to the server and now needs the prepared GitHub archive tag pushed, then a follow-up GitHub `main` push and Actions verification.
+- The mobile navigation fix is deployed on the server and verified on GitHub. Only this final handoff-doc commit remains to push after the prepared archive tag.
 - If the mobile drawer needs iconography like GitHub/Cloudflare, add an icon set later; this pass intentionally kept the change scoped to layout and interaction.
 
 ## 2026-08-13 P3 Runtime Process Observability Slice
