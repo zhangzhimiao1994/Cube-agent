@@ -1,4 +1,44 @@
 
+## 2026-08-13 P3 Schedule Alarm-Style UX
+
+Current state:
+
+- Plan task UI now uses a calendar/alarm-style form:
+  - `一次性` uses date + time and submits `kind: one_time` with `run_at`.
+  - `每天` uses time and submits `kind: cron` with `minute hour * * *`.
+  - `每周` uses weekday + time and submits `kind: cron` with `minute hour * * weekday`.
+- The old schedule page mojibake was replaced with readable Chinese labels and messages.
+- Existing schedules show a readable frequency summary such as `每天 09:00`.
+- Backend scheduler cron parsing now conservatively supports the weekday field `0..6`; day-of-month and month fields remain restricted to `*`.
+
+Verification performed:
+
+- TDD red/green:
+  - Added a backend unit test for weekly cron next-fire calculation.
+  - Added a frontend test for weekly alarm-style schedule creation, tick, and delete.
+- Local checks:
+  - `uv run pytest tests/unit/test_scheduler_types.py tests/api/test_admin_resources.py::test_schedule_api_creates_lists_and_ticks_user_visible_tasks tests/api/test_admin_resources.py::test_schedule_api_persists_restores_and_deletes_tasks -q --tb=short` -> 4 passed.
+  - `uv run ruff check src tests` -> passed.
+  - `uv run mypy --strict src tests` -> passed.
+  - `npm.cmd run test -- --run` -> 94 passed.
+  - `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-p3-schedule-alarm-ux.tgz` to `103.236.98.133`.
+  - Deployed `src/agent_hub/scheduler/types.py` and rebuilt `web/dist` into `/opt/agent-hub/current`.
+  - Restarted `agent-hub-api` and `agent-hub-worker`; reloaded Caddy.
+- Server real environment verification:
+  - Ran `/tmp/server_schedule_alarm_ux_check.py` using the same environment file as the API service.
+  - Created a real weekly cron schedule through the admin API, ticked it, verified it stayed active, verified `next_fire_at` advanced by one week, and deleted the probe schedule.
+  - Final output: `{"status": "ok", "checked": ["weekly_cron_schedule_create", "weekly_schedule_tick", "weekly_next_fire_advances_to_next_week", "delete_schedule_cleanup"], "schedule_id": "d6bed527-488f-4239-a9c8-035663839a7c"}`.
+
+Remaining risks / TODOs:
+
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue P3 with OpenClaw hardening/adapters, command grammar polish, final GitHub usage README, and Docker deployment readiness later.
+
 ## 2026-08-13 P3 UI Branding to 魔方agent
 
 Current state:

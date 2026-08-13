@@ -1,7 +1,8 @@
 from datetime import UTC, datetime
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
-from agent_hub.scheduler.types import deterministic_idempotency_key
+from agent_hub.scheduler.types import CronScheduleSpec, deterministic_idempotency_key
 
 
 def test_schedule_idempotency_key_fits_run_outbox_prefix_limit() -> None:
@@ -17,3 +18,11 @@ def test_schedule_idempotency_key_fits_run_outbox_prefix_limit() -> None:
     assert key.startswith("schedule:")
     assert len(key) <= 64
     assert len(f"{tenant_id}:{key}") <= 128
+
+
+def test_weekly_cron_schedule_advances_to_selected_weekday() -> None:
+    schedule = CronScheduleSpec(expression="0 9 * * 4", timezone="Asia/Shanghai")
+    first = schedule.first_fire_after(datetime(2026, 8, 12, 10, tzinfo=ZoneInfo("Asia/Shanghai")))
+
+    assert first == datetime(2026, 8, 13, 1, tzinfo=UTC)
+    assert schedule.next_after(first) == datetime(2026, 8, 20, 1, tzinfo=UTC)

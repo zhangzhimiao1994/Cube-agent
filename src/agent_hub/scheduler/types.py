@@ -254,16 +254,17 @@ def _timezone(name: str) -> ZoneInfo:
         raise ValueError("timezone must be a valid IANA timezone") from None
 
 
-def _parse_cron(expression: str) -> tuple[frozenset[int], frozenset[int]]:
+def _parse_cron(expression: str) -> tuple[frozenset[int], frozenset[int], frozenset[int]]:
     fields = expression.split()
     if len(fields) != 5:
         raise ValueError("cron expression must have five fields")
     minutes = _parse_cron_field(fields[0], minimum=0, maximum=59, name="cron minute")
     hours = _parse_cron_field(fields[1], minimum=0, maximum=23, name="cron hour")
-    for index, field_text in enumerate(fields[2:], start=3):
+    for index, field_text in enumerate(fields[2:4], start=3):
         if field_text != "*":
             raise ValueError(f"cron field {index} currently supports only '*'")
-    return minutes, hours
+    weekdays = _parse_cron_field(fields[4], minimum=0, maximum=6, name="cron weekday")
+    return minutes, hours, weekdays
 
 
 def _parse_cron_field(field_text: str, *, minimum: int, maximum: int, name: str) -> frozenset[int]:
@@ -289,13 +290,18 @@ def _parse_int(text: str, *, name: str) -> int:
 def _next_cron_fire(expression: str, timezone: str, *, after: datetime) -> datetime:
     if after.tzinfo is None:
         raise ValueError("cron reference time must be timezone-aware")
-    minutes, hours = _parse_cron(expression)
+    minutes, hours, weekdays = _parse_cron(expression)
     zone = _timezone(timezone)
     local_after = after.astimezone(zone).replace(second=0, microsecond=0)
     candidate = local_after + timedelta(minutes=1)
     max_minutes = 366 * 24 * 60
     for _ in range(max_minutes):
-        if candidate.minute in minutes and candidate.hour in hours:
+        cron_weekday = (candidate.weekday() + 1) % 7
+        if (
+            candidate.minute in minutes
+            and candidate.hour in hours
+            and cron_weekday in weekdays
+        ):
             return candidate.astimezone(UTC)
         candidate += timedelta(minutes=1)
     raise ValueError("cron expression did not produce a fire time")
