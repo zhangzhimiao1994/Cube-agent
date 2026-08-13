@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID, uuid4
@@ -72,7 +71,9 @@ async def test_repeated_scheduler_tick_submits_once() -> None:
     assert await scheduler.submission_count(schedule.id, fire_time, tenant_id=TENANT_A) == 1
     assert len(submitter.calls) == 1
     assert submitter.calls[0].mode is TaskMode.DISPATCH
-    assert str(schedule.id) in submitter.calls[0].idempotency_key
+    assert submitter.calls[0].metadata["schedule_id"] == str(schedule.id)
+    assert submitter.calls[0].idempotency_key.startswith("schedule:")
+    assert len(f"{TENANT_A}:{submitter.calls[0].idempotency_key}") <= 128
 
 
 async def test_failed_scheduler_submission_is_retried_on_next_tick() -> None:
@@ -311,10 +312,9 @@ async def test_long_base_idempotency_key_is_hashed_into_safe_task_request_key() 
 
     await scheduler.tick(now=fire_time)
 
-    assert len(submitter.calls[0].idempotency_key) <= 256
-    assert submitter.calls[0].idempotency_key.endswith(
-        ":" + hashlib.sha256(("x" * 256).encode("utf-8")).hexdigest()[:16]
-    )
+    assert submitter.calls[0].idempotency_key.startswith("schedule:")
+    assert len(submitter.calls[0].idempotency_key) <= 64
+    assert len(f"{TENANT_A}:{submitter.calls[0].idempotency_key}") <= 128
 
 
 async def test_unfinished_task_can_schedule_user_visible_follow_up() -> None:

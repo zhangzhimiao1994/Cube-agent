@@ -4924,7 +4924,7 @@ async def tick_schedules(
 @router.delete(
     "/schedules/{schedule_id}",
     response_model=RunDeleteResponse,
-    responses=error_responses(401, 403, 404, 503),
+    responses=error_responses(401, 403, 404, 422, 503),
 )
 async def delete_schedule(
     schedule_id: UUID,
