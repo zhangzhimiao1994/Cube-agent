@@ -23,6 +23,7 @@ from agent_hub.api.routers.admin import (
     RunDetailResponse,
     RunEventResponse,
     SecretCreateRequest,
+    SystemSettingsResponse,
     _admin_run_artifact,
     _admin_run_event,
     _mode_error_log_from_run,
@@ -129,6 +130,112 @@ class FakeModelTransport:
             text="agent-hub-model-check-ok",
             usage=TokenUsage(prompt_tokens=5, completion_tokens=5, total_tokens=10),
         )
+
+
+def test_system_settings_default_openclaw_is_disabled() -> None:
+    settings = SystemSettingsResponse()
+
+    assert settings.openclaw_enabled is False
+    assert settings.openclaw_mode == "ask"
+    assert settings.model_dump()["openclaw_enabled"] is False
+    assert settings.model_dump()["openclaw_mode"] == "ask"
+
+
+def test_openclaw_operation_requires_feature_switch() -> None:
+    response = client().post(
+        "/api/v1/admin/openclaw/operations",
+        headers=headers(),
+        json={
+            "platform": "linux",
+            "kind": "server_command",
+            "target": "agent-hub-server",
+            "argv": ["python", "--version"],
+            "risk_level": "low",
+            "reason": "smoke test OpenClaw approval path",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "openclaw_disabled"
+
+
+def test_openclaw_operation_creates_approval_request_when_enabled() -> None:
+    api = client()
+    settings_response = api.get("/api/v1/admin/settings", headers=headers())
+    payload = settings_response.json()
+    payload["openclaw_enabled"] = True
+    payload["openclaw_mode"] = "ask"
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+
+    response = api.post(
+        "/api/v1/admin/openclaw/operations",
+        headers=headers(),
+        json={
+            "platform": "linux",
+            "kind": "server_command",
+            "target": "agent-hub-server",
+            "argv": ["python", "--version"],
+            "risk_level": "low",
+            "reason": "smoke test OpenClaw approval path",
+        },
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "waiting_user_approval"
+    assert body["platform"] == "linux"
+    assert body["kind"] == "server_command"
+    assert body["approval_id"].startswith("openclaw_")
+    assert body["requires_user_approval"] is True
+    assert body["operation"]["argv"] == ["python", "--version"]
+    assert "agent-hub-server" in body["approval_summary"]
+
+    fetched = api.get(f"/api/v1/admin/openclaw/operations/{body['id']}", headers=headers())
+    assert fetched.status_code == 200
+    assert fetched.json()["id"] == body["id"]
+    assert fetched.json()["status"] == "waiting_user_approval"
+
+    approved = api.patch(
+        f"/api/v1/admin/openclaw/operations/{body['id']}",
+        headers=headers(),
+        json={"decision": "approve"},
+    )
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "approved"
+    assert approved.json()["requires_user_approval"] is False
+
+    repeated = api.patch(
+        f"/api/v1/admin/openclaw/operations/{body['id']}",
+        headers=headers(),
+        json={"decision": "reject"},
+    )
+    assert repeated.status_code == 409
+    assert repeated.json()["error"]["code"] == "openclaw_already_resolved"
+
+
+def test_openclaw_read_only_mode_rejects_write_operations() -> None:
+    api = client()
+    settings_response = api.get("/api/v1/admin/settings", headers=headers())
+    payload = settings_response.json()
+    payload["openclaw_enabled"] = True
+    payload["openclaw_mode"] = "read_only"
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+
+    response = api.post(
+        "/api/v1/admin/openclaw/operations",
+        headers=headers(),
+        json={
+            "platform": "linux",
+            "kind": "server_command",
+            "target": "agent-hub-server",
+            "argv": ["python", "--version"],
+            "risk_level": "low",
+            "reason": "read-only mode should block command execution plans",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "openclaw_read_only"
 
 
 def test_qwen_dashscope_unauthorized_model_check_returns_provider_specific_hint() -> None:

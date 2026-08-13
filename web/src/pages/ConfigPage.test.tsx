@@ -21,6 +21,8 @@ const settings = {
   allow_main_agent_override: false,
   allow_temporary_agents: false,
   multimedia_generation_enabled: false,
+  openclaw_enabled: false,
+  openclaw_mode: "ask",
   temporary_agent_policy:
     "主 Agent 发现角色池缺少必要能力时，必须先说明原因并取得用户确认，再临时加入子 Agent。",
   channel_entry: "web",
@@ -155,6 +157,8 @@ describe("ConfigPage", () => {
     await user.click(screen.getByLabelText("允许主 Agent 提出临场调整，执行前必须向用户核对"));
     await user.click(screen.getByLabelText("允许主 Agent 在能力不足时申请临时子 Agent"));
     await user.click(screen.getByTestId("multimedia-generation-toggle"));
+    await user.click(screen.getByTestId("openclaw-toggle"));
+    await user.selectOptions(screen.getByLabelText("OpenClaw 权限模式"), "read_only");
     fireEvent.change(screen.getByLabelText(/临时 Agent 补位规则/), {
       target: { value: "缺少专业能力时先申请临时 Agent，任务结束后询问是否永久保存。" },
     });
@@ -171,6 +175,8 @@ describe("ConfigPage", () => {
         allow_main_agent_override: true,
         allow_temporary_agents: true,
         multimedia_generation_enabled: true,
+        openclaw_enabled: true,
+        openclaw_mode: "read_only",
         temporary_agent_policy: "缺少专业能力时先申请临时 Agent，任务结束后询问是否永久保存。",
       },
     });

@@ -1353,3 +1353,74 @@ Next:
 - Push `main` with `git push --force-with-lease mutilagent main`.
 - Check GitHub Actions and fix/redeploy/repush if red.
 - Continue P3 toward OpenClaw feature switch wiring and conversation-integrated vibe coding after CI is green.
+
+## 2026-08-13 P3 OpenClaw Feature Switch
+
+Current state:
+
+- OpenClaw is represented as a system-level capability, not a workflow.
+- `openclaw_enabled` defaults to `false`.
+- `openclaw_mode` defaults to `ask` and supports Codex-style permission modes: `read_only`, `ask`, `auto_review`, and `trusted_auto`.
+- The settings page exposes the OpenClaw switch and permission mode selector.
+- OpenClaw operation requests currently create a persisted `waiting_user_approval` plan and audit record; they do not execute computer/server actions before approval.
+- OpenClaw plans can be fetched and resolved with approve/reject decisions; approval still does not execute the action yet.
+- The request model is platform-aware (`linux`, `windows`, `macos`) so future executors can adapt per OS instead of assuming Linux-only behavior.
+
+Changes made:
+
+- Added `openclaw_enabled` to admin system settings API request/response models.
+- Added `openclaw_mode` with Codex-style permission modes.
+- Added `POST /api/v1/admin/openclaw/operations` to create user-approval requests without executing actions.
+- Added `GET /api/v1/admin/openclaw/operations/{operation_id}` and `PATCH /api/v1/admin/openclaw/operations/{operation_id}` for the approval lifecycle.
+- Added read-only blocking for non-read OpenClaw operation plans.
+- Added persistent `openclaw` admin resources and Alembic migration `0016_openclaw_admin_resources.py`.
+- Added frontend API schema support for OpenClaw fields with backward-compatible defaulting.
+- Added Config page UI for the OpenClaw long-running computer operation switch and permission mode selector.
+- Added tests for default-disabled API behavior, approval-plan creation, read-only blocking, and frontend save payload behavior.
+
+Local verification:
+
+- TDD red checks were added first:
+  - backend failed because `SystemSettingsResponse` had no `openclaw_enabled`;
+  - OpenClaw operation endpoint initially returned 405 before approval planning was implemented;
+  - frontend failed because `openclaw-toggle` / mode controls did not exist.
+- `uv run pytest tests/api/test_admin_resources.py tests/unit/test_database_resources.py -q --tb=short` -> 63 passed.
+- `uv run ruff check src\agent_hub\api\routers\admin.py src\agent_hub\db\models.py tests\api\test_admin_resources.py tests\unit\test_database_resources.py alembic\versions\0016_openclaw_admin_resources.py` -> passed.
+- `uv run mypy --strict src\agent_hub\api\routers\admin.py src\agent_hub\db\models.py tests\api\test_admin_resources.py tests\unit\test_database_resources.py alembic\versions\0016_openclaw_admin_resources.py` -> passed.
+- `npm.cmd test -- --run src/pages/ConfigPage.test.tsx src/app/AppShell.test.tsx src/pages/OperationalPages.test.tsx` -> 45 passed.
+- `npm.cmd run lint` -> passed.
+- `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+
+Functional verification standard going forward:
+
+- Server-side verification must exercise the implemented feature path, not only port availability, service `active`, or `/health/*`.
+- For OpenClaw, server verification must cover the disabled rejection path, enabled approval-request path, read-only blocking path, audit/log evidence, and later the approved execution path on each supported OS adapter.
+- For image/video generation, server verification must submit an actual generation request when enabled, confirm the generated artifact or explicit provider result, and confirm disabled/capability-mismatch blocking.
+
+Server deployment and verification:
+
+- Uploaded incremental package to `103.236.98.133:/tmp/agent-hub-p3-openclaw-switch.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`.
+- Uploaded refreshed approval lifecycle package to `103.236.98.133:/tmp/agent-hub-p3-openclaw-approval.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`.
+- Ran Alembic migration `0016_openclaw_admin_resources` with the production EnvironmentFile loaded without printing secrets.
+- Restarted `agent-hub-api` and `agent-hub-worker`; reloaded Caddy.
+- Verified `agent-hub-api`, `agent-hub-worker`, and `caddy` were active.
+- Verified `/health/live` and `/health/ready` returned `{"status":"ok"}`.
+- Verified deployed Python files compile with `py_compile`.
+- Ran `/tmp/openclaw_settings_check.py` with `PYTHONPATH=src`; it passed default-disabled and enabled settings serialization checks.
+- Verified deployed `web/dist` contains the OpenClaw switch UI and `openclaw_enabled` field.
+- Ran `/tmp/openclaw_api_functional_check.py` through the real local HTTP API with a short-lived admin token generated from the running server environment; it passed:
+  - disabled OpenClaw rejects operation creation with `openclaw_disabled`;
+  - `ask` mode creates a persisted `waiting_user_approval` operation;
+  - the operation can be fetched by ID;
+  - approval changes status to `approved`;
+  - repeated resolution is rejected with `openclaw_already_resolved`;
+  - `read_only` mode rejects server command planning with `openclaw_read_only`;
+  - original settings are restored at the end.
+- Verified deployed `web/dist` contains `OpenClaw 权限模式` and `openclaw_mode`.
+
+Next:
+
+- Amend the local OpenClaw commit, then create recovery archive bundle/tag, force-with-lease push GitHub, and check Actions.
+- Continue P3 toward approved executor integration across Linux/Windows/macOS and conversation-integrated vibe coding after CI is green.

@@ -538,6 +538,8 @@ class SystemSettingsRequest(BaseModel):
     allow_main_agent_override: bool = False
     allow_temporary_agents: bool = False
     multimedia_generation_enabled: bool = False
+    openclaw_enabled: bool = False
+    openclaw_mode: str = Field(default="ask", pattern=r"^(ask|read_only|auto_review|trusted_auto)$")
     temporary_agent_policy: str = Field(
         default="主 Agent 发现角色池缺少必要能力时，必须先说明原因并取得用户确认，再临时加入子 Agent。",
         max_length=10_000,
@@ -549,6 +551,84 @@ class SystemSettingsRequest(BaseModel):
 
 class SystemSettingsResponse(SystemSettingsRequest):
     pass
+
+
+class OpenClawOperationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    platform: str = Field(pattern=r"^(linux|windows|macos)$")
+    kind: str = Field(pattern=r"^(server_command|desktop_action|screen_read|file_read)$")
+    target: str = Field(min_length=1, max_length=256)
+    argv: list[str] = Field(default_factory=list, max_length=32)
+    risk_level: str = Field(default="medium", pattern=r"^(low|medium|high)$")
+    reason: str = Field(min_length=1, max_length=2_000)
+
+    @field_validator("argv")
+    @classmethod
+    def validate_argv(cls, value: list[str]) -> list[str]:
+        for item in value:
+            if not isinstance(item, str) or not item or len(item) > 512:
+                raise ValueError("argv items must be nonblank bounded strings")
+            if item != item.strip() or any(ord(ch) < 32 or ord(ch) == 127 for ch in item):
+                raise ValueError("argv items must be printable and unpadded")
+        return value
+
+
+class OpenClawOperationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    status: str = Field(pattern=r"^(waiting_user_approval|approved|rejected)$")
+    approval_id: str
+    requires_user_approval: bool
+    platform: str
+    kind: str
+    operation: dict[str, object]
+    approval_summary: str
+    requested_by: str
+    created_at: datetime
+    resolved_by: str | None = None
+    resolved_at: datetime | None = None
+
+
+class OpenClawResolveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: str = Field(pattern=r"^(approve|reject)$")
+
+
+def _openclaw_operation_response(
+    *,
+    operation_id: str,
+    request: OpenClawOperationRequest,
+    actor: str,
+    mode: str,
+) -> OpenClawOperationResponse:
+    return OpenClawOperationResponse(
+        id=operation_id,
+        status="waiting_user_approval",
+        approval_id=f"{operation_id}_approval",
+        requires_user_approval=True,
+        platform=request.platform,
+        kind=request.kind,
+        operation=request.model_dump(),
+        approval_summary=(
+            f"OpenClaw {request.platform} {request.kind} on {request.target}; "
+            f"risk={request.risk_level}; mode={mode}; reason={request.reason}"
+        ),
+        requested_by=actor,
+        created_at=datetime.now(UTC),
+    )
+
+
+def _openclaw_audit_details(request: OpenClawOperationRequest, mode: str) -> dict[str, object]:
+    return {
+        "platform": request.platform,
+        "kind": request.kind,
+        "target": request.target,
+        "risk_level": request.risk_level,
+        "mode": mode,
+    }
 
 
 class MainAgentModelConfig(BaseModel):
@@ -779,6 +859,24 @@ class AdminResourceService(Protocol):
         details: dict[str, object] | None = None,
     ) -> AuditEventResponse: ...
 
+    async def create_openclaw_operation(
+        self,
+        request: OpenClawOperationRequest,
+        *,
+        actor: str,
+        mode: str,
+    ) -> OpenClawOperationResponse: ...
+
+    async def get_openclaw_operation(self, operation_id: str) -> OpenClawOperationResponse: ...
+
+    async def resolve_openclaw_operation(
+        self,
+        operation_id: str,
+        request: OpenClawResolveRequest,
+        *,
+        actor: str,
+    ) -> OpenClawOperationResponse: ...
+
     async def list_logs(self, category: str | None = None) -> tuple[LogEntryResponse, ...]: ...
 
     async def list_hermes_insights(self) -> tuple[HermesInsightResponse, ...]: ...
@@ -816,6 +914,7 @@ class InMemoryAdminResourceService:
     audit_events: list[AuditEventResponse] = field(default_factory=list)
     logs: list[LogEntryResponse] = field(default_factory=list)
     hermes_insights: dict[str, HermesInsightResponse] = field(default_factory=dict)
+    openclaw_operations: dict[str, OpenClawOperationResponse] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.runs:
@@ -1234,6 +1333,67 @@ class InMemoryAdminResourceService:
         )
         self.audit_events.append(event)
         return event
+
+    async def create_openclaw_operation(
+        self,
+        request: OpenClawOperationRequest,
+        *,
+        actor: str,
+        mode: str,
+    ) -> OpenClawOperationResponse:
+        operation_id = f"openclaw_{uuid4().hex}"
+        response = _openclaw_operation_response(
+            operation_id=operation_id,
+            request=request,
+            actor=actor,
+            mode=mode,
+        )
+        self.openclaw_operations[operation_id] = response
+        await self.record_audit_event(
+            actor=actor,
+            action="openclaw.approval_requested",
+            resource=f"openclaw:{operation_id}",
+            details=_openclaw_audit_details(request, mode),
+        )
+        return response
+
+    async def get_openclaw_operation(self, operation_id: str) -> OpenClawOperationResponse:
+        try:
+            return self.openclaw_operations[operation_id]
+        except KeyError:
+            raise PublicAPIError(404, "not_found", "not found") from None
+
+    async def resolve_openclaw_operation(
+        self,
+        operation_id: str,
+        request: OpenClawResolveRequest,
+        *,
+        actor: str,
+    ) -> OpenClawOperationResponse:
+        current = await self.get_openclaw_operation(operation_id)
+        if current.status != "waiting_user_approval":
+            raise PublicAPIError(
+                409,
+                "openclaw_already_resolved",
+                "OpenClaw operation is already resolved",
+            )
+        status = "approved" if request.decision == "approve" else "rejected"
+        updated = current.model_copy(
+            update={
+                "status": status,
+                "requires_user_approval": False,
+                "resolved_by": actor,
+                "resolved_at": datetime.now(UTC),
+            }
+        )
+        self.openclaw_operations[operation_id] = updated
+        await self.record_audit_event(
+            actor=actor,
+            action=f"openclaw.{status}",
+            resource=f"openclaw:{operation_id}",
+            details={"approval_id": current.approval_id},
+        )
+        return updated
 
     def make_log(
         self,
@@ -1956,6 +2116,71 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             return await super().update_settings(request)
         await self._record_audit("settings.update", "settings:system", {"default_mode": response.default_mode})
         return response
+
+    async def create_openclaw_operation(
+        self,
+        request: OpenClawOperationRequest,
+        *,
+        actor: str,
+        mode: str,
+    ) -> OpenClawOperationResponse:
+        operation_id = f"openclaw_{uuid4().hex}"
+        response = _openclaw_operation_response(
+            operation_id=operation_id,
+            request=request,
+            actor=actor,
+            mode=mode,
+        )
+        if not await self._upsert_admin_payload("openclaw", operation_id, response.model_dump(mode="json")):
+            return await super().create_openclaw_operation(request, actor=actor, mode=mode)
+        await self.record_audit_event(
+            actor=actor,
+            action="openclaw.approval_requested",
+            resource=f"openclaw:{operation_id}",
+            details=_openclaw_audit_details(request, mode),
+        )
+        return response
+
+    async def get_openclaw_operation(self, operation_id: str) -> OpenClawOperationResponse:
+        payload = await self._get_admin_payload("openclaw", operation_id)
+        if payload is None:
+            return await super().get_openclaw_operation(operation_id)
+        if not payload:
+            raise PublicAPIError(404, "not_found", "not found")
+        return OpenClawOperationResponse.model_validate(payload)
+
+    async def resolve_openclaw_operation(
+        self,
+        operation_id: str,
+        request: OpenClawResolveRequest,
+        *,
+        actor: str,
+    ) -> OpenClawOperationResponse:
+        current = await self.get_openclaw_operation(operation_id)
+        if current.status != "waiting_user_approval":
+            raise PublicAPIError(
+                409,
+                "openclaw_already_resolved",
+                "OpenClaw operation is already resolved",
+            )
+        status = "approved" if request.decision == "approve" else "rejected"
+        updated = current.model_copy(
+            update={
+                "status": status,
+                "requires_user_approval": False,
+                "resolved_by": actor,
+                "resolved_at": datetime.now(UTC),
+            }
+        )
+        if not await self._upsert_admin_payload("openclaw", operation_id, updated.model_dump(mode="json")):
+            return await super().resolve_openclaw_operation(operation_id, request, actor=actor)
+        await self.record_audit_event(
+            actor=actor,
+            action=f"openclaw.{status}",
+            resource=f"openclaw:{operation_id}",
+            details={"approval_id": current.approval_id},
+        )
+        return updated
 
     async def get_main_agent_config(self) -> MainAgentConfigResponse:
         payload = await self._get_admin_payload("main_agent", "default")
@@ -3788,6 +4013,63 @@ async def update_settings(
 ) -> SystemSettingsResponse:
     _require(principal, "config:write")
     return await service.update_settings(body)
+
+
+@router.post(
+    "/openclaw/operations",
+    response_model=OpenClawOperationResponse,
+    status_code=202,
+    responses=error_responses(401, 403, 409, 422),
+)
+async def create_openclaw_operation(
+    body: OpenClawOperationRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> OpenClawOperationResponse:
+    _require(principal, "config:write")
+    settings = await service.get_settings()
+    if not settings.openclaw_enabled:
+        raise PublicAPIError(409, "openclaw_disabled", "OpenClaw is disabled")
+    if settings.openclaw_mode == "read_only" and body.kind not in {"screen_read", "file_read"}:
+        raise PublicAPIError(403, "openclaw_read_only", "OpenClaw read-only mode blocks this operation")
+    return await service.create_openclaw_operation(
+        body,
+        actor=str(principal.user_id),
+        mode=settings.openclaw_mode,
+    )
+
+
+@router.get(
+    "/openclaw/operations/{operation_id}",
+    response_model=OpenClawOperationResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def get_openclaw_operation(
+    operation_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> OpenClawOperationResponse:
+    _require(principal, "config:read")
+    return await service.get_openclaw_operation(operation_id)
+
+
+@router.patch(
+    "/openclaw/operations/{operation_id}",
+    response_model=OpenClawOperationResponse,
+    responses=error_responses(401, 403, 404, 409, 422),
+)
+async def resolve_openclaw_operation(
+    operation_id: str,
+    body: OpenClawResolveRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> OpenClawOperationResponse:
+    _require(principal, "config:write")
+    return await service.resolve_openclaw_operation(
+        operation_id,
+        body,
+        actor=str(principal.user_id),
+    )
 
 
 @router.get("/main-agent", response_model=MainAgentConfigResponse, responses=error_responses(401, 403, 422))
