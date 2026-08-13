@@ -1,4 +1,59 @@
 
+## 2026-08-13 Chat Toggles and Hermes Delete Fix
+
+Current state:
+
+- Chat composer Handoff (`按照原思路`) is now a true toggle: click once to start a referenced follow-up conversation, click again to clear `reference_conversation_id` before sending.
+- Vibe Coding remains independently toggleable and is not mutually exclusive with Handoff. This is intentional: long Vibe Coding conversations may still need a referenced/condensed prior conversation.
+- Hermes learning records can now be deleted from the table and from the detail page. Delete calls the real admin API and removes the record from subsequent list/detail reads.
+- Server incremental deployment to `103.236.98.133:/opt/agent-hub/current` was performed with `/tmp/agent-hub-chat-hermes-fix.tgz`.
+- Server services `agent-hub-api`, `agent-hub-worker`, and `caddy` are active after restart/reload.
+- Server real HTTP functional check `/tmp/server_chat_hermes_check.py` passed in the deployed environment:
+  - temporarily enabled `vibe_coding_enabled`;
+  - submitted a real `/api/v1/runs` payload with both `reference_conversation_id` and `vibe_coding=true`;
+  - confirmed admin run detail preserved `conversation_id`, `reference_conversation_id`, `vibe_coding=enabled`, and `capability=vibe_coding`;
+  - created a Hermes learning record through `/api/v1/admin/hermes/feedback`;
+  - deleted it through `DELETE /api/v1/admin/hermes/{id}`;
+  - confirmed detail returns `404` and list no longer includes the deleted record;
+  - restored original system settings afterward.
+
+Changes made:
+
+- `web/src/pages/RunsPage.tsx`
+  - Added active pressed state for Handoff and second-click cancellation.
+  - Kept Handoff and Vibe Coding independent so they can be submitted together.
+- `src/agent_hub/api/routers/admin.py`
+  - Added `delete_hermes_insight` to the admin resource service protocol, in-memory service, persistent service, and REST router.
+- `web/src/api/client.ts`
+  - Added `deleteHermesInsight`.
+- `web/src/pages/HermesPage.tsx`
+  - Added delete actions in the Hermes table and detail view.
+- Tests added/updated:
+  - Handoff + Vibe can submit together.
+  - Handoff can be canceled before send.
+  - Vibe Coding can be canceled before send.
+  - Hermes delete removes a learning record from the UI.
+  - Hermes delete removes the backend learning record and returns 404 after deletion.
+
+Verification performed:
+
+- TDD red checks were observed first:
+  - Handoff cancellation and combined Handoff+Vibe behavior failed before the RunsPage fix.
+  - Hermes UI delete button was missing.
+  - Backend DELETE returned HTTP 405 before the API route/service method was added.
+- `npm.cmd test -- --run src/pages/OperationalPages.test.tsx` -> 42 passed.
+- `uv run pytest tests/api/test_admin_resources.py -q -k "hermes" --tb=short` -> 4 passed.
+- `uv run ruff check src tests` -> passed.
+- `uv run mypy src` -> passed.
+- `npm.cmd run lint` -> passed.
+- `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+
+Follow-up backlog from user feedback:
+
+- Model test/save page: after test-and-save, refresh persisted model data and clear stale local form/config state.
+- Chat page UI: improve layout and button presentation; current functional fix is intentionally narrow.
+- System framework context compression: implement automatic context compression at the system/runtime layer, not only for Vibe Coding. The decision should consider main-agent model capability/context window and trigger compression before long conversations degrade usability.
+
 ## 2026-08-13 P3 Conversation-Integrated Vibe Coding Switch
 
 Current state:

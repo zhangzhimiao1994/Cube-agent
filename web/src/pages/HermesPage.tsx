@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useMemo, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { api, formatApiError } from "../api/client";
 
@@ -58,6 +58,13 @@ function HermesLearningTable() {
     mutationFn: (ids: string[]) => api.bulkConfirmHermesInsights(ids),
     onSuccess: async () => {
       setSelectedIds([]);
+      await queryClient.invalidateQueries({ queryKey: ["hermes"] });
+    },
+  });
+  const deleteInsight = useMutation({
+    mutationFn: (id: string) => api.deleteHermesInsight(id),
+    onSuccess: async (_result, id) => {
+      setSelectedIds((current) => current.filter((item) => item !== id));
       await queryClient.invalidateQueries({ queryKey: ["hermes"] });
     },
   });
@@ -137,6 +144,9 @@ function HermesLearningTable() {
             {bulkConfirm.isError ? (
               <p role="alert">{formatApiError(bulkConfirm.error, "Hermes 批量确认失败")}</p>
             ) : null}
+            {deleteInsight.isError ? (
+              <p role="alert">{formatApiError(deleteInsight.error, "Hermes 删除失败")}</p>
+            ) : null}
             <div className="table-shell">
               <table aria-label="Hermes 学习台账">
                 <thead>
@@ -178,6 +188,15 @@ function HermesLearningTable() {
                           >
                             查看详情
                           </Link>
+                          <button
+                            type="button"
+                            className="secondary-action"
+                            aria-label={`删除 Hermes 学习 ${insight.id}`}
+                            disabled={deleteInsight.isPending}
+                            onClick={() => deleteInsight.mutate(insight.id)}
+                          >
+                            删除
+                          </button>
                         </td>
                       </tr>
                     );
@@ -238,6 +257,7 @@ function HermesLearningTable() {
 
 function HermesInsightDetail({ insightId }: { insightId: string }) {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const insight = useQuery({
     queryKey: ["hermes", insightId],
     queryFn: () => api.hermesInsight(insightId),
@@ -247,6 +267,14 @@ function HermesInsightDetail({ insightId }: { insightId: string }) {
     onSuccess: (updated) => {
       queryClient.setQueryData(["hermes", insightId], updated);
       void queryClient.invalidateQueries({ queryKey: ["hermes"] });
+    },
+  });
+  const deleteInsight = useMutation({
+    mutationFn: () => api.deleteHermesInsight(insightId),
+    onSuccess: async () => {
+      queryClient.removeQueries({ queryKey: ["hermes", insightId] });
+      await queryClient.invalidateQueries({ queryKey: ["hermes"] });
+      navigate("/hermes");
     },
   });
 
@@ -292,10 +320,21 @@ function HermesInsightDetail({ insightId }: { insightId: string }) {
             <dd>{item.weight}</dd>
           </div>
         </dl>
-        <button type="button" disabled={confirm.isPending || item.confirmed_at !== null} onClick={() => confirm.mutate()}>
-          {item.confirmed_at ? "已确认" : confirm.isPending ? "正在确认..." : "确认这条学习"}
-        </button>
+        <div className="inline-actions">
+          <button type="button" disabled={confirm.isPending || item.confirmed_at !== null} onClick={() => confirm.mutate()}>
+            {item.confirmed_at ? "已确认" : confirm.isPending ? "正在确认..." : "确认这条学习"}
+          </button>
+          <button
+            type="button"
+            className="secondary-action"
+            disabled={deleteInsight.isPending}
+            onClick={() => deleteInsight.mutate()}
+          >
+            {deleteInsight.isPending ? "正在删除..." : "删除"}
+          </button>
+        </div>
         {confirm.isError ? <p role="alert">{formatApiError(confirm.error, "Hermes 学习确认失败")}</p> : null}
+        {deleteInsight.isError ? <p role="alert">{formatApiError(deleteInsight.error, "Hermes 学习删除失败")}</p> : null}
       </article>
     </section>
   );

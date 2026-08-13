@@ -528,6 +528,12 @@ const HermesBulkConfirmSchema = z.object({
 
 export type HermesBulkConfirmResult = z.infer<typeof HermesBulkConfirmSchema>;
 
+const OperationStatusSchema = z.object({
+  status: z.string(),
+});
+
+export type OperationStatus = z.infer<typeof OperationStatusSchema>;
+
 const HermesRecommendationSchema = z.object({
   recommended_mode: z.string(),
   recommended_model: z.string().nullable(),
@@ -1110,6 +1116,9 @@ export const api = {
   },
   confirmHermesInsight(id: string): Promise<HermesInsight> {
     return request(`/api/v1/admin/hermes/${encodeURIComponent(id)}/confirm`, { method: "POST" }, HermesInsightSchema);
+  },
+  deleteHermesInsight(id: string): Promise<OperationStatus> {
+    return request(`/api/v1/admin/hermes/${encodeURIComponent(id)}`, { method: "DELETE" }, OperationStatusSchema);
   },
   bulkConfirmHermesInsights(ids: string[]): Promise<HermesBulkConfirmResult> {
     return request(

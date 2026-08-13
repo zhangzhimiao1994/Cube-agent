@@ -1173,6 +1173,7 @@ export function RunsPage() {
   const [temporaryFeedback, setTemporaryFeedback] = useState("");
   const userSelectedMode = useRef(false);
   const trimmedReferenceConversationId = referenceConversationId.trim();
+  const handoffActive = Boolean(trimmedReferenceConversationId);
 
   const selectedWorkflow = useMemo(
     () => (workflows.data ?? []).find((workflow) => workflow.id === workflowId),
@@ -1717,6 +1718,11 @@ export function RunsPage() {
   }
 
   function startHandoffConversation(sourceRun?: RunDetail | null) {
+    if (handoffActive) {
+      setReferenceConversationId("");
+      setSubmitNotice("已取消 Handoff 参考会话。");
+      return;
+    }
     const sourceConversationId = runConversationId(sourceRun ?? selectedRun.data) ?? conversationId;
     if (!sourceConversationId) {
       setSubmitNotice("当前没有可 Handoff 的会话。");
@@ -2266,10 +2272,11 @@ export function RunsPage() {
               </label>
               <button
                 type="button"
-                className="composer-handoff-button"
+                className={`composer-handoff-button${handoffActive ? " composer-toggle-active" : ""}`}
                 aria-label="按照原思路"
+                aria-pressed={handoffActive}
                 title="按照原思路开启新对话"
-                disabled={!latestVisibleRun}
+                disabled={!latestVisibleRun && !handoffActive}
                 onClick={() => startHandoffConversation(latestVisibleRun)}
               >
                 按照原思路

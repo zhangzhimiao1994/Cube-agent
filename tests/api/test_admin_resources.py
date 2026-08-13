@@ -1582,6 +1582,30 @@ def test_hermes_bulk_confirm_confirms_multiple_learning_records() -> None:
     assert response.json()["failed"] == []
 
 
+def test_hermes_delete_removes_learning_record() -> None:
+    api = client()
+    insight = api.post(
+        "/api/v1/admin/hermes/feedback",
+        headers=headers(),
+        json={
+            "outcome": "neutral",
+            "lesson": "Delete stale Hermes lessons when they are no longer useful.",
+            "conversation_id": "conv-delete-1",
+            "tags": ["cleanup"],
+            "weight": 2,
+        },
+    ).json()
+
+    deleted = api.delete(f"/api/v1/admin/hermes/{insight['id']}", headers=headers())
+    remaining = api.get("/api/v1/admin/hermes", headers=headers())
+    missing = api.get(f"/api/v1/admin/hermes/{insight['id']}", headers=headers())
+
+    assert deleted.status_code == 200
+    assert deleted.json() == {"status": "deleted"}
+    assert all(item["id"] != insight["id"] for item in remaining.json())
+    assert missing.status_code == 404
+
+
 def test_hermes_feedback_rejects_sensitive_content_without_echoing_it() -> None:
     response = client().post(
         "/api/v1/admin/hermes/feedback",

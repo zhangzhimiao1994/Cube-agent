@@ -979,6 +979,8 @@ class AdminResourceService(Protocol):
 
     async def confirm_hermes_insight(self, insight_id: str) -> HermesInsightResponse: ...
 
+    async def delete_hermes_insight(self, insight_id: str) -> None: ...
+
     async def record_hermes_feedback(
         self, request: HermesFeedbackRequest
     ) -> HermesInsightResponse: ...
@@ -1572,6 +1574,9 @@ class InMemoryAdminResourceService:
         updated = current.model_copy(update={"confirmed_at": datetime.now(UTC)})
         self.hermes_insights[insight_id] = updated
         return updated
+
+    async def delete_hermes_insight(self, insight_id: str) -> None:
+        del self.hermes_insights[insight_id]
 
     async def record_hermes_feedback(
         self, request: HermesFeedbackRequest
@@ -2653,6 +2658,13 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             return await super().confirm_hermes_insight(insight_id)
         await self._record_audit("hermes.confirm", f"hermes:{insight_id}", {"id": insight_id})
         return _hermes_response_from_payload(payload)
+
+    async def delete_hermes_insight(self, insight_id: str) -> None:
+        deleted = await self._delete_admin_payload("hermes", insight_id)
+        if not deleted:
+            await super().delete_hermes_insight(insight_id)
+            return
+        await self._record_audit("hermes.delete", f"hermes:{insight_id}", {"id": insight_id})
 
     async def record_hermes_feedback(
         self, request: HermesFeedbackRequest
@@ -4688,6 +4700,24 @@ async def confirm_hermes_insight(
         return await service.confirm_hermes_insight(insight_id)
     except KeyError:
         raise PublicAPIError(404, "hermes_not_found", "Hermes learning record was not found") from None
+
+
+@router.delete(
+    "/hermes/{insight_id}",
+    response_model=OperationStatusResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def delete_hermes_insight(
+    insight_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> OperationStatusResponse:
+    _require(principal, "hermes:write")
+    try:
+        await service.delete_hermes_insight(insight_id)
+    except KeyError:
+        raise PublicAPIError(404, "hermes_not_found", "Hermes learning record was not found") from None
+    return OperationStatusResponse(status="deleted")
 
 
 __all__ = ["InMemoryAdminResourceService", "PersistentAdminResourceService", "router"]

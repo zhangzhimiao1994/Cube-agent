@@ -277,6 +277,7 @@ describe("operational management pages", () => {
   let visibleRunListItems = [runListItem];
   let visibleModels = models;
   let deletedRunIds = new Set<string>();
+  let deletedHermesIds = new Set<string>();
 
   beforeEach(() => {
     requests.length = 0;
@@ -286,6 +287,7 @@ describe("operational management pages", () => {
     visibleRunListItems = [visibleRunListItem];
     visibleModels = models;
     deletedRunIds = new Set<string>();
+    deletedHermesIds = new Set<string>();
     vi.stubGlobal("confirm", vi.fn(() => true));
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
@@ -479,7 +481,11 @@ describe("operational management pages", () => {
           return jsonResponse(workflows);
         }
         if (path === "/api/v1/admin/hermes") {
-          return jsonResponse([hermesInsight, secondHermesInsight]);
+          return jsonResponse([hermesInsight, secondHermesInsight].filter((item) => !deletedHermesIds.has(item.id)));
+        }
+        if (path === "/api/v1/admin/hermes/hermes-1" && method === "DELETE") {
+          deletedHermesIds.add("hermes-1");
+          return jsonResponse({ status: "deleted" });
         }
         if (path === "/api/v1/admin/hermes/hermes-1") {
           return jsonResponse(hermesInsight);
@@ -805,6 +811,69 @@ describe("operational management pages", () => {
       body: {
         message: "审查这个代码附件。",
         vibe_coding: true,
+      },
+    });
+  });
+
+  it("submits handoff context and Vibe Coding together when both toggles are enabled", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
+    await screen.findByText(/当前会话：conv-previous/);
+    await user.click(screen.getByRole("button", { name: "按照原思路" }));
+    await user.click(screen.getByRole("button", { name: "Vibe Coding" }));
+    await user.type(screen.getByPlaceholderText(/输入消息/), "沿用上一轮方向。");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(requests.slice().reverse().find((request) => request.path === "/api/v1/runs")).toMatchObject({
+      method: "POST",
+      body: {
+        message: "沿用上一轮方向。",
+        reference_conversation_id: "conv-previous",
+        vibe_coding: true,
+      },
+    });
+  });
+
+  it("can cancel handoff mode before sending a message", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
+    await screen.findByText(/当前会话：conv-previous/);
+    await user.click(screen.getByRole("button", { name: "按照原思路" }));
+    await user.click(screen.getByRole("button", { name: "按照原思路" }));
+    await user.type(screen.getByPlaceholderText(/输入消息/), "不引用上一轮。");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    const request = requests.slice().reverse().find((item) => item.path === "/api/v1/runs");
+    expect(request).toMatchObject({
+      method: "POST",
+      body: {
+        message: "不引用上一轮。",
+        reference_conversation_id: null,
+      },
+    });
+  });
+
+  it("can cancel Vibe Coding mode before sending a message", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "Vibe Coding" }));
+    await user.click(screen.getByRole("button", { name: "Vibe Coding" }));
+    await user.type(screen.getByPlaceholderText(/输入消息/), "正常对话。");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(requests.slice().reverse().find((request) => request.path === "/api/v1/runs")).toMatchObject({
+      method: "POST",
+      body: {
+        message: "正常对话。",
+        vibe_coding: false,
       },
     });
   });
@@ -1701,6 +1770,22 @@ describe("operational management pages", () => {
         body: { ids: ["hermes-2", "hermes-1"] },
       }),
     );
+  });
+
+  it("deletes a Hermes learning record from the table", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/hermes" />);
+
+    expect(await screen.findByRole("table", { name: /Hermes/ })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "删除 Hermes 学习 hermes-1" }));
+
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === "/api/v1/admin/hermes/hermes-1")).toMatchObject({
+        method: "DELETE",
+      }),
+    );
+    await waitFor(() => expect(screen.queryByText("conv-architecture-1")).toBeNull());
+    expect(screen.getByText("conv-workflow-2")).not.toBeNull();
   });
 
   it("shows detailed API errors on run list loading failures", async () => {
