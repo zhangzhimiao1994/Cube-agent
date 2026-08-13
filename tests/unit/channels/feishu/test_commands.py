@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+import zipfile
+from collections.abc import AsyncIterator
+from io import BytesIO
 from uuid import UUID
 
 import pytest
 
+from agent_hub.api.routers.admin import InMemoryAdminResourceService
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
+from agent_hub.channels.base import (
+    AttachmentKind,
+    Channel,
+    ConversationType,
+    InboundAttachment,
+    InboundMessage,
+)
 from agent_hub.channels.feishu.cards import (
     FeishuActionError,
     FeishuCardBuilder,
@@ -16,6 +27,8 @@ from agent_hub.channels.feishu.commands import (
     FeishuCommandKind,
     FeishuCommandParser,
 )
+from agent_hub.channels.feishu.settings import FeishuSettings
+from agent_hub.channels.feishu.skill_install import FeishuSkillCommandHandler
 from agent_hub.domain.runs import TaskMode
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
@@ -26,6 +39,75 @@ RUN_ID = UUID("33333333-3333-4333-8333-333333333333")
 
 def principal(role: Role) -> AuthenticatedPrincipal:
     return AuthenticatedPrincipal(user_id=USER_ID, tenant_id=TENANT_ID, role=role)
+
+
+class FakeFeishuFileClient:
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+        self.resource_types: list[str] = []
+
+    async def tenant_access_token(self, tenant_external_id: str) -> str:
+        assert tenant_external_id == "tenant_1"
+        return "tenant-token"
+
+    async def download_resource(
+        self,
+        *,
+        message_id: str,
+        resource_key: str,
+        tenant_access_token: str,
+        resource_type: str = "image",
+    ) -> AsyncIterator[bytes]:
+        assert message_id == "om_skill"
+        assert resource_key == "file_1"
+        assert tenant_access_token == "tenant-token"
+        self.resource_types.append(resource_type)
+        yield self.payload
+
+
+def skill_archive() -> bytes:
+    manifest = (
+        "name: feishu_writer\n"
+        "version: 1.0.0\n"
+        "entry_point: main.py\n"
+        "compatible_runtime: python3\n"
+        "declared_tools: []\n"
+        "network_policy:\n"
+        "  mode: none\n"
+        "  allow_hosts: []\n"
+        "writable_paths: []\n"
+        "env_secret_refs: []\n"
+        "dependency_lock_hash: e3b0c44298fc1c149afbf4c8996fb924"
+        "27ae41e4649b934ca495991b7852b855\n"
+    )
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("skill.yaml", manifest)
+        archive.writestr("main.py", "print('ok')\n")
+    return buffer.getvalue()
+
+
+def inbound_skill_file_message(text: str, *, filename: str = "feishu-writer.zip") -> InboundMessage:
+    return InboundMessage(
+        channel=Channel.FEISHU,
+        tenant_external_id="tenant_1",
+        sender_external_id="ou_admin",
+        conversation_external_id="oc_1",
+        message_id="om_skill",
+        event_id="evt_skill",
+        conversation_type=ConversationType.PRIVATE,
+        text=text,
+        mentions_bot=False,
+        attachments=(
+            InboundAttachment(
+                kind=AttachmentKind.FILE,
+                external_key="file_1",
+                filename=filename,
+                declared_mime="application/zip",
+            ),
+        ),
+        received_at=__import__("datetime").datetime.now(__import__("datetime").UTC),
+    )
 
 
 def test_non_admin_cannot_publish_config() -> None:
@@ -95,10 +177,65 @@ def test_skill_and_mcp_use_structured_subcommands() -> None:
     parser = FeishuCommandParser()
 
     assert parser.parse("/skill approve pkg_1", principal(Role.ADMIN)).accepted is True
+    assert parser.parse("/skill install pkg_1", principal(Role.ADMIN)).accepted is True
     assert parser.parse("/mcp enable server_1", principal(Role.ADMIN)).accepted is True
     assert parser.parse("/skill approve pkg_1", principal(Role.OPERATOR)).error_code == (
         "permission_denied"
     )
+
+
+async def test_feishu_skill_install_uploads_attached_archive_for_scan_only() -> None:
+    service = InMemoryAdminResourceService()
+    file_client = FakeFeishuFileClient(skill_archive())
+    handler = FeishuSkillCommandHandler(
+        admin_service=service,
+        media_client_factory=lambda _settings: file_client,
+    )
+
+    result = await handler.handle(
+        inbound_skill_file_message("/skill install"),
+        settings=FeishuSettings(),
+    )
+
+    assert result is not None
+    assert result.handled is True
+    assert "feishu_writer" in result.reply_text
+    assert "待审批" in result.reply_text
+    assert file_client.resource_types == ["file"]
+    skills = await service.list_skills()
+    assert len(skills) == 1
+    assert skills[0].name == "feishu_writer"
+    assert skills[0].status == "scanned"
+
+
+async def test_feishu_skill_install_requires_file_attachment() -> None:
+    handler = FeishuSkillCommandHandler(
+        admin_service=InMemoryAdminResourceService(),
+        media_client_factory=lambda _settings: FakeFeishuFileClient(skill_archive()),
+    )
+    message = inbound_skill_file_message("/skill install").model_copy(update={"attachments": ()})
+
+    result = await handler.handle(message, settings=FeishuSettings())
+
+    assert result is not None
+    assert result.handled is True
+    assert "请附加" in result.reply_text
+
+
+async def test_feishu_skill_approval_is_not_executed_from_channel_message() -> None:
+    handler = FeishuSkillCommandHandler(
+        admin_service=InMemoryAdminResourceService(),
+        media_client_factory=lambda _settings: FakeFeishuFileClient(skill_archive()),
+    )
+
+    result = await handler.handle(
+        inbound_skill_file_message("/skill approve skill_1"),
+        settings=FeishuSettings(),
+    )
+
+    assert result is not None
+    assert result.handled is True
+    assert "管理端审批" in result.reply_text
 
 
 def test_mode_card_action_is_one_time_and_bound_to_actor() -> None:

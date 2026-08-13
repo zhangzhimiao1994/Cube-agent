@@ -2070,3 +2070,53 @@ Next:
 - Push `main` with `git push --force-with-lease mutilagent main`.
 - Check GitHub Actions and fix/redeploy/repush if red.
 - Continue P3 with protected Feishu Skill install commands, conversation-integrated Vibe Coding, richer multi-system OpenClaw adapters, channel command grammar, and final GitHub usage README.
+
+## 2026-08-13 P3 Protected Feishu Skill Install
+
+Current state:
+
+- Feishu command grammar now accepts `/skill install` in addition to existing skill subcommands.
+- File-type Feishu messages prefer `content.text` as the message text when present, so a file upload can carry `/skill install` instead of being reduced to only the filename.
+- The Feishu webhook can route Skill install file commands to a protected handler before ordinary run submission.
+- Skill file install from Feishu scans the attached ZIP/TAR package through the existing Skill archive upload path and leaves it pending approval; it does not auto-enable or execute the Skill.
+- `/skill approve` and `/skill disable` messages from Feishu are intentionally not executed directly; the reply tells the user to use the protected admin approval flow.
+- The multimedia-disabled guard now only intercepts image attachments, so non-image file attachments such as Skill archives are not incorrectly blocked with the image-handling message.
+
+Changes made:
+
+- Added `agent_hub.channels.feishu.skill_install.FeishuSkillCommandHandler`.
+- Extended `FeishuOpenAPIMediaClient.download_resource()` with `resource_type`, defaulting to `image`; Skill install uses `resource_type="file"`.
+- Wired the production app to create `feishu_skill_command_handler` when the production Feishu/media stack is available.
+- Added Feishu unit tests for `/skill install`, file download type, scan-only behavior, missing attachment feedback, and blocked channel-side approval.
+- Added webhook integration coverage showing `/skill install` file messages are handled and replied to instead of submitted as normal runs.
+
+Local verification:
+
+- TDD red checks were added first for the missing handler and webhook routing.
+- `uv run pytest tests/unit/channels/feishu/test_commands.py -q --tb=short` -> 15 passed.
+- `uv run pytest tests/api/test_channel_webhooks.py tests/unit/channels/feishu/test_commands.py tests/e2e/feishu/test_conversation.py tests/api/test_admin_resources.py tests/unit/test_app_wiring.py -q --tb=short` -> 131 passed.
+- `uv run ruff check src tests` -> passed.
+- `uv run mypy --strict src tests` -> passed.
+- `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+
+Server deployment and verification:
+
+- Uploaded incremental package to `103.236.98.133:/tmp/agent-hub-p3-feishu-skill-install.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`.
+- Restarted `agent-hub-api` and `agent-hub-worker`; reloaded Caddy.
+- Verified `agent-hub-api`, `agent-hub-worker`, and `caddy` were active.
+- Ran `/tmp/server_skill_archive_install_check.py` through the real local HTTP API with a short-lived admin token generated from the running server environment; it passed:
+  - uploaded a real ZIP Skill archive;
+  - scanned and parsed `server_feishu_skill_check`;
+  - verified the Skill appeared in list skills;
+  - approved/enabled it through the admin API;
+  - deleted the temporary Skill after the check.
+- A real Feishu OpenAPI file download was not executed because no live Feishu `file_key` attachment was available in this environment. The server-side Skill archive install path and local Feishu handler/download-type routing are verified; a live Feishu message can now exercise the remaining external download hop.
+
+Next:
+
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue P3 with conversation-integrated Vibe Coding, richer multi-system OpenClaw adapters, channel command grammar, and final GitHub usage README.

@@ -37,8 +37,10 @@ from agent_hub.auth.tokens import AccessTokenService
 from agent_hub.auth.user_admin import PersistentUserAdminService
 from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
 from agent_hub.channels.dedup import InboundDedupRepository
+from agent_hub.channels.feishu.media import FeishuOpenAPIMediaClient
 from agent_hub.channels.feishu.media_factory import build_feishu_media_service_factory
 from agent_hub.channels.feishu.reply import FeishuOpenAPIReplySender, FeishuRunReplyDispatcher
+from agent_hub.channels.feishu.skill_install import FeishuSkillCommandHandler
 from agent_hub.channels.feishu.webhook import (
     ChannelGatewayProtocol,
     create_lazy_feishu_webhook_router,
@@ -739,6 +741,17 @@ def create_app(
                     environment=configured.environment,
                 )
                 application.state.feishu_media_service_factory = media_factory
+                application.state.feishu_skill_command_handler = FeishuSkillCommandHandler(
+                    admin_service=cast(
+                        Any,
+                        admin_resource_service
+                        if admin_resource_service is not None
+                        else application.state.admin_resource_service,
+                    ),
+                    media_client_factory=lambda settings: FeishuOpenAPIMediaClient(
+                        settings=settings
+                    ),
+                )
                 cleanup_callbacks.append(
                     ("feishu_media_service_factory", media_factory.aclose)
                 )

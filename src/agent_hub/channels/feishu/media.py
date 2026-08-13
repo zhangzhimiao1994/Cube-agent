@@ -36,6 +36,7 @@ class FeishuMediaClient(Protocol):
         message_id: str,
         resource_key: str,
         tenant_access_token: str,
+        resource_type: str = "image",
     ) -> AsyncIterator[bytes]: ...
 
 
@@ -80,6 +81,7 @@ class FeishuOpenAPIMediaClient:
         message_id: str,
         resource_key: str,
         tenant_access_token: str,
+        resource_type: str = "image",
     ) -> AsyncIterator[bytes]:
         url = (
             f"{self._api_base}/im/v1/messages/{quote(message_id, safe='')}"
@@ -88,7 +90,7 @@ class FeishuOpenAPIMediaClient:
         async with self._client() as client, client.stream(
             "GET",
             url,
-            params={"type": "image"},
+            params={"type": resource_type},
             headers={"Authorization": f"Bearer {tenant_access_token}"},
         ) as response:
             if response.status_code >= 400:

@@ -92,8 +92,9 @@ class FakeMediaClient:
         message_id: str,
         resource_key: str,
         tenant_access_token: str,
+        resource_type: str = "image",
     ) -> AsyncIterator[bytes]:
-        del message_id, tenant_access_token
+        del message_id, tenant_access_token, resource_type
         if self.cancel:
             raise asyncio.CancelledError
         data = self.resources[resource_key]

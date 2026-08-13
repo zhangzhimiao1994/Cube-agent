@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import ValidationError
 
 from agent_hub.api.errors import error_responses
-from agent_hub.channels.base import InboundMessage
+from agent_hub.channels.base import AttachmentKind, InboundMessage
 from agent_hub.channels.directives import directive_summary, parse_channel_directives
 from agent_hub.channels.feishu.media import FeishuMediaError, log_feishu_media_failure
 from agent_hub.channels.feishu.normalize import (
@@ -197,6 +197,8 @@ def create_lazy_feishu_webhook_router(
         if result.message is None:
             await _record_feishu_ignored_event(request, result)
             return JSONResponse(content={"accepted": True, "ignored": True})
+        if await _handle_feishu_skill_command(request, settings, result):
+            return JSONResponse(status_code=202, content={"accepted": True})
         if await _reply_if_multimedia_disabled(request, settings, result):
             return JSONResponse(status_code=202, content={"accepted": True})
         result = await _append_feishu_media_context(request, settings, result)
@@ -218,6 +220,8 @@ async def _reply_if_multimedia_disabled(
     message = result.message
     if message is None or not message.attachments:
         return False
+    if not any(attachment.kind is AttachmentKind.IMAGE for attachment in message.attachments):
+        return False
     if await _multimedia_generation_enabled(request):
         return False
     reply_sender = _feishu_reply_sender(request)
@@ -228,6 +232,40 @@ async def _reply_if_multimedia_disabled(
             settings=settings,
             message_id=message.message_id,
             text=_MULTIMODAL_DISABLED_TEXT,
+        )
+    except Exception as error:  # noqa: BLE001 - best-effort channel delivery boundary
+        await log_feishu_reply_failure(
+            log_service=getattr(request.app.state, "admin_resource_service", None),
+            run_id=None,
+            message_id=message.message_id,
+            error=error,
+        )
+    return True
+
+
+async def _handle_feishu_skill_command(
+    request: Request,
+    settings: FeishuSettings,
+    result: FeishuWebhookResult,
+) -> bool:
+    message = result.message
+    if message is None:
+        return False
+    handler = getattr(request.app.state, "feishu_skill_command_handler", None)
+    handle = getattr(handler, "handle", None)
+    if handle is None:
+        return False
+    outcome = await handle(message, settings=settings)
+    if outcome is None or not bool(getattr(outcome, "handled", False)):
+        return False
+    reply_sender = _feishu_reply_sender(request)
+    if reply_sender is None:
+        return True
+    try:
+        await reply_sender.reply_text(
+            settings=settings,
+            message_id=message.message_id,
+            text=str(getattr(outcome, "reply_text", "")),
         )
     except Exception as error:  # noqa: BLE001 - best-effort channel delivery boundary
         await log_feishu_reply_failure(

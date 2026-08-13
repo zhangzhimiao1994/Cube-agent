@@ -63,6 +63,7 @@ class FeishuCommandParser:
     _SKILL_PERMISSIONS: ClassVar[dict[str, str]] = {
         "list": "skill:read",
         "show": "skill:read",
+        "install": "skill:write",
         "upload": "skill:write",
         "approve": "skill:approve",
         "disable": "skill:write",

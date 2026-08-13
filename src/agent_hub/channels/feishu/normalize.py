@@ -85,7 +85,7 @@ def _message_text(message_type: str, content: dict[str, Any]) -> str:
     if message_type == "image":
         return str(content.get("text") or "[image]").strip()
     if message_type == "file":
-        return str(content.get("file_name") or "[file]").strip()
+        return str(content.get("text") or content.get("file_name") or "[file]").strip()
     return str(content.get("text") or "").strip()
 
 

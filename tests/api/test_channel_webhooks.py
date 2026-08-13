@@ -51,6 +51,22 @@ class RecordingFeishuReplySender:
         self.replies.append((settings, message_id, text))
 
 
+class RecordingFeishuSkillHandler:
+    def __init__(self, reply_text: str = "Skill 已扫描入库，待审批：writer") -> None:
+        self.messages: list[InboundMessage] = []
+        self.reply_text = reply_text
+
+    async def handle(self, message: InboundMessage, *, settings: FeishuSettings) -> object:
+        del settings
+        self.messages.append(message)
+
+        class Result:
+            handled = True
+            reply_text = self.reply_text
+
+        return Result()
+
+
 @dataclass(frozen=True, slots=True)
 class StubVisionArtifact:
     summary: str
@@ -655,6 +671,73 @@ def test_feishu_webhook_replies_when_image_arrives_with_multimodal_disabled() ->
     assert len(reply_sender.replies) == 1
     assert reply_sender.replies[0][1] == "om_image_disabled"
     assert "暂时无法处理图片" in reply_sender.replies[0][2]
+
+
+def test_feishu_webhook_routes_skill_file_command_to_protected_handler() -> None:
+    gateway = RecordingGateway()
+    service = InMemoryAdminResourceService()
+    reply_sender = RecordingFeishuReplySender()
+    skill_handler = RecordingFeishuSkillHandler()
+    app = create_app(
+        auth_service=StubAuthService(),
+        rate_limiter=object(),
+        feishu_gateway=gateway,
+    )
+    app.state.admin_resource_service = service
+    app.state.feishu_reply_sender = reply_sender
+    app.state.feishu_skill_command_handler = skill_handler
+    api = TestClient(app)
+
+    saved = api.post(
+        "/api/v1/admin/channels/feishu/config",
+        headers={"Authorization": "Bearer valid-token"},
+        json={
+            "values": {
+                "AGENT_HUB_PUBLIC_URL": "https://agent.example.com",
+                "FEISHU_APP_ID": "cli_saved_feishu",
+                "FEISHU_APP_SECRET": "saved-secret",
+                "FEISHU_VERIFICATION_TOKEN": "saved-verification-token",
+                "FEISHU_ENCRYPT_KEY": "saved-encrypt-key",
+                "FEISHU_TRANSPORT": "webhook",
+            }
+        },
+    )
+    response = api.post(
+        "/channels/feishu/events",
+        json={
+            "schema": "2.0",
+            "header": {
+                "event_id": "evt_skill_file",
+                "event_type": "im.message.receive_v1",
+                "token": "saved-verification-token",
+                "app_id": "cli_saved_feishu",
+                "tenant_key": "tenant_1",
+                "create_time": str(int(time.time())),
+            },
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou_user"}},
+                "message": {
+                    "message_id": "om_skill_file",
+                    "chat_id": "oc_chat",
+                    "chat_type": "p2p",
+                    "message_type": "file",
+                    "content": (
+                        "{\"file_key\":\"file_1\",\"file_name\":\"writer.zip\","
+                        "\"mime_type\":\"application/zip\",\"text\":\"/skill install\"}"
+                    ),
+                },
+            },
+        },
+    )
+
+    assert saved.status_code == 200
+    assert response.status_code == 202
+    assert gateway.messages == []
+    assert len(skill_handler.messages) == 1
+    assert skill_handler.messages[0].text == "/skill install"
+    assert skill_handler.messages[0].attachments[0].kind.value == "file"
+    assert reply_sender.replies[0][1] == "om_skill_file"
+    assert "待审批" in reply_sender.replies[0][2]
 
 
 def test_feishu_webhook_uses_media_service_factory_with_runtime_settings() -> None:
