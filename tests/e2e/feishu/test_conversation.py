@@ -11,6 +11,7 @@ from uuid import uuid4
 import pytest
 from PIL import Image
 
+from agent_hub.api.routers.admin import InMemoryAdminResourceService
 from agent_hub.channels.base import (
     AttachmentKind,
     Channel,
@@ -157,6 +158,7 @@ def media_service(
     gateway: FakeVisionGateway,
     *,
     max_download_bytes: int = 20_000_000,
+    log_service: object | None = None,
 ) -> FeishuMediaService:
     return FeishuMediaService(
         client=client,
@@ -166,6 +168,7 @@ def media_service(
             cleanup_recovery_sink=RecordingRecoverySink(),
         ),
         max_download_bytes=max_download_bytes,
+        log_service=log_service,
     )
 
 
@@ -262,6 +265,40 @@ async def test_media_errors_include_channel_diagnostics() -> None:
         "tenant_key": TENANT,
         "attachment_kind": "image",
         "reason": "image MIME mismatch",
+    }
+
+
+async def test_media_errors_are_recorded_in_channel_logs() -> None:
+    service = InMemoryAdminResourceService()
+    message = inbound_image_message(
+        InboundAttachment(
+            kind=AttachmentKind.IMAGE,
+            external_key="bad.png",
+            declared_mime="image/png",
+        )
+    )
+
+    with pytest.raises(FeishuMediaError):
+        await media_service(
+            FakeMediaClient({"bad.png": b"not image"}),
+            FakeVisionGateway(),
+            log_service=service,
+        ).analyze_images(message)
+
+    logs = await service.list_logs(category="channel_error")
+    matching = [item for item in logs if item.source == "channels.feishu.media"]
+
+    assert matching
+    assert matching[0].level == "error"
+    assert matching[0].message == "image MIME mismatch"
+    assert matching[0].details == {
+        "attachment_kind": "image",
+        "channel": "feishu",
+        "error_type": "FeishuMediaError",
+        "message_id": message.message_id,
+        "reason": "image MIME mismatch",
+        "resource_key": "bad.png",
+        "tenant_key": TENANT,
     }
 
 

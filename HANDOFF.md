@@ -1,4 +1,40 @@
 
+## 2026-08-13 P3 Feishu Media Error Log Wiring Slice
+
+Current state:
+
+- P3 channel hardening continued after Feishu media diagnostics.
+- `FeishuMediaService` now accepts an optional admin log service and records `FeishuMediaError` failures into `channel_error` when media analysis is actually invoked.
+- Media failures keep propagating after logging; the new logging path is best-effort and does not mask the original channel/media exception.
+- Recorded details are safe diagnostics only: channel, message id, resource key, tenant key, attachment kind, reason, and error type.
+- Server incremental deployment to `103.236.98.133:/opt/agent-hub/current` was performed with `/tmp/agent-hub-p3-feishu-media-log-wiring.tgz`.
+- Server services `agent-hub-api`, `agent-hub-worker`, and `caddy` are active after restart/reload.
+- Server health checks passed on API port `8000`: `GET /health/live` -> `{"status":"ok"}`, `GET /health/ready` -> `{"status":"ok"}`.
+- Server source contains the deployed marker `log_feishu_media_failure`.
+- Server syntax check passed with `.venv/bin/python -m py_compile src/agent_hub/channels/feishu/media.py tests/e2e/feishu/test_conversation.py`.
+- GitHub push is pending for this slice.
+
+Changes made locally:
+
+- `src/agent_hub/channels/feishu/media.py`
+  - Added optional `log_service` support to `FeishuMediaService`.
+  - Added `log_feishu_media_failure()` to record media failures under `channels.feishu.media`.
+- `tests/e2e/feishu/test_conversation.py`
+  - Added TDD coverage that a Feishu image MIME mismatch is written to `channel_error` logs with diagnostics.
+
+Verification performed locally:
+
+- TDD red: `uv run pytest tests/e2e/feishu/test_conversation.py::test_media_errors_are_recorded_in_channel_logs -q --tb=short` first failed because `FeishuMediaService.__init__()` did not accept `log_service`.
+- Green: the same targeted test passed after implementation.
+- `uv run pytest tests/e2e/feishu/test_conversation.py tests/api/test_channel_webhooks.py tests/contracts/feishu/test_receivers.py tests/unit/channels/test_submitter.py -q --tb=short` -> 44 passed.
+- `uv run ruff check src tests/e2e/feishu/test_conversation.py tests/api/test_channel_webhooks.py tests/unit/channels/test_submitter.py` -> passed.
+- `uv run mypy --strict src tests` -> passed.
+
+Remaining risks / TODOs:
+
+- Recovery archive creation, GitHub full push, and GitHub Actions verification remain to be completed before this slice is closed.
+- Production app wiring still needs a concrete Feishu media client/provider before image bytes can be downloaded automatically from Feishu in live callbacks; this slice hardens the media-analysis error boundary that will be used by that runtime wiring.
+
 ## 2026-08-13 P3 Feishu Media Diagnostics Slice
 
 Current state:

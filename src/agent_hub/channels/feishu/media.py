@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Protocol
@@ -7,6 +8,8 @@ from typing import Protocol
 from agent_hub.channels.base import AttachmentKind, InboundAttachment, InboundMessage
 from agent_hub.multimodal.images import StrictSignatureDetector
 from agent_hub.multimodal.types import VisionAnalysisResult
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class FeishuMediaError(RuntimeError):
@@ -54,6 +57,7 @@ class FeishuMediaService:
         client: FeishuMediaClient,
         analyzer: VisionAnalyzer,
         max_download_bytes: int = 20_000_000,
+        log_service: object | None = None,
     ) -> None:
         if max_download_bytes <= 0:
             raise ValueError("max_download_bytes must be positive")
@@ -61,6 +65,7 @@ class FeishuMediaService:
         self._analyzer = analyzer
         self._max_download_bytes = max_download_bytes
         self._detector = StrictSignatureDetector()
+        self._log_service = log_service
 
     async def analyze_images(
         self,
@@ -70,7 +75,14 @@ class FeishuMediaService:
         for attachment in message.attachments:
             if attachment.kind is not AttachmentKind.IMAGE:
                 continue
-            analyses.append(await self._analyze_one(message, attachment))
+            try:
+                analyses.append(await self._analyze_one(message, attachment))
+            except FeishuMediaError as error:
+                await log_feishu_media_failure(
+                    log_service=self._log_service,
+                    error=error,
+                )
+                raise
         return tuple(analyses)
 
     async def _analyze_one(
@@ -153,6 +165,35 @@ def _diagnostics(message: InboundMessage, attachment: InboundAttachment) -> dict
     }
 
 
+async def log_feishu_media_failure(
+    *,
+    log_service: object | None,
+    error: FeishuMediaError,
+) -> None:
+    _LOGGER.warning(
+        "feishu_media_failed error_type=%s reason=%s",
+        type(error).__name__,
+        str(error) or "Feishu media failed",
+    )
+    if log_service is None:
+        return
+    recorder = getattr(log_service, "record_log", None)
+    if recorder is None:
+        return
+    details = {**error.diagnostics, "error_type": type(error).__name__}
+    try:
+        await recorder(
+            category="channel_error",
+            level="error",
+            title="Feishu media analysis failed",
+            message=str(error) or "Feishu media failed",
+            source="channels.feishu.media",
+            details=details,
+        )
+    except Exception:
+        _LOGGER.exception("feishu_media_failure_log_failed")
+
+
 __all__ = [
     "FeishuImageAnalysis",
     "FeishuMediaClient",
@@ -160,4 +201,5 @@ __all__ = [
     "FeishuMediaService",
     "FeishuMediaTooLarge",
     "VisionAnalyzer",
+    "log_feishu_media_failure",
 ]
