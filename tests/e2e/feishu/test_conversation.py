@@ -240,6 +240,31 @@ async def test_invalid_or_oversized_image_is_rejected() -> None:
         )
 
 
+async def test_media_errors_include_channel_diagnostics() -> None:
+    message = inbound_image_message(
+        InboundAttachment(
+            kind=AttachmentKind.IMAGE,
+            external_key="bad.png",
+            declared_mime="image/png",
+        )
+    )
+
+    with pytest.raises(FeishuMediaError) as error_info:
+        await media_service(
+            FakeMediaClient({"bad.png": b"not image"}),
+            FakeVisionGateway(),
+        ).analyze_images(message)
+
+    assert error_info.value.diagnostics == {
+        "channel": "feishu",
+        "message_id": message.message_id,
+        "resource_key": "bad.png",
+        "tenant_key": TENANT,
+        "attachment_kind": "image",
+        "reason": "image MIME mismatch",
+    }
+
+
 async def test_media_download_cancellation_propagates() -> None:
     with pytest.raises(asyncio.CancelledError):
         await media_service(

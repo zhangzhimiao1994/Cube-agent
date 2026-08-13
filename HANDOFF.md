@@ -1,4 +1,42 @@
 
+## 2026-08-13 P3 Feishu Media Diagnostics Slice
+
+Current state:
+
+- P3 channel hardening continued with Feishu media attachment diagnostics.
+- `FeishuMediaError` now carries a safe `diagnostics` dictionary that can be logged by later webhook/run boundaries.
+- Diagnostics include `channel`, `message_id`, `resource_key`, `tenant_key`, `attachment_kind`, and `reason`.
+- The diagnostics are populated for image MIME mismatch, invalid media chunks, empty media, and media size limit failures.
+- Server incremental deployment to `103.236.98.133:/opt/agent-hub/current` was performed with `/tmp/agent-hub-p3-feishu-media-diagnostics.tgz`.
+- Server services `agent-hub-api`, `agent-hub-worker`, and `caddy` are active after restart.
+- Server health checks passed on API port `8000`: `GET /health/live` -> `{"status":"ok"}`, `GET /health/ready` -> `{"status":"ok"}`.
+- Server source contains the deployed diagnostics marker.
+- Local recovery bundle for this GitHub push was created at `.local-archives/github-pushes/mutilagent-main-before-20260813-101600-1bdb93f.bundle`, pointing at current GitHub `mutilagent/main` commit `1bdb93f`.
+- GitHub recovery archive tag prepared for this push: `archive/mutilagent-main-before-20260813-101600-1bdb93f`.
+
+Changes made locally:
+
+- `src/agent_hub/channels/feishu/media.py`
+  - Added diagnostics support to `FeishuMediaError`.
+  - Added safe diagnostic metadata construction for image attachment processing.
+- `tests/e2e/feishu/test_conversation.py`
+  - Added TDD coverage that MIME mismatch errors include channel diagnostics.
+
+Verification performed locally:
+
+- TDD red: `uv run pytest tests/e2e/feishu/test_conversation.py::test_media_errors_include_channel_diagnostics -q --tb=short` first failed because `FeishuMediaError` had no `diagnostics`.
+- Green: the same targeted test passed after implementation.
+- `uv run pytest tests/e2e/feishu/test_conversation.py -q --tb=short` -> 10 passed.
+- `uv run pytest tests/unit/channels/test_submitter.py tests/api/test_channel_webhooks.py tests/contracts/feishu/test_receivers.py tests/e2e/feishu/test_conversation.py -q --tb=short` -> 43 passed.
+- `uv run ruff check src tests/unit/channels/test_submitter.py tests/api/test_channel_webhooks.py tests/e2e/feishu/test_conversation.py` -> passed.
+- `uv run mypy --strict src tests` -> passed.
+
+Remaining risks / TODOs:
+
+- This Feishu media diagnostics slice has been committed and server-synced, but has not yet been pushed to GitHub.
+- Before GitHub push, push the prepared GitHub archive tag, then push `main` and verify Actions.
+- Next P3 channel hardening step should wire these media diagnostics into the actual channel error log path when media analysis is invoked by production runtime.
+
 ## 2026-08-13 P3 Channel Directive Grammar Slice
 
 Current state:
@@ -13,6 +51,7 @@ Current state:
 - Server source contains the deployed diagnostic marker `invalid_directive`.
 - Local recovery bundle for this GitHub push was created at `.local-archives/github-pushes/mutilagent-main-before-20260813-100440-e752008.bundle`, pointing at current GitHub `mutilagent/main` commit `e752008`.
 - GitHub recovery archive tag prepared for this push: `archive/mutilagent-main-before-20260813-100440-e752008`.
+- P3 channel directive grammar commit `1bdb93f` was pushed to GitHub; Actions run `31659234998` passed all quality checks. The only annotation was GitHub's non-failing Node.js 20 deprecation warning for actions.
 
 Changes made locally:
 
@@ -32,8 +71,7 @@ Verification performed locally:
 
 Remaining risks / TODOs:
 
-- This directive grammar slice has been committed and server-synced, but has not yet been pushed to GitHub.
-- Before GitHub push, push the prepared GitHub archive tag, then push `main` and verify Actions.
+- This directive grammar slice has been committed, server-synced, pushed to GitHub, and verified by Actions.
 - Continue P3 channel hardening with real attachment retrieval/delivery diagnostics.
 
 ## 2026-08-13 P3 Channel Diagnostics Slice

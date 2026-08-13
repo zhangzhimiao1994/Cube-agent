@@ -10,7 +10,9 @@ from agent_hub.multimodal.types import VisionAnalysisResult
 
 
 class FeishuMediaError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, diagnostics: dict[str, str] | None = None) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics or {}
 
 
 class FeishuMediaTooLarge(FeishuMediaError):
@@ -77,15 +79,20 @@ class FeishuMediaService:
         attachment: InboundAttachment,
     ) -> FeishuImageAnalysis:
         token = await self._client.tenant_access_token(message.tenant_external_id)
+        diagnostics = _diagnostics(message, attachment)
         raw = await self._download_bounded(
             message_id=message.message_id,
             resource_key=attachment.external_key,
             tenant_access_token=token,
+            diagnostics=diagnostics,
         )
         detected_mime = self._detector.detect(raw)
         declared_mime = attachment.declared_mime or detected_mime
         if detected_mime is None or declared_mime != detected_mime:
-            raise FeishuMediaError("image MIME mismatch")
+            raise FeishuMediaError(
+                "image MIME mismatch",
+                diagnostics={**diagnostics, "reason": "image MIME mismatch"},
+            )
         result = await self._analyzer.analyze(
             raw,
             detected_mime,
@@ -107,6 +114,7 @@ class FeishuMediaService:
         message_id: str,
         resource_key: str,
         tenant_access_token: str,
+        diagnostics: dict[str, str],
     ) -> bytes:
         chunks: list[bytes] = []
         total = 0
@@ -116,14 +124,33 @@ class FeishuMediaService:
             tenant_access_token=tenant_access_token,
         ):
             if type(chunk) is not bytes or not chunk:
-                raise FeishuMediaError("invalid media chunk")
+                raise FeishuMediaError(
+                    "invalid media chunk",
+                    diagnostics={**diagnostics, "reason": "invalid media chunk"},
+                )
             total += len(chunk)
             if total > self._max_download_bytes:
-                raise FeishuMediaTooLarge("media exceeds limit")
+                raise FeishuMediaTooLarge(
+                    "media exceeds limit",
+                    diagnostics={**diagnostics, "reason": "media exceeds limit"},
+                )
             chunks.append(chunk)
         if total == 0:
-            raise FeishuMediaError("empty media")
+            raise FeishuMediaError(
+                "empty media",
+                diagnostics={**diagnostics, "reason": "empty media"},
+            )
         return b"".join(chunks)
+
+
+def _diagnostics(message: InboundMessage, attachment: InboundAttachment) -> dict[str, str]:
+    return {
+        "channel": message.channel.value,
+        "message_id": message.message_id,
+        "resource_key": attachment.external_key,
+        "tenant_key": message.tenant_external_id,
+        "attachment_kind": attachment.kind.value,
+    }
 
 
 __all__ = [
