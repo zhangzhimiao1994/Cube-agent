@@ -181,7 +181,7 @@ describe("ModelsPage", () => {
 
   it("limits the model dropdown to the selected provider and saves the api key as a secret", async () => {
     const user = userEvent.setup();
-    render(<TestApp initialPath="/models" />);
+    const view = render(<TestApp initialPath="/models" />);
 
     await screen.findByText("添加模型配置");
     await user.selectOptions(screen.getByLabelText("服务商"), "deepseek");
@@ -236,6 +236,10 @@ describe("ModelsPage", () => {
         weight: 100,
       },
     });
+    expect((view.container.querySelector("#provider") as HTMLSelectElement).value).toBe("openai");
+    expect((view.container.querySelector("#api-base") as HTMLInputElement).value).toBe("https://api.openai.com/v1");
+    expect((view.container.querySelector("#logical-model") as HTMLInputElement).value).toBe("main");
+    expect((view.container.querySelector("#api-key") as HTMLInputElement).value).toBe("");
   });
 
   it("includes Anthropic and Claude Code presets with provider-scoped models", async () => {

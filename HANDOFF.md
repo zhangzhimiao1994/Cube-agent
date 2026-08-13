@@ -1,4 +1,33 @@
 
+## 2026-08-13 Model Save Form Refresh Fix
+
+Current state:
+
+- Model test-and-save now immediately upserts the returned model into the `["models"]` React Query cache before invalidating the query.
+- After a successful create/update, the model form resets to the default add-new state: provider OpenAI, API Base `https://api.openai.com/v1`, logical model `main`, default capabilities/concurrency/limits, and an empty API Key field.
+- This prevents stale provider/API Base/logical model/capability values from lingering after a successful test-and-save.
+- Server incremental deployment to `103.236.98.133:/opt/agent-hub/current` was performed with `/tmp/agent-hub-model-form-refresh.tgz`.
+- Server-side bundle check passed via `/tmp/deploy_verify_model_form.sh`:
+  - deployed `web/dist/index.html` points to `/assets/index-BreD6_rd.js`;
+  - deployed bundle contains the expected default API Base marker and `setQueryData` cache-update path;
+  - Caddy serves the same bundle from `http://127.0.0.1/`.
+
+Changes made:
+
+- `web/src/pages/ModelsPage.tsx`
+  - Added `resetModelForm()`.
+  - Updated save success handling to upsert returned model data into query cache and reset stale local form state.
+- `web/src/pages/ModelsPage.test.tsx`
+  - Extended the save test to prove the provider/API Base/logical model/API Key fields reset after successful save.
+
+Verification performed:
+
+- TDD red: `npm.cmd test -- --run src/pages/ModelsPage.test.tsx -t "limits the model dropdown"` first failed because provider stayed `deepseek` after save.
+- Green: the same targeted test passed after the form reset/cache update fix.
+- `npm.cmd test -- --run src/pages/ModelsPage.test.tsx` -> 12 passed.
+- `npm.cmd run lint` -> passed.
+- `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+
 ## 2026-08-13 Chat Toggles and Hermes Delete Fix
 
 Current state:

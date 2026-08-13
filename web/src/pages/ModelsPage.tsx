@@ -279,6 +279,25 @@ export function ModelsPage() {
   const isCustomModel = isCustomProvider || isFreeformProvider || selectedModel === CUSTOM_MODEL;
   const canChooseProtocol = isCustomProvider || isFreeformProvider;
 
+  function resetModelForm() {
+    const preset = PROVIDERS[0];
+    const defaultModel = preset.models[0];
+    setProvider(preset.value);
+    setCustomProvider("");
+    setSelectedModel(defaultModel.value);
+    setCustomModel("");
+    setApiBase(preset.apiBase);
+    setApiProtocol(preset.apiProtocol);
+    setApiKey("");
+    setLogicalModel("main");
+    setQuotaScope(preset.quotaScope);
+    setCapabilities(defaultModel.capabilities);
+    setMaxConcurrency(String(preset.defaultMaxConcurrency ?? 1));
+    setRpm(String(preset.defaultRpm ?? 60));
+    setTpm(String(preset.defaultTpm ?? 100000));
+    setEditingModel(null);
+  }
+
   const saveModel = useMutation({
     mutationFn: async () => {
       const resolvedProvider = isCustomProvider ? customProvider.trim() : provider;
@@ -312,10 +331,15 @@ export function ModelsPage() {
           : await api.updateModel(editingModel.id, payload);
       return { model, credentialRef };
     },
-    onSuccess: async ({ credentialRef }) => {
+    onSuccess: async ({ model, credentialRef }) => {
       setSaveMessage(`模型已通过可用性测试并${editingModel ? "更新" : "保存"}，Key 引用：${credentialRef}`);
-      setApiKey("");
-      setEditingModel(null);
+      queryClient.setQueryData<ModelDeployment[]>(["models"], (current) => {
+        if (!current) return [model];
+        const existingIndex = current.findIndex((item) => item.id === model.id);
+        if (existingIndex === -1) return [...current, model];
+        return current.map((item, index) => (index === existingIndex ? model : item));
+      });
+      resetModelForm();
       await queryClient.invalidateQueries({ queryKey: ["models"] });
     },
     onError: async () => {
