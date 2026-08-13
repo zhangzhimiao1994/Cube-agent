@@ -2103,6 +2103,42 @@ def test_hermes_bulk_delete_removes_multiple_learning_records() -> None:
     assert all(item["id"] not in {first["id"], second["id"]} for item in remaining.json())
 
 
+def test_hermes_bulk_actions_accept_large_mobile_selection() -> None:
+    api = client()
+    created_ids: list[str] = []
+    for index in range(289):
+        response = api.post(
+            "/api/v1/admin/hermes/feedback",
+            headers=headers(),
+            json={
+                "outcome": "neutral",
+                "lesson": f"Large mobile bulk selection regression lesson {index}.",
+                "conversation_id": f"conv-large-bulk-{index}",
+                "tags": ["bulk"],
+                "weight": 1,
+            },
+        )
+        assert response.status_code == 200
+        created_ids.append(response.json()["id"])
+
+    confirm = api.post(
+        "/api/v1/admin/hermes/bulk-confirm",
+        headers=headers(),
+        json={"ids": created_ids},
+    )
+    delete = api.post(
+        "/api/v1/admin/hermes/bulk-delete",
+        headers=headers(),
+        json={"ids": created_ids},
+    )
+
+    assert confirm.status_code == 200
+    assert [item["id"] for item in confirm.json()["confirmed"]] == created_ids
+    assert confirm.json()["failed"] == []
+    assert delete.status_code == 200
+    assert delete.json() == {"deleted": created_ids, "failed": []}
+
+
 def test_hermes_delete_removes_learning_record() -> None:
     api = client()
     insight = api.post(

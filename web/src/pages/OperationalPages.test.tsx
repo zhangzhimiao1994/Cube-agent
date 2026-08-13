@@ -913,6 +913,31 @@ describe("operational management pages", () => {
     });
   });
 
+  it("keeps Handoff and Vibe Coding as independent composer toggles", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
+    await screen.findByText(/当前会话：conv-previous/);
+
+    const handoffButton = screen.getByRole("button", { name: "按照原思路" });
+    const vibeButton = screen.getByRole("button", { name: "Vibe Coding" });
+
+    await user.click(handoffButton);
+    await user.click(vibeButton);
+    expect(handoffButton.getAttribute("aria-pressed")).toBe("true");
+    expect(vibeButton.getAttribute("aria-pressed")).toBe("true");
+
+    await user.click(handoffButton);
+    expect(handoffButton.getAttribute("aria-pressed")).toBe("false");
+    expect(vibeButton.getAttribute("aria-pressed")).toBe("true");
+
+    await user.click(vibeButton);
+    expect(handoffButton.getAttribute("aria-pressed")).toBe("false");
+    expect(vibeButton.getAttribute("aria-pressed")).toBe("false");
+  });
+
   it("keeps multiple follow-up messages in the active conversation until the user starts a new chat", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);

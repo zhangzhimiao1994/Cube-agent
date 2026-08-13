@@ -1448,6 +1448,13 @@ article:hover {
   box-shadow: 0 0 18px rgba(125, 255, 189, 0.14);
 }
 
+.composer-toggle-active {
+  background: linear-gradient(135deg, rgba(125, 255, 189, 0.28), rgba(85, 215, 255, 0.2));
+  border-color: rgba(125, 255, 189, 0.78);
+  box-shadow: 0 0 0 1px rgba(125, 255, 189, 0.16), 0 0 20px rgba(125, 255, 189, 0.16);
+  color: #f7fffb;
+}
+
 .composer-handoff-button:disabled,
 .composer-answerer-button:disabled {
   cursor: not-allowed;
@@ -2848,6 +2855,10 @@ article:hover {
     grid-template-columns: minmax(4.2rem, 0.85fr) minmax(0, 1fr) minmax(0, 1fr) 2.75rem;
   }
 
+  .composer-tool-row > * {
+    min-width: 0;
+  }
+
   .secondary-action {
     text-align: center;
     width: 100%;
@@ -2858,18 +2869,16 @@ article:hover {
   }
 
   .composer-tool-row .composer-upload-button,
-  .composer-tool-row .composer-handoff-button,
-  .composer-tool-row .composer-plus-button {
-    min-width: 0;
-    width: 2.75rem;
-  }
-
-  .composer-tool-row .composer-upload-button,
   .composer-tool-row .composer-handoff-button {
     max-width: none;
     overflow: hidden;
     text-overflow: ellipsis;
     width: 100%;
+  }
+
+  .composer-tool-row .composer-plus-button {
+    min-width: 0;
+    width: 2.75rem;
   }
 
   .composer-send-row {

@@ -1,4 +1,46 @@
 
+## 2026-08-13 P3 Hermes Large Bulk and Chat Toggle Fix
+
+Current state:
+
+- Fixed the mobile Hermes learning bulk-action failure shown as `HTTP 422` when 289 records were selected.
+  - Backend Hermes bulk confirm/delete now accepts up to 1000 safe Hermes IDs per request.
+  - Added a regression test that creates 289 real API test records, confirms all, and deletes all in one request.
+- Rechecked the chat composer Handoff and Vibe Coding buttons.
+  - Existing behavior supports both toggles together and independent cancellation.
+  - Added a direct UI regression test asserting both toggles can be active, then Handoff and Vibe can be cancelled independently.
+  - Tightened mobile composer CSS so the upload button, Handoff toggle, Vibe toggle, and config button keep stable grid columns instead of conflicting width rules.
+  - Added a visible `.composer-toggle-active` pressed state for clearer mobile feedback.
+- Docker runtime work is intentionally deferred per user direction. Docker config syntax was checked only; no image build/container run was performed in this slice.
+
+Verification performed:
+
+- Local TDD red/green:
+  - New backend regression first failed with `422` for 289 Hermes IDs, then passed after increasing the limit.
+  - New frontend independent-toggle regression passed after confirming the interaction contract.
+- Local checks:
+  - `uv run pytest tests/api/test_admin_resources.py::test_hermes_bulk_actions_accept_large_mobile_selection -q --tb=short` -> passed.
+  - `uv run pytest tests/api/test_admin_resources.py::test_hermes_bulk_confirm_confirms_multiple_learning_records tests/api/test_admin_resources.py::test_hermes_bulk_delete_removes_multiple_learning_records tests/api/test_admin_resources.py::test_hermes_bulk_actions_accept_large_mobile_selection -q --tb=short` -> 3 passed.
+  - `uv run ruff check src tests alembic` -> passed.
+  - `uv run mypy --strict src tests` -> passed.
+  - `npm.cmd run test -- --run` -> 94 passed.
+  - `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-hermes-chat-toggle-fix.tgz` to `103.236.98.133`.
+  - Deployed incrementally into `/opt/agent-hub/current`.
+  - Restarted `agent-hub-api` and `agent-hub-worker`; reloaded Caddy.
+  - Verified `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.
+- Server real environment verification:
+  - Ran `/tmp/server_hermes_chat_toggle_check.py` through the deployed HTTP API with server env loaded.
+  - It created 289 Hermes learning records, bulk confirmed all of them, bulk deleted all of them, verified the served frontend bundle markers, and verified the deployed backend marker.
+  - Final output: `{"status": "ok", "checked": ["large_hermes_bulk_confirm_289", "large_hermes_bulk_delete_289", "served_frontend_toggle_markers", "deployed_backend_bulk_limit_marker"], "assets": ["assets/index-DAJJBCGP.js", "assets/index-CK2Dnuwq.css"]}`.
+
+Remaining risks / TODOs:
+
+- Push this slice to GitHub with the required local and GitHub recovery archives, then check GitHub Actions and fix if red.
+- Continue the larger P3 completion track after this push: remaining UI polish/branding to `魔方agent`, final usage README, OpenClaw system-level hardening/adapters, channel grammar polish, and Docker deployment readiness later.
+- Schedule mode needs a calendar/alarm-style UX next: one-time, daily, and weekly task setup without requiring users to hand-write cron, plus visible next-run status.
+
 ## 2026-08-13 P3 Scheduled Task Mode
 
 Current state:
