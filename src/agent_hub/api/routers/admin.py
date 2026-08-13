@@ -1152,26 +1152,21 @@ def _split_skill_bundle_archive(filename: str, archive_bytes: bytes) -> tuple[tu
 def _split_zip_skill_bundle(filename: str, archive_bytes: bytes) -> tuple[tuple[str, bytes], ...]:
     try:
         with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
-            groups: dict[str, list[tuple[str, zipfile.ZipInfo]]] = {}
-            order: list[str] = []
+            entries: list[tuple[str, zipfile.ZipInfo]] = []
             for info in archive.infolist():
                 if info.is_dir() or info.filename.replace("\\", "/").endswith("/"):
                     continue
                 mode = (info.external_attr >> 16) & 0o777777
                 if _skill_bundle_mode_is_unsafe(mode):
                     raise InvalidSkillPackage("skill bundle contains links or device files")
-                grouped = _skill_bundle_group_and_inner_path(info.filename)
-                if grouped is None:
-                    continue
-                group, inner_path = grouped
-                if group not in groups:
-                    groups[group] = []
-                    order.append(group)
-                groups[group].append((inner_path, info))
+                entries.append((_safe_skill_bundle_path(info.filename), info))
+            groups = _skill_bundle_groups(entries)
             return tuple(
-                (f"{PurePosixPath(filename).stem}-{group}.zip", _zip_group_to_skill_archive(archive, groups[group]))
-                for group in order
-                if _skill_group_has_manifest([path for path, _ in groups[group]])
+                (
+                    f"{PurePosixPath(filename).stem}-{_skill_bundle_group_filename(group)}.zip",
+                    _zip_group_to_skill_archive(archive, group_entries),
+                )
+                for group, group_entries in groups
             )
     except zipfile.BadZipFile as exc:
         raise InvalidSkillPackage("skill archive must be a valid zip file") from exc
@@ -1180,8 +1175,7 @@ def _split_zip_skill_bundle(filename: str, archive_bytes: bytes) -> tuple[tuple[
 def _split_tar_skill_bundle(filename: str, archive_bytes: bytes) -> tuple[tuple[str, bytes], ...]:
     try:
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
-            groups: dict[str, list[tuple[str, tarfile.TarInfo]]] = {}
-            order: list[str] = []
+            entries: list[tuple[str, tarfile.TarInfo]] = []
             for member in archive.getmembers():
                 if member.isdir():
                     continue
@@ -1189,24 +1183,20 @@ def _split_tar_skill_bundle(filename: str, archive_bytes: bytes) -> tuple[tuple[
                     raise InvalidSkillPackage("skill bundle contains links or device files")
                 if not member.isfile():
                     raise InvalidSkillPackage("skill bundle contains unsupported file types")
-                grouped = _skill_bundle_group_and_inner_path(member.name)
-                if grouped is None:
-                    continue
-                group, inner_path = grouped
-                if group not in groups:
-                    groups[group] = []
-                    order.append(group)
-                groups[group].append((inner_path, member))
+                entries.append((_safe_skill_bundle_path(member.name), member))
+            groups = _skill_bundle_groups(entries)
             return tuple(
-                (f"{PurePosixPath(filename).stem}-{group}.zip", _tar_group_to_skill_archive(archive, groups[group]))
-                for group in order
-                if _skill_group_has_manifest([path for path, _ in groups[group]])
+                (
+                    f"{PurePosixPath(filename).stem}-{_skill_bundle_group_filename(group)}.zip",
+                    _tar_group_to_skill_archive(archive, group_entries),
+                )
+                for group, group_entries in groups
             )
     except tarfile.TarError as exc:
         raise InvalidSkillPackage("skill archive must be a valid zip or tar archive") from exc
 
 
-def _skill_bundle_group_and_inner_path(name: str) -> tuple[str, str] | None:
+def _safe_skill_bundle_path(name: str) -> str:
     normalized = name.replace("\\", "/").rstrip("/")
     if normalized.startswith(("/", "../")) or "/../" in normalized:
         raise InvalidSkillPackage("skill bundle contains path traversal")
@@ -1217,13 +1207,31 @@ def _skill_bundle_group_and_inner_path(name: str) -> tuple[str, str] | None:
     path = PurePosixPath(normalized)
     if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
         raise InvalidSkillPackage("skill bundle contains unsafe paths")
-    if len(path.parts) < 2:
-        return None
-    return path.parts[0], PurePosixPath(*path.parts[1:]).as_posix()
+    return path.as_posix()
 
 
-def _skill_group_has_manifest(paths: Iterable[str]) -> bool:
-    return any(path in _SKILL_MANIFEST_NAMES for path in paths)
+def _skill_bundle_groups[T](entries: list[tuple[str, T]]) -> tuple[tuple[str, list[tuple[str, T]]], ...]:
+    roots: dict[str, None] = {}
+    for path, _entry in entries:
+        parts = PurePosixPath(path).parts
+        if len(parts) >= 2 and parts[-1] in _SKILL_MANIFEST_NAMES:
+            roots[PurePosixPath(*parts[:-1]).as_posix()] = None
+    groups: list[tuple[str, list[tuple[str, T]]]] = []
+    for root in roots:
+        group_entries: list[tuple[str, T]] = []
+        root_parts = PurePosixPath(root).parts
+        for path, entry in entries:
+            path_parts = PurePosixPath(path).parts
+            if len(path_parts) <= len(root_parts) or path_parts[: len(root_parts)] != root_parts:
+                continue
+            inner_path = PurePosixPath(*path_parts[len(root_parts) :]).as_posix()
+            group_entries.append((inner_path, entry))
+        groups.append((root, group_entries))
+    return tuple(groups)
+
+
+def _skill_bundle_group_filename(group: str) -> str:
+    return "-".join(PurePosixPath(group).parts)
 
 
 def _skill_bundle_mode_is_unsafe(mode: int) -> bool:

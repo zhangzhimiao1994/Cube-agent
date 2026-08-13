@@ -1,4 +1,52 @@
 
+## 2026-08-13 P3 Wrapped Skill Tar Bundle Upload
+
+Current state:
+
+- Skill archive upload now accepts common wrapped bundle archives such as `all-skills.tar.gz` created from a directory like:
+  - `all-skills/writer/skill.yaml`
+  - `all-skills/writer/main.py`
+  - `all-skills/reviewer/skill.yaml`
+  - `all-skills/reviewer/main.py`
+- Bundle splitting no longer assumes each Skill directory is directly at archive root.
+- The backend scans for `skill.yaml`, `skill.yml`, or `skill.json` at any safe nested directory, treats that directory as the Skill root, strips the wrapper path, scans each Skill independently, stores each scanned archive, and returns a multi-item bundle response.
+- Unsafe paths, links, devices, unsupported tar member types, size limits, dependency hashes, requested permissions, and the approval boundary remain enforced by the existing Skill scanner.
+
+Changes made:
+
+- Updated `src/agent_hub/api/routers/admin.py`
+  - Replaced first-directory grouping with manifest-root based bundle splitting for both ZIP and TAR archives.
+  - Added safe bundle path normalization and stable group filename generation.
+- Updated `tests/api/test_admin_resources.py`
+  - Added a regression test for `all-skills.tar.gz` containing multiple Skill directories under an outer wrapper directory.
+
+Verification performed:
+
+- TDD red:
+  - `uv run pytest tests/api/test_admin_resources.py::test_skill_archive_upload_scans_wrapped_tar_gz_bundle_with_multiple_skill_directories -q --tb=short` first failed with `422`, matching the mobile UI report.
+- Green/local:
+  - `uv run pytest tests/api/test_admin_resources.py::test_skill_archive_upload_scans_wrapped_tar_gz_bundle_with_multiple_skill_directories tests/api/test_admin_resources.py::test_skill_archive_upload_scans_bundle_with_multiple_skill_directories tests/api/test_admin_resources.py::test_skill_archive_upload_accepts_real_tar_gz_package tests/api/test_admin_resources.py::test_skill_archive_upload_scans_real_zip_package -q --tb=short` -> 4 passed.
+  - `uv run pytest tests/api/test_admin_resources.py tests/unit/channels/feishu/test_commands.py -q --tb=short` -> 87 passed.
+  - `uv run ruff check src tests` -> passed.
+  - `uv run mypy --strict src tests` -> passed.
+- Server deployment and real verification:
+  - Uploaded incremental package to `103.236.98.133:/tmp/agent-hub-p3-wrapped-skill-tar.tgz`.
+  - Deployed incrementally into `/opt/agent-hub/current`.
+  - Restarted `agent-hub-api` and `agent-hub-worker`; verified `agent-hub-api`, `agent-hub-worker`, and `caddy` were active.
+  - Ran `/tmp/server_wrapped_skill_tar_upload_check.py` through the real local HTTP API with the server's actual service environment loaded:
+    - uploaded a real `all-skills.tar.gz` with wrapper directory `all-skills/`;
+    - verified `bundle=true`;
+    - verified two scanned Skills: `server_wrapped_writer` and `server_wrapped_reviewer`;
+    - verified requested permission extraction for `filesystem.read`;
+    - verified the scanned Skills appeared in the server list response;
+    - deleted the temporary test Skills afterward.
+
+Remaining risks / TODOs:
+
+- This supports Agent Hub executable Skill packages with `skill.yaml`/`skill.yml`/`skill.json`. A raw Codex instruction Skill directory containing only `SKILL.md` is still not an executable Agent Hub Skill package and will require a separate import/conversion path if needed.
+- Commit this slice, create GitHub recovery archives, push with `git push --force-with-lease mutilagent main`, and check GitHub Actions.
+- Continue P3 with multimedia generation executor/temporary agent scheduling, additional video provider adapters, channel command grammar, and the final GitHub usage README.
+
 ## 2026-08-13 P3 Real MiniMax Hailuo Video Generation
 
 Current state:

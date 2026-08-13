@@ -881,6 +881,41 @@ def skill_bundle_archive() -> bytes:
     return buffer.getvalue()
 
 
+def wrapped_skill_tar_bundle_archive() -> bytes:
+    skill_manifests = {
+        "writer": (
+            "name: wrapped_writer_skill\n"
+            "version: 1.0.0\n"
+            "entry_point: main.py\n"
+            "compatible_runtime: python3.12\n"
+            "declared_tools:\n"
+            "  - filesystem.read\n"
+            "dependency_lock_hash: "
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+        ),
+        "reviewer": (
+            "name: wrapped_reviewer_skill\n"
+            "version: 1.0.0\n"
+            "entry_point: main.py\n"
+            "compatible_runtime: python3.12\n"
+            "declared_tools: []\n"
+            "dependency_lock_hash: "
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+        ),
+    }
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for folder, manifest in skill_manifests.items():
+            for name, content in {
+                f"all-skills/{folder}/skill.yaml": manifest.encode("utf-8"),
+                f"all-skills/{folder}/main.py": b"print('ok')\n",
+            }.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(content)
+                archive.addfile(info, io.BytesIO(content))
+    return buffer.getvalue()
+
+
 def test_model_pool_reports_serial_slot_and_queue_policy() -> None:
     response = client().post("/api/v1/admin/models", headers=headers(), json=model_payload())
 
@@ -1686,6 +1721,24 @@ def test_skill_archive_upload_scans_bundle_with_multiple_skill_directories() -> 
     assert [item["name"] for item in body["items"]] == ["writer_skill", "reviewer_skill"]
     assert body["items"][0]["requested_permissions"] == ["tool:filesystem.read"]
     assert {item["name"] for item in skills.json()} == {"writer_skill", "reviewer_skill"}
+
+
+def test_skill_archive_upload_scans_wrapped_tar_gz_bundle_with_multiple_skill_directories() -> None:
+    api = client()
+
+    uploaded = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "all-skills.tar.gz"},
+        content=wrapped_skill_tar_bundle_archive(),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert uploaded.status_code == 200
+    body = uploaded.json()
+    assert body["bundle"] is True
+    assert [item["name"] for item in body["items"]] == ["wrapped_writer_skill", "wrapped_reviewer_skill"]
+    assert body["items"][0]["requested_permissions"] == ["tool:filesystem.read"]
+    assert {item["name"] for item in skills.json()} == {"wrapped_writer_skill", "wrapped_reviewer_skill"}
 
 
 def test_skill_archive_upload_rejects_invalid_zip_without_saving_metadata() -> None:
