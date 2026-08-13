@@ -105,6 +105,7 @@ def test_admin_resource_kind_constraint_allows_all_persistent_admin_resources() 
         "setting",
         "channel",
         "openclaw",
+        "openclaw_session",
         "schedule",
     ):
         assert kind in sqltext

@@ -540,6 +540,110 @@ def test_openclaw_execute_returns_adapter_unavailable_for_windows_command() -> N
     assert response.json()["error"]["code"] == "openclaw_adapter_unavailable"
 
 
+def test_openclaw_session_requires_feature_switch() -> None:
+    response = client().post(
+        "/api/v1/admin/openclaw/sessions",
+        headers=headers(),
+        json={
+            "platform": "linux",
+            "target_type": "server",
+            "target": "agent-hub-server",
+            "purpose": "keep a bounded OpenClaw control session for server maintenance",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "openclaw_disabled"
+
+
+def test_openclaw_session_lifecycle_tracks_pause_resume_and_stop() -> None:
+    api = client()
+    payload = api.get("/api/v1/admin/settings", headers=headers()).json()
+    payload["openclaw_enabled"] = True
+    payload["openclaw_mode"] = "ask"
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+
+    created = api.post(
+        "/api/v1/admin/openclaw/sessions",
+        headers=headers(),
+        json={
+            "platform": "linux",
+            "target_type": "server",
+            "target": "agent-hub-server",
+            "purpose": "keep a bounded OpenClaw control session for server maintenance",
+        },
+    )
+    assert created.status_code == 201
+    session = created.json()
+    assert session["status"] == "active"
+    assert session["adapter_status"] == "available"
+    assert session["mode"] == "ask"
+    assert session["platform"] == "linux"
+    assert session["target_type"] == "server"
+    assert session["operation_ids"] == []
+
+    listed = api.get("/api/v1/admin/openclaw/sessions", headers=headers())
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()] == [session["id"]]
+
+    paused = api.patch(
+        f"/api/v1/admin/openclaw/sessions/{session['id']}",
+        headers=headers(),
+        json={"action": "pause"},
+    )
+    assert paused.status_code == 200
+    assert paused.json()["status"] == "paused"
+
+    resumed = api.patch(
+        f"/api/v1/admin/openclaw/sessions/{session['id']}",
+        headers=headers(),
+        json={"action": "resume"},
+    )
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "active"
+
+    stopped = api.patch(
+        f"/api/v1/admin/openclaw/sessions/{session['id']}",
+        headers=headers(),
+        json={"action": "stop"},
+    )
+    assert stopped.status_code == 200
+    assert stopped.json()["status"] == "stopped"
+
+    repeated = api.patch(
+        f"/api/v1/admin/openclaw/sessions/{session['id']}",
+        headers=headers(),
+        json={"action": "resume"},
+    )
+    assert repeated.status_code == 409
+    assert repeated.json()["error"]["code"] == "openclaw_session_closed"
+
+
+def test_openclaw_windows_session_is_managed_but_adapter_unavailable() -> None:
+    api = client()
+    payload = api.get("/api/v1/admin/settings", headers=headers()).json()
+    payload["openclaw_enabled"] = True
+    payload["openclaw_mode"] = "ask"
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+
+    created = api.post(
+        "/api/v1/admin/openclaw/sessions",
+        headers=headers(),
+        json={
+            "platform": "windows",
+            "target_type": "computer",
+            "target": "office-windows-pc",
+            "purpose": "prepare a future local Windows OpenClaw adapter session",
+        },
+    )
+
+    assert created.status_code == 201
+    session = created.json()
+    assert session["status"] == "adapter_unavailable"
+    assert session["adapter_status"] == "adapter_unavailable"
+    assert session["execution_host"] == "remote-windows-host"
+
+
 def test_qwen_dashscope_unauthorized_model_check_returns_provider_specific_hint() -> None:
     deployment = Deployment(
         id="qwen_1",

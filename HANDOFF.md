@@ -1,4 +1,52 @@
 
+## 2026-08-14 OpenClaw Session Lifecycle
+
+Current state:
+
+- Added system-level OpenClaw session management APIs:
+  - `POST /api/v1/admin/openclaw/sessions`
+  - `GET /api/v1/admin/openclaw/sessions`
+  - `PATCH /api/v1/admin/openclaw/sessions/{session_id}`
+- Sessions track long-running control intent separately from individual approved operations.
+- Linux server sessions can be created as `active`, paused, resumed, and stopped.
+- Windows/macOS/computer/desktop session requests are accepted as managed session records but explicitly return `adapter_unavailable`; the system does not pretend local computer control exists before a real adapter is connected.
+- Existing OpenClaw operation execution remains gated by the global feature switch, mode, user approval, exact argv allowlist, and shell executable denial.
+- Added `openclaw_session` to the persistent admin resource kind constraint.
+- Added frontend API client schemas and methods for the new session endpoints; UI wiring can build on those methods later.
+
+Verification performed:
+
+- TDD red/green:
+  - Initial session API tests failed with `405 Method Not Allowed`, confirming the feature was absent.
+  - Added regressions for disabled switch rejection, Linux session lifecycle, and Windows adapter-unavailable session handling.
+- Local checks:
+  - `uv run pytest tests/api/test_admin_resources.py::test_openclaw_session_requires_feature_switch tests/api/test_admin_resources.py::test_openclaw_session_lifecycle_tracks_pause_resume_and_stop tests/api/test_admin_resources.py::test_openclaw_windows_session_is_managed_but_adapter_unavailable -q --tb=short` -> 3 passed.
+  - `uv run pytest tests/api/test_admin_resources.py -q -k "openclaw" --tb=short` -> 15 passed, 72 deselected.
+  - `uv run pytest tests/unit/test_database_resources.py::test_admin_resource_kind_constraint_allows_all_persistent_admin_resources tests/api/test_admin_resources.py -q -k "openclaw" --tb=short` -> 15 passed, 73 deselected.
+  - `uv run ruff check src\agent_hub\api\routers\admin.py src\agent_hub\db\models.py tests\api\test_admin_resources.py tests\unit\test_database_resources.py` -> passed.
+  - `uv run mypy --strict src\agent_hub\api\routers\admin.py src\agent_hub\db\models.py tests\api\test_admin_resources.py tests\unit\test_database_resources.py` -> passed.
+  - `npm.cmd run lint` -> passed.
+  - `npm.cmd run test -- --run` -> 100 passed.
+  - `npm.cmd run build` -> passed with existing Vite chunk-size warning.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-openclaw-sessions-incremental.tgz` to `103.236.98.133`.
+  - Deployed `src/agent_hub/api/routers/admin.py`, `src/agent_hub/db/models.py`, and `web/dist`.
+  - Updated the server `agent_hub_admin_resources` kind check constraint to include `openclaw_session`.
+  - Restarted `agent-hub-api` and `agent-hub-worker`; `agent-hub-api`, `agent-hub-worker`, and `caddy` were all active.
+- Server real environment verification:
+  - Ran `/tmp/server_openclaw_session_check.py` against the deployed HTTP API using a short-lived real access token generated from the existing super-admin row and server JWT signing key.
+  - Verified disabled switch rejection, Linux session create/list/pause/resume/stop, and Windows session `adapter_unavailable`.
+  - Restored the previous system settings and removed the two probe session payloads.
+  - Final output: `{"status": "ok", "checked": ["disabled_switch_rejects_session", "linux_session_created", "session_list_includes_created", "session_pause_resume_stop", "windows_session_adapter_unavailable"], "cleaned_sessions": 2}`.
+
+Remaining risks / TODOs:
+
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Next OpenClaw work: wire the session APIs into the UI and later connect a real Windows/local-computer adapter with explicit user approval modes.
+
 ## 2026-08-14 Large Multi-Skill Archive Migration Fix
 
 Current state:

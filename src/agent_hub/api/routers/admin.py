@@ -667,6 +667,40 @@ class OpenClawAdapterResponse(BaseModel):
     description: str
 
 
+class OpenClawSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    platform: str = Field(pattern=r"^(linux|windows|macos)$")
+    target_type: str = Field(pattern=r"^(server|computer|desktop)$")
+    target: str = Field(min_length=1, max_length=256)
+    purpose: str = Field(min_length=1, max_length=2_000)
+
+
+class OpenClawSessionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    status: str = Field(pattern=r"^(active|paused|stopped|adapter_unavailable)$")
+    adapter_status: str = Field(pattern=r"^(available|adapter_unavailable)$")
+    mode: str = Field(pattern=r"^(ask|read_only|auto_review|trusted_auto)$")
+    platform: str
+    target_type: str
+    target: str
+    purpose: str
+    execution_host: str
+    requested_by: str
+    created_at: datetime
+    updated_at: datetime
+    stopped_at: datetime | None = None
+    operation_ids: list[str] = Field(default_factory=list)
+
+
+class OpenClawSessionActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: str = Field(pattern=r"^(pause|resume|stop)$")
+
+
 class MultimediaGenerationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -913,6 +947,84 @@ def _openclaw_adapter_responses() -> tuple[OpenClawAdapterResponse, ...]:
                 )
             )
     return tuple(adapters)
+
+
+def _openclaw_session_host(request: OpenClawSessionRequest) -> str:
+    if request.platform == "linux" and request.target_type == "server":
+        return "agent-hub-server"
+    return f"remote-{request.platform}-host"
+
+
+def _openclaw_session_adapter_status(request: OpenClawSessionRequest) -> str:
+    return "available" if request.platform == "linux" and request.target_type == "server" else "adapter_unavailable"
+
+
+def _openclaw_session_response(
+    *,
+    session_id: str,
+    request: OpenClawSessionRequest,
+    actor: str,
+    mode: str,
+) -> OpenClawSessionResponse:
+    now = datetime.now(UTC)
+    adapter_status = _openclaw_session_adapter_status(request)
+    return OpenClawSessionResponse(
+        id=session_id,
+        status="active" if adapter_status == "available" else "adapter_unavailable",
+        adapter_status=adapter_status,
+        mode=mode,
+        platform=request.platform,
+        target_type=request.target_type,
+        target=request.target,
+        purpose=request.purpose,
+        execution_host=_openclaw_session_host(request),
+        requested_by=actor,
+        created_at=now,
+        updated_at=now,
+        operation_ids=[],
+    )
+
+
+def _openclaw_session_audit_details(
+    session: OpenClawSessionResponse,
+    *,
+    action: str | None = None,
+) -> dict[str, object]:
+    details: dict[str, object] = {
+        "platform": session.platform,
+        "target_type": session.target_type,
+        "target": session.target,
+        "adapter_status": session.adapter_status,
+        "status": session.status,
+        "mode": session.mode,
+    }
+    if action is not None:
+        details["action"] = action
+    return details
+
+
+def _updated_openclaw_session(
+    session: OpenClawSessionResponse,
+    request: OpenClawSessionActionRequest,
+) -> OpenClawSessionResponse:
+    now = datetime.now(UTC)
+    if session.status == "stopped":
+        raise PublicAPIError(
+            409,
+            "openclaw_session_closed",
+            "OpenClaw session is already stopped",
+        )
+    if request.action == "stop":
+        return session.model_copy(update={"status": "stopped", "updated_at": now, "stopped_at": now})
+    if session.status == "adapter_unavailable":
+        raise PublicAPIError(
+            409,
+            "openclaw_adapter_unavailable",
+            "OpenClaw adapter is not available for this session",
+        )
+    if request.action == "pause":
+        return session.model_copy(update={"status": "paused", "updated_at": now})
+    return session.model_copy(update={"status": "active", "updated_at": now})
 
 
 async def _execute_openclaw_operation(
@@ -1241,6 +1353,24 @@ class AdminResourceService(Protocol):
         *,
         actor: str,
     ) -> OpenClawExecutionResponse: ...
+
+    async def create_openclaw_session(
+        self,
+        request: OpenClawSessionRequest,
+        *,
+        actor: str,
+        mode: str,
+    ) -> OpenClawSessionResponse: ...
+
+    async def list_openclaw_sessions(self) -> tuple[OpenClawSessionResponse, ...]: ...
+
+    async def update_openclaw_session(
+        self,
+        session_id: str,
+        request: OpenClawSessionActionRequest,
+        *,
+        actor: str,
+    ) -> OpenClawSessionResponse: ...
 
     async def list_logs(self, category: str | None = None) -> tuple[LogEntryResponse, ...]: ...
 
@@ -1605,6 +1735,7 @@ class InMemoryAdminResourceService:
     logs: list[LogEntryResponse] = field(default_factory=list)
     hermes_insights: dict[str, HermesInsightResponse] = field(default_factory=dict)
     openclaw_operations: dict[str, OpenClawOperationResponse] = field(default_factory=dict)
+    openclaw_sessions: dict[str, OpenClawSessionResponse] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.runs:
@@ -2095,6 +2226,53 @@ class InMemoryAdminResourceService:
             details={"approval_id": current.approval_id, "exit_code": result.exit_code},
         )
         return _openclaw_execution_response(updated, result)
+
+    async def create_openclaw_session(
+        self,
+        request: OpenClawSessionRequest,
+        *,
+        actor: str,
+        mode: str,
+    ) -> OpenClawSessionResponse:
+        session_id = f"openclaw_session_{uuid4().hex}"
+        response = _openclaw_session_response(
+            session_id=session_id,
+            request=request,
+            actor=actor,
+            mode=mode,
+        )
+        self.openclaw_sessions[session_id] = response
+        await self.record_audit_event(
+            actor=actor,
+            action="openclaw.session_created",
+            resource=f"openclaw_session:{session_id}",
+            details=_openclaw_session_audit_details(response),
+        )
+        return response
+
+    async def list_openclaw_sessions(self) -> tuple[OpenClawSessionResponse, ...]:
+        return tuple(self.openclaw_sessions.values())
+
+    async def update_openclaw_session(
+        self,
+        session_id: str,
+        request: OpenClawSessionActionRequest,
+        *,
+        actor: str,
+    ) -> OpenClawSessionResponse:
+        try:
+            current = self.openclaw_sessions[session_id]
+        except KeyError:
+            raise PublicAPIError(404, "not_found", "not found") from None
+        updated = _updated_openclaw_session(current, request)
+        self.openclaw_sessions[session_id] = updated
+        await self.record_audit_event(
+            actor=actor,
+            action=f"openclaw.session_{request.action}",
+            resource=f"openclaw_session:{session_id}",
+            details=_openclaw_session_audit_details(updated, action=request.action),
+        )
+        return updated
 
     def make_log(
         self,
@@ -2904,6 +3082,68 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             details={"approval_id": current.approval_id, "exit_code": result.exit_code},
         )
         return _openclaw_execution_response(updated, result)
+
+    async def create_openclaw_session(
+        self,
+        request: OpenClawSessionRequest,
+        *,
+        actor: str,
+        mode: str,
+    ) -> OpenClawSessionResponse:
+        session_id = f"openclaw_session_{uuid4().hex}"
+        response = _openclaw_session_response(
+            session_id=session_id,
+            request=request,
+            actor=actor,
+            mode=mode,
+        )
+        if not await self._upsert_admin_payload(
+            "openclaw_session",
+            session_id,
+            response.model_dump(mode="json"),
+        ):
+            return await super().create_openclaw_session(request, actor=actor, mode=mode)
+        await self.record_audit_event(
+            actor=actor,
+            action="openclaw.session_created",
+            resource=f"openclaw_session:{session_id}",
+            details=_openclaw_session_audit_details(response),
+        )
+        return response
+
+    async def list_openclaw_sessions(self) -> tuple[OpenClawSessionResponse, ...]:
+        payloads = await self._list_admin_payloads("openclaw_session")
+        if payloads is None:
+            return await super().list_openclaw_sessions()
+        return tuple(OpenClawSessionResponse.model_validate(payload) for payload in payloads)
+
+    async def update_openclaw_session(
+        self,
+        session_id: str,
+        request: OpenClawSessionActionRequest,
+        *,
+        actor: str,
+    ) -> OpenClawSessionResponse:
+        payload = await self._get_admin_payload("openclaw_session", session_id)
+        if payload is None:
+            return await super().update_openclaw_session(session_id, request, actor=actor)
+        if not payload:
+            raise PublicAPIError(404, "not_found", "not found")
+        current = OpenClawSessionResponse.model_validate(payload)
+        updated = _updated_openclaw_session(current, request)
+        if not await self._upsert_admin_payload(
+            "openclaw_session",
+            session_id,
+            updated.model_dump(mode="json"),
+        ):
+            return await super().update_openclaw_session(session_id, request, actor=actor)
+        await self.record_audit_event(
+            actor=actor,
+            action=f"openclaw.session_{request.action}",
+            resource=f"openclaw_session:{session_id}",
+            details=_openclaw_session_audit_details(updated, action=request.action),
+        )
+        return updated
 
     async def get_main_agent_config(self) -> MainAgentConfigResponse:
         payload = await self._get_admin_payload("main_agent", "default")
@@ -5299,6 +5539,60 @@ async def list_openclaw_adapters(
 ) -> tuple[OpenClawAdapterResponse, ...]:
     _require(principal, "config:read")
     return _openclaw_adapter_responses()
+
+
+@router.post(
+    "/openclaw/sessions",
+    response_model=OpenClawSessionResponse,
+    status_code=201,
+    responses=error_responses(401, 403, 409, 422),
+)
+async def create_openclaw_session(
+    body: OpenClawSessionRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> OpenClawSessionResponse:
+    _require(principal, "config:write")
+    settings = await service.get_settings()
+    if not settings.openclaw_enabled:
+        raise PublicAPIError(409, "openclaw_disabled", "OpenClaw is disabled")
+    return await service.create_openclaw_session(
+        body,
+        actor=str(principal.user_id),
+        mode=settings.openclaw_mode,
+    )
+
+
+@router.get(
+    "/openclaw/sessions",
+    response_model=list[OpenClawSessionResponse],
+    responses=error_responses(401, 403, 422),
+)
+async def list_openclaw_sessions(
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> tuple[OpenClawSessionResponse, ...]:
+    _require(principal, "config:read")
+    return await service.list_openclaw_sessions()
+
+
+@router.patch(
+    "/openclaw/sessions/{session_id}",
+    response_model=OpenClawSessionResponse,
+    responses=error_responses(401, 403, 404, 409, 422),
+)
+async def update_openclaw_session(
+    session_id: str,
+    body: OpenClawSessionActionRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> OpenClawSessionResponse:
+    _require(principal, "config:write")
+    return await service.update_openclaw_session(
+        session_id,
+        body,
+        actor=str(principal.user_id),
+    )
 
 
 @router.get(

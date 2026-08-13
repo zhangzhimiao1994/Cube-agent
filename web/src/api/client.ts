@@ -295,6 +295,34 @@ const OpenClawAdapterSchema = z.object({
 
 export type OpenClawAdapter = z.infer<typeof OpenClawAdapterSchema>;
 
+const OpenClawSessionRequestSchema = z.object({
+  platform: z.enum(["linux", "windows", "macos"]),
+  target_type: z.enum(["server", "computer", "desktop"]),
+  target: z.string(),
+  purpose: z.string(),
+});
+
+export type OpenClawSessionRequest = z.infer<typeof OpenClawSessionRequestSchema>;
+
+const OpenClawSessionSchema = z.object({
+  id: z.string(),
+  status: z.enum(["active", "paused", "stopped", "adapter_unavailable"]),
+  adapter_status: z.enum(["available", "adapter_unavailable"]),
+  mode: z.enum(["ask", "read_only", "auto_review", "trusted_auto"]),
+  platform: z.string(),
+  target_type: z.string(),
+  target: z.string(),
+  purpose: z.string(),
+  execution_host: z.string(),
+  requested_by: z.string(),
+  created_at: z.string(),
+  updated_at: z.string(),
+  stopped_at: z.string().nullable().optional(),
+  operation_ids: z.array(z.string()),
+});
+
+export type OpenClawSession = z.infer<typeof OpenClawSessionSchema>;
+
 const MainAgentModelConfigSchema = z.object({
   provider: z.string(),
   api_base: z.string(),
@@ -994,6 +1022,27 @@ export const api = {
       "/api/v1/admin/openclaw/adapters",
       { method: "GET" },
       z.array(OpenClawAdapterSchema),
+    );
+  },
+  createOpenClawSession(payload: OpenClawSessionRequest): Promise<OpenClawSession> {
+    return request(
+      "/api/v1/admin/openclaw/sessions",
+      { method: "POST", body: JSON.stringify(payload) },
+      OpenClawSessionSchema,
+    );
+  },
+  openClawSessions(): Promise<OpenClawSession[]> {
+    return request(
+      "/api/v1/admin/openclaw/sessions",
+      { method: "GET" },
+      z.array(OpenClawSessionSchema),
+    );
+  },
+  updateOpenClawSession(id: string, action: "pause" | "resume" | "stop"): Promise<OpenClawSession> {
+    return request(
+      `/api/v1/admin/openclaw/sessions/${encodeURIComponent(id)}`,
+      { method: "PATCH", body: JSON.stringify({ action }) },
+      OpenClawSessionSchema,
     );
   },
   mainAgent(): Promise<MainAgentConfig> {
