@@ -645,7 +645,7 @@ class OpenClawExecutionResponse(BaseModel):
 class MultimediaGenerationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    kind: str = Field(pattern=r"^(image|video)$")
+    kind: str = Field(pattern=r"^(image|video|audio)$")
     logical_model: str = Field(min_length=1, max_length=128, pattern=r"^[a-z0-9][a-z0-9_-]*$")
     prompt: str = Field(min_length=1, max_length=20_000)
 
@@ -3108,6 +3108,14 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         source: str = "models.create",
     ) -> None:
         if ModelCapability.TEXT not in deployment.capabilities:
+            if deployment.capabilities.intersection(
+                {
+                    ModelCapability.AUDIO_GENERATION,
+                    ModelCapability.IMAGE_GENERATION,
+                    ModelCapability.VIDEO_GENERATION,
+                }
+            ):
+                return
             reason = "model availability check requires text capability"
             details = await self._record_model_availability_failure(
                 deployment,

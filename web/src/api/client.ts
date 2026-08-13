@@ -456,7 +456,7 @@ const AttachmentDeleteSchema = z.object({
 });
 
 const MultimediaGenerationSchema = z.object({
-  kind: z.enum(["image", "video"]),
+  kind: z.enum(["image", "video", "audio"]),
   logical_model: z.string(),
   deployment_id: z.string(),
   text: z.string().nullable(),
@@ -978,7 +978,7 @@ export const api = {
     );
   },
   generateMultimedia(payload: {
-    kind: "image" | "video";
+    kind: "image" | "video" | "audio";
     logical_model: string;
     prompt: string;
   }): Promise<MultimediaGeneration> {

@@ -382,6 +382,8 @@ def _multimedia_required_capability(kind: MultimediaGenerationKind) -> ModelCapa
         return ModelCapability.IMAGE_GENERATION
     if kind is MultimediaGenerationKind.VIDEO:
         return ModelCapability.VIDEO_GENERATION
+    if kind is MultimediaGenerationKind.AUDIO:
+        return ModelCapability.AUDIO_GENERATION
     raise ValueError("generation kind is invalid")
 
 

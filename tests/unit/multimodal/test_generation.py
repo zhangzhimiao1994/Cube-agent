@@ -5,8 +5,11 @@ import pytest
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelCapability, ModelRequest, ModelResponse
 from agent_hub.multimodal.generation import (
+    InMemoryMultimediaGenerationJobStore,
+    MultimediaArtifact,
     MultimediaDailyLimitExceeded,
     MultimediaGenerationExecutor,
+    MultimediaGenerationJobStatus,
     MultimediaGenerationKind,
 )
 
@@ -42,6 +45,49 @@ async def test_video_generation_request_requires_video_capability() -> None:
     assert gateway.requests[0].required_capabilities == frozenset({
         ModelCapability.VIDEO_GENERATION
     })
+
+
+async def test_audio_generation_request_requires_audio_generation_capability() -> None:
+    gateway = GatewayStub()
+    executor = MultimediaGenerationExecutor(gateway)
+
+    result = await executor.generate(
+        kind=MultimediaGenerationKind.AUDIO,
+        logical_model="audio-primary",
+        prompt="generate a short intro sound",
+    )
+
+    assert result.text == "artifact://generated-video"
+    assert gateway.requests[0].logical_model == "audio-primary"
+    assert gateway.requests[0].required_capabilities == frozenset({
+        ModelCapability.AUDIO_GENERATION
+    })
+
+
+async def test_generation_job_store_receives_executor_artifacts_for_main_agent() -> None:
+    gateway = GatewayStub()
+    store = InMemoryMultimediaGenerationJobStore()
+    executor = MultimediaGenerationExecutor(gateway, job_store=store)
+
+    queued = executor.submit(
+        kind=MultimediaGenerationKind.VIDEO,
+        logical_model="video-primary",
+        prompt="generate a short product video",
+    )
+    assert queued.status is MultimediaGenerationJobStatus.QUEUED
+
+    completed = await executor.run_job(queued.id, executor_id="media-agent-1")
+
+    assert completed.status is MultimediaGenerationJobStatus.SUCCEEDED
+    assert completed.executor_id == "media-agent-1"
+    assert completed.artifacts == (
+        MultimediaArtifact(
+            kind=MultimediaGenerationKind.VIDEO,
+            uri="artifact://generated-video",
+            text="artifact://generated-video",
+        ),
+    )
+    assert store.get(queued.id) == completed
 
 
 async def test_generation_prompt_is_required() -> None:

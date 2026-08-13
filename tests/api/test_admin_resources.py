@@ -2248,6 +2248,92 @@ async def test_persistent_admin_model_is_not_published_when_availability_check_f
 
 
 @pytest.mark.asyncio
+async def test_persistent_admin_saves_multimedia_video_model_without_chat_probe() -> None:
+    configs = FakeConfigService()
+    transport = FakeModelTransport(RuntimeError("chat probe should not run"))
+    service = PersistentAdminResourceService(
+        config_service=configs,  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        model_transport=transport,
+    )
+
+    created = await service.create_model(
+        ModelDeploymentRequest(
+            provider="minimax",
+            api_base="https://api.minimax.io",
+            upstream_model="MiniMax-Hailuo-02",
+            logical_model="video_primary",
+            capabilities=["video_generation"],
+            credential_ref=f"secret://{SECRET_ID}",
+            quota_scope="minimax-video-account",
+            max_concurrency=1,
+            target_utilization=0.8,
+            reserved_capacity=0,
+            rpm=3,
+            tpm=None,
+            queue_timeout_seconds=60,
+            fallback=None,
+            weight=100,
+        )
+    )
+
+    assert created.api_base == "https://api.minimax.io/v1"
+    assert created.capabilities == ["video_generation"]
+    assert transport.calls == []
+    assert configs.current is not None
+    document = cast(dict[str, Any], configs.current.document)
+    models = cast(dict[str, Any], document["models"])
+    video_primary = cast(dict[str, Any], models["video_primary"])
+    deployments = cast(list[dict[str, Any]], video_primary["deployments"])
+    assert deployments[0]["model"] == "MiniMax-Hailuo-02"
+
+
+@pytest.mark.asyncio
+async def test_persistent_admin_saves_multimedia_audio_model_without_chat_probe() -> None:
+    configs = FakeConfigService()
+    transport = FakeModelTransport(RuntimeError("chat probe should not run"))
+    service = PersistentAdminResourceService(
+        config_service=configs,  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        model_transport=transport,
+    )
+
+    created = await service.create_model(
+        ModelDeploymentRequest(
+            provider="minimax",
+            api_base="https://api.minimax.io",
+            upstream_model="speech-2.8-turbo",
+            logical_model="audio_primary",
+            capabilities=["audio_generation"],
+            credential_ref=f"secret://{SECRET_ID}",
+            quota_scope="minimax-audio-account",
+            max_concurrency=2,
+            target_utilization=0.8,
+            reserved_capacity=0,
+            rpm=30,
+            tpm=None,
+            queue_timeout_seconds=60,
+            fallback=None,
+            weight=100,
+        )
+    )
+
+    assert created.api_base == "https://api.minimax.io/v1"
+    assert created.capabilities == ["audio_generation"]
+    assert transport.calls == []
+    assert configs.current is not None
+    document = cast(dict[str, Any], configs.current.document)
+    models = cast(dict[str, Any], document["models"])
+    audio_primary = cast(dict[str, Any], models["audio_primary"])
+    deployments = cast(list[dict[str, Any]], audio_primary["deployments"])
+    assert deployments[0]["model"] == "speech-2.8-turbo"
+
+
+@pytest.mark.asyncio
 async def test_persistent_admin_deletes_model_deployment_and_publishes_config() -> None:
     configs = FakeConfigService()
     service = PersistentAdminResourceService(

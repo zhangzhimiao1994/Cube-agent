@@ -100,15 +100,37 @@ describe("MultimediaPage", () => {
               effective_slots: 1,
               saturation_policy: "queue_first_then_fallback",
             },
+            {
+              id: "33333333-3333-4333-8333-333333333333",
+              provider: "minimax",
+              api_base: "https://api.minimax.io/v1",
+              api_protocol: "openai_compatible",
+              upstream_model: "speech-2.8-turbo",
+              logical_model: "audio_primary",
+              capabilities: ["audio_generation"],
+              credential_ref: "secret://audio",
+              quota_scope: "minimax-audio",
+              max_concurrency: 1,
+              target_utilization: 0.8,
+              reserved_capacity: 0,
+              rpm: null,
+              tpm: null,
+              queue_timeout_seconds: 60,
+              fallback: null,
+              weight: 100,
+              effective_slots: 1,
+              saturation_policy: "queue_first_then_fallback",
+            },
           ]);
         }
         if (path === "/api/v1/admin/multimedia/generate" && method === "POST") {
+          const body = init?.body ? JSON.parse(String(init.body)) : {};
           return jsonResponse(
             {
-              kind: "video",
-              logical_model: "video_primary",
+              kind: body.kind ?? "video",
+              logical_model: body.logical_model ?? "video_primary",
               deployment_id: "media_primary_1",
-              text: "artifact://generated-video",
+              text: `artifact://generated-${body.kind ?? "video"}`,
             },
             { status: 202 },
           );
@@ -143,6 +165,32 @@ describe("MultimediaPage", () => {
           kind: "video",
           logical_model: "video_primary",
           prompt: "make a 5 second launch video",
+        },
+      });
+    });
+  });
+
+  it("submits audio generation only to an audio capable model", async () => {
+    const user = userEvent.setup();
+    const view = render(<TestApp initialPath="/multimedia" />);
+
+    await waitFor(() => {
+      expect(view.container.querySelector("#multimedia-model")).not.toBeNull();
+    });
+    await user.click(view.container.querySelector('input[value="audio"]') as HTMLInputElement);
+    await user.selectOptions(view.container.querySelector("#multimedia-model") as HTMLSelectElement, "audio_primary");
+    await user.type(view.container.querySelector("#multimedia-prompt") as HTMLTextAreaElement, "make a short intro sound");
+    await user.click(view.container.querySelector('button[type="submit"]') as HTMLButtonElement);
+
+    await screen.findByText("artifact://generated-audio");
+    await waitFor(() => {
+      expect(requests).toContainEqual({
+        path: "/api/v1/admin/multimedia/generate",
+        method: "POST",
+        body: {
+          kind: "audio",
+          logical_model: "audio_primary",
+          prompt: "make a short intro sound",
         },
       });
     });

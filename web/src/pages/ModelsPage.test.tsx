@@ -43,7 +43,7 @@ describe("ModelsPage", () => {
           return jsonResponse(principal);
         }
         if (path === "/api/v1/admin/models" && method === "GET") {
-          return jsonResponse(modelDeleted ? [] : [
+          const savedModels = [
             {
               id: "11111111-1111-4111-8111-111111111111",
               provider: "deepseek",
@@ -64,7 +64,8 @@ describe("ModelsPage", () => {
               effective_slots: 1,
               saturation_policy: "queue_first_then_fallback",
             },
-          ]);
+          ];
+          return jsonResponse(modelDeleted ? [] : savedModels);
         }
         if (path === "/api/v1/admin/models/11111111-1111-4111-8111-111111111111" && method === "DELETE") {
           modelDeleted = true;
@@ -433,31 +434,145 @@ describe("ModelsPage", () => {
     });
   });
 
-  it("lets admins declare image and video generation model capabilities", async () => {
+  it("lets admins declare custom multimedia generation capabilities", async () => {
     const user = userEvent.setup();
-    render(<TestApp initialPath="/models" />);
+    const view = render(<TestApp initialPath="/models" />);
 
-    await screen.findByText("添加模型配置");
-    await user.selectOptions(screen.getByLabelText("服务商"), "custom");
-    await user.type(screen.getByLabelText("自定义服务商"), "media-provider");
-    await user.type(screen.getByLabelText("自定义模型"), "media-video-1");
-    await user.clear(screen.getByLabelText("API Base"));
-    await user.type(screen.getByLabelText("API Base"), "https://media.example.com");
-    await user.clear(screen.getByLabelText("逻辑模型名"));
-    await user.type(screen.getByLabelText("逻辑模型名"), "media_generator");
+    await screen.findByText("planner");
+    await user.selectOptions(view.container.querySelector("#model-category") as HTMLSelectElement, "multimedia");
+    await user.selectOptions(view.container.querySelector("#provider") as HTMLSelectElement, "custom");
+    await user.type(view.container.querySelector("#custom-provider") as HTMLInputElement, "media-provider");
+    await user.type(view.container.querySelector("#custom-model") as HTMLInputElement, "media-video-1");
+    await user.clear(view.container.querySelector("#api-base") as HTMLInputElement);
+    await user.type(view.container.querySelector("#api-base") as HTMLInputElement, "https://media.example.com");
+    await user.clear(view.container.querySelector("#logical-model") as HTMLInputElement);
+    await user.type(view.container.querySelector("#logical-model") as HTMLInputElement, "media_generator");
     await user.type(screen.getByLabelText("API Key"), "sk-media-1234");
-    await user.click(screen.getByLabelText("图片生成"));
-    await user.click(screen.getByLabelText("视频生成"));
-    await user.click(screen.getByRole("button", { name: "测试并保存模型" }));
+    await user.click(view.container.querySelector('input[value="image_generation"]') as HTMLInputElement);
+    await user.click(view.container.querySelector('button[type="submit"]') as HTMLButtonElement);
 
-    await screen.findByText("模型已通过可用性测试并保存，Key 引用：secret_created");
+    await screen.findByText(/secret_created/);
     expect(requests[1]).toMatchObject({
       path: "/api/v1/admin/models",
       method: "POST",
       body: expect.objectContaining({
+        provider: "media-provider",
         logical_model: "media_generator",
-        capabilities: ["text", "image_generation", "video_generation"],
+        capabilities: expect.arrayContaining(["image_generation", "video_generation"]),
       }),
     });
   });
+
+  it("separates normal models from multimedia AI configuration", async () => {
+    const user = userEvent.setup();
+    const view = render(<TestApp initialPath="/models" />);
+
+    await screen.findByText("planner");
+    const categorySelect = view.container.querySelector("#model-category") as HTMLSelectElement | null;
+    expect(categorySelect).not.toBeNull();
+    expect(Array.from(categorySelect?.options ?? []).map((option) => option.value)).toEqual([
+      "normal",
+      "multimedia",
+    ]);
+    expect(view.container.querySelector('input[value="image_generation"]')).toBeNull();
+    expect(view.container.querySelector('input[value="video_generation"]')).toBeNull();
+    expect(view.container.querySelector('input[value="audio_generation"]')).toBeNull();
+
+    await user.selectOptions(categorySelect as HTMLSelectElement, "multimedia");
+    const providerSelect = view.container.querySelector("#provider") as HTMLSelectElement;
+    expect(Array.from(providerSelect.options).map((option) => option.value)).toEqual([
+      "openai-sora",
+      "openai-audio",
+      "minimax-hailuo",
+      "minimax-audio",
+      "google-veo",
+      "runway",
+      "kling",
+      "luma",
+      "alibaba-token-plan-media",
+      "alibaba-wan",
+      "alibaba-audio",
+      "elevenlabs-audio",
+      "seedance",
+      "custom",
+    ]);
+
+    await user.selectOptions(providerSelect, "minimax-hailuo");
+    const modelSelect = view.container.querySelector("#model") as HTMLSelectElement;
+    expect(Array.from(modelSelect.options).map((option) => option.value)).toEqual([
+      "MiniMax-Hailuo-02",
+      "__custom_model__",
+    ]);
+    expect((view.container.querySelector("#api-base") as HTMLInputElement).value).toBe(
+      "https://api.minimax.io/v1",
+    );
+    expect((view.container.querySelector("#logical-model") as HTMLInputElement).value).toBe(
+      "video_primary",
+    );
+    expect(view.container.querySelector('input[value="text"]')).toBeNull();
+    expect((view.container.querySelector('input[value="video_generation"]') as HTMLInputElement).checked).toBe(
+      true,
+    );
+
+    await user.type(screen.getByLabelText("API Key"), "sk-hailuo-video");
+    await user.click(view.container.querySelector('button[type="submit"]') as HTMLButtonElement);
+
+    await screen.findByText(/secret_created/);
+    expect(requests[1]).toMatchObject({
+      path: "/api/v1/admin/models",
+      method: "POST",
+      body: {
+        provider: "minimax",
+        api_base: "https://api.minimax.io/v1",
+        api_protocol: "openai_compatible",
+        upstream_model: "MiniMax-Hailuo-02",
+        logical_model: "video_primary",
+        capabilities: ["video_generation"],
+        credential_ref: "secret_created",
+        quota_scope: "minimax-video-account",
+        max_concurrency: 1,
+        target_utilization: 0.8,
+        reserved_capacity: 0,
+        rpm: 3,
+        tpm: 100000,
+        queue_timeout_seconds: 60,
+        fallback: null,
+        weight: 100,
+      },
+    });
+  });
+
+  it("configures audio generation multimedia models without normal model capabilities", async () => {
+    const user = userEvent.setup();
+    const view = render(<TestApp initialPath="/models" />);
+
+    await screen.findByText("planner");
+    await user.selectOptions(view.container.querySelector("#model-category") as HTMLSelectElement, "multimedia");
+    await user.selectOptions(view.container.querySelector("#provider") as HTMLSelectElement, "minimax-audio");
+
+    expect((view.container.querySelector("#model") as HTMLSelectElement).value).toBe("speech-2.8-turbo");
+    expect((view.container.querySelector("#logical-model") as HTMLInputElement).value).toBe("audio_primary");
+    expect(view.container.querySelector('input[value="text"]')).toBeNull();
+    expect((view.container.querySelector('input[value="audio_generation"]') as HTMLInputElement).checked).toBe(
+      true,
+    );
+
+    await user.type(screen.getByLabelText("API Key"), "sk-minimax-audio");
+    await user.click(view.container.querySelector('button[type="submit"]') as HTMLButtonElement);
+
+    await screen.findByText(/secret_created/);
+    expect(requests[1]).toMatchObject({
+      path: "/api/v1/admin/models",
+      method: "POST",
+      body: expect.objectContaining({
+        provider: "minimax",
+        api_base: "https://api.minimax.io/v1",
+        upstream_model: "speech-2.8-turbo",
+        logical_model: "audio_primary",
+        capabilities: ["audio_generation"],
+        quota_scope: "minimax-audio-account",
+      }),
+    });
+  });
+
 });

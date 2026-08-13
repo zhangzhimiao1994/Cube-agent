@@ -15,6 +15,7 @@ Capability = Literal[
     "structured_output",
     "image_generation",
     "video_generation",
+    "audio_generation",
 ]
 
 
@@ -50,7 +51,7 @@ class DeploymentDefinition(StrictConfigModel):
     input_per_million_usd: Decimal | None = None
     output_per_million_usd: Decimal | None = None
     capabilities: set[Capability] = Field(
-        default_factory=_default_capabilities, min_length=1, max_length=6
+        default_factory=_default_capabilities, min_length=1, max_length=7
     )
 
     @field_validator("provider", "model", "api_base", "secret_ref", "quota_scope_id")

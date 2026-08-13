@@ -8,6 +8,7 @@ const CUSTOM_MODEL = "__custom_model__";
 const CHAT_COMPLETIONS_SUFFIX = /\/chat\/completions\/?$/i;
 
 type ApiProtocol = "openai_compatible" | "anthropic_messages";
+type ModelCategory = "normal" | "multimedia";
 
 type ModelPreset = {
   label: string;
@@ -20,6 +21,7 @@ type ProviderPreset = {
   apiProtocol: ApiProtocol;
   capabilities: string[];
   concurrencyHelp?: string;
+  defaultLogicalModel?: string;
   defaultMaxConcurrency?: number;
   defaultRpm?: number;
   defaultTpm?: number;
@@ -27,11 +29,12 @@ type ProviderPreset = {
   modelHelp?: string;
   modelEntryMode?: "catalog" | "freeform";
   models: ModelPreset[];
+  providerValue?: string;
   quotaScope: string;
   value: string;
 };
 
-const PROVIDERS: ProviderPreset[] = [
+const NORMAL_PROVIDERS: ProviderPreset[] = [
   {
     label: "OpenAI",
     value: "openai",
@@ -137,7 +140,6 @@ const PROVIDERS: ProviderPreset[] = [
     defaultTpm: 20000000,
     models: [
       { label: "MiniMax M3", value: "MiniMax-M3", capabilities: ["text", "tool_calling"] },
-      { label: "MiniMax Hailuo 02 视频", value: "MiniMax-Hailuo-02", capabilities: ["text", "video_generation"] },
     ],
   },
   {
@@ -183,13 +185,238 @@ const PROVIDERS: ProviderPreset[] = [
   },
 ];
 
-const ALL_CAPABILITIES = [
+const MULTIMEDIA_PROVIDERS: ProviderPreset[] = [
+  {
+    label: "OpenAI Sora",
+    value: "openai-sora",
+    providerValue: "openai",
+    apiBase: "https://api.openai.com/v1",
+    apiProtocol: "openai_compatible",
+    quotaScope: "openai-video-account",
+    defaultLogicalModel: "video_primary",
+    capabilities: ["video_generation"],
+    modelHelp: "Sora 视频 API 使用 /v1/videos，不是聊天补全接口；保存后由多媒体执行器调用。",
+    models: [
+      { label: "Sora 2", value: "sora-2", capabilities: ["video_generation"] },
+      { label: "Sora 2 Pro", value: "sora-2-pro", capabilities: ["video_generation"] },
+    ],
+  },
+  {
+    label: "OpenAI Audio",
+    value: "openai-audio",
+    providerValue: "openai",
+    apiBase: "https://api.openai.com/v1",
+    apiProtocol: "openai_compatible",
+    quotaScope: "openai-audio-account",
+    defaultLogicalModel: "audio_primary",
+    capabilities: ["audio_generation"],
+    modelHelp: "OpenAI Audio 用于语音、音频等生成能力，不作为聊天模型保存。",
+    models: [
+      { label: "GPT-4o Mini TTS", value: "gpt-4o-mini-tts", capabilities: ["audio_generation"] },
+      { label: "TTS 1", value: "tts-1", capabilities: ["audio_generation"] },
+      { label: "TTS 1 HD", value: "tts-1-hd", capabilities: ["audio_generation"] },
+    ],
+  },
+  {
+    label: "MiniMax Hailuo",
+    value: "minimax-hailuo",
+    providerValue: "minimax",
+    apiBase: "https://api.minimax.io/v1",
+    apiProtocol: "openai_compatible",
+    quotaScope: "minimax-video-account",
+    defaultLogicalModel: "video_primary",
+    defaultRpm: 3,
+    capabilities: ["video_generation"],
+    concurrencyHelp: "MiniMax Hailuo 视频按用户要求默认每天 3 条；并发建议保持 1。",
+    models: [
+      { label: "MiniMax Hailuo 02", value: "MiniMax-Hailuo-02", capabilities: ["video_generation"] },
+    ],
+  },
+  {
+    label: "MiniMax Audio",
+    value: "minimax-audio",
+    providerValue: "minimax",
+    apiBase: "https://api.minimax.io/v1",
+    apiProtocol: "openai_compatible",
+    quotaScope: "minimax-audio-account",
+    defaultLogicalModel: "audio_primary",
+    defaultRpm: 30,
+    capabilities: ["audio_generation"],
+    modelHelp: "MiniMax 音频模型可复用同账号 Key；这里保存为 audio_generation 能力，由多媒体执行器调用。",
+    models: [
+      { label: "Speech 2.8 Turbo", value: "speech-2.8-turbo", capabilities: ["audio_generation"] },
+      { label: "Speech 2.8 HD", value: "speech-2.8-hd", capabilities: ["audio_generation"] },
+      { label: "Speech 2.6 Turbo", value: "speech-2.6-turbo", capabilities: ["audio_generation"] },
+      { label: "Speech 2.6 HD", value: "speech-2.6-hd", capabilities: ["audio_generation"] },
+      { label: "Speech 02 Turbo", value: "speech-02-turbo", capabilities: ["audio_generation"] },
+      { label: "Speech 02 HD", value: "speech-02-hd", capabilities: ["audio_generation"] },
+    ],
+  },
+  {
+    label: "Google Veo",
+    value: "google-veo",
+    providerValue: "google",
+    apiBase: "https://generativelanguage.googleapis.com/v1beta",
+    apiProtocol: "openai_compatible",
+    quotaScope: "google-video-account",
+    defaultLogicalModel: "video_primary",
+    capabilities: ["video_generation"],
+    modelHelp: "Veo 3.1 通过 Gemini generateContent 视频接口调用，保存后由对应多媒体适配器执行。",
+    models: [
+      { label: "Veo 3.1 Preview", value: "veo-3.1-generate-preview", capabilities: ["video_generation"] },
+      { label: "Veo 3.1 Fast Preview", value: "veo-3.1-fast-generate-preview", capabilities: ["video_generation"] },
+      { label: "Veo 3.1 Lite Preview", value: "veo-3.1-lite-generate-preview", capabilities: ["video_generation"] },
+    ],
+  },
+  {
+    label: "Runway",
+    value: "runway",
+    providerValue: "runway",
+    apiBase: "https://api.dev.runwayml.com/v1",
+    apiProtocol: "openai_compatible",
+    quotaScope: "runway-video-account",
+    defaultLogicalModel: "video_primary",
+    capabilities: ["video_generation"],
+    models: [
+      { label: "Runway Gen-4.5", value: "gen4.5", capabilities: ["video_generation"] },
+      { label: "Runway Gen-4 Turbo", value: "gen4_turbo", capabilities: ["video_generation"] },
+      { label: "Runway Seedance 2", value: "seedance2", capabilities: ["video_generation"] },
+      { label: "Runway Seedance 2 Fast", value: "seedance2_fast", capabilities: ["video_generation"] },
+    ],
+  },
+  {
+    label: "Kling",
+    value: "kling",
+    providerValue: "kling",
+    apiBase: "https://api.klingai.com/v1",
+    apiProtocol: "openai_compatible",
+    quotaScope: "kling-video-account",
+    defaultLogicalModel: "video_primary",
+    capabilities: ["video_generation"],
+    modelEntryMode: "freeform",
+    modelHelp: "Kling API 模型名和接口版本以控制台为准；这里保存为视频生成模型。",
+    models: [
+      { label: "Kling 3.0", value: "kling-3.0", capabilities: ["video_generation"] },
+      { label: "Kling 2.5 Turbo", value: "kling-2.5-turbo", capabilities: ["video_generation"] },
+    ],
+  },
+  {
+    label: "Luma Ray",
+    value: "luma",
+    providerValue: "luma",
+    apiBase: "https://api.lumalabs.ai/dream-machine/v1",
+    apiProtocol: "openai_compatible",
+    quotaScope: "luma-video-account",
+    defaultLogicalModel: "video_primary",
+    capabilities: ["video_generation"],
+    models: [
+      { label: "Ray 2", value: "ray-2", capabilities: ["video_generation"] },
+      { label: "Ray 2 Flash", value: "ray-flash-2", capabilities: ["video_generation"] },
+    ],
+  },
+  {
+    label: "阿里百炼 Token Plan 多媒体",
+    value: "alibaba-token-plan-media",
+    providerValue: "qwen-token-plan",
+    apiBase: "",
+    apiProtocol: "openai_compatible",
+    quotaScope: "qwen-token-plan-media-account",
+    defaultLogicalModel: "video_primary",
+    capabilities: ["video_generation"],
+    modelEntryMode: "freeform",
+    modelHelp: "Token Plan 多媒体模型请填写控制台“我的订阅 / API Key”里的专属 Base URL；模型名可填 happyhorse、wan、qwen-image 或音频系列。",
+    models: [
+      { label: "HappyHorse 1.1 文生视频", value: "happyhorse-1.1-t2v", capabilities: ["video_generation"] },
+      { label: "HappyHorse 1.1 图生视频", value: "happyhorse-1.1-i2v", capabilities: ["video_generation"] },
+      { label: "HappyHorse 1.1 参考生视频", value: "happyhorse-1.1-r2v", capabilities: ["video_generation"] },
+      { label: "Qwen Image 2.0", value: "qwen-image-2.0", capabilities: ["image_generation"] },
+      { label: "Qwen Image 2.0 Pro", value: "qwen-image-2.0-pro", capabilities: ["image_generation"] },
+      { label: "Wan 2.7 Image", value: "wan2.7-image", capabilities: ["image_generation"] },
+      { label: "Qwen TTS", value: "qwen-tts", capabilities: ["audio_generation"] },
+      { label: "CosyVoice", value: "cosyvoice-v2", capabilities: ["audio_generation"] },
+      { label: "Sambert", value: "sambert", capabilities: ["audio_generation"] },
+    ],
+  },
+  {
+    label: "阿里 Wan / 通义万相",
+    value: "alibaba-wan",
+    providerValue: "dashscope",
+    apiBase: "https://dashscope.aliyuncs.com/api/v1",
+    apiProtocol: "openai_compatible",
+    quotaScope: "dashscope-video-account",
+    defaultLogicalModel: "video_primary",
+    capabilities: ["video_generation"],
+    modelHelp: "Wan 视频生成是异步任务接口；如使用业务空间专属域名，请替换 API Base。",
+    models: [
+      { label: "Wan 2.7 文生视频", value: "wan2.7-t2v-2026-06-12", capabilities: ["video_generation"] },
+      { label: "Wan 2.7 图生视频", value: "wan2.7-i2v-2026-04-25", capabilities: ["video_generation"] },
+      { label: "Wan 2.7 参考生视频", value: "wan2.7-r2v-2026-06-12", capabilities: ["video_generation"] },
+      { label: "Wan 2.2 T2V Plus", value: "wan2.2-t2v-plus", capabilities: ["video_generation"] },
+    ],
+  },
+  {
+    label: "阿里音频 / CosyVoice",
+    value: "alibaba-audio",
+    providerValue: "dashscope",
+    apiBase: "https://dashscope.aliyuncs.com/api/v1",
+    apiProtocol: "openai_compatible",
+    quotaScope: "dashscope-audio-account",
+    defaultLogicalModel: "audio_primary",
+    capabilities: ["audio_generation"],
+    modelEntryMode: "freeform",
+    modelHelp: "阿里音频模型包括 Qwen-TTS、CosyVoice、Sambert 等；具体模型 ID 请以百炼控制台为准。",
+    models: [
+      { label: "Qwen TTS", value: "qwen-tts", capabilities: ["audio_generation"] },
+      { label: "CosyVoice V2", value: "cosyvoice-v2", capabilities: ["audio_generation"] },
+      { label: "Sambert", value: "sambert", capabilities: ["audio_generation"] },
+    ],
+  },
+  {
+    label: "ElevenLabs Audio",
+    value: "elevenlabs-audio",
+    providerValue: "elevenlabs",
+    apiBase: "https://api.elevenlabs.io/v1",
+    apiProtocol: "openai_compatible",
+    quotaScope: "elevenlabs-audio-account",
+    defaultLogicalModel: "audio_primary",
+    capabilities: ["audio_generation"],
+    models: [
+      { label: "Eleven Multilingual V2", value: "eleven_multilingual_v2", capabilities: ["audio_generation"] },
+      { label: "Eleven Flash V2.5", value: "eleven_flash_v2_5", capabilities: ["audio_generation"] },
+      { label: "Eleven Turbo V2.5", value: "eleven_turbo_v2_5", capabilities: ["audio_generation"] },
+    ],
+  },
+  {
+    label: "Seedance",
+    value: "seedance",
+    providerValue: "seedance",
+    apiBase: "",
+    apiProtocol: "openai_compatible",
+    quotaScope: "seedance-video-account",
+    defaultLogicalModel: "video_primary",
+    capabilities: ["video_generation"],
+    modelEntryMode: "freeform",
+    modelHelp: "Seedance API 入口和模型名按你的平台控制台填写；也可以通过 Runway 的 Seedance 预设配置。",
+    models: [
+      { label: "Seedance 2", value: "seedance2", capabilities: ["video_generation"] },
+      { label: "Seedance 2 Fast", value: "seedance2_fast", capabilities: ["video_generation"] },
+    ],
+  },
+];
+
+const NORMAL_CAPABILITIES = [
   { label: "文本", value: "text" },
   { label: "工具调用", value: "tool_calling" },
   { label: "结构化输出", value: "structured_output" },
+];
+
+const MULTIMEDIA_CAPABILITIES = [
   { label: "图片生成", value: "image_generation" },
   { label: "视频生成", value: "video_generation" },
+  { label: "音频生成", value: "audio_generation" },
 ];
+
+const ALL_CAPABILITIES = [...NORMAL_CAPABILITIES, ...MULTIMEDIA_CAPABILITIES];
 
 const API_PROTOCOL_LABELS: Record<ApiProtocol, string> = {
   openai_compatible: "OpenAI-compatible（/v1/chat/completions）",
@@ -229,6 +456,22 @@ function displaySaturationPolicy(policy: string) {
   return policy === "queue_first_then_fallback" ? "先排队，超时后降级" : policy;
 }
 
+function findPresetForSavedModel(model: ModelDeployment): (ProviderPreset & { category: ModelCategory }) | null {
+  const allPresets: Array<ProviderPreset & { category: ModelCategory }> = [
+    ...NORMAL_PROVIDERS.map((preset) => ({ ...preset, category: "normal" as const })),
+    ...MULTIMEDIA_PROVIDERS.map((preset) => ({ ...preset, category: "multimedia" as const })),
+  ];
+  return (
+    allPresets.find(
+      (preset) =>
+        (preset.providerValue ?? preset.value) === model.provider &&
+        preset.models.some((item) => item.value === model.upstream_model),
+    ) ??
+    allPresets.find((preset) => (preset.providerValue ?? preset.value) === model.provider) ??
+    null
+  );
+}
+
 const MODEL_ERROR_LABELS: Record<string, string> = {
   stage: "阶段",
   provider: "服务商",
@@ -254,25 +497,28 @@ function modelErrorDiagnostics(error: unknown) {
 export function ModelsPage() {
   const queryClient = useQueryClient();
   const models = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
-  const [provider, setProvider] = useState(PROVIDERS[0].value);
+  const [modelCategory, setModelCategory] = useState<ModelCategory>("normal");
+  const [provider, setProvider] = useState(NORMAL_PROVIDERS[0].value);
   const [customProvider, setCustomProvider] = useState("");
-  const [selectedModel, setSelectedModel] = useState(PROVIDERS[0].models[0].value);
+  const [selectedModel, setSelectedModel] = useState(NORMAL_PROVIDERS[0].models[0].value);
   const [customModel, setCustomModel] = useState("");
-  const [apiBase, setApiBase] = useState(PROVIDERS[0].apiBase);
-  const [apiProtocol, setApiProtocol] = useState<ApiProtocol>(PROVIDERS[0].apiProtocol);
+  const [apiBase, setApiBase] = useState(NORMAL_PROVIDERS[0].apiBase);
+  const [apiProtocol, setApiProtocol] = useState<ApiProtocol>(NORMAL_PROVIDERS[0].apiProtocol);
   const [apiKey, setApiKey] = useState("");
   const [logicalModel, setLogicalModel] = useState("main");
-  const [quotaScope, setQuotaScope] = useState(PROVIDERS[0].quotaScope);
-  const [capabilities, setCapabilities] = useState<string[]>(PROVIDERS[0].models[0].capabilities);
+  const [quotaScope, setQuotaScope] = useState(NORMAL_PROVIDERS[0].quotaScope);
+  const [capabilities, setCapabilities] = useState<string[]>(NORMAL_PROVIDERS[0].models[0].capabilities);
   const [maxConcurrency, setMaxConcurrency] = useState("1");
   const [rpm, setRpm] = useState("60");
   const [tpm, setTpm] = useState("100000");
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const [editingModel, setEditingModel] = useState<ModelDeployment | null>(null);
 
+  const availableProviders = modelCategory === "normal" ? NORMAL_PROVIDERS : MULTIMEDIA_PROVIDERS;
+  const capabilityOptions = modelCategory === "normal" ? NORMAL_CAPABILITIES : MULTIMEDIA_CAPABILITIES;
   const selectedProviderPreset = useMemo(
-    () => PROVIDERS.find((item) => item.value === provider),
-    [provider],
+    () => availableProviders.find((item) => item.value === provider),
+    [availableProviders, provider],
   );
   const modelOptions = selectedProviderPreset?.models ?? [];
   const isCustomProvider = provider === CUSTOM_PROVIDER;
@@ -280,9 +526,11 @@ export function ModelsPage() {
   const isCustomModel = isCustomProvider || isFreeformProvider || selectedModel === CUSTOM_MODEL;
   const canChooseProtocol = isCustomProvider || isFreeformProvider;
 
-  function resetModelForm() {
-    const preset = PROVIDERS[0];
+  function resetModelForm(nextCategory: ModelCategory = "normal") {
+    const presets = nextCategory === "normal" ? NORMAL_PROVIDERS : MULTIMEDIA_PROVIDERS;
+    const preset = presets[0];
     const defaultModel = preset.models[0];
+    setModelCategory(nextCategory);
     setProvider(preset.value);
     setCustomProvider("");
     setSelectedModel(defaultModel.value);
@@ -290,7 +538,7 @@ export function ModelsPage() {
     setApiBase(preset.apiBase);
     setApiProtocol(preset.apiProtocol);
     setApiKey("");
-    setLogicalModel("main");
+    setLogicalModel(preset.defaultLogicalModel ?? "main");
     setQuotaScope(preset.quotaScope);
     setCapabilities(defaultModel.capabilities);
     setMaxConcurrency(String(preset.defaultMaxConcurrency ?? 1));
@@ -301,7 +549,7 @@ export function ModelsPage() {
 
   const saveModel = useMutation({
     mutationFn: async () => {
-      const resolvedProvider = isCustomProvider ? customProvider.trim() : provider;
+      const resolvedProvider = isCustomProvider ? customProvider.trim() : selectedProviderPreset?.providerValue ?? provider;
       const resolvedModel = isCustomModel ? customModel.trim() : selectedModel;
       const credentialRef =
         apiKey.trim() !== ""
@@ -365,13 +613,14 @@ export function ModelsPage() {
       setApiBase("");
       setApiProtocol("openai_compatible");
       setQuotaScope("");
-      setCapabilities(["text"]);
+      setCapabilities(modelCategory === "normal" ? ["text"] : ["video_generation"]);
+      setLogicalModel(modelCategory === "normal" ? "main" : "video_primary");
       setMaxConcurrency("1");
       setRpm("60");
       setTpm("100000");
       return;
     }
-    const preset = PROVIDERS.find((item) => item.value === nextProvider) ?? PROVIDERS[0];
+    const preset = availableProviders.find((item) => item.value === nextProvider) ?? availableProviders[0];
     const defaultModel = preset.models[0];
     setSelectedModel(preset.modelEntryMode === "freeform" ? CUSTOM_MODEL : defaultModel.value);
     setCustomModel("");
@@ -379,9 +628,16 @@ export function ModelsPage() {
     setApiProtocol(preset.apiProtocol);
     setQuotaScope(preset.quotaScope);
     setCapabilities(preset.modelEntryMode === "freeform" ? preset.capabilities : defaultModel.capabilities);
+    setLogicalModel(preset.defaultLogicalModel ?? (modelCategory === "normal" ? "main" : "video_primary"));
     setMaxConcurrency(String(preset.defaultMaxConcurrency ?? 1));
     setRpm(String(preset.defaultRpm ?? 60));
     setTpm(String(preset.defaultTpm ?? 100000));
+  }
+
+  function changeModelCategory(nextCategory: ModelCategory) {
+    setSaveMessage(null);
+    setEditingModel(null);
+    resetModelForm(nextCategory);
   }
 
   function changeModel(nextModel: string) {
@@ -396,10 +652,11 @@ export function ModelsPage() {
   }
 
   function editSavedModel(model: ModelDeployment) {
-    const preset = PROVIDERS.find((item) => item.value === model.provider);
+    const preset = findPresetForSavedModel(model);
     setEditingModel(model);
     setSaveMessage(null);
     if (preset) {
+      setModelCategory(preset.category);
       setProvider(preset.value);
       setCustomProvider("");
       const presetModel = preset.models.find((item) => item.value === model.upstream_model);
@@ -412,6 +669,12 @@ export function ModelsPage() {
       }
       setApiProtocol(preset.apiProtocol);
     } else {
+      const inferredCategory = model.capabilities.some((item) =>
+        item === "image_generation" || item === "video_generation" || item === "audio_generation"
+      )
+        ? "multimedia"
+        : "normal";
+      setModelCategory(inferredCategory);
       setProvider(CUSTOM_PROVIDER);
       setCustomProvider(model.provider);
       setSelectedModel(CUSTOM_MODEL);
@@ -496,11 +759,21 @@ export function ModelsPage() {
             时会复用原 Key 引用；填写新 Key 会替换并重新测试。
           </p>
         ) : null}
-        <p>选择服务商后，普通服务商只显示其下属模型；中转站支持直接输入任意上游模型名，并会照常做 API 可用性测试。</p>
+        <p>先选择模型大类：普通模型用于对话、工具调用和结构化输出；多媒体 AI 用于图片和视频生成。</p>
+
+        <label htmlFor="model-category">模型大类</label>
+        <select
+          id="model-category"
+          value={modelCategory}
+          onChange={(event) => changeModelCategory(event.target.value as ModelCategory)}
+        >
+          <option value="normal">普通模型</option>
+          <option value="multimedia">多媒体 AI</option>
+        </select>
 
         <label htmlFor="provider">服务商</label>
         <select id="provider" value={provider} onChange={(event) => changeProvider(event.target.value)}>
-          {PROVIDERS.map((item) => (
+          {availableProviders.map((item) => (
             <option key={item.value} value={item.value}>
               {item.label}
             </option>
@@ -535,7 +808,7 @@ export function ModelsPage() {
           </>
         ) : null}
 
-        {isFreeformProvider && selectedProviderPreset?.modelHelp ? <p>{selectedProviderPreset.modelHelp}</p> : null}
+        {selectedProviderPreset?.modelHelp ? <p>{selectedProviderPreset.modelHelp}</p> : null}
 
         {isCustomModel ? (
           <>
@@ -621,9 +894,10 @@ export function ModelsPage() {
 
         <fieldset>
           <legend>能力</legend>
-          {ALL_CAPABILITIES.map((capability) => (
+          {capabilityOptions.map((capability) => (
             <label key={capability.value}>
               <input
+                value={capability.value}
                 type="checkbox"
                 checked={capabilities.includes(capability.value)}
                 onChange={() => toggleCapability(capability.value)}

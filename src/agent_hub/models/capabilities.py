@@ -36,6 +36,21 @@ _KNOWN_VIDEO_GENERATION_PATTERNS = tuple(
     )
 )
 
+_KNOWN_AUDIO_GENERATION_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bspeech[-_ ]?(?:0?2|2(?:\.\d+)?)\b",
+        r"\btts\b",
+        r"\btext[-_ ]?to[-_ ]?(?:speech|audio)\b",
+        r"\bcosyvoice\b",
+        r"\bqwen[-_ ]?tts\b",
+        r"\bsambert\b",
+        r"\beleven[-_ ]?(?:multilingual|flash|turbo)\b",
+        r"\baudio[-_ ]?generation\b",
+        r"\bmusic[-_ ]?generation\b",
+    )
+)
+
 
 def infer_model_capabilities(
     *,
@@ -50,6 +65,8 @@ def infer_model_capabilities(
         capabilities.add(ModelCapability.IMAGE_GENERATION)
     if is_known_video_generation_model(provider, upstream_model):
         capabilities.add(ModelCapability.VIDEO_GENERATION)
+    if is_known_audio_generation_model(provider, upstream_model):
+        capabilities.add(ModelCapability.AUDIO_GENERATION)
     return tuple(sorted(capabilities, key=lambda capability: capability.value))
 
 
@@ -67,12 +84,20 @@ def is_known_video_generation_model(provider: str, upstream_model: str) -> bool:
     )
 
 
+def is_known_audio_generation_model(provider: str, upstream_model: str) -> bool:
+    return _matches_any(
+        f"{provider}/{upstream_model}",
+        _KNOWN_AUDIO_GENERATION_PATTERNS,
+    )
+
+
 def _matches_any(value: str, patterns: Iterable[re.Pattern[str]]) -> bool:
     return any(pattern.search(value) is not None for pattern in patterns)
 
 
 __all__ = [
     "infer_model_capabilities",
+    "is_known_audio_generation_model",
     "is_known_image_generation_model",
     "is_known_video_generation_model",
 ]

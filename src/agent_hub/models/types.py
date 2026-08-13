@@ -33,6 +33,7 @@ class ModelCapability(StrEnum):
     STRUCTURED_OUTPUT = "structured_output"
     IMAGE_GENERATION = "image_generation"
     VIDEO_GENERATION = "video_generation"
+    AUDIO_GENERATION = "audio_generation"
 
 
 def _require_safe_identifier(name: str, value: str) -> None:

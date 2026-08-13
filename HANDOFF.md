@@ -2012,3 +2012,61 @@ Next:
 - Push `main` with `git push --force-with-lease mutilagent main`.
 - Check GitHub Actions and fix/redeploy/repush if red.
 - Continue P3 with protected Feishu Skill install commands, conversation-integrated Vibe Coding, richer multi-system OpenClaw adapters, channel command grammar, and final GitHub usage README.
+
+## 2026-08-13 P3 Model Categories and Audio Generation
+
+Current state:
+
+- Model configuration is split into two top-level categories:
+  - Normal models: text, tool calling, structured output.
+  - Multimedia AI: image generation, video generation, audio generation.
+- Normal model setup no longer exposes image/video/audio capability checkboxes.
+- Multimedia AI setup includes video/image/audio presets for OpenAI, MiniMax, Google Veo, Runway, Kling, Luma, Alibaba Token Plan, Alibaba Wan, Alibaba audio/CosyVoice, ElevenLabs, Seedance, and custom relays.
+- The system uses `audio_generation` as the capability name, not `speech_synthesis`, so TTS, speech, music, and other text-to-audio style models can share the same capability.
+- Media-only model configurations can be saved without running a chat-completion availability probe.
+- The multimedia executor now has an in-memory async job inbox:
+  - submit a job and get a job id;
+  - one of several media executor agents can run the job;
+  - the completed artifact is written back to the job store for the main agent to query by id.
+
+Changes made:
+
+- Added `ModelCapability.AUDIO_GENERATION`.
+- Extended config schema capability validation to accept `audio_generation`.
+- Added conservative audio model capability inference for MiniMax speech, OpenAI TTS, Qwen-TTS, CosyVoice, Sambert, ElevenLabs, and generic text-to-audio markers.
+- Extended multimedia generation kind/API/frontend types from image/video to image/video/audio.
+- Added `InMemoryMultimediaGenerationJobStore`, `MultimediaGenerationJob`, `MultimediaGenerationJobStatus`, and `MultimediaArtifact`.
+- Updated the model setup UI and tests for normal vs multimedia categories and audio presets.
+- Updated the multimedia page to filter and submit audio generation jobs only to `audio_generation` models.
+
+Local verification:
+
+- TDD red checks were added first for audio capabilities, media-only model save, and the async artifact inbox.
+- `uv run pytest tests/unit/multimodal/test_generation.py tests/unit/models/test_registry.py tests/unit/config/test_schema.py tests/api/test_admin_resources.py -q --tb=short` -> 242 passed.
+- `uv run pytest tests/api/test_admin_resources.py tests/unit/test_app_wiring.py tests/unit/multimodal/test_generation.py tests/unit/models/test_registry.py tests/unit/config/test_schema.py -q --tb=short` -> 254 passed.
+- `uv run ruff check src tests` -> passed.
+- `uv run mypy --strict src tests` -> passed.
+- `npm.cmd test -- --run src/pages/ModelsPage.test.tsx src/pages/MultimediaPage.test.tsx src/pages/MainAgentPage.test.tsx` -> 21 passed.
+- `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+
+Server deployment and verification:
+
+- Uploaded incremental package to `103.236.98.133:/tmp/agent-hub-p3-model-category-media.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`.
+- Restarted `agent-hub-api` and `agent-hub-worker`; reloaded Caddy.
+- Verified `agent-hub-api`, `agent-hub-worker`, and `caddy` were active.
+- Ran `/tmp/server_multimedia_model_config_check.py` through the real local HTTP API with a short-lived admin token generated from the running server environment; it passed:
+  - reused the existing MiniMax M3 credential reference `secret://a023b083-bb9d-4fb5-9d4d-e61e22cc814b`;
+  - created a MiniMax Hailuo video model with `video_generation`;
+  - created a MiniMax speech model with `audio_generation`;
+  - verified API Base normalization to `https://api.minimax.io/v1`;
+  - verified both created models appeared in list models;
+  - deleted both temporary models after the check.
+
+Next:
+
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue P3 with protected Feishu Skill install commands, conversation-integrated Vibe Coding, richer multi-system OpenClaw adapters, channel command grammar, and final GitHub usage README.

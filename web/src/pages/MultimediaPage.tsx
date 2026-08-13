@@ -4,11 +4,12 @@ import { Link } from "react-router-dom";
 
 import { api, formatApiError, type ModelDeployment } from "../api/client";
 
-type GenerationKind = "image" | "video";
+type GenerationKind = "image" | "video" | "audio";
 
 const KIND_OPTIONS: Array<{ value: GenerationKind; label: string; capability: string }> = [
   { value: "image", label: "图片", capability: "image_generation" },
   { value: "video", label: "视频", capability: "video_generation" },
+  { value: "audio", label: "音频", capability: "audio_generation" },
 ];
 
 export function MultimediaPage() {
@@ -55,7 +56,7 @@ export function MultimediaPage() {
     <section>
       <p className="eyebrow">Multimedia executor</p>
       <h2>多媒体生成</h2>
-      <p>图片和视频生成会先按模型能力过滤；视频请求只会提交给声明或识别为 video_generation 的模型。</p>
+      <p>图片、视频和音频生成会先按模型能力过滤；请求只会提交给声明或识别为对应多媒体能力的模型。</p>
 
       {settings.isLoading || models.isLoading ? <p>正在加载配置...</p> : null}
       {settings.isError ? <p role="alert">{formatApiError(settings.error, "系统设置加载失败")}</p> : null}
@@ -131,7 +132,9 @@ export function MultimediaPage() {
 }
 
 function capabilityFor(kind: GenerationKind) {
-  return kind === "image" ? "image_generation" : "video_generation";
+  if (kind === "image") return "image_generation";
+  if (kind === "video") return "video_generation";
+  return "audio_generation";
 }
 
 function uniqueLogicalModels(models: ModelDeployment[], capability: string) {

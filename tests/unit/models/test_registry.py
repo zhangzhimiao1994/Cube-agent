@@ -52,6 +52,19 @@ def test_known_video_generation_models_are_inferred_conservatively() -> None:
     )
 
 
+def test_known_audio_generation_models_are_inferred_conservatively() -> None:
+    inferred = infer_model_capabilities(
+        provider="minimax",
+        upstream_model="speech-2.8-turbo",
+        declared={"text"},
+    )
+
+    assert inferred == (
+        ModelCapability.AUDIO_GENERATION,
+        ModelCapability.TEXT,
+    )
+
+
 def test_unknown_models_do_not_gain_video_generation_without_admin_override() -> None:
     inferred = infer_model_capabilities(
         provider="deepseek",
@@ -76,6 +89,16 @@ def test_admin_video_generation_override_is_preserved() -> None:
         ModelCapability.TEXT,
         ModelCapability.VIDEO_GENERATION,
     )
+
+
+def test_admin_audio_generation_override_is_preserved() -> None:
+    inferred = infer_model_capabilities(
+        provider="custom",
+        upstream_model="private-audio-model",
+        declared={"audio_generation"},
+    )
+
+    assert inferred == (ModelCapability.AUDIO_GENERATION,)
 
 
 def test_registry_returns_the_same_deployment_for_repeated_agent_role_lookups() -> None:
