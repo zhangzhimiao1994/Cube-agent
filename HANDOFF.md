@@ -12,7 +12,9 @@ Current state:
 - Server health checks passed on API port `8000`: `GET /health/live` -> `{"status":"ok"}`, `GET /health/ready` -> `{"status":"ok"}`.
 - Server source contains the deployed marker `log_feishu_media_failure`.
 - Server syntax check passed with `.venv/bin/python -m py_compile src/agent_hub/channels/feishu/media.py tests/e2e/feishu/test_conversation.py`.
-- GitHub push is pending for this slice.
+- Local recovery bundle for this GitHub push was created at `.local-archives/github-pushes/mutilagent-main-before-20260813-102125-b851967.bundle`, pointing at current GitHub `mutilagent/main` commit `b851967`.
+- GitHub recovery archive tag prepared and pushed for this push: `archive/mutilagent-main-before-20260813-102125-b851967`.
+- P3 Feishu media error log wiring commit `0630f06` was pushed to GitHub; Actions run `31660607365` passed all quality checks. The only annotation was GitHub's non-failing Node.js 20 deprecation warning for actions.
 
 Changes made locally:
 
@@ -32,7 +34,7 @@ Verification performed locally:
 
 Remaining risks / TODOs:
 
-- Recovery archive creation, GitHub full push, and GitHub Actions verification remain to be completed before this slice is closed.
+- This slice has been committed, server-synced, pushed to GitHub, and verified by Actions.
 - Production app wiring still needs a concrete Feishu media client/provider before image bytes can be downloaded automatically from Feishu in live callbacks; this slice hardens the media-analysis error boundary that will be used by that runtime wiring.
 
 ## 2026-08-13 P3 Feishu Media Diagnostics Slice
