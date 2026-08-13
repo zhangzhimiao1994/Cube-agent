@@ -10,6 +10,11 @@ Current state:
 - The mobile drawer closes after selecting a second-level module link.
 - User confirmed the standing release workflow: every change should be synced to the server incrementally and verified first, then fully pushed to GitHub.
 - User also requires a recovery archive for every GitHub push. Keep both a local ignored `git bundle` under `.local-archives/github-pushes/` and a GitHub archive tag such as `archive/mutilagent-main-before-YYYYMMDD-HHMMSS` pointing at the previous remote `main`.
+- Local recovery bundle for this push was created at `.local-archives/github-pushes/mutilagent-main-before-20260813-091728-00b77c4.bundle`, pointing at the pre-push GitHub `mutilagent/main` commit `00b77c4`.
+- Server incremental deployment to `103.236.98.133:/opt/agent-hub/current` was performed with `/tmp/agent-hub-mobile-nav-incremental.tgz`.
+- Server services `agent-hub-api`, `agent-hub-worker`, and `caddy` are active after restart.
+- Server health checks passed: `GET /health/live` -> `{"status":"ok"}`, `GET /health/ready` -> `{"status":"ok"}`.
+- Server frontend dist contains the mobile drawer CSS marker `mobile-nav-groups`.
 
 Changes made locally:
 
@@ -41,8 +46,8 @@ Verification performed locally:
 
 Remaining risks / TODOs:
 
-- This UI fix has been committed locally but has not yet been server-synced or pushed to GitHub.
-- Before pushing this UI fix to GitHub, archive the current GitHub `mutilagent/main` both locally and as a GitHub tag.
+- This UI fix has been committed locally and server-synced, but has not yet been pushed to GitHub.
+- Before pushing this UI fix to GitHub, create the GitHub archive tag for the previous `mutilagent/main` commit `00b77c4`.
 - If the mobile drawer needs iconography like GitHub/Cloudflare, add an icon set later; this pass intentionally kept the change scoped to layout and interaction.
 
 ## 2026-08-13 P3 Runtime Process Observability Slice
