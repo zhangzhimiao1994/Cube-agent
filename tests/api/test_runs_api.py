@@ -27,6 +27,14 @@ class StubAuthService:
 
 
 @dataclass(slots=True)
+class StubSettingsService:
+    vibe_coding_enabled: bool = False
+
+    async def get_settings(self) -> object:
+        return type("Settings", (), {"vibe_coding_enabled": self.vibe_coding_enabled})()
+
+
+@dataclass(slots=True)
 class StubRunService:
     submitted: list[
         tuple[
@@ -44,6 +52,7 @@ class StubRunService:
     ]
     enqueue_count: int = 0
     direct_models: list[str | None] | None = None
+    vibe_coding_flags: list[bool] | None = None
 
     async def submit(
         self,
@@ -59,11 +68,14 @@ class StubRunService:
         reference_conversation_id: str | None = None,
         attachment_ids: tuple[str, ...] = (),
         direct_model: str | None = None,
+        vibe_coding: bool = False,
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         del idempotency_key
         if self.direct_models is not None:
             self.direct_models.append(direct_model)
+        if self.vibe_coding_flags is not None:
+            self.vibe_coding_flags.append(vibe_coding)
         self.submitted.append(
             (
                 tenant_id,
@@ -210,6 +222,7 @@ def _client(
     role: Role = Role.OPERATOR,
     *,
     attachment_store_dir: Path | None = None,
+    settings_service: StubSettingsService | None = None,
 ) -> tuple[TestClient, StubRunService, AuthenticatedPrincipal]:
     principal = AuthenticatedPrincipal(uuid4(), uuid4(), role)
     service = StubRunService([])
@@ -217,6 +230,7 @@ def _client(
         auth_service=StubAuthService(principal),
         rate_limiter=object(),
         config_service=object(),
+        admin_resource_service=settings_service,
         run_service=service,
     )
     if attachment_store_dir is not None:
@@ -283,6 +297,55 @@ def test_direct_submission_forwards_selected_model_without_agent_ids() -> None:
             None,
             False,
             None,
+            None,
+            (),
+        )
+    ]
+
+
+def test_vibe_coding_submission_is_rejected_when_system_switch_is_disabled() -> None:
+    client, service, _ = _client(settings_service=StubSettingsService(vibe_coding_enabled=False))
+    service.vibe_coding_flags = []
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={"message": "review this repo", "mode": "hybrid", "vibe_coding": True},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "vibe_coding_disabled"
+    assert service.vibe_coding_flags == []
+
+
+def test_vibe_coding_submission_is_forwarded_when_system_switch_is_enabled() -> None:
+    client, service, principal = _client(settings_service=StubSettingsService(vibe_coding_enabled=True))
+    service.vibe_coding_flags = []
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": "review this repo",
+            "mode": "hybrid",
+            "conversation_id": "conv-vibe-coding",
+            "vibe_coding": True,
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["conversation_id"] == "conv-vibe-coding"
+    assert service.vibe_coding_flags == [True]
+    assert service.submitted == [
+        (
+            principal.tenant_id,
+            principal.user_id,
+            "review this repo",
+            TaskMode.HYBRID,
+            (),
+            None,
+            False,
+            "conv-vibe-coding",
             None,
             (),
         )

@@ -20,6 +20,7 @@ const settings = {
   require_approval_for_tools: true,
   allow_main_agent_override: false,
   allow_temporary_agents: false,
+  vibe_coding_enabled: false,
   multimedia_generation_enabled: false,
   openclaw_enabled: false,
   openclaw_mode: "ask",
@@ -239,6 +240,7 @@ describe("ConfigPage", () => {
     await user.click(screen.getByLabelText(/导演/));
     await user.click(screen.getByLabelText("允许主 Agent 提出临场调整，执行前必须向用户核对"));
     await user.click(screen.getByLabelText("允许主 Agent 在能力不足时申请临时子 Agent"));
+    await user.click(screen.getByTestId("vibe-coding-toggle"));
     await user.click(screen.getByTestId("multimedia-generation-toggle"));
     await user.click(screen.getByTestId("openclaw-toggle"));
     await user.selectOptions(screen.getByLabelText("OpenClaw 权限模式"), "read_only");
@@ -257,6 +259,7 @@ describe("ConfigPage", () => {
         default_agent_ids: ["director"],
         allow_main_agent_override: true,
         allow_temporary_agents: true,
+        vibe_coding_enabled: true,
         multimedia_generation_enabled: true,
         openclaw_enabled: true,
         openclaw_mode: "read_only",

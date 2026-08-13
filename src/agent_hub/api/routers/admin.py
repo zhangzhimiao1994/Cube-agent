@@ -542,6 +542,7 @@ class SystemSettingsRequest(BaseModel):
     require_approval_for_tools: bool = True
     allow_main_agent_override: bool = False
     allow_temporary_agents: bool = False
+    vibe_coding_enabled: bool = False
     multimedia_generation_enabled: bool = False
     openclaw_enabled: bool = False
     openclaw_mode: str = Field(default="ask", pattern=r"^(ask|read_only|auto_review|trusted_auto)$")
@@ -3871,6 +3872,11 @@ def _routing_details(routing_decision: dict[str, object] | None) -> dict[str, st
         details["workflow_adjustment_policy"] = "ask_before_apply"
     elif adjustment_policy == "strict_preset":
         details["workflow_adjustment_policy"] = "strict_preset"
+    if routing_decision.get("vibe_coding") is True:
+        details["vibe_coding"] = "enabled"
+    capability = routing_decision.get("capability")
+    if isinstance(capability, str) and capability:
+        details["capability"] = capability
     selected_agent_ids = routing_decision.get("selected_agent_ids")
     if isinstance(selected_agent_ids, list):
         safe_ids = [item for item in selected_agent_ids if isinstance(item, str) and item]

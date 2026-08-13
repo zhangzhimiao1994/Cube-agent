@@ -220,6 +220,7 @@ const SystemSettingsSchema = z.object({
   require_approval_for_tools: z.boolean(),
   allow_main_agent_override: z.boolean().default(false),
   allow_temporary_agents: z.boolean().default(false),
+  vibe_coding_enabled: z.boolean().default(false),
   multimedia_generation_enabled: z.boolean().default(false),
   openclaw_enabled: z.boolean().default(false),
   openclaw_mode: z.enum(["ask", "read_only", "auto_review", "trusted_auto"]).default("ask"),
@@ -912,6 +913,7 @@ export const api = {
     conversation_id?: string | null;
     reference_conversation_id?: string | null;
     attachment_ids?: string[];
+    vibe_coding?: boolean;
   }): Promise<SubmittedRun> {
     return request(
       "/api/v1/runs",

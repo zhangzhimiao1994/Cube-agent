@@ -1,4 +1,57 @@
 
+## 2026-08-13 P3 Conversation-Integrated Vibe Coding Switch
+
+Current state:
+
+- Vibe Coding is now a system-level conversation capability, not a workflow.
+- System settings include `vibe_coding_enabled`, defaulting to `false`.
+- `/api/v1/runs` accepts `vibe_coding: true` only when the system switch is enabled; when disabled, the API fails closed with `409 vibe_coding_disabled`.
+- Accepted Vibe Coding conversation runs persist `vibe_coding=true` and `capability=vibe_coding` in the existing run `routing_decision`, so admin run details and runtime context can identify the request without adding a separate workflow/module.
+- The chat composer exposes a `Vibe Coding` button when the system switch is enabled and submits the flag with the normal conversation run payload.
+- The settings page exposes the Vibe Coding system switch alongside OpenClaw and multimedia generation switches.
+- Server incremental deployment to `103.236.98.133:/opt/agent-hub/current` was performed with `/tmp/agent-hub-p3-vibe-coding.tgz` before GitHub push.
+- Server services `agent-hub-api`, `agent-hub-worker`, and `caddy` are active after restart/reload.
+- Server source compiles with `.venv/bin/python -m py_compile src/agent_hub/api/routers/admin.py src/agent_hub/api/routers/runs.py src/agent_hub/runs/service.py`.
+- Server functional check `/tmp/vibe_coding_functional_check.py` passed through the real local HTTP API with the production EnvironmentFile loaded:
+  - disabled `vibe_coding_enabled=false` rejects a Vibe Coding run with `vibe_coding_disabled`;
+  - enabled `vibe_coding_enabled=true` accepts a real conversation run;
+  - admin run detail exposes `conversation_id`, `vibe_coding=enabled`, and `capability=vibe_coding`;
+  - original system settings are restored afterward.
+- Server frontend bundle contains the Vibe Coding settings toggle and composer button markers.
+
+Changes made:
+
+- Added `vibe_coding_enabled` to admin system settings request/response models and frontend settings schema.
+- Added `vibe_coding` to run creation requests and RunService submission.
+- Added fail-closed run API gating based on system settings.
+- Added run metadata exposure through admin `explicit_details`.
+- Added Config page switch and chat composer Vibe Coding button.
+- Added backend API/unit coverage and frontend Config/Runs regression tests.
+
+Local verification:
+
+- TDD red checks were added first:
+  - run API initially accepted Vibe Coding while disabled;
+  - run API did not forward the flag while enabled;
+  - system settings had no `vibe_coding_enabled`;
+  - RunService did not accept/persist `vibe_coding`;
+  - composer had no `Vibe Coding` button.
+- `uv run pytest tests/api/test_runs_api.py::test_vibe_coding_submission_is_rejected_when_system_switch_is_disabled tests/api/test_runs_api.py::test_vibe_coding_submission_is_forwarded_when_system_switch_is_enabled tests/api/test_admin_resources.py::test_system_settings_default_openclaw_is_disabled tests/unit/runs/test_temporary_agent.py::test_submit_persists_vibe_coding_capability_metadata -q --tb=short` -> 4 passed.
+- `uv run pytest tests/api/test_runs_api.py tests/api/test_admin_resources.py tests/unit/runs/test_temporary_agent.py -q --tb=short` -> 84 passed.
+- `uv run ruff check src\agent_hub\api\routers\runs.py src\agent_hub\api\routers\admin.py src\agent_hub\runs\service.py tests\api\test_runs_api.py tests\api\test_admin_resources.py tests\unit\runs\test_temporary_agent.py` -> passed.
+- `uv run mypy --strict src\agent_hub\api\routers\runs.py src\agent_hub\api\routers\admin.py src\agent_hub\runs\service.py tests\api\test_runs_api.py tests\api\test_admin_resources.py tests\unit\runs\test_temporary_agent.py` -> passed.
+- `npm.cmd test -- --run src/pages/OperationalPages.test.tsx src/pages/ConfigPage.test.tsx` -> 41 passed.
+- `npm.cmd run lint` -> passed.
+- `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+
+Next:
+
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue P3 with richer Vibe Coding behavior inside runtime prompts/artifact handling and multi-system OpenClaw adapters.
+
 ## 2026-08-13 P3 Feishu Production Media Factory Wiring Slice
 
 Current state:

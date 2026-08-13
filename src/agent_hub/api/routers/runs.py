@@ -73,6 +73,7 @@ class RunServiceProtocol(Protocol):
         reference_conversation_id: str | None = None,
         attachment_ids: tuple[str, ...] = (),
         direct_model: str | None = None,
+        vibe_coding: bool = False,
         idempotency_key: str | None = None,
     ) -> SubmittedRun: ...
 
@@ -134,6 +135,7 @@ class CreateRunRequest(BaseModel):
     conversation_id: str | None = Field(default=None, min_length=4, max_length=128)
     reference_conversation_id: str | None = Field(default=None, min_length=4, max_length=128)
     attachment_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
+    vibe_coding: bool = False
 
     @field_validator("attachment_ids", mode="before")
     @classmethod
@@ -244,6 +246,17 @@ def _run_service(request: Request) -> RunServiceProtocol:
     if service is None:
         raise PublicAPIError(503, "service_unavailable", "service unavailable")
     return cast(RunServiceProtocol, service)
+
+
+async def _vibe_coding_enabled(request: Request) -> bool:
+    service = getattr(request.app.state, "admin_resource_service", None)
+    if service is None or not hasattr(service, "get_settings"):
+        return False
+    try:
+        settings = await service.get_settings()
+    except (AttributeError, RuntimeError, TypeError, ValueError, SQLAlchemyError):
+        return False
+    return getattr(settings, "vibe_coding_enabled", False) is True
 
 
 def _attachment_store_dir(request: Request) -> Path:
@@ -519,10 +532,17 @@ def _run_conflict(error: RunConflict) -> PublicAPIError:
 )
 async def create_run(
     body: CreateRunRequest,
+    request: Request,
     service: Annotated[RunServiceProtocol, Depends(_run_service)],
     principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:create"))],
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> SubmittedRunResponse:
+    if body.vibe_coding and not await _vibe_coding_enabled(request):
+        raise PublicAPIError(
+            409,
+            "vibe_coding_disabled",
+            "Vibe Coding is disabled in system settings",
+        )
     submitted = await service.submit(
         tenant_id=principal.tenant_id,
         actor_id=principal.user_id,
@@ -535,6 +555,7 @@ async def create_run(
         reference_conversation_id=body.reference_conversation_id,
         attachment_ids=body.attachment_ids,
         direct_model=body.direct_model,
+        vibe_coding=body.vibe_coding,
         idempotency_key=idempotency_key,
     )
     return SubmittedRunResponse.from_submitted(submitted)

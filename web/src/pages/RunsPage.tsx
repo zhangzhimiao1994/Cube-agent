@@ -36,6 +36,7 @@ type RunSubmissionOverride = {
   message?: string;
   directModel?: string;
   mode?: RunMode;
+  vibeCoding?: boolean;
 };
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
@@ -1154,6 +1155,7 @@ export function RunsPage() {
   const [submitNotice, setSubmitNotice] = useState<string | null>(null);
   const [configOpen, setConfigOpen] = useState(false);
   const [directModel, setDirectModel] = useState("");
+  const [vibeCoding, setVibeCoding] = useState(false);
   const [showModeEntry, setShowModeEntry] = useState(true);
   const [processDetailTarget, setProcessDetailTarget] = useState<ProcessDetailTarget | null>(null);
   const [modeSelection, setModeSelection] = useState<ModeSelection | null>(null);
@@ -1216,6 +1218,7 @@ export function RunsPage() {
     }
     setWorkflowId(settings.data.default_workflow_id ?? "");
     setAgentIds(settings.data.default_agent_ids);
+    if (!settings.data.vibe_coding_enabled) setVibeCoding(false);
   }, [settings.data]);
 
   useEffect(() => {
@@ -1311,6 +1314,7 @@ export function RunsPage() {
         conversation_id: conversationId,
         reference_conversation_id: referenceConversationId.trim() || null,
         attachment_ids: attachmentDraft?.attachment ? [attachmentDraft.attachment.id] : [],
+        vibe_coding: override?.vibeCoding ?? vibeCoding,
       });
     },
     onSuccess: async (run, override) => {
@@ -1688,10 +1692,10 @@ export function RunsPage() {
         setSubmitNotice(`已选择直连模型/API：${selectedModel}。现在输入你的问题即可发送。`);
         return;
       }
-      createRun.mutate({ message: nextMessage, directModel: selectedModel, mode: effectiveMode });
+      createRun.mutate({ message: nextMessage, directModel: selectedModel, mode: effectiveMode, vibeCoding });
       return;
     }
-    createRun.mutate({ message: effectiveMessage, mode: effectiveMode });
+    createRun.mutate({ message: effectiveMessage, mode: effectiveMode, vibeCoding });
   }
 
   function startNewConversation() {
@@ -1705,6 +1709,7 @@ export function RunsPage() {
     setWorkflowId(settings.data?.default_workflow_id ?? "");
     setAgentIds(settings.data?.default_agent_ids ?? []);
     setDirectModel("");
+    setVibeCoding(false);
     setTemporaryApproval(null);
     setModeSelection(null);
     setProcessDetailTarget(null);
@@ -2268,6 +2273,17 @@ export function RunsPage() {
                 onClick={() => startHandoffConversation(latestVisibleRun)}
               >
                 按照原思路
+              </button>
+              <button
+                type="button"
+                className={`composer-handoff-button${vibeCoding ? " composer-toggle-active" : ""}`}
+                aria-label="Vibe Coding"
+                aria-pressed={vibeCoding}
+                title={settings.data?.vibe_coding_enabled ? "在当前对话中启用代码协作上下文" : "系统设置未启用 Vibe Coding"}
+                disabled={!settings.data?.vibe_coding_enabled}
+                onClick={() => setVibeCoding((current) => !current)}
+              >
+                Vibe Coding
               </button>
               <button
                 type="button"

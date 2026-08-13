@@ -276,6 +276,10 @@ export function ConfigPage() {
           <p>{settings.hermes_enabled ? "已启用经验沉淀，但不绕过审批。" : "已关闭经验沉淀。"}</p>
         </article>
         <article className="status-card">
+          <span>Vibe Coding</span>
+          <p>{settings.vibe_coding_enabled ? "已允许对话内代码协作。" : "已关闭对话内代码协作。"}</p>
+        </article>
+        <article className="status-card">
           <span>多媒体生成</span>
           <p>{settings.multimedia_generation_enabled ? "已允许图片和视频处理/生成。" : "已关闭图片和视频处理/生成。"}</p>
         </article>
@@ -382,6 +386,15 @@ export function ConfigPage() {
               onChange={(event) => updateSettings({ require_approval_for_tools: event.target.checked })}
             />
             高风险工具调用必须审批
+          </label>
+          <label className="inline-check">
+            <input
+              type="checkbox"
+              data-testid="vibe-coding-toggle"
+              checked={settings.vibe_coding_enabled}
+              onChange={(event) => updateSettings({ vibe_coding_enabled: event.target.checked })}
+            />
+            Vibe Coding 对话能力开关
           </label>
           <label className="inline-check">
             <input

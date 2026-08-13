@@ -180,6 +180,7 @@ class RunService:
         reference_conversation_id: str | None = None,
         attachment_ids: tuple[str, ...] = (),
         direct_model: str | None = None,
+        vibe_coding: bool = False,
         channel_context: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
@@ -200,6 +201,9 @@ class RunService:
         }
         if cleaned_direct_model:
             operator_selection["direct_model"] = cleaned_direct_model
+        if vibe_coding:
+            operator_selection["vibe_coding"] = True
+            operator_selection["capability"] = "vibe_coding"
         if channel_context:
             operator_selection.update(_safe_channel_context(channel_context))
         if mode is TaskMode.AUTO:

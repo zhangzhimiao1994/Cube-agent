@@ -108,6 +108,7 @@ const settings = {
   require_approval_for_tools: true,
   allow_main_agent_override: true,
   allow_temporary_agents: true,
+  vibe_coding_enabled: true,
   temporary_agent_policy: "全局策略：缺少专业能力时先询问用户，再临时加入子 Agent。",
   channel_entry: "web",
   attachment_retention_days: 7,
@@ -786,6 +787,24 @@ describe("operational management pages", () => {
       body: {
         message: "继续优化这个脚本。",
         conversation_id: "conv-previous",
+      },
+    });
+  });
+
+  it("sends a conversation-integrated Vibe Coding flag when enabled from the composer", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "Vibe Coding" }));
+    await user.type(screen.getByPlaceholderText(/输入消息/), "审查这个代码附件。");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(requests.slice().reverse().find((request) => request.path === "/api/v1/runs")).toMatchObject({
+      method: "POST",
+      body: {
+        message: "审查这个代码附件。",
+        vibe_coding: true,
       },
     });
   });

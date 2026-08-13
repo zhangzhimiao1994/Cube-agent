@@ -136,9 +136,11 @@ class FakeModelTransport:
 def test_system_settings_default_openclaw_is_disabled() -> None:
     settings = SystemSettingsResponse()
 
+    assert settings.vibe_coding_enabled is False
     assert settings.openclaw_enabled is False
     assert settings.openclaw_mode == "ask"
     assert settings.openclaw_allowed_commands == []
+    assert settings.model_dump()["vibe_coding_enabled"] is False
     assert settings.model_dump()["openclaw_enabled"] is False
     assert settings.model_dump()["openclaw_mode"] == "ask"
     assert settings.model_dump()["openclaw_allowed_commands"] == []

@@ -316,6 +316,38 @@ async def test_auto_ready_direct_is_promoted_for_generation_work() -> None:
 
 
 @pytest.mark.asyncio
+async def test_submit_persists_vibe_coding_capability_metadata() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    queue = RecordingQueue()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=None,
+        task_queue=queue,
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="review this code archive",
+        mode=TaskMode.HYBRID,
+        conversation_id="conv-vibe-coding",
+        attachment_ids=("att_11111111111111111111111111111111",),
+        vibe_coding=True,
+    )
+
+    routing = repository.records[submitted.id].routing_decision
+
+    assert routing is not None
+    assert routing["vibe_coding"] is True
+    assert routing["capability"] == "vibe_coding"
+    assert routing["conversation_id"] == "conv-vibe-coding"
+    assert routing["attachment_ids"] == ["att_11111111111111111111111111111111"]
+
+
+@pytest.mark.asyncio
 async def test_auto_router_timeout_uses_local_main_agent_for_generation_work() -> None:
     tenant_id = uuid4()
     actor_id = uuid4()
