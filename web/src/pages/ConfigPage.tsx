@@ -7,6 +7,7 @@ import {
   api,
   formatApiError,
   type ConfigRevision,
+  type OpenClawAdapter,
   type OpenClawOperation,
   type SystemSettings,
 } from "../api/client";
@@ -84,6 +85,25 @@ function parseCommandList(value: string) {
   return parsed;
 }
 
+function sortOpenClawAdapters(adapters: OpenClawAdapter[]) {
+  const platformRank = new Map([
+    ["linux", 0],
+    ["windows", 1],
+    ["macos", 2],
+  ]);
+  const kindRank = new Map([
+    ["server_command", 0],
+    ["desktop_action", 1],
+    ["screen_read", 2],
+    ["file_read", 3],
+  ]);
+  return [...adapters].sort(
+    (left, right) =>
+      (platformRank.get(left.platform) ?? 99) - (platformRank.get(right.platform) ?? 99) ||
+      (kindRank.get(left.kind) ?? 99) - (kindRank.get(right.kind) ?? 99),
+  );
+}
+
 export function ConfigPage() {
   const queryClient = useQueryClient();
   const current = useQuery({ queryKey: ["config-current"], queryFn: () => api.currentConfig() });
@@ -91,6 +111,7 @@ export function ConfigPage() {
   const agentsQuery = useQuery({ queryKey: ["agents"], queryFn: () => api.agents() });
   const workflowsQuery = useQuery({ queryKey: ["workflows"], queryFn: () => api.workflows() });
   const modelsQuery = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
+  const openClawAdaptersQuery = useQuery({ queryKey: ["openclaw-adapters"], queryFn: () => api.openClawAdapters() });
   const document = useMemo(
     () => currentOrEmpty(current.data, current.error),
     [current.data, current.error],
@@ -207,7 +228,14 @@ export function ConfigPage() {
     },
   });
 
-  if (current.isLoading || settingsQuery.isLoading || agentsQuery.isLoading || workflowsQuery.isLoading || modelsQuery.isLoading) {
+  if (
+    current.isLoading ||
+    settingsQuery.isLoading ||
+    agentsQuery.isLoading ||
+    workflowsQuery.isLoading ||
+    modelsQuery.isLoading ||
+    openClawAdaptersQuery.isLoading
+  ) {
     return <p>正在加载系统设置...</p>;
   }
   if (current.isError && !(current.error instanceof ApiError && current.error.status === 404)) {
@@ -217,10 +245,14 @@ export function ConfigPage() {
   if (agentsQuery.isError) return <p role="alert">{formatApiError(agentsQuery.error, "Agent 列表加载失败")}</p>;
   if (workflowsQuery.isError) return <p role="alert">{formatApiError(workflowsQuery.error, "工作流列表加载失败")}</p>;
   if (modelsQuery.isError) return <p role="alert">{formatApiError(modelsQuery.error, "模型列表加载失败")}</p>;
+  if (openClawAdaptersQuery.isError) {
+    return <p role="alert">{formatApiError(openClawAdaptersQuery.error, "OpenClaw adapters loading failed")}</p>;
+  }
   if (!settings) return <p role="alert">系统设置加载失败：后端没有返回设置内容。</p>;
 
   const agents = agentsQuery.data ?? [];
   const workflows = workflowsQuery.data ?? [];
+  const openClawAdapters = sortOpenClawAdapters(openClawAdaptersQuery.data ?? []);
   const modelCount = Object.keys(document?.models ?? {}).length || (modelsQuery.data ?? []).length;
   const agentCount = document?.agents.length || agents.length;
 
@@ -438,6 +470,39 @@ export function ConfigPage() {
             />
             <small>Only exact argv matches can execute after approval. Shell wrappers remain blocked.</small>
           </label>
+          <div className="inline-guide" aria-label="OpenClaw adapter status">
+            <h4>OpenClaw adapter status</h4>
+            <div className="openclaw-adapter-grid">
+              {openClawAdapters.map((adapter) => (
+                <article
+                  key={`${adapter.platform}-${adapter.kind}`}
+                  className={`openclaw-adapter-card openclaw-adapter-${adapter.status}`}
+                >
+                  <div className="openclaw-adapter-header">
+                    <strong>
+                      {adapter.platform} {adapter.kind}
+                    </strong>
+                    <span>{adapter.status}</span>
+                  </div>
+                  <p>{adapter.description}</p>
+                  <dl>
+                    <div>
+                      <dt>host</dt>
+                      <dd>{adapter.execution_host}</dd>
+                    </div>
+                    <div>
+                      <dt>approval</dt>
+                      <dd>{adapter.requires_user_approval ? "required" : "not required"}</dd>
+                    </div>
+                    <div>
+                      <dt>read-only</dt>
+                      <dd>{adapter.supports_read_only ? "supported" : "not supported"}</dd>
+                    </div>
+                  </dl>
+                </article>
+              ))}
+            </div>
+          </div>
           <div className="inline-guide" aria-label="OpenClaw operation console">
             <h4>OpenClaw operation console</h4>
             <label htmlFor="openclaw-operation-argv">

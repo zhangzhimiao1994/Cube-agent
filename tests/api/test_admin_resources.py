@@ -195,6 +195,31 @@ def test_openclaw_operation_requires_feature_switch() -> None:
     assert response.json()["error"]["code"] == "openclaw_disabled"
 
 
+def test_openclaw_adapters_expose_multisystem_execution_boundary() -> None:
+    response = client().get("/api/v1/admin/openclaw/adapters", headers=headers())
+
+    assert response.status_code == 200
+    adapters = {
+        (adapter["platform"], adapter["kind"]): adapter
+        for adapter in response.json()
+    }
+    assert adapters[("linux", "server_command")] == {
+        "platform": "linux",
+        "kind": "server_command",
+        "target_type": "server",
+        "status": "available",
+        "execution_host": "agent-hub-server",
+        "requires_user_approval": True,
+        "supports_read_only": False,
+        "description": "Runs exact allowlisted argv commands on the Agent Hub Linux server after approval.",
+    }
+    assert adapters[("windows", "server_command")]["status"] == "adapter_unavailable"
+    assert adapters[("windows", "server_command")]["execution_host"] == "remote-windows-host"
+    assert adapters[("macos", "desktop_action")]["status"] == "adapter_unavailable"
+    assert adapters[("linux", "screen_read")]["supports_read_only"] is True
+    assert adapters[("windows", "file_read")]["requires_user_approval"] is True
+
+
 def test_openclaw_operation_creates_approval_request_when_enabled() -> None:
     api = client()
     settings_response = api.get("/api/v1/admin/settings", headers=headers())

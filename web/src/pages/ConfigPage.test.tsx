@@ -143,6 +143,30 @@ describe("ConfigPage", () => {
             truncated: false,
           });
         }
+        if (path === "/api/v1/admin/openclaw/adapters") {
+          return jsonResponse([
+            {
+              platform: "linux",
+              kind: "server_command",
+              target_type: "server",
+              status: "available",
+              execution_host: "agent-hub-server",
+              requires_user_approval: true,
+              supports_read_only: false,
+              description: "Runs exact allowlisted argv commands on the Agent Hub Linux server after approval.",
+            },
+            {
+              platform: "windows",
+              kind: "server_command",
+              target_type: "computer",
+              status: "adapter_unavailable",
+              execution_host: "remote-windows-host",
+              requires_user_approval: true,
+              supports_read_only: false,
+              description: "Requires a connected Windows OpenClaw adapter before execution.",
+            },
+          ]);
+        }
         if (path === "/api/v1/admin/agents") {
           return jsonResponse([
             {
@@ -311,5 +335,15 @@ describe("ConfigPage", () => {
 
     await user.click(screen.getByTestId("openclaw-execute-operation"));
     expect((await screen.findByTestId("openclaw-execution-output")).textContent).toContain("ui-openclaw-ok");
+  });
+
+  it("shows OpenClaw adapter availability in settings", async () => {
+    render(<TestApp initialPath="/config" />);
+
+    expect(await screen.findByText("linux server_command")).not.toBeNull();
+    expect(screen.getByText("available")).not.toBeNull();
+    expect(screen.getByText("windows server_command")).not.toBeNull();
+    expect(screen.getByText("adapter_unavailable")).not.toBeNull();
+    expect(screen.getByText(/remote-windows-host/)).not.toBeNull();
   });
 });

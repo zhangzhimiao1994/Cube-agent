@@ -1,4 +1,68 @@
 
+## 2026-08-13 P3 OpenClaw Adapter Status Matrix
+
+Current state:
+
+- OpenClaw now exposes a multi-system adapter status matrix through `GET /api/v1/admin/openclaw/adapters`.
+- The matrix makes the execution boundary explicit:
+  - Linux `server_command` on the Agent Hub server is available.
+  - Windows/macOS commands and desktop/screen/file adapters are modeled but return `adapter_unavailable` until a real remote adapter is connected.
+  - Screen/file read operation types are marked as read-only capable, but still require user approval and a real adapter before execution.
+- The settings page now shows OpenClaw adapter availability before the operation console, including platform, operation kind, host, approval requirement, and read-only support.
+- The settings page now makes `.settings-form .inline-guide` visible, so the OpenClaw operation console and adapter status block are not hidden by the generic guide CSS.
+- The execution safety boundary remains unchanged: OpenClaw still requires the global switch, approval, exact argv allowlist match, and shell-wrapper denial. Windows/macOS are not misrouted into the Linux executor.
+
+Changes made:
+
+- `src/agent_hub/api/routers/admin.py`
+  - Added `OpenClawAdapterResponse`.
+  - Added `_openclaw_adapter_responses()`.
+  - Added `GET /api/v1/admin/openclaw/adapters` with `config:read` permission.
+- `web/src/api/client.ts`
+  - Added OpenClaw adapter schema/type and API client method.
+- `web/src/pages/ConfigPage.tsx`
+  - Loads and sorts adapter statuses.
+  - Displays OpenClaw adapter availability in the settings form.
+- `web/src/styles.css`
+  - Added settings-scoped visible guide styling and responsive OpenClaw adapter cards.
+- Tests:
+  - Added backend coverage for the multi-system adapter matrix.
+  - Added frontend coverage for adapter status rendering.
+
+Verification performed:
+
+- TDD red:
+  - `uv run pytest tests/api/test_admin_resources.py::test_openclaw_adapters_expose_multisystem_execution_boundary -q --tb=short` first failed with 404 because the endpoint did not exist.
+  - `npm.cmd test -- --run src/pages/ConfigPage.test.tsx -t "adapter availability"` first failed because the settings page did not render adapter status.
+- Green/local:
+  - `uv run pytest tests/api/test_admin_resources.py::test_openclaw_adapters_expose_multisystem_execution_boundary -q --tb=short` -> 1 passed.
+  - `uv run pytest tests/api/test_admin_resources.py -q -k openclaw --tb=short` -> 10 passed.
+  - `uv run pytest tests/api/test_admin_resources.py tests/unit/test_app_wiring.py -q --tb=short` -> 82 passed.
+  - `uv run ruff check src tests` -> passed.
+  - `uv run mypy --strict src tests` -> passed.
+  - `npm.cmd test -- --run src/pages/ConfigPage.test.tsx` -> 4 passed.
+  - `npm.cmd test -- --run src/pages/ConfigPage.test.tsx src/app/AppShell.test.tsx src/pages/OperationalPages.test.tsx` -> 53 passed.
+  - `npm.cmd run lint` -> passed.
+  - `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+- Server deployment and real verification:
+  - Uploaded incremental package to `103.236.98.133:/tmp/agent-hub-p3-openclaw-adapters.tgz`.
+  - Deployed incrementally into `/opt/agent-hub/current`.
+  - Restarted `agent-hub-api` and `agent-hub-worker`; reloaded Caddy.
+  - Verified `agent-hub-api`, `agent-hub-worker`, and `caddy` were active.
+  - Ran `/tmp/server_openclaw_adapters_check.py` through the real local HTTP API with a short-lived admin token generated from the running server environment; it passed:
+    - listed OpenClaw adapter statuses;
+    - confirmed Linux `server_command` is available and requires approval;
+    - confirmed Windows `server_command` and macOS `desktop_action` are explicitly unavailable;
+    - enabled OpenClaw with a real allowlisted Python command;
+    - created, approved, and executed the Linux command through the real API, returning `server-openclaw-adapter-ok`;
+    - created and approved a Windows command operation, then confirmed execution returns `openclaw_adapter_unavailable`;
+    - restored the original system settings afterward.
+
+Remaining risks / TODOs:
+
+- Real Windows/macOS computer operation still requires a dedicated remote OpenClaw adapter/service; this slice only exposes the adapter boundary and prevents unsafe misrouting.
+- Continue P3 with any remaining UI polish, final usage README, and final full GitHub push workflow.
+
 ## 2026-08-13 Attachment Manager Slice
 
 Current state:

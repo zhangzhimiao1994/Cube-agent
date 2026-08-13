@@ -1626,6 +1626,92 @@ article:hover {
   display: none;
 }
 
+.settings-form .inline-guide {
+  background: rgba(8, 15, 29, 0.46);
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  display: block;
+  padding: 1rem;
+}
+
+.settings-form .inline-guide h4 {
+  color: var(--text);
+  font-size: 0.94rem;
+  margin: 0 0 0.85rem;
+}
+
+.openclaw-adapter-grid {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.openclaw-adapter-card {
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 0.5rem;
+  padding: 0.8rem;
+}
+
+.openclaw-adapter-card p {
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.45;
+  margin: 0.5rem 0 0.7rem;
+}
+
+.openclaw-adapter-header {
+  align-items: center;
+  display: flex;
+  gap: 0.6rem;
+  justify-content: space-between;
+}
+
+.openclaw-adapter-header strong {
+  font-size: 0.86rem;
+}
+
+.openclaw-adapter-header span {
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+  color: var(--muted);
+  flex: 0 0 auto;
+  font-size: 0.72rem;
+  padding: 0.16rem 0.48rem;
+}
+
+.openclaw-adapter-available .openclaw-adapter-header span {
+  background: rgba(33, 201, 133, 0.12);
+  border-color: rgba(33, 201, 133, 0.3);
+  color: #91e8bd;
+}
+
+.openclaw-adapter-card dl {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0;
+}
+
+.openclaw-adapter-card dl div {
+  align-items: baseline;
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: 5.5rem minmax(0, 1fr);
+}
+
+.openclaw-adapter-card dt {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.openclaw-adapter-card dd {
+  color: var(--text);
+  font-size: 0.78rem;
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .inline-guide summary {
   color: var(--accent);
   cursor: pointer;

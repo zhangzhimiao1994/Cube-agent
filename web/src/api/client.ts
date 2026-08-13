@@ -274,6 +274,19 @@ const OpenClawExecutionSchema = z.object({
 
 export type OpenClawExecution = z.infer<typeof OpenClawExecutionSchema>;
 
+const OpenClawAdapterSchema = z.object({
+  platform: z.enum(["linux", "windows", "macos"]),
+  kind: z.enum(["server_command", "desktop_action", "screen_read", "file_read"]),
+  target_type: z.enum(["server", "computer", "desktop", "filesystem", "screen"]),
+  status: z.enum(["available", "adapter_unavailable"]),
+  execution_host: z.string(),
+  requires_user_approval: z.boolean(),
+  supports_read_only: z.boolean(),
+  description: z.string(),
+});
+
+export type OpenClawAdapter = z.infer<typeof OpenClawAdapterSchema>;
+
 const MainAgentModelConfigSchema = z.object({
   provider: z.string(),
   api_base: z.string(),
@@ -921,6 +934,13 @@ export const api = {
       `/api/v1/admin/openclaw/operations/${encodeURIComponent(id)}/execute`,
       { method: "POST" },
       OpenClawExecutionSchema,
+    );
+  },
+  openClawAdapters(): Promise<OpenClawAdapter[]> {
+    return request(
+      "/api/v1/admin/openclaw/adapters",
+      { method: "GET" },
+      z.array(OpenClawAdapterSchema),
     );
   },
   mainAgent(): Promise<MainAgentConfig> {

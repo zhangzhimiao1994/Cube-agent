@@ -642,6 +642,19 @@ class OpenClawExecutionResponse(BaseModel):
     truncated: bool
 
 
+class OpenClawAdapterResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    platform: str = Field(pattern=r"^(linux|windows|macos)$")
+    kind: str = Field(pattern=r"^(server_command|desktop_action|screen_read|file_read)$")
+    target_type: str = Field(pattern=r"^(server|computer|desktop|filesystem|screen)$")
+    status: str = Field(pattern=r"^(available|adapter_unavailable)$")
+    execution_host: str
+    requires_user_approval: bool
+    supports_read_only: bool
+    description: str
+
+
 class MultimediaGenerationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -701,6 +714,49 @@ def _openclaw_audit_details(request: OpenClawOperationRequest, mode: str) -> dic
         "risk_level": request.risk_level,
         "mode": mode,
     }
+
+
+def _openclaw_adapter_responses() -> tuple[OpenClawAdapterResponse, ...]:
+    target_types = {
+        "server_command": "server",
+        "desktop_action": "desktop",
+        "screen_read": "screen",
+        "file_read": "filesystem",
+    }
+    descriptions = {
+        ("linux", "server_command"): (
+            "Runs exact allowlisted argv commands on the Agent Hub Linux server after approval."
+        ),
+        ("linux", "desktop_action"): "Requires a connected Linux desktop OpenClaw adapter before execution.",
+        ("linux", "screen_read"): "Requires a connected Linux screen OpenClaw adapter before execution.",
+        ("linux", "file_read"): "Requires a connected Linux filesystem OpenClaw adapter before execution.",
+        ("windows", "server_command"): "Requires a connected Windows OpenClaw adapter before execution.",
+        ("windows", "desktop_action"): "Requires a connected Windows desktop OpenClaw adapter before execution.",
+        ("windows", "screen_read"): "Requires a connected Windows screen OpenClaw adapter before execution.",
+        ("windows", "file_read"): "Requires a connected Windows filesystem OpenClaw adapter before execution.",
+        ("macos", "server_command"): "Requires a connected macOS OpenClaw adapter before execution.",
+        ("macos", "desktop_action"): "Requires a connected macOS desktop OpenClaw adapter before execution.",
+        ("macos", "screen_read"): "Requires a connected macOS screen OpenClaw adapter before execution.",
+        ("macos", "file_read"): "Requires a connected macOS filesystem OpenClaw adapter before execution.",
+    }
+    adapters: list[OpenClawAdapterResponse] = []
+    for platform in ("linux", "windows", "macos"):
+        for kind in ("server_command", "desktop_action", "screen_read", "file_read"):
+            available = platform == "linux" and kind == "server_command"
+            host = "agent-hub-server" if platform == "linux" else f"remote-{platform}-host"
+            adapters.append(
+                OpenClawAdapterResponse(
+                    platform=platform,
+                    kind=kind,
+                    target_type=target_types[kind],
+                    status="available" if available else "adapter_unavailable",
+                    execution_host=host,
+                    requires_user_approval=True,
+                    supports_read_only=kind in {"screen_read", "file_read"},
+                    description=descriptions[(platform, kind)],
+                )
+            )
+    return tuple(adapters)
 
 
 async def _execute_openclaw_operation(
@@ -4463,6 +4519,18 @@ async def create_openclaw_operation(
         actor=str(principal.user_id),
         mode=settings.openclaw_mode,
     )
+
+
+@router.get(
+    "/openclaw/adapters",
+    response_model=list[OpenClawAdapterResponse],
+    responses=error_responses(401, 403, 422),
+)
+async def list_openclaw_adapters(
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+) -> tuple[OpenClawAdapterResponse, ...]:
+    _require(principal, "config:read")
+    return _openclaw_adapter_responses()
 
 
 @router.get(
