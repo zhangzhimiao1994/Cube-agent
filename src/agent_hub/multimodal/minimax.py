@@ -1,23 +1,21 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit
-from uuid import uuid4
 
 import httpx
 
 from agent_hub.multimodal.video_providers import (
     GeneratedVideoArtifact,
     VideoProviderGenerationError,
+    media_filename_for_model,
+    unique_media_path,
 )
 
 MiniMaxGeneratedVideo = GeneratedVideoArtifact
-
-_SAFE_FILENAME = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
 
 
 class MiniMaxVideoGenerationError(VideoProviderGenerationError):
@@ -82,6 +80,7 @@ class MiniMaxVideoGenerationClient:
                 download_url=download_url,
                 output_dir=output_dir,
                 filename=filename,
+                model=model,
             )
         return MiniMaxGeneratedVideo(
             path=stored_path,
@@ -188,18 +187,13 @@ class MiniMaxVideoGenerationClient:
         download_url: str,
         output_dir: Path,
         filename: str | None,
+        model: str,
     ) -> tuple[Path, str]:
         response = await client.get(download_url)
         if response.status_code >= 400:
             raise MiniMaxVideoGenerationError("MiniMax file download failed")
         suffix = _filename_suffix(filename, download_url) or ".mp4"
-        original_name = _safe_filename(filename)
-        stem = PurePosixPath(original_name).stem if original_name else "minimax-video"
-        name = f"{stem}-{uuid4().hex}{suffix}"
-        target = (output_dir / name).resolve()
-        root = output_dir.resolve()
-        if root not in target.parents:
-            raise MiniMaxVideoGenerationError("MiniMax file target path is unsafe")
+        target = unique_media_path(output_dir, media_filename_for_model(model, suffix=suffix))
         target.write_bytes(response.content)
         mime_type = response.headers.get("content-type", "").split(";", 1)[0].strip()
         return target, mime_type or "video/mp4"
@@ -251,15 +245,6 @@ def _normalized_base(api_base: str) -> str:
     if value.endswith("/v1"):
         return value
     return f"{value}/v1"
-
-
-def _safe_filename(filename: str | None) -> str | None:
-    if filename is None:
-        return None
-    name = PurePosixPath(filename).name
-    if _SAFE_FILENAME.fullmatch(name) is None:
-        return None
-    return name
 
 
 def _filename_suffix(filename: str | None, url: str) -> str | None:

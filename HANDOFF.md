@@ -14,7 +14,8 @@ Current state:
   - uses the model deployment `api_base`, `upstream_model`, and `credential_ref`;
   - keeps the MiniMax daily video cap of 3 requests.
 - Generated videos are stored under `/var/lib/agent-hub/media/{tenant_id}/`.
-- Provider returned filenames are made unique before storing, so repeated Hailuo downloads do not overwrite `output_aigc.mp4`.
+- Generated media filenames now use the configured model and UTC timestamp, e.g. `MiniMax-Hailuo-02_20260813-112233.mp4`; same-second collisions append a numeric suffix.
+- Provider returned filenames are only used to infer the file extension, so repeated Hailuo downloads do not overwrite `output_aigc.mp4`.
 - Provider failures now return `502 multimedia_provider_failed` with safe details such as provider code and message, instead of surfacing as an internal 500.
 - Frontend MiniMax Hailuo and MiniMax Audio presets now default to `https://api.minimaxi.com/v1`, because the server's existing MiniMax key succeeds on `api.minimaxi.com` and returns `invalid api key` on `api.minimax.io`.
 
@@ -25,6 +26,7 @@ Changes made:
   - `VideoProviderGenerationError`.
   - `TextToVideoProvider`.
   - `TextToVideoProviderRouter`.
+  - Shared `media_filename_for_model()` / `unique_media_path()` helpers for provider-neutral artifact naming.
 - Added `src/agent_hub/multimodal/minimax.py`
   - `MiniMaxVideoGenerationClient`.
   - MiniMax text-to-video submit, query, retrieve, download, and unique local file storage.
@@ -60,6 +62,14 @@ Verification performed:
   - `npm.cmd test -- --run src/pages/ModelsPage.test.tsx` -> 14 passed.
   - `npm.cmd run lint` -> passed.
   - `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+- File naming follow-up:
+  - `uv run pytest tests/unit/multimodal/test_minimax_generation.py::test_minimax_video_client_polls_downloads_and_stores_file -q --tb=short` first failed because files were still named `output_aigc-<uuid>.mp4`.
+  - Updated the shared provider helpers and MiniMax adapter so generated files are named `model_YYYYMMDD-HHMMSS.ext`.
+  - `uv run pytest tests/unit/multimodal/test_minimax_generation.py -q --tb=short` -> 1 passed.
+  - `uv run pytest tests/unit/multimodal/test_minimax_generation.py tests/unit/test_app_wiring.py tests/api/test_admin_resources.py -q --tb=short` -> 86 passed.
+  - `npm.cmd run test -- --run` -> 90 passed.
+  - `uv run ruff check src tests` -> passed.
+  - `uv run mypy --strict src tests` -> passed.
 - Server deployment and real verification:
   - Uploaded incremental package to `103.236.98.133:/tmp/agent-hub-p3-minimax-video-provider.tgz`.
   - Deployed incrementally into `/opt/agent-hub/current`.
@@ -78,10 +88,16 @@ Verification performed:
     - verified the resulting file exists and is non-empty at `/var/lib/agent-hub/media/00000000-0000-4000-8000-000000000001/output_aigc.mp4`;
     - restored original settings and deleted the temporary model afterward.
   - After adding unique filename storage, redeployed the code and verified Python compilation plus the previously generated real file still exists and is non-empty. The real generation was not repeated to avoid consuming another MiniMax daily video quota.
+  - Uploaded incremental package to `103.236.98.133:/tmp/agent-hub-p3-media-model-time-names.tgz`.
+  - Deployed incrementally into `/opt/agent-hub/current`.
+  - Restarted `agent-hub-api` and `agent-hub-worker`; verified `agent-hub-api`, `agent-hub-worker`, and `caddy` were active.
+  - Ran `/tmp/server_media_filename_check.py` against the deployed server source with `PYTHONPATH=src`; it passed:
+    - generated `MiniMax-Hailuo-02_20260813-112233.mp4`;
+    - verified same-second collision naming becomes `MiniMax-Hailuo-02_20260813-112233_2.mp4`.
 
 Remaining risks / TODOs:
 
-- The real generated file was produced before the unique-filename patch; the patch is covered by unit tests and deployed, but not re-tested with another real generation to avoid spending another daily video quota.
+- The real generated file was produced before the `model_timestamp` naming patch; the patch is covered by unit tests and deployed, but not re-tested with another real generation to avoid spending another daily video quota.
 - Add provider adapters for Alibaba/Token Plan, Seedance, Runway, Kling, Veo, and other configured video providers under the same `TextToVideoProvider` contract.
 - Continue adapting multimedia generation to temporary/executor agent scheduling so planning can delegate generation jobs to dedicated media executor agents and return artifacts to the main Agent automatically.
 

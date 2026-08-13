@@ -64,8 +64,12 @@ async def test_minimax_video_client_polls_downloads_and_stores_file(tmp_path) ->
     assert artifact.file_id == "file-1"
     assert artifact.mime_type == "video/mp4"
     assert artifact.path.read_bytes() == b"fake-mp4-bytes"
-    assert artifact.path.name.startswith("output_aigc-")
     assert artifact.path.name.endswith(".mp4")
+    assert artifact.path.name.startswith("MiniMax-Hailuo-02_")
+    timestamp = artifact.path.stem.removeprefix("MiniMax-Hailuo-02_")
+    assert len(timestamp) == 15
+    assert timestamp[8] == "-"
+    assert timestamp.replace("-", "").isdigit()
     assert artifact.uri == artifact.path.as_uri()
     assert [request.url.path for request in requests] == [
         "/v1/video_generation",
