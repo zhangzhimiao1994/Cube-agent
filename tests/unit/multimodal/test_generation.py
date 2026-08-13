@@ -4,7 +4,11 @@ import pytest
 
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelCapability, ModelRequest, ModelResponse
-from agent_hub.multimodal.generation import MultimediaGenerationExecutor, MultimediaGenerationKind
+from agent_hub.multimodal.generation import (
+    MultimediaDailyLimitExceeded,
+    MultimediaGenerationExecutor,
+    MultimediaGenerationKind,
+)
 
 
 class GatewayStub:
@@ -49,3 +53,24 @@ async def test_generation_prompt_is_required() -> None:
             logical_model="image-primary",
             prompt=" ",
         )
+
+
+async def test_generation_daily_limit_blocks_the_fourth_video_request() -> None:
+    gateway = GatewayStub()
+    executor = MultimediaGenerationExecutor(gateway, daily_limit=3)
+
+    for index in range(3):
+        await executor.generate(
+            kind=MultimediaGenerationKind.VIDEO,
+            logical_model="video-primary",
+            prompt=f"generate video {index}",
+        )
+
+    with pytest.raises(MultimediaDailyLimitExceeded, match="daily multimedia generation limit"):
+        await executor.generate(
+            kind=MultimediaGenerationKind.VIDEO,
+            logical_model="video-primary",
+            prompt="generate video 4",
+        )
+
+    assert len(gateway.requests) == 3

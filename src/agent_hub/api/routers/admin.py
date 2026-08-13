@@ -32,7 +32,13 @@ from agent_hub.domain.runs import RunStatus
 from agent_hub.models.capabilities import infer_model_capabilities
 from agent_hub.models.gateway import ModelTransport
 from agent_hub.models.litellm_client import LiteLLMClient, ModelTransportError
+from agent_hub.models.registry import NoCapableDeployment
 from agent_hub.models.types import Deployment, ModelCapability, ModelMessage, ModelRequest
+from agent_hub.multimodal.generation import (
+    MultimediaDailyLimitExceeded,
+    MultimediaGenerationKind,
+    MultimediaGenerationResult,
+)
 from agent_hub.openclaw.executor import (
     OpenClawCommandResult,
     openclaw_command_allowed,
@@ -634,6 +640,33 @@ class OpenClawExecutionResponse(BaseModel):
     stdout: str
     stderr: str
     truncated: bool
+
+
+class MultimediaGenerationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str = Field(pattern=r"^(image|video)$")
+    logical_model: str = Field(min_length=1, max_length=128, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    prompt: str = Field(min_length=1, max_length=20_000)
+
+
+class MultimediaGenerationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+    logical_model: str
+    deployment_id: str
+    text: str | None
+
+
+class MultimediaGenerationExecutorProtocol(Protocol):
+    async def generate(
+        self,
+        *,
+        kind: MultimediaGenerationKind,
+        logical_model: str,
+        prompt: str,
+    ) -> MultimediaGenerationResult: ...
 
 
 def _openclaw_operation_response(
@@ -3254,6 +3287,17 @@ def _service(request: Request) -> AdminResourceService:
     return cast(AdminResourceService, service)
 
 
+def _multimedia_generation_executor(request: Request) -> MultimediaGenerationExecutorProtocol:
+    executor = getattr(request.app.state, "multimedia_generation_executor", None)
+    if executor is None or not hasattr(executor, "generate"):
+        raise PublicAPIError(
+            503,
+            "multimedia_generation_unavailable",
+            "multimedia generation executor is unavailable",
+        )
+    return cast(MultimediaGenerationExecutorProtocol, executor)
+
+
 def _deployment_document_from_request(request: ModelDeploymentRequest) -> dict[str, object]:
     return {
         "provider": request.provider,
@@ -4339,6 +4383,54 @@ async def update_settings(
 ) -> SystemSettingsResponse:
     _require(principal, "config:write")
     return await service.update_settings(body)
+
+
+@router.post(
+    "/multimedia/generate",
+    response_model=MultimediaGenerationResponse,
+    status_code=202,
+    responses=error_responses(401, 403, 409, 422, 503),
+)
+async def generate_multimedia(
+    body: MultimediaGenerationRequest,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> MultimediaGenerationResponse:
+    _require(principal, "run:create")
+    settings = await service.get_settings()
+    if not settings.multimedia_generation_enabled:
+        raise PublicAPIError(
+            409,
+            "multimedia_generation_disabled",
+            "multimedia generation is disabled",
+        )
+    executor = _multimedia_generation_executor(request)
+    try:
+        result = await executor.generate(
+            kind=MultimediaGenerationKind(body.kind),
+            logical_model=body.logical_model,
+            prompt=body.prompt,
+        )
+    except NoCapableDeployment as error:
+        raise PublicAPIError(
+            422,
+            "model_capability_unavailable",
+            "no configured model can satisfy the requested multimedia capability",
+            details={"reason": str(error)},
+        ) from error
+    except MultimediaDailyLimitExceeded as error:
+        raise PublicAPIError(
+            429,
+            "multimedia_daily_limit_exceeded",
+            "daily multimedia generation limit exceeded",
+        ) from error
+    return MultimediaGenerationResponse(
+        kind=result.kind.value,
+        logical_model=result.logical_model,
+        deployment_id=result.deployment_id,
+        text=result.text,
+    )
 
 
 @router.post(

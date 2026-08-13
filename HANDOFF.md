@@ -1960,3 +1960,55 @@ Next:
 - Push `main` with `git push --force-with-lease mutilagent main`.
 - Check GitHub Actions and fix/redeploy/repush if red.
 - Continue P3 with conversation-integrated Vibe Coding and richer multi-system OpenClaw adapters.
+
+## 2026-08-13 P3 Multimedia Generation Executor
+
+Current state:
+
+- Multimedia generation is now exposed as a system resource, not a workflow.
+- The system settings switch `multimedia_generation_enabled` gates the generation API.
+- Added `POST /api/v1/admin/multimedia/generate` for image/video generation requests.
+- The backend requires `image_generation` or `video_generation` capability before dispatch.
+- Video generation has an extra server-side known-model guard, so a text model that is incorrectly marked as `video_generation` is rejected before capacity, secret, or provider calls.
+- MiniMax video-capable deployments are capped at 3 video requests per day in the running production executor.
+- The frontend has a `/multimedia` page and only offers models that declare the selected image/video capability.
+- Model presets now include `MiniMax-Hailuo-02` with `video_generation`.
+
+Changes made:
+
+- Added `agent_hub.multimodal.generation.MultimediaGenerationExecutor`, result types, request kind enum, and daily limit exception.
+- Wired a config-backed production multimedia executor in `create_app`.
+- Added known image/video model capability helper functions.
+- Added API handling for disabled switch (`409`), missing/unsupported model capability (`422`), and daily limit (`429`).
+- Added `api.generateMultimedia` and the `/multimedia` console page.
+- Added frontend route/navigation entries and MiniMax Hailuo presets in model setup pages.
+- Added tests for switch enforcement, video capability routing, MiniMax daily limit, production wiring, unsupported MiniMax-M3 video rejection, and frontend video model filtering.
+
+Local verification:
+
+- `uv run pytest tests/unit/test_app_wiring.py::test_multimedia_executor_rejects_unknown_video_model_even_if_declared tests/unit/test_app_wiring.py::test_multimedia_executor_limits_minimax_video_to_three_daily_requests tests/api/test_admin_resources.py::test_multimedia_video_generation_requires_video_capable_model -q --tb=short` -> 3 passed.
+- `uv run pytest tests/api/test_admin_resources.py tests/unit/test_app_wiring.py tests/unit/multimodal/test_generation.py tests/unit/models/test_registry.py -q --tb=short` -> 184 passed.
+- `uv run ruff check src tests` -> passed.
+- `uv run mypy --strict src tests` -> passed.
+- `npm test -- --run src/pages/MultimediaPage.test.tsx src/pages/ModelsPage.test.tsx src/pages/MainAgentPage.test.tsx` -> 18 passed.
+- `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+
+Server deployment and verification:
+
+- Uploaded incremental package to `103.236.98.133:/tmp/agent-hub-p3-multimedia-generation.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`.
+- Restarted `agent-hub-api` and `agent-hub-worker`; reloaded Caddy.
+- Verified `agent-hub-api`, `agent-hub-worker`, and `caddy` were active.
+- Ran `/tmp/server_multimedia_generation_check.py` through the real local HTTP API with a short-lived admin token generated from the running server environment; it passed:
+  - disabled multimedia generation returns `multimedia_generation_disabled`;
+  - video request to a non-video model returns `model_capability_unavailable`;
+  - incorrectly marked MiniMax-M3 video request is rejected before provider dispatch.
+- Server currently has no configured MiniMax Hailuo/video model, so the HTTP daily-limit check printed `SKIP: server has no configured MiniMax video model for daily-limit HTTP check`. The daily-limit path is covered locally with a config-backed executor test.
+
+Next:
+
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue P3 with protected Feishu Skill install commands, conversation-integrated Vibe Coding, richer multi-system OpenClaw adapters, channel command grammar, and final GitHub usage README.

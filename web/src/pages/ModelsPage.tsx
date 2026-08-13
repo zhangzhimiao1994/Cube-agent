@@ -137,6 +137,7 @@ const PROVIDERS: ProviderPreset[] = [
     defaultTpm: 20000000,
     models: [
       { label: "MiniMax M3", value: "MiniMax-M3", capabilities: ["text", "tool_calling"] },
+      { label: "MiniMax Hailuo 02 视频", value: "MiniMax-Hailuo-02", capabilities: ["text", "video_generation"] },
     ],
   },
   {

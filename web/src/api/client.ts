@@ -455,6 +455,15 @@ const AttachmentDeleteSchema = z.object({
   deleted: z.boolean(),
 });
 
+const MultimediaGenerationSchema = z.object({
+  kind: z.enum(["image", "video"]),
+  logical_model: z.string(),
+  deployment_id: z.string(),
+  text: z.string().nullable(),
+});
+
+export type MultimediaGeneration = z.infer<typeof MultimediaGenerationSchema>;
+
 const McpServerSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -966,6 +975,17 @@ export const api = {
       `/api/v1/runs/attachments/${encodeURIComponent(id)}`,
       { method: "DELETE" },
       AttachmentDeleteSchema,
+    );
+  },
+  generateMultimedia(payload: {
+    kind: "image" | "video";
+    logical_model: string;
+    prompt: string;
+  }): Promise<MultimediaGeneration> {
+    return request(
+      "/api/v1/admin/multimedia/generate",
+      { method: "POST", body: JSON.stringify(payload) },
+      MultimediaGenerationSchema,
     );
   },
   chooseMode(

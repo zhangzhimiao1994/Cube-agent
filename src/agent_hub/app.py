@@ -7,6 +7,7 @@ import os
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Protocol, cast
 from uuid import UUID
@@ -54,11 +55,18 @@ from agent_hub.db.models import TenantRow
 from agent_hub.db.session import build_database
 from agent_hub.domain.runs import TaskMode
 from agent_hub.hermes import PersistentHermesRunAdvisor
+from agent_hub.models.capabilities import is_known_video_generation_model
 from agent_hub.models.capacity import CapacityPool, CredentialDescriptor, CredentialRegistry
 from agent_hub.models.gateway import CapacityController, ModelGateway, ModelTransport
 from agent_hub.models.litellm_client import LiteLLMClient
-from agent_hub.models.registry import ModelRegistry
+from agent_hub.models.registry import ModelRegistry, NoCapableDeployment
 from agent_hub.models.types import Deployment, ModelCapability
+from agent_hub.multimodal.generation import (
+    MultimediaDailyLimitExceeded,
+    MultimediaGenerationExecutor,
+    MultimediaGenerationKind,
+    MultimediaGenerationResult,
+)
 from agent_hub.observability.logging import configure_logging
 from agent_hub.observability.metrics import default_metrics_registry
 from agent_hub.routing.classifier import GatewayRouteClassifier
@@ -103,6 +111,10 @@ class RedisResource(Protocol):
 
 
 RouterCapacityFactory = Callable[
+    [tuple[Deployment, ...]],
+    Awaitable[CapacityController | CapacityPool],
+]
+MultimediaCapacityFactory = Callable[
     [tuple[Deployment, ...]],
     Awaitable[CapacityController | CapacityPool],
 ]
@@ -245,6 +257,183 @@ class _MainAgentContextWindowGetter:
             config.model.provider,
             config.model.upstream_model,
         )
+
+
+class _ConfigBackedMultimediaGenerationExecutor:
+    """Build a generation gateway from the current registered model resources."""
+
+    def __init__(
+        self,
+        *,
+        list_models: RegisteredModelListGetter,
+        secret_service: SecretService,
+        tenant_id: UUID,
+        redis_client: object,
+        transport: ModelTransport | None = None,
+        capacity_factory: MultimediaCapacityFactory | None = None,
+    ) -> None:
+        self._list_models = list_models
+        self._secret_service = secret_service
+        self._tenant_id = tenant_id
+        self._redis_client = redis_client
+        self._transport = transport or LiteLLMClient()
+        self._capacity_factory = capacity_factory
+        self._daily_usage: dict[tuple[date, str, str], int] = {}
+
+    async def generate(
+        self,
+        *,
+        kind: MultimediaGenerationKind,
+        logical_model: str,
+        prompt: str,
+    ) -> MultimediaGenerationResult:
+        deployments = tuple(
+            _deployment_from_model_resource(model) for model in await self._list_models()
+        )
+        registry = ModelRegistry(deployments)
+        candidates = registry.candidates(logical_model, {_multimedia_required_capability(kind)})
+        _require_supported_multimedia_generation(
+            kind=kind,
+            logical_model=logical_model,
+            candidates=candidates,
+        )
+        daily_limit = _multimedia_daily_limit(kind, deployments, logical_model)
+        self._claim_daily_slot(
+            kind=kind,
+            logical_model=logical_model,
+            daily_limit=daily_limit,
+        )
+        capacity = (
+            await self._capacity_factory(deployments)
+            if self._capacity_factory is not None
+            else await self._default_capacity(deployments)
+        )
+        gateway = ModelGateway(
+            registry,
+            capacity,
+            TenantSecretResolver(self._secret_service, self._tenant_id),
+            self._transport,
+            capacity_wait_timeout=60,
+        )
+        return await MultimediaGenerationExecutor(gateway).generate(
+            kind=kind,
+            logical_model=logical_model,
+            prompt=prompt,
+        )
+
+    def _claim_daily_slot(
+        self,
+        *,
+        kind: MultimediaGenerationKind,
+        logical_model: str,
+        daily_limit: int | None,
+    ) -> None:
+        if daily_limit is None:
+            return
+        today = datetime.now(UTC).date()
+        self._daily_usage = {
+            key: count for key, count in self._daily_usage.items() if key[0] == today
+        }
+        key = (today, kind.value, logical_model)
+        current = self._daily_usage.get(key, 0)
+        if current >= daily_limit:
+            raise MultimediaDailyLimitExceeded("daily multimedia generation limit exceeded")
+        self._daily_usage[key] = current + 1
+
+    async def _default_capacity(
+        self,
+        deployments: tuple[Deployment, ...],
+    ) -> CapacityPool:
+        credentials = CredentialRegistry(
+            [
+                CredentialDescriptor(
+                    secret_ref,
+                    await self._secret_service.fingerprint(self._tenant_id, secret_ref),
+                )
+                for secret_ref in dict.fromkeys(
+                    deployment.secret_ref for deployment in deployments
+                )
+            ]
+        )
+        return CapacityPool(self._redis_client, deployments=deployments, credentials=credentials)
+
+
+def _deployment_from_model_resource(model: admin.ModelDeploymentResponse) -> Deployment:
+    return Deployment(
+        id=str(model.id),
+        logical_model=model.logical_model,
+        provider_model=f"{model.provider}/{model.upstream_model}",
+        request_model=model.upstream_model,
+        api_base=model.api_base,
+        secret_ref=model.credential_ref,
+        quota_scope_id=model.quota_scope,
+        max_concurrency=model.max_concurrency,
+        target_utilization=model.target_utilization,
+        reserved_slots=model.reserved_capacity,
+        rpm=model.rpm,
+        tpm=model.tpm,
+        weight=model.weight,
+        capabilities=frozenset(ModelCapability(item) for item in model.capabilities),
+    )
+
+
+def _multimedia_required_capability(kind: MultimediaGenerationKind) -> ModelCapability:
+    if kind is MultimediaGenerationKind.IMAGE:
+        return ModelCapability.IMAGE_GENERATION
+    if kind is MultimediaGenerationKind.VIDEO:
+        return ModelCapability.VIDEO_GENERATION
+    raise ValueError("generation kind is invalid")
+
+
+def _multimedia_daily_limit(
+    kind: MultimediaGenerationKind,
+    deployments: tuple[Deployment, ...],
+    logical_model: str,
+) -> int | None:
+    if kind is not MultimediaGenerationKind.VIDEO:
+        return None
+    matching = [deployment for deployment in deployments if deployment.logical_model == logical_model]
+    if any(_is_minimax_video_deployment(deployment) for deployment in matching):
+        return 3
+    return None
+
+
+def _require_supported_multimedia_generation(
+    *,
+    kind: MultimediaGenerationKind,
+    logical_model: str,
+    candidates: tuple[Deployment, ...],
+) -> None:
+    if kind is not MultimediaGenerationKind.VIDEO:
+        return
+    if any(_is_supported_video_generation_deployment(deployment) for deployment in candidates):
+        return
+    raise NoCapableDeployment(
+        f"no supported video generation deployment for logical model {logical_model!r}: "
+        "video_generation"
+    )
+
+
+def _is_supported_video_generation_deployment(deployment: Deployment) -> bool:
+    provider, upstream_model = _deployment_provider_and_model(deployment)
+    return (
+        ModelCapability.VIDEO_GENERATION in deployment.capabilities
+        and is_known_video_generation_model(provider, upstream_model)
+    )
+
+
+def _is_minimax_video_deployment(deployment: Deployment) -> bool:
+    provider, _upstream_model = _deployment_provider_and_model(deployment)
+    return "minimax" in provider.casefold() and _is_supported_video_generation_deployment(
+        deployment
+    )
+
+
+def _deployment_provider_and_model(deployment: Deployment) -> tuple[str, str]:
+    provider, separator, upstream_model = deployment.provider_model.partition("/")
+    if not separator:
+        return "", deployment.request_model or deployment.provider_model
+    return provider, upstream_model
 
 
 def _infer_main_agent_context_window_tokens(provider: str, upstream_model: str) -> int:
@@ -524,6 +713,20 @@ def create_app(
                     sender=FeishuOpenAPIReplySender(),
                 )
             if active_secret_service is not None and active_redis is not None:
+                admin_service_for_generation = cast(
+                    admin.AdminResourceService,
+                    admin_resource_service
+                    if admin_resource_service is not None
+                    else application.state.admin_resource_service,
+                )
+                application.state.multimedia_generation_executor = (
+                    _ConfigBackedMultimediaGenerationExecutor(
+                        list_models=admin_service_for_generation.list_models,
+                        secret_service=active_secret_service,
+                        tenant_id=configured.bootstrap_tenant_id,
+                        redis_client=active_redis,
+                    )
+                )
                 media_factory = build_feishu_media_service_factory(
                     config_service=cast(ConfigService, application.state.config_service),
                     secret_service=active_secret_service,
@@ -587,6 +790,7 @@ def create_app(
     application.state.feishu_gateway = feishu_gateway
     application.state.feishu_reply_dispatcher = None
     application.state.feishu_reply_tasks = set()
+    application.state.multimedia_generation_executor = None
     application.state.metrics_registry = default_metrics_registry()
     application.state.extra_readiness_checks = {}
     application.state.channel_runtime_config = None

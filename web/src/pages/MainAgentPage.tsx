@@ -127,6 +127,7 @@ const PROVIDERS: ProviderPreset[] = [
     concurrencyHelp: "MiniMax 官方主要公开 RPM/TPM；文本接口常见 500 RPM、20,000,000 TPM，具体以账号额度为准。",
     models: [
       { label: "MiniMax M3", value: "MiniMax-M3", capabilities: ["text", "tool_calling"] },
+      { label: "MiniMax Hailuo 02 视频", value: "MiniMax-Hailuo-02", capabilities: ["text", "video_generation"] },
     ],
   },
   {

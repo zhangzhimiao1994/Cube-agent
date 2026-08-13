@@ -16,6 +16,7 @@ from agent_hub.api.routers.admin import (
     ModelDeploymentResponse,
 )
 from agent_hub.app import (
+    _ConfigBackedMultimediaGenerationExecutor,
     _infer_main_agent_context_window_tokens,
     _MainAgentContextWindowGetter,
     _MainAgentModeRouter,
@@ -28,7 +29,9 @@ from agent_hub.channels.feishu.media_factory import build_feishu_media_service_f
 from agent_hub.channels.feishu.settings import FeishuSettings
 from agent_hub.models.capacity import CapacityLease
 from agent_hub.models.gateway import CapacityController
+from agent_hub.models.registry import NoCapableDeployment
 from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, TokenUsage
+from agent_hub.multimodal.generation import MultimediaGenerationKind
 from agent_hub.routing.types import RiskLevel
 from agent_hub.settings import Settings
 
@@ -143,6 +146,25 @@ def test_create_app_wires_production_feishu_media_service_factory(tmp_path: Path
     assert isinstance(service, FeishuMediaService)
 
 
+def test_create_app_wires_production_multimedia_generation_executor(tmp_path: Path) -> None:
+    application = create_app(
+        settings=valid_settings(tmp_path),
+        database=FakeDatabase(),
+        redis_client=FakeRedis(),
+        auth_service=StubAuthService(),
+        rate_limiter=StubRateLimiter(),
+        config_service=StubConfigService(),
+        admin_resource_service=InMemoryAdminResourceService(),
+        user_admin_service=object(),
+        run_service=object(),
+    )
+
+    with TestClient(application):
+        executor = getattr(application.state, "multimedia_generation_executor", None)
+
+    assert isinstance(executor, _ConfigBackedMultimediaGenerationExecutor)
+
+
 def test_feishu_media_factory_uses_memory_store_in_development(tmp_path: Path) -> None:
     factory = build_feishu_media_service_factory(
         config_service=StubConfigService(),
@@ -154,6 +176,157 @@ def test_feishu_media_factory_uses_memory_store_in_development(tmp_path: Path) -
     )
 
     assert factory.object_store.store_id == "memory-image-store"
+
+
+@pytest.mark.asyncio
+async def test_multimedia_executor_rejects_video_without_capacity_or_secret_lookup() -> None:
+    capacity_calls = 0
+
+    async def list_models() -> tuple[ModelDeploymentResponse, ...]:
+        return (
+            ModelDeploymentResponse(
+                provider="deepseek",
+                api_base="https://api.deepseek.com/v1",
+                api_protocol="openai_compatible",
+                upstream_model="deepseek-v4-flash",
+                logical_model="video_primary",
+                capabilities=["text"],
+                credential_ref="secret://video-primary",
+                quota_scope="deepseek-account",
+                max_concurrency=1,
+                target_utilization=0.8,
+                reserved_capacity=0,
+                id=uuid4(),
+                effective_slots=1,
+                saturation_policy="queue_first_then_fallback",
+            ),
+        )
+
+    async def capacity_factory(
+        _deployments: tuple[Deployment, ...],
+    ) -> CapacityController:
+        nonlocal capacity_calls
+        capacity_calls += 1
+        return ImmediateCapacity()
+
+    executor = _ConfigBackedMultimediaGenerationExecutor(
+        list_models=list_models,
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        redis_client=object(),
+        capacity_factory=capacity_factory,
+    )
+
+    with pytest.raises(NoCapableDeployment, match="video_generation"):
+        await executor.generate(
+            kind=MultimediaGenerationKind.VIDEO,
+            logical_model="video_primary",
+            prompt="make a short launch video",
+        )
+
+    assert capacity_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_multimedia_executor_rejects_unknown_video_model_even_if_declared() -> None:
+    capacity_calls = 0
+
+    async def list_models() -> tuple[ModelDeploymentResponse, ...]:
+        return (
+            ModelDeploymentResponse(
+                provider="minimax",
+                api_base="https://api.minimax.chat/v1",
+                api_protocol="openai_compatible",
+                upstream_model="MiniMax-M3",
+                logical_model="video_primary",
+                capabilities=["text", "video_generation"],
+                credential_ref="secret://video-primary",
+                quota_scope="minimax-account",
+                max_concurrency=1,
+                target_utilization=0.8,
+                reserved_capacity=0,
+                id=uuid4(),
+                effective_slots=1,
+                saturation_policy="queue_first_then_fallback",
+            ),
+        )
+
+    async def capacity_factory(
+        _deployments: tuple[Deployment, ...],
+    ) -> CapacityController:
+        nonlocal capacity_calls
+        capacity_calls += 1
+        return ImmediateCapacity()
+
+    executor = _ConfigBackedMultimediaGenerationExecutor(
+        list_models=list_models,
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        redis_client=object(),
+        capacity_factory=capacity_factory,
+    )
+
+    with pytest.raises(NoCapableDeployment, match="supported video generation"):
+        await executor.generate(
+            kind=MultimediaGenerationKind.VIDEO,
+            logical_model="video_primary",
+            prompt="make a short launch video",
+        )
+
+    assert capacity_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_multimedia_executor_limits_minimax_video_to_three_daily_requests() -> None:
+    transport = FakeTransport()
+
+    async def list_models() -> tuple[ModelDeploymentResponse, ...]:
+        return (
+            ModelDeploymentResponse(
+                provider="minimax",
+                api_base="https://api.minimax.chat/v1",
+                api_protocol="openai_compatible",
+                upstream_model="MiniMax-Hailuo-02",
+                logical_model="video_primary",
+                capabilities=["text", "video_generation"],
+                credential_ref="secret://main-agent",
+                quota_scope="minimax-account",
+                max_concurrency=1,
+                target_utilization=0.8,
+                reserved_capacity=0,
+                id=uuid4(),
+                effective_slots=1,
+                saturation_policy="queue_first_then_fallback",
+            ),
+        )
+
+    async def capacity_factory(_deployments: tuple[Deployment, ...]) -> CapacityController:
+        return ImmediateCapacity()
+
+    executor = _ConfigBackedMultimediaGenerationExecutor(
+        list_models=list_models,
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        redis_client=object(),
+        transport=transport,
+        capacity_factory=capacity_factory,
+    )
+
+    for index in range(3):
+        await executor.generate(
+            kind=MultimediaGenerationKind.VIDEO,
+            logical_model="video_primary",
+            prompt=f"make minimax video {index}",
+        )
+
+    with pytest.raises(RuntimeError, match="daily multimedia generation limit"):
+        await executor.generate(
+            kind=MultimediaGenerationKind.VIDEO,
+            logical_model="video_primary",
+            prompt="make minimax video 4",
+        )
+
+    assert len(transport.requests) == 3
 
 
 class FakeSecretService:

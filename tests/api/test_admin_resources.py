@@ -36,7 +36,19 @@ from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
 from agent_hub.config.repository import ConfigRevision, ConfigStatus
 from agent_hub.domain.runs import RunStatus, TaskMode
-from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, TokenUsage
+from agent_hub.models.gateway import GatewayCompletion
+from agent_hub.models.registry import NoCapableDeployment
+from agent_hub.models.types import (
+    Deployment,
+    ModelCapability,
+    ModelRequest,
+    ModelResponse,
+    TokenUsage,
+)
+from agent_hub.multimodal.generation import (
+    MultimediaDailyLimitExceeded,
+    MultimediaGenerationExecutor,
+)
 from agent_hub.runs.repository import RunRecord
 from agent_hub.security.secrets import SecretReference
 
@@ -131,6 +143,24 @@ class FakeModelTransport:
         return ModelResponse(
             text="agent-hub-model-check-ok",
             usage=TokenUsage(prompt_tokens=5, completion_tokens=5, total_tokens=10),
+        )
+
+
+class FakeGenerationGateway:
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.error = error
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        if self.error is not None:
+            raise self.error
+        return GatewayCompletion(
+            response=ModelResponse(text="artifact://generated-media"),
+            deployment_id="media_primary_1",
+            logical_model=request.logical_model,
+            provider_id="minimax",
+            provider_model="minimax/MiniMax-Hailuo-02",
         )
 
 
@@ -848,6 +878,76 @@ def test_model_create_auto_infers_known_video_generation_capability() -> None:
 
     assert response.status_code == 200
     assert response.json()["capabilities"] == ["text", "video_generation"]
+
+
+def test_multimedia_generation_requires_feature_switch() -> None:
+    response = client().post(
+        "/api/v1/admin/multimedia/generate",
+        headers=headers(),
+        json={
+            "kind": "video",
+            "logical_model": "video_primary",
+            "prompt": "make a 5 second product video",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "multimedia_generation_disabled"
+
+
+def test_multimedia_video_generation_requires_video_capable_model() -> None:
+    api = client()
+    settings_response = api.get("/api/v1/admin/settings", headers=headers())
+    payload = settings_response.json()
+    payload["multimedia_generation_enabled"] = True
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+    gateway = FakeGenerationGateway(
+        error=NoCapableDeployment(
+            "no capable deployment for logical model 'video_primary': video_generation"
+        )
+    )
+    cast(Any, api.app).state.multimedia_generation_executor = MultimediaGenerationExecutor(gateway)
+
+    response = api.post(
+        "/api/v1/admin/multimedia/generate",
+        headers=headers(),
+        json={
+            "kind": "video",
+            "logical_model": "video_primary",
+            "prompt": "make a 5 second product video",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "model_capability_unavailable"
+    assert gateway.requests[0].required_capabilities == frozenset({
+        ModelCapability.VIDEO_GENERATION
+    })
+
+
+def test_multimedia_generation_daily_limit_returns_429() -> None:
+    api = client()
+    settings_response = api.get("/api/v1/admin/settings", headers=headers())
+    payload = settings_response.json()
+    payload["multimedia_generation_enabled"] = True
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+    gateway = FakeGenerationGateway(
+        error=MultimediaDailyLimitExceeded("daily multimedia generation limit exceeded")
+    )
+    cast(Any, api.app).state.multimedia_generation_executor = MultimediaGenerationExecutor(gateway)
+
+    response = api.post(
+        "/api/v1/admin/multimedia/generate",
+        headers=headers(),
+        json={
+            "kind": "video",
+            "logical_model": "video_primary",
+            "prompt": "make a 5 second product video",
+        },
+    )
+
+    assert response.status_code == 429
+    assert response.json()["error"]["code"] == "multimedia_daily_limit_exceeded"
 
 
 def test_main_agent_config_saves_dedicated_model_api_and_control_policy() -> None:

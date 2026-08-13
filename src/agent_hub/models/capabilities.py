@@ -46,16 +46,33 @@ def infer_model_capabilities(
     """Return admin-declared capabilities plus conservative known-model inference."""
 
     capabilities = {ModelCapability(item) for item in declared}
-    fingerprint = f"{provider}/{upstream_model}"
-    if _matches_any(fingerprint, _KNOWN_IMAGE_GENERATION_PATTERNS):
+    if is_known_image_generation_model(provider, upstream_model):
         capabilities.add(ModelCapability.IMAGE_GENERATION)
-    if _matches_any(fingerprint, _KNOWN_VIDEO_GENERATION_PATTERNS):
+    if is_known_video_generation_model(provider, upstream_model):
         capabilities.add(ModelCapability.VIDEO_GENERATION)
     return tuple(sorted(capabilities, key=lambda capability: capability.value))
+
+
+def is_known_image_generation_model(provider: str, upstream_model: str) -> bool:
+    return _matches_any(
+        f"{provider}/{upstream_model}",
+        _KNOWN_IMAGE_GENERATION_PATTERNS,
+    )
+
+
+def is_known_video_generation_model(provider: str, upstream_model: str) -> bool:
+    return _matches_any(
+        f"{provider}/{upstream_model}",
+        _KNOWN_VIDEO_GENERATION_PATTERNS,
+    )
 
 
 def _matches_any(value: str, patterns: Iterable[re.Pattern[str]]) -> bool:
     return any(pattern.search(value) is not None for pattern in patterns)
 
 
-__all__ = ["infer_model_capabilities"]
+__all__ = [
+    "infer_model_capabilities",
+    "is_known_image_generation_model",
+    "is_known_video_generation_model",
+]
