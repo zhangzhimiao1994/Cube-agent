@@ -8,6 +8,8 @@ Current state:
 - Server incremental deployment to `103.236.98.133:/opt/agent-hub/current` was performed after user authorization.
 - Server services `agent-hub-api`, `agent-hub-worker`, and `caddy` are active after restart.
 - Server health checks passed after startup completed: `GET /health/live` -> `{"status":"ok"}`, `GET /health/ready` -> `{"status":"ok"}`.
+- GitHub full sync to `zhangzhimiao1994/mutilagent` was completed with user-approved `git push --force-with-lease mutilagent main`, updating remote `main` from `094e56c` to `ae7352d` for the implementation push.
+- GitHub Actions `quality` run `31654453267` for `feat: improve runtime process observability` passed. The run executed ruff, strict mypy, docker-backed pytest, frontend lint/test/build, shell syntax, shellcheck, bats, and docker compose config checks. Only a non-failing Node.js 20 deprecation annotation was reported by GitHub Actions.
 - Config-backed dispatch, discussion, and hybrid runtimes now emit a first-class `step.started` planning event from `main_agent` before child execution.
 - The planning event uses `step_id=main_agent_plan` and includes structured, safe payload fields for mode, main-agent logical model, selected roles, selected models, and planned steps.
 - Hybrid runtime now preserves safe child process events instead of collapsing child execution down to only artifacts/messages. Forwarded child events include step, model, message, review, and tool events, while still filtering child checkpoints and terminal events.
@@ -51,9 +53,7 @@ Verification performed locally:
 Remaining risks / TODOs:
 
 - Server sync and server validation have been performed for this P3 slice. The first immediate health check ran too early while Uvicorn was still starting; a follow-up check passed once application startup completed.
-- This pass has been committed locally but not pushed to GitHub yet.
-- Normal push to `zhangzhimiao1994/mutilagent main` is blocked by non-fast-forward remote history. Remote-only commits at the time of checking were `4f02862 refactor run process timeline` and `094e56c docs update handoff after push`; completing the requested GitHub full sync requires explicit approval to overwrite the remote `main` ref, for example with `git push --force-with-lease mutilagent main`.
-- After push, GitHub Actions must be checked and fixed until green or a concrete external blocker is identified.
+- Final handoff status should be committed and pushed after this note so future sessions can see the completed server sync, GitHub full sync, and green Actions run.
 - P3 channel hardening, Skill/MCP real E2E, attachment edge formats, multimodal expansion, Vibe Coding, and OpenClaw remain pending.
 - Vibe Coding must be integrated into the conversation experience, not implemented as a standalone system module and not as a workflow preset.
 - OpenClaw should be a system-level feature switch, off by default, for long-lived controlled computer-operation sessions. It needs explicit administrator configuration for allowed operation scope, session timeout, human-confirmation policy, audit level, and emergency-stop behavior.
