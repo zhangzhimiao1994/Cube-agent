@@ -1,4 +1,44 @@
 
+## 2026-08-14 Large Multi-Skill Archive Migration Fix
+
+Current state:
+
+- Fixed Skill archive upload for migration-style bundles containing many instruction Skills.
+- Supported structures now include:
+  - `skills.zip/<skill-name>/SKILL.md`
+  - `all-skills_1.tar.gz/skills/<skill-name>/SKILL.md`
+  - Existing smaller wrapped bundles such as `all-skills/<skill-name>/SKILL.md`.
+- Removed the accidental bundle-level Skill count limit. The retained safety limit applies to files inside one Skill package, not to the number of Skills in a migration archive.
+- The scanner no longer treats a multi-`SKILL.md` archive as one oversized instruction Skill before bundle splitting.
+
+Verification performed:
+
+- TDD red/green:
+  - Added regressions for a flat `skills.zip` with 99 instruction Skill directories and a nested `all-skills_1.tar.gz/skills/...` package with 99 instruction Skill directories.
+  - Initial red run returned `HTTP 422` for both structures, matching the mobile failure.
+- Local checks:
+  - `uv run pytest tests/api/test_admin_resources.py::test_skill_archive_upload_accepts_large_flat_instruction_bundle_zip tests/api/test_admin_resources.py::test_skill_archive_upload_accepts_large_nested_instruction_bundle_tar_gz -q --tb=short` -> 2 passed.
+  - `uv run pytest tests/api/test_admin_resources.py -q -k "skill_archive_upload" --tb=short` -> 9 passed, 75 deselected.
+  - `uv run ruff check src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+  - `uv run mypy --strict src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-skill-large-bundle-fix.tgz` to `103.236.98.133`.
+  - Deployed `src/agent_hub/api/routers/admin.py` into `/opt/agent-hub/current`.
+  - Restarted `agent-hub-api` and `agent-hub-worker`.
+- Server real environment verification:
+  - Ran `/tmp/server_large_skill_bundle_check.py` against the deployed HTTP API.
+  - It uploaded a real `skills.zip` containing 99 `SKILL.md` instruction Skills and a real `all-skills_1.tar.gz` containing `skills/<skill-name>/SKILL.md` for 99 Skills.
+  - It verified both uploads returned bundle results, verified records were listed, and deleted all 198 probe records.
+  - Final output: `{"status": "ok", "checked": ["flat_skills_zip_99_instruction_skills", "nested_all_skills_tar_gz_99_instruction_skills", "uploaded_records_listed", "probe_records_cleaned"], "skill_ids_cleaned": 198}`.
+
+Remaining risks / TODOs:
+
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Resume the interrupted OpenClaw session lifecycle work after this urgent Skill installer fix.
+
 ## 2026-08-14 OpenClaw Auto-Review Approval Semantics
 
 Current state:

@@ -1345,15 +1345,17 @@ def _instruction_skill_members(archive_bytes: bytes) -> tuple[str, bytes] | None
                     path = _safe_skill_bundle_path(info.filename)
                     _validate_instruction_skill_file(path)
                     normalized_to_original[path] = info.filename
-                if len(normalized_to_original) > _MAX_SKILL_BUNDLE_ITEMS:
-                    raise InvalidSkillPackage("instruction skill contains too many files")
                 candidates = [
                     name
                     for name in normalized_to_original
                     if PurePosixPath(name).name.lower() in _SKILL_INSTRUCTION_NAMES
                 ]
+                if len(candidates) > 1:
+                    return None
                 if len(candidates) != 1:
                     return None
+                if len(normalized_to_original) > _MAX_SKILL_BUNDLE_ITEMS:
+                    raise InvalidSkillPackage("instruction skill contains too many files")
                 return candidates[0], archive.read(normalized_to_original[candidates[0]])
         except zipfile.BadZipFile as exc:
             raise InvalidSkillPackage("skill archive must be a valid zip file") from exc
@@ -1371,10 +1373,12 @@ def _instruction_skill_members(archive_bytes: bytes) -> tuple[str, bytes] | None
                 _validate_instruction_skill_file(path)
                 if PurePosixPath(path).name.lower() in _SKILL_INSTRUCTION_NAMES:
                     files.append((path, member))
-            if len(archive.getmembers()) > _MAX_SKILL_BUNDLE_ITEMS:
-                raise InvalidSkillPackage("instruction skill contains too many files")
+            if len(files) > 1:
+                return None
             if len(files) != 1:
                 return None
+            if len(archive.getmembers()) > _MAX_SKILL_BUNDLE_ITEMS:
+                raise InvalidSkillPackage("instruction skill contains too many files")
             path, member = files[0]
             source = archive.extractfile(member)
             if source is None:

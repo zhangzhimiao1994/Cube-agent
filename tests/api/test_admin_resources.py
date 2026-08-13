@@ -1155,6 +1155,40 @@ def instruction_skill_bundle_archive() -> bytes:
     return buffer.getvalue()
 
 
+def large_nested_instruction_skill_bundle_archive() -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for index in range(99):
+            skill_name = f"nested-instruction-skill-{index:03d}"
+            content = (
+                "---\n"
+                f"name: {skill_name}\n"
+                "description: Nested bundle regression.\n"
+                "---\n\n"
+                "Use this instruction skill from a wrapped all-skills archive.\n"
+            ).encode()
+            info = tarfile.TarInfo(f"all-skills_1/skills/{skill_name}/SKILL.md")
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+    return buffer.getvalue()
+
+
+def large_flat_instruction_skill_bundle_zip() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for index in range(99):
+            skill_name = f"flat-instruction-skill-{index:03d}"
+            archive.writestr(
+                f"{skill_name}/SKILL.md",
+                "---\n"
+                f"name: {skill_name}\n"
+                "description: Flat bundle regression.\n"
+                "---\n\n"
+                "Use this instruction skill from a flat skills.zip archive.\n",
+            )
+    return buffer.getvalue()
+
+
 def test_model_pool_reports_serial_slot_and_queue_policy() -> None:
     response = client().post("/api/v1/admin/models", headers=headers(), json=model_payload())
 
@@ -2080,6 +2114,44 @@ def test_skill_archive_upload_accepts_instruction_skill_tar_gz_bundle() -> None:
     assert [item["name"] for item in body["items"]] == ["research-writer", "reviewer-checklist"]
     assert all("SKILL.md detected" in item["scan_diff"] for item in body["items"])
     assert {item["name"] for item in skills.json()} == {"research-writer", "reviewer-checklist"}
+
+
+def test_skill_archive_upload_accepts_large_flat_instruction_bundle_zip() -> None:
+    api = client()
+
+    uploaded = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "skills.zip"},
+        content=large_flat_instruction_skill_bundle_zip(),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert uploaded.status_code == 200
+    body = uploaded.json()
+    assert body["bundle"] is True
+    assert len(body["items"]) == 99
+    assert body["items"][0]["name"] == "flat-instruction-skill-000"
+    assert body["items"][-1]["name"] == "flat-instruction-skill-098"
+    assert len(skills.json()) == 99
+
+
+def test_skill_archive_upload_accepts_large_nested_instruction_bundle_tar_gz() -> None:
+    api = client()
+
+    uploaded = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "all-skills_1.tar.gz"},
+        content=large_nested_instruction_skill_bundle_archive(),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert uploaded.status_code == 200
+    body = uploaded.json()
+    assert body["bundle"] is True
+    assert len(body["items"]) == 99
+    assert body["items"][0]["name"] == "nested-instruction-skill-000"
+    assert body["items"][-1]["name"] == "nested-instruction-skill-098"
+    assert len(skills.json()) == 99
 
 
 def test_skill_archive_upload_rejects_invalid_zip_without_saving_metadata() -> None:
