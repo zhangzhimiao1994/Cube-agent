@@ -2,7 +2,7 @@ import { FormEvent, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { ApiError, formatApiError } from "../api/client";
-import { APP_BRAND_NAME } from "../app/brand";
+import { APP_BRAND_LOGO_SRC, APP_BRAND_NAME } from "../app/brand";
 import { useAuth } from "../auth/AuthProvider";
 
 export function LoginPage() {
@@ -30,11 +30,10 @@ export function LoginPage() {
   return (
     <section className="auth-layout">
       <div className="auth-hero">
+        <img className="auth-brand-logo" src={APP_BRAND_LOGO_SRC} alt={APP_BRAND_NAME} />
         <span className="eyebrow">{APP_BRAND_NAME}</span>
         <h1>登录控制台</h1>
-        <p>
-          在一个受保护的生产控制台里管理模型路由、Agent 角色、Skill、记忆、通道和审计日志。
-        </p>
+        <p>在受保护的生产控制台里管理模型路由、Agent 角色、Skill、记忆、通道和审计日志。</p>
       </div>
       <form className="auth-card" onSubmit={(event) => void submit(event)}>
         <div>

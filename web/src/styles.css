@@ -398,6 +398,17 @@ article:hover {
   width: 3.5rem;
 }
 
+.auth-brand-logo {
+  aspect-ratio: 1;
+  border: 1px solid rgba(123, 225, 255, 0.36);
+  border-radius: 1rem;
+  box-shadow: 0 0 28px rgba(85, 215, 255, 0.22);
+  display: block;
+  height: 4.5rem;
+  object-fit: cover;
+  width: 4.5rem;
+}
+
 .compact-brand-card {
   border-radius: 1rem;
   padding: 0.75rem;

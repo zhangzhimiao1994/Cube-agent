@@ -1,4 +1,37 @@
 
+## 2026-08-13 Login and Setup Brand/Mojibake Fix
+
+Current state:
+
+- Login page no longer shows old Agent Hub branding or mojibake.
+- Login page now shows the `魔方agent` logo image and normal Chinese copy.
+- Setup page now shows the `魔方agent` logo image and normal Chinese copy.
+- Login/setup tests assert the logo, readable Chinese labels, invalid-login error, setup failure message, and protected-route redirect state.
+
+Verification performed:
+
+- Local checks:
+  - `npm.cmd run test -- --run src/pages/LoginPage.test.tsx` -> 6 passed.
+  - `npm.cmd run test -- --run` -> 94 passed.
+  - `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+  - Searched login/setup source for old brand and common mojibake markers; no hits.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-login-brand-fix.tgz` to `103.236.98.133`.
+  - Deployed rebuilt `web/dist` into `/opt/agent-hub/current`.
+  - Reloaded Caddy.
+- Server real environment verification:
+  - Ran `/tmp/server_login_brand_check.py` against the deployed HTTP entrypoint.
+  - Verified served login/setup bundle markers for Chinese copy, `auth-brand-logo`, `mofang-agent.jpg`, no old brand/mojibake markers, and served brand image bytes.
+  - Final output: `{"status": "ok", "checked": ["login_chinese_copy", "setup_chinese_copy", "auth_logo_marker", "no_login_brand_mojibake", "served_brand_image"], "assets": ["assets/index-DjfH-pqd.css", "assets/index-Dqxgrnhs.js"], "image_size": 90878}`.
+
+Remaining risks / TODOs:
+
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Next user-requested follow-up: investigate newly broken batch buttons, then run a broader missing-button/missing-function audit.
+
 ## 2026-08-13 P3 OpenClaw Brand Surface Check
 
 Current state:

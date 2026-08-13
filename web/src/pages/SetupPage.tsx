@@ -2,12 +2,12 @@ import { FormEvent, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { formatApiError } from "../api/client";
-import { APP_BRAND_NAME } from "../app/brand";
+import { APP_BRAND_LOGO_SRC, APP_BRAND_NAME } from "../app/brand";
 import { useAuth } from "../auth/AuthProvider";
 
 const INSTALL_STEPS = [
   ["安装依赖", "安装系统包、Python 运行时、Node 构建工具、Redis 和 PostgreSQL。"],
-  ["部署版本", "代码复制到 /opt/agent-hub/releases，并更新 current 指向。"],
+  ["部署版本", "把代码复制到 /opt/agent-hub/releases，并更新 current 指向。"],
   ["执行迁移", "API 接收流量前先升级数据库结构。"],
   ["启动服务", "启动 Caddy、API、worker、LiteLLM 和隔离 Skill 服务。"],
   ["创建管理员", "使用安装器打印的一次性设置码创建第一个管理员账号。"],
@@ -35,11 +35,12 @@ export function SetupPage() {
   return (
     <section className="auth-layout setup-layout">
       <div className="auth-hero">
+        <img className="auth-brand-logo" src={APP_BRAND_LOGO_SRC} alt={APP_BRAND_NAME} />
         <span className="eyebrow">{APP_BRAND_NAME}</span>
         <h1>初始化 {APP_BRAND_NAME}</h1>
         <p>使用安装脚本打印的一次性设置码创建第一个管理员账号。</p>
         <p>设置码使用后会立即失效。如果失败，页面会显示后端错误码和错误 ID。</p>
-        <div className="setup-timeline" aria-label="Installation flow">
+        <div className="setup-timeline" aria-label="安装流程">
           {INSTALL_STEPS.map(([title, detail], index) => (
             <article key={title} className="timeline-step">
               <span>{String(index + 1).padStart(2, "0")}</span>

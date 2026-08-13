@@ -92,6 +92,8 @@ describe("LoginPage", () => {
 
   it("logs in and opens the run dashboard", async () => {
     render(<TestApp initialPath="/login" />);
+    expect(await screen.findByRole("heading", { name: "登录控制台" })).not.toBeNull();
+    expect(screen.getByAltText("魔方agent")).not.toBeNull();
     await userEvent.type(screen.getByLabelText("Username"), "owner");
     await userEvent.type(screen.getByLabelText("Password"), "correct horse battery staple");
     await userEvent.click(screen.getByRole("button", { name: "登录" }));
@@ -113,6 +115,7 @@ describe("LoginPage", () => {
   it("creates the first admin through setup", async () => {
     render(<TestApp initialPath="/setup" />);
     expect(await screen.findByText("魔方agent")).not.toBeNull();
+    expect(screen.getByAltText("魔方agent")).not.toBeNull();
     expect(screen.getByText("使用安装脚本打印的一次性设置码创建第一个管理员账号。")).not.toBeNull();
     expect(screen.getByText("安装依赖")).not.toBeNull();
     expect(screen.getByText("部署版本")).not.toBeNull();
@@ -143,6 +146,7 @@ describe("LoginPage", () => {
     render(<TestApp initialPath="/" />);
 
     await waitFor(() => expect(screen.getByRole("heading", { name: "登录控制台" })).not.toBeNull());
+    expect(screen.getByAltText("魔方agent")).not.toBeNull();
   });
 
   it("keeps module groups visible and lets viewers use installed tool capabilities", async () => {
@@ -155,7 +159,14 @@ describe("LoginPage", () => {
             tenant_id: principal.tenant_id,
             username: "viewer",
             role: "viewer",
-            permissions: ["run:read", "agent:read", "config:read", "skill:read", "mcp:read", "audit:read"],
+            permissions: [
+              "run:read",
+              "agent:read",
+              "config:read",
+              "skill:read",
+              "mcp:read",
+              "audit:read",
+            ],
           });
         }
         if (String(input) === "/api/v1/admin/runs") {
