@@ -891,7 +891,7 @@ def create_app(
             )
 
     application = FastAPI(
-        title="Agent Hub",
+        title="魔方agent",
         version="0.1.0",
         lifespan=lifespan,
     )

@@ -1,4 +1,41 @@
 
+## 2026-08-13 P3 OpenClaw Brand Surface Check
+
+Current state:
+
+- OpenClaw execution remains conservative:
+  - default off;
+  - user approval required;
+  - exact argv allowlist for Linux server commands;
+  - shell executables denied even if allowlisted;
+  - Windows/macOS/desktop/screen/filesystem adapters exposed as unavailable until a real local adapter exists.
+- Updated user-visible OpenClaw Linux server adapter description from old `Agent Hub` wording to `魔方agent`.
+- Updated FastAPI OpenAPI title to `魔方agent`.
+
+Verification performed:
+
+- Local checks:
+  - `uv run pytest tests/api/test_admin_resources.py::test_openclaw_adapters_expose_multisystem_execution_boundary tests/api/test_admin_resources.py::test_openclaw_operation_creates_approval_request_when_enabled tests/api/test_admin_resources.py::test_openclaw_execute_runs_allowlisted_linux_command tests/api/test_admin_resources.py::test_openclaw_execute_returns_adapter_unavailable_for_windows_command -q --tb=short` -> 4 passed.
+  - `uv run ruff check src tests` -> passed.
+  - `uv run mypy --strict src tests` -> passed.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-p3-openclaw-brand-title.tgz` to `103.236.98.133`.
+  - Deployed `src/agent_hub/api/routers/admin.py` and `src/agent_hub/app.py`.
+  - Restarted `agent-hub-api` and `agent-hub-worker`.
+- Server real environment verification:
+  - Ran `/tmp/server_openclaw_brand_title_check.py` using the same environment file as the API service.
+  - Verified `/openapi.json` title is `魔方agent`.
+  - Verified `/api/v1/admin/openclaw/adapters` exposes the Linux server adapter as available with `魔方agent Linux server` in the description.
+  - Final output: `{"status": "ok", "checked": ["openapi_title_mofang_agent", "openclaw_linux_adapter_brand_description", "openclaw_linux_server_adapter_available"]}`.
+
+Remaining risks / TODOs:
+
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- After the core system is complete, run a horizontal UI/function audit for missing buttons, missing batch actions, paired confirm/delete actions, filters/search, and mobile button usability.
+
 ## 2026-08-13 P3 Schedule Alarm-Style UX
 
 Current state:

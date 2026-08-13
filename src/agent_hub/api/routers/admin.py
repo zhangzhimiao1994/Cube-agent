@@ -870,7 +870,7 @@ def _openclaw_adapter_responses() -> tuple[OpenClawAdapterResponse, ...]:
     }
     descriptions = {
         ("linux", "server_command"): (
-            "Runs exact allowlisted argv commands on the Agent Hub Linux server after approval."
+            "Runs exact allowlisted argv commands on the 魔方agent Linux server after approval."
         ),
         ("linux", "desktop_action"): "Requires a connected Linux desktop OpenClaw adapter before execution.",
         ("linux", "screen_read"): "Requires a connected Linux screen OpenClaw adapter before execution.",
