@@ -16,6 +16,11 @@ Current state:
   - deleted it through `DELETE /api/v1/admin/hermes/{id}`;
   - confirmed detail returns `404` and list no longer includes the deleted record;
   - restored original system settings afterward.
+- GitHub recovery archive was created before pushing the functional fix:
+  - local ignored bundle `.local-archives/github-pushes/mutilagent-main-before-20260813-143955-55a3500.bundle`;
+  - GitHub tag `archive/mutilagent-main-before-20260813-143955-55a3500`.
+- Commit `b87c945 fix chat toggles and hermes deletion` was pushed with `git push --force-with-lease mutilagent main`.
+- GitHub Actions run `31674722025` passed. The only annotation was GitHub's non-failing Node.js 20 deprecation warning for actions.
 
 Changes made:
 
@@ -53,6 +58,7 @@ Follow-up backlog from user feedback:
 - Model test/save page: after test-and-save, refresh persisted model data and clear stale local form/config state.
 - Chat page UI: improve layout and button presentation; current functional fix is intentionally narrow.
 - System framework context compression: implement automatic context compression at the system/runtime layer, not only for Vibe Coding. The decision should consider main-agent model capability/context window and trigger compression before long conversations degrade usability.
+- Channel mode grammar: define bilingual channel commands/directives so non-web channels can select modes/capabilities, for example `//vi` or `//vibe` for Vibe Coding plus Chinese equivalents. This should be implemented as channel-language parsing, not ad hoc per-channel string checks.
 
 ## 2026-08-13 P3 Conversation-Integrated Vibe Coding Switch
 
