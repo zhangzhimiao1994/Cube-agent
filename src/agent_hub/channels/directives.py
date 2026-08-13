@@ -44,6 +44,15 @@ def parse_channel_directives(text: str) -> ChannelDirectives:
     for token in tokens:
         parsed = _parse_token(token)
         if parsed is None:
+            if _looks_like_channel_directive(token):
+                return ChannelDirectives(
+                    mode=None,
+                    task_text=" ".join(tokens[consumed:]).strip(),
+                    plugins=tuple(dict.fromkeys(plugins)),
+                    mcp_servers=tuple(dict.fromkeys(mcp_servers)),
+                    skills=tuple(dict.fromkeys(skills)),
+                    invalid_reason="invalid_directive",
+                )
             break
         kind, value = parsed
         consumed += 1
@@ -116,6 +125,11 @@ def _reason_text(reason: str) -> str:
         return "缺少任务正文，请在模式、插件、MCP 或 Skill 指令后写清楚要做什么。"
     if reason == "empty_message":
         return "消息内容为空。"
+    if reason == "invalid_directive":
+        return (
+            "Invalid channel directive format. Use /#name for MCP, &name for Skill, "
+            "and @name for plugin; names may contain letters, numbers, dot, underscore, and dash."
+        )
     return reason
 
 
@@ -132,6 +146,10 @@ def _parse_token(token: str) -> tuple[str, str] | None:
         value = token[1:]
         return ("skill", value) if _DIRECTIVE_RE.fullmatch(value) else None
     return None
+
+
+def _looks_like_channel_directive(token: str) -> bool:
+    return token.startswith(("/#", "@", "&"))
 
 
 __all__ = [

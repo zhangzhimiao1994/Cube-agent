@@ -1,4 +1,41 @@
 
+## 2026-08-13 P3 Channel Directive Grammar Slice
+
+Current state:
+
+- P3 channel hardening continued after ignored Feishu event diagnostics.
+- Channel directive parsing now rejects malformed MCP/Skill/plugin reference tokens instead of silently folding them into task text.
+- Invalid reference forms are limited to channel directive prefixes: `/#` for MCP, `&` for Skill, and `@` for plugin.
+- Unknown ordinary slash commands remain untouched so existing explicit command parsing is not broadened accidentally.
+- Server incremental deployment to `103.236.98.133:/opt/agent-hub/current` was performed with `/tmp/agent-hub-p3-channel-directives.tgz`.
+- Server services `agent-hub-api`, `agent-hub-worker`, and `caddy` are active after restart.
+- Server health checks passed on API port `8000`: `GET /health/live` -> `{"status":"ok"}`, `GET /health/ready` -> `{"status":"ok"}`.
+- Server source contains the deployed diagnostic marker `invalid_directive`.
+- Local recovery bundle for this GitHub push was created at `.local-archives/github-pushes/mutilagent-main-before-20260813-100440-e752008.bundle`, pointing at current GitHub `mutilagent/main` commit `e752008`.
+- GitHub recovery archive tag prepared for this push: `archive/mutilagent-main-before-20260813-100440-e752008`.
+
+Changes made locally:
+
+- `src/agent_hub/channels/directives.py`
+  - Added malformed directive detection for invalid `/#...`, `&...`, and `@...` tokens.
+  - Added an `invalid_directive` summary message.
+- `tests/unit/channels/test_submitter.py`
+  - Added TDD coverage that malformed channel directives raise `ChannelDirectiveError` and do not submit a run.
+
+Verification performed locally:
+
+- TDD red: `uv run pytest tests/unit/channels/test_submitter.py::test_submitter_rejects_malformed_channel_directives -q --tb=short` first failed because `/#bad!` was accepted as task text.
+- Green: the same targeted test passed after implementation.
+- `uv run pytest tests/unit/channels/test_submitter.py tests/api/test_channel_webhooks.py -q --tb=short` -> 22 passed.
+- `uv run ruff check src tests/unit/channels/test_submitter.py tests/api/test_channel_webhooks.py` -> passed.
+- `uv run mypy --strict src tests` -> passed.
+
+Remaining risks / TODOs:
+
+- This directive grammar slice has been committed and server-synced, but has not yet been pushed to GitHub.
+- Before GitHub push, push the prepared GitHub archive tag, then push `main` and verify Actions.
+- Continue P3 channel hardening with real attachment retrieval/delivery diagnostics.
+
 ## 2026-08-13 P3 Channel Diagnostics Slice
 
 Current state:
@@ -14,6 +51,7 @@ Current state:
 - Server source contains the deployed diagnostic marker `ignored_reason`.
 - Local recovery bundle for this GitHub push was created at `.local-archives/github-pushes/mutilagent-main-before-20260813-095330-f8749e2.bundle`, pointing at current GitHub `mutilagent/main` commit `f8749e2`.
 - GitHub recovery archive tag prepared for this push: `archive/mutilagent-main-before-20260813-095330-f8749e2`.
+- P3 channel diagnostics commit `e752008` was pushed to GitHub; Actions run `31658743485` passed all quality checks. The only annotation was GitHub's non-failing Node.js 20 deprecation warning for actions.
 
 Changes made locally:
 
@@ -38,8 +76,7 @@ Verification performed locally:
 
 Remaining risks / TODOs:
 
-- This P3 channel diagnostics slice has been committed and server-synced, but has not yet been pushed to GitHub.
-- Before GitHub push, push the prepared GitHub archive tag, then push `main` and verify Actions.
+- This P3 channel diagnostics slice has been committed, server-synced, pushed to GitHub, and verified by Actions.
 - Continue P3 channel hardening after this slice with real attachment retrieval/delivery diagnostics and command grammar validation.
 
 ## 2026-08-13 Mobile Floating Navigation Fix

@@ -11,6 +11,7 @@ from agent_hub.channels.base import (
     InboundAttachment,
     InboundMessage,
 )
+from agent_hub.channels.directives import ChannelDirectiveError, parse_channel_directives
 from agent_hub.channels.submitter import RunServiceInboundSubmitter
 from agent_hub.domain.runs import TaskMode
 
@@ -125,3 +126,31 @@ async def test_submitter_parses_channel_directives_for_mode_skills_mcp_and_plugi
     assert context["requested_skills"] == "deep-research,pdf"
     assert context["requested_mcp_servers"] == "filesystem"
     assert context["requested_plugins"] == "github"
+
+
+async def test_submitter_rejects_malformed_channel_directives() -> None:
+    run_service = RecordingRunService()
+    submitter = RunServiceInboundSubmitter(run_service=run_service, tenant_id=TENANT_ID)
+    message = InboundMessage(
+        channel=Channel.FEISHU,
+        tenant_external_id="tenant_1",
+        sender_external_id="user_1",
+        conversation_external_id="conv_1",
+        message_id="msg_1",
+        event_id="evt_1",
+        conversation_type=ConversationType.PRIVATE,
+        text="/dispatch /#bad! &skill_ok @github Review this repo",
+        mentions_bot=True,
+        received_at=datetime(2026, 8, 11, tzinfo=UTC),
+    )
+
+    directives = parse_channel_directives(message.text)
+
+    assert directives.invalid_reason == "invalid_directive"
+    try:
+        await submitter.submit(message, idempotency_key="idem_1")
+    except ChannelDirectiveError as error:
+        assert error.reason == "invalid_directive"
+    else:  # pragma: no cover - assertion clarity
+        raise AssertionError("submitter accepted malformed channel directive")
+    assert run_service.calls == []
