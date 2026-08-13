@@ -513,6 +513,75 @@ def test_feishu_webhook_acks_supported_platform_events_even_when_no_message() ->
     assert gateway.messages == []
 
 
+def test_feishu_webhook_records_ignored_platform_event_diagnostics() -> None:
+    gateway = RecordingGateway()
+    service = InMemoryAdminResourceService()
+    app = create_app(
+        auth_service=StubAuthService(),
+        rate_limiter=object(),
+        feishu_gateway=gateway,
+    )
+    app.state.admin_resource_service = service
+    api = TestClient(app)
+
+    saved = api.post(
+        "/api/v1/admin/channels/feishu/config",
+        headers={"Authorization": "Bearer valid-token"},
+        json={
+            "values": {
+                "AGENT_HUB_PUBLIC_URL": "https://agent.example.com",
+                "FEISHU_APP_ID": "cli_saved_feishu",
+                "FEISHU_APP_SECRET": "saved-secret",
+                "FEISHU_VERIFICATION_TOKEN": "saved-verification-token",
+                "FEISHU_ENCRYPT_KEY": "saved-encrypt-key",
+                "FEISHU_TRANSPORT": "webhook",
+            }
+        },
+    )
+    response = api.post(
+        "/channels/feishu/events",
+        json={
+            "schema": "2.0",
+            "header": {
+                "event_id": "evt_group_entered",
+                "event_type": "im.chat.member.bot.added_v1",
+                "token": "saved-verification-token",
+                "app_id": "cli_saved_feishu",
+                "tenant_key": "tenant_1",
+                "create_time": str(int(time.time())),
+            },
+            "event": {
+                "operator_id": {"open_id": "ou_user"},
+                "chat_id": "oc_chat",
+            },
+        },
+    )
+    logs = api.get(
+        "/api/v1/admin/logs?category=channel_error",
+        headers={"Authorization": "Bearer valid-token"},
+    )
+
+    assert saved.status_code == 200
+    assert response.status_code == 200
+    assert response.json() == {"accepted": True, "ignored": True}
+    assert gateway.messages == []
+    assert logs.status_code == 200
+    matching = [
+        item
+        for item in logs.json()
+        if item["source"] == "channels.feishu.webhook"
+        and item["details"].get("event_id") == "evt_group_entered"
+    ]
+    assert matching
+    assert matching[0]["level"] == "warning"
+    assert matching[0]["details"] == {
+        "event_id": "evt_group_entered",
+        "event_type": "im.chat.member.bot.added_v1",
+        "reason": "unsupported event type",
+        "tenant_key": "tenant_1",
+    }
+
+
 def test_generic_channel_webhook_rejects_wrong_token(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CUSTOM_WEBHOOK_TOKEN", "correct")
     gateway = RecordingGateway()

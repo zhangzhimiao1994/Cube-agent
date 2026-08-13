@@ -40,6 +40,10 @@ class FeishuWebhookResult:
     message: InboundMessage | None
     challenge: str | None = None
     submission: object | None = None
+    ignored_reason: str | None = None
+    ignored_event_type: str | None = None
+    ignored_event_id: str | None = None
+    ignored_tenant_key: str | None = None
 
 
 class FeishuWebhookReceiver:
@@ -70,8 +74,18 @@ class FeishuWebhookReceiver:
             return FeishuWebhookResult(message=None, challenge=verified.challenge)
         try:
             message = normalize_feishu_event(verified.payload, bot_open_id=self._bot_open_id)
-        except UnsupportedFeishuEvent:
-            return FeishuWebhookResult(message=None)
+        except UnsupportedFeishuEvent as error:
+            header = verified.payload.get("header")
+            header = header if isinstance(header, dict) else {}
+            return FeishuWebhookResult(
+                message=None,
+                ignored_reason=str(error) or "unsupported event",
+                ignored_event_type=_diagnostic_text(header.get("event_type")),
+                ignored_event_id=_diagnostic_text(header.get("event_id")),
+                ignored_tenant_key=_diagnostic_text(
+                    header.get("tenant_key") or header.get("tenant_key_v2")
+                ),
+            )
         submission: object | None = None
         if self._gateway is not None:
             submission = await self._gateway.handle(message)
@@ -162,6 +176,7 @@ def create_lazy_feishu_webhook_router(
         if result.challenge is not None:
             return JSONResponse(content={"challenge": result.challenge})
         if result.message is None:
+            await _record_feishu_ignored_event(request, result)
             return JSONResponse(content={"accepted": True, "ignored": True})
         _schedule_feishu_reply(request, settings, result)
         return JSONResponse(status_code=202, content={"accepted": True})
@@ -280,6 +295,41 @@ async def _record_feishu_verification_failure(
         )
     except Exception:
         _LOGGER.exception("feishu_verification_failure_log_failed")
+
+
+async def _record_feishu_ignored_event(
+    request: Request,
+    result: FeishuWebhookResult,
+) -> None:
+    if result.ignored_reason is None:
+        return
+    service = getattr(request.app.state, "admin_resource_service", None)
+    recorder = getattr(service, "record_log", None)
+    if recorder is None:
+        return
+    details = {
+        "reason": result.ignored_reason,
+        "event_type": result.ignored_event_type or "unknown",
+        "event_id": result.ignored_event_id or "unknown",
+        "tenant_key": result.ignored_tenant_key or "unknown",
+    }
+    try:
+        await recorder(
+            category="channel_error",
+            level="warning",
+            title="Feishu event ignored",
+            message=result.ignored_reason,
+            source="channels.feishu.webhook",
+            details=details,
+        )
+    except Exception:
+        _LOGGER.exception("feishu_ignored_event_log_failed")
+
+
+def _diagnostic_text(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return value[:256]
 
 
 __all__ = [

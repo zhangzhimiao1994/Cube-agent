@@ -24,11 +24,11 @@ def normalize_feishu_event(
 ) -> InboundMessage:
     header = _dict(payload.get("header"), "header")
     event = _dict(payload.get("event"), "event")
-    message = _dict(event.get("message"), "event.message")
-    sender = _dict(event.get("sender"), "event.sender")
     event_type = str(header.get("event_type", ""))
     if event_type and event_type != "im.message.receive_v1":
         raise UnsupportedFeishuEvent("unsupported event type")
+    message = _dict(event.get("message"), "event.message")
+    sender = _dict(event.get("sender"), "event.sender")
 
     message_type = str(message.get("message_type", ""))
     content = _message_content(message)

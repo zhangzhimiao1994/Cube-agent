@@ -1,4 +1,47 @@
 
+## 2026-08-13 P3 Channel Diagnostics Slice
+
+Current state:
+
+- P3 channel hardening has started after the mobile navigation interruption was completed.
+- This slice improves Feishu callback observability for valid platform callbacks that are acknowledged but ignored because they are not inbound user messages.
+- Ignored Feishu events now retain diagnostic metadata from the callback header: `event_type`, `event_id`, `tenant_key`, and `reason`.
+- The lazy Feishu webhook route records ignored-event diagnostics as `channel_error` warning logs through the admin resource service when available.
+- Feishu event normalization now checks `header.event_type` before requiring `event.message`, so unsupported platform events report `unsupported event type` instead of the misleading `missing event.message`.
+- Server incremental deployment to `103.236.98.133:/opt/agent-hub/current` was performed with `/tmp/agent-hub-p3-channel-diagnostics.tgz`.
+- Server services `agent-hub-api`, `agent-hub-worker`, and `caddy` are active after restart.
+- Server health checks passed on API port `8000`: `GET /health/live` -> `{"status":"ok"}`, `GET /health/ready` -> `{"status":"ok"}`.
+- Server source contains the deployed diagnostic marker `ignored_reason`.
+- Local recovery bundle for this GitHub push was created at `.local-archives/github-pushes/mutilagent-main-before-20260813-095330-f8749e2.bundle`, pointing at current GitHub `mutilagent/main` commit `f8749e2`.
+- GitHub recovery archive tag prepared for this push: `archive/mutilagent-main-before-20260813-095330-f8749e2`.
+
+Changes made locally:
+
+- `src/agent_hub/channels/feishu/webhook.py`
+  - Extended `FeishuWebhookResult` with ignored-event diagnostic fields.
+  - Added `_record_feishu_ignored_event()` for best-effort `channel_error` logging.
+- `src/agent_hub/channels/feishu/normalize.py`
+  - Moved event-type filtering ahead of message extraction for clearer diagnostics.
+- `tests/api/test_channel_webhooks.py`
+  - Added TDD coverage for ignored Feishu platform event diagnostics in admin logs.
+
+Verification performed locally:
+
+- TDD red: `uv run pytest tests/api/test_channel_webhooks.py::test_feishu_webhook_records_ignored_platform_event_diagnostics -q --tb=short` first failed because no diagnostic log existed.
+- Intermediate red: after adding logging, the test failed because the reason was `missing event.message`; this exposed the event-type ordering bug.
+- Green: `uv run pytest tests/api/test_channel_webhooks.py::test_feishu_webhook_records_ignored_platform_event_diagnostics -q --tb=short` -> passed.
+- `uv run pytest tests/api/test_channel_webhooks.py -q --tb=short` -> 19 passed.
+- `uv run pytest tests/api/test_channel_webhooks.py tests/contracts/feishu/test_receivers.py -q --tb=short` -> 30 passed.
+- `uv run ruff check src tests/api/test_channel_webhooks.py` -> passed.
+- `uv run mypy --strict src tests` -> passed.
+- Server target pytest was attempted with `.venv/bin/python -m pytest`, but the production virtualenv does not install pytest (`No module named pytest`).
+
+Remaining risks / TODOs:
+
+- This P3 channel diagnostics slice has been committed and server-synced, but has not yet been pushed to GitHub.
+- Before GitHub push, push the prepared GitHub archive tag, then push `main` and verify Actions.
+- Continue P3 channel hardening after this slice with real attachment retrieval/delivery diagnostics and command grammar validation.
+
 ## 2026-08-13 Mobile Floating Navigation Fix
 
 Current state:
@@ -60,7 +103,7 @@ Verification performed locally:
 
 Remaining risks / TODOs:
 
-- The mobile navigation fix is deployed on the server and verified on GitHub. Only this final handoff-doc commit remains to push after the prepared archive tag.
+- The mobile navigation fix is deployed on the server and verified on GitHub. Final handoff-doc commit `f8749e2` was pushed and GitHub Actions `quality` run `31658163507` passed.
 - If the mobile drawer needs iconography like GitHub/Cloudflare, add an icon set later; this pass intentionally kept the change scoped to layout and interaction.
 
 ## 2026-08-13 P3 Runtime Process Observability Slice
