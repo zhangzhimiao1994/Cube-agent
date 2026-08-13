@@ -29,6 +29,11 @@ from agent_hub.models.capabilities import infer_model_capabilities
 from agent_hub.models.gateway import ModelTransport
 from agent_hub.models.litellm_client import LiteLLMClient, ModelTransportError
 from agent_hub.models.types import Deployment, ModelCapability, ModelMessage, ModelRequest
+from agent_hub.openclaw.executor import (
+    OpenClawCommandResult,
+    openclaw_command_allowed,
+    run_openclaw_command,
+)
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRecord, RunRepository
 from agent_hub.runtime.contracts import JsonValue
 from agent_hub.runtime.failure_reason import is_legacy_generic_failure_reason
@@ -540,6 +545,7 @@ class SystemSettingsRequest(BaseModel):
     multimedia_generation_enabled: bool = False
     openclaw_enabled: bool = False
     openclaw_mode: str = Field(default="ask", pattern=r"^(ask|read_only|auto_review|trusted_auto)$")
+    openclaw_allowed_commands: list[list[str]] = Field(default_factory=list, max_length=64)
     temporary_agent_policy: str = Field(
         default="主 Agent 发现角色池缺少必要能力时，必须先说明原因并取得用户确认，再临时加入子 Agent。",
         max_length=10_000,
@@ -547,6 +553,15 @@ class SystemSettingsRequest(BaseModel):
     channel_entry: str = Field(default="web", max_length=64)
     attachment_retention_days: int = Field(default=7, ge=1, le=365)
     attachment_max_mb: int = Field(default=25, ge=1, le=200)
+
+    @field_validator("openclaw_allowed_commands")
+    @classmethod
+    def validate_openclaw_allowed_commands(cls, value: list[list[str]]) -> list[list[str]]:
+        for argv in value:
+            if not argv or len(argv) > 32:
+                raise ValueError("OpenClaw allowed commands must be nonempty bounded argv lists")
+            OpenClawOperationRequest.validate_argv(argv)
+        return value
 
 
 class SystemSettingsResponse(SystemSettingsRequest):
@@ -578,7 +593,7 @@ class OpenClawOperationResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    status: str = Field(pattern=r"^(waiting_user_approval|approved|rejected)$")
+    status: str = Field(pattern=r"^(waiting_user_approval|approved|rejected|executed)$")
     approval_id: str
     requires_user_approval: bool
     platform: str
@@ -589,12 +604,23 @@ class OpenClawOperationResponse(BaseModel):
     created_at: datetime
     resolved_by: str | None = None
     resolved_at: datetime | None = None
+    execution: dict[str, object] | None = None
 
 
 class OpenClawResolveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     decision: str = Field(pattern=r"^(approve|reject)$")
+
+
+class OpenClawExecutionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    operation: OpenClawOperationResponse
+    exit_code: int
+    stdout: str
+    stderr: str
+    truncated: bool
 
 
 def _openclaw_operation_response(
@@ -629,6 +655,65 @@ def _openclaw_audit_details(request: OpenClawOperationRequest, mode: str) -> dic
         "risk_level": request.risk_level,
         "mode": mode,
     }
+
+
+async def _execute_openclaw_operation(
+    operation: OpenClawOperationResponse,
+    settings: SystemSettingsResponse,
+    *,
+    actor: str,
+) -> tuple[OpenClawOperationResponse, OpenClawCommandResult]:
+    if operation.status != "approved":
+        raise PublicAPIError(
+            409,
+            "openclaw_not_approved",
+            "OpenClaw operation must be approved before execution",
+        )
+    if not settings.openclaw_enabled:
+        raise PublicAPIError(409, "openclaw_disabled", "OpenClaw is disabled")
+
+    request = OpenClawOperationRequest.model_validate(operation.operation)
+    if settings.openclaw_mode == "read_only" and request.kind not in {"screen_read", "file_read"}:
+        raise PublicAPIError(403, "openclaw_read_only", "OpenClaw read-only mode blocks this operation")
+    if request.platform != "linux" or request.kind != "server_command":
+        raise PublicAPIError(
+            409,
+            "openclaw_adapter_unavailable",
+            "OpenClaw execution adapter is not available for this operation",
+        )
+    if not openclaw_command_allowed(request.argv, settings.openclaw_allowed_commands):
+        raise PublicAPIError(
+            403,
+            "openclaw_command_denied",
+            "OpenClaw command is not in the allowed command list",
+        )
+
+    result = await run_openclaw_command(request.argv)
+    execution: dict[str, object] = {
+        "exit_code": result.exit_code,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "truncated": result.truncated,
+        "executed_by": actor,
+        "executed_at": datetime.now(UTC),
+    }
+    return (
+        operation.model_copy(update={"status": "executed", "execution": execution}),
+        result,
+    )
+
+
+def _openclaw_execution_response(
+    operation: OpenClawOperationResponse,
+    result: OpenClawCommandResult,
+) -> OpenClawExecutionResponse:
+    return OpenClawExecutionResponse(
+        operation=operation,
+        exit_code=result.exit_code,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        truncated=result.truncated,
+    )
 
 
 class MainAgentModelConfig(BaseModel):
@@ -876,6 +961,14 @@ class AdminResourceService(Protocol):
         *,
         actor: str,
     ) -> OpenClawOperationResponse: ...
+
+    async def execute_openclaw_operation(
+        self,
+        operation_id: str,
+        settings: SystemSettingsResponse,
+        *,
+        actor: str,
+    ) -> OpenClawExecutionResponse: ...
 
     async def list_logs(self, category: str | None = None) -> tuple[LogEntryResponse, ...]: ...
 
@@ -1394,6 +1487,24 @@ class InMemoryAdminResourceService:
             details={"approval_id": current.approval_id},
         )
         return updated
+
+    async def execute_openclaw_operation(
+        self,
+        operation_id: str,
+        settings: SystemSettingsResponse,
+        *,
+        actor: str,
+    ) -> OpenClawExecutionResponse:
+        current = await self.get_openclaw_operation(operation_id)
+        updated, result = await _execute_openclaw_operation(current, settings, actor=actor)
+        self.openclaw_operations[operation_id] = updated
+        await self.record_audit_event(
+            actor=actor,
+            action="openclaw.executed",
+            resource=f"openclaw:{operation_id}",
+            details={"approval_id": current.approval_id, "exit_code": result.exit_code},
+        )
+        return _openclaw_execution_response(updated, result)
 
     def make_log(
         self,
@@ -2181,6 +2292,25 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             details={"approval_id": current.approval_id},
         )
         return updated
+
+    async def execute_openclaw_operation(
+        self,
+        operation_id: str,
+        settings: SystemSettingsResponse,
+        *,
+        actor: str,
+    ) -> OpenClawExecutionResponse:
+        current = await self.get_openclaw_operation(operation_id)
+        updated, result = await _execute_openclaw_operation(current, settings, actor=actor)
+        if not await self._upsert_admin_payload("openclaw", operation_id, updated.model_dump(mode="json")):
+            return await super().execute_openclaw_operation(operation_id, settings, actor=actor)
+        await self.record_audit_event(
+            actor=actor,
+            action="openclaw.executed",
+            resource=f"openclaw:{operation_id}",
+            details={"approval_id": current.approval_id, "exit_code": result.exit_code},
+        )
+        return _openclaw_execution_response(updated, result)
 
     async def get_main_agent_config(self) -> MainAgentConfigResponse:
         payload = await self._get_admin_payload("main_agent", "default")
@@ -4068,6 +4198,25 @@ async def resolve_openclaw_operation(
     return await service.resolve_openclaw_operation(
         operation_id,
         body,
+        actor=str(principal.user_id),
+    )
+
+
+@router.post(
+    "/openclaw/operations/{operation_id}/execute",
+    response_model=OpenClawExecutionResponse,
+    responses=error_responses(401, 403, 404, 409, 422),
+)
+async def execute_openclaw_operation(
+    operation_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> OpenClawExecutionResponse:
+    _require(principal, "config:write")
+    settings = await service.get_settings()
+    return await service.execute_openclaw_operation(
+        operation_id,
+        settings,
         actor=str(principal.user_id),
     )
 

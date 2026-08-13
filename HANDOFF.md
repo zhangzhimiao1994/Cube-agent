@@ -1431,3 +1431,62 @@ GitHub push and recovery:
 Next:
 
 - Continue P3 toward approved executor integration across Linux/Windows/macOS and conversation-integrated vibe coding after CI is green.
+
+## 2026-08-13 P3 OpenClaw Approved Execution Boundary
+
+Current state:
+
+- OpenClaw now has an approved execution path for Linux `server_command` operations.
+- Execution is still blocked by default: `openclaw_allowed_commands` defaults to an empty list.
+- An operation must be approved first, the global OpenClaw switch must still be enabled at execution time, and the command argv must exactly match an allowlisted argv list.
+- Shell wrapper executables (`bash`, `sh`, `cmd`, `powershell`, `pwsh`, etc.) are denied even if an admin accidentally allowlists them.
+- Windows/macOS and non-command OpenClaw operations are explicitly modeled but return `openclaw_adapter_unavailable` until dedicated adapters are implemented.
+- Executed operations are persisted with `status=executed` and an execution summary (`exit_code`, stdout/stderr, truncation flag, executor, timestamp).
+
+Changes made:
+
+- Added `agent_hub.openclaw.executor` with a bounded subprocess executor and command allowlist check.
+- Added `openclaw_allowed_commands` to system settings.
+- Added `OpenClawExecutionResponse` and execution metadata on OpenClaw operations.
+- Added `POST /api/v1/admin/openclaw/operations/{operation_id}/execute`.
+- Added in-memory and persistent service support for saving execution results and audit records.
+- Updated frontend system settings schema so config saves preserve the allowlist field.
+- Added API tests for approval-required execution, unlisted command denial, allowlisted Linux command execution, shell-deny hardening, and Windows adapter unavailability.
+
+Local verification:
+
+- TDD red checks were added first:
+  - default settings had no `openclaw_allowed_commands`;
+  - execution endpoint returned 405;
+  - settings update with the new allowlist field returned 422.
+- `uv run pytest tests/api/test_admin_resources.py -q -k openclaw --tb=short` -> 9 passed.
+- `uv run pytest tests/api/test_admin_resources.py tests/unit/test_database_resources.py -q --tb=short` -> 68 passed.
+- `uv run ruff check src\agent_hub\api\routers\admin.py src\agent_hub\openclaw tests\api\test_admin_resources.py` -> passed.
+- `uv run mypy --strict src\agent_hub\api\routers\admin.py src\agent_hub\openclaw tests\api\test_admin_resources.py` -> passed.
+- `npm.cmd test -- --run src/pages/ConfigPage.test.tsx src/app/AppShell.test.tsx src/pages/OperationalPages.test.tsx` -> 45 passed.
+- `npm.cmd run lint` -> passed.
+- `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+- `uv run pytest -q --tb=short` was attempted but timed out after 5 minutes before producing a result; targeted backend and frontend checks above passed.
+
+Server deployment and verification:
+
+- Uploaded incremental package to `103.236.98.133:/tmp/agent-hub-p3-openclaw-executor.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`.
+- Restarted `agent-hub-api` and `agent-hub-worker`; reloaded Caddy.
+- Verified `agent-hub-api`, `agent-hub-worker`, and `caddy` were active.
+- Verified deployed Python files compile with `py_compile`.
+- Ran `/tmp/openclaw_executor_functional_check.py` through the real local HTTP API with a short-lived admin token generated from the running server environment; it passed:
+  - unapproved OpenClaw operation execution is rejected with `openclaw_not_approved`;
+  - approved allowlisted Linux command executes and returns `openclaw-approved-exec-ok`;
+  - executed operation can be fetched with persisted `status=executed` and execution metadata;
+  - shell wrapper command is rejected with `openclaw_command_denied` even when present in the allowlist;
+  - Windows command returns `openclaw_adapter_unavailable`.
+- Verified deployed `web/dist` contains `openclaw_allowed_commands`.
+
+Next:
+
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue P3 with the OpenClaw approval UI/operation console and then conversation-integrated Vibe Coding.

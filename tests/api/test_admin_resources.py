@@ -1,5 +1,6 @@
 import asyncio
 import io
+import sys
 import tarfile
 import zipfile
 from datetime import UTC, datetime
@@ -137,8 +138,10 @@ def test_system_settings_default_openclaw_is_disabled() -> None:
 
     assert settings.openclaw_enabled is False
     assert settings.openclaw_mode == "ask"
+    assert settings.openclaw_allowed_commands == []
     assert settings.model_dump()["openclaw_enabled"] is False
     assert settings.model_dump()["openclaw_mode"] == "ask"
+    assert settings.model_dump()["openclaw_allowed_commands"] == []
 
 
 def test_openclaw_operation_requires_feature_switch() -> None:
@@ -236,6 +239,179 @@ def test_openclaw_read_only_mode_rejects_write_operations() -> None:
 
     assert response.status_code == 403
     assert response.json()["error"]["code"] == "openclaw_read_only"
+
+
+def test_openclaw_execute_requires_approved_operation() -> None:
+    api = client()
+    payload = api.get("/api/v1/admin/settings", headers=headers()).json()
+    payload["openclaw_enabled"] = True
+    payload["openclaw_mode"] = "ask"
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+
+    created = api.post(
+        "/api/v1/admin/openclaw/operations",
+        headers=headers(),
+        json={
+            "platform": "linux",
+            "kind": "server_command",
+            "target": "agent-hub-server",
+            "argv": [sys.executable, "-c", "print('openclaw-api-exec-ok')"],
+            "risk_level": "low",
+            "reason": "approved execution should be required",
+        },
+    )
+    assert created.status_code == 202
+
+    response = api.post(
+        f"/api/v1/admin/openclaw/operations/{created.json()['id']}/execute",
+        headers=headers(),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "openclaw_not_approved"
+
+
+def test_openclaw_execute_denies_approved_unlisted_command() -> None:
+    api = client()
+    payload = api.get("/api/v1/admin/settings", headers=headers()).json()
+    payload["openclaw_enabled"] = True
+    payload["openclaw_mode"] = "ask"
+    payload["openclaw_allowed_commands"] = []
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+
+    created = api.post(
+        "/api/v1/admin/openclaw/operations",
+        headers=headers(),
+        json={
+            "platform": "linux",
+            "kind": "server_command",
+            "target": "agent-hub-server",
+            "argv": [sys.executable, "-c", "print('openclaw-api-exec-ok')"],
+            "risk_level": "low",
+            "reason": "approved command should still require an allowlist match",
+        },
+    )
+    operation_id = created.json()["id"]
+    assert api.patch(
+        f"/api/v1/admin/openclaw/operations/{operation_id}",
+        headers=headers(),
+        json={"decision": "approve"},
+    ).status_code == 200
+
+    response = api.post(f"/api/v1/admin/openclaw/operations/{operation_id}/execute", headers=headers())
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "openclaw_command_denied"
+
+
+def test_openclaw_execute_runs_allowlisted_linux_command() -> None:
+    api = client()
+    command = [sys.executable, "-c", "print('openclaw-api-exec-ok')"]
+    payload = api.get("/api/v1/admin/settings", headers=headers()).json()
+    payload["openclaw_enabled"] = True
+    payload["openclaw_mode"] = "ask"
+    payload["openclaw_allowed_commands"] = [command]
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+
+    created = api.post(
+        "/api/v1/admin/openclaw/operations",
+        headers=headers(),
+        json={
+            "platform": "linux",
+            "kind": "server_command",
+            "target": "agent-hub-server",
+            "argv": command,
+            "risk_level": "low",
+            "reason": "run a bounded smoke command after approval",
+        },
+    )
+    operation_id = created.json()["id"]
+    assert api.patch(
+        f"/api/v1/admin/openclaw/operations/{operation_id}",
+        headers=headers(),
+        json={"decision": "approve"},
+    ).status_code == 200
+
+    response = api.post(f"/api/v1/admin/openclaw/operations/{operation_id}/execute", headers=headers())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["operation"]["status"] == "executed"
+    assert body["exit_code"] == 0
+    assert body["stdout"].strip() == "openclaw-api-exec-ok"
+    assert body["stderr"] == ""
+    assert body["truncated"] is False
+
+    fetched = api.get(f"/api/v1/admin/openclaw/operations/{operation_id}", headers=headers())
+    assert fetched.json()["status"] == "executed"
+    assert fetched.json()["execution"]["exit_code"] == 0
+
+
+def test_openclaw_execute_denies_shell_even_when_allowlisted() -> None:
+    api = client()
+    command = ["bash", "-c", "echo unsafe"]
+    payload = api.get("/api/v1/admin/settings", headers=headers()).json()
+    payload["openclaw_enabled"] = True
+    payload["openclaw_mode"] = "ask"
+    payload["openclaw_allowed_commands"] = [command]
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+
+    created = api.post(
+        "/api/v1/admin/openclaw/operations",
+        headers=headers(),
+        json={
+            "platform": "linux",
+            "kind": "server_command",
+            "target": "agent-hub-server",
+            "argv": command,
+            "risk_level": "low",
+            "reason": "shell execution must stay blocked",
+        },
+    )
+    operation_id = created.json()["id"]
+    assert api.patch(
+        f"/api/v1/admin/openclaw/operations/{operation_id}",
+        headers=headers(),
+        json={"decision": "approve"},
+    ).status_code == 200
+
+    response = api.post(f"/api/v1/admin/openclaw/operations/{operation_id}/execute", headers=headers())
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "openclaw_command_denied"
+
+
+def test_openclaw_execute_returns_adapter_unavailable_for_windows_command() -> None:
+    api = client()
+    payload = api.get("/api/v1/admin/settings", headers=headers()).json()
+    payload["openclaw_enabled"] = True
+    payload["openclaw_mode"] = "ask"
+    payload["openclaw_allowed_commands"] = [["cmd", "/c", "echo", "ok"]]
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+
+    created = api.post(
+        "/api/v1/admin/openclaw/operations",
+        headers=headers(),
+        json={
+            "platform": "windows",
+            "kind": "server_command",
+            "target": "desktop",
+            "argv": ["cmd", "/c", "echo", "ok"],
+            "risk_level": "low",
+            "reason": "windows adapter must not be treated as linux execution",
+        },
+    )
+    operation_id = created.json()["id"]
+    assert api.patch(
+        f"/api/v1/admin/openclaw/operations/{operation_id}",
+        headers=headers(),
+        json={"decision": "approve"},
+    ).status_code == 200
+
+    response = api.post(f"/api/v1/admin/openclaw/operations/{operation_id}/execute", headers=headers())
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "openclaw_adapter_unavailable"
 
 
 def test_qwen_dashscope_unauthorized_model_check_returns_provider_specific_hint() -> None:

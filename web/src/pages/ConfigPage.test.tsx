@@ -23,6 +23,7 @@ const settings = {
   multimedia_generation_enabled: false,
   openclaw_enabled: false,
   openclaw_mode: "ask",
+  openclaw_allowed_commands: [],
   temporary_agent_policy:
     "主 Agent 发现角色池缺少必要能力时，必须先说明原因并取得用户确认，再临时加入子 Agent。",
   channel_entry: "web",
@@ -177,6 +178,7 @@ describe("ConfigPage", () => {
         multimedia_generation_enabled: true,
         openclaw_enabled: true,
         openclaw_mode: "read_only",
+        openclaw_allowed_commands: [],
         temporary_agent_policy: "缺少专业能力时先申请临时 Agent，任务结束后询问是否永久保存。",
       },
     });

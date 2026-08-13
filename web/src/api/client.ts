@@ -223,6 +223,7 @@ const SystemSettingsSchema = z.object({
   multimedia_generation_enabled: z.boolean().default(false),
   openclaw_enabled: z.boolean().default(false),
   openclaw_mode: z.enum(["ask", "read_only", "auto_review", "trusted_auto"]).default("ask"),
+  openclaw_allowed_commands: z.array(z.array(z.string())).default([]),
   temporary_agent_policy: z.string().default(
     "主 Agent 发现角色池缺少必要能力时，必须先说明原因并取得用户确认，再临时加入子 Agent。",
   ),
