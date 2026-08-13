@@ -137,7 +137,7 @@ export const MODULE_GROUPS: ModuleGroup[] = [
       {
         to: "/config",
         label: "系统设置",
-        description: "配置默认模式、日志等级、工具审批、临场调整和临时 Agent 策略。",
+        description: "配置默认模式、日志等级、工具审批、运行期调度和临时 Agent 策略。",
         permission: "config:read",
       },
       {

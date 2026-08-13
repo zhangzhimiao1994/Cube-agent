@@ -13,8 +13,14 @@ Current state:
 - Local recovery bundle for this push was created at `.local-archives/github-pushes/mutilagent-main-before-20260813-091728-00b77c4.bundle`, pointing at the pre-push GitHub `mutilagent/main` commit `00b77c4`.
 - Server incremental deployment to `103.236.98.133:/opt/agent-hub/current` was performed with `/tmp/agent-hub-mobile-nav-incremental.tgz`.
 - Server services `agent-hub-api`, `agent-hub-worker`, and `caddy` are active after restart.
-- Server health checks passed: `GET /health/live` -> `{"status":"ok"}`, `GET /health/ready` -> `{"status":"ok"}`.
+- Server health checks passed on the API service port `8000`: `GET /health/live` -> `{"status":"ok"}`, `GET /health/ready` -> `{"status":"ok"}`.
 - Server frontend dist contains the mobile drawer CSS marker `mobile-nav-groups`.
+- GitHub recovery archive tag `archive/mutilagent-main-before-20260813-091728-00b77c4` has been pushed and points at pre-push remote `main` commit `00b77c4`.
+- GitHub `main` was pushed to `8d84adc`; Actions run `31657441326` failed in `npm run test -- --run` because the global navigation description reused the text `临场调整`, which conflicted with the workflow page test that asserts those controls are not present in workflow configuration.
+- The CI failure was fixed by changing the system configuration navigation description to use `运行期调度` instead of the workflow-sensitive phrase.
+- The CI fix was deployed incrementally to `103.236.98.133:/opt/agent-hub/current` with `/tmp/agent-hub-mobile-nav-ci-fix.tgz`; server dist now contains `运行期调度`.
+- Local recovery bundle for the follow-up CI fix push was created at `.local-archives/github-pushes/mutilagent-main-before-20260813-093300-8d84adc.bundle`, pointing at current GitHub `mutilagent/main` commit `8d84adc`.
+- GitHub recovery archive tag prepared for the follow-up CI fix push: `archive/mutilagent-main-before-20260813-093300-8d84adc`.
 
 Changes made locally:
 
@@ -30,10 +36,14 @@ Changes made locally:
   - Added mobile drawer and expandable second-level module coverage.
 - `.gitignore`
   - Added `.local-archives/` so local recovery bundles are never committed.
+- `web/src/app/navigation.ts`
+  - Updated the system configuration module description so global navigation text does not collide with workflow-isolation tests.
 
 Verification performed locally:
 
 - `npm.cmd test -- src/app/AppShell.test.tsx -- --runInBand` -> passed, 6 tests.
+- `npm.cmd test -- src/pages/OperationalPages.test.tsx -- --runInBand` -> passed, 37 tests.
+- `npm.cmd test -- --run` -> passed, 10 test files / 76 tests.
 - Playwright mobile smoke at 390x844 with mocked API/login:
   - Closed state: `scrollWidth=390`, `innerWidth=390`.
   - Open drawer state: `scrollWidth=390`, `innerWidth=390`, drawer width about `296px`, workspace width stays `390px`.
@@ -46,8 +56,7 @@ Verification performed locally:
 
 Remaining risks / TODOs:
 
-- This UI fix has been committed locally and server-synced, but has not yet been pushed to GitHub.
-- Before pushing this UI fix to GitHub, create the GitHub archive tag for the previous `mutilagent/main` commit `00b77c4`.
+- The first UI fix push is on GitHub; the navigation-description CI fix has been deployed to the server and now needs the prepared GitHub archive tag pushed, then a follow-up GitHub `main` push and Actions verification.
 - If the mobile drawer needs iconography like GitHub/Cloudflare, add an icon set later; this pass intentionally kept the change scoped to layout and interaction.
 
 ## 2026-08-13 P3 Runtime Process Observability Slice
