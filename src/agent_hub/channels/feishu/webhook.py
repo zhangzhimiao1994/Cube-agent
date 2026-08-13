@@ -48,6 +48,10 @@ class FeishuMediaServiceProtocol(Protocol):
     ) -> Sequence[FeishuImageAnalysisLike]: ...
 
 
+class FeishuMediaServiceFactoryProtocol(Protocol):
+    def __call__(self, settings: FeishuSettings) -> FeishuMediaServiceProtocol | None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class FeishuWebhookResult:
     message: InboundMessage | None
@@ -191,7 +195,7 @@ def create_lazy_feishu_webhook_router(
         if result.message is None:
             await _record_feishu_ignored_event(request, result)
             return JSONResponse(content={"accepted": True, "ignored": True})
-        result = await _append_feishu_media_context(request, result)
+        result = await _append_feishu_media_context(request, settings, result)
         message = result.message
         if message is None:
             return JSONResponse(content={"accepted": True, "ignored": True})
@@ -346,18 +350,18 @@ async def _record_feishu_ignored_event(
 
 async def _append_feishu_media_context(
     request: Request,
+    settings: FeishuSettings,
     result: FeishuWebhookResult,
 ) -> FeishuWebhookResult:
     message = result.message
     if message is None or not message.attachments:
         return result
-    media_service = getattr(request.app.state, "feishu_media_service", None)
-    analyzer = getattr(media_service, "analyze_images", None)
-    if analyzer is None:
+    media_service = _feishu_media_service(request, settings)
+    if media_service is None:
         return result
     log_service = getattr(request.app.state, "admin_resource_service", None)
     try:
-        analyses = await cast(FeishuMediaServiceProtocol, media_service).analyze_images(message)
+        analyses = await media_service.analyze_images(message)
     except FeishuMediaError as error:
         await log_feishu_media_failure(log_service=log_service, error=error)
         return result
@@ -375,6 +379,20 @@ async def _append_feishu_media_context(
         ignored_event_id=result.ignored_event_id,
         ignored_tenant_key=result.ignored_tenant_key,
     )
+
+
+def _feishu_media_service(
+    request: Request,
+    settings: FeishuSettings,
+) -> FeishuMediaServiceProtocol | None:
+    factory = getattr(request.app.state, "feishu_media_service_factory", None)
+    if callable(factory):
+        candidate = cast(FeishuMediaServiceFactoryProtocol, factory)(settings)
+    else:
+        candidate = getattr(request.app.state, "feishu_media_service", None)
+    if getattr(candidate, "analyze_images", None) is None:
+        return None
+    return cast(FeishuMediaServiceProtocol, candidate)
 
 
 def _message_text_with_image_analysis(

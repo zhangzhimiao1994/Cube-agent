@@ -1,4 +1,40 @@
 
+## 2026-08-13 P3 Feishu Media Service Factory Hook Slice
+
+Current state:
+
+- P3 channel hardening continued after the Feishu webhook media context hook slice.
+- Lazy Feishu webhook media enrichment now prefers `request.app.state.feishu_media_service_factory(settings)` when present.
+- The factory receives the Feishu settings resolved from saved runtime channel config, so production wiring can construct Feishu media dependencies with the tenant's active app id/secret/token/encrypt key.
+- The previous fixed `request.app.state.feishu_media_service` hook remains supported as a fallback for tests and simple deployments.
+- Server incremental deployment to `103.236.98.133:/opt/agent-hub/current` was performed with `/tmp/agent-hub-p3-feishu-media-factory-hook.tgz`.
+- Server services `agent-hub-api`, `agent-hub-worker`, and `caddy` are active after restart/reload.
+- Server health checks passed on API port `8000`: `GET /health/live` -> `{"status":"ok"}`, `GET /health/ready` -> `{"status":"ok"}`.
+- Server source contains the deployed marker `feishu_media_service_factory`.
+- Server syntax check passed with `.venv/bin/python -m py_compile src/agent_hub/channels/feishu/webhook.py tests/api/test_channel_webhooks.py`.
+
+Changes made locally:
+
+- `src/agent_hub/channels/feishu/webhook.py`
+  - Added `FeishuMediaServiceFactoryProtocol`.
+  - Passed resolved `FeishuSettings` into media-context enrichment.
+  - Added `_feishu_media_service()` to choose the settings-aware factory first and the existing fixed service second.
+- `tests/api/test_channel_webhooks.py`
+  - Added TDD coverage that a Feishu image webhook uses the factory with the runtime settings saved through admin channel config.
+
+Verification performed locally:
+
+- TDD red: `uv run pytest tests/api/test_channel_webhooks.py::test_feishu_webhook_uses_media_service_factory_with_runtime_settings -q --tb=short` first failed with `assert [] == ['cli_runtime_feishu']`, proving the factory was not called.
+- Green: the same targeted test passed after adding the settings-aware factory hook.
+- `uv run pytest tests/api/test_channel_webhooks.py tests/contracts/feishu/test_receivers.py tests/unit/channels/feishu/test_media_client.py tests/e2e/feishu/test_conversation.py tests/unit/channels/test_submitter.py -q --tb=short` -> 48 passed.
+- `uv run ruff check src tests/api/test_channel_webhooks.py tests/contracts/feishu/test_receivers.py tests/unit/channels/feishu/test_media_client.py tests/e2e/feishu/test_conversation.py tests/unit/channels/test_submitter.py` -> passed.
+- `uv run mypy --strict src tests` -> passed.
+
+Remaining risks / TODOs:
+
+- GitHub recovery archive, full push, and Actions verification are pending for this slice.
+- The next slice should wire a real production `feishu_media_service_factory` into app bootstrap using `FeishuOpenAPIMediaClient` and the configured vision analyzer.
+
 ## 2026-08-13 P3 Feishu Webhook Media Context Hook Slice
 
 Current state:
