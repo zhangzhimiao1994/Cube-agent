@@ -4,12 +4,17 @@ import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Protocol
+from urllib.parse import quote
+
+import httpx
 
 from agent_hub.channels.base import AttachmentKind, InboundAttachment, InboundMessage
+from agent_hub.channels.feishu.settings import FeishuSettings
 from agent_hub.multimodal.images import StrictSignatureDetector
 from agent_hub.multimodal.types import VisionAnalysisResult
 
 _LOGGER = logging.getLogger(__name__)
+_DEFAULT_FEISHU_API_BASE = "https://open.feishu.cn/open-apis"
 
 
 class FeishuMediaError(RuntimeError):
@@ -32,6 +37,72 @@ class FeishuMediaClient(Protocol):
         resource_key: str,
         tenant_access_token: str,
     ) -> AsyncIterator[bytes]: ...
+
+
+class FeishuOpenAPIMediaClient:
+    def __init__(
+        self,
+        *,
+        settings: FeishuSettings,
+        api_base: str = _DEFAULT_FEISHU_API_BASE,
+        timeout_seconds: float = 10.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self._settings = settings
+        self._api_base = api_base.rstrip("/")
+        self._timeout_seconds = timeout_seconds
+        self._transport = transport
+
+    async def tenant_access_token(self, tenant_external_id: str) -> str:
+        del tenant_external_id
+        url = f"{self._api_base}/auth/v3/tenant_access_token/internal"
+        async with self._client() as client:
+            response = await client.post(
+                url,
+                json={
+                    "app_id": self._settings.app_id,
+                    "app_secret": self._settings.app_secret_value(),
+                },
+            )
+        if response.status_code >= 400:
+            raise FeishuMediaError(f"token request failed status={response.status_code}")
+        payload = _json_object(response)
+        if payload.get("code") != 0:
+            raise FeishuMediaError(f"token request rejected code={payload.get('code')}")
+        token = payload.get("tenant_access_token")
+        if not isinstance(token, str) or not token:
+            raise FeishuMediaError("token response is missing tenant_access_token")
+        return token
+
+    async def download_resource(
+        self,
+        *,
+        message_id: str,
+        resource_key: str,
+        tenant_access_token: str,
+    ) -> AsyncIterator[bytes]:
+        url = (
+            f"{self._api_base}/im/v1/messages/{quote(message_id, safe='')}"
+            f"/resources/{quote(resource_key, safe='')}"
+        )
+        async with self._client() as client, client.stream(
+            "GET",
+            url,
+            params={"type": "image"},
+            headers={"Authorization": f"Bearer {tenant_access_token}"},
+        ) as response:
+            if response.status_code >= 400:
+                raise FeishuMediaError(
+                    f"media download request failed status={response.status_code}"
+                )
+            async for chunk in response.aiter_bytes():
+                yield chunk
+
+    def _client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            timeout=self._timeout_seconds,
+            transport=self._transport,
+        )
 
 
 class VisionAnalyzer(Protocol):
@@ -165,6 +236,16 @@ def _diagnostics(message: InboundMessage, attachment: InboundAttachment) -> dict
     }
 
 
+def _json_object(response: httpx.Response) -> dict[str, object]:
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise FeishuMediaError("Feishu response is not JSON") from error
+    if not isinstance(payload, dict):
+        raise FeishuMediaError("Feishu response is not an object")
+    return payload
+
+
 async def log_feishu_media_failure(
     *,
     log_service: object | None,
@@ -200,6 +281,7 @@ __all__ = [
     "FeishuMediaError",
     "FeishuMediaService",
     "FeishuMediaTooLarge",
+    "FeishuOpenAPIMediaClient",
     "VisionAnalyzer",
     "log_feishu_media_failure",
 ]

@@ -1,4 +1,42 @@
 
+## 2026-08-13 P3 Feishu OpenAPI Media Client Slice
+
+Current state:
+
+- P3 channel hardening continued after Feishu media error log wiring.
+- Added a concrete `FeishuOpenAPIMediaClient` for Feishu user-message resource download.
+- The client uses `FeishuSettings` explicitly instead of reading global environment at construction time.
+- Tenant token retrieval calls `/open-apis/auth/v3/tenant_access_token/internal`.
+- User-message resource download calls `/open-apis/im/v1/messages/:message_id/resources/:file_key?type=image` with `Authorization: Bearer <tenant_access_token>`.
+- Official Feishu documentation distinguishes this user-message resource endpoint from `/open-apis/im/v1/images/:image_key`, which only downloads images uploaded by the current bot; this slice intentionally uses the message resource endpoint for inbound user images.
+- Server incremental deployment to `103.236.98.133:/opt/agent-hub/current` was performed with `/tmp/agent-hub-p3-feishu-openapi-media-client.tgz`.
+- Server services `agent-hub-api`, `agent-hub-worker`, and `caddy` are active after restart/reload.
+- Server health checks passed on API port `8000`: `GET /health/live` -> `{"status":"ok"}`, `GET /health/ready` -> `{"status":"ok"}`.
+- Server source contains the deployed marker `FeishuOpenAPIMediaClient`.
+- Server syntax check passed with `.venv/bin/python -m py_compile src/agent_hub/channels/feishu/media.py tests/unit/channels/feishu/test_media_client.py`.
+- GitHub push is pending for this slice.
+
+Changes made locally:
+
+- `src/agent_hub/channels/feishu/media.py`
+  - Added `FeishuOpenAPIMediaClient`.
+  - Added safe response validation for tenant token JSON and binary resource download status errors.
+- `tests/unit/channels/feishu/test_media_client.py`
+  - Added TDD coverage for tenant token retrieval, resource download URL, `type=image`, authorization header, and binary chunk streaming.
+
+Verification performed locally:
+
+- TDD red: `uv run pytest tests/unit/channels/feishu/test_media_client.py -q --tb=short` first failed because `FeishuOpenAPIMediaClient` did not exist.
+- Green: the same targeted test passed after implementation.
+- `uv run pytest tests/unit/channels/feishu/test_media_client.py tests/e2e/feishu/test_conversation.py tests/api/test_channel_webhooks.py tests/contracts/feishu/test_receivers.py tests/unit/channels/test_submitter.py -q --tb=short` -> 45 passed.
+- `uv run ruff check src tests/unit/channels/feishu/test_media_client.py tests/e2e/feishu/test_conversation.py tests/api/test_channel_webhooks.py tests/unit/channels/test_submitter.py` -> passed.
+- `uv run mypy --strict src tests` -> passed.
+
+Remaining risks / TODOs:
+
+- Recovery archive creation, GitHub full push, and GitHub Actions verification remain to be completed before this slice is closed.
+- The production app still needs a factory/wiring pass that constructs `FeishuOpenAPIMediaClient` from saved channel config and a configured vision analyzer; this slice supplies the HTTP client boundary.
+
 ## 2026-08-13 P3 Feishu Media Error Log Wiring Slice
 
 Current state:
