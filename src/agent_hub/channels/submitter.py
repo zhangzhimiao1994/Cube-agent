@@ -29,8 +29,13 @@ class RunSubmissionService(Protocol):
         mode: TaskMode,
         attachment_ids: tuple[str, ...] = (),
         channel_context: dict[str, str] | None = None,
+        vibe_coding: bool = False,
         idempotency_key: str | None = None,
     ) -> SubmittedRunLike: ...
+
+
+class ChannelSettingsService(Protocol):
+    async def get_settings(self) -> object: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,11 +44,14 @@ class RunServiceInboundSubmitter:
 
     run_service: RunSubmissionService
     tenant_id: UUID
+    settings_service: ChannelSettingsService | None = None
 
     async def submit(self, message: InboundMessage, *, idempotency_key: str) -> UUID:
         directives = parse_channel_directives(message.text)
         if directives.invalid_reason is not None:
             raise ChannelDirectiveError(directives.invalid_reason)
+        if directives.vibe_coding and not await self._vibe_coding_enabled():
+            raise ChannelDirectiveError("vibe_coding_disabled")
         command = parse_explicit_command(directives.task_text)
         mode = TaskMode.AUTO
         task_text = directives.task_text
@@ -62,9 +70,16 @@ class RunServiceInboundSubmitter:
             mode=mode,
             attachment_ids=attachment_ids,
             channel_context=_channel_context(message, directives=directives),
+            vibe_coding=directives.vibe_coding,
             idempotency_key=idempotency_key,
         )
         return submitted.id
+
+    async def _vibe_coding_enabled(self) -> bool:
+        if self.settings_service is None:
+            return False
+        settings = await self.settings_service.get_settings()
+        return getattr(settings, "vibe_coding_enabled", False) is True
 
 
 def _channel_actor_id(message: InboundMessage) -> UUID:
@@ -119,7 +134,9 @@ def _channel_context(message: InboundMessage, *, directives: ChannelDirectives) 
         context["requested_mcp_servers"] = ",".join(mcp_servers)
     if plugins:
         context["requested_plugins"] = ",".join(plugins)
+    if directives.vibe_coding:
+        context["requested_channel_features"] = "vibe_coding"
     return context
 
 
-__all__ = ["RunServiceInboundSubmitter", "RunSubmissionService"]
+__all__ = ["ChannelSettingsService", "RunServiceInboundSubmitter", "RunSubmissionService"]

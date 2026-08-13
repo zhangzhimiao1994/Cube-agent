@@ -1,4 +1,74 @@
 
+## 2026-08-13 Channel Language Directives Slice
+
+Current state:
+
+- Channel messages now support a unified `//` channel language directive layer before the task text.
+- English mode directives:
+  - `//auto`, `//direct`, `//dispatch`, `//discuss`, `//hybrid` plus conservative aliases such as `//route`, `//mix`, and `//mixed`.
+- Chinese mode directives:
+  - `//自动`, `//直连`, `//直接`, `//派单`, `//分派`, `//讨论`, `//辩论`, `//混合`.
+- Vibe Coding capability directives:
+  - `//vi`, `//vibe`, `//vibecoding`, `//vibe-coding`, `//code`, `//coding`, `//代码`, `//编程`, `//代码协作`.
+- Existing channel directives remain compatible:
+  - `/dispatch` and the other legacy single-slash mode commands;
+  - `/#name` for MCP;
+  - `&name` for Skill;
+  - `@name` for plugin.
+- Channel Vibe Coding requests fail closed when the system `vibe_coding_enabled` switch is disabled.
+- Production app wiring now passes the admin settings service into `RunServiceInboundSubmitter`, so channel submissions obey the same Vibe switch as the web API.
+- Accepted channel Vibe requests pass `vibe_coding=True` into `RunService` and preserve `requested_channel_features=vibe_coding` in routing metadata.
+- Admin run detail now exposes channel-requested features, skills, MCP servers, and plugins through `explicit_details`.
+- Server incremental deployment to `103.236.98.133:/opt/agent-hub/current` was performed with `/tmp/agent-hub-channel-language-directives.tgz`.
+- Server services `agent-hub-api` and `agent-hub-worker` were restarted and active afterward.
+- Server real environment check passed with `/tmp/server_channel_language_directives_check.py`:
+  - loaded `/etc/agent-hub/secrets.env` and deployed code from `/opt/agent-hub/current`;
+  - used the real production database;
+  - used real `PersistentAdminResourceService`, `RunService`, `RunServiceInboundSubmitter`, `ChannelGateway`, and `InboundDedupRepository`;
+  - confirmed `//hybrid //vi` is rejected with `vibe_coding_disabled` while the system switch is off;
+  - enabled the system switch and submitted real English and Chinese channel messages;
+  - confirmed created run records have `mode=hybrid` and `mode=discuss`;
+  - confirmed admin details expose `vibe_coding=enabled`, `capability=vibe_coding`, and `requested_channel_features=vibe_coding`;
+  - restored original system settings and cleaned up created test runs.
+
+Changes made:
+
+- `src/agent_hub/channels/directives.py`
+  - Added `//` channel language parsing for bilingual modes and Vibe Coding capability requests.
+  - Invalid `//...` directives now fail through the existing channel directive validation path.
+- `src/agent_hub/channels/submitter.py`
+  - Added settings-service gating for channel Vibe Coding.
+  - Passes channel Vibe requests into `RunService.submit(vibe_coding=True)`.
+  - Adds `requested_channel_features=vibe_coding` to safe channel context.
+- `src/agent_hub/app.py`
+  - Wires the production admin settings service into the channel submitter.
+- `src/agent_hub/runs/service.py`
+  - Allows `requested_channel_features` through the safe channel context whitelist.
+- `src/agent_hub/api/routers/admin.py`
+  - Exposes requested channel features, skills, MCP servers, and plugins in run details.
+- Tests:
+  - Added unit coverage for English and Chinese channel language directives.
+  - Added admin detail coverage for channel directive metadata.
+
+Verification performed:
+
+- TDD red:
+  - `uv run pytest tests/unit/channels/test_submitter.py::test_submitter_parses_english_channel_language_directives_for_mode_and_vibe tests/unit/channels/test_submitter.py::test_submitter_parses_chinese_channel_language_directives_and_rejects_disabled_vibe -q --tb=short` first failed because `RunServiceInboundSubmitter` did not accept `settings_service`.
+  - `uv run pytest tests/api/test_admin_resources.py::test_routing_details_exposes_channel_directive_context -q --tb=short` first failed because `_routing_details` did not expose `requested_channel_features`.
+- Green:
+  - `uv run pytest tests/unit/channels/test_submitter.py::test_submitter_parses_english_channel_language_directives_for_mode_and_vibe tests/unit/channels/test_submitter.py::test_submitter_parses_chinese_channel_language_directives_and_rejects_disabled_vibe -q --tb=short` -> 2 passed.
+  - `uv run pytest tests/api/test_admin_resources.py::test_routing_details_exposes_channel_directive_context -q --tb=short` -> 1 passed.
+  - `uv run pytest tests/unit/channels/test_submitter.py tests/api/test_channel_webhooks.py tests/unit/test_app_wiring.py tests/unit/runs/test_temporary_agent.py tests/api/test_admin_resources.py::test_routing_details_exposes_channel_directive_context -q --tb=short` -> 47 passed.
+  - `uv run ruff check src tests/unit/channels/test_submitter.py tests/api/test_channel_webhooks.py tests/unit/test_app_wiring.py tests/unit/runs/test_temporary_agent.py tests/api/test_admin_resources.py` -> passed.
+  - `uv run mypy src` -> passed.
+  - Server real channel language directives check -> passed.
+
+Remaining risks / TODOs:
+
+- Add a user-facing attachment manager with list/delete support. Current attachments are stored under `/var/lib/agent-hub/attachments/{tenant_id}/` as `att_*.bin`, `att_*.json`, optional manifests, and optional extracted archive directories; there is no web UI or API delete endpoint yet.
+- Final project README should focus on system usage, not test reporting. It should cover setup, settings, channel command language, Vibe Coding, OpenClaw, multimedia generation, Feishu/channel usage, recovery archive workflow, and common operations.
+- Continue the remaining P3 items: deeper Vibe runtime integration, OpenClaw multi-system adapters and permission modes, multimedia generation executor/capability enforcement, and protected Feishu Skill install commands.
+
 ## 2026-08-13 Chat Composer Layout Fix
 
 Current state:

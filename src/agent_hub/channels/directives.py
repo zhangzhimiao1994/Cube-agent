@@ -6,12 +6,44 @@ from dataclasses import dataclass
 from agent_hub.domain.runs import TaskMode
 
 _DIRECTIVE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
-_MODES = {
+_LEGACY_MODES = {
     "/auto": TaskMode.AUTO,
     "/direct": TaskMode.DIRECT,
     "/dispatch": TaskMode.DISPATCH,
     "/discuss": TaskMode.DISCUSS,
     "/hybrid": TaskMode.HYBRID,
+}
+_CHANNEL_LANGUAGE_MODES = {
+    "//auto": TaskMode.AUTO,
+    "//automatic": TaskMode.AUTO,
+    "//自动": TaskMode.AUTO,
+    "//direct": TaskMode.DIRECT,
+    "//directly": TaskMode.DIRECT,
+    "//直连": TaskMode.DIRECT,
+    "//直接": TaskMode.DIRECT,
+    "//dispatch": TaskMode.DISPATCH,
+    "//route": TaskMode.DISPATCH,
+    "//派单": TaskMode.DISPATCH,
+    "//分派": TaskMode.DISPATCH,
+    "//discuss": TaskMode.DISCUSS,
+    "//discussion": TaskMode.DISCUSS,
+    "//讨论": TaskMode.DISCUSS,
+    "//辩论": TaskMode.DISCUSS,
+    "//hybrid": TaskMode.HYBRID,
+    "//mix": TaskMode.HYBRID,
+    "//mixed": TaskMode.HYBRID,
+    "//混合": TaskMode.HYBRID,
+}
+_VIBE_CODING_DIRECTIVES = {
+    "//vi",
+    "//vibe",
+    "//vibecoding",
+    "//vibe-coding",
+    "//code",
+    "//coding",
+    "//代码",
+    "//编程",
+    "//代码协作",
 }
 
 
@@ -22,6 +54,7 @@ class ChannelDirectives:
     plugins: tuple[str, ...] = ()
     mcp_servers: tuple[str, ...] = ()
     skills: tuple[str, ...] = ()
+    vibe_coding: bool = False
     invalid_reason: str | None = None
 
 
@@ -57,11 +90,14 @@ def parse_channel_directives(text: str) -> ChannelDirectives:
         kind, value = parsed
         consumed += 1
         if kind == "mode":
-            next_mode = _MODES[value]
+            next_mode = _mode_from_directive(value)
             if mode is not None and mode is not next_mode:
                 return ChannelDirectives(
                     mode=None,
                     task_text=" ".join(tokens[consumed:]).strip(),
+                    plugins=tuple(dict.fromkeys(plugins)),
+                    mcp_servers=tuple(dict.fromkeys(mcp_servers)),
+                    skills=tuple(dict.fromkeys(skills)),
                     invalid_reason="conflicting_modes",
                 )
             mode = next_mode
@@ -71,6 +107,8 @@ def parse_channel_directives(text: str) -> ChannelDirectives:
             mcp_servers.append(value)
         elif kind == "skill":
             skills.append(value)
+        elif kind == "vibe_coding":
+            pass
 
     task_text = " ".join(tokens[consumed:]).strip() if consumed else text
     if not task_text:
@@ -80,6 +118,7 @@ def parse_channel_directives(text: str) -> ChannelDirectives:
             plugins=tuple(dict.fromkeys(plugins)),
             mcp_servers=tuple(dict.fromkeys(mcp_servers)),
             skills=tuple(dict.fromkeys(skills)),
+            vibe_coding=any(token.casefold() in _VIBE_CODING_DIRECTIVES for token in tokens[:consumed]),
             invalid_reason="missing_task_text",
         )
     return ChannelDirectives(
@@ -88,6 +127,7 @@ def parse_channel_directives(text: str) -> ChannelDirectives:
         plugins=tuple(dict.fromkeys(plugins)),
         mcp_servers=tuple(dict.fromkeys(mcp_servers)),
         skills=tuple(dict.fromkeys(skills)),
+        vibe_coding=any(token.casefold() in _VIBE_CODING_DIRECTIVES for token in tokens[:consumed]),
     )
 
 
@@ -102,6 +142,8 @@ def directive_summary(directives: ChannelDirectives) -> str:
         lines.append("MCP: " + ", ".join(directives.mcp_servers))
     if directives.plugins:
         lines.append("Plugins: " + ", ".join(directives.plugins))
+    if directives.vibe_coding:
+        lines.append("Vibe Coding: enabled")
     lines.append("我会按这些选择执行；若未指定模式，将由主 Agent 自动判断。")
     return "\n".join(lines)
 
@@ -134,8 +176,11 @@ def _reason_text(reason: str) -> str:
 
 
 def _parse_token(token: str) -> tuple[str, str] | None:
-    if token in _MODES:
+    lowered = token.casefold()
+    if token in _LEGACY_MODES or lowered in _CHANNEL_LANGUAGE_MODES:
         return ("mode", token)
+    if lowered in _VIBE_CODING_DIRECTIVES:
+        return ("vibe_coding", token)
     if token.startswith("/#"):
         value = token[2:]
         return ("mcp", value) if _DIRECTIVE_RE.fullmatch(value) else None
@@ -149,7 +194,13 @@ def _parse_token(token: str) -> tuple[str, str] | None:
 
 
 def _looks_like_channel_directive(token: str) -> bool:
-    return token.startswith(("/#", "@", "&"))
+    return token.startswith(("//", "/#", "@", "&"))
+
+
+def _mode_from_directive(token: str) -> TaskMode:
+    if token in _LEGACY_MODES:
+        return _LEGACY_MODES[token]
+    return _CHANNEL_LANGUAGE_MODES[token.casefold()]
 
 
 __all__ = [

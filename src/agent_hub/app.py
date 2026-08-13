@@ -44,7 +44,11 @@ from agent_hub.channels.feishu.webhook import (
 )
 from agent_hub.channels.gateway import ChannelGateway
 from agent_hub.channels.generic_webhook import create_generic_channel_webhook_router
-from agent_hub.channels.submitter import RunServiceInboundSubmitter, RunSubmissionService
+from agent_hub.channels.submitter import (
+    ChannelSettingsService,
+    RunServiceInboundSubmitter,
+    RunSubmissionService,
+)
 from agent_hub.config.service import ConfigService
 from agent_hub.db.models import TenantRow
 from agent_hub.db.session import build_database
@@ -505,6 +509,12 @@ def create_app(
                             application.state.run_service,
                         ),
                         tenant_id=configured.bootstrap_tenant_id,
+                        settings_service=cast(
+                            ChannelSettingsService,
+                            admin_resource_service
+                            if admin_resource_service is not None
+                            else application.state.admin_resource_service,
+                        ),
                     ),
                     deduplicator=InboundDedupRepository(active_sessions),
                 )

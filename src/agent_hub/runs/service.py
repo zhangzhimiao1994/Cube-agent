@@ -1278,6 +1278,7 @@ def _safe_channel_context(channel_context: Mapping[str, str]) -> dict[str, str]:
         "requested_skills",
         "requested_mcp_servers",
         "requested_plugins",
+        "requested_channel_features",
     }
     result: dict[str, str] = {}
     for key, value in channel_context.items():

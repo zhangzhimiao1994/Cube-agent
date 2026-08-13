@@ -37,6 +37,7 @@ class RecordingRunService:
         mode: TaskMode,
         attachment_ids: tuple[str, ...] = (),
         channel_context: dict[str, str] | None = None,
+        vibe_coding: bool = False,
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         self.calls.append(
@@ -47,10 +48,24 @@ class RecordingRunService:
                 "mode": mode,
                 "attachment_ids": attachment_ids,
                 "channel_context": channel_context,
+                "vibe_coding": vibe_coding,
                 "idempotency_key": idempotency_key,
             }
         )
         return SubmittedRun(RUN_ID)
+
+
+@dataclass(frozen=True, slots=True)
+class StubSystemSettings:
+    vibe_coding_enabled: bool = False
+
+
+class StubSettingsService:
+    def __init__(self, *, vibe_coding_enabled: bool) -> None:
+        self.settings = StubSystemSettings(vibe_coding_enabled=vibe_coding_enabled)
+
+    async def get_settings(self) -> StubSystemSettings:
+        return self.settings
 
 
 async def test_submitter_forwards_agent_hub_attachment_ids_and_manifest() -> None:
@@ -126,6 +141,75 @@ async def test_submitter_parses_channel_directives_for_mode_skills_mcp_and_plugi
     assert context["requested_skills"] == "deep-research,pdf"
     assert context["requested_mcp_servers"] == "filesystem"
     assert context["requested_plugins"] == "github"
+
+
+async def test_submitter_parses_english_channel_language_directives_for_mode_and_vibe() -> None:
+    run_service = RecordingRunService()
+    submitter = RunServiceInboundSubmitter(
+        run_service=run_service,
+        tenant_id=TENANT_ID,
+        settings_service=StubSettingsService(vibe_coding_enabled=True),
+    )
+    message = InboundMessage(
+        channel=Channel.FEISHU,
+        tenant_external_id="tenant_1",
+        sender_external_id="user_1",
+        conversation_external_id="conv_1",
+        message_id="msg_1",
+        event_id="evt_1",
+        conversation_type=ConversationType.PRIVATE,
+        text="//hybrid //vi Refactor this module with context compression",
+        mentions_bot=True,
+        received_at=datetime(2026, 8, 11, tzinfo=UTC),
+    )
+
+    directives = parse_channel_directives(message.text)
+    await submitter.submit(message, idempotency_key="idem_1")
+
+    assert directives.mode is TaskMode.HYBRID
+    assert directives.vibe_coding is True
+    assert directives.task_text == "Refactor this module with context compression"
+    call = run_service.calls[0]
+    assert call["mode"] is TaskMode.HYBRID
+    assert call["vibe_coding"] is True
+    assert call["message"] == "Refactor this module with context compression"
+    context = call["channel_context"]
+    assert isinstance(context, dict)
+    assert context["requested_channel_features"] == "vibe_coding"
+
+
+async def test_submitter_parses_chinese_channel_language_directives_and_rejects_disabled_vibe() -> None:
+    run_service = RecordingRunService()
+    submitter = RunServiceInboundSubmitter(
+        run_service=run_service,
+        tenant_id=TENANT_ID,
+        settings_service=StubSettingsService(vibe_coding_enabled=False),
+    )
+    message = InboundMessage(
+        channel=Channel.FEISHU,
+        tenant_external_id="tenant_1",
+        sender_external_id="user_1",
+        conversation_external_id="conv_1",
+        message_id="msg_1",
+        event_id="evt_1",
+        conversation_type=ConversationType.PRIVATE,
+        text="//讨论 //代码协作 评审这个实现方案",
+        mentions_bot=True,
+        received_at=datetime(2026, 8, 11, tzinfo=UTC),
+    )
+
+    directives = parse_channel_directives(message.text)
+
+    assert directives.mode is TaskMode.DISCUSS
+    assert directives.vibe_coding is True
+    assert directives.task_text == "评审这个实现方案"
+    try:
+        await submitter.submit(message, idempotency_key="idem_1")
+    except ChannelDirectiveError as error:
+        assert error.reason == "vibe_coding_disabled"
+    else:  # pragma: no cover - assertion clarity
+        raise AssertionError("submitter accepted channel Vibe Coding while the system switch is off")
+    assert run_service.calls == []
 
 
 async def test_submitter_rejects_malformed_channel_directives() -> None:

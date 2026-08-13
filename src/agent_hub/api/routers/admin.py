@@ -3889,6 +3889,15 @@ def _routing_details(routing_decision: dict[str, object] | None) -> dict[str, st
     capability = routing_decision.get("capability")
     if isinstance(capability, str) and capability:
         details["capability"] = capability
+    for key in (
+        "requested_channel_features",
+        "requested_skills",
+        "requested_mcp_servers",
+        "requested_plugins",
+    ):
+        value = routing_decision.get(key)
+        if isinstance(value, str) and value:
+            details[key] = value[:512]
     selected_agent_ids = routing_decision.get("selected_agent_ids")
     if isinstance(selected_agent_ids, list):
         safe_ids = [item for item in selected_agent_ids if isinstance(item, str) and item]

@@ -29,6 +29,7 @@ from agent_hub.api.routers.admin import (
     _admin_run_event,
     _mode_error_log_from_run,
     _model_check_failure_details,
+    _routing_details,
     _run_debug_from_detail,
 )
 from agent_hub.app import create_app
@@ -690,6 +691,22 @@ def test_run_debug_endpoint_exposes_safe_failure_snapshot() -> None:
     assert body["partial_output_available"] is False
     assert body["artifacts"][0]["title"] == "Readiness report"
     assert body["artifacts"][0]["has_text"] is False
+
+
+def test_routing_details_exposes_channel_directive_context() -> None:
+    details = _routing_details(
+        {
+            "requested_channel_features": "vibe_coding",
+            "requested_skills": "deep-research",
+            "requested_mcp_servers": "filesystem",
+            "requested_plugins": "github",
+        }
+    )
+
+    assert details["requested_channel_features"] == "vibe_coding"
+    assert details["requested_skills"] == "deep-research"
+    assert details["requested_mcp_servers"] == "filesystem"
+    assert details["requested_plugins"] == "github"
 
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
