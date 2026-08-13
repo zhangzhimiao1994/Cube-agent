@@ -441,12 +441,18 @@ describe("operational management pages", () => {
         }
         if (path === "/api/v1/admin/skills/upload" && method === "POST") {
           return jsonResponse({
-            id: "skill-uploaded-from-chat",
-            name: "uploaded_skill",
-            version: "1.0.0",
-            status: "scanned",
-            requested_permissions: ["tool:filesystem.read"],
-            scan_diff: ["content sha256: abc123", "entry point: main.py"],
+            filename: "uploaded-skill.zip",
+            bundle: false,
+            items: [
+              {
+                id: "skill-uploaded-from-chat",
+                name: "uploaded_skill",
+                version: "1.0.0",
+                status: "scanned",
+                requested_permissions: ["tool:filesystem.read"],
+                scan_diff: ["content sha256: abc123", "entry point: main.py"],
+              },
+            ],
           });
         }
         if (path === "/api/v1/admin/skills/skill-uploaded-from-chat/approve" && method === "POST") {
@@ -1523,7 +1529,7 @@ describe("operational management pages", () => {
 
     expect(await screen.findByText("Skill 包已扫描，等待确认")).not.toBeNull();
     expect(screen.getByText("uploaded_skill")).not.toBeNull();
-    expect(screen.getByText("tool:filesystem.read")).not.toBeNull();
+    expect(screen.getByText(/tool:filesystem\.read/)).not.toBeNull();
     expect(requests.find((request) => request.path === "/api/v1/admin/skills/upload")).toMatchObject({
       method: "POST",
     });

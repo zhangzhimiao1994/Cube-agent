@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
 import os
 import re
+import stat
+import tarfile
+import zipfile
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Protocol, cast
 from urllib.parse import urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -39,7 +43,7 @@ from agent_hub.runtime.contracts import JsonValue
 from agent_hub.runtime.failure_reason import is_legacy_generic_failure_reason
 from agent_hub.security.secrets import SecretService, SecretValidationError
 from agent_hub.skills.package import InvalidSkillPackage
-from agent_hub.skills.scanner import SkillScanner
+from agent_hub.skills.scanner import SkillScanner, SkillScanReport
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"], responses=BASE_ERROR_RESPONSES)
 _LOGGER = logging.getLogger(__name__)
@@ -320,6 +324,14 @@ class SkillResponse(BaseModel):
     status: str
     scan_diff: list[str]
     requested_permissions: list[str]
+
+
+class SkillArchiveUploadResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    filename: str
+    bundle: bool
+    items: list[SkillResponse]
 
 
 class McpServerResponse(BaseModel):
@@ -906,7 +918,7 @@ class AdminResourceService(Protocol):
 
     async def upload_skill(self, request: SkillUploadRequest) -> SkillResponse: ...
 
-    async def upload_skill_archive(self, filename: str, archive_bytes: bytes) -> SkillResponse: ...
+    async def upload_skill_archive(self, filename: str, archive_bytes: bytes) -> SkillArchiveUploadResponse: ...
 
     async def approve_skill(self, skill_id: str) -> SkillResponse: ...
 
@@ -988,6 +1000,178 @@ class AdminResourceService(Protocol):
     async def recommend_with_hermes(
         self, request: HermesRecommendationRequest
     ) -> HermesRecommendationResponse: ...
+
+
+_SKILL_MANIFEST_NAMES = frozenset({"skill.yaml", "skill.yml", "skill.json"})
+_MAX_SKILL_BUNDLE_ITEMS = 64
+
+
+@dataclass(frozen=True, slots=True)
+class _ScannedSkillArchive:
+    filename: str
+    archive_bytes: bytes
+    scan_report: SkillScanReport
+
+
+def _scan_skill_archive_upload(filename: str, archive_bytes: bytes) -> tuple[bool, tuple[_ScannedSkillArchive, ...]]:
+    scanner = SkillScanner()
+    try:
+        return False, (
+            _ScannedSkillArchive(
+                filename=filename,
+                archive_bytes=archive_bytes,
+                scan_report=scanner.scan(archive_bytes),
+            ),
+        )
+    except InvalidSkillPackage:
+        split_archives = _split_skill_bundle_archive(filename, archive_bytes)
+        if not split_archives:
+            raise
+        scanned = tuple(
+            _ScannedSkillArchive(
+                filename=item_filename,
+                archive_bytes=item_bytes,
+                scan_report=scanner.scan(item_bytes),
+            )
+            for item_filename, item_bytes in split_archives
+        )
+        return len(scanned) > 1, scanned
+
+
+def _skill_response_from_scan(filename: str, skill_id: str, scan_report: SkillScanReport) -> SkillResponse:
+    inspection = scan_report.inspection
+    return SkillResponse(
+        id=skill_id,
+        name=inspection.manifest.name,
+        status="scanned",
+        scan_diff=[
+            f"package {filename} scanned",
+            f"entry point: {inspection.manifest.entry_point}",
+            f"content sha256: {inspection.content_sha256}",
+        ],
+        requested_permissions=list(inspection.requested_capabilities),
+    )
+
+
+def _split_skill_bundle_archive(filename: str, archive_bytes: bytes) -> tuple[tuple[str, bytes], ...]:
+    if zipfile.is_zipfile(io.BytesIO(archive_bytes)):
+        return _split_zip_skill_bundle(filename, archive_bytes)
+    return _split_tar_skill_bundle(filename, archive_bytes)
+
+
+def _split_zip_skill_bundle(filename: str, archive_bytes: bytes) -> tuple[tuple[str, bytes], ...]:
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+            groups: dict[str, list[tuple[str, zipfile.ZipInfo]]] = {}
+            order: list[str] = []
+            for info in archive.infolist():
+                if info.is_dir() or info.filename.replace("\\", "/").endswith("/"):
+                    continue
+                mode = (info.external_attr >> 16) & 0o777777
+                if _skill_bundle_mode_is_unsafe(mode):
+                    raise InvalidSkillPackage("skill bundle contains links or device files")
+                grouped = _skill_bundle_group_and_inner_path(info.filename)
+                if grouped is None:
+                    continue
+                group, inner_path = grouped
+                if group not in groups:
+                    groups[group] = []
+                    order.append(group)
+                groups[group].append((inner_path, info))
+            return tuple(
+                (f"{PurePosixPath(filename).stem}-{group}.zip", _zip_group_to_skill_archive(archive, groups[group]))
+                for group in order
+                if _skill_group_has_manifest([path for path, _ in groups[group]])
+            )
+    except zipfile.BadZipFile as exc:
+        raise InvalidSkillPackage("skill archive must be a valid zip file") from exc
+
+
+def _split_tar_skill_bundle(filename: str, archive_bytes: bytes) -> tuple[tuple[str, bytes], ...]:
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
+            groups: dict[str, list[tuple[str, tarfile.TarInfo]]] = {}
+            order: list[str] = []
+            for member in archive.getmembers():
+                if member.isdir():
+                    continue
+                if member.issym() or member.islnk() or member.ischr() or member.isblk() or member.isfifo():
+                    raise InvalidSkillPackage("skill bundle contains links or device files")
+                if not member.isfile():
+                    raise InvalidSkillPackage("skill bundle contains unsupported file types")
+                grouped = _skill_bundle_group_and_inner_path(member.name)
+                if grouped is None:
+                    continue
+                group, inner_path = grouped
+                if group not in groups:
+                    groups[group] = []
+                    order.append(group)
+                groups[group].append((inner_path, member))
+            return tuple(
+                (f"{PurePosixPath(filename).stem}-{group}.zip", _tar_group_to_skill_archive(archive, groups[group]))
+                for group in order
+                if _skill_group_has_manifest([path for path, _ in groups[group]])
+            )
+    except tarfile.TarError as exc:
+        raise InvalidSkillPackage("skill archive must be a valid zip or tar archive") from exc
+
+
+def _skill_bundle_group_and_inner_path(name: str) -> tuple[str, str] | None:
+    normalized = name.replace("\\", "/").rstrip("/")
+    if normalized.startswith(("/", "../")) or "/../" in normalized:
+        raise InvalidSkillPackage("skill bundle contains path traversal")
+    if normalized in {"", ".", ".."} or normalized.endswith("/.."):
+        raise InvalidSkillPackage("skill bundle contains path traversal")
+    if len(normalized) >= 2 and normalized[1] == ":" and normalized[0].isalpha():
+        raise InvalidSkillPackage("skill bundle contains absolute paths")
+    path = PurePosixPath(normalized)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise InvalidSkillPackage("skill bundle contains unsafe paths")
+    if len(path.parts) < 2:
+        return None
+    return path.parts[0], PurePosixPath(*path.parts[1:]).as_posix()
+
+
+def _skill_group_has_manifest(paths: Iterable[str]) -> bool:
+    return any(path in _SKILL_MANIFEST_NAMES for path in paths)
+
+
+def _skill_bundle_mode_is_unsafe(mode: int) -> bool:
+    file_type = stat.S_IFMT(mode)
+    return file_type in {
+        stat.S_IFLNK,
+        stat.S_IFCHR,
+        stat.S_IFBLK,
+        stat.S_IFIFO,
+        stat.S_IFSOCK,
+    }
+
+
+def _zip_group_to_skill_archive(archive: zipfile.ZipFile, entries: list[tuple[str, zipfile.ZipInfo]]) -> bytes:
+    if len(entries) > _MAX_SKILL_BUNDLE_ITEMS:
+        raise InvalidSkillPackage("skill bundle item contains too many files")
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        for inner_path, source_info in entries:
+            target_info = zipfile.ZipInfo(inner_path)
+            target_info.external_attr = source_info.external_attr
+            output.writestr(target_info, archive.read(source_info.filename))
+    return buffer.getvalue()
+
+
+def _tar_group_to_skill_archive(archive: tarfile.TarFile, entries: list[tuple[str, tarfile.TarInfo]]) -> bytes:
+    if len(entries) > _MAX_SKILL_BUNDLE_ITEMS:
+        raise InvalidSkillPackage("skill bundle item contains too many files")
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        for inner_path, member in entries:
+            source = archive.extractfile(member)
+            if source is None:
+                raise InvalidSkillPackage("skill bundle item cannot be read")
+            target_info = zipfile.ZipInfo(inner_path)
+            target_info.external_attr = (member.mode & 0o777) << 16
+            output.writestr(target_info, source.read())
+    return buffer.getvalue()
 
 
 @dataclass(slots=True)
@@ -1305,9 +1489,9 @@ class InMemoryAdminResourceService:
         self.skills[response.id] = response
         return response
 
-    async def upload_skill_archive(self, filename: str, archive_bytes: bytes) -> SkillResponse:
+    async def upload_skill_archive(self, filename: str, archive_bytes: bytes) -> SkillArchiveUploadResponse:
         try:
-            inspection = SkillScanner().scan(archive_bytes).inspection
+            bundle, scanned_archives = _scan_skill_archive_upload(filename, archive_bytes)
         except InvalidSkillPackage:
             await self.record_log(
                 category="feature_error",
@@ -1318,19 +1502,12 @@ class InMemoryAdminResourceService:
                 details={"feature": "skills", "filename": filename},
             )
             raise
-        response = SkillResponse(
-            id=f"skill_{uuid4().hex}",
-            name=inspection.manifest.name,
-            status="scanned",
-            scan_diff=[
-                f"package {filename} scanned",
-                f"entry point: {inspection.manifest.entry_point}",
-                f"content sha256: {inspection.content_sha256}",
-            ],
-            requested_permissions=list(inspection.requested_capabilities),
-        )
-        self.skills[response.id] = response
-        return response
+        items: list[SkillResponse] = []
+        for scanned in scanned_archives:
+            response = _skill_response_from_scan(scanned.filename, f"skill_{uuid4().hex}", scanned.scan_report)
+            self.skills[response.id] = response
+            items.append(response)
+        return SkillArchiveUploadResponse(filename=filename, bundle=bundle, items=items)
 
     async def approve_skill(self, skill_id: str) -> SkillResponse:
         current = self.skills[skill_id]
@@ -2378,9 +2555,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         await self._record_audit("skill.upload", f"skill:{skill_id}", {"filename": request.filename})
         return response
 
-    async def upload_skill_archive(self, filename: str, archive_bytes: bytes) -> SkillResponse:
+    async def upload_skill_archive(self, filename: str, archive_bytes: bytes) -> SkillArchiveUploadResponse:
         try:
-            scan_report = SkillScanner().scan(archive_bytes)
+            bundle, scanned_archives = _scan_skill_archive_upload(filename, archive_bytes)
         except InvalidSkillPackage:
             await self.record_log(
                 category="feature_error",
@@ -2391,11 +2568,14 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 details={"feature": "skills", "filename": _safe_model_check_detail(filename)},
             )
             raise PublicAPIError(422, "invalid_skill_package", "skill package is invalid") from None
-        skill_id = f"skill_{uuid4().hex}"
+        items: list[SkillResponse] = []
         try:
-            archive_path = self._skill_archive_path(skill_id)
-            archive_path.parent.mkdir(parents=True, exist_ok=True)
-            archive_path.write_bytes(archive_bytes)
+            for scanned in scanned_archives:
+                skill_id = f"skill_{uuid4().hex}"
+                archive_path = self._skill_archive_path(skill_id)
+                archive_path.parent.mkdir(parents=True, exist_ok=True)
+                archive_path.write_bytes(scanned.archive_bytes)
+                items.append(_skill_response_from_scan(scanned.filename, skill_id, scanned.scan_report))
         except OSError:
             await self.record_log(
                 category="feature_error",
@@ -2406,22 +2586,11 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 details={"feature": "skills", "filename": _safe_model_check_detail(filename)},
             )
             raise PublicAPIError(503, "skill_store_unavailable", "skill store is unavailable") from None
-        inspection = scan_report.inspection
-        response = SkillResponse(
-            id=skill_id,
-            name=inspection.manifest.name,
-            status="scanned",
-            scan_diff=[
-                f"package {filename} scanned",
-                f"entry point: {inspection.manifest.entry_point}",
-                f"content sha256: {inspection.content_sha256}",
-            ],
-            requested_permissions=list(inspection.requested_capabilities),
-        )
-        if not await self._upsert_admin_payload("skill", skill_id, response.model_dump(mode="json")):
-            return await super().upload_skill_archive(filename, archive_bytes)
-        await self._record_audit("skill.upload", f"skill:{skill_id}", {"filename": filename})
-        return response
+        for response in items:
+            if not await self._upsert_admin_payload("skill", response.id, response.model_dump(mode="json")):
+                return await super().upload_skill_archive(filename, archive_bytes)
+            await self._record_audit("skill.upload", f"skill:{response.id}", {"filename": filename})
+        return SkillArchiveUploadResponse(filename=filename, bundle=bundle, items=items)
 
     async def approve_skill(self, skill_id: str) -> SkillResponse:
         payload = await self._get_admin_payload("skill", skill_id)
@@ -4430,12 +4599,16 @@ async def upload_skill(
     return await service.upload_skill(body)
 
 
-@router.post("/skills/upload", response_model=SkillResponse, responses=error_responses(401, 403, 413, 422, 503))
+@router.post(
+    "/skills/upload",
+    response_model=SkillArchiveUploadResponse,
+    responses=error_responses(401, 403, 413, 422, 503),
+)
 async def upload_skill_archive(
     request: Request,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
-) -> SkillResponse:
+) -> SkillArchiveUploadResponse:
     _require(principal, "skill:write")
     filename = _safe_skill_upload_filename(request.headers.get("x-agent-hub-skill-filename"))
     archive_bytes = await request.body()

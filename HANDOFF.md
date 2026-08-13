@@ -1,4 +1,61 @@
 
+## 2026-08-13 Skill Bundle Upload Slice
+
+Current state:
+
+- Skill archive uploads now return a structured upload result: `{ filename, bundle, items }`.
+- A normal single Skill ZIP/TAR upload remains compatible through `items[0]` and `bundle=false`.
+- A ZIP/TAR that contains multiple top-level Skill folders is now split into independent safe ZIP packages, scanned separately, stored separately, and returned as multiple `items` with `bundle=true`.
+- A single Skill that was zipped with one outer folder is also accepted by the same fallback split path.
+- Chat attachment flow still treats archives as ordinary attachments first; the user must click `作为 Skill 安装` before scanning/installing.
+- Chat Skill install confirmation now displays every scanned Skill in a bundle and approves all scanned items only after the user confirms.
+- Server incremental deployment to `103.236.98.133:/opt/agent-hub/current` was performed with `/tmp/agent-hub-skill-bundle-upload.tgz`.
+- Server services `agent-hub-api` and `agent-hub-worker` were restarted and active afterward; Caddy was reloaded for the rebuilt frontend.
+- Server real HTTP check passed with `/tmp/server_skill_bundle_upload_check.py`:
+  - loaded `/etc/agent-hub/secrets.env` and used deployed code from `/opt/agent-hub/current`;
+  - generated a short-lived in-memory super-admin token without printing secrets;
+  - created a real multi-Skill ZIP containing `server_bundle_writer` and `server_bundle_reviewer`;
+  - called real `POST /api/v1/admin/skills/upload`;
+  - confirmed `bundle=true`, two scanned items, and requested permission `tool:filesystem.read`;
+  - called real approve APIs for both uploaded Skill IDs;
+  - confirmed both uploaded Skills appeared as `enabled` through `GET /api/v1/admin/skills`;
+  - deleted the uploaded test Skills afterward.
+
+Changes made:
+
+- `src/agent_hub/api/routers/admin.py`
+  - Added `SkillArchiveUploadResponse`.
+  - Added bundle splitting for ZIP and TAR archives with path traversal and special-file rejection before subpackage scanning.
+  - Updated in-memory and persistent admin resource services to store and return multiple scanned Skills.
+- `web/src/api/client.ts`
+  - Added upload-result schema and updated `uploadSkillArchive`.
+- `web/src/pages/RunsPage.tsx`
+  - Tracks `skills[]` for pending Skill installs and approves all scanned bundle items after confirmation.
+- `web/src/pages/OperationalPages.test.tsx`
+  - Updated Skill upload mock and assertion to match the new upload result shape.
+- `tests/api/test_admin_resources.py`
+  - Updated existing ZIP/TAR upload tests for `bundle/items`.
+  - Added regression coverage for a multi-directory all-Skills ZIP.
+
+Verification performed:
+
+- TDD red:
+  - `uv run pytest tests/api/test_admin_resources.py::test_skill_archive_upload_scans_real_zip_package tests/api/test_admin_resources.py::test_skill_archive_upload_accepts_real_tar_gz_package tests/api/test_admin_resources.py::test_skill_archive_upload_scans_bundle_with_multiple_skill_directories -q --tb=short` first failed because the API returned a single `SkillResponse` and rejected the multi-directory bundle with 422.
+- Green/local:
+  - `uv run pytest tests/api/test_admin_resources.py::test_skill_archive_upload_scans_real_zip_package tests/api/test_admin_resources.py::test_skill_archive_upload_accepts_real_tar_gz_package tests/api/test_admin_resources.py::test_skill_archive_upload_scans_bundle_with_multiple_skill_directories -q --tb=short` -> 3 passed.
+  - `uv run pytest tests/api/test_admin_resources.py tests/unit/skills/test_package.py -q --tb=short` -> 89 passed.
+  - `uv run ruff check src tests` -> passed.
+  - `uv run mypy --strict src tests` -> passed.
+  - `npm test -- --run src/pages/OperationalPages.test.tsx -t "archive|Skill"` -> 43 passed.
+  - `npm run build` -> passed; Vite still reports the existing chunk-size warning.
+- Green/server:
+  - `/tmp/server_skill_bundle_upload_check.py` -> `PASS: server skill bundle upload scanned, approved, listed, and cleaned up`.
+
+Remaining risks / TODOs:
+
+- Add a user-facing attachment manager with list/delete support. Current attachments are stored under `/var/lib/agent-hub/attachments/{tenant_id}/` as `att_*.bin`, `att_*.json`, optional manifests, and optional extracted archive directories; there is no web UI or API delete endpoint yet.
+- Continue remaining P3 items after this release workflow: deeper Vibe runtime integration, OpenClaw multi-system adapters and permission modes, multimedia generation executor/capability enforcement, protected Feishu Skill install commands, and final usage README.
+
 ## 2026-08-13 Channel Language Directives Slice
 
 Current state:

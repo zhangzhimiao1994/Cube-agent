@@ -795,6 +795,36 @@ def skill_tar_archive() -> bytes:
     return buffer.getvalue()
 
 
+def skill_bundle_archive() -> bytes:
+    buffer = io.BytesIO()
+    skill_manifests = {
+        "writer": (
+            "name: writer_skill\n"
+            "version: 1.0.0\n"
+            "entry_point: main.py\n"
+            "compatible_runtime: python3.12\n"
+            "declared_tools:\n"
+            "  - filesystem.read\n"
+            "dependency_lock_hash: "
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+        ),
+        "reviewer": (
+            "name: reviewer_skill\n"
+            "version: 1.0.0\n"
+            "entry_point: main.py\n"
+            "compatible_runtime: python3.12\n"
+            "declared_tools: []\n"
+            "dependency_lock_hash: "
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+        ),
+    }
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for folder, manifest in skill_manifests.items():
+            archive.writestr(f"{folder}/skill.yaml", manifest)
+            archive.writestr(f"{folder}/main.py", "print('ok')\n")
+    return buffer.getvalue()
+
+
 def test_model_pool_reports_serial_slot_and_queue_policy() -> None:
     response = client().post("/api/v1/admin/models", headers=headers(), json=model_payload())
 
@@ -1457,11 +1487,14 @@ def test_skill_archive_upload_scans_real_zip_package() -> None:
 
     assert uploaded.status_code == 200
     body = uploaded.json()
-    assert body["name"] == "safe_skill"
-    assert body["status"] == "scanned"
-    assert body["requested_permissions"] == ["tool:filesystem.read"]
-    assert any("content sha256" in item for item in body["scan_diff"])
-    assert skills.json()[0]["id"] == body["id"]
+    assert body["bundle"] is False
+    assert len(body["items"]) == 1
+    item = body["items"][0]
+    assert item["name"] == "safe_skill"
+    assert item["status"] == "scanned"
+    assert item["requested_permissions"] == ["tool:filesystem.read"]
+    assert any("content sha256" in entry for entry in item["scan_diff"])
+    assert skills.json()[0]["id"] == item["id"]
 
 
 def test_skill_archive_upload_accepts_real_tar_gz_package() -> None:
@@ -1476,9 +1509,28 @@ def test_skill_archive_upload_accepts_real_tar_gz_package() -> None:
 
     assert uploaded.status_code == 200
     body = uploaded.json()
-    assert body["name"] == "safe_tar_skill"
-    assert body["status"] == "scanned"
-    assert any(item["id"] == body["id"] for item in skills.json())
+    assert body["bundle"] is False
+    assert body["items"][0]["name"] == "safe_tar_skill"
+    assert body["items"][0]["status"] == "scanned"
+    assert any(item["id"] == body["items"][0]["id"] for item in skills.json())
+
+
+def test_skill_archive_upload_scans_bundle_with_multiple_skill_directories() -> None:
+    api = client()
+
+    uploaded = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "all-skills.zip"},
+        content=skill_bundle_archive(),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert uploaded.status_code == 200
+    body = uploaded.json()
+    assert body["bundle"] is True
+    assert [item["name"] for item in body["items"]] == ["writer_skill", "reviewer_skill"]
+    assert body["items"][0]["requested_permissions"] == ["tool:filesystem.read"]
+    assert {item["name"] for item in skills.json()} == {"writer_skill", "reviewer_skill"}
 
 
 def test_skill_archive_upload_rejects_invalid_zip_without_saving_metadata() -> None:

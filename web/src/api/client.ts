@@ -426,6 +426,14 @@ const SkillSchema = z.object({
 
 export type Skill = z.infer<typeof SkillSchema>;
 
+const SkillArchiveUploadSchema = z.object({
+  filename: z.string(),
+  bundle: z.boolean(),
+  items: z.array(SkillSchema),
+});
+
+export type SkillArchiveUpload = z.infer<typeof SkillArchiveUploadSchema>;
+
 const AttachmentUploadSchema = z.object({
   id: z.string(),
   filename: z.string(),
@@ -1018,7 +1026,7 @@ export const api = {
       SkillSchema,
     );
   },
-  uploadSkillArchive(file: File): Promise<Skill> {
+  uploadSkillArchive(file: File): Promise<SkillArchiveUpload> {
     return requestBinary(
       "/api/v1/admin/skills/upload",
       {
@@ -1029,7 +1037,7 @@ export const api = {
           "X-Agent-Hub-Skill-Filename": file.name,
         },
       },
-      SkillSchema,
+      SkillArchiveUploadSchema,
     );
   },
   approveSkill(id: string): Promise<Skill> {

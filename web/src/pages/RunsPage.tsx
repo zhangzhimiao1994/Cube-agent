@@ -22,7 +22,7 @@ type ModeSelection = {
 };
 type SkillInstallCandidate = {
   fileName: string;
-  skill: Skill;
+  skills: Skill[];
   status: "scanned" | "enabled";
 };
 type ChatAttachmentDraft = {
@@ -1505,9 +1505,9 @@ export function RunsPage() {
 
   const uploadSkillArchive = useMutation({
     mutationFn: (file: File) => api.uploadSkillArchive(file),
-    onSuccess: (skill, file) => {
+    onSuccess: (result, file) => {
       setArchiveInstallFile(null);
-      setSkillInstallCandidate({ fileName: file.name, skill, status: "scanned" });
+      setSkillInstallCandidate({ fileName: file.name, skills: result.items, status: "scanned" });
       setSubmitNotice("Skill 包已完成安全扫描，请确认权限后再安装。");
       void queryClient.invalidateQueries({ queryKey: ["skills"] });
     },
@@ -1531,10 +1531,10 @@ export function RunsPage() {
   const approveUploadedSkill = useMutation({
     mutationFn: () => {
       if (!skillInstallCandidate) throw new Error("skill install candidate is unavailable");
-      return api.approveSkill(skillInstallCandidate.skill.id);
+      return Promise.all(skillInstallCandidate.skills.map((skill) => api.approveSkill(skill.id)));
     },
-    onSuccess: async (skill) => {
-      setSkillInstallCandidate((current) => (current ? { ...current, skill, status: "enabled" } : current));
+    onSuccess: async (skills) => {
+      setSkillInstallCandidate((current) => (current ? { ...current, skills, status: "enabled" } : current));
       setSubmitNotice("Skill 已安装并启用。后续 Agent 可以在权限边界内引用它。");
       await queryClient.invalidateQueries({ queryKey: ["skills"] });
     },
@@ -2202,14 +2202,20 @@ export function RunsPage() {
                   <span className="eyebrow">
                     {skillInstallCandidate.status === "enabled" ? "Skill 已安装并启用" : "Skill 包已扫描，等待确认"}
                   </span>
-                  <strong>{skillInstallCandidate.skill.name}</strong>
-                  <small>{skillInstallCandidate.fileName}</small>
+                  <strong>{skillInstallCandidate.skills.map((skill) => skill.name).join(", ")}</strong>
+                  <small>
+                    {skillInstallCandidate.fileName} · {skillInstallCandidate.skills.length} Skill
+                  </small>
                 </div>
-                {skillInstallCandidate.skill.requested_permissions.length > 0 ? (
+                {skillInstallCandidate.skills.some((skill) => skill.requested_permissions.length > 0) ? (
                   <ul>
-                    {skillInstallCandidate.skill.requested_permissions.map((permission) => (
-                      <li key={permission}>{permission}</li>
-                    ))}
+                    {skillInstallCandidate.skills.flatMap((skill) =>
+                      skill.requested_permissions.map((permission) => (
+                        <li key={`${skill.id}-${permission}`}>
+                          {skill.name}: {permission}
+                        </li>
+                      )),
+                    )}
                   </ul>
                 ) : (
                   <p>未请求额外权限。</p>
