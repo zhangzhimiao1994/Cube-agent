@@ -142,10 +142,18 @@ def test_configuration_models_reject_unknown_fields(
         validator.model_validate(value)
 
 
-@pytest.mark.parametrize("capabilities", [set(), {"audio"}])
+@pytest.mark.parametrize("capabilities", [set(), {"unknown"}])
 def test_capabilities_are_non_empty_and_known(capabilities: set[str]) -> None:
     with pytest.raises(ValidationError):
         deployment(capabilities=capabilities)
+
+
+def test_deployment_accepts_input_understanding_capabilities() -> None:
+    definition = deployment(capabilities={"text", "vision", "audio"})
+    runtime = definition.to_deployment(deployment_id="primary-1", logical_model="primary")
+
+    assert definition.capabilities == {"text", "vision", "audio"}
+    assert {str(capability) for capability in runtime.capabilities} == {"text", "vision", "audio"}
 
 
 def test_deployment_accepts_generation_capabilities() -> None:

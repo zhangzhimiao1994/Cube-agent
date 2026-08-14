@@ -36,7 +36,12 @@ Remaining risks / next:
 
 - This slice adds configuration support for speech/audio input understanding; actual audio file transcription/routing still needs a later runtime/channel implementation.
 - Continue the queued attachment upload `network request failed (HTTP 0)` investigation next.
-- Commit this slice, create local ignored GitHub recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions.
+
+Push / archive status:
+
+- Runtime code was committed as `371223a feat: add input understanding model capabilities` and pushed to `mutilagent/main` after creating local recovery bundle `.local-archives/github-pushes/mutilagent-main-before-20260814-122339-3a9a5f8.bundle` and GitHub archive tag `archive/mutilagent-main-before-20260814-122339-3a9a5f8`.
+- GitHub Actions run `31769748362` failed because `tests/unit/config/test_schema.py` still expected `audio` to be invalid. The follow-up test-only fix changes that old assertion to an unknown capability and adds a unit round trip for `text`, `vision`, and `audio`.
+- Follow-up verification: `uv run pytest tests/unit/config/test_schema.py -q --tb=short` -> 65 passed; `uv run ruff check tests/unit/config/test_schema.py` -> passed; `uv run mypy --strict src/agent_hub/config/schema.py tests/unit/config/test_schema.py` -> passed; `git diff --check` -> passed with the existing CRLF warning. Local full `uv run pytest -q` on Windows still times out/fails in integration setup because the temporary Postgres service does not become ready on `127.0.0.1`, while the GitHub Linux runner previously reached the schema assertion.
 ## 2026-08-14 Hermes Runtime Learning Bulk ID Fix
 
 Current state:
