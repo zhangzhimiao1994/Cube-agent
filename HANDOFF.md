@@ -3876,3 +3876,8 @@ CI follow-up:
 - Local targeted verification passed: `uv run pytest tests/unit/install/test_native_install_scripts.py::test_auto_mode_prefers_native_on_supported_systemd_hosts tests/unit/test_deployment_contracts.py::test_readme_uses_repository_checkout_instead_of_placeholder_install_url -q`.
 - Local `uv run ruff check tests/unit/test_deployment_contracts.py tests/unit/install/test_native_install_scripts.py` passed.
 - Local full `uv run pytest -q` did not complete on Windows before the 300s tool timeout; it ended with stdout flush errors after timeout rather than a test failure report. Recheck full suite through GitHub Actions after pushing the fix.
+
+GitHub push status:
+- Recovery bundle before the README/audit push: `.local-archives/github-pushes/mutilagent-main-before-20260814-153938-8aed15f.bundle`; GitHub archive tag `archive/mutilagent-main-before-20260814-153938-8aed15f`.
+- Recovery bundle before the CI contract fix push: `.local-archives/github-pushes/mutilagent-main-before-20260814-155049-6ced4bf.bundle`; GitHub archive tag `archive/mutilagent-main-before-20260814-155049-6ced4bf`.
+- Latest pushed commit `ac8fd55` (`test: update readme deployment contract`) passed GitHub Actions run `31781542679`.
