@@ -637,6 +637,7 @@ const AuditEventSchema = z.object({
   actor: z.string(),
   action: z.string(),
   resource: z.string(),
+  details: z.record(z.string(), z.string()).default({}),
   created_at: z.string(),
 });
 

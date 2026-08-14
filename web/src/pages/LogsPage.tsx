@@ -10,7 +10,7 @@ const LOG_MODULES = [
     path: "audit",
     category: "audit",
     title: "审计日志",
-    description: "配置发布、Skill 审批、运行控制等必须留痕的安全审计记录。",
+    description: "配置发布、Skill 审批、运行控制和用户对话提交等必须留痕的安全审计记录。",
   },
   {
     path: "model",
@@ -64,10 +64,36 @@ function logDetailsText(entry: LogEntry) {
   return Object.entries(entry.details).map(([key, value]) => `${key}: ${value}`).join("; ");
 }
 
+function auditDisplayMessage(entry: LogEntry) {
+  if (entry.category !== "audit") return entry.message;
+  if (entry.details.action === "run.submit" || entry.message === "run.submit") return "对话提交";
+  return entry.message;
+}
+
+function auditConversationSummary(entry: LogEntry) {
+  if (entry.category !== "audit" || (entry.details.action !== "run.submit" && entry.message !== "run.submit")) return null;
+  return [
+    `用户 ${entry.details.user_id ?? entry.details.actor ?? "未知"}`,
+    `对话 ${entry.details.conversation_id ?? "未关联"}`,
+    `运行 ${entry.details.run_id ?? entry.details.resource ?? "未知"}`,
+    `模式 ${entry.details.accepted_mode ?? entry.details.mode ?? "未知"}`,
+  ].join(" / ");
+}
+
 function logMatchesFilters(entry: LogEntry, searchTerm: string, levelFilter: "all" | LogEntry["level"]) {
   if (levelFilter !== "all" && entry.level !== levelFilter) return false;
   return textContains(
-    [entry.id, entry.category, entry.level, entry.title, entry.message, entry.source, entry.created_at, logDetailsText(entry)].join(" "),
+    [
+      entry.id,
+      entry.category,
+      entry.level,
+      entry.title,
+      auditDisplayMessage(entry),
+      auditConversationSummary(entry) ?? "",
+      entry.source,
+      entry.created_at,
+      logDetailsText(entry),
+    ].join(" "),
     searchTerm,
   );
 }
@@ -93,7 +119,7 @@ const EMPTY_LOG_FILTERS: LogColumnFilters = {
 function matchesLogColumns(entry: LogEntry, filters: LogColumnFilters) {
   return (
     (filters.level === "all" || entry.level === filters.level) &&
-    textContains(`${entry.title} ${entry.message}`, filters.title) &&
+    textContains(`${entry.title} ${auditDisplayMessage(entry)} ${auditConversationSummary(entry) ?? ""}`, filters.title) &&
     textContains(entry.source, filters.source) &&
     textContains(entry.created_at, filters.time) &&
     textContains(logDetailsText(entry), filters.details)
@@ -102,7 +128,7 @@ function matchesLogColumns(entry: LogEntry, filters: LogColumnFilters) {
 
 function logSortValue(entry: LogEntry, key: LogSortKey) {
   if (key === "level") return entry.level;
-  if (key === "title") return `${entry.title} ${entry.message}`;
+  if (key === "title") return `${entry.title} ${auditDisplayMessage(entry)} ${auditConversationSummary(entry) ?? ""}`;
   if (key === "source") return entry.source;
   if (key === "time") return entry.created_at;
   return logDetailsText(entry);
@@ -196,7 +222,7 @@ function LogModulePage({ module }: { module: (typeof LOG_MODULES)[number] }) {
             aria-label="搜索日志"
             value={searchTerm}
             onChange={(event) => setSearchTerm(event.target.value)}
-            placeholder="搜索标题、消息、来源或详情"
+            placeholder={module.category === "audit" ? "搜索用户、对话、操作、来源或详情" : "搜索标题、消息、来源或详情"}
           />
         </label>
         <label>
@@ -264,10 +290,10 @@ function LogModulePage({ module }: { module: (typeof LOG_MODULES)[number] }) {
                     <option value="error">error</option>
                   </select>
                 </th>
-                <th><input aria-label="按日志标题筛选" value={columnFilters.title} onChange={(event) => updateColumnFilter("title", event.currentTarget.value)} placeholder="标题或消息" /></th>
+                <th><input aria-label="按日志标题筛选" value={columnFilters.title} onChange={(event) => updateColumnFilter("title", event.currentTarget.value)} placeholder={module.category === "audit" ? "操作或对话" : "标题或消息"} /></th>
                 <th><input aria-label="按日志来源筛选" value={columnFilters.source} onChange={(event) => updateColumnFilter("source", event.currentTarget.value)} placeholder="来源" /></th>
                 <th><input aria-label="按日志时间筛选" value={columnFilters.time} onChange={(event) => updateColumnFilter("time", event.currentTarget.value)} placeholder="时间" /></th>
-                <th><input aria-label="按日志详情筛选" value={columnFilters.details} onChange={(event) => updateColumnFilter("details", event.currentTarget.value)} placeholder="详情键或值" /></th>
+                <th><input aria-label="按日志详情筛选" value={columnFilters.details} onChange={(event) => updateColumnFilter("details", event.currentTarget.value)} placeholder={module.category === "audit" ? "用户、对话或运行" : "详情键或值"} /></th>
               </tr>
             </thead>
             <tbody>
@@ -285,7 +311,13 @@ function LogModulePage({ module }: { module: (typeof LOG_MODULES)[number] }) {
                   <td>
                     <strong>{entry.title}</strong>
                     <br />
-                    <span>{entry.message}</span>
+                    <span>{auditDisplayMessage(entry)}</span>
+                    {auditConversationSummary(entry) ? (
+                      <>
+                        <br />
+                        <small>{auditConversationSummary(entry)}</small>
+                      </>
+                    ) : null}
                   </td>
                   <td>{entry.source}</td>
                   <td><time dateTime={entry.created_at}>{entry.created_at}</time></td>

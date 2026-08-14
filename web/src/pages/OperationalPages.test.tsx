@@ -618,6 +618,29 @@ describe("operational management pages", () => {
               details: { resource: "configuration", actor: "system" },
               created_at: "2026-08-07T00:03:00Z",
             },
+            {
+              id: "audit-run-submit-1",
+              category: "audit",
+              level: "info",
+              title: "审计日志",
+              message: "run.submit",
+              source: "admin.audit",
+              details: {
+                action: "run.submit",
+                actor: "11111111-1111-4111-8111-111111111111",
+                user_id: "11111111-1111-4111-8111-111111111111",
+                user_role: "super_admin",
+                resource: runId,
+                run_id: runId,
+                conversation_id: "conv-audit-user-1",
+                reference_conversation_id: "conv-previous",
+                mode: "auto",
+                accepted_mode: "dispatch",
+                status: "queued",
+                message_preview: "请继续优化这个方案",
+              },
+              created_at: "2026-08-07T00:03:30Z",
+            },
           ];
           const url = new URL(path, "https://agent-hub.test");
           const category = url.searchParams.get("category");
@@ -1951,6 +1974,16 @@ describe("operational management pages", () => {
     const logTable = screen.getByRole("table", { name: "模型配置与调用错误列表" });
     expect(within(logTable).getByText("anthropic preflight latency is high")).not.toBeNull();
     expect(within(logTable).queryByText("provider returned status=401")).toBeNull();
+
+    cleanup();
+    render(<TestApp initialPath="/logs/audit" />);
+    expect(await screen.findByRole("heading", { name: "审计日志", level: 2 })).not.toBeNull();
+    expect(screen.getByText("对话提交")).not.toBeNull();
+    expect(screen.getByText(/用户 11111111-1111-4111-8111-111111111111 \/ 对话 conv-audit-user-1/)).not.toBeNull();
+    await user.type(screen.getByRole("textbox", { name: "按日志详情筛选" }), "conv-audit-user-1");
+    const auditTable = screen.getByRole("table", { name: "审计日志列表" });
+    expect(within(auditTable).getByText("对话提交")).not.toBeNull();
+    expect(within(auditTable).queryByText("config.publish")).toBeNull();
   });
 
   it("shows Hermes learning by time and conversation id with detail confirmation", async () => {

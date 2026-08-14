@@ -3838,3 +3838,34 @@ Remaining risks / next:
 
 - Create local and GitHub recovery archives, push `mutilagent/main`, and verify Actions.
 - Continue P3 with final usage README/README.zh-CN, broader UI copy/layout audit, and Docker readiness later.
+
+## 2026-08-14 Audit Conversation Ledger And GitHub README
+
+Changed:
+- Made `/logs/audit` explicitly classify `run.submit` audit entries as `对话提交` and surface user, conversation, run, and accepted mode in the log row summary.
+- Kept audit detail filtering useful for user/conversation lookup by including run-submit summaries in search, sort, and title-column filters.
+- Added `details` to the frontend `AuditEvent` schema so older audit views/export paths do not discard backend audit details.
+- Added a frontend regression fixture for a user-submitted conversation audit log and verified filtering by conversation id.
+- Rewrote `README.md` for GitHub usage and added `README.zh-CN.md` as the detailed Chinese usage guide. Updated install commands to `zhangzhimiao1994/mutilagent`.
+
+Verification:
+- `npm test -- OperationalPages.test.tsx --runInBand` passed: 51 tests.
+- `npm run lint -- --max-warnings=0` passed.
+- `npm test -- --run` passed: 13 files / 114 tests.
+- `npm run build` passed; Vite only reported the existing large chunk warning.
+- `git diff --check` passed with only the existing CRLF normalization warning for `web/src/pages/LogsPage.tsx`.
+- README local links exist and no `mix-agent` references remain in the README files.
+
+Remaining notes:
+- The audit backend already records `run.submit` with `user_id`, `user_role`, `run_id`, `conversation_id`, `reference_conversation_id`, mode fields, Vibe Coding flag, attachment count, message preview, and message SHA-256.
+- MiniMax/Hailuo is the current implemented multimedia video provider. Other multimedia provider presets are configuration/routing groundwork unless a provider client is added.
+- Continue with server incremental deployment and real server verification before GitHub force-with-lease push.
+Server deployment and real verification:
+- Incremental package: `.local-archives/server-incrementals/agent-hub-readme-audit-logs-20260814-153243.tgz`.
+- Uploaded to `root@103.236.98.133:/tmp/agent-hub-readme-audit-logs.tgz` and extracted into `/opt/agent-hub/current`.
+- Server backup created at `/opt/agent-hub/backups/readme-audit-logs-20260814-073614`.
+- Deployed frontend `web/dist` contains the new audit wording `对话提交`.
+- Server README files contain `zhangzhimiao1994/mutilagent` clone/archive URLs.
+- Real server API probe used a short-lived admin token generated on the server, submitted a real `POST /api/v1/runs` request, then read `GET /api/v1/admin/logs?category=audit`.
+- Probe result: `submit_status=202`, `audit_logs_status=200`, run `af80f59f-2358-43d5-929e-e362d26924e8`, conversation `conv-audit-probe-9cb4c999fc8f`, `audit_user_id_present=True`, `audit_conversation_id_present=True`, mode fields `auto->None`.
+- Cleaned server `/tmp/agent-hub-readme-audit-logs.tgz`, `/tmp/deploy-readme-audit-logs.sh`, and `/tmp/probe-audit-run-submit.sh`.
