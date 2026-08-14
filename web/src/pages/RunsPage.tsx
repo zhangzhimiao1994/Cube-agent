@@ -1926,14 +1926,14 @@ export function RunsPage() {
       </div>
 
       <div className="chat-console">
-        <nav className="conversation-list" aria-label="手机版会话导航">
+        <nav className="conversation-list" aria-label="会话导航">
           <div className="conversation-list-header">
             <div>
-              <h3>历史会话</h3>
+              <h3>会话</h3>
               <span>{items.length} 条</span>
             </div>
-            <button type="button" className="secondary-action conversation-new-button" onClick={startNewConversation}>
-              新建对话
+            <button type="button" className="secondary-action conversation-new-button" aria-label="新建对话" onClick={startNewConversation}>
+              新建
             </button>
           </div>
           {items.length > 0 ? (
@@ -1954,13 +1954,13 @@ export function RunsPage() {
                 disabled={selectedDeletableConversationIds.length === 0 || bulkDeleteRuns.isPending}
                 onClick={deleteSelectedConversations}
               >
-                {bulkDeleteRuns.isPending ? "删除中..." : "批量删除已选会话"}
+                {bulkDeleteRuns.isPending ? "删除中..." : "批量删除"}
               </button>
               <small>已选 {selectedDeletableConversationIds.length}</small>
             </div>
           ) : null}
           {items.length === 0 ? (
-            <p className="field-help">还没有对话。可以从右侧输入框发起第一次交流。</p>
+            <p className="field-help">还没有会话。直接发送消息即可开始。</p>
           ) : (
             items.map((run) => {
               const canDelete = TERMINAL_STATUSES.has(run.status);
@@ -2175,10 +2175,10 @@ export function RunsPage() {
               <p role="alert">{formatApiError(activeConversation.error, "当前会话读取失败")}</p>
             ) : null}
             <div className="chat-session-toolbar" aria-label="当前对话操作">
-              <p className="chat-conversation-status">当前会话：{conversationId}</p>
+              <p className="chat-conversation-status">会话：{conversationId}</p>
               <div>
-                <button type="button" className="secondary-action" onClick={startNewConversation}>
-                  新建对话
+                <button type="button" className="secondary-action" aria-label="新建对话" onClick={startNewConversation}>
+                  新建
                 </button>
               </div>
             </div>
@@ -2408,7 +2408,7 @@ export function RunsPage() {
                   disabled={!latestVisibleRun && !handoffActive}
                   onClick={() => startHandoffConversation(latestVisibleRun)}
                 >
-                  按照原思路
+                  原思路
                 </button>
                 <button
                   type="button"
@@ -2419,7 +2419,7 @@ export function RunsPage() {
                   disabled={!settings.data?.vibe_coding_enabled}
                   onClick={() => setVibeCoding((current) => !current)}
                 >
-                  Vibe Coding
+                  Vibe
                 </button>
                 <button
                   type="button"

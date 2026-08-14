@@ -867,7 +867,7 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
     expect(await within(stream).findByText("给我做一个短视频脚本方案。")).not.toBeNull();
     expect(within(stream).getAllByText(/这是最终回复正文/).length).toBeGreaterThan(0);
-    expect(screen.getByText(/当前会话：conv-previous/)).not.toBeNull();
+    expect(screen.getByText(/会话：conv-previous/)).not.toBeNull();
   });
 
   it("opens a historical conversation and continues inside the same conversation id", async () => {
@@ -876,7 +876,7 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
-    await screen.findByText(/当前会话：conv-previous/);
+    await screen.findByText(/会话：conv-previous/);
     await user.type(screen.getByPlaceholderText(/输入消息/), "继续优化这个脚本。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
@@ -950,7 +950,7 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
-    await screen.findByText(/当前会话：conv-previous/);
+    await screen.findByText(/会话：conv-previous/);
     await user.click(screen.getByRole("button", { name: "按照原思路" }));
     await user.click(screen.getByRole("button", { name: "Vibe Coding" }));
     await user.type(screen.getByPlaceholderText(/输入消息/), "沿用上一轮方向。");
@@ -972,7 +972,7 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
-    await screen.findByText(/当前会话：conv-previous/);
+    await screen.findByText(/会话：conv-previous/);
     await user.click(screen.getByRole("button", { name: "按照原思路" }));
     await user.click(screen.getByRole("button", { name: "按照原思路" }));
     await user.type(screen.getByPlaceholderText(/输入消息/), "不引用上一轮。");
@@ -1013,7 +1013,7 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
-    await screen.findByText(/当前会话：conv-previous/);
+    await screen.findByText(/会话：conv-previous/);
 
     const handoffButton = screen.getByRole("button", { name: "按照原思路" });
     const vibeButton = screen.getByRole("button", { name: "Vibe Coding" });
@@ -1038,7 +1038,7 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
-    await screen.findByText(/当前会话：conv-previous/);
+    await screen.findByText(/会话：conv-previous/);
 
     await user.type(screen.getByPlaceholderText(/输入消息/), "继续优化这个脚本。");
     await user.click(screen.getByRole("button", { name: "发送" }));
@@ -1098,7 +1098,7 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
-    await screen.findByText(/当前会话：conv-previous/);
+    await screen.findByText(/会话：conv-previous/);
     await user.click(screen.getByRole("button", { name: "按照原思路" }));
     expect(screen.queryByRole("button", { name: "自动" })).toBeNull();
     expect(screen.queryByRole("button", { name: "直连" })).toBeNull();
@@ -1767,7 +1767,7 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("checkbox", { name: "Select all deletable conversations" })).not.toBeNull();
     await user.click(screen.getByRole("checkbox", { name: "Select all deletable conversations" }));
-    await user.click(screen.getByRole("button", { name: "批量删除已选会话" }));
+    await user.click(screen.getByRole("button", { name: "批量删除" }));
 
     await waitFor(() =>
       expect(requests.find((request) => request.path === "/api/v1/admin/runs/bulk-delete")).toMatchObject({
@@ -1857,7 +1857,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
-    expect(screen.getByRole("navigation", { name: "手机版会话导航" })).not.toBeNull();
+    expect(screen.getByRole("navigation", { name: "会话导航" })).not.toBeNull();
     expect(screen.getByRole("region", { name: "主对话内容" })).not.toBeNull();
     expect(screen.getByRole("button", { name: /打开本次运行配置/ })).not.toBeNull();
     await openRunConfig(user);

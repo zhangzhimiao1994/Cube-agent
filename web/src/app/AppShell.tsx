@@ -50,7 +50,7 @@ export function AppShell() {
           </button>
           <div className="mobile-nav-title">
             <span>{APP_BRAND_NAME}</span>
-            <strong>工作台</strong>
+            <strong>魔方工作台</strong>
           </div>
         </div>
         <button
@@ -155,8 +155,8 @@ export function AppShell() {
       <div className="workspace">
         <header className="topbar">
           <div>
-            <p className="eyebrow">Production management</p>
-            <h2>魔方 Agent 工作台</h2>
+            <p className="eyebrow">工作台</p>
+            <h2>魔方agent</h2>
           </div>
           <div className="user-chip">
             <span>{auth.user?.username}</span>

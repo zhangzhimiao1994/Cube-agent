@@ -92,12 +92,12 @@ describe("LoginPage", () => {
 
   it("logs in and opens the run dashboard", async () => {
     render(<TestApp initialPath="/login" />);
-    expect(await screen.findByRole("heading", { name: "魔方 Agent 工作台" })).not.toBeNull();
-    expect(screen.getByRole("heading", { name: "登录工作台" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "魔方agent" })).not.toBeNull();
+    expect(screen.getByRole("heading", { name: "进入魔方agent" })).not.toBeNull();
     expect(screen.getByAltText("魔方agent")).not.toBeNull();
     await userEvent.type(screen.getByLabelText("Username"), "owner");
     await userEvent.type(screen.getByLabelText("Password"), "correct horse battery staple");
-    await userEvent.click(screen.getByRole("button", { name: "登录魔方 Agent" }));
+    await userEvent.click(screen.getByRole("button", { name: "进入工作台" }));
 
     expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
   });
@@ -107,7 +107,7 @@ describe("LoginPage", () => {
     render(<TestApp initialPath="/login" />);
     await userEvent.type(screen.getByLabelText("Username"), "owner");
     await userEvent.type(screen.getByLabelText("Password"), "wrong");
-    await userEvent.click(screen.getByRole("button", { name: "登录魔方 Agent" }));
+    await userEvent.click(screen.getByRole("button", { name: "进入工作台" }));
 
     expect((await screen.findByRole("alert")).textContent).toBe("账号或密码不对，请再检查一次。");
     expect(setItem).not.toHaveBeenCalled();
@@ -146,7 +146,7 @@ describe("LoginPage", () => {
   it("protects the dashboard while session is missing", async () => {
     render(<TestApp initialPath="/" />);
 
-    await waitFor(() => expect(screen.getByRole("heading", { name: "魔方 Agent 工作台" })).not.toBeNull());
+    await waitFor(() => expect(screen.getByRole("heading", { name: "魔方agent" })).not.toBeNull());
     expect(screen.getByAltText("魔方agent")).not.toBeNull();
   });
 

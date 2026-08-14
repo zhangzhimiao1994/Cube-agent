@@ -3013,3 +3013,143 @@ article:hover {
     transition-duration: 0.01ms !important;
   }
 }
+/* P3 compact mobile UI refinements. */
+.conversation-item {
+  border: 0;
+  border-radius: 0.5rem;
+  box-shadow: none;
+  min-height: auto;
+  transform: none;
+}
+
+.conversation-item:hover,
+.conversation-item:focus-visible {
+  box-shadow: none;
+  transform: none;
+}
+
+.conversation-delete-button {
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  .auth-layout {
+    align-content: start;
+    gap: 1rem;
+    padding: 0.95rem;
+  }
+
+  .auth-hero h1 {
+    font-size: 2.6rem;
+    line-height: 1;
+  }
+
+  .auth-hero p {
+    font-size: 0.96rem;
+    line-height: 1.6;
+  }
+
+  .auth-card {
+    border-radius: 1.15rem;
+  }
+
+  .conversation-list {
+    border-radius: 0.75rem;
+    gap: 0.35rem;
+    max-height: 10.5rem;
+    padding: 0.5rem;
+  }
+
+  .conversation-list-header {
+    border-radius: 0.55rem;
+    padding: 0.38rem 0.45rem;
+  }
+
+  .conversation-list-header h3 {
+    font-size: 0.9rem;
+  }
+
+  .conversation-new-button {
+    font-size: 0.78rem;
+    min-height: 1.9rem;
+    padding: 0.3rem 0.5rem;
+  }
+
+  .conversation-row {
+    border-radius: 0.55rem;
+    gap: 0.25rem;
+    min-height: 2.45rem;
+    padding: 0.3rem;
+  }
+
+  .conversation-item {
+    gap: 0.08rem;
+    padding: 0.18rem;
+  }
+
+  .conversation-item strong {
+    font-size: 0.88rem;
+  }
+
+  .conversation-delete-button {
+    font-size: 0.72rem;
+    min-height: 1.7rem;
+    padding: 0.25rem 0.38rem;
+  }
+
+  .conversation-bulk-actions {
+    border-radius: 0.65rem;
+    gap: 0.35rem;
+    padding: 0.45rem;
+  }
+
+  .conversation-bulk-actions button {
+    font-size: 0.78rem;
+    min-height: 1.9rem;
+    padding: 0.3rem 0.48rem;
+  }
+
+  .chat-session-toolbar {
+    align-items: center;
+    flex-direction: row;
+    gap: 0.45rem;
+  }
+
+  .chat-session-toolbar div {
+    flex: 0 0 auto;
+    width: auto;
+  }
+
+  .chat-session-toolbar .secondary-action {
+    flex: 0 0 auto;
+    width: auto;
+  }
+
+  .chat-conversation-status {
+    flex: 1 1 11rem;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .composer-tool-row {
+    gap: 0.35rem;
+    grid-template-columns: minmax(3.5rem, 0.65fr) minmax(4.4rem, 1fr) minmax(3.8rem, 0.8fr) 2.35rem;
+  }
+
+  .composer-tool-row .composer-plus-button {
+    width: 2.35rem;
+  }
+
+  .composer-tool-row .composer-upload-button,
+  .composer-tool-row .composer-handoff-button,
+  .composer-tool-row .composer-plus-button {
+    font-size: 0.78rem;
+    height: 2.25rem;
+    min-height: 2.25rem;
+    padding-left: 0.45rem;
+    padding-right: 0.45rem;
+    white-space: nowrap;
+  }
+}

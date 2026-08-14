@@ -3442,3 +3442,58 @@ Remaining risks / next:
 - Push `main` with `git push --force-with-lease mutilagent main`.
 - Check GitHub Actions and fix/redeploy/repush if red.
 - Continue P3 with UI layout/text cleanup and final usage README.
+
+## 2026-08-14 Compact Login and Mobile Chat UI Polish
+
+Current state:
+
+- Login and authenticated shell copy now use `魔方agent` without the old split `魔方 Agent 工作台` wording.
+- Login page copy is more product-oriented and the submit action is now `进入工作台`.
+- Mobile shell title is `魔方工作台`; the topbar eyebrow is localized to `工作台`.
+- Chat history navigation is more compact: visible header is `会话`, the primary new-chat button is visually `新建` while keeping `aria-label="新建对话"`.
+- Chat composer buttons keep full accessible labels but show shorter mobile text: `原思路`, `Vibe`, and `+`.
+- Mobile CSS now makes conversation rows less round and lower height, trims bulk-action/new buttons, and stabilizes composer columns so buttons do not wrap into unusable multi-line controls.
+
+Changes made:
+
+- Updated `web/src/pages/LoginPage.tsx` login branding and product copy.
+- Updated `web/src/app/AppShell.tsx` topbar/mobile shell wording.
+- Updated `web/src/pages/RunsPage.tsx` conversation navigation wording and compact visible action labels.
+- Added compact mobile CSS overrides in `web/src/styles.css` for login, conversation list, conversation toolbar, and composer tools.
+- Updated frontend tests for the new copy and compact conversation labels.
+
+Local verification:
+
+- `npm.cmd run lint` -> passed.
+- `npm.cmd run test -- --run src/app/AppShell.test.tsx src/pages/LoginPage.test.tsx src/pages/OperationalPages.test.tsx` -> 62 passed.
+- `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+- Browser plugin invocation failed because the local Node browser runtime hit the Windows ACL sandbox read error; used Playwright fallback per frontend-debugging skill.
+- Playwright against local Vite preview at `http://127.0.0.1:4173` checked mobile login and mobile chat rendering:
+  - login headings `魔方agent` and `进入魔方agent` visible;
+  - chat heading and `会话导航` visible;
+  - `按照原思路` and `Vibe Coding` buttons retained accessible names;
+  - composer tool boxes measured as 68x36, 104x36, 83x36, and 38x36 px;
+  - screenshots saved under ignored `.tmp/`.
+- `npm.cmd run test -- --run` -> 105 passed.
+- `git diff --check` -> passed.
+
+Server deployment and verification:
+
+- Uploaded `/tmp/agent-hub-ui-compact-branding.tgz` first, but server build showed `web/src` was missing earlier frontend files such as `app/brand.ts` and newer client schemas.
+- Uploaded a corrective source sync package `/tmp/agent-hub-web-src-sync-ui-compact.tgz` containing the complete `web/src` tree only; no `dist`, `node_modules`, env, local archives, screenshots, or temp files were included.
+- Server backup path for the successful source sync: `/opt/agent-hub/backups/web-src-sync-ui-compact-20260814-034827`.
+- Rebuilt frontend on the server and restarted `agent-hub-api`, `agent-hub-worker`, and Caddy; all three reported active.
+- Server build passed but printed the existing Node version warning: server Node.js is 18.19.1 while Vite recommends 20.19+ or 22.12+.
+- Ran `/tmp/server_ui_compact_check.py` against real Caddy/API on the server:
+  - `caddy_serves_index`;
+  - `frontend_assets_fetchable`;
+  - `login_brand_copy_deployed`;
+  - `chat_compact_copy_deployed`;
+  - `mobile_compact_css_deployed`;
+  - `auth_api_still_responds` with `/api/v1/auth/me` returning 401 for unauthenticated access.
+
+Remaining risks / next:
+
+- This is a focused UI polish slice, not the final whole-product UI copy/layout audit.
+- Need commit this slice, create local ignored recovery bundle and GitHub archive tag for the previous remote main, push `main` with `--force-with-lease`, and check GitHub Actions.
+- Continue the remaining P3 queue after green: broader UI audit after remaining modules, final README/README.zh-CN, and later Docker readiness.
