@@ -369,6 +369,18 @@ class SkillResponse(BaseModel):
     requested_permissions: list[str]
 
 
+class SkillBulkDeleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ids: list[str] = Field(min_length=1, max_length=1000)
+
+
+class SkillBulkDeleteResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    deleted: list[str]
+    failed: list[BulkFailureResponse]
+
 class SkillArchiveSkippedResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -7391,6 +7403,30 @@ async def approve_skill(
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
 
+
+@router.post(
+    "/skills/bulk-delete",
+    response_model=SkillBulkDeleteResponse,
+    responses=error_responses(401, 403, 422),
+)
+async def bulk_delete_skills(
+    body: SkillBulkDeleteRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> SkillBulkDeleteResponse:
+    _require(principal, "skill:approve")
+    deleted: list[str] = []
+    failed: list[BulkFailureResponse] = []
+    for skill_id in dict.fromkeys(body.ids):
+        try:
+            await service.delete_skill(skill_id)
+        except PublicAPIError as error:
+            failed.append(BulkFailureResponse(id=skill_id, code=error.code, message=error.public_message))
+        except KeyError:
+            failed.append(BulkFailureResponse(id=skill_id, code="not_found", message="not found"))
+        else:
+            deleted.append(skill_id)
+    return SkillBulkDeleteResponse(deleted=deleted, failed=failed)
 
 @router.delete(
     "/skills/{skill_id}",

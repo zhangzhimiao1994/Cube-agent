@@ -1,3 +1,38 @@
+## 2026-08-15 Skill Bulk Delete Backend Contract
+
+### State
+- Added a real `POST /api/v1/admin/skills/bulk-delete` endpoint with de-duplicated ids, per-item deletion, and per-item failure reporting.
+- Updated the web API client and Skill management page so batch deletion uses one backend bulk request instead of firing multiple single DELETE requests from the browser.
+- The Skill page already had quick search, per-column filters, sorting, select-current-result, select-pending-approval, batch approve, and batch delete; this slice makes batch delete match the same backend contract style used by runs/Hermes.
+- Partial batch delete failures keep failed ids selected and show a compact status line, so operators can retry or inspect failures without losing context.
+
+### Verification
+- TDD red first:
+  - `.\.venv\Scripts\python.exe -m pytest tests\api\test_admin_resources.py::test_skill_bulk_delete_removes_selected_skills_and_reports_missing -q --tb=short` failed with HTTP 405 before the endpoint existed.
+  - `npm test -- --run src/pages/SkillsPage.test.tsx -t "supports selecting multiple skills and deleting|bulk actions only operate"` failed because the UI still called single DELETE endpoints.
+- Green local checks:
+  - `.\.venv\Scripts\python.exe -m pytest tests\api\test_admin_resources.py::test_skill_bulk_delete_removes_selected_skills_and_reports_missing -q --tb=short` -> 1 passed.
+  - `.\.venv\Scripts\python.exe -m pytest tests\api\test_admin_resources.py -q` -> 119 passed.
+  - `npm test -- --run src/pages/SkillsPage.test.tsx` -> 6 passed.
+  - `.\.venv\Scripts\python.exe -m ruff check src tests` -> passed.
+  - `.\.venv\Scripts\python.exe -m mypy --strict src tests` -> passed.
+  - `npm run lint` -> passed.
+  - `npm run build` -> passed with the existing Vite large chunk warning.
+  - `git diff --check` -> passed with only existing CRLF normalization warnings for touched Python files.
+
+### Server Deployment And Real Probe
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-skill-bulk-delete-20260815-050952.tgz` containing changed backend/frontend/test files and rebuilt `web/dist`.
+- Uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed incrementally into `/opt/agent-hub/current`.
+- Server backups retained under `/opt/agent-hub/backups/skill-bulk-delete-20260815-050952` and `/opt/agent-hub/backups/skill-bulk-delete-20260815-050952-rerun`; server archive retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-skill-bulk-delete-20260815-050952.tgz`.
+- Synced the changed admin router into the active production venv `site-packages`, rebuilt frontend assets were deployed, and `agent-hub-api`, `agent-hub-worker`, and `caddy` are active with `/health` returning `{"status":"ok"}`.
+- Real server probe used a short-lived super-admin JWT generated on the server without printing secrets. It uploaded a real two-Skill zip bundle through HTTP, called the deployed `skills/bulk-delete` endpoint with duplicate and missing ids, verified two unique skills were deleted, verified the missing id was reported in `failed`, confirmed no probe Skill remained, and checked the deployed frontend bundle contains `skills/bulk-delete`, `快速搜索 Skill`, and `批量删除已选 Skill`.
+- Probe output: `{"status": "ok", "checks": {"upload_bundle": true, "created_two": true, "deleted_two_unique": true, "missing_reported": true, "probe_skills_removed": true, "bulk_delete_endpoint_in_bundle": true, "quick_search_copy_in_bundle": true, "bulk_delete_copy_in_bundle": true}, "created_ids": 2}`.
+- Deployment note: do not pipe PowerShell here-strings directly into remote `bash -s`; it can carry BOM/CRLF. Write LF/no-BOM scripts to `.tmp` and `scp` them before running on Linux.
+- Removed server `/tmp/probe_skill_bulk_delete.py`, `/tmp/deploy-skill-bulk-delete.sh`, `/tmp/agent-hub-p3-runtime-incremental.tgz`, and health temp files after verification.
+
+### Remaining / Next
+- Commit this slice, create local GitHub recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, then watch GitHub Actions until green.
+- Continue remaining P3 items after green: broader UI text/layout audit, missing button/function sweep, OpenClaw follow-up, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 Feishu WebSocket Runtime Diagnostics
 
 ### State

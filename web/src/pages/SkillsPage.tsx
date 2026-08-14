@@ -88,12 +88,10 @@ export function SkillsPage() {
     },
   });
   const bulkDelete = useMutation({
-    mutationFn: async (ids: string[]) => {
-      await Promise.all(ids.map((id) => api.deleteSkill(id)));
-      return ids;
-    },
-    onSuccess: () => {
-      setSelectedIds([]);
+    mutationFn: (ids: string[]) => api.bulkDeleteSkills(ids),
+    onSuccess: (result) => {
+      const failedIds = new Set(result.failed.map((item) => item.id));
+      setSelectedIds((current) => current.filter((id) => failedIds.has(id)));
       void queryClient.invalidateQueries({ queryKey: ["skills"] });
     },
   });
@@ -171,6 +169,9 @@ export function SkillsPage() {
           {deleteSkill.isError ? <p role="alert">{formatApiError(deleteSkill.error, "Skill 删除失败")}</p> : null}
           {bulkApprove.isError ? <p role="alert">{formatApiError(bulkApprove.error, "Skill 批量审批失败")}</p> : null}
           {bulkDelete.isError ? <p role="alert">{formatApiError(bulkDelete.error, "Skill 批量删除失败")}</p> : null}
+          {bulkDelete.isSuccess && bulkDelete.data.failed.length > 0 ? (
+            <p role="status">已删除 {bulkDelete.data.deleted.length} 个 Skill，{bulkDelete.data.failed.length} 个未删除。</p>
+          ) : null}
         </article>
 
         <article>

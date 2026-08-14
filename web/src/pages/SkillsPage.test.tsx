@@ -80,6 +80,9 @@ describe("SkillsPage", () => {
           const id = path.split("/").at(-2) ?? "";
           return jsonResponse({ ...skills.find((skill) => skill.id === id), status: "enabled" });
         }
+        if (path === "/api/v1/admin/skills/bulk-delete" && init?.method === "POST") {
+          return jsonResponse({ deleted: JSON.parse(String(init.body)).ids, failed: [] });
+        }
         if (path.includes("/api/v1/admin/skills/") && init?.method === "DELETE") {
           return jsonResponse({ status: "deleted" });
         }
@@ -128,14 +131,17 @@ describe("SkillsPage", () => {
     expect(window.confirm).toHaveBeenCalledTimes(1);
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
-        "/api/v1/admin/skills/deep-research",
-        expect.objectContaining({ method: "DELETE" }),
-      );
-      expect(fetchMock).toHaveBeenCalledWith(
-        "/api/v1/admin/skills/pdf",
-        expect.objectContaining({ method: "DELETE" }),
+        "/api/v1/admin/skills/bulk-delete",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({ ids: ["deep-research", "pdf"] }),
+        }),
       );
     });
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/v1/admin/skills/deep-research",
+      expect.objectContaining({ method: "DELETE" }),
+    );
   });
 
   it("bulk actions only operate on selected visible skills", async () => {
@@ -150,8 +156,11 @@ describe("SkillsPage", () => {
     expect(window.confirm).toHaveBeenCalledWith("确认删除当前结果中已选的 1 个 Skill？删除后不会再分发给主 Agent 或子 Agent。");
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
-        "/api/v1/admin/skills/docx",
-        expect.objectContaining({ method: "DELETE" }),
+        "/api/v1/admin/skills/bulk-delete",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({ ids: ["docx"] }),
+        }),
       );
     });
     expect(fetchMock).not.toHaveBeenCalledWith(

@@ -668,6 +668,13 @@ const SkillSchema = z.object({
 
 export type Skill = z.infer<typeof SkillSchema>;
 
+const SkillBulkDeleteSchema = z.object({
+  deleted: z.array(z.string()),
+  failed: z.array(BulkFailureSchema),
+});
+
+export type SkillBulkDeleteResult = z.infer<typeof SkillBulkDeleteSchema>;
+
 const SkillArchiveSkippedSchema = z.object({
   path: z.string(),
   reason: z.string(),
@@ -1503,6 +1510,13 @@ export const api = {
       `/api/v1/admin/skills/${encodeURIComponent(id)}`,
       { method: "DELETE" },
       z.object({ status: z.string() }),
+    );
+  },
+  bulkDeleteSkills(ids: string[]): Promise<SkillBulkDeleteResult> {
+    return request(
+      "/api/v1/admin/skills/bulk-delete",
+      { method: "POST", body: JSON.stringify({ ids }) },
+      SkillBulkDeleteSchema,
     );
   },
   mcpServers(): Promise<McpServer[]> {

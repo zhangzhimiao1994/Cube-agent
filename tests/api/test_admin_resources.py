@@ -2995,6 +2995,36 @@ def test_skill_archive_upload_accepts_large_nested_instruction_bundle_tar_gz() -
     assert len(skills.json()) == 99
 
 
+def test_skill_bulk_delete_removes_selected_skills_and_reports_missing() -> None:
+    api = client()
+
+    uploaded = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "all-skills.tar.gz"},
+        content=instruction_skill_bundle_archive(),
+    )
+    skill_ids = [item["id"] for item in uploaded.json()["items"]]
+
+    deleted = api.post(
+        "/api/v1/admin/skills/bulk-delete",
+        headers=headers(),
+        json={"ids": [skill_ids[0], skill_ids[1], skill_ids[0], "missing-skill"]},
+    )
+    remaining = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert deleted.status_code == 200
+    assert deleted.json() == {
+        "deleted": [skill_ids[0], skill_ids[1]],
+        "failed": [
+            {
+                "id": "missing-skill",
+                "code": "not_found",
+                "message": "not found",
+            }
+        ],
+    }
+    assert remaining.json() == []
+
 def test_skill_archive_upload_accepts_rich_instruction_skill_directory() -> None:
     api = client()
 
