@@ -1,3 +1,39 @@
+## 2026-08-14 OpenClaw Session UI Wiring
+
+Current state:
+
+- Wired the existing OpenClaw session lifecycle API into the system settings page.
+- Settings now loads OpenClaw sessions, can start a bounded Linux server control session, and can pause, resume, or stop listed sessions.
+- Session UI uses the existing API client methods and invalidates the session query after create/update.
+- Added a frontend regression that exercises the full settings-page session flow: create -> listed active -> pause -> resume -> stop.
+- Deferred new user requirement: chat should later recognize planning/schedule intent, let the main Agent produce a方案, then add the approved plan into scheduled execution. This belongs with the planned schedule-mode / channel-intent work, not this OpenClaw UI slice.
+
+Verification performed:
+
+- Local frontend checks:
+  - `npm.cmd run test -- --run src/pages/ConfigPage.test.tsx -t "manages OpenClaw control sessions"` -> 1 passed.
+  - `npm.cmd run test -- --run src/pages/ConfigPage.test.tsx` -> 5 passed.
+  - `npm.cmd run lint` -> passed.
+  - `npm.cmd run test -- --run` -> 101 passed.
+  - `npm.cmd run build` -> passed with the existing Vite chunk-size warning.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-openclaw-session-ui.tgz` to `103.236.98.133` as `root`.
+  - Preserved the prior deployed frontend as `web/dist-prev-openclaw-session-ui-<timestamp>`.
+  - Extracted the new `web/dist`, fixed ownership, and reloaded Caddy.
+  - Confirmed `caddy`, `agent-hub-api`, and `agent-hub-worker` were active.
+- Server real environment verification:
+  - Ran `/tmp/server_openclaw_session_ui_check.py` against the deployed server, using the real DB/JWT secret to mint a short-lived super-admin token.
+  - Verified the served frontend bundle contains `OpenClaw control sessions` and `openclaw-create-session`.
+  - Temporarily enabled OpenClaw, created a real Linux server session through HTTP API, listed it, paused it, resumed it, stopped it, restored the previous system settings, and deleted the probe session record.
+  - Final output: `{"status": "ok", "checked": ["frontend_bundle", "session_create", "session_list", "session_pause_resume_stop"], "cleaned_sessions": 1}`.
+
+Remaining risks / TODOs:
+
+- Commit this UI slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote `mutilagent/main`.
+- Push with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue planned work after green: OpenClaw adapter hardening/terminal-system integration, plan/schedule intent recognition, final README, and later full UI text/layout audit.
 
 ## 2026-08-14 OpenClaw Session Lifecycle
 

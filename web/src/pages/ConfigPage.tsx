@@ -9,6 +9,7 @@ import {
   type ConfigRevision,
   type OpenClawAdapter,
   type OpenClawOperation,
+  type OpenClawSession,
   type SystemSettings,
 } from "../api/client";
 
@@ -112,6 +113,7 @@ export function ConfigPage() {
   const workflowsQuery = useQuery({ queryKey: ["workflows"], queryFn: () => api.workflows() });
   const modelsQuery = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
   const openClawAdaptersQuery = useQuery({ queryKey: ["openclaw-adapters"], queryFn: () => api.openClawAdapters() });
+  const openClawSessionsQuery = useQuery({ queryKey: ["openclaw-sessions"], queryFn: () => api.openClawSessions() });
   const document = useMemo(
     () => currentOrEmpty(current.data, current.error),
     [current.data, current.error],
@@ -207,6 +209,26 @@ export function ConfigPage() {
     },
   });
 
+  const createOpenClawSession = useMutation({
+    mutationFn: () =>
+      api.createOpenClawSession({
+        platform: "linux",
+        target_type: "server",
+        target: "agent-hub-server",
+        purpose: "Keep a bounded OpenClaw control session for server maintenance",
+      }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["openclaw-sessions"] });
+    },
+  });
+
+  const updateOpenClawSession = useMutation({
+    mutationFn: ({ id, action }: { id: string; action: "pause" | "resume" | "stop" }) =>
+      api.updateOpenClawSession(id, action),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["openclaw-sessions"] });
+    },
+  });
   const publish = useMutation({
     mutationFn: async () => {
       setLocalError(null);
@@ -234,7 +256,8 @@ export function ConfigPage() {
     agentsQuery.isLoading ||
     workflowsQuery.isLoading ||
     modelsQuery.isLoading ||
-    openClawAdaptersQuery.isLoading
+    openClawAdaptersQuery.isLoading ||
+    openClawSessionsQuery.isLoading
   ) {
     return <p>正在加载系统设置...</p>;
   }
@@ -248,11 +271,15 @@ export function ConfigPage() {
   if (openClawAdaptersQuery.isError) {
     return <p role="alert">{formatApiError(openClawAdaptersQuery.error, "OpenClaw adapters loading failed")}</p>;
   }
+  if (openClawSessionsQuery.isError) {
+    return <p role="alert">{formatApiError(openClawSessionsQuery.error, "OpenClaw sessions loading failed")}</p>;
+  }
   if (!settings) return <p role="alert">系统设置加载失败：后端没有返回设置内容。</p>;
 
   const agents = agentsQuery.data ?? [];
   const workflows = workflowsQuery.data ?? [];
   const openClawAdapters = sortOpenClawAdapters(openClawAdaptersQuery.data ?? []);
+  const openClawSessions = openClawSessionsQuery.data ?? [];
   const modelCount = Object.keys(document?.models ?? {}).length || (modelsQuery.data ?? []).length;
   const agentCount = document?.agents.length || agents.length;
 
@@ -502,6 +529,86 @@ export function ConfigPage() {
                 </article>
               ))}
             </div>
+          </div>
+          <div className="inline-guide" aria-label="OpenClaw control sessions">
+            <h4>OpenClaw control sessions</h4>
+            <p>
+              会话用于登记长时间控制意图。Linux server 会话可以进入 active 状态；Windows、macOS、本机桌面会话在接入真实适配器前会显示 adapter_unavailable。
+            </p>
+            <div className="action-row">
+              <button
+                type="button"
+                data-testid="openclaw-create-session"
+                disabled={createOpenClawSession.isPending}
+                onClick={() => createOpenClawSession.mutate()}
+              >
+                Start Linux server session
+              </button>
+            </div>
+            {openClawSessions.length === 0 ? (
+              <p className="field-help">No OpenClaw control sessions have been created yet.</p>
+            ) : (
+              <div className="table-shell">
+                <table aria-label="OpenClaw control sessions">
+                  <thead>
+                    <tr>
+                      <th>Session</th>
+                      <th>Status</th>
+                      <th>Target</th>
+                      <th>Host</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {openClawSessions.map((session: OpenClawSession) => (
+                      <tr key={session.id}>
+                        <td>{session.id}</td>
+                        <td>{session.status}</td>
+                        <td>
+                          {session.platform} {session.target_type} {session.target}
+                        </td>
+                        <td>{session.execution_host}</td>
+                        <td>
+                          <div className="action-row compact-actions">
+                            <button
+                              type="button"
+                              data-testid={`openclaw-pause-session-${session.id}`}
+                              disabled={session.status !== "active" || updateOpenClawSession.isPending}
+                              onClick={() => updateOpenClawSession.mutate({ id: session.id, action: "pause" })}
+                            >
+                              Pause
+                            </button>
+                            <button
+                              type="button"
+                              data-testid={`openclaw-resume-session-${session.id}`}
+                              disabled={session.status !== "paused" || updateOpenClawSession.isPending}
+                              onClick={() => updateOpenClawSession.mutate({ id: session.id, action: "resume" })}
+                            >
+                              Resume
+                            </button>
+                            <button
+                              type="button"
+                              className="danger-action"
+                              data-testid={`openclaw-stop-session-${session.id}`}
+                              disabled={session.status === "stopped" || updateOpenClawSession.isPending}
+                              onClick={() => updateOpenClawSession.mutate({ id: session.id, action: "stop" })}
+                            >
+                              Stop
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {createOpenClawSession.isError ? (
+              <p role="alert">{formatApiError(createOpenClawSession.error, "OpenClaw session creation failed")}</p>
+            ) : null}
+            {updateOpenClawSession.isError ? (
+              <p role="alert">{formatApiError(updateOpenClawSession.error, "OpenClaw session update failed")}</p>
+            ) : null}
           </div>
           <div className="inline-guide" aria-label="OpenClaw operation console">
             <h4>OpenClaw operation console</h4>

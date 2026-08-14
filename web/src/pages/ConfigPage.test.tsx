@@ -42,9 +42,11 @@ function jsonResponse(payload: unknown, init: ResponseInit = {}) {
 
 describe("ConfigPage", () => {
   const requests: Array<{ body: unknown; method: string; path: string }> = [];
+  let openClawSessions: Array<Record<string, unknown>> = [];
 
   beforeEach(() => {
     requests.length = 0;
+    openClawSessions = [];
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
       "fetch",
@@ -166,6 +168,40 @@ describe("ConfigPage", () => {
               description: "Requires a connected Windows OpenClaw adapter before execution.",
             },
           ]);
+        }
+        if (path === "/api/v1/admin/openclaw/sessions" && method === "GET") {
+          return jsonResponse(openClawSessions);
+        }
+        if (path === "/api/v1/admin/openclaw/sessions" && method === "POST") {
+          const body = JSON.parse(String(init?.body));
+          const session = {
+            id: "openclaw_session_ui_test",
+            status: "active",
+            adapter_status: "available",
+            mode: "ask",
+            platform: body.platform,
+            target_type: body.target_type,
+            target: body.target,
+            purpose: body.purpose,
+            execution_host: "agent-hub-server",
+            requested_by: principal.user_id,
+            created_at: "2026-08-13T00:00:00Z",
+            updated_at: "2026-08-13T00:00:00Z",
+            stopped_at: null,
+            operation_ids: [],
+          };
+          openClawSessions = [session];
+          return jsonResponse(session, { status: 201 });
+        }
+        if (path === "/api/v1/admin/openclaw/sessions/openclaw_session_ui_test" && method === "PATCH") {
+          const body = JSON.parse(String(init?.body));
+          const status = body.action === "pause" ? "paused" : body.action === "stop" ? "stopped" : "active";
+          openClawSessions = openClawSessions.map((session) =>
+            session.id === "openclaw_session_ui_test"
+              ? { ...session, status, updated_at: "2026-08-13T00:01:00Z" }
+              : session,
+          );
+          return jsonResponse(openClawSessions[0]);
         }
         if (path === "/api/v1/admin/agents") {
           return jsonResponse([
@@ -345,5 +381,32 @@ describe("ConfigPage", () => {
     expect(screen.getByText("windows server_command")).not.toBeNull();
     expect(screen.getByText("adapter_unavailable")).not.toBeNull();
     expect(screen.getByText(/remote-windows-host/)).not.toBeNull();
+  });
+
+  it("manages OpenClaw control sessions from settings", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/config" />);
+
+    await user.click(await screen.findByTestId("openclaw-create-session"));
+    expect(await screen.findByText(/openclaw_session_ui_test/)).not.toBeNull();
+    expect(screen.getByText("active")).not.toBeNull();
+    expect(requests.find((request) => request.path === "/api/v1/admin/openclaw/sessions")).toMatchObject({
+      method: "POST",
+      body: {
+        platform: "linux",
+        target_type: "server",
+        target: "agent-hub-server",
+        purpose: "Keep a bounded OpenClaw control session for server maintenance",
+      },
+    });
+
+    await user.click(screen.getByTestId("openclaw-pause-session-openclaw_session_ui_test"));
+    expect(await screen.findByText("paused")).not.toBeNull();
+
+    await user.click(screen.getByTestId("openclaw-resume-session-openclaw_session_ui_test"));
+    expect(await screen.findByText("active")).not.toBeNull();
+
+    await user.click(screen.getByTestId("openclaw-stop-session-openclaw_session_ui_test"));
+    expect(await screen.findByText("stopped")).not.toBeNull();
   });
 });
