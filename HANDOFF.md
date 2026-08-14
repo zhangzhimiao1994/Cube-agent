@@ -1,4 +1,41 @@
-﻿## 2026-08-14 OpenClaw Operation Session Binding
+﻿## 2026-08-14 OpenClaw Execute Session Guard
+
+Current state:
+
+- Hardened OpenClaw execution for long-running control sessions.
+- Operations bound to a session now re-check that the session still exists and is `active` immediately before execution.
+- Paused, stopped, or adapter-unavailable sessions block bound operation execution with the existing `openclaw_session_not_active` guard.
+- Creation-time and execution-time session checks now use one shared helper, reducing the chance of future adapter work bypassing the same safety boundary.
+- Existing unbound operation behavior and allowlist/approval checks remain unchanged.
+
+Verification performed:
+
+- TDD red/green:
+  - Added `test_openclaw_execute_rechecks_bound_session_is_active`.
+  - Initial run failed because a paused bound session still allowed execution (`200` instead of `409`).
+  - After the fix, the same test passed.
+- Local backend checks:
+  - `uv run pytest tests/api/test_admin_resources.py::test_openclaw_execute_rechecks_bound_session_is_active -q --tb=short` -> 1 passed.
+  - `uv run pytest tests/api/test_admin_resources.py -q -k "openclaw" --tb=short` -> 18 passed, 72 deselected.
+  - `uv run ruff check src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+  - `uv run mypy --strict src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-openclaw-execute-session-guard.tgz` to `103.236.98.133`.
+  - Preserved the prior deployed `admin.py`, extracted the incremental package, fixed ownership, and restarted `agent-hub-api` and `agent-hub-worker`.
+  - Confirmed `agent-hub-api`, `agent-hub-worker`, and `caddy` were active.
+- Server real environment verification:
+  - Ran `/tmp/server_openclaw_execute_session_guard_check.py` against the deployed HTTP API using the real server DB/JWT environment.
+  - Temporarily enabled OpenClaw, allowlisted a bounded Python command, created a real Linux server session, created and approved a real operation bound to that session, paused the session, verified execution was rejected with `openclaw_session_not_active`, resumed the session, verified execution succeeded, restored settings, and deleted probe records.
+  - Final output: `{"status": "ok", "checked": ["paused_bound_session_blocks_execution", "resumed_bound_session_executes", "settings_restored", "probe_records_cleaned"], "cleaned_sessions": 1, "cleaned_operations": 1}`.
+
+Remaining risks / TODOs:
+
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote `mutilagent/main`.
+- Push with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue planned work after green: adapter registry cleanup / terminal-system integration, plan/schedule intent recognition, final README, and later full UI text/layout audit.
+## 2026-08-14 OpenClaw Operation Session Binding
 
 Current state:
 
@@ -3073,4 +3110,5 @@ Remaining risks / next:
 - Push `main` with `git push --force-with-lease mutilagent main`.
 - Check GitHub Actions and fix/redeploy/repush if red.
 - Continue P3 with the remaining project-completion items and final GitHub usage README.
+
 

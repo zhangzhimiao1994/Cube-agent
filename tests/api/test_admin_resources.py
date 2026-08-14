@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import io
 import sys
 import tarfile
@@ -624,6 +624,59 @@ def test_openclaw_operation_rejects_inactive_session_binding() -> None:
 
     assert created_operation.status_code == 409
     assert created_operation.json()["error"]["code"] == "openclaw_session_not_active"
+
+def test_openclaw_execute_rechecks_bound_session_is_active() -> None:
+    api = client()
+    command = [sys.executable, "-c", "print('openclaw-paused-session-should-not-run')"]
+    payload = api.get("/api/v1/admin/settings", headers=headers()).json()
+    payload["openclaw_enabled"] = True
+    payload["openclaw_mode"] = "ask"
+    payload["openclaw_allowed_commands"] = [command]
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+
+    created_session = api.post(
+        "/api/v1/admin/openclaw/sessions",
+        headers=headers(),
+        json={
+            "platform": "linux",
+            "target_type": "server",
+            "target": "agent-hub-server",
+            "purpose": "pause this control session before executing a bound operation",
+        },
+    )
+    assert created_session.status_code == 201
+    session_id = created_session.json()["id"]
+
+    created_operation = api.post(
+        "/api/v1/admin/openclaw/operations",
+        headers=headers(),
+        json={
+            "platform": "linux",
+            "kind": "server_command",
+            "target": "agent-hub-server",
+            "argv": command,
+            "risk_level": "low",
+            "reason": "bound operation must respect session pause at execute time",
+            "session_id": session_id,
+        },
+    )
+    assert created_operation.status_code == 202
+    operation_id = created_operation.json()["id"]
+    assert api.patch(
+        f"/api/v1/admin/openclaw/operations/{operation_id}",
+        headers=headers(),
+        json={"decision": "approve"},
+    ).status_code == 200
+    assert api.patch(
+        f"/api/v1/admin/openclaw/sessions/{session_id}",
+        headers=headers(),
+        json={"action": "pause"},
+    ).status_code == 200
+
+    response = api.post(f"/api/v1/admin/openclaw/operations/{operation_id}/execute", headers=headers())
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "openclaw_session_not_active"
 
 def test_openclaw_session_requires_feature_switch() -> None:
     response = client().post(
@@ -3227,3 +3280,4 @@ async def test_persistent_admin_secret_uses_sealed_secret_service() -> None:
     assert reference.ref == f"secret://{SECRET_ID}"
     assert reference.last_four == "1234"
     assert secrets.values == ["sk-live-1234"]
+

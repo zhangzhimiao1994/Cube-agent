@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import hashlib
 import io
@@ -5595,6 +5595,21 @@ async def _require_multimedia_generation_enabled(service: AdminResourceService) 
         )
 
 
+async def _require_openclaw_bound_session_active(
+    service: AdminResourceService,
+    request: OpenClawOperationRequest,
+) -> None:
+    if request.session_id is None:
+        return
+    session = next(
+        (item for item in await service.list_openclaw_sessions() if item.id == request.session_id),
+        None,
+    )
+    if session is None:
+        raise PublicAPIError(404, "not_found", "not found")
+    _validate_openclaw_session_for_operation(session, request)
+
+
 @router.post(
     "/openclaw/operations",
     response_model=OpenClawOperationResponse,
@@ -5612,14 +5627,7 @@ async def create_openclaw_operation(
         raise PublicAPIError(409, "openclaw_disabled", "OpenClaw is disabled")
     if settings.openclaw_mode == "read_only" and body.kind not in {"screen_read", "file_read"}:
         raise PublicAPIError(403, "openclaw_read_only", "OpenClaw read-only mode blocks this operation")
-    if body.session_id is not None:
-        session = next(
-            (item for item in await service.list_openclaw_sessions() if item.id == body.session_id),
-            None,
-        )
-        if session is None:
-            raise PublicAPIError(404, "not_found", "not found")
-        _validate_openclaw_session_for_operation(session, body)
+    await _require_openclaw_bound_session_active(service, body)
     operation = await service.create_openclaw_operation(
         body,
         actor=str(principal.user_id),
@@ -5751,6 +5759,9 @@ async def execute_openclaw_operation(
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> OpenClawExecutionResponse:
     _require(principal, "config:write")
+    operation = await service.get_openclaw_operation(operation_id)
+    request = OpenClawOperationRequest.model_validate(operation.operation)
+    await _require_openclaw_bound_session_active(service, request)
     settings = await service.get_settings()
     return await service.execute_openclaw_operation(
         operation_id,
@@ -6274,3 +6285,6 @@ async def delete_hermes_insight(
 
 
 __all__ = ["InMemoryAdminResourceService", "PersistentAdminResourceService", "router"]
+
+
+
