@@ -3952,3 +3952,13 @@ Remaining risks / next:
 
 - Commit this slice, create local ignored recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
 - Continue remaining P3 queue after green: OpenClaw terminal/desktop capability follow-up, broader UI copy/layout audit, missing button/function sweep, final README/README.zh-CN refresh if needed, and Docker readiness later.
+
+CI follow-up for this slice:
+
+- GitHub Actions run `31787154117` failed in `npm run test -- --run` because `web/src/pages/LoginPage.test.tsx` still asserted the old `对话` navigation label and heading after the module was renamed to `对话与进化`.
+- Updated the LoginPage tests to expect `对话与进化`.
+- Local verification after the fix:
+  - `npm test -- LoginPage.test.tsx --run` -> 6 passed.
+  - `npm test -- --run` -> 13 files / 116 tests passed.
+  - `npm run build` -> passed with the existing Vite large chunk warning.
+  - `git diff --check` -> passed.

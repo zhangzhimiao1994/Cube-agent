@@ -99,7 +99,7 @@ describe("LoginPage", () => {
     await userEvent.type(screen.getByLabelText("Password"), "correct horse battery staple");
     await userEvent.click(screen.getByRole("button", { name: "进入工作台" }));
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
   });
 
   it("shows invalid credentials without storing browser tokens", async () => {
@@ -128,7 +128,7 @@ describe("LoginPage", () => {
     await userEvent.type(screen.getByLabelText("Password"), "correct horse battery staple");
     await userEvent.click(screen.getByRole("button", { name: "创建管理员" }));
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
   });
 
   it("shows the setup failure reason returned by the API", async () => {
@@ -179,7 +179,7 @@ describe("LoginPage", () => {
 
     render(<TestApp initialPath="/extensions" />);
 
-    expect(await screen.findByRole("link", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("link", { name: "对话与进化" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "编排" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "资源" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "工具" })).not.toBeNull();
