@@ -3389,3 +3389,56 @@ Remaining risks / next:
 - Push `main` with `git push --force-with-lease mutilagent main`.
 - Check GitHub Actions and fix/redeploy/repush if red.
 - Continue P3 with the remaining project-completion tasks, including UI layout/text cleanup and final usage README.
+
+## 2026-08-14 OpenClaw Local Adapter Service
+
+Current state:
+
+- Added a standalone OpenClaw local adapter service that can run on a Windows/Linux/macOS host.
+- The local adapter exposes:
+  - `GET /v1/openclaw/health`;
+  - `POST /v1/openclaw/execute`.
+- The adapter requires `Authorization: Bearer <OPENCLAW_ADAPTER_TOKEN>` and rejects missing or wrong bearer tokens.
+- The adapter checks the requested platform against its configured platform.
+- The first implementation supports `server_command` operations with an exact local allowlist and still blocks shell-wrapper execution through the existing OpenClaw command guard.
+- It can be started with `python -m agent_hub.openclaw.local_adapter` and configured by environment variables:
+  - `OPENCLAW_ADAPTER_TOKEN`;
+  - `OPENCLAW_ADAPTER_PLATFORM` (`windows`, `linux`, or `macos`; defaults from the host OS);
+  - `OPENCLAW_ADAPTER_ALLOWED_COMMANDS_JSON`;
+  - `OPENCLAW_ADAPTER_HOST`;
+  - `OPENCLAW_ADAPTER_PORT`;
+  - `OPENCLAW_ADAPTER_COMMAND_TIMEOUT_SECONDS`.
+- This is the host-side piece needed for Windows terminal-style OpenClaw operations. Actual Windows GUI control still needs a future `desktop_action` implementation in this adapter.
+
+Changes made:
+
+- Added `agent_hub.openclaw.local_adapter` with a FastAPI app factory, environment loader, and module entrypoint.
+- Added unit coverage for unauthorized requests, platform mismatch, unlisted commands, and allowlisted command execution.
+
+Local verification:
+
+- TDD red check first failed because `agent_hub.openclaw.local_adapter` did not exist.
+- `uv run pytest tests/unit/openclaw/test_local_adapter.py -q --tb=short` -> 4 passed.
+- `uv run ruff check src/agent_hub/openclaw/local_adapter.py tests/unit/openclaw/test_local_adapter.py` -> passed.
+- `uv run mypy --strict src/agent_hub/openclaw/local_adapter.py tests/unit/openclaw/test_local_adapter.py` -> passed.
+
+Server deployment and verification:
+
+- Uploaded incremental package to `103.236.98.133:/tmp/agent-hub-openclaw-local-adapter.tgz`.
+- Deployed `src/agent_hub/openclaw/local_adapter.py` and its test into `/opt/agent-hub/current`, restarted `agent-hub-api` and `agent-hub-worker`, and verified API, worker, and Caddy were active.
+- Ran `/tmp/server_openclaw_local_adapter_check.py` in the real server Python environment. The script started a real uvicorn listener for the local adapter and called it over HTTP.
+- Server verification passed:
+  - `local_adapter_health`;
+  - `local_adapter_rejects_missing_token`;
+  - `local_adapter_rejects_unlisted_command`;
+  - `local_adapter_runs_allowlisted_command`.
+
+Remaining risks / next:
+
+- Windows host deployment still requires running this adapter on the Windows machine with a strong token, a narrow allowlist, and a matching central `openclaw_remote_adapters` entry.
+- GUI/screen/file OpenClaw operation kinds are still explicitly unavailable in the local adapter until dedicated implementations are added.
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue P3 with UI layout/text cleanup and final usage README.
