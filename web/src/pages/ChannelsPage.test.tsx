@@ -26,6 +26,7 @@ const channelPayload = [
     transports: ["webhook"],
     webhook_path: "/channels/feishu/events",
     public_webhook_url: "https://agent.example.com/channels/feishu/events",
+    configured: ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_TRANSPORT"],
     missing: [],
     notes: ["Webhook 已挂载在主 API 服务，不需要额外暴露 8001。"],
   },
@@ -214,6 +215,19 @@ describe("ChannelsPage", () => {
     expect(screen.getByText(/校验失败会返回明确错误/)).not.toBeNull();
   });
 
+  it("does not mark unconfigured optional channel fields as already configured", async () => {
+    render(<TestApp initialPath="/channels" />);
+
+    await screen.findByRole("heading", { name: "通道连接" });
+
+    expect(screen.getByLabelText(/Verification Token/).getAttribute("placeholder")).toBe(
+      "自建应用事件订阅校验 token",
+    );
+    expect(screen.getByLabelText(/Encrypt Key/).getAttribute("placeholder")).toBe(
+      "启用事件加密时填写",
+    );
+    expect(screen.getByRole("textbox", { name: /App ID FEISHU_APP_ID/ }).getAttribute("placeholder")).toContain("已配置，留空不覆盖");
+  });
   it("filters the channel matrix by missing configuration", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/channels" />);

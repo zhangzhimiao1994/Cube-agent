@@ -1,3 +1,18 @@
+## 2026-08-15 Channel Configured Field UI Fix
+
+### State
+- Fixed the channel configuration page so optional fields no longer show `已配置，留空不覆盖` merely because they are not in `missing`.
+- The deployment template and input placeholders now use the API `configured` field to decide whether a field is actually configured.
+- Added a ChannelsPage regression test for Feishu where only `FEISHU_APP_ID`, `FEISHU_APP_SECRET`, and `FEISHU_TRANSPORT` are configured; optional `Verification Token` and `Encrypt Key` correctly show their normal placeholders.
+
+### Verification
+- TDD red: `npm test -- --run src/pages/ChannelsPage.test.tsx -t "does not mark unconfigured optional channel fields"` first failed because `Verification Token` was shown as already configured.
+- Green:
+  - `npm test -- --run src/pages/ChannelsPage.test.tsx` -> 4 passed.
+  - `npm run lint` -> passed.
+  - `npm run build` -> passed with existing Vite large chunk warning.
+- Server incremental deploy updated `web/src/pages/ChannelsPage.tsx`, `web/src/pages/ChannelsPage.test.tsx`, and `web/dist`; server health returned `{"status":"ok"}`.
+- Server source verification found `configured.includes(field.env)` in both template and placeholder paths.
 ## 2026-08-15 Feishu Runtime Config Refresh and WebSocket Restart
 
 ### State

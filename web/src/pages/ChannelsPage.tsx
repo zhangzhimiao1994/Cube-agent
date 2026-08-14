@@ -272,7 +272,7 @@ function statusLabel(status: string) {
 
 function envTemplate(channel: ChannelStatus, guide: ChannelGuide) {
   return guide.fields
-    .map((field) => `${field.env}=${channel.missing.includes(field.env) ? field.placeholder : "<已配置>"}`)
+    .map((field) => `${field.env}=${channel.configured.includes(field.env) ? "<已配置>" : field.placeholder}`)
     .join("\n");
 }
 
@@ -499,9 +499,9 @@ export function ChannelsPage() {
                           }))
                         }
                         placeholder={
-                          selected.missing.includes(field.env)
-                            ? field.placeholder
-                            : `已配置，留空不覆盖；如需更换请输入新的 ${field.label}`
+                          selected.configured.includes(field.env)
+                            ? `已配置，留空不覆盖；如需更换请输入新的 ${field.label}`
+                            : field.placeholder
                         }
                       />
                     )}
