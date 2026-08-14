@@ -1244,7 +1244,7 @@ class HermesBulkConfirmRequest(BaseModel):
         seen: set[str] = set()
         result: list[str] = []
         for item in value:
-            if re.fullmatch(r"hermes[-_][a-f0-9-]{1,64}", item) is None:
+            if re.fullmatch(r"hermes[-_][A-Za-z0-9][A-Za-z0-9_-]{0,120}", item) is None:
                 raise ValueError("Hermes ids must be safe learning identifiers")
             if item not in seen:
                 seen.add(item)

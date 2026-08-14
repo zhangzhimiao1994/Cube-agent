@@ -2630,6 +2630,44 @@ def test_hermes_bulk_actions_accept_large_mobile_selection() -> None:
     assert delete.status_code == 200
     assert delete.json() == {"deleted": created_ids, "failed": []}
 
+def test_hermes_bulk_actions_accept_runtime_learning_ids() -> None:
+    api = client()
+    runtime_id = "hermes_run_deadbeef0123456789abcdef01234567"
+
+    confirm = api.post(
+        "/api/v1/admin/hermes/bulk-confirm",
+        headers=headers(),
+        json={"ids": [runtime_id]},
+    )
+    delete = api.post(
+        "/api/v1/admin/hermes/bulk-delete",
+        headers=headers(),
+        json={"ids": [runtime_id]},
+    )
+
+    assert confirm.status_code == 200
+    assert confirm.json() == {
+        "confirmed": [],
+        "failed": [
+            {
+                "id": runtime_id,
+                "code": "hermes_not_found",
+                "message": "Hermes learning record was not found",
+            }
+        ],
+    }
+    assert delete.status_code == 200
+    assert delete.json() == {
+        "deleted": [],
+        "failed": [
+            {
+                "id": runtime_id,
+                "code": "hermes_not_found",
+                "message": "Hermes learning record was not found",
+            }
+        ],
+    }
+
 
 def test_hermes_delete_removes_learning_record() -> None:
     api = client()

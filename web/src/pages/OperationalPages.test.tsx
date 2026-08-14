@@ -133,7 +133,7 @@ const secondRunListItem: RunListItem = {
 };
 
 const hermesInsight = {
-  id: "hermes-1",
+  id: "hermes_run_11111111111111111111111111111111",
   outcome: "success",
   lesson: "Use group chat when debate review is required.",
   summary: "Learned success pattern: Use group chat when debate review is required. Tags: debate, review. Weight: 5.",
@@ -147,7 +147,7 @@ const hermesInsight = {
 
 const secondHermesInsight = {
   ...hermesInsight,
-  id: "hermes-2",
+  id: "hermes_run_22222222222222222222222222222222",
   outcome: "failure",
   lesson: "Ask for confirmation before changing the workflow role pool.",
   summary: "Learned failure pattern: Ask for confirmation before changing the workflow role pool. Tags: workflow, approval. Weight: 4.",
@@ -526,20 +526,20 @@ describe("operational management pages", () => {
         if (path === "/api/v1/admin/hermes") {
           return jsonResponse([hermesInsight, secondHermesInsight].filter((item) => !deletedHermesIds.has(item.id)));
         }
-        if (path === "/api/v1/admin/hermes/hermes-1" && method === "DELETE") {
-          deletedHermesIds.add("hermes-1");
+        if (path === "/api/v1/admin/hermes/hermes_run_11111111111111111111111111111111" && method === "DELETE") {
+          deletedHermesIds.add("hermes_run_11111111111111111111111111111111");
           return jsonResponse({ status: "deleted" });
         }
-        if (path === "/api/v1/admin/hermes/hermes-1") {
+        if (path === "/api/v1/admin/hermes/hermes_run_11111111111111111111111111111111") {
           return jsonResponse(hermesInsight);
         }
-        if (path === "/api/v1/admin/hermes/hermes-1/confirm" && method === "POST") {
+        if (path === "/api/v1/admin/hermes/hermes_run_11111111111111111111111111111111/confirm" && method === "POST") {
           return jsonResponse({ ...hermesInsight, confirmed_at: "2026-08-07T00:05:00Z" });
         }
-        if (path === "/api/v1/admin/hermes/hermes-2") {
+        if (path === "/api/v1/admin/hermes/hermes_run_22222222222222222222222222222222") {
           return jsonResponse(secondHermesInsight);
         }
-        if (path === "/api/v1/admin/hermes/hermes-2/confirm" && method === "POST") {
+        if (path === "/api/v1/admin/hermes/hermes_run_22222222222222222222222222222222/confirm" && method === "POST") {
           return jsonResponse({ ...secondHermesInsight, confirmed_at: "2026-08-07T00:07:00Z" });
         }
         if (path === "/api/v1/admin/hermes/bulk-confirm" && method === "POST") {
@@ -547,7 +547,7 @@ describe("operational management pages", () => {
           const ids = Array.isArray(body.ids) ? body.ids : [];
           return jsonResponse({
             confirmed: ids.map((id: unknown) =>
-              id === "hermes-2"
+              id === "hermes_run_22222222222222222222222222222222"
                 ? { ...secondHermesInsight, confirmed_at: "2026-08-07T00:07:00Z" }
                 : { ...hermesInsight, confirmed_at: "2026-08-07T00:05:00Z" },
             ),
@@ -1931,7 +1931,7 @@ describe("operational management pages", () => {
     await waitFor(() =>
       expect(requests.find((request) => request.path === "/api/v1/admin/hermes/bulk-confirm")).toMatchObject({
         method: "POST",
-        body: { ids: ["hermes-2", "hermes-1"] },
+        body: { ids: ["hermes_run_22222222222222222222222222222222", "hermes_run_11111111111111111111111111111111"] },
       }),
     );
   });
@@ -1941,10 +1941,10 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/hermes" />);
 
     expect(await screen.findByRole("table", { name: /Hermes/ })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "确认 Hermes 学习 hermes-1" }));
+    await user.click(screen.getByRole("button", { name: "确认 Hermes 学习 hermes_run_11111111111111111111111111111111" }));
 
     await waitFor(() =>
-      expect(requests.find((request) => request.path === "/api/v1/admin/hermes/hermes-1/confirm")).toMatchObject({
+      expect(requests.find((request) => request.path === "/api/v1/admin/hermes/hermes_run_11111111111111111111111111111111/confirm")).toMatchObject({
         method: "POST",
       }),
     );
@@ -1982,7 +1982,7 @@ describe("operational management pages", () => {
     await waitFor(() =>
       expect(requests.find((request) => request.path === "/api/v1/admin/hermes/bulk-delete")).toMatchObject({
         method: "POST",
-        body: { ids: ["hermes-2", "hermes-1"] },
+        body: { ids: ["hermes_run_22222222222222222222222222222222", "hermes_run_11111111111111111111111111111111"] },
       }),
     );
     await waitFor(() => expect(screen.queryByText("conv-architecture-1")).toBeNull());
@@ -1994,10 +1994,10 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/hermes" />);
 
     expect(await screen.findByRole("table", { name: /Hermes/ })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "删除 Hermes 学习 hermes-1" }));
+    await user.click(screen.getByRole("button", { name: "删除 Hermes 学习 hermes_run_11111111111111111111111111111111" }));
 
     await waitFor(() =>
-      expect(requests.find((request) => request.path === "/api/v1/admin/hermes/hermes-1")).toMatchObject({
+      expect(requests.find((request) => request.path === "/api/v1/admin/hermes/hermes_run_11111111111111111111111111111111")).toMatchObject({
         method: "DELETE",
       }),
     );

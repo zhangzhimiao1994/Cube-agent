@@ -1,3 +1,54 @@
+## 2026-08-14 Hermes Runtime Learning Bulk ID Fix
+
+Current state:
+
+- Fixed Hermes bulk confirm/delete rejecting runtime-generated learning IDs such as `hermes_run_<hex>` with HTTP 422.
+- Root cause: `HermesBulkConfirmRequest.validate_ids` only accepted `hermes-<hex>` or `hermes_<hex>` with a single separator and hex-only tail, while runtime learning creates IDs with `hermes_run_...`.
+- The validator now accepts `hermes-` or `hermes_` prefixed safe identifiers made from letters, numbers, `_`, and `-`, capped to a bounded length. It still rejects spaces, slashes, path traversal, and non-Hermes IDs.
+- Frontend Hermes tests now use runtime-shaped IDs so table quick confirm, batch confirm, and batch delete remain covered for actual automatic learning records.
+- Follow-up queued from user: after this slice, investigate chat attachment upload showing `network request failed (network_error, HTTP 0)` on mobile.
+- Follow-up queued for later UI pass: compact chat history cards, reduce oversized mobile text/buttons, and fix crowded controls after module work is complete.
+
+Verification performed:
+
+- TDD red/green:
+  - Added `test_hermes_bulk_actions_accept_runtime_learning_ids`.
+  - Initial run failed with `422`, proving the production-shaped ID bug.
+  - After relaxing the safe ID validator, the test passed.
+- Local backend checks:
+  - `uv run pytest tests/api/test_admin_resources.py::test_hermes_bulk_actions_accept_runtime_learning_ids tests/api/test_admin_resources.py::test_hermes_bulk_actions_accept_large_mobile_selection tests/api/test_admin_resources.py::test_hermes_bulk_confirm_confirms_multiple_learning_records tests/api/test_admin_resources.py::test_hermes_bulk_delete_removes_multiple_learning_records -q --tb=short` -> 4 passed.
+  - `uv run ruff check src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+  - `uv run mypy --strict src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+  - `uv run pytest tests/api/test_admin_resources.py -q -k hermes --tb=short` -> 7 passed.
+  - `uv run pytest tests/api/test_admin_resources.py -q --tb=short` -> 92 passed.
+- Local frontend checks:
+  - `npm.cmd run test -- --run src/pages/OperationalPages.test.tsx -t Hermes` -> 6 passed.
+  - `npm.cmd run lint` -> passed.
+  - `npm.cmd run test -- --run` -> 103 passed.
+  - `npm.cmd run build` -> passed with existing Vite chunk-size warning.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-hermes-runtime-id.tgz` to `103.236.98.133`.
+  - Backed up deployed `src/agent_hub/api/routers/admin.py`, extracted the incremental package into `/opt/agent-hub/current`, fixed ownership, and restarted `agent-hub-api` and `agent-hub-worker`.
+  - Confirmed `agent-hub-api`, `agent-hub-worker`, and `caddy` were active.
+- Server real environment verification:
+  - Created a real `hermes_run_serverbulk...` Hermes record in the production database using the same systemd environment as the API.
+  - Called real HTTP `POST /api/v1/admin/hermes/bulk-confirm` and verified it confirmed the runtime-shaped ID instead of returning 422.
+  - Called real HTTP `POST /api/v1/admin/hermes/bulk-delete` and verified deletion.
+  - Verified `GET /api/v1/admin/hermes/{id}` returned 404 after deletion and ran DB cleanup.
+  - Final output: `{"status": "ok", "checked": ["runtime_hermes_bulk_confirm", "runtime_hermes_bulk_delete", "probe_record_cleanup"]}`.
+
+Push / archive status:
+
+- Previous Skill Bundle Partial Install Hardening slice was committed as `cad9dfc fix: keep valid skills from partial bundles`, deployed, pushed to `mutilagent/main`, archived locally at `.local-archives/github-pushes/mutilagent-main-before-20260814-101426-549e36d.bundle`, archived on GitHub as `archive/mutilagent-main-before-20260814-101426-549e36d`, and GitHub Actions run `31763136910` passed.
+- This Hermes slice is deployed and verified, but not yet committed/pushed.
+
+Remaining risks / TODOs:
+
+- Commit this Hermes slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for current remote `mutilagent/main`.
+- Push with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Then investigate the mobile chat attachment upload `network_error, HTTP 0` report before continuing the larger project plan.
 ## 2026-08-14 Skill Bundle Partial Install Hardening
 
 Current state:
