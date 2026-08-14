@@ -284,6 +284,31 @@ describe("OpenClawPage", () => {
       });
     });
   });
+  it("creates selected Windows control sessions from the dedicated page", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/openclaw" />);
+
+    expect(await screen.findByRole("heading", { name: "OpenClaw 控制" })).not.toBeNull();
+    await user.selectOptions(screen.getByLabelText("会话平台"), "windows");
+    await user.selectOptions(screen.getByLabelText("会话目标类型"), "computer");
+    await user.clear(screen.getByLabelText("会话目标"));
+    await user.type(screen.getByLabelText("会话目标"), "office-windows-pc");
+    await user.clear(screen.getByLabelText("会话用途"));
+    await user.type(screen.getByLabelText("会话用途"), "远程审批后接管 Windows 桌面执行报表任务");
+
+    await user.click(screen.getByTestId("openclaw-page-create-session"));
+    await waitFor(() => {
+      expect(requests.find((request) => request.path === "/api/v1/admin/openclaw/sessions")).toMatchObject({
+        method: "POST",
+        body: expect.objectContaining({
+          platform: "windows",
+          target_type: "computer",
+          target: "office-windows-pc",
+          purpose: "远程审批后接管 Windows 桌面执行报表任务",
+        }),
+      });
+    });
+  });
   it("runs the OpenClaw approval and execution chain from the dedicated page", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/openclaw" />);

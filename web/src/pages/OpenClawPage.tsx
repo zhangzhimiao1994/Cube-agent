@@ -9,6 +9,7 @@ import {
   type OpenClawOperation,
   type OpenClawOperationRequest,
   type OpenClawSession,
+  type OpenClawSessionRequest,
   type SystemSettings,
 } from "../api/client";
 
@@ -107,6 +108,17 @@ function commandLabel(command: string[]) {
   return command.join(" ");
 }
 
+function defaultSessionTarget(platform: OpenClawSessionRequest["platform"], targetType: OpenClawSessionRequest["target_type"]) {
+  if (targetType === "server") return platform === "linux" ? "agent-hub-server" : "remote-server";
+  if (targetType === "desktop") return "desktop";
+  return platform === "windows" ? "local-windows-pc" : "local-computer";
+}
+
+function defaultSessionPurpose(platform: OpenClawSessionRequest["platform"], targetType: OpenClawSessionRequest["target_type"]) {
+  if (targetType === "server") return `Keep a bounded OpenClaw control session for ${platform} server maintenance`;
+  if (targetType === "desktop") return `Keep a bounded OpenClaw control session for ${platform} desktop operation`;
+  return `Keep a bounded OpenClaw control session for ${platform} computer operation`;
+}
 function defaultOperationTarget(platform: OpenClawOperationRequest["platform"], kind: OpenClawOperationRequest["kind"]) {
   if (kind === "file_read") return platform === "windows" ? "C:\\Reports\\daily.txt" : "/var/log/syslog";
   if (kind === "screen_read") return "desktop";
@@ -154,6 +166,10 @@ export function OpenClawPage() {
   const [allowedCommandsText, setAllowedCommandsText] = useState("[]");
   const [remoteAdaptersText, setRemoteAdaptersText] = useState("[]");
   const [adapterDraft, setAdapterDraft] = useState<OpenClawRemoteAdapterSetting>(DEFAULT_OPENCLAW_REMOTE_ADAPTER);
+  const [sessionPlatform, setSessionPlatform] = useState<OpenClawSessionRequest["platform"]>("linux");
+  const [sessionTargetType, setSessionTargetType] = useState<OpenClawSessionRequest["target_type"]>("server");
+  const [sessionTarget, setSessionTarget] = useState("agent-hub-server");
+  const [sessionPurpose, setSessionPurpose] = useState(defaultSessionPurpose("linux", "server"));
   const [operationPlatform, setOperationPlatform] = useState<OpenClawOperationRequest["platform"]>("linux");
   const [operationKind, setOperationKind] = useState<OpenClawOperationRequest["kind"]>("server_command");
   const [operationTarget, setOperationTarget] = useState("agent-hub-server");
@@ -352,13 +368,18 @@ export function OpenClawPage() {
   });
 
   const createSession = useMutation({
-    mutationFn: () =>
-      api.createOpenClawSession({
-        platform: "linux",
-        target_type: "server",
-        target: "agent-hub-server",
-        purpose: "Keep a bounded OpenClaw control session for server maintenance",
-      }),
+    mutationFn: () => {
+      setLocalError(null);
+      const target = sessionTarget.trim();
+      const purpose = sessionPurpose.trim();
+      if (!target || !purpose) throw new Error("请填写 OpenClaw 会话目标和用途。");
+      return api.createOpenClawSession({
+        platform: sessionPlatform,
+        target_type: sessionTargetType,
+        target,
+        purpose,
+      });
+    },
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["openclaw-sessions"] });
     },
@@ -606,10 +627,54 @@ export function OpenClawPage() {
 
       <div className="inline-guide" aria-label="OpenClaw 控制会话">
         <h3>控制会话</h3>
-        <p>会话用于登记长时间控制意图。Linux server 会话可以进入 active；Windows、macOS 和本机桌面需要真实适配器在线。</p>
+        <p>会话用于登记长时间控制意图。服务器、本机电脑和桌面会话都必须经过 OpenClaw 策略和适配器状态约束。</p>
+        <div className="form-grid">
+          <label htmlFor="openclaw-page-session-platform">
+            会话平台
+            <select
+              id="openclaw-page-session-platform"
+              value={sessionPlatform}
+              onChange={(event) => {
+                const nextPlatform = event.target.value as OpenClawSessionRequest["platform"];
+                setSessionPlatform(nextPlatform);
+                setSessionTarget(defaultSessionTarget(nextPlatform, sessionTargetType));
+                setSessionPurpose(defaultSessionPurpose(nextPlatform, sessionTargetType));
+              }}
+            >
+              <option value="linux">Linux</option>
+              <option value="windows">Windows</option>
+              <option value="macos">macOS</option>
+            </select>
+          </label>
+          <label htmlFor="openclaw-page-session-target-type">
+            会话目标类型
+            <select
+              id="openclaw-page-session-target-type"
+              value={sessionTargetType}
+              onChange={(event) => {
+                const nextTargetType = event.target.value as OpenClawSessionRequest["target_type"];
+                setSessionTargetType(nextTargetType);
+                setSessionTarget(defaultSessionTarget(sessionPlatform, nextTargetType));
+                setSessionPurpose(defaultSessionPurpose(sessionPlatform, nextTargetType));
+              }}
+            >
+              <option value="server">服务器</option>
+              <option value="computer">电脑</option>
+              <option value="desktop">桌面</option>
+            </select>
+          </label>
+          <label htmlFor="openclaw-page-session-target">
+            会话目标
+            <input id="openclaw-page-session-target" value={sessionTarget} onChange={(event) => setSessionTarget(event.target.value)} />
+          </label>
+          <label htmlFor="openclaw-page-session-purpose">
+            会话用途
+            <input id="openclaw-page-session-purpose" value={sessionPurpose} onChange={(event) => setSessionPurpose(event.target.value)} />
+          </label>
+        </div>
         <div className="action-row">
           <button type="button" data-testid="openclaw-page-create-session" disabled={createSession.isPending} onClick={() => createSession.mutate()}>
-            启动 Linux 服务器会话
+            创建控制会话
           </button>
         </div>
         {sessions.length === 0 ? (

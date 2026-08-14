@@ -1,3 +1,29 @@
+## 2026-08-15 OpenClaw Multi-Platform Session Console
+
+### State
+- Updated the dedicated OpenClaw control-session UI so operators can choose session platform (`linux`, `windows`, `macos`), target type (`server`, `computer`, `desktop`), target name, and purpose before creating a control session.
+- Removed the remaining hardcoded `启动 Linux 服务器会话` path from the page; Linux remains the default, but Windows/macOS/local computer sessions can now be requested from the UI and are still bounded by OpenClaw policy and adapter availability.
+- Added a regression test proving the page can create a Windows `computer` control session with operator-provided target and purpose.
+
+### Verification
+- TDD red first: `npm test -- --run src/pages/OpenClawPage.test.tsx -t "creates selected Windows control sessions"` failed before the UI exposed `会话平台`.
+- Green local checks:
+  - `npm test -- --run src/pages/OpenClawPage.test.tsx` -> 6 passed.
+  - `npm run lint` -> passed.
+  - `.\.venv\Scripts\python.exe -m pytest tests\unit\openclaw tests\api\test_admin_resources.py -q -k "openclaw" --tb=short` -> 42 passed, 98 deselected; only existing FastAPI/httpx deprecation and pytest cache ACL warnings.
+  - `npm run build` -> passed with the existing Vite large chunk warning.
+  - `git diff --check` -> passed with only CRLF normalization warnings for touched files.
+
+### Server Deployment And Real Probe
+- Created local server incremental archive `.local-archives/server-incrementals/agent-hub-openclaw-session-console-20260815-061556.tgz` and uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`; server backup retained under `/opt/agent-hub/backups/p3-openclaw-session-console-20260815-061632`.
+- Server archive retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-openclaw-session-console-20260815-061556.tgz`.
+- Initial deploy probe again showed the API can take longer than 3 seconds after restart; a follow-up probe waited for `http://127.0.0.1:8000/health`.
+- Real server probe output: API health returned `{"status":"ok"}`, `/openclaw` loaded `/assets/index-BRVGlwUv.js`, and the active production bundle contains `会话平台`, `会话目标类型`, `创建控制会话`, and `服务器、本机电脑和桌面会话`.
+
+### Remaining / Next
+- Commit this slice, create local GitHub recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, then watch GitHub Actions until green.
+- Continue remaining P3 items after green: evolution/memory refinements, broader UI layout/copy audit, missing button/function sweep, README/README.zh-CN usage refresh, and Docker readiness remain later items.
 ## 2026-08-15 OpenClaw Multi-Platform Operation Console
 
 ### State
