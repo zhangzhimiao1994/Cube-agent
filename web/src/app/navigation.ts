@@ -92,12 +92,7 @@ export const MODULE_GROUPS: ModuleGroup[] = [
         description: "配置官方模型、自定义中转站、Claude Code/API 协议和可用性测试。",
         permission: "config:read",
       },
-      {
-        to: "/multimedia",
-        label: "多媒体生成",
-        description: "按图片/视频能力选择模型并提交生成请求，视频只会使用 video_generation 模型。",
-        permission: "run:create",
-      },
+
       {
         to: "/memory",
         label: "记忆",

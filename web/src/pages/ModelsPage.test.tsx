@@ -573,6 +573,23 @@ describe("ModelsPage", () => {
     });
   });
 
+  it("offers verified Seedance video model ids and keeps Seedance 2.5 as manual configuration", async () => {
+    const user = userEvent.setup();
+    const view = render(<TestApp initialPath="/models" />);
+
+    await screen.findByText("planner");
+    await user.selectOptions(view.container.querySelector("#model-category") as HTMLSelectElement, "multimedia");
+    await user.selectOptions(view.container.querySelector("#provider") as HTMLSelectElement, "seedance");
+
+    expect(screen.getAllByText(/Seedance 2.5/).length).toBeGreaterThan(0);
+    const suggestions = view.container.querySelector("#relay-model-suggestions") as HTMLDataListElement;
+    expect(Array.from(suggestions.options).map((option) => option.value)).toEqual([
+      "doubao-seedance-2-0-260128",
+      "doubao-seedance-2-0-fast-260128",
+      "doubao-seedance-1-5-pro-251215",
+      "seedance-2.5",
+    ]);
+  });
   it("configures audio generation multimedia models without normal model capabilities", async () => {
     const user = userEvent.setup();
     const view = render(<TestApp initialPath="/models" />);

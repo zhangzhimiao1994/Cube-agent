@@ -397,10 +397,12 @@ const MULTIMEDIA_PROVIDERS: ProviderPreset[] = [
     defaultLogicalModel: "video_primary",
     capabilities: ["video_generation"],
     modelEntryMode: "freeform",
-    modelHelp: "Seedance API 入口和模型名按你的平台控制台填写；也可以通过 Runway 的 Seedance 预设配置。",
+    modelHelp: "火山方舟可验证的 Seedance 2.0 ID 是 doubao-seedance-2-0-260128 与 doubao-seedance-2-0-fast-260128；Seedance 2.5 已发布但公开 API model ID 需要以你的控制台为准，未确认前请手动填写且不要把它作为默认执行模型。",
     models: [
-      { label: "Seedance 2", value: "seedance2", capabilities: ["video_generation"] },
-      { label: "Seedance 2 Fast", value: "seedance2_fast", capabilities: ["video_generation"] },
+      { label: "Doubao Seedance 2.0", value: "doubao-seedance-2-0-260128", capabilities: ["video_generation"] },
+      { label: "Doubao Seedance 2.0 Fast", value: "doubao-seedance-2-0-fast-260128", capabilities: ["video_generation"] },
+      { label: "Doubao Seedance 1.5 Pro", value: "doubao-seedance-1-5-pro-251215", capabilities: ["video_generation"] },
+      { label: "Seedance 2.5（按控制台手动填写）", value: "seedance-2.5", capabilities: ["video_generation"] },
     ],
   },
 ];

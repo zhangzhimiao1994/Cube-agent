@@ -4164,3 +4164,47 @@ Server deployment and real verification for Channel Config Edit/Clear Controls:
 - Real server probe loaded `/etc/agent-hub/secrets.env` without printing secrets, generated a short-lived super-admin JWT, saved a temporary `custom_webhook` token through the real admin API, verified configured status without secret echo, cleared the channel through the new DELETE API, verified `channel.clear` audit, and checked frontend bundle markers for the new UI.
 - Probe output: `{"status": "ok", "checked": ["channel_save", "channel_clear", "audit", "frontend_bundle_markers"], "restored_original": false}`. `restored_original=false` means the server had no pre-existing saved `custom_webhook` config to restore.
 - Removed `/tmp/channel_config_clear_check.py`, `/tmp/deploy-channel-config-clear.sh`, and `/tmp/agent-hub-p3-runtime-incremental.tgz`; `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.
+CI status for Channel Config Edit/Clear Controls:
+
+- GitHub Actions run `31795686778` for commit `bffa821` failed because `web/src/pages/ChannelsPage.test.tsx` still asserted the old save message `通道配置已保存。`.
+- Fixed the stale assertion in commit `cfd8298` and reran the full GitHub quality workflow.
+- GitHub Actions run `31796114780` for commit `cfd8298` completed successfully in 2m58s.
+## 2026-08-14 Multimedia Generation Entry Removal + Seedance Presets
+
+Current state:
+
+- The standalone `/multimedia` UI generation page has been removed; multimedia generation is no longer exposed as a separate resource module.
+- The old `/multimedia` route now redirects to `/models`, because multimedia AI belongs in model/capability configuration while generation requests should flow through conversation planning and the guarded executor APIs.
+- The backend/client multimedia generation API remains in place for the conversation flow and media executor agents.
+- The `资源` module now only exposes `模型与 API`, `记忆`, and `附件`.
+- Seedance multimedia model presets now include verified Volcengine Ark 2.0 IDs: `doubao-seedance-2-0-260128`, `doubao-seedance-2-0-fast-260128`, and the existing 1.5 Pro ID `doubao-seedance-1-5-pro-251215`.
+- Seedance 2.5 is shown as a manual-control suggestion only (`seedance-2.5`) with copy warning that the API model ID must come from the user's console before it is used as an execution model.
+
+Local verification:
+
+- Watched `web/src/pages/MultimediaRouting.test.tsx` fail first because `资源` still exposed `多媒体生成` and `/multimedia` still rendered the generation form.
+- Watched the Seedance preset test fail first because the UI did not mention Seedance 2.5 and did not suggest the Volcengine 2.0 IDs.
+- `npm.cmd run test -- --run src/pages/MultimediaRouting.test.tsx src/pages/ModelsPage.test.tsx -t "multimedia generation routing|Seedance"` -> 3 passed after implementation.
+- `npm.cmd run test -- --run` -> 119 passed.
+- `npm.cmd run lint` -> passed.
+- `npm.cmd run build` -> passed with the existing Vite large chunk warning.
+- `git diff --check` -> passed with CRLF normalization warnings only.
+
+Research note:
+
+- Verified current Seedance model ID handling against public sources on 2026-08-14. Volcengine API Explorer references `doubao-seedance-2-0-260128` and `doubao-seedance-2-0-fast-260128`; Volcengine docs/articles also reference `doubao-seedance-1-5-pro-251215` as the newer replacement for older 1.0 lite operators. Public third-party Seedance 2.5 API pages conflict, so the product should not auto-submit 2.5 until a real provider/API key exposes a confirmed model ID.
+
+Remaining risks / next:
+
+- Deploy this frontend slice incrementally to `103.236.98.133`, run real server frontend-marker and route checks, then create recovery archive/tag, push to `mutilagent/main`, and check GitHub Actions until green.
+- Continue broader P3 queue after this slice: OpenClaw desktop/scheduled-control follow-ups, evolution execution orchestration, Skill archive robustness, UI copy/layout audit, missing button/function sweep, README/README.zh-CN refresh, and Docker readiness later.
+Server deployment and real verification for Multimedia Generation Entry Removal + Seedance Presets:
+
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-multimedia-entry-seedance-20260814-193652.tgz`.
+- Uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed incrementally into `/opt/agent-hub/current`.
+- First deployment left old frontend hashed JS assets in `web/dist/assets`, and the real bundle probe correctly failed because old standalone multimedia markers were still present.
+- Replayed the same package after backing up and clearing `web/dist`, then reloaded Caddy.
+- Server backup paths: `/opt/agent-hub/backups/multimedia-entry-seedance-20260814-113730n` and `/opt/agent-hub/backups/multimedia-entry-seedance-clean-dist-20260814-113813n`.
+- Real server probe fetched the deployed SPA through `http://127.0.0.1/` and `http://127.0.0.1/multimedia`, inspected the deployed production JS bundle, verified Seedance model markers, verified forbidden standalone generation markers were absent, verified router source redirects `/multimedia` to `/models`, and verified the old `MultimediaPage.tsx` source file is removed.
+- Probe output: `{'status': 'ok', 'checked': ['caddy_spa_entry', 'frontend_bundle_markers', 'legacy_route_source', 'old_page_removed'], 'js_bundle_count': 1, 'css_bundle_count': 1}`.
+- Removed `/tmp/check_multimedia_entry_seedance.py` and `/tmp/agent-hub-p3-runtime-incremental.tgz`; `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.

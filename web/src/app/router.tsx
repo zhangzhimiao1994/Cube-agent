@@ -16,7 +16,6 @@ import { McpPage } from "../pages/McpPage";
 import { MemoryPage } from "../pages/MemoryPage";
 import { ModelsPage } from "../pages/ModelsPage";
 import { ModuleHubPage } from "../pages/ModuleHubPage";
-import { MultimediaPage } from "../pages/MultimediaPage";
 import { RunDetailPage } from "../pages/RunDetailPage";
 import { RunsPage } from "../pages/RunsPage";
 import { SchedulesPage } from "../pages/SchedulesPage";
@@ -55,7 +54,7 @@ export function AppRoutes() {
         <Route path="config" element={<ConfigPage />} />
         <Route path="main-agent" element={<MainAgentPage />} />
         <Route path="models" element={<ModelsPage />} />
-        <Route path="multimedia" element={<MultimediaPage />} />
+        <Route path="multimedia" element={<Navigate to="/models" replace />} />
         <Route path="attachments" element={<AttachmentsPage />} />
         <Route path="agents" element={<AgentsPage />} />
         <Route path="workflows" element={<WorkflowsPage />} />
