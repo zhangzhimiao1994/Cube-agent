@@ -479,7 +479,7 @@ export function ChannelsPage() {
                   </label>
                 ))}
               </div>
-              <div className="composer-actions">
+              <div className="channel-config-actions" role="group" aria-label="通道配置操作">
                 <button
                   type="button"
                   disabled={saveConfig.isPending || Object.values(draftValues).every((value) => value.trim() === "")}

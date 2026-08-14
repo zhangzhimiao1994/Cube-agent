@@ -3948,6 +3948,120 @@ def test_evolution_next_round_execution_queues_real_run_with_metadata() -> None:
     assert audit.status_code == 200
     assert audit.json()[0]["details"]["execution_run_id"] == execution["execution_run_id"]
 
+
+def test_evolution_execution_result_ingest_records_round_from_artifact() -> None:
+    api = client()
+    app = cast(Any, api.app)
+    service = cast(InMemoryAdminResourceService, app.state.admin_resource_service)
+    created = api.post(
+        "/api/v1/admin/evolution-runs",
+        headers=headers(),
+        json={
+            "kind": "skill_optimization",
+            "title": "进化科研 Skill",
+            "objective": "执行一轮候选 Skill 评测并返回结构化评分。",
+            "mode": "hybrid",
+            "source_skill_ids": ["darwin-skill"],
+            "target_artifact_type": "skill",
+            "baseline_agent_id": "agent-main-m3",
+            "candidate_agent_ids": ["agent-researcher"],
+            "evaluator_agent_id": "agent-evaluator",
+            "approval_policy": "auto",
+        },
+    )
+    run = created.json()
+    executed = api.post(f"/api/v1/admin/evolution-runs/{run['id']}/execute-next-round", headers=headers())
+    execution = executed.json()
+    execution_run_id = UUID(execution["execution_run_id"])
+    queued = service.runs[execution_run_id]
+    round_payload = {
+        "changed_dimension": "可验证性",
+        "candidate_summary": "补充固定评测集和失败样例。",
+        "score_before": 62.0,
+        "score_after": 71.5,
+        "tests_passed": True,
+        "regression_detected": False,
+        "accepted": True,
+        "judge_summary": "候选版本在边界用例上有稳定提升。",
+        "artifact_refs": ["skill://candidate/research-v2"],
+        "tokens_used": 1200,
+        "elapsed_seconds": 45,
+    }
+    service.runs[execution_run_id] = queued.model_copy(
+        update={
+            "status": "completed",
+            "artifacts": [
+                RunArtifactResponse(
+                    id="evolution-round-result",
+                    kind="json",
+                    title="Evolution round result",
+                    text=json.dumps(round_payload, ensure_ascii=False),
+                )
+            ],
+        }
+    )
+
+    ingested = api.post(
+        f"/api/v1/admin/evolution-runs/{run['id']}/execution-runs/{execution_run_id}/ingest",
+        headers=headers(),
+    )
+
+    assert ingested.status_code == 200
+    updated = ingested.json()
+    assert updated["rounds"][0]["changed_dimension"] == "可验证性"
+    assert updated["rounds"][0]["delta"] == 9.5
+    assert updated["rounds"][0]["accepted"] is True
+    assert f"run://{execution_run_id}" in updated["rounds"][0]["artifact_refs"]
+    assert updated["next_action"] == "run_next_round"
+
+    audit = api.get("/api/v1/admin/audit?action=evolution.round_ingested", headers=headers())
+    assert audit.status_code == 200
+    assert audit.json()[0]["details"]["execution_run_id"] == str(execution_run_id)
+
+
+def test_evolution_execution_result_ingest_rejects_unlinked_run() -> None:
+    api = client()
+    app = cast(Any, api.app)
+    service = cast(InMemoryAdminResourceService, app.state.admin_resource_service)
+    created = api.post(
+        "/api/v1/admin/evolution-runs",
+        headers=headers(),
+        json={
+            "kind": "skill_optimization",
+            "title": "进化科研 Skill",
+            "objective": "执行一轮候选 Skill 评测并返回结构化评分。",
+            "mode": "hybrid",
+            "target_artifact_type": "skill",
+            "approval_policy": "auto",
+        },
+    )
+    run = created.json()
+    unrelated_run_id = uuid4()
+    now = datetime.now(UTC)
+    service.runs[unrelated_run_id] = RunDetailResponse(
+        id=unrelated_run_id,
+        status="completed",
+        mode="hybrid",
+        conversation_id="manual-run",
+        request="manual task",
+        created_at=now,
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        events=[RunEventResponse(sequence=1, kind="completed", message="done", created_at=now)],
+        artifacts=[RunArtifactResponse(id="result", kind="json", title="result", text="{}")],
+        explicit_details={"source": "manual"},
+    )
+
+    ingested = api.post(
+        f"/api/v1/admin/evolution-runs/{run['id']}/execution-runs/{unrelated_run_id}/ingest",
+        headers=headers(),
+    )
+
+    assert ingested.status_code == 409
+    assert ingested.json()["error"]["code"] == "evolution_execution_mismatch"
+
+
 @pytest.mark.asyncio
 async def test_persistent_evolution_next_round_execution_enqueues_run_repository() -> None:
     execution_run_id = UUID("33333333-3333-4333-8333-333333333333")
@@ -4038,6 +4152,103 @@ async def test_persistent_evolution_next_round_execution_enqueues_run_repository
     assert routing["evolution_round"] == 1
     assert routing["candidate_agent_ids"] == ["agent-researcher"]
     assert routing["selected_agent_ids"] == ["agent-researcher", "agent-evaluator"]
+
+
+@pytest.mark.asyncio
+async def test_persistent_evolution_execution_result_ingest_uses_run_repository_artifacts() -> None:
+    execution_run_id = UUID("44444444-4444-4444-8444-444444444444")
+    routing_decision: dict[str, object] = {}
+    artifact_payload = {
+        "changed_dimension": "边界评测",
+        "candidate_summary": "增加反例和压缩上下文策略。",
+        "score_before": 70.0,
+        "score_after": 75.0,
+        "tests_passed": True,
+        "regression_detected": False,
+        "judge_summary": "多轮对话后的偏差下降。",
+        "artifact_refs": [],
+        "tokens_used": 2400,
+        "elapsed_seconds": 90,
+    }
+
+    class FakeRunRepository:
+        async def get(self, tenant_id: UUID, run_id: UUID) -> RunRecord:
+            assert tenant_id == TENANT_ID
+            assert run_id == execution_run_id
+            return RunRecord(
+                id=execution_run_id,
+                tenant_id=tenant_id,
+                actor_id=USER_ID,
+                request="execute evolution round",
+                mode=TaskMode.HYBRID,
+                status=RunStatus.COMPLETED,
+                version=1,
+                created_at=datetime.now(UTC),
+                routing_decision=routing_decision,
+            )
+
+        async def artifacts(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
+            assert tenant_id == TENANT_ID
+            assert run_id == execution_run_id
+            return (
+                {
+                    "id": "round-result",
+                    "type": "json",
+                    "producer": "evaluator",
+                    "content": {"text": "result:\n```json\n" + json.dumps(artifact_payload, ensure_ascii=False) + "\n```"},
+                },
+            )
+
+    class StoredPersistentService(PersistentAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__(
+                config_service=FakeConfigService(),  # type: ignore[arg-type]
+                secret_service=FakeSecretService(),  # type: ignore[arg-type]
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+                run_repository=FakeRunRepository(),  # type: ignore[arg-type]
+            )
+            self.payloads: dict[tuple[str, str], dict[str, object]] = {}
+
+        async def _get_admin_payload(self, kind: str, resource_id: str) -> dict[str, object] | None:
+            return self.payloads.get((kind, resource_id), {})
+
+        async def _upsert_admin_payload(self, kind: str, resource_id: str, payload: dict[str, object]) -> bool:
+            self.payloads[(kind, resource_id)] = payload
+            return True
+
+    service = StoredPersistentService()
+    evolution = await service.create_evolution_run(
+        EvolutionRunRequest(
+            kind="skill_optimization",
+            title="进化科研 Skill",
+            objective="执行一轮候选 Skill 评测并返回结构化评分。",
+            mode="hybrid",
+            source_skill_ids=["darwin-skill"],
+            target_artifact_type="skill",
+            baseline_agent_id="agent-main-m3",
+            candidate_agent_ids=["agent-researcher"],
+            evaluator_agent_id="agent-evaluator",
+            approval_policy="auto",
+        ),
+        actor=str(USER_ID),
+    )
+    plan = await service.plan_evolution_next_round(evolution.id, actor=str(USER_ID))
+    routing_decision.update(
+        {
+            "source": "evolution",
+            "evolution_run_id": evolution.id,
+            "evolution_round": plan.round,
+        }
+    )
+
+    updated = await service.ingest_evolution_execution_run(evolution.id, execution_run_id, actor=str(USER_ID))
+
+    assert updated.rounds[0].changed_dimension == "边界评测"
+    assert updated.rounds[0].delta == 5.0
+    assert f"run://{execution_run_id}" in updated.rounds[0].artifact_refs
+    assert updated.next_action == "run_next_round"
+
 
 def test_evolution_run_stops_after_two_low_delta_rounds() -> None:
     api = client()

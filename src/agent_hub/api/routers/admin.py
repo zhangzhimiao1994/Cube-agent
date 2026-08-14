@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import logging
 import os
 import re
@@ -1522,6 +1523,14 @@ class AdminResourceService(Protocol):
         actor: str,
     ) -> EvolutionNextRoundExecutionResponse: ...
 
+    async def ingest_evolution_execution_run(
+        self,
+        run_id: str,
+        execution_run_id: UUID,
+        *,
+        actor: str,
+    ) -> EvolutionRunResponse: ...
+
     async def approve_evolution_run(
         self,
         run_id: str,
@@ -2469,6 +2478,59 @@ class InMemoryAdminResourceService:
             task_title=plan.task_title,
             task_prompt=plan.task_prompt,
         )
+
+    async def ingest_evolution_execution_run(
+        self,
+        run_id: str,
+        execution_run_id: UUID,
+        *,
+        actor: str,
+    ) -> EvolutionRunResponse:
+        current = await self.get_evolution_run(run_id)
+        if current.status in {"stopped", "completed"}:
+            raise PublicAPIError(409, "evolution_run_closed", "evolution run is already closed")
+        if current.status == "waiting_approval":
+            raise PublicAPIError(
+                409,
+                "evolution_run_requires_approval",
+                "evolution run requires approval before ingesting execution results",
+            )
+        try:
+            execution = self.runs[execution_run_id]
+        except KeyError:
+            raise PublicAPIError(404, "not_found", "execution run was not found") from None
+        if execution.status != RunStatus.COMPLETED.value:
+            raise PublicAPIError(
+                409,
+                "evolution_execution_not_completed",
+                "execution run must be completed before it can be ingested",
+                details={"status": execution.status},
+            )
+        _assert_evolution_execution_binding(
+            run_id,
+            execution_run_id,
+            execution.explicit_details,
+            expected_round=len(current.rounds) + 1,
+        )
+        request = _evolution_round_request_from_artifacts(execution.artifacts, execution_run_id=execution_run_id)
+        updated = append_evolution_round(current, request)
+        latest = updated.rounds[-1]
+        self.evolution_runs[run_id] = updated
+        await self.record_audit_event(
+            actor=actor,
+            action="evolution.round_ingested",
+            resource=f"evolution:{run_id}",
+            details={
+                "round": latest.round,
+                "delta": latest.delta,
+                "accepted": latest.accepted,
+                "recommendation": latest.recommendation,
+                "status": updated.status,
+                "next_action": updated.next_action,
+                "execution_run_id": str(execution_run_id),
+            },
+        )
+        return updated
 
     async def approve_evolution_run(
         self,
@@ -3876,6 +3938,63 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             task_title=plan.task_title,
             task_prompt=plan.task_prompt,
         )
+
+    async def ingest_evolution_execution_run(
+        self,
+        run_id: str,
+        execution_run_id: UUID,
+        *,
+        actor: str,
+    ) -> EvolutionRunResponse:
+        if self._run_repository is None:
+            return await super().ingest_evolution_execution_run(run_id, execution_run_id, actor=actor)
+        current = await self.get_evolution_run(run_id)
+        if current.status in {"stopped", "completed"}:
+            raise PublicAPIError(409, "evolution_run_closed", "evolution run is already closed")
+        if current.status == "waiting_approval":
+            raise PublicAPIError(
+                409,
+                "evolution_run_requires_approval",
+                "evolution run requires approval before ingesting execution results",
+            )
+        try:
+            execution = await self._run_repository.get(self._tenant_id, execution_run_id)
+        except RunNotFound:
+            raise PublicAPIError(404, "not_found", "execution run was not found") from None
+        if execution.status is not RunStatus.COMPLETED:
+            raise PublicAPIError(
+                409,
+                "evolution_execution_not_completed",
+                "execution run must be completed before it can be ingested",
+                details={"status": execution.status.value},
+            )
+        _assert_evolution_execution_binding(
+            run_id,
+            execution_run_id,
+            execution.routing_decision,
+            expected_round=len(current.rounds) + 1,
+        )
+        artifacts = await self._run_repository.artifacts(self._tenant_id, execution_run_id)
+        request = _evolution_round_request_from_artifacts(artifacts, execution_run_id=execution_run_id)
+        updated = append_evolution_round(current, request)
+        latest = updated.rounds[-1]
+        if not await self._upsert_admin_payload("evolution", run_id, updated.model_dump(mode="json")):
+            return await super().ingest_evolution_execution_run(run_id, execution_run_id, actor=actor)
+        await self.record_audit_event(
+            actor=actor,
+            action="evolution.round_ingested",
+            resource=f"evolution:{run_id}",
+            details={
+                "round": latest.round,
+                "delta": latest.delta,
+                "accepted": latest.accepted,
+                "recommendation": latest.recommendation,
+                "status": updated.status,
+                "next_action": updated.next_action,
+                "execution_run_id": str(execution_run_id),
+            },
+        )
+        return updated
 
     async def approve_evolution_run(
         self,
@@ -5684,6 +5803,130 @@ def _uuid_or_default(value: str, default: UUID) -> UUID:
         return default
 
 
+def _evolution_round_request_from_artifacts(
+    artifacts: Iterable[RunArtifactResponse | dict[str, object]],
+    *,
+    execution_run_id: UUID,
+) -> EvolutionRoundRequest:
+    last_validation_error: ValidationError | None = None
+    for artifact in artifacts:
+        response = artifact if isinstance(artifact, RunArtifactResponse) else _admin_run_artifact(artifact)
+        if response.text is None:
+            continue
+        for candidate in _json_object_candidates(response.text):
+            try:
+                request = EvolutionRoundRequest.model_validate(candidate)
+            except ValidationError as exc:
+                last_validation_error = exc
+                continue
+            artifact_refs = list(request.artifact_refs)
+            execution_ref = f"run://{execution_run_id}"
+            if execution_ref not in artifact_refs:
+                artifact_refs.append(execution_ref)
+            return request.model_copy(update={"artifact_refs": artifact_refs})
+    if last_validation_error is not None:
+        raise PublicAPIError(
+            422,
+            "invalid_evolution_round_output",
+            "execution artifact does not match the required Evolution round schema",
+        ) from None
+    raise PublicAPIError(
+        422,
+        "missing_evolution_round_output",
+        "execution run did not produce a readable Evolution round artifact",
+    )
+
+
+def _json_object_candidates(text: str) -> tuple[dict[str, object], ...]:
+    candidates: list[dict[str, object]] = []
+    seen: set[str] = set()
+
+    def add(candidate: object) -> None:
+        if not isinstance(candidate, dict):
+            return
+        key = json.dumps(candidate, sort_keys=True, ensure_ascii=False)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(candidate)
+
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        try:
+            add(json.loads(stripped))
+        except json.JSONDecodeError:
+            pass
+    for match in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.IGNORECASE | re.DOTALL):
+        try:
+            add(json.loads(match.group(1)))
+        except json.JSONDecodeError:
+            continue
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            candidate, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        add(candidate)
+    return tuple(candidates)
+
+
+def _assert_evolution_execution_binding(
+    run_id: str,
+    execution_run_id: UUID,
+    routing: Mapping[str, object] | None,
+    *,
+    expected_round: int,
+) -> None:
+    if not routing:
+        raise PublicAPIError(
+            409,
+            "evolution_execution_mismatch",
+            "execution run is not linked to an Evolution run",
+            details={"execution_run_id": str(execution_run_id)},
+        )
+    if str(routing.get("source") or "") != "evolution" or str(routing.get("evolution_run_id") or "") != run_id:
+        raise PublicAPIError(
+            409,
+            "evolution_execution_mismatch",
+            "execution run is not linked to this Evolution run",
+            details={"execution_run_id": str(execution_run_id)},
+        )
+    round_marker = routing.get("evolution_round")
+    if type(round_marker) is int:
+        round_number = round_marker
+    elif type(round_marker) is str:
+        try:
+            round_number = int(round_marker)
+        except ValueError:
+            raise PublicAPIError(
+                409,
+                "evolution_execution_round_mismatch",
+                "execution run has no valid Evolution round marker",
+                details={"execution_run_id": str(execution_run_id)},
+            ) from None
+    else:
+        raise PublicAPIError(
+            409,
+            "evolution_execution_round_mismatch",
+            "execution run has no valid Evolution round marker",
+            details={"execution_run_id": str(execution_run_id)},
+        )
+    if round_number != expected_round:
+        raise PublicAPIError(
+            409,
+            "evolution_execution_round_mismatch",
+            "execution run round does not match the next expected Evolution round",
+            details={
+                "execution_run_id": str(execution_run_id),
+                "execution_round": str(round_number),
+                "expected_round": str(expected_round),
+            },
+        )
+
+
 def _evolution_execution_conversation_id(run_id: str, round_number: int) -> str:
     safe_run_id = re.sub(r"[^a-zA-Z0-9_-]", "-", run_id).strip("-") or "evolution"
     return f"{safe_run_id}-round-{round_number}"
@@ -6786,6 +7029,21 @@ async def execute_evolution_next_round_route(
     _require(principal, "skill:write")
     request = body or EvolutionNextRoundExecutionRequest()
     return await service.execute_evolution_next_round(run_id, request, actor=str(principal.user_id))
+
+
+@router.post(
+    "/evolution-runs/{run_id}/execution-runs/{execution_run_id}/ingest",
+    response_model=EvolutionRunResponse,
+    responses=error_responses(401, 403, 404, 409, 422),
+)
+async def ingest_evolution_execution_run(
+    run_id: str,
+    execution_run_id: UUID,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> EvolutionRunResponse:
+    _require(principal, "skill:write")
+    return await service.ingest_evolution_execution_run(run_id, execution_run_id, actor=str(principal.user_id))
 
 
 @router.post(

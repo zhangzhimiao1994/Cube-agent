@@ -218,7 +218,10 @@ describe("ChannelsPage", () => {
     await user.type(screen.getByLabelText(/App Key/), "ding-app-key");
     await user.type(screen.getByLabelText(/App Secret/), "ding-secret");
     await user.type(screen.getByLabelText(/Webhook Token/), "ding-token");
-    await user.click(screen.getByRole("button", { name: "保存通道配置" }));
+    const actions = screen.getByRole("group", { name: "通道配置操作" });
+    expect(within(actions).getByRole("button", { name: "保存通道配置" })).not.toBeNull();
+    expect(within(actions).getByRole("button", { name: "清空当前通道配置" })).not.toBeNull();
+    await user.click(within(actions).getByRole("button", { name: "保存通道配置" }));
 
     await waitFor(() =>
       expect(requests.find((request) => request.path === "/api/v1/admin/channels/dingtalk/config")).toMatchObject({

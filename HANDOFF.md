@@ -1,3 +1,39 @@
+﻿## 2026-08-14 Evolution Execution Ingest And Channel Config Layout
+
+Current state:
+
+- Added a controlled admin ingest endpoint: `POST /api/v1/admin/evolution-runs/{run_id}/execution-runs/{execution_run_id}/ingest`.
+- Ingest only accepts completed execution runs whose routing metadata is explicitly linked to the same Evolution run: `source=evolution`, matching `evolution_run_id`, and the next expected `evolution_round`.
+- The endpoint parses the completed execution run's public artifact text for a JSON object matching `EvolutionRoundRequest`, supports plain JSON and fenced JSON blocks, appends `run://{execution_run_id}` to artifact refs, records the Evolution round, updates `next_action`, and writes `evolution.round_ingested` audit details.
+- Implemented both in-memory and persistent `RunRepository` paths so production can ingest real completed run artifacts instead of manually posting round data.
+- Fixed the channel configuration page layout bug where `保存通道配置` / `清空当前通道配置` could squeeze or cover UI text on mobile. The page now uses a dedicated `channel-config-actions` group instead of the chat composer action styles, with mobile full-width buttons and a separate status line.
+
+Local verification:
+
+- `.\.venv\Scripts\python.exe -m pytest tests\api\test_admin_resources.py -k "evolution" -q` -> 8 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\api\test_admin_resources.py -q` -> 109 passed.
+- `.\.venv\Scripts\python.exe -m ruff check src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+- `.\.venv\Scripts\python.exe -m mypy --strict src tests` -> passed, 259 source files.
+- `npm.cmd run test -- --run src/pages/ChannelsPage.test.tsx` -> 3 passed.
+- `npm.cmd run test -- --run` from `web/` -> 14 files / 123 tests passed.
+- `npm.cmd run lint` from `web/` -> passed.
+- `npm.cmd run build` from `web/` -> passed with the existing Vite large chunk warning.
+- `git diff --check` -> passed with CRLF normalization warnings only.
+
+Server deployment and real verification:
+
+- Created incremental package `.local-archives/server-incrementals/agent-hub-evolution-ingest-channel-ui-20260814-234621.tgz` containing `src/agent_hub/api/routers/admin.py` and rebuilt `web/dist`.
+- Uploaded to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed incrementally into `/opt/agent-hub/current`.
+- Server backup retained under `/opt/agent-hub/backups/evolution-ingest-channel-ui-20260814-234706`.
+- Synced `admin.py` into active source and production venv site-packages, replaced `web/dist`, restarted `agent-hub-api` and `agent-hub-worker`, reloaded Caddy, and confirmed `agent-hub-api`, `agent-hub-worker`, and `caddy` active.
+- Real server probe loaded the actual systemd env, created an Evolution run through HTTP API, inserted a real completed DB run/artifact with Evolution routing metadata, called the new HTTP ingest endpoint, verified the returned round/delta/artifact refs/next action, verified `evolution.round_ingested` audit, and verified the deployed JS/CSS assets contain `channel-config-actions`.
+- Probe output: `{"status": "ok", "run_id": "evolution_250fe6e950054ff580f1f281f40c72f7", "execution_run_id": "2e600998-3913-4251-8efc-ec2875d3ff9a", "checked": ["evolution_ingest_api", "real_db_artifact", "channel_config_actions_asset", "audit"]}`.
+- Probe cleaned the temporary run/evolution resource; server `/tmp/probe_evolution_ingest_channel_ui.py`, `/tmp/deploy-evolution-ingest-channel-ui.sh`, and `/tmp/agent-hub-p3-runtime-incremental.tgz` were removed; services remained active.
+
+Remaining / next:
+
+- Commit this slice, create local GitHub recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, then watch GitHub Actions until green.
+- Continue P3 after green: remaining OpenClaw workflow/dialog integration, automatic worker-side Evolution result ingestion when execution runs complete, plan-task mode refinement, channel configuration edit/clear polish, UI copy/layout audit, missing button/function sweep, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-14 OpenClaw Navigation And Zhipu GLM Presets
 
 Current state:

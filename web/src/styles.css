@@ -2242,6 +2242,26 @@ article:hover {
   min-width: 0;
 }
 
+.channel-config-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  margin-top: 0.85rem;
+}
+
+.channel-config-actions button {
+  min-width: min(100%, 10rem);
+  white-space: normal;
+}
+
+.channel-config-actions [role="status"] {
+  color: var(--accent-2);
+  flex: 1 1 100%;
+  font-weight: 800;
+  min-width: 0;
+}
+
 .code-line,
 .code-block {
   font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
@@ -2863,6 +2883,17 @@ article:hover {
 
   .channel-picker {
     position: static;
+  }
+
+  .channel-config-actions {
+    align-items: stretch;
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .channel-config-actions button {
+    min-height: 2.7rem;
+    width: 100%;
   }
 
   .topbar {
