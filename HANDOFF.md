@@ -4125,3 +4125,6 @@ Server deployment and real verification for Evolution Controls + Right Drawer Bu
 - Real server probe used the actual API path `http://127.0.0.1/api/v1`, created a real evolution run, approved it while changing `baseline_agent_id` and `evaluator_agent_id`, recorded a regression round with `accepted=false`, `artifact_refs`, `tokens_used`, and `elapsed_seconds`, verified `next_action=rollback_candidate`, then cleaned the probe evolution resource.
 - Probe output: `{"status": "ok", "checked": ["evolution_create", "approval_edits", "round_regression", "frontend_bundle_markers"], "probe_evolution_id": "evolution_a295c9d42db24c4694a612713e4f6a6b"}`.
 - Removed `/tmp/evolution_controls_check.py`, `/tmp/deploy-evolution-controls-right-drawer.sh`, and `/tmp/agent-hub-p3-runtime-incremental.tgz`; `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.
+CI status for Evolution Controls + Right Drawer Button Polish:
+
+- GitHub Actions run `31794375035` for commit `e76c92f` completed successfully in 2m54s.
