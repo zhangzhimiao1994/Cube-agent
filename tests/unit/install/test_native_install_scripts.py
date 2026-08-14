@@ -1,3 +1,4 @@
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -6,6 +7,22 @@ ROOT = Path(__file__).resolve().parents[3]
 def read(relative: str) -> str:
     return (ROOT / relative).read_text(encoding="utf-8")
 
+
+
+def test_openclaw_local_adapter_has_cross_platform_and_installed_cli_entrypoints() -> None:
+    pyproject = tomllib.loads(read("pyproject.toml"))
+    launcher = read("scripts/agent-hub")
+    command = read("scripts/commands/openclaw-adapter.sh")
+
+    assert (
+        pyproject["project"]["scripts"]["agent-hub-openclaw-adapter"]
+        == "agent_hub.openclaw.local_adapter:main"
+    )
+    assert "openclaw-adapter     Start a local OpenClaw Adapter" in launcher
+    assert "doctor|status|logs|backup|restore|upgrade|openclaw-adapter" in launcher
+    assert "OPENCLAW_ADAPTER_TOKEN" in command
+    assert "OPENCLAW_ADAPTER_ALLOWED_COMMANDS_JSON" in command
+    assert "-m agent_hub.openclaw.local_adapter" in command
 
 def test_native_installer_deploys_release_before_starting_services() -> None:
     script = read("scripts/lib/install_native.sh")

@@ -1,3 +1,44 @@
+## 2026-08-14 OpenClaw Local Adapter Entrypoints
+
+Current state:
+
+- Added a cross-platform Python console script entrypoint: `agent-hub-openclaw-adapter` -> `agent_hub.openclaw.local_adapter:main`.
+- Added an installed Linux CLI entrypoint: `scripts/agent-hub openclaw-adapter`.
+- The CLI requires an explicit `OPENCLAW_ADAPTER_TOKEN` and `OPENCLAW_ADAPTER_ALLOWED_COMMANDS_JSON`; it does not start with broad/default permissions.
+- The adapter remains bounded to exact argv allowlists and bearer-token authentication. It currently supports command execution; desktop/screen/file actions still require later adapter capability work.
+
+Verification performed:
+
+- Local Windows real probe:
+  - Confirmed `.venv/Scripts/agent-hub-openclaw-adapter.exe` is generated after package install.
+  - Started `python -m agent_hub.openclaw.local_adapter` on `127.0.0.1:18766` with `OPENCLAW_ADAPTER_PLATFORM=windows` and a single exact allowlisted Python command.
+  - Called real HTTP `GET /v1/openclaw/health` and `POST /v1/openclaw/execute`; execution returned `openclaw-local-adapter-live`, exit code `0`, no stderr.
+  - Stopped the probe process after the request.
+- Local tests:
+  - Added `test_openclaw_local_adapter_has_cross_platform_and_installed_cli_entrypoints`.
+  - `uv run pytest tests/unit/install/test_native_install_scripts.py::test_openclaw_local_adapter_has_cross_platform_and_installed_cli_entrypoints tests/unit/openclaw/test_local_adapter.py -q --tb=short` -> 5 passed.
+  - `uv run pytest tests/unit/install/test_native_install_scripts.py tests/unit/openclaw/test_local_adapter.py -q --tb=short` -> 29 passed.
+  - `uv run ruff check tests/unit/install/test_native_install_scripts.py tests/unit/openclaw/test_local_adapter.py src/agent_hub/openclaw/local_adapter.py` -> passed.
+  - `uv run mypy --strict src/agent_hub/openclaw/local_adapter.py tests/unit/openclaw/test_local_adapter.py tests/unit/install/test_native_install_scripts.py` -> passed.
+  - `uv lock --check` -> passed.
+  - `git diff --check` -> passed with existing CRLF warnings.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-openclaw-local-adapter-entrypoints.tgz` with only `pyproject.toml`, `scripts/agent-hub`, `scripts/commands/openclaw-adapter.sh`, and the install test.
+  - Backed up overwritten files to `/opt/agent-hub/backups/openclaw-local-adapter-entrypoints-20260814-052133`.
+  - Initial `bash -n` caught CRLF line endings from the Windows-built package; normalized the deployed shell files with `sed -i 's/\r$//'` and also normalized the local shell files to LF for future packages.
+  - Verified `bash -n /opt/agent-hub/current/scripts/agent-hub /opt/agent-hub/current/scripts/commands/openclaw-adapter.sh` passes and `caddy`, `agent-hub-api`, and `agent-hub-worker` are active.
+- Server Linux real probe:
+  - Started `/opt/agent-hub/current/scripts/agent-hub openclaw-adapter` on `127.0.0.1:18767` with a temporary bearer token and a single exact allowlisted Python command.
+  - Called real HTTP health and execute endpoints; execution returned `openclaw-server-adapter-live`, exit code `0`.
+  - Removed `/tmp/probe_openclaw_adapter_cli.sh` and confirmed no adapter probe process remained.
+
+Remaining risks / TODOs:
+
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for current remote `mutilagent/main`.
+- Push with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue OpenClaw capability work later for desktop/screen/file actions; command execution is now exposed through guarded Windows/Linux-compatible adapter entrypoints.
 ## 2026-08-14 OpenClaw Remote Adapter UI
 
 Current state:

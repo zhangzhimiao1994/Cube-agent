@@ -15,6 +15,7 @@ Commands:
   backup              Create or verify a backup.
   restore             Restore a verified backup.
   upgrade             Upgrade with backup and readiness rollback.
+  openclaw-adapter     Start a local OpenClaw Adapter.
   version             Print installed version.
 EOF
 }
@@ -27,7 +28,7 @@ fi
 shift || true
 
 case "$command" in
-  doctor|status|logs|backup|restore|upgrade)
+  doctor|status|logs|backup|restore|upgrade|openclaw-adapter)
     exec "$COMMAND_DIR/$command.sh" "$@"
     ;;
   version)
