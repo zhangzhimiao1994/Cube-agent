@@ -484,7 +484,9 @@ async def test_explicit_skill_creation_request_returns_grounded_evolution_propos
     assert submitted.evolution_proposal["target_artifact_type"] == "skill"
     assert submitted.evolution_proposal["title"] == "Skill 创建任务"
     assert submitted.evolution_proposal["source_conversation_id"] == "conv-research-skill"
-    assert "真实任务验收" in submitted.evolution_proposal["summary"]
+    summary = submitted.evolution_proposal["summary"]
+    assert isinstance(summary, str)
+    assert "真实任务验收" in summary
 
 
 @pytest.mark.asyncio

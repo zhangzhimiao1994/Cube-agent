@@ -4460,3 +4460,20 @@ Remaining risks / next:
 
 - Deploy this trigger-boundary slice incrementally to the server, run real server probes for normal plan vs explicit Skill creation, then commit, archive, push, and check GitHub Actions.
 - Continue P3 after green: Evolution executor orchestration, plan-task mode UX, OpenClaw broader workflow integration, Skill Creator grounding into full real-input/real-test workflows, UI copy/layout audit, missing button/function sweep, README/README.zh-CN final usage refresh, and Docker readiness later.
+## 2026-08-14 GitHub CI Recovery After Evolution Trigger Boundary Push
+
+Current state:
+
+- Pushed `d1bede9 fix: narrow evolution proposal triggers`; GitHub Actions run `31810035140` failed in `uv run mypy --strict src tests`.
+- Failure was in the new unit test: `submitted.evolution_proposal["summary"]` is typed as `object`, so using `"真实任务验收" in ...` directly failed strict mypy.
+- Fixed the test by assigning `summary`, asserting `isinstance(summary, str)`, then checking the substring.
+
+Local verification:
+
+- `\.\.venv\Scripts\python.exe -m mypy --strict src tests` -> passed, 259 source files checked.
+- `\.\.venv\Scripts\python.exe -m pytest tests\unit\runs\test_temporary_agent.py tests\api\test_runs_api.py -q` -> 36 passed.
+
+Remaining risks / next:
+
+- Commit this CI fix, create recovery bundle/tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
+- Continue P3 after green: Evolution executor orchestration, plan-task mode UX, OpenClaw broader workflow integration, Skill Creator grounding into full real-input/real-test workflows, UI copy/layout audit, missing button/function sweep, README/README.zh-CN final usage refresh, and Docker readiness later.
