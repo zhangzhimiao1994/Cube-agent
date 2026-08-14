@@ -206,6 +206,54 @@ def test_create_app_starts_feishu_websocket_when_runtime_config_enables_it(
     assert task.done()
     assert client.cancelled.wait(timeout=1)
 
+def test_channel_status_exposes_feishu_websocket_runtime_diagnostics(
+    tmp_path: Path,
+) -> None:
+    client = BlockingFeishuClient()
+
+    async def client_factory(settings: FeishuSettings) -> FeishuWebSocketClient:
+        return client
+
+    admin_service = InMemoryAdminResourceService()
+    admin_service.channel_config["feishu"] = {
+        "FEISHU_APP_ID": "cli_runtime",
+        "FEISHU_APP_SECRET": "secret",
+        "FEISHU_TRANSPORT": "websocket",
+    }
+    application = create_app(
+        settings=valid_settings(tmp_path),
+        database=FakeDatabase(),
+        redis_client=FakeRedis(),
+        auth_service=StubAuthService(),
+        rate_limiter=StubRateLimiter(),
+        config_service=StubConfigService(),
+        admin_resource_service=admin_service,
+        user_admin_service=object(),
+        run_service=object(),
+        feishu_websocket_client_factory=client_factory,
+    )
+
+    with TestClient(application) as api:
+        assert client.started.wait(timeout=1)
+        response = api.get(
+            "/api/v1/admin/channels",
+            headers={"Authorization": "Bearer valid-token"},
+        )
+
+    assert response.status_code == 200
+    feishu = next(item for item in response.json() if item["id"] == "feishu")
+    assert feishu["runtime"] == {
+        "status": "running",
+        "ready": True,
+        "connection_attempts": 1,
+        "reconnects": 0,
+        "received_events": 0,
+        "submitted_messages": 0,
+        "ignored_events": 0,
+        "failures": 0,
+        "last_error_type": None,
+        "last_error_message": None,
+    }
 
 def test_feishu_websocket_restarts_when_channel_config_changes(
     tmp_path: Path,

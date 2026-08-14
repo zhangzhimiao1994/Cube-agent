@@ -270,6 +270,21 @@ function statusLabel(status: string) {
   return STATUS_LABELS[status] ?? status;
 }
 
+function channelRuntimeTitle(channel: ChannelStatus) {
+  if (!channel.runtime) return null;
+  if (channel.id === "feishu" && channel.runtime.status === "running") return "飞书长连接运行中";
+  if (channel.id === "feishu" && channel.runtime.status === "starting") return "飞书长连接启动中";
+  if (channel.id === "feishu" && channel.runtime.status === "not_started") return "飞书长连接未启动";
+  if (channel.id === "feishu" && channel.runtime.status === "stopped") return "飞书长连接已停止";
+  return `运行状态：${channel.runtime.status}`;
+}
+
+function channelRuntimeSummary(channel: ChannelStatus) {
+  const runtime = channel.runtime;
+  if (!runtime) return "";
+  return `连接次数 ${runtime.connection_attempts} / 收到事件 ${runtime.received_events} / 已提交 ${runtime.submitted_messages} / 失败 ${runtime.failures}`;
+}
+
 function envTemplate(channel: ChannelStatus, guide: ChannelGuide) {
   return guide.fields
     .map((field) => `${field.env}=${channel.configured.includes(field.env) ? "<已配置>" : field.placeholder}`)
@@ -435,6 +450,18 @@ export function ChannelsPage() {
                   <p>{selected.transports.join(" / ") || "待定义"}</p>
                 </div>
               </div>
+              {selected.runtime ? (
+                <div className="channel-runtime-status" role="status">
+                  <strong>{channelRuntimeTitle(selected)}</strong>
+                  <span>{channelRuntimeSummary(selected)}</span>
+                  {selected.runtime.last_error_type ? (
+                    <span>
+                      最近错误：{selected.runtime.last_error_type}
+                      {selected.runtime.last_error_message ? ` - ${selected.runtime.last_error_message}` : ""}
+                    </span>
+                  ) : null}
+                </div>
+              ) : null}
               {selected.missing.length > 0 ? (
                 <p role="alert">还缺少配置：{selected.missing.join(", ")}</p>
               ) : (

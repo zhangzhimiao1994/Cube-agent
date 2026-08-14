@@ -1,3 +1,38 @@
+## 2026-08-15 Feishu WebSocket Runtime Diagnostics
+
+### State
+- Added a `runtime` diagnostic object to channel status responses for Feishu websocket mode.
+- The API now exposes whether the Feishu connector is `running`, `starting`, `stopped`, or `not_started`, plus readiness and connector metrics: connection attempts, reconnects, received events, submitted messages, ignored events, failures, and the last safe error type/message.
+- The Feishu websocket connector now records the last bounded error type/message after transient SDK/network failures without exposing credentials.
+- The channel configuration page now shows a compact Feishu runtime strip such as `飞书长连接运行中` and `连接次数 ... / 收到事件 ... / 已提交 ... / 失败 ...`, so operators can distinguish saved credentials from an actually running long connection.
+
+### Verification
+- TDD red first:
+  - `pytest tests\unit\test_app_wiring.py::test_channel_status_exposes_feishu_websocket_runtime_diagnostics -q --tb=short` failed with missing `runtime`.
+  - `npm test -- --run src/pages/ChannelsPage.test.tsx -t "shows channel connection status"` failed because the page did not show `飞书长连接运行中`.
+- Green local checks:
+  - `pytest tests\unit\test_app_wiring.py::test_channel_status_exposes_feishu_websocket_runtime_diagnostics -q --tb=short` -> 1 passed.
+  - `npm test -- --run src/pages/ChannelsPage.test.tsx -t "shows channel connection status"` -> 4 passed.
+  - `pytest tests\unit\test_app_wiring.py tests\api\test_admin_resources.py -q` -> 135 passed.
+  - `npm test -- --run src/pages/ChannelsPage.test.tsx src/pages/OperationalPages.test.tsx` -> 61 passed.
+  - `ruff check src tests` -> passed.
+  - `mypy --strict src tests` -> passed.
+  - `npm run lint` -> passed.
+  - `npm run build` -> passed with the existing Vite large chunk warning.
+  - `git diff --check` -> passed.
+
+### Server Deployment And Real Probe
+- Uploaded `.local-archives/server-incrementals/agent-hub-feishu-runtime-diagnostics-20260815-045500.tgz` to `103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed into `/opt/agent-hub/current`.
+- Server backup retained under `/opt/agent-hub/backups/feishu-runtime-diagnostics-20260815-045500`; server archive retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-feishu-runtime-diagnostics-20260815-045500.tgz`.
+- Restarted `agent-hub-api` and `agent-hub-worker`; final health returned `{"status":"ok"}` and `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.
+- Real server HTTP probe called `/api/v1/admin/channels` with a short-lived admin token and verified Feishu is configured for websocket plus runtime diagnostics are present.
+- Probe output: `{"status": "ok", "checks": {"configured": true, "websocket_transport": true, "runtime_present": true, "runtime_status_known": true, "metrics_present": true}, "runtime": {"status": "running", "ready": true, "connection_attempts": 1, "reconnects": 0, "received_events": 0, "submitted_messages": 0, "ignored_events": 0, "failures": 0, "last_error_type": null, "last_error_message": null}}`.
+- Frontend asset probe loaded `/channels`, fetched active JS/CSS assets, and verified the runtime text, summary text, and `channel-runtime-status` CSS are present.
+
+### Remaining / Next
+- Commit this slice, create local GitHub recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, then watch GitHub Actions until green.
+- Feishu credentials and SDK are now verified on the server. If user chat still gets no reply, the next evidence to inspect is whether Feishu platform is publishing message events to this app and whether outbound reply permissions are enabled.
+- Continue remaining P3 items after green: UI copy/layout audit, missing button/function sweep, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 Schedule Intent Boundary Fix
 
 ### State

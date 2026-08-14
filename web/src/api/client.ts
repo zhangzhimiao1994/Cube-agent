@@ -766,6 +766,18 @@ const McpServerSchema = z.object({
 
 export type McpServer = z.infer<typeof McpServerSchema>;
 
+const ChannelRuntimeStatusSchema = z.object({
+  status: z.string(),
+  ready: z.boolean(),
+  connection_attempts: z.number(),
+  reconnects: z.number(),
+  received_events: z.number(),
+  submitted_messages: z.number(),
+  ignored_events: z.number(),
+  failures: z.number(),
+  last_error_type: z.string().nullable(),
+  last_error_message: z.string().nullable(),
+});
 const ChannelStatusSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -776,6 +788,7 @@ const ChannelStatusSchema = z.object({
   missing: z.array(z.string()),
   configured: z.array(z.string()).default([]),
   notes: z.array(z.string()),
+  runtime: ChannelRuntimeStatusSchema.nullable().optional(),
 });
 
 export type ChannelStatus = z.infer<typeof ChannelStatusSchema>;

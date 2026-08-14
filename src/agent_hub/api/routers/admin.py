@@ -416,6 +416,21 @@ class McpServerRequest(BaseModel):
     timeout_seconds: float = Field(default=10, gt=0, le=120)
 
 
+class ChannelRuntimeStatusResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+    ready: bool
+    connection_attempts: int = Field(ge=0)
+    reconnects: int = Field(ge=0)
+    received_events: int = Field(ge=0)
+    submitted_messages: int = Field(ge=0)
+    ignored_events: int = Field(ge=0)
+    failures: int = Field(ge=0)
+    last_error_type: str | None = None
+    last_error_message: str | None = None
+
+
 class ChannelStatusResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -428,6 +443,7 @@ class ChannelStatusResponse(BaseModel):
     missing: list[str] = Field(default_factory=list)
     configured: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    runtime: ChannelRuntimeStatusResponse | None = None
 
 
 class ChannelConfigRequest(BaseModel):
@@ -7431,13 +7447,68 @@ async def delete_mcp_server(
     return OperationStatusResponse(status="deleted")
 
 
+
+def _channels_with_runtime_status(
+    channels: Iterable[ChannelStatusResponse], request: Request
+) -> list[ChannelStatusResponse]:
+    enriched: list[ChannelStatusResponse] = []
+    for channel in channels:
+        if channel.id != "feishu" or "websocket" not in channel.transports:
+            enriched.append(channel)
+            continue
+        enriched.append(channel.model_copy(update={"runtime": _feishu_runtime_status(request)}))
+    return enriched
+
+
+def _feishu_runtime_status(request: Request) -> ChannelRuntimeStatusResponse:
+    connector = getattr(request.app.state, "feishu_websocket_connector", None)
+    task = getattr(request.app.state, "feishu_websocket_task", None)
+    metrics = getattr(connector, "metrics", None)
+    task_done = getattr(task, "done", None)
+    task_running = callable(task_done) and not bool(task_done())
+    ready = bool(getattr(connector, "ready", False))
+    if connector is None:
+        status = "not_started"
+    elif task_running and ready:
+        status = "running"
+    elif task_running:
+        status = "starting"
+    else:
+        status = "stopped"
+    return ChannelRuntimeStatusResponse(
+        status=status,
+        ready=ready,
+        connection_attempts=_runtime_metric_int(metrics, "connection_attempts"),
+        reconnects=_runtime_metric_int(metrics, "reconnects"),
+        received_events=_runtime_metric_int(metrics, "received_events"),
+        submitted_messages=_runtime_metric_int(metrics, "submitted_messages"),
+        ignored_events=_runtime_metric_int(metrics, "ignored_events"),
+        failures=_runtime_metric_int(metrics, "failures"),
+        last_error_type=_runtime_metric_str(metrics, "last_error_type"),
+        last_error_message=_runtime_metric_str(metrics, "last_error_message"),
+    )
+
+
+def _runtime_metric_int(metrics: object | None, name: str) -> int:
+    value = getattr(metrics, name, 0)
+    return value if isinstance(value, int) and value >= 0 else 0
+
+
+def _runtime_metric_str(metrics: object | None, name: str) -> str | None:
+    value = getattr(metrics, name, None)
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
 @router.get("/channels", response_model=list[ChannelStatusResponse], responses=error_responses(401, 403, 422))
 async def list_channels(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
+    request: Request,
 ) -> list[ChannelStatusResponse]:
     _require(principal, "config:read")
-    return list(await service.list_channels())
+    return _channels_with_runtime_status(await service.list_channels(), request)
 
 
 @router.post(

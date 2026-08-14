@@ -34,6 +34,8 @@ class FeishuWebSocketMetrics:
     submitted_messages: int = 0
     ignored_events: int = 0
     failures: int = 0
+    last_error_type: str | None = None
+    last_error_message: str | None = None
 
 
 class FeishuWebSocketReceiver:
@@ -113,8 +115,10 @@ class FeishuWebSocketConnector:
             except asyncio.CancelledError:
                 self._ready = False
                 raise
-            except Exception:  # noqa: BLE001 -- connector isolates transient network failures.
+            except Exception as error:  # noqa: BLE001 -- connector isolates transient network failures.
                 self.metrics.failures += 1
+                self.metrics.last_error_type = type(error).__name__
+                self.metrics.last_error_message = _bounded_error_message(error)
             finally:
                 self._ready = False
             if not self._stop.is_set():
@@ -125,6 +129,13 @@ class FeishuWebSocketConnector:
         if self._reconnect_max_seconds <= self._reconnect_min_seconds:
             return self._reconnect_min_seconds
         return random.uniform(self._reconnect_min_seconds, self._reconnect_max_seconds)
+
+
+def _bounded_error_message(error: Exception) -> str:
+    message = str(error).strip() or type(error).__name__
+    if len(message) <= 256:
+        return message
+    return message[:253] + "..."
 
 
 def build_feishu_websocket_receiver(

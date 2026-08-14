@@ -29,6 +29,18 @@ const channelPayload = [
     configured: ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_TRANSPORT"],
     missing: [],
     notes: ["Webhook 已挂载在主 API 服务，不需要额外暴露 8001。"],
+    runtime: {
+      status: "running",
+      ready: true,
+      connection_attempts: 2,
+      reconnects: 1,
+      received_events: 3,
+      submitted_messages: 2,
+      ignored_events: 1,
+      failures: 0,
+      last_error_type: null,
+      last_error_message: null,
+    },
   },
   {
     id: "dingtalk",
@@ -213,6 +225,8 @@ describe("ChannelsPage", () => {
     expect(screen.getByRole("option", { name: "长连接" })).not.toBeNull();
     expect(screen.getByText(/长连接与 CowAgent\/OpenClaw 一样只需要 App ID/)).not.toBeNull();
     expect(screen.getByText(/校验失败会返回明确错误/)).not.toBeNull();
+    expect(screen.getByText("飞书长连接运行中")).not.toBeNull();
+    expect(screen.getByText("连接次数 2 / 收到事件 3 / 已提交 2 / 失败 0")).not.toBeNull();
   });
 
   it("does not mark unconfigured optional channel fields as already configured", async () => {
