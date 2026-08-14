@@ -4208,3 +4208,7 @@ Server deployment and real verification for Multimedia Generation Entry Removal 
 - Real server probe fetched the deployed SPA through `http://127.0.0.1/` and `http://127.0.0.1/multimedia`, inspected the deployed production JS bundle, verified Seedance model markers, verified forbidden standalone generation markers were absent, verified router source redirects `/multimedia` to `/models`, and verified the old `MultimediaPage.tsx` source file is removed.
 - Probe output: `{'status': 'ok', 'checked': ['caddy_spa_entry', 'frontend_bundle_markers', 'legacy_route_source', 'old_page_removed'], 'js_bundle_count': 1, 'css_bundle_count': 1}`.
 - Removed `/tmp/check_multimedia_entry_seedance.py` and `/tmp/agent-hub-p3-runtime-incremental.tgz`; `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.
+CI status for Multimedia Generation Entry Removal + Seedance Presets:
+
+- Commit `42a0442` was pushed to `mutilagent/main` after creating recovery bundle `.local-archives/github-recovery/mutilagent-main-before-20260814-193902-cfd8298.bundle` and GitHub tag `archive/mutilagent-main-before-20260814-193902-cfd8298`.
+- GitHub Actions run `31797093485` for commit `42a0442` completed successfully in 2m58s.
