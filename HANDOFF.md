@@ -21,8 +21,13 @@
 - Probe output: Feishu status `configured`, sources `{FEISHU_APP_ID: saved, FEISHU_APP_SECRET: saved, FEISHU_TRANSPORT: saved}`, runtime `{status: running, ready: true, connection_attempts: 1, reconnects: 0, received_events: 0, submitted_messages: 0, ignored_events: 0, failures: 0}`.
 - Removed server deployment/probe temp files and `/tmp/agent-hub-p3-runtime-incremental.tgz` after verification.
 
+### GitHub / Recovery
+- Committed as `24594d6 fix: refresh channel config state immediately`.
+- Created local GitHub recovery bundle `.local-archives/github-recovery/mutilagent-main-before-20260815-065846-67a2f6a.bundle` and pushed GitHub archive tag `archive/mutilagent-main-before-20260815-065846-67a2f6a`.
+- Force-with-lease pushed `mutilagent/main`; GitHub again reported the repository has moved to `zhangzhimiao1994/CubeAgent.git`, but the configured `mutilagent` remote accepted the push.
+- GitHub Actions run `31848717242` (`quality`) passed.
+
 ### Remaining / Next
-- Commit, create GitHub recovery archive/tag, force-with-lease push `mutilagent/main`, and verify GitHub Actions.
 - Continue remaining P3 items after green: Feishu platform-side event delivery confirmation if the user sends a test message, OpenClaw follow-ups, evolution execution/backlog UI, broader UI layout/copy audit, missing button/function sweep, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 Evolution Copy Boundary
 
