@@ -27,6 +27,11 @@ export function AppShell() {
   const drawerGroup = visibleGroups.find((group) => group.id === hoveredGroupId) ?? activeGroup;
 
   useEffect(() => {
+    const closeMobileNav = () => setMobileNavOpen(false);
+    window.addEventListener("agent-hub:close-mobile-nav", closeMobileNav);
+    return () => window.removeEventListener("agent-hub:close-mobile-nav", closeMobileNav);
+  }, []);
+  useEffect(() => {
     setMobileNavOpen(false);
     setExpandedMobileGroupId(activeGroup?.id ?? null);
   }, [activeGroup?.id, location.pathname]);
@@ -40,7 +45,11 @@ export function AppShell() {
             className="mobile-nav-trigger"
             aria-label={mobileNavOpen ? "关闭导航栏" : "打开导航栏"}
             aria-expanded={mobileNavOpen}
-            onClick={() => setMobileNavOpen((open) => !open)}
+            onClick={() => {
+              const next = !mobileNavOpen;
+              if (next) window.dispatchEvent(new Event("agent-hub:close-history-drawer"));
+              setMobileNavOpen(next);
+            }}
           >
             <span className="mobile-nav-trigger-icon" aria-hidden="true">
               <span />

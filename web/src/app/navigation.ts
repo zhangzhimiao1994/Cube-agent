@@ -19,16 +19,22 @@ export const MODULE_GROUPS: ModuleGroup[] = [
   {
     id: "workspace",
     to: "/workspace",
-    label: "对话",
-    eyebrow: "Workspace",
-    description: "发起新对话、接续历史会话、查看运行过程和产物，是日常使用 Agent 的主入口。",
+    label: "对话与进化",
+    eyebrow: "Conversation & Evolution",
+    description: "发起对话、接续会话、查看运行过程，并管理 Skill 蒸馏、长期迭代和进化任务。",
     tone: "cyan",
     modules: [
       {
         to: "/",
-        label: "对话与任务",
-        description: "自动、直连、派单、讨论、混合五种运行方式统一从这里进入。",
+        label: "对话",
+        description: "连续对话、历史会话、运行过程和附件入口集中在这里。",
         permission: "run:read",
+      },
+      {
+        to: "/evolution",
+        label: "进化",
+        description: "管理 Skill 蒸馏、达尔文迭代、长期多轮任务和候选产物验收。",
+        permission: "skill:read",
       },
     ],
   },

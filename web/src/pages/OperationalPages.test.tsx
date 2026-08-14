@@ -242,6 +242,46 @@ const models = [
   },
 ];
 
+
+const evolutionRun = {
+  id: "evolution_11111111111111111111111111111111",
+  kind: "skill_optimization",
+  title: "Darwin Skill 迭代",
+  objective: "用固定评测集优化 darwin-skill，未达标不发布。",
+  mode: "hybrid",
+  source_skill_ids: ["darwin-skill"],
+  target_artifact_type: "skill",
+  status: "running",
+  max_rounds: 5,
+  min_delta: 2,
+  budget_tokens: 200000,
+  budget_minutes: 120,
+  rubric: ["实测表现", "反例覆盖"],
+  rounds: [
+    {
+      round: 1,
+      changed_dimension: "实测表现",
+      candidate_summary: "补充测试 prompt 并降低自评偏差。",
+      score_before: 72,
+      score_after: 76.5,
+      delta: 4.5,
+      tests_passed: true,
+      regression_detected: false,
+      accepted: true,
+      recommendation: "continue",
+      stop_reason: null,
+      judge_summary: "两个测试 prompt 均优于基线。",
+      artifact_refs: ["artifact://generated-skill/darwin-v2"],
+      tokens_used: 12000,
+      elapsed_seconds: 180,
+      created_at: "2026-08-14T10:00:00Z",
+    },
+  ],
+  created_by: "11111111-1111-4111-8111-111111111111",
+  created_at: "2026-08-14T09:00:00Z",
+  updated_at: "2026-08-14T10:00:00Z",
+  stop_reason: null,
+};
 const workflows = [
   {
     id: "short-video-dispatch",
@@ -278,6 +318,8 @@ describe("operational management pages", () => {
   let visibleModels = models;
   let deletedRunIds = new Set<string>();
   let deletedHermesIds = new Set<string>();
+  let visibleEvolutionRuns = [evolutionRun];
+  let createdEvolutionRun: typeof evolutionRun | null = null;
   let failNextAttachmentUpload = false;
 
   beforeEach(() => {
@@ -289,6 +331,8 @@ describe("operational management pages", () => {
     visibleModels = models;
     deletedRunIds = new Set<string>();
     deletedHermesIds = new Set<string>();
+    visibleEvolutionRuns = [evolutionRun];
+    createdEvolutionRun = null;
     failNextAttachmentUpload = false;
     vi.stubGlobal("confirm", vi.fn(() => true));
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
@@ -505,6 +549,23 @@ describe("operational management pages", () => {
             scan_diff: ["content sha256: abc123", "entry point: main.py", "approved by production admin"],
           });
         }
+        if (path === "/api/v1/admin/evolution-runs" && method === "POST") {
+          const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
+          createdEvolutionRun = {
+            ...evolutionRun,
+            id: "evolution_22222222222222222222222222222222",
+            title: String(body.title ?? "新进化任务"),
+            objective: String(body.objective ?? ""),
+            source_skill_ids: Array.isArray(body.source_skill_ids) ? body.source_skill_ids : [],
+            rounds: [],
+            status: "waiting_approval",
+          };
+          visibleEvolutionRuns = [createdEvolutionRun, ...visibleEvolutionRuns];
+          return jsonResponse(createdEvolutionRun);
+        }
+        if (path === "/api/v1/admin/evolution-runs") {
+          return jsonResponse(visibleEvolutionRuns);
+        }
         if (path === "/api/v1/admin/skills") {
           return jsonResponse([]);
         }
@@ -676,7 +737,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     expect(screen.getByText(/连续对话窗口/)).not.toBeNull();
 
     await openRunConfig(user);
@@ -743,7 +804,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     ["自动", "直连", "派单", "讨论", "混合"].forEach((label) => {
       expect(screen.getByRole("button", { name: label })).not.toBeNull();
     });
@@ -772,7 +833,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: "直连" }));
     expect(screen.getByText(/直连需要先选择本次对话使用的模型\/API/)).not.toBeNull();
     await user.type(screen.getByPlaceholderText(/输入消息/), "直接回答这句话。");
@@ -801,7 +862,7 @@ describe("operational management pages", () => {
     visibleModels = [];
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: "直连" }));
     await user.type(screen.getByPlaceholderText(/输入消息/), "请直接分析一下这个问题。");
 
@@ -813,7 +874,7 @@ describe("operational management pages", () => {
   it("renders text artifacts as assistant chat replies instead of artifact-only cards", async () => {
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await userEvent.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
@@ -836,7 +897,7 @@ describe("operational management pages", () => {
     visibleConversationRuns = [visibleRunDetail];
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await userEvent.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
@@ -869,7 +930,7 @@ describe("operational management pages", () => {
 
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await userEvent.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
@@ -883,7 +944,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
     expect(await within(stream).findByText("给我做一个短视频脚本方案。")).not.toBeNull();
@@ -903,7 +964,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
     await screen.findByText(/会话：conv-previous/);
     await user.type(screen.getByPlaceholderText(/输入消息/), "继续优化这个脚本。");
@@ -922,7 +983,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: "Vibe Coding" }));
     await user.type(screen.getByPlaceholderText(/输入消息/), "审查这个代码附件。");
     await user.click(screen.getByRole("button", { name: "发送" }));
@@ -940,7 +1001,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.type(screen.getByPlaceholderText(/输入消息/), "每天9点提醒我填写日报");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
@@ -967,7 +1028,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     const input = screen.getByLabelText("上传文件或 Skill 压缩包") as HTMLInputElement;
     const file = new File(["image-bytes"], "截图.png", { type: "image/png" });
 
@@ -998,7 +1059,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
     await screen.findByText(/会话：conv-previous/);
     await user.click(screen.getByRole("button", { name: "按照原思路" }));
@@ -1020,7 +1081,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
     await screen.findByText(/会话：conv-previous/);
     await user.click(screen.getByRole("button", { name: "按照原思路" }));
@@ -1042,7 +1103,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: "Vibe Coding" }));
     await user.click(screen.getByRole("button", { name: "Vibe Coding" }));
     await user.type(screen.getByPlaceholderText(/输入消息/), "正常对话。");
@@ -1061,7 +1122,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
     await screen.findByText(/会话：conv-previous/);
 
@@ -1086,7 +1147,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
     await screen.findByText(/会话：conv-previous/);
 
@@ -1128,7 +1189,7 @@ describe("operational management pages", () => {
 
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
     expect(await within(stream).findByText("给我做一个短视频脚本方案。")).not.toBeNull();
@@ -1146,7 +1207,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
     await screen.findByText(/会话：conv-previous/);
     await user.click(screen.getByRole("button", { name: "按照原思路" }));
@@ -1188,7 +1249,7 @@ describe("operational management pages", () => {
 
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await userEvent.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
@@ -1202,7 +1263,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
@@ -1377,7 +1438,7 @@ describe("operational management pages", () => {
 
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
     const mainPlan = within(stream).getByRole("button", { name: /主 Agent 接收任务：选择运行模式、角色和模型/ });
@@ -1511,7 +1572,7 @@ describe("operational management pages", () => {
 
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
     const copywriterOutput = within(stream).getByRole("button", {
@@ -1572,7 +1633,7 @@ describe("operational management pages", () => {
 
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
     const outputRow = within(stream).getByRole("button", { name: /文案生成 输出：中秋活动文案初稿/ });
@@ -1589,7 +1650,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /进入会话 22222222/ }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
@@ -1611,11 +1672,33 @@ describe("operational management pages", () => {
     expect(within(drawer).queryByText("artifact.created")).toBeNull();
   });
 
+
+  it("opens conversation history as a right drawer", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    const shell = document.querySelector(".app-shell");
+    const chatConsole = document.querySelector(".chat-console");
+
+    await user.click(screen.getByRole("button", { name: "打开导航栏" }));
+    expect(shell?.className).toContain("mobile-nav-open");
+
+    await user.click(screen.getByRole("button", { name: "打开历史对话" }));
+    expect(shell?.className).not.toContain("mobile-nav-open");
+    expect(chatConsole?.className).toContain("history-drawer-open");
+    expect(screen.getByRole("navigation", { name: "会话导航" })).not.toBeNull();
+    expect(screen.getByRole("button", { name: /进入会话 22222222/ })).not.toBeNull();
+    expect(screen.getByRole("button", { name: "关闭历史对话" })).not.toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "打开导航栏" }));
+    expect(chatConsole?.className).not.toContain("history-drawer-open");
+  });
   it("keeps quick mode under main-agent auto routing without forcing direct", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.type(screen.getByPlaceholderText(/输入消息/), "你好，直接回复我。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
@@ -1633,7 +1716,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: "讨论" }));
     await user.type(screen.getByPlaceholderText(/输入消息/), "请让多个角色评审这个方案。");
     await user.click(screen.getByRole("button", { name: "发送" }));
@@ -1652,7 +1735,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     expect(screen.getByRole("button", { name: "自动" })).not.toBeNull();
     expect(screen.getByRole("button", { name: "直连" })).not.toBeNull();
     expect(screen.getByRole("button", { name: "派单" })).not.toBeNull();
@@ -1676,7 +1759,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: "讨论" }));
     await user.type(screen.getByPlaceholderText(/输入消息/), "这个任务不应该二次确认。");
     await user.click(screen.getByRole("button", { name: "发送" }));
@@ -1701,7 +1784,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     const file = new File(["PK\x03\x04"], "uploaded-skill.zip", { type: "application/zip" });
     await user.upload(screen.getByLabelText("上传文件或 Skill 压缩包"), file);
 
@@ -1732,7 +1815,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     const file = new File(["image-bytes"], "screen.png", { type: "image/png" });
     await user.upload(screen.getByLabelText("上传文件或 Skill 压缩包"), file);
     expect(await screen.findByText("图片附件")).not.toBeNull();
@@ -1754,7 +1837,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     const fileName = "截图 方案.png";
     const file = new File(["image-bytes"], fileName, { type: "image/png" });
     await user.upload(screen.getByLabelText("上传文件或 Skill 压缩包"), file);
@@ -1771,7 +1854,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     const uploadInput = screen.getByLabelText("上传文件或 Skill 压缩包");
     const accept = uploadInput.getAttribute("accept") ?? "";
     expect(accept).toContain(".rar");
@@ -1906,7 +1989,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     expect(screen.getByRole("navigation", { name: "会话导航" })).not.toBeNull();
     expect(screen.getByRole("region", { name: "主对话内容" })).not.toBeNull();
     expect(screen.getByRole("button", { name: /打开本次运行配置/ })).not.toBeNull();
@@ -1920,7 +2003,7 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await openRunConfig(user);
     await user.type(screen.getByLabelText("参考会话 ID"), "conv-previous");
     await user.click(screen.getByRole("button", { name: "读取参考会话" }));
@@ -1931,6 +2014,31 @@ describe("operational management pages", () => {
   });
 
 
+
+  it("shows evolution records in the evolution module and creates a new run", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/evolution" />);
+
+    expect(await screen.findByRole("heading", { name: "进化" })).not.toBeNull();
+    const records = await screen.findByRole("region", { name: "进化任务" });
+    expect(within(records).getByText("Darwin Skill 迭代")).not.toBeNull();
+    expect(within(records).getByText(/第 1 轮/)).not.toBeNull();
+
+    await user.clear(screen.getByLabelText("任务名称"));
+    await user.type(screen.getByLabelText("任务名称"), "学术研究进化");
+    await user.clear(screen.getByLabelText("目标"));
+    await user.type(screen.getByLabelText("目标"), "迭代发现论文创新点。");
+    await user.click(screen.getByRole("button", { name: "创建任务" }));
+
+    await waitFor(() => expect(createdEvolutionRun?.title).toBe("学术研究进化"));
+    expect(requests.find((request) => request.path === "/api/v1/admin/evolution-runs" && request.method === "POST")).toMatchObject({
+      body: {
+        title: "学术研究进化",
+        objective: "迭代发现论文创新点。",
+        kind: "skill_optimization",
+      },
+    });
+  });
   it("shows MCP, memory, and modular log pages", async () => {
     const user = userEvent.setup();
 

@@ -29,6 +29,7 @@ describe("AppShell presentation", () => {
           });
         }
         if (path === "/api/v1/admin/runs") return jsonResponse([]);
+        if (path === "/api/v1/admin/evolution-runs") return jsonResponse([]);
         if (path === "/api/v1/admin/agents") return jsonResponse([]);
         if (path === "/api/v1/admin/workflows") return jsonResponse([]);
         if (path === "/api/v1/admin/settings") {
@@ -63,7 +64,7 @@ describe("AppShell presentation", () => {
 
     expect(await screen.findByRole("heading", { name: "魔方agent" })).not.toBeNull();
     expect(screen.getAllByText("工作台").length).toBeGreaterThan(0);
-    expect(screen.getByRole("link", { name: "对话" })).not.toBeNull();
+    expect(screen.getByRole("link", { name: "对话与进化" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "编排" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "系统" })).not.toBeNull();
     expect(screen.queryByText("实时调度")).toBeNull();
@@ -77,7 +78,7 @@ describe("AppShell presentation", () => {
     expect(await screen.findByRole("heading", { name: "魔方agent" })).not.toBeNull();
     const navigation = screen.getByRole("navigation", { name: "Main navigation" });
     expect(within(navigation).getAllByRole("link")).toHaveLength(6);
-    expect(within(navigation).getByRole("link", { name: "对话" })).not.toBeNull();
+    expect(within(navigation).getByRole("link", { name: "对话与进化" })).not.toBeNull();
     expect(within(navigation).getByRole("link", { name: "编排" })).not.toBeNull();
     expect(within(navigation).getByRole("link", { name: "资源" })).not.toBeNull();
     expect(within(navigation).getByRole("link", { name: "工具" })).not.toBeNull();
@@ -100,7 +101,7 @@ describe("AppShell presentation", () => {
 
     expect(await screen.findByRole("heading", { name: "魔方agent" })).not.toBeNull();
     const navigation = screen.getByRole("navigation", { name: "Main navigation" });
-    expect(within(navigation).getByRole("link", { name: "对话" }).getAttribute("href")).toBe("/");
+    expect(within(navigation).getByRole("link", { name: "对话与进化" }).getAttribute("href")).toBe("/");
     expect(within(navigation).getByRole("link", { name: "编排" }).getAttribute("href")).toBe("/main-agent");
     expect(within(navigation).getByRole("link", { name: "资源" }).getAttribute("href")).toBe("/models");
     expect(within(navigation).getByRole("link", { name: "工具" }).getAttribute("href")).toBe("/skills");
@@ -150,5 +151,6 @@ describe("AppShell presentation", () => {
     expect(stylesCss).toMatch(/@media \(max-width: 980px\)[\s\S]*\.nav-floating \.floating-nav-panel\s*{[\s\S]*position:\s*fixed;[\s\S]*transform:\s*translateX\(-105%\);/);
     expect(stylesCss).toMatch(/@media \(max-width: 980px\)[\s\S]*\.nav-floating \.nav-list,[\s\S]*\.nav-floating \.nav-drawer\s*{[\s\S]*display:\s*none;/);
     expect(stylesCss).toMatch(/@media \(max-width: 980px\)[\s\S]*\.nav-floating \.mobile-nav-groups\s*{[\s\S]*display:\s*grid;/);
+    expect(stylesCss).toMatch(/\.history-drawer-open \.chat-panel\s*{[\s\S]*opacity:\s*0\.38;[\s\S]*pointer-events:\s*none;/);
   });
 });

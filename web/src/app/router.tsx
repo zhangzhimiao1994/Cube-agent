@@ -7,6 +7,7 @@ import { AgentsPage } from "../pages/AgentsPage";
 import { AttachmentsPage } from "../pages/AttachmentsPage";
 import { ChannelsPage } from "../pages/ChannelsPage";
 import { ConfigPage } from "../pages/ConfigPage";
+import { EvolutionPage } from "../pages/EvolutionPage";
 import { HermesPage } from "../pages/HermesPage";
 import { LoginPage } from "../pages/LoginPage";
 import { LogsPage } from "../pages/LogsPage";
@@ -50,6 +51,7 @@ export function AppRoutes() {
           <Route key={group.id} path={group.to.slice(1)} element={<ModuleHubPage group={group} />} />
         ))}
         <Route path="runs/:runId" element={<RunDetailPage />} />
+        <Route path="evolution" element={<EvolutionPage />} />
         <Route path="config" element={<ConfigPage />} />
         <Route path="main-agent" element={<MainAgentPage />} />
         <Route path="models" element={<ModelsPage />} />

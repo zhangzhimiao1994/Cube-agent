@@ -1,4 +1,4 @@
-﻿import { z } from "zod";
+import { z } from "zod";
 
 const PrincipalSchema = z.object({
   user_id: z.string(),
@@ -336,6 +336,75 @@ const OpenClawSessionSchema = z.object({
 
 export type OpenClawSession = z.infer<typeof OpenClawSessionSchema>;
 
+
+const EvolutionRoundSchema = z.object({
+  round: z.number(),
+  changed_dimension: z.string(),
+  candidate_summary: z.string(),
+  score_before: z.number(),
+  score_after: z.number(),
+  delta: z.number(),
+  tests_passed: z.boolean(),
+  regression_detected: z.boolean(),
+  accepted: z.boolean(),
+  recommendation: z.string(),
+  stop_reason: z.string().nullable(),
+  judge_summary: z.string(),
+  artifact_refs: z.array(z.string()),
+  tokens_used: z.number(),
+  elapsed_seconds: z.number(),
+  created_at: z.string(),
+});
+
+const EvolutionRunSchema = z.object({
+  id: z.string(),
+  kind: z.string(),
+  title: z.string(),
+  objective: z.string(),
+  mode: z.string(),
+  source_skill_ids: z.array(z.string()),
+  target_artifact_type: z.string(),
+  status: z.string(),
+  max_rounds: z.number(),
+  min_delta: z.number(),
+  budget_tokens: z.number(),
+  budget_minutes: z.number(),
+  rubric: z.array(z.string()),
+  rounds: z.array(EvolutionRoundSchema),
+  created_by: z.string(),
+  created_at: z.string(),
+  updated_at: z.string(),
+  stop_reason: z.string().nullable(),
+});
+
+export type EvolutionRun = z.infer<typeof EvolutionRunSchema>;
+export type EvolutionRunRequest = {
+  kind: "skill_distillation" | "skill_optimization" | "media_strategy" | "academic_research" | "custom";
+  title: string;
+  objective: string;
+  mode?: "auto" | "direct" | "dispatch" | "discuss" | "hybrid";
+  source_skill_ids?: string[];
+  target_artifact_type?: "skill" | "strategy" | "research_gap" | "paper_plan" | "media_plan" | "custom";
+  max_rounds?: number;
+  min_delta?: number;
+  budget_tokens?: number;
+  budget_minutes?: number;
+  rubric?: string[];
+};
+
+export type EvolutionRoundRequest = {
+  changed_dimension: string;
+  candidate_summary: string;
+  score_before: number;
+  score_after: number;
+  tests_passed?: boolean;
+  regression_detected?: boolean;
+  accepted?: boolean | null;
+  judge_summary?: string;
+  artifact_refs?: string[];
+  tokens_used?: number;
+  elapsed_seconds?: number;
+};
 const MainAgentModelConfigSchema = z.object({
   provider: z.string(),
   api_base: z.string(),
@@ -1080,6 +1149,23 @@ export const api = {
       `/api/v1/admin/openclaw/sessions/${encodeURIComponent(id)}`,
       { method: "PATCH", body: JSON.stringify({ action }) },
       OpenClawSessionSchema,
+    );
+  },
+  evolutionRuns(): Promise<EvolutionRun[]> {
+    return request("/api/v1/admin/evolution-runs", { method: "GET" }, z.array(EvolutionRunSchema));
+  },
+  createEvolutionRun(payload: EvolutionRunRequest): Promise<EvolutionRun> {
+    return request(
+      "/api/v1/admin/evolution-runs",
+      { method: "POST", body: JSON.stringify(payload) },
+      EvolutionRunSchema,
+    );
+  },
+  recordEvolutionRound(id: string, payload: EvolutionRoundRequest): Promise<EvolutionRun> {
+    return request(
+      `/api/v1/admin/evolution-runs/${encodeURIComponent(id)}/rounds`,
+      { method: "POST", body: JSON.stringify(payload) },
+      EvolutionRunSchema,
     );
   },
   mainAgent(): Promise<MainAgentConfig> {

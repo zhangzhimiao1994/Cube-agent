@@ -1204,6 +1204,7 @@ export function RunsPage() {
   const [directModel, setDirectModel] = useState("");
   const [vibeCoding, setVibeCoding] = useState(false);
   const [showModeEntry, setShowModeEntry] = useState(true);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [processDetailTarget, setProcessDetailTarget] = useState<ProcessDetailTarget | null>(null);
   const [modeSelection, setModeSelection] = useState<ModeSelection | null>(null);
   const [skillInstallCandidate, setSkillInstallCandidate] = useState<SkillInstallCandidate | null>(null);
@@ -1264,6 +1265,11 @@ export function RunsPage() {
     },
   });
 
+  useEffect(() => {
+    const closeHistoryDrawer = () => setHistoryOpen(false);
+    window.addEventListener("agent-hub:close-history-drawer", closeHistoryDrawer);
+    return () => window.removeEventListener("agent-hub:close-history-drawer", closeHistoryDrawer);
+  }, []);
   useEffect(() => {
     if (!settings.data) return;
     if (!userSelectedMode.current) {
@@ -1916,9 +1922,9 @@ export function RunsPage() {
   return (
     <section>
       <p className="eyebrow">Conversation</p>
-      <h2>对话</h2>
+      <h2>对话与进化</h2>
       <p className="compact-page-intro">
-        这里是连续对话窗口。只要不新建对话，后续消息都会沿用当前会话上下文；工作流配置请到“工作流配置”页面维护。
+        这里是连续对话窗口，也会承接长期多轮任务、上下文压缩和后续 Skill 进化。历史会话从右侧抽屉打开。
       </p>
 
       <div className="mobile-chat-hierarchy" aria-label="移动端对话层级">
@@ -1927,7 +1933,7 @@ export function RunsPage() {
         <span>3 · 设置 / 详情</span>
       </div>
 
-      <div className="chat-console">
+      <div className={`chat-console${historyOpen ? " history-drawer-open" : ""}`}>
         <nav className="conversation-list" aria-label="会话导航">
           <div className="conversation-list-header">
             <div>
@@ -1987,6 +1993,7 @@ export function RunsPage() {
                       setShowModeEntry(false);
                       if (run.conversation_id) setConversationId(run.conversation_id);
                       setSelectedRunId(run.id);
+                      setHistoryOpen(false);
                     }}
                   >
                     <span>{displayMode(run.mode)}</span>
@@ -2181,6 +2188,19 @@ export function RunsPage() {
               <div>
                 <button type="button" className="secondary-action" aria-label="新建对话" onClick={startNewConversation}>
                   新建
+                </button>
+                <button
+                  type="button"
+                  className="secondary-action"
+                  aria-label={historyOpen ? "关闭历史对话" : "打开历史对话"}
+                  aria-pressed={historyOpen}
+                  onClick={() => {
+                    const next = !historyOpen;
+                    if (next) window.dispatchEvent(new Event("agent-hub:close-mobile-nav"));
+                    setHistoryOpen(next);
+                  }}
+                >
+                  历史
                 </button>
               </div>
             </div>

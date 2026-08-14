@@ -3916,3 +3916,39 @@ Remaining risks / next:
 
 - This adds a bounded host-side file-read primitive. `screen_read` and GUI `desktop_action` still require platform-specific host tools or drivers wired behind the same adapter contract.
 - Continue with GitHub recovery archive, commit, force-with-lease push, and Actions verification.
+## 2026-08-14 Conversation And Evolution Module
+
+Current state:
+
+- Navigation group now uses `对话与进化` with two second-level entries: `对话` and `进化`.
+- The left drawer remains the global navigation drawer; the right drawer is now the conversation history drawer.
+- Opening the right history drawer closes the left navigation drawer, dims the chat panel to a transparent non-interactive background, and selecting a history conversation closes the drawer before switching conversations.
+- Added the first persistent Evolution management surface for long-running distillation/optimization loops. It can create evolution runs and record scored iteration rounds with continue/observe/stop/rollback recommendations.
+- Added persistent API support for `evolution` admin resources and Alembic migration `0018_evolution_admin_resources` so real PostgreSQL deployments can store evolution records.
+
+Local verification:
+
+- `npm test -- AppShell.test.tsx OperationalPages.test.tsx --run` -> 2 files / 59 tests passed.
+- `npm run build` -> passed with the existing Vite large chunk warning.
+- `uv run pytest tests/api/test_admin_resources.py -q -k "evolution" --tb=short` -> 2 passed.
+- `uv run pytest tests\unit\test_database_resources.py::test_admin_resource_kind_constraint_allows_all_persistent_admin_resources -q --tb=short` -> passed.
+- `uv run ruff check src\agent_hub\evolution.py src\agent_hub\api\routers\admin.py src\agent_hub\db\models.py tests\api\test_admin_resources.py tests\unit\test_database_resources.py alembic\versions\0018_evolution_admin_resources.py` -> passed.
+- `uv run mypy --strict src\agent_hub\evolution.py src\agent_hub\api\routers\admin.py src\agent_hub\db\models.py tests\api\test_admin_resources.py tests\unit\test_database_resources.py` -> passed.
+- `git diff --check` -> passed with CRLF normalization warnings only.
+
+Server deployment and real verification:
+
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-evolution-chat-drawers-20260814-170214.tgz`.
+- Uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed incrementally into `/opt/agent-hub/current`.
+- Server backup path: `/opt/agent-hub/backups/evolution-chat-drawers-20260814-090306`.
+- Synced backend files into the active production venv site-packages because current services import from `.venv/site-packages` unless source path is explicitly active.
+- Ran `alembic upgrade head` with the real service environment loaded from `/etc/agent-hub/secrets.env`, then restarted `agent-hub-api` and `agent-hub-worker` and reloaded Caddy.
+- Real server probe used the actual Caddy/API path `http://127.0.0.1/api/v1/admin` with a short-lived super-admin JWT generated on the server without printing secrets.
+- Probe created a real evolution run, recorded a real iteration round, fetched detail/list endpoints, verified `evolution.round_recorded` audit, checked deployed frontend JS contains `对话与进化`, `进化记录`, `打开历史对话`, and `关闭历史对话`, then cleaned the probe evolution records.
+- Cleanup verification returned `probe_evolution_records=0`; `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.
+- Removed server `/tmp/evolution_chat_drawers_check.py`, `/tmp/cleanup_evolution_probe_check.py`, `/tmp/deploy-evolution-chat-drawers.sh`, `/tmp/agent-hub-p3-runtime-incremental.tgz`, and `/tmp/agent-hub-evolution-migration.log`.
+
+Remaining risks / next:
+
+- Commit this slice, create local ignored recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
+- Continue remaining P3 queue after green: OpenClaw terminal/desktop capability follow-up, broader UI copy/layout audit, missing button/function sweep, final README/README.zh-CN refresh if needed, and Docker readiness later.

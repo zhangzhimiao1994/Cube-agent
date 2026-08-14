@@ -30,6 +30,13 @@ from agent_hub.config.schema import PlatformConfig
 from agent_hub.config.service import ConfigService, ConfigValidationError
 from agent_hub.db.models import AdminResourceRow
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.evolution import (
+    EvolutionRoundRequest,
+    EvolutionRunRequest,
+    EvolutionRunResponse,
+    append_evolution_round,
+    create_evolution_run_response,
+)
 from agent_hub.models.capabilities import infer_model_capabilities
 from agent_hub.models.gateway import ModelTransport
 from agent_hub.models.litellm_client import LiteLLMClient, ModelTransportError
@@ -1479,6 +1486,26 @@ class AdminResourceService(Protocol):
 
     async def delete_run(self, run_id: UUID) -> RunDeleteResponse: ...
 
+
+    async def list_evolution_runs(self) -> tuple[EvolutionRunResponse, ...]: ...
+
+    async def create_evolution_run(
+        self,
+        request: EvolutionRunRequest,
+        *,
+        actor: str,
+    ) -> EvolutionRunResponse: ...
+
+    async def get_evolution_run(self, run_id: str) -> EvolutionRunResponse: ...
+
+    async def record_evolution_round(
+        self,
+        run_id: str,
+        request: EvolutionRoundRequest,
+        *,
+        actor: str,
+    ) -> EvolutionRunResponse: ...
+
     async def list_skills(self) -> tuple[SkillResponse, ...]: ...
 
     async def upload_skill(self, request: SkillUploadRequest) -> SkillResponse: ...
@@ -1993,6 +2020,7 @@ class InMemoryAdminResourceService:
     hermes_insights: dict[str, HermesInsightResponse] = field(default_factory=dict)
     openclaw_operations: dict[str, OpenClawOperationResponse] = field(default_factory=dict)
     openclaw_sessions: dict[str, OpenClawSessionResponse] = field(default_factory=dict)
+    evolution_runs: dict[str, EvolutionRunResponse] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.runs:
@@ -2274,6 +2302,59 @@ class InMemoryAdminResourceService:
         current = self.runs[run_id]
         updated = current.model_copy(update={"status": status})
         self.runs[run_id] = updated
+        return updated
+
+
+    async def list_evolution_runs(self) -> tuple[EvolutionRunResponse, ...]:
+        return tuple(sorted(self.evolution_runs.values(), key=lambda item: item.created_at, reverse=True))
+
+    async def create_evolution_run(
+        self,
+        request: EvolutionRunRequest,
+        *,
+        actor: str,
+    ) -> EvolutionRunResponse:
+        response = create_evolution_run_response(request, actor=actor)
+        self.evolution_runs[response.id] = response
+        await self.record_audit_event(
+            actor=actor,
+            action="evolution.create",
+            resource=f"evolution:{response.id}",
+            details={"kind": response.kind, "mode": response.mode, "target_artifact_type": response.target_artifact_type},
+        )
+        return response
+
+    async def get_evolution_run(self, run_id: str) -> EvolutionRunResponse:
+        try:
+            return self.evolution_runs[run_id]
+        except KeyError:
+            raise PublicAPIError(404, "not_found", "not found") from None
+
+    async def record_evolution_round(
+        self,
+        run_id: str,
+        request: EvolutionRoundRequest,
+        *,
+        actor: str,
+    ) -> EvolutionRunResponse:
+        current = await self.get_evolution_run(run_id)
+        if current.status in {"stopped", "completed"}:
+            raise PublicAPIError(409, "evolution_run_closed", "evolution run is already closed")
+        updated = append_evolution_round(current, request)
+        latest = updated.rounds[-1]
+        self.evolution_runs[run_id] = updated
+        await self.record_audit_event(
+            actor=actor,
+            action="evolution.round_recorded",
+            resource=f"evolution:{run_id}",
+            details={
+                "round": latest.round,
+                "delta": latest.delta,
+                "accepted": latest.accepted,
+                "recommendation": latest.recommendation,
+                "status": updated.status,
+            },
+        )
         return updated
 
     async def list_skills(self) -> tuple[SkillResponse, ...]:
@@ -3514,6 +3595,67 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             },
         )
         return response
+
+
+    async def list_evolution_runs(self) -> tuple[EvolutionRunResponse, ...]:
+        resources = await self._list_admin_payloads("evolution")
+        if resources is None:
+            return await super().list_evolution_runs()
+        runs = [EvolutionRunResponse.model_validate(payload) for payload in resources]
+        return tuple(sorted(runs, key=lambda item: item.created_at, reverse=True))
+
+    async def create_evolution_run(
+        self,
+        request: EvolutionRunRequest,
+        *,
+        actor: str,
+    ) -> EvolutionRunResponse:
+        response = create_evolution_run_response(request, actor=actor)
+        if not await self._upsert_admin_payload("evolution", response.id, response.model_dump(mode="json")):
+            return await super().create_evolution_run(request, actor=actor)
+        await self.record_audit_event(
+            actor=actor,
+            action="evolution.create",
+            resource=f"evolution:{response.id}",
+            details={"kind": response.kind, "mode": response.mode, "target_artifact_type": response.target_artifact_type},
+        )
+        return response
+
+    async def get_evolution_run(self, run_id: str) -> EvolutionRunResponse:
+        payload = await self._get_admin_payload("evolution", run_id)
+        if payload is None:
+            return await super().get_evolution_run(run_id)
+        if not payload:
+            raise PublicAPIError(404, "not_found", "not found")
+        return EvolutionRunResponse.model_validate(payload)
+
+    async def record_evolution_round(
+        self,
+        run_id: str,
+        request: EvolutionRoundRequest,
+        *,
+        actor: str,
+    ) -> EvolutionRunResponse:
+        current = await self.get_evolution_run(run_id)
+        if current.status in {"stopped", "completed"}:
+            raise PublicAPIError(409, "evolution_run_closed", "evolution run is already closed")
+        updated = append_evolution_round(current, request)
+        latest = updated.rounds[-1]
+        if not await self._upsert_admin_payload("evolution", run_id, updated.model_dump(mode="json")):
+            return await super().record_evolution_round(run_id, request, actor=actor)
+        await self.record_audit_event(
+            actor=actor,
+            action="evolution.round_recorded",
+            resource=f"evolution:{run_id}",
+            details={
+                "round": latest.round,
+                "delta": latest.delta,
+                "accepted": latest.accepted,
+                "recommendation": latest.recommendation,
+                "status": updated.status,
+            },
+        )
+        return updated
 
     async def list_skills(self) -> tuple[SkillResponse, ...]:
         resources = await self._list_admin_payloads("skill")
@@ -6214,6 +6356,49 @@ async def delete_operational_run(
         raise PublicAPIError(404, "not_found", "not found") from None
 
 
+
+@router.get("/evolution-runs", response_model=list[EvolutionRunResponse], responses=error_responses(401, 403, 422))
+async def list_evolution_runs(
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> list[EvolutionRunResponse]:
+    _require(principal, "skill:read")
+    return list(await service.list_evolution_runs())
+
+
+@router.post("/evolution-runs", response_model=EvolutionRunResponse, responses=error_responses(401, 403, 422))
+async def create_evolution_run(
+    body: EvolutionRunRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> EvolutionRunResponse:
+    _require(principal, "skill:write")
+    return await service.create_evolution_run(body, actor=str(principal.user_id))
+
+
+@router.get("/evolution-runs/{run_id}", response_model=EvolutionRunResponse, responses=error_responses(401, 403, 404, 422))
+async def get_evolution_run(
+    run_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> EvolutionRunResponse:
+    _require(principal, "skill:read")
+    return await service.get_evolution_run(run_id)
+
+
+@router.post(
+    "/evolution-runs/{run_id}/rounds",
+    response_model=EvolutionRunResponse,
+    responses=error_responses(401, 403, 404, 409, 422),
+)
+async def record_evolution_round(
+    run_id: str,
+    body: EvolutionRoundRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> EvolutionRunResponse:
+    _require(principal, "skill:write")
+    return await service.record_evolution_round(run_id, body, actor=str(principal.user_id))
 @router.get("/skills", response_model=list[SkillResponse], responses=error_responses(401, 403, 422))
 async def list_skills(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],

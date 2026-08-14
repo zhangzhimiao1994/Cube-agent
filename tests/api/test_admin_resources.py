@@ -3604,3 +3604,126 @@ async def test_persistent_admin_secret_uses_sealed_secret_service() -> None:
     assert reference.ref == f"secret://{SECRET_ID}"
     assert reference.last_four == "1234"
     assert secrets.values == ["sk-live-1234"]
+
+def test_evolution_run_records_skill_optimization_rounds_and_audit() -> None:
+    api = client()
+    created = api.post(
+        "/api/v1/admin/evolution-runs",
+        headers=headers(),
+        json={
+            "kind": "skill_optimization",
+            "title": "优化 darwin-skill",
+            "objective": "对 darwin-skill 做标准三轮优化，保留有测试收益的版本。",
+            "mode": "hybrid",
+            "source_skill_ids": ["darwin-skill"],
+            "target_artifact_type": "skill",
+            "max_rounds": 3,
+            "min_delta": 2.0,
+            "rubric": ["结构评分", "实测表现", "反例黑名单"],
+        },
+    )
+
+    assert created.status_code == 200
+    run = created.json()
+    assert run["id"].startswith("evolution_")
+    assert run["status"] == "waiting_approval"
+    assert run["kind"] == "skill_optimization"
+
+    recorded = api.post(
+        f"/api/v1/admin/evolution-runs/{run['id']}/rounds",
+        headers=headers(),
+        json={
+            "changed_dimension": "实测表现",
+            "candidate_summary": "补充 test-prompts 并减少自评偏差。",
+            "score_before": 72.0,
+            "score_after": 76.5,
+            "tests_passed": True,
+            "regression_detected": False,
+            "judge_summary": "两个测试 prompt 均优于基线。",
+            "artifact_refs": ["artifact://generated-skill/darwin-v2"],
+            "tokens_used": 12000,
+            "elapsed_seconds": 180,
+        },
+    )
+
+    assert recorded.status_code == 200
+    body = recorded.json()
+    assert body["status"] == "running"
+    assert body["rounds"][0]["delta"] == 4.5
+    assert body["rounds"][0]["accepted"] is True
+    assert body["rounds"][0]["recommendation"] == "continue"
+
+    listed = api.get("/api/v1/admin/evolution-runs", headers=headers())
+    assert listed.status_code == 200
+    assert listed.json()[0]["id"] == run["id"]
+
+    audit = api.get("/api/v1/admin/audit?action=evolution.round_recorded", headers=headers())
+    assert audit.status_code == 200
+    event = audit.json()[0]
+    assert event["resource"] == f"evolution:{run['id']}"
+    assert event["details"]["recommendation"] == "continue"
+
+
+def test_evolution_run_stops_after_two_low_delta_rounds() -> None:
+    api = client()
+    created = api.post(
+        "/api/v1/admin/evolution-runs",
+        headers=headers(),
+        json={
+            "kind": "academic_research",
+            "title": "论文创新点发现",
+            "objective": "迭代发现论文创新点并用反例筛选。",
+            "mode": "discuss",
+            "target_artifact_type": "research_gap",
+            "max_rounds": 5,
+            "min_delta": 2.0,
+        },
+    )
+    run_id = created.json()["id"]
+
+    first = api.post(
+        f"/api/v1/admin/evolution-runs/{run_id}/rounds",
+        headers=headers(),
+        json={
+            "changed_dimension": "可发表性",
+            "candidate_summary": "提出一个小幅改进的研究 gap。",
+            "score_before": 80.0,
+            "score_after": 81.0,
+            "tests_passed": True,
+            "regression_detected": False,
+        },
+    )
+    assert first.status_code == 200
+    assert first.json()["status"] == "running"
+    assert first.json()["rounds"][0]["recommendation"] == "observe_one_more_round"
+
+    second = api.post(
+        f"/api/v1/admin/evolution-runs/{run_id}/rounds",
+        headers=headers(),
+        json={
+            "changed_dimension": "反例验证",
+            "candidate_summary": "反例检查后只有小幅提升。",
+            "score_before": 81.0,
+            "score_after": 81.7,
+            "tests_passed": True,
+            "regression_detected": False,
+        },
+    )
+    assert second.status_code == 200
+    body = second.json()
+    assert body["status"] == "stopped"
+    assert body["rounds"][1]["recommendation"] == "stop"
+    assert body["stop_reason"] == "two consecutive rounds below minimum delta"
+
+    rejected = api.post(
+        f"/api/v1/admin/evolution-runs/{run_id}/rounds",
+        headers=headers(),
+        json={
+            "changed_dimension": "继续迭代",
+            "candidate_summary": "不应继续执行。",
+            "score_before": 81.7,
+            "score_after": 82.0,
+        },
+    )
+    assert rejected.status_code == 409
+    assert rejected.json()["error"]["code"] == "evolution_run_closed"
