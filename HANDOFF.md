@@ -1,3 +1,30 @@
+## 2026-08-15 Schedule Intent Boundary Fix
+
+### State
+- Tightened chat schedule detection so ordinary planning requests are not treated as scheduled tasks merely because they mention `计划`, `明天`, `每日`, or `日程` in a negative instruction.
+- Schedule proposals now require either explicit scheduling language such as reminders/timers/schedules, or a time/frequency anchor combined with an execution verb.
+- Added regression coverage for normal planning prompts like `请帮我规划明天的 AI 科研资料检索计划` and `请给我一个每日学习计划，不要加入日程表`.
+- Kept the existing confirmed schedule flow intact: explicit requests such as `每天9点提醒我填写日报` still return a `schedule_creation` approval proposal before any schedule is saved.
+
+### Verification
+- TDD red first: `pytest tests\unit\runs\test_temporary_agent.py::test_normal_planning_request_does_not_become_schedule_task -q --tb=short` failed because both normal planning prompts became `waiting_approval` schedule proposals.
+- Green local checks:
+  - `pytest tests\unit\runs\test_temporary_agent.py::test_normal_planning_request_does_not_become_schedule_task tests\unit\runs\test_temporary_agent.py::test_schedule_intent_returns_confirmation_proposal_without_enqueue -q --tb=short` -> 3 passed.
+  - `pytest tests\unit\runs\test_temporary_agent.py tests\api\test_runs_api.py -q` -> 41 passed.
+  - `npm test -- --run src/pages/SchedulesPage.test.tsx src/pages/OperationalPages.test.tsx -t "计划任务|schedule|OpenClaw|进化"` -> 58 passed.
+  - `ruff check src tests` -> passed.
+  - `mypy --strict src tests` -> passed.
+
+### Server Deployment And Real Probe
+- Uploaded `.local-archives/server-incrementals/agent-hub-schedule-intent-boundary-20260815-042658.tgz` to `103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed into `/opt/agent-hub/current`.
+- Server backup retained under `/opt/agent-hub/backups/schedule-intent-boundary-20260815-042658`; server archive retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-schedule-intent-boundary-20260815-042658.tgz`.
+- Restarted `agent-hub-api` and `agent-hub-worker`; an immediate health check in the deploy script raced API startup, but follow-up status checks showed both services active and `/health` returned `{"status":"ok"}`.
+- Real server HTTP probe used a short-lived local token, posted a normal planning prompt and an explicit reminder prompt to `/api/v1/runs`, verified only the reminder produced a schedule proposal, and then deleted the two probe run records from the production database.
+- Probe output: `{"status": "ok", "checks": {"normal_no_schedule_proposal": true, "normal_not_schedule_confirmation": true, "schedule_waiting_approval": true, "schedule_confirmation_reason": true, "schedule_cron": true}}`.
+
+### Remaining / Next
+- Commit this slice, create local GitHub recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, then watch GitHub Actions until green.
+- Continue remaining P3 work after green: remaining UI copy/layout audit, missing button/function sweep, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 OpenClaw Approval Policy UX
 
 ### State

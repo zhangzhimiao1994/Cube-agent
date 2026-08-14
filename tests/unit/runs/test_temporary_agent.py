@@ -388,6 +388,40 @@ async def test_schedule_intent_returns_confirmation_proposal_without_enqueue() -
     assert routing["schedule_proposal"] == submitted.schedule_proposal
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "请帮我规划明天的 AI 科研资料检索计划",
+        "请给我一个每日学习计划，不要加入日程表",
+    ],
+)
+async def test_normal_planning_request_does_not_become_schedule_task(message: str) -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    queue = RecordingQueue()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=FailingRouter(),
+        task_queue=queue,
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message=message,
+        mode=TaskMode.AUTO,
+        conversation_id="conv-normal-planning",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.schedule_proposal is None
+    routing = repository.records[submitted.id].routing_decision
+    assert routing is not None
+    assert "schedule_proposal" not in routing
+
+@pytest.mark.asyncio
 async def test_evolution_intent_returns_confirmation_proposal_without_enqueue() -> None:
     tenant_id = uuid4()
     actor_id = uuid4()

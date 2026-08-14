@@ -1460,10 +1460,17 @@ def _openclaw_target(platform: str, target_type: str) -> str:
 
 
 _SCHEDULE_TRIGGER_RE = re.compile(
-    r"(定时|提醒|闹钟|日程|每天|每日|每周|schedule|scheduled|remind|reminder|daily|weekly)",
+    r"(定时|提醒|闹钟|日程|排程|计划任务|加入计划|列入计划|schedule|scheduled|remind|reminder|alarm)",
     re.IGNORECASE,
 )
-_SCHEDULE_PLAN_RE = re.compile(r"计划")
+_SCHEDULE_EXECUTION_RE = re.compile(
+    r"(执行|运行|提交|发送|填写|填报|打开|检查|触发|通知|生成|创建|更新|写|execute|run|submit|send|fill|open|check|generate|create|update)",
+    re.IGNORECASE,
+)
+_SCHEDULE_NEGATION_RE = re.compile(
+    r"(不要|不需要|不用|无需|别)(?!忘).{0,16}(加入|创建|保存|列入|放入)?(日程|计划任务|提醒|闹钟|schedule|reminder|alarm)",
+    re.IGNORECASE,
+)
 _SCHEDULE_TIME_RE = re.compile(
     r"(?P<hour>[01]?\d|2[0-3])(?:\s*点|:)(?P<minute>[0-5]\d)?|(?P<hour_en>[01]?\d|2[0-3])\s*(?:am|pm)",
     re.IGNORECASE,
@@ -1543,19 +1550,19 @@ def _local_schedule_proposal(
 
 
 def _looks_like_schedule_intent(message: str, lowered: str) -> bool:
+    if _SCHEDULE_NEGATION_RE.search(message):
+        return False
     if _SCHEDULE_TRIGGER_RE.search(message):
         return True
-    return bool(
-        _SCHEDULE_PLAN_RE.search(message)
-        and (
-            _contains_daily_intent(message, lowered)
-            or _contains_weekly_intent(message, lowered)
-            or _SCHEDULE_TIME_RE.search(message)
-            or "明天" in message
-            or "后天" in message
-            or "tomorrow" in lowered
-        )
+    has_recurrence = _contains_daily_intent(message, lowered) or _contains_weekly_intent(message, lowered)
+    has_time_anchor = bool(
+        _SCHEDULE_TIME_RE.search(message)
+        or "明天" in message
+        or "后天" in message
+        or "tomorrow" in lowered
     )
+    has_execution = _SCHEDULE_EXECUTION_RE.search(message) is not None
+    return bool((has_recurrence and (has_time_anchor or has_execution)) or (has_time_anchor and has_execution))
 
 
 def _contains_daily_intent(message: str, lowered: str) -> bool:
