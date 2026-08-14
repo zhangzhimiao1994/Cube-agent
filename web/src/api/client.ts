@@ -122,6 +122,9 @@ function archiveContentType(filename: string): string {
   if (lowered.endsWith(".tar.gz") || lowered.endsWith(".tgz")) return "application/gzip";
   return "application/octet-stream";
 }
+function encodedFilenameHeader(filename: string): { encoded: string; encoding: "percent" } {
+  return { encoded: encodeURIComponent(filename), encoding: "percent" };
+}
 
 function rememberSession(token: string, principal: Principal): CurrentUser {
   accessToken = token;
@@ -1100,6 +1103,7 @@ export const api = {
     );
   },
   uploadAttachment(file: File): Promise<AttachmentUpload> {
+    const filename = encodedFilenameHeader(file.name);
     return requestBinary(
       "/api/v1/runs/attachments/upload",
       {
@@ -1107,7 +1111,8 @@ export const api = {
         body: file,
         headers: {
           "Content-Type": file.type || "application/octet-stream",
-          "X-Agent-Hub-Filename": file.name,
+          "X-Agent-Hub-Filename": filename.encoded,
+          "X-Agent-Hub-Filename-Encoding": filename.encoding,
         },
       },
       AttachmentUploadSchema,
@@ -1243,6 +1248,7 @@ export const api = {
     );
   },
   uploadSkillArchive(file: File): Promise<SkillArchiveUpload> {
+    const filename = encodedFilenameHeader(file.name);
     return requestBinary(
       "/api/v1/admin/skills/upload",
       {
@@ -1250,7 +1256,8 @@ export const api = {
         body: file,
         headers: {
           "Content-Type": archiveContentType(file.name),
-          "X-Agent-Hub-Skill-Filename": file.name,
+          "X-Agent-Hub-Skill-Filename": filename.encoded,
+          "X-Agent-Hub-Skill-Filename-Encoding": filename.encoding,
         },
       },
       SkillArchiveUploadSchema,

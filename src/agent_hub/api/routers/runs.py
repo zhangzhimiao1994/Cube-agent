@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Protocol, cast
+from urllib.parse import unquote
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, Request, status
@@ -354,9 +355,23 @@ async def _attachment_limits_from_settings(request: Request) -> tuple[int, int]:
     return max_mb, retention_days
 
 
+def _decode_upload_filename_header(value: str | None, encoding: str | None) -> str | None:
+    if value is None or encoding is None:
+        return value
+    if encoding.strip().lower() != "percent":
+        raise PublicAPIError(422, "request_validation", "unsupported filename header encoding")
+    try:
+        return unquote(value, errors="strict")
+    except UnicodeDecodeError:
+        raise PublicAPIError(422, "request_validation", "invalid filename header encoding") from None
+
+
 def _safe_attachment_filename(value: str | None) -> str:
     raw = (value or "attachment.bin").strip().replace("\\", "/").split("/")[-1]
-    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", raw)[:180].strip("._")
+    cleaned = "".join(
+        "_" if character in '<>:"|?*' or ord(character) < 32 or ord(character) == 127 else character
+        for character in raw
+    )[:180].strip(" ._")
     return cleaned or "attachment.bin"
 
 
@@ -509,9 +524,10 @@ async def upload_attachment(
     request: Request,
     principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:create"))],
     filename_header: Annotated[str | None, Header(alias="X-Agent-Hub-Filename")] = None,
+    filename_encoding_header: Annotated[str | None, Header(alias="X-Agent-Hub-Filename-Encoding")] = None,
     content_type: Annotated[str | None, Header(alias="Content-Type")] = None,
 ) -> AttachmentUploadResponse:
-    filename = _safe_attachment_filename(filename_header)
+    filename = _safe_attachment_filename(_decode_upload_filename_header(filename_header, filename_encoding_header))
     media_type = (content_type or "application/octet-stream").split(";", 1)[0].strip().lower()
     body = await request.body()
     max_mb, retention_days = await _attachment_limits_from_settings(request)

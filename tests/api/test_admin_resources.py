@@ -6,6 +6,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
+from urllib.parse import quote
 from uuid import UUID, uuid4
 
 import pytest
@@ -2279,6 +2280,23 @@ def test_skill_archive_upload_scans_real_zip_package() -> None:
     assert item["requested_permissions"] == ["tool:filesystem.read"]
     assert any("content sha256" in entry for entry in item["scan_diff"])
     assert skills.json()[0]["id"] == item["id"]
+
+def test_skill_archive_upload_accepts_percent_encoded_filename_header() -> None:
+    api = client()
+    filename = "技能包.zip"
+
+    uploaded = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={
+            **headers(),
+            "X-Agent-Hub-Skill-Filename": quote(filename, safe=""),
+            "X-Agent-Hub-Skill-Filename-Encoding": "percent",
+        },
+        content=skill_archive(),
+    )
+
+    assert uploaded.status_code == 200
+    assert uploaded.json()["items"][0]["name"] == "safe_skill"
 
 
 def test_skill_archive_upload_accepts_real_tar_gz_package() -> None:

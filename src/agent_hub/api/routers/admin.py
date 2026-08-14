@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Protocol, cast
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import yaml
@@ -4276,6 +4276,17 @@ def _is_safe_admin_identifier(value: str) -> bool:
     )
 
 
+def _decode_upload_filename_header(value: str | None, encoding: str | None) -> str | None:
+    if value is None or encoding is None:
+        return value
+    if encoding.strip().lower() != "percent":
+        raise PublicAPIError(422, "request_validation", "unsupported filename header encoding")
+    try:
+        return unquote(value, errors="strict")
+    except UnicodeDecodeError:
+        raise PublicAPIError(422, "request_validation", "invalid filename header encoding") from None
+
+
 def _safe_skill_upload_filename(value: str | None) -> str:
     if value is None:
         raise PublicAPIError(422, "request_validation", "skill filename is required")
@@ -6030,7 +6041,12 @@ async def upload_skill_archive(
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> SkillArchiveUploadResponse:
     _require(principal, "skill:write")
-    filename = _safe_skill_upload_filename(request.headers.get("x-agent-hub-skill-filename"))
+    filename = _safe_skill_upload_filename(
+        _decode_upload_filename_header(
+            request.headers.get("x-agent-hub-skill-filename"),
+            request.headers.get("x-agent-hub-skill-filename-encoding"),
+        )
+    )
     archive_bytes = await request.body()
     if not archive_bytes:
         raise PublicAPIError(422, "request_validation", "skill archive is empty")

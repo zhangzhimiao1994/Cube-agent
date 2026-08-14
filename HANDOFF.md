@@ -3277,3 +3277,60 @@ Remaining risks / next:
 
 
 
+
+## 2026-08-14 Upload Filename Header Encoding
+
+Current state:
+
+- Chat attachment upload no longer sends raw filenames in custom request headers.
+- Skill archive upload uses the same filename header encoding path, so non-ASCII ZIP/TAR archive names do not fail before the request reaches the API.
+- The API accepts `X-Agent-Hub-Filename-Encoding: percent` and `X-Agent-Hub-Skill-Filename-Encoding: percent`, decodes the percent-encoded filenames, and keeps user-visible Unicode names while still stripping path separators and dangerous filename characters.
+- This targets the mobile browser symptom where attachment upload showed `network request failed (network_error, HTTP 0)` before the server could return a normal response.
+
+Changes made:
+
+- Added a shared frontend `encodeURIComponent` filename header path for chat attachments and Skill archives.
+- Added backend percent-decoding support for attachment and Skill archive filename headers.
+- Relaxed attachment filename sanitization so valid Unicode display names are preserved.
+- Added regression coverage for Chinese attachment filenames and Chinese Skill archive filenames.
+
+Local verification:
+
+- TDD red checks reproduced the missing frontend upload completion and backend encoded filename storage before implementation.
+- `uv run pytest tests/api/test_runs_api.py::test_attachment_upload_decodes_percent_encoded_filename_header tests/api/test_admin_resources.py::test_skill_archive_upload_accepts_percent_encoded_filename_header -q --tb=short` -> 2 passed.
+- `uv run ruff check src\agent_hub\api\routers\runs.py src\agent_hub\api\routers\admin.py tests\api\test_runs_api.py tests\api\test_admin_resources.py` -> passed.
+- `uv run mypy --strict src\agent_hub\api\routers\runs.py src\agent_hub\api\routers\admin.py tests\api\test_runs_api.py tests\api\test_admin_resources.py` -> passed.
+- `uv run pytest tests/api/test_runs_api.py tests/api/test_admin_resources.py -q --tb=short` -> 111 passed.
+- `npm.cmd run lint` -> passed.
+- `npm.cmd run test -- --run` -> 104 passed.
+- `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+
+Next:
+
+- Deploy the incremental attachment filename package to `103.236.98.133`.
+- Run real server API checks for encoded chat attachment upload, encoded Skill archive upload, cleanup, and deployed frontend bundle markers.
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue P3 with OpenClaw system integration and the remaining project-completion tasks.
+
+Server deployment and verification update:
+
+- Uploaded incremental package to `103.236.98.133:/tmp/agent-hub-upload-filename-encoding.tgz`.
+- Deployed into `/opt/agent-hub/current`, restarted `agent-hub-api` and `agent-hub-worker`, reloaded Caddy, and verified all three services were active.
+- The deployment backup path was created as `/opt/agent-hub/backups/upload-filename-` because the local PowerShell shell expanded the intended remote timestamp expression before SSH; the original files were still backed up before extraction.
+- Ran `/tmp/server_upload_filename_encoding_check.py` through the real local HTTP API with `/etc/agent-hub/secrets.env` loaded:
+  - pre-cleaned one leftover temporary Skill from the first verification-script parsing failure;
+  - uploaded an image attachment using percent-encoded `截图 方案.png` and verified the stored filename and `image` kind;
+  - uploaded a real Skill ZIP using percent-encoded `技能包.zip`, verified the decoded filename, scanned Skill item, and list visibility;
+  - verified deployed frontend JS assets contain both filename encoding header markers;
+  - deleted the temporary Skill and attachment through the API.
+
+Remaining risks / next:
+
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue P3 with OpenClaw system integration and the remaining project-completion tasks.

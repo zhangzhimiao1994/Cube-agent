@@ -7,6 +7,7 @@ import zipfile
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
+from urllib.parse import quote
 from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
@@ -411,6 +412,25 @@ def test_attachment_upload_stores_image_without_exposing_server_path(tmp_path: P
     assert body["sha256"]
     assert "path" not in body
     assert list(tmp_path.rglob("*.bin"))
+
+def test_attachment_upload_decodes_percent_encoded_filename_header(tmp_path: Path) -> None:
+    client, _, _ = _client(attachment_store_dir=tmp_path)
+    filename = "截图 方案.png"
+
+    response = client.post(
+        "/api/v1/runs/attachments/upload",
+        headers={
+            **bearer(),
+            "X-Agent-Hub-Filename": quote(filename, safe=""),
+            "X-Agent-Hub-Filename-Encoding": "percent",
+            "Content-Type": "image/png",
+        },
+        content=b"image-bytes",
+    )
+
+    assert response.status_code == 200
+    assert response.json()["filename"] == filename
+    assert response.json()["kind"] == "image"
 
 
 def test_attachment_upload_extracts_common_archive_manifest_safely(tmp_path: Path) -> None:

@@ -270,7 +270,7 @@ function jsonResponse(payload: unknown, init: ResponseInit = {}) {
 }
 
 describe("operational management pages", () => {
-  const requests: Array<{ body: unknown; method: string; path: string }> = [];
+  const requests: Array<{ body: unknown; headers: Record<string, string>; method: string; path: string }> = [];
   let visibleRunListItem = runListItem;
   let visibleRunDetail = runDetail;
   let visibleConversationRuns = [runDetail];
@@ -295,10 +295,11 @@ describe("operational management pages", () => {
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const path = String(input);
         const method = init?.method ?? "GET";
+        const requestHeaders = Object.fromEntries(new Headers(init?.headers).entries());
         if (init?.body && typeof init.body === "string") {
-          requests.push({ path, method, body: JSON.parse(init.body) });
+          requests.push({ path, method, headers: requestHeaders, body: JSON.parse(init.body) });
         } else {
-          requests.push({ path, method, body: null });
+          requests.push({ path, method, headers: requestHeaders, body: null });
         }
         if (path === "/api/v1/auth/me") {
           return jsonResponse({
@@ -507,7 +508,8 @@ describe("operational management pages", () => {
         }
         if (path === "/api/v1/runs/attachments/upload" && method === "POST") {
           const headers = init?.headers instanceof Headers ? init.headers : new Headers(init?.headers);
-          const filename = headers.get("X-Agent-Hub-Filename") ?? "screen.png";
+          const rawFilename = headers.get("X-Agent-Hub-Filename") ?? "screen.png";
+          const filename = headers.get("X-Agent-Hub-Filename-Encoding") === "percent" ? decodeURIComponent(rawFilename) : rawFilename;
           const contentType = headers.get("Content-Type") ?? "image/png";
           const archive = /\.(?:zip|tar|tgz|gz|bz2|xz|zst|rar|7z|cab|iso|jar|war|ear|apk|ipa)$/i.test(filename);
           return jsonResponse({
@@ -1697,6 +1699,22 @@ describe("operational management pages", () => {
         attachment_ids: ["att_0123456789abcdef0123456789abcdef"],
       },
     });
+  });
+  it("encodes non-ascii attachment filenames before sending upload headers", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    const fileName = "截图 方案.png";
+    const file = new File(["image-bytes"], fileName, { type: "image/png" });
+    await user.upload(screen.getByLabelText("上传文件或 Skill 压缩包"), file);
+
+    expect(await screen.findByText("图片附件")).not.toBeNull();
+    expect(screen.getByText(fileName)).not.toBeNull();
+    const uploadRequest = requests.find((request) => request.path === "/api/v1/runs/attachments/upload");
+    expect(uploadRequest?.headers["x-agent-hub-filename-encoding"]).toBe("percent");
+    expect(uploadRequest?.headers["x-agent-hub-filename"]).toBe(encodeURIComponent(fileName));
+    expect(/^[\x00-\x7F]*$/.test(uploadRequest?.headers["x-agent-hub-filename"] ?? "")).toBe(true);
   });
 
   it("allows common archive and document attachments from chat", async () => {
