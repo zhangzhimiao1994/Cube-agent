@@ -1,4 +1,4 @@
-﻿import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
@@ -384,7 +384,7 @@ export function ConfigPage() {
         </article>
         <article className="status-card">
           <span>多媒体生成</span>
-          <p>{settings.multimedia_generation_enabled ? "已允许图片和视频处理/生成。" : "已关闭图片和视频处理/生成。"}</p>
+          <p>{settings.multimedia_generation_enabled ? "已允许图片、视频和音频生成。" : "已关闭图片、视频和音频生成。"}</p>
         </article>
         <article className="status-card">
           <span>OpenClaw</span>

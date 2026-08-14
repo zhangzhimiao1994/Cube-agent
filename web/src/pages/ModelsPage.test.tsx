@@ -434,6 +434,33 @@ describe("ModelsPage", () => {
     });
   });
 
+  it("lets admins declare normal input understanding capabilities", async () => {
+    const user = userEvent.setup();
+    const view = render(<TestApp initialPath="/models" />);
+
+    await screen.findByText("planner");
+    await user.selectOptions(view.container.querySelector("#provider") as HTMLSelectElement, "openai-compatible");
+    await user.type(view.container.querySelector("#custom-model") as HTMLInputElement, "gpt-vision-audio");
+    await user.clear(view.container.querySelector("#api-base") as HTMLInputElement);
+    await user.type(view.container.querySelector("#api-base") as HTMLInputElement, "https://relay.example.com/v1");
+    await user.clear(view.container.querySelector("#logical-model") as HTMLInputElement);
+    await user.type(view.container.querySelector("#logical-model") as HTMLInputElement, "multimodal_main");
+    await user.type(screen.getByLabelText("API Key"), "sk-normal-1234");
+    await user.click(screen.getByLabelText("图片理解"));
+    await user.click(screen.getByLabelText("语音理解"));
+    await user.click(view.container.querySelector('button[type="submit"]') as HTMLButtonElement);
+
+    await screen.findByText(/secret_created/);
+    expect(requests[1]).toMatchObject({
+      path: "/api/v1/admin/models",
+      method: "POST",
+      body: expect.objectContaining({
+        logical_model: "multimodal_main",
+        capabilities: expect.arrayContaining(["text", "vision", "audio", "tool_calling", "structured_output"]),
+      }),
+    });
+  });
+
   it("lets admins declare custom multimedia generation capabilities", async () => {
     const user = userEvent.setup();
     const view = render(<TestApp initialPath="/models" />);
@@ -474,11 +501,15 @@ describe("ModelsPage", () => {
       "normal",
       "multimedia",
     ]);
+    expect(view.container.querySelector('input[value="vision"]')).not.toBeNull();
+    expect(view.container.querySelector('input[value="audio"]')).not.toBeNull();
     expect(view.container.querySelector('input[value="image_generation"]')).toBeNull();
     expect(view.container.querySelector('input[value="video_generation"]')).toBeNull();
     expect(view.container.querySelector('input[value="audio_generation"]')).toBeNull();
 
     await user.selectOptions(categorySelect as HTMLSelectElement, "multimedia");
+    expect(view.container.querySelector('input[value="vision"]')).toBeNull();
+    expect(view.container.querySelector('input[value="audio"]')).toBeNull();
     const providerSelect = view.container.querySelector("#provider") as HTMLSelectElement;
     expect(Array.from(providerSelect.options).map((option) => option.value)).toEqual([
       "openai-sora",

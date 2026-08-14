@@ -1,4 +1,4 @@
-﻿import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useMemo, useState } from "react";
 
 import { ApiError, api, formatApiError, type ModelDeployment } from "../api/client";
@@ -406,6 +406,8 @@ const MULTIMEDIA_PROVIDERS: ProviderPreset[] = [
 
 const NORMAL_CAPABILITIES = [
   { label: "文本", value: "text" },
+  { label: "图片理解", value: "vision" },
+  { label: "语音理解", value: "audio" },
   { label: "工具调用", value: "tool_calling" },
   { label: "结构化输出", value: "structured_output" },
 ];
@@ -759,7 +761,7 @@ export function ModelsPage() {
             时会复用原 Key 引用；填写新 Key 会替换并重新测试。
           </p>
         ) : null}
-        <p>先选择模型大类：普通模型用于对话、工具调用和结构化输出；多媒体 AI 用于图片和视频生成。</p>
+        <p>先选择模型大类：普通模型用于对话、图片/语音理解、工具调用和结构化输出；多媒体 AI 用于图片、视频和音频生成。</p>
 
         <label htmlFor="model-category">模型大类</label>
         <select

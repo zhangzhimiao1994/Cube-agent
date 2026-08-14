@@ -29,6 +29,7 @@ type MessageContent = str | tuple[ContentPart, ...]
 class ModelCapability(StrEnum):
     TEXT = "text"
     VISION = "vision"
+    AUDIO = "audio"
     TOOL_CALLING = "tool_calling"
     STRUCTURED_OUTPUT = "structured_output"
     IMAGE_GENERATION = "image_generation"

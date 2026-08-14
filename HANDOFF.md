@@ -1,3 +1,42 @@
+## 2026-08-14 Model Input Understanding Capabilities
+
+Current state:
+
+- Added `audio` as a normal model capability alongside the existing `vision` capability.
+- Model configuration now exposes normal-model input understanding controls as `图片理解` and `语音理解`.
+- Multimedia AI remains reserved for generation capabilities: image, video, and audio generation.
+- System settings copy now describes the global multimedia switch as generation-only, avoiding the earlier mixed `处理/生成` wording.
+
+Verification performed:
+
+- Local backend:
+  - `uv run pytest tests/api/test_admin_resources.py::test_model_create_accepts_input_understanding_capabilities -q --tb=short` -> passed.
+  - `uv run pytest tests/api/test_admin_resources.py -q -k "model_create or multimedia_generation" --tb=short` -> 6 passed.
+  - `uv run pytest tests/api/test_admin_resources.py -q --tb=short` -> 95 passed.
+  - `uv run ruff check src/agent_hub/models/types.py src/agent_hub/config/schema.py tests/api/test_admin_resources.py` -> passed.
+  - `uv run mypy --strict src/agent_hub/models/types.py src/agent_hub/config/schema.py tests/api/test_admin_resources.py` -> passed earlier in the slice after the Python changes.
+- Local frontend:
+  - `npm.cmd run test -- --run src/pages/ModelsPage.test.tsx -t "input understanding"` -> passed.
+  - `npm.cmd run test -- --run src/pages/ModelsPage.test.tsx src/pages/ConfigPage.test.tsx` -> 22 passed.
+  - `npm.cmd run test -- --run src/pages/ModelsPage.test.tsx` -> 15 passed.
+  - `npm.cmd run lint` -> passed.
+  - `npm.cmd run build` -> passed with the existing Vite chunk-size warning.
+  - `npm.cmd run test -- --run` -> 106 passed.
+  - `git diff --check` -> passed.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-model-input-capabilities.tgz` to `103.236.98.133` with only changed source files and built `web/dist`; no temp files, env files, or dependency directories were included.
+  - Deployed into `/opt/agent-hub/current`, backed up previous files to `/opt/agent-hub/backups/model-input-capabilities-20260814-041152`, restarted `agent-hub-api` and `agent-hub-worker`, reloaded Caddy, and verified all three services were active.
+- Server real environment verification:
+  - Initial attempt to verify through `PUT /api/v1/admin/models/{id}` was stopped because the real upstream model availability check did not complete within the command timeout; `update_model` verifies before publishing, and the validation process was killed/cleaned with no persisted model change.
+  - Ran a real authenticated `POST /api/v1/config/validate` against the deployed API using the current production config plus a cloned deployment tagged with `text`, `vision`, and `audio`; response was `{"valid": true}`.
+  - Verified deployed frontend JS assets contain `图片理解`, `语音理解`, and `已允许图片、视频和音频生成`.
+  - Removed `/tmp/agent_hub_model_input_capabilities_validate.py` and confirmed no matching validation processes or temp scripts remain.
+
+Remaining risks / next:
+
+- This slice adds configuration support for speech/audio input understanding; actual audio file transcription/routing still needs a later runtime/channel implementation.
+- Continue the queued attachment upload `network request failed (HTTP 0)` investigation next.
+- Commit this slice, create local ignored GitHub recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions.
 ## 2026-08-14 Hermes Runtime Learning Bulk ID Fix
 
 Current state:

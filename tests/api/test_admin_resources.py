@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import io
 import json
 import sys
@@ -1595,6 +1595,18 @@ def test_model_create_auto_infers_known_video_generation_capability() -> None:
 
     assert response.status_code == 200
     assert response.json()["capabilities"] == ["text", "video_generation"]
+
+
+def test_model_create_accepts_input_understanding_capabilities() -> None:
+    payload = {
+        **model_payload(),
+        "capabilities": ["text", "vision", "audio", "tool_calling"],
+    }
+
+    response = client().post("/api/v1/admin/models", headers=headers(), json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["capabilities"] == ["audio", "text", "tool_calling", "vision"]
 
 
 def test_multimedia_generation_requires_feature_switch() -> None:
