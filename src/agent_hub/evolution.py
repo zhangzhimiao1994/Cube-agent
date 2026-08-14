@@ -87,6 +87,25 @@ class EvolutionNextRoundPlanResponse(BaseModel):
     previous_rounds: list[str]
 
 
+class EvolutionNextRoundExecutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class EvolutionNextRoundExecutionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evolution_run_id: str
+    round: int = Field(ge=1)
+    action: str = Field(pattern=r"^(run_next_round|review_baseline|rollback_candidate)$")
+    execution_run_id: str
+    execution_conversation_id: str
+    status: str
+    task_title: str
+    task_prompt: str
+
+
 class EvolutionRoundResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -393,6 +412,8 @@ def evolution_next_action_after_round(status: str, latest: EvolutionRoundRespons
 
 __all__ = [
     "EvolutionApprovalRequest",
+    "EvolutionNextRoundExecutionRequest",
+    "EvolutionNextRoundExecutionResponse",
     "EvolutionNextRoundPlanResponse",
     "EvolutionRoundRequest",
     "EvolutionRoundResponse",

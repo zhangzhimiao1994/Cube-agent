@@ -370,6 +370,17 @@ const EvolutionNextRoundPlanSchema = z.object({
   previous_rounds: z.array(z.string()),
 });
 
+const EvolutionNextRoundExecutionSchema = z.object({
+  evolution_run_id: z.string(),
+  round: z.number(),
+  action: z.string(),
+  execution_run_id: z.string(),
+  execution_conversation_id: z.string(),
+  status: z.string(),
+  task_title: z.string(),
+  task_prompt: z.string(),
+});
+
 const EvolutionRunSchema = z.object({
   id: z.string(),
   kind: z.string(),
@@ -406,6 +417,7 @@ const EvolutionRunSchema = z.object({
 
 export type EvolutionRun = z.infer<typeof EvolutionRunSchema>;
 export type EvolutionNextRoundPlan = z.infer<typeof EvolutionNextRoundPlanSchema>;
+export type EvolutionNextRoundExecution = z.infer<typeof EvolutionNextRoundExecutionSchema>;
 export type EvolutionRunRequest = {
   kind: "skill_distillation" | "skill_optimization" | "media_strategy" | "academic_research" | "custom";
   title: string;
@@ -1236,6 +1248,13 @@ export const api = {
       `/api/v1/admin/evolution-runs/${encodeURIComponent(id)}/next-round-plan`,
       { method: "GET" },
       EvolutionNextRoundPlanSchema,
+    );
+  },
+  executeEvolutionNextRound(id: string): Promise<EvolutionNextRoundExecution> {
+    return request(
+      `/api/v1/admin/evolution-runs/${encodeURIComponent(id)}/execute-next-round`,
+      { method: "POST" },
+      EvolutionNextRoundExecutionSchema,
     );
   },
   approveEvolutionRun(id: string, payload: EvolutionApprovalRequest): Promise<EvolutionRun> {

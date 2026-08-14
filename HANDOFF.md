@@ -1,3 +1,41 @@
+## 2026-08-14 Evolution Next-Round Execution Queueing
+
+Current state:
+
+- Evolution triggering remains opt-in for durable asset creation/improvement; normal questions, one-off plans, and ordinary方案 requests do not enter Evolution by default.
+- Added `POST /api/v1/admin/evolution-runs/{run_id}/execute-next-round` behind `skill:write` permission.
+- The endpoint refuses execution while an Evolution run is still waiting for approval, then uses the same next-round execution contract to create a real queued run with `enqueue=True` through `RunRepository` in production.
+- The queued run carries stable routing metadata: `source=evolution`, evolution run id, round, action, baseline agent, candidate agents, evaluator agent, memory policy, required output schema, previous rounds, and selected agent ids.
+- The Evolution UI now exposes a `启动执行` button next to `生成执行包`; successful execution displays the created run id and queued status.
+- `run` details now preserve `routing_decision.source`, so production execution runs show `explicit_details.source=evolution` instead of only `database`.
+
+Local verification:
+
+- `.\.venv\Scripts\python.exe -m pytest tests\api\test_admin_resources.py::test_evolution_next_round_execution_queues_real_run_with_metadata tests\api\test_admin_resources.py::test_persistent_evolution_next_round_execution_enqueues_run_repository -q` -> 2 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\api\test_admin_resources.py -k "evolution" -q` -> 5 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\api\test_admin_resources.py tests\api\test_runs_api.py -q` -> 128 passed.
+- `.\.venv\Scripts\python.exe -m ruff check src\agent_hub\evolution.py src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+- `.\.venv\Scripts\python.exe -m mypy --strict src tests` -> passed, 259 source files.
+- `npm.cmd run test -- --run src/pages/OperationalPages.test.tsx -t "evolution records"` -> passed.
+- `npm.cmd run test -- --run` from `web/` -> 13 files / 119 tests passed.
+- `npm.cmd run lint` from `web/` -> passed.
+- `npm.cmd run build` from `web/` -> passed with the existing Vite large chunk warning.
+- `git diff --check` -> passed with CRLF normalization warnings only.
+
+Server deployment and real verification:
+
+- Created incremental archives `.local-archives/server-incrementals/agent-hub-evolution-execute-next-round-20260814-225539.tgz` and `.local-archives/server-incrementals/agent-hub-evolution-execute-next-round-fix-20260814-230335.tgz`.
+- Uploaded to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed incrementally into `/opt/agent-hub/current`.
+- Server backups retained under `/opt/agent-hub/backups/evolution-execute-next-round-20260814-225628` and `/opt/agent-hub/backups/evolution-execute-next-round-fix-20260814-230402`.
+- Synced `src/agent_hub/evolution.py` and `src/agent_hub/api/routers/admin.py` into active source and production venv site-packages, deployed rebuilt `web/dist`, restarted `agent-hub-api` and `agent-hub-worker`, reloaded Caddy, and confirmed all services active.
+- Real server probe used production settings and real HTTP API at `http://127.0.0.1/api/v1/admin`: created an Evolution run, verified `execute-next-round` is blocked before approval, approved it, started execution, verified queued run detail metadata, verified DB outbox creation, verified `evolution.round_execution_queued` audit, then deleted the temporary outbox/run/evolution/audit records.
+- Probe output: `{"status": "ok", "checks": {"blocked_before_approval": true, "approved_status_running": true, "execution_status_queued": true, "execution_round_one": true, "detail_has_evolution_source": true, "detail_has_candidate": true, "outbox_created": true, "run_row_created": true, "run_metadata_source": true, "audit_recorded": true, "cleanup_requested": true}}`.
+- Removed `/tmp/probe_evolution_execute_next_round.py` and `/tmp/agent-hub-p3-runtime-incremental.tgz`; confirmed `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.
+
+Remaining / next:
+
+- Commit this slice, create local GitHub recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, then watch GitHub Actions until green.
+- Continue P3 after green: automatic extraction/approval of completed execution results into Evolution rounds, plan-task mode UX, broader OpenClaw workflow integration, Skill Creator grounding into real-input/real-test workflows, UI copy/layout audit, missing button/function sweep, README/README.zh-CN final usage refresh, and Docker readiness later.
 ## 2026-08-14 Evolution Approval Gate And Agent Baselines
 
 Current state:

@@ -746,6 +746,21 @@ describe("operational management pages", () => {
             previous_rounds: current.rounds.map((round) => `round ${round.round}: ${round.recommendation}`),
           });
         }
+        const executeEvolutionMatch = path.match(/^\/api\/v1\/admin\/evolution-runs\/(evolution_[a-f0-9]+)\/execute-next-round$/);
+        if (executeEvolutionMatch && method === "POST") {
+          const id = executeEvolutionMatch[1];
+          const current = visibleEvolutionRuns.find((run) => run.id === id) ?? evolutionRun;
+          return jsonResponse({
+            evolution_run_id: id,
+            round: current.rounds.length + 1,
+            action: "run_next_round",
+            execution_run_id: "44444444-4444-4444-8444-444444444444",
+            execution_conversation_id: `${id}-round-${current.rounds.length + 1}`,
+            status: "queued",
+            task_title: `${current.title} / round ${current.rounds.length + 1}`,
+            task_prompt: "Execute one bounded evolution round.",
+          });
+        }
         if (path === "/api/v1/admin/evolution-runs") {
           return jsonResponse(visibleEvolutionRuns);
         }
@@ -2305,6 +2320,13 @@ describe("operational management pages", () => {
     expect(screen.getByText(/score_before/)).not.toBeNull();
     expect(requests.find((request) => request.path.endsWith(`/evolution-runs/${createdEvolutionRun?.id}/next-round-plan`))).toMatchObject({
       method: "GET",
+    });
+
+    await user.click(within(createdRunCard as HTMLElement).getByRole("button", { name: "启动执行" }));
+    await waitFor(() => expect(screen.getByText(/已启动第 1 轮执行/)).not.toBeNull());
+    expect(screen.getByText(/44444444-4444-4444-8444-444444444444/)).not.toBeNull();
+    expect(requests.find((request) => request.path.endsWith(`/evolution-runs/${createdEvolutionRun?.id}/execute-next-round`))).toMatchObject({
+      method: "POST",
     });
 
     await user.clear(screen.getByLabelText("改动维度"));

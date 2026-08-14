@@ -32,6 +32,8 @@ from agent_hub.db.models import AdminResourceRow
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.evolution import (
     EvolutionApprovalRequest,
+    EvolutionNextRoundExecutionRequest,
+    EvolutionNextRoundExecutionResponse,
     EvolutionNextRoundPlanResponse,
     EvolutionRoundRequest,
     EvolutionRunRequest,
@@ -1512,6 +1514,14 @@ class AdminResourceService(Protocol):
         actor: str,
     ) -> EvolutionNextRoundPlanResponse: ...
 
+    async def execute_evolution_next_round(
+        self,
+        run_id: str,
+        request: EvolutionNextRoundExecutionRequest,
+        *,
+        actor: str,
+    ) -> EvolutionNextRoundExecutionResponse: ...
+
     async def approve_evolution_run(
         self,
         run_id: str,
@@ -2407,6 +2417,58 @@ class InMemoryAdminResourceService:
                 "evolution run requires approval before planning the next round",
             )
         return plan_evolution_next_round(current)
+
+    async def execute_evolution_next_round(
+        self,
+        run_id: str,
+        request: EvolutionNextRoundExecutionRequest,
+        *,
+        actor: str,
+    ) -> EvolutionNextRoundExecutionResponse:
+        del request
+        current = await self.get_evolution_run(run_id)
+        plan = await self.plan_evolution_next_round(run_id, actor=actor)
+        execution_run_id = uuid4()
+        conversation_id = _evolution_execution_conversation_id(run_id, plan.round)
+        now = datetime.now(UTC)
+        self.runs[execution_run_id] = RunDetailResponse(
+            id=execution_run_id,
+            status="queued",
+            mode=current.mode,
+            conversation_id=conversation_id,
+            request=plan.task_prompt,
+            created_at=now,
+            queue_wait_ms=0,
+            capacity_wait_ms=0,
+            cost_usd="0",
+            events=[RunEventResponse(sequence=1, kind="queued", message="Evolution round execution queued.", created_at=now)],
+            artifacts=[],
+            explicit_details={
+                "source": "evolution",
+                **_evolution_execution_routing_details(current, plan, conversation_id),
+            },
+        )
+        await self.record_audit_event(
+            actor=actor,
+            action="evolution.round_execution_queued",
+            resource=f"evolution:{run_id}",
+            details={
+                "round": plan.round,
+                "action": plan.action,
+                "execution_run_id": str(execution_run_id),
+                "execution_conversation_id": conversation_id,
+            },
+        )
+        return EvolutionNextRoundExecutionResponse(
+            evolution_run_id=run_id,
+            round=plan.round,
+            action=plan.action,
+            execution_run_id=str(execution_run_id),
+            execution_conversation_id=conversation_id,
+            status="queued",
+            task_title=plan.task_title,
+            task_prompt=plan.task_prompt,
+        )
 
     async def approve_evolution_run(
         self,
@@ -3768,6 +3830,52 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 "evolution run requires approval before planning the next round",
             )
         return plan_evolution_next_round(current)
+
+    async def execute_evolution_next_round(
+        self,
+        run_id: str,
+        request: EvolutionNextRoundExecutionRequest,
+        *,
+        actor: str,
+    ) -> EvolutionNextRoundExecutionResponse:
+        if self._run_repository is None:
+            return await super().execute_evolution_next_round(run_id, request, actor=actor)
+        current = await self.get_evolution_run(run_id)
+        plan = await self.plan_evolution_next_round(run_id, actor=actor)
+        conversation_id = _evolution_execution_conversation_id(run_id, plan.round)
+        idempotency_key = request.idempotency_key or f"evolution:{run_id}:round:{plan.round}:execute"
+        record = await self._run_repository.create_run(
+            tenant_id=self._tenant_id,
+            actor_id=_uuid_or_default(actor, self._actor_id),
+            request=plan.task_prompt,
+            mode=TaskMode(current.mode),
+            status=RunStatus.QUEUED,
+            idempotency_key=idempotency_key,
+            routing_decision=_evolution_execution_routing_decision(current, plan, conversation_id),
+            enqueue=True,
+        )
+        await self.record_audit_event(
+            actor=actor,
+            action="evolution.round_execution_queued",
+            resource=f"evolution:{run_id}",
+            details={
+                "round": plan.round,
+                "action": plan.action,
+                "execution_run_id": str(record.id),
+                "execution_conversation_id": conversation_id,
+                "idempotency_key": idempotency_key,
+            },
+        )
+        return EvolutionNextRoundExecutionResponse(
+            evolution_run_id=run_id,
+            round=plan.round,
+            action=plan.action,
+            execution_run_id=str(record.id),
+            execution_conversation_id=conversation_id,
+            status=record.status.value,
+            task_title=plan.task_title,
+            task_prompt=plan.task_prompt,
+        )
 
     async def approve_evolution_run(
         self,
@@ -5569,6 +5677,49 @@ def _artifact_text(content: object) -> str | None:
     return stripped
 
 
+def _uuid_or_default(value: str, default: UUID) -> UUID:
+    try:
+        return UUID(value)
+    except ValueError:
+        return default
+
+
+def _evolution_execution_conversation_id(run_id: str, round_number: int) -> str:
+    safe_run_id = re.sub(r"[^a-zA-Z0-9_-]", "-", run_id).strip("-") or "evolution"
+    return f"{safe_run_id}-round-{round_number}"
+
+
+def _evolution_execution_routing_decision(
+    current: EvolutionRunResponse,
+    plan: EvolutionNextRoundPlanResponse,
+    conversation_id: str,
+) -> dict[str, object]:
+    return {
+        "source": "evolution",
+        "conversation_id": conversation_id,
+        "evolution_run_id": current.id,
+        "evolution_round": plan.round,
+        "evolution_action": plan.action,
+        "evolution_target_artifact_type": current.target_artifact_type,
+        "evolution_memory_policy": plan.memory_policy,
+        "evolution_required_output_schema": plan.required_output_schema,
+        "evolution_previous_rounds": plan.previous_rounds,
+        "baseline_agent_id": plan.baseline_agent_id,
+        "candidate_agent_ids": plan.candidate_agent_ids,
+        "evaluator_agent_id": plan.evaluator_agent_id,
+        "selected_agent_ids": list(dict.fromkeys([*plan.candidate_agent_ids, plan.evaluator_agent_id])),
+        "requested_skills": ", ".join(current.source_skill_ids),
+        "reason": "approved_evolution_next_round_execution",
+    }
+
+
+def _evolution_execution_routing_details(
+    current: EvolutionRunResponse,
+    plan: EvolutionNextRoundPlanResponse,
+    conversation_id: str,
+) -> dict[str, str]:
+    return _routing_details(_evolution_execution_routing_decision(current, plan, conversation_id))
+
 def _routing_details(routing_decision: dict[str, object] | None) -> dict[str, str]:
     if not routing_decision:
         return {}
@@ -5576,6 +5727,9 @@ def _routing_details(routing_decision: dict[str, object] | None) -> dict[str, st
     workflow_id = routing_decision.get("workflow_id")
     if isinstance(workflow_id, str) and workflow_id:
         details["workflow_id"] = workflow_id
+    source = routing_decision.get("source")
+    if isinstance(source, str) and source:
+        details["source"] = source[:128]
     conversation_id = routing_decision.get("conversation_id")
     if isinstance(conversation_id, str) and conversation_id:
         details["conversation_id"] = conversation_id
@@ -5606,6 +5760,25 @@ def _routing_details(routing_decision: dict[str, object] | None) -> dict[str, st
         safe_ids = [item for item in selected_agent_ids if isinstance(item, str) and item]
         if safe_ids:
             details["selected_agent_ids"] = ", ".join(safe_ids)
+    candidate_agent_ids = routing_decision.get("candidate_agent_ids")
+    if isinstance(candidate_agent_ids, list):
+        safe_candidates = [item for item in candidate_agent_ids if isinstance(item, str) and item]
+        if safe_candidates:
+            details["candidate_agent_ids"] = ", ".join(safe_candidates)
+    for key in (
+        "evolution_run_id",
+        "evolution_action",
+        "evolution_target_artifact_type",
+        "evolution_memory_policy",
+        "baseline_agent_id",
+        "evaluator_agent_id",
+    ):
+        value = routing_decision.get(key)
+        if isinstance(value, str) and value:
+            details[key] = value[:512]
+    evolution_round = routing_decision.get("evolution_round")
+    if isinstance(evolution_round, int):
+        details["evolution_round"] = str(evolution_round)
     reason = routing_decision.get("reason")
     if isinstance(reason, str) and reason:
         details["routing_reason"] = reason
@@ -6597,6 +6770,23 @@ async def plan_evolution_next_round_route(
 ) -> EvolutionNextRoundPlanResponse:
     _require(principal, "skill:read")
     return await service.plan_evolution_next_round(run_id, actor=str(principal.user_id))
+
+
+@router.post(
+    "/evolution-runs/{run_id}/execute-next-round",
+    response_model=EvolutionNextRoundExecutionResponse,
+    responses=error_responses(401, 403, 404, 409, 422),
+)
+async def execute_evolution_next_round_route(
+    run_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+    body: EvolutionNextRoundExecutionRequest | None = None,
+) -> EvolutionNextRoundExecutionResponse:
+    _require(principal, "skill:write")
+    request = body or EvolutionNextRoundExecutionRequest()
+    return await service.execute_evolution_next_round(run_id, request, actor=str(principal.user_id))
+
 
 @router.post(
     "/evolution-runs/{run_id}/approve",

@@ -41,6 +41,7 @@ from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
 from agent_hub.config.repository import ConfigRevision, ConfigStatus
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.evolution import EvolutionNextRoundExecutionRequest, EvolutionRunRequest
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.registry import NoCapableDeployment
 from agent_hub.models.types import (
@@ -1208,6 +1209,7 @@ def test_routing_details_exposes_channel_directive_context() -> None:
             "requested_skills": "deep-research",
             "requested_mcp_servers": "filesystem",
             "requested_plugins": "github",
+            "source": "evolution",
         }
     )
 
@@ -1215,6 +1217,7 @@ def test_routing_details_exposes_channel_directive_context() -> None:
     assert details["requested_skills"] == "deep-research"
     assert details["requested_mcp_servers"] == "filesystem"
     assert details["requested_plugins"] == "github"
+    assert details["source"] == "evolution"
 
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
@@ -3889,6 +3892,153 @@ def test_evolution_next_round_plan_requires_approval_and_contains_execution_cont
     assert "darwin-skill" in plan["task_prompt"]
     assert "score_before" in plan["required_output_schema"]
     assert plan["memory_policy"] == "summarize_between_rounds"
+
+def test_evolution_next_round_execution_queues_real_run_with_metadata() -> None:
+    api = client()
+    created = api.post(
+        "/api/v1/admin/evolution-runs",
+        headers=headers(),
+        json={
+            "kind": "skill_optimization",
+            "title": "进化科研 Skill",
+            "objective": "执行一轮候选 Skill 评测并返回结构化评分。",
+            "mode": "hybrid",
+            "source_skill_ids": ["darwin-skill"],
+            "target_artifact_type": "skill",
+            "baseline_agent_id": "agent-main-m3",
+            "candidate_agent_ids": ["agent-researcher", "agent-reviewer"],
+            "evaluator_agent_id": "agent-evaluator",
+            "approval_policy": "ask",
+        },
+    )
+    run = created.json()
+
+    blocked = api.post(f"/api/v1/admin/evolution-runs/{run['id']}/execute-next-round", headers=headers())
+
+    assert blocked.status_code == 409
+    assert blocked.json()["error"]["code"] == "evolution_run_requires_approval"
+
+    approved = api.post(
+        f"/api/v1/admin/evolution-runs/{run['id']}/approve",
+        headers=headers(),
+        json={"approved": True, "note": "确认执行下一轮。"},
+    )
+    assert approved.status_code == 200
+
+    executed = api.post(f"/api/v1/admin/evolution-runs/{run['id']}/execute-next-round", headers=headers())
+
+    assert executed.status_code == 200
+    execution = executed.json()
+    assert execution["evolution_run_id"] == run["id"]
+    assert execution["round"] == 1
+    assert execution["status"] == "queued"
+    assert "fixed evaluation set" in execution["task_prompt"]
+
+    run_detail = api.get(f"/api/v1/admin/runs/{execution['execution_run_id']}", headers=headers())
+    assert run_detail.status_code == 200
+    detail = run_detail.json()
+    assert detail["status"] == "queued"
+    assert detail["conversation_id"] == execution["execution_conversation_id"]
+    assert detail["explicit_details"]["source"] == "evolution"
+    assert detail["explicit_details"]["evolution_run_id"] == run["id"]
+    assert detail["explicit_details"]["evolution_round"] == "1"
+    assert detail["explicit_details"]["candidate_agent_ids"] == "agent-researcher, agent-reviewer"
+
+    audit = api.get("/api/v1/admin/audit?action=evolution.round_execution_queued", headers=headers())
+    assert audit.status_code == 200
+    assert audit.json()[0]["details"]["execution_run_id"] == execution["execution_run_id"]
+
+@pytest.mark.asyncio
+async def test_persistent_evolution_next_round_execution_enqueues_run_repository() -> None:
+    execution_run_id = UUID("33333333-3333-4333-8333-333333333333")
+
+    class FakeRunRepository:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def create_run(
+            self,
+            *,
+            tenant_id: UUID,
+            actor_id: UUID,
+            request: str,
+            mode: TaskMode | None,
+            status: RunStatus,
+            idempotency_key: str | None,
+            routing_decision: dict[str, object] | None = None,
+            enqueue: bool,
+        ) -> RunRecord:
+            self.calls.append(
+                {
+                    "tenant_id": tenant_id,
+                    "actor_id": actor_id,
+                    "request": request,
+                    "mode": mode,
+                    "status": status,
+                    "idempotency_key": idempotency_key,
+                    "routing_decision": routing_decision,
+                    "enqueue": enqueue,
+                }
+            )
+            return RunRecord(
+                id=execution_run_id,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                request=request,
+                mode=mode,
+                status=status,
+                version=1,
+                created_at=datetime.now(UTC),
+                routing_decision=routing_decision,
+            )
+
+    repository = FakeRunRepository()
+    service = PersistentAdminResourceService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        run_repository=repository,  # type: ignore[arg-type]
+    )
+    evolution = await service.create_evolution_run(
+        EvolutionRunRequest(
+            kind="skill_optimization",
+            title="进化科研 Skill",
+            objective="执行一轮候选 Skill 评测并返回结构化评分。",
+            mode="hybrid",
+            source_skill_ids=["darwin-skill"],
+            target_artifact_type="skill",
+            baseline_agent_id="agent-main-m3",
+            candidate_agent_ids=["agent-researcher"],
+            evaluator_agent_id="agent-evaluator",
+            approval_policy="auto",
+        ),
+        actor=str(USER_ID),
+    )
+
+    response = await service.execute_evolution_next_round(
+        evolution.id,
+        EvolutionNextRoundExecutionRequest(idempotency_key="evolution-test-key"),
+        actor=str(USER_ID),
+    )
+
+    assert response.execution_run_id == str(execution_run_id)
+    assert response.status == "queued"
+    assert len(repository.calls) == 1
+    call = repository.calls[0]
+    assert call["tenant_id"] == TENANT_ID
+    assert call["actor_id"] == USER_ID
+    assert call["mode"] is TaskMode.HYBRID
+    assert call["status"] is RunStatus.QUEUED
+    assert call["idempotency_key"] == "evolution-test-key"
+    assert call["enqueue"] is True
+    routing = cast(dict[str, object], call["routing_decision"])
+    assert routing["source"] == "evolution"
+    assert routing["evolution_run_id"] == evolution.id
+    assert routing["evolution_round"] == 1
+    assert routing["candidate_agent_ids"] == ["agent-researcher"]
+    assert routing["selected_agent_ids"] == ["agent-researcher", "agent-evaluator"]
+
 def test_evolution_run_stops_after_two_low_delta_rounds() -> None:
     api = client()
     created = api.post(

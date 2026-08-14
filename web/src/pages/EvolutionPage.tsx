@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useState } from "react";
 
-import { api, formatApiError, type EvolutionNextRoundPlan, type EvolutionRun } from "../api/client";
+import { api, formatApiError, type EvolutionNextRoundExecution, type EvolutionNextRoundPlan, type EvolutionRun } from "../api/client";
 
 function latestRound(run: EvolutionRun) {
   return run.rounds[run.rounds.length - 1] ?? null;
@@ -54,6 +54,7 @@ export function EvolutionPage() {
   const [memoryPolicy, setMemoryPolicy] = useState<"none" | "summarize_between_rounds" | "full_ledger">("summarize_between_rounds");
   const [approvalDrafts, setApprovalDrafts] = useState<Record<string, ApprovalDraft>>({});
   const [nextRoundPlans, setNextRoundPlans] = useState<Record<string, EvolutionNextRoundPlan>>({});
+  const [nextRoundExecutions, setNextRoundExecutions] = useState<Record<string, EvolutionNextRoundExecution>>({});
   const [roundRunId, setRoundRunId] = useState("");
   const [changedDimension, setChangedDimension] = useState("实测表现");
   const [candidateSummary, setCandidateSummary] = useState("补充测试 prompt 并降低自评偏差。");
@@ -113,6 +114,13 @@ export function EvolutionPage() {
     mutationFn: (run: EvolutionRun) => api.evolutionNextRoundPlan(run.id),
     onSuccess: (plan) => {
       setNextRoundPlans((current) => ({ ...current, [plan.run_id]: plan }));
+    },
+  });
+  const executeNextRound = useMutation({
+    mutationFn: (run: EvolutionRun) => api.executeEvolutionNextRound(run.id),
+    onSuccess: async (execution) => {
+      setNextRoundExecutions((current) => ({ ...current, [execution.evolution_run_id]: execution }));
+      await queryClient.invalidateQueries({ queryKey: ["runs"] });
     },
   });
   const approveRun = useMutation({
@@ -326,8 +334,11 @@ export function EvolutionPage() {
             const latest = latestRound(run);
             const draft = draftFor(run);
             const nextRoundPlan = nextRoundPlans[run.id] ?? null;
+            const nextRoundExecution = nextRoundExecutions[run.id] ?? null;
             const isPlanningThisRun = planNextRound.isPending && planNextRound.variables?.id === run.id;
             const planningFailedThisRun = planNextRound.isError && planNextRound.variables?.id === run.id;
+            const isExecutingThisRun = executeNextRound.isPending && executeNextRound.variables?.id === run.id;
+            const executionFailedThisRun = executeNextRound.isError && executeNextRound.variables?.id === run.id;
             return (
               <article key={run.id} className="evolution-run-card">
                 <div>
@@ -387,9 +398,18 @@ export function EvolutionPage() {
                     <button type="button" onClick={() => planNextRound.mutate(run)} disabled={isPlanningThisRun}>
                       {isPlanningThisRun ? "生成中..." : "生成执行包"}
                     </button>
+                    <button type="button" onClick={() => executeNextRound.mutate(run)} disabled={isExecutingThisRun}>
+                      {isExecutingThisRun ? "启动中..." : "启动执行"}
+                    </button>
                   </div>
                 ) : null}
                 {planningFailedThisRun ? <p role="alert">{formatApiError(planNextRound.error, "执行包生成失败")}</p> : null}
+                {executionFailedThisRun ? <p role="alert">{formatApiError(executeNextRound.error, "执行启动失败")}</p> : null}
+                {nextRoundExecution ? (
+                  <p className="field-help">
+                    已启动第 {nextRoundExecution.round} 轮执行：{nextRoundExecution.execution_run_id}（{nextRoundExecution.status}）
+                  </p>
+                ) : null}
                 {nextRoundPlan ? (
                   <div className="reference-preview">
                     <strong>{nextRoundPlan.task_title}</strong>
