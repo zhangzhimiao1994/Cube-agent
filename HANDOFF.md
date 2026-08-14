@@ -1,3 +1,49 @@
+## 2026-08-14 Skill Bundle Partial Install Hardening
+
+Current state:
+
+- Investigated the reported multi-Skill archive upload failure.
+- Verified the deployed server already accepts 99-skill archives for these structures: `skills.zip/<skill>/SKILL.md`, `all-skills_1.tar.gz/all-skills_1/skills/<skill>/SKILL.md`, and `skills.tar.gz/skills/<skill>/SKILL.md`.
+- Found a root cause for real migration archives: during the fallback path, the whole archive was first scanned as one instruction Skill. If any subdirectory contained a nested archive or invalid file, that whole-archive probe raised `InvalidSkillPackage` before bundle splitting could scan valid subdirectories individually.
+- Changed bundle scanning so whole-archive instruction scan failures fall through to per-skill bundle splitting.
+- Bundle uploads now keep valid Skill directories and return a `skipped` list with `{path, reason}` for invalid child directories. If no valid Skill exists, upload still fails with `invalid_skill_package`.
+- Frontend API schema now accepts `skipped`; Skill management and chat Skill install confirmation show skipped directory count and reasons.
+
+Verification performed:
+
+- TDD red/green:
+  - Added `test_skill_archive_upload_keeps_valid_bundle_items_when_one_item_is_invalid`.
+  - Initial run failed with `422`, proving the current bug.
+  - After falling through to bundle splitting and converting skipped items to response models, the test passed.
+- Local backend checks:
+  - `uv run pytest tests/api/test_admin_resources.py::test_skill_archive_upload_keeps_valid_bundle_items_when_one_item_is_invalid -q --tb=short` -> passed.
+  - `uv run pytest tests/api/test_admin_resources.py -q -k "skill_archive_upload" --tb=short` -> 10 passed.
+  - `uv run pytest tests/api/test_admin_resources.py -q --tb=short` -> 91 passed.
+  - `uv run ruff check src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+  - `uv run mypy --strict src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+- Local frontend checks:
+  - `npm.cmd run lint` -> passed.
+  - `npm.cmd run test -- --run src/pages/SkillsPage.test.tsx` -> 3 passed.
+  - `npm.cmd run test -- --run` -> 103 passed.
+  - `npm.cmd run build` -> passed with the existing Vite chunk-size warning.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-skill-partial-bundle.tgz` to `103.236.98.133`.
+  - Backed up deployed `admin.py` and `web/dist`, extracted into `/opt/agent-hub/current`, fixed ownership, restarted `agent-hub-api` and `agent-hub-worker`, and reloaded Caddy.
+  - Confirmed `agent-hub-api`, `agent-hub-worker`, and `caddy` were active.
+- Server real environment verification:
+  - Uploaded a real `mixed-skills.zip` via HTTP API containing one valid instruction Skill plus one invalid child directory with `nested.zip`.
+  - Verified HTTP 200, one valid Skill persisted/listed, and `skipped=[{"path":"invalid-skill","reason":"instruction skill contains nested archives"}]` returned.
+  - Cleaned the test Skill via API.
+  - Final partial-bundle output: `{"status": "ok", "checked": ["partial_bundle_upload", "skipped_reason", "valid_skill_listed"], "cleanup": ["skill_0be8b9f1fea84e1b980c90c1df22fc27:200"]}`.
+  - Re-ran the 99-directory server probe after deployment; `skills.zip`, `all-skills_1.tar.gz`, and `skills.tar.gz` all returned 99 scanned items and were cleaned up.
+
+Remaining risks / TODOs:
+
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote `mutilagent/main`.
+- Push with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue planned work after green: OpenClaw terminal/system integration and Windows executor path, Hermes quick confirm/batch robustness, batch-button audit, final README/README.zh-CN, and later full UI text/layout audit.
 ## 2026-08-14 Chat Schedule Intent Confirmation
 
 Current state:

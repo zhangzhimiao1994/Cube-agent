@@ -82,6 +82,7 @@ export function SkillsPage() {
   const allQuarantinedSelected =
     quarantinedIds.length > 0 && quarantinedIds.every((id) => selectedIds.includes(id));
   const busy = approve.isPending || deleteSkill.isPending || bulkApprove.isPending || bulkDelete.isPending;
+  const skippedUploadItems = upload.data?.skipped ?? [];
 
   return (
     <section>
@@ -111,6 +112,12 @@ export function SkillsPage() {
             {upload.isPending ? "正在扫描..." : "上传并扫描"}
           </button>
           {upload.isError ? <p role="alert">{formatApiError(upload.error, "Skill 上传失败")}</p> : null}
+          {upload.isSuccess ? (
+            <p role="status">
+              已扫描 {upload.data.items.length} 个 Skill
+              {skippedUploadItems.length > 0 ? `，跳过 ${skippedUploadItems.length} 项：${skippedUploadItems.map((item) => `${item.path}（${item.reason}）`).join("；")}` : ""}
+            </p>
+          ) : null}
           {approve.isError ? <p role="alert">{formatApiError(approve.error, "Skill 审批失败")}</p> : null}
           {deleteSkill.isError ? <p role="alert">{formatApiError(deleteSkill.error, "Skill 删除失败")}</p> : null}
           {bulkApprove.isError ? <p role="alert">{formatApiError(bulkApprove.error, "Skill 批量审批失败")}</p> : null}

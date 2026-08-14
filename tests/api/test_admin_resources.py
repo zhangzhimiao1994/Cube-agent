@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import io
 import sys
 import tarfile
@@ -1430,6 +1430,20 @@ def large_flat_instruction_skill_bundle_zip() -> bytes:
             )
     return buffer.getvalue()
 
+def partially_invalid_instruction_skill_bundle_zip() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "valid-skill/SKILL.md",
+            "---\nname: valid-bundle-skill\ndescription: Valid bundled skill.\n---\n\nUse this skill.\n",
+        )
+        archive.writestr(
+            "invalid-skill/SKILL.md",
+            "---\nname: invalid-bundle-skill\ndescription: Invalid bundled skill.\n---\n\nUse this skill.\n",
+        )
+        archive.writestr("invalid-skill/nested.zip", b"PK\x03\x04")
+    return buffer.getvalue()
+
 
 def test_model_pool_reports_serial_slot_and_queue_policy() -> None:
     response = client().post("/api/v1/admin/models", headers=headers(), json=model_payload())
@@ -2394,6 +2408,28 @@ def test_skill_archive_upload_accepts_large_nested_instruction_bundle_tar_gz() -
     assert body["items"][0]["name"] == "nested-instruction-skill-000"
     assert body["items"][-1]["name"] == "nested-instruction-skill-098"
     assert len(skills.json()) == 99
+
+def test_skill_archive_upload_keeps_valid_bundle_items_when_one_item_is_invalid() -> None:
+    api = client()
+
+    uploaded = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "mixed-skills.zip"},
+        content=partially_invalid_instruction_skill_bundle_zip(),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert uploaded.status_code == 200
+    body = uploaded.json()
+    assert body["bundle"] is True
+    assert [item["name"] for item in body["items"]] == ["valid-bundle-skill"]
+    assert body["skipped"] == [
+        {
+            "path": "invalid-skill",
+            "reason": "instruction skill contains nested archives",
+        }
+    ]
+    assert [item["name"] for item in skills.json()] == ["valid-bundle-skill"]
 
 
 def test_skill_archive_upload_rejects_invalid_zip_without_saving_metadata() -> None:

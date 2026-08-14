@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
-import { ApiError, api, formatApiError, type AttachmentUpload, type ModelDeployment, type RunDetail, type Skill, type SubmittedRun } from "../api/client";
+import { ApiError, api, formatApiError, type AttachmentUpload, type ModelDeployment, type RunDetail, type Skill, type SkillArchiveUpload, type SubmittedRun } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
 
 const RUN_MODES = [
@@ -24,6 +24,7 @@ type ModeSelection = {
 type SkillInstallCandidate = {
   fileName: string;
   skills: Skill[];
+  skipped: SkillArchiveUpload["skipped"];
   status: "scanned" | "enabled";
 };
 type ChatAttachmentDraft = {
@@ -1589,7 +1590,7 @@ export function RunsPage() {
     mutationFn: (file: File) => api.uploadSkillArchive(file),
     onSuccess: (result, file) => {
       setArchiveInstallFile(null);
-      setSkillInstallCandidate({ fileName: file.name, skills: result.items, status: "scanned" });
+      setSkillInstallCandidate({ fileName: file.name, skills: result.items, skipped: result.skipped, status: "scanned" });
       setSubmitNotice("Skill 压缩包已完成安全扫描，请确认权限后再安装。");
       void queryClient.invalidateQueries({ queryKey: ["skills"] });
     },
@@ -2322,6 +2323,12 @@ export function RunsPage() {
                     {skillInstallCandidate.fileName} · {skillInstallCandidate.skills.length} Skill
                   </small>
                 </div>
+                {skillInstallCandidate.skipped.length > 0 ? (
+                  <p className="field-help">
+                    已跳过 {skillInstallCandidate.skipped.length} 项：
+                    {skillInstallCandidate.skipped.map((item) => `${item.path}（${item.reason}）`).join("；")}
+                  </p>
+                ) : null}
                 {skillInstallCandidate.skills.some((skill) => skill.requested_permissions.length > 0) ? (
                   <ul>
                     {skillInstallCandidate.skills.flatMap((skill) =>

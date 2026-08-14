@@ -73,6 +73,7 @@ describe("SkillsPage", () => {
                 requested_permissions: [],
               },
             ],
+            skipped: [{ path: "invalid-skill", reason: "instruction skill contains nested archives" }],
           });
         }
         if (path.endsWith("/approve") && init?.method === "POST") {
@@ -159,5 +160,7 @@ describe("SkillsPage", () => {
         }),
       );
     });
+    expect(await screen.findByText(/跳过 1 项/)).not.toBeNull();
+    expect(screen.getByText(/invalid-skill/)).not.toBeNull();
   });
 });

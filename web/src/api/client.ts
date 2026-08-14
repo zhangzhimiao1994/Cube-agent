@@ -493,10 +493,16 @@ const SkillSchema = z.object({
 
 export type Skill = z.infer<typeof SkillSchema>;
 
+const SkillArchiveSkippedSchema = z.object({
+  path: z.string(),
+  reason: z.string(),
+});
+
 const SkillArchiveUploadSchema = z.object({
   filename: z.string(),
   bundle: z.boolean(),
   items: z.array(SkillSchema),
+  skipped: z.array(SkillArchiveSkippedSchema).default([]),
 });
 
 export type SkillArchiveUpload = z.infer<typeof SkillArchiveUploadSchema>;

@@ -344,12 +344,20 @@ class SkillResponse(BaseModel):
     requested_permissions: list[str]
 
 
+class SkillArchiveSkippedResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    reason: str
+
+
 class SkillArchiveUploadResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     filename: str
     bundle: bool
     items: list[SkillResponse]
+    skipped: list[SkillArchiveSkippedResponse] = Field(default_factory=list)
 
 
 class McpServerResponse(BaseModel):
@@ -1458,7 +1466,13 @@ class _ScannedSkillArchive:
     instruction_sha256: str | None = None
 
 
-def _scan_skill_archive_upload(filename: str, archive_bytes: bytes) -> tuple[bool, tuple[_ScannedSkillArchive, ...]]:
+@dataclass(frozen=True, slots=True)
+class _SkippedSkillArchive:
+    path: str
+    reason: str
+
+
+def _scan_skill_archive_upload(filename: str, archive_bytes: bytes) -> tuple[bool, tuple[_ScannedSkillArchive, ...], tuple[_SkippedSkillArchive, ...]]:
     scanner = SkillScanner()
     try:
         return False, (
@@ -1467,16 +1481,20 @@ def _scan_skill_archive_upload(filename: str, archive_bytes: bytes) -> tuple[boo
                 archive_bytes=archive_bytes,
                 scan_report=scanner.scan(archive_bytes),
             ),
-        )
+        ), ()
     except InvalidSkillPackage:
-        instruction_scan = _scan_instruction_skill_archive(filename, archive_bytes)
+        try:
+            instruction_scan = _scan_instruction_skill_archive(filename, archive_bytes)
+        except InvalidSkillPackage:
+            instruction_scan = None
         if instruction_scan is not None:
-            return False, (instruction_scan,)
+            return False, (instruction_scan,), ()
         split_archives = _split_skill_bundle_archive(filename, archive_bytes)
         if not split_archives:
             raise
         scanned: list[_ScannedSkillArchive] = []
-        for item_filename, item_bytes in split_archives:
+        skipped: list[_SkippedSkillArchive] = []
+        for item_path, item_filename, item_bytes in split_archives:
             try:
                 scanned.append(
                     _ScannedSkillArchive(
@@ -1485,12 +1503,19 @@ def _scan_skill_archive_upload(filename: str, archive_bytes: bytes) -> tuple[boo
                         scan_report=scanner.scan(item_bytes),
                     )
                 )
-            except InvalidSkillPackage:
-                instruction_item = _scan_instruction_skill_archive(item_filename, item_bytes)
+            except InvalidSkillPackage as scan_error:
+                try:
+                    instruction_item = _scan_instruction_skill_archive(item_filename, item_bytes)
+                except InvalidSkillPackage as instruction_error:
+                    skipped.append(_SkippedSkillArchive(path=item_path, reason=str(instruction_error)))
+                    continue
                 if instruction_item is None:
-                    raise
+                    skipped.append(_SkippedSkillArchive(path=item_path, reason=str(scan_error)))
+                    continue
                 scanned.append(instruction_item)
-        return len(scanned) > 1, tuple(scanned)
+        if not scanned:
+            raise InvalidSkillPackage("skill archive contains no valid skill packages")
+        return len(scanned) + len(skipped) > 1, tuple(scanned), tuple(skipped)
 
 
 def _scan_instruction_skill_archive(filename: str, archive_bytes: bytes) -> _ScannedSkillArchive | None:
@@ -1631,14 +1656,17 @@ def _skill_response_from_scanned_archive(scanned: _ScannedSkillArchive, skill_id
         requested_permissions=[],
     )
 
+def _skipped_skill_responses(skipped: tuple[_SkippedSkillArchive, ...]) -> list[SkillArchiveSkippedResponse]:
+    return [SkillArchiveSkippedResponse(path=item.path, reason=item.reason) for item in skipped]
 
-def _split_skill_bundle_archive(filename: str, archive_bytes: bytes) -> tuple[tuple[str, bytes], ...]:
+
+def _split_skill_bundle_archive(filename: str, archive_bytes: bytes) -> tuple[tuple[str, str, bytes], ...]:
     if zipfile.is_zipfile(io.BytesIO(archive_bytes)):
         return _split_zip_skill_bundle(filename, archive_bytes)
     return _split_tar_skill_bundle(filename, archive_bytes)
 
 
-def _split_zip_skill_bundle(filename: str, archive_bytes: bytes) -> tuple[tuple[str, bytes], ...]:
+def _split_zip_skill_bundle(filename: str, archive_bytes: bytes) -> tuple[tuple[str, str, bytes], ...]:
     try:
         with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
             entries: list[tuple[str, zipfile.ZipInfo]] = []
@@ -1652,6 +1680,7 @@ def _split_zip_skill_bundle(filename: str, archive_bytes: bytes) -> tuple[tuple[
             groups = _skill_bundle_groups(entries)
             return tuple(
                 (
+                    group,
                     f"{PurePosixPath(filename).stem}-{_skill_bundle_group_filename(group)}.zip",
                     _zip_group_to_skill_archive(archive, group_entries),
                 )
@@ -1661,7 +1690,7 @@ def _split_zip_skill_bundle(filename: str, archive_bytes: bytes) -> tuple[tuple[
         raise InvalidSkillPackage("skill archive must be a valid zip file") from exc
 
 
-def _split_tar_skill_bundle(filename: str, archive_bytes: bytes) -> tuple[tuple[str, bytes], ...]:
+def _split_tar_skill_bundle(filename: str, archive_bytes: bytes) -> tuple[tuple[str, str, bytes], ...]:
     try:
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
             entries: list[tuple[str, tarfile.TarInfo]] = []
@@ -1676,6 +1705,7 @@ def _split_tar_skill_bundle(filename: str, archive_bytes: bytes) -> tuple[tuple[
             groups = _skill_bundle_groups(entries)
             return tuple(
                 (
+                    group,
                     f"{PurePosixPath(filename).stem}-{_skill_bundle_group_filename(group)}.zip",
                     _tar_group_to_skill_archive(archive, group_entries),
                 )
@@ -2079,7 +2109,7 @@ class InMemoryAdminResourceService:
 
     async def upload_skill_archive(self, filename: str, archive_bytes: bytes) -> SkillArchiveUploadResponse:
         try:
-            bundle, scanned_archives = _scan_skill_archive_upload(filename, archive_bytes)
+            bundle, scanned_archives, skipped_archives = _scan_skill_archive_upload(filename, archive_bytes)
         except InvalidSkillPackage:
             await self.record_log(
                 category="feature_error",
@@ -2095,7 +2125,7 @@ class InMemoryAdminResourceService:
             response = _skill_response_from_scanned_archive(scanned, f"skill_{uuid4().hex}")
             self.skills[response.id] = response
             items.append(response)
-        return SkillArchiveUploadResponse(filename=filename, bundle=bundle, items=items)
+        return SkillArchiveUploadResponse(filename=filename, bundle=bundle, items=items, skipped=_skipped_skill_responses(skipped_archives))
 
     async def approve_skill(self, skill_id: str) -> SkillResponse:
         current = self.skills[skill_id]
@@ -3306,7 +3336,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
 
     async def upload_skill_archive(self, filename: str, archive_bytes: bytes) -> SkillArchiveUploadResponse:
         try:
-            bundle, scanned_archives = _scan_skill_archive_upload(filename, archive_bytes)
+            bundle, scanned_archives, skipped_archives = _scan_skill_archive_upload(filename, archive_bytes)
         except InvalidSkillPackage:
             await self.record_log(
                 category="feature_error",
@@ -3339,7 +3369,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             if not await self._upsert_admin_payload("skill", response.id, response.model_dump(mode="json")):
                 return await super().upload_skill_archive(filename, archive_bytes)
             await self._record_audit("skill.upload", f"skill:{response.id}", {"filename": filename})
-        return SkillArchiveUploadResponse(filename=filename, bundle=bundle, items=items)
+        return SkillArchiveUploadResponse(filename=filename, bundle=bundle, items=items, skipped=_skipped_skill_responses(skipped_archives))
 
     async def approve_skill(self, skill_id: str) -> SkillResponse:
         payload = await self._get_admin_payload("skill", skill_id)
