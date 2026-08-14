@@ -19,8 +19,13 @@
 - Real server probe output: API health returned `{"status":"ok"}`, `/evolution` loaded `/assets/index-DEK92yP9.js`, and the active production bundle contains `普通问答、方案规划和对话上下文压缩属于对话框架`, `不会默认进入进化`, and `需要评测门控的长期改进任务`.
 - Removed server deployment/probe temp files and `/tmp/agent-hub-p3-runtime-incremental.tgz` after verification.
 
+### GitHub / Recovery
+- Committed as `c9d30b8 fix: clarify evolution conversation boundary`.
+- Created local GitHub recovery bundle `.local-archives/github-recovery/mutilagent-main-before-20260815-063708-9d0302b.bundle` and pushed GitHub archive tag `archive/mutilagent-main-before-20260815-063708-9d0302b`.
+- Force-with-lease pushed `mutilagent/main`; GitHub again reported the repository has moved to `zhangzhimiao1994/CubeAgent.git`, but the configured `mutilagent` remote accepted the push.
+- GitHub Actions run `31847350628` (`quality`) passed.
+
 ### Remaining / Next
-- Commit, create GitHub recovery archive/tag, force-with-lease push `mutilagent/main`, and verify GitHub Actions.
 - Continue remaining P3 items after green: Feishu channel runtime reply checks, channel clear-state/runtime reload fixes if needed, OpenClaw follow-ups, evolution execution/backlog UI, broader UI layout/copy audit, missing button/function sweep, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 OpenClaw Multi-Platform Session Console
 
