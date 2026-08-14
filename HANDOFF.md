@@ -34,10 +34,17 @@ Server deployment and real verification:
 - Probe output: `{"status": "ok", "checked": ["create", "blocked_round", "approve", "record_round", "audit", "frontend_bundle"], "deleted": 1}`.
 - Removed `/tmp/evolution_approval_gate_check.py`, `/tmp/deploy-evolution-approval-gate.sh`, and `/tmp/agent-hub-p3-runtime-incremental.tgz`; `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.
 
+GitHub push status:
+
+- Recovery bundle before push: `.local-archives/github-pushes/mutilagent-main-before-20260814-175953-3c4c566.bundle`.
+- GitHub archive tag: `archive/mutilagent-main-before-20260814-175953-3c4c566`.
+- Pushed commit `c460ff9` (`feat: gate evolution iterations with approval`) to `mutilagent/main` with `git push --force-with-lease`.
+- GitHub Actions run `31790426587` completed successfully.
+
 Remaining / next:
 
-- Create local ignored recovery bundle and GitHub archive tag, commit this slice, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
-- Continue evolution follow-up after green: wire conversation-triggered evolution planning and long-running iteration execution workers, not just manual record keeping.
+- Continue evolution follow-up: wire conversation-triggered evolution planning and long-running iteration execution workers, not just manual record keeping.
+- Later queued items remain: broader UI copy/layout audit, missing button/function sweep, final README refresh if later modules change, and Docker readiness.
 ## 2026-08-14 OpenClaw Remote Operation Kinds
 
 Current state:
