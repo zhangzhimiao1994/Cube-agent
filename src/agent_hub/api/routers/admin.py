@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import stat
 import tarfile
 import zipfile
@@ -957,6 +958,106 @@ def _openclaw_can_auto_approve(request: OpenClawOperationRequest, settings: Syst
     if request.platform != "linux" or request.kind != "server_command":
         return False
     return openclaw_command_allowed(request.argv, settings.openclaw_allowed_commands)
+
+
+def _openclaw_proposal_string(proposal: Mapping[str, JsonValue], key: str) -> str:
+    value = proposal.get(key)
+    return value if isinstance(value, str) else ""
+
+
+def _openclaw_operation_request_from_run_detail(detail: RunDetailResponse) -> OpenClawOperationRequest:
+    proposal = detail.openclaw_proposal
+    if detail.status != "waiting_approval" or proposal is None:
+        raise PublicAPIError(
+            409,
+            "openclaw_proposal_missing",
+            "Run does not contain a pending OpenClaw proposal",
+        )
+    platform = _openclaw_proposal_string(proposal, "platform")
+    kind = _openclaw_proposal_string(proposal, "kind")
+    target = _openclaw_normalized_target(
+        platform=platform,
+        kind=kind,
+        target=_openclaw_proposal_string(proposal, "target"),
+    )
+    operation_text = _openclaw_proposal_string(proposal, "operation_text") or detail.request
+    source_conversation_id = _openclaw_proposal_string(proposal, "source_conversation_id") or detail.conversation_id or ""
+    try:
+        return OpenClawOperationRequest(
+            platform=platform,
+            kind=kind,
+            target=target,
+            argv=_openclaw_argv_from_operation_text(kind, operation_text),
+            risk_level="medium",
+            reason=_openclaw_reason_from_run_proposal(
+                detail,
+                operation_text=operation_text,
+                source_conversation_id=source_conversation_id,
+            ),
+        )
+    except ValidationError as exc:
+        raise PublicAPIError(
+            422,
+            "openclaw_proposal_invalid",
+            "OpenClaw proposal cannot be converted into a controlled operation",
+        ) from exc
+
+
+def _openclaw_normalized_target(*, platform: str, kind: str, target: str) -> str:
+    if platform == "linux" and kind == "server_command" and target in {"", "linux-server"}:
+        return "agent-hub-server"
+    return target or "operator-selected"
+
+
+def _openclaw_reason_from_run_proposal(
+    detail: RunDetailResponse,
+    *,
+    operation_text: str,
+    source_conversation_id: str,
+) -> str:
+    parts = [
+        "Created from chat OpenClaw proposal",
+        f"run_id={detail.id}",
+    ]
+    if source_conversation_id:
+        parts.append(f"conversation_id={source_conversation_id}")
+    if detail.request:
+        parts.append(f"request={detail.request}")
+    if operation_text and operation_text != detail.request:
+        parts.append(f"operation_text={operation_text}")
+    return "; ".join(parts)[:2000]
+
+
+_OPENCLAW_COMMAND_PHRASE_RE = re.compile(
+    r"(?:execute|run|\u6267\u884c|\u8fd0\u884c)\s+(?P<command>.+)",
+    re.IGNORECASE,
+)
+_OPENCLAW_COMMAND_STOP_RE = re.compile(r"\s+(?:on|after|before|with|in)\b.*$", re.IGNORECASE)
+
+
+def _openclaw_argv_from_operation_text(kind: str, operation_text: str) -> list[str]:
+    if kind != "server_command":
+        return []
+    match = _OPENCLAW_COMMAND_PHRASE_RE.search(operation_text)
+    if match is not None:
+        command = _OPENCLAW_COMMAND_STOP_RE.sub("", match.group("command")).strip(" .。；;")
+    else:
+        command = operation_text.strip(" .。；;")
+        if _looks_like_openclaw_natural_language_request(command):
+            return []
+    if not command:
+        return []
+    try:
+        return shlex.split(command, posix=True)
+    except ValueError:
+        return []
+
+
+def _looks_like_openclaw_natural_language_request(value: str) -> bool:
+    lowered = value.lower()
+    return any(marker in lowered for marker in ("openclaw", "please", "server", "approval")) or any(
+        marker in value for marker in ("请", "服务器", "审批", "确认")
+    )
 
 
 def _openclaw_operation_target_types(kind: str) -> frozenset[str]:
@@ -6766,6 +6867,42 @@ async def create_openclaw_operation(
             body,
             actor=str(principal.user_id),
         )
+    if _openclaw_can_auto_approve(body, settings):
+        return await service.resolve_openclaw_operation(
+            operation.id,
+            OpenClawResolveRequest(decision="approve"),
+            actor=str(principal.user_id),
+        )
+    return operation
+
+
+@router.post(
+    "/openclaw/operations/from-run/{run_id}",
+    response_model=OpenClawOperationResponse,
+    status_code=202,
+    responses=error_responses(401, 403, 404, 409, 422),
+)
+async def create_openclaw_operation_from_run(
+    run_id: UUID,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> OpenClawOperationResponse:
+    _require(principal, "config:write")
+    settings = await service.get_settings()
+    if not settings.openclaw_enabled:
+        raise PublicAPIError(409, "openclaw_disabled", "OpenClaw is disabled")
+    try:
+        run = await service.get_run(run_id)
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+    body = _openclaw_operation_request_from_run_detail(run)
+    if settings.openclaw_mode == "read_only" and body.kind not in {"screen_read", "file_read"}:
+        raise PublicAPIError(403, "openclaw_read_only", "OpenClaw read-only mode blocks this operation")
+    operation = await service.create_openclaw_operation(
+        body,
+        actor=str(principal.user_id),
+        mode=settings.openclaw_mode,
+    )
     if _openclaw_can_auto_approve(body, settings):
         return await service.resolve_openclaw_operation(
             operation.id,

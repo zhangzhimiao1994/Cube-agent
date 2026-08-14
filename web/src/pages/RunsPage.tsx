@@ -553,6 +553,7 @@ function openClawApprovalFromRunDetail(run: RunDetail | undefined) {
   return {
     runId: run.id,
     proposal: run.openclaw_proposal,
+    createdOperationId: null,
   };
 }
 
@@ -1343,7 +1344,9 @@ export function RunsPage() {
   const [openClawApproval, setOpenClawApproval] = useState<{
     runId: string;
     proposal: OpenClawProposal;
-  } | null>(null);  const userSelectedMode = useRef(false);
+    createdOperationId: string | null;
+  } | null>(null);
+  const userSelectedMode = useRef(false);
   const trimmedReferenceConversationId = referenceConversationId.trim();
   const handoffActive = Boolean(trimmedReferenceConversationId);
 
@@ -1563,7 +1566,7 @@ export function RunsPage() {
         setTemporaryApproval(null);
         setScheduleApproval(null);
         setEvolutionApproval(null);
-        setOpenClawApproval({ runId: run.id, proposal: run.openclaw_proposal });
+        setOpenClawApproval({ runId: run.id, proposal: run.openclaw_proposal, createdOperationId: null });
         setSubmitNotice("主 Agent 已识别为 OpenClaw 操作请求，请到 OpenClaw 管理页确认权限和执行边界。");
       } else if (run.schedule_proposal) {
         setModeSelection(null);
@@ -1678,6 +1681,19 @@ export function RunsPage() {
       );
       setSubmitNotice(`已加入进化：${run.title}。到进化页面可以审批、登记轮次和查看结果。`);
       await queryClient.invalidateQueries({ queryKey: ["evolution-runs"] });
+    },
+  });
+
+  const createOpenClawFromProposal = useMutation({
+    mutationFn: () => {
+      if (!openClawApproval) throw new Error("openclaw approval is unavailable");
+      return api.createOpenClawOperationFromRun(openClawApproval.runId);
+    },
+    onSuccess: (operation) => {
+      setOpenClawApproval((current) =>
+        current ? { ...current, createdOperationId: operation.id } : current,
+      );
+      setSubmitNotice(`已创建 OpenClaw 待审批操作：${operation.id}。请到 OpenClaw 控制页审批和执行。`);
     },
   });
   const promoteTemporaryAgent = useMutation({
@@ -2553,15 +2569,27 @@ export function RunsPage() {
             {openClawApproval ? (
               <aside className="composer-attachment-card" role="status" aria-label="OpenClaw 操作确认">
                 <div>
-                  <span className="eyebrow">OpenClaw 待确认</span>
+                  <span className="eyebrow">
+                    {openClawApproval.createdOperationId ? "OpenClaw 操作已创建" : "OpenClaw 待确认"}
+                  </span>
                   <strong>{openClawApproval.proposal.target}</strong>
                   <small>{openClawApproval.proposal.summary}</small>
                 </div>
                 <p>{openClawApproval.proposal.operation_text}</p>
+                {openClawApproval.createdOperationId ? (
+                  <small>待审批操作：{openClawApproval.createdOperationId}</small>
+                ) : (
+                  <button type="button" onClick={() => createOpenClawFromProposal.mutate()} disabled={createOpenClawFromProposal.isPending}>
+                    {createOpenClawFromProposal.isPending ? "创建中..." : "创建待审批操作"}
+                  </button>
+                )}
                 <Link to="/openclaw" className="secondary-action">
                   打开 OpenClaw
                 </Link>
               </aside>
+            ) : null}
+            {createOpenClawFromProposal.isError ? (
+              <p role="alert">{formatApiError(createOpenClawFromProposal.error, "OpenClaw 操作创建失败")}</p>
             ) : null}
             {scheduleApproval ? (
               <aside className="composer-attachment-card" role="status" aria-label="计划任务确认">

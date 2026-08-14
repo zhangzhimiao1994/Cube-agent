@@ -230,6 +230,89 @@ def test_openclaw_adapters_expose_multisystem_execution_boundary() -> None:
     assert adapters[("windows", "file_read")]["requires_user_approval"] is True
 
 
+def test_openclaw_operation_can_be_created_from_chat_proposal() -> None:
+    api = client()
+    service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)
+    settings_response = api.get("/api/v1/admin/settings", headers=headers())
+    payload = settings_response.json()
+    payload["openclaw_enabled"] = True
+    payload["openclaw_mode"] = "ask"
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+    run_id = uuid4()
+    now = datetime.now(UTC)
+    service.runs[run_id] = RunDetailResponse(
+        id=run_id,
+        status="waiting_approval",
+        mode="dispatch",
+        conversation_id="conv-openclaw-api-test",
+        request="请用 OpenClaw 在 Linux 服务器执行 python --version",
+        created_at=now,
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        events=[RunEventResponse(sequence=1, kind="queued", message="waiting approval", created_at=now)],
+        artifacts=[],
+        explicit_details={"conversation_id": "conv-openclaw-api-test"},
+        openclaw_proposal={
+            "kind": "server_command",
+            "platform": "linux",
+            "target_type": "server",
+            "target": "agent-hub-server",
+            "operation_text": "python --version",
+            "source_conversation_id": "conv-openclaw-api-test",
+            "summary": "主 Agent 检测到 OpenClaw 服务器操作请求。",
+            "metadata": {"source": "chat_openclaw_proposal"},
+        },
+    )
+
+    response = api.post(
+        f"/api/v1/admin/openclaw/operations/from-run/{run_id}",
+        headers=headers(),
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "waiting_user_approval"
+    assert body["platform"] == "linux"
+    assert body["kind"] == "server_command"
+    assert body["operation"]["target"] == "agent-hub-server"
+    assert body["operation"]["argv"] == ["python", "--version"]
+    assert body["operation"]["risk_level"] == "medium"
+    assert "conv-openclaw-api-test" in body["operation"]["reason"]
+
+
+def test_openclaw_operation_from_run_rejects_non_openclaw_proposal() -> None:
+    api = client()
+    service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)
+    settings_response = api.get("/api/v1/admin/settings", headers=headers())
+    payload = settings_response.json()
+    payload["openclaw_enabled"] = True
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+    run_id = uuid4()
+    now = datetime.now(UTC)
+    service.runs[run_id] = RunDetailResponse(
+        id=run_id,
+        status="completed",
+        mode="dispatch",
+        conversation_id="conv-normal-api-test",
+        request="写一个普通方案",
+        created_at=now,
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        events=[RunEventResponse(sequence=1, kind="completed", message="done", created_at=now)],
+        artifacts=[],
+        explicit_details={"conversation_id": "conv-normal-api-test"},
+    )
+
+    response = api.post(
+        f"/api/v1/admin/openclaw/operations/from-run/{run_id}",
+        headers=headers(),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "openclaw_proposal_missing"
+
 def test_openclaw_operation_creates_approval_request_when_enabled() -> None:
     api = client()
     settings_response = api.get("/api/v1/admin/settings", headers=headers())

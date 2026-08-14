@@ -1197,6 +1197,13 @@ export const api = {
       SystemSettingsSchema,
     );
   },
+  createOpenClawOperationFromRun(runId: string): Promise<OpenClawOperation> {
+    return request(
+      `/api/v1/admin/openclaw/operations/from-run/${encodeURIComponent(runId)}`,
+      { method: "POST" },
+      OpenClawOperationSchema,
+    );
+  },
   createOpenClawOperation(payload: OpenClawOperationRequest): Promise<OpenClawOperation> {
     return request(
       "/api/v1/admin/openclaw/operations",

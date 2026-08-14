@@ -1,3 +1,38 @@
+## 2026-08-15 OpenClaw Chat Proposal Materialization
+
+Current state:
+
+- Chat-detected OpenClaw proposals can now be materialized into regular OpenClaw controlled operations through `POST /api/v1/admin/openclaw/operations/from-run/{run_id}`.
+- The new endpoint reads the persisted waiting-approval run detail, validates that it contains an `openclaw_proposal`, converts it into `OpenClawOperationRequest`, and reuses the same OpenClaw feature switch, read-only guard, approval request creation, audit, and auto-review allowlist logic as manual operations.
+- The conversion normalizes Linux server command targets from `linux-server` to `agent-hub-server`, extracts bounded argv from explicit `execute/run/执行/运行` command phrases, and otherwise leaves ambiguous natural-language command text unexecutable by returning an empty argv so approval/allowlist boundaries still apply.
+- The chat composer now shows `创建待审批操作` on the OpenClaw confirmation card. Clicking it calls the from-run endpoint, shows the created operation id, and links to `/openclaw` for approval/execution. It does not approve or execute from chat.
+
+TDD / local verification:
+
+- RED first: `pytest tests\api\test_admin_resources.py::test_openclaw_operation_can_be_created_from_chat_proposal tests\api\test_admin_resources.py::test_openclaw_operation_from_run_rejects_non_openclaw_proposal -q --tb=short` failed with HTTP 405 because the from-run route did not exist.
+- RED first: `npm test -- --run src/pages/OperationalPages.test.tsx -t "creates an OpenClaw operation from a chat proposal"` failed because the `创建待审批操作` button did not exist.
+- Target backend tests passed: `2 passed`.
+- OpenClaw backend slice passed: `pytest tests\api\test_admin_resources.py -q -k "openclaw" --tb=short` -> 22 passed.
+- `python -m ruff check src tests` -> passed.
+- `python -m mypy --strict src tests` -> passed, 264 source files checked.
+- Main backend test set passed: `pytest tests\unit tests\api tests\contracts tests\security tests\resilience -q` -> 1459 passed, 13 skipped.
+- Frontend target/full tests passed: `npm test -- --run src/pages/OperationalPages.test.tsx -t "creates an OpenClaw operation from a chat proposal"` and `npm test -- --run` -> 14 files / 125 tests passed.
+- `npm run lint` -> passed.
+- `npm run build` -> passed with the existing Vite large chunk warning.
+
+Server deployment and real verification:
+
+- Created `.local-archives/server-incrementals/agent-hub-openclaw-from-run-20260815-024957.tgz` with changed backend/frontend/test files and rebuilt `web/dist`.
+- Uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`, backed up overwritten files under `/opt/agent-hub/backups/openclaw-from-run-20260815-024957`, extracted into `/opt/agent-hub/current`, compiled `src/agent_hub/api/routers/admin.py`, restarted `agent-hub-api` and `agent-hub-worker`, and reloaded Caddy.
+- The deploy script's immediate health curl hit the API before the socket was ready, but the follow-up readiness check returned `{"status":"ok"}`.
+- Real server probe loaded `/etc/agent-hub/secrets.env`, generated a short-lived admin token without printing secrets, temporarily enabled OpenClaw ask mode, inserted a real waiting-approval run with `openclaw_proposal`, called the deployed HTTP endpoint, and verified a persisted OpenClaw operation was created as `waiting_user_approval` with `platform=linux`, `kind=server_command`, normalized target `agent-hub-server`, extracted argv `["date"]`, `requires_user_approval=true`, no execution payload, and the source run still `waiting_approval`.
+- Probe output: `{"status": "ok", "run_id": "3bbe8b3e-572c-42f6-8db6-db158253849a", "operation_id": "openclaw_0e97d3cb349545e79d408da5b58237a2", "checks": {"status_waiting_user_approval": true, "platform_linux": true, "kind_server_command": true, "target_normalized": true, "argv_extracted": true, "not_executed": true, "requires_user_approval": true, "operation_persisted": true, "source_run_preserved": true}}`.
+- Cleanup verified: `{"probe_run_cleaned": true, "probe_operation_cleaned": true}`; `agent-hub-api`, `agent-hub-worker`, and `caddy` active; final health `{"status":"ok"}`.
+
+Remaining / next:
+
+- Commit this slice, create local GitHub recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, then watch GitHub Actions until green.
+- Continue P3 after green: tighten OpenClaw approval-policy UX, finish plan-task mode refinement, fix remaining Skill archive install edge cases, channel configuration refresh/clear polish, UI copy/layout audit, missing button/function sweep, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 OpenClaw Chat Proposal Approval Boundary
 
 Current state:
