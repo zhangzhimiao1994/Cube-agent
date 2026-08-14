@@ -373,6 +373,16 @@ function sortedChannels(channels: ChannelStatus[], sort: SortState<ChannelSortKe
   });
 }
 
+function mergeChannelStatus(channels: ChannelStatus[] | undefined, status: ChannelStatus) {
+  if (!channels || channels.length === 0) return [status];
+  let matched = false;
+  const next = channels.map((channel) => {
+    if (channel.id !== status.id) return channel;
+    matched = true;
+    return status;
+  });
+  return matched ? next : [status, ...next];
+}
 export function ChannelsPage() {
   const queryClient = useQueryClient();
   const channels = useQuery({ queryKey: ["channels"], queryFn: () => api.channels() });
@@ -399,8 +409,9 @@ export function ChannelsPage() {
       if (!selected) throw new Error("channel is not selected");
       return api.saveChannelConfig(selected.id, { values: draftValues });
     },
-    onSuccess: async () => {
+    onSuccess: async (data) => {
       setDraftValues({});
+      queryClient.setQueryData<ChannelStatus[]>(["channels"], (current) => mergeChannelStatus(current, data.status));
       setSaveNotice("通道配置已保存，可继续修改或清空。面板已刷新最新状态。");
       await queryClient.invalidateQueries({ queryKey: ["channels"] });
     },
@@ -413,6 +424,7 @@ export function ChannelsPage() {
     },
     onSuccess: async (data) => {
       setDraftValues({});
+      queryClient.setQueryData<ChannelStatus[]>(["channels"], (current) => mergeChannelStatus(current, data.status));
       const remainingSources = Object.values(data.status.configured_sources);
       setSaveNotice(
         remainingSources.includes("environment")

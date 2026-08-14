@@ -144,9 +144,11 @@ const channelPayload = [
 
 describe("ChannelsPage", () => {
   const requests: Array<{ body: unknown; method: string; path: string }> = [];
+  let currentChannels: Array<Record<string, unknown>> = channelPayload;
 
   beforeEach(() => {
     requests.length = 0;
+    currentChannels = channelPayload;
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
       "fetch",
@@ -159,7 +161,7 @@ describe("ChannelsPage", () => {
           body: init?.body && typeof init.body === "string" ? JSON.parse(init.body) : null,
         });
         if (path === "/api/v1/auth/me") return jsonResponse(principal);
-        if (path === "/api/v1/admin/channels") return jsonResponse(channelPayload);
+        if (path === "/api/v1/admin/channels") return jsonResponse(currentChannels);
         if (path === "/api/v1/admin/channels/dingtalk/config" && method === "POST") {
           return jsonResponse({
             id: "dingtalk",
@@ -171,6 +173,29 @@ describe("ChannelsPage", () => {
               configured: ["DINGTALK_APP_KEY", "DINGTALK_APP_SECRET", "DINGTALK_WEBHOOK_TOKEN"],
             },
           });
+        }
+        if (path === "/api/v1/admin/channels/feishu/config" && method === "DELETE") {
+          const clearedFeishu = {
+            ...channelPayload[0],
+            status: "missing_config",
+            configured: [],
+            configured_sources: {},
+            missing: ["FEISHU_APP_ID", "FEISHU_APP_SECRET"],
+            runtime: {
+              status: "not_started",
+              ready: false,
+              connection_attempts: 0,
+              reconnects: 0,
+              received_events: 0,
+              submitted_messages: 0,
+              ignored_events: 0,
+              failures: 0,
+              last_error_type: null,
+              last_error_message: null,
+            },
+          };
+          currentChannels = [clearedFeishu, ...channelPayload.slice(1)];
+          return jsonResponse({ id: "feishu", saved: [], status: clearedFeishu });
         }
         return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
       }),
@@ -251,6 +276,22 @@ describe("ChannelsPage", () => {
 
     expect(within(table).getByText("企微智能机器人")).not.toBeNull();
     expect(within(table).queryByText("飞书")).toBeNull();
+  });
+
+  it("clears saved Feishu settings from the visible form state", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/channels" />);
+
+    await screen.findByRole("heading", { name: "通道连接" });
+    expect(screen.getByRole("textbox", { name: /App ID FEISHU_APP_ID/ }).getAttribute("placeholder")).toContain("已配置");
+
+    await user.click(screen.getByRole("button", { name: "清空当前通道配置" }));
+
+    expect(await screen.findByText("通道配置已清空。需要重新填写后才会接通。")).not.toBeNull();
+    expect(screen.getByText("还缺少配置：FEISHU_APP_ID, FEISHU_APP_SECRET")).not.toBeNull();
+    expect(screen.getByRole("textbox", { name: /App ID FEISHU_APP_ID/ }).getAttribute("placeholder")).toBe("cli_xxx");
+    expect(screen.queryByText("当前来源：本页保存")).toBeNull();
+    expect(requests.find((request) => request.path === "/api/v1/admin/channels/feishu/config" && request.method === "DELETE")).toBeTruthy();
   });
   it("lets operators type and save channel configuration values", async () => {
     const user = userEvent.setup();

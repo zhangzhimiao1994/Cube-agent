@@ -1,3 +1,29 @@
+## 2026-08-15 Channel Config Immediate Refresh And Feishu Runtime Probe
+
+### State
+- Fixed the channel configuration page so successful save/clear responses immediately merge the returned channel status into the `channels` query cache before background refetch. This prevents stale `已配置` / `当前来源：本页保存` labels from lingering after an operator clears a channel.
+- Added a Feishu regression test proving a clear response removes saved Feishu source labels from the visible form state and shows missing `FEISHU_APP_ID` / `FEISHU_APP_SECRET` instead.
+- Probed the live server Feishu channel with a short-lived local super-admin JWT generated from the systemd environment. The server is using saved `FEISHU_APP_ID`, saved `FEISHU_APP_SECRET`, and saved `FEISHU_TRANSPORT=websocket`; no re-entry is needed unless the Feishu app credentials changed.
+- Current live Feishu runtime is connected and ready, but `received_events=0`; if chat still has no reply, the next external check is Feishu platform setup: bot published/installed, bot in target chat, receive-message event enabled, permissions granted, and app republished.
+
+### Verification
+- `npm test -- --run src/pages/ChannelsPage.test.tsx` from `web/` -> 5 passed.
+- `npm run lint` from `web/` -> passed.
+- `npm test -- --run src/pages/ChannelsPage.test.tsx src/pages/OperationalPages.test.tsx` from `web/` -> 63 passed.
+- `npm run build` from `web/` -> passed with the existing Vite large chunk warning.
+- `git diff --check` -> passed with only CRLF normalization warnings for touched files.
+
+### Server Deployment And Real Probe
+- Created local server incremental archive `.local-archives/server-incrementals/agent-hub-channel-cache-refresh-20260815-065504.tgz` and uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`; server backup retained under `/opt/agent-hub/backups/p3-channel-cache-refresh-20260815-065504`.
+- Server archive retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-channel-cache-refresh-20260815-065504.tgz`.
+- Real server probe loaded `/channels`, verified the active bundle contains the channel runtime/clear-state copy, verified deployed source contains `mergeChannelStatus` and two cache `setQueryData` updates, and queried live Feishu runtime state.
+- Probe output: Feishu status `configured`, sources `{FEISHU_APP_ID: saved, FEISHU_APP_SECRET: saved, FEISHU_TRANSPORT: saved}`, runtime `{status: running, ready: true, connection_attempts: 1, reconnects: 0, received_events: 0, submitted_messages: 0, ignored_events: 0, failures: 0}`.
+- Removed server deployment/probe temp files and `/tmp/agent-hub-p3-runtime-incremental.tgz` after verification.
+
+### Remaining / Next
+- Commit, create GitHub recovery archive/tag, force-with-lease push `mutilagent/main`, and verify GitHub Actions.
+- Continue remaining P3 items after green: Feishu platform-side event delivery confirmation if the user sends a test message, OpenClaw follow-ups, evolution execution/backlog UI, broader UI layout/copy audit, missing button/function sweep, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 Evolution Copy Boundary
 
 ### State
