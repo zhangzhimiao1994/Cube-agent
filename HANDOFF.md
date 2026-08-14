@@ -1,4 +1,45 @@
-﻿## 2026-08-14 Evolution Execution Ingest And Channel Config Layout
+﻿## 2026-08-15 Feishu Long-Connection Channel Defaults
+
+Current state:
+
+- Updated Feishu channel configuration to match the CowAgent/OpenClaw-style default: long connection / `websocket` mode is the normal path and only requires `FEISHU_APP_ID` plus `FEISHU_APP_SECRET`.
+- Kept Feishu Webhook as a fallback mode. When `FEISHU_TRANSPORT=webhook` or `both`, channel status requires `FEISHU_VERIFICATION_TOKEN` and `AGENT_HUB_PUBLIC_URL`; `FEISHU_ENCRYPT_KEY` remains optional unless Feishu event encryption is enabled.
+- Added `FEISHU_APP_TYPE` and `FEISHU_TRANSPORT` to the allowed Feishu channel config fields. `FEISHU_TRANSPORT` accepts `websocket`, `webhook`, or `both`; omitted/invalid values default to `websocket`.
+- Updated the Channels UI copy to explain why two parameters are enough in long-connection mode, while clearly keeping Webhook as a backup that still needs event callback verification.
+- Important runtime note: this slice updates configuration/status/UI semantics. The codebase already has Feishu WebSocket receiver/connector classes, but app startup does not yet launch a real Feishu long-connection background connector. That remains a follow-up before claiming full CowAgent/OpenClaw parity for live Feishu message receiving.
+
+References checked:
+
+- CowAgent Feishu docs state WebSocket/long-connection mode only needs App ID/App Secret, while Webhook mode needs an additional verification token and public callback.
+- Feishu official bot docs show App ID/App Secret from credentials/basic information and Verification Token from event subscription; Encrypt Key is only needed when event encryption is configured.
+
+Local verification:
+
+- `.\.venv\Scripts\python.exe -m pytest tests\api\test_admin_resources.py -k "channel" -q` -> 9 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\api\test_channel_webhooks.py -q` -> 24 passed.
+- `.\.venv\Scripts\python.exe -m ruff check src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+- `.\.venv\Scripts\python.exe -m mypy --strict src tests` -> passed, 259 source files.
+- `npm.cmd run test -- --run src/pages/ChannelsPage.test.tsx` -> 3 passed.
+- `npm.cmd run lint` from `web/` -> passed.
+- `npm.cmd run build` from `web/` -> passed with the existing Vite large chunk warning.
+
+Server deployment and real verification:
+
+- Created incremental package `.local-archives/server-incrementals/agent-hub-feishu-long-connection-20260815-000531.tgz` containing `src/agent_hub/api/routers/admin.py` and rebuilt `web/dist`.
+- Uploaded to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed incrementally into `/opt/agent-hub/current`.
+- Server backup retained under `/opt/agent-hub/backups/feishu-long-connection-20260815-000555`.
+- Synced `admin.py` into active source and production venv site-packages, replaced `web/dist`, restarted `agent-hub-api` and `agent-hub-worker`, reloaded Caddy, and confirmed `agent-hub-api`, `agent-hub-worker`, and `caddy` active.
+- Real server probe loaded the actual systemd env, backed up the current Feishu channel config, used the real admin API to save `FEISHU_APP_TYPE=bot_template`, `FEISHU_TRANSPORT=websocket`, `FEISHU_APP_ID`, and `FEISHU_APP_SECRET`, verified Feishu status becomes `configured` with no missing fields and `transports=["websocket"]`, verified deployed frontend assets include the new long-connection copy, then restored the original Feishu config through the API.
+- Probe output: `{"status": "ok", "checked": ["feishu_websocket_two_parameter_api", "channel_status", "frontend_copy"], "restored": true}`.
+- Removed `/tmp/probe_feishu_long_connection.py`, `/tmp/deploy-feishu-long-connection.sh`, and `/tmp/agent-hub-p3-runtime-incremental.tgz`; services remained active.
+
+Remaining / next:
+
+- Commit this slice, create local GitHub recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, then watch GitHub Actions until green.
+- Follow-up for Feishu parity: wire the existing Feishu WebSocket connector into app startup with credentials from runtime channel config, real reconnect lifecycle, metrics/logging, and a server-side live receive test.
+- Continue P3 after green: remaining OpenClaw workflow/dialog integration, automatic worker-side Evolution result ingestion when execution runs complete, plan-task mode refinement, UI copy/layout audit, missing button/function sweep, README/README.zh-CN usage refresh, and Docker readiness later.
+
+## 2026-08-14 Evolution Execution Ingest And Channel Config Layout
 
 Current state:
 
@@ -71,6 +112,7 @@ Remaining / next:
 
 - Commit this slice, create local GitHub recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, then watch GitHub Actions until green.
 - Continue queued P3 work after green: remaining OpenClaw workflow integration, Evolution result extraction/iteration worker, plan-task mode refinement, UI copy/layout audit, missing button/function sweep, final README/README.zh-CN usage refresh, and Docker readiness later.
+
 ## 2026-08-14 Evolution Next-Round Execution Queueing
 
 Current state:
@@ -109,6 +151,7 @@ Remaining / next:
 
 - Commit this slice, create local GitHub recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, then watch GitHub Actions until green.
 - Continue P3 after green: automatic extraction/approval of completed execution results into Evolution rounds, plan-task mode UX, broader OpenClaw workflow integration, Skill Creator grounding into real-input/real-test workflows, UI copy/layout audit, missing button/function sweep, README/README.zh-CN final usage refresh, and Docker readiness later.
+
 ## 2026-08-14 Evolution Approval Gate And Agent Baselines
 
 Current state:
@@ -4203,6 +4246,7 @@ Server deployment and real verification for Chat-Triggered Evolution Plan + Righ
 CI status for Chat-Triggered Evolution Plan + Right History Drawer:
 
 - GitHub Actions run `31792510103` for commit `4214c62` completed successfully.
+
 ## 2026-08-14 Evolution Controls + Right Drawer Button Polish
 
 Current state:
@@ -4489,6 +4533,7 @@ Remaining risks / next:
 - Commit this slice, create a GitHub recovery bundle/tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
 - Continue P3 after green: Evolution execution orchestration, plan-task mode UX, OpenClaw broader workflow integration, UI copy/layout audit, missing button/function sweep, README/README.zh-CN final usage refresh, and Docker readiness later.
 
+
 ## 2026-08-14 Evolution Next-Round Execution Package
 
 Current state:
@@ -4549,6 +4594,7 @@ Local verification for CI fix:
 Remaining risks / next:
 
 - Continue P3 after green: Evolution executor orchestration, plan-task mode UX, OpenClaw broader workflow integration, Skill Creator grounding into real-input/real-test generation workflows, UI copy/layout audit, missing button/function sweep, README/README.zh-CN final usage refresh, and Docker readiness later.
+
 ## 2026-08-14 Evolution Trigger Boundary and Grounded Skill Creation Intent
 
 Current state:

@@ -458,9 +458,6 @@ CHANNEL_DEFINITIONS: tuple[ChannelDefinition, ...] = (
         required_env=(
             "FEISHU_APP_ID",
             "FEISHU_APP_SECRET",
-            "FEISHU_VERIFICATION_TOKEN",
-            "FEISHU_ENCRYPT_KEY",
-            "AGENT_HUB_PUBLIC_URL",
         ),
         webhook_path="/channels/feishu/events",
         notes=(
@@ -5559,11 +5556,8 @@ def _channel_status_from_definition(
     config: Mapping[str, Mapping[str, str]],
 ) -> ChannelStatusResponse:
     public_url = _channel_config_value("AGENT_HUB_PUBLIC_URL", definition.id, config).rstrip("/")
-    missing = [
-        name
-        for name in definition.required_env
-        if not _channel_config_value(name, definition.id, config)
-    ]
+    required_env = _channel_required_env(definition, config)
+    missing = [name for name in required_env if not _channel_config_value(name, definition.id, config)]
     public_webhook_url = (
         f"{public_url}{definition.webhook_path}"
         if public_url and definition.webhook_path is not None
@@ -5571,7 +5565,7 @@ def _channel_status_from_definition(
     )
     transports = list(definition.transports)
     if definition.id == "feishu":
-        configured_transport = _channel_config_value("FEISHU_TRANSPORT", definition.id, config)
+        configured_transport = _feishu_transport(config)
         if configured_transport:
             transports = [configured_transport]
     status = "missing_config" if missing else "configured"
@@ -5583,8 +5577,55 @@ def _channel_status_from_definition(
         webhook_path=definition.webhook_path,
         public_webhook_url=public_webhook_url,
         missing=missing,
-        notes=list(definition.notes),
+        notes=_channel_notes(definition, config),
     )
+
+
+def _channel_required_env(
+    definition: ChannelDefinition,
+    config: Mapping[str, Mapping[str, str]],
+) -> tuple[str, ...]:
+    if definition.id != "feishu":
+        return definition.required_env
+    transport = _feishu_transport(config)
+    if transport == "websocket":
+        return ("FEISHU_APP_ID", "FEISHU_APP_SECRET")
+    required = ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_VERIFICATION_TOKEN"]
+    if transport in {"webhook", "both"}:
+        required.append("AGENT_HUB_PUBLIC_URL")
+    return tuple(required)
+
+
+def _feishu_transport(config: Mapping[str, Mapping[str, str]]) -> str:
+    raw = _channel_config_value("FEISHU_TRANSPORT", "feishu", config).strip().lower()
+    if raw in {"websocket", "webhook", "both"}:
+        return raw
+    return "websocket"
+
+
+def _feishu_app_type(config: Mapping[str, Mapping[str, str]]) -> str:
+    raw = _channel_config_value("FEISHU_APP_TYPE", "feishu", config).strip().lower()
+    if raw in {"bot_template", "template_bot", "template"}:
+        return "bot_template"
+    return "custom_app"
+
+
+def _channel_notes(
+    definition: ChannelDefinition,
+    config: Mapping[str, Mapping[str, str]],
+) -> list[str]:
+    notes = list(definition.notes)
+    if definition.id == "feishu":
+        transport = _feishu_transport(config)
+        if transport == "websocket":
+            notes.append("当前按飞书长连接配置：只要求 App ID 和 App Secret；不需要公网 Webhook URL。")
+        elif _feishu_app_type(config) == "bot_template":
+            notes.append(
+                "当前按机器人模板应用配置：只要求 App ID 和 App Secret；公开事件回调仍需要飞书事件订阅校验信息或其他可信接入方式。"
+            )
+        else:
+            notes.append("当前按飞书 Webhook 配置：Verification Token 和公网 URL 必填；Encrypt Key 仅在飞书开启事件加密时填写。")
+    return notes
 
 
 def _channel_statuses_from_configuration(
@@ -5604,7 +5645,19 @@ def _channel_statuses_from_environment() -> tuple[ChannelStatusResponse, ...]:
 def _channel_config_allowed_names(definition: ChannelDefinition) -> set[str]:
     allowed = set(definition.required_env)
     if definition.id == "feishu":
-        allowed.add("FEISHU_TRANSPORT")
+        allowed.update(
+            {
+                "AGENT_HUB_PUBLIC_URL",
+                "FEISHU_ALLOWED_TENANT_KEYS",
+                "FEISHU_APP_TYPE",
+                "FEISHU_BOT_OPEN_ID",
+                "FEISHU_ENCRYPT_KEY",
+                "FEISHU_TIMESTAMP_TOLERANCE_SECONDS",
+                "FEISHU_TRANSPORT",
+                "FEISHU_VERIFICATION_TOKEN",
+                "FEISHU_WEBHOOK_PATH",
+            }
+        )
     return allowed
 
 

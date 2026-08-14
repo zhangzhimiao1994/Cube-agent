@@ -10,7 +10,7 @@ type ChannelGuide = {
   docUrl: string;
   consoleUrl?: string;
   consolePath: string[];
-  fields: { env: string; label: string; secret?: boolean; placeholder: string; source: string }[];
+  fields: { env: string; label: string; secret?: boolean; placeholder: string; source: string; options?: { value: string; label: string }[] }[];
   steps: string[];
   verify: string[];
 };
@@ -22,29 +22,51 @@ const STATUS_LABELS: Record<string, string> = {
 
 const CHANNEL_GUIDES: Record<string, ChannelGuide> = {
   feishu: {
-    purpose: "把飞书机器人、群聊和私聊消息连接到主 Agent；底层仍使用飞书开放平台凭证完成验签和回复。",
-    auth: "飞书签名 + verification token + encrypt key",
+    purpose: "支持飞书长连接和 Webhook。长连接与 CowAgent/OpenClaw 一样只需要 App ID / App Secret；Webhook 才需要事件订阅校验信息和公网地址。",
+    auth: "长连接：App ID + App Secret；Webhook：飞书签名 + Verification Token + 公网 URL，Encrypt Key 按是否开启事件加密填写",
     docUrl: "https://open.feishu.cn/document/server-docs/event-subscription-guide/overview?lang=zh-CN",
     consoleUrl: "https://open.feishu.cn/app",
     consolePath: [
       "开发者后台 → 我的应用 → 选择机器人入口对应的应用 → 凭证与基础信息",
-      "事件与回调 → 事件订阅 → 将事件发送至开发者服务器",
-      "事件与回调 → 加密策略 → 复制 Verification Token 和 Encrypt Key",
+      "推荐：事件与回调 → 选择长连接模式，添加接收消息事件",
+      "自建应用：事件与回调 → 加密策略 → 复制 Verification Token；如开启事件加密，再复制 Encrypt Key",
+      "Webhook 备用：事件与回调 → 事件订阅 → 将事件发送至开发者服务器",
     ],
     fields: [
-      { env: "FEISHU_APP_ID", label: "App ID", placeholder: "cli_xxx", source: "凭证与基础信息 → App ID" },
-      { env: "FEISHU_APP_SECRET", label: "App Secret", secret: true, placeholder: "飞书应用密钥", source: "凭证与基础信息 → App Secret" },
-      { env: "FEISHU_VERIFICATION_TOKEN", label: "Verification Token", secret: true, placeholder: "事件订阅校验 token", source: "事件与回调 → 加密策略 → Verification Token" },
-      { env: "FEISHU_ENCRYPT_KEY", label: "Encrypt Key", secret: true, placeholder: "事件加密 key", source: "事件与回调 → 加密策略 → Encrypt Key" },
-      { env: "AGENT_HUB_PUBLIC_URL", label: "公网访问地址", placeholder: "https://agent.example.com", source: "你的服务器域名，必须能被飞书公网访问" },
+      {
+        env: "FEISHU_APP_TYPE",
+        label: "应用类型",
+        placeholder: "custom_app",
+        source: "自建应用选择 custom_app；机器人模板应用选择 bot_template",
+        options: [
+          { value: "custom_app", label: "自建应用" },
+          { value: "bot_template", label: "机器人模板应用" },
+        ],
+      },
+      {
+        env: "FEISHU_TRANSPORT",
+        label: "接收方式",
+        placeholder: "websocket",
+        source: "长连接 websocket 只需要 App ID / App Secret；Webhook 需要公网回调校验",
+        options: [
+          { value: "websocket", label: "长连接" },
+          { value: "webhook", label: "Webhook" },
+          { value: "both", label: "长连接 + Webhook" },
+        ],
+      },
+      { env: "FEISHU_APP_ID", label: "App ID", placeholder: "cli_xxx", source: "凭证与基础信息 → App ID；机器人模板应用也会提供" },
+      { env: "FEISHU_APP_SECRET", label: "App Secret", secret: true, placeholder: "飞书应用密钥", source: "凭证与基础信息 → App Secret；机器人模板应用也会提供" },
+      { env: "FEISHU_VERIFICATION_TOKEN", label: "Verification Token", secret: true, placeholder: "自建应用事件订阅校验 token", source: "自建应用 → 事件与回调 → 加密策略 → Verification Token" },
+      { env: "FEISHU_ENCRYPT_KEY", label: "Encrypt Key", secret: true, placeholder: "启用事件加密时填写", source: "自建应用 → 事件与回调 → 加密策略 → Encrypt Key；未启用加密可留空" },
+      { env: "AGENT_HUB_PUBLIC_URL", label: "公网访问地址", placeholder: "https://agent.example.com", source: "Webhook 回调需要公网地址；长连接模式可留空" },
     ],
     steps: [
-      "在飞书开放平台准备一个机器人入口，并启用机器人能力。",
-      "把事件订阅 Request URL 设置为本页 Webhook 地址。",
+      "推荐长连接：在飞书事件与回调中选择长连接模式，系统只需要 App ID 和 App Secret。",
+      "Webhook 备用：配置事件订阅 Request URL，并补充 Verification Token；如果开启事件加密，再填写 Encrypt Key。",
       "把本页列出的环境变量写入服务器配置后重启 API 服务。",
-      "在飞书里给机器人发送一条文本消息，任务页应出现新运行记录。",
+      "接入验证通过后，在飞书里给机器人发送文本消息，任务页应出现新运行记录。",
     ],
-    verify: ["飞书后台 URL 验证通过", "发送文本后任务页出现新任务", "失败时查看系统日志中的 channel=feishu"],
+    verify: ["长连接模式：飞书后台长连接保存成功并能接收消息", "Webhook 模式：飞书后台 URL 验证通过", "发送文本后任务页出现新任务", "失败时查看系统日志中的 channel=feishu"],
   },
   dingtalk: {
     purpose: "用于钉钉机器人或应用事件入口。",
@@ -458,22 +480,41 @@ export function ChannelsPage() {
                 {guide.fields.map((field) => (
                   <label key={field.env}>
                     {field.label}
-                    <input
-                      type={field.secret ? "password" : "text"}
-                      autoComplete="off"
-                      value={draftValues[field.env] ?? ""}
-                      onChange={(event) =>
-                        setDraftValues((current) => ({
-                          ...current,
-                          [field.env]: event.target.value,
-                        }))
-                      }
-                      placeholder={
-                        selected.missing.includes(field.env)
-                          ? field.placeholder
-                          : `已配置，留空不覆盖；如需更换请输入新的 ${field.label}`
-                      }
-                    />
+                    {field.options ? (
+                      <select
+                        value={draftValues[field.env] ?? ""}
+                        onChange={(event) =>
+                          setDraftValues((current) => ({
+                            ...current,
+                            [field.env]: event.target.value,
+                          }))
+                        }
+                      >
+                        <option value="">保持当前配置</option>
+                        {field.options.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        type={field.secret ? "password" : "text"}
+                        autoComplete="off"
+                        value={draftValues[field.env] ?? ""}
+                        onChange={(event) =>
+                          setDraftValues((current) => ({
+                            ...current,
+                            [field.env]: event.target.value,
+                          }))
+                        }
+                        placeholder={
+                          selected.missing.includes(field.env)
+                            ? field.placeholder
+                            : `已配置，留空不覆盖；如需更换请输入新的 ${field.label}`
+                        }
+                      />
+                    )}
                     <span className="field-help">{field.env}</span>
                     <span className="field-help">来源：{field.source}</span>
                   </label>

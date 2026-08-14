@@ -2072,6 +2072,103 @@ def test_channel_status_exposes_feishu_setup_without_secrets(monkeypatch: pytest
     assert "encrypt-live" not in serialized
 
 
+def test_channel_status_supports_feishu_bot_template_app_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "AGENT_HUB_PUBLIC_URL",
+        "FEISHU_VERIFICATION_TOKEN",
+        "FEISHU_ENCRYPT_KEY",
+        "FEISHU_TRANSPORT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("FEISHU_APP_TYPE", "bot_template")
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_template")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "template-secret")
+
+    response = client().get("/api/v1/admin/channels", headers=headers())
+
+    assert response.status_code == 200
+    by_id = {item["id"]: item for item in response.json()}
+    assert by_id["feishu"]["status"] == "configured"
+    assert by_id["feishu"]["missing"] == []
+    assert by_id["feishu"]["public_webhook_url"] is None
+    assert any("长连接" in note for note in by_id["feishu"]["notes"])
+    assert "template-secret" not in response.text
+
+
+def test_channel_status_defaults_feishu_to_websocket_two_parameter_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "AGENT_HUB_PUBLIC_URL",
+        "FEISHU_APP_TYPE",
+        "FEISHU_VERIFICATION_TOKEN",
+        "FEISHU_ENCRYPT_KEY",
+        "FEISHU_TRANSPORT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_default")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "default-secret")
+
+    response = client().get("/api/v1/admin/channels", headers=headers())
+
+    assert response.status_code == 200
+    by_id = {item["id"]: item for item in response.json()}
+    assert by_id["feishu"]["status"] == "configured"
+    assert by_id["feishu"]["missing"] == []
+    assert by_id["feishu"]["transports"] == ["websocket"]
+    assert any("长连接" in note for note in by_id["feishu"]["notes"])
+
+
+def test_channel_status_treats_feishu_custom_app_token_as_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "AGENT_HUB_PUBLIC_URL",
+        "FEISHU_APP_TYPE",
+        "FEISHU_VERIFICATION_TOKEN",
+        "FEISHU_ENCRYPT_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_custom")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "custom-secret")
+    monkeypatch.setenv("FEISHU_TRANSPORT", "webhook")
+
+    response = client().get("/api/v1/admin/channels", headers=headers())
+
+    assert response.status_code == 200
+    by_id = {item["id"]: item for item in response.json()}
+    assert by_id["feishu"]["status"] == "missing_config"
+    assert by_id["feishu"]["missing"] == ["FEISHU_VERIFICATION_TOKEN", "AGENT_HUB_PUBLIC_URL"]
+    assert any("Webhook" in note for note in by_id["feishu"]["notes"])
+
+
+def test_channel_config_accepts_feishu_bot_template_app_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "AGENT_HUB_PUBLIC_URL",
+        "FEISHU_APP_ID",
+        "FEISHU_APP_SECRET",
+        "FEISHU_APP_TYPE",
+        "FEISHU_VERIFICATION_TOKEN",
+        "FEISHU_ENCRYPT_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    api = client()
+    response = api.post(
+        "/api/v1/admin/channels/feishu/config",
+        headers=headers(),
+        json={
+            "values": {
+                "FEISHU_APP_TYPE": "bot_template",
+                "FEISHU_APP_ID": "cli_template",
+                "FEISHU_APP_SECRET": "template-secret",
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["saved"] == ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_APP_TYPE"]
+    assert response.json()["status"]["status"] == "configured"
+    assert response.json()["status"]["missing"] == []
+    assert "template-secret" not in response.text
+
+
 def test_channel_config_can_be_saved_without_exposing_secrets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2148,6 +2245,7 @@ def test_all_channel_statuses_are_configured_when_required_env_exists(
         "AGENT_HUB_PUBLIC_URL",
         "FEISHU_APP_ID",
         "FEISHU_APP_SECRET",
+        "FEISHU_APP_TYPE",
         "FEISHU_VERIFICATION_TOKEN",
         "FEISHU_ENCRYPT_KEY",
         "DINGTALK_APP_KEY",

@@ -196,7 +196,12 @@ describe("ChannelsPage", () => {
       "https://open.feishu.cn/app",
     );
     expect(screen.getByText("开发者后台 → 我的应用 → 选择机器人入口对应的应用 → 凭证与基础信息")).not.toBeNull();
-    expect(screen.getByText("来源：凭证与基础信息 → App ID")).not.toBeNull();
+    expect(screen.getByRole("combobox", { name: /应用类型/ })).not.toBeNull();
+    expect(screen.getByRole("combobox", { name: /接收方式/ })).not.toBeNull();
+    expect(screen.getByRole("option", { name: "机器人模板应用" })).not.toBeNull();
+    expect(screen.getByText("来源：凭证与基础信息 → App ID；机器人模板应用也会提供")).not.toBeNull();
+    expect(screen.getByRole("option", { name: "长连接" })).not.toBeNull();
+    expect(screen.getByText(/长连接与 CowAgent\/OpenClaw 一样只需要 App ID/)).not.toBeNull();
     expect(screen.getByText(/校验失败会返回明确错误/)).not.toBeNull();
   });
 
