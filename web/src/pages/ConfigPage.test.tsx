@@ -1,4 +1,4 @@
-﻿import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -363,6 +363,50 @@ describe("ConfigPage", () => {
     expect((await screen.findByTestId("openclaw-execution-output")).textContent).toContain("ui-openclaw-ok");
   });
 
+  it("adds and removes OpenClaw remote adapters through dedicated controls", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/config" />);
+
+    await screen.findByRole("heading", { name: "系统设置" });
+    await user.selectOptions(screen.getByTestId("openclaw-adapter-platform"), "windows");
+    await user.selectOptions(screen.getByTestId("openclaw-adapter-target-type"), "computer");
+    fireEvent.change(screen.getByTestId("openclaw-adapter-target"), { target: { value: "reporting-pc" } });
+    fireEvent.change(screen.getByTestId("openclaw-adapter-base-url"), { target: { value: "http://127.0.0.1:8765" } });
+    fireEvent.change(screen.getByTestId("openclaw-adapter-credential-ref"), {
+      target: { value: "secret://openclaw-reporting-pc" },
+    });
+
+    await user.click(screen.getByTestId("openclaw-add-remote-adapter"));
+    expect(screen.getByText("computer · reporting-pc")).not.toBeNull();
+    await user.click(screen.getByTestId("save-system-settings"));
+
+    await waitFor(() => {
+      expect(requests.filter((request) => request.path === "/api/v1/admin/settings").at(-1)).toMatchObject({
+        method: "PUT",
+        body: expect.objectContaining({
+          openclaw_remote_adapters: [
+            {
+              platform: "windows",
+              target_type: "computer",
+              target: "reporting-pc",
+              base_url: "http://127.0.0.1:8765",
+              credential_ref: "secret://openclaw-reporting-pc",
+            },
+          ],
+        }),
+      });
+    });
+
+    await user.click(screen.getByTestId("openclaw-remove-remote-adapter-0"));
+    await user.click(screen.getByTestId("save-system-settings"));
+
+    await waitFor(() => {
+      expect(requests.filter((request) => request.path === "/api/v1/admin/settings").at(-1)).toMatchObject({
+        method: "PUT",
+        body: expect.objectContaining({ openclaw_remote_adapters: [] }),
+      });
+    });
+  });
   it("saves configured OpenClaw remote adapters as secret references", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/config" />);

@@ -18,7 +18,16 @@ type EditableConfig = {
   agents: unknown[];
 };
 
+type OpenClawRemoteAdapterSetting = SystemSettings["openclaw_remote_adapters"][number];
+
 const EMPTY_CONFIG: EditableConfig = { models: {}, agents: [] };
+const DEFAULT_OPENCLAW_REMOTE_ADAPTER: OpenClawRemoteAdapterSetting = {
+  platform: "windows",
+  target_type: "computer",
+  target: "local-windows-pc",
+  base_url: "http://127.0.0.1:8765",
+  credential_ref: "secret://openclaw-local-adapter",
+};
 
 function formatDocument(document: EditableConfig) {
   return `${JSON.stringify(document, null, 2)}\n`;
@@ -151,6 +160,7 @@ export function ConfigPage() {
   const [settingsLocalError, setSettingsLocalError] = useState<string | null>(null);
   const [openClawAllowedCommandsText, setOpenClawAllowedCommandsText] = useState("[]");
   const [openClawRemoteAdaptersText, setOpenClawRemoteAdaptersText] = useState("[]");
+  const [openClawAdapterDraft, setOpenClawAdapterDraft] = useState<OpenClawRemoteAdapterSetting>(DEFAULT_OPENCLAW_REMOTE_ADAPTER);
   const [openClawArgvText, setOpenClawArgvText] = useState("[\"python\", \"--version\"]");
   const [openClawReason, setOpenClawReason] = useState("Manual OpenClaw operation from settings console");
   const [selectedOpenClawSessionId, setSelectedOpenClawSessionId] = useState("");
@@ -173,6 +183,60 @@ export function ConfigPage() {
     () => (openClawSessionsQuery.data ?? []).filter((session) => session.status === "active"),
     [openClawSessionsQuery.data],
   );
+
+  const configuredOpenClawRemoteAdapters = useMemo(() => {
+    try {
+      return parseOpenClawRemoteAdapters(openClawRemoteAdaptersText);
+    } catch {
+      return [];
+    }
+  }, [openClawRemoteAdaptersText]);
+
+  function updateOpenClawAdapterDraft<K extends keyof OpenClawRemoteAdapterSetting>(
+    field: K,
+    value: OpenClawRemoteAdapterSetting[K],
+  ) {
+    setOpenClawAdapterDraft((current) => ({ ...current, [field]: value }));
+  }
+
+  function replaceOpenClawRemoteAdapters(next: OpenClawRemoteAdapterSetting[]) {
+    setOpenClawRemoteAdaptersText(formatJson(next));
+    setSettingsLocalError(null);
+  }
+
+  function addOpenClawRemoteAdapter() {
+    let current: OpenClawRemoteAdapterSetting[];
+    try {
+      current = parseOpenClawRemoteAdapters(openClawRemoteAdaptersText);
+    } catch (error) {
+      setSettingsLocalError(error instanceof Error ? error.message : "OpenClaw 远程适配器 JSON 无法解析。");
+      return;
+    }
+    const adapter: OpenClawRemoteAdapterSetting = {
+      platform: openClawAdapterDraft.platform,
+      target_type: openClawAdapterDraft.target_type,
+      target: openClawAdapterDraft.target.trim(),
+      base_url: openClawAdapterDraft.base_url.trim(),
+      credential_ref: openClawAdapterDraft.credential_ref.trim(),
+    };
+    if (!adapter.target || !adapter.base_url || !adapter.credential_ref) {
+      setSettingsLocalError("请填写 OpenClaw 适配器目标、Base URL 和凭据引用。");
+      return;
+    }
+    replaceOpenClawRemoteAdapters([...current, adapter]);
+    setOpenClawAdapterDraft({ ...adapter, target: "local-windows-pc" });
+  }
+
+  function removeOpenClawRemoteAdapter(index: number) {
+    let current: OpenClawRemoteAdapterSetting[];
+    try {
+      current = parseOpenClawRemoteAdapters(openClawRemoteAdaptersText);
+    } catch (error) {
+      setSettingsLocalError(error instanceof Error ? error.message : "OpenClaw 远程适配器 JSON 无法解析。");
+      return;
+    }
+    replaceOpenClawRemoteAdapters(current.filter((_, itemIndex) => itemIndex !== index));
+  }
 
   useEffect(() => {
     setSelectedOpenClawSessionId((currentSessionId) =>
@@ -541,17 +605,130 @@ export function ConfigPage() {
             />
             <small>Only exact argv matches can execute after approval. Shell wrappers remain blocked.</small>
           </label>
-          <label htmlFor="openclaw-remote-adapters">
-            OpenClaw remote adapters JSON
-            <textarea
-              id="openclaw-remote-adapters"
-              data-testid="openclaw-remote-adapters"
-              value={openClawRemoteAdaptersText}
-              onChange={(event) => setOpenClawRemoteAdaptersText(event.target.value)}
-              spellCheck={false}
-            />
-            <small>Use sealed secret refs for adapter tokens. Windows/local computer control requires a reachable local adapter.</small>
-          </label>
+          <div className="inline-guide" aria-label="OpenClaw remote adapters">
+            <h4>OpenClaw 远程适配器</h4>
+            <p>
+              这里登记可长期连接的本机或远程 OpenClaw Adapter。Windows 电脑、桌面动作、文件和屏幕能力必须先接入 Adapter，执行时仍走开关、审批和 allowlist 边界。
+            </p>
+            <div className="form-grid">
+              <label htmlFor="openclaw-adapter-platform">
+                平台
+                <select
+                  id="openclaw-adapter-platform"
+                  data-testid="openclaw-adapter-platform"
+                  value={openClawAdapterDraft.platform}
+                  onChange={(event) =>
+                    updateOpenClawAdapterDraft("platform", event.target.value as OpenClawRemoteAdapterSetting["platform"])
+                  }
+                >
+                  <option value="windows">Windows</option>
+                  <option value="linux">Linux</option>
+                  <option value="macos">macOS</option>
+                </select>
+              </label>
+              <label htmlFor="openclaw-adapter-target-type">
+                目标类型
+                <select
+                  id="openclaw-adapter-target-type"
+                  data-testid="openclaw-adapter-target-type"
+                  value={openClawAdapterDraft.target_type}
+                  onChange={(event) =>
+                    updateOpenClawAdapterDraft("target_type", event.target.value as OpenClawRemoteAdapterSetting["target_type"])
+                  }
+                >
+                  <option value="computer">本机电脑</option>
+                  <option value="desktop">桌面</option>
+                  <option value="server">服务器</option>
+                  <option value="filesystem">文件系统</option>
+                  <option value="screen">屏幕</option>
+                </select>
+              </label>
+              <label htmlFor="openclaw-adapter-target">
+                目标名称
+                <input
+                  id="openclaw-adapter-target"
+                  data-testid="openclaw-adapter-target"
+                  value={openClawAdapterDraft.target}
+                  onChange={(event) => updateOpenClawAdapterDraft("target", event.target.value)}
+                />
+              </label>
+              <label htmlFor="openclaw-adapter-base-url">
+                Adapter Base URL
+                <input
+                  id="openclaw-adapter-base-url"
+                  data-testid="openclaw-adapter-base-url"
+                  value={openClawAdapterDraft.base_url}
+                  onChange={(event) => updateOpenClawAdapterDraft("base_url", event.target.value)}
+                />
+              </label>
+              <label htmlFor="openclaw-adapter-credential-ref">
+                凭据引用
+                <input
+                  id="openclaw-adapter-credential-ref"
+                  data-testid="openclaw-adapter-credential-ref"
+                  value={openClawAdapterDraft.credential_ref}
+                  onChange={(event) => updateOpenClawAdapterDraft("credential_ref", event.target.value)}
+                />
+              </label>
+            </div>
+            <div className="action-row">
+              <button type="button" data-testid="openclaw-add-remote-adapter" onClick={addOpenClawRemoteAdapter}>
+                添加适配器
+              </button>
+            </div>
+            {configuredOpenClawRemoteAdapters.length === 0 ? (
+              <p className="field-help">还没有登记远程适配器。Linux 服务器本地执行不需要填写这里。</p>
+            ) : (
+              <div className="table-shell">
+                <table aria-label="Configured OpenClaw remote adapters">
+                  <thead>
+                    <tr>
+                      <th>平台</th>
+                      <th>目标</th>
+                      <th>Base URL</th>
+                      <th>凭据</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {configuredOpenClawRemoteAdapters.map((adapter, index) => (
+                      <tr key={`${adapter.platform}-${adapter.target_type}-${adapter.target}-${index}`}>
+                        <td>{adapter.platform}</td>
+                        <td>
+                          {adapter.target_type} · {adapter.target}
+                        </td>
+                        <td>{adapter.base_url}</td>
+                        <td>{adapter.credential_ref}</td>
+                        <td>
+                          <button
+                            type="button"
+                            className="danger-action"
+                            data-testid={`openclaw-remove-remote-adapter-${index}`}
+                            onClick={() => removeOpenClawRemoteAdapter(index)}
+                          >
+                            删除
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            <details>
+              <summary>高级 JSON</summary>
+              <label htmlFor="openclaw-remote-adapters">
+                OpenClaw remote adapters JSON
+                <textarea
+                  id="openclaw-remote-adapters"
+                  data-testid="openclaw-remote-adapters"
+                  value={openClawRemoteAdaptersText}
+                  onChange={(event) => setOpenClawRemoteAdaptersText(event.target.value)}
+                  spellCheck={false}
+                />
+              </label>
+            </details>
+          </div>
           <div className="inline-guide" aria-label="OpenClaw adapter status">
             <h4>OpenClaw adapter status</h4>
             <div className="openclaw-adapter-grid">

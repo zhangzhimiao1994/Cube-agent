@@ -1,3 +1,41 @@
+## 2026-08-14 OpenClaw Remote Adapter UI
+
+Current state:
+
+- Added a structured system-settings UI for OpenClaw remote adapters instead of requiring operators to edit JSON first.
+- The UI now supports adding/removing adapters with platform, target type, target name, Adapter Base URL, and sealed credential reference fields.
+- Kept the advanced JSON editor as a fallback for bulk edits and migrations.
+- This is a configuration/UI step for the existing backend remote-adapter pathway; it does not install a Windows local adapter binary by itself.
+
+Verification performed:
+
+- Local frontend:
+  - Added `adds and removes OpenClaw remote adapters through dedicated controls` regression coverage.
+  - `npm.cmd run test -- --run src/pages/ConfigPage.test.tsx -t "OpenClaw"` -> 6 passed, 2 skipped.
+  - `npm.cmd run test -- --run src/pages/ConfigPage.test.tsx` -> 8 passed.
+  - `npm.cmd run lint` -> passed.
+  - `npm.cmd run test -- --run` -> 108 passed.
+  - `npm.cmd run build` -> passed with the existing Vite chunk-size warning.
+  - `git diff --check` -> passed with existing CRLF warnings.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-openclaw-remote-adapter-ui.tgz` with `web/src/pages/ConfigPage.tsx`, `web/src/pages/ConfigPage.test.tsx`, and rebuilt `web/dist`; no temp files, env files, or dependency directories were included.
+  - Backed up overwritten files to `/opt/agent-hub/backups/openclaw-remote-adapter-ui-20260814-050249`, extracted into `/opt/agent-hub/current`, reloaded Caddy, and verified `caddy`, `agent-hub-api`, and `agent-hub-worker` are active.
+  - Confirmed deployed `ConfigPage.tsx` contains `openclaw-add-remote-adapter` and `Configured OpenClaw remote adapters`.
+- Server real environment verification:
+  - Generated a short-lived production JWT on the server without printing token/key material.
+  - Called real HTTP `GET /api/v1/admin/settings`, then `PUT /api/v1/admin/settings` with a temporary Windows computer adapter.
+  - Verified `GET /api/v1/admin/openclaw/adapters` reported the Windows screen adapter as `available`.
+  - Verified `POST /api/v1/admin/openclaw/sessions` for that Windows computer target returned `adapter_status=available` and bound to `127.0.0.1:8765`.
+  - Restored the original system settings and removed `/tmp/probe_openclaw_remote_adapter.py`.
+
+Remaining risks / TODOs:
+
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for current remote `mutilagent/main`.
+- Push with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue the queued OpenClaw work: define the actual cross-platform local adapter/executor contract, Windows-side install/runtime path, and real command/screen/file operation probes with approval boundaries.
+
 ## 2026-08-14 Attachment Upload Retry UI
 
 Current state:
