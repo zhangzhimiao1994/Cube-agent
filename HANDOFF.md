@@ -1,4 +1,41 @@
-﻿## 2026-08-15 Feishu Long-Connection Channel Defaults
+## 2026-08-15 Evolution Worker Auto-Ingest
+
+Current state:
+
+- Evolution execution runs now close the loop automatically from the worker side.
+- `RunService` has a generic best-effort terminal hook boundary. Hooks receive tenant, actor, run id, final status, mode, and routing metadata after a run reaches a terminal state.
+- Added `EvolutionExecutionIngestHook`, which only acts on completed runs whose routing metadata says `source=evolution` and includes `evolution_run_id`.
+- The production worker now injects that hook using `PersistentAdminResourceService`, so completed Evolution execution runs call the same existing `ingest_evolution_execution_run()` path that the manual admin endpoint uses.
+- Hook failures are logged and do not change the already-terminal run result; this keeps worker completion durable while preserving audit visibility through the existing ingest path when parsing succeeds.
+- Note from the previous Feishu CI recovery: latest GitHub Actions after `b0d0224 fix: tolerate missing channel runtime config` passed before this slice started.
+
+Local verification:
+
+- RED first: `.\.venv\Scripts\python.exe -m pytest tests\unit\runs\test_terminal_hooks.py -q` failed with `RunService.__init__() got an unexpected keyword argument 'terminal_run_hooks'`.
+- RED first: `.\.venv\Scripts\python.exe -m pytest tests\unit\test_evolution_hooks.py -q` failed with `ModuleNotFoundError: No module named 'agent_hub.evolution_hooks'`.
+- RED first: `.\.venv\Scripts\python.exe -m pytest tests\unit\runtime\test_worker_evolution_wiring.py -q` failed because `_evolution_terminal_hooks` did not exist.
+- `.\.venv\Scripts\python.exe -m pytest tests\unit\test_evolution_hooks.py tests\unit\runs\test_terminal_hooks.py tests\unit\runtime\test_worker_evolution_wiring.py tests\api\test_admin_resources.py -k "evolution" -q` -> 11 passed, 107 deselected.
+- `.\.venv\Scripts\python.exe -m ruff check src tests` -> passed.
+- `.\.venv\Scripts\python.exe -m mypy --strict src tests` -> passed, 264 source files checked.
+- Full local `pytest -q` timed out after 5 minutes before returning results, likely on local external-service integration setup. The non-external main test set passed: `.\.venv\Scripts\python.exe -m pytest tests\unit tests\api tests\contracts tests\security tests\resilience -q` -> 1453 passed, 13 skipped.
+
+Server deployment and real verification:
+
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-evolution-auto-ingest-20260815-013911.tgz`.
+- Uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed incrementally into `/opt/agent-hub/current`.
+- Server backup retained at `/opt/agent-hub/backups/evolution-auto-ingest-20260815-013936`.
+- Synced `src/agent_hub/runs/service.py`, `src/agent_hub/runtime/worker.py`, and `src/agent_hub/evolution_hooks.py` into active source and production venv site-packages, compiled them, restarted `agent-hub-api` and `agent-hub-worker`, and reloaded Caddy.
+- Real server probe used the production DB, real `PersistentAdminResourceService`, real `RunRepository`, and production `RunService` hook path: it created a temporary auto-approved Evolution run, queued a real next-round execution run, completed that run with a deterministic runtime artifact, and verified the terminal hook automatically ingested round 1.
+- Probe output: `{"status": "ok", "checked": {"execution_completed": true, "round_auto_ingested": true, "artifact_ref_has_execution_run": true, "next_action_updated": true, "delta_positive": true}}`.
+- Probe cleaned the temporary execution run, Evolution resource, audit rows, `/tmp/probe_evolution_auto_ingest.py`, and `/tmp/agent-hub-p3-runtime-incremental.tgz`.
+- Final server health: `/health/live` and `/health/ready` returned `{"status":"ok"}`; `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.
+
+Remaining / next:
+
+- Commit this slice, create local GitHub recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, then watch GitHub Actions until green.
+- Continue P3 after green: remaining OpenClaw workflow/dialog integration, plan-task mode refinement, Skill Creator grounding into real-input/real-test workflows, UI copy/layout audit, missing button/function sweep, README/README.zh-CN usage refresh, and Docker readiness later.
+
+## 2026-08-15 Feishu Long-Connection Channel Defaults
 
 Current state:
 

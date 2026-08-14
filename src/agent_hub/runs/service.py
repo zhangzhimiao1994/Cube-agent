@@ -67,6 +67,19 @@ class ModeRouterProtocol(Protocol):
     async def route(self, task_text: object) -> RouteDecision: ...
 
 
+class TerminalRunHook(Protocol):
+    async def __call__(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID | None,
+        run_id: UUID,
+        status: RunStatus,
+        mode: TaskMode | None,
+        routing_decision: dict[str, object],
+    ) -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class ScheduleProposal:
     name: str
@@ -245,6 +258,7 @@ class RunService:
         runtime_timeout_seconds: float = 300.0,
         runtime_token_budget: int = 1_000_000,
         main_agent_context_window_getter: Callable[[], Awaitable[int | None]] | None = None,
+        terminal_run_hooks: tuple[TerminalRunHook, ...] = (),
     ) -> None:
         self._repository = repository
         self._runtime_registry = runtime_registry
@@ -259,6 +273,7 @@ class RunService:
             TaskMode.DIRECT, configured_tokens=runtime_token_budget
         )
         self._main_agent_context_window_getter = main_agent_context_window_getter
+        self._terminal_run_hooks = terminal_run_hooks
 
     async def submit(
         self,
@@ -850,12 +865,28 @@ class RunService:
                 mode=failed.mode,
                 routing_decision=failed.routing_decision,
             )
+            await self._safe_notify_terminal_hooks(
+                tenant_id=failed.tenant_id,
+                actor_id=failed.actor_id,
+                run_id=run_id,
+                status=failed.status,
+                mode=failed.mode,
+                routing_decision=failed.routing_decision,
+            )
             return _submitted(failed)
         if terminal is RunStatus.RUNNING:
             terminal = RunStatus.COMPLETED
             await self._repository.update_status(tenant_id, run_id, terminal)
         if terminal in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
             await self._safe_record_hermes_outcome(
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                run_id=run_id,
+                status=terminal,
+                mode=mode,
+                routing_decision=routing_decision,
+            )
+            await self._safe_notify_terminal_hooks(
                 tenant_id=tenant_id,
                 actor_id=actor_id,
                 run_id=run_id,
@@ -884,6 +915,37 @@ class RunService:
             artifact_ids=await self._repository.artifact_ids(record.tenant_id, record.id),
             usage_cost_usd=await self._repository.usage_cost(record.tenant_id, record.id),
         )
+
+    async def _safe_notify_terminal_hooks(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID | None,
+        run_id: UUID,
+        status: RunStatus,
+        mode: TaskMode | None,
+        routing_decision: dict[str, object] | None,
+    ) -> None:
+        if not self._terminal_run_hooks:
+            return
+        safe_routing = {} if routing_decision is None else dict(routing_decision)
+        for hook in self._terminal_run_hooks:
+            try:
+                await hook(
+                    tenant_id=tenant_id,
+                    actor_id=actor_id,
+                    run_id=run_id,
+                    status=status,
+                    mode=mode,
+                    routing_decision=safe_routing,
+                )
+            except Exception as error:
+                _LOGGER.exception(
+                    "run_terminal_hook_failed run_id=%s status=%s error_type=%s",
+                    run_id,
+                    status.value,
+                    type(error).__name__,
+                )
 
     async def _conversation_artifacts(
         self,
