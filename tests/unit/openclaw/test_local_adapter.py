@@ -358,3 +358,85 @@ def test_local_adapter_health_reports_screen_read_when_driver_configured() -> No
 
     assert response.status_code == 200
     assert response.json()["capabilities"] == ["screen_read"]
+
+
+def test_local_adapter_desktop_action_runs_configured_driver_with_operation_stdin() -> None:
+    driver = [
+        sys.executable,
+        "-c",
+        "import json, sys; data=json.load(sys.stdin); print(f\"{data['kind']}:{data['target']}:{data['reason']}\")",
+    ]
+    app = create_local_adapter_app(
+        OpenClawLocalAdapterConfig(
+            token="adapter-token",
+            platform="linux",
+            allowed_commands=[],
+            desktop_action_command=driver,
+        )
+    )
+
+    response = TestClient(app).post(
+        "/v1/openclaw/execute",
+        headers=_headers(),
+        json={
+            "operation_id": "openclaw_probe_desktop_action",
+            "platform": "linux",
+            "kind": "desktop_action",
+            "target": "desktop",
+            "risk_level": "low",
+            "reason": "click report submit button",
+            "session_id": "openclaw_session_probe",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["exit_code"] == 0
+    assert body["stdout"].strip() == "desktop_action:desktop:click report submit button"
+    assert body["stderr"] == ""
+    assert body["truncated"] is False
+
+
+def test_local_adapter_desktop_action_requires_configured_driver() -> None:
+    client = TestClient(
+        create_local_adapter_app(
+            OpenClawLocalAdapterConfig(
+                token="adapter-token",
+                platform="linux",
+                allowed_commands=[],
+            )
+        )
+    )
+
+    response = client.post(
+        "/v1/openclaw/execute",
+        headers=_headers(),
+        json={
+            "operation_id": "openclaw_probe_desktop_action",
+            "platform": "linux",
+            "kind": "desktop_action",
+            "target": "desktop",
+            "risk_level": "low",
+            "reason": "click report submit button",
+            "session_id": "openclaw_session_probe",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "openclaw_adapter_desktop_action_unavailable"
+
+
+def test_local_adapter_health_reports_desktop_action_when_driver_configured() -> None:
+    app = create_local_adapter_app(
+        OpenClawLocalAdapterConfig(
+            token="adapter-token",
+            platform="linux",
+            allowed_commands=[],
+            desktop_action_command=[sys.executable, "-c", "print('desktop-action-live')"],
+        )
+    )
+
+    response = TestClient(app).get("/v1/openclaw/health", headers=_headers())
+
+    assert response.status_code == 200
+    assert response.json()["capabilities"] == ["desktop_action"]

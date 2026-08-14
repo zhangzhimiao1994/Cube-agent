@@ -4300,3 +4300,47 @@ Remaining risks / next:
 
 - Commit this slice, create a GitHub recovery bundle/tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
 - Continue P3 after green: OpenClaw desktop_action driver path, evolution execution orchestration, plan-task mode UX, broader UI copy/layout audit, missing button/function sweep, README/README.zh-CN final usage refresh, and Docker readiness later.
+
+## 2026-08-14 OpenClaw Adapter Desktop Action Driver + Conversation Memory Scope Correction
+
+Current state:
+
+- OpenClaw local/remote adapter now supports a dedicated `desktop_action` execution path that does not require Agent Hub to send arbitrary operation argv.
+- Host operators configure a fixed non-shell desktop driver with `OPENCLAW_ADAPTER_DESKTOP_ACTION_COMMAND_JSON`; health reports `desktop_action` when the driver is configured.
+- A `desktop_action` operation without argv now returns `openclaw_adapter_desktop_action_unavailable` with HTTP 409 if the host adapter has no configured driver.
+- The adapter passes the bounded operation JSON to the fixed desktop driver over stdin, so platform-specific drivers can inspect kind, target, reason, risk level, operation id, and session id without opening arbitrary command execution.
+- `run_openclaw_command` now accepts optional stdin text while preserving the shell executable denial and exact-argv allowlist model.
+- `scripts/agent-hub openclaw-adapter --help`, `README.md`, and `README.zh-CN.md` now mention both `OPENCLAW_ADAPTER_SCREEN_READ_COMMAND_JSON` and `OPENCLAW_ADAPTER_DESKTOP_ACTION_COMMAND_JSON`.
+
+Important scope correction from user:
+
+- Multi-round conversation context, automatic context compression, memory retention, and drift control are not an Evolution-module-only requirement.
+- This must be treated as a conversation-framework/system capability used by all long-running dialogue flows, including normal chat, Vibe Coding, research, scheduling, media planning, Skill distillation, Darwin-style evolution, and channel conversations.
+- The Evolution module can consume this capability and can help iteratively improve it, but the ownership should remain in the core conversation/memory/context layer rather than inside the Evolution module alone.
+
+Local verification:
+
+- RED first: `uv run pytest tests\unit\openclaw\test_local_adapter.py -q -k "desktop_action" --tb=short` failed with missing `desktop_action_command` support and the old 403 fallback.
+- RED first for script docs: `uv run pytest tests\unit\install\test_native_install_scripts.py::test_openclaw_local_adapter_has_cross_platform_and_installed_cli_entrypoints -q --tb=short` failed because the adapter help did not mention `OPENCLAW_ADAPTER_DESKTOP_ACTION_COMMAND_JSON`.
+- `uv run pytest tests\unit\openclaw\test_local_adapter.py -q -k "desktop_action" --tb=short` -> 3 passed.
+- `uv run pytest tests\unit\openclaw\test_local_adapter.py tests\unit\install\test_native_install_scripts.py tests\api\test_admin_resources.py -q -k "openclaw" --tb=short` -> 38 passed, 108 deselected.
+- `uv run ruff check src\agent_hub\openclaw\executor.py src\agent_hub\openclaw\local_adapter.py tests\unit\openclaw\test_local_adapter.py tests\unit\install\test_native_install_scripts.py` -> passed.
+- `uv run mypy --strict src\agent_hub\openclaw\executor.py src\agent_hub\openclaw\local_adapter.py tests\unit\openclaw\test_local_adapter.py tests\unit\install\test_native_install_scripts.py` -> passed.
+- `git diff --check` -> passed with CRLF normalization warnings only.
+
+Server deployment and real verification:
+
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-openclaw-desktop-action-20260814-205837.tgz`.
+- Uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed incrementally into `/opt/agent-hub/current`.
+- First deployment attempt correctly failed at server Linux `bash -n` because the OpenClaw adapter script here-doc `EOF` had been written on the same line as help text. Fixed locally, rebuilt the archive, and redeployed.
+- Server backup path for the successful deployment: `/opt/agent-hub/backups/openclaw-desktop-action-20260814-205900`.
+- Synced `src/agent_hub/openclaw/executor.py` and `src/agent_hub/openclaw/local_adapter.py` into the active production venv site-packages, chmodded and checked `scripts/commands/openclaw-adapter.sh` with Linux `bash -n`, restarted `agent-hub-api` and `agent-hub-worker`, and reloaded Caddy.
+- Real server probe started a real adapter process through `/opt/agent-hub/current/scripts/agent-hub openclaw-adapter` on `127.0.0.1:18773` with `OPENCLAW_ADAPTER_ALLOWED_COMMANDS_JSON=[]` and a fixed `OPENCLAW_ADAPTER_DESKTOP_ACTION_COMMAND_JSON` driver.
+- Probe verified authenticated `/v1/openclaw/health` reports `desktop_action`, then executed a real `desktop_action` request without operation argv and verified the driver received the operation JSON over stdin.
+- Probe output: `{"status": "ok", "checked": ["adapter_health_desktop_action_capability", "desktop_action_execute_without_operation_argv", "operation_json_stdin"], "stdout": "desktop-action-live:desktop_action:desktop:click report submit button"}`.
+- Removed `/tmp/probe_openclaw_desktop_action.py`, `/tmp/deploy_openclaw_desktop_action.sh`, and `/tmp/agent-hub-p3-runtime-incremental.tgz`; confirmed no temporary `openclaw.local_adapter` / `openclaw-adapter` process remained and `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.
+
+Remaining risks / next:
+
+- Commit this slice, create a GitHub recovery bundle/tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
+- Continue P3 after green: core conversation-level long-memory and automatic context compression, evolution execution orchestration, plan-task mode UX, broader UI copy/layout audit, missing button/function sweep, README/README.zh-CN final usage refresh, and Docker readiness later.

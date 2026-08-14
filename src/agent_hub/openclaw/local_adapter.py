@@ -22,6 +22,7 @@ class OpenClawLocalAdapterConfig:
     platform: str
     allowed_commands: Sequence[Sequence[str]]
     command_timeout_seconds: float = 15.0
+    desktop_action_command: Sequence[str] | None = None
     screen_read_command: Sequence[str] | None = None
     allowed_file_roots: Sequence[Path] = ()
     file_read_limit_bytes: int = 64_000
@@ -34,6 +35,8 @@ class OpenClawLocalAdapterConfig:
         for command in self.allowed_commands:
             if not command or any(not item or item != item.strip() for item in command):
                 raise ValueError("OpenClaw adapter allowed commands must be bounded argv arrays")
+        if self.desktop_action_command is not None and not _safe_configured_command(self.desktop_action_command):
+            raise ValueError("OpenClaw adapter desktop action command must be a bounded non-shell argv array")
         if self.screen_read_command is not None and not _safe_configured_command(self.screen_read_command):
             raise ValueError("OpenClaw adapter screen read command must be a bounded non-shell argv array")
         if self.file_read_limit_bytes < 1 or self.file_read_limit_bytes > 1_000_000:
@@ -89,19 +92,14 @@ def create_local_adapter_app(config: OpenClawLocalAdapterConfig) -> FastAPI:
             return _execute_file_read(body.target, config)
         if body.kind == "screen_read" and not body.argv:
             return await _execute_screen_read(config)
+        if body.kind == "desktop_action" and not body.argv:
+            return await _execute_desktop_action(body, config)
 
         allowed_commands = [list(command) for command in config.allowed_commands]
         if not openclaw_command_allowed(body.argv, allowed_commands):
             return _error(403, "openclaw_adapter_command_denied", "OpenClaw adapter command is not allowlisted")
         result = await run_openclaw_command(body.argv, timeout_seconds=config.command_timeout_seconds)
-        return JSONResponse(
-            {
-                "exit_code": result.exit_code,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "truncated": result.truncated,
-            }
-        )
+        return _result_response(result.exit_code, result.stdout, result.stderr, result.truncated)
 
     @app.exception_handler(Exception)
     async def unhandled_error(request: Request, error: Exception) -> JSONResponse:
@@ -117,13 +115,21 @@ def load_local_adapter_config_from_env() -> OpenClawLocalAdapterConfig:
     allowed_commands = _allowed_commands_from_env(os.environ.get("OPENCLAW_ADAPTER_ALLOWED_COMMANDS_JSON", "[]"))
     timeout = float(os.environ.get("OPENCLAW_ADAPTER_COMMAND_TIMEOUT_SECONDS", "15"))
     allowed_file_roots = _file_roots_from_env(os.environ.get("OPENCLAW_ADAPTER_ALLOWED_FILE_ROOTS_JSON", "[]"))
-    screen_read_command = _optional_command_from_env(os.environ.get("OPENCLAW_ADAPTER_SCREEN_READ_COMMAND_JSON", ""))
+    desktop_action_command = _optional_command_from_env(
+        os.environ.get("OPENCLAW_ADAPTER_DESKTOP_ACTION_COMMAND_JSON", ""),
+        variable="OPENCLAW_ADAPTER_DESKTOP_ACTION_COMMAND_JSON",
+    )
+    screen_read_command = _optional_command_from_env(
+        os.environ.get("OPENCLAW_ADAPTER_SCREEN_READ_COMMAND_JSON", ""),
+        variable="OPENCLAW_ADAPTER_SCREEN_READ_COMMAND_JSON",
+    )
     file_read_limit = int(os.environ.get("OPENCLAW_ADAPTER_FILE_READ_LIMIT_BYTES", "64000"))
     return OpenClawLocalAdapterConfig(
         token=token,
         platform=platform,
         allowed_commands=allowed_commands,
         command_timeout_seconds=timeout,
+        desktop_action_command=desktop_action_command,
         screen_read_command=screen_read_command,
         allowed_file_roots=allowed_file_roots,
         file_read_limit_bytes=file_read_limit,
@@ -142,6 +148,8 @@ def _adapter_capabilities(config: OpenClawLocalAdapterConfig) -> list[str]:
     capabilities: list[str] = []
     if config.allowed_commands:
         capabilities.extend(["server_command", "desktop_action", "screen_read", "file_read"])
+    if config.desktop_action_command is not None and "desktop_action" not in capabilities:
+        capabilities.append("desktop_action")
     if config.allowed_file_roots and "file_read" not in capabilities:
         capabilities.append("file_read")
     if config.screen_read_command is not None and "screen_read" not in capabilities:
@@ -161,16 +169,16 @@ def _allowed_commands_from_env(value: str) -> list[list[str]]:
     return commands
 
 
-def _optional_command_from_env(value: str) -> list[str] | None:
+def _optional_command_from_env(value: str, *, variable: str) -> list[str] | None:
     if not value.strip():
         return None
     parsed = json.loads(value)
     if parsed == []:
         return None
     if not isinstance(parsed, list) or any(not isinstance(item, str) for item in parsed):
-        raise ValueError("OPENCLAW_ADAPTER_SCREEN_READ_COMMAND_JSON must be a JSON argv array")
+        raise ValueError(f"{variable} must be a JSON argv array")
     if not _safe_configured_command(parsed):
-        raise ValueError("OPENCLAW_ADAPTER_SCREEN_READ_COMMAND_JSON must be a bounded non-shell argv array")
+        raise ValueError(f"{variable} must be a bounded non-shell argv array")
     return parsed
 
 
@@ -186,6 +194,22 @@ def _file_roots_from_env(value: str) -> list[Path]:
     return roots
 
 
+async def _execute_desktop_action(body: LocalOpenClawExecuteRequest, config: OpenClawLocalAdapterConfig) -> JSONResponse:
+    if config.desktop_action_command is None:
+        return _error(
+            409,
+            "openclaw_adapter_desktop_action_unavailable",
+            "OpenClaw adapter desktop action driver is not configured",
+        )
+    stdin_text = json.dumps(body.model_dump(mode="json"), ensure_ascii=False, sort_keys=True) + "\n"
+    result = await run_openclaw_command(
+        list(config.desktop_action_command),
+        timeout_seconds=config.command_timeout_seconds,
+        stdin_text=stdin_text,
+    )
+    return _result_response(result.exit_code, result.stdout, result.stderr, result.truncated)
+
+
 async def _execute_screen_read(config: OpenClawLocalAdapterConfig) -> JSONResponse:
     if config.screen_read_command is None:
         return _error(
@@ -194,14 +218,7 @@ async def _execute_screen_read(config: OpenClawLocalAdapterConfig) -> JSONRespon
             "OpenClaw adapter screen read driver is not configured",
         )
     result = await run_openclaw_command(list(config.screen_read_command), timeout_seconds=config.command_timeout_seconds)
-    return JSONResponse(
-        {
-            "exit_code": result.exit_code,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "truncated": result.truncated,
-        }
-    )
+    return _result_response(result.exit_code, result.stdout, result.stderr, result.truncated)
 
 
 def _execute_file_read(target: str, config: OpenClawLocalAdapterConfig) -> JSONResponse:
@@ -217,11 +234,15 @@ def _execute_file_read(target: str, config: OpenClawLocalAdapterConfig) -> JSONR
     truncated = len(data) > config.file_read_limit_bytes
     if truncated:
         data = data[: config.file_read_limit_bytes]
+    return _result_response(0, data.decode("utf-8", errors="replace"), "", truncated)
+
+
+def _result_response(exit_code: int, stdout: str, stderr: str, truncated: bool) -> JSONResponse:
     return JSONResponse(
         {
-            "exit_code": 0,
-            "stdout": data.decode("utf-8", errors="replace"),
-            "stderr": "",
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
             "truncated": truncated,
         }
     )

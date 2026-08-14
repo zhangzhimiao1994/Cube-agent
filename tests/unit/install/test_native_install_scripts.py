@@ -24,6 +24,7 @@ def test_openclaw_local_adapter_has_cross_platform_and_installed_cli_entrypoints
     assert "OPENCLAW_ADAPTER_ALLOWED_COMMANDS_JSON" in command
     assert "OPENCLAW_ADAPTER_ALLOWED_FILE_ROOTS_JSON" in command
     assert "OPENCLAW_ADAPTER_SCREEN_READ_COMMAND_JSON" in command
+    assert "OPENCLAW_ADAPTER_DESKTOP_ACTION_COMMAND_JSON" in command
     assert 'export PYTHONPATH="$SOURCE_DIR/src:$PYTHONPATH"' in command
     assert "-m agent_hub.openclaw.local_adapter" in command
 

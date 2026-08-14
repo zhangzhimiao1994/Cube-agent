@@ -41,16 +41,18 @@ async def run_openclaw_command(
     *,
     timeout_seconds: float = 15,
     output_limit: int = 16_384,
+    stdin_text: str | None = None,
 ) -> OpenClawCommandResult:
     process = await asyncio.create_subprocess_exec(
         *argv,
+        stdin=asyncio.subprocess.PIPE if stdin_text is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     timed_out = False
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            process.communicate(),
+            process.communicate(None if stdin_text is None else stdin_text.encode("utf-8")),
             timeout=timeout_seconds,
         )
     except TimeoutError:

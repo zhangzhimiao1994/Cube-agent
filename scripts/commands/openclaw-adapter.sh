@@ -23,6 +23,7 @@ Optional environment:
   OPENCLAW_ADAPTER_ALLOWED_FILE_ROOTS_JSON JSON array of absolute roots allowed for file_read.
   OPENCLAW_ADAPTER_FILE_READ_LIMIT_BYTES   Maximum bytes returned by file_read. Defaults to 64000.
   OPENCLAW_ADAPTER_SCREEN_READ_COMMAND_JSON Fixed non-shell argv array used for screen_read without operation argv.
+  OPENCLAW_ADAPTER_DESKTOP_ACTION_COMMAND_JSON Fixed non-shell argv array used for desktop_action without operation argv; receives operation JSON on stdin.
 EOF
 }
 
