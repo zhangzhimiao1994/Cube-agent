@@ -1711,6 +1711,24 @@ def instruction_bundle_with_rich_skill_directory_zip() -> bytes:
     return buffer.getvalue()
 
 
+def instruction_bundle_with_very_large_skill_directory_zip() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "large-research-skill/SKILL.md",
+            "---\nname: large-research-skill\ndescription: Skill with many reference files.\n---\n\nUse this skill.\n",
+        )
+        for index in range(320):
+            archive.writestr(
+                f"large-research-skill/references/source-{index:03d}.md",
+                f"Reference source {index}.\n",
+            )
+        archive.writestr(
+            "compact-neighbor-skill/SKILL.md",
+            "---\nname: compact-neighbor-skill\ndescription: Neighbor skill.\n---\n\nUse this skill.\n",
+        )
+    return buffer.getvalue()
+
 def instruction_bundle_with_non_slug_frontmatter_name_zip() -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
@@ -2994,6 +3012,28 @@ def test_skill_archive_upload_accepts_rich_instruction_skill_directory() -> None
     assert {item["name"] for item in skills.json()} == {"rich-skill", "compact-skill"}
 
 
+def test_skill_archive_upload_accepts_large_instruction_skill_directory() -> None:
+    api = client()
+
+    uploaded = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "large-skills.zip"},
+        content=instruction_bundle_with_very_large_skill_directory_zip(),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert uploaded.status_code == 200
+    body = uploaded.json()
+    assert body["bundle"] is True
+    assert [item["name"] for item in body["items"]] == [
+        "large-research-skill",
+        "compact-neighbor-skill",
+    ]
+    assert {item["name"] for item in skills.json()} == {
+        "large-research-skill",
+        "compact-neighbor-skill",
+    }
+
 def test_skill_archive_upload_uses_directory_slug_when_frontmatter_name_has_no_slug() -> None:
     api = client()
 
@@ -3091,7 +3131,9 @@ def test_skill_archive_upload_rejects_invalid_zip_without_saving_metadata() -> N
     skills = api.get("/api/v1/admin/skills", headers=headers())
 
     assert uploaded.status_code == 422
-    assert uploaded.json()["error"]["code"] == "invalid_skill_package"
+    body = uploaded.json()
+    assert body["error"]["code"] == "invalid_skill_package"
+    assert body["error"]["details"]["reason"] == "skill archive must be a valid zip or tar archive"
     assert skills.json() == []
 
 

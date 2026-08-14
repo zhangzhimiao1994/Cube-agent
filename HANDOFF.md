@@ -1,3 +1,29 @@
+## 2026-08-15 Skill Large Directory Archive Upload Fix
+
+### State
+- Fixed a remaining Skill archive upload edge case where a multi-Skill migration bundle could fail with HTTP 422 when any single instruction Skill directory contained more than 256 files, such as many `references/` or example assets.
+- Raised the per-Skill bundled file scan ceiling from 256 to 4096 while keeping path traversal, hidden directory, nested archive, forbidden binary/script extension, link/device file, and archive format validation in place.
+- Skill upload failures now return a safe `details.reason` and record that reason in `skills.upload` logs, so future invalid packages are diagnosable instead of only showing `invalid_skill_package`.
+
+### Verification
+- TDD red first: `pytest tests\api\test_admin_resources.py::test_skill_archive_upload_accepts_large_instruction_skill_directory -q --tb=short` failed with HTTP 422 before the fix.
+- Green local checks:
+  - `pytest tests\api\test_admin_resources.py::test_skill_archive_upload_accepts_large_instruction_skill_directory tests\api\test_admin_resources.py::test_skill_archive_upload_accepts_large_flat_instruction_bundle_zip tests\api\test_admin_resources.py::test_skill_archive_upload_accepts_large_nested_instruction_bundle_tar_gz tests\api\test_admin_resources.py::test_skill_archive_upload_accepts_phone_wrapped_large_instruction_bundle_with_assets tests\api\test_admin_resources.py::test_skill_archive_upload_rejects_invalid_zip_without_saving_metadata -q` -> 5 passed.
+  - `pytest tests\api\test_admin_resources.py -q -k "skill_archive_upload"` -> 17 passed.
+  - `ruff check src tests` -> passed.
+  - `mypy --strict src tests` -> passed.
+  - `pytest tests\unit tests\api tests\contracts tests\security tests\resilience -q` -> 1463 passed, 13 skipped.
+
+### Server Deployment And Real Probe
+- Uploaded incremental archive `.local-archives/server-incrementals/agent-hub-skill-large-dir-20260815-034943.tgz` to `103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed into `/opt/agent-hub/current`.
+- Server backup retained under `/opt/agent-hub/backups/skill-large-dir-*`; server archive retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-skill-large-dir-20260815-034943.tgz`.
+- Real server HTTP probe uploaded a generated `large-skills.zip` containing `large-research-skill/SKILL.md`, 320 reference files, and a neighboring Skill through `/api/v1/admin/skills/upload`, verified both Skill records were created as a bundle with no skipped items, verified invalid archives expose `details.reason`, then deleted the temporary Skill records.
+- Probe output: `{"status": "ok", "checks": {"status_200": true, "bundle": true, "count_two": true, "large_skill_present": true, "neighbor_present": true, "no_skipped": true, "invalid_reason_exposed": true}, "created": 2}`.
+- Cleaned `/tmp` probe/deploy files and the uploaded temp package; final server health returned `{"status":"ok"}` and `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.
+
+### Remaining / Next
+- Commit this slice, create local GitHub recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, then watch GitHub Actions until green.
+- Continue remaining P3 work after green: OpenClaw approval-policy UX, plan-task refinement, UI copy/layout audit, missing button/function sweep, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 Channel Configured Field UI Fix
 
 ### State

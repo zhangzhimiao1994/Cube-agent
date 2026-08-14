@@ -1774,7 +1774,7 @@ _INSTRUCTION_SKILL_FORBIDDEN_EXTENSIONS = frozenset(
 _INSTRUCTION_SKILL_NESTED_ARCHIVE_EXTENSIONS = frozenset(
     {".zip", ".tar", ".tgz", ".gz", ".bz2", ".xz", ".7z", ".rar", ".whl"}
 )
-_MAX_SKILL_BUNDLE_ITEMS = 256
+_MAX_SKILL_BUNDLE_ITEMS = 4096
 
 
 @dataclass(frozen=True, slots=True)
@@ -2705,14 +2705,15 @@ class InMemoryAdminResourceService:
     async def upload_skill_archive(self, filename: str, archive_bytes: bytes) -> SkillArchiveUploadResponse:
         try:
             bundle, scanned_archives, skipped_archives = _scan_skill_archive_upload(filename, archive_bytes)
-        except InvalidSkillPackage:
+        except InvalidSkillPackage as error:
+            reason = _safe_model_check_detail(str(error))
             await self.record_log(
                 category="feature_error",
                 level="warning",
                 title="主要功能运行错误",
                 message="skill package is invalid",
                 source="skills.upload",
-                details={"feature": "skills", "filename": filename},
+                details={"feature": "skills", "filename": filename, "reason": reason},
             )
             raise
         items: list[SkillResponse] = []
@@ -4177,16 +4178,26 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
     async def upload_skill_archive(self, filename: str, archive_bytes: bytes) -> SkillArchiveUploadResponse:
         try:
             bundle, scanned_archives, skipped_archives = _scan_skill_archive_upload(filename, archive_bytes)
-        except InvalidSkillPackage:
+        except InvalidSkillPackage as error:
+            reason = _safe_model_check_detail(str(error))
             await self.record_log(
                 category="feature_error",
                 level="warning",
                 title="主要功能运行错误",
                 message="skill package is invalid",
                 source="skills.upload",
-                details={"feature": "skills", "filename": _safe_model_check_detail(filename)},
+                details={
+                    "feature": "skills",
+                    "filename": _safe_model_check_detail(filename),
+                    "reason": reason,
+                },
             )
-            raise PublicAPIError(422, "invalid_skill_package", "skill package is invalid") from None
+            raise PublicAPIError(
+                422,
+                "invalid_skill_package",
+                "skill package is invalid",
+                details={"reason": reason},
+            ) from None
         items: list[SkillResponse] = []
         try:
             for scanned in scanned_archives:
@@ -7343,8 +7354,13 @@ async def upload_skill_archive(
         raise PublicAPIError(422, "request_validation", "skill archive is empty")
     try:
         return await service.upload_skill_archive(filename, archive_bytes)
-    except InvalidSkillPackage:
-        raise PublicAPIError(422, "invalid_skill_package", "skill package is invalid") from None
+    except InvalidSkillPackage as error:
+        raise PublicAPIError(
+            422,
+            "invalid_skill_package",
+            "skill package is invalid",
+            details={"reason": _safe_model_check_detail(str(error))},
+        ) from None
 
 
 @router.post("/skills/{skill_id}/approve", response_model=SkillResponse, responses=error_responses(401, 403, 404, 422))
