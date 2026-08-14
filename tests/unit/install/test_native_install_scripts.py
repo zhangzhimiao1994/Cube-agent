@@ -22,6 +22,8 @@ def test_openclaw_local_adapter_has_cross_platform_and_installed_cli_entrypoints
     assert "doctor|status|logs|backup|restore|upgrade|openclaw-adapter" in launcher
     assert "OPENCLAW_ADAPTER_TOKEN" in command
     assert "OPENCLAW_ADAPTER_ALLOWED_COMMANDS_JSON" in command
+    assert "OPENCLAW_ADAPTER_ALLOWED_FILE_ROOTS_JSON" in command
+    assert 'export PYTHONPATH="$SOURCE_DIR/src:$PYTHONPATH"' in command
     assert "-m agent_hub.openclaw.local_adapter" in command
 
 def test_native_installer_deploys_release_before_starting_services() -> None:

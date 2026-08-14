@@ -109,7 +109,7 @@ Permission modes are:
 - `auto_review`: auto-review low-risk operations and require approval for higher risk.
 - `trusted_auto`: for trusted environments only.
 
-Operations use configured command allowlists and adapter records. Local Linux server commands can run through the bundled adapter. Windows, Linux desktop, macOS, screen, and filesystem targets are represented as remote adapters and should be connected with dedicated credentials and least privilege.
+Operations use configured command allowlists and adapter records. Local Linux server commands can run through the bundled adapter. Remote adapters can also perform bounded `file_read` operations without an argv command when `OPENCLAW_ADAPTER_ALLOWED_FILE_ROOTS_JSON` is configured with explicit absolute roots; output is capped by `OPENCLAW_ADAPTER_FILE_READ_LIMIT_BYTES`. Windows, Linux desktop, macOS, screen, and filesystem targets should be connected with dedicated credentials and least privilege.
 
 Useful command:
 

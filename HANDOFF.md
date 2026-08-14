@@ -3881,3 +3881,38 @@ GitHub push status:
 - Recovery bundle before the README/audit push: `.local-archives/github-pushes/mutilagent-main-before-20260814-153938-8aed15f.bundle`; GitHub archive tag `archive/mutilagent-main-before-20260814-153938-8aed15f`.
 - Recovery bundle before the CI contract fix push: `.local-archives/github-pushes/mutilagent-main-before-20260814-155049-6ced4bf.bundle`; GitHub archive tag `archive/mutilagent-main-before-20260814-155049-6ced4bf`.
 - Latest pushed commit `ac8fd55` (`test: update readme deployment contract`) passed GitHub Actions run `31781542679`.
+
+## 2026-08-14 OpenClaw Adapter Bounded File Read
+
+Current state:
+
+- Added built-in bounded `file_read` support to the OpenClaw local/remote adapter path when the operation uses `kind=file_read` with no `argv`.
+- File reads require explicit absolute roots through `OPENCLAW_ADAPTER_ALLOWED_FILE_ROOTS_JSON`; no file root means `openclaw_adapter_file_read_unavailable`.
+- File reads outside configured roots return `openclaw_adapter_file_denied`; missing targets return `openclaw_adapter_file_not_found`.
+- File output is UTF-8 decoded with replacement and capped by `OPENCLAW_ADAPTER_FILE_READ_LIMIT_BYTES`.
+- Kept exact argv allowlist behavior for `server_command`, `desktop_action`, `screen_read`, and file reads that intentionally use host-side scripts.
+- Fixed `scripts/agent-hub openclaw-adapter` so the active source tree is prepended to `PYTHONPATH` even when the environment already defines `PYTHONPATH`.
+- Updated README/README.zh-CN and adapter CLI usage with the new file-read root and byte-limit configuration.
+
+Verification performed:
+
+- Local checks:
+  - `uv run pytest tests/unit/openclaw/test_local_adapter.py tests/unit/install/test_native_install_scripts.py::test_openclaw_local_adapter_has_cross_platform_and_installed_cli_entrypoints tests/api/test_admin_resources.py -k "openclaw" -q --tb=short` -> 30 passed.
+  - `uv run ruff check src/agent_hub/openclaw/local_adapter.py tests/unit/openclaw/test_local_adapter.py tests/unit/install/test_native_install_scripts.py` -> passed.
+  - `uv run mypy --strict src/agent_hub/openclaw/local_adapter.py tests/unit/openclaw/test_local_adapter.py` -> passed.
+  - `uv run pytest tests/unit/test_deployment_contracts.py -q --tb=short` -> 14 passed before the final script-source-priority patch; no README contract changed afterward.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-openclaw-file-read.tgz` and deployed into `/opt/agent-hub/current`.
+  - Backed up overwritten files under `/opt/agent-hub/backups/openclaw-file-read-20260814-081038` and `/opt/agent-hub/backups/openclaw-file-read-pypath-20260814-081426`.
+  - Normalized and chmodded `scripts/commands/openclaw-adapter.sh`; direct `scp` corrected the deployed script after the first package left the module name truncated.
+  - Verified `bash -n /opt/agent-hub/current/scripts/commands/openclaw-adapter.sh` passes and the script ends with `agent_hub.openclaw.local_adapter`.
+- Server real environment verification:
+  - Uploaded `/tmp/probe_openclaw_file_read.py` and started a temporary real adapter via `/opt/agent-hub/current/scripts/agent-hub openclaw-adapter` on `127.0.0.1:18770`.
+  - Configured `OPENCLAW_ADAPTER_ALLOWED_FILE_ROOTS_JSON` to a temporary allowed directory and `OPENCLAW_ADAPTER_ALLOWED_COMMANDS_JSON=[]`.
+  - Real HTTP probe returned `{"status":"ok","checked":["allowed_file_read","outside_root_denied"]}`.
+  - Verified no `openclaw.local_adapter` or `openclaw-adapter` probe process remained and removed `/tmp/probe_openclaw_file_read.py`.
+
+Remaining risks / next:
+
+- This adds a bounded host-side file-read primitive. `screen_read` and GUI `desktop_action` still require platform-specific host tools or drivers wired behind the same adapter contract.
+- Continue with GitHub recovery archive, commit, force-with-lease push, and Actions verification.

@@ -20,6 +20,8 @@ Optional environment:
   OPENCLAW_ADAPTER_HOST                   Bind host. Defaults to 127.0.0.1.
   OPENCLAW_ADAPTER_PORT                   Bind port. Defaults to 8765.
   OPENCLAW_ADAPTER_COMMAND_TIMEOUT_SECONDS Command timeout. Defaults to 15.
+  OPENCLAW_ADAPTER_ALLOWED_FILE_ROOTS_JSON JSON array of absolute roots allowed for file_read.
+  OPENCLAW_ADAPTER_FILE_READ_LIMIT_BYTES   Maximum bytes returned by file_read. Defaults to 64000.
 EOF
 }
 
@@ -51,5 +53,9 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   fi
 fi
 
-export PYTHONPATH="${PYTHONPATH:-$SOURCE_DIR/src}"
+if [[ -n "${PYTHONPATH:-}" ]]; then
+  export PYTHONPATH="$SOURCE_DIR/src:$PYTHONPATH"
+else
+  export PYTHONPATH="$SOURCE_DIR/src"
+fi
 exec "$PYTHON_BIN" -m agent_hub.openclaw.local_adapter

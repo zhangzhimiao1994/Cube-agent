@@ -1,4 +1,5 @@
 import sys
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -145,3 +146,122 @@ def test_local_adapter_rejects_unlisted_remote_operation_kind_command() -> None:
 
     assert response.status_code == 403
     assert response.json()["error"]["code"] == "openclaw_adapter_command_denied"
+
+def _file_read_client(root: Path, *, limit: int = 64_000) -> TestClient:
+    app = create_local_adapter_app(
+        OpenClawLocalAdapterConfig(
+            token="adapter-token",
+            platform="windows",
+            allowed_commands=[],
+            allowed_file_roots=[root.resolve()],
+            file_read_limit_bytes=limit,
+        )
+    )
+    return TestClient(app)
+
+
+def test_local_adapter_file_read_reads_file_inside_allowed_root(tmp_path: Path) -> None:
+    target = tmp_path / "report.txt"
+    target.write_text("openclaw file read ok", encoding="utf-8")
+
+    response = _file_read_client(tmp_path).post(
+        "/v1/openclaw/execute",
+        headers=_headers(),
+        json={
+            "operation_id": "openclaw_probe_file_read",
+            "platform": "windows",
+            "kind": "file_read",
+            "target": str(target),
+            "risk_level": "low",
+            "reason": "read a bounded allowed file",
+            "session_id": "openclaw_session_probe",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["exit_code"] == 0
+    assert body["stdout"] == "openclaw file read ok"
+    assert body["stderr"] == ""
+    assert body["truncated"] is False
+
+
+def test_local_adapter_file_read_truncates_large_allowed_file(tmp_path: Path) -> None:
+    target = tmp_path / "large.txt"
+    target.write_text("abcdef", encoding="utf-8")
+
+    response = _file_read_client(tmp_path, limit=3).post(
+        "/v1/openclaw/execute",
+        headers=_headers(),
+        json={
+            "operation_id": "openclaw_probe_file_read",
+            "platform": "windows",
+            "kind": "file_read",
+            "target": str(target),
+            "risk_level": "low",
+            "reason": "read a bounded allowed file",
+            "session_id": "openclaw_session_probe",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["stdout"] == "abc"
+    assert body["truncated"] is True
+
+
+def test_local_adapter_file_read_rejects_path_outside_allowed_roots(tmp_path: Path) -> None:
+    allowed = tmp_path / "allowed"
+    outside = tmp_path / "outside"
+    allowed.mkdir()
+    outside.mkdir()
+    target = outside / "secret.txt"
+    target.write_text("not allowed", encoding="utf-8")
+
+    response = _file_read_client(allowed).post(
+        "/v1/openclaw/execute",
+        headers=_headers(),
+        json={
+            "operation_id": "openclaw_probe_file_read",
+            "platform": "windows",
+            "kind": "file_read",
+            "target": str(target),
+            "risk_level": "low",
+            "reason": "read a bounded allowed file",
+            "session_id": "openclaw_session_probe",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "openclaw_adapter_file_denied"
+
+
+def test_local_adapter_file_read_requires_explicit_allowed_roots(tmp_path: Path) -> None:
+    target = tmp_path / "report.txt"
+    target.write_text("openclaw file read ok", encoding="utf-8")
+    client = TestClient(
+        create_local_adapter_app(
+            OpenClawLocalAdapterConfig(
+                token="adapter-token",
+                platform="windows",
+                allowed_commands=[],
+            )
+        )
+    )
+
+    response = client.post(
+        "/v1/openclaw/execute",
+        headers=_headers(),
+        json={
+            "operation_id": "openclaw_probe_file_read",
+            "platform": "windows",
+            "kind": "file_read",
+            "target": str(target),
+            "risk_level": "low",
+            "reason": "read a bounded allowed file",
+            "session_id": "openclaw_session_probe",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "openclaw_adapter_file_read_unavailable"
