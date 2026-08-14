@@ -4257,3 +4257,9 @@ Remaining risks / next:
 
 - Commit these changes, create a GitHub recovery bundle/tag, force-with-lease push to `mutilagent/main`, then check GitHub Actions until green.
 - Continue broader P3 queue after this slice: OpenClaw desktop/scheduled-control follow-ups, evolution execution orchestration, plan-task mode UX, broader UI copy/layout audit, missing button/function sweep, README/README.zh-CN refresh, and Docker readiness later.
+CI follow-up for Skill Bundle Robustness + Conversation History Titles:
+
+- GitHub Actions run `31800354524` for commit `0f7f499` failed because `web/src/pages/OperationalPages.test.tsx` hardcoded the expected chat-history timestamp as `2026-08-07 08:00` while GitHub CI runs in UTC and correctly rendered `2026-08-07 00:00`.
+- Fixed the test to derive `conversationHistoryTitle` from the fixture `created_at` using the same local-time formatting rule as the UI, so the assertion remains valid across local Asia/Shanghai and CI UTC environments.
+- Local follow-up verification: `npm.cmd run test -- --run src/pages/OperationalPages.test.tsx` -> 55 passed; `npm.cmd run lint` -> passed.
+- Next: commit this CI-only test fix, create a new recovery bundle/tag, push to `mutilagent/main`, and re-check GitHub Actions until green.
