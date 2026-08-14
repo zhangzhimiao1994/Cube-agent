@@ -348,6 +348,43 @@ async def test_submit_persists_vibe_coding_capability_metadata() -> None:
 
 
 @pytest.mark.asyncio
+async def test_schedule_intent_returns_confirmation_proposal_without_enqueue() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    queue = RecordingQueue()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=None,
+        task_queue=queue,
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="每天9点提醒我填写日报",
+        mode=TaskMode.AUTO,
+    )
+
+    assert submitted.status is RunStatus.WAITING_APPROVAL
+    assert submitted.mode is TaskMode.DISPATCH
+    assert submitted.clarification_reason == "schedule_requires_user_confirmation"
+    assert submitted.decision_token is not None
+    assert submitted.schedule_proposal is not None
+    assert submitted.schedule_proposal["kind"] == "cron"
+    assert submitted.schedule_proposal["cron"] == "0 9 * * *"
+    assert submitted.schedule_proposal["timezone"] == "Asia/Shanghai"
+    assert submitted.schedule_proposal["workflow_id"] == "scheduled_task"
+    assert repository.outbox == []
+    assert queue.enqueued == []
+    routing = repository.records[submitted.id].routing_decision
+    assert routing is not None
+    assert routing["approval_kind"] == "schedule_creation"
+    assert routing["schedule_proposal"] == submitted.schedule_proposal
+
+
+@pytest.mark.asyncio
 async def test_auto_router_timeout_uses_local_main_agent_for_generation_work() -> None:
     tenant_id = uuid4()
     actor_id = uuid4()

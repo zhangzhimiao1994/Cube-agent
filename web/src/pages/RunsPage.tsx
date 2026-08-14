@@ -33,6 +33,7 @@ type ChatAttachmentDraft = {
   attachment?: AttachmentUpload;
 };
 type TemporaryAgentProposal = NonNullable<SubmittedRun["temporary_agent_proposal"]>;
+type ScheduleProposal = NonNullable<SubmittedRun["schedule_proposal"]>;
 type RunSubmissionOverride = {
   message?: string;
   directModel?: string;
@@ -526,6 +527,40 @@ function temporaryApprovalFromRunDetail(run: RunDetail | undefined) {
   };
 }
 
+function scheduleApprovalFromRunDetail(run: RunDetail | undefined) {
+  if (!run || run.status !== "waiting_approval" || !run.schedule_proposal) return null;
+  return {
+    runId: run.id,
+    proposal: run.schedule_proposal,
+    createdScheduleId: null,
+  };
+}
+
+function scheduleProposalBody(proposal: ScheduleProposal) {
+  return [
+    "主 Agent 判断这条消息更像计划任务。请先确认计划，再加入日程；加入后由系统计划任务按时间提交普通运行。",
+    `执行安排：${proposal.summary}`,
+    `执行模式：${displayMode(proposal.mode)}`,
+    `工作流：${proposal.workflow_id}`,
+    `任务内容：${proposal.message}`,
+  ].join("\n\n");
+}
+
+function scheduleProposalCreatePayload(proposal: ScheduleProposal) {
+  return {
+    name: proposal.name,
+    message: proposal.message,
+    mode: proposal.mode,
+    workflow_id: proposal.workflow_id,
+    kind: proposal.kind,
+    run_at: proposal.run_at ?? null,
+    cron: proposal.cron ?? null,
+    timezone: proposal.timezone,
+    misfire_policy: proposal.misfire_policy,
+    budget: proposal.budget,
+    metadata: proposal.metadata,
+  };
+}
 function temporaryAgentApprovalBody(proposal: TemporaryAgentProposal) {
   const skills =
     proposal.suggested_skills.length > 0 ? `\n建议 Skill：${proposal.suggested_skills.join("、")}` : "";
@@ -593,10 +628,20 @@ function detailMessages(detail: RunDetail | undefined) {
     ...(detail.status === "waiting_approval" && detail.temporary_agent_proposal
       ? [
           {
-            id: "temporary-agent-approval",
+            id: `${detail.id}-temporary-agent-approval`,
             role: "assistant",
             title: detail.temporary_agent_proposal.name,
             body: temporaryAgentApprovalBody(detail.temporary_agent_proposal),
+          },
+        ]
+      : []),
+    ...(detail.status === "waiting_approval" && detail.schedule_proposal
+      ? [
+          {
+            id: `${detail.id}-schedule-approval`,
+            role: "assistant",
+            title: "计划任务确认",
+            body: scheduleProposalBody(detail.schedule_proposal),
           },
         ]
       : []),
@@ -1172,6 +1217,11 @@ export function RunsPage() {
     approved: boolean;
   } | null>(null);
   const [temporaryFeedback, setTemporaryFeedback] = useState("");
+  const [scheduleApproval, setScheduleApproval] = useState<{
+    runId: string;
+    proposal: ScheduleProposal;
+    createdScheduleId: string | null;
+  } | null>(null);
   const userSelectedMode = useRef(false);
   const trimmedReferenceConversationId = referenceConversationId.trim();
   const handoffActive = Boolean(trimmedReferenceConversationId);
@@ -1258,6 +1308,7 @@ export function RunsPage() {
     const approval = temporaryApprovalFromRunDetail(selectedRun.data);
     if (approval) {
       setModeSelection(null);
+      setScheduleApproval(null);
       setTemporaryApproval((current) =>
         current &&
         current.runId === approval.runId &&
@@ -1265,6 +1316,14 @@ export function RunsPage() {
         current.decisionToken === approval.decisionToken
           ? current
           : approval,
+      );
+    }
+    const proposedSchedule = scheduleApprovalFromRunDetail(selectedRun.data);
+    if (proposedSchedule) {
+      setModeSelection(null);
+      setTemporaryApproval(null);
+      setScheduleApproval((current) =>
+        current && current.runId === proposedSchedule.runId ? current : proposedSchedule,
       );
     }
   }, [modeSelection, selectedRun.data, temporaryApproval]);
@@ -1327,6 +1386,7 @@ export function RunsPage() {
       const submittedMode = override?.mode ?? mode;
       if (selection && submittedMode !== "auto") {
         setTemporaryApproval(null);
+        setScheduleApproval(null);
         setModeSelection(null);
         setSubmitNotice(`已按你选择的“${displayMode(submittedMode)}”继续，不再重复确认模式。`);
         const continued = await api.chooseMode(run.id, {
@@ -1346,8 +1406,14 @@ export function RunsPage() {
         setArchiveInstallFile(null);
         return;
       }
-      if (run.temporary_agent_proposal && run.decision_token) {
+      if (run.schedule_proposal) {
         setModeSelection(null);
+        setTemporaryApproval(null);
+        setScheduleApproval({ runId: run.id, proposal: run.schedule_proposal, createdScheduleId: null });
+        setSubmitNotice("主 Agent 已识别为计划任务，确认后会加入计划任务列表。");
+      } else if (run.temporary_agent_proposal && run.decision_token) {
+        setModeSelection(null);
+        setScheduleApproval(null);
         setTemporaryApproval({
           runId: run.id,
           decisionToken: run.decision_token,
@@ -1359,10 +1425,12 @@ export function RunsPage() {
         setSubmitNotice("主 Agent 发现当前角色池能力不足，已暂停并等待你确认是否临时加入新子 Agent。");
       } else if (selection) {
         setTemporaryApproval(null);
+        setScheduleApproval(null);
         setModeSelection(selection);
         setSubmitNotice("主 Agent 对这轮回复的模式判断不够确定，请直接在输入框回复编号或关键词继续。");
       } else {
         setTemporaryApproval(null);
+        setScheduleApproval(null);
         setModeSelection(null);
         setSubmitNotice(explainActualMode(run));
       }
@@ -1412,6 +1480,19 @@ export function RunsPage() {
     },
   });
 
+  const createScheduleFromProposal = useMutation({
+    mutationFn: () => {
+      if (!scheduleApproval) throw new Error("schedule approval is unavailable");
+      return api.createSchedule(scheduleProposalCreatePayload(scheduleApproval.proposal));
+    },
+    onSuccess: async (schedule) => {
+      setScheduleApproval((current) =>
+        current ? { ...current, createdScheduleId: schedule.id } : current,
+      );
+      setSubmitNotice(`已加入计划：${schedule.name}。到计划任务页面可以查看、删除或等待系统自动触发。`);
+      await queryClient.invalidateQueries({ queryKey: ["schedules"] });
+    },
+  });
   const promoteTemporaryAgent = useMutation({
     mutationFn: () => {
       if (!temporaryApproval) throw new Error("temporary approval is unavailable");
@@ -1764,6 +1845,8 @@ export function RunsPage() {
   const temporaryApprovalVisibleInMessages =
     !!temporaryApproval &&
     messages.some((item) => item.id === `${temporaryApproval.runId}-temporary-agent-approval`);
+  const scheduleApprovalVisibleInMessages =
+    !!scheduleApproval && messages.some((item) => item.id === `${scheduleApproval.runId}-schedule-approval`);
   const latestVisibleRun = visibleRuns.at(-1) ?? selectedRun.data;
   const registeredModelIds = new Set(savedModels.map((model) => model.logical_model));
   const directModelDeployment = savedModels.find((model) => model.logical_model === directModel) ?? null;
@@ -2153,6 +2236,13 @@ export function RunsPage() {
                 <p>{temporaryAgentApprovalBody(temporaryApproval.proposal)}</p>
               </article>
             ) : null}
+            {scheduleApproval && !scheduleApprovalVisibleInMessages ? (
+              <article className="chat-message assistant" aria-label="计划任务文字确认">
+                <span className="eyebrow">{APP_BRAND_NAME}</span>
+                <h3>计划任务确认</h3>
+                <p>{scheduleProposalBody(scheduleApproval.proposal)}</p>
+              </article>
+            ) : null}
             {messages.map((item, index) => (
               <Fragment key={item.id}>
                 <article className={`chat-message ${item.role}`}>
@@ -2198,6 +2288,28 @@ export function RunsPage() {
             ) : null}
             {promoteTemporaryAgent.isError ? (
               <p role="alert">{formatApiError(promoteTemporaryAgent.error, "永久化 Agent 失败")}</p>
+            ) : null}
+            {createScheduleFromProposal.isError ? (
+              <p role="alert">{formatApiError(createScheduleFromProposal.error, "计划任务创建失败")}</p>
+            ) : null}
+            {scheduleApproval ? (
+              <aside className="composer-attachment-card" role="status" aria-label="计划任务确认">
+                <div>
+                  <span className="eyebrow">{scheduleApproval.createdScheduleId ? "计划任务已加入" : "计划任务待确认"}</span>
+                  <strong>{scheduleApproval.proposal.name}</strong>
+                  <small>{scheduleApproval.proposal.summary}</small>
+                </div>
+                <p>{scheduleApproval.proposal.message}</p>
+                {scheduleApproval.createdScheduleId ? (
+                  <Link to="/schedules" className="secondary-action">
+                    查看计划任务
+                  </Link>
+                ) : (
+                  <button type="button" disabled={createScheduleFromProposal.isPending} onClick={() => createScheduleFromProposal.mutate()}>
+                    {createScheduleFromProposal.isPending ? "加入中..." : "加入计划"}
+                  </button>
+                )}
+              </aside>
             ) : null}
             {skillInstallCandidate ? (
               <aside className="composer-attachment-card" role="status" aria-label="Skill 安装确认">

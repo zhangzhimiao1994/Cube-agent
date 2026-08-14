@@ -8,6 +8,7 @@ import math
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol, cast
 from uuid import UUID, uuid4
@@ -42,6 +43,7 @@ class SubmittedRun:
     conversation_id: str | None = None
     reference_conversation_id: str | None = None
     temporary_agent_proposal: dict[str, object] | None = None
+    schedule_proposal: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +64,40 @@ class TaskQueue(Protocol):
 
 class ModeRouterProtocol(Protocol):
     async def route(self, task_text: object) -> RouteDecision: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduleProposal:
+    name: str
+    message: str
+    mode: TaskMode
+    workflow_id: str
+    kind: str
+    timezone: str
+    misfire_policy: str
+    budget: int
+    summary: str
+    run_at: str | None = None
+    cron: str | None = None
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "message": self.message,
+            "mode": self.mode.value,
+            "workflow_id": self.workflow_id,
+            "kind": self.kind,
+            "timezone": self.timezone,
+            "misfire_policy": self.misfire_policy,
+            "budget": self.budget,
+            "run_at": self.run_at,
+            "cron": self.cron,
+            "summary": self.summary,
+            "metadata": {
+                "source": "chat_schedule_proposal",
+                "requires_user_confirmation": "true",
+            },
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,6 +248,21 @@ class RunService:
             operator_selection["capability"] = "vibe_coding"
         if channel_context:
             operator_selection.update(_safe_channel_context(channel_context))
+        schedule_proposal = _local_schedule_proposal(
+            message=message,
+            mode=TaskMode.DISPATCH if mode is TaskMode.AUTO else mode,
+            workflow_id=workflow_id,
+        )
+        if schedule_proposal is not None:
+            return await self._create_schedule_approval_run(
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                message=message,
+                mode=schedule_proposal.mode,
+                proposal=schedule_proposal,
+                idempotency_key=idempotency_key,
+                operator_selection=operator_selection,
+            )
         if mode is TaskMode.AUTO:
             decision: RouteDecision | None = None
             if self._router is not None:
@@ -911,6 +962,37 @@ class RunService:
         )
         return _submitted(record)
 
+    async def _create_schedule_approval_run(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        message: str,
+        mode: TaskMode,
+        proposal: ScheduleProposal,
+        idempotency_key: str | None,
+        operator_selection: dict[str, object],
+    ) -> SubmittedRun:
+        token = _decision_token()
+        proposal_payload = proposal.to_payload()
+        record = await self._repository.create_run(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            request=message,
+            mode=mode,
+            status=RunStatus.WAITING_APPROVAL,
+            idempotency_key=idempotency_key,
+            routing_decision={
+                **operator_selection,
+                "reason": "schedule_requires_user_confirmation",
+                "decision_token": token,
+                "approval_kind": "schedule_creation",
+                "schedule_proposal": proposal_payload,
+            },
+            enqueue=False,
+        )
+        return _submitted(record)
+
     async def _safe_record_hermes_outcome(
         self,
         *,
@@ -945,6 +1027,7 @@ def _submitted(record: RunRecord) -> SubmittedRun:
     decision = record.routing_decision or {}
     reason = str(decision.get("reason", "routing_requires_user_choice"))
     proposal = decision.get("temporary_agent_proposal")
+    schedule_proposal = decision.get("schedule_proposal")
     return SubmittedRun(
         id=record.id,
         tenant_id=record.tenant_id,
@@ -963,8 +1046,140 @@ def _submitted(record: RunRecord) -> SubmittedRun:
         temporary_agent_proposal=cast(dict[str, object], proposal)
         if isinstance(proposal, dict)
         else None,
+        schedule_proposal=cast(dict[str, object], schedule_proposal)
+        if isinstance(schedule_proposal, dict)
+        else None,
     )
 
+
+_SCHEDULE_TRIGGER_RE = re.compile(
+    r"(定时|提醒|闹钟|日程|每天|每日|每周|schedule|scheduled|remind|reminder|daily|weekly)",
+    re.IGNORECASE,
+)
+_SCHEDULE_PLAN_RE = re.compile(r"计划")
+_SCHEDULE_TIME_RE = re.compile(
+    r"(?P<hour>[01]?\d|2[0-3])(?:\s*点|:)(?P<minute>[0-5]\d)?|(?P<hour_en>[01]?\d|2[0-3])\s*(?:am|pm)",
+    re.IGNORECASE,
+)
+_WEEKDAY_BY_TEXT = {
+    "周日": 0,
+    "星期日": 0,
+    "周天": 0,
+    "星期天": 0,
+    "周一": 1,
+    "星期一": 1,
+    "周二": 2,
+    "星期二": 2,
+    "周三": 3,
+    "星期三": 3,
+    "周四": 4,
+    "星期四": 4,
+    "周五": 5,
+    "星期五": 5,
+    "周六": 6,
+    "星期六": 6,
+}
+
+
+def _local_schedule_proposal(
+    *,
+    message: str,
+    mode: TaskMode,
+    workflow_id: str | None,
+) -> ScheduleProposal | None:
+    lowered = message.lower()
+    if not _looks_like_schedule_intent(message, lowered):
+        return None
+    hour, minute = _schedule_time(message)
+    timezone = "Asia/Shanghai"
+    selected_workflow = workflow_id or "scheduled_task"
+    if _contains_weekly_intent(message, lowered):
+        weekday = _schedule_weekday(message)
+        return ScheduleProposal(
+            name="chat-weekly-schedule",
+            message=message,
+            mode=mode,
+            workflow_id=selected_workflow,
+            kind="cron",
+            timezone=timezone,
+            misfire_policy="fire_once",
+            budget=16_384,
+            cron=f"{minute} {hour} * * {weekday}",
+            summary=f"每周{_weekday_label(weekday)} {hour:02d}:{minute:02d} 执行。",
+        )
+    if _contains_daily_intent(message, lowered):
+        return ScheduleProposal(
+            name="chat-daily-schedule",
+            message=message,
+            mode=mode,
+            workflow_id=selected_workflow,
+            kind="cron",
+            timezone=timezone,
+            misfire_policy="fire_once",
+            budget=16_384,
+            cron=f"{minute} {hour} * * *",
+            summary=f"每天 {hour:02d}:{minute:02d} 执行。",
+        )
+    run_at = (datetime.now(UTC) + timedelta(days=1)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return ScheduleProposal(
+        name="chat-one-time-schedule",
+        message=message,
+        mode=mode,
+        workflow_id=selected_workflow,
+        kind="one_time",
+        timezone=timezone,
+        misfire_policy="fire_once",
+        budget=16_384,
+        run_at=run_at.isoformat(),
+        summary=f"将在 {run_at.isoformat()} 执行一次。",
+    )
+
+
+def _looks_like_schedule_intent(message: str, lowered: str) -> bool:
+    if _SCHEDULE_TRIGGER_RE.search(message):
+        return True
+    return bool(
+        _SCHEDULE_PLAN_RE.search(message)
+        and (
+            _contains_daily_intent(message, lowered)
+            or _contains_weekly_intent(message, lowered)
+            or _SCHEDULE_TIME_RE.search(message)
+            or "明天" in message
+            or "后天" in message
+            or "tomorrow" in lowered
+        )
+    )
+
+
+def _contains_daily_intent(message: str, lowered: str) -> bool:
+    return any(token in message for token in ("每天", "每日")) or "daily" in lowered or "every day" in lowered
+
+
+def _contains_weekly_intent(message: str, lowered: str) -> bool:
+    return "每周" in message or "weekly" in lowered or "every week" in lowered
+
+
+def _schedule_time(message: str) -> tuple[int, int]:
+    match = _SCHEDULE_TIME_RE.search(message)
+    if match is None:
+        return 9, 0
+    raw_hour = match.group("hour") or match.group("hour_en") or "9"
+    hour = int(raw_hour)
+    if match.group("hour_en") and "pm" in match.group(0).lower() and hour < 12:
+        hour += 12
+    minute = int(match.group("minute") or "0")
+    return hour, minute
+
+
+def _schedule_weekday(message: str) -> int:
+    for token, value in _WEEKDAY_BY_TEXT.items():
+        if token in message:
+            return value
+    return 1
+
+
+def _weekday_label(weekday: int) -> str:
+    return ["日", "一", "二", "三", "四", "五", "六"][weekday]
 
 def _decision_token() -> str:
     return f"decision-{uuid4().hex}{uuid4().hex}"

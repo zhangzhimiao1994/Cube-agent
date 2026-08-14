@@ -1,4 +1,48 @@
-﻿## 2026-08-14 GitHub Actions Mobile Navigation Test Fix
+## 2026-08-14 Chat Schedule Intent Confirmation
+
+Current state:
+
+- Added chat-side schedule intent handling before normal auto-routing.
+- Messages such as `每天9点提醒我填写日报` now create a `waiting_approval` run with a `schedule_proposal` instead of immediately enqueuing work.
+- The proposal includes schedule kind, cron/run time, timezone, workflow, execution mode, budget, and metadata so the UI can submit it to the existing scheduled-task API without guessing.
+- Admin run detail now exposes `schedule_proposal` for persisted waiting-approval runs.
+- The chat UI shows a `计划任务确认` card and an `加入计划` button; confirming creates the user-visible schedule through `/api/v1/admin/schedules`.
+- Existing Handoff and Vibe Coding composer behavior remains independent and covered by tests.
+
+Verification performed:
+
+- Local backend checks:
+  - `uv run pytest tests/unit/runs/test_temporary_agent.py::test_schedule_intent_returns_confirmation_proposal_without_enqueue -q --tb=short` -> 1 passed.
+  - `uv run pytest tests/unit/runs/test_temporary_agent.py -q --tb=short` -> 11 passed.
+  - `uv run ruff check src\agent_hub\runs\service.py src\agent_hub\api\routers\runs.py src\agent_hub\api\routers\admin.py tests\unit\runs\test_temporary_agent.py` -> passed.
+  - `uv run mypy --strict src\agent_hub\runs\service.py src\agent_hub\api\routers\runs.py src\agent_hub\api\routers\admin.py tests\unit\runs\test_temporary_agent.py` -> passed.
+  - `uv run pytest tests/api/test_admin_resources.py -q --tb=short` -> 90 passed.
+- Local frontend checks:
+  - `npm.cmd run lint` -> passed.
+  - `npm.cmd run test -- --run src/pages/OperationalPages.test.tsx -t "schedule"` -> 1 passed, 48 skipped.
+  - `npm.cmd run test -- --run src/pages/OperationalPages.test.tsx` -> 49 passed.
+  - `npm.cmd run test -- --run` -> 103 passed.
+  - `npm.cmd run build` -> passed with the existing Vite chunk-size warning.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-chat-schedule-proposal.tgz` to `103.236.98.133`.
+  - Backed up the prior deployed `admin.py`, `runs.py`, `service.py`, and `web/dist`, extracted the incremental package into `/opt/agent-hub/current`, fixed ownership, restarted `agent-hub-api` and `agent-hub-worker`, and reloaded Caddy.
+  - Confirmed `agent-hub-api`, `agent-hub-worker`, and `caddy` were active.
+- Server real environment verification:
+  - Ran a real HTTP API probe against the deployed server using the real JWT/DB environment.
+  - Submitted `POST /api/v1/runs` with `每天9点提醒我填写日报` and verified `waiting_approval`, `mode=dispatch`, and `schedule_proposal.cron=0 9 * * *`.
+  - Submitted the returned proposal to `POST /api/v1/admin/schedules` and verified the schedule was created as active with a next fire time.
+  - Fetched `GET /api/v1/admin/runs/{run_id}` and verified admin detail exposes the same schedule proposal.
+  - Cleaned up the created schedule via API; the waiting-approval probe run required narrow DB cleanup because protected admin deletion returned 409 before cancellation. Cleanup removed 1 probe run matching the exact message, reason, and recent timestamp.
+  - Final functional output: `{"status": "ok", "checked": ["chat_schedule_proposal", "schedule_created_from_proposal", "admin_run_detail_exposes_schedule_proposal"], "cleanup": ["schedule:200", "run:409"]}` followed by cleanup output `{"status": "ok", "removed_probe_runs": 1}`.
+
+Remaining risks / TODOs:
+
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote `mutilagent/main`.
+- Push with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue planned work after green: OpenClaw terminal/system integration and Windows executor path, Skill archive install edge cases, Hermes quick confirm/batch robustness, final README/README.zh-CN, and later full UI text/layout audit including denser mobile chat/history layout.
+## 2026-08-14 GitHub Actions Mobile Navigation Test Fix
 
 Current state:
 

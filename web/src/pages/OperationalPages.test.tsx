@@ -1,4 +1,4 @@
-﻿import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -356,6 +356,34 @@ describe("operational management pages", () => {
               clarification_reason: "routing_requires_user_choice",
             });
           }
+          if (message.includes("每天9点提醒")) {
+            return jsonResponse({
+              id: runId,
+              tenant_id: "33333333-3333-4333-8333-333333333333",
+              status: "waiting_approval",
+              mode: "dispatch",
+              decision_token: "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+              version: 1,
+              clarification_reason: "schedule_requires_user_confirmation",
+              schedule_proposal: {
+                name: "chat-daily-schedule",
+                message,
+                mode: "dispatch",
+                workflow_id: "scheduled_task",
+                kind: "cron",
+                timezone: "Asia/Shanghai",
+                misfire_policy: "fire_once",
+                budget: 16384,
+                run_at: null,
+                cron: "0 9 * * *",
+                summary: "每天 09:00 执行。",
+                metadata: {
+                  source: "chat_schedule_proposal",
+                  requires_user_confirmation: "true",
+                },
+              },
+            });
+          }
           if (message.includes("网页") || message.toLowerCase().includes("web page")) {
             return jsonResponse({
               id: runId,
@@ -428,6 +456,15 @@ describe("operational management pages", () => {
         }
         if (path === "/api/v1/admin/main-agent") {
           return jsonResponse(mainAgent);
+        }
+        if (path === "/api/v1/admin/schedules" && method === "POST") {
+          const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
+          return jsonResponse({
+            id: "44444444-4444-4444-8444-444444444444",
+            status: "active",
+            next_fire_at: "2026-08-15T01:00:00Z",
+            ...body,
+          });
         }
         if (path === "/api/v1/admin/agents" && method === "POST") {
           const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
@@ -868,6 +905,32 @@ describe("operational management pages", () => {
     });
   });
 
+  it("creates a schedule from a chat-detected plan after user confirmation", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "每天9点提醒我填写日报");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(await screen.findByRole("status", { name: "计划任务确认" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "加入计划" }));
+
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === "/api/v1/admin/schedules" && request.method === "POST")).toMatchObject({
+        body: {
+          name: "chat-daily-schedule",
+          message: "每天9点提醒我填写日报",
+          mode: "dispatch",
+          workflow_id: "scheduled_task",
+          kind: "cron",
+          cron: "0 9 * * *",
+          timezone: "Asia/Shanghai",
+        },
+      }),
+    );
+    expect(await screen.findByText(/已加入计划/)).not.toBeNull();
+  });
   it("separates composer tools, status, and send controls so actions do not crowd each other", async () => {
     const view = render(<TestApp initialPath="/" />);
 

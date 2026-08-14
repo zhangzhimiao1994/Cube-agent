@@ -384,6 +384,21 @@ const TemporaryAgentProposalSchema = z.object({
   permanentizable: z.boolean(),
 });
 
+const ScheduleProposalSchema = z.object({
+  name: z.string(),
+  message: z.string(),
+  mode: z.enum(["auto", "direct", "dispatch", "discuss", "hybrid"]),
+  workflow_id: z.string(),
+  kind: z.enum(["one_time", "cron"]),
+  timezone: z.string(),
+  misfire_policy: z.enum(["fire_once", "skip"]),
+  budget: z.number(),
+  run_at: z.string().nullable().optional(),
+  cron: z.string().nullable().optional(),
+  summary: z.string(),
+  metadata: z.record(z.string(), z.string()),
+});
+
 const SubmittedRunSchema = z.object({
   id: z.string(),
   tenant_id: z.string(),
@@ -395,6 +410,7 @@ const SubmittedRunSchema = z.object({
   conversation_id: z.string().nullable().optional(),
   reference_conversation_id: z.string().nullable().optional(),
   temporary_agent_proposal: TemporaryAgentProposalSchema.nullable().optional(),
+  schedule_proposal: ScheduleProposalSchema.nullable().optional(),
 });
 
 export type SubmittedRun = z.infer<typeof SubmittedRunSchema>;
@@ -436,6 +452,7 @@ const RunDetailSchema = RunListItemSchema.extend({
   explicit_details: z.record(z.string(), z.string()),
   decision_token: z.string().nullable().optional(),
   temporary_agent_proposal: TemporaryAgentProposalSchema.nullable().optional(),
+  schedule_proposal: ScheduleProposalSchema.nullable().optional(),
 });
 
 const RunDeleteSchema = z.object({

@@ -185,6 +185,7 @@ class SubmittedRunResponse(BaseModel):
     conversation_id: str | None = None
     reference_conversation_id: str | None = None
     temporary_agent_proposal: dict[str, object] | None = None
+    schedule_proposal: dict[str, object] | None = None
 
     @classmethod
     def from_submitted(cls, run: SubmittedRun) -> SubmittedRunResponse:
@@ -199,6 +200,7 @@ class SubmittedRunResponse(BaseModel):
             conversation_id=run.conversation_id,
             reference_conversation_id=run.reference_conversation_id,
             temporary_agent_proposal=run.temporary_agent_proposal,
+            schedule_proposal=run.schedule_proposal,
         )
 
 

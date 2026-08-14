@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import io
@@ -263,6 +263,7 @@ class RunDetailResponse(RunListItem):
     explicit_details: dict[str, str]
     decision_token: str | None = None
     temporary_agent_proposal: dict[str, JsonValue] | None = None
+    schedule_proposal: dict[str, JsonValue] | None = None
 
 
 class RunDebugArtifactResponse(BaseModel):
@@ -2655,6 +2656,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             },
             decision_token=_waiting_mode_decision_token(record),
             temporary_agent_proposal=_temporary_agent_proposal(record.routing_decision),
+            schedule_proposal=_schedule_proposal(record.routing_decision),
         )
 
     async def list_models(self) -> tuple[ModelDeploymentResponse, ...]:
@@ -5080,6 +5082,41 @@ def _temporary_agent_proposal(
     return safe or None
 
 
+def _schedule_proposal(
+    routing_decision: dict[str, object] | None,
+) -> dict[str, JsonValue] | None:
+    if not routing_decision:
+        return None
+    proposal = routing_decision.get("schedule_proposal")
+    if not isinstance(proposal, dict):
+        return None
+    safe = _safe_proposal_json_mapping(proposal)
+    return safe or None
+
+
+def _safe_proposal_json_mapping(value: dict[object, object]) -> dict[str, JsonValue]:
+    safe: dict[str, JsonValue] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            continue
+        converted = _safe_proposal_json_value(item)
+        if converted is not None:
+            safe[key] = converted
+    return safe
+
+
+def _safe_proposal_json_value(value: object) -> JsonValue | None:
+    if isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, list):
+        return tuple(
+            converted for item in value if (converted := _safe_proposal_json_value(item)) is not None
+        )
+    if isinstance(value, dict):
+        return _safe_proposal_json_mapping(value)
+    return None
+
+
 @router.get("/models", response_model=list[ModelDeploymentResponse], responses=error_responses(401, 403, 422))
 async def list_models(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -6285,6 +6322,3 @@ async def delete_hermes_insight(
 
 
 __all__ = ["InMemoryAdminResourceService", "PersistentAdminResourceService", "router"]
-
-
-
