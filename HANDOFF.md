@@ -3962,3 +3962,8 @@ CI follow-up for this slice:
   - `npm test -- --run` -> 13 files / 116 tests passed.
   - `npm run build` -> passed with the existing Vite large chunk warning.
   - `git diff --check` -> passed.
+
+Final CI status for this slice:
+
+- Latest GitHub Actions run `31787569309` for commit `795a3cf` completed successfully.
+- The failed run `31787154117` is superseded by the passing CI-fix run.
