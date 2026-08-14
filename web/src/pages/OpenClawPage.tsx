@@ -21,19 +21,42 @@ const DEFAULT_OPENCLAW_REMOTE_ADAPTER: OpenClawRemoteAdapterSetting = {
   credential_ref: "secret://openclaw-local-adapter",
 };
 
+const OPENCLAW_POLICY_COPY: Record<SystemSettings["openclaw_mode"], { badge: string; summary: string; title: string }> = {
+  ask: {
+    badge: "人工审批",
+    title: "默认审核",
+    summary: "所有操作先进入待审批；批准后仍必须命中 allowlist，危险 shell 包装命令会被拦截。",
+  },
+  read_only: {
+    badge: "禁止写操作",
+    title: "只读模式",
+    summary: "允许屏幕、文件读取等受控请求进入流程；命令执行和桌面写操作会被拒绝。",
+  },
+  auto_review: {
+    badge: "低风险自动",
+    title: "自动审核",
+    summary: "只有低风险且精确命中 allowlist 的命令会自动批准；未命中仍等待人工审批。",
+  },
+  trusted_auto: {
+    badge: "受信环境",
+    title: "受信自动",
+    summary: "适合已确认的本机或服务器适配器；执行仍受 allowlist、shell 拦截和会话状态限制。",
+  },
+};
+
 function formatJson(value: unknown) {
   return JSON.stringify(value, null, 2);
 }
 
-function parseStringList(value: string, fieldName: string) {
+function parseStringList(value: string, fieldName: string): string[] {
   const parsed: unknown = JSON.parse(value);
   if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string" || item.trim() === "")) {
     throw new Error(`${fieldName} must be a JSON string array.`);
   }
-  return parsed;
+  return parsed as string[];
 }
 
-function parseCommandList(value: string) {
+function parseCommandList(value: string): string[][] {
   const parsed: unknown = JSON.parse(value);
   if (
     !Array.isArray(parsed) ||
@@ -46,7 +69,7 @@ function parseCommandList(value: string) {
   ) {
     throw new Error("OpenClaw allowed commands must be a JSON array of argv arrays.");
   }
-  return parsed;
+  return parsed as string[][];
 }
 
 function parseOpenClawRemoteAdapters(value: string): SystemSettings["openclaw_remote_adapters"] {
@@ -73,6 +96,14 @@ function parseOpenClawRemoteAdapters(value: string): SystemSettings["openclaw_re
     throw new Error("OpenClaw remote adapters must be JSON objects with platform, target_type, target, base_url, and credential_ref.");
   }
   return parsed as SystemSettings["openclaw_remote_adapters"];
+}
+
+function commandKey(command: string[]) {
+  return JSON.stringify(command);
+}
+
+function commandLabel(command: string[]) {
+  return command.join(" ");
 }
 
 function sortOpenClawAdapters(adapters: OpenClawAdapter[]) {
@@ -131,6 +162,23 @@ export function OpenClawPage() {
     }
   }, [remoteAdaptersText]);
 
+  const allowedCommandPreview = useMemo(() => {
+    try {
+      return { commands: parseCommandList(allowedCommandsText), error: null };
+    } catch (error) {
+      return {
+        commands: [],
+        error: error instanceof Error ? error.message : "OpenClaw allowlist JSON 无法解析。",
+      };
+    }
+  }, [allowedCommandsText]);
+
+  const activePolicy = OPENCLAW_POLICY_COPY[settings?.openclaw_mode ?? "ask"];
+  const shouldWarnEmptyAllowlist =
+    (settings?.openclaw_mode === "auto_review" || settings?.openclaw_mode === "trusted_auto") &&
+    !allowedCommandPreview.error &&
+    allowedCommandPreview.commands.length === 0;
+
   useEffect(() => {
     setSelectedSessionId((currentSessionId) =>
       currentSessionId && activeSessions.some((session) => session.id === currentSessionId)
@@ -187,6 +235,29 @@ export function OpenClawPage() {
       return;
     }
     replaceRemoteAdapters(current.filter((_, itemIndex) => itemIndex !== index));
+  }
+
+  function addOperationCommandToAllowlist() {
+    let current: string[][];
+    let argv: string[];
+    try {
+      current = parseCommandList(allowedCommandsText);
+      argv = parseStringList(argvText, "OpenClaw argv");
+    } catch (error) {
+      setLocalError(error instanceof Error ? error.message : "OpenClaw 命令 JSON 无法解析。");
+      return;
+    }
+    if (current.some((command) => commandKey(command) === commandKey(argv))) {
+      setLocalError("当前控制台命令已在 allowlist 中。");
+      return;
+    }
+    setAllowedCommandsText(formatJson([...current, argv]));
+    setLocalError(null);
+  }
+
+  function clearAllowedCommands() {
+    setAllowedCommandsText("[]");
+    setLocalError(null);
   }
 
   const saveSettings = useMutation({
@@ -339,6 +410,25 @@ export function OpenClawPage() {
               <option value="trusted_auto">受信环境自动执行</option>
             </select>
           </label>
+          <div className="openclaw-policy-preview" role="region" aria-label="OpenClaw 审批策略预览">
+            <div className="openclaw-policy-header">
+              <strong>{activePolicy.title}</strong>
+              <span>{activePolicy.badge}</span>
+            </div>
+            <p>{activePolicy.summary}</p>
+            <p className="field-help">当前 allowlist：{allowedCommandPreview.commands.length} 条</p>
+            {allowedCommandPreview.error ? <p role="alert">{allowedCommandPreview.error}</p> : null}
+            {shouldWarnEmptyAllowlist ? <p className="openclaw-policy-warning">当前没有 allowlist，自动审核不会放行任何命令。</p> : null}
+            {allowedCommandPreview.commands.length === 0 ? (
+              <p className="field-help">还没有允许执行的命令。建议先在控制台写入测试 argv，再加入 allowlist。</p>
+            ) : (
+              <ul className="openclaw-allowlist-preview" aria-label="OpenClaw 命令 allowlist">
+                {allowedCommandPreview.commands.slice(0, 6).map((command) => (
+                  <li key={commandKey(command)}>{commandLabel(command)}</li>
+                ))}
+              </ul>
+            )}
+          </div>
           <label htmlFor="openclaw-page-allowed-commands">
             允许执行的命令 JSON
             <textarea
@@ -350,6 +440,10 @@ export function OpenClawPage() {
             />
             <small>只允许精确匹配的 argv；shell 包装命令仍会被拦截。</small>
           </label>
+          <div className="action-row compact-actions">
+            <button type="button" onClick={addOperationCommandToAllowlist}>添加当前控制台命令</button>
+            <button type="button" className="danger-action" onClick={clearAllowedCommands}>清空命令 allowlist</button>
+          </div>
         </fieldset>
 
         <fieldset>

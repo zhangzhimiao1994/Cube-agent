@@ -1,3 +1,31 @@
+## 2026-08-15 OpenClaw Approval Policy UX
+
+### State
+- Tightened the dedicated OpenClaw control page so the approval mode is no longer just a raw select value. The page now shows a policy preview for `ask`, `read_only`, `auto_review`, and `trusted_auto`, including the practical execution boundary for each mode.
+- Added an allowlist preview with a clear empty-state warning: automatic approval modes will not release any command while the allowlist is empty.
+- Added operator controls to append the current console argv into the OpenClaw command allowlist and to clear the allowlist without manually editing JSON.
+- Kept OpenClaw as a system-level configuration/control feature with explicit approval, allowlist, adapter, and session boundaries; this does not broaden execution permissions.
+
+### Verification
+- TDD red first: `npm test -- --run src/pages/OpenClawPage.test.tsx -t "explains approval modes"` failed because the page did not expose `OpenClaw 审批策略预览`.
+- Green local checks:
+  - `npm test -- --run src/pages/OpenClawPage.test.tsx` -> 4 passed.
+  - `npm run lint` -> passed.
+  - `git diff --check` -> passed.
+  - `npm run build` -> passed with the existing Vite large chunk warning.
+
+### Server Deployment And Real Probe
+- Uploaded `.local-archives/server-incrementals/agent-hub-openclaw-policy-ux-20260815-041515.tgz` to `103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed into `/opt/agent-hub/current`.
+- Server backup retained under `/opt/agent-hub/backups/openclaw-policy-ux-20260815-041515`; clean-dist backup retained under `/opt/agent-hub/backups/openclaw-policy-ux-clean-dist-20260815-041515`.
+- Server archive retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-openclaw-policy-ux-20260815-041515.tgz`.
+- Cleaned stale `web/dist` assets on the server and restored the dist directory from the current incremental archive so old bundles do not remain alongside the active build.
+- Real server HTTP probe requested `/openclaw`, loaded the active JS/CSS assets from `index.html`, and verified policy preview text, automatic-review empty allowlist warning, add/clear allowlist controls, and `openclaw-policy-preview` CSS are present.
+- Probe output: `{'status': 'ok', 'checks': {'policy_region': True, 'auto_review_warning': True, 'add_command_button': True, 'clear_allowlist_button': True, 'policy_css': True}, 'assets': ['assets/index-L5jBNBY1.js', 'assets/index-BeKjbozd.css']}`.
+- Final server health returned `{"status":"ok"}`.
+
+### Remaining / Next
+- Commit this slice, create local GitHub recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, then watch GitHub Actions until green.
+- Continue remaining P3 work after green: plan-task refinement, remaining UI copy/layout audit, missing button/function sweep, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 Skill Large Directory Archive Upload Fix
 
 ### State

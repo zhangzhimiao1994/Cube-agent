@@ -230,6 +230,36 @@ describe("OpenClawPage", () => {
     expect(await screen.findByText("OpenClaw 设置已保存")).not.toBeNull();
   });
 
+  it("explains approval modes and lets operators curate the command allowlist", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/openclaw" />);
+
+    expect(await screen.findByRole("region", { name: "OpenClaw 审批策略预览" })).not.toBeNull();
+    expect(screen.getByText("默认审核")).not.toBeNull();
+    expect(screen.getByText(/所有操作先进入待审批/)).not.toBeNull();
+
+    await user.selectOptions(screen.getByLabelText("权限模式"), "auto_review");
+    expect(screen.getByText("自动审核")).not.toBeNull();
+    expect(screen.getByText("当前没有 allowlist，自动审核不会放行任何命令。")).not.toBeNull();
+
+    fireEvent.change(screen.getByTestId("openclaw-page-operation-argv"), {
+      target: { value: `["python","--version"]` },
+    });
+    await user.click(screen.getByRole("button", { name: "添加当前控制台命令" }));
+    expect(screen.getByText("python --version")).not.toBeNull();
+
+    await user.click(screen.getByTestId("save-openclaw-settings"));
+
+    await waitFor(() => {
+      expect(requests.find((request) => request.path === "/api/v1/admin/settings")).toMatchObject({
+        method: "PUT",
+        body: expect.objectContaining({
+          openclaw_mode: "auto_review",
+          openclaw_allowed_commands: [["python", "--version"]],
+        }),
+      });
+    });
+  });
   it("runs the OpenClaw approval and execution chain from the dedicated page", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/openclaw" />);
