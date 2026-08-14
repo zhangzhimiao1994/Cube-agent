@@ -1,3 +1,36 @@
+## 2026-08-14 Attachment Upload Retry UI
+
+Current state:
+
+- Investigated the mobile composer attachment error shown as `network request failed (network_error, HTTP 0)`.
+- Production API and Caddy did not reproduce a backend/proxy failure: server logs showed real `/api/v1/runs/attachments/upload` requests returning `200 OK`, including a public client request.
+- Caddy is a simple `:80` reverse proxy for `/api/*` to `127.0.0.1:8000`; no Cloudflare Tunnel or extra proxy process is running on the server.
+- Fixed a concrete frontend retry issue: before starting a new upload, the composer now resets both attachment and Skill upload mutation state, and the file input is cleared after handling selection so retrying the same file on mobile fires a new `change` event.
+
+Verification performed:
+
+- Server real environment probes:
+  - Generated a short-lived production JWT on the server without printing token/key material.
+  - Uploaded and deleted `附件探针 截图.png` via `http://127.0.0.1/api/v1/runs/attachments/upload` -> upload `200`, delete `200`.
+  - Uploaded and deleted the same file via `http://103.236.98.133/api/v1/runs/attachments/upload` -> upload `200`, delete `200`.
+- Local frontend:
+  - Added `clears failed attachment upload state and allows retrying the same file` regression coverage.
+  - `npm.cmd run test -- --run src/pages/OperationalPages.test.tsx -t "retrying the same file"` -> passed.
+  - `npm.cmd run test -- --run src/pages/OperationalPages.test.tsx` -> 51 passed.
+  - `npm.cmd run lint` -> passed.
+  - `npm.cmd run test -- --run` -> 107 passed.
+  - `npm.cmd run build` -> passed with the existing Vite chunk-size warning.
+  - `git diff --check` -> passed.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-attachment-retry-ui.tgz` with `web/src/pages/RunsPage.tsx`, `web/src/pages/OperationalPages.test.tsx`, and rebuilt `web/dist`; no temp files, env files, or dependencies were included.
+  - Backed up overwritten files to `/opt/agent-hub/backups/attachment-retry-ui-20260814-045107`, extracted into `/opt/agent-hub/current`, reloaded Caddy, and verified `caddy`, `agent-hub-api`, and `agent-hub-worker` are active.
+  - Confirmed deployed `RunsPage.tsx` contains `uploadAttachment.reset()` and clears `event.currentTarget.value` after file selection.
+  - Re-ran the public-IP upload/delete probe after deployment -> upload `200`, delete `200`.
+
+Remaining risks / next:
+
+- The original `HTTP 0` network exception could not be reproduced at API/Caddy level. The implemented fix addresses the observed stuck retry/error-state failure path; if mobile still shows `HTTP 0`, capture the exact browser URL/proxy path and network details next.
+- Continue the queued P3 project work after GitHub archive/push/Actions verification.
 ## 2026-08-14 Model Input Understanding Capabilities
 
 Current state:

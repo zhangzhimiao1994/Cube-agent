@@ -1648,6 +1648,8 @@ export function RunsPage() {
   function handleAttachmentUpload(fileList: FileList | null) {
     const file = fileList?.item(0);
     if (!file) return;
+    uploadAttachment.reset();
+    uploadSkillArchive.reset();
     setSubmitNotice(null);
     setAttachmentDraft(null);
     setSkillInstallCandidate(null);
@@ -2396,7 +2398,10 @@ export function RunsPage() {
                     type="file"
                     accept={ATTACHMENT_ACCEPT}
                     disabled={uploadSkillArchive.isPending || uploadAttachment.isPending}
-                    onChange={(event) => handleAttachmentUpload(event.currentTarget.files)}
+                    onChange={(event) => {
+                      handleAttachmentUpload(event.currentTarget.files);
+                      event.currentTarget.value = "";
+                    }}
                   />
                 </label>
                 <button

@@ -278,6 +278,7 @@ describe("operational management pages", () => {
   let visibleModels = models;
   let deletedRunIds = new Set<string>();
   let deletedHermesIds = new Set<string>();
+  let failNextAttachmentUpload = false;
 
   beforeEach(() => {
     requests.length = 0;
@@ -288,6 +289,7 @@ describe("operational management pages", () => {
     visibleModels = models;
     deletedRunIds = new Set<string>();
     deletedHermesIds = new Set<string>();
+    failNextAttachmentUpload = false;
     vi.stubGlobal("confirm", vi.fn(() => true));
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
@@ -507,6 +509,10 @@ describe("operational management pages", () => {
           return jsonResponse([]);
         }
         if (path === "/api/v1/runs/attachments/upload" && method === "POST") {
+          if (failNextAttachmentUpload) {
+            failNextAttachmentUpload = false;
+            throw new TypeError("Failed to fetch");
+          }
           const headers = init?.headers instanceof Headers ? init.headers : new Headers(init?.headers);
           const rawFilename = headers.get("X-Agent-Hub-Filename") ?? "screen.png";
           const filename = headers.get("X-Agent-Hub-Filename-Encoding") === "percent" ? decodeURIComponent(rawFilename) : rawFilename;
@@ -932,6 +938,27 @@ describe("operational management pages", () => {
       }),
     );
     expect(await screen.findByText(/已加入计划/)).not.toBeNull();
+  });
+  it("clears failed attachment upload state and allows retrying the same file", async () => {
+    failNextAttachmentUpload = true;
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    const input = screen.getByLabelText("上传文件或 Skill 压缩包") as HTMLInputElement;
+    const file = new File(["image-bytes"], "截图.png", { type: "image/png" });
+
+    await user.upload(input, file);
+    expect(await screen.findByText(/附件上传失败: network request failed/)).not.toBeNull();
+    expect(input.value).toBe("");
+
+    await user.upload(input, file);
+    expect(await screen.findByText("图片已上传。提交任务后会作为附件引用进入运行上下文。")).not.toBeNull();
+    expect(screen.queryByText(/附件上传失败/)).toBeNull();
+
+    const uploads = requests.filter((request) => request.path === "/api/v1/runs/attachments/upload");
+    expect(uploads).toHaveLength(2);
+    expect(uploads[1].headers["x-agent-hub-filename"]).toBe(encodeURIComponent("截图.png"));
   });
   it("separates composer tools, status, and send controls so actions do not crowd each other", async () => {
     const view = render(<TestApp initialPath="/" />);
