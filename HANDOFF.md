@@ -1,3 +1,74 @@
+## 2026-08-14 Multi-Skill Archive Install Fix
+
+Current state:
+
+- Fixed multi-Skill archive scanning for migration-style bundles that contain many `SKILL.md` directories, rich reference folders, Chinese frontmatter names, hidden temporary directories, and `__pycache__` cache files.
+- Instruction Skill bundle item file limit was raised from 64 to 256 files to support realistic Skill directories while keeping bounded scanning.
+- Hidden/system cache paths are ignored during bundle splitting and instruction scan: dot-prefixed paths, `__MACOSX`, and `__pycache__`.
+- If a `SKILL.md` frontmatter `name` cannot produce a safe slug, the installer now falls back to the directory containing `SKILL.md` instead of the uploaded archive filename.
+
+Verification performed:
+
+- TDD red checks first failed for:
+  - rich instruction Skill directory with 80 reference files;
+  - Chinese-only frontmatter name needing directory slug fallback;
+  - hidden nested `.worktrees` Skill plus `__pycache__/*.pyc` cache files.
+- Local green checks:
+  - `uv run pytest tests/api/test_admin_resources.py::test_skill_archive_upload_accepts_rich_instruction_skill_directory tests/api/test_admin_resources.py::test_skill_archive_upload_uses_directory_slug_when_frontmatter_name_has_no_slug tests/api/test_admin_resources.py::test_skill_archive_upload_ignores_hidden_nested_skill_directories -q --tb=short` -> 3 passed.
+  - `uv run pytest tests/api/test_admin_resources.py -k "skill_archive_upload or skill" -q --tb=short` -> 15 passed.
+  - `uv run pytest tests/unit/skills/test_package.py tests/unit/channels/feishu/test_commands.py -q --tb=short` -> 41 passed.
+  - `uv run ruff check src/agent_hub/api/routers/admin.py tests/api/test_admin_resources.py tests/unit/channels/feishu/test_commands.py tests/unit/skills/test_package.py` -> passed.
+  - `uv run mypy --strict src/agent_hub/api/routers/admin.py` -> passed.
+  - `git diff --check` -> passed with existing CRLF warnings.
+- Local integration skill lifecycle tests were attempted but the local Postgres test DB did not become ready within 30 seconds, so that group was environment-blocked locally.
+- Real migration-like local scan:
+  - Built an in-memory zip from real local Skill directories `aibiandao` and `automation-assistant`.
+  - `_scan_skill_archive_upload` returned `bundle=True`, `scanned=2`, `skipped=0`.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-skill-bundle-install-fix.tgz` with only `src/agent_hub/api/routers/admin.py`, `tests/api/test_admin_resources.py`, and `HANDOFF.md`.
+  - Backed up overwritten files under `/opt/agent-hub/backups/skill-bundle-install-fix-<timestamp>`.
+  - Restarted `agent-hub-api` and `agent-hub-worker`; verified API, worker, and Caddy are active.
+- Server real environment upload verification:
+  - Uploaded and ran `/tmp/probe_skill_bundle_upload.py` with production env and real admin API.
+  - Verified real `POST /api/v1/admin/skills/upload` accepts:
+    - `skills.zip` with 99 Skill directories;
+    - `all-skills_1.tar.gz` with `all-skills_1/skills/<skill>/SKILL.md` structure;
+    - rich Skill directory with 80 reference files;
+    - Chinese-only frontmatter name using directory slug fallback;
+    - hidden `.worktrees` nested Skill and `__pycache__/*.pyc` ignored.
+  - The probe deleted created test Skill resources through the real API afterward.
+  - Removed `/tmp/probe_skill_bundle_upload.py` and `/tmp/agent-hub-skill-bundle-install-fix.tgz`.
+
+Remaining risks / next:
+
+- Full local integration lifecycle tests still require a reachable local Postgres test DB.
+- Continue queued P3 tasks after GitHub archive/push/check: OpenClaw desktop/screen/file capabilities, UI/layout/copy audit, README/README.zh-CN, and Docker readiness later.
+## 2026-08-14 OpenClaw Agent Hub Remote Adapter E2E and Audio Capability Note
+
+Current state:
+
+- Confirmed model input-understanding capabilities include both `vision` and `audio`; UI exposes them as `图片理解` and `语音理解` under model capability configuration, not as a global system switch.
+- Completed a real server end-to-end OpenClaw test through Agent Hub's admin API and the configured remote adapter path.
+- The probe used `openclaw_mode=ask`, created an OpenClaw session, created a low-risk server command operation, explicitly approved it through the API, and executed it through a bearer-token protected remote adapter.
+- The adapter was started temporarily with `OPENCLAW_ADAPTER_PLATFORM=windows` and a single exact argv allowlist. It did not run with broad/default permissions.
+
+Verification performed:
+
+- Local check: `python -m py_compile .local-archives\probe_openclaw_agenthub_remote_e2e.py` passed; `git status --short` stayed clean because the probe is under ignored `.local-archives`.
+- Server real environment test:
+  - Uploaded `/tmp/probe_openclaw_agenthub_remote_e2e.py` to `prod-web-01`.
+  - Loaded `/etc/agent-hub/secrets.env`, used `/opt/agent-hub/current/.venv/bin/python`, production settings, production DB, and the real API at `http://127.0.0.1:8000`.
+  - The script created a short-lived super-admin JWT without printing token/key material.
+  - It called real `GET/PUT /api/v1/admin/settings`, `POST /api/v1/admin/secrets`, `POST /api/v1/admin/openclaw/sessions`, `POST/PATCH/execute /api/v1/admin/openclaw/operations`.
+  - Execution returned `openclaw-agenthub-remote-adapter-live`, exit code `0`; operation status was `executed`.
+  - Original system settings were restored in `finally`.
+  - Temporary OpenClaw session/operation resources and temporary adapter secret row were deleted narrowly by resource id/ref.
+  - Removed `/tmp/probe_openclaw_agenthub_remote_e2e.py` and confirmed no adapter probe process remained.
+
+Remaining risks / next:
+
+- This verifies guarded remote command execution through Agent Hub. Desktop action, screen read, and file read OpenClaw adapters still need dedicated cross-platform capability implementations and real probes.
+- Continue the P3 queue with the multi-Skill archive install bug, then remaining UI/functionality audit items.
 ## 2026-08-14 OpenClaw Local Adapter Entrypoints
 
 Current state:

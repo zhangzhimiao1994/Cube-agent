@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import io
@@ -1603,7 +1603,7 @@ _INSTRUCTION_SKILL_FORBIDDEN_EXTENSIONS = frozenset(
 _INSTRUCTION_SKILL_NESTED_ARCHIVE_EXTENSIONS = frozenset(
     {".zip", ".tar", ".tgz", ".gz", ".bz2", ".xz", ".7z", ".rar", ".whl"}
 )
-_MAX_SKILL_BUNDLE_ITEMS = 64
+_MAX_SKILL_BUNDLE_ITEMS = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -1671,8 +1671,11 @@ def _scan_instruction_skill_archive(filename: str, archive_bytes: bytes) -> _Sca
     members = _instruction_skill_members(archive_bytes)
     if members is None:
         return None
-    _skill_md_path, skill_md_bytes = members
-    name = _instruction_skill_name(skill_md_bytes, fallback=PurePosixPath(filename).stem)
+    skill_md_path, skill_md_bytes = members
+    name = _instruction_skill_name(
+        skill_md_bytes,
+        fallback=_instruction_skill_fallback_name(filename, skill_md_path),
+    )
     return _ScannedSkillArchive(
         filename=filename,
         archive_bytes=archive_bytes,
@@ -1694,6 +1697,8 @@ def _instruction_skill_members(archive_bytes: bytes) -> tuple[str, bytes] | None
                     if _skill_bundle_mode_is_unsafe(mode):
                         raise InvalidSkillPackage("instruction skill contains links or device files")
                     path = _safe_skill_bundle_path(info.filename)
+                    if _skill_bundle_path_is_ignored(path):
+                        continue
                     _validate_instruction_skill_file(path)
                     normalized_to_original[path] = info.filename
                 candidates = [
@@ -1721,6 +1726,8 @@ def _instruction_skill_members(archive_bytes: bytes) -> tuple[str, bytes] | None
                 if not member.isfile():
                     raise InvalidSkillPackage("instruction skill contains unsupported file types")
                 path = _safe_skill_bundle_path(member.name)
+                if _skill_bundle_path_is_ignored(path):
+                    continue
                 _validate_instruction_skill_file(path)
                 if PurePosixPath(path).name.lower() in _SKILL_INSTRUCTION_NAMES:
                     files.append((path, member))
@@ -1737,6 +1744,13 @@ def _instruction_skill_members(archive_bytes: bytes) -> tuple[str, bytes] | None
             return path, source.read()
     except tarfile.TarError as exc:
         raise InvalidSkillPackage("skill archive must be a valid zip or tar archive") from exc
+
+
+def _instruction_skill_fallback_name(filename: str, skill_md_path: str) -> str:
+    parent = PurePosixPath(skill_md_path).parent
+    if parent.as_posix() not in {"", "."}:
+        return parent.name
+    return PurePosixPath(filename).stem
 
 
 def _instruction_skill_name(skill_md_bytes: bytes, *, fallback: str) -> str:
@@ -1756,14 +1770,20 @@ def _instruction_skill_name(skill_md_bytes: bytes, *, fallback: str) -> str:
                 value = front_matter.get("name")
                 if isinstance(value, str):
                     raw_name = value
-    return _skill_name_slug(raw_name or fallback)
+    slug = _skill_name_slug_or_none(raw_name) if raw_name else None
+    return slug or _skill_name_slug(fallback)
 
 
 def _skill_name_slug(value: str) -> str:
-    slug = re.sub(r"[^a-z0-9_-]+", "-", value.strip().lower()).strip("-_")
-    if not slug:
+    slug = _skill_name_slug_or_none(value)
+    if slug is None:
         raise InvalidSkillPackage("instruction skill name is invalid")
-    return slug[:128]
+    return slug
+
+
+def _skill_name_slug_or_none(value: str) -> str | None:
+    slug = re.sub(r"[^a-z0-9_-]+", "-", value.strip().lower()).strip("-_")
+    return slug[:128] if slug else None
 
 
 def _validate_instruction_skill_file(path: str) -> None:
@@ -1825,7 +1845,10 @@ def _split_zip_skill_bundle(filename: str, archive_bytes: bytes) -> tuple[tuple[
                 mode = (info.external_attr >> 16) & 0o777777
                 if _skill_bundle_mode_is_unsafe(mode):
                     raise InvalidSkillPackage("skill bundle contains links or device files")
-                entries.append((_safe_skill_bundle_path(info.filename), info))
+                path = _safe_skill_bundle_path(info.filename)
+                if _skill_bundle_path_is_ignored(path):
+                    continue
+                entries.append((path, info))
             groups = _skill_bundle_groups(entries)
             return tuple(
                 (
@@ -1850,7 +1873,10 @@ def _split_tar_skill_bundle(filename: str, archive_bytes: bytes) -> tuple[tuple[
                     raise InvalidSkillPackage("skill bundle contains links or device files")
                 if not member.isfile():
                     raise InvalidSkillPackage("skill bundle contains unsupported file types")
-                entries.append((_safe_skill_bundle_path(member.name), member))
+                path = _safe_skill_bundle_path(member.name)
+                if _skill_bundle_path_is_ignored(path):
+                    continue
+                entries.append((path, member))
             groups = _skill_bundle_groups(entries)
             return tuple(
                 (
@@ -1876,6 +1902,10 @@ def _safe_skill_bundle_path(name: str) -> str:
     if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
         raise InvalidSkillPackage("skill bundle contains unsafe paths")
     return path.as_posix()
+
+
+def _skill_bundle_path_is_ignored(path: str) -> bool:
+    return any(part.startswith(".") or part in {"__MACOSX", "__pycache__"} for part in PurePosixPath(path).parts)
 
 
 def _skill_bundle_groups[T](entries: list[tuple[str, T]]) -> tuple[tuple[str, list[tuple[str, T]]], ...]:

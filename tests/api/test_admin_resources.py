@@ -1557,6 +1557,55 @@ def large_flat_instruction_skill_bundle_zip() -> bytes:
             )
     return buffer.getvalue()
 
+
+def instruction_bundle_with_rich_skill_directory_zip() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "rich-skill/SKILL.md",
+            "---\nname: rich-skill\ndescription: Skill with reference files.\n---\n\nUse this skill.\n",
+        )
+        for index in range(80):
+            archive.writestr(
+                f"rich-skill/references/note-{index:03d}.md",
+                f"Reference note {index}.\n",
+            )
+        archive.writestr(
+            "compact-skill/SKILL.md",
+            "---\nname: compact-skill\ndescription: Compact bundled skill.\n---\n\nUse this skill.\n",
+        )
+    return buffer.getvalue()
+
+
+def instruction_bundle_with_non_slug_frontmatter_name_zip() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "bianzheng-pingheng/SKILL.md",
+            "---\nname: 辩证平衡\ndescription: 中文名称的 Skill。\n---\n\nUse this skill.\n",
+        )
+    return buffer.getvalue()
+
+
+def instruction_bundle_with_hidden_nested_skill_zip() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "aibiandao/SKILL.md",
+            "---\nname: aibiandao\ndescription: Parent skill.\n---\n\nUse this skill.\n",
+        )
+        archive.writestr(
+            "aibiandao/.worktrees/draft/SKILL.md",
+            "---\nname: should-not-install\ndescription: Hidden worktree.\n---\n\nIgnore this worktree.\n",
+        )
+        archive.writestr("aibiandao/.worktrees/draft/notes.md", "temporary worktree note\n")
+        archive.writestr("aibiandao/__pycache__/cached.cpython-314.pyc", b"cached")
+        archive.writestr(
+            "other-skill/SKILL.md",
+            "---\nname: other-skill\ndescription: Other skill.\n---\n\nUse this skill.\n",
+        )
+    return buffer.getvalue()
+
 def partially_invalid_instruction_skill_bundle_zip() -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
@@ -2564,6 +2613,51 @@ def test_skill_archive_upload_accepts_large_nested_instruction_bundle_tar_gz() -
     assert body["items"][0]["name"] == "nested-instruction-skill-000"
     assert body["items"][-1]["name"] == "nested-instruction-skill-098"
     assert len(skills.json()) == 99
+
+
+def test_skill_archive_upload_accepts_rich_instruction_skill_directory() -> None:
+    api = client()
+
+    uploaded = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "rich-skills.zip"},
+        content=instruction_bundle_with_rich_skill_directory_zip(),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert uploaded.status_code == 200
+    body = uploaded.json()
+    assert body["bundle"] is True
+    assert [item["name"] for item in body["items"]] == ["rich-skill", "compact-skill"]
+    assert {item["name"] for item in skills.json()} == {"rich-skill", "compact-skill"}
+
+
+def test_skill_archive_upload_uses_directory_slug_when_frontmatter_name_has_no_slug() -> None:
+    api = client()
+
+    uploaded = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "skills.zip"},
+        content=instruction_bundle_with_non_slug_frontmatter_name_zip(),
+    )
+
+    assert uploaded.status_code == 200
+    body = uploaded.json()
+    assert body["items"][0]["name"] == "bianzheng-pingheng"
+
+
+def test_skill_archive_upload_ignores_hidden_nested_skill_directories() -> None:
+    api = client()
+
+    uploaded = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "hidden-worktree-skills.zip"},
+        content=instruction_bundle_with_hidden_nested_skill_zip(),
+    )
+
+    assert uploaded.status_code == 200
+    body = uploaded.json()
+    assert [item["name"] for item in body["items"]] == ["aibiandao", "other-skill"]
 
 def test_skill_archive_upload_keeps_valid_bundle_items_when_one_item_is_invalid() -> None:
     api = client()
