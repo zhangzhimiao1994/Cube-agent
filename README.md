@@ -27,7 +27,7 @@ cd mutilagent
 sudo bash install.sh --mode auto --yes
 ```
 
-`auto` prefers native systemd mode on Ubuntu 22.04/24.04, Debian 12/13, Rocky Linux 9, and AlmaLinux 9. Docker mode is available as an optional fallback.
+`auto` prefers native mode on supported systemd Linux hosts: Ubuntu 22.04/24.04, Debian 12/13, Rocky Linux 9, and AlmaLinux 9. Docker mode is available as an optional fallback.
 
 If the server does not have `git`:
 

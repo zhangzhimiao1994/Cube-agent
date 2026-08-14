@@ -3869,3 +3869,10 @@ Server deployment and real verification:
 - Real server API probe used a short-lived admin token generated on the server, submitted a real `POST /api/v1/runs` request, then read `GET /api/v1/admin/logs?category=audit`.
 - Probe result: `submit_status=202`, `audit_logs_status=200`, run `af80f59f-2358-43d5-929e-e362d26924e8`, conversation `conv-audit-probe-9cb4c999fc8f`, `audit_user_id_present=True`, `audit_conversation_id_present=True`, mode fields `auto->None`.
 - Cleaned server `/tmp/agent-hub-readme-audit-logs.tgz`, `/tmp/deploy-readme-audit-logs.sh`, and `/tmp/probe-audit-run-submit.sh`.
+
+CI follow-up:
+- GitHub Actions run `31780816883` failed in `uv run pytest -q` because README contract tests still expected the old `mix-agent` checkout URL and the exact phrase `prefers native mode`.
+- Fixed `README.md` to include `prefers native mode` and updated `tests/unit/test_deployment_contracts.py` to expect `zhangzhimiao1994/mutilagent` and `cd mutilagent`.
+- Local targeted verification passed: `uv run pytest tests/unit/install/test_native_install_scripts.py::test_auto_mode_prefers_native_on_supported_systemd_hosts tests/unit/test_deployment_contracts.py::test_readme_uses_repository_checkout_instead_of_placeholder_install_url -q`.
+- Local `uv run ruff check tests/unit/test_deployment_contracts.py tests/unit/install/test_native_install_scripts.py` passed.
+- Local full `uv run pytest -q` did not complete on Windows before the 300s tool timeout; it ended with stdout flush errors after timeout rather than a test failure report. Recheck full suite through GitHub Actions after pushing the fix.
