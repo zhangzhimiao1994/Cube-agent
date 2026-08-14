@@ -18,6 +18,28 @@ function compactValue(value: string | null | undefined, fallback = "未设置") 
   return value && value.trim() ? value : fallback;
 }
 
+type ApprovalDraft = {
+  baselineAgentId: string;
+  evaluatorAgentId: string;
+  note: string;
+};
+
+type AcceptedChoice = "auto" | "accept" | "reject";
+
+function defaultApprovalDraft(run: EvolutionRun): ApprovalDraft {
+  return {
+    baselineAgentId: run.baseline_agent_id ?? "",
+    evaluatorAgentId: run.evaluator_agent_id ?? "",
+    note: run.approval_note || "人工确认基准 agent 和评测口径。",
+  };
+}
+
+function acceptedValue(choice: AcceptedChoice) {
+  if (choice === "accept") return true;
+  if (choice === "reject") return false;
+  return null;
+}
+
 export function EvolutionPage() {
   const queryClient = useQueryClient();
   const evolutionRuns = useQuery({ queryKey: ["evolution-runs"], queryFn: () => api.evolutionRuns() });
@@ -30,16 +52,35 @@ export function EvolutionPage() {
   const [approvalPolicy, setApprovalPolicy] = useState<"ask" | "auto" | "manual">("ask");
   const [iterationPolicy, setIterationPolicy] = useState<"score_gated" | "fixed_rounds" | "manual_review">("score_gated");
   const [memoryPolicy, setMemoryPolicy] = useState<"none" | "summarize_between_rounds" | "full_ledger">("summarize_between_rounds");
+  const [approvalDrafts, setApprovalDrafts] = useState<Record<string, ApprovalDraft>>({});
   const [roundRunId, setRoundRunId] = useState("");
   const [changedDimension, setChangedDimension] = useState("实测表现");
   const [candidateSummary, setCandidateSummary] = useState("补充测试 prompt 并降低自评偏差。");
   const [scoreBefore, setScoreBefore] = useState("72");
   const [scoreAfter, setScoreAfter] = useState("76");
+  const [testsPassed, setTestsPassed] = useState(true);
+  const [regressionDetected, setRegressionDetected] = useState(false);
+  const [acceptedChoice, setAcceptedChoice] = useState<AcceptedChoice>("auto");
+  const [judgeSummary, setJudgeSummary] = useState("由基准评测 agent 和固定测试集记录。");
+  const [artifactRefs, setArtifactRefs] = useState("");
+  const [tokensUsed, setTokensUsed] = useState("0");
+  const [elapsedSeconds, setElapsedSeconds] = useState("0");
 
   const runs = evolutionRuns.data ?? [];
   const activeRuns = runs.filter((run) => run.status === "running");
   const selectedRoundRunId = roundRunId || activeRuns[0]?.id || runs[0]?.id || "";
   const selectedRoundRun = runs.find((run) => run.id === selectedRoundRunId) ?? null;
+
+  function draftFor(run: EvolutionRun) {
+    return approvalDrafts[run.id] ?? defaultApprovalDraft(run);
+  }
+
+  function updateDraft(run: EvolutionRun, patch: Partial<ApprovalDraft>) {
+    setApprovalDrafts((current) => ({
+      ...current,
+      [run.id]: { ...draftFor(run), ...patch },
+    }));
+  }
 
   const createRun = useMutation({
     mutationFn: () =>
@@ -62,20 +103,24 @@ export function EvolutionPage() {
       }),
     onSuccess: async (created) => {
       setRoundRunId(created.id);
+      setApprovalDrafts((current) => ({ ...current, [created.id]: defaultApprovalDraft(created) }));
       await queryClient.invalidateQueries({ queryKey: ["evolution-runs"] });
     },
   });
 
   const approveRun = useMutation({
-    mutationFn: (run: EvolutionRun) =>
-      api.approveEvolutionRun(run.id, {
-        approved: true,
-        baseline_agent_id: run.baseline_agent_id,
-        evaluator_agent_id: run.evaluator_agent_id,
-        note: "人工确认基准 agent 和评测口径。",
-      }),
+    mutationFn: ({ run, approved }: { run: EvolutionRun; approved: boolean }) => {
+      const draft = draftFor(run);
+      return api.approveEvolutionRun(run.id, {
+        approved,
+        baseline_agent_id: draft.baselineAgentId.trim() || null,
+        evaluator_agent_id: draft.evaluatorAgentId.trim() || null,
+        note: draft.note.trim(),
+      });
+    },
     onSuccess: async (approved) => {
       setRoundRunId(approved.id);
+      setApprovalDrafts((current) => ({ ...current, [approved.id]: defaultApprovalDraft(approved) }));
       await queryClient.invalidateQueries({ queryKey: ["evolution-runs"] });
     },
   });
@@ -87,9 +132,13 @@ export function EvolutionPage() {
         candidate_summary: candidateSummary.trim(),
         score_before: Number(scoreBefore),
         score_after: Number(scoreAfter),
-        tests_passed: true,
-        regression_detected: false,
-        judge_summary: "由基准评测 agent 和固定测试集记录。",
+        tests_passed: testsPassed,
+        regression_detected: regressionDetected,
+        accepted: acceptedValue(acceptedChoice),
+        judge_summary: judgeSummary.trim(),
+        artifact_refs: splitList(artifactRefs),
+        tokens_used: Number(tokensUsed) || 0,
+        elapsed_seconds: Number(elapsedSeconds) || 0,
       }),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["evolution-runs"] });
@@ -211,6 +260,42 @@ export function EvolutionPage() {
                 <input value={scoreAfter} onChange={(event) => setScoreAfter(event.target.value)} inputMode="decimal" />
               </label>
             </div>
+            <div className="inline-fields">
+              <label className="inline-check compact-check">
+                <input type="checkbox" checked={testsPassed} onChange={(event) => setTestsPassed(event.target.checked)} />
+                测试通过
+              </label>
+              <label className="inline-check compact-check">
+                <input type="checkbox" checked={regressionDetected} onChange={(event) => setRegressionDetected(event.target.checked)} />
+                发现回归
+              </label>
+            </div>
+            <label>
+              候选接收
+              <select value={acceptedChoice} onChange={(event) => setAcceptedChoice(event.target.value as AcceptedChoice)}>
+                <option value="auto">按分数和测试自动判断</option>
+                <option value="accept">人工接收</option>
+                <option value="reject">人工拒绝</option>
+              </select>
+            </label>
+            <label>
+              评审说明
+              <textarea value={judgeSummary} onChange={(event) => setJudgeSummary(event.target.value)} />
+            </label>
+            <label>
+              产物引用
+              <textarea value={artifactRefs} onChange={(event) => setArtifactRefs(event.target.value)} placeholder="每行一个产物或报告引用" />
+            </label>
+            <div className="inline-fields">
+              <label>
+                Token 消耗
+                <input value={tokensUsed} onChange={(event) => setTokensUsed(event.target.value)} inputMode="numeric" />
+              </label>
+              <label>
+                耗时秒
+                <input value={elapsedSeconds} onChange={(event) => setElapsedSeconds(event.target.value)} inputMode="numeric" />
+              </label>
+            </div>
             <button type="submit" disabled={recordRound.isPending || !selectedRoundRunId || selectedRoundRun?.status !== "running"}>
               {recordRound.isPending ? "登记中..." : "登记轮次"}
             </button>
@@ -232,6 +317,7 @@ export function EvolutionPage() {
         <div className="evolution-run-list">
           {runs.map((run) => {
             const latest = latestRound(run);
+            const draft = draftFor(run);
             return (
               <article key={run.id} className="evolution-run-card">
                 <div>
@@ -254,13 +340,37 @@ export function EvolutionPage() {
                   <dd>{run.rounds.length} / {run.max_rounds}</dd>
                   <dt>最近建议</dt>
                   <dd>{latest ? latest.recommendation : "等待首轮"}</dd>
+                  <dt>停止原因</dt>
+                  <dd>{run.stop_reason ?? latest?.stop_reason ?? "无"}</dd>
                 </dl>
                 {run.candidate_agent_ids.length > 0 ? <p>候选 agent：{run.candidate_agent_ids.join("、")}</p> : null}
+                {run.source_conversation_id ? <p>来源会话：{run.source_conversation_id}</p> : null}
                 {latest ? <p>第 {latest.round} 轮：{latest.changed_dimension}，提升 {latest.delta}</p> : null}
                 {run.approval_status === "pending" ? (
-                  <button type="button" onClick={() => approveRun.mutate(run)} disabled={approveRun.isPending}>
-                    {approveRun.isPending ? "审批中..." : "审批通过"}
-                  </button>
+                  <div className="stacked-form evolution-approval-controls" aria-label={`${run.title} 审批设置`}>
+                    <div className="inline-fields">
+                      <label>
+                        审批基准 agent
+                        <input value={draft.baselineAgentId} onChange={(event) => updateDraft(run, { baselineAgentId: event.target.value })} />
+                      </label>
+                      <label>
+                        审批评测 agent
+                        <input value={draft.evaluatorAgentId} onChange={(event) => updateDraft(run, { evaluatorAgentId: event.target.value })} />
+                      </label>
+                    </div>
+                    <label>
+                      审批备注
+                      <textarea value={draft.note} onChange={(event) => updateDraft(run, { note: event.target.value })} />
+                    </label>
+                    <div className="table-actions">
+                      <button type="button" onClick={() => approveRun.mutate({ run, approved: true })} disabled={approveRun.isPending}>
+                        {approveRun.isPending ? "审批中..." : "审批通过"}
+                      </button>
+                      <button type="button" className="danger-action" onClick={() => approveRun.mutate({ run, approved: false })} disabled={approveRun.isPending}>
+                        拒绝进化
+                      </button>
+                    </div>
+                  </div>
                 ) : null}
                 {approveRun.isError ? <p role="alert">{formatApiError(approveRun.error, "进化任务审批失败")}</p> : null}
               </article>

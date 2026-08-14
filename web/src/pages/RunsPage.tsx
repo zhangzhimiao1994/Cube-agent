@@ -2033,7 +2033,7 @@ export function RunsPage() {
 
       <button
         type="button"
-        className="conversation-drawer-trigger"
+        className="mobile-nav-trigger conversation-drawer-trigger"
         aria-label={historyOpen ? "关闭历史对话" : "打开历史对话"}
         aria-expanded={historyOpen}
         onClick={() => {

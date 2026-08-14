@@ -4092,3 +4092,36 @@ Server deployment and real verification for Chat-Triggered Evolution Plan + Righ
 CI status for Chat-Triggered Evolution Plan + Right History Drawer:
 
 - GitHub Actions run `31792510103` for commit `4214c62` completed successfully.
+## 2026-08-14 Evolution Controls + Right Drawer Button Polish
+
+Current state:
+
+- Evolution approval cards now let the operator edit the baseline agent, evaluator agent, and approval note before approving, or explicitly reject the evolution run.
+- Evolution round registration now captures test pass/fail, regression state, manual accept/reject choice, judge summary, artifact references, token usage, and elapsed seconds, so Darwin-style long iteration has a concrete round ledger instead of a one-button placeholder.
+- Evolution records now surface stop reason and source conversation context when available.
+- The conversation history entry now reuses the same `mobile-nav-trigger` button class as the left navigation trigger while keeping the right-side drawer behavior.
+
+Local verification:
+
+- Watched the right-drawer button test fail first because the trigger lacked `mobile-nav-trigger`.
+- `npm.cmd run test -- --run src/pages/OperationalPages.test.tsx -t "opens conversation history as a right drawer"` -> 1 passed after the fix.
+- `npm.cmd run test -- --run src/pages/OperationalPages.test.tsx` -> 54 passed.
+- `npm.cmd run lint` -> passed.
+- `npm.cmd run build` -> passed with the existing Vite large chunk warning.
+- `git diff --check` -> passed with CRLF normalization warnings only.
+
+Remaining risks / next:
+
+- Deploy this frontend slice incrementally to `103.236.98.133`, run real server/API/frontend marker checks, then create recovery archive/tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
+- User added a later task: channel configurations that are already completed must still support edit and clear/reset actions.
+- Continue broader P3 queue after this slice: OpenClaw desktop/scheduled-control follow-ups, evolution execution orchestration, Skill archive robustness, UI copy/layout audit, missing button/function sweep, README/README.zh-CN refresh, and Docker readiness later.
+Server deployment and real verification for Evolution Controls + Right Drawer Button Polish:
+
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-evolution-controls-right-drawer-20260814-185429.tgz`.
+- Uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed incrementally into `/opt/agent-hub/current`.
+- Server backup path: `/opt/agent-hub/backups/evolution-controls-right-drawer-20260814-105458`.
+- Reloaded Caddy; no backend source changes were needed for this frontend slice. `agent-hub-api`, `agent-hub-worker`, and `caddy` stayed active.
+- First real API probe intentionally failed with `invalid_token` because the probe process had not loaded the systemd service environment. Re-ran with `/etc/agent-hub/secrets.env` loaded without printing secrets.
+- Real server probe used the actual API path `http://127.0.0.1/api/v1`, created a real evolution run, approved it while changing `baseline_agent_id` and `evaluator_agent_id`, recorded a regression round with `accepted=false`, `artifact_refs`, `tokens_used`, and `elapsed_seconds`, verified `next_action=rollback_candidate`, then cleaned the probe evolution resource.
+- Probe output: `{"status": "ok", "checked": ["evolution_create", "approval_edits", "round_regression", "frontend_bundle_markers"], "probe_evolution_id": "evolution_a295c9d42db24c4694a612713e4f6a6b"}`.
+- Removed `/tmp/evolution_controls_check.py`, `/tmp/deploy-evolution-controls-right-drawer.sh`, and `/tmp/agent-hub-p3-runtime-incremental.tgz`; `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.

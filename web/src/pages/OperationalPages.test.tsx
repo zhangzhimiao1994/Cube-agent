@@ -2,7 +2,7 @@ import { cleanup, render, screen, waitFor, within } from "@testing-library/react
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { RunDetail, RunListItem } from "../api/client";
+import type { EvolutionRun, RunDetail, RunListItem } from "../api/client";
 import { TestApp } from "../app/router";
 
 const runId = "22222222-2222-4222-8222-222222222222";
@@ -243,13 +243,15 @@ const models = [
 ];
 
 
-const evolutionRun = {
+const evolutionRun: EvolutionRun = {
   id: "evolution_11111111111111111111111111111111",
   kind: "skill_optimization",
   title: "Darwin Skill 迭代",
   objective: "用固定评测集优化 darwin-skill，未达标不发布。",
   mode: "hybrid",
   source_skill_ids: ["darwin-skill"],
+  source_conversation_id: "conv-evolution-darwin",
+  source_run_id: null,
   target_artifact_type: "skill",
   baseline_agent_id: "agent-main-m3",
   candidate_agent_ids: ["agent-coder", "agent-reviewer"],
@@ -626,19 +628,56 @@ describe("operational management pages", () => {
         const approveEvolutionMatch = path.match(/^\/api\/v1\/admin\/evolution-runs\/(evolution_[a-f0-9]+)\/approve$/);
         if (approveEvolutionMatch && method === "POST") {
           const id = approveEvolutionMatch[1];
+          const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
           const current = visibleEvolutionRuns.find((run) => run.id === id) ?? evolutionRun;
           const approved = {
             ...current,
-            status: "running",
-            approval_status: "approved",
+            status: body.approved === false ? "stopped" : "running",
+            approval_status: body.approved === false ? "rejected" : "approved",
             approved_by: "11111111-1111-4111-8111-111111111111",
             approved_at: "2026-08-14T10:10:00Z",
-            approval_note: "人工确认基准 agent。",
-            next_action: "run_next_round",
+            approval_note: String(body.note ?? "人工确认基准 agent。"),
+            baseline_agent_id: typeof body.baseline_agent_id === "string" ? body.baseline_agent_id : current.baseline_agent_id,
+            evaluator_agent_id: typeof body.evaluator_agent_id === "string" ? body.evaluator_agent_id : current.evaluator_agent_id,
+            next_action: body.approved === false ? "stop" : "run_next_round",
           };
           visibleEvolutionRuns = visibleEvolutionRuns.map((run) => (run.id === id ? approved : run));
           if (createdEvolutionRun?.id === id) createdEvolutionRun = approved;
           return jsonResponse(approved);
+        }
+        const roundEvolutionMatch = path.match(/^\/api\/v1\/admin\/evolution-runs\/(evolution_[a-f0-9]+)\/rounds$/);
+        if (roundEvolutionMatch && method === "POST") {
+          const id = roundEvolutionMatch[1];
+          const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
+          const current = visibleEvolutionRuns.find((run) => run.id === id) ?? evolutionRun;
+          const round = {
+            round: current.rounds.length + 1,
+            changed_dimension: String(body.changed_dimension ?? ""),
+            candidate_summary: String(body.candidate_summary ?? ""),
+            score_before: Number(body.score_before ?? 0),
+            score_after: Number(body.score_after ?? 0),
+            delta: Number(body.score_after ?? 0) - Number(body.score_before ?? 0),
+            tests_passed: Boolean(body.tests_passed),
+            regression_detected: Boolean(body.regression_detected),
+            accepted: body.accepted === true,
+            recommendation: body.regression_detected ? "rollback" : "continue",
+            stop_reason: body.regression_detected ? "tests regressed or score did not improve" : null,
+            judge_summary: String(body.judge_summary ?? ""),
+            artifact_refs: Array.isArray(body.artifact_refs) ? body.artifact_refs : [],
+            tokens_used: Number(body.tokens_used ?? 0),
+            elapsed_seconds: Number(body.elapsed_seconds ?? 0),
+            created_at: "2026-08-14T10:12:00Z",
+          };
+          const updated = {
+            ...current,
+            rounds: [...current.rounds, round],
+            status: body.regression_detected ? "stopped" : "running",
+            next_action: body.regression_detected ? "rollback_candidate" : "run_next_round",
+            stop_reason: body.regression_detected ? "tests regressed or score did not improve" : current.stop_reason,
+          };
+          visibleEvolutionRuns = visibleEvolutionRuns.map((run) => (run.id === id ? updated : run));
+          if (createdEvolutionRun?.id === id) createdEvolutionRun = updated;
+          return jsonResponse(updated);
         }
         if (path === "/api/v1/admin/evolution-runs") {
           return jsonResponse(visibleEvolutionRuns);
@@ -1791,7 +1830,11 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: "打开导航栏" }));
     expect(shell?.className).toContain("mobile-nav-open");
 
-    await user.click(screen.getByRole("button", { name: "打开历史对话" }));
+    const historyTrigger = screen.getByRole("button", { name: "打开历史对话" });
+    expect(historyTrigger.className).toContain("mobile-nav-trigger");
+    expect(historyTrigger.className).toContain("conversation-drawer-trigger");
+
+    await user.click(historyTrigger);
     expect(shell?.className).not.toContain("mobile-nav-open");
     expect(chatConsole?.className).toContain("history-drawer-open");
     expect(screen.getByRole("navigation", { name: "会话导航" })).not.toBeNull();
@@ -2153,8 +2196,59 @@ describe("operational management pages", () => {
       },
     });
 
+    await user.clear(screen.getByLabelText(/审批基准 agent/));
+    await user.type(screen.getByLabelText(/审批基准 agent/), "agent-main-strong");
+    await user.clear(screen.getByLabelText(/审批评测 agent/));
+    await user.type(screen.getByLabelText(/审批评测 agent/), "agent-evaluator-strong");
+    await user.clear(screen.getByLabelText(/审批备注/));
+    await user.type(screen.getByLabelText(/审批备注/), "更换基准后再进入首轮。");
     await user.click(await screen.findByRole("button", { name: "审批通过" }));
     await waitFor(() => expect(createdEvolutionRun?.status).toBe("running"));
+    expect(requests.find((request) => request.path.endsWith(`/evolution-runs/${createdEvolutionRun?.id}/approve`))).toMatchObject({
+      body: {
+        approved: true,
+        baseline_agent_id: "agent-main-strong",
+        evaluator_agent_id: "agent-evaluator-strong",
+        note: "更换基准后再进入首轮。",
+      },
+    });
+
+    await user.clear(screen.getByLabelText("改动维度"));
+    await user.type(screen.getByLabelText("改动维度"), "反例覆盖");
+    await user.clear(screen.getByLabelText("候选摘要"));
+    await user.type(screen.getByLabelText("候选摘要"), "扩展失败样例并压缩提示词。");
+    await user.clear(screen.getByLabelText("前分数"));
+    await user.type(screen.getByLabelText("前分数"), "76");
+    await user.clear(screen.getByLabelText("后分数"));
+    await user.type(screen.getByLabelText("后分数"), "74");
+    await user.click(screen.getByLabelText("发现回归"));
+    await user.selectOptions(screen.getByLabelText("候选接收"), "reject");
+    await user.clear(screen.getByLabelText("评审说明"));
+    await user.type(screen.getByLabelText("评审说明"), "反例集失败，要求回滚候选版本。");
+    await user.clear(screen.getByLabelText("产物引用"));
+    await user.type(screen.getByLabelText("产物引用"), "artifact://eval/report-1\nartifact://candidate/patch-1");
+    await user.clear(screen.getByLabelText("Token 消耗"));
+    await user.type(screen.getByLabelText("Token 消耗"), "4096");
+    await user.clear(screen.getByLabelText("耗时秒"));
+    await user.type(screen.getByLabelText("耗时秒"), "180");
+    await user.click(screen.getByRole("button", { name: "登记轮次" }));
+
+    await waitFor(() => expect(createdEvolutionRun?.next_action).toBe("rollback_candidate"));
+    expect(requests.find((request) => request.path.endsWith(`/evolution-runs/${createdEvolutionRun?.id}/rounds`))).toMatchObject({
+      body: {
+        changed_dimension: "反例覆盖",
+        candidate_summary: "扩展失败样例并压缩提示词。",
+        score_before: 76,
+        score_after: 74,
+        tests_passed: true,
+        regression_detected: true,
+        accepted: false,
+        judge_summary: "反例集失败，要求回滚候选版本。",
+        artifact_refs: ["artifact://eval/report-1", "artifact://candidate/patch-1"],
+        tokens_used: 4096,
+        elapsed_seconds: 180,
+      },
+    });
   });
   it("shows MCP, memory, and modular log pages", async () => {
     const user = userEvent.setup();
