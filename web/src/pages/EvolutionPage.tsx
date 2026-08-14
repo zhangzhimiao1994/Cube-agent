@@ -177,7 +177,7 @@ export function EvolutionPage() {
       <p className="eyebrow">Evolution</p>
       <h2>进化</h2>
       <p className="compact-page-intro">
-        这里管理 Skill 蒸馏、达尔文式迭代和长期多轮任务。候选结果先进入记录，经过评测和审批后再发布。
+        这里管理 Skill 蒸馏、达尔文式迭代和需要评测门控的长期改进任务。普通问答、方案规划和对话上下文压缩属于对话框架，不会默认进入进化。候选结果先进入记录，经过评测和审批后再发布。
       </p>
 
       <div className="resource-layout">

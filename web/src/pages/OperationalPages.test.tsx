@@ -2360,6 +2360,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/evolution" />);
 
     expect(await screen.findByRole("heading", { name: "进化" })).not.toBeNull();
+    expect(screen.getByText(/普通问答、方案规划和对话上下文压缩属于对话框架/)).not.toBeNull();
     const records = await screen.findByRole("region", { name: "进化任务" });
     expect(await within(records).findByText("Darwin Skill 迭代")).not.toBeNull();
     expect(within(records).getByText("agent-main-m3")).not.toBeNull();

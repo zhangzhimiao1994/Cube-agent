@@ -33,7 +33,7 @@ export const MODULE_GROUPS: ModuleGroup[] = [
       {
         to: "/evolution",
         label: "进化",
-        description: "管理 Skill 蒸馏、达尔文迭代、长期多轮任务和候选产物验收。",
+        description: "管理 Skill 蒸馏、达尔文迭代和候选产物验收；普通对话不会默认进入进化。",
         permission: "skill:read",
       },
     ],

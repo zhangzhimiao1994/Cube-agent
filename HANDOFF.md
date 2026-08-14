@@ -1,3 +1,27 @@
+## 2026-08-15 Evolution Copy Boundary
+
+### State
+- Clarified the Evolution page and navigation copy so Skill distillation, Darwin-style iteration, and score-gated long-running improvement tasks stay in the Evolution module, while ordinary Q&A, planning, multi-turn context compression, and memory continuity remain part of the conversation framework.
+- Added a regression assertion so the Evolution page must keep the copy that normal chat and context compression do not default into evolution.
+- Answered the Feishu saved-config question during this slice: previously saved Feishu App ID/Secret/transport can be reused if credentials and app setup did not change; if the page was cleared or still shows stale configured state, the channel-config follow-up must verify backend stored sources and runtime reload, not just the UI label.
+
+### Verification
+- `npm test -- --run src/pages/OperationalPages.test.tsx -t "shows evolution records"` from `web/` -> 58 passed.
+- `npm test -- --run src/pages/OperationalPages.test.tsx src/app/AppShell.test.tsx` from `web/` -> 64 passed.
+- `npm run lint` from `web/` -> passed.
+- `npm run build` from `web/` -> passed with the existing Vite large chunk warning.
+- `git diff --check` -> passed with only CRLF normalization warnings for touched files.
+
+### Server Deployment And Real Probe
+- Created local server incremental archive `.local-archives/server-incrementals/agent-hub-evolution-copy-boundary-20260815-063309.tgz` and uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`; server backup retained under `/opt/agent-hub/backups/p3-evolution-copy-boundary-20260815-063309`.
+- Server archive retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-evolution-copy-boundary-20260815-063309.tgz`.
+- Real server probe output: API health returned `{"status":"ok"}`, `/evolution` loaded `/assets/index-DEK92yP9.js`, and the active production bundle contains `普通问答、方案规划和对话上下文压缩属于对话框架`, `不会默认进入进化`, and `需要评测门控的长期改进任务`.
+- Removed server deployment/probe temp files and `/tmp/agent-hub-p3-runtime-incremental.tgz` after verification.
+
+### Remaining / Next
+- Commit, create GitHub recovery archive/tag, force-with-lease push `mutilagent/main`, and verify GitHub Actions.
+- Continue remaining P3 items after green: Feishu channel runtime reply checks, channel clear-state/runtime reload fixes if needed, OpenClaw follow-ups, evolution execution/backlog UI, broader UI layout/copy audit, missing button/function sweep, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 OpenClaw Multi-Platform Session Console
 
 ### State
