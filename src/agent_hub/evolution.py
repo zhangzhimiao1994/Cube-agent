@@ -71,6 +71,22 @@ class EvolutionRoundRequest(BaseModel):
         return value
 
 
+class EvolutionNextRoundPlanResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    round: int = Field(ge=1)
+    action: str = Field(pattern=r"^(run_next_round|review_baseline|rollback_candidate)$")
+    task_title: str
+    task_prompt: str
+    baseline_agent_id: str
+    candidate_agent_ids: list[str]
+    evaluator_agent_id: str
+    memory_policy: str
+    required_output_schema: dict[str, str]
+    previous_rounds: list[str]
+
+
 class EvolutionRoundResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -221,6 +237,56 @@ def append_evolution_round(current: EvolutionRunResponse, request: EvolutionRoun
     )
 
 
+def plan_evolution_next_round(current: EvolutionRunResponse) -> EvolutionNextRoundPlanResponse:
+    round_number = len(current.rounds) + 1
+    action = current.next_action
+    if action not in {"run_next_round", "review_baseline", "rollback_candidate"}:
+        action = "run_next_round"
+    baseline_agent_id = current.baseline_agent_id or "main-agent"
+    candidate_agent_ids = current.candidate_agent_ids or ["candidate-agent"]
+    evaluator_agent_id = current.evaluator_agent_id or baseline_agent_id
+    previous_rounds = [
+        (
+            f"Round {item.round}: {item.changed_dimension}; "
+            f"delta={item.delta}; accepted={item.accepted}; "
+            f"recommendation={item.recommendation}"
+        )
+        for item in current.rounds[-5:]
+    ]
+    task_prompt = _evolution_next_round_prompt(
+        current,
+        round_number=round_number,
+        action=action,
+        baseline_agent_id=baseline_agent_id,
+        candidate_agent_ids=candidate_agent_ids,
+        evaluator_agent_id=evaluator_agent_id,
+        previous_rounds=previous_rounds,
+    )
+    return EvolutionNextRoundPlanResponse(
+        run_id=current.id,
+        round=round_number,
+        action=action,
+        task_title=f"{current.title} / round {round_number}",
+        task_prompt=task_prompt,
+        baseline_agent_id=baseline_agent_id,
+        candidate_agent_ids=candidate_agent_ids,
+        evaluator_agent_id=evaluator_agent_id,
+        memory_policy=current.memory_policy,
+        required_output_schema={
+            "changed_dimension": "The tested dimension changed in this round.",
+            "candidate_summary": "Concrete candidate change summary.",
+            "score_before": "Baseline score before applying the candidate.",
+            "score_after": "Candidate score after evaluation.",
+            "tests_passed": "Whether required tests passed.",
+            "regression_detected": "Whether any regression was detected.",
+            "judge_summary": "Evaluator evidence and reasoning summary.",
+            "artifact_refs": "Generated artifact or report references.",
+            "tokens_used": "Total tokens consumed by this round.",
+            "elapsed_seconds": "Elapsed execution time in seconds.",
+        },
+        previous_rounds=previous_rounds,
+    )
+
 def evolution_round_response(current: EvolutionRunResponse, request: EvolutionRoundRequest) -> EvolutionRoundResponse:
     round_number = len(current.rounds) + 1
     delta = round(request.score_after - request.score_before, 3)
@@ -245,6 +311,42 @@ def evolution_round_response(current: EvolutionRunResponse, request: EvolutionRo
         created_at=datetime.now(UTC),
     )
 
+
+def _evolution_next_round_prompt(
+    current: EvolutionRunResponse,
+    *,
+    round_number: int,
+    action: str,
+    baseline_agent_id: str,
+    candidate_agent_ids: list[str],
+    evaluator_agent_id: str,
+    previous_rounds: list[str],
+) -> str:
+    source_skills = ", ".join(current.source_skill_ids) or "none"
+    candidates = ", ".join(candidate_agent_ids)
+    rubric = "; ".join(current.rubric) or "use the objective-specific rubric"
+    previous = "\n".join(previous_rounds) if previous_rounds else "No previous rounds."
+    return (
+        f"Evolution run: {current.title}\n"
+        f"Objective: {current.objective}\n"
+        f"Round: {round_number}\n"
+        f"Action: {action}\n"
+        f"Target artifact type: {current.target_artifact_type}\n"
+        f"Source skills: {source_skills}\n"
+        f"Baseline agent: {baseline_agent_id}\n"
+        f"Candidate agents: {candidates}\n"
+        f"Evaluator agent: {evaluator_agent_id}\n"
+        f"Iteration policy: {current.iteration_policy}; min_delta={current.min_delta}; "
+        f"max_rounds={current.max_rounds}\n"
+        f"Memory policy: {current.memory_policy}\n"
+        f"Rubric: {rubric}\n"
+        f"Previous rounds:\n{previous}\n"
+        "Execute one bounded evolution round. Compare the candidate against the baseline "
+        "with the fixed evaluation set, reject regressions, and return an EvolutionRoundRequest "
+        "JSON object containing changed_dimension, candidate_summary, score_before, "
+        "score_after, tests_passed, regression_detected, judge_summary, artifact_refs, "
+        "tokens_used, and elapsed_seconds. Do not publish or install the candidate directly."
+    )
 
 def evolution_recommendation(
     current: EvolutionRunResponse,
@@ -291,6 +393,7 @@ def evolution_next_action_after_round(status: str, latest: EvolutionRoundRespons
 
 __all__ = [
     "EvolutionApprovalRequest",
+    "EvolutionNextRoundPlanResponse",
     "EvolutionRoundRequest",
     "EvolutionRoundResponse",
     "EvolutionRunRequest",
@@ -298,4 +401,5 @@ __all__ = [
     "append_evolution_round",
     "approve_evolution_run_response",
     "create_evolution_run_response",
+    "plan_evolution_next_round",
 ]

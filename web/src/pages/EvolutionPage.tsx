@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useState } from "react";
 
-import { api, formatApiError, type EvolutionRun } from "../api/client";
+import { api, formatApiError, type EvolutionNextRoundPlan, type EvolutionRun } from "../api/client";
 
 function latestRound(run: EvolutionRun) {
   return run.rounds[run.rounds.length - 1] ?? null;
@@ -53,6 +53,7 @@ export function EvolutionPage() {
   const [iterationPolicy, setIterationPolicy] = useState<"score_gated" | "fixed_rounds" | "manual_review">("score_gated");
   const [memoryPolicy, setMemoryPolicy] = useState<"none" | "summarize_between_rounds" | "full_ledger">("summarize_between_rounds");
   const [approvalDrafts, setApprovalDrafts] = useState<Record<string, ApprovalDraft>>({});
+  const [nextRoundPlans, setNextRoundPlans] = useState<Record<string, EvolutionNextRoundPlan>>({});
   const [roundRunId, setRoundRunId] = useState("");
   const [changedDimension, setChangedDimension] = useState("实测表现");
   const [candidateSummary, setCandidateSummary] = useState("补充测试 prompt 并降低自评偏差。");
@@ -108,6 +109,12 @@ export function EvolutionPage() {
     },
   });
 
+  const planNextRound = useMutation({
+    mutationFn: (run: EvolutionRun) => api.evolutionNextRoundPlan(run.id),
+    onSuccess: (plan) => {
+      setNextRoundPlans((current) => ({ ...current, [plan.run_id]: plan }));
+    },
+  });
   const approveRun = useMutation({
     mutationFn: ({ run, approved }: { run: EvolutionRun; approved: boolean }) => {
       const draft = draftFor(run);
@@ -318,6 +325,9 @@ export function EvolutionPage() {
           {runs.map((run) => {
             const latest = latestRound(run);
             const draft = draftFor(run);
+            const nextRoundPlan = nextRoundPlans[run.id] ?? null;
+            const isPlanningThisRun = planNextRound.isPending && planNextRound.variables?.id === run.id;
+            const planningFailedThisRun = planNextRound.isError && planNextRound.variables?.id === run.id;
             return (
               <article key={run.id} className="evolution-run-card">
                 <div>
@@ -370,6 +380,23 @@ export function EvolutionPage() {
                         拒绝进化
                       </button>
                     </div>
+                  </div>
+                ) : null}
+                {run.status === "running" ? (
+                  <div className="table-actions">
+                    <button type="button" onClick={() => planNextRound.mutate(run)} disabled={isPlanningThisRun}>
+                      {isPlanningThisRun ? "生成中..." : "生成执行包"}
+                    </button>
+                  </div>
+                ) : null}
+                {planningFailedThisRun ? <p role="alert">{formatApiError(planNextRound.error, "执行包生成失败")}</p> : null}
+                {nextRoundPlan ? (
+                  <div className="reference-preview">
+                    <strong>{nextRoundPlan.task_title}</strong>
+                    <p>
+                      第 {nextRoundPlan.round} 轮 · {nextRoundPlan.action} · 记忆：{nextRoundPlan.memory_policy}
+                    </p>
+                    <pre className="code-block">{nextRoundPlan.task_prompt}</pre>
                   </div>
                 ) : null}
                 {approveRun.isError ? <p role="alert">{formatApiError(approveRun.error, "进化任务审批失败")}</p> : null}

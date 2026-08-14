@@ -4377,3 +4377,44 @@ Remaining risks / next:
 
 - Commit this slice, create a GitHub recovery bundle/tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
 - Continue P3 after green: Evolution execution orchestration, plan-task mode UX, OpenClaw broader workflow integration, UI copy/layout audit, missing button/function sweep, README/README.zh-CN final usage refresh, and Docker readiness later.
+
+## 2026-08-14 Evolution Next-Round Execution Package
+
+Current state:
+
+- Evolution now has a concrete next-round execution package endpoint instead of only manual round records.
+- Added `GET /api/v1/admin/evolution-runs/{run_id}/next-round-plan` behind `skill:read` permission.
+- The endpoint refuses closed runs and still requires human approval when the run is waiting for approval, returning `evolution_run_requires_approval` before an approval decision.
+- After approval, the endpoint returns a structured execution contract for the next round: run id, round number, action, task title, task prompt, baseline agent, candidate agents, evaluator agent, memory policy, required output schema, and previous-round summaries.
+- The task prompt explicitly asks the execution side to compare baseline and candidate outputs on a fixed evaluation set and to return the required score/judgement fields, so Darwin-style iteration is no longer just a UI note.
+- The Evolution UI can now request and display this execution package with a `生成执行包` button for running tasks.
+- This is still the planning/contract slice. The later executor slice should consume this contract, create temporary agent work, collect artifacts, and register a round result automatically or with approval.
+
+Local verification:
+
+- RED first: `.\.venv\Scripts\python.exe -m pytest tests\api\test_admin_resources.py::test_evolution_next_round_plan_requires_approval_and_contains_execution_contract -q` initially failed with 404 before the endpoint existed.
+- `.\.venv\Scripts\python.exe -m pytest tests\api\test_admin_resources.py::test_evolution_next_round_plan_requires_approval_and_contains_execution_contract -q` -> passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\api\test_admin_resources.py -q -k "evolution"` -> 3 passed, 101 deselected.
+- `.\.venv\Scripts\python.exe -m ruff check src\agent_hub\evolution.py src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+- `.\.venv\Scripts\python.exe -m mypy --strict src\agent_hub\evolution.py src\agent_hub\api\routers\admin.py` -> passed.
+- `npm run test -- --run src/pages/OperationalPages.test.tsx -t "shows evolution records"` from `web/` -> 55 passed.
+- `npm run lint` from `web/` -> passed.
+- `npm run build` from `web/` -> passed, with existing Vite large chunk warning only.
+- `git diff --check` -> passed with CRLF normalization warnings only.
+
+Server deployment and real verification:
+
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-evolution-next-round-20260814-220100.tgz`.
+- Uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed incrementally into `/opt/agent-hub/current`.
+- Server backup path retained: `/opt/agent-hub/backups/evolution-next-round-20260814-220232`.
+- Copied changed backend modules into active source and production venv site-packages, deployed the rebuilt frontend `web/dist`, restarted `agent-hub-api` and `agent-hub-worker`, reloaded Caddy, and confirmed all three services are active.
+- During verification, a direct venv import first exposed older site-packages drift for `agent_hub.models.capabilities`; the live systemd service already uses `PYTHONPATH=/opt/agent-hub/current/src`, but the missing module was also copied into active venv to reduce future drift.
+- Full FastAPI lifespan probing was blocked by existing Feishu image-store initialization permissions, so the real functional probe instantiated the same production `PersistentAdminResourceService` against the real database and secret service instead of mocks.
+- Real server probe created a temporary persisted evolution run, confirmed next-round planning is blocked before approval, approved the run, generated the next-round execution package, verified baseline/candidate/evaluator/memory/schema/prompt fields, then deleted the temporary run.
+- Probe output: `{"status": "ok", "checks": {"requires_approval_before_plan": true, "approved_run_is_running": true, "round_is_one": true, "action_is_run_next_round": true, "uses_baseline_agent": true, "uses_candidates": true, "uses_evaluator": true, "uses_memory_policy": true, "prompt_mentions_fixed_eval": true, "prompt_mentions_skill": true, "schema_contains_score_before": true}}`.
+- Removed `/tmp/probe_evolution_next_round.py`, `/tmp/deploy_evolution_next_round.sh`, and `/tmp/agent-hub-p3-runtime-incremental.tgz`; confirmed `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.
+
+Remaining risks / next:
+
+- Commit this slice, create a GitHub recovery bundle/tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
+- Continue P3 after green: Evolution executor orchestration, plan-task mode UX, OpenClaw broader workflow integration, Skill Creator grounding into real-input/real-test generation workflows, UI copy/layout audit, missing button/function sweep, README/README.zh-CN final usage refresh, and Docker readiness later.

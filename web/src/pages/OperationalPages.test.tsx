@@ -720,6 +720,32 @@ describe("operational management pages", () => {
           if (createdEvolutionRun?.id === id) createdEvolutionRun = updated;
           return jsonResponse(updated);
         }
+        const nextRoundPlanMatch = path.match(/^\/api\/v1\/admin\/evolution-runs\/(evolution_[a-f0-9]+)\/next-round-plan$/);
+        if (nextRoundPlanMatch && method === "GET") {
+          const id = nextRoundPlanMatch[1];
+          const current = visibleEvolutionRuns.find((run) => run.id === id) ?? evolutionRun;
+          return jsonResponse({
+            run_id: id,
+            round: current.rounds.length + 1,
+            action: "run_next_round",
+            task_title: `${current.title} / round ${current.rounds.length + 1}`,
+            task_prompt: [
+              `Evolution run: ${current.title}`,
+              `Objective: ${current.objective}`,
+              `Source skills: ${current.source_skill_ids.join(", ") || "none"}`,
+              "固定评测集比较基准和候选，输出 score_before 和 score_after。",
+            ].join("\n"),
+            baseline_agent_id: current.baseline_agent_id,
+            candidate_agent_ids: current.candidate_agent_ids,
+            evaluator_agent_id: current.evaluator_agent_id,
+            memory_policy: current.memory_policy,
+            required_output_schema: {
+              score_before: "Baseline score before candidate changes.",
+              score_after: "Candidate score after changes.",
+            },
+            previous_rounds: current.rounds.map((round) => `round ${round.round}: ${round.recommendation}`),
+          });
+        }
         if (path === "/api/v1/admin/evolution-runs") {
           return jsonResponse(visibleEvolutionRuns);
         }
@@ -2269,6 +2295,16 @@ describe("operational management pages", () => {
         evaluator_agent_id: "agent-evaluator-strong",
         note: "更换基准后再进入首轮。",
       },
+    });
+
+    const createdRunCard = screen.getByRole("heading", { name: "学术研究进化" }).closest("article");
+    expect(createdRunCard).not.toBeNull();
+    await user.click(within(createdRunCard as HTMLElement).getByRole("button", { name: "生成执行包" }));
+    await waitFor(() => expect(screen.getByText("学术研究进化 / round 1")).not.toBeNull());
+    expect(screen.getByText(/固定评测集比较基准和候选/)).not.toBeNull();
+    expect(screen.getByText(/score_before/)).not.toBeNull();
+    expect(requests.find((request) => request.path.endsWith(`/evolution-runs/${createdEvolutionRun?.id}/next-round-plan`))).toMatchObject({
+      method: "GET",
     });
 
     await user.clear(screen.getByLabelText("改动维度"));

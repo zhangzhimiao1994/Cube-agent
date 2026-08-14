@@ -32,12 +32,14 @@ from agent_hub.db.models import AdminResourceRow
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.evolution import (
     EvolutionApprovalRequest,
+    EvolutionNextRoundPlanResponse,
     EvolutionRoundRequest,
     EvolutionRunRequest,
     EvolutionRunResponse,
     append_evolution_round,
     approve_evolution_run_response,
     create_evolution_run_response,
+    plan_evolution_next_round,
 )
 from agent_hub.models.capabilities import infer_model_capabilities
 from agent_hub.models.gateway import ModelTransport
@@ -1503,6 +1505,13 @@ class AdminResourceService(Protocol):
 
     async def get_evolution_run(self, run_id: str) -> EvolutionRunResponse: ...
 
+    async def plan_evolution_next_round(
+        self,
+        run_id: str,
+        *,
+        actor: str,
+    ) -> EvolutionNextRoundPlanResponse: ...
+
     async def approve_evolution_run(
         self,
         run_id: str,
@@ -2380,6 +2389,24 @@ class InMemoryAdminResourceService:
             return self.evolution_runs[run_id]
         except KeyError:
             raise PublicAPIError(404, "not_found", "not found") from None
+
+    async def plan_evolution_next_round(
+        self,
+        run_id: str,
+        *,
+        actor: str,
+    ) -> EvolutionNextRoundPlanResponse:
+        del actor
+        current = await self.get_evolution_run(run_id)
+        if current.status in {"stopped", "completed"}:
+            raise PublicAPIError(409, "evolution_run_closed", "evolution run is already closed")
+        if current.status == "waiting_approval":
+            raise PublicAPIError(
+                409,
+                "evolution_run_requires_approval",
+                "evolution run requires approval before planning the next round",
+            )
+        return plan_evolution_next_round(current)
 
     async def approve_evolution_run(
         self,
@@ -3723,6 +3750,24 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         if not payload:
             raise PublicAPIError(404, "not_found", "not found")
         return EvolutionRunResponse.model_validate(payload)
+
+    async def plan_evolution_next_round(
+        self,
+        run_id: str,
+        *,
+        actor: str,
+    ) -> EvolutionNextRoundPlanResponse:
+        del actor
+        current = await self.get_evolution_run(run_id)
+        if current.status in {"stopped", "completed"}:
+            raise PublicAPIError(409, "evolution_run_closed", "evolution run is already closed")
+        if current.status == "waiting_approval":
+            raise PublicAPIError(
+                409,
+                "evolution_run_requires_approval",
+                "evolution run requires approval before planning the next round",
+            )
+        return plan_evolution_next_round(current)
 
     async def approve_evolution_run(
         self,
@@ -6539,6 +6584,19 @@ async def get_evolution_run(
     _require(principal, "skill:read")
     return await service.get_evolution_run(run_id)
 
+
+@router.get(
+    "/evolution-runs/{run_id}/next-round-plan",
+    response_model=EvolutionNextRoundPlanResponse,
+    responses=error_responses(401, 403, 404, 409, 422),
+)
+async def plan_evolution_next_round_route(
+    run_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> EvolutionNextRoundPlanResponse:
+    _require(principal, "skill:read")
+    return await service.plan_evolution_next_round(run_id, actor=str(principal.user_id))
 
 @router.post(
     "/evolution-runs/{run_id}/approve",

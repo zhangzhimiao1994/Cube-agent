@@ -356,6 +356,20 @@ const EvolutionRoundSchema = z.object({
   created_at: z.string(),
 });
 
+const EvolutionNextRoundPlanSchema = z.object({
+  run_id: z.string(),
+  round: z.number(),
+  action: z.string(),
+  task_title: z.string(),
+  task_prompt: z.string(),
+  baseline_agent_id: z.string(),
+  candidate_agent_ids: z.array(z.string()),
+  evaluator_agent_id: z.string(),
+  memory_policy: z.string(),
+  required_output_schema: z.record(z.string(), z.string()),
+  previous_rounds: z.array(z.string()),
+});
+
 const EvolutionRunSchema = z.object({
   id: z.string(),
   kind: z.string(),
@@ -391,6 +405,7 @@ const EvolutionRunSchema = z.object({
 });
 
 export type EvolutionRun = z.infer<typeof EvolutionRunSchema>;
+export type EvolutionNextRoundPlan = z.infer<typeof EvolutionNextRoundPlanSchema>;
 export type EvolutionRunRequest = {
   kind: "skill_distillation" | "skill_optimization" | "media_strategy" | "academic_research" | "custom";
   title: string;
@@ -1214,6 +1229,13 @@ export const api = {
       "/api/v1/admin/evolution-runs",
       { method: "POST", body: JSON.stringify(payload) },
       EvolutionRunSchema,
+    );
+  },
+  evolutionNextRoundPlan(id: string): Promise<EvolutionNextRoundPlan> {
+    return request(
+      `/api/v1/admin/evolution-runs/${encodeURIComponent(id)}/next-round-plan`,
+      { method: "GET" },
+      EvolutionNextRoundPlanSchema,
     );
   },
   approveEvolutionRun(id: string, payload: EvolutionApprovalRequest): Promise<EvolutionRun> {

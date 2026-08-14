@@ -3838,6 +3838,57 @@ def test_evolution_run_records_skill_optimization_rounds_and_audit() -> None:
     assert approval_audit.json()[0]["details"]["approval_status"] == "approved"
 
 
+def test_evolution_next_round_plan_requires_approval_and_contains_execution_contract() -> None:
+    api = client()
+    created = api.post(
+        "/api/v1/admin/evolution-runs",
+        headers=headers(),
+        json={
+            "kind": "skill_optimization",
+            "title": "进化科研 Skill",
+            "objective": "生成并迭代 AI 科研 Skill，必须用固定评测集比较基准和候选。",
+            "mode": "hybrid",
+            "source_skill_ids": ["darwin-skill", "zhengliu"],
+            "target_artifact_type": "skill",
+            "baseline_agent_id": "agent-main-m3",
+            "candidate_agent_ids": ["agent-researcher", "agent-reviewer"],
+            "evaluator_agent_id": "agent-evaluator",
+            "approval_policy": "ask",
+            "iteration_policy": "score_gated",
+            "memory_policy": "summarize_between_rounds",
+            "max_rounds": 4,
+            "min_delta": 2.0,
+            "rubric": ["科研可用性", "反例覆盖", "可复现评测"],
+        },
+    )
+    run = created.json()
+
+    blocked = api.get(f"/api/v1/admin/evolution-runs/{run['id']}/next-round-plan", headers=headers())
+
+    assert blocked.status_code == 409
+    assert blocked.json()["error"]["code"] == "evolution_run_requires_approval"
+
+    approved = api.post(
+        f"/api/v1/admin/evolution-runs/{run['id']}/approve",
+        headers=headers(),
+        json={"approved": True, "note": "确认基准、候选和评测口径。"},
+    )
+    assert approved.status_code == 200
+
+    planned = api.get(f"/api/v1/admin/evolution-runs/{run['id']}/next-round-plan", headers=headers())
+
+    assert planned.status_code == 200
+    plan = planned.json()
+    assert plan["run_id"] == run["id"]
+    assert plan["round"] == 1
+    assert plan["action"] == "run_next_round"
+    assert plan["baseline_agent_id"] == "agent-main-m3"
+    assert plan["candidate_agent_ids"] == ["agent-researcher", "agent-reviewer"]
+    assert plan["evaluator_agent_id"] == "agent-evaluator"
+    assert "固定评测集比较基准和候选" in plan["task_prompt"]
+    assert "darwin-skill" in plan["task_prompt"]
+    assert "score_before" in plan["required_output_schema"]
+    assert plan["memory_policy"] == "summarize_between_rounds"
 def test_evolution_run_stops_after_two_low_delta_rounds() -> None:
     api = client()
     created = api.post(
