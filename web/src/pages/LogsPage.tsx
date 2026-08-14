@@ -3,6 +3,7 @@ import { useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
 import { api, formatApiError, type LogEntry } from "../api/client";
+import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
 
 const LOG_MODULES = [
   {
@@ -59,23 +60,56 @@ function exportLogs(moduleTitle: string, entries: LogEntry[]) {
   URL.revokeObjectURL(url);
 }
 
+function logDetailsText(entry: LogEntry) {
+  return Object.entries(entry.details).map(([key, value]) => `${key}: ${value}`).join("; ");
+}
+
 function logMatchesFilters(entry: LogEntry, searchTerm: string, levelFilter: "all" | LogEntry["level"]) {
   if (levelFilter !== "all" && entry.level !== levelFilter) return false;
-  const query = searchTerm.trim().toLowerCase();
-  if (!query) return true;
-  const haystack = [
-    entry.id,
-    entry.category,
-    entry.level,
-    entry.title,
-    entry.message,
-    entry.source,
-    entry.created_at,
-    ...Object.entries(entry.details).flatMap(([key, value]) => [key, value]),
-  ]
-    .join(" ")
-    .toLowerCase();
-  return haystack.includes(query);
+  return textContains(
+    [entry.id, entry.category, entry.level, entry.title, entry.message, entry.source, entry.created_at, logDetailsText(entry)].join(" "),
+    searchTerm,
+  );
+}
+
+type LogSortKey = "level" | "title" | "source" | "time" | "details";
+
+type LogColumnFilters = {
+  details: string;
+  level: "all" | LogEntry["level"];
+  source: string;
+  time: string;
+  title: string;
+};
+
+const EMPTY_LOG_FILTERS: LogColumnFilters = {
+  details: "",
+  level: "all",
+  source: "",
+  time: "",
+  title: "",
+};
+
+function matchesLogColumns(entry: LogEntry, filters: LogColumnFilters) {
+  return (
+    (filters.level === "all" || entry.level === filters.level) &&
+    textContains(`${entry.title} ${entry.message}`, filters.title) &&
+    textContains(entry.source, filters.source) &&
+    textContains(entry.created_at, filters.time) &&
+    textContains(logDetailsText(entry), filters.details)
+  );
+}
+
+function logSortValue(entry: LogEntry, key: LogSortKey) {
+  if (key === "level") return entry.level;
+  if (key === "title") return `${entry.title} ${entry.message}`;
+  if (key === "source") return entry.source;
+  if (key === "time") return entry.created_at;
+  return logDetailsText(entry);
+}
+
+function sortedLogs(entries: LogEntry[], sort: SortState<LogSortKey>) {
+  return [...entries].sort((left, right) => compareText(logSortValue(left, sort.key), logSortValue(right, sort.key), sort.direction));
 }
 
 export function LogsPage() {
@@ -108,14 +142,16 @@ function LogModulePage({ module }: { module: (typeof LOG_MODULES)[number] }) {
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [searchTerm, setSearchTerm] = useState("");
   const [levelFilter, setLevelFilter] = useState<"all" | LogEntry["level"]>("all");
+  const [columnFilters, setColumnFilters] = useState<LogColumnFilters>(EMPTY_LOG_FILTERS);
+  const [sort, setSort] = useState<SortState<LogSortKey>>({ key: "time", direction: "desc" });
   const logs = useQuery({
     queryKey: ["logs", module.category],
     queryFn: () => api.logs(module.category),
   });
   const entries = logs.data ?? [];
   const visibleEntries = useMemo(
-    () => entries.filter((entry) => logMatchesFilters(entry, searchTerm, levelFilter)),
-    [entries, searchTerm, levelFilter],
+    () => sortedLogs(entries.filter((entry) => logMatchesFilters(entry, searchTerm, levelFilter) && matchesLogColumns(entry, columnFilters)), sort),
+    [columnFilters, entries, searchTerm, levelFilter, sort],
   );
   const selectedEntries = visibleEntries.filter((entry) => selectedIds.includes(entry.id));
   const allSelected = visibleEntries.length > 0 && visibleEntries.every((entry) => selectedIds.includes(entry.id));
@@ -135,6 +171,10 @@ function LogModulePage({ module }: { module: (typeof LOG_MODULES)[number] }) {
     });
   }
 
+  function updateColumnFilter<Key extends keyof LogColumnFilters>(key: Key, value: LogColumnFilters[Key]) {
+    setColumnFilters((current) => ({ ...current, [key]: value }));
+  }
+
   return (
     <section>
       <p className="eyebrow">Logs center</p>
@@ -148,7 +188,7 @@ function LogModulePage({ module }: { module: (typeof LOG_MODULES)[number] }) {
           导出安全 JSON
         </button>
       </div>
-      <div className="toolbar">
+      <div className="list-toolbar">
         <label>
           搜索日志
           <input
@@ -172,6 +212,9 @@ function LogModulePage({ module }: { module: (typeof LOG_MODULES)[number] }) {
             <option value="error">error</option>
           </select>
         </label>
+        <button type="button" className="secondary-action" onClick={() => { setSearchTerm(""); setLevelFilter("all"); setColumnFilters(EMPTY_LOG_FILTERS); }}>
+          清空筛选
+        </button>
       </div>
 
       {visibleEntries.length === 0 ? (
@@ -199,45 +242,58 @@ function LogModulePage({ module }: { module: (typeof LOG_MODULES)[number] }) {
             >
               导出已选 JSON
             </button>
-            <small>已选 {selectedEntries.length}</small>
+            <small>当前结果已选 {selectedEntries.length}</small>
           </div>
-          <div className="log-list">
-            {visibleEntries.map((entry) => (
-              <article key={entry.id} className="log-entry">
-                <div className="log-entry-header">
-                  <input
-                    type="checkbox"
-                    aria-label={`Select log ${entry.id}`}
-                    checked={selectedIds.includes(entry.id)}
-                    onChange={() => toggleLog(entry.id)}
-                  />
-                  <span className={`level-pill level-${entry.level}`}>{entry.level}</span>
-                  <div>
-                    <h3>{entry.title}</h3>
-                    <p>{entry.message}</p>
-                  </div>
-                </div>
-                <dl className="diagnostic-grid">
-                  <div className="diagnostic-row">
-                    <dt>来源</dt>
-                    <dd>{entry.source}</dd>
-                  </div>
-                  <div className="diagnostic-row">
-                    <dt>时间</dt>
-                    <dd>
-                      <time dateTime={entry.created_at}>{entry.created_at}</time>
-                    </dd>
-                  </div>
-                  {Object.entries(entry.details).map(([key, value]) => (
-                    <div key={key} className="diagnostic-row">
-                      <dt>{key}</dt>
-                      <dd>{value}</dd>
-                    </div>
-                  ))}
-                </dl>
-              </article>
-            ))}
-          </div>
+          <table aria-label={`${module.title}列表`} className="dense-table">
+            <thead>
+              <tr>
+                <th>选择</th>
+                <th><SortHeader column="level" label="级别" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>级别</SortHeader></th>
+                <th><SortHeader column="title" label="标题与消息" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>标题与消息</SortHeader></th>
+                <th><SortHeader column="source" label="来源" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>来源</SortHeader></th>
+                <th><SortHeader column="time" label="时间" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>时间</SortHeader></th>
+                <th><SortHeader column="details" label="详情" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>详情</SortHeader></th>
+              </tr>
+              <tr className="table-filter-row">
+                <th aria-label="日志选择筛选占位" />
+                <th>
+                  <select aria-label="按日志级别筛选" value={columnFilters.level} onChange={(event) => updateColumnFilter("level", event.currentTarget.value as LogColumnFilters["level"])}>
+                    <option value="all">全部</option>
+                    <option value="info">info</option>
+                    <option value="warning">warning</option>
+                    <option value="error">error</option>
+                  </select>
+                </th>
+                <th><input aria-label="按日志标题筛选" value={columnFilters.title} onChange={(event) => updateColumnFilter("title", event.currentTarget.value)} placeholder="标题或消息" /></th>
+                <th><input aria-label="按日志来源筛选" value={columnFilters.source} onChange={(event) => updateColumnFilter("source", event.currentTarget.value)} placeholder="来源" /></th>
+                <th><input aria-label="按日志时间筛选" value={columnFilters.time} onChange={(event) => updateColumnFilter("time", event.currentTarget.value)} placeholder="时间" /></th>
+                <th><input aria-label="按日志详情筛选" value={columnFilters.details} onChange={(event) => updateColumnFilter("details", event.currentTarget.value)} placeholder="详情键或值" /></th>
+              </tr>
+            </thead>
+            <tbody>
+              {visibleEntries.map((entry) => (
+                <tr key={entry.id}>
+                  <td>
+                    <input
+                      type="checkbox"
+                      aria-label={`Select log ${entry.id}`}
+                      checked={selectedIds.includes(entry.id)}
+                      onChange={() => toggleLog(entry.id)}
+                    />
+                  </td>
+                  <td><span className={`level-pill level-${entry.level}`}>{entry.level}</span></td>
+                  <td>
+                    <strong>{entry.title}</strong>
+                    <br />
+                    <span>{entry.message}</span>
+                  </td>
+                  <td>{entry.source}</td>
+                  <td><time dateTime={entry.created_at}>{entry.created_at}</time></td>
+                  <td>{logDetailsText(entry)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </>
       )}
     </section>

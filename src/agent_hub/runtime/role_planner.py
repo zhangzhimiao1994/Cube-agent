@@ -867,6 +867,8 @@ _ROLE_TRIGGER_KEYWORDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
 def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
     role_id, role, _purpose, mission, must_answer, _tools, _forbidden, skills, _schema = spec
     requested = set(request.requested_skills)
+    if role_id == "multimedia_generator":
+        return _is_multimedia_generation_request(request.task)
     if requested and requested.intersection(skills):
         return True
     task = request.task.casefold()
@@ -943,6 +945,62 @@ def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
     )
 
 
+
+_MULTIMEDIA_GENERATION_TERMS = (
+    "generate an image",
+    "generate a product image",
+    "generate image",
+    "generate images",
+    "generate a video",
+    "generate video",
+    "generate videos",
+    "generate audio",
+    "generate speech",
+    "create an image",
+    "create image",
+    "create a video",
+    "create video",
+    "make a video",
+    "text-to-image",
+    "text to image",
+    "text-to-video",
+    "text to video",
+    "text-to-speech",
+    "text to speech",
+    "image generation",
+    "video generation",
+    "audio generation",
+    "生成图片",
+    "生成一张图",
+    "生成图像",
+    "生成视频",
+    "制作视频",
+    "生成语音",
+    "语音合成",
+    "文生图",
+    "文生视频",
+    "文生语音",
+)
+
+_MULTIMEDIA_GENERATION_NEGATIONS = (
+    "不需要",
+    "无需",
+    "不要",
+    "不用",
+    "暂不",
+    "not need",
+    "do not",
+    "don't",
+    "without",
+    "no need",
+)
+
+
+def _is_multimedia_generation_request(task: str) -> bool:
+    normalized = task.casefold()
+    return any(term in normalized for term in _MULTIMEDIA_GENERATION_TERMS) and not any(
+        negation in normalized for negation in _MULTIMEDIA_GENERATION_NEGATIONS
+    )
 def _normalize_profiles(
     primary: TaskProfile,
     profiles: tuple[TaskProfile, ...],

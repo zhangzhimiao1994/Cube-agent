@@ -1794,7 +1794,7 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("checkbox", { name: "Select all deletable conversations" })).not.toBeNull();
     await user.click(screen.getByRole("checkbox", { name: "Select all deletable conversations" }));
-    await user.click(screen.getByRole("button", { name: "批量删除" }));
+    await user.click(screen.getByRole("button", { name: /批量删除已选会话/ }));
 
     await waitFor(() =>
       expect(requests.find((request) => request.path === "/api/v1/admin/runs/bulk-delete")).toMatchObject({
@@ -1945,6 +1945,12 @@ describe("operational management pages", () => {
     await user.selectOptions(screen.getByRole("combobox", { name: "日志级别" }), "error");
     expect(screen.getByText("provider returned status=401")).not.toBeNull();
     expect(screen.queryByText("anthropic preflight latency is high")).toBeNull();
+
+    await user.selectOptions(screen.getByRole("combobox", { name: "日志级别" }), "all");
+    await user.type(screen.getByRole("textbox", { name: "按日志来源筛选" }), "models.probe");
+    const logTable = screen.getByRole("table", { name: "模型配置与调用错误列表" });
+    expect(within(logTable).getByText("anthropic preflight latency is high")).not.toBeNull();
+    expect(within(logTable).queryByText("provider returned status=401")).toBeNull();
   });
 
   it("shows Hermes learning by time and conversation id with detail confirmation", async () => {
@@ -1969,9 +1975,9 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/hermes" />);
 
-    expect(await screen.findByRole("checkbox", { name: "Select all Hermes learning records" })).not.toBeNull();
-    await user.click(screen.getByRole("checkbox", { name: "Select all Hermes learning records" }));
-    await user.click(screen.getByRole("button", { name: "批量确认已选学习" }));
+    expect(await screen.findByRole("checkbox", { name: "Select all visible Hermes learning records" })).not.toBeNull();
+    await user.click(screen.getByRole("checkbox", { name: "Select all visible Hermes learning records" }));
+    await user.click(screen.getByRole("button", { name: /批量确认待确认学习/ }));
 
     await waitFor(() =>
       expect(requests.find((request) => request.path === "/api/v1/admin/hermes/bulk-confirm")).toMatchObject({
@@ -1999,19 +2005,19 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/hermes" />);
 
-    const selectAll = await screen.findByRole("checkbox", { name: "Select all Hermes learning records" });
-    const confirmButton = screen.getByRole("button", { name: "批量确认已选学习" }) as HTMLButtonElement;
-    const deleteButton = screen.getByRole("button", { name: "批量删除已选学习" }) as HTMLButtonElement;
+    const selectAll = await screen.findByRole("checkbox", { name: "Select all visible Hermes learning records" });
+    const confirmButton = screen.getByRole("button", { name: /批量确认待确认学习/ }) as HTMLButtonElement;
+    const deleteButton = screen.getByRole("button", { name: /批量删除已选学习/ }) as HTMLButtonElement;
 
     expect(confirmButton.disabled).toBe(true);
     expect(deleteButton.disabled).toBe(true);
     await user.click(selectAll);
-    expect(screen.getByText("已选 2")).not.toBeNull();
+    expect(screen.getByText("当前结果已选 2")).not.toBeNull();
     expect(confirmButton.disabled).toBe(false);
     expect(deleteButton.disabled).toBe(false);
     await user.click(selectAll);
 
-    expect(screen.getByText("已选 0")).not.toBeNull();
+    expect(screen.getByText("当前结果已选 0")).not.toBeNull();
     expect(confirmButton.disabled).toBe(true);
     expect(deleteButton.disabled).toBe(true);
   });
@@ -2020,9 +2026,9 @@ describe("operational management pages", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/hermes" />);
 
-    expect(await screen.findByRole("checkbox", { name: "Select all Hermes learning records" })).not.toBeNull();
-    await user.click(screen.getByRole("checkbox", { name: "Select all Hermes learning records" }));
-    await user.click(screen.getByRole("button", { name: "批量删除已选学习" }));
+    expect(await screen.findByRole("checkbox", { name: "Select all visible Hermes learning records" })).not.toBeNull();
+    await user.click(screen.getByRole("checkbox", { name: "Select all visible Hermes learning records" }));
+    await user.click(screen.getByRole("button", { name: /批量删除已选学习/ }));
 
     await waitFor(() =>
       expect(requests.find((request) => request.path === "/api/v1/admin/hermes/bulk-delete")).toMatchObject({

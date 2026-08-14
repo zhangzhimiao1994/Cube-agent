@@ -3759,3 +3759,48 @@ Remaining risks / next:
 - This is a focused UI polish slice, not the final whole-product UI copy/layout audit.
 - Need commit this slice, create local ignored recovery bundle and GitHub archive tag for the previous remote main, push `main` with `--force-with-lease`, and check GitHub Actions.
 - Continue the remaining P3 queue after green: broader UI audit after remaining modules, final README/README.zh-CN, and later Docker readiness.
+## 2026-08-14 Audit Conversation Attribution and List Filtering
+
+Current state:
+
+- User-submitted chat/run requests now emit an audit event with `action=run.submit` after successful run creation.
+- The audit details classify which authenticated user submitted which run/conversation, including `user_id`, `user_role`, `run_id`, `conversation_id`, `reference_conversation_id`, selected mode, accepted mode, workflow/direct model metadata, Vibe Coding flag, attachment count, bounded message preview, and message SHA-256.
+- Multimedia generator role selection is now limited to explicit generation requests. Tasks that merely discuss whether images, video, or audio are needed, or explicitly say not to generate, no longer route through the multimedia generator.
+- High-information admin pages now use shared table tooling for keyword search, per-column filters, and sortable headers across Skill, attachment, Hermes, model, user, channel, and log views.
+- Bulk action wording was tightened so confirm/delete operations describe the selected target clearly, and run conversation bulk delete now labels itself as deleting selected conversations.
+
+Verification performed:
+
+- `uv run pytest tests/api/test_runs_api.py tests/unit/runtime/test_role_planner.py -q --tb=short` -> 32 passed.
+- `uv run ruff check src/agent_hub/api/routers/runs.py src/agent_hub/runtime/role_planner.py tests/api/test_runs_api.py tests/unit/runtime/test_role_planner.py` -> passed.
+- `uv run mypy --strict src/agent_hub/api/routers/runs.py src/agent_hub/runtime/role_planner.py tests/api/test_runs_api.py tests/unit/runtime/test_role_planner.py` -> passed.
+- `npm run lint` -> passed.
+- `npm test -- --run --reporter=dot` -> 13 files passed, 114 tests passed.
+- `npm run build` -> passed with the existing Vite chunk-size warning.
+- `git diff --check` -> passed with existing CRLF warnings only.
+- Browser/Playwright rendered validation was attempted locally, but the Windows sandbox denied read ACLs for the browser runtime. Server-side real environment verification is still required before GitHub push.
+
+Remaining risks / next:
+
+- Deploy this slice incrementally to `103.236.98.133` and run real server API checks for `run.submit` audit classification and multimedia generator routing.
+- Verify deployed frontend assets expose the new table search/filter/sort controls.
+- Create recovery archives, force-with-lease push to `mutilagent/main`, then check GitHub Actions and fix any failing run.
+- Continue the remaining P3 queue after this slice: OpenClaw follow-up, final whole-product UI copy/layout audit, README/README.zh-CN, and Docker readiness later.
+Server deployment and verification update:
+
+- Uploaded `/tmp/agent-hub-audit-list-filters.tgz` and deployed it incrementally into `/opt/agent-hub/current`.
+- Backed up overwritten files under `/opt/agent-hub/backups/audit-list-filters-20260814-065358`.
+- The first real server probe exposed that the production Python process was importing from `.venv/site-packages`, not the updated `src` tree. Synchronized `src/agent_hub/api/routers/runs.py` and `src/agent_hub/runtime/role_planner.py` into the active site-packages copy and backed up the previous active files under `/opt/agent-hub/backups/audit-list-filters-sitepackages-20260814-065801`.
+- Restarted `agent-hub-api` and `agent-hub-worker`; verified `agent-hub-api`, `agent-hub-worker`, and `caddy` were active.
+- Server real environment probe passed through the actual Caddy/API path:
+  - submitted a real `/api/v1/runs` request with a unique conversation id;
+  - verified `/api/v1/admin/audit?action=run.submit` contains the actor user id, details user id, run id, conversation id, and message SHA-256;
+  - verified `/api/v1/admin/logs?category=audit` exposes the `run.submit` audit log entry;
+  - cleaned the probe run through the real admin run APIs;
+  - verified deployed frontend JS contains the new log/source filter, model quick search, and conversation bulk-delete labels;
+  - verified the deployed runtime multimedia-generation classifier rejects non-generation analysis tasks and accepts explicit video generation tasks.
+- Removed `/tmp/probe_audit_list_filters.py`, `/tmp/deploy_audit_sitepackages.sh`, and `/tmp/agent-hub-audit-list-filters.tgz` from the server.
+
+Deployment note:
+
+- Future incremental backend deployments should either install the project into the active venv or explicitly update `.venv/site-packages`; copying only `src` is not enough for the current production service layout.

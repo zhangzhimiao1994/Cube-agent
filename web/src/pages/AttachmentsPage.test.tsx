@@ -90,15 +90,26 @@ describe("AttachmentsPage", () => {
     });
   });
 
+  it("filters uploaded attachments by filename, type, and checksum", async () => {
+    render(<TestApp initialPath="/attachments" />);
+
+    expect(await screen.findByRole("heading", { name: "附件管理" })).not.toBeNull();
+    await userEvent.type(screen.getByRole("searchbox", { name: "快速搜索附件" }), "context");
+
+    expect(screen.getByText("old-context.md")).not.toBeNull();
+    expect(screen.queryByText("broken-skill-pack.zip")).toBeNull();
+    expect(screen.getByText("显示 1 / 2")).not.toBeNull();
+  });
+
   it("bulk deletes selected attachments through one batch request", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<TestApp initialPath="/attachments" />);
 
     expect(await screen.findByText("broken-skill-pack.zip")).not.toBeNull();
-    await userEvent.click(screen.getByRole("checkbox", { name: "Select all attachments" }));
-    await userEvent.click(screen.getByRole("button", { name: "批量删除已选附件" }));
+    await userEvent.click(screen.getByRole("checkbox", { name: "全选当前附件结果" }));
+    await userEvent.click(screen.getByRole("button", { name: /批量删除已选附件/ }));
 
-    expect(window.confirm).toHaveBeenCalledWith("确认删除 2 个已选附件？删除后对话里不能再引用它们。");
+    expect(window.confirm).toHaveBeenCalledWith("确认删除当前结果中已选的 2 个附件？删除后对话里不能再引用它们。");
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
         "/api/v1/runs/attachments/bulk-delete",
@@ -115,16 +126,16 @@ describe("AttachmentsPage", () => {
   it("clears the bulk selection when select all is clicked again", async () => {
     render(<TestApp initialPath="/attachments" />);
 
-    const selectAll = await screen.findByRole("checkbox", { name: "Select all attachments" });
-    const bulkDelete = screen.getByRole("button", { name: "批量删除已选附件" }) as HTMLButtonElement;
+    const selectAll = await screen.findByRole("checkbox", { name: "全选当前附件结果" });
+    const bulkDelete = screen.getByRole("button", { name: /批量删除已选附件/ }) as HTMLButtonElement;
 
     expect(bulkDelete.disabled).toBe(true);
     await userEvent.click(selectAll);
-    expect(screen.getByText("已选 2")).not.toBeNull();
+    expect(screen.getByText("当前结果已选 2")).not.toBeNull();
     expect(bulkDelete.disabled).toBe(false);
     await userEvent.click(selectAll);
 
-    expect(screen.getByText("已选 0")).not.toBeNull();
+    expect(screen.getByText("当前结果已选 0")).not.toBeNull();
     expect(bulkDelete.disabled).toBe(true);
   });
 });

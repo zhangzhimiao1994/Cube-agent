@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -200,6 +200,16 @@ describe("ChannelsPage", () => {
     expect(screen.getByText(/校验失败会返回明确错误/)).not.toBeNull();
   });
 
+  it("filters the channel matrix by missing configuration", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/channels" />);
+
+    const table = await screen.findByRole("table", { name: "通道支持矩阵列表" });
+    await user.type(screen.getByRole("textbox", { name: "按缺失配置筛选" }), "WECOM_BOT_WEBHOOK_KEY");
+
+    expect(within(table).getByText("企微智能机器人")).not.toBeNull();
+    expect(within(table).queryByText("飞书")).toBeNull();
+  });
   it("lets operators type and save channel configuration values", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/channels" />);

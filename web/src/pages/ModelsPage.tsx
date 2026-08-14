@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useMemo, useState } from "react";
 
 import { ApiError, api, formatApiError, type ModelDeployment } from "../api/client";
+import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
 
 const CUSTOM_PROVIDER = "custom";
 const CUSTOM_MODEL = "__custom_model__";
@@ -496,6 +497,89 @@ function modelErrorDiagnostics(error: unknown) {
     }));
 }
 
+type ModelSortKey = "category" | "logical" | "provider" | "upstream" | "apiBase" | "capabilities" | "slots" | "quota" | "policy";
+
+type ModelColumnFilters = {
+  apiBase: string;
+  capabilities: string;
+  category: "all" | ModelCategory;
+  logical: string;
+  provider: string;
+  quota: string;
+  upstream: string;
+};
+
+const EMPTY_MODEL_FILTERS: ModelColumnFilters = {
+  apiBase: "",
+  capabilities: "",
+  category: "all",
+  logical: "",
+  provider: "",
+  quota: "",
+  upstream: "",
+};
+
+function savedModelCategory(model: ModelDeployment): ModelCategory {
+  return model.capabilities.some((item) => item === "image_generation" || item === "video_generation" || item === "audio_generation")
+    ? "multimedia"
+    : "normal";
+}
+
+function savedModelCategoryLabel(model: ModelDeployment) {
+  return savedModelCategory(model) === "multimedia" ? "多媒体 AI" : "普通模型";
+}
+
+function modelCapabilitiesText(model: ModelDeployment) {
+  return model.capabilities.map(displayCapability).join("、");
+}
+
+function matchesModelSearch(model: ModelDeployment, searchTerm: string) {
+  return textContains(
+    [
+      savedModelCategoryLabel(model),
+      model.logical_model,
+      model.provider,
+      model.upstream_model,
+      model.api_base,
+      modelCapabilitiesText(model),
+      model.quota_scope,
+      displaySaturationPolicy(model.saturation_policy),
+    ].join(" "),
+    searchTerm,
+  );
+}
+
+function matchesModelColumns(model: ModelDeployment, filters: ModelColumnFilters) {
+  return (
+    (filters.category === "all" || savedModelCategory(model) === filters.category) &&
+    textContains(model.logical_model, filters.logical) &&
+    textContains(model.provider, filters.provider) &&
+    textContains(model.upstream_model, filters.upstream) &&
+    textContains(model.api_base, filters.apiBase) &&
+    textContains(modelCapabilitiesText(model), filters.capabilities) &&
+    textContains(model.quota_scope, filters.quota)
+  );
+}
+
+function sortedSavedModels(models: ModelDeployment[], sort: SortState<ModelSortKey>) {
+  const copy = [...models];
+  if (false) return copy;
+  const direction = sort.direction === "asc" ? 1 : -1;
+  return copy.sort((left, right) => {
+    let result = 0;
+    if (sort.key === "category") result = compareText(savedModelCategoryLabel(left), savedModelCategoryLabel(right), "asc");
+    if (sort.key === "logical") result = compareText(left.logical_model, right.logical_model, "asc");
+    if (sort.key === "provider") result = compareText(left.provider, right.provider, "asc");
+    if (sort.key === "upstream") result = compareText(left.upstream_model, right.upstream_model, "asc");
+    if (sort.key === "apiBase") result = compareText(left.api_base, right.api_base, "asc");
+    if (sort.key === "capabilities") result = compareText(modelCapabilitiesText(left), modelCapabilitiesText(right), "asc");
+    if (sort.key === "slots") result = left.effective_slots - right.effective_slots;
+    if (sort.key === "quota") result = compareText(left.quota_scope, right.quota_scope, "asc");
+    if (sort.key === "policy") result = compareText(displaySaturationPolicy(left.saturation_policy), displaySaturationPolicy(right.saturation_policy), "asc");
+    return sort.direction === "asc" ? result : -result;
+  });
+}
+
 export function ModelsPage() {
   const queryClient = useQueryClient();
   const models = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
@@ -515,6 +599,9 @@ export function ModelsPage() {
   const [tpm, setTpm] = useState("100000");
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const [editingModel, setEditingModel] = useState<ModelDeployment | null>(null);
+  const [modelSearchTerm, setModelSearchTerm] = useState("");
+  const [modelColumnFilters, setModelColumnFilters] = useState<ModelColumnFilters>(EMPTY_MODEL_FILTERS);
+  const [modelSort, setModelSort] = useState<SortState<ModelSortKey>>({ key: "logical", direction: "asc" });
 
   const availableProviders = modelCategory === "normal" ? NORMAL_PROVIDERS : MULTIMEDIA_PROVIDERS;
   const capabilityOptions = modelCategory === "normal" ? NORMAL_CAPABILITIES : MULTIMEDIA_CAPABILITIES;
@@ -713,12 +800,18 @@ export function ModelsPage() {
     saveModel.mutate();
   }
 
+  function updateModelColumnFilter<Key extends keyof ModelColumnFilters>(key: Key, value: ModelColumnFilters[Key]) {
+    setModelColumnFilters((current) => ({ ...current, [key]: value }));
+  }
+
   if (models.isLoading) return <p>加载模型...</p>;
   if (models.isError) {
     return <p role="alert">{formatApiError(models.error, "模型加载失败")}</p>;
   }
 
   const savedModels = models.data ?? [];
+  const filteredSavedModels = savedModels.filter((model) => matchesModelSearch(model, modelSearchTerm) && matchesModelColumns(model, modelColumnFilters));
+  const visibleSavedModels = sortedSavedModels(filteredSavedModels, modelSort);
   const protocolHint =
     apiProtocol === "anthropic_messages"
       ? "Claude Code API 管理工具（例如 CC-Switch）如果显示 Anthropic Messages 兼容接口，请填写根域名、/v1 或完整 /v1/messages；保存前会统一成 /v1/messages。"
@@ -972,52 +1065,98 @@ export function ModelsPage() {
             <p>先在上方添加模型并通过 API 可用性测试；保存成功后会立即出现在这里。</p>
           </article>
         ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>逻辑模型</th>
-                <th>服务商</th>
-                <th>上游模型</th>
-                <th>API Base</th>
-                <th>能力</th>
-                <th>有效并发</th>
-                <th>限流</th>
-                <th>Quota Scope</th>
-                <th>操作</th>
-                <th>策略</th>
-              </tr>
-            </thead>
-            <tbody>
-              {savedModels.map((model) => (
-                <tr key={model.id}>
-                  <td>{model.logical_model}</td>
-                  <td>{model.provider}</td>
-                  <td>{model.upstream_model}</td>
-                  <td>{model.api_base}</td>
-                  <td>{model.capabilities.map(displayCapability).join("、")}</td>
-                  <td>{model.effective_slots}</td>
-                  <td>
-                    RPM {model.rpm ?? "未设置"} / TPM {model.tpm ?? "未设置"}
-                  </td>
-                  <td>{model.quota_scope}</td>
-                  <td>
-                    <button type="button" data-testid={`edit-model-${model.id}`} onClick={() => editSavedModel(model)}>
-                      编辑模型
-                    </button>
-                    <button
-                      type="button"
-                      data-testid={`delete-model-${model.id}`}
-                      onClick={() => deleteModel.mutate(model.id)}
-                      disabled={deleteModel.isPending}
-                    >
-                      删除模型
-                    </button>
-                  </td>
-                  <td>{displaySaturationPolicy(model.saturation_policy)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <>
+            <div className="list-toolbar">
+              <label>
+                快速搜索模型
+                <input
+                  type="search"
+                  aria-label="快速搜索模型"
+                  value={modelSearchTerm}
+                  onChange={(event) => setModelSearchTerm(event.currentTarget.value)}
+                  placeholder="逻辑模型、服务商、能力或 Quota"
+                />
+              </label>
+              <button type="button" className="secondary-action" onClick={() => { setModelSearchTerm(""); setModelColumnFilters(EMPTY_MODEL_FILTERS); }}>
+                清空筛选
+              </button>
+            </div>
+            {visibleSavedModels.length === 0 ? (
+              <article>
+                <h4>当前筛选没有匹配模型</h4>
+                <p>调整列筛选或清空筛选查看全部模型。</p>
+              </article>
+            ) : (
+              <table aria-label="已保存模型列表">
+                <thead>
+                  <tr>
+                    <th><SortHeader column="category" label="类别" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>类别</SortHeader></th>
+                    <th><SortHeader column="logical" label="逻辑模型" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>逻辑模型</SortHeader></th>
+                    <th><SortHeader column="provider" label="服务商" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>服务商</SortHeader></th>
+                    <th><SortHeader column="upstream" label="上游模型" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>上游模型</SortHeader></th>
+                    <th><SortHeader column="apiBase" label="API Base" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>API Base</SortHeader></th>
+                    <th><SortHeader column="capabilities" label="能力" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>能力</SortHeader></th>
+                    <th><SortHeader column="slots" label="有效并发" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>有效并发</SortHeader></th>
+                    <th>限流</th>
+                    <th><SortHeader column="quota" label="Quota Scope" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>Quota Scope</SortHeader></th>
+                    <th>操作</th>
+                    <th><SortHeader column="policy" label="策略" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>策略</SortHeader></th>
+                  </tr>
+                  <tr className="table-filter-row">
+                    <th>
+                      <select aria-label="按模型类别筛选" value={modelColumnFilters.category} onChange={(event) => updateModelColumnFilter("category", event.currentTarget.value as ModelColumnFilters["category"])}>
+                        <option value="all">全部</option>
+                        <option value="normal">普通模型</option>
+                        <option value="multimedia">多媒体 AI</option>
+                      </select>
+                    </th>
+                    <th><input aria-label="按逻辑模型筛选" value={modelColumnFilters.logical} onChange={(event) => updateModelColumnFilter("logical", event.currentTarget.value)} placeholder="逻辑模型" /></th>
+                    <th><input aria-label="按服务商筛选" value={modelColumnFilters.provider} onChange={(event) => updateModelColumnFilter("provider", event.currentTarget.value)} placeholder="服务商" /></th>
+                    <th><input aria-label="按上游模型筛选" value={modelColumnFilters.upstream} onChange={(event) => updateModelColumnFilter("upstream", event.currentTarget.value)} placeholder="上游模型" /></th>
+                    <th><input aria-label="按 API Base 筛选" value={modelColumnFilters.apiBase} onChange={(event) => updateModelColumnFilter("apiBase", event.currentTarget.value)} placeholder="API Base" /></th>
+                    <th><input aria-label="按模型能力筛选" value={modelColumnFilters.capabilities} onChange={(event) => updateModelColumnFilter("capabilities", event.currentTarget.value)} placeholder="能力" /></th>
+                    <th aria-label="有效并发筛选占位" />
+                    <th aria-label="限流筛选占位" />
+                    <th><input aria-label="按 Quota Scope 筛选" value={modelColumnFilters.quota} onChange={(event) => updateModelColumnFilter("quota", event.currentTarget.value)} placeholder="Quota Scope" /></th>
+                    <th aria-label="模型操作筛选占位" />
+                    <th aria-label="策略筛选占位" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {visibleSavedModels.map((model) => (
+                    <tr key={model.id}>
+                      <td>{savedModelCategoryLabel(model)}</td>
+                      <td>{model.logical_model}</td>
+                      <td>{model.provider}</td>
+                      <td>{model.upstream_model}</td>
+                      <td>{model.api_base}</td>
+                      <td>{modelCapabilitiesText(model)}</td>
+                      <td>{model.effective_slots}</td>
+                      <td>
+                        RPM {model.rpm ?? "未设置"} / TPM {model.tpm ?? "未设置"}
+                      </td>
+                      <td>{model.quota_scope}</td>
+                      <td className="table-actions">
+                        <button type="button" data-testid={`edit-model-${model.id}`} onClick={() => editSavedModel(model)}>
+                          编辑模型
+                        </button>
+                        <button
+                          type="button"
+                          className="danger-button"
+                          data-testid={`delete-model-${model.id}`}
+                          onClick={() => deleteModel.mutate(model.id)}
+                          disabled={deleteModel.isPending}
+                        >
+                          删除模型
+                        </button>
+                      </td>
+                      <td>{displaySaturationPolicy(model.saturation_policy)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </>
         )}
         {deleteModel.isError ? <p role="alert">{formatApiError(deleteModel.error, "模型删除失败")}</p> : null}
       </section>

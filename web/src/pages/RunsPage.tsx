@@ -1948,7 +1948,7 @@ export function RunsPage() {
                   disabled={deletableConversationIds.length === 0 || bulkDeleteRuns.isPending}
                   onChange={toggleAllConversations}
                 />
-                全选可删
+                全选可删除会话
               </label>
               <button
                 type="button"
@@ -1956,9 +1956,9 @@ export function RunsPage() {
                 disabled={selectedDeletableConversationIds.length === 0 || bulkDeleteRuns.isPending}
                 onClick={deleteSelectedConversations}
               >
-                {bulkDeleteRuns.isPending ? "删除中..." : "批量删除"}
+                {bulkDeleteRuns.isPending ? "删除中..." : `批量删除已选会话（${selectedDeletableConversationIds.length}）`}
               </button>
-              <small>已选 {selectedDeletableConversationIds.length}</small>
+              <small>当前结果已选 {selectedDeletableConversationIds.length}</small>
             </div>
           ) : null}
           {items.length === 0 ? (

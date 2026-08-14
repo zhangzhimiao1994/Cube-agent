@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { api, formatApiError, type ChannelStatus } from "../api/client";
+import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
 
 type ChannelGuide = {
   purpose: string;
@@ -253,15 +254,77 @@ function envTemplate(channel: ChannelStatus, guide: ChannelGuide) {
     .join("\n");
 }
 
+type ChannelSortKey = "name" | "status" | "entry" | "missing";
+
+type ChannelColumnFilters = {
+  entry: string;
+  missing: string;
+  name: string;
+  status: "all" | string;
+};
+
+const EMPTY_CHANNEL_FILTERS: ChannelColumnFilters = {
+  entry: "",
+  missing: "",
+  name: "",
+  status: "all",
+};
+
+function channelEntry(channel: ChannelStatus) {
+  return channel.public_webhook_url ?? channel.webhook_path ?? "无";
+}
+
+function channelMissing(channel: ChannelStatus) {
+  return channel.missing.length > 0 ? channel.missing.join(", ") : "无";
+}
+
+function channelSearchText(channel: ChannelStatus) {
+  return [channel.name, channel.id, statusLabel(channel.status), channelEntry(channel), channelMissing(channel)].join(" ");
+}
+
+function matchesChannelColumns(channel: ChannelStatus, filters: ChannelColumnFilters) {
+  return (
+    textContains(`${channel.name} ${channel.id}`, filters.name) &&
+    (filters.status === "all" || channel.status === filters.status) &&
+    textContains(channelEntry(channel), filters.entry) &&
+    textContains(channelMissing(channel), filters.missing)
+  );
+}
+
+function sortedChannels(channels: ChannelStatus[], sort: SortState<ChannelSortKey>) {
+  const copy = [...channels];
+  if (false) return copy;
+  const direction = sort.direction === "asc" ? 1 : -1;
+  return copy.sort((left, right) => {
+    let result = 0;
+    if (sort.key === "name") result = compareText(left.name, right.name, "asc");
+    if (sort.key === "status") result = compareText(statusLabel(left.status), statusLabel(right.status), "asc");
+    if (sort.key === "entry") result = compareText(channelEntry(left), channelEntry(right), "asc");
+    if (sort.key === "missing") result = compareText(channelMissing(left), channelMissing(right), "asc");
+    return sort.direction === "asc" ? result : -result;
+  });
+}
+
 export function ChannelsPage() {
   const queryClient = useQueryClient();
   const channels = useQuery({ queryKey: ["channels"], queryFn: () => api.channels() });
   const [selectedId, setSelectedId] = useState("feishu");
   const [draftValues, setDraftValues] = useState<Record<string, string>>({});
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
+  const [channelSearchTerm, setChannelSearchTerm] = useState("");
+  const [channelColumnFilters, setChannelColumnFilters] = useState<ChannelColumnFilters>(EMPTY_CHANNEL_FILTERS);
+  const [channelSort, setChannelSort] = useState<SortState<ChannelSortKey>>({ key: "name", direction: "asc" });
 
   const selected = useMemo(() => {
     const items = channels.data ?? [];
+  const visibleChannels = sortedChannels(
+    items.filter((channel) => textContains(channelSearchText(channel), channelSearchTerm) && matchesChannelColumns(channel, channelColumnFilters)),
+    channelSort,
+  );
+
+  function updateChannelColumnFilter<Key extends keyof ChannelColumnFilters>(key: Key, value: ChannelColumnFilters[Key]) {
+    setChannelColumnFilters((current) => ({ ...current, [key]: value }));
+  }
     return items.find((item) => item.id === selectedId) ?? items[0] ?? null;
   }, [channels.data, selectedId]);
   const guide = selected ? CHANNEL_GUIDES[selected.id] : null;
@@ -289,6 +352,14 @@ export function ChannelsPage() {
   }
 
   const items = channels.data ?? [];
+  const visibleChannels = sortedChannels(
+    items.filter((channel) => textContains(channelSearchText(channel), channelSearchTerm) && matchesChannelColumns(channel, channelColumnFilters)),
+    channelSort,
+  );
+
+  function updateChannelColumnFilter<Key extends keyof ChannelColumnFilters>(key: Key, value: ChannelColumnFilters[Key]) {
+    setChannelColumnFilters((current) => ({ ...current, [key]: value }));
+  }
 
   return (
     <section>
@@ -440,30 +511,64 @@ export function ChannelsPage() {
 
       <section aria-label="通道支持矩阵">
         <h3>通道支持矩阵</h3>
-        <table>
-          <thead>
-            <tr>
-              <th>通道</th>
-              <th>状态</th>
-              <th>入口</th>
-              <th>缺失配置</th>
-            </tr>
-          </thead>
-          <tbody>
-            {items.map((channel) => (
-              <tr key={channel.id}>
-                <td>
-                  <strong>{channel.name}</strong>
-                  <br />
-                  <span>{channel.id}</span>
-                </td>
-                <td>{statusLabel(channel.status)}</td>
-                <td>{channel.public_webhook_url ?? channel.webhook_path ?? "无"}</td>
-                <td>{channel.missing.length > 0 ? channel.missing.join(", ") : "无"}</td>
+        <div className="list-toolbar">
+          <label>
+            快速搜索通道
+            <input
+              type="search"
+              aria-label="快速搜索通道"
+              value={channelSearchTerm}
+              onChange={(event) => setChannelSearchTerm(event.currentTarget.value)}
+              placeholder="通道、状态、入口或缺失配置"
+            />
+          </label>
+          <button type="button" className="secondary-action" onClick={() => { setChannelSearchTerm(""); setChannelColumnFilters(EMPTY_CHANNEL_FILTERS); }}>
+            清空筛选
+          </button>
+        </div>
+        {visibleChannels.length === 0 ? (
+          <article>
+            <h4>当前筛选没有匹配通道</h4>
+            <p>调整列筛选或清空筛选查看全部通道。</p>
+          </article>
+        ) : (
+          <table aria-label="通道支持矩阵列表">
+            <thead>
+              <tr>
+                <th><SortHeader column="name" label="通道" sort={channelSort} onSort={(column) => setChannelSort((current) => nextSortState(current, column))}>通道</SortHeader></th>
+                <th><SortHeader column="status" label="状态" sort={channelSort} onSort={(column) => setChannelSort((current) => nextSortState(current, column))}>状态</SortHeader></th>
+                <th><SortHeader column="entry" label="入口" sort={channelSort} onSort={(column) => setChannelSort((current) => nextSortState(current, column))}>入口</SortHeader></th>
+                <th><SortHeader column="missing" label="缺失配置" sort={channelSort} onSort={(column) => setChannelSort((current) => nextSortState(current, column))}>缺失配置</SortHeader></th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+              <tr className="table-filter-row">
+                <th><input aria-label="按通道筛选" value={channelColumnFilters.name} onChange={(event) => updateChannelColumnFilter("name", event.currentTarget.value)} placeholder="名称或 ID" /></th>
+                <th>
+                  <select aria-label="按通道状态筛选" value={channelColumnFilters.status} onChange={(event) => updateChannelColumnFilter("status", event.currentTarget.value)}>
+                    <option value="all">全部</option>
+                    <option value="configured">已接通</option>
+                    <option value="missing_config">待配置</option>
+                  </select>
+                </th>
+                <th><input aria-label="按通道入口筛选" value={channelColumnFilters.entry} onChange={(event) => updateChannelColumnFilter("entry", event.currentTarget.value)} placeholder="Webhook 或路径" /></th>
+                <th><input aria-label="按缺失配置筛选" value={channelColumnFilters.missing} onChange={(event) => updateChannelColumnFilter("missing", event.currentTarget.value)} placeholder="环境变量或无" /></th>
+              </tr>
+            </thead>
+            <tbody>
+              {visibleChannels.map((channel) => (
+                <tr key={channel.id}>
+                  <td>
+                    <strong>{channel.name}</strong>
+                    <br />
+                    <span>{channel.id}</span>
+                  </td>
+                  <td>{statusLabel(channel.status)}</td>
+                  <td>{channelEntry(channel)}</td>
+                  <td>{channelMissing(channel)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </section>
     </section>
   );

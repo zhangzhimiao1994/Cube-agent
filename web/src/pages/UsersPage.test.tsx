@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -108,6 +108,15 @@ describe("UsersPage", () => {
     );
   });
 
+  it("filters users by Feishu binding and keeps row actions aligned", async () => {
+    render(<TestApp initialPath="/users" />);
+
+    const table = await screen.findByRole("table", { name: "用户列表" });
+    await userEvent.type(screen.getByRole("textbox", { name: "按飞书绑定筛选" }), "ou_owner");
+
+    expect(within(table).getByText("owner")).not.toBeNull();
+    expect(within(table).queryByText("ops-user")).toBeNull();
+  });
   it("can create, disable, and delete manageable users", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<TestApp initialPath="/users" />);
@@ -116,8 +125,9 @@ describe("UsersPage", () => {
     await userEvent.type(screen.getByPlaceholderText("ops-user"), "new-ops");
     await userEvent.type(screen.getByPlaceholderText("至少 12 位"), "valid password 456");
     await userEvent.click(screen.getByRole("button", { name: "创建用户" }));
-    await userEvent.click(screen.getAllByRole("button", { name: "禁用" })[1]);
-    await userEvent.click(screen.getAllByRole("button", { name: "删除" })[1]);
+    const opsRow = screen.getByRole("row", { name: /ops-user/ });
+    await userEvent.click(within(opsRow).getByRole("button", { name: "禁用" }));
+    await userEvent.click(within(opsRow).getByRole("button", { name: "删除" }));
 
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/v1/users",
@@ -138,7 +148,7 @@ describe("UsersPage", () => {
     render(<TestApp initialPath="/users" />);
 
     await screen.findByRole("heading", { name: "用户管理" });
-    await userEvent.click(screen.getAllByRole("button", { name: "重置密码" })[1]);
+    await userEvent.click(within(screen.getByRole("row", { name: /ops-user/ })).getByRole("button", { name: "重置密码" }));
     await userEvent.type(screen.getByLabelText("新密码"), "new valid password 789");
     await userEvent.click(screen.getByRole("button", { name: "保存新密码" }));
 
@@ -157,7 +167,7 @@ describe("UsersPage", () => {
     render(<TestApp initialPath="/users" />);
 
     await screen.findByRole("heading", { name: "用户管理" });
-    await userEvent.click(screen.getAllByRole("button", { name: "编辑" })[1]);
+    await userEvent.click(within(screen.getByRole("row", { name: /ops-user/ })).getByRole("button", { name: "编辑" }));
     expect(screen.getByRole("heading", { name: "编辑用户" })).not.toBeNull();
 
     const usernameInput = screen.getByLabelText("用户名（编辑）");

@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { api, formatApiError, type ManagedUser } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
+import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
 
 const ROLES = [
   {
@@ -38,6 +39,60 @@ function can(permission: string, permissions: string[]) {
   return permissions.includes(`${namespace}:*`);
 }
 
+type UserSortKey = "username" | "role" | "status" | "feishu";
+
+type UserColumnFilters = {
+  feishu: string;
+  role: "all" | string;
+  status: "all" | "enabled" | "disabled";
+  username: string;
+};
+
+const EMPTY_USER_FILTERS: UserColumnFilters = {
+  feishu: "",
+  role: "all",
+  status: "all",
+  username: "",
+};
+
+function userStatus(user: ManagedUser) {
+  return user.disabled ? "已禁用" : "正常";
+}
+
+function userSearchText(user: ManagedUser) {
+  return [
+    user.username,
+    user.id,
+    roleLabel(user.role),
+    userStatus(user),
+    user.feishu_open_id ?? "未绑定",
+    user.protected ? "初始管理员" : "",
+  ].join(" ");
+}
+
+function matchesUserColumns(user: ManagedUser, filters: UserColumnFilters) {
+  return (
+    textContains(`${user.username} ${user.id}`, filters.username) &&
+    (filters.role === "all" || user.role === filters.role) &&
+    (filters.status === "all" || (filters.status === "disabled") === user.disabled) &&
+    textContains(user.feishu_open_id ?? "未绑定", filters.feishu)
+  );
+}
+
+function sortedUsers(users: ManagedUser[], sort: SortState<UserSortKey>) {
+  const copy = [...users];
+  if (false) return copy;
+  const direction = sort.direction === "asc" ? 1 : -1;
+  return copy.sort((left, right) => {
+    let result = 0;
+    if (sort.key === "username") result = compareText(left.username, right.username, "asc");
+    if (sort.key === "role") result = compareText(roleLabel(left.role), roleLabel(right.role), "asc");
+    if (sort.key === "status") result = compareText(userStatus(left), userStatus(right), "asc");
+    if (sort.key === "feishu") result = compareText(left.feishu_open_id ?? "未绑定", right.feishu_open_id ?? "未绑定", "asc");
+    return sort.direction === "asc" ? result : -result;
+  });
+}
+
 export function UsersPage() {
   const auth = useAuth();
   const queryClient = useQueryClient();
@@ -51,6 +106,9 @@ export function UsersPage() {
   const [editDisabled, setEditDisabled] = useState(false);
   const [resetTarget, setResetTarget] = useState<ManagedUser | null>(null);
   const [resetPassword, setResetPassword] = useState("");
+  const [userSearchTerm, setUserSearchTerm] = useState("");
+  const [userColumnFilters, setUserColumnFilters] = useState<UserColumnFilters>(EMPTY_USER_FILTERS);
+  const [userSort, setUserSort] = useState<SortState<UserSortKey>>({ key: "username", direction: "asc" });
   const permissions = auth.user?.permissions ?? [];
   const canWriteUsers = can("user:write", permissions);
   const currentUserId = auth.user?.user_id ?? "";
@@ -130,6 +188,16 @@ export function UsersPage() {
   if (users.isLoading) return <p>正在加载用户...</p>;
   if (users.isError) {
     return <p role="alert">{formatApiError(users.error, "用户列表加载失败")}</p>;
+  }
+
+  const userItems = users.data ?? [];
+  const visibleUsers = sortedUsers(
+    userItems.filter((user) => textContains(userSearchText(user), userSearchTerm) && matchesUserColumns(user, userColumnFilters)),
+    userSort,
+  );
+
+  function updateUserColumnFilter<Key extends keyof UserColumnFilters>(key: Key, value: UserColumnFilters[Key]) {
+    setUserColumnFilters((current) => ({ ...current, [key]: value }));
   }
 
   return (
@@ -328,18 +396,57 @@ export function UsersPage() {
 
       <article>
         <h3>用户列表</h3>
-        <table>
-          <thead>
-            <tr>
-              <th>用户名</th>
-              <th>角色</th>
-              <th>状态</th>
-              <th>飞书绑定</th>
-              <th>操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {users.data?.map((user) => {
+        <div className="list-toolbar">
+          <label>
+            快速搜索用户
+            <input
+              type="search"
+              aria-label="快速搜索用户"
+              value={userSearchTerm}
+              onChange={(event) => setUserSearchTerm(event.currentTarget.value)}
+              placeholder="用户名、角色、状态或飞书 ID"
+            />
+          </label>
+          <button type="button" className="secondary-action" onClick={() => { setUserSearchTerm(""); setUserColumnFilters(EMPTY_USER_FILTERS); }}>
+            清空筛选
+          </button>
+        </div>
+        {visibleUsers.length === 0 ? (
+          <article>
+            <h4>当前筛选没有匹配用户</h4>
+            <p>调整列筛选或清空筛选查看全部用户。</p>
+          </article>
+        ) : (
+          <table aria-label="用户列表">
+            <thead>
+              <tr>
+                <th><SortHeader column="username" label="用户名" sort={userSort} onSort={(column) => setUserSort((current) => nextSortState(current, column))}>用户名</SortHeader></th>
+                <th><SortHeader column="role" label="角色" sort={userSort} onSort={(column) => setUserSort((current) => nextSortState(current, column))}>角色</SortHeader></th>
+                <th><SortHeader column="status" label="状态" sort={userSort} onSort={(column) => setUserSort((current) => nextSortState(current, column))}>状态</SortHeader></th>
+                <th><SortHeader column="feishu" label="飞书绑定" sort={userSort} onSort={(column) => setUserSort((current) => nextSortState(current, column))}>飞书绑定</SortHeader></th>
+                <th>操作</th>
+              </tr>
+              <tr className="table-filter-row">
+                <th><input aria-label="按用户名筛选" value={userColumnFilters.username} onChange={(event) => updateUserColumnFilter("username", event.currentTarget.value)} placeholder="用户名或 ID" /></th>
+                <th>
+                  <select aria-label="按用户角色筛选" value={userColumnFilters.role} onChange={(event) => updateUserColumnFilter("role", event.currentTarget.value)}>
+                    <option value="all">全部</option>
+                    {ROLES.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+                  </select>
+                </th>
+                <th>
+                  <select aria-label="按用户状态筛选" value={userColumnFilters.status} onChange={(event) => updateUserColumnFilter("status", event.currentTarget.value as UserColumnFilters["status"])}>
+                    <option value="all">全部</option>
+                    <option value="enabled">正常</option>
+                    <option value="disabled">已禁用</option>
+                  </select>
+                </th>
+                <th><input aria-label="按飞书绑定筛选" value={userColumnFilters.feishu} onChange={(event) => updateUserColumnFilter("feishu", event.currentTarget.value)} placeholder="open_id 或未绑定" /></th>
+                <th aria-label="用户操作筛选占位" />
+              </tr>
+            </thead>
+            <tbody>
+              {visibleUsers.map((user) => {
               const isSelf = user.id === currentUserId;
               const locked = user.protected || isSelf || !canWriteUsers;
               return (
@@ -417,8 +524,9 @@ export function UsersPage() {
                 </tr>
               );
             })}
-          </tbody>
-        </table>
+            </tbody>
+          </table>
+        )}
       </article>
     </section>
   );

@@ -100,8 +100,8 @@ describe("SkillsPage", () => {
     render(<TestApp initialPath="/skills" />);
 
     await screen.findByRole("heading", { name: "技能管理" });
-    await userEvent.click(screen.getByLabelText("全选待审批 Skill"));
-    await userEvent.click(screen.getByRole("button", { name: "批量审批启用已选 Skill" }));
+    await userEvent.click(screen.getByLabelText("全选当前待审批 Skill"));
+    await userEvent.click(screen.getByRole("button", { name: /批量审批待审批 Skill/ }));
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
@@ -123,7 +123,7 @@ describe("SkillsPage", () => {
     const table = screen.getByRole("table", { name: "已上传 Skill" });
     await userEvent.click(within(table).getByLabelText("选择 Skill deep-research"));
     await userEvent.click(within(table).getByLabelText("选择 Skill pdf"));
-    await userEvent.click(screen.getByRole("button", { name: "批量删除已选 Skill" }));
+    await userEvent.click(screen.getByRole("button", { name: /批量删除已选 Skill/ }));
 
     expect(window.confirm).toHaveBeenCalledTimes(1);
     await waitFor(() => {
@@ -136,6 +136,52 @@ describe("SkillsPage", () => {
         expect.objectContaining({ method: "DELETE" }),
       );
     });
+  });
+
+  it("bulk actions only operate on selected visible skills", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<TestApp initialPath="/skills" />);
+
+    await screen.findByRole("heading", { name: "技能管理" });
+    await userEvent.type(screen.getByRole("textbox", { name: "按 Skill 请求权限筛选" }), "filesystem");
+    await userEvent.click(screen.getByLabelText("全选当前待审批 Skill"));
+    await userEvent.click(screen.getByRole("button", { name: /批量删除已选 Skill/ }));
+
+    expect(window.confirm).toHaveBeenCalledWith("确认删除当前结果中已选的 1 个 Skill？删除后不会再分发给主 Agent 或子 Agent。");
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/admin/skills/docx",
+        expect.objectContaining({ method: "DELETE" }),
+      );
+    });
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/v1/admin/skills/deep-research",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
+
+  it("filters uploaded skills by name, permissions, and scan details", async () => {
+    render(<TestApp initialPath="/skills" />);
+
+    await screen.findByRole("heading", { name: "技能管理" });
+    await userEvent.type(screen.getByRole("textbox", { name: "按 Skill 请求权限筛选" }), "filesystem");
+
+    expect(screen.getByText("docx")).not.toBeNull();
+    expect(screen.queryByText("deep-research")).toBeNull();
+    expect(screen.queryByText("pdf")).toBeNull();
+    expect(screen.getByText("显示 1 / 3")).not.toBeNull();
+  });
+
+  it("sorts skills by column header", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/skills" />);
+
+    const table = await screen.findByRole("table", { name: "已上传 Skill" });
+    await user.click(screen.getByRole("button", { name: "状态排序" }));
+    const dataRows = within(table).getAllByRole("row").slice(2).map((row) => row.textContent ?? "");
+    const joinedRows = dataRows.join("\n");
+
+    expect(joinedRows.indexOf("enabled")).toBeLessThan(joinedRows.indexOf("quarantined"));
   });
 
   it("uploads tar.gz skill archives with the matching archive content type", async () => {

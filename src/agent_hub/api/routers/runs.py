@@ -310,6 +310,42 @@ async def _vibe_coding_enabled(request: Request) -> bool:
     return getattr(settings, "vibe_coding_enabled", False) is True
 
 
+async def _record_run_submit_audit(
+    request: Request,
+    principal: AuthenticatedPrincipal,
+    body: CreateRunRequest,
+    submitted: SubmittedRun,
+) -> None:
+    service = getattr(request.app.state, "admin_resource_service", None)
+    recorder = getattr(service, "record_audit_event", None)
+    if recorder is None:
+        return
+    preview = body.message.strip().replace("\r", " ").replace("\n", " ")[:120]
+    details: dict[str, object] = {
+        "user_id": str(principal.user_id),
+        "user_role": principal.role.value,
+        "run_id": str(submitted.id),
+        "conversation_id": submitted.conversation_id,
+        "reference_conversation_id": submitted.reference_conversation_id,
+        "mode": body.mode.value,
+        "accepted_mode": submitted.mode.value if submitted.mode is not None else None,
+        "status": submitted.status.value,
+        "agent_ids": list(body.agent_ids),
+        "workflow_id": body.workflow_id,
+        "direct_model": body.direct_model,
+        "vibe_coding": body.vibe_coding,
+        "attachment_count": len(body.attachment_ids),
+        "message_preview": preview,
+        "message_sha256": hashlib.sha256(body.message.encode("utf-8")).hexdigest(),
+    }
+    await recorder(
+        actor=str(principal.user_id),
+        action="run.submit",
+        resource=str(submitted.id),
+        details=details,
+    )
+
+
 def _attachment_store_dir(request: Request) -> Path:
     configured = getattr(request.app.state, "attachment_store_dir", None)
     if isinstance(configured, Path):
@@ -730,6 +766,7 @@ async def create_run(
         vibe_coding=body.vibe_coding,
         idempotency_key=idempotency_key,
     )
+    await _record_run_submit_audit(request, principal, body, submitted)
     return SubmittedRunResponse.from_submitted(submitted)
 
 

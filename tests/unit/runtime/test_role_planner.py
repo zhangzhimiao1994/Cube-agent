@@ -208,6 +208,21 @@ def test_multimedia_generation_dispatch_adds_dedicated_executor_role() -> None:
     assert "submit_video_to_text_only_model" in executor.forbidden_actions
 
 
+
+def test_multimedia_generator_is_not_selected_for_non_generation_tasks() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="请做一个产品发布方案，分析是否需要图片、视频或语音素材，但暂不生成视频。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "multimedia_generator" not in role_ids
+
 def test_role_catalog_can_be_extended_without_changing_role_planner_code() -> None:
     catalog = default_role_catalog().with_role(
         RoleDefinition(

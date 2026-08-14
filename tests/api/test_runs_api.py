@@ -4,9 +4,10 @@ import io
 import json
 import tarfile
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
+from typing import cast
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
@@ -31,9 +32,21 @@ class StubAuthService:
 @dataclass(slots=True)
 class StubSettingsService:
     vibe_coding_enabled: bool = False
+    audit_events: list[dict[str, object]] = field(default_factory=list)
 
     async def get_settings(self) -> object:
         return type("Settings", (), {"vibe_coding_enabled": self.vibe_coding_enabled})()
+
+    async def record_audit_event(
+        self,
+        *,
+        actor: str,
+        action: str,
+        resource: str,
+        details: dict[str, object],
+    ) -> object:
+        self.audit_events.append({"actor": actor, "action": action, "resource": resource, "details": details})
+        return object()
 
 
 @dataclass(slots=True)
@@ -276,6 +289,47 @@ def test_low_confidence_submission_returns_202_waiting_user_mode_and_does_not_en
     ]
     assert service.enqueue_count == 0
 
+
+def test_run_submission_records_user_conversation_audit_event() -> None:
+    settings_service = StubSettingsService()
+    client, service, principal = _client(settings_service=settings_service)
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": "请分析这个产品方案并给出下一步。",
+            "mode": "hybrid",
+            "agent_ids": ["researcher"],
+            "workflow_id": "market-review",
+            "conversation_id": "conv-audit-1",
+            "reference_conversation_id": "conv-previous",
+            "vibe_coding": False,
+        },
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert len(settings_service.audit_events) == 1
+    event = settings_service.audit_events[0]
+    assert event["actor"] == str(principal.user_id)
+    assert event["action"] == "run.submit"
+    assert event["resource"] == body["id"]
+    details = cast(dict[str, object], event["details"])
+    assert details["user_id"] == str(principal.user_id)
+    assert details["user_role"] == principal.role.value
+    assert details["run_id"] == body["id"]
+    assert details["conversation_id"] == "conv-audit-1"
+    assert details["reference_conversation_id"] == "conv-previous"
+    assert details["mode"] == "hybrid"
+    assert details["accepted_mode"] == "hybrid"
+    assert details["status"] == "queued"
+    assert details["agent_ids"] == ["researcher"]
+    assert details["workflow_id"] == "market-review"
+    assert details["attachment_count"] == 0
+    assert details["message_preview"] == "请分析这个产品方案并给出下一步。"
+    assert isinstance(details["message_sha256"], str)
+    assert service.enqueue_count == 1
 
 def test_direct_submission_forwards_selected_model_without_agent_ids() -> None:
     client, service, principal = _client()

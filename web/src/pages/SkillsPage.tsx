@@ -2,14 +2,61 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
 import { api, formatApiError, type Skill } from "../api/client";
+import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
+
+type SkillSortKey = "name" | "status" | "scan" | "permissions";
+
+type SkillColumnFilters = {
+  name: string;
+  permissions: string;
+  scan: string;
+  status: string;
+};
+
+const EMPTY_SKILL_FILTERS: SkillColumnFilters = {
+  name: "",
+  permissions: "",
+  scan: "",
+  status: "all",
+};
 
 function toggle(values: string[], value: string) {
   return values.includes(value) ? values.filter((item) => item !== value) : [...values, value];
 }
 
+function skillColumnValue(skill: Skill, key: SkillSortKey) {
+  if (key === "name") return `${skill.name} ${skill.id}`;
+  if (key === "status") return skill.status;
+  if (key === "scan") return skill.scan_diff.join("; ");
+  return skill.requested_permissions.join(", ");
+}
+
+function matchesSkillSearch(skill: Skill, query: string) {
+  return textContains(
+    [skill.id, skill.name, skill.status, ...skill.scan_diff, ...skill.requested_permissions].join(" "),
+    query,
+  );
+}
+
+function matchesSkillColumns(skill: Skill, filters: SkillColumnFilters) {
+  return (
+    textContains(`${skill.name} ${skill.id}`, filters.name) &&
+    (filters.status === "all" || skill.status === filters.status) &&
+    textContains(skill.scan_diff.join("; "), filters.scan) &&
+    textContains(skill.requested_permissions.join(", "), filters.permissions)
+  );
+}
+
+function sortedSkills(items: Skill[], sort: SortState<SkillSortKey>) {
+  return [...items].sort((left, right) => compareText(skillColumnValue(left, sort.key), skillColumnValue(right, sort.key), sort.direction));
+}
+
 export function SkillsPage() {
   const [file, setFile] = useState<File | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [searchTerm, setSearchTerm] = useState("");
+  const [columnFilters, setColumnFilters] = useState<SkillColumnFilters>(EMPTY_SKILL_FILTERS);
+  const [sort, setSort] = useState<SortState<SkillSortKey>>({ key: "name", direction: "asc" });
   const queryClient = useQueryClient();
   const skills = useQuery({ queryKey: ["skills"], queryFn: () => api.skills() });
   const upload = useMutation({
@@ -51,6 +98,10 @@ export function SkillsPage() {
     },
   });
 
+  function updateColumnFilter(key: keyof SkillColumnFilters, value: string) {
+    setColumnFilters((current) => ({ ...current, [key]: value }));
+  }
+
   function confirmDeleteSkill(id: string, name: string) {
     if (!window.confirm(`确定删除 Skill「${name}」吗？删除后不会再分发给主 Agent 或子 Agent。`)) return;
     deleteSkill.mutate(id);
@@ -64,23 +115,21 @@ export function SkillsPage() {
     });
   }
 
-  function selectedSkills(items: Skill[]) {
-    return items.filter((item) => selectedIds.includes(item.id));
-  }
-
   if (skills.isLoading) return <p>正在加载 Skill...</p>;
   if (skills.isError) {
     return <p role="alert">{formatApiError(skills.error, "Skill 加载失败")}</p>;
   }
 
   const items = skills.data ?? [];
-  const quarantinedIds = items.filter((skill) => skill.status !== "enabled").map((skill) => skill.id);
-  const selectedItems = selectedSkills(items);
-  const selectedQuarantinedIds = selectedItems
-    .filter((skill) => skill.status !== "enabled")
-    .map((skill) => skill.id);
-  const allQuarantinedSelected =
-    quarantinedIds.length > 0 && quarantinedIds.every((id) => selectedIds.includes(id));
+  const filteredItems = items.filter((skill) => matchesSkillSearch(skill, searchTerm) && matchesSkillColumns(skill, columnFilters));
+  const visibleItems = sortedSkills(filteredItems, sort);
+  const visibleIds = visibleItems.map((skill) => skill.id);
+  const visibleApprovalIds = visibleItems.filter((skill) => skill.status !== "enabled").map((skill) => skill.id);
+  const selectedVisibleIds = selectedIds.filter((id) => visibleIds.includes(id));
+  const selectedVisibleApprovalIds = selectedIds.filter((id) => visibleApprovalIds.includes(id));
+  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.includes(id));
+  const allVisibleApprovalSelected =
+    visibleApprovalIds.length > 0 && visibleApprovalIds.every((id) => selectedIds.includes(id));
   const busy = approve.isPending || deleteSkill.isPending || bulkApprove.isPending || bulkDelete.isPending;
   const skippedUploadItems = upload.data?.skipped ?? [];
 
@@ -144,93 +193,151 @@ export function SkillsPage() {
           </article>
         ) : (
           <>
+            <div className="list-toolbar">
+              <label>
+                快速搜索 Skill
+                <input
+                  type="search"
+                  aria-label="快速搜索 Skill"
+                  value={searchTerm}
+                  onChange={(event) => setSearchTerm(event.currentTarget.value)}
+                  placeholder="跨名称、ID、状态、权限和扫描结果搜索"
+                />
+              </label>
+              <button type="button" className="secondary-action" onClick={() => { setSearchTerm(""); setColumnFilters(EMPTY_SKILL_FILTERS); }}>
+                清空筛选
+              </button>
+              <small>
+                显示 {visibleItems.length} / {items.length}
+              </small>
+            </div>
             <div className="bulk-action-bar">
               <label className="inline-check compact-check">
                 <input
                   type="checkbox"
-                  aria-label="全选待审批 Skill"
-                  checked={allQuarantinedSelected}
-                  disabled={quarantinedIds.length === 0 || busy}
-                  onChange={() => toggleAll(quarantinedIds)}
+                  aria-label="全选当前结果 Skill"
+                  checked={allVisibleSelected}
+                  disabled={visibleIds.length === 0 || busy}
+                  onChange={() => toggleAll(visibleIds)}
+                />
+                全选当前结果
+              </label>
+              <label className="inline-check compact-check">
+                <input
+                  type="checkbox"
+                  aria-label="全选当前待审批 Skill"
+                  checked={allVisibleApprovalSelected}
+                  disabled={visibleApprovalIds.length === 0 || busy}
+                  onChange={() => toggleAll(visibleApprovalIds)}
                 />
                 全选待审批
               </label>
               <button
                 type="button"
                 className="secondary-action"
-                disabled={selectedQuarantinedIds.length === 0 || busy}
-                onClick={() => bulkApprove.mutate(selectedQuarantinedIds)}
+                disabled={selectedVisibleApprovalIds.length === 0 || busy}
+                onClick={() => bulkApprove.mutate(selectedVisibleApprovalIds)}
               >
-                {bulkApprove.isPending ? "审批中..." : "批量审批启用已选 Skill"}
+                {bulkApprove.isPending ? "审批中..." : `批量审批待审批 Skill（${selectedVisibleApprovalIds.length}）`}
               </button>
               <button
                 type="button"
                 className="danger-button"
-                disabled={selectedIds.length === 0 || busy}
+                disabled={selectedVisibleIds.length === 0 || busy}
                 onClick={() => {
-                  if (!window.confirm(`确认删除 ${selectedIds.length} 个已选 Skill？删除后不会再分发给主 Agent 或子 Agent。`)) {
+                  if (!window.confirm(`确认删除当前结果中已选的 ${selectedVisibleIds.length} 个 Skill？删除后不会再分发给主 Agent 或子 Agent。`)) {
                     return;
                   }
-                  bulkDelete.mutate(selectedIds);
+                  bulkDelete.mutate(selectedVisibleIds);
                 }}
               >
-                {bulkDelete.isPending ? "删除中..." : "批量删除已选 Skill"}
+                {bulkDelete.isPending ? "删除中..." : `批量删除已选 Skill（${selectedVisibleIds.length}）`}
               </button>
-              <small>已选 {selectedIds.length}</small>
+              <small>当前结果已选 {selectedVisibleIds.length}</small>
             </div>
-            <div className="table-shell">
-              <table aria-label="已上传 Skill">
-                <thead>
-                  <tr>
-                    <th>选择</th>
-                    <th>Skill</th>
-                    <th>状态</th>
-                    <th>扫描结果</th>
-                    <th>请求权限</th>
-                    <th>操作</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {items.map((skill) => (
-                    <tr key={skill.id}>
-                      <td>
-                        <input
-                          type="checkbox"
-                          aria-label={`选择 Skill ${skill.id}`}
-                          checked={selectedIds.includes(skill.id)}
-                          disabled={busy}
-                          onChange={() => setSelectedIds((current) => toggle(current, skill.id))}
-                        />
-                      </td>
-                      <td>
-                        <strong>{skill.name}</strong>
-                        <p className="field-help">ID：{skill.id}</p>
-                      </td>
-                      <td>{skill.status}</td>
-                      <td>{skill.scan_diff.join("; ") || "无"}</td>
-                      <td>{skill.requested_permissions.join(", ") || "无"}</td>
-                      <td className="table-actions">
-                        <button
-                          type="button"
-                          disabled={skill.status === "enabled" || busy}
-                          onClick={() => approve.mutate(skill.id)}
-                        >
-                          {skill.status === "enabled" ? "已启用" : "审批启用"}
-                        </button>
-                        <button
-                          type="button"
-                          className="danger-action"
-                          disabled={busy}
-                          onClick={() => confirmDeleteSkill(skill.id, skill.name)}
-                        >
-                          删除
-                        </button>
-                      </td>
+            {visibleItems.length === 0 ? (
+              <article>
+                <h4>没有匹配的 Skill</h4>
+                <p>调整列筛选或清空筛选查看全部 Skill。</p>
+              </article>
+            ) : (
+              <div className="table-shell">
+                <table aria-label="已上传 Skill">
+                  <thead>
+                    <tr>
+                      <th>选择</th>
+                      <th><SortHeader column="name" label="Skill" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>Skill</SortHeader></th>
+                      <th><SortHeader column="status" label="状态" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>状态</SortHeader></th>
+                      <th><SortHeader column="scan" label="扫描结果" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>扫描结果</SortHeader></th>
+                      <th><SortHeader column="permissions" label="请求权限" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>请求权限</SortHeader></th>
+                      <th>操作</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                    <tr className="table-filter-row">
+                      <th></th>
+                      <th>
+                        <input aria-label="按 Skill 筛选" value={columnFilters.name} onChange={(event) => updateColumnFilter("name", event.currentTarget.value)} placeholder="名称或 ID" />
+                      </th>
+                      <th>
+                        <select aria-label="按 Skill 状态筛选" value={columnFilters.status} onChange={(event) => updateColumnFilter("status", event.currentTarget.value)}>
+                          <option value="all">全部</option>
+                          <option value="quarantined">quarantined</option>
+                          <option value="scanned">scanned</option>
+                          <option value="approved">approved</option>
+                          <option value="enabled">enabled</option>
+                          <option value="disabled">disabled</option>
+                        </select>
+                      </th>
+                      <th>
+                        <input aria-label="按 Skill 扫描结果筛选" value={columnFilters.scan} onChange={(event) => updateColumnFilter("scan", event.currentTarget.value)} placeholder="扫描关键词" />
+                      </th>
+                      <th>
+                        <input aria-label="按 Skill 请求权限筛选" value={columnFilters.permissions} onChange={(event) => updateColumnFilter("permissions", event.currentTarget.value)} placeholder="权限关键词" />
+                      </th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {visibleItems.map((skill) => (
+                      <tr key={skill.id}>
+                        <td>
+                          <input
+                            type="checkbox"
+                            aria-label={`选择 Skill ${skill.id}`}
+                            checked={selectedIds.includes(skill.id)}
+                            disabled={busy}
+                            onChange={() => setSelectedIds((current) => toggle(current, skill.id))}
+                          />
+                        </td>
+                        <td>
+                          <strong>{skill.name}</strong>
+                          <p className="field-help">ID：{skill.id}</p>
+                        </td>
+                        <td>{skill.status}</td>
+                        <td>{skill.scan_diff.join("; ") || "无"}</td>
+                        <td>{skill.requested_permissions.join(", ") || "无"}</td>
+                        <td className="table-actions">
+                          <button
+                            type="button"
+                            disabled={skill.status === "enabled" || busy}
+                            onClick={() => approve.mutate(skill.id)}
+                          >
+                            {skill.status === "enabled" ? "已启用" : "审批启用"}
+                          </button>
+                          <button
+                            type="button"
+                            className="danger-action"
+                            disabled={busy}
+                            onClick={() => confirmDeleteSkill(skill.id, skill.name)}
+                          >
+                            删除
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </>
         )}
       </section>

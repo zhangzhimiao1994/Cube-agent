@@ -1,8 +1,27 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
-import { api, formatApiError } from "../api/client";
+import { api, formatApiError, type HermesInsight } from "../api/client";
+import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
+
+type HermesSortKey = "created" | "conversation" | "summary" | "outcome" | "status";
+
+type HermesColumnFilters = {
+  conversation: string;
+  created: string;
+  outcome: string;
+  status: string;
+  summary: string;
+};
+
+const EMPTY_HERMES_FILTERS: HermesColumnFilters = {
+  conversation: "",
+  created: "",
+  outcome: "all",
+  status: "all",
+  summary: "",
+};
 
 function parseList(value: string) {
   return value
@@ -17,6 +36,46 @@ function statusLabel(confirmedAt: string | null) {
 
 function toggle(values: string[], value: string) {
   return values.includes(value) ? values.filter((item) => item !== value) : [...values, value];
+}
+
+function hermesColumnValue(insight: HermesInsight, key: HermesSortKey) {
+  if (key === "created") return insight.created_at;
+  if (key === "conversation") return insight.conversation_id ?? "未关联";
+  if (key === "summary") return insight.summary;
+  if (key === "outcome") return insight.outcome;
+  return statusLabel(insight.confirmed_at);
+}
+
+function matchesHermesSearch(insight: HermesInsight, query: string) {
+  return textContains(
+    [
+      insight.id,
+      insight.run_id ?? "",
+      insight.conversation_id ?? "",
+      insight.outcome,
+      insight.summary,
+      insight.lesson,
+      statusLabel(insight.confirmed_at),
+      insight.created_at,
+      ...insight.tags,
+    ].join(" "),
+    query,
+  );
+}
+
+function matchesHermesColumns(insight: HermesInsight, filters: HermesColumnFilters) {
+  const status = insight.confirmed_at ? "confirmed" : "pending";
+  return (
+    textContains(insight.created_at, filters.created) &&
+    textContains(insight.conversation_id ?? "未关联", filters.conversation) &&
+    textContains(insight.summary, filters.summary) &&
+    (filters.outcome === "all" || insight.outcome === filters.outcome) &&
+    (filters.status === "all" || status === filters.status)
+  );
+}
+
+function sortedHermesInsights(items: HermesInsight[], sort: SortState<HermesSortKey>) {
+  return [...items].sort((left, right) => compareText(hermesColumnValue(left, sort.key), hermesColumnValue(right, sort.key), sort.direction));
 }
 
 export function HermesPage() {
@@ -35,6 +94,9 @@ function HermesLearningTable() {
   const [outcome, setOutcome] = useState<"success" | "failure" | "neutral">("success");
   const [weight, setWeight] = useState("5");
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [searchTerm, setSearchTerm] = useState("");
+  const [columnFilters, setColumnFilters] = useState<HermesColumnFilters>(EMPTY_HERMES_FILTERS);
+  const [sort, setSort] = useState<SortState<HermesSortKey>>({ key: "created", direction: "desc" });
 
   const insights = useQuery({
     queryKey: ["hermes"],
@@ -82,44 +144,50 @@ function HermesLearningTable() {
     },
   });
 
-  const sortedInsights = useMemo(
-    () => [...(insights.data ?? [])].sort((a, b) => b.created_at.localeCompare(a.created_at)),
-    [insights.data],
-  );
-  const insightIds = sortedInsights.map((insight) => insight.id);
-  const selectedInsightIds = selectedIds.filter((id) => insightIds.includes(id));
-  const confirmableIds = sortedInsights
-    .filter((insight) => insight.confirmed_at === null)
-    .map((insight) => insight.id);
-  const selectedConfirmableIds = selectedIds.filter((id) => confirmableIds.includes(id));
-  const allInsightsSelected = insightIds.length > 0 && insightIds.every((id) => selectedIds.includes(id));
+  function updateColumnFilter(key: keyof HermesColumnFilters, value: string) {
+    setColumnFilters((current) => ({ ...current, [key]: value }));
+  }
 
   function submitFeedback(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     feedback.mutate();
   }
 
-  function toggleAllInsights() {
+  function toggleAll(ids: string[]) {
     setSelectedIds((current) => {
-      if (allInsightsSelected) return current.filter((id) => !insightIds.includes(id));
-      return Array.from(new Set([...current, ...insightIds]));
+      const allSelected = ids.length > 0 && ids.every((id) => current.includes(id));
+      if (allSelected) return current.filter((id) => !ids.includes(id));
+      return Array.from(new Set([...current, ...ids]));
     });
   }
 
-  function confirmSelectedInsights() {
-    if (selectedConfirmableIds.length === 0) return;
-    bulkConfirm.mutate(selectedConfirmableIds);
+  function confirmSelectedInsights(ids: string[]) {
+    if (ids.length === 0) return;
+    bulkConfirm.mutate(ids);
   }
 
-  function deleteSelectedInsights() {
-    if (selectedInsightIds.length === 0) return;
-    bulkDelete.mutate(selectedInsightIds);
+  function deleteSelectedInsights(ids: string[]) {
+    if (ids.length === 0) return;
+    if (!window.confirm(`确认删除当前结果中已选的 ${ids.length} 条学习记录？删除后不会再进入 Hermes 建议。`)) return;
+    bulkDelete.mutate(ids);
   }
 
   if (insights.isLoading) return <p>正在加载 Hermes...</p>;
   if (insights.isError) {
     return <p role="alert">{formatApiError(insights.error, "Hermes 加载失败")}</p>;
   }
+
+  const items = insights.data ?? [];
+  const filteredInsights = items.filter((insight) => matchesHermesSearch(insight, searchTerm) && matchesHermesColumns(insight, columnFilters));
+  const visibleInsights = sortedHermesInsights(filteredInsights, sort);
+  const visibleIds = visibleInsights.map((insight) => insight.id);
+  const visibleConfirmableIds = visibleInsights.filter((insight) => insight.confirmed_at === null).map((insight) => insight.id);
+  const selectedVisibleIds = selectedIds.filter((id) => visibleIds.includes(id));
+  const selectedVisibleConfirmableIds = selectedIds.filter((id) => visibleConfirmableIds.includes(id));
+  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.includes(id));
+  const allVisibleConfirmableSelected =
+    visibleConfirmableIds.length > 0 && visibleConfirmableIds.every((id) => selectedIds.includes(id));
+  const busy = bulkConfirm.isPending || bulkDelete.isPending || confirmInsight.isPending || deleteInsight.isPending;
 
   return (
     <section>
@@ -132,41 +200,69 @@ function HermesLearningTable() {
 
       <section aria-label="Hermes 学习台账">
         <h3>学习台账</h3>
-        {sortedInsights.length === 0 ? (
+        {items.length === 0 ? (
           <article>
             <h4>还没有学习记录</h4>
             <p>运行完成或手动记录经验后，Hermes 会按时间和对话 ID 在这里建立台账。</p>
           </article>
         ) : (
           <>
+            <div className="list-toolbar">
+              <label>
+                快速搜索学习记录
+                <input
+                  type="search"
+                  aria-label="快速搜索 Hermes 学习"
+                  value={searchTerm}
+                  onChange={(event) => setSearchTerm(event.currentTarget.value)}
+                  placeholder="跨对话 ID、摘要、标签、结果或状态搜索"
+                />
+              </label>
+              <button type="button" className="secondary-action" onClick={() => { setSearchTerm(""); setColumnFilters(EMPTY_HERMES_FILTERS); }}>
+                清空筛选
+              </button>
+              <small>
+                显示 {visibleInsights.length} / {items.length}
+              </small>
+            </div>
             <div className="bulk-action-bar">
               <label className="inline-check compact-check">
                 <input
                   type="checkbox"
-                  aria-label="Select all Hermes learning records"
-                  checked={allInsightsSelected}
-                  disabled={insightIds.length === 0 || bulkConfirm.isPending || bulkDelete.isPending}
-                  onChange={toggleAllInsights}
+                  aria-label="Select all visible Hermes learning records"
+                  checked={allVisibleSelected}
+                  disabled={visibleIds.length === 0 || busy}
+                  onChange={() => toggleAll(visibleIds)}
                 />
-                全选
+                全选当前结果
+              </label>
+              <label className="inline-check compact-check">
+                <input
+                  type="checkbox"
+                  aria-label="Select all visible unconfirmed Hermes learning records"
+                  checked={allVisibleConfirmableSelected}
+                  disabled={visibleConfirmableIds.length === 0 || busy}
+                  onChange={() => toggleAll(visibleConfirmableIds)}
+                />
+                全选待确认
               </label>
               <button
                 type="button"
                 className="secondary-action"
-                disabled={selectedConfirmableIds.length === 0 || bulkConfirm.isPending || bulkDelete.isPending}
-                onClick={confirmSelectedInsights}
+                disabled={selectedVisibleConfirmableIds.length === 0 || busy}
+                onClick={() => confirmSelectedInsights(selectedVisibleConfirmableIds)}
               >
-                {bulkConfirm.isPending ? "确认中..." : "批量确认已选学习"}
+                {bulkConfirm.isPending ? "确认中..." : `批量确认待确认学习（${selectedVisibleConfirmableIds.length}）`}
               </button>
               <button
                 type="button"
-                className="secondary-action danger-action"
-                disabled={selectedInsightIds.length === 0 || bulkConfirm.isPending || bulkDelete.isPending}
-                onClick={deleteSelectedInsights}
+                className="danger-button"
+                disabled={selectedVisibleIds.length === 0 || busy}
+                onClick={() => deleteSelectedInsights(selectedVisibleIds)}
               >
-                {bulkDelete.isPending ? "正在删除..." : "批量删除已选学习"}
+                {bulkDelete.isPending ? "正在删除..." : `批量删除已选学习（${selectedVisibleIds.length}）`}
               </button>
-              <small>已选 {selectedInsightIds.length}</small>
+              <small>当前结果已选 {selectedVisibleIds.length}</small>
             </div>
             {bulkConfirm.isError ? (
               <p role="alert">{formatApiError(bulkConfirm.error, "Hermes 批量确认失败")}</p>
@@ -180,29 +276,56 @@ function HermesLearningTable() {
             {deleteInsight.isError ? (
               <p role="alert">{formatApiError(deleteInsight.error, "Hermes 删除失败")}</p>
             ) : null}
-            <div className="table-shell">
-              <table aria-label="Hermes 学习台账">
-                <thead>
-                  <tr>
-                    <th>选择</th>
-                    <th>时间</th>
-                    <th>对话 ID</th>
-                    <th>学习总结</th>
-                    <th>结果</th>
-                    <th>确认状态</th>
-                    <th>操作</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {sortedInsights.map((insight) => {
-                    return (
+            {visibleInsights.length === 0 ? (
+              <article>
+                <h4>没有匹配的学习记录</h4>
+                <p>调整列筛选或清空筛选查看全部 Hermes 学习记录。</p>
+              </article>
+            ) : (
+              <div className="table-shell">
+                <table aria-label="Hermes 学习台账">
+                  <thead>
+                    <tr>
+                      <th>选择</th>
+                      <th><SortHeader column="created" label="时间" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>时间</SortHeader></th>
+                      <th><SortHeader column="conversation" label="对话 ID" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>对话 ID</SortHeader></th>
+                      <th><SortHeader column="summary" label="学习总结" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>学习总结</SortHeader></th>
+                      <th><SortHeader column="outcome" label="结果" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>结果</SortHeader></th>
+                      <th><SortHeader column="status" label="确认状态" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>确认状态</SortHeader></th>
+                      <th>操作</th>
+                    </tr>
+                    <tr className="table-filter-row">
+                      <th></th>
+                      <th><input aria-label="按 Hermes 时间筛选" value={columnFilters.created} onChange={(event) => updateColumnFilter("created", event.currentTarget.value)} placeholder="时间" /></th>
+                      <th><input aria-label="按 Hermes 对话 ID 筛选" value={columnFilters.conversation} onChange={(event) => updateColumnFilter("conversation", event.currentTarget.value)} placeholder="对话 ID" /></th>
+                      <th><input aria-label="按 Hermes 学习总结筛选" value={columnFilters.summary} onChange={(event) => updateColumnFilter("summary", event.currentTarget.value)} placeholder="总结关键词" /></th>
+                      <th>
+                        <select aria-label="按 Hermes 结果筛选" value={columnFilters.outcome} onChange={(event) => updateColumnFilter("outcome", event.currentTarget.value)}>
+                          <option value="all">全部</option>
+                          <option value="success">success</option>
+                          <option value="failure">failure</option>
+                          <option value="neutral">neutral</option>
+                        </select>
+                      </th>
+                      <th>
+                        <select aria-label="按 Hermes 确认状态筛选" value={columnFilters.status} onChange={(event) => updateColumnFilter("status", event.currentTarget.value)}>
+                          <option value="all">全部</option>
+                          <option value="pending">待确认</option>
+                          <option value="confirmed">已确认</option>
+                        </select>
+                      </th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {visibleInsights.map((insight) => (
                       <tr key={insight.id}>
                         <td>
                           <input
                             type="checkbox"
                             aria-label={`Select Hermes learning ${insight.id}`}
                             checked={selectedIds.includes(insight.id)}
-                            disabled={bulkConfirm.isPending || bulkDelete.isPending}
+                            disabled={busy}
                             onChange={() => setSelectedIds((current) => toggle(current, insight.id))}
                           />
                         </td>
@@ -213,13 +336,13 @@ function HermesLearningTable() {
                         <td>{insight.summary}</td>
                         <td>{insight.outcome}</td>
                         <td>{statusLabel(insight.confirmed_at)}</td>
-                        <td>
+                        <td className="table-actions">
                           {insight.confirmed_at === null ? (
                             <button
                               type="button"
                               className="secondary-action"
                               aria-label={`确认 Hermes 学习 ${insight.id}`}
-                              disabled={confirmInsight.isPending || bulkConfirm.isPending}
+                              disabled={busy}
                               onClick={() => confirmInsight.mutate(insight.id)}
                             >
                               确认
@@ -233,20 +356,24 @@ function HermesLearningTable() {
                           </Link>
                           <button
                             type="button"
-                            className="secondary-action"
+                            className="danger-action"
                             aria-label={`删除 Hermes 学习 ${insight.id}`}
-                            disabled={deleteInsight.isPending}
-                            onClick={() => deleteInsight.mutate(insight.id)}
+                            disabled={busy}
+                            onClick={() => {
+                              if (window.confirm(`确认删除这条 Hermes 学习记录？删除后不会再进入 Hermes 建议。`)) {
+                                deleteInsight.mutate(insight.id);
+                              }
+                            }}
                           >
                             删除
                           </button>
                         </td>
                       </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </>
         )}
       </section>
@@ -369,9 +496,13 @@ function HermesInsightDetail({ insightId }: { insightId: string }) {
           </button>
           <button
             type="button"
-            className="secondary-action"
+            className="danger-action"
             disabled={deleteInsight.isPending}
-            onClick={() => deleteInsight.mutate()}
+            onClick={() => {
+              if (window.confirm(`确认删除这条 Hermes 学习记录？删除后不会再进入 Hermes 建议。`)) {
+                deleteInsight.mutate();
+              }
+            }}
           >
             {deleteInsight.isPending ? "正在删除..." : "删除"}
           </button>
