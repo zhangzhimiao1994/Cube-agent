@@ -4680,3 +4680,23 @@ Remaining risks / next:
 - Commit this slice, create a GitHub recovery bundle/tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
 - Ask the user to send one Feishu test message after GitHub is green; then inspect run creation/reply logs if needed.
 - Continue P3 after green: Evolution executor orchestration, plan-task mode UX, OpenClaw broader workflow integration, Skill Creator grounding into full real-input/real-test workflows, UI copy/layout audit, missing button/function sweep, README/README.zh-CN final usage refresh, and Docker readiness later.
+
+## 2026-08-15 GitHub CI Recovery After Feishu Long-Connection Push
+
+Current state:
+
+- GitHub Actions run `31822850231` failed in `uv run pytest -q` after the Feishu long-connection push.
+- Root cause: app lifespan now reads channel runtime config before starting the Feishu WebSocket connector. In fake-database foundation tests, `PersistentAdminResourceService.channel_runtime_config()` can hit a fake session whose `execute()` returns `None`, raising `AttributeError` before lifespan cleanup assertions run.
+- Fixed `_channel_runtime_config_from_app()` and `_channel_runtime_config_from_request()` to catch config-provider failures, log a warning, and degrade to `{}`. This keeps channel config lookup from breaking app startup or webhook handling in degraded/fake environments.
+
+Local verification:
+
+- `.\.venv\Scripts\python.exe -m pytest tests\api\test_foundation_api.py -q` -> 74 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\unit\test_app_wiring.py tests\contracts\feishu\test_receivers.py tests\api\test_admin_resources.py -k "channel or feishu or starts_feishu" -q` -> 27 passed.
+- `.\.venv\Scripts\python.exe -m ruff check src tests` -> passed.
+- `.\.venv\Scripts\python.exe -m mypy --strict src tests` -> passed, 260 source files checked.
+- Local `tests\integration\auth\test_rate_limit_redis.py::test_real_redis_readiness_success_and_failure` did not complete because the local temporary PostgreSQL service did not become ready within 30 seconds; this was an environment setup issue and not the CI failure being fixed.
+
+Remaining risks / next:
+
+- Deploy this `app.py` fallback fix incrementally to the server, verify health and Feishu runtime status, commit, create another recovery bundle/tag, force-with-lease push, and re-check GitHub Actions until green.

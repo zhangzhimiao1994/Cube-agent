@@ -1171,7 +1171,11 @@ async def _channel_runtime_config_from_app(application: FastAPI) -> dict[str, st
     provider = getattr(service, "channel_runtime_config", None)
     if provider is None:
         return {}
-    config = await provider()
+    try:
+        config = await provider()
+    except Exception as error:  # noqa: BLE001 - channel startup must not break app lifespan.
+        _LOGGER.warning("channel_runtime_config_unavailable error_type=%s", type(error).__name__)
+        return {}
     if isinstance(config, dict):
         return cast(dict[str, str], config)
     return {}
@@ -1202,7 +1206,11 @@ async def _channel_runtime_config_from_request(request: Request) -> Mapping[str,
     provider = getattr(service, "channel_runtime_config", None)
     if provider is None:
         return {}
-    config = await provider()
+    try:
+        config = await provider()
+    except Exception as error:  # noqa: BLE001 - webhook config lookup degrades to env settings.
+        _LOGGER.warning("channel_runtime_config_unavailable error_type=%s", type(error).__name__)
+        return {}
     if isinstance(config, dict):
         request.app.state.channel_runtime_config = config
         return cast(dict[str, str], config)
