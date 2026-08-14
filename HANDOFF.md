@@ -1,3 +1,38 @@
+## 2026-08-14 OpenClaw Remote Operation Kinds
+
+Current state:
+
+- The OpenClaw local adapter no longer hard-rejects `desktop_action`, `screen_read`, and `file_read`.
+- All local adapter operation kinds now share the same safety boundary: bearer token authentication, platform match, exact argv allowlist, denied shell executables, timeout, and bounded stdout/stderr.
+- This makes Windows/Linux/macOS hosts usable through pre-approved local scripts or native executables without granting unrestricted system access.
+- Central Agent Hub approval still applies. Auto-approval remains limited to low-risk Linux `server_command`; remote desktop/screen/file operations stay user-approved under `ask` mode.
+
+Verification performed:
+
+- TDD red check first failed because the adapter returned `409 openclaw_adapter_kind_unavailable` for non-`server_command` kinds.
+- Local checks:
+  - `uv run pytest tests/unit/openclaw/test_local_adapter.py -q --tb=short` -> 6 passed.
+  - `uv run pytest tests/unit/openclaw/test_local_adapter.py tests/unit/install/test_native_install_scripts.py -q --tb=short` -> 31 passed.
+  - `uv run pytest tests/api/test_admin_resources.py -k "openclaw" -q --tb=short` -> 19 passed.
+  - `uv run ruff check src/agent_hub/openclaw/local_adapter.py tests/unit/openclaw/test_local_adapter.py` -> passed.
+  - `uv run mypy --strict src/agent_hub/openclaw/local_adapter.py tests/unit/openclaw/test_local_adapter.py` -> passed.
+  - `git diff --check` -> passed with existing CRLF warnings.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-openclaw-remote-operation-kinds.tgz` with only `src/agent_hub/openclaw/local_adapter.py` and `tests/unit/openclaw/test_local_adapter.py`.
+  - Backed up overwritten files under `/opt/agent-hub/backups/openclaw-remote-operation-kinds-<timestamp>`.
+  - Restarted `agent-hub-api` and `agent-hub-worker`; verified API, worker, and Caddy are active.
+- Server real environment E2E:
+  - Started a temporary Windows-platform OpenClaw adapter on `127.0.0.1:18769` with a single exact allowlisted Python argv.
+  - Configured a temporary `computer` remote adapter through real `GET/PUT /api/v1/admin/settings` and a sealed temporary token via `POST /api/v1/admin/secrets`.
+  - Created a real OpenClaw control session through `POST /api/v1/admin/openclaw/sessions`.
+  - Created, approved, and executed real operations for `desktop_action`, `screen_read`, and `file_read` via `/api/v1/admin/openclaw/operations`.
+  - Each operation returned status `executed` and stdout `openclaw-remote-kind-live`.
+  - Original system settings were restored; temporary OpenClaw session/operation resources and secret were narrowly deleted; probe script and tgz were removed; no adapter probe process remained.
+
+Remaining risks / next:
+
+- This enables cross-platform operation dispatch through configured scripts. It does not yet ship native GUI drivers, screenshot capture, or filesystem readers; those can now be added as host-side allowlisted tools per platform.
+- Continue P3 queue with final UI/layout/copy pass, README/README.zh-CN, and Docker readiness later.
 ## 2026-08-14 Multi-Skill Archive Install Fix
 
 Current state:

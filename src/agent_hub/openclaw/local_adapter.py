@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import os
@@ -71,8 +71,7 @@ def create_local_adapter_app(config: OpenClawLocalAdapterConfig) -> FastAPI:
             return _error(401, "openclaw_adapter_unauthorized", "OpenClaw adapter token is invalid")
         if body.platform != config.platform:
             return _error(409, "openclaw_adapter_platform_mismatch", "OpenClaw adapter platform does not match request")
-        if body.kind != "server_command":
-            return _error(409, "openclaw_adapter_kind_unavailable", "OpenClaw local adapter supports command execution only")
+
         allowed_commands = [list(command) for command in config.allowed_commands]
         if not openclaw_command_allowed(body.argv, allowed_commands):
             return _error(403, "openclaw_adapter_command_denied", "OpenClaw adapter command is not allowlisted")
