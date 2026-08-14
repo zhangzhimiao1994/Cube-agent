@@ -30,7 +30,7 @@
 - Removed server `/tmp/probe-channel-config-sources.py`, `/tmp/deploy-channel-config-sources.sh`, and `/tmp/agent-hub-p3-runtime-incremental.tgz` after verification.
 
 ### Remaining / Next
-- Commit this slice, create local GitHub recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, then watch GitHub Actions until green.
+- Committed as `5f57e07 feat: show channel config sources`, created local GitHub recovery bundle `.local-archives/github-recovery/mutilagent-main-before-20260815-054014-b16ada1.bundle`, pushed archive tag `archive/mutilagent-main-before-20260815-054014-b16ada1`, force-with-lease pushed `mutilagent/main`, and verified GitHub Actions run `31843507088` passed.
 - If Feishu still does not reply in chat, the next checks are Feishu platform event publishing, bot installation scope, message receive/reply permissions, and whether runtime metrics show `received_events` increasing after sending a test message.
 - Continue remaining P3 items after green: OpenClaw follow-up, evolution/memory refinements, broader UI layout/copy audit, missing button/function sweep, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 Skill Bulk Delete Backend Contract
