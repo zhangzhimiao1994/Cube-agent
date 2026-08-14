@@ -260,6 +260,30 @@ describe("OpenClawPage", () => {
       });
     });
   });
+  it("creates non-Linux read operations from the dedicated console", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/openclaw" />);
+
+    expect(await screen.findByRole("heading", { name: "OpenClaw 控制" })).not.toBeNull();
+    await user.selectOptions(screen.getByLabelText("操作平台"), "windows");
+    await user.selectOptions(screen.getByLabelText("操作类型"), "file_read");
+    await user.clear(screen.getByLabelText("操作目标"));
+    await user.type(screen.getByLabelText("操作目标"), "C:\\Reports\\daily.txt");
+    fireEvent.change(screen.getByTestId("openclaw-page-operation-argv"), { target: { value: "[]" } });
+
+    await user.click(screen.getByTestId("openclaw-page-create-operation"));
+    await waitFor(() => {
+      expect(requests.find((request) => request.path === "/api/v1/admin/openclaw/operations")).toMatchObject({
+        method: "POST",
+        body: expect.objectContaining({
+          platform: "windows",
+          kind: "file_read",
+          target: "C:\\Reports\\daily.txt",
+          argv: [],
+        }),
+      });
+    });
+  });
   it("runs the OpenClaw approval and execution chain from the dedicated page", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/openclaw" />);

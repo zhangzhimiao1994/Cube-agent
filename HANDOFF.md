@@ -1,3 +1,33 @@
+## 2026-08-15 OpenClaw Multi-Platform Operation Console
+
+### State
+- Updated the dedicated OpenClaw page operation console so operators can choose operation platform (`linux`, `windows`, `macos`), operation type (`server_command`, `desktop_action`, `screen_read`, `file_read`), target, and risk level instead of always creating Linux `server_command` operations.
+- Kept `server_command` strict: the UI still requires a non-empty exact argv array before creating or adding commands to the allowlist. Desktop/screen/file operations may use `[]` because their remote/local adapters execute bounded, configured drivers.
+- Added a regression test proving the page can create a Windows `file_read` operation request with an empty argv array.
+- Answered the Feishu configuration question during this slice: the server has `lark_oapi` installed. Previously saved Feishu `FEISHU_APP_ID`, `FEISHU_APP_SECRET`, and websocket transport can be reused unless the Feishu app credentials changed; SDK installed does not by itself prove the bot is receiving events.
+
+### Verification
+- TDD red first: `npm test -- --run src/pages/OpenClawPage.test.tsx -t "creates non-Linux read operations"` failed before the UI exposed 操作平台 / 操作类型.
+- Green local checks:
+  - `npm test -- --run src/pages/OpenClawPage.test.tsx` -> 5 passed.
+  - `npm run lint` -> passed.
+  - `.\.venv\Scripts\python.exe -m pytest tests\unit\openclaw tests\api\test_admin_resources.py -q -k "openclaw" --tb=short` -> 42 passed, 98 deselected; only existing FastAPI/httpx deprecation and pytest cache ACL warnings.
+  - `npm run build` -> passed with the existing Vite large chunk warning.
+  - `git diff --check` -> passed with only CRLF normalization warnings for touched files.
+
+### Server Deployment And Real Probe
+- Created local server incremental archives:
+  - `.local-archives/server-incrementals/agent-hub-openclaw-operation-console-20260815-055854.tgz` (first package had `dist` at the wrong root path; retained as diagnostic archive).
+  - `.local-archives/server-incrementals/agent-hub-openclaw-operation-console-20260815-060012.tgz` (correct `web/dist` path; uploaded to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`).
+- Deployed incrementally into `/opt/agent-hub/current`; server backups retained under `/opt/agent-hub/backups/p3-openclaw-operation-console-20260815-055929` and `/opt/agent-hub/backups/p3-openclaw-operation-console-20260815-055952`.
+- Services verified active: `agent-hub-api`, `agent-hub-worker`, and `caddy`.
+- Corrected the probe to call API health directly at `http://127.0.0.1:8000/health` because Caddy `/health` falls back to the frontend app.
+- Real server probe output: API health returned `{"status":"ok"}`, `/openclaw` loaded `/assets/index-CsuPobiX.js`, and the active production bundle contains `操作平台`, `操作类型`, `文件读取`, and `server_command 必须填写精确 argv`.
+- Note: avoid `pipefail + grep -q` on a large streamed JS variable; `grep -q` can close early and turn a successful match into a pipeline failure. Probe downloaded/located the asset file and used file grep instead.
+
+### Remaining / Next
+- Commit this slice, create local GitHub recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, then watch GitHub Actions until green.
+- Continue remaining P3 items after green: OpenClaw session creation UI still defaults to a Linux server session; evolution/memory refinements, broader UI layout/copy audit, missing button/function sweep, README/README.zh-CN usage refresh, and Docker readiness remain later items.
 ## 2026-08-15 Channel Config Source Visibility
 
 ### State

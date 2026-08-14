@@ -7,6 +7,7 @@ import {
   formatApiError,
   type OpenClawAdapter,
   type OpenClawOperation,
+  type OpenClawOperationRequest,
   type OpenClawSession,
   type SystemSettings,
 } from "../api/client";
@@ -106,6 +107,24 @@ function commandLabel(command: string[]) {
   return command.join(" ");
 }
 
+function defaultOperationTarget(platform: OpenClawOperationRequest["platform"], kind: OpenClawOperationRequest["kind"]) {
+  if (kind === "file_read") return platform === "windows" ? "C:\\Reports\\daily.txt" : "/var/log/syslog";
+  if (kind === "screen_read") return "desktop";
+  if (kind === "desktop_action") return "desktop";
+  return platform === "linux" ? "agent-hub-server" : "local-computer";
+}
+
+function defaultOperationArgv(kind: OpenClawOperationRequest["kind"]) {
+  return kind === "server_command" ? '["python", "--version"]' : "[]";
+}
+
+function parseOperationArgv(value: string, kind: OpenClawOperationRequest["kind"]): string[] {
+  const argv = parseStringList(value, "OpenClaw argv");
+  if (kind === "server_command" && argv.length === 0) {
+    throw new Error("server_command requires a non-empty argv array.");
+  }
+  return argv;
+}
 function sortOpenClawAdapters(adapters: OpenClawAdapter[]) {
   const platformRank = new Map([
     ["linux", 0],
@@ -135,7 +154,11 @@ export function OpenClawPage() {
   const [allowedCommandsText, setAllowedCommandsText] = useState("[]");
   const [remoteAdaptersText, setRemoteAdaptersText] = useState("[]");
   const [adapterDraft, setAdapterDraft] = useState<OpenClawRemoteAdapterSetting>(DEFAULT_OPENCLAW_REMOTE_ADAPTER);
-  const [argvText, setArgvText] = useState("[\"python\", \"--version\"]");
+  const [operationPlatform, setOperationPlatform] = useState<OpenClawOperationRequest["platform"]>("linux");
+  const [operationKind, setOperationKind] = useState<OpenClawOperationRequest["kind"]>("server_command");
+  const [operationTarget, setOperationTarget] = useState("agent-hub-server");
+  const [operationRiskLevel, setOperationRiskLevel] = useState<OpenClawOperationRequest["risk_level"]>("low");
+  const [argvText, setArgvText] = useState('["python", "--version"]');
   const [reason, setReason] = useState("Manual OpenClaw operation from dedicated console");
   const [selectedSessionId, setSelectedSessionId] = useState("");
   const [operation, setOperation] = useState<OpenClawOperation | null>(null);
@@ -242,7 +265,7 @@ export function OpenClawPage() {
     let argv: string[];
     try {
       current = parseCommandList(allowedCommandsText);
-      argv = parseStringList(argvText, "OpenClaw argv");
+      argv = parseOperationArgv(argvText, "server_command");
     } catch (error) {
       setLocalError(error instanceof Error ? error.message : "OpenClaw 命令 JSON 无法解析。");
       return;
@@ -286,11 +309,11 @@ export function OpenClawPage() {
       setLocalError(null);
       setExecutionOutput(null);
       return api.createOpenClawOperation({
-        platform: "linux",
-        kind: "server_command",
-        target: "agent-hub-server",
-        argv: parseStringList(argvText, "OpenClaw argv"),
-        risk_level: "low",
+        platform: operationPlatform,
+        kind: operationKind,
+        target: operationTarget.trim(),
+        argv: parseOperationArgv(argvText, operationKind),
+        risk_level: operationRiskLevel,
         reason,
         ...(selectedSessionId ? { session_id: selectedSessionId } : {}),
       });
@@ -623,9 +646,62 @@ export function OpenClawPage() {
 
       <div className="inline-guide" aria-label="OpenClaw 操作控制台">
         <h3>审批执行控制台</h3>
+        <div className="form-grid">
+          <label htmlFor="openclaw-page-operation-platform">
+            操作平台
+            <select
+              id="openclaw-page-operation-platform"
+              value={operationPlatform}
+              onChange={(event) => {
+                const nextPlatform = event.target.value as OpenClawOperationRequest["platform"];
+                setOperationPlatform(nextPlatform);
+                setOperationTarget(defaultOperationTarget(nextPlatform, operationKind));
+              }}
+            >
+              <option value="linux">Linux</option>
+              <option value="windows">Windows</option>
+              <option value="macos">macOS</option>
+            </select>
+          </label>
+          <label htmlFor="openclaw-page-operation-kind">
+            操作类型
+            <select
+              id="openclaw-page-operation-kind"
+              value={operationKind}
+              onChange={(event) => {
+                const nextKind = event.target.value as OpenClawOperationRequest["kind"];
+                setOperationKind(nextKind);
+                setOperationTarget(defaultOperationTarget(operationPlatform, nextKind));
+                setArgvText(defaultOperationArgv(nextKind));
+              }}
+            >
+              <option value="server_command">服务器/终端命令</option>
+              <option value="desktop_action">桌面动作</option>
+              <option value="screen_read">屏幕读取</option>
+              <option value="file_read">文件读取</option>
+            </select>
+          </label>
+          <label htmlFor="openclaw-page-operation-target">
+            操作目标
+            <input id="openclaw-page-operation-target" value={operationTarget} onChange={(event) => setOperationTarget(event.target.value)} />
+          </label>
+          <label htmlFor="openclaw-page-operation-risk">
+            风险等级
+            <select
+              id="openclaw-page-operation-risk"
+              value={operationRiskLevel}
+              onChange={(event) => setOperationRiskLevel(event.target.value as OpenClawOperationRequest["risk_level"])}
+            >
+              <option value="low">低</option>
+              <option value="medium">中</option>
+              <option value="high">高</option>
+            </select>
+          </label>
+        </div>
         <label htmlFor="openclaw-page-operation-argv">
-          Operation argv JSON
+          操作参数 JSON
           <textarea id="openclaw-page-operation-argv" data-testid="openclaw-page-operation-argv" value={argvText} onChange={(event) => setArgvText(event.target.value)} spellCheck={false} />
+          <small>server_command 必须填写精确 argv；桌面、屏幕和文件能力可填 []，由对应 Adapter 的受控驱动执行。</small>
         </label>
         <label htmlFor="openclaw-page-operation-reason">
           执行原因
