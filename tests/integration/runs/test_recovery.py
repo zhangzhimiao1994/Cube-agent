@@ -332,6 +332,68 @@ async def test_worker_resumes_from_latest_safe_checkpoint_without_duplicate_arti
     assert len(runtime.restored) == 1
 
 
+async def test_conversation_context_keeps_origin_anchor_when_history_exceeds_window(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    user_id = uuid4()
+    conversation_id = "conv-long-memory-anchor"
+    repository = RunRepository(run_session_factory)
+
+    first = await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        request="初始目标：完成 Agent Hub，并且所有高风险操作都必须审批。",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.COMPLETED,
+        idempotency_key=None,
+        routing_decision={"conversation_id": conversation_id},
+        enqueue=False,
+    )
+    for index in range(8):
+        await repository.create_run(
+            tenant_id=tenant_id,
+            actor_id=user_id,
+            request=f"中间讨论 {index}",
+            mode=TaskMode.DISPATCH,
+            status=RunStatus.COMPLETED,
+            idempotency_key=None,
+            routing_decision={"conversation_id": conversation_id},
+            enqueue=False,
+        )
+    latest = await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        request="最新结论：上下文压缩属于对话框架，不属于进化模块。",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.COMPLETED,
+        idempotency_key=None,
+        routing_decision={"conversation_id": conversation_id},
+        enqueue=False,
+    )
+    current = await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        request="继续当前任务",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.QUEUED,
+        idempotency_key=None,
+        routing_decision={"conversation_id": conversation_id},
+        enqueue=False,
+    )
+
+    items = await repository.conversation_context(
+        tenant_id,
+        conversation_id,
+        before_run_id=current.id,
+    )
+
+    assert len(items) == 6
+    assert items[0].run_id == first.id
+    assert items[-1].run_id == latest.id
+    assert all(item.run_id != current.id for item in items)
+
+
 async def test_dispatch_waits_for_user_before_creating_temporary_agent(
     run_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

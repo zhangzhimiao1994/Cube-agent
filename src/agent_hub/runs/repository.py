@@ -645,18 +645,25 @@ class RunRepository:
             )
             if current is None:
                 raise RunNotFound("run was not found")
+            base_filter = (
+                select(RunRow)
+                .where(RunRow.tenant_id == tenant_id)
+                .where(RunRow.id != before_run_id)
+                .where(RunRow.routing_decision["conversation_id"].astext == conversation_id)
+                .where(RunRow.created_at <= current)
+            )
             rows = (
                 await session.scalars(
-                    select(RunRow)
-                    .where(RunRow.tenant_id == tenant_id)
-                    .where(RunRow.id != before_run_id)
-                    .where(RunRow.routing_decision["conversation_id"].astext == conversation_id)
-                    .where(RunRow.created_at <= current)
-                    .order_by(RunRow.created_at.desc(), RunRow.id.desc())
-                    .limit(limit)
+                    base_filter.order_by(RunRow.created_at.desc(), RunRow.id.desc()).limit(limit)
                 )
             ).all()
             ordered_rows = tuple(reversed(rows))
+            if limit > 1 and len(ordered_rows) >= limit:
+                origin = await session.scalar(
+                    base_filter.order_by(RunRow.created_at.asc(), RunRow.id.asc()).limit(1)
+                )
+                if origin is not None and all(row.id != origin.id for row in ordered_rows):
+                    ordered_rows = (origin, *ordered_rows[-(limit - 1) :])
             if not ordered_rows:
                 return ()
             run_ids = [row.id for row in ordered_rows]

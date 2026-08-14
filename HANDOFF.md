@@ -206,7 +206,7 @@ Verification performed:
 - Local frontend:
   - Added `adds and removes OpenClaw remote adapters through dedicated controls` regression coverage.
   - `npm.cmd run test -- --run src/pages/ConfigPage.test.tsx -t "OpenClaw"` -> 6 passed, 2 skipped.
-  - `npm.cmd run test -- --run src/pages/ConfigPage.test.tsx` -> 8 passed.
+  - `npm.cmd run test -- --run src/pages/ConfigPage.test.tsx` -> 9 passed.
   - `npm.cmd run lint` -> passed.
   - `npm.cmd run test -- --run` -> 108 passed.
   - `npm.cmd run build` -> passed with the existing Vite chunk-size warning.
@@ -1107,7 +1107,7 @@ Verification performed:
 - Green/local:
   - `uv run pytest tests/api/test_runs_api.py -q -k "attachment" --tb=short` -> 6 passed.
   - `uv run pytest tests/api/test_foundation_api.py::test_login_attempts_are_recorded_in_audit_logs_without_secrets tests/api/test_foundation_api.py::test_login_invalid_credentials_is_generic_401_with_challenge tests/api/test_foundation_api.py::test_setup_and_login_return_only_safe_principal_fields -q --tb=short` -> 3 passed.
-  - `uv run pytest tests/api/test_admin_resources.py -q -k "hermes or logs" --tb=short` -> 8 passed.
+  - `uv run pytest tests/api/test_admin_resources.py -q -k "hermes or logs" --tb=short` -> 9 passed.
   - `uv run pytest tests/api/test_foundation_api.py::test_login_audit_logs_preserve_safe_username_details -q --tb=short` -> passed after the audit details fix.
   - `uv run pytest tests/api/test_runs_api.py tests/api/test_foundation_api.py tests/api/test_admin_resources.py -q --tb=short` -> 164 passed.
   - `uv run ruff check src tests` -> passed.
@@ -4344,3 +4344,36 @@ Remaining risks / next:
 
 - Commit this slice, create a GitHub recovery bundle/tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
 - Continue P3 after green: core conversation-level long-memory and automatic context compression, evolution execution orchestration, plan-task mode UX, broader UI copy/layout audit, missing button/function sweep, README/README.zh-CN final usage refresh, and Docker readiness later.
+
+## 2026-08-14 Core Conversation Memory Anchor and Auto-Compaction
+
+Current state:
+
+- Long-running conversation context is now treated as a core conversation-framework capability, not an Evolution-only feature.
+- Conversation history compaction now protects the first meaningful conversation turn as an origin anchor while still preserving the latest decision under small model-aware history budgets.
+- `RunRepository.conversation_context` now returns the conversation origin plus the newest context window when history exceeds the default limit, instead of only returning the newest runs.
+- `_conversation_history_artifact` passes origin anchors into the compactor as protected continuity context, so long chats, Vibe Coding, Skill distillation, Darwin-style evolution, research, scheduling, media planning, and channel conversations have a stronger anti-drift baseline.
+- During server verification, active venv drift was found: `site-packages/agent_hub/context/compaction.py` still used the old head-preserving tail truncation. The deployment synced `src/agent_hub/context/compaction.py` into active site-packages as part of this slice.
+
+Local verification:
+
+- RED first: `.\.venv\Scripts\python.exe -m pytest tests\unit\runs\test_runtime_context_policy.py::test_conversation_history_compaction_preserves_origin_goal_anchor -q` failed because the initial goal anchor was missing from compacted history.
+- After implementation: `.\.venv\Scripts\python.exe -m pytest tests\unit\runs\test_runtime_context_policy.py -q` -> 9 passed.
+- Added request-only coverage for long noisy histories without artifacts.
+- `.\.venv\Scripts\python.exe -m pytest tests\unit\context\test_builder.py tests\unit\runs\test_runtime_context_policy.py -q` -> 16 passed.
+- `.\.venv\Scripts\python.exe -m ruff check src\agent_hub\runs\service.py src\agent_hub\runs\repository.py tests\unit\runs\test_runtime_context_policy.py tests\integration\runs\test_recovery.py` -> passed.
+- Local integration test `tests\integration\runs\test_recovery.py::test_conversation_context_keeps_origin_anchor_when_history_exceeds_window` could not run locally because the local PostgreSQL test database did not become ready within 30 seconds. The same behavior was verified against the real server database instead.
+
+Server deployment and real verification:
+
+- Uploaded `.tmp\agent-hub-p3-runtime-incremental.tgz` to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed incrementally into `/opt/agent-hub/current`.
+- Server backup paths retained: `/opt/agent-hub/backups/conversation-memory-anchor-20260814-212600` and `/opt/agent-hub/backups/conversation-memory-anchor-20260814-213120`.
+- Synced `src/agent_hub/runs/repository.py`, `src/agent_hub/runs/service.py`, and `src/agent_hub/context/compaction.py` into the active production venv site-packages, compiled them with the server venv Python, restarted `agent-hub-api` and `agent-hub-worker`, and confirmed `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.
+- Real server probe loaded the same environment file used by `agent-hub-api` without printing secrets, created temporary run records in the actual database, verified `conversation_context` returns the origin plus latest window, built a compacted conversation artifact, and then deleted the temporary records.
+- Probe output: `{"status": "ok", "checks": {"window_size_is_six": true, "origin_is_first_item": true, "latest_is_last_item": true, "current_excluded": true, "artifact_auto_compacted": true, "origin_goal_in_compaction": true, "latest_decision_in_compaction": true}}`.
+- Removed server temporary unpack directories for this slice; the uploaded `/tmp/agent-hub-p3-runtime-incremental.tgz` may be overwritten by the next incremental deployment.
+
+Remaining risks / next:
+
+- Commit this slice, create a GitHub recovery bundle/tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
+- Continue P3 after green: Evolution execution orchestration, plan-task mode UX, OpenClaw broader workflow integration, UI copy/layout audit, missing button/function sweep, README/README.zh-CN final usage refresh, and Docker readiness later.

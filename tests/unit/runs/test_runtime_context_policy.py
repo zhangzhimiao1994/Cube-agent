@@ -109,3 +109,92 @@ def test_conversation_history_is_auto_compacted_when_over_model_budget() -> None
     assert isinstance(text, str)
     assert original_tokens > history_budget
     assert latest_decision in text
+
+
+def test_conversation_history_compaction_preserves_origin_goal_anchor() -> None:
+    first_goal = "初始目标：完成 Agent Hub，并且所有高风险操作都必须审批。"
+    items = [
+        ConversationContextItem(
+            run_id=uuid4(),
+            request=first_goal,
+            artifacts=(
+                {
+                    "producer": "main_agent",
+                    "content": {"text": "长期约束：服务器增量部署，GitHub 全量推送。"},
+                },
+            ),
+        )
+    ]
+    items.extend(
+        ConversationContextItem(
+            run_id=uuid4(),
+            request=f"中间讨论 {index} " * 30,
+            artifacts=(
+                {
+                    "producer": "main_agent",
+                    "content": {"text": f"中间结果 {index} " * 30},
+                },
+            ),
+        )
+        for index in range(12)
+    )
+    latest_decision = "最新结论：上下文压缩属于对话框架，不属于进化模块。"
+    items.append(
+        ConversationContextItem(
+            run_id=uuid4(),
+            request="确认长期记忆归属",
+            artifacts=(
+                {
+                    "producer": "main_agent",
+                    "content": {"text": latest_decision},
+                },
+            ),
+        )
+    )
+
+    artifact = _conversation_history_artifact(
+        conversation_id="conv-framework-memory",
+        current_request="继续当前任务",
+        context_items=tuple(items),
+        history_token_budget=128,
+    )
+
+    assert artifact is not None
+    assert artifact.content["context_policy"] == "auto_compacted"
+    text = artifact.content["text"]
+    assert isinstance(text, str)
+    assert first_goal in text
+    assert "服务器增量部署" in text
+    assert latest_decision in text
+
+def test_conversation_history_compaction_preserves_latest_request_without_artifacts() -> None:
+    first_goal = "初始目标：完成 Agent Hub，并且所有高风险操作都必须审批。"
+    latest_decision = "最新结论：上下文压缩属于对话框架，不属于进化模块。"
+    items = [
+        ConversationContextItem(run_id=uuid4(), request=first_goal, artifacts=()),
+    ]
+    items.extend(
+        ConversationContextItem(
+            run_id=uuid4(),
+            request=f"中间讨论 {index} " * 300,
+            artifacts=(),
+        )
+        for index in range(4)
+    )
+    items.append(
+        ConversationContextItem(run_id=uuid4(), request=latest_decision, artifacts=())
+    )
+
+    artifact = _conversation_history_artifact(
+        conversation_id="conv-framework-memory-requests-only",
+        current_request="继续当前任务",
+        context_items=tuple(items),
+        history_token_budget=128,
+    )
+
+    assert artifact is not None
+    assert artifact.content["context_policy"] == "auto_compacted"
+    text = artifact.content["text"]
+    assert isinstance(text, str)
+    assert first_goal in text
+    assert latest_decision in text
