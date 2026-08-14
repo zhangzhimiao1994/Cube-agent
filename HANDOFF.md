@@ -4418,3 +4418,45 @@ Remaining risks / next:
 
 - Commit this slice, create a GitHub recovery bundle/tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
 - Continue P3 after green: Evolution executor orchestration, plan-task mode UX, OpenClaw broader workflow integration, Skill Creator grounding into real-input/real-test generation workflows, UI copy/layout audit, missing button/function sweep, README/README.zh-CN final usage refresh, and Docker readiness later.
+## 2026-08-14 GitHub CI Recovery After Evolution Next-Round Push
+
+Current state:
+
+- Pushed `89d2a25 feat: add evolution next round plan`; GitHub Actions run `31808202233` failed in frontend tests on a flaky mobile drawer assertion in `web/src/app/AppShell.test.tsx`.
+- The failing assertion expected `mobile-nav-open` immediately after a synthetic click. The product code was working locally, but CI full-run timing exposed the test using synchronous `fireEvent` for an async user interaction.
+- Fixed the test to use `userEvent.setup()` and awaited clicks for opening the mobile drawer, expanding a second-level module, and closing the drawer.
+- Committed `c67c13f test: stabilize mobile nav drawer interaction`.
+- Created local recovery bundle `.local-archives/github-recovery/mutilagent-main-before-20260814-221807-89d2a25.bundle` and pushed GitHub recovery tag `archive/mutilagent-main-before-20260814-221807-89d2a25` before force-with-lease pushing the fix.
+- GitHub Actions run `31808866820` passed all checks.
+
+Local verification for CI fix:
+
+- `npm run test -- --run src/app/AppShell.test.tsx` from `web/` -> 6 passed.
+- `npm run lint` from `web/` -> passed.
+- `npm run test -- --run` from `web/` -> 13 files, 119 tests passed.
+
+Remaining risks / next:
+
+- Continue P3 after green: Evolution executor orchestration, plan-task mode UX, OpenClaw broader workflow integration, Skill Creator grounding into real-input/real-test generation workflows, UI copy/layout audit, missing button/function sweep, README/README.zh-CN final usage refresh, and Docker readiness later.
+## 2026-08-14 Evolution Trigger Boundary and Grounded Skill Creation Intent
+
+Current state:
+
+- Tightened chat-side Evolution triggering so normal questions, ordinary research planning, and one-off方案 requests do not become Evolution tasks just because they mention long-term iteration or optimization.
+- Evolution proposal now requires both an evolution/iteration action and a durable asset target such as Skill, agent, workflow, prompt, tool, knowledge base, capability, artifact, or template.
+- Explicit Skill creation requests such as “生成一个相关的 skill” now produce a grounded `Skill 创建任务` proposal with `kind=skill_distillation`, `target_artifact_type=skill`, and a summary requiring goal/input collection, `SKILL.md`, references/scripts/assets, and real-task validation.
+- Skill source extraction no longer treats arbitrary English words as skill IDs; it only extracts explicit `*-skill` identifiers and still handles `darwin-skill`.
+- This keeps Evolution as an opt-in/asset-improvement workflow, not the default route for normal conversations or方案 generation.
+
+Local verification:
+
+- `.\.venv\Scripts\python.exe -m pytest tests\unit\runs\test_temporary_agent.py::test_normal_research_or_plan_request_does_not_become_evolution_task tests\unit\runs\test_temporary_agent.py::test_explicit_skill_creation_request_returns_grounded_evolution_proposal tests\unit\runs\test_temporary_agent.py::test_evolution_intent_returns_confirmation_proposal_without_enqueue tests\api\test_runs_api.py::test_evolution_proposal_is_returned_from_run_submission tests\api\test_runs_api.py::test_normal_iterative_plan_submission_does_not_return_evolution_proposal tests\api\test_runs_api.py::test_skill_creation_submission_returns_grounded_evolution_proposal -q` -> 6 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\unit\runs\test_temporary_agent.py tests\api\test_runs_api.py -q` -> 36 passed.
+- `.\.venv\Scripts\python.exe -m ruff check src\agent_hub\runs\service.py tests\unit\runs\test_temporary_agent.py tests\api\test_runs_api.py` -> passed.
+- `.\.venv\Scripts\python.exe -m mypy --strict src\agent_hub\runs\service.py` -> passed.
+- `git diff --check` -> passed with CRLF normalization warnings only.
+
+Remaining risks / next:
+
+- Deploy this trigger-boundary slice incrementally to the server, run real server probes for normal plan vs explicit Skill creation, then commit, archive, push, and check GitHub Actions.
+- Continue P3 after green: Evolution executor orchestration, plan-task mode UX, OpenClaw broader workflow integration, Skill Creator grounding into full real-input/real-test workflows, UI copy/layout audit, missing button/function sweep, README/README.zh-CN final usage refresh, and Docker readiness later.

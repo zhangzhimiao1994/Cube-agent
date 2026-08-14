@@ -1154,11 +1154,24 @@ def _submitted(record: RunRecord) -> SubmittedRun:
     )
 
 
-_EVOLUTION_TRIGGER_RE = re.compile(
-    r"(进化|蒸馏|长期迭代|多轮迭代|达尔文|darwin|evolve|evolution|distill|optimi[sz]e|iteration)",
+_EVOLUTION_EXPLICIT_ACTION_RE = re.compile(
+    r"(进化|蒸馏|达尔文|darwin|evolve|evolution|distill)",
     re.IGNORECASE,
 )
-_SKILL_ID_RE = re.compile(r"([a-z0-9][a-z0-9_-]{1,80}-skill|[a-z0-9][a-z0-9_-]{1,80})", re.IGNORECASE)
+_EVOLUTION_ITERATION_ACTION_RE = re.compile(
+    r"(长期迭代|多轮迭代|迭代|优化|optimi[sz]e|iteration)",
+    re.IGNORECASE,
+)
+_EVOLUTION_ASSET_RE = re.compile(
+    r"(skill|技能|agent|智能体|工具|工作流|流程|prompt|提示词|知识库|能力|产物|模板)",
+    re.IGNORECASE,
+)
+_SKILL_CREATION_RE = re.compile(
+    r"((生成|创建|新建|制作|构建|开发|沉淀|打包|create|build|generate|make).{0,24}(skill|技能)|"
+    r"(skill|技能).{0,24}(生成|创建|新建|制作|构建|开发|沉淀|打包|create|build|generate|make))",
+    re.IGNORECASE,
+)
+_SKILL_ID_RE = re.compile(r"\b([a-z0-9][a-z0-9_-]{1,80}-skill)\b", re.IGNORECASE)
 
 
 def _local_evolution_proposal(
@@ -1167,15 +1180,21 @@ def _local_evolution_proposal(
     mode: TaskMode,
     conversation_id: str | None,
 ) -> EvolutionProposal | None:
-    if _EVOLUTION_TRIGGER_RE.search(message) is None:
+    intent = _evolution_intent(message)
+    if intent is None:
         return None
     lowered = message.lower()
-    kind = "skill_distillation" if any(token in lowered for token in ("distill", "蒸馏")) else "skill_optimization"
-    target_artifact_type = "skill" if "skill" in lowered or "技能" in message or "蒸馏" in message else "custom"
+    kind = "skill_distillation" if intent == "skill_creation" or any(token in lowered for token in ("distill", "蒸馏")) else "skill_optimization"
+    target_artifact_type = "skill" if intent == "skill_creation" or "skill" in lowered or "技能" in message or "蒸馏" in message else "custom"
     source_skill_ids = _evolution_source_skill_ids(message)
-    if not source_skill_ids and target_artifact_type == "skill":
-        source_skill_ids = ("darwin-skill",) if "darwin" in lowered or "达尔文" in message else ()
-    title = "Skill 蒸馏任务" if kind == "skill_distillation" else "Skill 进化任务"
+    if not source_skill_ids and target_artifact_type == "skill" and ("darwin" in lowered or "达尔文" in message):
+        source_skill_ids = ("darwin-skill",)
+    if intent == "skill_creation":
+        title = "Skill 创建任务"
+        summary = "主 Agent 判断这条消息是在创建可沉淀的 Skill：先收敛目标和输入资料，再生成 SKILL.md、references/scripts/assets，并用真实任务验收。"
+    else:
+        title = "Skill 蒸馏任务" if kind == "skill_distillation" else "Skill 进化任务"
+        summary = "主 Agent 判断这条消息适合进入进化任务：先确认目标、基准 agent 和评测口径，再启动多轮迭代。"
     return EvolutionProposal(
         kind=kind,
         title=title,
@@ -1196,16 +1215,25 @@ def _local_evolution_proposal(
         budget_tokens=200_000,
         budget_minutes=120,
         rubric=("实测表现", "反例覆盖", "人工验收"),
-        summary="主 Agent 判断这条消息适合进入进化任务：先确认目标、基准 agent 和评测口径，再启动多轮迭代。",
+        summary=summary,
     )
+
+
+def _evolution_intent(message: str) -> str | None:
+    if _SKILL_CREATION_RE.search(message) is not None:
+        return "skill_creation"
+    has_asset = _EVOLUTION_ASSET_RE.search(message) is not None
+    if has_asset and _EVOLUTION_EXPLICIT_ACTION_RE.search(message) is not None:
+        return "evolution"
+    if has_asset and _EVOLUTION_ITERATION_ACTION_RE.search(message) is not None:
+        return "evolution"
+    return None
 
 
 def _evolution_source_skill_ids(message: str) -> tuple[str, ...]:
     candidates: list[str] = []
     for match in _SKILL_ID_RE.finditer(message):
         value = match.group(1).strip().lower()
-        if value in {"skill", "agent", "darwin", "evolution", "distill", "optimize", "iteration"}:
-            continue
         if value not in candidates:
             candidates.append(value)
     return tuple(candidates[:8])

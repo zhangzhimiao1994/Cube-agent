@@ -140,6 +140,41 @@ class StubRunService:
                     "metadata": {"source": "chat_evolution_proposal", "requires_user_confirmation": "true"},
                 },
             )
+        if "生成一个相关的 skill" in message:
+            return SubmittedRun(
+                id=uuid4(),
+                tenant_id=tenant_id,
+                status=RunStatus.WAITING_APPROVAL,
+                mode=TaskMode.HYBRID,
+                decision_token="safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+                version=1,
+                clarification_reason="evolution_requires_user_confirmation",
+                conversation_id=conversation_id or "conv-test",
+                reference_conversation_id=reference_conversation_id,
+                evolution_proposal={
+                    "kind": "skill_distillation",
+                    "title": "Skill 创建任务",
+                    "objective": message,
+                    "mode": "hybrid",
+                    "source_skill_ids": [],
+                    "source_conversation_id": conversation_id or "conv-test",
+                    "source_run_id": None,
+                    "target_artifact_type": "skill",
+                    "baseline_agent_id": "main-agent",
+                    "candidate_agent_ids": ["worker-agent", "reviewer-agent"],
+                    "evaluator_agent_id": "evaluator-agent",
+                    "approval_policy": "ask",
+                    "iteration_policy": "score_gated",
+                    "memory_policy": "summarize_between_rounds",
+                    "max_rounds": 5,
+                    "min_delta": 2.0,
+                    "budget_tokens": 200000,
+                    "budget_minutes": 120,
+                    "rubric": ["实测表现", "反例覆盖", "人工验收"],
+                    "summary": "主 Agent 判断这条消息是在创建可沉淀的 Skill：先收敛目标和输入资料，再生成 SKILL.md、references/scripts/assets，并用真实任务验收。",
+                    "metadata": {"source": "chat_evolution_proposal", "requires_user_confirmation": "true"},
+                },
+            )
         status = RunStatus.WAITING_USER_MODE if mode is TaskMode.AUTO else RunStatus.QUEUED
         if status is RunStatus.QUEUED:
             self.enqueue_count += 1
@@ -464,6 +499,49 @@ def test_evolution_proposal_is_returned_from_run_submission() -> None:
     assert body["evolution_proposal"]["source_skill_ids"] == ["darwin-skill"]
     assert body["evolution_proposal"]["baseline_agent_id"] == "main-agent"
     assert body["evolution_proposal"]["source_conversation_id"] == "conv-evolution-api"
+
+
+def test_normal_iterative_plan_submission_does_not_return_evolution_proposal() -> None:
+    client, _, _ = _client()
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": "这个 AI 科研项目需要长期迭代，先帮我给出研究方案和资料检索计划",
+            "mode": "auto",
+            "conversation_id": "conv-normal-plan-api",
+        },
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["clarification_reason"] != "evolution_requires_user_confirmation"
+    assert body["evolution_proposal"] is None
+
+
+def test_skill_creation_submission_returns_grounded_evolution_proposal() -> None:
+    client, _, _ = _client()
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": "我想进行 AI 方面的科研，给我生成一个相关的 skill，并用真实资料和测试任务验收",
+            "mode": "auto",
+            "conversation_id": "conv-skill-create-api",
+        },
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "waiting_approval"
+    assert body["clarification_reason"] == "evolution_requires_user_confirmation"
+    assert body["evolution_proposal"]["kind"] == "skill_distillation"
+    assert body["evolution_proposal"]["title"] == "Skill 创建任务"
+    assert body["evolution_proposal"]["target_artifact_type"] == "skill"
+    assert "真实任务验收" in body["evolution_proposal"]["summary"]
+
 
 def test_submission_forwards_selected_workflow_and_agents() -> None:
     client, service, principal = _client()

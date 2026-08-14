@@ -430,6 +430,64 @@ async def test_evolution_intent_returns_confirmation_proposal_without_enqueue() 
 
 
 @pytest.mark.asyncio
+async def test_normal_research_or_plan_request_does_not_become_evolution_task() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    queue = RecordingQueue()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=FailingRouter(),
+        task_queue=queue,
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="这个 AI 科研项目需要长期迭代，先帮我给出研究方案和资料检索计划",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-research-plan",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.evolution_proposal is None
+    routing = repository.records[submitted.id].routing_decision
+    assert routing is not None
+    assert "evolution_proposal" not in routing
+
+
+@pytest.mark.asyncio
+async def test_explicit_skill_creation_request_returns_grounded_evolution_proposal() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    queue = RecordingQueue()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=None,
+        task_queue=queue,
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="我想进行 AI 方面的科研，给我生成一个相关的 skill，并用真实资料和测试任务验收",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-research-skill",
+    )
+
+    assert submitted.status is RunStatus.WAITING_APPROVAL
+    assert submitted.evolution_proposal is not None
+    assert submitted.evolution_proposal["kind"] == "skill_distillation"
+    assert submitted.evolution_proposal["target_artifact_type"] == "skill"
+    assert submitted.evolution_proposal["title"] == "Skill 创建任务"
+    assert submitted.evolution_proposal["source_conversation_id"] == "conv-research-skill"
+    assert "真实任务验收" in submitted.evolution_proposal["summary"]
+
+
+@pytest.mark.asyncio
 async def test_auto_router_timeout_uses_local_main_agent_for_generation_work() -> None:
     tenant_id = uuid4()
     actor_id = uuid4()
