@@ -232,6 +232,6 @@ describe("ChannelsPage", () => {
         },
       }),
     );
-    expect(await screen.findByText("通道配置已保存。")).not.toBeNull();
+    expect(await screen.findByText("通道配置已保存，可继续修改或清空。面板已刷新最新状态。")).not.toBeNull();
   });
 });
