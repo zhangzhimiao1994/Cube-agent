@@ -21,6 +21,7 @@ class FeishuWebSocketClient(Protocol):
 
 
 FeishuWebSocketClientFactory = Callable[[], Awaitable[FeishuWebSocketClient]]
+FeishuWebSocketSubmissionHandler = Callable[[InboundMessage, object], Awaitable[None]]
 CredentialRefresh = Callable[[], Awaitable[None]]
 Sleep = Callable[[float], Awaitable[None]]
 
@@ -42,10 +43,12 @@ class FeishuWebSocketReceiver:
         verifier: FeishuVerifier,
         gateway: ChannelGatewayProtocol | None,
         bot_open_id: str | None,
+        submission_handler: FeishuWebSocketSubmissionHandler | None = None,
     ) -> None:
         self._verifier = verifier
         self._gateway = gateway
         self._bot_open_id = bot_open_id
+        self._submission_handler = submission_handler
 
     async def receive(self, payload: dict[str, object]) -> InboundMessage | None:
         verified = self._verifier.verify_payload(payload)
@@ -56,7 +59,9 @@ class FeishuWebSocketReceiver:
         except UnsupportedFeishuEvent:
             return None
         if self._gateway is not None:
-            await self._gateway.handle(message)
+            submission = await self._gateway.handle(message)
+            if self._submission_handler is not None:
+                await self._submission_handler(message, submission)
         return message
 
 
@@ -126,6 +131,7 @@ def build_feishu_websocket_receiver(
     settings: FeishuSettings,
     *,
     gateway: ChannelGatewayProtocol | None,
+    submission_handler: FeishuWebSocketSubmissionHandler | None = None,
     clock: Callable[[], float] | None = None,
 ) -> FeishuWebSocketReceiver:
     verifier = FeishuVerifier(
@@ -133,6 +139,7 @@ def build_feishu_websocket_receiver(
         verification_token=settings.verification_token_value(),
         encrypt_key=settings.encrypt_key_value(),
         allowed_tenant_keys=settings.allowed_tenant_keys,
+        require_verification_token=False,
         timestamp_tolerance_seconds=settings.timestamp_tolerance_seconds,
         clock=clock,
     )
@@ -140,6 +147,7 @@ def build_feishu_websocket_receiver(
         verifier=verifier,
         gateway=gateway,
         bot_open_id=settings.bot_open_id,
+        submission_handler=submission_handler,
     )
 
 
@@ -150,5 +158,6 @@ __all__ = [
     "FeishuWebSocketConnector",
     "FeishuWebSocketMetrics",
     "FeishuWebSocketReceiver",
+    "FeishuWebSocketSubmissionHandler",
     "build_feishu_websocket_receiver",
 ]

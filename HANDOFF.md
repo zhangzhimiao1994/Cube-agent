@@ -4574,6 +4574,7 @@ Remaining risks / next:
 
 - Commit this slice, create a GitHub recovery bundle/tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
 - Continue P3 after green: Evolution executor orchestration, plan-task mode UX, OpenClaw broader workflow integration, Skill Creator grounding into real-input/real-test generation workflows, UI copy/layout audit, missing button/function sweep, README/README.zh-CN final usage refresh, and Docker readiness later.
+
 ## 2026-08-14 GitHub CI Recovery After Evolution Next-Round Push
 
 Current state:
@@ -4617,6 +4618,7 @@ Remaining risks / next:
 
 - Deploy this trigger-boundary slice incrementally to the server, run real server probes for normal plan vs explicit Skill creation, then commit, archive, push, and check GitHub Actions.
 - Continue P3 after green: Evolution executor orchestration, plan-task mode UX, OpenClaw broader workflow integration, Skill Creator grounding into full real-input/real-test workflows, UI copy/layout audit, missing button/function sweep, README/README.zh-CN final usage refresh, and Docker readiness later.
+
 ## 2026-08-14 GitHub CI Recovery After Evolution Trigger Boundary Push
 
 Current state:
@@ -4627,10 +4629,54 @@ Current state:
 
 Local verification:
 
-- `\.\.venv\Scripts\python.exe -m mypy --strict src tests` -> passed, 259 source files checked.
-- `\.\.venv\Scripts\python.exe -m pytest tests\unit\runs\test_temporary_agent.py tests\api\test_runs_api.py -q` -> 36 passed.
+- `.\.venv\Scripts\python.exe -m mypy --strict src tests` -> passed, 259 source files checked.
+- `.\.venv\Scripts\python.exe -m pytest tests\unit\runs\test_temporary_agent.py tests\api\test_runs_api.py -q` -> 36 passed.
 
 Remaining risks / next:
 
 - Commit this CI fix, create recovery bundle/tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
+- Continue P3 after green: Evolution executor orchestration, plan-task mode UX, OpenClaw broader workflow integration, Skill Creator grounding into full real-input/real-test workflows, UI copy/layout audit, missing button/function sweep, README/README.zh-CN final usage refresh, and Docker readiness later.
+
+## 2026-08-15 Feishu Long Connection Runtime and Channel Config Display
+
+Current state:
+
+- Added the official Feishu/Lark SDK dependency `lark-oapi>=1.7.2` and a lazy SDK adapter at `src/agent_hub/channels/feishu/sdk_client.py`.
+- FastAPI lifespan now starts a Feishu WebSocket connector when the effective Feishu transport is `websocket` or `both` and App ID/App Secret are configured.
+- WebSocket Feishu events now use the same normalized inbound message path as Webhook, but skip Webhook verification-token enforcement because SDK P2 event payloads do not always include `token`.
+- WebSocket submissions now schedule the same Feishu reply flow as Webhook: immediate directive acknowledgement, then terminal run reply when a run id exists.
+- SDK logging was lowered from INFO to WARN/ERROR preference so successful WebSocket connection URLs do not log temporary `access_key`/`ticket` values.
+- `scripts/lib/verify.sh` now checks native deployments for both `agent_hub` and `lark_oapi` so missing Feishu SDK installation is caught by deployment verification.
+- Channel status responses now include an explicit `configured` field. The web UI uses this instead of inferring configured fields from `missing`, fixing the bug where optional Feishu fields looked configured after clearing saved config.
+- For Feishu `websocket` mode, Webhook-only fields (`AGENT_HUB_PUBLIC_URL`, `FEISHU_VERIFICATION_TOKEN`, `FEISHU_ENCRYPT_KEY`, `FEISHU_WEBHOOK_PATH`) are not counted as configured even if global env has a public URL. The effective configured list on the server is now `FEISHU_APP_ID,FEISHU_APP_SECRET,FEISHU_TRANSPORT`.
+- Operational note: clearing a channel in the UI only removes DB-saved channel config. Credentials or transport still present in `/etc/agent-hub/secrets.env` continue to take effect and will still show as configured where relevant.
+
+Local verification:
+
+- `.\.venv\Scripts\python.exe -m pytest tests\contracts\feishu\test_receivers.py -q` -> 14 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\api\test_admin_resources.py -k "channel" -q` -> 9 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\unit\test_app_wiring.py tests\api\test_channel_webhooks.py -q` -> 39 passed.
+- `.\.venv\Scripts\python.exe -m ruff check src tests` -> passed.
+- `.\.venv\Scripts\python.exe -m mypy --strict src tests` -> passed, 260 source files checked.
+- `npm.cmd run test -- --run src/pages/ChannelsPage.test.tsx src/pages/OperationalPages.test.tsx` from `web/` -> 58 passed.
+- `npm.cmd run lint` from `web/` -> passed.
+- `npm.cmd run build` from `web/` -> passed, with existing Vite large-chunk warning only.
+
+Server deployment and real verification:
+
+- Uploaded incremental packages to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed into `/opt/agent-hub/current`.
+- Server archives retained:
+  - `/opt/agent-hub/archives/server-incrementals/agent-hub-feishu-channel-config-20260815-005738.tgz`
+  - `/opt/agent-hub/archives/server-incrementals/agent-hub-feishu-configured-fields-20260815-010738.tgz`
+- Installed/verified `lark_oapi` in the production venv. Server dependency check output: `lark_oapi_installed=True`, `agent_hub_installed=True`.
+- Updated `/etc/agent-hub/secrets.env` to `FEISHU_TRANSPORT=websocket` per the product decision to prefer long connection; backup retained at `/etc/agent-hub/secrets.env.bak.20260815-0100-feishu-transport`.
+- Restarted `agent-hub-api` and `agent-hub-worker`; `/health/live` and `/health/ready` returned `{"status":"ok"}`.
+- Real server DB/runtime probe without printing secrets: `status=configured`, `transports=websocket`, `configured=FEISHU_APP_ID,FEISHU_APP_SECRET,FEISHU_TRANSPORT`, `missing=`, `should_start=True`.
+- Actual API process check showed a persistent external 443 connection from the Uvicorn process after restart, consistent with the Feishu long-connection SDK staying connected.
+- No live Feishu user-message round trip was performed in this slice because that requires sending a real message from Feishu. The server-side receiver/reply scheduling is covered by contract/lifespan tests and the production process now has the long connection active.
+
+Remaining risks / next:
+
+- Commit this slice, create a GitHub recovery bundle/tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
+- Ask the user to send one Feishu test message after GitHub is green; then inspect run creation/reply logs if needed.
 - Continue P3 after green: Evolution executor orchestration, plan-task mode UX, OpenClaw broader workflow integration, Skill Creator grounding into full real-input/real-test workflows, UI copy/layout audit, missing button/function sweep, README/README.zh-CN final usage refresh, and Docker readiness later.

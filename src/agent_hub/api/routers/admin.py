@@ -423,6 +423,7 @@ class ChannelStatusResponse(BaseModel):
     webhook_path: str | None = None
     public_webhook_url: str | None = None
     missing: list[str] = Field(default_factory=list)
+    configured: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
 
 
@@ -5557,7 +5558,8 @@ def _channel_status_from_definition(
 ) -> ChannelStatusResponse:
     public_url = _channel_config_value("AGENT_HUB_PUBLIC_URL", definition.id, config).rstrip("/")
     required_env = _channel_required_env(definition, config)
-    missing = [name for name in required_env if not _channel_config_value(name, definition.id, config)]
+    configured = _channel_configured_fields(definition, config)
+    missing = [name for name in required_env if name not in configured]
     public_webhook_url = (
         f"{public_url}{definition.webhook_path}"
         if public_url and definition.webhook_path is not None
@@ -5577,8 +5579,28 @@ def _channel_status_from_definition(
         webhook_path=definition.webhook_path,
         public_webhook_url=public_webhook_url,
         missing=missing,
+        configured=configured,
         notes=_channel_notes(definition, config),
     )
+
+
+def _channel_configured_fields(
+    definition: ChannelDefinition,
+    config: Mapping[str, Mapping[str, str]],
+) -> list[str]:
+    allowed = _channel_config_allowed_names(definition)
+    if definition.id == "feishu" and _feishu_transport(config) == "websocket":
+        allowed = allowed - {
+            "AGENT_HUB_PUBLIC_URL",
+            "FEISHU_ENCRYPT_KEY",
+            "FEISHU_VERIFICATION_TOKEN",
+            "FEISHU_WEBHOOK_PATH",
+        }
+    return [
+        name
+        for name in sorted(allowed)
+        if _channel_config_value(name, definition.id, config)
+    ]
 
 
 def _channel_required_env(

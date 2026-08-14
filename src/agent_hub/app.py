@@ -1,6 +1,7 @@
 """FastAPI application factory and owned process resources."""
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import os
@@ -36,14 +37,28 @@ from agent_hub.auth.service import AuthService
 from agent_hub.auth.tokens import AccessTokenService
 from agent_hub.auth.user_admin import PersistentUserAdminService
 from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
+from agent_hub.channels.base import InboundMessage
 from agent_hub.channels.dedup import InboundDedupRepository
+from agent_hub.channels.directives import directive_summary, parse_channel_directives
 from agent_hub.channels.feishu.media import FeishuOpenAPIMediaClient
 from agent_hub.channels.feishu.media_factory import build_feishu_media_service_factory
-from agent_hub.channels.feishu.reply import FeishuOpenAPIReplySender, FeishuRunReplyDispatcher
+from agent_hub.channels.feishu.reply import (
+    FeishuOpenAPIReplySender,
+    FeishuRunReplyDispatcher,
+    log_feishu_reply_failure,
+)
+from agent_hub.channels.feishu.sdk_client import create_lark_oapi_feishu_websocket_client
+from agent_hub.channels.feishu.settings import FeishuSettings, FeishuTransport
 from agent_hub.channels.feishu.skill_install import FeishuSkillCommandHandler
 from agent_hub.channels.feishu.webhook import (
     ChannelGatewayProtocol,
+    _feishu_settings_from_runtime_config,
     create_lazy_feishu_webhook_router,
+)
+from agent_hub.channels.feishu.websocket import (
+    FeishuWebSocketClient,
+    FeishuWebSocketConnector,
+    build_feishu_websocket_receiver,
 )
 from agent_hub.channels.gateway import ChannelGateway
 from agent_hub.channels.generic_webhook import create_generic_channel_webhook_router
@@ -129,6 +144,9 @@ MultimediaCapacityFactory = Callable[
 ]
 MainAgentConfigGetter = Callable[[], Awaitable[admin.MainAgentConfigResponse]]
 RegisteredModelListGetter = Callable[[], Awaitable[tuple[admin.ModelDeploymentResponse, ...]]]
+FeishuWebSocketClientFactoryForSettings = Callable[
+    [FeishuSettings], Awaitable[FeishuWebSocketClient]
+]
 
 
 class _MainAgentModeRouter:
@@ -650,6 +668,7 @@ def create_app(
     mode_router: ModeRouterProtocol | None = None,
     task_queue: TaskQueue | None = None,
     feishu_gateway: ChannelGatewayProtocol | None = None,
+    feishu_websocket_client_factory: FeishuWebSocketClientFactoryForSettings | None = None,
     database_factory: Callable[[str], DatabaseResource] = build_database,
     redis_factory: Callable[[str], RedisResource] = Redis.from_url,
 ) -> FastAPI:
@@ -862,6 +881,11 @@ def create_app(
                     ("feishu_media_service_factory", media_factory.aclose)
                 )
 
+            await _start_feishu_websocket_connector_if_configured(
+                application,
+                client_factory=feishu_websocket_client_factory,
+            )
+
             if rate_limiter is None:
                 assert active_redis is not None
                 hmac_key = hashlib.sha256(
@@ -884,6 +908,7 @@ def create_app(
                 application.state.extra_readiness_checks = extra_checks
             yield
         finally:
+            await _stop_feishu_websocket_connector(application)
             await _cancel_background_tasks(application.state.feishu_reply_tasks)
             await _cleanup_owned_resources(
                 cleanup_callbacks,
@@ -912,6 +937,8 @@ def create_app(
     application.state.feishu_gateway = feishu_gateway
     application.state.feishu_reply_dispatcher = None
     application.state.feishu_reply_tasks = set()
+    application.state.feishu_websocket_connector = None
+    application.state.feishu_websocket_task = None
     application.state.multimedia_generation_executor = None
     application.state.metrics_registry = default_metrics_registry()
     application.state.extra_readiness_checks = {}
@@ -999,6 +1026,155 @@ def _feishu_gateway_from_request(request: Request) -> ChannelGatewayProtocol | N
         return None
     return cast(ChannelGatewayProtocol, gateway)
 
+
+
+
+async def _start_feishu_websocket_connector_if_configured(
+    application: FastAPI,
+    *,
+    client_factory: FeishuWebSocketClientFactoryForSettings | None,
+) -> None:
+    runtime_config = await _channel_runtime_config_from_app(application)
+    application.state.channel_runtime_config = runtime_config
+    settings = _feishu_settings_from_runtime_config(FeishuSettings(), runtime_config)
+    if not _should_start_feishu_websocket(settings, runtime_config):
+        return
+    gateway = getattr(application.state, "feishu_gateway", None)
+    if gateway is None:
+        return
+    receiver = build_feishu_websocket_receiver(
+        settings,
+        gateway=cast(ChannelGatewayProtocol, gateway),
+        submission_handler=_feishu_websocket_submission_handler(application, settings),
+    )
+    resolved_factory = client_factory or create_lark_oapi_feishu_websocket_client
+
+    async def create_client() -> FeishuWebSocketClient:
+        return await resolved_factory(settings)
+
+    connector = FeishuWebSocketConnector(
+        receiver=receiver,
+        client_factory=create_client,
+        reconnect_min_seconds=settings.websocket_reconnect_min_seconds,
+        reconnect_max_seconds=settings.websocket_reconnect_max_seconds,
+    )
+    task: asyncio.Task[object] = asyncio.create_task(
+        connector.run_forever(), name="feishu-websocket-connector"
+    )
+    application.state.feishu_websocket_connector = connector
+    application.state.feishu_websocket_task = task
+    _LOGGER.info("feishu_websocket_connector_started")
+
+
+def _feishu_websocket_submission_handler(
+    application: FastAPI,
+    settings: FeishuSettings,
+) -> Callable[[InboundMessage, object], Awaitable[None]]:
+    async def handle(message: InboundMessage, submission: object) -> None:
+        _schedule_feishu_websocket_reply(application, settings, message, submission)
+
+    return handle
+
+
+def _schedule_feishu_websocket_reply(
+    application: FastAPI,
+    settings: FeishuSettings,
+    message: InboundMessage,
+    submission: object,
+) -> None:
+    if bool(getattr(submission, "duplicate", False)):
+        return
+    dispatcher = getattr(application.state, "feishu_reply_dispatcher", None)
+    if not isinstance(dispatcher, FeishuRunReplyDispatcher):
+        return
+    tenant_id = getattr(application.state, "bootstrap_tenant_id", None)
+    if tenant_id is None:
+        return
+    tasks = getattr(application.state, "feishu_reply_tasks", None)
+    if not isinstance(tasks, set):
+        return
+    run_id = getattr(submission, "run_id", None)
+    log_service = getattr(application.state, "admin_resource_service", None)
+
+    async def task() -> None:
+        try:
+            await dispatcher.sender.reply_text(
+                settings=settings,
+                message_id=message.message_id,
+                text=directive_summary(parse_channel_directives(message.text)),
+            )
+            if run_id is not None:
+                await dispatcher.reply_when_terminal(
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    source_message_id=message.message_id,
+                    settings=settings,
+                )
+        except Exception as error:  # noqa: BLE001 - best-effort channel delivery boundary
+            await log_feishu_reply_failure(
+                log_service=log_service,
+                run_id=run_id,
+                message_id=message.message_id,
+                error=error,
+            )
+
+    created = asyncio.create_task(task())
+    tasks.add(created)
+    created.add_done_callback(tasks.discard)
+
+
+async def _stop_feishu_websocket_connector(application: FastAPI) -> None:
+    connector = getattr(application.state, "feishu_websocket_connector", None)
+    task = getattr(application.state, "feishu_websocket_task", None)
+    if isinstance(connector, FeishuWebSocketConnector):
+        connector.request_shutdown()
+    if isinstance(task, asyncio.Task):
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    application.state.feishu_websocket_connector = None
+    application.state.feishu_websocket_task = None
+
+
+def _should_start_feishu_websocket(
+    settings: FeishuSettings, runtime_config: Mapping[str, str]
+) -> bool:
+    raw_transport = (
+        runtime_config.get("FEISHU_TRANSPORT")
+        or os.environ.get("FEISHU_TRANSPORT")
+        or FeishuTransport.WEBSOCKET.value
+    )
+    try:
+        transport = FeishuTransport(raw_transport)
+    except ValueError:
+        transport = FeishuTransport.WEBSOCKET
+    if FeishuTransport.WEBSOCKET not in (
+        {FeishuTransport.WEBHOOK, FeishuTransport.WEBSOCKET}
+        if transport is FeishuTransport.BOTH
+        else {transport}
+    ):
+        return False
+    has_app_id = bool(runtime_config.get("FEISHU_APP_ID") or os.environ.get("FEISHU_APP_ID"))
+    has_app_secret = bool(
+        runtime_config.get("FEISHU_APP_SECRET") or os.environ.get("FEISHU_APP_SECRET")
+    )
+    return has_app_id and has_app_secret and bool(settings.app_id and settings.app_secret_value())
+
+
+async def _channel_runtime_config_from_app(application: FastAPI) -> dict[str, str]:
+    cached = getattr(application.state, "channel_runtime_config", None)
+    if isinstance(cached, dict):
+        return cast(dict[str, str], cached)
+    service = getattr(application.state, "admin_resource_service", None)
+    if service is None:
+        return {}
+    provider = getattr(service, "channel_runtime_config", None)
+    if provider is None:
+        return {}
+    config = await provider()
+    if isinstance(config, dict):
+        return cast(dict[str, str], config)
+    return {}
 
 async def _submit_scheduled_task(application: FastAPI, request: TaskRequest) -> object:
     run_service = getattr(application.state, "run_service", None)

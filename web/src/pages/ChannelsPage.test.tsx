@@ -37,6 +37,7 @@ const channelPayload = [
     webhook_path: "/channels/dingtalk/events",
     public_webhook_url: "https://agent.example.com/channels/dingtalk/events",
     missing: ["DINGTALK_APP_KEY"],
+    configured: [],
     notes: ["已列入通道配置矩阵；真实验签和消息归一化适配器需要按平台规范接线。"],
   },
   {
@@ -47,6 +48,7 @@ const channelPayload = [
     webhook_path: "/channels/wecom/bot/events",
     public_webhook_url: "https://agent.example.com/channels/wecom/bot/events",
     missing: ["WECOM_BOT_WEBHOOK_KEY"],
+    configured: [],
     notes: ["适合企业微信群机器人场景；需配置机器人 webhook key 后再启用。"],
   },
   {
@@ -57,6 +59,7 @@ const channelPayload = [
     webhook_path: "/channels/wecom/app/events",
     public_webhook_url: "https://agent.example.com/channels/wecom/app/events",
     missing: ["WECOM_CORP_ID"],
+    configured: [],
     notes: ["适合企业内部审批、任务派发和私聊机器人。"],
   },
   {
@@ -67,6 +70,7 @@ const channelPayload = [
     webhook_path: "/channels/wechatmp/events",
     public_webhook_url: "https://agent.example.com/channels/wechatmp/events",
     missing: ["WECHATMP_APP_ID"],
+    configured: [],
     notes: ["适合公众号消息入口；配置齐全后可接收文本消息。"],
   },
   {
@@ -77,6 +81,7 @@ const channelPayload = [
     webhook_path: "/channels/wechat-kf/events",
     public_webhook_url: "https://agent.example.com/channels/wechat-kf/events",
     missing: ["WECHAT_KF_CORP_ID"],
+    configured: [],
     notes: ["适合微信客服入口；配置齐全后可接收客服消息。"],
   },
   {
@@ -87,6 +92,7 @@ const channelPayload = [
     webhook_path: "/channels/telegram/events",
     public_webhook_url: "https://agent.example.com/channels/telegram/events",
     missing: ["TELEGRAM_BOT_TOKEN"],
+    configured: [],
     notes: ["适合海外聊天机器人场景；需配置 Bot Token 和 webhook。"],
   },
   {
@@ -97,6 +103,7 @@ const channelPayload = [
     webhook_path: "/channels/slack/events",
     public_webhook_url: "https://agent.example.com/channels/slack/events",
     missing: ["SLACK_BOT_TOKEN"],
+    configured: [],
     notes: ["适合团队协作空间；需校验 signing secret。"],
   },
   {
@@ -107,6 +114,7 @@ const channelPayload = [
     webhook_path: "/channels/qq/events",
     public_webhook_url: "https://agent.example.com/channels/qq/events",
     missing: ["QQ_BOT_APP_ID"],
+    configured: [],
     notes: ["适合 QQ 频道或机器人入口；需按平台事件格式接线。"],
   },
   {
@@ -147,6 +155,7 @@ describe("ChannelsPage", () => {
               ...channelPayload[1],
               status: "configured",
               missing: [],
+              configured: ["DINGTALK_APP_KEY", "DINGTALK_APP_SECRET", "DINGTALK_WEBHOOK_TOKEN"],
             },
           });
         }

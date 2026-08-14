@@ -1,8 +1,10 @@
+import asyncio
 import base64
+import threading
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Self
+from typing import Any, Self
 from uuid import UUID, uuid4
 
 import pytest
@@ -27,6 +29,7 @@ from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Ro
 from agent_hub.channels.feishu.media import FeishuMediaService
 from agent_hub.channels.feishu.media_factory import build_feishu_media_service_factory
 from agent_hub.channels.feishu.settings import FeishuSettings
+from agent_hub.channels.feishu.websocket import FeishuWebSocketClient
 from agent_hub.models.capacity import CapacityLease
 from agent_hub.models.gateway import CapacityController
 from agent_hub.models.registry import NoCapableDeployment
@@ -79,6 +82,20 @@ class FakeRedis:
     async def ping(self, **kwargs: object) -> bool:
         del kwargs
         return True
+
+
+class BlockingFeishuClient:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.cancelled = threading.Event()
+
+    async def events(self) -> Any:
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+            yield {}
+        finally:
+            self.cancelled.set()
 
 
 def valid_settings(attachment_store_dir: Path | None = None) -> Settings:
@@ -146,6 +163,48 @@ def test_create_app_wires_production_feishu_media_service_factory(tmp_path: Path
         )
 
     assert isinstance(service, FeishuMediaService)
+
+
+
+def test_create_app_starts_feishu_websocket_when_runtime_config_enables_it(
+    tmp_path: Path,
+) -> None:
+    client = BlockingFeishuClient()
+    created_settings: list[FeishuSettings] = []
+
+    async def client_factory(settings: FeishuSettings) -> FeishuWebSocketClient:
+        created_settings.append(settings)
+        return client
+
+    admin_service = InMemoryAdminResourceService()
+    admin_service.channel_config["feishu"] = {
+        "FEISHU_APP_ID": "cli_runtime",
+        "FEISHU_APP_SECRET": "secret",
+        "FEISHU_TRANSPORT": "websocket",
+    }
+    application = create_app(
+        settings=valid_settings(tmp_path),
+        database=FakeDatabase(),
+        redis_client=FakeRedis(),
+        auth_service=StubAuthService(),
+        rate_limiter=StubRateLimiter(),
+        config_service=StubConfigService(),
+        admin_resource_service=admin_service,
+        user_admin_service=object(),
+        run_service=object(),
+        feishu_websocket_client_factory=client_factory,
+    )
+
+    with TestClient(application):
+        assert client.started.wait(timeout=1)
+        connector = getattr(application.state, "feishu_websocket_connector", None)
+        task = getattr(application.state, "feishu_websocket_task", None)
+        assert connector is not None
+        assert task is not None
+        assert created_settings[0].app_id == "cli_runtime"
+
+    assert task.done()
+    assert client.cancelled.wait(timeout=1)
 
 
 def test_create_app_wires_production_multimedia_generation_executor(tmp_path: Path) -> None:

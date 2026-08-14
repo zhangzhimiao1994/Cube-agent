@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -11,6 +13,7 @@ import pytest
 from fastapi import FastAPI
 
 from agent_hub.channels.base import ConversationType, InboundMessage
+from agent_hub.channels.feishu.sdk_client import LarkOAPIFeishuWebSocketClient
 from agent_hub.channels.feishu.settings import FeishuSettings, FeishuTransport
 from agent_hub.channels.feishu.verify import FeishuVerificationError, FeishuVerifier
 from agent_hub.channels.feishu.webhook import (
@@ -29,10 +32,13 @@ NOW = 1_800_000_000
 @dataclass(slots=True)
 class RecordingGateway:
     messages: list[InboundMessage] = field(default_factory=list)
+    submissions: list[object] = field(default_factory=list)
 
     async def handle(self, message: InboundMessage) -> object:
         self.messages.append(message)
-        return object()
+        submission = object()
+        self.submissions.append(submission)
+        return submission
 
 
 @dataclass(slots=True)
@@ -149,6 +155,41 @@ async def test_receivers_produce_same_inbound_message(transport: str) -> None:
     assert message.message_id == "om_123"
     assert message.text == "hello"
     assert gateway.messages == [message]
+
+
+async def test_websocket_receiver_accepts_sdk_payload_without_verification_token() -> None:
+    gateway = RecordingGateway()
+    receiver = build_feishu_websocket_receiver(settings(), gateway=gateway, clock=lambda: float(NOW))
+    payload = private_text_event()
+    payload.pop("token")
+
+    message = await receiver.receive(payload)
+
+    assert message is not None
+    assert message.text == "hello"
+    assert gateway.messages == [message]
+
+
+async def test_websocket_receiver_notifies_submission_handler() -> None:
+    gateway = RecordingGateway()
+    submissions: list[tuple[InboundMessage, object]] = []
+
+    async def submission_handler(message: InboundMessage, submission: object) -> None:
+        submissions.append((message, submission))
+
+    receiver = build_feishu_websocket_receiver(
+        settings(),
+        gateway=gateway,
+        submission_handler=submission_handler,
+        clock=lambda: float(NOW),
+    )
+
+    message = await receiver.receive(private_text_event())
+
+    assert message is not None
+    assert len(submissions) == 1
+    assert submissions[0][0] == message
+    assert submissions[0][1] is gateway.submissions[0]
 
 
 async def test_webhook_rejects_invalid_signature() -> None:
@@ -293,6 +334,62 @@ async def test_websocket_reconnects_refreshes_credentials_and_shutdowns() -> Non
     assert connector.metrics.failures == 1
     assert connector.ready is False
 
+
+
+
+async def test_lark_oapi_websocket_client_streams_message_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callbacks: list[object] = []
+    payload = private_text_event(text="from sdk")
+
+    class FakeBuilder:
+        def register_p2_im_message_receive_v1(self, callback: object) -> FakeBuilder:
+            callbacks.append(callback)
+            return self
+
+        def build(self) -> object:
+            return object()
+
+    class FakeEventDispatcherHandler:
+        @staticmethod
+        def builder(_token: str, _encrypt_key: str) -> FakeBuilder:
+            return FakeBuilder()
+
+    class FakeJSON:
+        @staticmethod
+        def marshal(value: object) -> str:
+            return json.dumps(value)
+
+    class FakeClient:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def start(self) -> None:
+            callback = callbacks[0]
+            assert callable(callback)
+            callback(payload)
+
+    fake_sdk = SimpleNamespace(
+        EventDispatcherHandler=FakeEventDispatcherHandler,
+        JSON=FakeJSON,
+        LogLevel=SimpleNamespace(INFO=object()),
+        ws=SimpleNamespace(Client=FakeClient),
+    )
+
+    def import_module(name: str) -> object:
+        if name == "lark_oapi":
+            return fake_sdk
+        if name == "lark_oapi.ws.client":
+            return SimpleNamespace(loop=None)
+        return importlib.import_module(name)
+
+    monkeypatch.setattr(importlib, "import_module", import_module)
+    client = LarkOAPIFeishuWebSocketClient(settings(), startup_timeout_seconds=0.1)
+
+    async for received in client.events():
+        assert received["event"] == payload["event"]
+        break
 
 def test_transport_selection_supports_webhook_websocket_and_both() -> None:
     assert settings(transport=FeishuTransport.WEBHOOK).enabled_transports() == {

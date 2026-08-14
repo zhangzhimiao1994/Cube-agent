@@ -60,6 +60,29 @@ PY
   fi
 }
 
+
+verify_native_agent_hub_python_dependencies() {
+  local current python_bin
+  [[ "${MODE:-}" == "native" ]] || return 0
+  current="${INSTALL_ROOT:-/opt/agent-hub}/current"
+  python_bin="$current/.venv/bin/python"
+  [[ -x "$python_bin" ]] || {
+    warn "Agent Hub Python interpreter missing or not executable at $python_bin"
+    return 0
+  }
+  if ! "$python_bin" - <<'PY'
+import importlib.util
+
+required_modules = ("agent_hub", "lark_oapi")
+missing = [name for name in required_modules if importlib.util.find_spec(name) is None]
+if missing:
+    raise SystemExit("missing modules: " + ", ".join(missing))
+PY
+  then
+    warn "Agent Hub Python dependencies are incomplete; Feishu long-connection mode requires lark-oapi. Reinstall native mode so uv sync installs pyproject/uv.lock dependencies."
+  fi
+}
+
 verify_installation() {
   local base_url
   base_url="$(installation_health_base_url)"
@@ -68,6 +91,7 @@ verify_installation() {
   verify_native_service agent-hub-worker.service
   verify_native_service agent-hub-litellm.service
   verify_native_litellm_proxy
+  verify_native_agent_hub_python_dependencies
   verify_url "$base_url/health/live" || warn "live health not reachable yet at $base_url"
   verify_url "$base_url/health/ready" || warn "readiness not reachable yet at $base_url; run scripts/agent-hub doctor"
 }

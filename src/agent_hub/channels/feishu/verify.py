@@ -37,6 +37,7 @@ class FeishuVerifier:
         verification_token: str,
         encrypt_key: str,
         allowed_tenant_keys: frozenset[str] = frozenset(),
+        require_verification_token: bool = True,
         timestamp_tolerance_seconds: int = 300,
         clock: Callable[[], float] | None = None,
     ) -> None:
@@ -44,6 +45,7 @@ class FeishuVerifier:
         self._verification_token = verification_token
         self._encrypt_key = encrypt_key
         self._allowed_tenant_keys = allowed_tenant_keys
+        self._require_verification_token = require_verification_token
         self._timestamp_tolerance_seconds = timestamp_tolerance_seconds
         self._clock = clock or time.time
 
@@ -107,6 +109,8 @@ class FeishuVerifier:
             raise FeishuVerificationError("invalid signature")
 
     def _verify_token(self, payload: dict[str, Any]) -> None:
+        if not self._require_verification_token:
+            return
         token = payload.get("token")
         header = payload.get("header")
         if token is None and isinstance(header, dict):

@@ -315,8 +315,6 @@ function matchesChannelColumns(channel: ChannelStatus, filters: ChannelColumnFil
 
 function sortedChannels(channels: ChannelStatus[], sort: SortState<ChannelSortKey>) {
   const copy = [...channels];
-  if (false) return copy;
-  const direction = sort.direction === "asc" ? 1 : -1;
   return copy.sort((left, right) => {
     let result = 0;
     if (sort.key === "name") result = compareText(left.name, right.name, "asc");
@@ -339,14 +337,6 @@ export function ChannelsPage() {
 
   const selected = useMemo(() => {
     const items = channels.data ?? [];
-  const visibleChannels = sortedChannels(
-    items.filter((channel) => textContains(channelSearchText(channel), channelSearchTerm) && matchesChannelColumns(channel, channelColumnFilters)),
-    channelSort,
-  );
-
-  function updateChannelColumnFilter<Key extends keyof ChannelColumnFilters>(key: Key, value: ChannelColumnFilters[Key]) {
-    setChannelColumnFilters((current) => ({ ...current, [key]: value }));
-  }
     return items.find((item) => item.id === selectedId) ?? items[0] ?? null;
   }, [channels.data, selectedId]);
   const guide = selected ? CHANNEL_GUIDES[selected.id] : null;

@@ -762,6 +762,7 @@ const ChannelStatusSchema = z.object({
   webhook_path: z.string().nullable(),
   public_webhook_url: z.string().nullable(),
   missing: z.array(z.string()),
+  configured: z.array(z.string()).default([]),
   notes: z.array(z.string()),
 });
 

@@ -150,6 +150,7 @@ const baseChannels: ChannelStatus[] = [
     webhook_path: "/channels/feishu/events",
     public_webhook_url: null,
     missing: ["FEISHU_APP_ID"],
+    configured: [],
     notes: ["Webhook 已挂载在主 API 服务。"],
   },
   {
@@ -160,6 +161,7 @@ const baseChannels: ChannelStatus[] = [
     webhook_path: "/channels/custom/events",
     public_webhook_url: null,
     missing: ["CUSTOM_WEBHOOK_TOKEN"],
+    configured: [],
     notes: ["用于兼容其他支持 HTTP Webhook 的聊天软件。"],
   },
 ];

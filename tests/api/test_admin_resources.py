@@ -2106,6 +2106,7 @@ def test_channel_status_defaults_feishu_to_websocket_two_parameter_mode(monkeypa
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("FEISHU_APP_ID", "cli_default")
     monkeypatch.setenv("FEISHU_APP_SECRET", "default-secret")
+    monkeypatch.setenv("AGENT_HUB_PUBLIC_URL", "https://agent.example.com")
 
     response = client().get("/api/v1/admin/channels", headers=headers())
 
@@ -2114,6 +2115,9 @@ def test_channel_status_defaults_feishu_to_websocket_two_parameter_mode(monkeypa
     assert by_id["feishu"]["status"] == "configured"
     assert by_id["feishu"]["missing"] == []
     assert by_id["feishu"]["transports"] == ["websocket"]
+    assert by_id["feishu"]["configured"] == ["FEISHU_APP_ID", "FEISHU_APP_SECRET"]
+    assert "AGENT_HUB_PUBLIC_URL" not in by_id["feishu"]["configured"]
+    assert "FEISHU_VERIFICATION_TOKEN" not in by_id["feishu"]["configured"]
     assert any("长连接" in note for note in by_id["feishu"]["notes"])
 
 
