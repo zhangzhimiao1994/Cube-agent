@@ -6,6 +6,7 @@ After=agent-hub-api.service
 Type=simple
 DynamicUser=yes
 EnvironmentFile=/etc/agent-hub/secrets.env
+Environment=PYTHONPATH=/opt/agent-hub/current/src
 WorkingDirectory=/var/lib/agent-hub/skills/%i
 ExecStart=/opt/agent-hub/current/.venv/bin/python -m agent_hub.skills.runner --skill %i
 RuntimeMaxSec=300

@@ -16,6 +16,7 @@ from agent_hub.skills.sandbox.base import (
 @dataclass(frozen=True, slots=True)
 class SystemdSandboxSettings:
     python: str = "/opt/agent-hub/current/.venv/bin/python"
+    source_path: Path = Path("/opt/agent-hub/current/src")
 
 
 class SystemdSkillSandbox:
@@ -94,6 +95,8 @@ def build_systemd_run_command(
         f"ReadWritePaths={_path_arg(invocation.writable_tmp_path)}",
         "-p",
         f"WorkingDirectory={_path_arg(invocation.writable_tmp_path)}",
+        "-E",
+        f"PYTHONPATH={_path_arg(settings.source_path)}",
         "-E",
         f"AGENT_HUB_EXECUTION_ID={invocation.execution_id}",
         "-E",

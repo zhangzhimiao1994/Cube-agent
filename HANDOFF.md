@@ -3804,3 +3804,37 @@ Server deployment and verification update:
 Deployment note:
 
 - Future incremental backend deployments should either install the project into the active venv or explicitly update `.venv/site-packages`; copying only `src` is not enough for the current production service layout.
+## 2026-08-14 Skill Sandbox Active Source Path
+
+Current state:
+
+- The real systemd-run Skill sandbox now passes `PYTHONPATH=/opt/agent-hub/current/src` into each dynamic Skill runner unit.
+- `SystemdSandboxSettings` exposes `source_path` with the production default `/opt/agent-hub/current/src`, so source-first loading is explicit and testable.
+- The static `agent-hub-skill@.service` template now also declares the same PYTHONPATH for consistency with API and worker units.
+- Native install tests now assert that API, worker, and Skill systemd service files all load the active release source tree before site-packages.
+
+Verification performed:
+
+- Local checks:
+  - `uv run pytest tests/contracts/test_skill_sandbox.py -q --tb=short` -> 9 passed.
+  - `uv run pytest tests/unit/skills/test_runner.py tests/contracts/test_skill_sandbox.py -q --tb=short` -> 12 passed.
+  - `uv run ruff check src/agent_hub/skills/sandbox/systemd.py tests/contracts/test_skill_sandbox.py` -> passed.
+  - `uv run mypy --strict src/agent_hub/skills/sandbox/systemd.py tests/contracts/test_skill_sandbox.py` -> passed.
+  - `git diff --check` -> passed with existing CRLF warnings only.
+  - Windows-local `bash`/`bats` were unavailable (`bash.exe` points to missing WSL `/bin/bash`, `bats` not installed), so shell checks were moved to the server/GitHub path.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-skill-sandbox-pythonpath.tgz` and deployed into `/opt/agent-hub/current`.
+  - Backed up overwritten files under `/opt/agent-hub/backups/skill-sandbox-pythonpath-20260814-071405`.
+  - Installed updated `/etc/systemd/system/agent-hub-skill@.service`, ran `systemctl daemon-reload`, restarted `agent-hub-api` and `agent-hub-worker`, and verified API, worker, and Caddy were active.
+- Server real environment verification:
+  - `systemctl cat agent-hub-skill@probe.service` contains `Environment=PYTHONPATH=/opt/agent-hub/current/src`.
+  - A real `SystemdSkillSandbox` invocation created a temporary Skill package and executed it through `systemd-run`.
+  - The Skill process exited `0`, saw `PYTHONPATH=/opt/agent-hub/current/src`, and imported `agent_hub.skills.runner` from `/opt/agent-hub/current/src/agent_hub/...`.
+  - Server `bash -n install.sh scripts/agent-hub scripts/lib/*.sh scripts/commands/*.sh deploy/native/*.sh` -> passed.
+  - Server `bats` and production `.venv` pytest are not installed, so those tests were not runnable on the production host; GitHub Actions will cover them.
+  - Removed `/tmp/probe_skill_sandbox_pythonpath.py`, `/tmp/deploy_skill_sandbox_pythonpath.sh`, `/tmp/agent-hub-skill-sandbox-pythonpath.tgz`, and probe directories.
+
+Remaining risks / next:
+
+- Create local and GitHub recovery archives, push `mutilagent/main`, and verify Actions.
+- Continue P3 with final usage README/README.zh-CN, broader UI copy/layout audit, and Docker readiness later.

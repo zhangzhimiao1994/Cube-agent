@@ -133,6 +133,7 @@ def test_systemd_command_enforces_process_filesystem_and_network_restrictions() 
     assert properties["RuntimeMaxSec"] == "3s"
     assert properties["ReadWritePaths"] == "/srv/agent-hub/tmp/exec_1"
     assert properties["WorkingDirectory"] == "/srv/agent-hub/tmp/exec_1"
+    assert "PYTHONPATH=/opt/agent-hub/current/src" in _environment_values(command)
     assert any(item == "ReadOnlyPaths=/srv/agent-hub/packages/pkg.zip" for item in _property_values(command))
     assert any(item == "ReadOnlyPaths=/srv/agent-hub/input.txt" for item in _property_values(command))
     assert command[-3:] == (
@@ -174,6 +175,10 @@ def test_systemd_terminate_command_targets_unit_without_shell() -> None:
     )
     with pytest.raises(ValueError):
         build_systemd_terminate_command("../escape")
+
+
+def _environment_values(command: tuple[str, ...]) -> list[str]:
+    return [command[index + 1] for index, value in enumerate(command) if value == "-E"]
 
 
 def _value_after(command: tuple[str, ...], flag: str) -> str:

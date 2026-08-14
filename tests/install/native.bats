@@ -19,6 +19,15 @@
   grep -q '^ReadWritePaths=/var/lib/agent-hub /run/agent-hub' deploy/native/systemd/agent-hub-api.service
 }
 
+@test "python systemd services load the active release source tree" {
+  for unit in \
+    deploy/native/systemd/agent-hub-api.service \
+    deploy/native/systemd/agent-hub-worker.service \
+    deploy/native/systemd/agent-hub-skill@.service
+  do
+    grep -q '^Environment=PYTHONPATH=/opt/agent-hub/current/src' "$unit"
+  done
+}
 @test "native installer deploys a release before starting systemd services" {
   grep -q 'deploy_native_release' scripts/lib/install_native.sh
   grep -q 'ln -sfn' scripts/lib/install_native.sh
