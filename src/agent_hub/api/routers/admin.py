@@ -239,6 +239,8 @@ class RunListItem(BaseModel):
     status: str
     mode: str
     conversation_id: str | None = None
+    request: str = ""
+    created_at: datetime | None = None
     queue_wait_ms: int = Field(ge=0)
     capacity_wait_ms: int = Field(ge=0)
     cost_usd: str
@@ -1746,13 +1748,12 @@ def _instruction_skill_members(archive_bytes: bytes) -> tuple[str, bytes] | None
                     for name in normalized_to_original
                     if PurePosixPath(name).name.lower() in _SKILL_INSTRUCTION_NAMES
                 ]
-                if len(candidates) > 1:
-                    return None
-                if len(candidates) != 1:
+                candidate = _select_instruction_skill_path(candidates)
+                if candidate is None:
                     return None
                 if len(normalized_to_original) > _MAX_SKILL_BUNDLE_ITEMS:
                     raise InvalidSkillPackage("instruction skill contains too many files")
-                return candidates[0], archive.read(normalized_to_original[candidates[0]])
+                return candidate, archive.read(normalized_to_original[candidate])
         except zipfile.BadZipFile as exc:
             raise InvalidSkillPackage("skill archive must be a valid zip file") from exc
     try:
@@ -1771,13 +1772,12 @@ def _instruction_skill_members(archive_bytes: bytes) -> tuple[str, bytes] | None
                 _validate_instruction_skill_file(path)
                 if PurePosixPath(path).name.lower() in _SKILL_INSTRUCTION_NAMES:
                     files.append((path, member))
-            if len(files) > 1:
-                return None
-            if len(files) != 1:
+            candidate = _select_instruction_skill_path(path for path, _member in files)
+            if candidate is None:
                 return None
             if len(archive.getmembers()) > _MAX_SKILL_BUNDLE_ITEMS:
                 raise InvalidSkillPackage("instruction skill contains too many files")
-            path, member = files[0]
+            path, member = next((path, member) for path, member in files if path == candidate)
             source = archive.extractfile(member)
             if source is None:
                 raise InvalidSkillPackage("skill instruction file cannot be read")
@@ -1786,6 +1786,16 @@ def _instruction_skill_members(archive_bytes: bytes) -> tuple[str, bytes] | None
         raise InvalidSkillPackage("skill archive must be a valid zip or tar archive") from exc
 
 
+
+def _select_instruction_skill_path(candidates: Iterable[str]) -> str | None:
+    ordered = tuple(candidates)
+    if not ordered:
+        return None
+    shallowest_depth = min(len(PurePosixPath(candidate).parts) for candidate in ordered)
+    shallowest = [candidate for candidate in ordered if len(PurePosixPath(candidate).parts) == shallowest_depth]
+    if len(shallowest) != 1:
+        return None
+    return shallowest[0]
 def _instruction_skill_fallback_name(filename: str, skill_md_path: str) -> str:
     parent = PurePosixPath(skill_md_path).parent
     if parent.as_posix() not in {"", "."}:
@@ -1955,7 +1965,7 @@ def _skill_bundle_groups[T](entries: list[tuple[str, T]]) -> tuple[tuple[str, li
         if len(parts) >= 2 and (parts[-1] in _SKILL_MANIFEST_NAMES or parts[-1].lower() in _SKILL_INSTRUCTION_NAMES):
             roots[PurePosixPath(*parts[:-1]).as_posix()] = None
     groups: list[tuple[str, list[tuple[str, T]]]] = []
-    for root in roots:
+    for root in _select_skill_bundle_roots(roots):
         group_entries: list[tuple[str, T]] = []
         root_parts = PurePosixPath(root).parts
         for path, entry in entries:
@@ -1968,6 +1978,32 @@ def _skill_bundle_groups[T](entries: list[tuple[str, T]]) -> tuple[tuple[str, li
     return tuple(groups)
 
 
+
+def _select_skill_bundle_roots(roots: Iterable[str]) -> tuple[str, ...]:
+    ordered = tuple(roots)
+    selected: list[str] = []
+    for root in sorted(ordered, key=_skill_bundle_root_depth):
+        if any(_skill_bundle_root_contains(parent, root) for parent in selected):
+            continue
+        selected.append(root)
+    selected_set = set(selected)
+    return tuple(root for root in ordered if root in selected_set)
+
+
+def _skill_bundle_root_depth(root: str) -> int:
+    if root in {"", "."}:
+        return 0
+    return len(PurePosixPath(root).parts)
+
+
+def _skill_bundle_root_contains(parent: str, child: str) -> bool:
+    if parent == child:
+        return False
+    if parent in {"", "."}:
+        return True
+    parent_parts = PurePosixPath(parent).parts
+    child_parts = PurePosixPath(child).parts
+    return len(child_parts) > len(parent_parts) and child_parts[: len(parent_parts)] == parent_parts
 def _skill_bundle_group_filename(group: str) -> str:
     return "-".join(PurePosixPath(group).parts)
 
@@ -2270,6 +2306,8 @@ class InMemoryAdminResourceService:
                 status=run.status,
                 mode=run.mode,
                 conversation_id=run.explicit_details.get("conversation_id"),
+                request=run.request,
+                created_at=run.events[0].created_at if run.events else None,
                 queue_wait_ms=run.queue_wait_ms,
                 capacity_wait_ms=run.capacity_wait_ms,
                 cost_usd=run.cost_usd,
@@ -2991,6 +3029,8 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             status=record.status.value,
             mode="auto" if record.mode is None else record.mode.value,
             conversation_id=_routing_details(record.routing_decision).get("conversation_id"),
+            request=record.request,
+            created_at=record.created_at,
             queue_wait_ms=0,
             capacity_wait_ms=0,
             cost_usd=str(await self._run_repository.usage_cost(self._tenant_id, record.id)),
@@ -3003,7 +3043,6 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         artifacts = await self._run_repository.artifacts(self._tenant_id, record.id)
         return RunDetailResponse(
             **list_item.model_dump(),
-            request=record.request,
             events=[_admin_run_event(event) for event in events],
             artifacts=[_admin_run_artifact(artifact) for artifact in artifacts],
             explicit_details={

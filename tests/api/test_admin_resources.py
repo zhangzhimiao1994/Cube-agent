@@ -1622,6 +1622,51 @@ def instruction_bundle_with_hidden_nested_skill_zip() -> bytes:
         )
     return buffer.getvalue()
 
+
+def instruction_bundle_with_nested_example_skill_zip() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "skills/nuwa/SKILL.md",
+            "---\nname: nuwa\ndescription: Parent skill with examples.\n---\n\nUse this skill.\n",
+        )
+        archive.writestr(
+            "skills/nuwa/examples/example-persona/SKILL.md",
+            "---\nname: example-persona\ndescription: Nested example skill.\n---\n\nReference example.\n",
+        )
+        archive.writestr(
+            "skills/nuwa/references/notes.md",
+            "Reference notes for the parent skill.\n",
+        )
+        archive.writestr(
+            "skills/other-skill/SKILL.md",
+            "---\nname: other-skill\ndescription: Other skill.\n---\n\nUse this skill.\n",
+        )
+    return buffer.getvalue()
+
+
+def large_phone_wrapped_instruction_skill_bundle_archive() -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for index in range(99):
+            skill_name = f"phone-wrapped-skill-{index:03d}"
+            files = {
+                f"phone-export/all-skills_1/skills/{skill_name}/SKILL.md": (
+                    "---\n"
+                    f"name: {skill_name}\n"
+                    "description: Phone wrapped bundle regression.\n"
+                    "---\n\n"
+                    "Use this instruction skill from a multi-layer phone archive.\n"
+                ).encode(),
+                f"phone-export/all-skills_1/skills/{skill_name}/references/note.md": (
+                    f"Reference note {index}.\n"
+                ).encode(),
+            }
+            for path, content in files.items():
+                info = tarfile.TarInfo(path)
+                info.size = len(content)
+                archive.addfile(info, io.BytesIO(content))
+    return buffer.getvalue()
 def partially_invalid_instruction_skill_bundle_zip() -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
@@ -2146,6 +2191,7 @@ def test_operational_run_listing_details_and_controls() -> None:
     assert runs.json()[0]["queue_wait_ms"] >= 0
     assert runs.json()[0]["capacity_wait_ms"] >= 0
     assert runs.json()[0]["cost_usd"] == "0.0132"
+    assert runs.json()[0]["request"] == "Summarize current deployment readiness."
 
     detail = api.get(f"/api/v1/admin/runs/{run_id}", headers=headers())
     pause = api.post(f"/api/v1/admin/runs/{run_id}/pause", headers=headers())
@@ -2283,6 +2329,7 @@ async def test_persistent_admin_conversation_keeps_chronological_messages() -> N
                     mode=TaskMode.DISPATCH,
                     status=RunStatus.COMPLETED,
                     version=1,
+                    created_at=datetime.now(UTC),
                     routing_decision={"conversation_id": "conv-multi-turn"},
                 ),
                 RunRecord(
@@ -2293,6 +2340,7 @@ async def test_persistent_admin_conversation_keeps_chronological_messages() -> N
                     mode=TaskMode.DISPATCH,
                     status=RunStatus.COMPLETED,
                     version=1,
+                    created_at=datetime.now(UTC),
                     routing_decision={"conversation_id": "conv-multi-turn"},
                 ),
             )
@@ -2709,6 +2757,42 @@ def test_skill_archive_upload_ignores_hidden_nested_skill_directories() -> None:
     body = uploaded.json()
     assert [item["name"] for item in body["items"]] == ["aibiandao", "other-skill"]
 
+
+def test_skill_archive_upload_keeps_parent_skill_with_nested_example_skill_files() -> None:
+    api = client()
+
+    uploaded = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "skills-with-examples.zip"},
+        content=instruction_bundle_with_nested_example_skill_zip(),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert uploaded.status_code == 200
+    body = uploaded.json()
+    assert body["bundle"] is True
+    assert [item["name"] for item in body["items"]] == ["nuwa", "other-skill"]
+    assert body["skipped"] == []
+    assert {item["name"] for item in skills.json()} == {"nuwa", "other-skill"}
+
+
+def test_skill_archive_upload_accepts_phone_wrapped_large_instruction_bundle_with_assets() -> None:
+    api = client()
+
+    uploaded = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "all-skills_1.tar.gz"},
+        content=large_phone_wrapped_instruction_skill_bundle_archive(),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert uploaded.status_code == 200
+    body = uploaded.json()
+    assert body["bundle"] is True
+    assert len(body["items"]) == 99
+    assert body["items"][0]["name"] == "phone-wrapped-skill-000"
+    assert body["items"][-1]["name"] == "phone-wrapped-skill-098"
+    assert len(skills.json()) == 99
 def test_skill_archive_upload_keeps_valid_bundle_items_when_one_item_is_invalid() -> None:
     api = client()
 

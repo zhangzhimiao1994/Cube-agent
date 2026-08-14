@@ -4212,3 +4212,48 @@ CI status for Multimedia Generation Entry Removal + Seedance Presets:
 
 - Commit `42a0442` was pushed to `mutilagent/main` after creating recovery bundle `.local-archives/github-recovery/mutilagent-main-before-20260814-193902-cfd8298.bundle` and GitHub tag `archive/mutilagent-main-before-20260814-193902-cfd8298`.
 - GitHub Actions run `31797093485` for commit `42a0442` completed successfully in 2m58s.
+Final CI status after documenting Multimedia Generation Entry Removal + Seedance Presets:
+
+- Documentation/status commit `8a4fbf4` was pushed after creating recovery bundle `.local-archives/github-recovery/mutilagent-main-before-20260814-194305-42a0442.bundle` and GitHub tag `archive/mutilagent-main-before-20260814-194305-42a0442`.
+- GitHub Actions run `31797364026` for commit `8a4fbf4` completed successfully in 3m2s.
+## 2026-08-14 Skill Bundle Robustness + Conversation History Titles
+
+Current state:
+
+- Skill archive scanning now keeps the parent instruction Skill when a Skill directory contains nested example `SKILL.md` files such as `examples/.../SKILL.md`; nested example files are treated as part of the parent package instead of being installed as separate Skills.
+- Multi-layer phone/file-manager archives are supported for instruction bundles such as `all-skills_1.tar.gz/skills/<skill>/SKILL.md`, including per-Skill `references/` assets.
+- The Skill management UI copy now says `.zip`, `.tar`, `.tar.gz`, and `.tgz` are supported, and explains that multi-layer wrapper folders, `references`, `assets`, and nested example files are accepted.
+- Admin run list responses now include `request` and `created_at` so the chat history drawer can label sessions by the user's first question plus a timestamp, instead of showing only `run.id`/`conv-*` identifiers.
+- The chat history drawer displays titles like `给我做一个短视频脚本方案。 · 2026-08-07 08:00`; delete/select/open actions use the same readable title while still deleting by run ID internally.
+
+Local verification:
+
+- `uv run pytest tests\api\test_admin_resources.py -q -k "skill_archive_upload" --tb=short` -> 16 passed after adding nested-example and phone-wrapped bundle regressions.
+- `uv run pytest tests\api\test_admin_resources.py tests\unit\runs\test_temporary_agent.py -q --tb=short` -> 115 passed.
+- `uv run ruff check src\agent_hub\api\routers\admin.py src\agent_hub\runs\repository.py tests\api\test_admin_resources.py tests\unit\runs\test_temporary_agent.py` -> passed.
+- `uv run mypy src\agent_hub\api\routers\admin.py src\agent_hub\runs\repository.py` -> passed.
+- `npm.cmd run lint` -> passed.
+- `npm.cmd run test -- --run src/pages/OperationalPages.test.tsx` -> 55 passed.
+- `npm.cmd run test -- --run` -> 119 passed.
+- `npm.cmd run build` -> passed with the existing Vite large chunk warning.
+
+Server deployment and real verification:
+
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-skill-history-title-20260814-201947.tgz`.
+- Uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed incrementally into `/opt/agent-hub/current`.
+- Server backup path: `/opt/agent-hub/backups/skill-history-title-20260814-122012`.
+- Cleared deployed `web/dist` before extraction to avoid stale hashed JS, copied updated backend files into the active production venv site-packages, restarted `agent-hub-api` and `agent-hub-worker`, and reloaded Caddy. `agent-hub-api`, `agent-hub-worker`, and `caddy` were active after deployment.
+- Real server probe ran in the active server environment with `PYTHONPATH=src`, used real zip/tar.gz bytes, verified active scanner support for a 99-Skill phone-wrapped tar.gz with `references`, verified nested example `SKILL.md` files remain under the parent Skill, verified run list exposes `request` and `created_at`, and checked the deployed frontend bundle markers.
+- Probe output: `{"status": "passed", "checks": ["active_scanner_real_archives", "run_list_request_created_at", "frontend_bundle_markers"], "skill_results": [{"filename": "all-skills_1.tar.gz", "count": 99, "first": "probe-phone-skill-000", "last": "probe-phone-skill-098"}, {"filename": "skills-with-examples.zip", "count": 2, "first": "probe-parent", "last": "probe-other"}], "run_list_request": "Summarize current deployment readiness.", "run_list_created_at": "2026-08-14T12:21:41.135160+00:00"}`.
+
+DeepSeek Harness consultation note for future/new project work:
+
+- User asked about `deepseek-harness` and its claim that everything is a plugin. The useful interpretation is `core protocol contract + multiple host entrypoints`: the DeepSeek protocol rules should live in a reusable adapter/contract layer, while Python lib, CLI, MCP server, Skill, and one-file snippets are entrypoints over the same behavior.
+- For future Agent Hub or new-project improvements, borrow this pattern for provider adapters: keep DeepSeek-specific details such as thinking defaults, `reasoning_content`, streamed tool-call aggregation, token-window validation, and prefix-cache estimation inside a provider adapter instead of leaking them into workflows or the UI.
+- Product implication: model testing should verify provider-specific contracts, not only a single chat completion. A DeepSeek-compatible model check should include multi-turn history, tool calls, stream handling, context/window guardrails, cache-friendly prompts, and redaction of sensitive headers/errors.
+- Architecture implication: OpenClaw, multimedia generation, channels, skills, and evolution execution should follow the same plugin-style principle: one core capability contract with multiple controlled entrypoints (conversation, scheduled tasks, Feishu/channel commands, admin UI, MCP/Skill where appropriate) and shared audit/approval policy.
+
+Remaining risks / next:
+
+- Commit these changes, create a GitHub recovery bundle/tag, force-with-lease push to `mutilagent/main`, then check GitHub Actions until green.
+- Continue broader P3 queue after this slice: OpenClaw desktop/scheduled-control follow-ups, evolution execution orchestration, plan-task mode UX, broader UI copy/layout audit, missing button/function sweep, README/README.zh-CN refresh, and Docker readiness later.

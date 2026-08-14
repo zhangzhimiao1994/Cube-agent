@@ -155,7 +155,7 @@ export function SkillsPage() {
             />
           </label>
           <p className="field-help">
-            接受 `.zip`、`.tar`、`.tar.gz`、`.tgz`。可以上传单个可执行 Skill，也可以上传包含多个 Skill 目录的归档；指令型 Skill 目录需包含 `SKILL.md`。
+            支持 `.zip`、`.tar`、`.tar.gz`、`.tgz`。可以上传单个 Skill，也可以上传包含多个 Skill 目录的归档；多层外层文件夹会自动识别，每个指令型 Skill 目录需包含 `SKILL.md`。
           </p>
           <button type="button" disabled={!file || upload.isPending} onClick={() => upload.mutate()}>
             {upload.isPending ? "正在扫描..." : "上传并扫描"}
@@ -177,7 +177,7 @@ export function SkillsPage() {
           <h3>配置指引</h3>
           <ol>
             <li>可执行 Skill 需包含 `skill.yaml`/`skill.json` 和入口文件；指令型 Skill 需包含 `SKILL.md`。</li>
-            <li>多 Skill 归档请把每个 Skill 放在独立目录中，系统会逐个扫描并入库。</li>
+            <li>多 Skill 归档请把每个 Skill 放在独立目录中；可以带 references、assets 或嵌套示例文件，系统会识别父 Skill 并逐个扫描。</li>
             <li>扫描结果会显示包类型、入口或 `SKILL.md`、内容哈希和请求权限。</li>
             <li>审批前重点检查 requested permissions，危险权限不要直接启用。</li>
           </ol>

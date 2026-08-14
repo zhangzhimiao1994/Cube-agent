@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
-import { ApiError, api, formatApiError, type AttachmentUpload, type ModelDeployment, type RunDetail, type Skill, type SkillArchiveUpload, type SubmittedRun } from "../api/client";
+import { ApiError, api, formatApiError, type AttachmentUpload, type ModelDeployment, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
 
 const RUN_MODES = [
@@ -740,6 +740,30 @@ function preferredReplyArtifact(artifacts: RunDetail["artifacts"]) {
 
 function runConversationId(detail: RunDetail | undefined) {
   return detail?.explicit_details.conversation_id?.trim() || null;
+}
+
+function normalizeConversationQuestion(value: string | undefined, fallback: string) {
+  const normalized = (value ?? "").replace(/\s+/g, " ").trim();
+  if (!normalized) return fallback;
+  return normalized.length > 32 ? `${normalized.slice(0, 31)}...` : normalized;
+}
+
+function conversationTimestamp(value: string | null | undefined) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const pad = (part: number) => part.toString().padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function conversationTitle(run: RunListItem, items: RunListItem[]) {
+  const fallback = run.id.slice(0, 8);
+  const conversationKey = run.conversation_id?.trim();
+  const sameConversation = conversationKey ? items.filter((item) => item.conversation_id === conversationKey) : [];
+  const firstRun = sameConversation.length > 0 ? sameConversation.at(-1) : run;
+  const question = normalizeConversationQuestion(firstRun?.request, fallback);
+  const timestamp = conversationTimestamp(firstRun?.created_at);
+  return timestamp ? `${question} · ${timestamp}` : question;
 }
 
 function conversationMessages(runs: RunDetail[]) {
@@ -1984,7 +2008,8 @@ export function RunsPage() {
       setSubmitNotice("这条对话仍在运行或等待处理，请先取消后再删除。");
       return;
     }
-    if (!window.confirm(`确认删除对话 ${run.id.slice(0, 8)}？删除后运行详情和产物记录也会移除。`)) {
+    const title = conversationTitle(run, items);
+    if (!window.confirm(`确认删除对话「${title}」？删除后运行详情和产物记录也会移除。`)) {
       return;
     }
     deleteRun.mutate(run.id);
@@ -2099,6 +2124,7 @@ export function RunsPage() {
           ) : (
             items.map((run) => {
               const canDelete = TERMINAL_STATUSES.has(run.status);
+              const title = conversationTitle(run, items);
               return (
                 <div
                   key={run.id}
@@ -2107,7 +2133,7 @@ export function RunsPage() {
                   <input
                     type="checkbox"
                     className="conversation-select"
-                    aria-label={`Select conversation ${run.id.slice(0, 8)}`}
+                    aria-label={`选择会话 ${title}`}
                     checked={selectedConversationIds.includes(run.id)}
                     disabled={!canDelete || bulkDeleteRuns.isPending}
                     onChange={() => toggleConversation(run.id)}
@@ -2115,7 +2141,7 @@ export function RunsPage() {
                   <button
                     type="button"
                     className="conversation-item"
-                    aria-label={`进入会话 ${run.id.slice(0, 8)}`}
+                    aria-label={`进入会话 ${title}`}
                     onClick={() => {
                       setShowModeEntry(false);
                       if (run.conversation_id) setConversationId(run.conversation_id);
@@ -2124,13 +2150,13 @@ export function RunsPage() {
                     }}
                   >
                     <span>{displayMode(run.mode)}</span>
-                    <strong>{run.id.slice(0, 8)}</strong>
+                    <strong>{title}</strong>
                     <small>{run.status}</small>
                   </button>
                   <button
                     type="button"
                     className="conversation-delete-button"
-                    aria-label={`Delete conversation ${run.id.slice(0, 8)}`}
+                    aria-label={`删除会话 ${title}`}
                     title={canDelete ? "删除对话" : "运行中先取消"}
                     disabled={!canDelete || deleteRun.isPending}
                     onClick={() => deleteConversation(run)}

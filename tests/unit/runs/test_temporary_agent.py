@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
@@ -77,6 +78,7 @@ class FakeRepository:
             mode=mode,
             status=status,
             version=1,
+            created_at=datetime.now(UTC),
             routing_decision=routing_decision,
         )
         self.records[run_id] = record
@@ -116,6 +118,7 @@ class FakeRepository:
             mode=record.mode,
             status=RunStatus.QUEUED,
             version=record.version + 1,
+            created_at=record.created_at,
             routing_decision={
                 **decision,
                 "selected_agent_ids": selected,
@@ -154,6 +157,7 @@ class FakeRepository:
             mode=record.mode,
             status=RunStatus.QUEUED,
             version=record.version + 1,
+            created_at=record.created_at,
             routing_decision={
                 **decision,
                 "temporary_agent_rejected": True,

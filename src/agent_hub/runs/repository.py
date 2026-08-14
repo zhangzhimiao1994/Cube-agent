@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
@@ -35,6 +36,7 @@ class RunRecord:
     mode: TaskMode | None
     status: RunStatus
     version: int
+    created_at: datetime
     routing_decision: dict[str, object] | None
 
 
@@ -754,6 +756,7 @@ class RunRepository:
             mode=None if row.mode is None else TaskMode(row.mode),
             status=RunStatus(row.status),
             version=row.version,
+            created_at=row.created_at,
             routing_decision=None if row.routing_decision is None else dict(row.routing_decision),
         )
 
