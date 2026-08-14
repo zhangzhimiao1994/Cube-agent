@@ -123,6 +123,14 @@ export function EvolutionPage() {
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
     },
   });
+  const ingestExecutionResult = useMutation({
+    mutationFn: ({ run, execution }: { run: EvolutionRun; execution: EvolutionNextRoundExecution }) =>
+      api.ingestEvolutionExecutionRun(run.id, execution.execution_run_id),
+    onSuccess: async (updated) => {
+      setRoundRunId(updated.id);
+      await queryClient.invalidateQueries({ queryKey: ["evolution-runs"] });
+    },
+  });
   const approveRun = useMutation({
     mutationFn: ({ run, approved }: { run: EvolutionRun; approved: boolean }) => {
       const draft = draftFor(run);
@@ -339,6 +347,8 @@ export function EvolutionPage() {
             const planningFailedThisRun = planNextRound.isError && planNextRound.variables?.id === run.id;
             const isExecutingThisRun = executeNextRound.isPending && executeNextRound.variables?.id === run.id;
             const executionFailedThisRun = executeNextRound.isError && executeNextRound.variables?.id === run.id;
+            const isIngestingThisRun = ingestExecutionResult.isPending && ingestExecutionResult.variables?.run.id === run.id;
+            const ingestionFailedThisRun = ingestExecutionResult.isError && ingestExecutionResult.variables?.run.id === run.id;
             return (
               <article key={run.id} className="evolution-run-card">
                 <div>
@@ -406,10 +416,23 @@ export function EvolutionPage() {
                 {planningFailedThisRun ? <p role="alert">{formatApiError(planNextRound.error, "执行包生成失败")}</p> : null}
                 {executionFailedThisRun ? <p role="alert">{formatApiError(executeNextRound.error, "执行启动失败")}</p> : null}
                 {nextRoundExecution ? (
-                  <p className="field-help">
-                    已启动第 {nextRoundExecution.round} 轮执行：{nextRoundExecution.execution_run_id}（{nextRoundExecution.status}）
-                  </p>
+                  <div className="reference-preview">
+                    <p className="field-help">
+                      已启动第 {nextRoundExecution.round} 轮执行：{nextRoundExecution.execution_run_id}（{nextRoundExecution.status}）
+                    </p>
+                    <div className="table-actions">
+                      <a href={`/runs/${nextRoundExecution.execution_run_id}`}>打开执行运行</a>
+                      <button
+                        type="button"
+                        onClick={() => ingestExecutionResult.mutate({ run, execution: nextRoundExecution })}
+                        disabled={isIngestingThisRun}
+                      >
+                        {isIngestingThisRun ? "导入中..." : "导入执行结果"}
+                      </button>
+                    </div>
+                  </div>
                 ) : null}
+                {ingestionFailedThisRun ? <p role="alert">{formatApiError(ingestExecutionResult.error, "执行结果导入失败")}</p> : null}
                 {nextRoundPlan ? (
                   <div className="reference-preview">
                     <strong>{nextRoundPlan.task_title}</strong>

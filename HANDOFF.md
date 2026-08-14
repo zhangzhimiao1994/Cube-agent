@@ -5178,3 +5178,34 @@ Local verification:
 Remaining risks / next:
 
 - Deploy this `app.py` fallback fix incrementally to the server, verify health and Feishu runtime status, commit, create another recovery bundle/tag, force-with-lease push, and re-check GitHub Actions until green.
+
+## 2026-08-15 Evolution Execution Result Ingestion UI
+
+Current state:
+
+- Added a frontend API client method for `POST /api/v1/admin/evolution-runs/{run_id}/execution-runs/{execution_run_id}/ingest`.
+- The Evolution page now keeps the queued execution run visible after `启动执行`, exposes `打开执行运行`, and provides `导入执行结果` so async temporary-agent execution artifacts can be pulled back into the Evolution run rounds.
+- Import failures are shown next to the corresponding Evolution run card without affecting other runs.
+- The operational page test now verifies the link to the execution run, the ingest button, the POST route, and the newly displayed imported round.
+
+Local verification:
+
+- `npm test -- --run src/pages/OperationalPages.test.tsx -t "shows evolution records"` from `web/` -> 58 passed.
+- `npm test -- --run src/pages/OperationalPages.test.tsx src/app/AppShell.test.tsx` from `web/` -> 64 passed.
+- `npm run lint` from `web/` -> passed.
+- `npm run build` from `web/` -> passed, with the existing Vite large-chunk warning only.
+- `git diff --check` -> passed with CRLF normalization warnings only.
+
+Server deployment and real verification:
+
+- Uploaded incremental package `.local-archives/server-incrementals/agent-hub-evolution-ingest-ui-20260815-071523.tgz` to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed into `/opt/agent-hub/current`.
+- Server backup retained at `/opt/agent-hub/backups/p3-evolution-ingest-ui-20260815-071523`.
+- Server archive retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-evolution-ingest-ui-20260815-071523.tgz`.
+- `/health` returned `{"status":"ok"}` after restarting `agent-hub-api`, `agent-hub-worker`, and `caddy`.
+- Real server page probe loaded `/evolution`, active asset `/assets/index-DY3QtEyY.js`, and confirmed the deployed bundle contains `打开执行运行`, `导入执行结果`, and `execution-runs`.
+- Real server API probe generated a short-lived admin JWT locally on the server without printing secrets: `GET /api/v1/admin/evolution-runs` returned 200 JSON, and the ingest route returned application JSON `not_found` for a deliberately nonexistent run id. No real Evolution run or model execution was created by this probe.
+
+Remaining risks / next:
+
+- Commit this slice, create a GitHub recovery bundle/tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
+- Continue P3 after green: plan-task mode UX, OpenClaw broader workflow integration/config polishing, Evolution execution dashboard refinements, grounded Skill Creator workflows, Skill archive multi-folder/multi-skill import hardening, bulk action/search/filter audits, UI copy/layout audit, README/README.zh-CN final usage refresh, and Docker readiness later.

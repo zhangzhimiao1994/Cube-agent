@@ -817,6 +817,39 @@ describe("operational management pages", () => {
             task_prompt: "Execute one bounded evolution round.",
           });
         }
+        const ingestEvolutionMatch = path.match(/^\/api\/v1\/admin\/evolution-runs\/(evolution_[a-f0-9]+)\/execution-runs\/([0-9a-f-]+)\/ingest$/);
+        if (ingestEvolutionMatch && method === "POST") {
+          const id = ingestEvolutionMatch[1];
+          const executionRunId = ingestEvolutionMatch[2];
+          const current = visibleEvolutionRuns.find((run) => run.id === id) ?? evolutionRun;
+          const round = {
+            round: current.rounds.length + 1,
+            changed_dimension: "执行结果导入",
+            candidate_summary: "执行运行产物已导入。",
+            score_before: 76,
+            score_after: 81,
+            delta: 5,
+            tests_passed: true,
+            regression_detected: false,
+            accepted: true,
+            recommendation: "accept_candidate",
+            stop_reason: null,
+            judge_summary: "从执行运行产物自动导入。",
+            artifact_refs: [`run://${executionRunId}`],
+            tokens_used: 2048,
+            elapsed_seconds: 120,
+            created_at: "2026-08-14T10:13:00Z",
+          };
+          const updated = {
+            ...current,
+            rounds: [...current.rounds, round],
+            status: "running",
+            next_action: "run_next_round",
+          };
+          visibleEvolutionRuns = visibleEvolutionRuns.map((run) => (run.id === id ? updated : run));
+          if (createdEvolutionRun?.id === id) createdEvolutionRun = updated;
+          return jsonResponse(updated);
+        }
         if (path === "/api/v1/admin/evolution-runs") {
           return jsonResponse(visibleEvolutionRuns);
         }
@@ -2417,10 +2450,19 @@ describe("operational management pages", () => {
     await user.click(within(createdRunCard as HTMLElement).getByRole("button", { name: "启动执行" }));
     await waitFor(() => expect(screen.getByText(/已启动第 1 轮执行/)).not.toBeNull());
     expect(screen.getByText(/44444444-4444-4444-8444-444444444444/)).not.toBeNull();
+    expect(screen.getByRole("link", { name: "打开执行运行" }).getAttribute("href")).toBe(
+      "/runs/44444444-4444-4444-8444-444444444444",
+    );
     expect(requests.find((request) => request.path.endsWith(`/evolution-runs/${createdEvolutionRun?.id}/execute-next-round`))).toMatchObject({
       method: "POST",
     });
 
+    await user.click(screen.getByRole("button", { name: "导入执行结果" }));
+    await waitFor(() => expect(createdEvolutionRun?.rounds[0]?.candidate_summary).toBe("执行运行产物已导入。"));
+    expect(screen.getByText(/第 1 轮：执行结果导入/)).not.toBeNull();
+    expect(requests.find((request) => request.path.endsWith(`/evolution-runs/${createdEvolutionRun?.id}/execution-runs/44444444-4444-4444-8444-444444444444/ingest`))).toMatchObject({
+      method: "POST",
+    });
     await user.clear(screen.getByLabelText("改动维度"));
     await user.type(screen.getByLabelText("改动维度"), "反例覆盖");
     await user.clear(screen.getByLabelText("候选摘要"));

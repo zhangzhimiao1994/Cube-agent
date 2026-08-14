@@ -1298,6 +1298,13 @@ export const api = {
       EvolutionNextRoundExecutionSchema,
     );
   },
+  ingestEvolutionExecutionRun(id: string, executionRunId: string): Promise<EvolutionRun> {
+    return request(
+      `/api/v1/admin/evolution-runs/${encodeURIComponent(id)}/execution-runs/${encodeURIComponent(executionRunId)}/ingest`,
+      { method: "POST" },
+      EvolutionRunSchema,
+    );
+  },
   approveEvolutionRun(id: string, payload: EvolutionApprovalRequest): Promise<EvolutionRun> {
     return request(
       `/api/v1/admin/evolution-runs/${encodeURIComponent(id)}/approve`,
