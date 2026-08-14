@@ -34,6 +34,7 @@ from agent_hub.api.routers.admin import (
     _admin_run_event,
     _mode_error_log_from_run,
     _model_check_failure_details,
+    _openclaw_proposal,
     _routing_details,
     _run_debug_from_detail,
 )
@@ -947,6 +948,37 @@ def test_qwen_dashscope_unauthorized_model_check_returns_provider_specific_hint(
     assert "AccessKey" in details["hint"]
     assert "Bearer" in details["hint"]
 
+
+def test_openclaw_proposal_helper_preserves_safe_operation_details() -> None:
+    proposal = _openclaw_proposal(
+        {
+            "openclaw_proposal": {
+                "kind": "server_command",
+                "platform": "linux",
+                "target_type": "server",
+                "target": "linux-server",
+                "operation_text": "Use OpenClaw to execute date on the Linux server after approval.",
+                "source_conversation_id": "conv-openclaw-admin",
+                "summary": "Confirm before execution.",
+                "metadata": {
+                    "source": "chat_openclaw_proposal",
+                    "requires_user_confirmation": "true",
+                },
+                "unsafe": object(),
+            }
+        }
+    )
+
+    assert proposal is not None
+    assert proposal["kind"] == "server_command"
+    assert proposal["platform"] == "linux"
+    assert proposal["target_type"] == "server"
+    assert proposal["source_conversation_id"] == "conv-openclaw-admin"
+    assert proposal["metadata"] == {
+        "source": "chat_openclaw_proposal",
+        "requires_user_confirmation": "true",
+    }
+    assert "unsafe" not in proposal
 
 def test_run_detail_response_can_expose_mode_decision_token() -> None:
     token = "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234"

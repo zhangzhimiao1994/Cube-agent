@@ -1,3 +1,42 @@
+## 2026-08-15 OpenClaw Chat Proposal Approval Boundary
+
+Current state:
+
+- OpenClaw is now recognized from normal chat as a system-level computer/server operation request, but the chat path only creates a waiting-approval proposal and never executes directly.
+- Added `openclaw_proposal` to `SubmittedRun`, `/api/v1/runs` responses, admin run details, and frontend API schemas.
+- `RunService.submit()` detects explicit OpenClaw operation requests such as running a command on the Linux server, creates a `waiting_approval` run with `approval_kind=openclaw_operation`, and stores a safe proposal payload with kind/platform/target/operation text/source conversation.
+- Normal explanatory OpenClaw questions, such as asking what the sandbox is for, do not create an operation proposal.
+- The chat UI now shows an `OpenClaw 操作确认` card above the composer and links operators to `/openclaw`; actual approval/execution remains inside OpenClaw control management.
+- Opening historical waiting-approval runs can restore the OpenClaw proposal state, and new conversation/Handoff flows clear stale proposal cards.
+- Feishu note from user Q&A: if `FEISHU_APP_ID` and `FEISHU_APP_SECRET` were already saved for long-connection mode, they generally do not need to be re-entered, but the current WebSocket connector starts at API startup, so saving credentials may still require restarting `agent-hub-api` before live receiving works. If the UI still shows configured after clearing, check server env values from `/etc/agent-hub/secrets.env` and the channel config refresh path.
+
+Local verification:
+
+- RED first: targeted OpenClaw tests initially failed because `SubmittedRun` had no `openclaw_proposal`, `RunService` did not detect OpenClaw intent, and the API stub could not serialize the new field.
+- `.\.venv\Scripts\python.exe -m pytest tests\unit\runs\test_temporary_agent.py::test_openclaw_command_request_returns_confirmation_proposal_without_enqueue tests\unit\runs\test_temporary_agent.py::test_openclaw_explanation_request_does_not_create_operation_proposal tests\api\test_runs_api.py::test_openclaw_proposal_is_returned_from_run_submission tests\api\test_admin_resources.py::test_openclaw_proposal_helper_preserves_safe_operation_details -q` -> 4 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\unit\runs\test_temporary_agent.py tests\api\test_runs_api.py tests\api\test_admin_resources.py -q` -> 153 passed.
+- `.\.venv\Scripts\python.exe -m ruff check src tests` -> passed.
+- `.\.venv\Scripts\python.exe -m mypy --strict src tests` -> passed, 264 source files checked.
+- `.\.venv\Scripts\python.exe -m pytest tests\unit tests\api tests\contracts tests\security tests\resilience -q` -> 1457 passed, 13 skipped.
+- `npm test -- --run` from `web/` -> 14 files / 124 tests passed.
+- `npm run lint` from `web/` -> passed.
+- `npm run build` from `web/` -> passed with the existing Vite large chunk warning.
+
+Server deployment and real verification:
+
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-openclaw-chat-proposal-20260815-021309.tgz`.
+- Uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed incrementally into `/opt/agent-hub/current`.
+- Server backup retained at `/opt/agent-hub/backups/openclaw-chat-proposal-20260815-021309`.
+- Deployed changed backend files and rebuilt `web/dist`; restarted `agent-hub-api` and `agent-hub-worker`, reloaded Caddy, and confirmed `agent-hub-api`, `agent-hub-worker`, and `caddy` active.
+- Real server probe loaded the actual systemd env from `/etc/agent-hub/secrets.env`, used the deployed current source, created a real chat-submitted run through production `RunService`, verified `waiting_approval`, `openclaw_requires_user_confirmation`, `server_command/linux/server` proposal, matching source conversation id, `agent_hub_runs.status=waiting_approval`, no outbox row, and empty local execution queue.
+- Probe output: `{"status": "ok", "run_id": "d4aa00a1-d038-4f46-bc4c-b1302b343fa8", "checks": {"status_waiting_approval": true, "reason": "openclaw_requires_user_confirmation", "proposal_kind": "server_command", "proposal_platform": "linux", "proposal_target_type": "server", "source_conversation_id": "conv-openclaw-probe-e92ebc2822ee", "db_status": "waiting_approval", "outbox_count": 0, "queue_empty": true}}`.
+- Probe cleanup verified: `probe_cleaned=true`; final health `{"status":"ok"}` and all three services remained active.
+
+Remaining / next:
+
+- Commit this slice, create local GitHub recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, then watch GitHub Actions until green.
+- Continue P3 after green: create the actual OpenClaw operation materialization path from approved chat proposals, tighten approval policy UX, finish plan-task mode refinement, fix remaining Skill archive install edge cases, channel configuration refresh/clear polish, UI copy/layout audit, missing button/function sweep, README/README.zh-CN usage refresh, and Docker readiness later.
+
 ## 2026-08-15 Evolution Worker Auto-Ingest
 
 Current state:

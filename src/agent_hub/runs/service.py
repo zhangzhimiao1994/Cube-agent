@@ -45,6 +45,7 @@ class SubmittedRun:
     temporary_agent_proposal: dict[str, object] | None = None
     schedule_proposal: dict[str, object] | None = None
     evolution_proposal: dict[str, object] | None = None
+    openclaw_proposal: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +162,31 @@ class EvolutionProposal:
             "summary": self.summary,
             "metadata": {
                 "source": "chat_evolution_proposal",
+                "requires_user_confirmation": "true",
+            },
+        }
+
+@dataclass(frozen=True, slots=True)
+class OpenClawProposal:
+    kind: str
+    platform: str
+    target_type: str
+    target: str
+    operation_text: str
+    source_conversation_id: str | None
+    summary: str
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "platform": self.platform,
+            "target_type": self.target_type,
+            "target": self.target,
+            "operation_text": self.operation_text,
+            "source_conversation_id": self.source_conversation_id,
+            "summary": self.summary,
+            "metadata": {
+                "source": "chat_openclaw_proposal",
                 "requires_user_confirmation": "true",
             },
         }
@@ -342,6 +368,21 @@ class RunService:
                 message=message,
                 mode=schedule_proposal.mode,
                 proposal=schedule_proposal,
+                idempotency_key=idempotency_key,
+                operator_selection=operator_selection,
+            )
+        openclaw_proposal = _local_openclaw_proposal(
+            message=message,
+            mode=TaskMode.DISPATCH if mode is TaskMode.AUTO else mode,
+            conversation_id=effective_conversation_id,
+        )
+        if openclaw_proposal is not None:
+            return await self._create_openclaw_approval_run(
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                message=message,
+                mode=TaskMode.DISPATCH if mode is TaskMode.AUTO else mode,
+                proposal=openclaw_proposal,
                 idempotency_key=idempotency_key,
                 operator_selection=operator_selection,
             )
@@ -1153,6 +1194,37 @@ class RunService:
         )
         return _submitted(record)
 
+    async def _create_openclaw_approval_run(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        message: str,
+        mode: TaskMode,
+        proposal: OpenClawProposal,
+        idempotency_key: str | None,
+        operator_selection: dict[str, object],
+    ) -> SubmittedRun:
+        token = _decision_token()
+        proposal_payload = proposal.to_payload()
+        record = await self._repository.create_run(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            request=message,
+            mode=mode,
+            status=RunStatus.WAITING_APPROVAL,
+            idempotency_key=idempotency_key,
+            routing_decision={
+                **operator_selection,
+                "reason": "openclaw_requires_user_confirmation",
+                "decision_token": token,
+                "approval_kind": "openclaw_operation",
+                "openclaw_proposal": proposal_payload,
+            },
+            enqueue=False,
+        )
+        return _submitted(record)
+
     async def _safe_record_hermes_outcome(
         self,
         *,
@@ -1189,6 +1261,7 @@ def _submitted(record: RunRecord) -> SubmittedRun:
     proposal = decision.get("temporary_agent_proposal")
     schedule_proposal = decision.get("schedule_proposal")
     evolution_proposal = decision.get("evolution_proposal")
+    openclaw_proposal = decision.get("openclaw_proposal")
     return SubmittedRun(
         id=record.id,
         tenant_id=record.tenant_id,
@@ -1212,6 +1285,9 @@ def _submitted(record: RunRecord) -> SubmittedRun:
         else None,
         evolution_proposal=cast(dict[str, object], evolution_proposal)
         if isinstance(evolution_proposal, dict)
+        else None,
+        openclaw_proposal=cast(dict[str, object], openclaw_proposal)
+        if isinstance(openclaw_proposal, dict)
         else None,
     )
 
@@ -1299,6 +1375,89 @@ def _evolution_source_skill_ids(message: str) -> tuple[str, ...]:
         if value not in candidates:
             candidates.append(value)
     return tuple(candidates[:8])
+
+_OPENCLAW_NAME_RE = re.compile(
+    "(openclaw|\u63a5\u7ba1\u7535\u8111|\u64cd\u4f5c\u7535\u8111|\u63a7\u5236\u7535\u8111|\u670d\u52a1\u5668\u64cd\u4f5c|\u7ec8\u7aef\u63a7\u5236|\u7535\u8111\u64cd\u4f5c)",
+    re.IGNORECASE,
+)
+_OPENCLAW_ACTION_RE = re.compile(
+    "(execute|run|command|terminal|shell|click|screen|file|\u6267\u884c|\u8fd0\u884c|\u547d\u4ee4|\u7ec8\u7aef|\u70b9\u51fb|\u8bfb\u53d6\u5c4f\u5e55|\u5c4f\u5e55|\u6587\u4ef6|\u63a5\u7ba1|\u64cd\u4f5c)",
+    re.IGNORECASE,
+)
+_OPENCLAW_COMMAND_RE = re.compile(
+    "(execute|run|command|terminal|shell|\u6267\u884c|\u8fd0\u884c|\u547d\u4ee4|\u7ec8\u7aef)",
+    re.IGNORECASE,
+)
+_OPENCLAW_SCREEN_RE = re.compile(
+    "(screen|screenshot|\u8bfb\u53d6\u5c4f\u5e55|\u5c4f\u5e55|\u622a\u56fe)",
+    re.IGNORECASE,
+)
+_OPENCLAW_FILE_RE = re.compile("(file|\u6587\u4ef6)", re.IGNORECASE)
+
+
+def _local_openclaw_proposal(
+    *,
+    message: str,
+    mode: TaskMode,
+    conversation_id: str | None,
+) -> OpenClawProposal | None:
+    del mode
+    if _OPENCLAW_NAME_RE.search(message) is None or _OPENCLAW_ACTION_RE.search(message) is None:
+        return None
+    kind = _openclaw_kind(message)
+    platform = _openclaw_platform(message)
+    target_type = _openclaw_target_type(kind, platform)
+    return OpenClawProposal(
+        kind=kind,
+        platform=platform,
+        target_type=target_type,
+        target=_openclaw_target(platform, target_type),
+        operation_text=message.strip(),
+        source_conversation_id=conversation_id,
+        summary="Main Agent detected an OpenClaw computer/server operation request. Confirm target, permissions, and risk before creating the controlled operation.",
+    )
+
+
+def _openclaw_kind(message: str) -> str:
+    if _OPENCLAW_SCREEN_RE.search(message) is not None:
+        return "screen_read"
+    if _OPENCLAW_FILE_RE.search(message) is not None:
+        return "file_read"
+    if _OPENCLAW_COMMAND_RE.search(message) is not None:
+        return "server_command"
+    return "desktop_action"
+
+
+def _openclaw_platform(message: str) -> str:
+    lowered = message.lower()
+    if "windows" in lowered or "win" in lowered or "\u7535\u8111" in message or "\u672c\u673a" in message:
+        return "windows"
+    if "mac" in lowered or "macos" in lowered:
+        return "macos"
+    if "linux" in lowered or "server" in lowered or "\u670d\u52a1\u5668" in message:
+        return "linux"
+    return "auto"
+
+
+def _openclaw_target_type(kind: str, platform: str) -> str:
+    if kind == "server_command" and platform == "linux":
+        return "server"
+    if kind == "screen_read":
+        return "screen"
+    if kind == "file_read":
+        return "filesystem"
+    return "computer"
+
+
+def _openclaw_target(platform: str, target_type: str) -> str:
+    if target_type == "server":
+        return "linux-server"
+    if platform == "windows":
+        return "windows-computer"
+    if platform == "macos":
+        return "macos-computer"
+    return "operator-selected"
+
 
 _SCHEDULE_TRIGGER_RE = re.compile(
     r"(定时|提醒|闹钟|日程|每天|每日|每周|schedule|scheduled|remind|reminder|daily|weekly)",

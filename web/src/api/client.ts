@@ -560,6 +560,16 @@ const EvolutionProposalSchema = z.object({
   summary: z.string(),
   metadata: z.record(z.string(), z.string()),
 });
+const OpenClawProposalSchema = z.object({
+  kind: z.enum(["server_command", "desktop_action", "screen_read", "file_read"]),
+  platform: z.enum(["auto", "linux", "windows", "macos"]),
+  target_type: z.enum(["server", "computer", "desktop", "filesystem", "screen"]),
+  target: z.string(),
+  operation_text: z.string(),
+  source_conversation_id: z.string().nullable().optional(),
+  summary: z.string(),
+  metadata: z.record(z.string(), z.string()),
+});
 const SubmittedRunSchema = z.object({
   id: z.string(),
   tenant_id: z.string(),
@@ -573,6 +583,7 @@ const SubmittedRunSchema = z.object({
   temporary_agent_proposal: TemporaryAgentProposalSchema.nullable().optional(),
   schedule_proposal: ScheduleProposalSchema.nullable().optional(),
   evolution_proposal: EvolutionProposalSchema.nullable().optional(),
+  openclaw_proposal: OpenClawProposalSchema.nullable().optional(),
 });
 
 export type SubmittedRun = z.infer<typeof SubmittedRunSchema>;
@@ -616,6 +627,7 @@ const RunDetailSchema = RunListItemSchema.extend({
   temporary_agent_proposal: TemporaryAgentProposalSchema.nullable().optional(),
   schedule_proposal: ScheduleProposalSchema.nullable().optional(),
   evolution_proposal: EvolutionProposalSchema.nullable().optional(),
+  openclaw_proposal: OpenClawProposalSchema.nullable().optional(),
 });
 
 const RunDeleteSchema = z.object({

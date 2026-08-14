@@ -175,6 +175,28 @@ class StubRunService:
                     "metadata": {"source": "chat_evolution_proposal", "requires_user_confirmation": "true"},
                 },
             )
+        if "OpenClaw" in message and "execute date" in message:
+            return SubmittedRun(
+                id=uuid4(),
+                tenant_id=tenant_id,
+                status=RunStatus.WAITING_APPROVAL,
+                mode=TaskMode.DISPATCH,
+                decision_token="safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+                version=1,
+                clarification_reason="openclaw_requires_user_confirmation",
+                conversation_id=conversation_id or "conv-test",
+                reference_conversation_id=reference_conversation_id,
+                openclaw_proposal={
+                    "kind": "server_command",
+                    "platform": "linux",
+                    "target_type": "server",
+                    "target": "linux-server",
+                    "operation_text": message,
+                    "source_conversation_id": conversation_id or "conv-test",
+                    "summary": "User confirmation is required before creating an OpenClaw operation.",
+                    "metadata": {"source": "chat_openclaw_proposal", "requires_user_confirmation": "true"},
+                },
+            )
         status = RunStatus.WAITING_USER_MODE if mode is TaskMode.AUTO else RunStatus.QUEUED
         if status is RunStatus.QUEUED:
             self.enqueue_count += 1
@@ -541,6 +563,29 @@ def test_skill_creation_submission_returns_grounded_evolution_proposal() -> None
     assert body["evolution_proposal"]["title"] == "Skill 创建任务"
     assert body["evolution_proposal"]["target_artifact_type"] == "skill"
     assert "真实任务验收" in body["evolution_proposal"]["summary"]
+
+
+def test_openclaw_proposal_is_returned_from_run_submission() -> None:
+    client, _, _ = _client()
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": "Use OpenClaw to execute date on the Linux server after approval.",
+            "mode": "auto",
+            "conversation_id": "conv-openclaw-api",
+        },
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "waiting_approval"
+    assert body["clarification_reason"] == "openclaw_requires_user_confirmation"
+    assert body["openclaw_proposal"]["kind"] == "server_command"
+    assert body["openclaw_proposal"]["platform"] == "linux"
+    assert body["openclaw_proposal"]["target_type"] == "server"
+    assert body["openclaw_proposal"]["source_conversation_id"] == "conv-openclaw-api"
 
 
 def test_submission_forwards_selected_workflow_and_agents() -> None:

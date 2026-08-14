@@ -188,6 +188,7 @@ class SubmittedRunResponse(BaseModel):
     temporary_agent_proposal: dict[str, object] | None = None
     schedule_proposal: dict[str, object] | None = None
     evolution_proposal: dict[str, object] | None = None
+    openclaw_proposal: dict[str, object] | None = None
 
     @classmethod
     def from_submitted(cls, run: SubmittedRun) -> SubmittedRunResponse:
@@ -204,6 +205,7 @@ class SubmittedRunResponse(BaseModel):
             temporary_agent_proposal=run.temporary_agent_proposal,
             schedule_proposal=run.schedule_proposal,
             evolution_proposal=run.evolution_proposal,
+            openclaw_proposal=run.openclaw_proposal,
         )
 
 

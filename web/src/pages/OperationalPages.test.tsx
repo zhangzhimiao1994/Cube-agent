@@ -497,6 +497,31 @@ describe("operational management pages", () => {
               },
             });
           }
+          if (message.includes("OpenClaw")) {
+            return jsonResponse({
+              id: runId,
+              tenant_id: "33333333-3333-4333-8333-333333333333",
+              status: "waiting_approval",
+              mode: "dispatch",
+              decision_token: "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+              version: 1,
+              clarification_reason: "openclaw_requires_user_confirmation",
+              conversation_id: typeof body.conversation_id === "string" ? body.conversation_id : null,
+              openclaw_proposal: {
+                kind: "server_command",
+                platform: "linux",
+                target_type: "server",
+                target: "linux-server",
+                operation_text: message,
+                source_conversation_id: typeof body.conversation_id === "string" ? body.conversation_id : null,
+                summary: "主 Agent 检测到 OpenClaw 服务器操作请求。",
+                metadata: {
+                  source: "chat_openclaw_proposal",
+                  requires_user_confirmation: "true",
+                },
+              },
+            });
+          }
           if (message.includes("每天9点提醒")) {
             return jsonResponse({
               id: runId,
@@ -1267,6 +1292,20 @@ describe("operational management pages", () => {
       }),
     );
     expect(await screen.findByText(/已加入进化/)).not.toBeNull();
+  });
+  it("shows an OpenClaw operation proposal from chat and links to OpenClaw control", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "Use OpenClaw to execute date on the Linux server after approval.");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(await screen.findByRole("status", { name: "OpenClaw 操作确认" })).not.toBeNull();
+    expect(screen.getByText("linux-server")).not.toBeNull();
+    expect(screen.getAllByText(/execute date/).length).toBeGreaterThan(0);
+
+    expect(screen.getByRole("link", { name: "打开 OpenClaw" }).getAttribute("href")).toBe("/openclaw");
   });
   it("clears failed attachment upload state and allows retrying the same file", async () => {
     failNextAttachmentUpload = true;

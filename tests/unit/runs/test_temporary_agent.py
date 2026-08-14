@@ -490,6 +490,67 @@ async def test_explicit_skill_creation_request_returns_grounded_evolution_propos
 
 
 @pytest.mark.asyncio
+async def test_openclaw_command_request_returns_confirmation_proposal_without_enqueue() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="Use OpenClaw to execute date on the Linux server after approval.",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-openclaw-chat",
+    )
+
+    assert submitted.status is RunStatus.WAITING_APPROVAL
+    assert submitted.mode is TaskMode.DISPATCH
+    assert submitted.clarification_reason == "openclaw_requires_user_confirmation"
+    assert submitted.openclaw_proposal is not None
+    assert submitted.openclaw_proposal["kind"] == "server_command"
+    assert submitted.openclaw_proposal["platform"] == "linux"
+    assert submitted.openclaw_proposal["target_type"] == "server"
+    assert submitted.openclaw_proposal["source_conversation_id"] == "conv-openclaw-chat"
+    assert repository.outbox == []
+    routing = repository.records[submitted.id].routing_decision
+    assert routing is not None
+    assert routing["approval_kind"] == "openclaw_operation"
+    assert routing["openclaw_proposal"] == submitted.openclaw_proposal
+
+
+@pytest.mark.asyncio
+async def test_openclaw_explanation_request_does_not_create_operation_proposal() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="Explain what the OpenClaw sandbox is for.",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-openclaw-info",
+    )
+
+    assert submitted.openclaw_proposal is None
+    routing = repository.records[submitted.id].routing_decision
+    assert routing is not None
+    assert "openclaw_proposal" not in routing
+
+
+@pytest.mark.asyncio
 async def test_auto_router_timeout_uses_local_main_agent_for_generation_work() -> None:
     tenant_id = uuid4()
     actor_id = uuid4()
