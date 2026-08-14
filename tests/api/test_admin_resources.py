@@ -2341,6 +2341,32 @@ def test_channel_config_can_be_saved_without_exposing_secrets(
     assert by_id["dingtalk"]["missing"] == []
 
 
+def test_channel_status_reports_configured_sources_after_clear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CUSTOM_WEBHOOK_TOKEN", "env-token")
+
+    api = client()
+    env_only = api.get("/api/v1/admin/channels", headers=headers())
+    by_id = {item["id"]: item for item in env_only.json()}
+    assert by_id["custom_webhook"]["configured"] == ["CUSTOM_WEBHOOK_TOKEN"]
+    assert by_id["custom_webhook"]["configured_sources"] == {"CUSTOM_WEBHOOK_TOKEN": "environment"}
+
+    saved = api.post(
+        "/api/v1/admin/channels/custom_webhook/config",
+        headers=headers(),
+        json={"values": {"CUSTOM_WEBHOOK_TOKEN": "saved-token"}},
+    )
+    assert saved.status_code == 200
+    assert saved.json()["status"]["configured_sources"] == {"CUSTOM_WEBHOOK_TOKEN": "saved"}
+
+    cleared = api.delete("/api/v1/admin/channels/custom_webhook/config", headers=headers())
+
+    assert cleared.status_code == 200
+    assert cleared.json()["saved"] == []
+    assert cleared.json()["status"]["status"] == "configured"
+    assert cleared.json()["status"]["configured_sources"] == {"CUSTOM_WEBHOOK_TOKEN": "environment"}
+
 def test_channel_config_can_be_cleared_after_save(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

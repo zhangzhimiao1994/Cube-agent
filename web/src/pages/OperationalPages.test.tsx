@@ -150,7 +150,8 @@ const baseChannels: ChannelStatus[] = [
     webhook_path: "/channels/feishu/events",
     public_webhook_url: null,
     missing: ["FEISHU_APP_ID"],
-    configured: [],
+    configured: ["FEISHU_TRANSPORT"],
+    configured_sources: { FEISHU_TRANSPORT: "environment" },
     notes: ["Webhook 已挂载在主 API 服务。"],
   },
   {
@@ -162,6 +163,7 @@ const baseChannels: ChannelStatus[] = [
     public_webhook_url: null,
     missing: ["CUSTOM_WEBHOOK_TOKEN"],
     configured: [],
+    configured_sources: {},
     notes: ["用于兼容其他支持 HTTP Webhook 的聊天软件。"],
   },
 ];
@@ -2454,6 +2456,16 @@ describe("operational management pages", () => {
         elapsed_seconds: 180,
       },
     });
+  });
+  it("distinguishes server environment channel values from cleared page settings", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/channels" />);
+
+    expect(await screen.findByRole("heading", { name: "通道连接" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: /飞书/ }));
+
+    expect(screen.getByText("当前来源：服务器环境")).not.toBeNull();
+    expect(screen.getByText(/服务器环境已配置，页面清空不会删除/)).not.toBeNull();
   });
   it("lets configured channel settings be edited and cleared", async () => {
     const user = userEvent.setup();

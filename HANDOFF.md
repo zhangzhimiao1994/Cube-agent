@@ -1,3 +1,38 @@
+## 2026-08-15 Channel Config Source Visibility
+
+### State
+- Added `configured_sources` to channel status responses so the UI can distinguish values coming from this channel page, another saved channel page, or server environment variables.
+- Updated the channel configuration page to show `当前来源：服务器环境 / 本页保存 / 其他通道页面配置`, adjust placeholders/select keep labels accordingly, and make clear operations explain whether server environment values still keep the channel configured.
+- This addresses the confusing case where clearing the page-saved channel config still showed `已配置` because an environment variable or shared saved value remained active.
+- Confirmed the Feishu SDK dependency is present in the project (`lark-oapi>=1.7.2`) and on the server (`lark-oapi 1.7.2`). Current server Feishu channel status reports saved sources for `FEISHU_APP_ID`, `FEISHU_APP_SECRET`, and `FEISHU_TRANSPORT`; previously saved Feishu information is therefore still being used and does not need to be re-entered unless the Feishu app credentials changed.
+
+### Verification
+- TDD red first:
+  - `python -m pytest tests/api/test_admin_resources.py::test_channel_status_reports_configured_sources_after_clear -q --tb=short` failed with missing `configured_sources` before the backend change.
+  - `npm test -- --run src/pages/OperationalPages.test.tsx -t "distinguishes server environment channel values"` failed because the UI did not show server-environment source copy.
+- Green local checks:
+  - `.\.venv\Scripts\python.exe -m pytest tests\api\test_admin_resources.py::test_channel_status_reports_configured_sources_after_clear tests\api\test_admin_resources.py::test_channel_config_can_be_cleared_after_save -q --tb=short` -> 2 passed.
+  - `npm test -- --run src/pages/OperationalPages.test.tsx -t "distinguishes server environment channel values|lets configured channel settings be edited and cleared"` -> 58 passed.
+  - `.\.venv\Scripts\python.exe -m pytest tests\api\test_admin_resources.py -q` -> 120 passed.
+  - `.\.venv\Scripts\python.exe -m ruff check src tests` -> passed.
+  - `.\.venv\Scripts\python.exe -m mypy --strict src tests` -> passed.
+  - `npm run lint` -> passed.
+  - `npm run build` -> passed with the existing Vite large chunk warning.
+  - `git diff --check` -> passed with only CRLF normalization warnings for touched files.
+
+### Server Deployment And Real Probe
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-channel-config-sources-20260815-053549.tgz` and uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`, synced the changed admin router into active venv `site-packages`, rebuilt frontend assets were deployed, and server archive is retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-channel-config-sources-20260815-053549.tgz`.
+- Server backup retained under `/opt/agent-hub/backups/channel-config-sources-20260815-053549`.
+- Initial deploy health check waited only 3 seconds and hit API before Uvicorn finished startup; service was healthy after startup. Final `/health` returned `{"status":"ok"}` and `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.
+- Real server probe used a short-lived super-admin JWT without printing secrets, backed up any `custom_webhook` channel DB rows, called the deployed channel API, saved a temporary custom webhook token, verified `configured_sources` reported `saved`, cleared it, verified the cleared state, checked Feishu runtime was present, verified the active frontend bundle contains the new source copy, and restored the original channel DB rows.
+- Probe output: `{"status": "ok", "checks": {"channel_api_has_configured_sources": true, "feishu_runtime_present": true, "custom_webhook_save_reports_saved_source": true, "custom_webhook_clear_reports_remaining_state": true, "frontend_bundle_has_source_copy": true}, "feishu_sources": {"FEISHU_APP_ID": "saved", "FEISHU_APP_SECRET": "saved", "FEISHU_TRANSPORT": "saved"}, "custom_webhook_clear_sources": {}}`.
+- Removed server `/tmp/probe-channel-config-sources.py`, `/tmp/deploy-channel-config-sources.sh`, and `/tmp/agent-hub-p3-runtime-incremental.tgz` after verification.
+
+### Remaining / Next
+- Commit this slice, create local GitHub recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, then watch GitHub Actions until green.
+- If Feishu still does not reply in chat, the next checks are Feishu platform event publishing, bot installation scope, message receive/reply permissions, and whether runtime metrics show `received_events` increasing after sending a test message.
+- Continue remaining P3 items after green: OpenClaw follow-up, evolution/memory refinements, broader UI layout/copy audit, missing button/function sweep, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 Skill Bulk Delete Backend Contract
 
 ### State

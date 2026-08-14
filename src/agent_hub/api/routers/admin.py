@@ -454,6 +454,7 @@ class ChannelStatusResponse(BaseModel):
     public_webhook_url: str | None = None
     missing: list[str] = Field(default_factory=list)
     configured: list[str] = Field(default_factory=list)
+    configured_sources: dict[str, str] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
     runtime: ChannelRuntimeStatusResponse | None = None
 
@@ -5701,7 +5702,8 @@ def _channel_status_from_definition(
 ) -> ChannelStatusResponse:
     public_url = _channel_config_value("AGENT_HUB_PUBLIC_URL", definition.id, config).rstrip("/")
     required_env = _channel_required_env(definition, config)
-    configured = _channel_configured_fields(definition, config)
+    configured_sources = _channel_configured_sources(definition, config)
+    configured = list(configured_sources)
     missing = [name for name in required_env if name not in configured]
     public_webhook_url = (
         f"{public_url}{definition.webhook_path}"
@@ -5723,6 +5725,7 @@ def _channel_status_from_definition(
         public_webhook_url=public_webhook_url,
         missing=missing,
         configured=configured,
+        configured_sources=configured_sources,
         notes=_channel_notes(definition, config),
     )
 
@@ -5731,6 +5734,13 @@ def _channel_configured_fields(
     definition: ChannelDefinition,
     config: Mapping[str, Mapping[str, str]],
 ) -> list[str]:
+    return list(_channel_configured_sources(definition, config))
+
+
+def _channel_configured_sources(
+    definition: ChannelDefinition,
+    config: Mapping[str, Mapping[str, str]],
+) -> dict[str, str]:
     allowed = _channel_config_allowed_names(definition)
     if definition.id == "feishu" and _feishu_transport(config) == "websocket":
         allowed = allowed - {
@@ -5739,11 +5749,29 @@ def _channel_configured_fields(
             "FEISHU_VERIFICATION_TOKEN",
             "FEISHU_WEBHOOK_PATH",
         }
-    return [
-        name
-        for name in sorted(allowed)
-        if _channel_config_value(name, definition.id, config)
-    ]
+    sources: dict[str, str] = {}
+    for name in sorted(allowed):
+        source = _channel_config_source(name, definition.id, config)
+        if source is not None:
+            sources[name] = source
+    return sources
+
+
+def _channel_config_source(
+    name: str,
+    channel_id: str,
+    config: Mapping[str, Mapping[str, str]],
+) -> str | None:
+    if config.get(channel_id, {}).get(name):
+        return "saved"
+    for other_channel_id, values in config.items():
+        if other_channel_id == channel_id:
+            continue
+        if values.get(name):
+            return "shared_saved"
+    if os.environ.get(name, ""):
+        return "environment"
+    return None
 
 
 def _channel_required_env(

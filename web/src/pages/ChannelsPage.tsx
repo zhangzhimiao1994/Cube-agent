@@ -285,9 +285,42 @@ function channelRuntimeSummary(channel: ChannelStatus) {
   return `连接次数 ${runtime.connection_attempts} / 收到事件 ${runtime.received_events} / 已提交 ${runtime.submitted_messages} / 失败 ${runtime.failures}`;
 }
 
+function channelConfiguredSource(channel: ChannelStatus, env: string) {
+  return channel.configured_sources[env] ?? (channel.configured.includes(env) ? "saved" : null);
+}
+
+function configuredSourceLabel(source: string | null) {
+  if (source === "environment") return "服务器环境";
+  if (source === "shared_saved") return "其他通道页面配置";
+  if (source === "saved") return "本页保存";
+  return "未配置";
+}
+
+function configuredPlaceholder(field: ChannelGuide["fields"][number], source: string | null) {
+  if (source === "environment") return `服务器环境已配置，页面清空不会删除；如需临时覆盖请输入新的 ${field.label}`;
+  if (source === "shared_saved") return `其他通道页面配置已提供，留空不覆盖；如需覆盖请输入新的 ${field.label}`;
+  if (source === "saved") return `已配置，留空不覆盖；如需更换请输入新的 ${field.label}`;
+  return field.placeholder;
+}
+
+function configuredSourceHelp(field: ChannelGuide["fields"][number], source: string | null) {
+  if (!source) return null;
+  return configuredPlaceholder(field, source);
+}
+
+function keepOptionLabel(source: string | null) {
+  if (source === "environment") return "保持服务器环境配置";
+  if (source === "shared_saved") return "保持其他通道页面配置";
+  if (source === "saved") return "保持本页保存配置";
+  return "选择配置";
+}
+
 function envTemplate(channel: ChannelStatus, guide: ChannelGuide) {
   return guide.fields
-    .map((field) => `${field.env}=${channel.configured.includes(field.env) ? "<已配置>" : field.placeholder}`)
+    .map((field) => {
+      const source = channelConfiguredSource(channel, field.env);
+      return `${field.env}=${source ? `<已配置：${configuredSourceLabel(source)}>` : field.placeholder}`;
+    })
     .join("\n");
 }
 
@@ -378,9 +411,16 @@ export function ChannelsPage() {
       if (!selected) throw new Error("channel is not selected");
       return api.clearChannelConfig(selected.id);
     },
-    onSuccess: async () => {
+    onSuccess: async (data) => {
       setDraftValues({});
-      setSaveNotice("通道配置已清空。需要重新填写后才会接通。");
+      const remainingSources = Object.values(data.status.configured_sources);
+      setSaveNotice(
+        remainingSources.includes("environment")
+          ? "本页保存的通道配置已清空；服务器环境变量仍会继续生效。"
+          : remainingSources.includes("shared_saved")
+            ? "本页保存的通道配置已清空；其他通道页面配置仍会继续生效。"
+            : "通道配置已清空。需要重新填写后才会接通。",
+      );
       await queryClient.invalidateQueries({ queryKey: ["channels"] });
     },
   });
@@ -494,48 +534,51 @@ export function ChannelsPage() {
 可直接在这里填写并保存；已配置的密钥不会回显。输入新值会覆盖旧配置，留空不会修改已有配置。需要重新接入时可以清空本页保存的通道配置。
               </p>
               <div className="form-grid">
-                {guide.fields.map((field) => (
-                  <label key={field.env}>
-                    {field.label}
-                    {field.options ? (
-                      <select
-                        value={draftValues[field.env] ?? ""}
-                        onChange={(event) =>
-                          setDraftValues((current) => ({
-                            ...current,
-                            [field.env]: event.target.value,
-                          }))
-                        }
-                      >
-                        <option value="">保持当前配置</option>
-                        {field.options.map((option) => (
-                          <option key={option.value} value={option.value}>
-                            {option.label}
-                          </option>
-                        ))}
-                      </select>
-                    ) : (
-                      <input
-                        type={field.secret ? "password" : "text"}
-                        autoComplete="off"
-                        value={draftValues[field.env] ?? ""}
-                        onChange={(event) =>
-                          setDraftValues((current) => ({
-                            ...current,
-                            [field.env]: event.target.value,
-                          }))
-                        }
-                        placeholder={
-                          selected.configured.includes(field.env)
-                            ? `已配置，留空不覆盖；如需更换请输入新的 ${field.label}`
-                            : field.placeholder
-                        }
-                      />
-                    )}
-                    <span className="field-help">{field.env}</span>
-                    <span className="field-help">来源：{field.source}</span>
-                  </label>
-                ))}
+                {guide.fields.map((field) => {
+                  const source = channelConfiguredSource(selected, field.env);
+                  return (
+                    <label key={field.env}>
+                      {field.label}
+                      {field.options ? (
+                        <select
+                          value={draftValues[field.env] ?? ""}
+                          onChange={(event) =>
+                            setDraftValues((current) => ({
+                              ...current,
+                              [field.env]: event.target.value,
+                            }))
+                          }
+                        >
+                          <option value="">{keepOptionLabel(source)}</option>
+                          {field.options.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <input
+                          type={field.secret ? "password" : "text"}
+                          autoComplete="off"
+                          value={draftValues[field.env] ?? ""}
+                          onChange={(event) =>
+                            setDraftValues((current) => ({
+                              ...current,
+                              [field.env]: event.target.value,
+                            }))
+                          }
+                          placeholder={configuredPlaceholder(field, source)}
+                        />
+                      )}
+                      <span className="field-help">{field.env}</span>
+                      {source ? <span className="field-help">当前来源：{configuredSourceLabel(source)}</span> : null}
+                      {configuredSourceHelp(field, source) ? (
+                        <span className="field-help">{configuredSourceHelp(field, source)}</span>
+                      ) : null}
+                      <span className="field-help">来源：{field.source}</span>
+                    </label>
+                  );
+                })}
               </div>
               <div className="channel-config-actions" role="group" aria-label="通道配置操作">
                 <button
