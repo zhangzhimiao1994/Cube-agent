@@ -1,4 +1,5 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -122,25 +123,26 @@ describe("AppShell presentation", () => {
   });
 
   it("opens the floating navigation as a mobile drawer with expandable second-level modules", async () => {
+    const user = userEvent.setup();
     render(<TestApp initialPath="/models" />);
 
     expect(await screen.findByRole("heading", { name: "魔方agent" })).not.toBeNull();
     const shell = document.querySelector(".app-shell");
     const mobileTrigger = screen.getByRole("button", { name: "打开导航栏" });
 
-    fireEvent.click(mobileTrigger);
+    await user.click(mobileTrigger);
 
     await waitFor(() => expect(shell?.className).toContain("mobile-nav-open"));
     const mobileNavigation = screen.getByRole("navigation", { name: "手机版主导航" });
     const orchestrationTrigger = within(mobileNavigation).getByRole("button", { name: "展开编排二级导航" });
 
-    fireEvent.click(orchestrationTrigger);
+    await user.click(orchestrationTrigger);
 
     expect(orchestrationTrigger.getAttribute("aria-expanded")).toBe("true");
     expect(within(mobileNavigation).getByRole("link", { name: /主 Agent/ })).not.toBeNull();
     expect(within(mobileNavigation).getByRole("link", { name: /工作流配置/ })).not.toBeNull();
 
-    fireEvent.click(screen.getAllByRole("button", { name: "关闭导航栏" })[0]);
+    await user.click(screen.getAllByRole("button", { name: "关闭导航栏" })[0]);
 
     await waitFor(() => expect(shell?.className).not.toContain("mobile-nav-open"));
   });
