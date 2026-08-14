@@ -363,7 +363,20 @@ const EvolutionRunSchema = z.object({
   objective: z.string(),
   mode: z.string(),
   source_skill_ids: z.array(z.string()),
+  source_conversation_id: z.string().nullable().optional().default(null),
+  source_run_id: z.string().nullable().optional().default(null),
   target_artifact_type: z.string(),
+  baseline_agent_id: z.string().nullable().optional().default(null),
+  candidate_agent_ids: z.array(z.string()).optional().default([]),
+  evaluator_agent_id: z.string().nullable().optional().default(null),
+  approval_policy: z.string().optional().default("ask"),
+  approval_status: z.string().optional().default("pending"),
+  approved_by: z.string().nullable().optional().default(null),
+  approved_at: z.string().nullable().optional().default(null),
+  approval_note: z.string().optional().default(""),
+  iteration_policy: z.string().optional().default("score_gated"),
+  memory_policy: z.string().optional().default("summarize_between_rounds"),
+  next_action: z.string().optional().default("request_approval"),
   status: z.string(),
   max_rounds: z.number(),
   min_delta: z.number(),
@@ -384,12 +397,27 @@ export type EvolutionRunRequest = {
   objective: string;
   mode?: "auto" | "direct" | "dispatch" | "discuss" | "hybrid";
   source_skill_ids?: string[];
+  source_conversation_id?: string | null;
+  source_run_id?: string | null;
   target_artifact_type?: "skill" | "strategy" | "research_gap" | "paper_plan" | "media_plan" | "custom";
+  baseline_agent_id?: string | null;
+  candidate_agent_ids?: string[];
+  evaluator_agent_id?: string | null;
+  approval_policy?: "ask" | "auto" | "manual";
+  iteration_policy?: "score_gated" | "fixed_rounds" | "manual_review";
+  memory_policy?: "none" | "summarize_between_rounds" | "full_ledger";
   max_rounds?: number;
   min_delta?: number;
   budget_tokens?: number;
   budget_minutes?: number;
   rubric?: string[];
+};
+
+export type EvolutionApprovalRequest = {
+  approved: boolean;
+  baseline_agent_id?: string | null;
+  evaluator_agent_id?: string | null;
+  note?: string;
 };
 
 export type EvolutionRoundRequest = {
@@ -1157,6 +1185,13 @@ export const api = {
   createEvolutionRun(payload: EvolutionRunRequest): Promise<EvolutionRun> {
     return request(
       "/api/v1/admin/evolution-runs",
+      { method: "POST", body: JSON.stringify(payload) },
+      EvolutionRunSchema,
+    );
+  },
+  approveEvolutionRun(id: string, payload: EvolutionApprovalRequest): Promise<EvolutionRun> {
+    return request(
+      `/api/v1/admin/evolution-runs/${encodeURIComponent(id)}/approve`,
       { method: "POST", body: JSON.stringify(payload) },
       EvolutionRunSchema,
     );

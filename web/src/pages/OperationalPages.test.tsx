@@ -251,6 +251,17 @@ const evolutionRun = {
   mode: "hybrid",
   source_skill_ids: ["darwin-skill"],
   target_artifact_type: "skill",
+  baseline_agent_id: "agent-main-m3",
+  candidate_agent_ids: ["agent-coder", "agent-reviewer"],
+  evaluator_agent_id: "agent-evaluator",
+  approval_policy: "ask",
+  approval_status: "approved",
+  approved_by: "11111111-1111-4111-8111-111111111111",
+  approved_at: "2026-08-14T09:59:00Z",
+  approval_note: "人工确认基准 agent。",
+  iteration_policy: "score_gated",
+  memory_policy: "summarize_between_rounds",
+  next_action: "run_next_round",
   status: "running",
   max_rounds: 5,
   min_delta: 2,
@@ -557,11 +568,39 @@ describe("operational management pages", () => {
             title: String(body.title ?? "新进化任务"),
             objective: String(body.objective ?? ""),
             source_skill_ids: Array.isArray(body.source_skill_ids) ? body.source_skill_ids : [],
+            baseline_agent_id: typeof body.baseline_agent_id === "string" ? body.baseline_agent_id : "",
+            candidate_agent_ids: Array.isArray(body.candidate_agent_ids) ? body.candidate_agent_ids : [],
+            evaluator_agent_id: typeof body.evaluator_agent_id === "string" ? body.evaluator_agent_id : "",
+            approval_policy: typeof body.approval_policy === "string" ? body.approval_policy : "ask",
+            approval_status: "pending",
+            approved_by: "",
+            approved_at: "",
+            approval_note: "",
+            iteration_policy: typeof body.iteration_policy === "string" ? body.iteration_policy : "score_gated",
+            memory_policy: typeof body.memory_policy === "string" ? body.memory_policy : "summarize_between_rounds",
+            next_action: "request_approval",
             rounds: [],
             status: "waiting_approval",
           };
           visibleEvolutionRuns = [createdEvolutionRun, ...visibleEvolutionRuns];
           return jsonResponse(createdEvolutionRun);
+        }
+        const approveEvolutionMatch = path.match(/^\/api\/v1\/admin\/evolution-runs\/(evolution_[a-f0-9]+)\/approve$/);
+        if (approveEvolutionMatch && method === "POST") {
+          const id = approveEvolutionMatch[1];
+          const current = visibleEvolutionRuns.find((run) => run.id === id) ?? evolutionRun;
+          const approved = {
+            ...current,
+            status: "running",
+            approval_status: "approved",
+            approved_by: "11111111-1111-4111-8111-111111111111",
+            approved_at: "2026-08-14T10:10:00Z",
+            approval_note: "人工确认基准 agent。",
+            next_action: "run_next_round",
+          };
+          visibleEvolutionRuns = visibleEvolutionRuns.map((run) => (run.id === id ? approved : run));
+          if (createdEvolutionRun?.id === id) createdEvolutionRun = approved;
+          return jsonResponse(approved);
         }
         if (path === "/api/v1/admin/evolution-runs") {
           return jsonResponse(visibleEvolutionRuns);
@@ -2021,7 +2060,9 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "进化" })).not.toBeNull();
     const records = await screen.findByRole("region", { name: "进化任务" });
-    expect(within(records).getByText("Darwin Skill 迭代")).not.toBeNull();
+    expect(await within(records).findByText("Darwin Skill 迭代")).not.toBeNull();
+    expect(within(records).getByText("agent-main-m3")).not.toBeNull();
+    expect(within(records).getByText("run_next_round")).not.toBeNull();
     expect(within(records).getByText(/第 1 轮/)).not.toBeNull();
 
     await user.clear(screen.getByLabelText("任务名称"));
@@ -2036,8 +2077,16 @@ describe("operational management pages", () => {
         title: "学术研究进化",
         objective: "迭代发现论文创新点。",
         kind: "skill_optimization",
+        baseline_agent_id: "agent-main-m3",
+        evaluator_agent_id: "agent-evaluator",
+        approval_policy: "ask",
+        iteration_policy: "score_gated",
+        memory_policy: "summarize_between_rounds",
       },
     });
+
+    await user.click(await screen.findByRole("button", { name: "审批通过" }));
+    await waitFor(() => expect(createdEvolutionRun?.status).toBe("running"));
   });
   it("shows MCP, memory, and modular log pages", async () => {
     const user = userEvent.setup();

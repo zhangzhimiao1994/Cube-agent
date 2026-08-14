@@ -17,19 +17,34 @@ class EvolutionRunRequest(BaseModel):
     source_conversation_id: str | None = Field(default=None, max_length=200)
     source_run_id: str | None = Field(default=None, max_length=200)
     target_artifact_type: str = Field(default="skill", pattern=r"^(skill|strategy|research_gap|paper_plan|media_plan|custom)$")
+    baseline_agent_id: str | None = Field(default=None, max_length=200)
+    candidate_agent_ids: list[str] = Field(default_factory=list, max_length=16)
+    evaluator_agent_id: str | None = Field(default=None, max_length=200)
+    approval_policy: str = Field(default="ask", pattern=r"^(ask|auto|manual)$")
+    iteration_policy: str = Field(default="score_gated", pattern=r"^(score_gated|fixed_rounds|manual_review)$")
+    memory_policy: str = Field(default="summarize_between_rounds", pattern=r"^(none|summarize_between_rounds|full_ledger)$")
     max_rounds: int = Field(default=3, ge=1, le=20)
     min_delta: float = Field(default=2.0, ge=0.0, le=100.0)
     budget_tokens: int = Field(default=200_000, ge=1_000, le=50_000_000)
     budget_minutes: int = Field(default=120, ge=1, le=10_080)
     rubric: list[str] = Field(default_factory=list, max_length=32)
 
-    @field_validator("source_skill_ids", "rubric")
+    @field_validator("source_skill_ids", "candidate_agent_ids", "rubric")
     @classmethod
     def validate_bounded_strings(cls, value: list[str]) -> list[str]:
         for item in value:
             if not isinstance(item, str) or not item or len(item) > 256 or item != item.strip():
                 raise ValueError("items must be nonblank bounded strings")
         return value
+
+
+class EvolutionApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    approved: bool = True
+    baseline_agent_id: str | None = Field(default=None, max_length=200)
+    evaluator_agent_id: str | None = Field(default=None, max_length=200)
+    note: str = Field(default="", max_length=2_000)
 
 
 class EvolutionRoundRequest(BaseModel):
@@ -86,9 +101,23 @@ class EvolutionRunResponse(BaseModel):
     objective: str
     mode: str
     source_skill_ids: list[str]
-    source_conversation_id: str | None
-    source_run_id: str | None
+    source_conversation_id: str | None = None
+    source_run_id: str | None = None
     target_artifact_type: str
+    baseline_agent_id: str | None = None
+    candidate_agent_ids: list[str] = Field(default_factory=list)
+    evaluator_agent_id: str | None = None
+    approval_policy: str = "ask"
+    approval_status: str = Field(default="pending", pattern=r"^(pending|approved|rejected)$")
+    approved_by: str | None = None
+    approved_at: datetime | None = None
+    approval_note: str = ""
+    iteration_policy: str = "score_gated"
+    memory_policy: str = "summarize_between_rounds"
+    next_action: str = Field(
+        default="request_approval",
+        pattern=r"^(request_approval|run_next_round|review_baseline|rollback_candidate|stop|completed)$",
+    )
     status: str = Field(pattern=r"^(waiting_approval|running|stopped|completed)$")
     max_rounds: int
     min_delta: float
@@ -104,6 +133,7 @@ class EvolutionRunResponse(BaseModel):
 
 def create_evolution_run_response(request: EvolutionRunRequest, *, actor: str) -> EvolutionRunResponse:
     now = datetime.now(UTC)
+    auto_approved = request.approval_policy == "auto"
     return EvolutionRunResponse(
         id=f"evolution_{uuid4().hex}",
         kind=request.kind,
@@ -114,7 +144,18 @@ def create_evolution_run_response(request: EvolutionRunRequest, *, actor: str) -
         source_conversation_id=request.source_conversation_id,
         source_run_id=request.source_run_id,
         target_artifact_type=request.target_artifact_type,
-        status="waiting_approval",
+        baseline_agent_id=request.baseline_agent_id,
+        candidate_agent_ids=request.candidate_agent_ids,
+        evaluator_agent_id=request.evaluator_agent_id,
+        approval_policy=request.approval_policy,
+        approval_status="approved" if auto_approved else "pending",
+        approved_by=actor if auto_approved else None,
+        approved_at=now if auto_approved else None,
+        approval_note="auto approved by policy" if auto_approved else "",
+        iteration_policy=request.iteration_policy,
+        memory_policy=request.memory_policy,
+        next_action="run_next_round" if auto_approved else "request_approval",
+        status="running" if auto_approved else "waiting_approval",
         max_rounds=request.max_rounds,
         min_delta=request.min_delta,
         budget_tokens=request.budget_tokens,
@@ -127,14 +168,53 @@ def create_evolution_run_response(request: EvolutionRunRequest, *, actor: str) -
     )
 
 
+def approve_evolution_run_response(
+    current: EvolutionRunResponse,
+    request: EvolutionApprovalRequest,
+    *,
+    actor: str,
+) -> EvolutionRunResponse:
+    now = datetime.now(UTC)
+    if current.status in {"stopped", "completed"}:
+        return current.model_copy(update={"updated_at": now})
+    if not request.approved:
+        return current.model_copy(
+            update={
+                "status": "stopped",
+                "approval_status": "rejected",
+                "approved_by": actor,
+                "approved_at": now,
+                "approval_note": request.note,
+                "next_action": "stop",
+                "stop_reason": request.note or "approval rejected",
+                "updated_at": now,
+            }
+        )
+    return current.model_copy(
+        update={
+            "status": "running",
+            "approval_status": "approved",
+            "approved_by": actor,
+            "approved_at": now,
+            "approval_note": request.note,
+            "baseline_agent_id": request.baseline_agent_id or current.baseline_agent_id,
+            "evaluator_agent_id": request.evaluator_agent_id or current.evaluator_agent_id,
+            "next_action": "run_next_round",
+            "updated_at": now,
+        }
+    )
+
+
 def append_evolution_round(current: EvolutionRunResponse, request: EvolutionRoundRequest) -> EvolutionRunResponse:
     round_response = evolution_round_response(current, request)
     rounds = [*current.rounds, round_response]
     status = evolution_status_after_round(current, rounds, round_response)
+    next_action = evolution_next_action_after_round(status, round_response)
     return current.model_copy(
         update={
             "status": status,
             "rounds": rounds,
+            "next_action": next_action,
             "updated_at": datetime.now(UTC),
             "stop_reason": round_response.stop_reason if status in {"stopped", "completed"} else current.stop_reason,
         }
@@ -197,11 +277,25 @@ def evolution_status_after_round(
     return "running"
 
 
+def evolution_next_action_after_round(status: str, latest: EvolutionRoundResponse) -> str:
+    if status == "completed":
+        return "completed"
+    if latest.recommendation == "rollback":
+        return "rollback_candidate"
+    if latest.recommendation == "stop":
+        return "stop"
+    if latest.recommendation == "observe_one_more_round":
+        return "review_baseline"
+    return "run_next_round"
+
+
 __all__ = [
+    "EvolutionApprovalRequest",
     "EvolutionRoundRequest",
     "EvolutionRoundResponse",
     "EvolutionRunRequest",
     "EvolutionRunResponse",
     "append_evolution_round",
+    "approve_evolution_run_response",
     "create_evolution_run_response",
 ]

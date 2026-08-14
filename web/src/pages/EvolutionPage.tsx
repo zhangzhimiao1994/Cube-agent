@@ -14,12 +14,22 @@ function splitList(value: string) {
     .filter(Boolean);
 }
 
+function compactValue(value: string | null | undefined, fallback = "未设置") {
+  return value && value.trim() ? value : fallback;
+}
+
 export function EvolutionPage() {
   const queryClient = useQueryClient();
   const evolutionRuns = useQuery({ queryKey: ["evolution-runs"], queryFn: () => api.evolutionRuns() });
   const [title, setTitle] = useState("Skill 进化任务");
   const [objective, setObjective] = useState("用固定评测集验证候选版本，未达标不发布。");
   const [sourceSkills, setSourceSkills] = useState("darwin-skill");
+  const [baselineAgentId, setBaselineAgentId] = useState("agent-main-m3");
+  const [candidateAgentIds, setCandidateAgentIds] = useState("agent-coder, agent-reviewer");
+  const [evaluatorAgentId, setEvaluatorAgentId] = useState("agent-evaluator");
+  const [approvalPolicy, setApprovalPolicy] = useState<"ask" | "auto" | "manual">("ask");
+  const [iterationPolicy, setIterationPolicy] = useState<"score_gated" | "fixed_rounds" | "manual_review">("score_gated");
+  const [memoryPolicy, setMemoryPolicy] = useState<"none" | "summarize_between_rounds" | "full_ledger">("summarize_between_rounds");
   const [roundRunId, setRoundRunId] = useState("");
   const [changedDimension, setChangedDimension] = useState("实测表现");
   const [candidateSummary, setCandidateSummary] = useState("补充测试 prompt 并降低自评偏差。");
@@ -27,8 +37,9 @@ export function EvolutionPage() {
   const [scoreAfter, setScoreAfter] = useState("76");
 
   const runs = evolutionRuns.data ?? [];
-  const activeRuns = runs.filter((run) => run.status !== "stopped" && run.status !== "completed");
+  const activeRuns = runs.filter((run) => run.status === "running");
   const selectedRoundRunId = roundRunId || activeRuns[0]?.id || runs[0]?.id || "";
+  const selectedRoundRun = runs.find((run) => run.id === selectedRoundRunId) ?? null;
 
   const createRun = useMutation({
     mutationFn: () =>
@@ -39,12 +50,32 @@ export function EvolutionPage() {
         mode: "hybrid",
         source_skill_ids: splitList(sourceSkills),
         target_artifact_type: "skill",
+        baseline_agent_id: baselineAgentId.trim() || null,
+        candidate_agent_ids: splitList(candidateAgentIds),
+        evaluator_agent_id: evaluatorAgentId.trim() || null,
+        approval_policy: approvalPolicy,
+        iteration_policy: iterationPolicy,
+        memory_policy: memoryPolicy,
         max_rounds: 5,
         min_delta: 2,
         rubric: ["实测表现", "反例覆盖", "人工验收"],
       }),
     onSuccess: async (created) => {
       setRoundRunId(created.id);
+      await queryClient.invalidateQueries({ queryKey: ["evolution-runs"] });
+    },
+  });
+
+  const approveRun = useMutation({
+    mutationFn: (run: EvolutionRun) =>
+      api.approveEvolutionRun(run.id, {
+        approved: true,
+        baseline_agent_id: run.baseline_agent_id,
+        evaluator_agent_id: run.evaluator_agent_id,
+        note: "人工确认基准 agent 和评测口径。",
+      }),
+    onSuccess: async (approved) => {
+      setRoundRunId(approved.id);
       await queryClient.invalidateQueries({ queryKey: ["evolution-runs"] });
     },
   });
@@ -73,7 +104,7 @@ export function EvolutionPage() {
 
   function submitRound(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!selectedRoundRunId || !changedDimension.trim() || !candidateSummary.trim()) return;
+    if (!selectedRoundRunId || selectedRoundRun?.status !== "running" || !changedDimension.trim() || !candidateSummary.trim()) return;
     recordRound.mutate();
   }
 
@@ -101,6 +132,46 @@ export function EvolutionPage() {
               来源 Skill
               <input value={sourceSkills} onChange={(event) => setSourceSkills(event.target.value)} />
             </label>
+            <div className="inline-fields">
+              <label>
+                基准 agent
+                <input value={baselineAgentId} onChange={(event) => setBaselineAgentId(event.target.value)} />
+              </label>
+              <label>
+                评测 agent
+                <input value={evaluatorAgentId} onChange={(event) => setEvaluatorAgentId(event.target.value)} />
+              </label>
+            </div>
+            <label>
+              候选 agent
+              <input value={candidateAgentIds} onChange={(event) => setCandidateAgentIds(event.target.value)} />
+            </label>
+            <div className="inline-fields">
+              <label>
+                审批
+                <select value={approvalPolicy} onChange={(event) => setApprovalPolicy(event.target.value as typeof approvalPolicy)}>
+                  <option value="ask">需要确认</option>
+                  <option value="manual">手动推进</option>
+                  <option value="auto">自动推进</option>
+                </select>
+              </label>
+              <label>
+                迭代
+                <select value={iterationPolicy} onChange={(event) => setIterationPolicy(event.target.value as typeof iterationPolicy)}>
+                  <option value="score_gated">按评分门控</option>
+                  <option value="fixed_rounds">固定轮次</option>
+                  <option value="manual_review">人工复核</option>
+                </select>
+              </label>
+            </div>
+            <label>
+              记忆
+              <select value={memoryPolicy} onChange={(event) => setMemoryPolicy(event.target.value as typeof memoryPolicy)}>
+                <option value="summarize_between_rounds">轮次间压缩</option>
+                <option value="full_ledger">完整台账</option>
+                <option value="none">不启用</option>
+              </select>
+            </label>
             <button type="submit" disabled={createRun.isPending || !title.trim() || !objective.trim()}>
               {createRun.isPending ? "创建中..." : "创建任务"}
             </button>
@@ -121,6 +192,7 @@ export function EvolutionPage() {
                 ))}
               </select>
             </label>
+            {selectedRoundRun && selectedRoundRun.status !== "running" ? <p className="field-help">该任务需要审批后才能登记轮次。</p> : null}
             <label>
               改动维度
               <input value={changedDimension} onChange={(event) => setChangedDimension(event.target.value)} />
@@ -139,7 +211,7 @@ export function EvolutionPage() {
                 <input value={scoreAfter} onChange={(event) => setScoreAfter(event.target.value)} inputMode="decimal" />
               </label>
             </div>
-            <button type="submit" disabled={recordRound.isPending || !selectedRoundRunId}>
+            <button type="submit" disabled={recordRound.isPending || !selectedRoundRunId || selectedRoundRun?.status !== "running"}>
               {recordRound.isPending ? "登记中..." : "登记轮次"}
             </button>
             {recordRound.isError ? <p role="alert">{formatApiError(recordRound.error, "迭代轮次登记失败")}</p> : null}
@@ -170,14 +242,27 @@ export function EvolutionPage() {
                 <dl>
                   <dt>状态</dt>
                   <dd>{run.status}</dd>
-                  <dt>模式</dt>
-                  <dd>{run.mode}</dd>
+                  <dt>审批</dt>
+                  <dd>{run.approval_status}</dd>
+                  <dt>基准 agent</dt>
+                  <dd>{compactValue(run.baseline_agent_id)}</dd>
+                  <dt>评测 agent</dt>
+                  <dd>{compactValue(run.evaluator_agent_id)}</dd>
+                  <dt>下一步</dt>
+                  <dd>{run.next_action}</dd>
                   <dt>轮次</dt>
                   <dd>{run.rounds.length} / {run.max_rounds}</dd>
                   <dt>最近建议</dt>
                   <dd>{latest ? latest.recommendation : "等待首轮"}</dd>
                 </dl>
+                {run.candidate_agent_ids.length > 0 ? <p>候选 agent：{run.candidate_agent_ids.join("、")}</p> : null}
                 {latest ? <p>第 {latest.round} 轮：{latest.changed_dimension}，提升 {latest.delta}</p> : null}
+                {run.approval_status === "pending" ? (
+                  <button type="button" onClick={() => approveRun.mutate(run)} disabled={approveRun.isPending}>
+                    {approveRun.isPending ? "审批中..." : "审批通过"}
+                  </button>
+                ) : null}
+                {approveRun.isError ? <p role="alert">{formatApiError(approveRun.error, "进化任务审批失败")}</p> : null}
               </article>
             );
           })}

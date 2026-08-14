@@ -1,3 +1,43 @@
+## 2026-08-14 Evolution Approval Gate And Agent Baselines
+
+Current state:
+
+- OpenClaw health/capability slice is fully closed: GitHub Actions run `31789070945` for commit `3c4c566` passed.
+- Evolution runs now carry baseline agent, candidate agents, evaluator agent, approval policy, iteration policy, memory policy, approval status, approver metadata, and structured `next_action`.
+- Evolution tasks created with `approval_policy=ask` or `manual` stay in `waiting_approval` and reject round recording with `evolution_run_requires_approval` until explicitly approved.
+- `POST /api/v1/admin/evolution-runs/{run_id}/approve` approves or rejects an evolution run and records `evolution.approve` audit details.
+- Round recording now updates `next_action`: continue -> `run_next_round`, low-delta observe -> `review_baseline`, rollback -> `rollback_candidate`, stop -> `stop`, completed -> `completed`.
+- The Evolution UI can create tasks with baseline/evaluator/candidate agent controls, show approval/next-action state, and approve pending runs from the record card.
+
+Local verification:
+
+- RED first: backend evolution tests failed with HTTP 422 for new fields; frontend target test failed because agent baselines/next action/approve button were absent.
+- `uv run pytest tests\api\test_admin_resources.py -q -k "evolution" --tb=short` -> 2 passed.
+- `uv run pytest tests\api\test_admin_resources.py tests\unit\test_database_resources.py -q -k "evolution or database_resources" --tb=short` -> 9 passed, 98 deselected.
+- `uv run ruff check src\agent_hub\evolution.py src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+- `uv run mypy --strict src\agent_hub\evolution.py src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+- `npm.cmd run test -- --run src/pages/OperationalPages.test.tsx -t "evolution records"` -> passed.
+- `npm.cmd run test -- --run src/pages/OperationalPages.test.tsx` -> 53 passed.
+- `npm.cmd run test -- --run` -> 13 files / 116 tests passed.
+- `npm.cmd run lint` -> passed.
+- `npm.cmd run build` -> passed with the existing Vite large chunk warning.
+- `git diff --check` -> passed with CRLF normalization warnings only.
+
+Server deployment and real verification:
+
+- Incremental package: `.local-archives/server-incrementals/agent-hub-evolution-approval-gate-20260814-175646.tgz`.
+- Uploaded to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed into `/opt/agent-hub/current`.
+- Server backup path: `/opt/agent-hub/backups/evolution-approval-gate-20260814-095710`.
+- Synced `src/agent_hub/evolution.py` and `src/agent_hub/api/routers/admin.py` into the active production venv site-packages, rebuilt frontend `web/dist`, restarted `agent-hub-api` and `agent-hub-worker`, and reloaded Caddy.
+- Real server probe used the actual Caddy/API path `http://127.0.0.1/api/v1/admin` with a short-lived super-admin JWT generated on the server without printing secrets.
+- Probe created a real approval-gated evolution run, verified round recording is blocked before approval, approved the run, recorded a real round, verified `evolution.approve` and `evolution.round_recorded` audit entries, and verified deployed frontend JS contains `基准 agent`, `审批通过`, `轮次间压缩`, and `next_action`.
+- Probe output: `{"status": "ok", "checked": ["create", "blocked_round", "approve", "record_round", "audit", "frontend_bundle"], "deleted": 1}`.
+- Removed `/tmp/evolution_approval_gate_check.py`, `/tmp/deploy-evolution-approval-gate.sh`, and `/tmp/agent-hub-p3-runtime-incremental.tgz`; `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.
+
+Remaining / next:
+
+- Create local ignored recovery bundle and GitHub archive tag, commit this slice, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
+- Continue evolution follow-up after green: wire conversation-triggered evolution planning and long-running iteration execution workers, not just manual record keeping.
 ## 2026-08-14 OpenClaw Remote Operation Kinds
 
 Current state:

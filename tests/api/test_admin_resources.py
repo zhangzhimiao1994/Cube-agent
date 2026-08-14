@@ -3633,6 +3633,12 @@ def test_evolution_run_records_skill_optimization_rounds_and_audit() -> None:
             "mode": "hybrid",
             "source_skill_ids": ["darwin-skill"],
             "target_artifact_type": "skill",
+            "baseline_agent_id": "agent-main-m3",
+            "candidate_agent_ids": ["agent-coder", "agent-reviewer"],
+            "evaluator_agent_id": "agent-evaluator",
+            "approval_policy": "ask",
+            "iteration_policy": "score_gated",
+            "memory_policy": "summarize_between_rounds",
             "max_rounds": 3,
             "min_delta": 2.0,
             "rubric": ["结构评分", "实测表现", "反例黑名单"],
@@ -3644,6 +3650,34 @@ def test_evolution_run_records_skill_optimization_rounds_and_audit() -> None:
     assert run["id"].startswith("evolution_")
     assert run["status"] == "waiting_approval"
     assert run["kind"] == "skill_optimization"
+    assert run["baseline_agent_id"] == "agent-main-m3"
+    assert run["candidate_agent_ids"] == ["agent-coder", "agent-reviewer"]
+    assert run["evaluator_agent_id"] == "agent-evaluator"
+    assert run["approval_status"] == "pending"
+    assert run["next_action"] == "request_approval"
+
+    blocked = api.post(
+        f"/api/v1/admin/evolution-runs/{run['id']}/rounds",
+        headers=headers(),
+        json={
+            "changed_dimension": "未审批测试",
+            "candidate_summary": "未审批前不应记录候选版本。",
+            "score_before": 70.0,
+            "score_after": 71.0,
+        },
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["error"]["code"] == "evolution_run_requires_approval"
+
+    approved = api.post(
+        f"/api/v1/admin/evolution-runs/{run['id']}/approve",
+        headers=headers(),
+        json={"approved": True, "note": "人工确认基准 agent 和评测口径。"},
+    )
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "running"
+    assert approved.json()["approval_status"] == "approved"
+    assert approved.json()["next_action"] == "run_next_round"
 
     recorded = api.post(
         f"/api/v1/admin/evolution-runs/{run['id']}/rounds",
@@ -3665,6 +3699,7 @@ def test_evolution_run_records_skill_optimization_rounds_and_audit() -> None:
     assert recorded.status_code == 200
     body = recorded.json()
     assert body["status"] == "running"
+    assert body["next_action"] == "run_next_round"
     assert body["rounds"][0]["delta"] == 4.5
     assert body["rounds"][0]["accepted"] is True
     assert body["rounds"][0]["recommendation"] == "continue"
@@ -3678,6 +3713,11 @@ def test_evolution_run_records_skill_optimization_rounds_and_audit() -> None:
     event = audit.json()[0]
     assert event["resource"] == f"evolution:{run['id']}"
     assert event["details"]["recommendation"] == "continue"
+    assert event["details"]["next_action"] == "run_next_round"
+
+    approval_audit = api.get("/api/v1/admin/audit?action=evolution.approve", headers=headers())
+    assert approval_audit.status_code == 200
+    assert approval_audit.json()[0]["details"]["approval_status"] == "approved"
 
 
 def test_evolution_run_stops_after_two_low_delta_rounds() -> None:
@@ -3691,6 +3731,7 @@ def test_evolution_run_stops_after_two_low_delta_rounds() -> None:
             "objective": "迭代发现论文创新点并用反例筛选。",
             "mode": "discuss",
             "target_artifact_type": "research_gap",
+            "approval_policy": "auto",
             "max_rounds": 5,
             "min_delta": 2.0,
         },

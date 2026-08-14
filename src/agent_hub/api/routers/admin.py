@@ -31,10 +31,12 @@ from agent_hub.config.service import ConfigService, ConfigValidationError
 from agent_hub.db.models import AdminResourceRow
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.evolution import (
+    EvolutionApprovalRequest,
     EvolutionRoundRequest,
     EvolutionRunRequest,
     EvolutionRunResponse,
     append_evolution_round,
+    approve_evolution_run_response,
     create_evolution_run_response,
 )
 from agent_hub.models.capabilities import infer_model_capabilities
@@ -1498,6 +1500,14 @@ class AdminResourceService(Protocol):
 
     async def get_evolution_run(self, run_id: str) -> EvolutionRunResponse: ...
 
+    async def approve_evolution_run(
+        self,
+        run_id: str,
+        request: EvolutionApprovalRequest,
+        *,
+        actor: str,
+    ) -> EvolutionRunResponse: ...
+
     async def record_evolution_round(
         self,
         run_id: str,
@@ -2330,6 +2340,30 @@ class InMemoryAdminResourceService:
         except KeyError:
             raise PublicAPIError(404, "not_found", "not found") from None
 
+    async def approve_evolution_run(
+        self,
+        run_id: str,
+        request: EvolutionApprovalRequest,
+        *,
+        actor: str,
+    ) -> EvolutionRunResponse:
+        current = await self.get_evolution_run(run_id)
+        updated = approve_evolution_run_response(current, request, actor=actor)
+        self.evolution_runs[run_id] = updated
+        await self.record_audit_event(
+            actor=actor,
+            action="evolution.approve",
+            resource=f"evolution:{run_id}",
+            details={
+                "approval_status": updated.approval_status,
+                "status": updated.status,
+                "baseline_agent_id": updated.baseline_agent_id,
+                "evaluator_agent_id": updated.evaluator_agent_id,
+                "next_action": updated.next_action,
+            },
+        )
+        return updated
+
     async def record_evolution_round(
         self,
         run_id: str,
@@ -2340,6 +2374,8 @@ class InMemoryAdminResourceService:
         current = await self.get_evolution_run(run_id)
         if current.status in {"stopped", "completed"}:
             raise PublicAPIError(409, "evolution_run_closed", "evolution run is already closed")
+        if current.status == "waiting_approval":
+            raise PublicAPIError(409, "evolution_run_requires_approval", "evolution run requires approval before recording rounds")
         updated = append_evolution_round(current, request)
         latest = updated.rounds[-1]
         self.evolution_runs[run_id] = updated
@@ -2353,6 +2389,7 @@ class InMemoryAdminResourceService:
                 "accepted": latest.accepted,
                 "recommendation": latest.recommendation,
                 "status": updated.status,
+                "next_action": updated.next_action,
             },
         )
         return updated
@@ -3629,6 +3666,31 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             raise PublicAPIError(404, "not_found", "not found")
         return EvolutionRunResponse.model_validate(payload)
 
+    async def approve_evolution_run(
+        self,
+        run_id: str,
+        request: EvolutionApprovalRequest,
+        *,
+        actor: str,
+    ) -> EvolutionRunResponse:
+        current = await self.get_evolution_run(run_id)
+        updated = approve_evolution_run_response(current, request, actor=actor)
+        if not await self._upsert_admin_payload("evolution", run_id, updated.model_dump(mode="json")):
+            return await super().approve_evolution_run(run_id, request, actor=actor)
+        await self.record_audit_event(
+            actor=actor,
+            action="evolution.approve",
+            resource=f"evolution:{run_id}",
+            details={
+                "approval_status": updated.approval_status,
+                "status": updated.status,
+                "baseline_agent_id": updated.baseline_agent_id,
+                "evaluator_agent_id": updated.evaluator_agent_id,
+                "next_action": updated.next_action,
+            },
+        )
+        return updated
+
     async def record_evolution_round(
         self,
         run_id: str,
@@ -3639,6 +3701,8 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         current = await self.get_evolution_run(run_id)
         if current.status in {"stopped", "completed"}:
             raise PublicAPIError(409, "evolution_run_closed", "evolution run is already closed")
+        if current.status == "waiting_approval":
+            raise PublicAPIError(409, "evolution_run_requires_approval", "evolution run requires approval before recording rounds")
         updated = append_evolution_round(current, request)
         latest = updated.rounds[-1]
         if not await self._upsert_admin_payload("evolution", run_id, updated.model_dump(mode="json")):
@@ -3653,6 +3717,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 "accepted": latest.accepted,
                 "recommendation": latest.recommendation,
                 "status": updated.status,
+                "next_action": updated.next_action,
             },
         )
         return updated
@@ -6384,6 +6449,21 @@ async def get_evolution_run(
 ) -> EvolutionRunResponse:
     _require(principal, "skill:read")
     return await service.get_evolution_run(run_id)
+
+
+@router.post(
+    "/evolution-runs/{run_id}/approve",
+    response_model=EvolutionRunResponse,
+    responses=error_responses(401, 403, 404, 409, 422),
+)
+async def approve_evolution_run(
+    run_id: str,
+    body: EvolutionApprovalRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> EvolutionRunResponse:
+    _require(principal, "skill:write")
+    return await service.approve_evolution_run(run_id, body, actor=str(principal.user_id))
 
 
 @router.post(
