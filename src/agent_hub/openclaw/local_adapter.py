@@ -67,8 +67,10 @@ def create_local_adapter_app(config: OpenClawLocalAdapterConfig) -> FastAPI:
     app = FastAPI(title="OpenClaw local adapter", version="0.1.0")
 
     @app.get("/v1/openclaw/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok", "platform": config.platform}
+    async def health(authorization: Annotated[str | None, Header()] = None) -> JSONResponse:
+        if not _authorized(authorization, config.token):
+            return _error(401, "openclaw_adapter_unauthorized", "OpenClaw adapter token is invalid")
+        return JSONResponse({"status": "ok", "platform": config.platform, "capabilities": _adapter_capabilities(config)})
 
     @app.post("/v1/openclaw/execute")
     async def execute(
@@ -128,6 +130,14 @@ def main() -> None:
     port = int(os.environ.get("OPENCLAW_ADAPTER_PORT", "8765"))
     uvicorn.run(create_local_adapter_app(load_local_adapter_config_from_env()), host=host, port=port)
 
+
+def _adapter_capabilities(config: OpenClawLocalAdapterConfig) -> list[str]:
+    capabilities: list[str] = []
+    if config.allowed_commands:
+        capabilities.extend(["server_command", "desktop_action", "screen_read", "file_read"])
+    elif config.allowed_file_roots:
+        capabilities.append("file_read")
+    return capabilities
 
 def _allowed_commands_from_env(value: str) -> list[list[str]]:
     parsed = json.loads(value)

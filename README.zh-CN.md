@@ -120,7 +120,7 @@ OpenClaw 是系统级功能开关，用于受控操作服务器或电脑，不�
 - `auto_review`：低风险自动审核，高风险仍需审批。
 - `trusted_auto`：可信环境自动执行，需谨慎使用。
 
-OpenClaw 使用命令白名单、适配器配置、会话状态和审计记录。Linux 服务器命令可以通过本地适配器执行；远程适配器在配置 `OPENCLAW_ADAPTER_ALLOWED_FILE_ROOTS_JSON` 后，也可以在无需 argv 命令的情况下执行受限 `file_read`，返回内容受 `OPENCLAW_ADAPTER_FILE_READ_LIMIT_BYTES` 限制。Windows、Linux 桌面、macOS、屏幕和文件系统接管应通过远程适配器连接，并配置独立凭证和最小权限。
+OpenClaw 使用命令白名单、适配器配置、会话状态和审计记录。Linux 服务器命令可以通过本地适配器执行；远程适配器在配置 `OPENCLAW_ADAPTER_ALLOWED_FILE_ROOTS_JSON` 后，也可以在无需 argv 命令的情况下执行受限 `file_read`，返回内容受 `OPENCLAW_ADAPTER_FILE_READ_LIMIT_BYTES` 限制。Windows、Linux 桌面、macOS、屏幕和文件系统接管应通过远程适配器连接，并配置独立凭证和最小权限。每个远程适配器必须在 `/v1/openclaw/health` 返回平台和支持的能力清单；Agent Hub 会在执行前校验该健康响应，避免把不支持的桌面、屏幕或文件操作当成可用能力。
 
 常用命令：
 

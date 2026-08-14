@@ -265,3 +265,19 @@ def test_local_adapter_file_read_requires_explicit_allowed_roots(tmp_path: Path)
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "openclaw_adapter_file_read_unavailable"
+
+
+def test_local_adapter_health_reports_platform_and_capabilities() -> None:
+    response = _client().get("/v1/openclaw/health", headers=_headers())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["platform"] == "windows"
+    assert body["capabilities"] == ["server_command", "desktop_action", "screen_read", "file_read"]
+
+def test_local_adapter_health_requires_bearer_token() -> None:
+    response = _client().get("/v1/openclaw/health")
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "openclaw_adapter_unauthorized"

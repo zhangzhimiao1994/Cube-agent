@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
@@ -20,6 +20,43 @@ class OpenClawRemoteAdapter:
     base_url: str
 
 
+@dataclass(frozen=True, slots=True)
+class OpenClawRemoteAdapterProbe:
+    status: str
+    platform: str
+    capabilities: tuple[str, ...]
+
+
+async def probe_remote_openclaw_adapter(
+    adapter: OpenClawRemoteAdapter,
+    *,
+    bearer_token: str,
+    required_kind: str | None = None,
+    timeout_seconds: float = 10,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> OpenClawRemoteAdapterProbe:
+    url = f"{adapter.base_url.rstrip('/')}/v1/openclaw/health"
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds, transport=transport) as client:
+            response = await client.get(url, headers={"Authorization": f"Bearer {bearer_token}"})
+    except httpx.HTTPError as error:
+        raise OpenClawRemoteAdapterError("remote OpenClaw adapter health request failed") from error
+    if response.status_code < 200 or response.status_code >= 300:
+        raise OpenClawRemoteAdapterError(f"remote OpenClaw adapter health returned HTTP {response.status_code}")
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise OpenClawRemoteAdapterError("remote OpenClaw adapter health returned invalid JSON") from error
+    probe = _probe_from_payload(payload)
+    if probe.status != "available":
+        raise OpenClawRemoteAdapterError("remote OpenClaw adapter is not available")
+    if probe.platform != adapter.platform:
+        raise OpenClawRemoteAdapterError("remote OpenClaw adapter platform mismatch")
+    if required_kind is not None and required_kind not in probe.capabilities:
+        raise OpenClawRemoteAdapterError(f"remote OpenClaw adapter does not support {required_kind}")
+    return probe
+
+
 async def run_remote_openclaw_operation(
     adapter: OpenClawRemoteAdapter,
     *,
@@ -28,6 +65,12 @@ async def run_remote_openclaw_operation(
     bearer_token: str,
     timeout_seconds: float = 30,
 ) -> OpenClawCommandResult:
+    kind = operation.get("kind")
+    await probe_remote_openclaw_adapter(
+        adapter,
+        bearer_token=bearer_token,
+        required_kind=kind if isinstance(kind, str) else None,
+    )
     url = f"{adapter.base_url.rstrip('/')}/v1/openclaw/execute"
     body = {
         "operation_id": operation_id,
@@ -57,6 +100,25 @@ async def run_remote_openclaw_operation(
     return _result_from_payload(payload)
 
 
+def _probe_from_payload(payload: Any) -> OpenClawRemoteAdapterProbe:
+    if not isinstance(payload, dict):
+        raise OpenClawRemoteAdapterError("remote OpenClaw adapter health response must be an object")
+    status = payload.get("status")
+    platform = payload.get("platform")
+    capabilities = payload.get("capabilities")
+    if status == "ok":
+        status = "available"
+    if status != "available" or not isinstance(platform, str) or not isinstance(capabilities, list):
+        raise OpenClawRemoteAdapterError("remote OpenClaw adapter health response shape is invalid")
+    parsed_capabilities: list[str] = []
+    for capability in capabilities:
+        if not isinstance(capability, str) or capability not in {"server_command", "desktop_action", "screen_read", "file_read"}:
+            raise OpenClawRemoteAdapterError("remote OpenClaw adapter capability is invalid")
+        if capability not in parsed_capabilities:
+            parsed_capabilities.append(capability)
+    return OpenClawRemoteAdapterProbe(status=status, platform=platform, capabilities=tuple(parsed_capabilities))
+
+
 def _result_from_payload(payload: Any) -> OpenClawCommandResult:
     if not isinstance(payload, dict):
         raise OpenClawRemoteAdapterError("remote OpenClaw adapter response must be an object")
@@ -81,5 +143,7 @@ def _bounded_text(value: str, limit: int = 16_384) -> str:
 __all__ = [
     "OpenClawRemoteAdapter",
     "OpenClawRemoteAdapterError",
+    "OpenClawRemoteAdapterProbe",
+    "probe_remote_openclaw_adapter",
     "run_remote_openclaw_operation",
 ]

@@ -548,6 +548,22 @@ def test_openclaw_execute_uses_configured_remote_windows_adapter() -> None:
     adapter_calls: list[dict[str, object]] = []
 
     class AdapterHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path != "/v1/openclaw/health":
+                self.send_response(404)
+                self.end_headers()
+                return
+            payload = json.dumps({
+                "status": "ok",
+                "platform": "windows",
+                "capabilities": ["server_command"],
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
         def do_POST(self) -> None:
             length = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(length).decode("utf-8"))

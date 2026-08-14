@@ -9,7 +9,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/agent-hub openclaw-adapter
 
-Starts a local OpenClaw Adapter for a Linux, Windows, or macOS host.
+Starts a local OpenClaw Adapter for a Linux, Windows, or macOS host. The adapter exposes /v1/openclaw/health with platform and capability metadata, and Agent Hub verifies that health response before remote execution.
 
 Required environment:
   OPENCLAW_ADAPTER_TOKEN                  Bearer token configured as a sealed secret ref in Agent Hub.

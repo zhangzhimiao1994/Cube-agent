@@ -3967,3 +3967,38 @@ Final CI status for this slice:
 
 - Latest GitHub Actions run `31787569309` for commit `795a3cf` completed successfully.
 - The failed run `31787154117` is superseded by the passing CI-fix run.
+
+## 2026-08-14 OpenClaw Adapter Health Capabilities
+
+Current state:
+
+- OpenClaw local adapter `/v1/openclaw/health` now requires the same bearer token boundary as execution requests.
+- The health response now exposes adapter `platform` and `capabilities`, so the system can distinguish a terminal-capable adapter from a file-only, screen-only, or future desktop driver adapter.
+- Remote OpenClaw execution now probes `/v1/openclaw/health` before calling `/v1/openclaw/execute` and rejects platform mismatches or unsupported operation kinds before sending the operation payload.
+- This keeps long-running server/terminal control inside the existing OpenClaw switch, session, approval, bearer token, and exact argv allowlist boundaries. GUI desktop and screen control still require platform-specific drivers behind the same adapter contract.
+- README/README.zh-CN and `scripts/agent-hub openclaw-adapter --help` document the health/capability contract.
+
+Local verification:
+
+- Watched new tests fail first for missing `probe_remote_openclaw_adapter`, missing health `capabilities`, and unauthenticated health returning 200.
+- `uv run pytest tests\unit\openclaw tests\api\test_admin_resources.py -q -k "openclaw" --tb=short` -> 33 passed, 81 deselected.
+- `uv run pytest tests\unit\test_deployment_contracts.py -q --tb=short` -> 14 passed.
+- `uv run ruff check src\agent_hub\openclaw\local_adapter.py src\agent_hub\openclaw\remote_adapter.py tests\unit\openclaw tests\api\test_admin_resources.py` -> passed.
+- `uv run mypy --strict src\agent_hub\openclaw\local_adapter.py src\agent_hub\openclaw\remote_adapter.py tests\unit\openclaw` -> passed.
+- `git diff --check` -> passed with CRLF normalization warnings only.
+
+Server deployment and real verification:
+
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-openclaw-health-capabilities-20260814-173542.tgz`.
+- Uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed incrementally into `/opt/agent-hub/current`.
+- Server backup path: `/opt/agent-hub/backups/openclaw-health-capabilities-20260814-093633`.
+- Synced `src/agent_hub/openclaw/local_adapter.py` and `src/agent_hub/openclaw/remote_adapter.py` into the active production venv site-packages, normalized `scripts/commands/openclaw-adapter.sh` executable permissions, restarted `agent-hub-api` and `agent-hub-worker`, and reloaded Caddy.
+- Real server probe started two temporary real OpenClaw adapters through `/opt/agent-hub/current/scripts/agent-hub openclaw-adapter`: one Windows-reporting adapter with an allowlisted terminal command, and one Windows-reporting file-only adapter.
+- The probe verified unauthenticated health is rejected, authenticated health returns capabilities, a real API-created Windows `server_command` operation executes through the health-gated remote adapter, and a server command routed to the file-only adapter fails with `openclaw_adapter_failed` instead of being treated as available.
+- Probe output: `{"status": "ok", "checked": ["health_auth", "capabilities", "remote_execute", "capability_mismatch"]}`.
+- Restored system settings, cleaned probe OpenClaw resources, removed `/tmp/openclaw_health_capabilities_check.py` and `/tmp/deploy-openclaw-health-capabilities.sh`, confirmed no temporary adapter process remained, and confirmed `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.
+
+Remaining risks / next:
+
+- Commit this slice, create local ignored recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
+- Continue P3 after green: platform-specific OpenClaw desktop/screen drivers, broader UI copy/layout audit, missing button/function sweep, final README refresh if later modules change, and Docker readiness later.
