@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+﻿import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -129,7 +129,7 @@ describe("AppShell presentation", () => {
 
     fireEvent.click(mobileTrigger);
 
-    expect(shell?.className).toContain("mobile-nav-open");
+    await waitFor(() => expect(shell?.className).toContain("mobile-nav-open"));
     const mobileNavigation = screen.getByRole("navigation", { name: "手机版主导航" });
     const orchestrationTrigger = within(mobileNavigation).getByRole("button", { name: "展开编排二级导航" });
 
@@ -141,7 +141,7 @@ describe("AppShell presentation", () => {
 
     fireEvent.click(screen.getAllByRole("button", { name: "关闭导航栏" })[0]);
 
-    expect(shell?.className).not.toContain("mobile-nav-open");
+    await waitFor(() => expect(shell?.className).not.toContain("mobile-nav-open"));
   });
 
   it("keeps mobile floating navigation as an overlay drawer", () => {
@@ -152,3 +152,4 @@ describe("AppShell presentation", () => {
     expect(stylesCss).toMatch(/@media \(max-width: 980px\)[\s\S]*\.nav-floating \.mobile-nav-groups\s*{[\s\S]*display:\s*grid;/);
   });
 });
+

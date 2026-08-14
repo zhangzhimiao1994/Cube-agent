@@ -1,4 +1,27 @@
-﻿## 2026-08-14 OpenClaw Execute Session Guard
+﻿## 2026-08-14 GitHub Actions Mobile Navigation Test Fix
+
+Current state:
+
+- Fixed the GitHub Actions failure from run `31760296797`.
+- `web/src/app/AppShell.test.tsx` now waits for the mobile floating navigation class to update after open/close clicks instead of reading React state synchronously.
+- No runtime UI code changed in this slice.
+
+Verification performed:
+
+- Local frontend checks:
+  - `npm.cmd run test -- --run src/app/AppShell.test.tsx` -> 6 passed.
+  - `npm.cmd run lint` -> passed.
+  - `npm.cmd run test -- --run` -> 102 passed.
+  - `npm.cmd run build` -> passed with the existing Vite chunk-size warning.
+
+Remaining risks / TODOs:
+
+- Commit this CI fix.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote `mutilagent/main`.
+- Push with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue planned work after green.
+## 2026-08-14 OpenClaw Execute Session Guard
 
 Current state:
 
@@ -3110,5 +3133,6 @@ Remaining risks / next:
 - Push `main` with `git push --force-with-lease mutilagent main`.
 - Check GitHub Actions and fix/redeploy/repush if red.
 - Continue P3 with the remaining project-completion items and final GitHub usage README.
+
 
 
