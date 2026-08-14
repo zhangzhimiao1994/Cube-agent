@@ -4263,3 +4263,40 @@ CI follow-up for Skill Bundle Robustness + Conversation History Titles:
 - Fixed the test to derive `conversationHistoryTitle` from the fixture `created_at` using the same local-time formatting rule as the UI, so the assertion remains valid across local Asia/Shanghai and CI UTC environments.
 - Local follow-up verification: `npm.cmd run test -- --run src/pages/OperationalPages.test.tsx` -> 55 passed; `npm.cmd run lint` -> passed.
 - Next: commit this CI-only test fix, create a new recovery bundle/tag, push to `mutilagent/main`, and re-check GitHub Actions until green.
+
+## 2026-08-14 OpenClaw Adapter Screen Read Driver
+
+Current state:
+
+- OpenClaw local/remote adapter now supports a dedicated `screen_read` execution path that does not require Agent Hub to send arbitrary operation argv.
+- Host operators configure a fixed non-shell argv driver with `OPENCLAW_ADAPTER_SCREEN_READ_COMMAND_JSON`; health reports `screen_read` when the driver is configured.
+- A `screen_read` operation without argv now returns `openclaw_adapter_screen_read_unavailable` with HTTP 409 if the host adapter has no configured driver, instead of falling through to generic command denial.
+- Existing command allowlist behavior, file_read roots, bearer-token authentication, platform match checks, and command shell denial remain in place.
+- `scripts/agent-hub openclaw-adapter --help`, `README.md`, and `README.zh-CN.md` now mention the screen_read driver variable.
+
+Local verification:
+
+- RED first: `uv run pytest tests\unit\openclaw\test_local_adapter.py -q -k "screen_read" --tb=short` failed with missing `screen_read_command` support and the old 403 fallback.
+- RED first for script docs: `uv run pytest tests\unit\install\test_native_install_scripts.py::test_openclaw_local_adapter_has_cross_platform_and_installed_cli_entrypoints -q --tb=short` failed because the adapter help did not mention `OPENCLAW_ADAPTER_SCREEN_READ_COMMAND_JSON`.
+- `uv run pytest tests\unit\openclaw\test_local_adapter.py -q -k "screen_read" --tb=short` -> 3 passed.
+- `uv run pytest tests\unit\openclaw\test_local_adapter.py tests\unit\install\test_native_install_scripts.py tests\api\test_admin_resources.py -q -k "openclaw" --tb=short` -> 35 passed, 108 deselected.
+- `uv run ruff check src\agent_hub\openclaw\local_adapter.py tests\unit\openclaw\test_local_adapter.py tests\unit\install\test_native_install_scripts.py` -> passed.
+- `uv run mypy --strict src\agent_hub\openclaw\local_adapter.py tests\unit\openclaw\test_local_adapter.py tests\unit\install\test_native_install_scripts.py` -> passed.
+- Local `bash -n scripts/commands/openclaw-adapter.sh` could not run because this Windows/WSL environment only exposes `C:\Windows\System32\bash.exe` and no `/bin/bash`; the deployed Linux server ran `bash -n` successfully during deployment.
+- `git diff --check` -> passed with CRLF normalization warnings only.
+
+Server deployment and real verification:
+
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-openclaw-screen-read-20260814-204420.tgz`.
+- Uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed incrementally into `/opt/agent-hub/current`.
+- Server backup path: `/opt/agent-hub/backups/openclaw-screen-read-20260814-204528`.
+- Synced `src/agent_hub/openclaw/local_adapter.py` into the active production venv site-packages, chmodded and checked `scripts/commands/openclaw-adapter.sh` with Linux `bash -n`, restarted `agent-hub-api` and `agent-hub-worker`, and reloaded Caddy.
+- Real server probe started a real adapter process through `/opt/agent-hub/current/scripts/agent-hub openclaw-adapter` on `127.0.0.1:18772` with `OPENCLAW_ADAPTER_ALLOWED_COMMANDS_JSON=[]` and a fixed `OPENCLAW_ADAPTER_SCREEN_READ_COMMAND_JSON` driver.
+- Probe verified authenticated `/v1/openclaw/health` reports `screen_read`, then executed a real `screen_read` request without operation argv and received stdout `openclaw-screen-read-live`.
+- Probe output: `{"status": "ok", "checked": ["adapter_health_screen_read_capability", "screen_read_execute_without_operation_argv"], "stdout": "openclaw-screen-read-live"}`.
+- Removed `/tmp/probe_openclaw_screen_read.py`, `/tmp/deploy_openclaw_screen_read.sh`, and `/tmp/agent-hub-p3-runtime-incremental.tgz`; confirmed no temporary `openclaw.local_adapter` / `openclaw-adapter` process remained and `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.
+
+Remaining risks / next:
+
+- Commit this slice, create a GitHub recovery bundle/tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
+- Continue P3 after green: OpenClaw desktop_action driver path, evolution execution orchestration, plan-task mode UX, broader UI copy/layout audit, missing button/function sweep, README/README.zh-CN final usage refresh, and Docker readiness later.

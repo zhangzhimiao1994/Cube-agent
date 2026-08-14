@@ -281,3 +281,80 @@ def test_local_adapter_health_requires_bearer_token() -> None:
 
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "openclaw_adapter_unauthorized"
+
+def test_local_adapter_screen_read_runs_configured_driver_without_operation_argv() -> None:
+    app = create_local_adapter_app(
+        OpenClawLocalAdapterConfig(
+            token="adapter-token",
+            platform="linux",
+            allowed_commands=[],
+            screen_read_command=[sys.executable, "-c", "print('screen-read-live')"],
+        )
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/openclaw/execute",
+        headers=_headers(),
+        json={
+            "operation_id": "openclaw_probe_screen_read",
+            "platform": "linux",
+            "kind": "screen_read",
+            "target": "desktop",
+            "risk_level": "low",
+            "reason": "read the bounded current screen state",
+            "session_id": "openclaw_session_probe",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["exit_code"] == 0
+    assert body["stdout"].strip() == "screen-read-live"
+    assert body["stderr"] == ""
+    assert body["truncated"] is False
+
+
+def test_local_adapter_screen_read_requires_configured_driver() -> None:
+    client = TestClient(
+        create_local_adapter_app(
+            OpenClawLocalAdapterConfig(
+                token="adapter-token",
+                platform="linux",
+                allowed_commands=[],
+            )
+        )
+    )
+
+    response = client.post(
+        "/v1/openclaw/execute",
+        headers=_headers(),
+        json={
+            "operation_id": "openclaw_probe_screen_read",
+            "platform": "linux",
+            "kind": "screen_read",
+            "target": "desktop",
+            "risk_level": "low",
+            "reason": "read the bounded current screen state",
+            "session_id": "openclaw_session_probe",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "openclaw_adapter_screen_read_unavailable"
+
+
+def test_local_adapter_health_reports_screen_read_when_driver_configured() -> None:
+    app = create_local_adapter_app(
+        OpenClawLocalAdapterConfig(
+            token="adapter-token",
+            platform="linux",
+            allowed_commands=[],
+            screen_read_command=[sys.executable, "-c", "print('screen-read-live')"],
+        )
+    )
+
+    response = TestClient(app).get("/v1/openclaw/health", headers=_headers())
+
+    assert response.status_code == 200
+    assert response.json()["capabilities"] == ["screen_read"]
