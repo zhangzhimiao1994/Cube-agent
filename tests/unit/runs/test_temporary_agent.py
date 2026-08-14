@@ -383,6 +383,47 @@ async def test_schedule_intent_returns_confirmation_proposal_without_enqueue() -
     assert routing["approval_kind"] == "schedule_creation"
     assert routing["schedule_proposal"] == submitted.schedule_proposal
 
+@pytest.mark.asyncio
+async def test_evolution_intent_returns_confirmation_proposal_without_enqueue() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    queue = RecordingQueue()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=None,
+        task_queue=queue,
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="帮我进化 darwin-skill，做多轮迭代并用基准 agent 判断是否继续",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-evolution-chat",
+    )
+
+    assert submitted.status is RunStatus.WAITING_APPROVAL
+    assert submitted.mode is TaskMode.HYBRID
+    assert submitted.clarification_reason == "evolution_requires_user_confirmation"
+    assert submitted.decision_token is not None
+    assert submitted.evolution_proposal is not None
+    assert submitted.evolution_proposal["kind"] == "skill_optimization"
+    assert submitted.evolution_proposal["title"] == "Skill 进化任务"
+    assert submitted.evolution_proposal["source_skill_ids"] == ["darwin-skill"]
+    assert submitted.evolution_proposal["baseline_agent_id"] == "main-agent"
+    assert submitted.evolution_proposal["evaluator_agent_id"] == "evaluator-agent"
+    assert submitted.evolution_proposal["approval_policy"] == "ask"
+    assert submitted.evolution_proposal["memory_policy"] == "summarize_between_rounds"
+    assert submitted.evolution_proposal["source_conversation_id"] == "conv-evolution-chat"
+    assert repository.outbox == []
+    assert queue.enqueued == []
+    routing = repository.records[submitted.id].routing_decision
+    assert routing is not None
+    assert routing["approval_kind"] == "evolution_creation"
+    assert routing["evolution_proposal"] == submitted.evolution_proposal
+
 
 @pytest.mark.asyncio
 async def test_auto_router_timeout_uses_local_main_agent_for_generation_work() -> None:

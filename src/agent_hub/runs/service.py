@@ -44,6 +44,7 @@ class SubmittedRun:
     reference_conversation_id: str | None = None
     temporary_agent_proposal: dict[str, object] | None = None
     schedule_proposal: dict[str, object] | None = None
+    evolution_proposal: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +100,57 @@ class ScheduleProposal:
             },
         }
 
+
+@dataclass(frozen=True, slots=True)
+class EvolutionProposal:
+    kind: str
+    title: str
+    objective: str
+    mode: TaskMode
+    source_skill_ids: tuple[str, ...]
+    source_conversation_id: str | None
+    source_run_id: str | None
+    target_artifact_type: str
+    baseline_agent_id: str
+    candidate_agent_ids: tuple[str, ...]
+    evaluator_agent_id: str
+    approval_policy: str
+    iteration_policy: str
+    memory_policy: str
+    max_rounds: int
+    min_delta: float
+    budget_tokens: int
+    budget_minutes: int
+    rubric: tuple[str, ...]
+    summary: str
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "title": self.title,
+            "objective": self.objective,
+            "mode": self.mode.value,
+            "source_skill_ids": list(self.source_skill_ids),
+            "source_conversation_id": self.source_conversation_id,
+            "source_run_id": self.source_run_id,
+            "target_artifact_type": self.target_artifact_type,
+            "baseline_agent_id": self.baseline_agent_id,
+            "candidate_agent_ids": list(self.candidate_agent_ids),
+            "evaluator_agent_id": self.evaluator_agent_id,
+            "approval_policy": self.approval_policy,
+            "iteration_policy": self.iteration_policy,
+            "memory_policy": self.memory_policy,
+            "max_rounds": self.max_rounds,
+            "min_delta": self.min_delta,
+            "budget_tokens": self.budget_tokens,
+            "budget_minutes": self.budget_minutes,
+            "rubric": list(self.rubric),
+            "summary": self.summary,
+            "metadata": {
+                "source": "chat_evolution_proposal",
+                "requires_user_confirmation": "true",
+            },
+        }
 
 @dataclass(frozen=True, slots=True)
 class TemporaryAgentProposal:
@@ -248,6 +300,21 @@ class RunService:
             operator_selection["capability"] = "vibe_coding"
         if channel_context:
             operator_selection.update(_safe_channel_context(channel_context))
+        evolution_proposal = _local_evolution_proposal(
+            message=message,
+            mode=TaskMode.HYBRID if mode is TaskMode.AUTO else mode,
+            conversation_id=effective_conversation_id,
+        )
+        if evolution_proposal is not None:
+            return await self._create_evolution_approval_run(
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                message=message,
+                mode=evolution_proposal.mode,
+                proposal=evolution_proposal,
+                idempotency_key=idempotency_key,
+                operator_selection=operator_selection,
+            )
         schedule_proposal = _local_schedule_proposal(
             message=message,
             mode=TaskMode.DISPATCH if mode is TaskMode.AUTO else mode,
@@ -962,6 +1029,37 @@ class RunService:
         )
         return _submitted(record)
 
+    async def _create_evolution_approval_run(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        message: str,
+        mode: TaskMode,
+        proposal: EvolutionProposal,
+        idempotency_key: str | None,
+        operator_selection: dict[str, object],
+    ) -> SubmittedRun:
+        token = _decision_token()
+        proposal_payload = proposal.to_payload()
+        record = await self._repository.create_run(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            request=message,
+            mode=mode,
+            status=RunStatus.WAITING_APPROVAL,
+            idempotency_key=idempotency_key,
+            routing_decision={
+                **operator_selection,
+                "reason": "evolution_requires_user_confirmation",
+                "decision_token": token,
+                "approval_kind": "evolution_creation",
+                "evolution_proposal": proposal_payload,
+            },
+            enqueue=False,
+        )
+        return _submitted(record)
+
     async def _create_schedule_approval_run(
         self,
         *,
@@ -1028,6 +1126,7 @@ def _submitted(record: RunRecord) -> SubmittedRun:
     reason = str(decision.get("reason", "routing_requires_user_choice"))
     proposal = decision.get("temporary_agent_proposal")
     schedule_proposal = decision.get("schedule_proposal")
+    evolution_proposal = decision.get("evolution_proposal")
     return SubmittedRun(
         id=record.id,
         tenant_id=record.tenant_id,
@@ -1049,8 +1148,67 @@ def _submitted(record: RunRecord) -> SubmittedRun:
         schedule_proposal=cast(dict[str, object], schedule_proposal)
         if isinstance(schedule_proposal, dict)
         else None,
+        evolution_proposal=cast(dict[str, object], evolution_proposal)
+        if isinstance(evolution_proposal, dict)
+        else None,
     )
 
+
+_EVOLUTION_TRIGGER_RE = re.compile(
+    r"(进化|蒸馏|长期迭代|多轮迭代|达尔文|darwin|evolve|evolution|distill|optimi[sz]e|iteration)",
+    re.IGNORECASE,
+)
+_SKILL_ID_RE = re.compile(r"([a-z0-9][a-z0-9_-]{1,80}-skill|[a-z0-9][a-z0-9_-]{1,80})", re.IGNORECASE)
+
+
+def _local_evolution_proposal(
+    *,
+    message: str,
+    mode: TaskMode,
+    conversation_id: str | None,
+) -> EvolutionProposal | None:
+    if _EVOLUTION_TRIGGER_RE.search(message) is None:
+        return None
+    lowered = message.lower()
+    kind = "skill_distillation" if any(token in lowered for token in ("distill", "蒸馏")) else "skill_optimization"
+    target_artifact_type = "skill" if "skill" in lowered or "技能" in message or "蒸馏" in message else "custom"
+    source_skill_ids = _evolution_source_skill_ids(message)
+    if not source_skill_ids and target_artifact_type == "skill":
+        source_skill_ids = ("darwin-skill",) if "darwin" in lowered or "达尔文" in message else ()
+    title = "Skill 蒸馏任务" if kind == "skill_distillation" else "Skill 进化任务"
+    return EvolutionProposal(
+        kind=kind,
+        title=title,
+        objective=message.strip(),
+        mode=mode if mode is not TaskMode.AUTO else TaskMode.HYBRID,
+        source_skill_ids=source_skill_ids,
+        source_conversation_id=conversation_id,
+        source_run_id=None,
+        target_artifact_type=target_artifact_type,
+        baseline_agent_id="main-agent",
+        candidate_agent_ids=("worker-agent", "reviewer-agent"),
+        evaluator_agent_id="evaluator-agent",
+        approval_policy="ask",
+        iteration_policy="score_gated",
+        memory_policy="summarize_between_rounds",
+        max_rounds=5,
+        min_delta=2.0,
+        budget_tokens=200_000,
+        budget_minutes=120,
+        rubric=("实测表现", "反例覆盖", "人工验收"),
+        summary="主 Agent 判断这条消息适合进入进化任务：先确认目标、基准 agent 和评测口径，再启动多轮迭代。",
+    )
+
+
+def _evolution_source_skill_ids(message: str) -> tuple[str, ...]:
+    candidates: list[str] = []
+    for match in _SKILL_ID_RE.finditer(message):
+        value = match.group(1).strip().lower()
+        if value in {"skill", "agent", "darwin", "evolution", "distill", "optimize", "iteration"}:
+            continue
+        if value not in candidates:
+            candidates.append(value)
+    return tuple(candidates[:8])
 
 _SCHEDULE_TRIGGER_RE = re.compile(
     r"(定时|提醒|闹钟|日程|每天|每日|每周|schedule|scheduled|remind|reminder|daily|weekly)",

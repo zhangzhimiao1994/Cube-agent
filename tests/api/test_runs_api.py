@@ -105,6 +105,41 @@ class StubRunService:
                 attachment_ids,
             )
         )
+        if "进化 darwin-skill" in message:
+            return SubmittedRun(
+                id=uuid4(),
+                tenant_id=tenant_id,
+                status=RunStatus.WAITING_APPROVAL,
+                mode=TaskMode.HYBRID,
+                decision_token="safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+                version=1,
+                clarification_reason="evolution_requires_user_confirmation",
+                conversation_id=conversation_id or "conv-test",
+                reference_conversation_id=reference_conversation_id,
+                evolution_proposal={
+                    "kind": "skill_optimization",
+                    "title": "Skill 进化任务",
+                    "objective": message,
+                    "mode": "hybrid",
+                    "source_skill_ids": ["darwin-skill"],
+                    "source_conversation_id": conversation_id or "conv-test",
+                    "source_run_id": None,
+                    "target_artifact_type": "skill",
+                    "baseline_agent_id": "main-agent",
+                    "candidate_agent_ids": ["worker-agent", "reviewer-agent"],
+                    "evaluator_agent_id": "evaluator-agent",
+                    "approval_policy": "ask",
+                    "iteration_policy": "score_gated",
+                    "memory_policy": "summarize_between_rounds",
+                    "max_rounds": 5,
+                    "min_delta": 2.0,
+                    "budget_tokens": 200000,
+                    "budget_minutes": 120,
+                    "rubric": ["实测表现", "反例覆盖", "人工验收"],
+                    "summary": "主 Agent 判断这条消息适合进入进化任务。",
+                    "metadata": {"source": "chat_evolution_proposal", "requires_user_confirmation": "true"},
+                },
+            )
         status = RunStatus.WAITING_USER_MODE if mode is TaskMode.AUTO else RunStatus.QUEUED
         if status is RunStatus.QUEUED:
             self.enqueue_count += 1
@@ -407,6 +442,28 @@ def test_vibe_coding_submission_is_forwarded_when_system_switch_is_enabled() -> 
         )
     ]
 
+
+def test_evolution_proposal_is_returned_from_run_submission() -> None:
+    client, _, _ = _client()
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": "请进化 darwin-skill，做多轮迭代",
+            "mode": "auto",
+            "conversation_id": "conv-evolution-api",
+        },
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "waiting_approval"
+    assert body["clarification_reason"] == "evolution_requires_user_confirmation"
+    assert body["evolution_proposal"]["kind"] == "skill_optimization"
+    assert body["evolution_proposal"]["source_skill_ids"] == ["darwin-skill"]
+    assert body["evolution_proposal"]["baseline_agent_id"] == "main-agent"
+    assert body["evolution_proposal"]["source_conversation_id"] == "conv-evolution-api"
 
 def test_submission_forwards_selected_workflow_and_agents() -> None:
     client, service, principal = _client()

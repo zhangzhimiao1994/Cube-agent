@@ -508,6 +508,29 @@ const ScheduleProposalSchema = z.object({
   metadata: z.record(z.string(), z.string()),
 });
 
+const EvolutionProposalSchema = z.object({
+  kind: z.enum(["skill_distillation", "skill_optimization", "media_strategy", "academic_research", "custom"]),
+  title: z.string(),
+  objective: z.string(),
+  mode: z.enum(["auto", "direct", "dispatch", "discuss", "hybrid"]),
+  source_skill_ids: z.array(z.string()),
+  source_conversation_id: z.string().nullable().optional(),
+  source_run_id: z.string().nullable().optional(),
+  target_artifact_type: z.enum(["skill", "strategy", "research_gap", "paper_plan", "media_plan", "custom"]),
+  baseline_agent_id: z.string().nullable().optional(),
+  candidate_agent_ids: z.array(z.string()).default([]),
+  evaluator_agent_id: z.string().nullable().optional(),
+  approval_policy: z.enum(["ask", "auto", "manual"]),
+  iteration_policy: z.enum(["score_gated", "fixed_rounds", "manual_review"]),
+  memory_policy: z.enum(["none", "summarize_between_rounds", "full_ledger"]),
+  max_rounds: z.number(),
+  min_delta: z.number(),
+  budget_tokens: z.number(),
+  budget_minutes: z.number(),
+  rubric: z.array(z.string()),
+  summary: z.string(),
+  metadata: z.record(z.string(), z.string()),
+});
 const SubmittedRunSchema = z.object({
   id: z.string(),
   tenant_id: z.string(),
@@ -520,6 +543,7 @@ const SubmittedRunSchema = z.object({
   reference_conversation_id: z.string().nullable().optional(),
   temporary_agent_proposal: TemporaryAgentProposalSchema.nullable().optional(),
   schedule_proposal: ScheduleProposalSchema.nullable().optional(),
+  evolution_proposal: EvolutionProposalSchema.nullable().optional(),
 });
 
 export type SubmittedRun = z.infer<typeof SubmittedRunSchema>;
@@ -562,6 +586,7 @@ const RunDetailSchema = RunListItemSchema.extend({
   decision_token: z.string().nullable().optional(),
   temporary_agent_proposal: TemporaryAgentProposalSchema.nullable().optional(),
   schedule_proposal: ScheduleProposalSchema.nullable().optional(),
+  evolution_proposal: EvolutionProposalSchema.nullable().optional(),
 });
 
 const RunDeleteSchema = z.object({

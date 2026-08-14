@@ -414,6 +414,44 @@ describe("operational management pages", () => {
               clarification_reason: "routing_requires_user_choice",
             });
           }
+          if (message.includes("进化 darwin-skill")) {
+            return jsonResponse({
+              id: runId,
+              tenant_id: "33333333-3333-4333-8333-333333333333",
+              status: "waiting_approval",
+              mode: "hybrid",
+              decision_token: "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+              version: 1,
+              clarification_reason: "evolution_requires_user_confirmation",
+              conversation_id: typeof body.conversation_id === "string" ? body.conversation_id : null,
+              evolution_proposal: {
+                kind: "skill_optimization",
+                title: "Skill 进化任务",
+                objective: message,
+                mode: "hybrid",
+                source_skill_ids: ["darwin-skill"],
+                source_conversation_id: typeof body.conversation_id === "string" ? body.conversation_id : null,
+                source_run_id: null,
+                target_artifact_type: "skill",
+                baseline_agent_id: "main-agent",
+                candidate_agent_ids: ["worker-agent", "reviewer-agent"],
+                evaluator_agent_id: "evaluator-agent",
+                approval_policy: "ask",
+                iteration_policy: "score_gated",
+                memory_policy: "summarize_between_rounds",
+                max_rounds: 5,
+                min_delta: 2,
+                budget_tokens: 200000,
+                budget_minutes: 120,
+                rubric: ["实测表现", "反例覆盖", "人工验收"],
+                summary: "主 Agent 判断这条消息适合进入进化任务。",
+                metadata: {
+                  source: "chat_evolution_proposal",
+                  requires_user_confirmation: "true",
+                },
+              },
+            });
+          }
           if (message.includes("每天9点提醒")) {
             return jsonResponse({
               id: runId,
@@ -1061,6 +1099,36 @@ describe("operational management pages", () => {
       }),
     );
     expect(await screen.findByText(/已加入计划/)).not.toBeNull();
+  });
+  it("creates an evolution run from a chat-detected evolution plan after user confirmation", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "请进化 darwin-skill，做多轮迭代");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(await screen.findByRole("status", { name: "进化任务确认" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "加入进化" }));
+
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === "/api/v1/admin/evolution-runs" && request.method === "POST")).toMatchObject({
+        body: {
+          kind: "skill_optimization",
+          title: "Skill 进化任务",
+          objective: "请进化 darwin-skill，做多轮迭代",
+          mode: "hybrid",
+          source_skill_ids: ["darwin-skill"],
+          target_artifact_type: "skill",
+          baseline_agent_id: "main-agent",
+          evaluator_agent_id: "evaluator-agent",
+          approval_policy: "ask",
+          iteration_policy: "score_gated",
+          memory_policy: "summarize_between_rounds",
+        },
+      }),
+    );
+    expect(await screen.findByText(/已加入进化/)).not.toBeNull();
   });
   it("clears failed attachment upload state and allows retrying the same file", async () => {
     failNextAttachmentUpload = true;
@@ -1728,7 +1796,7 @@ describe("operational management pages", () => {
     expect(chatConsole?.className).toContain("history-drawer-open");
     expect(screen.getByRole("navigation", { name: "会话导航" })).not.toBeNull();
     expect(screen.getByRole("button", { name: /进入会话 22222222/ })).not.toBeNull();
-    expect(screen.getByRole("button", { name: "关闭历史对话" })).not.toBeNull();
+    expect(screen.getAllByRole("button", { name: "关闭历史对话" }).length).toBeGreaterThan(0);
 
     await user.click(screen.getByRole("button", { name: "打开导航栏" }));
     expect(chatConsole?.className).not.toContain("history-drawer-open");

@@ -278,6 +278,7 @@ class RunDetailResponse(RunListItem):
     decision_token: str | None = None
     temporary_agent_proposal: dict[str, JsonValue] | None = None
     schedule_proposal: dict[str, JsonValue] | None = None
+    evolution_proposal: dict[str, JsonValue] | None = None
 
 
 class RunDebugArtifactResponse(BaseModel):
@@ -2996,6 +2997,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             decision_token=_waiting_mode_decision_token(record),
             temporary_agent_proposal=_temporary_agent_proposal(record.routing_decision),
             schedule_proposal=_schedule_proposal(record.routing_decision),
+            evolution_proposal=_evolution_proposal(record.routing_decision),
         )
 
     async def list_models(self) -> tuple[ModelDeploymentResponse, ...]:
@@ -5530,6 +5532,17 @@ def _temporary_agent_proposal(
             safe[key] = tuple(item for item in value if isinstance(item, str))
     return safe or None
 
+
+
+def _evolution_proposal(
+    routing_decision: Mapping[str, object] | None,
+) -> dict[str, JsonValue] | None:
+    if routing_decision is None:
+        return None
+    proposal = routing_decision.get("evolution_proposal")
+    if not isinstance(proposal, dict):
+        return None
+    return cast(dict[str, JsonValue], proposal)
 
 def _schedule_proposal(
     routing_decision: dict[str, object] | None,

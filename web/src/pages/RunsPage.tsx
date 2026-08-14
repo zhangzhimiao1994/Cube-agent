@@ -35,6 +35,7 @@ type ChatAttachmentDraft = {
 };
 type TemporaryAgentProposal = NonNullable<SubmittedRun["temporary_agent_proposal"]>;
 type ScheduleProposal = NonNullable<SubmittedRun["schedule_proposal"]>;
+type EvolutionProposal = NonNullable<SubmittedRun["evolution_proposal"]>;
 type RunSubmissionOverride = {
   message?: string;
   directModel?: string;
@@ -537,6 +538,54 @@ function scheduleApprovalFromRunDetail(run: RunDetail | undefined) {
   };
 }
 
+function evolutionApprovalFromRunDetail(run: RunDetail | undefined) {
+  if (!run || run.status !== "waiting_approval" || !run.evolution_proposal) return null;
+  return {
+    runId: run.id,
+    proposal: run.evolution_proposal,
+    createdEvolutionId: null,
+  };
+}
+
+function evolutionProposalBody(proposal: EvolutionProposal) {
+  const skills = proposal.source_skill_ids.length > 0 ? proposal.source_skill_ids.join("、") : "由主 Agent 在确认后补齐";
+  const candidates = proposal.candidate_agent_ids.length > 0 ? proposal.candidate_agent_ids.join("、") : "由主 Agent 调度";
+  return [
+    proposal.summary,
+    `任务目标：${proposal.objective}`,
+    `任务类型：${proposal.kind}`,
+    `来源 Skill：${skills}`,
+    `基准 agent：${proposal.baseline_agent_id ?? "主 Agent 判断"}`,
+    `候选 agent：${candidates}`,
+    `评测 agent：${proposal.evaluator_agent_id ?? "主 Agent 判断"}`,
+    `迭代策略：${proposal.iteration_policy}；记忆策略：${proposal.memory_policy}`,
+  ].join("\n\n");
+}
+
+function evolutionProposalCreatePayload(proposal: EvolutionProposal) {
+  return {
+    kind: proposal.kind,
+    title: proposal.title,
+    objective: proposal.objective,
+    mode: proposal.mode,
+    source_skill_ids: proposal.source_skill_ids,
+    source_conversation_id: proposal.source_conversation_id ?? null,
+    source_run_id: proposal.source_run_id ?? null,
+    target_artifact_type: proposal.target_artifact_type,
+    baseline_agent_id: proposal.baseline_agent_id ?? null,
+    candidate_agent_ids: proposal.candidate_agent_ids,
+    evaluator_agent_id: proposal.evaluator_agent_id ?? null,
+    approval_policy: proposal.approval_policy,
+    iteration_policy: proposal.iteration_policy,
+    memory_policy: proposal.memory_policy,
+    max_rounds: proposal.max_rounds,
+    min_delta: proposal.min_delta,
+    budget_tokens: proposal.budget_tokens,
+    budget_minutes: proposal.budget_minutes,
+    rubric: proposal.rubric,
+  };
+}
+
 function scheduleProposalBody(proposal: ScheduleProposal) {
   return [
     "主 Agent 判断这条消息更像计划任务。请先确认计划，再加入日程；加入后由系统计划任务按时间提交普通运行。",
@@ -643,6 +692,16 @@ function detailMessages(detail: RunDetail | undefined) {
             role: "assistant",
             title: "计划任务确认",
             body: scheduleProposalBody(detail.schedule_proposal),
+          },
+        ]
+      : []),
+    ...(detail.status === "waiting_approval" && detail.evolution_proposal
+      ? [
+          {
+            id: `${detail.id}-evolution-approval`,
+            role: "assistant",
+            title: "进化任务确认",
+            body: evolutionProposalBody(detail.evolution_proposal),
           },
         ]
       : []),
@@ -1224,6 +1283,11 @@ export function RunsPage() {
     proposal: ScheduleProposal;
     createdScheduleId: string | null;
   } | null>(null);
+  const [evolutionApproval, setEvolutionApproval] = useState<{
+    runId: string;
+    proposal: EvolutionProposal;
+    createdEvolutionId: string | null;
+  } | null>(null);
   const userSelectedMode = useRef(false);
   const trimmedReferenceConversationId = referenceConversationId.trim();
   const handoffActive = Boolean(trimmedReferenceConversationId);
@@ -1316,6 +1380,7 @@ export function RunsPage() {
     if (approval) {
       setModeSelection(null);
       setScheduleApproval(null);
+      setEvolutionApproval(null);
       setTemporaryApproval((current) =>
         current &&
         current.runId === approval.runId &&
@@ -1329,8 +1394,18 @@ export function RunsPage() {
     if (proposedSchedule) {
       setModeSelection(null);
       setTemporaryApproval(null);
+      setEvolutionApproval(null);
       setScheduleApproval((current) =>
         current && current.runId === proposedSchedule.runId ? current : proposedSchedule,
+      );
+    }
+    const proposedEvolution = evolutionApprovalFromRunDetail(selectedRun.data);
+    if (proposedEvolution) {
+      setModeSelection(null);
+      setTemporaryApproval(null);
+      setScheduleApproval(null);
+      setEvolutionApproval((current) =>
+        current && current.runId === proposedEvolution.runId ? current : proposedEvolution,
       );
     }
   }, [modeSelection, selectedRun.data, temporaryApproval]);
@@ -1394,6 +1469,7 @@ export function RunsPage() {
       if (selection && submittedMode !== "auto") {
         setTemporaryApproval(null);
         setScheduleApproval(null);
+        setEvolutionApproval(null);
         setModeSelection(null);
         setSubmitNotice(`已按你选择的“${displayMode(submittedMode)}”继续，不再重复确认模式。`);
         const continued = await api.chooseMode(run.id, {
@@ -1418,9 +1494,16 @@ export function RunsPage() {
         setTemporaryApproval(null);
         setScheduleApproval({ runId: run.id, proposal: run.schedule_proposal, createdScheduleId: null });
         setSubmitNotice("主 Agent 已识别为计划任务，确认后会加入计划任务列表。");
+      } else if (run.evolution_proposal) {
+        setModeSelection(null);
+        setTemporaryApproval(null);
+        setScheduleApproval(null);
+        setEvolutionApproval({ runId: run.id, proposal: run.evolution_proposal, createdEvolutionId: null });
+        setSubmitNotice("主 Agent 已识别为进化任务，确认后会加入进化记录。");
       } else if (run.temporary_agent_proposal && run.decision_token) {
         setModeSelection(null);
         setScheduleApproval(null);
+        setEvolutionApproval(null);
         setTemporaryApproval({
           runId: run.id,
           decisionToken: run.decision_token,
@@ -1433,11 +1516,13 @@ export function RunsPage() {
       } else if (selection) {
         setTemporaryApproval(null);
         setScheduleApproval(null);
+        setEvolutionApproval(null);
         setModeSelection(selection);
         setSubmitNotice("主 Agent 对这轮回复的模式判断不够确定，请直接在输入框回复编号或关键词继续。");
       } else {
         setTemporaryApproval(null);
         setScheduleApproval(null);
+        setEvolutionApproval(null);
         setModeSelection(null);
         setSubmitNotice(explainActualMode(run));
       }
@@ -1498,6 +1583,19 @@ export function RunsPage() {
       );
       setSubmitNotice(`已加入计划：${schedule.name}。到计划任务页面可以查看、删除或等待系统自动触发。`);
       await queryClient.invalidateQueries({ queryKey: ["schedules"] });
+    },
+  });
+  const createEvolutionFromProposal = useMutation({
+    mutationFn: () => {
+      if (!evolutionApproval) throw new Error("evolution approval is unavailable");
+      return api.createEvolutionRun(evolutionProposalCreatePayload(evolutionApproval.proposal));
+    },
+    onSuccess: async (run) => {
+      setEvolutionApproval((current) =>
+        current ? { ...current, createdEvolutionId: run.id } : current,
+      );
+      setSubmitNotice(`已加入进化：${run.title}。到进化页面可以审批、登记轮次和查看结果。`);
+      await queryClient.invalidateQueries({ queryKey: ["evolution-runs"] });
     },
   });
   const promoteTemporaryAgent = useMutation({
@@ -1933,16 +2031,45 @@ export function RunsPage() {
         <span>3 · 设置 / 详情</span>
       </div>
 
+      <button
+        type="button"
+        className="conversation-drawer-trigger"
+        aria-label={historyOpen ? "关闭历史对话" : "打开历史对话"}
+        aria-expanded={historyOpen}
+        onClick={() => {
+          const next = !historyOpen;
+          if (next) window.dispatchEvent(new Event("agent-hub:close-mobile-nav"));
+          setHistoryOpen(next);
+        }}
+      >
+        <span className="mobile-nav-trigger-icon" aria-hidden="true">
+          <span />
+          <span />
+          <span />
+        </span>
+      </button>
+
       <div className={`chat-console${historyOpen ? " history-drawer-open" : ""}`}>
+        <button
+          type="button"
+          className="conversation-drawer-backdrop"
+          aria-label="关闭历史对话"
+          onClick={() => setHistoryOpen(false)}
+        />
         <nav className="conversation-list" aria-label="会话导航">
           <div className="conversation-list-header">
             <div>
               <h3>会话</h3>
               <span>{items.length} 条</span>
             </div>
-            <button type="button" className="secondary-action conversation-new-button" aria-label="新建对话" onClick={startNewConversation}>
-              新建
-            </button>
+            <div className="conversation-list-actions">
+              <button type="button" className="secondary-action conversation-new-button" aria-label="新建对话" onClick={startNewConversation}>
+                新建
+              </button>
+              <button type="button" className="conversation-close-button" aria-label="关闭历史对话" onClick={() => setHistoryOpen(false)}>
+                ×
+              </button>
+            </div>
           </div>
           {items.length > 0 ? (
             <div className="bulk-action-bar conversation-bulk-actions">
@@ -2189,19 +2316,6 @@ export function RunsPage() {
                 <button type="button" className="secondary-action" aria-label="新建对话" onClick={startNewConversation}>
                   新建
                 </button>
-                <button
-                  type="button"
-                  className="secondary-action"
-                  aria-label={historyOpen ? "关闭历史对话" : "打开历史对话"}
-                  aria-pressed={historyOpen}
-                  onClick={() => {
-                    const next = !historyOpen;
-                    if (next) window.dispatchEvent(new Event("agent-hub:close-mobile-nav"));
-                    setHistoryOpen(next);
-                  }}
-                >
-                  历史
-                </button>
               </div>
             </div>
             {showModeEntry ? (
@@ -2314,6 +2428,28 @@ export function RunsPage() {
             ) : null}
             {createScheduleFromProposal.isError ? (
               <p role="alert">{formatApiError(createScheduleFromProposal.error, "计划任务创建失败")}</p>
+            ) : null}
+            {evolutionApproval ? (
+              <aside className="composer-attachment-card" role="status" aria-label="进化任务确认">
+                <div>
+                  <span className="eyebrow">{evolutionApproval.createdEvolutionId ? "进化任务已加入" : "进化任务待确认"}</span>
+                  <strong>{evolutionApproval.proposal.title}</strong>
+                  <small>{evolutionApproval.proposal.summary}</small>
+                </div>
+                <p>{evolutionApproval.proposal.objective}</p>
+                {evolutionApproval.createdEvolutionId ? (
+                  <Link to="/evolution" className="secondary-action">
+                    查看进化任务
+                  </Link>
+                ) : (
+                  <button type="button" onClick={() => createEvolutionFromProposal.mutate()} disabled={createEvolutionFromProposal.isPending}>
+                    {createEvolutionFromProposal.isPending ? "加入中..." : "加入进化"}
+                  </button>
+                )}
+              </aside>
+            ) : null}
+            {createEvolutionFromProposal.isError ? (
+              <p role="alert">{formatApiError(createEvolutionFromProposal.error, "进化任务创建失败")}</p>
             ) : null}
             {scheduleApproval ? (
               <aside className="composer-attachment-card" role="status" aria-label="计划任务确认">

@@ -4049,3 +4049,43 @@ Remaining risks / next:
 
 - Commit this slice, create local ignored recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
 - Continue P3 after green: platform-specific OpenClaw desktop/screen drivers, broader UI copy/layout audit, missing button/function sweep, final README refresh if later modules change, and Docker readiness later.
+
+## 2026-08-14 Chat-Triggered Evolution Plan + Right History Drawer
+
+Current state:
+
+- Chat submission can now recognize evolution/distillation intent such as `请进化 darwin-skill，做多轮迭代` and creates a `waiting_approval` run with `clarification_reason=evolution_requires_user_confirmation` instead of enqueueing immediately.
+- The run response and admin run detail now expose `evolution_proposal`, including target skill ids, baseline/candidate/evaluator agents, approval policy, score-gated iteration policy, memory policy, budgets, rubric, and source conversation id.
+- The conversation UI now shows an `进化任务确认` card after the main agent identifies an evolution task. Clicking `加入进化` creates a real evolution run from the proposal and links to the evolution page.
+- The conversation history entry is now a dedicated right-side floating trigger using the same three-line button structure as the left mobile navigation trigger. It opens a right overlay drawer with its own close button and backdrop, closes the left navigation when opened, and no longer occupies the chat toolbar.
+- Mobile history drawer height now stays usable instead of being compressed to a short list.
+
+Local verification:
+
+- `uv run pytest tests\unit\runs\test_temporary_agent.py tests\api\test_runs_api.py -q -k "evolution or schedule_intent or selected_workflow" --tb=short` -> 4 passed, 28 deselected.
+- `uv run ruff check src\agent_hub\runs\service.py src\agent_hub\api\routers\runs.py src\agent_hub\api\routers\admin.py tests\unit\runs\test_temporary_agent.py tests\api\test_runs_api.py` -> passed.
+- `uv run mypy --strict src\agent_hub\runs\service.py src\agent_hub\api\routers\runs.py src\agent_hub\api\routers\admin.py tests\unit\runs\test_temporary_agent.py tests\api\test_runs_api.py` -> passed.
+- `npm run lint` -> passed.
+- `npm run test -- --run src/pages/OperationalPages.test.tsx -t "opens conversation history as a right drawer"` -> 1 passed.
+- `npm run test -- --run src/pages/OperationalPages.test.tsx` -> 54 passed.
+- `npm run build` -> passed with the existing Vite large chunk warning.
+- `git diff --check` -> passed with CRLF normalization warnings only.
+
+Remaining risks / next:
+
+- Deploy this slice incrementally to `103.236.98.133`, run real server probes for chat-detected evolution creation and deployed right-drawer frontend bundle markers, then commit, archive, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
+- After this slice is green, continue the broader evolution module work and then the remaining OpenClaw desktop/scheduled-control follow-ups, UI copy/layout audit, missing button/function sweep, README/README.zh-CN refresh, and Docker readiness later.
+Server deployment and real verification for Chat-Triggered Evolution Plan + Right History Drawer:
+
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-chat-evolution-right-drawer-20260814-182340.tgz`.
+- Uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed incrementally into `/opt/agent-hub/current`.
+- Server backup path: `/opt/agent-hub/backups/chat-evolution-right-drawer-20260814-102419`.
+- Synced `src/agent_hub/runs/service.py`, `src/agent_hub/api/routers/runs.py`, and `src/agent_hub/api/routers/admin.py` into the active production venv site-packages, restarted `agent-hub-api` and `agent-hub-worker`, and reloaded Caddy.
+- Verified deployed server source and active venv both contain `evolution_requires_user_confirmation`.
+- Verified deployed frontend bundle contains the right history drawer trigger styling and evolution confirmation UI markers.
+- Real server probe used the actual API path `http://127.0.0.1/api/v1` with a short-lived super-admin JWT generated on the server without printing secrets.
+- Probe submitted `请进化 darwin-skill，做多轮迭代` as a real chat run, confirmed `waiting_approval`, `clarification_reason=evolution_requires_user_confirmation`, `source_skill_ids=[darwin-skill]`, `baseline_agent_id=main-agent`, and `memory_policy=summarize_between_rounds`.
+- Probe fetched real admin run detail and verified `evolution_proposal` persisted on the waiting-approval run.
+- Probe created a real evolution run from the proposal through `POST /api/v1/admin/evolution-runs`, verified it was pending approval with `next_action=request_approval`, listed it back, then cleaned the probe evolution record and waiting run.
+- Probe output: `{"status": "ok", "checked": ["chat_submit", "admin_detail", "evolution_create", "frontend_bundle_deployed"], "probe_evolution_records": 0}`.
+- Removed `/tmp/evolution_chat_proposal_check.py` and `/tmp/agent-hub-p3-runtime-incremental.tgz`; `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.
