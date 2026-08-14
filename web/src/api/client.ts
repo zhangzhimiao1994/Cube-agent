@@ -1,4 +1,4 @@
-import { z } from "zod";
+﻿import { z } from "zod";
 
 const PrincipalSchema = z.object({
   user_id: z.string(),
@@ -221,6 +221,14 @@ const WorkflowResourceSchema = NamedResourceSchema.extend({
 
 export type WorkflowResource = z.infer<typeof WorkflowResourceSchema>;
 
+const OpenClawRemoteAdapterConfigSchema = z.object({
+  platform: z.enum(["linux", "windows", "macos"]),
+  target_type: z.enum(["server", "computer", "desktop", "filesystem", "screen"]),
+  target: z.string(),
+  base_url: z.string(),
+  credential_ref: z.string(),
+});
+
 const SystemSettingsSchema = z.object({
   default_mode: z.enum(["auto", "direct", "dispatch", "discuss", "hybrid"]),
   default_workflow_id: z.string().nullable(),
@@ -236,6 +244,7 @@ const SystemSettingsSchema = z.object({
   openclaw_enabled: z.boolean().default(false),
   openclaw_mode: z.enum(["ask", "read_only", "auto_review", "trusted_auto"]).default("ask"),
   openclaw_allowed_commands: z.array(z.array(z.string())).default([]),
+  openclaw_remote_adapters: z.array(OpenClawRemoteAdapterConfigSchema).default([]),
   temporary_agent_policy: z.string().default(
     "主 Agent 发现角色池缺少必要能力时，必须先说明原因并取得用户确认，再临时加入子 Agent。",
   ),

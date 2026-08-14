@@ -1,10 +1,13 @@
-import asyncio
+﻿import asyncio
 import io
+import json
 import sys
 import tarfile
+import threading
 import zipfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, cast
 from urllib.parse import quote
 from uuid import UUID, uuid4
@@ -539,6 +542,129 @@ def test_openclaw_execute_returns_adapter_unavailable_for_windows_command() -> N
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "openclaw_adapter_unavailable"
+
+
+def test_openclaw_execute_uses_configured_remote_windows_adapter() -> None:
+    adapter_calls: list[dict[str, object]] = []
+
+    class AdapterHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            adapter_calls.append(
+                {
+                    "path": self.path,
+                    "authorization": self.headers.get("Authorization"),
+                    "body": body,
+                }
+            )
+            payload = json.dumps(
+                {
+                    "exit_code": 0,
+                    "stdout": "windows-adapter-ok\n",
+                    "stderr": "",
+                    "truncated": False,
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), AdapterHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        api = client()
+        secret = api.post(
+            "/api/v1/admin/secrets",
+            headers=headers(),
+            json={"label": "openclaw-windows-adapter", "value": "sk-live"},
+        )
+        assert secret.status_code == 200
+        payload = api.get("/api/v1/admin/settings", headers=headers()).json()
+        payload["openclaw_enabled"] = True
+        payload["openclaw_mode"] = "ask"
+        payload["openclaw_allowed_commands"] = [["whoami"]]
+        payload["openclaw_remote_adapters"] = [
+            {
+                "platform": "windows",
+                "target_type": "server",
+                "target": "desktop",
+                "base_url": f"http://127.0.0.1:{server.server_port}",
+                "credential_ref": secret.json()["ref"],
+            }
+        ]
+        assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+
+        adapters = api.get("/api/v1/admin/openclaw/adapters", headers=headers()).json()
+        windows_command = next(
+            item for item in adapters if item["platform"] == "windows" and item["kind"] == "server_command"
+        )
+        assert windows_command["status"] == "available"
+
+        session = api.post(
+            "/api/v1/admin/openclaw/sessions",
+            headers=headers(),
+            json={
+                "platform": "windows",
+                "target_type": "server",
+                "target": "desktop",
+                "purpose": "keep the configured Windows adapter bounded to this host",
+            },
+        )
+        assert session.status_code == 201
+        assert session.json()["status"] == "active"
+
+        created = api.post(
+            "/api/v1/admin/openclaw/operations",
+            headers=headers(),
+            json={
+                "platform": "windows",
+                "kind": "server_command",
+                "target": "desktop",
+                "argv": ["whoami"],
+                "risk_level": "low",
+                "reason": "execute through the configured Windows adapter",
+                "session_id": session.json()["id"],
+            },
+        )
+        assert created.status_code == 202
+        operation_id = created.json()["id"]
+        assert api.patch(
+            f"/api/v1/admin/openclaw/operations/{operation_id}",
+            headers=headers(),
+            json={"decision": "approve"},
+        ).status_code == 200
+
+        executed = api.post(f"/api/v1/admin/openclaw/operations/{operation_id}/execute", headers=headers())
+
+        assert executed.status_code == 200
+        assert executed.json()["stdout"] == "windows-adapter-ok\n"
+        assert adapter_calls == [
+            {
+                "path": "/v1/openclaw/execute",
+                "authorization": "Bearer sk-live",
+                "body": {
+                    "operation_id": operation_id,
+                    "platform": "windows",
+                    "kind": "server_command",
+                    "target": "desktop",
+                    "argv": ["whoami"],
+                    "risk_level": "low",
+                    "reason": "execute through the configured Windows adapter",
+                    "session_id": session.json()["id"],
+                },
+            }
+        ]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_openclaw_operation_can_bind_to_active_session() -> None:
@@ -3372,4 +3498,3 @@ async def test_persistent_admin_secret_uses_sealed_secret_service() -> None:
     assert reference.ref == f"secret://{SECRET_ID}"
     assert reference.last_four == "1234"
     assert secrets.values == ["sk-live-1234"]
-

@@ -3334,3 +3334,58 @@ Remaining risks / next:
 - Push `main` with `git push --force-with-lease mutilagent main`.
 - Check GitHub Actions and fix/redeploy/repush if red.
 - Continue P3 with OpenClaw system integration and the remaining project-completion tasks.
+
+## 2026-08-14 OpenClaw Remote Adapter Contract
+
+Current state:
+
+- OpenClaw keeps the existing local Linux server command execution path.
+- OpenClaw now also supports configured remote adapters for non-local platforms/targets, including Windows.
+- Remote adapters are configured in system settings as `openclaw_remote_adapters` with `platform`, `target_type`, `target`, `base_url`, and `credential_ref`.
+- Adapter tokens are resolved from the sealed secret service at execution time; settings store only the secret reference.
+- Remote execution still requires the OpenClaw global switch, a valid approval state, read-only mode checks, active bound session checks, and exact argv allowlist checks for `server_command` operations.
+- The remote adapter HTTP contract is `POST {base_url}/v1/openclaw/execute` with `Authorization: Bearer <resolved-token>` and a bounded operation payload. The adapter returns `exit_code`, `stdout`, `stderr`, and `truncated`.
+- This makes Windows/local-computer OpenClaw viable through a dedicated Windows adapter service. It does not mean the Linux server can directly operate a Windows desktop without that adapter running on the Windows side.
+
+Changes made:
+
+- Added `agent_hub.openclaw.remote_adapter` for authenticated HTTP adapter execution and response validation.
+- Added `OpenClawRemoteAdapterSettings` and `openclaw_remote_adapters` to system settings.
+- Updated OpenClaw adapter status listing to mark configured remote adapters as available.
+- Updated OpenClaw session creation so configured remote adapter targets can become active sessions.
+- Updated OpenClaw execution to route non-local operations through configured remote adapters and resolve adapter bearer tokens through the secret service.
+- Added settings UI support for editing remote adapter JSON.
+- Added backend and frontend regression coverage for configured remote Windows adapter execution/configuration.
+
+Local verification:
+
+- TDD red check first failed with HTTP 422 because `openclaw_remote_adapters` was not accepted by system settings.
+- `uv run pytest tests/api/test_admin_resources.py::test_openclaw_execute_uses_configured_remote_windows_adapter -q --tb=short` -> passed.
+- `uv run pytest tests/api/test_admin_resources.py -q -k "openclaw" --tb=short` -> 19 passed.
+- `uv run pytest tests/api/test_admin_resources.py -q --tb=short` -> 94 passed.
+- `uv run mypy --strict src/agent_hub/api/routers/admin.py src/agent_hub/openclaw/remote_adapter.py tests/api/test_admin_resources.py` -> passed.
+- `uv run ruff check src/agent_hub/api/routers/admin.py src/agent_hub/openclaw/remote_adapter.py tests/api/test_admin_resources.py` -> passed.
+- `npm.cmd run lint` -> passed.
+- `npm.cmd run test -- --run` -> 105 passed.
+- `npm.cmd run build` -> passed, with the existing Vite chunk-size warning.
+
+Server deployment and verification:
+
+- Uploaded incremental package to `103.236.98.133:/tmp/agent-hub-openclaw-remote-adapter.tgz`.
+- Deployed into `/opt/agent-hub/current`, restarted `agent-hub-api` and `agent-hub-worker`, reloaded Caddy, and verified all three services were active.
+- Ran `/tmp/server_openclaw_remote_adapter_check.py` through the real deployed API with `/etc/agent-hub/secrets.env` loaded.
+- The server verification started a real temporary HTTP OpenClaw adapter listener on `127.0.0.1`, configured it through the system settings API using a sealed secret ref, created an active Windows session, created and approved a bound Windows `server_command`, executed it through the adapter, verified the adapter received the bearer token and full operation payload, restored settings, and cleaned probe OpenClaw/secret records.
+- Verification output checked:
+  - `configured_windows_remote_adapter_available`;
+  - `windows_remote_session_active`;
+  - `approved_operation_executed_via_real_http_adapter`;
+  - `adapter_token_resolved_from_secret_ref`.
+
+Remaining risks / next:
+
+- A real Windows desktop adapter executable/service still needs to be implemented and installed on the Windows host before OpenClaw can operate an actual Windows GUI.
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote main.
+- Push `main` with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue P3 with the remaining project-completion tasks, including UI layout/text cleanup and final usage README.

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import hashlib
 import io
@@ -8,7 +8,7 @@ import re
 import stat
 import tarfile
 import zipfile
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -47,6 +47,11 @@ from agent_hub.openclaw.executor import (
     OpenClawCommandResult,
     openclaw_command_allowed,
     run_openclaw_command,
+)
+from agent_hub.openclaw.remote_adapter import (
+    OpenClawRemoteAdapter,
+    OpenClawRemoteAdapterError,
+    run_remote_openclaw_operation,
 )
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRecord, RunRepository
 from agent_hub.runtime.contracts import JsonValue
@@ -566,6 +571,27 @@ class LogEntryResponse(BaseModel):
     created_at: datetime
 
 
+class OpenClawRemoteAdapterSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    platform: str = Field(pattern=r"^(linux|windows|macos)$")
+    target_type: str = Field(pattern=r"^(server|computer|desktop|filesystem|screen)$")
+    target: str = Field(min_length=1, max_length=256)
+    base_url: str = Field(min_length=1, max_length=2048)
+    credential_ref: str = Field(min_length=1, max_length=128)
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("OpenClaw adapter URL must be an HTTP(S) URL")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("OpenClaw adapter URL must not contain credentials, query, or fragment")
+        normalized_path = parsed.path.rstrip("/")
+        return urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))
+
+
 class SystemSettingsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -586,6 +612,7 @@ class SystemSettingsRequest(BaseModel):
     openclaw_enabled: bool = False
     openclaw_mode: str = Field(default="ask", pattern=r"^(ask|read_only|auto_review|trusted_auto)$")
     openclaw_allowed_commands: list[list[str]] = Field(default_factory=list, max_length=64)
+    openclaw_remote_adapters: list[OpenClawRemoteAdapterSettings] = Field(default_factory=list, max_length=32)
     temporary_agent_policy: str = Field(
         default="主 Agent 发现角色池缺少必要能力时，必须先说明原因并取得用户确认，再临时加入子 Agent。",
         max_length=10_000,
@@ -916,13 +943,83 @@ def _openclaw_can_auto_approve(request: OpenClawOperationRequest, settings: Syst
     return openclaw_command_allowed(request.argv, settings.openclaw_allowed_commands)
 
 
-def _openclaw_adapter_responses() -> tuple[OpenClawAdapterResponse, ...]:
-    target_types = {
+def _openclaw_operation_target_types(kind: str) -> frozenset[str]:
+    if kind == "server_command":
+        return frozenset({"server"})
+    if kind == "desktop_action":
+        return frozenset({"computer", "desktop"})
+    if kind == "screen_read":
+        return frozenset({"computer", "desktop", "screen"})
+    if kind == "file_read":
+        return frozenset({"computer", "filesystem", "server"})
+    return frozenset()
+
+
+def _openclaw_default_target_type(kind: str) -> str:
+    return {
         "server_command": "server",
         "desktop_action": "desktop",
         "screen_read": "screen",
         "file_read": "filesystem",
-    }
+    }[kind]
+
+
+def _remote_adapter_host(adapter: OpenClawRemoteAdapterSettings) -> str:
+    parsed = urlsplit(adapter.base_url)
+    return parsed.netloc or f"remote-{adapter.platform}-host"
+
+
+def _configured_openclaw_adapter_for_kind(
+    settings: SystemSettingsResponse,
+    *,
+    platform: str,
+    kind: str,
+) -> OpenClawRemoteAdapterSettings | None:
+    target_types = _openclaw_operation_target_types(kind)
+    return next(
+        (
+            adapter
+            for adapter in settings.openclaw_remote_adapters
+            if adapter.platform == platform and adapter.target_type in target_types
+        ),
+        None,
+    )
+
+
+def _configured_openclaw_adapter_for_operation(
+    settings: SystemSettingsResponse,
+    request: OpenClawOperationRequest,
+) -> OpenClawRemoteAdapterSettings | None:
+    target_types = _openclaw_operation_target_types(request.kind)
+    return next(
+        (
+            adapter
+            for adapter in settings.openclaw_remote_adapters
+            if adapter.platform == request.platform
+            and adapter.target == request.target
+            and adapter.target_type in target_types
+        ),
+        None,
+    )
+
+
+def _configured_openclaw_adapter_for_session(
+    settings: SystemSettingsResponse,
+    request: OpenClawSessionRequest,
+) -> OpenClawRemoteAdapterSettings | None:
+    return next(
+        (
+            adapter
+            for adapter in settings.openclaw_remote_adapters
+            if adapter.platform == request.platform
+            and adapter.target == request.target
+            and adapter.target_type == request.target_type
+        ),
+        None,
+    )
+
+
+def _openclaw_adapter_responses(settings: SystemSettingsResponse | None = None) -> tuple[OpenClawAdapterResponse, ...]:
     descriptions = {
         ("linux", "server_command"): (
             "Runs exact allowlisted argv commands on the 魔方agent Linux server after approval."
@@ -942,31 +1039,46 @@ def _openclaw_adapter_responses() -> tuple[OpenClawAdapterResponse, ...]:
     adapters: list[OpenClawAdapterResponse] = []
     for platform in ("linux", "windows", "macos"):
         for kind in ("server_command", "desktop_action", "screen_read", "file_read"):
-            available = platform == "linux" and kind == "server_command"
-            host = "agent-hub-server" if platform == "linux" else f"remote-{platform}-host"
+            configured = None if settings is None else _configured_openclaw_adapter_for_kind(settings, platform=platform, kind=kind)
+            local_linux = platform == "linux" and kind == "server_command"
+            available = local_linux or configured is not None
+            if configured is not None:
+                host = _remote_adapter_host(configured)
+                description = (
+                    f"Uses configured remote OpenClaw adapter for {configured.target} at {host}; "
+                    "execution still requires policy approval and adapter authentication."
+                )
+            else:
+                host = "agent-hub-server" if platform == "linux" else f"remote-{platform}-host"
+                description = descriptions[(platform, kind)]
             adapters.append(
                 OpenClawAdapterResponse(
                     platform=platform,
                     kind=kind,
-                    target_type=target_types[kind],
+                    target_type=_openclaw_default_target_type(kind),
                     status="available" if available else "adapter_unavailable",
                     execution_host=host,
                     requires_user_approval=True,
                     supports_read_only=kind in {"screen_read", "file_read"},
-                    description=descriptions[(platform, kind)],
+                    description=description,
                 )
             )
     return tuple(adapters)
 
 
-def _openclaw_session_host(request: OpenClawSessionRequest) -> str:
+def _openclaw_session_host(request: OpenClawSessionRequest, settings: SystemSettingsResponse) -> str:
     if request.platform == "linux" and request.target_type == "server":
         return "agent-hub-server"
+    configured = _configured_openclaw_adapter_for_session(settings, request)
+    if configured is not None:
+        return _remote_adapter_host(configured)
     return f"remote-{request.platform}-host"
 
 
-def _openclaw_session_adapter_status(request: OpenClawSessionRequest) -> str:
-    return "available" if request.platform == "linux" and request.target_type == "server" else "adapter_unavailable"
+def _openclaw_session_adapter_status(request: OpenClawSessionRequest, settings: SystemSettingsResponse) -> str:
+    if request.platform == "linux" and request.target_type == "server":
+        return "available"
+    return "available" if _configured_openclaw_adapter_for_session(settings, request) is not None else "adapter_unavailable"
 
 
 def _openclaw_session_response(
@@ -975,9 +1087,10 @@ def _openclaw_session_response(
     request: OpenClawSessionRequest,
     actor: str,
     mode: str,
+    settings: SystemSettingsResponse,
 ) -> OpenClawSessionResponse:
     now = datetime.now(UTC)
-    adapter_status = _openclaw_session_adapter_status(request)
+    adapter_status = _openclaw_session_adapter_status(request, settings)
     return OpenClawSessionResponse(
         id=session_id,
         status="active" if adapter_status == "available" else "adapter_unavailable",
@@ -987,7 +1100,7 @@ def _openclaw_session_response(
         target_type=request.target_type,
         target=request.target,
         purpose=request.purpose,
-        execution_host=_openclaw_session_host(request),
+        execution_host=_openclaw_session_host(request, settings),
         requested_by=actor,
         created_at=now,
         updated_at=now,
@@ -1053,11 +1166,11 @@ def _validate_openclaw_session_for_operation(
             "openclaw_session_target_mismatch",
             "OpenClaw operation target does not match the control session",
         )
-    if request.kind == "server_command" and session.target_type != "server":
+    if session.target_type not in _openclaw_operation_target_types(request.kind):
         raise PublicAPIError(
             409,
             "openclaw_session_target_mismatch",
-            "OpenClaw server command requires a server control session",
+            "OpenClaw operation kind does not match the control session type",
         )
 
 
@@ -1078,6 +1191,7 @@ async def _execute_openclaw_operation(
     settings: SystemSettingsResponse,
     *,
     actor: str,
+    adapter_token_resolver: Callable[[str], Awaitable[str]] | None = None,
 ) -> tuple[OpenClawOperationResponse, OpenClawCommandResult]:
     if operation.status != "approved":
         raise PublicAPIError(
@@ -1091,20 +1205,55 @@ async def _execute_openclaw_operation(
     request = OpenClawOperationRequest.model_validate(operation.operation)
     if settings.openclaw_mode == "read_only" and request.kind not in {"screen_read", "file_read"}:
         raise PublicAPIError(403, "openclaw_read_only", "OpenClaw read-only mode blocks this operation")
-    if request.platform != "linux" or request.kind != "server_command":
-        raise PublicAPIError(
-            409,
-            "openclaw_adapter_unavailable",
-            "OpenClaw execution adapter is not available for this operation",
-        )
-    if not openclaw_command_allowed(request.argv, settings.openclaw_allowed_commands):
-        raise PublicAPIError(
-            403,
-            "openclaw_command_denied",
-            "OpenClaw command is not in the allowed command list",
-        )
 
-    result = await run_openclaw_command(request.argv)
+    if request.platform == "linux" and request.kind == "server_command":
+        if not openclaw_command_allowed(request.argv, settings.openclaw_allowed_commands):
+            raise PublicAPIError(
+                403,
+                "openclaw_command_denied",
+                "OpenClaw command is not in the allowed command list",
+            )
+        result = await run_openclaw_command(request.argv)
+    else:
+        adapter = _configured_openclaw_adapter_for_operation(settings, request)
+        if adapter is None:
+            raise PublicAPIError(
+                409,
+                "openclaw_adapter_unavailable",
+                "OpenClaw execution adapter is not available for this operation",
+            )
+        if request.kind == "server_command" and not openclaw_command_allowed(request.argv, settings.openclaw_allowed_commands):
+            raise PublicAPIError(
+                403,
+                "openclaw_command_denied",
+                "OpenClaw command is not in the allowed command list",
+            )
+        if adapter_token_resolver is None:
+            raise PublicAPIError(
+                409,
+                "openclaw_adapter_unavailable",
+                "OpenClaw adapter credentials are not available",
+            )
+        try:
+            adapter_token = await adapter_token_resolver(adapter.credential_ref)
+            result = await run_remote_openclaw_operation(
+                OpenClawRemoteAdapter(
+                    platform=adapter.platform,
+                    target_type=adapter.target_type,
+                    target=adapter.target,
+                    base_url=adapter.base_url,
+                ),
+                operation_id=operation.id,
+                operation=request.model_dump(),
+                bearer_token=adapter_token,
+            )
+        except (KeyError, SecretValidationError, OpenClawRemoteAdapterError):
+            raise PublicAPIError(
+                502,
+                "openclaw_adapter_failed",
+                "OpenClaw remote adapter execution failed",
+            ) from None
+
     execution: dict[str, object] = {
         "exit_code": result.exit_code,
         "stdout": result.stdout,
@@ -1117,7 +1266,6 @@ async def _execute_openclaw_operation(
         operation.model_copy(update={"status": "executed", "execution": execution}),
         result,
     )
-
 
 def _openclaw_execution_response(
     operation: OpenClawOperationResponse,
@@ -1406,6 +1554,7 @@ class AdminResourceService(Protocol):
         *,
         actor: str,
         mode: str,
+        settings: SystemSettingsResponse,
     ) -> OpenClawSessionResponse: ...
 
     async def list_openclaw_sessions(self) -> tuple[OpenClawSessionResponse, ...]: ...
@@ -1795,6 +1944,7 @@ def _tar_group_to_skill_archive(archive: tarfile.TarFile, entries: list[tuple[st
 class InMemoryAdminResourceService:
     models: dict[UUID, ModelDeploymentResponse] = field(default_factory=dict)
     secrets: dict[str, SecretReferenceResponse] = field(default_factory=dict)
+    secret_values: dict[str, str] = field(default_factory=dict)
     secret_fingerprints: set[str] = field(default_factory=set)
     draft_yaml: str = ""
     published_yaml: str = ""
@@ -1951,10 +2101,14 @@ class InMemoryAdminResourceService:
         ref = f"secret_{uuid4().hex}"
         response = SecretReferenceResponse(ref=ref, last_four=raw[-4:])
         self.secrets[ref] = response
+        self.secret_values[ref] = raw
         return response
 
     async def get_secret(self, ref: str) -> SecretReferenceResponse:
         return self.secrets[ref]
+
+    async def resolve_secret_value(self, ref: str) -> str:
+        return self.secret_values[ref]
 
     async def probe_concurrency(self, request: ProbeRequest) -> ProbeResponse:
         recommended = max(1, min(request.desired_concurrency, 8))
@@ -2294,7 +2448,12 @@ class InMemoryAdminResourceService:
         actor: str,
     ) -> OpenClawExecutionResponse:
         current = await self.get_openclaw_operation(operation_id)
-        updated, result = await _execute_openclaw_operation(current, settings, actor=actor)
+        updated, result = await _execute_openclaw_operation(
+            current,
+            settings,
+            actor=actor,
+            adapter_token_resolver=self.resolve_secret_value,
+        )
         self.openclaw_operations[operation_id] = updated
         await self.record_audit_event(
             actor=actor,
@@ -2310,6 +2469,7 @@ class InMemoryAdminResourceService:
         *,
         actor: str,
         mode: str,
+        settings: SystemSettingsResponse,
     ) -> OpenClawSessionResponse:
         session_id = f"openclaw_session_{uuid4().hex}"
         response = _openclaw_session_response(
@@ -2317,6 +2477,7 @@ class InMemoryAdminResourceService:
             request=request,
             actor=actor,
             mode=mode,
+            settings=settings,
         )
         self.openclaw_sessions[session_id] = response
         await self.record_audit_event(
@@ -2943,6 +3104,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         await self._record_audit("secret.create", "secret", {"label": request.label})
         return response
 
+    async def resolve_secret_value(self, ref: str) -> str:
+        return await self._secret_service.resolve(self._tenant_id, ref)
+
     async def list_agents(self) -> tuple[AgentResourceResponse, ...]:
         revision = await self._config_service.get_current(self._tenant_id)
         if revision is None:
@@ -3172,7 +3336,12 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         actor: str,
     ) -> OpenClawExecutionResponse:
         current = await self.get_openclaw_operation(operation_id)
-        updated, result = await _execute_openclaw_operation(current, settings, actor=actor)
+        updated, result = await _execute_openclaw_operation(
+            current,
+            settings,
+            actor=actor,
+            adapter_token_resolver=self.resolve_secret_value,
+        )
         if not await self._upsert_admin_payload("openclaw", operation_id, updated.model_dump(mode="json")):
             return await super().execute_openclaw_operation(operation_id, settings, actor=actor)
         await self.record_audit_event(
@@ -3189,6 +3358,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         *,
         actor: str,
         mode: str,
+        settings: SystemSettingsResponse,
     ) -> OpenClawSessionResponse:
         session_id = f"openclaw_session_{uuid4().hex}"
         response = _openclaw_session_response(
@@ -3196,13 +3366,14 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             request=request,
             actor=actor,
             mode=mode,
+            settings=settings,
         )
         if not await self._upsert_admin_payload(
             "openclaw_session",
             session_id,
             response.model_dump(mode="json"),
         ):
-            return await super().create_openclaw_session(request, actor=actor, mode=mode)
+            return await super().create_openclaw_session(request, actor=actor, mode=mode, settings=settings)
         await self.record_audit_event(
             actor=actor,
             action="openclaw.session_created",
@@ -5734,9 +5905,10 @@ async def create_openclaw_operation(
 )
 async def list_openclaw_adapters(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
 ) -> tuple[OpenClawAdapterResponse, ...]:
     _require(principal, "config:read")
-    return _openclaw_adapter_responses()
+    return _openclaw_adapter_responses(await service.get_settings())
 
 
 @router.post(
@@ -5758,6 +5930,7 @@ async def create_openclaw_session(
         body,
         actor=str(principal.user_id),
         mode=settings.openclaw_mode,
+        settings=settings,
     )
 
 

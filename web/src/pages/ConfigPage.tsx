@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+﻿import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
@@ -86,6 +86,32 @@ function parseCommandList(value: string) {
   return parsed;
 }
 
+function parseOpenClawRemoteAdapters(value: string): SystemSettings["openclaw_remote_adapters"] {
+  const parsed: unknown = JSON.parse(value);
+  const platforms = new Set(["linux", "windows", "macos"]);
+  const targetTypes = new Set(["server", "computer", "desktop", "filesystem", "screen"]);
+  if (
+    !Array.isArray(parsed) ||
+    parsed.some(
+      (adapter) =>
+        typeof adapter !== "object" ||
+        adapter === null ||
+        Array.isArray(adapter) ||
+        !platforms.has(String((adapter as Record<string, unknown>).platform)) ||
+        !targetTypes.has(String((adapter as Record<string, unknown>).target_type)) ||
+        typeof (adapter as Record<string, unknown>).target !== "string" ||
+        String((adapter as Record<string, unknown>).target).trim() === "" ||
+        typeof (adapter as Record<string, unknown>).base_url !== "string" ||
+        String((adapter as Record<string, unknown>).base_url).trim() === "" ||
+        typeof (adapter as Record<string, unknown>).credential_ref !== "string" ||
+        String((adapter as Record<string, unknown>).credential_ref).trim() === "",
+    )
+  ) {
+    throw new Error("OpenClaw remote adapters must be JSON objects with platform, target_type, target, base_url, and credential_ref.");
+  }
+  return parsed as SystemSettings["openclaw_remote_adapters"];
+}
+
 function sortOpenClawAdapters(adapters: OpenClawAdapter[]) {
   const platformRank = new Map([
     ["linux", 0],
@@ -124,6 +150,7 @@ export function ConfigPage() {
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [settingsLocalError, setSettingsLocalError] = useState<string | null>(null);
   const [openClawAllowedCommandsText, setOpenClawAllowedCommandsText] = useState("[]");
+  const [openClawRemoteAdaptersText, setOpenClawRemoteAdaptersText] = useState("[]");
   const [openClawArgvText, setOpenClawArgvText] = useState("[\"python\", \"--version\"]");
   const [openClawReason, setOpenClawReason] = useState("Manual OpenClaw operation from settings console");
   const [selectedOpenClawSessionId, setSelectedOpenClawSessionId] = useState("");
@@ -138,6 +165,7 @@ export function ConfigPage() {
     if (settingsQuery.data) {
       setSettings(settingsQuery.data);
       setOpenClawAllowedCommandsText(formatJson(settingsQuery.data.openclaw_allowed_commands));
+      setOpenClawRemoteAdaptersText(formatJson(settingsQuery.data.openclaw_remote_adapters));
     }
   }, [settingsQuery.data]);
 
@@ -160,11 +188,13 @@ export function ConfigPage() {
       return api.updateSettings({
         ...settings,
         openclaw_allowed_commands: parseCommandList(openClawAllowedCommandsText),
+        openclaw_remote_adapters: parseOpenClawRemoteAdapters(openClawRemoteAdaptersText),
       });
     },
     onSuccess: async (saved) => {
       setSettings(saved);
       setOpenClawAllowedCommandsText(formatJson(saved.openclaw_allowed_commands));
+      setOpenClawRemoteAdaptersText(formatJson(saved.openclaw_remote_adapters));
       await queryClient.invalidateQueries({ queryKey: ["settings"] });
     },
     onError: (error) => {
@@ -510,6 +540,17 @@ export function ConfigPage() {
               spellCheck={false}
             />
             <small>Only exact argv matches can execute after approval. Shell wrappers remain blocked.</small>
+          </label>
+          <label htmlFor="openclaw-remote-adapters">
+            OpenClaw remote adapters JSON
+            <textarea
+              id="openclaw-remote-adapters"
+              data-testid="openclaw-remote-adapters"
+              value={openClawRemoteAdaptersText}
+              onChange={(event) => setOpenClawRemoteAdaptersText(event.target.value)}
+              spellCheck={false}
+            />
+            <small>Use sealed secret refs for adapter tokens. Windows/local computer control requires a reachable local adapter.</small>
           </label>
           <div className="inline-guide" aria-label="OpenClaw adapter status">
             <h4>OpenClaw adapter status</h4>

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+﻿import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -25,6 +25,7 @@ const settings = {
   openclaw_enabled: false,
   openclaw_mode: "ask",
   openclaw_allowed_commands: [],
+  openclaw_remote_adapters: [],
   temporary_agent_policy:
     "主 Agent 发现角色池缺少必要能力时，必须先说明原因并取得用户确认，再临时加入子 Agent。",
   channel_entry: "web",
@@ -360,6 +361,32 @@ describe("ConfigPage", () => {
 
     await user.click(screen.getByTestId("openclaw-execute-operation"));
     expect((await screen.findByTestId("openclaw-execution-output")).textContent).toContain("ui-openclaw-ok");
+  });
+
+  it("saves configured OpenClaw remote adapters as secret references", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/config" />);
+
+    const remoteAdapters = [
+      {
+        platform: "windows",
+        target_type: "server",
+        target: "desktop",
+        base_url: "http://127.0.0.1:8765",
+        credential_ref: "secret://openclaw-adapter",
+      },
+    ];
+    fireEvent.change(await screen.findByTestId("openclaw-remote-adapters"), {
+      target: { value: JSON.stringify(remoteAdapters) },
+    });
+    await user.click(screen.getByTestId("save-system-settings"));
+
+    await waitFor(() => {
+      expect(requests.find((request) => request.path === "/api/v1/admin/settings")).toMatchObject({
+        method: "PUT",
+        body: expect.objectContaining({ openclaw_remote_adapters: remoteAdapters }),
+      });
+    });
   });
 
   it("shows OpenClaw adapter availability in settings", async () => {
