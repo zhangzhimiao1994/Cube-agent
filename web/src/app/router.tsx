@@ -15,6 +15,7 @@ import { MainAgentPage } from "../pages/MainAgentPage";
 import { McpPage } from "../pages/McpPage";
 import { MemoryPage } from "../pages/MemoryPage";
 import { ModelsPage } from "../pages/ModelsPage";
+import { OpenClawPage } from "../pages/OpenClawPage";
 import { ModuleHubPage } from "../pages/ModuleHubPage";
 import { RunDetailPage } from "../pages/RunDetailPage";
 import { RunsPage } from "../pages/RunsPage";
@@ -54,6 +55,7 @@ export function AppRoutes() {
         <Route path="config" element={<ConfigPage />} />
         <Route path="main-agent" element={<MainAgentPage />} />
         <Route path="models" element={<ModelsPage />} />
+        <Route path="openclaw" element={<OpenClawPage />} />
         <Route path="multimedia" element={<Navigate to="/models" replace />} />
         <Route path="attachments" element={<AttachmentsPage />} />
         <Route path="agents" element={<AgentsPage />} />

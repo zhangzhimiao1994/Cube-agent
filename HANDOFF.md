@@ -1,3 +1,40 @@
+## 2026-08-14 OpenClaw Navigation And Zhipu GLM Presets
+
+Current state:
+
+- Confirmed previous Evolution next-round execution commit `d4fb6a7` passed GitHub Actions run `31813019304` before starting this slice.
+- Added 智谱 GLM as a normal model provider preset in `web/src/pages/ModelsPage.tsx`, not as a multimedia-generation provider.
+- GLM preset uses the official OpenAI-compatible base `https://open.bigmodel.cn/api/paas/v4` and exposes `glm-5.2`, `glm-5.1`, `glm-5-turbo`, `glm-5`, `glm-4.7`, `glm-4.7-flash`, `glm-4.7-flashx`, and `glm-4.6`.
+- Added GLM suggestions to the OpenAI-compatible relay/mixed-model provider so relay users can still type routed GLM IDs.
+- Added `/openclaw` as a standalone navigation/configuration module under System, with a dedicated `OpenClawPage` for feature switch, permission mode, allowed commands, remote adapters, adapter status, control sessions, and approval/execution console.
+- System settings now includes a shortcut to `配置 OpenClaw`; the existing OpenClaw controls in system settings were left in place for compatibility and can be slimmed to a summary in a later UI cleanup.
+
+References checked:
+
+- Zhipu GLM text API/model docs: https://docs.bigmodel.cn/api-reference/模型-api/对话补全 and https://docs.bigmodel.cn/cn/guide/models/text/glm-4.7
+
+Local verification:
+
+- `npm.cmd run test -- --run src/pages/ModelsPage.test.tsx src/pages/OpenClawPage.test.tsx src/pages/ConfigPage.test.tsx` -> 28 passed.
+- `npm.cmd run test -- --run` from `web/` -> 14 files / 123 tests passed.
+- `npm.cmd run lint` from `web/` -> passed.
+- `npm.cmd run build` from `web/` -> passed with the existing Vite large chunk warning.
+- `git diff --check` -> passed with CRLF normalization warnings only.
+
+Server deployment and real verification:
+
+- Created incremental package `.local-archives/server-incrementals/agent-hub-openclaw-nav-glm-20260814-232137.tgz` containing only changed frontend source and rebuilt `web/dist`.
+- Uploaded to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed incrementally into `/opt/agent-hub/current`.
+- Server backup retained under `/opt/agent-hub/backups/openclaw-nav-glm-20260814-152233`.
+- Deployment cleared old `web/dist` before extraction to avoid stale hashed assets, then reloaded Caddy and confirmed `caddy`, `agent-hub-api`, and `agent-hub-worker` active.
+- Real server probe fetched deployed `/openclaw` and `/`, inspected the actual served JS bundle, verified OpenClaw standalone page/route/link markers and Zhipu GLM markers, then used a short-lived real admin JWT to call `GET /api/v1/admin/settings` and `GET /api/v1/admin/openclaw/adapters`.
+- Probe output: `{"status": "ok", "checked": ["openclaw_page", "openclaw_route", "openclaw_settings_link", "zhipu_provider", "zhipu_glm_52", "zhipu_api_base", "settings_api", "adapters_api"], "assets": ["/assets/index-CVpnL1I_.js"], "adapter_count": 12, "openclaw_enabled": true, "openclaw_mode": "auto_review"}`.
+- Removed `/tmp/openclaw_nav_glm_frontend_check.py`, `/tmp/deploy-openclaw-nav-glm.sh`, and `/tmp/agent-hub-p3-runtime-incremental.tgz`; services remained active.
+
+Remaining / next:
+
+- Commit this slice, create local GitHub recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, then watch GitHub Actions until green.
+- Continue queued P3 work after green: remaining OpenClaw workflow integration, Evolution result extraction/iteration worker, plan-task mode refinement, UI copy/layout audit, missing button/function sweep, final README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-14 Evolution Next-Round Execution Queueing
 
 Current state:

@@ -283,7 +283,7 @@ describe("ConfigPage", () => {
 
     expect(await screen.findByRole("heading", { name: "系统设置" })).not.toBeNull();
     expect(screen.getByText("版本 3")).not.toBeNull();
-    expect(view.container.querySelectorAll(".settings-shortcut-card")).toHaveLength(5);
+    expect(view.container.querySelectorAll(".settings-shortcut-card")).toHaveLength(6);
 
     await user.selectOptions(screen.getByLabelText("默认运行模式"), "dispatch");
     await user.selectOptions(screen.getByLabelText("默认工作流"), "short-video-dispatch");

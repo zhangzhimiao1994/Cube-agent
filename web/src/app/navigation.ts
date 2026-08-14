@@ -160,6 +160,12 @@ export const MODULE_GROUPS: ModuleGroup[] = [
         permission: "config:read",
       },
       {
+        to: "/openclaw",
+        label: "OpenClaw 控制",
+        description: "配置跨平台电脑/服务器接管、权限模式、远程适配器和审批执行控制台。",
+        permission: "config:read",
+      },
+      {
         to: "/users",
         label: "用户管理",
         description: "管理控制台用户、权限、登录状态和初始管理员保护。",

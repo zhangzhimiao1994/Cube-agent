@@ -264,6 +264,26 @@ describe("ModelsPage", () => {
     );
   });
 
+  it("includes Zhipu GLM presets as normal provider models", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/models" />);
+
+    await screen.findByText("添加模型配置");
+    await user.selectOptions(screen.getByLabelText("服务商"), "zhipu");
+
+    const modelSelect = screen.getByLabelText("模型") as HTMLSelectElement;
+    const optionValues = Array.from(modelSelect.options).map((option) => option.value);
+    expect(optionValues).toContain("glm-5.2");
+    expect(optionValues).toContain("glm-5.1");
+    expect(optionValues).toContain("glm-4.7");
+    expect(optionValues).toContain("__custom_model__");
+    expect(optionValues).not.toContain("MiniMax-Hailuo-02");
+    expect((screen.getByLabelText("API Base") as HTMLInputElement).value).toBe(
+      "https://open.bigmodel.cn/api/paas/v4",
+    );
+    expect((screen.getByLabelText("Quota Scope") as HTMLInputElement).value).toBe("zhipu-account");
+  });
+
   it("keeps Claude Code API relay endpoints on the Anthropic Messages protocol", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/models" />);
