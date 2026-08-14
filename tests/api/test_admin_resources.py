@@ -2357,6 +2357,50 @@ def test_channel_config_can_be_cleared_after_save(
     assert audit.status_code == 200
     assert audit.json()[0]["resource"] == "channel:custom_webhook"
 
+
+def test_channel_config_save_and_clear_refresh_runtime_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("FEISHU_APP_ID", raising=False)
+    monkeypatch.delenv("FEISHU_APP_SECRET", raising=False)
+
+    application = create_app(
+        auth_service=StubAuthService(),
+        rate_limiter=object(),
+    )
+    application.state.admin_resource_service = InMemoryAdminResourceService()
+    refreshes: list[dict[str, str]] = []
+
+    async def refresh_channel_runtime_config(config: dict[str, str]) -> None:
+        refreshes.append(dict(config))
+
+    application.state.refresh_channel_runtime_config = refresh_channel_runtime_config
+    api = TestClient(application)
+
+    saved = api.post(
+        "/api/v1/admin/channels/feishu/config",
+        headers=headers(),
+        json={
+            "values": {
+                "FEISHU_TRANSPORT": "websocket",
+                "FEISHU_APP_ID": "cli_live",
+                "FEISHU_APP_SECRET": "live-secret",
+            }
+        },
+    )
+
+    assert saved.status_code == 200
+    assert refreshes[-1] == {
+        "FEISHU_TRANSPORT": "websocket",
+        "FEISHU_APP_ID": "cli_live",
+        "FEISHU_APP_SECRET": "live-secret",
+    }
+
+    cleared = api.delete("/api/v1/admin/channels/feishu/config", headers=headers())
+
+    assert cleared.status_code == 200
+    assert refreshes[-1] == {}
+
 def test_all_channel_statuses_are_configured_when_required_env_exists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

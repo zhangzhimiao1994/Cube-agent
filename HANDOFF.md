@@ -1,3 +1,42 @@
+## 2026-08-15 Feishu Runtime Config Refresh and WebSocket Restart
+
+### State
+- Fixed Feishu channel configuration saves/clears so they refresh the live runtime config immediately instead of only updating `app.state.channel_runtime_config` for later requests.
+- `create_app()` now exposes `app.state.refresh_channel_runtime_config`; saving or clearing channel config restarts/stops the Feishu WebSocket connector according to the latest saved config.
+- Fixed the official `lark-oapi` WebSocket SDK adapter restart issue: disconnect now closes the SDK connection, stops the SDK module-level event loop when it is running in the SDK thread, and waits for the SDK thread to exit before reconnecting. This addresses the production error `This event loop is already running` after channel config refresh.
+- Updated the channel setup UI copy so it no longer says page saves require an API restart; restart is only needed when operators manually edit server environment files outside the UI.
+
+### Local Verification
+- TDD red first:
+  - `pytest tests/api/test_admin_resources.py::test_channel_config_save_and_clear_refresh_runtime_config -q --tb=short` failed with no runtime refresh calls.
+  - `pytest tests/unit/test_app_wiring.py::test_feishu_websocket_restarts_when_channel_config_changes -q --tb=short` failed because saving config did not start the connector.
+  - `pytest tests/contracts/feishu/test_receivers.py::test_lark_oapi_disconnect_stops_running_sdk_loop -q --tb=short` failed because disconnect did not stop the SDK loop.
+- Green/quality:
+  - `pytest tests/contracts/feishu/test_receivers.py::test_lark_oapi_disconnect_stops_running_sdk_loop tests/contracts/feishu/test_receivers.py::test_lark_oapi_websocket_client_streams_message_payload tests/unit/test_app_wiring.py::test_feishu_websocket_restarts_when_channel_config_changes -q --tb=short` -> passed.
+  - `pytest tests/unit/test_app_wiring.py::test_create_app_starts_feishu_websocket_when_runtime_config_enables_it tests/unit/test_app_wiring.py::test_feishu_websocket_restarts_when_channel_config_changes tests/api/test_admin_resources.py::test_channel_config_save_and_clear_refresh_runtime_config tests/api/test_admin_resources.py::test_channel_config_accepts_feishu_bot_template_app_type tests/api/test_admin_resources.py::test_channel_config_can_be_cleared_after_save -q --tb=short` -> passed.
+  - `ruff check src tests` -> passed.
+  - `mypy --strict src tests` -> passed.
+  - `pytest tests/unit tests/api tests/contracts tests/security tests/resilience -q` -> 1462 passed, 13 skipped.
+  - `npm test -- --run src/pages/ChannelsPage.test.tsx` -> 3 passed.
+  - `npm run build` -> passed with the existing Vite large chunk warning.
+
+### Server Deployment And Real Probe
+- Uploaded incremental archive to `103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed into `/opt/agent-hub/current` with backups under:
+  - `/opt/agent-hub/backups/feishu-runtime-refresh-20260815-032000`
+  - `/opt/agent-hub/backups/feishu-runtime-refresh-20260815-032100`
+- Server syntax check passed for changed Python files, then `agent-hub-api`, `agent-hub-worker`, and Caddy were restarted/reloaded.
+- Server health after final deploy: `{"status":"ok"}` on `http://127.0.0.1:8000/health`.
+- Real server probe used the production JWT signing key to call the deployed admin API without printing secrets. It saved only the current `FEISHU_TRANSPORT` value, did not overwrite App ID/App Secret, and verified Feishu stayed configured:
+  - `{"status":"ok","save_status":200,"saved":["FEISHU_TRANSPORT"],"before_status":"configured","after_status":"configured","before_transports":["websocket"],"after_transports":["websocket"],"after_missing":[]}`
+- Post-probe logs since `2026-08-15 03:21:00` had no `This event loop is already running` or `connect failed` entries.
+
+### Answered User-Facing Point
+- `lark-oapi==1.7.2` is installed on the server and `import lark_oapi` succeeds.
+- Previously saved Feishu App ID/App Secret do not need to be re-entered if they are still present. With this fix, saving/clearing channel config from the UI refreshes the running Feishu connection; only manual edits to server env files still require service restart.
+
+### Remaining / Next
+- Continue with remaining P3 items: channel config clear-display polish, OpenClaw approval-policy UX, remaining Skill archive edge cases, plan-task refinement, UI copy/layout audit, missing button/function sweep, README updates, and later Docker readiness.
+
 ## 2026-08-15 OpenClaw Chat Proposal Materialization
 
 Current state:

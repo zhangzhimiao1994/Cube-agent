@@ -63,7 +63,7 @@ const CHANNEL_GUIDES: Record<string, ChannelGuide> = {
     steps: [
       "推荐长连接：在飞书事件与回调中选择长连接模式，系统只需要 App ID 和 App Secret。",
       "Webhook 备用：配置事件订阅 Request URL，并补充 Verification Token；如果开启事件加密，再填写 Encrypt Key。",
-      "把本页列出的环境变量写入服务器配置后重启 API 服务。",
+      "在本页保存后系统会刷新飞书长连接；如果改的是服务器环境文件，再重启 API 服务。",
       "接入验证通过后，在飞书里给机器人发送文本消息，任务页应出现新运行记录。",
     ],
     verify: ["长连接模式：飞书后台长连接保存成功并能接收消息", "Webhook 模式：飞书后台 URL 验证通过", "发送文本后任务页出现新任务", "失败时查看系统日志中的 channel=feishu"],
@@ -131,7 +131,7 @@ const CHANNEL_GUIDES: Record<string, ChannelGuide> = {
     steps: [
       "在企业微信管理后台准备一个内部应用作为 Agent 入口。",
       "把接收消息服务器 URL 设置为本页 Webhook。",
-      "保存 token 和 secret 后重启服务，并用企业微信发送文本消息测试。",
+      "在本页保存 token 和 secret 后发送测试消息；如果改的是服务器环境文件，再重启服务。",
     ],
     verify: ["企业微信 URL 校验通过", "应用私聊发送文本后任务页出现新任务", "失败时检查 CorpID/AgentID/Token 是否来自同一个应用"],
   },
@@ -542,7 +542,7 @@ export function ChannelsPage() {
 
             <article>
               <h3>部署配置模板</h3>
-              <p>把下面变量写入服务器环境配置或安装脚本生成的 `.env`，然后重启服务。</p>
+              <p>这里用于核对部署变量；在本页保存会自动刷新运行中配置，只有手工改服务器环境文件时才需要重启服务。</p>
               <pre className="code-block">{envTemplate(selected, guide)}</pre>
             </article>
 

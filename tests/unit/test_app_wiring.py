@@ -207,6 +207,78 @@ def test_create_app_starts_feishu_websocket_when_runtime_config_enables_it(
     assert client.cancelled.wait(timeout=1)
 
 
+def test_feishu_websocket_restarts_when_channel_config_changes(
+    tmp_path: Path,
+) -> None:
+    first_client = BlockingFeishuClient()
+    second_client = BlockingFeishuClient()
+    clients = [first_client, second_client]
+    created_settings: list[FeishuSettings] = []
+
+    async def client_factory(settings: FeishuSettings) -> FeishuWebSocketClient:
+        created_settings.append(settings)
+        return clients.pop(0)
+
+    admin_service = InMemoryAdminResourceService()
+    application = create_app(
+        settings=valid_settings(tmp_path),
+        database=FakeDatabase(),
+        redis_client=FakeRedis(),
+        auth_service=StubAuthService(),
+        rate_limiter=StubRateLimiter(),
+        config_service=StubConfigService(),
+        admin_resource_service=admin_service,
+        user_admin_service=object(),
+        run_service=object(),
+        feishu_websocket_client_factory=client_factory,
+    )
+
+    with TestClient(application) as api:
+        assert getattr(application.state, "feishu_websocket_connector", None) is None
+
+        saved = api.post(
+            "/api/v1/admin/channels/feishu/config",
+            headers={"Authorization": "Bearer valid-token"},
+            json={
+                "values": {
+                    "FEISHU_TRANSPORT": "websocket",
+                    "FEISHU_APP_ID": "cli_runtime",
+                    "FEISHU_APP_SECRET": "secret",
+                }
+            },
+        )
+
+        assert saved.status_code == 200
+        assert first_client.started.wait(timeout=1)
+        assert created_settings[-1].app_id == "cli_runtime"
+        assert getattr(application.state, "feishu_websocket_connector", None) is not None
+
+        updated = api.post(
+            "/api/v1/admin/channels/feishu/config",
+            headers={"Authorization": "Bearer valid-token"},
+            json={
+                "values": {
+                    "FEISHU_APP_ID": "cli_runtime_2",
+                    "FEISHU_APP_SECRET": "secret-2",
+                }
+            },
+        )
+
+        assert updated.status_code == 200
+        assert first_client.cancelled.wait(timeout=1)
+        assert second_client.started.wait(timeout=1)
+        assert created_settings[-1].app_id == "cli_runtime_2"
+
+        cleared = api.delete(
+            "/api/v1/admin/channels/feishu/config",
+            headers={"Authorization": "Bearer valid-token"},
+        )
+
+        assert cleared.status_code == 200
+        assert second_client.cancelled.wait(timeout=1)
+        assert getattr(application.state, "feishu_websocket_connector", None) is None
+
+
 def test_create_app_wires_production_multimedia_generation_executor(tmp_path: Path) -> None:
     application = create_app(
         settings=valid_settings(tmp_path),

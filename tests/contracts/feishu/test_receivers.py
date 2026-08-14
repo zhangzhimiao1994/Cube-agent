@@ -6,7 +6,7 @@ import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -390,6 +390,65 @@ async def test_lark_oapi_websocket_client_streams_message_payload(
     async for received in client.events():
         assert received["event"] == payload["event"]
         break
+
+
+@pytest.mark.asyncio
+async def test_lark_oapi_disconnect_stops_running_sdk_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stopped: list[bool] = []
+    joined: list[float | None] = []
+    scheduled: list[object] = []
+
+    class FakeFuture:
+        def result(self, timeout: float) -> None:
+            joined.append(timeout)
+
+    class FakeLoop:
+        def is_running(self) -> bool:
+            return True
+
+        def call_soon_threadsafe(self, callback: object) -> None:
+            assert callable(callback)
+            callback()
+
+        def stop(self) -> None:
+            stopped.append(True)
+
+    class FakeSdkClient:
+        async def _disconnect(self) -> None:
+            return None
+
+    class FakeThread:
+        def join(self, timeout: float | None = None) -> None:
+            joined.append(timeout)
+
+    fake_loop = FakeLoop()
+
+    def import_module(name: str) -> object:
+        if name == "lark_oapi.ws.client":
+            return SimpleNamespace(loop=fake_loop)
+        return importlib.import_module(name)
+
+    def run_coroutine_threadsafe(coro: object, loop: object) -> FakeFuture:
+        assert loop is fake_loop
+        scheduled.append(coro)
+        if hasattr(coro, "close"):
+            coro.close()
+        return FakeFuture()
+
+    monkeypatch.setattr(importlib, "import_module", import_module)
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", run_coroutine_threadsafe)
+
+    client = LarkOAPIFeishuWebSocketClient(settings(), startup_timeout_seconds=0.1)
+    client._sdk_client = FakeSdkClient()
+    client._sdk_thread = cast(Any, FakeThread())
+
+    await client._disconnect_best_effort()
+
+    assert scheduled
+    assert stopped == [True]
+    assert 3 in joined
 
 def test_transport_selection_supports_webhook_websocket_and_both() -> None:
     assert settings(transport=FeishuTransport.WEBHOOK).enabled_transports() == {

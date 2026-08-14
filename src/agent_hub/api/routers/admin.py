@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import io
 import json
 import logging
@@ -7437,7 +7438,7 @@ async def save_channel_config(
 ) -> ChannelConfigSaveResponse:
     _require(principal, "config:write")
     response = await service.save_channel_config(channel_id, body)
-    request.app.state.channel_runtime_config = await service.channel_runtime_config()
+    await _refresh_channel_runtime_config(request, service)
     return response
 
 
@@ -7454,8 +7455,22 @@ async def clear_channel_config(
 ) -> ChannelConfigSaveResponse:
     _require(principal, "config:write")
     response = await service.clear_channel_config(channel_id, actor=str(principal.user_id))
-    request.app.state.channel_runtime_config = await service.channel_runtime_config()
+    await _refresh_channel_runtime_config(request, service)
     return response
+
+
+async def _refresh_channel_runtime_config(
+    request: Request,
+    service: AdminResourceService,
+) -> None:
+    runtime_config = await service.channel_runtime_config()
+    request.app.state.channel_runtime_config = runtime_config
+    refresh = getattr(request.app.state, "refresh_channel_runtime_config", None)
+    if not callable(refresh):
+        return
+    result = refresh(runtime_config)
+    if inspect.isawaitable(result):
+        await result
 
 
 @router.get("/memory", response_model=list[MemoryRecordResponse], responses=error_responses(401, 403, 422))

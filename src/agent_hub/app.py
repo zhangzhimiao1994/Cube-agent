@@ -940,6 +940,15 @@ def create_app(
     application.state.feishu_websocket_connector = None
     application.state.feishu_websocket_task = None
     application.state.multimedia_generation_executor = None
+
+    async def refresh_channel_runtime_config(runtime_config: Mapping[str, str]) -> None:
+        application.state.channel_runtime_config = dict(runtime_config)
+        await _restart_feishu_websocket_connector(
+            application,
+            client_factory=feishu_websocket_client_factory,
+        )
+
+    application.state.refresh_channel_runtime_config = refresh_channel_runtime_config
     application.state.metrics_registry = default_metrics_registry()
     application.state.extra_readiness_checks = {}
     application.state.channel_runtime_config = None
@@ -1134,6 +1143,18 @@ async def _stop_feishu_websocket_connector(application: FastAPI) -> None:
             await task
     application.state.feishu_websocket_connector = None
     application.state.feishu_websocket_task = None
+
+
+async def _restart_feishu_websocket_connector(
+    application: FastAPI,
+    *,
+    client_factory: FeishuWebSocketClientFactoryForSettings | None,
+) -> None:
+    await _stop_feishu_websocket_connector(application)
+    await _start_feishu_websocket_connector_if_configured(
+        application,
+        client_factory=client_factory,
+    )
 
 
 def _should_start_feishu_websocket(

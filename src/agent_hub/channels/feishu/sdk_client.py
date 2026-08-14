@@ -21,6 +21,7 @@ class LarkOAPIFeishuWebSocketClient:
         self._settings = settings
         self._startup_timeout_seconds = startup_timeout_seconds
         self._sdk_client: Any | None = None
+        self._sdk_thread: threading.Thread | None = None
 
     async def events(self) -> AsyncIterator[dict[str, object]]:
         loop = asyncio.get_running_loop()
@@ -64,6 +65,7 @@ class LarkOAPIFeishuWebSocketClient:
                 loop.call_soon_threadsafe(queue.put_nowait, None)
 
         thread = threading.Thread(target=run_sdk, name="feishu-websocket-sdk", daemon=True)
+        self._sdk_thread = thread
         thread.start()
         await asyncio.to_thread(ready.wait, self._startup_timeout_seconds)
         try:
@@ -84,13 +86,23 @@ class LarkOAPIFeishuWebSocketClient:
         try:
             sdk_client_module = importlib.import_module("lark_oapi.ws.client")
             sdk_loop = getattr(sdk_client_module, "loop", None)
-            if sdk_loop is not None and sdk_loop.is_running():
+            current_loop = asyncio.get_running_loop()
+            if sdk_loop is not None and sdk_loop.is_running() and sdk_loop is not current_loop:
                 future = asyncio.run_coroutine_threadsafe(client._disconnect(), sdk_loop)
                 await asyncio.to_thread(future.result, 3)
-            elif sdk_loop is not None:
+                if hasattr(sdk_loop, "call_soon_threadsafe"):
+                    sdk_loop.call_soon_threadsafe(sdk_loop.stop)
+                    await self._join_sdk_thread_best_effort()
+            else:
                 await client._disconnect()
         except Exception:
             _LOGGER.warning("feishu_websocket_sdk_disconnect_failed", exc_info=True)
+
+    async def _join_sdk_thread_best_effort(self) -> None:
+        thread = self._sdk_thread
+        if thread is None or thread is threading.current_thread():
+            return
+        await asyncio.to_thread(thread.join, 3)
 
 
 async def create_lark_oapi_feishu_websocket_client(
