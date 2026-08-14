@@ -4128,3 +4128,39 @@ Server deployment and real verification for Evolution Controls + Right Drawer Bu
 CI status for Evolution Controls + Right Drawer Button Polish:
 
 - GitHub Actions run `31794375035` for commit `e76c92f` completed successfully in 2m54s.
+## 2026-08-14 Channel Config Edit/Clear Controls
+
+Current state:
+
+- Saved channel configuration can now be cleared through `DELETE /api/v1/admin/channels/{channel_id}/config`.
+- Clearing removes the saved channel resource, refreshes `app.state.channel_runtime_config`, recalculates channel status, and records `channel.clear` audit events with the acting user.
+- Existing save behavior still supports editing configured channels by entering replacement values; the channel UI now states this explicitly.
+- The channel UI now has a `清空当前通道配置` button for configured channels and clearer success messages after save/clear.
+
+Local verification:
+
+- Watched the backend clear test fail first with HTTP 405 before the DELETE route existed.
+- Watched the frontend channel edit/clear test fail first before the new UI copy and clear button existed.
+- `uv run pytest tests\api\test_admin_resources.py -q -k "channel_config_can_be_cleared_after_save" --tb=short` -> 1 passed.
+- `uv run pytest tests\api\test_admin_resources.py tests\api\test_channel_webhooks.py -q -k "channel" --tb=short` -> 29 passed, 96 deselected.
+- `uv run ruff check src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+- `uv run mypy --strict src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+- `npm.cmd run test -- --run src/pages/OperationalPages.test.tsx -t "lets configured channel settings be edited and cleared"` -> 1 passed.
+- `npm.cmd run test -- --run src/pages/OperationalPages.test.tsx` -> 55 passed.
+- `npm.cmd run lint` -> passed.
+- `npm.cmd run build` -> passed with the existing Vite large chunk warning.
+- `git diff --check` -> passed with CRLF normalization warnings only.
+
+Remaining risks / next:
+
+- Deploy this channel slice incrementally to `103.236.98.133`, sync the backend router into the active production venv site-packages, run real server API/UI-marker probes, then create recovery archive/tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
+- Continue broader P3 queue after this slice: OpenClaw desktop/scheduled-control follow-ups, evolution execution orchestration, Skill archive robustness, UI copy/layout audit, missing button/function sweep, README/README.zh-CN refresh, and Docker readiness later.
+Server deployment and real verification for Channel Config Edit/Clear Controls:
+
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-channel-config-clear-20260814-191545.tgz`.
+- Uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed incrementally into `/opt/agent-hub/current`.
+- Server backup path: `/opt/agent-hub/backups/channel-config-clear-20260814-111614`.
+- Synced `src/agent_hub/api/routers/admin.py` into the active production venv site-packages, restarted `agent-hub-api` and `agent-hub-worker`, and reloaded Caddy.
+- Real server probe loaded `/etc/agent-hub/secrets.env` without printing secrets, generated a short-lived super-admin JWT, saved a temporary `custom_webhook` token through the real admin API, verified configured status without secret echo, cleared the channel through the new DELETE API, verified `channel.clear` audit, and checked frontend bundle markers for the new UI.
+- Probe output: `{"status": "ok", "checked": ["channel_save", "channel_clear", "audit", "frontend_bundle_markers"], "restored_original": false}`. `restored_original=false` means the server had no pre-existing saved `custom_webhook` config to restore.
+- Removed `/tmp/channel_config_clear_check.py`, `/tmp/deploy-channel-config-clear.sh`, and `/tmp/agent-hub-p3-runtime-incremental.tgz`; `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.

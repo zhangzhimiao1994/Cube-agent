@@ -341,7 +341,19 @@ export function ChannelsPage() {
     },
     onSuccess: async () => {
       setDraftValues({});
-      setSaveNotice("通道配置已保存。");
+      setSaveNotice("通道配置已保存，可继续修改或清空。面板已刷新最新状态。");
+      await queryClient.invalidateQueries({ queryKey: ["channels"] });
+    },
+  });
+
+  const clearConfig = useMutation({
+    mutationFn: () => {
+      if (!selected) throw new Error("channel is not selected");
+      return api.clearChannelConfig(selected.id);
+    },
+    onSuccess: async () => {
+      setDraftValues({});
+      setSaveNotice("通道配置已清空。需要重新填写后才会接通。");
       await queryClient.invalidateQueries({ queryKey: ["channels"] });
     },
   });
@@ -440,7 +452,7 @@ export function ChannelsPage() {
             <article>
               <h3>配置内容</h3>
               <p className="field-help">
-                可直接在这里填写并保存；已配置的密钥不会回显。留空的字段不会覆盖服务器已有配置。
+可直接在这里填写并保存；已配置的密钥不会回显。输入新值会覆盖旧配置，留空不会修改已有配置。需要重新接入时可以清空本页保存的通道配置。
               </p>
               <div className="form-grid">
                 {guide.fields.map((field) => (
@@ -475,11 +487,24 @@ export function ChannelsPage() {
                 >
                   {saveConfig.isPending ? "保存中..." : "保存通道配置"}
                 </button>
+                <button
+                  type="button"
+                  className="danger-action"
+                  disabled={clearConfig.isPending || selected.status !== "configured"}
+                  onClick={() => clearConfig.mutate()}
+                >
+                  {clearConfig.isPending ? "清空中..." : "清空当前通道配置"}
+                </button>
                 {saveNotice ? <span role="status">{saveNotice}</span> : null}
               </div>
               {saveConfig.isError ? (
                 <p className="form-error" role="alert">
                   {formatApiError(saveConfig.error, "通道配置保存失败")}
+                </p>
+              ) : null}
+              {clearConfig.isError ? (
+                <p className="form-error" role="alert">
+                  {formatApiError(clearConfig.error, "通道配置清空失败")}
                 </p>
               ) : null}
             </article>

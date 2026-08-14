@@ -2,7 +2,7 @@ import { cleanup, render, screen, waitFor, within } from "@testing-library/react
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { EvolutionRun, RunDetail, RunListItem } from "../api/client";
+import type { ChannelStatus, EvolutionRun, RunDetail, RunListItem } from "../api/client";
 import { TestApp } from "../app/router";
 
 const runId = "22222222-2222-4222-8222-222222222222";
@@ -124,6 +124,28 @@ const mainAgent = {
   hermes_policy: "confirm_before_apply",
   max_review_rounds: 2,
 };
+const baseChannels: ChannelStatus[] = [
+  {
+    id: "feishu",
+    name: "飞书",
+    status: "missing_config",
+    transports: ["webhook", "websocket"],
+    webhook_path: "/channels/feishu/events",
+    public_webhook_url: null,
+    missing: ["FEISHU_APP_ID"],
+    notes: ["Webhook 已挂载在主 API 服务。"],
+  },
+  {
+    id: "custom_webhook",
+    name: "自定义 Webhook",
+    status: "missing_config",
+    transports: ["webhook"],
+    webhook_path: "/channels/custom/events",
+    public_webhook_url: null,
+    missing: ["CUSTOM_WEBHOOK_TOKEN"],
+    notes: ["用于兼容其他支持 HTTP Webhook 的聊天软件。"],
+  },
+];
 
 const secondRunListItem: RunListItem = {
   ...runListItem,
@@ -332,6 +354,7 @@ describe("operational management pages", () => {
   let deletedRunIds = new Set<string>();
   let deletedHermesIds = new Set<string>();
   let visibleEvolutionRuns = [evolutionRun];
+  let visibleChannels = baseChannels;
   let createdEvolutionRun: typeof evolutionRun | null = null;
   let failNextAttachmentUpload = false;
 
@@ -345,6 +368,7 @@ describe("operational management pages", () => {
     deletedRunIds = new Set<string>();
     deletedHermesIds = new Set<string>();
     visibleEvolutionRuns = [evolutionRun];
+    visibleChannels = baseChannels;
     createdEvolutionRun = null;
     failNextAttachmentUpload = false;
     vi.stubGlobal("confirm", vi.fn(() => true));
@@ -681,6 +705,21 @@ describe("operational management pages", () => {
         }
         if (path === "/api/v1/admin/evolution-runs") {
           return jsonResponse(visibleEvolutionRuns);
+        }
+        if (path === "/api/v1/admin/channels") {
+          return jsonResponse(visibleChannels);
+        }
+        if (path === "/api/v1/admin/channels/custom_webhook/config" && method === "POST") {
+          visibleChannels = visibleChannels.map((channel) =>
+            channel.id === "custom_webhook" ? { ...channel, status: "configured", missing: [] } : channel,
+          );
+          return jsonResponse({ id: "custom_webhook", saved: ["CUSTOM_WEBHOOK_TOKEN"], status: visibleChannels.find((channel) => channel.id === "custom_webhook") });
+        }
+        if (path === "/api/v1/admin/channels/custom_webhook/config" && method === "DELETE") {
+          visibleChannels = visibleChannels.map((channel) =>
+            channel.id === "custom_webhook" ? { ...channel, status: "missing_config", missing: ["CUSTOM_WEBHOOK_TOKEN"] } : channel,
+          );
+          return jsonResponse({ id: "custom_webhook", saved: [], status: visibleChannels.find((channel) => channel.id === "custom_webhook") });
         }
         if (path === "/api/v1/admin/skills") {
           return jsonResponse([]);
@@ -2249,6 +2288,26 @@ describe("operational management pages", () => {
         elapsed_seconds: 180,
       },
     });
+  });
+  it("lets configured channel settings be edited and cleared", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/channels" />);
+
+    expect(await screen.findByRole("heading", { name: "通道连接" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: /自定义 Webhook/ }));
+
+    await user.type(screen.getByLabelText(/Webhook Token/), "saved-token");
+    await user.click(screen.getByRole("button", { name: "保存通道配置" }));
+    await waitFor(() => expect(screen.getByText("通道配置已保存，可继续修改或清空。面板已刷新最新状态。")));
+    expect(screen.getAllByText("已接通").length).toBeGreaterThan(0);
+    expect(requests.find((request) => request.path === "/api/v1/admin/channels/custom_webhook/config" && request.method === "POST")).toMatchObject({
+      body: { values: { CUSTOM_WEBHOOK_TOKEN: "saved-token" } },
+    });
+
+    await user.click(screen.getByRole("button", { name: "清空当前通道配置" }));
+    await waitFor(() => expect(screen.getByText("通道配置已清空。需要重新填写后才会接通。")));
+    expect(screen.getByText(/还缺少配置：CUSTOM_WEBHOOK_TOKEN/)).not.toBeNull();
+    expect(requests.find((request) => request.path === "/api/v1/admin/channels/custom_webhook/config" && request.method === "DELETE")).toBeTruthy();
   });
   it("shows MCP, memory, and modular log pages", async () => {
     const user = userEvent.setup();

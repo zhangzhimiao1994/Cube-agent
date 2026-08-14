@@ -1467,6 +1467,13 @@ export const api = {
       ChannelConfigSaveSchema,
     );
   },
+  clearChannelConfig(id: string): Promise<ChannelConfigSave> {
+    return request(
+      `/api/v1/admin/channels/${encodeURIComponent(id)}/config`,
+      { method: "DELETE" },
+      ChannelConfigSaveSchema,
+    );
+  },
   memory(): Promise<MemoryRecord[]> {
     return request("/api/v1/admin/memory", { method: "GET" }, z.array(MemoryRecordSchema));
   },

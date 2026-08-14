@@ -1539,6 +1539,8 @@ class AdminResourceService(Protocol):
         self, channel_id: str, request: ChannelConfigRequest
     ) -> ChannelConfigSaveResponse: ...
 
+    async def clear_channel_config(self, channel_id: str, *, actor: str) -> ChannelConfigSaveResponse: ...
+
     async def channel_runtime_config(self) -> dict[str, str]: ...
 
     async def list_memory(self) -> tuple[MemoryRecordResponse, ...]: ...
@@ -2478,6 +2480,21 @@ class InMemoryAdminResourceService:
         return ChannelConfigSaveResponse(
             id=channel_id,
             saved=_ordered_channel_saved_fields(definition, cleaned),
+            status=_channel_status_from_definition(definition, self.channel_config),
+        )
+
+    async def clear_channel_config(self, channel_id: str, *, actor: str) -> ChannelConfigSaveResponse:
+        definition = _channel_definition(channel_id)
+        self.channel_config.pop(channel_id, None)
+        await self.record_audit_event(
+            actor=actor,
+            action="channel.clear",
+            resource=f"channel:{channel_id}",
+            details={"cleared": ",".join(definition.required_env)},
+        )
+        return ChannelConfigSaveResponse(
+            id=channel_id,
+            saved=[],
             status=_channel_status_from_definition(definition, self.channel_config),
         )
 
@@ -3894,6 +3911,26 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         return ChannelConfigSaveResponse(
             id=channel_id,
             saved=_ordered_channel_saved_fields(definition, cleaned),
+            status=_channel_status_from_definition(definition, config),
+        )
+
+    async def clear_channel_config(self, channel_id: str, *, actor: str) -> ChannelConfigSaveResponse:
+        config = await self._channel_config_values()
+        if config is None:
+            return await super().clear_channel_config(channel_id, actor=actor)
+        definition = _channel_definition(channel_id)
+        config.pop(channel_id, None)
+        deleted = await self._delete_admin_payload("channel", channel_id)
+        if deleted is None:
+            return await super().clear_channel_config(channel_id, actor=actor)
+        await self._record_audit(
+            "channel.clear",
+            f"channel:{channel_id}",
+            {"cleared": ",".join(definition.required_env)},
+        )
+        return ChannelConfigSaveResponse(
+            id=channel_id,
+            saved=[],
             status=_channel_status_from_definition(definition, config),
         )
 
@@ -6628,6 +6665,23 @@ async def save_channel_config(
 ) -> ChannelConfigSaveResponse:
     _require(principal, "config:write")
     response = await service.save_channel_config(channel_id, body)
+    request.app.state.channel_runtime_config = await service.channel_runtime_config()
+    return response
+
+
+@router.delete(
+    "/channels/{channel_id}/config",
+    response_model=ChannelConfigSaveResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def clear_channel_config(
+    channel_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+    request: Request,
+) -> ChannelConfigSaveResponse:
+    _require(principal, "config:write")
+    response = await service.clear_channel_config(channel_id, actor=str(principal.user_id))
     request.app.state.channel_runtime_config = await service.channel_runtime_config()
     return response
 
