@@ -43,10 +43,12 @@ function jsonResponse(payload: unknown, init: ResponseInit = {}) {
 describe("ConfigPage", () => {
   const requests: Array<{ body: unknown; method: string; path: string }> = [];
   let openClawSessions: Array<Record<string, unknown>> = [];
+  let lastOpenClawOperationBody: Record<string, unknown> = {};
 
   beforeEach(() => {
     requests.length = 0;
     openClawSessions = [];
+    lastOpenClawOperationBody = {};
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
       "fetch",
@@ -65,6 +67,7 @@ describe("ConfigPage", () => {
         }
         if (path === "/api/v1/admin/openclaw/operations" && method === "POST") {
           const body = JSON.parse(String(init?.body));
+          lastOpenClawOperationBody = body;
           return jsonResponse(
             {
               id: "openclaw_ui_test",
@@ -73,7 +76,7 @@ describe("ConfigPage", () => {
               requires_user_approval: true,
               platform: body.platform,
               kind: body.kind,
-              operation: body,
+              operation: lastOpenClawOperationBody,
               approval_summary: "OpenClaw linux server_command on agent-hub-server",
               requested_by: principal.user_id,
               created_at: "2026-08-13T00:00:00Z",
@@ -92,14 +95,7 @@ describe("ConfigPage", () => {
             requires_user_approval: false,
             platform: "linux",
             kind: "server_command",
-            operation: {
-              platform: "linux",
-              kind: "server_command",
-              target: "agent-hub-server",
-              argv: ["python", "-c", "print('ui-openclaw-ok')"],
-              risk_level: "low",
-              reason: "UI smoke",
-            },
+            operation: lastOpenClawOperationBody,
             approval_summary: "OpenClaw linux server_command on agent-hub-server",
             requested_by: principal.user_id,
             created_at: "2026-08-13T00:00:00Z",
@@ -117,14 +113,7 @@ describe("ConfigPage", () => {
               requires_user_approval: false,
               platform: "linux",
               kind: "server_command",
-              operation: {
-                platform: "linux",
-                kind: "server_command",
-                target: "agent-hub-server",
-                argv: ["python", "-c", "print('ui-openclaw-ok')"],
-                risk_level: "low",
-                reason: "UI smoke",
-              },
+              operation: lastOpenClawOperationBody,
               approval_summary: "OpenClaw linux server_command on agent-hub-server",
               requested_by: principal.user_id,
               created_at: "2026-08-13T00:00:00Z",
@@ -383,12 +372,35 @@ describe("ConfigPage", () => {
     expect(screen.getByText(/remote-windows-host/)).not.toBeNull();
   });
 
+  it("binds OpenClaw operation requests to the selected active session", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/config" />);
+
+    await user.click(await screen.findByTestId("openclaw-create-session"));
+    expect((await screen.findAllByText(/openclaw_session_ui_test/)).length).toBeGreaterThan(0);
+    expect(screen.getByTestId("openclaw-operation-session")).toHaveProperty("value", "openclaw_session_ui_test");
+
+    const allowedCommands = screen.getByTestId("openclaw-allowed-commands");
+    fireEvent.change(allowedCommands, { target: { value: `[["python","-c","print('ui-openclaw-ok')"]]` } });
+    await user.click(screen.getByText("保存系统设置"));
+
+    fireEvent.change(screen.getByTestId("openclaw-operation-argv"), {
+      target: { value: `["python","-c","print('ui-openclaw-ok')"]` },
+    });
+    await user.click(screen.getByTestId("openclaw-create-operation"));
+
+    expect(requests.find((request) => request.path === "/api/v1/admin/openclaw/operations")).toMatchObject({
+      method: "POST",
+      body: expect.objectContaining({ session_id: "openclaw_session_ui_test" }),
+    });
+  });
+
   it("manages OpenClaw control sessions from settings", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/config" />);
 
     await user.click(await screen.findByTestId("openclaw-create-session"));
-    expect(await screen.findByText(/openclaw_session_ui_test/)).not.toBeNull();
+    expect((await screen.findAllByText(/openclaw_session_ui_test/)).length).toBeGreaterThan(0);
     expect(screen.getByText("active")).not.toBeNull();
     expect(requests.find((request) => request.path === "/api/v1/admin/openclaw/sessions")).toMatchObject({
       method: "POST",

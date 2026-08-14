@@ -126,6 +126,7 @@ export function ConfigPage() {
   const [openClawAllowedCommandsText, setOpenClawAllowedCommandsText] = useState("[]");
   const [openClawArgvText, setOpenClawArgvText] = useState("[\"python\", \"--version\"]");
   const [openClawReason, setOpenClawReason] = useState("Manual OpenClaw operation from settings console");
+  const [selectedOpenClawSessionId, setSelectedOpenClawSessionId] = useState("");
   const [openClawOperation, setOpenClawOperation] = useState<OpenClawOperation | null>(null);
   const [openClawExecutionOutput, setOpenClawExecutionOutput] = useState<string | null>(null);
 
@@ -140,6 +141,18 @@ export function ConfigPage() {
     }
   }, [settingsQuery.data]);
 
+  const activeOpenClawSessions = useMemo(
+    () => (openClawSessionsQuery.data ?? []).filter((session) => session.status === "active"),
+    [openClawSessionsQuery.data],
+  );
+
+  useEffect(() => {
+    setSelectedOpenClawSessionId((currentSessionId) =>
+      currentSessionId && activeOpenClawSessions.some((session) => session.id === currentSessionId)
+        ? currentSessionId
+        : activeOpenClawSessions[0]?.id ?? "",
+    );
+  }, [activeOpenClawSessions]);
   const saveSettings = useMutation({
     mutationFn: async () => {
       if (!settings) throw new Error("设置尚未加载完成");
@@ -172,6 +185,7 @@ export function ConfigPage() {
         argv: parseStringList(openClawArgvText, "OpenClaw argv"),
         risk_level: "low",
         reason: openClawReason,
+        ...(selectedOpenClawSessionId ? { session_id: selectedOpenClawSessionId } : {}),
       });
     },
     onSuccess: (operation) => setOpenClawOperation(operation),
@@ -629,6 +643,22 @@ export function ConfigPage() {
                 value={openClawReason}
                 onChange={(event) => setOpenClawReason(event.target.value)}
               />
+            </label>
+            <label htmlFor="openclaw-operation-session">
+              Control session
+              <select
+                id="openclaw-operation-session"
+                data-testid="openclaw-operation-session"
+                value={selectedOpenClawSessionId}
+                onChange={(event) => setSelectedOpenClawSessionId(event.target.value)}
+              >
+                <option value="">No session binding</option>
+                {activeOpenClawSessions.map((session) => (
+                  <option key={session.id} value={session.id}>
+                    {session.id} - {session.target}
+                  </option>
+                ))}
+              </select>
             </label>
             <div className="action-row">
               <button

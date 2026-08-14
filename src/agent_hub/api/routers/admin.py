@@ -608,6 +608,7 @@ class OpenClawOperationRequest(BaseModel):
     argv: list[str] = Field(default_factory=list, max_length=32)
     risk_level: str = Field(default="medium", pattern=r"^(low|medium|high)$")
     reason: str = Field(min_length=1, max_length=2_000)
+    session_id: str | None = Field(default=None, max_length=128, pattern=r"^openclaw_session_[a-f0-9]+$")
 
     @field_validator("argv")
     @classmethod
@@ -1027,6 +1028,42 @@ def _updated_openclaw_session(
     return session.model_copy(update={"status": "active", "updated_at": now})
 
 
+def _validate_openclaw_session_for_operation(
+    session: OpenClawSessionResponse,
+    request: OpenClawOperationRequest,
+) -> None:
+    if session.status != "active":
+        raise PublicAPIError(
+            409,
+            "openclaw_session_not_active",
+            "OpenClaw operation requires an active control session",
+        )
+    if session.platform != request.platform or session.target != request.target:
+        raise PublicAPIError(
+            409,
+            "openclaw_session_target_mismatch",
+            "OpenClaw operation target does not match the control session",
+        )
+    if request.kind == "server_command" and session.target_type != "server":
+        raise PublicAPIError(
+            409,
+            "openclaw_session_target_mismatch",
+            "OpenClaw server command requires a server control session",
+        )
+
+
+def _attach_openclaw_operation_to_session_payload(
+    session: OpenClawSessionResponse,
+    operation_id: str,
+    request: OpenClawOperationRequest,
+) -> OpenClawSessionResponse:
+    _validate_openclaw_session_for_operation(session, request)
+    operation_ids = list(session.operation_ids)
+    if operation_id not in operation_ids:
+        operation_ids.append(operation_id)
+    return session.model_copy(update={"operation_ids": operation_ids, "updated_at": datetime.now(UTC)})
+
+
 async def _execute_openclaw_operation(
     operation: OpenClawOperationResponse,
     settings: SystemSettingsResponse,
@@ -1368,6 +1405,15 @@ class AdminResourceService(Protocol):
         self,
         session_id: str,
         request: OpenClawSessionActionRequest,
+        *,
+        actor: str,
+    ) -> OpenClawSessionResponse: ...
+
+    async def attach_openclaw_operation_to_session(
+        self,
+        session_id: str,
+        operation_id: str,
+        request: OpenClawOperationRequest,
         *,
         actor: str,
     ) -> OpenClawSessionResponse: ...
@@ -2274,6 +2320,28 @@ class InMemoryAdminResourceService:
         )
         return updated
 
+    async def attach_openclaw_operation_to_session(
+        self,
+        session_id: str,
+        operation_id: str,
+        request: OpenClawOperationRequest,
+        *,
+        actor: str,
+    ) -> OpenClawSessionResponse:
+        try:
+            current = self.openclaw_sessions[session_id]
+        except KeyError:
+            raise PublicAPIError(404, "not_found", "not found") from None
+        updated = _attach_openclaw_operation_to_session_payload(current, operation_id, request)
+        self.openclaw_sessions[session_id] = updated
+        await self.record_audit_event(
+            actor=actor,
+            action="openclaw.session_operation_attached",
+            resource=f"openclaw_session:{session_id}",
+            details={"operation_id": operation_id, **_openclaw_session_audit_details(updated)},
+        )
+        return updated
+
     def make_log(
         self,
         *,
@@ -3142,6 +3210,35 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             action=f"openclaw.session_{request.action}",
             resource=f"openclaw_session:{session_id}",
             details=_openclaw_session_audit_details(updated, action=request.action),
+        )
+        return updated
+
+    async def attach_openclaw_operation_to_session(
+        self,
+        session_id: str,
+        operation_id: str,
+        request: OpenClawOperationRequest,
+        *,
+        actor: str,
+    ) -> OpenClawSessionResponse:
+        payload = await self._get_admin_payload("openclaw_session", session_id)
+        if payload is None:
+            return await super().attach_openclaw_operation_to_session(session_id, operation_id, request, actor=actor)
+        if not payload:
+            raise PublicAPIError(404, "not_found", "not found")
+        current = OpenClawSessionResponse.model_validate(payload)
+        updated = _attach_openclaw_operation_to_session_payload(current, operation_id, request)
+        if not await self._upsert_admin_payload(
+            "openclaw_session",
+            session_id,
+            updated.model_dump(mode="json"),
+        ):
+            return await super().attach_openclaw_operation_to_session(session_id, operation_id, request, actor=actor)
+        await self.record_audit_event(
+            actor=actor,
+            action="openclaw.session_operation_attached",
+            resource=f"openclaw_session:{session_id}",
+            details={"operation_id": operation_id, **_openclaw_session_audit_details(updated)},
         )
         return updated
 
@@ -5515,11 +5612,26 @@ async def create_openclaw_operation(
         raise PublicAPIError(409, "openclaw_disabled", "OpenClaw is disabled")
     if settings.openclaw_mode == "read_only" and body.kind not in {"screen_read", "file_read"}:
         raise PublicAPIError(403, "openclaw_read_only", "OpenClaw read-only mode blocks this operation")
+    if body.session_id is not None:
+        session = next(
+            (item for item in await service.list_openclaw_sessions() if item.id == body.session_id),
+            None,
+        )
+        if session is None:
+            raise PublicAPIError(404, "not_found", "not found")
+        _validate_openclaw_session_for_operation(session, body)
     operation = await service.create_openclaw_operation(
         body,
         actor=str(principal.user_id),
         mode=settings.openclaw_mode,
     )
+    if body.session_id is not None:
+        await service.attach_openclaw_operation_to_session(
+            body.session_id,
+            operation.id,
+            body,
+            actor=str(principal.user_id),
+        )
     if _openclaw_can_auto_approve(body, settings):
         return await service.resolve_openclaw_operation(
             operation.id,

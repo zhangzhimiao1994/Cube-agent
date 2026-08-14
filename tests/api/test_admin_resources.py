@@ -540,6 +540,91 @@ def test_openclaw_execute_returns_adapter_unavailable_for_windows_command() -> N
     assert response.json()["error"]["code"] == "openclaw_adapter_unavailable"
 
 
+def test_openclaw_operation_can_bind_to_active_session() -> None:
+    api = client()
+    payload = api.get("/api/v1/admin/settings", headers=headers()).json()
+    payload["openclaw_enabled"] = True
+    payload["openclaw_mode"] = "ask"
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+
+    created_session = api.post(
+        "/api/v1/admin/openclaw/sessions",
+        headers=headers(),
+        json={
+            "platform": "linux",
+            "target_type": "server",
+            "target": "agent-hub-server",
+            "purpose": "keep server operations inside an approved control session",
+        },
+    )
+    assert created_session.status_code == 201
+    session_id = created_session.json()["id"]
+
+    created_operation = api.post(
+        "/api/v1/admin/openclaw/operations",
+        headers=headers(),
+        json={
+            "platform": "linux",
+            "kind": "server_command",
+            "target": "agent-hub-server",
+            "argv": ["python", "--version"],
+            "risk_level": "low",
+            "reason": "bind this command to the active OpenClaw session",
+            "session_id": session_id,
+        },
+    )
+
+    assert created_operation.status_code == 202
+    operation = created_operation.json()
+    assert operation["operation"]["session_id"] == session_id
+
+    sessions = api.get("/api/v1/admin/openclaw/sessions", headers=headers())
+    assert sessions.status_code == 200
+    stored = next(item for item in sessions.json() if item["id"] == session_id)
+    assert stored["operation_ids"] == [operation["id"]]
+
+
+def test_openclaw_operation_rejects_inactive_session_binding() -> None:
+    api = client()
+    payload = api.get("/api/v1/admin/settings", headers=headers()).json()
+    payload["openclaw_enabled"] = True
+    payload["openclaw_mode"] = "ask"
+    assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
+
+    created_session = api.post(
+        "/api/v1/admin/openclaw/sessions",
+        headers=headers(),
+        json={
+            "platform": "linux",
+            "target_type": "server",
+            "target": "agent-hub-server",
+            "purpose": "pause this session before operation binding",
+        },
+    )
+    session_id = created_session.json()["id"]
+    assert api.patch(
+        f"/api/v1/admin/openclaw/sessions/{session_id}",
+        headers=headers(),
+        json={"action": "pause"},
+    ).status_code == 200
+
+    created_operation = api.post(
+        "/api/v1/admin/openclaw/operations",
+        headers=headers(),
+        json={
+            "platform": "linux",
+            "kind": "server_command",
+            "target": "agent-hub-server",
+            "argv": ["python", "--version"],
+            "risk_level": "low",
+            "reason": "paused sessions cannot accept new operations",
+            "session_id": session_id,
+        },
+    )
+
+    assert created_operation.status_code == 409
+    assert created_operation.json()["error"]["code"] == "openclaw_session_not_active"
+
 def test_openclaw_session_requires_feature_switch() -> None:
     response = client().post(
         "/api/v1/admin/openclaw/sessions",

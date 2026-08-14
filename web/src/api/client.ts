@@ -250,6 +250,7 @@ const OpenClawOperationRequestSchema = z.object({
   argv: z.array(z.string()),
   risk_level: z.enum(["low", "medium", "high"]),
   reason: z.string(),
+  session_id: z.string().optional(),
 });
 
 export type OpenClawOperationRequest = z.infer<typeof OpenClawOperationRequestSchema>;

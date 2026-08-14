@@ -1,3 +1,44 @@
+﻿## 2026-08-14 OpenClaw Operation Session Binding
+
+Current state:
+
+- Bound OpenClaw operation creation to active long-running OpenClaw control sessions when `session_id` is provided.
+- Backend now validates that the referenced session exists, is `active`, and matches operation platform/target before creating or attaching an operation.
+- Created operation IDs are recorded on the session `operation_ids` list for auditability and continuity.
+- Paused/stopped/unavailable sessions reject operation binding with `openclaw_session_not_active`; mismatched platform/target rejects with `openclaw_session_target_mismatch`.
+- Existing no-session OpenClaw operation flow remains compatible.
+- Settings UI now lets an admin choose an active OpenClaw control session before submitting an operation request.
+
+Verification performed:
+
+- Local backend checks:
+  - `uv run pytest tests/api/test_admin_resources.py::test_openclaw_operation_can_bind_to_active_session tests/api/test_admin_resources.py::test_openclaw_operation_rejects_inactive_session_binding -q --tb=short` -> 2 passed.
+  - `uv run pytest tests/api/test_admin_resources.py -q -k "openclaw" --tb=short` -> 17 passed, 72 deselected.
+  - `uv run ruff check src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+  - `uv run mypy --strict src\agent_hub\api\routers\admin.py tests\api\test_admin_resources.py` -> passed.
+- Local frontend checks:
+  - `npm.cmd run test -- --run src/pages/ConfigPage.test.tsx` -> 6 passed.
+  - `npm.cmd run test -- --run src/pages/ConfigPage.test.tsx -t "OpenClaw"` -> 4 passed, 2 skipped.
+  - `npm.cmd run lint` -> passed.
+  - `npm.cmd run test -- --run` -> 102 passed.
+  - `npm.cmd run build` -> passed with the existing Vite chunk-size warning.
+- Server incremental deployment:
+  - Uploaded `/tmp/agent-hub-openclaw-session-binding.tgz` to `103.236.98.133`.
+  - Preserved the prior deployed `admin.py` and `web/dist`, extracted the incremental package, fixed ownership, restarted `agent-hub-api` and `agent-hub-worker`, and reloaded Caddy.
+  - Confirmed `agent-hub-api`, `agent-hub-worker`, and `caddy` were active.
+- Server real environment verification:
+  - Ran `/tmp/server_openclaw_session_binding_check.py` against the deployed HTTP API using the real server DB/JWT environment.
+  - Verified the served frontend bundle contains `openclaw-operation-session` and `session_id`.
+  - Temporarily enabled OpenClaw, created a real Linux server session, created a real operation bound to that session, verified the session recorded the operation ID, paused the session, verified a second bound operation was rejected with `openclaw_session_not_active`, restored settings, and deleted probe records.
+  - Final output: `{"status": "ok", "checked": ["frontend_bundle", "operation_session_binding", "session_operation_ids", "inactive_session_rejection"], "cleaned_sessions": 1, "cleaned_operations": 1}`.
+
+Remaining risks / TODOs:
+
+- Commit this slice.
+- Create local ignored GitHub recovery bundle and GitHub archive tag for the previous remote `mutilagent/main`.
+- Push with `git push --force-with-lease mutilagent main`.
+- Check GitHub Actions and fix/redeploy/repush if red.
+- Continue planned work after green: OpenClaw adapter hardening/terminal-system integration, plan/schedule intent recognition, final README, and later full UI text/layout audit.
 ## 2026-08-14 OpenClaw Session UI Wiring
 
 Current state:
@@ -3032,3 +3073,4 @@ Remaining risks / next:
 - Push `main` with `git push --force-with-lease mutilagent main`.
 - Check GitHub Actions and fix/redeploy/repush if red.
 - Continue P3 with the remaining project-completion items and final GitHub usage README.
+
