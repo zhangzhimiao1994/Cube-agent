@@ -4089,3 +4089,6 @@ Server deployment and real verification for Chat-Triggered Evolution Plan + Righ
 - Probe created a real evolution run from the proposal through `POST /api/v1/admin/evolution-runs`, verified it was pending approval with `next_action=request_approval`, listed it back, then cleaned the probe evolution record and waiting run.
 - Probe output: `{"status": "ok", "checked": ["chat_submit", "admin_detail", "evolution_create", "frontend_bundle_deployed"], "probe_evolution_records": 0}`.
 - Removed `/tmp/evolution_chat_proposal_check.py` and `/tmp/agent-hub-p3-runtime-incremental.tgz`; `agent-hub-api`, `agent-hub-worker`, and `caddy` are active.
+CI status for Chat-Triggered Evolution Plan + Right History Drawer:
+
+- GitHub Actions run `31792510103` for commit `4214c62` completed successfully.
