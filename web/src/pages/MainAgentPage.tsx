@@ -572,8 +572,12 @@ export function MainAgentPage() {
               required
             />
           </label>
+          <p className="field-hint" aria-live="polite">
+            <strong>实际最大并发：{previewEffectiveSlots}</strong>
+            （配置最大并发 {configuredMaxConcurrency}，目标利用率 80%）
+          </p>
           <p className="field-hint">
-            当前配置最大并发 {configuredMaxConcurrency}，按目标利用率 80% 计算，实际有效并发槽 {previewEffectiveSlots} 个。要让 2 个子 Agent 同时运行，最大并发至少填 {maxConcurrencyForTwoSlots}。
+            实际有效并发槽 {previewEffectiveSlots} 个；要让 2 个子 Agent 同时运行，最大并发至少填 {maxConcurrencyForTwoSlots}。
           </p>
 
           <label htmlFor="main-agent-api-key">

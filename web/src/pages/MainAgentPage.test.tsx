@@ -102,6 +102,7 @@ describe("MainAgentPage", () => {
     await user.clear(screen.getByTestId("main-agent-max-concurrency"));
     await user.type(screen.getByTestId("main-agent-max-concurrency"), "3");
     expect(screen.getByText(/实际有效并发槽 2 个/)).not.toBeNull();
+    expect(screen.getByText("实际最大并发：2")).not.toBeNull();
     await user.selectOptions(screen.getByTestId("main-agent-control-mode"), "supervisor");
     await user.selectOptions(screen.getByTestId("main-agent-hermes-policy"), "confirm_before_apply");
     await user.clear(screen.getByTestId("main-agent-decision-policy"));

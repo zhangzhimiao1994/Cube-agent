@@ -1,3 +1,30 @@
+## 2026-08-15 Main Agent Effective Concurrency Display
+
+### State
+- Made the main Agent model/API page show a dedicated live status line `实际最大并发：n` next to the max concurrency input.
+- Kept the existing capacity logic unchanged: effective slots are still calculated from configured max concurrency with target utilization 80% and no reserved capacity.
+- This addresses the UI confusion where operators could enter a max concurrency value but had to read a longer help sentence to infer the actual usable concurrency.
+
+### Verification
+- TDD red: `npm test -- --run src/pages/MainAgentPage.test.tsx -t "configures the main agent"` first failed because `实际最大并发：2` was not rendered.
+- `npm test -- --run src/pages/MainAgentPage.test.tsx -t "configures the main agent"` from `web/` -> 5 passed after implementation. The current Vitest invocation runs the full `MainAgentPage.test.tsx` file.
+- `npm run lint` from `web/` -> passed.
+- `npm run build` from `web/` -> passed with the existing Vite large chunk warning; active build files include `web/dist/assets/index-CWv2Ucal.js` and `web/dist/assets/index-DvSJOsuV.css`.
+
+### Server Deployment And Real Probe
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-main-agent-concurrency-display-20260815-112548.tgz` and uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`; server backup retained under `/opt/agent-hub/backups/p3-main-agent-concurrency-display-20260815-112548`.
+- Server archive retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-main-agent-concurrency-display-20260815-112548.tgz`.
+- Real server probe called `http://127.0.0.1:8000/health` and got `{"status":"ok"}`.
+- Loaded `/` and `/main-agent` through Caddy, resolved active frontend asset `/assets/index-CWv2Ucal.js`, and verified deployed bundle markers for `实际最大并发`, `实际有效并发槽`, and `main-agent-max-concurrency`.
+- `caddy` and `agent-hub-api` were active after deployment.
+- Removed server `/tmp/agent-hub-p3-runtime-incremental.tgz`, `/tmp/deploy-main-agent-concurrency-display.sh`, and `/tmp/probe-main-agent-concurrency-display.sh` after verification.
+
+### GitHub / Recovery
+- Pending this slice: commit, local GitHub recovery bundle, archive tag push, force-with-lease push to `mutilagent/main`, and Actions verification.
+
+### Remaining / Next
+- Continue remaining P3 backlog after GitHub green: OpenClaw follow-ups if requested, evolution and long-memory refinements, broader missing button/function sweep, overall UI copy/layout audit, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 Workflow List Search And Filters
 
 ### State
