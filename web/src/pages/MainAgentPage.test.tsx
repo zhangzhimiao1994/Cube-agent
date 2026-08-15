@@ -99,6 +99,9 @@ describe("MainAgentPage", () => {
     await user.type(screen.getByTestId("main-agent-api-base"), "https://toapis.com/v1");
     await user.type(screen.getByTestId("main-agent-custom-model"), "claude-sonnet-4-6");
     await user.type(screen.getByTestId("main-agent-api-key"), "sk-test-main-agent-live");
+    await user.clear(screen.getByTestId("main-agent-max-concurrency"));
+    await user.type(screen.getByTestId("main-agent-max-concurrency"), "3");
+    expect(screen.getByText(/实际有效并发槽 2 个/)).not.toBeNull();
     await user.selectOptions(screen.getByTestId("main-agent-control-mode"), "supervisor");
     await user.selectOptions(screen.getByTestId("main-agent-hermes-policy"), "confirm_before_apply");
     await user.clear(screen.getByTestId("main-agent-decision-policy"));
@@ -119,6 +122,7 @@ describe("MainAgentPage", () => {
             upstream_model: "claude-sonnet-4-6",
             credential_ref: "secret://generated-main-agent",
             capabilities: ["text", "tool_calling"],
+            max_concurrency: 3,
           },
           control_mode: "supervisor",
           hermes_policy: "confirm_before_apply",
@@ -163,6 +167,7 @@ describe("MainAgentPage", () => {
         upstream_model: "deepseek-v4-flash",
         credential_ref: "secret://saved-main-agent",
         capabilities: ["text", "tool_calling"],
+        max_concurrency: 3,
       },
     };
     render(<TestApp initialPath="/main-agent" />);
@@ -170,6 +175,7 @@ describe("MainAgentPage", () => {
     expect(await screen.findByRole("heading", { name: "当前主 Agent 模型情况" })).not.toBeNull();
     expect(screen.getAllByText("deepseek").length).toBeGreaterThan(0);
     expect(screen.getAllByText("https://api.deepseek.com/v1").length).toBeGreaterThan(0);
+    expect(screen.getByText("2 / 3")).not.toBeNull();
     expect(screen.getByText("可沿用当前已保存 Key")).not.toBeNull();
 
     await user.selectOptions(screen.getByTestId("main-agent-model"), "deepseek-v4-pro");
@@ -195,6 +201,7 @@ describe("MainAgentPage", () => {
         upstream_model: "deepseek-v4-flash",
         credential_ref: "secret://saved-main-agent",
         capabilities: ["text", "tool_calling"],
+        max_concurrency: 3,
       },
     };
     render(<TestApp initialPath="/main-agent" />);

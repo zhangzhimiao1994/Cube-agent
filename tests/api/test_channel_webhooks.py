@@ -3,7 +3,9 @@ from __future__ import annotations
 import hmac
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from hashlib import sha1, sha256
+from typing import cast
 from uuid import UUID
 
 import pytest
@@ -14,8 +16,11 @@ from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
 from agent_hub.channels.base import InboundMessage
 from agent_hub.channels.feishu.media import FeishuMediaError
+from agent_hub.channels.feishu.reply import FeishuRunReplyDispatcher
 from agent_hub.channels.feishu.settings import FeishuSettings
 from agent_hub.channels.feishu.verify import FeishuVerifier
+from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.runs.repository import RunRecord, RunRepository
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
 USER_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -49,6 +54,109 @@ class RecordingFeishuReplySender:
         text: str,
     ) -> None:
         self.replies.append((settings, message_id, text))
+
+
+class StructuredRunRepository:
+    run_id = UUID("22222222-2222-4222-8222-222222222222")
+
+    async def get(self, tenant_id: UUID, run_id: UUID) -> RunRecord:
+        return RunRecord(
+            id=run_id,
+            tenant_id=tenant_id,
+            actor_id=USER_ID,
+            request="给我生成一个中秋晚会的方案",
+            mode=TaskMode.HYBRID,
+            status=RunStatus.COMPLETED,
+            version=3,
+            created_at=datetime(2026, 8, 15, tzinfo=UTC),
+            routing_decision={
+                "main_agent_model": "main-m3",
+                "selected_agent_ids": ["planner", "quality_reviewer"],
+            },
+        )
+
+    async def artifacts(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
+        del tenant_id, run_id
+        return (
+            {
+                "id": "artifact-step",
+                "type": "text",
+                "producer": "planner",
+                "content": {"text": "流程方案草案。"},
+            },
+            {
+                "id": "artifact-final",
+                "type": "text",
+                "producer": "final_synthesizer",
+                "content": {"text": "最终方案：主题、流程、预算、风险和验收标准。"},
+            },
+        )
+
+    async def events(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
+        del tenant_id, run_id
+        return (
+            {
+                "kind": "step.started",
+                "step_id": "main_agent_plan",
+                "actor": "main_agent",
+                "payload": {
+                    "main_agent_model": "main-m3",
+                    "roles": [
+                        {
+                            "id": "planner",
+                            "role": "Planner",
+                            "purpose": "execute",
+                            "logical_model": "m3",
+                        },
+                        {
+                            "id": "quality_reviewer",
+                            "role": "Quality Reviewer",
+                            "purpose": "verify",
+                            "logical_model": "m3",
+                        },
+                    ],
+                },
+            },
+            {
+                "kind": "step.completed",
+                "step_id": "planner_step",
+                "actor": "planner",
+                "payload": {
+                    "role": "Planner",
+                    "logical_model": "m3",
+                    "output": "给出活动流程和物料清单。",
+                },
+            },
+            {
+                "kind": "discussion.started",
+                "actor": "planner",
+                "session_id": "session-1",
+                "participants": ["planner", "quality_reviewer"],
+            },
+            {
+                "kind": "message.created",
+                "actor": "planner",
+                "message": "方案主线可采用游园会加晚会。",
+                "payload": {"logical_model": "m3"},
+            },
+            {
+                "kind": "message.created",
+                "actor": "quality_reviewer",
+                "message": "需要补充天气和安全预案。",
+                "payload": {"logical_model": "m3"},
+            },
+            {
+                "kind": "review.completed",
+                "actor": "quality_reviewer",
+                "payload": {
+                    "role": "Quality Reviewer",
+                    "verdict": "approve",
+                    "feedback": "已覆盖核心验收项。",
+                },
+            },
+            {"kind": "checkpoint.saved", "message": "internal checkpoint"},
+            {"kind": "model.started", "message": "internal model call"},
+        )
 
 
 class RecordingFeishuSkillHandler:
@@ -124,11 +232,14 @@ def client(gateway: RecordingGateway) -> TestClient:
 
 def slack_headers(signing_secret: str, body: bytes) -> dict[str, str]:
     timestamp = str(int(time.time()))
-    signature = "v0=" + hmac.new(
-        signing_secret.encode(),
-        b"v0:" + timestamp.encode() + b":" + body,
-        sha256,
-    ).hexdigest()
+    signature = (
+        "v0="
+        + hmac.new(
+            signing_secret.encode(),
+            b"v0:" + timestamp.encode() + b":" + body,
+            sha256,
+        ).hexdigest()
+    )
     return {
         "Content-Type": "application/json",
         "X-Slack-Request-Timestamp": timestamp,
@@ -223,7 +334,9 @@ def test_token_channel_webhooks_submit_to_gateway(
     assert gateway.messages[0].text == text
 
 
-def test_generic_channel_webhook_preserves_attachment_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_generic_channel_webhook_preserves_attachment_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("CUSTOM_WEBHOOK_TOKEN", "token")
     gateway = RecordingGateway()
 
@@ -531,7 +644,7 @@ def test_feishu_webhook_accepts_token_only_event_when_signature_headers_are_abse
                     "chat_id": "oc_chat",
                     "chat_type": "p2p",
                     "message_type": "text",
-                    "content": "{\"text\":\"/direct hello\"}",
+                    "content": '{"text":"/direct hello"}',
                 },
             },
         },
@@ -542,12 +655,74 @@ def test_feishu_webhook_accepts_token_only_event_when_signature_headers_are_abse
     assert gateway.messages[0].text == "/direct hello"
 
 
+def test_saved_feishu_command_aliases_are_applied_before_submission() -> None:
+    gateway = RecordingGateway()
+    app = create_app(
+        auth_service=StubAuthService(),
+        rate_limiter=object(),
+        feishu_gateway=gateway,
+    )
+    app.state.admin_resource_service = InMemoryAdminResourceService()
+    api = TestClient(app)
+
+    saved = api.post(
+        "/api/v1/admin/channels/feishu/config",
+        headers={"Authorization": "Bearer valid-token"},
+        json={
+            "values": {
+                "AGENT_HUB_PUBLIC_URL": "https://agent.example.com",
+                "FEISHU_APP_ID": "cli_saved_feishu",
+                "FEISHU_APP_SECRET": "saved-secret",
+                "FEISHU_VERIFICATION_TOKEN": "saved-verification-token",
+                "FEISHU_ENCRYPT_KEY": "saved-encrypt-key",
+                "FEISHU_COMMAND_ALIASES": "方案=//派单, 代码=//vi",
+                "FEISHU_TRANSPORT": "webhook",
+            }
+        },
+    )
+    response = api.post(
+        "/channels/feishu/events",
+        json={
+            "schema": "2.0",
+            "header": {
+                "event_id": "evt_alias",
+                "event_type": "im.message.receive_v1",
+                "token": "saved-verification-token",
+                "app_id": "cli_saved_feishu",
+                "tenant_key": "tenant_1",
+                "create_time": str(int(time.time())),
+            },
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou_user"}},
+                "message": {
+                    "message_id": "om_alias",
+                    "chat_id": "oc_chat",
+                    "chat_type": "p2p",
+                    "message_type": "text",
+                    "content": '{"text":"方案 写一个中秋晚会方案"}',
+                },
+            },
+        },
+    )
+
+    assert saved.status_code == 200
+    assert set(saved.json()["saved"]) == {
+        "AGENT_HUB_PUBLIC_URL",
+        "FEISHU_APP_ID",
+        "FEISHU_APP_SECRET",
+        "FEISHU_VERIFICATION_TOKEN",
+        "FEISHU_ENCRYPT_KEY",
+        "FEISHU_COMMAND_ALIASES",
+        "FEISHU_TRANSPORT",
+    }
+    assert response.status_code == 202
+    assert gateway.messages[0].text == "//派单 写一个中秋晚会方案"
+
+
 def test_feishu_webhook_appends_image_analysis_context() -> None:
     gateway = RecordingGateway()
     service = InMemoryAdminResourceService()
-    service.settings = service.settings.model_copy(
-        update={"multimedia_generation_enabled": True}
-    )
+    service.settings = service.settings.model_copy(update={"multimedia_generation_enabled": True})
     app = create_app(
         auth_service=StubAuthService(),
         rate_limiter=object(),
@@ -592,8 +767,7 @@ def test_feishu_webhook_appends_image_analysis_context() -> None:
                     "chat_type": "p2p",
                     "message_type": "image",
                     "content": (
-                        "{\"image_key\":\"img_123\",\"mime_type\":\"image/png\","
-                        "\"file_name\":\"diagram.png\"}"
+                        '{"image_key":"img_123","mime_type":"image/png","file_name":"diagram.png"}'
                     ),
                 },
             },
@@ -658,7 +832,7 @@ def test_feishu_webhook_replies_when_image_arrives_with_multimodal_disabled() ->
                     "chat_id": "oc_chat",
                     "chat_type": "p2p",
                     "message_type": "image",
-                    "content": "{\"image_key\":\"img_123\",\"mime_type\":\"image/png\"}",
+                    "content": '{"image_key":"img_123","mime_type":"image/png"}',
                 },
             },
         },
@@ -722,8 +896,8 @@ def test_feishu_webhook_routes_skill_file_command_to_protected_handler() -> None
                     "chat_type": "p2p",
                     "message_type": "file",
                     "content": (
-                        "{\"file_key\":\"file_1\",\"file_name\":\"writer.zip\","
-                        "\"mime_type\":\"application/zip\",\"text\":\"/skill install\"}"
+                        '{"file_key":"file_1","file_name":"writer.zip",'
+                        '"mime_type":"application/zip","text":"/skill install"}'
                     ),
                 },
             },
@@ -743,9 +917,7 @@ def test_feishu_webhook_routes_skill_file_command_to_protected_handler() -> None
 def test_feishu_webhook_uses_media_service_factory_with_runtime_settings() -> None:
     gateway = RecordingGateway()
     service = InMemoryAdminResourceService()
-    service.settings = service.settings.model_copy(
-        update={"multimedia_generation_enabled": True}
-    )
+    service.settings = service.settings.model_copy(update={"multimedia_generation_enabled": True})
     app = create_app(
         auth_service=StubAuthService(),
         rate_limiter=object(),
@@ -795,7 +967,7 @@ def test_feishu_webhook_uses_media_service_factory_with_runtime_settings() -> No
                     "chat_id": "oc_chat",
                     "chat_type": "p2p",
                     "message_type": "image",
-                    "content": "{\"image_key\":\"img_123\",\"mime_type\":\"image/png\"}",
+                    "content": '{"image_key":"img_123","mime_type":"image/png"}',
                 },
             },
         },
@@ -811,9 +983,7 @@ def test_feishu_webhook_uses_media_service_factory_with_runtime_settings() -> No
 def test_feishu_webhook_logs_media_failure_and_submits_original_message() -> None:
     gateway = RecordingGateway()
     service = InMemoryAdminResourceService()
-    service.settings = service.settings.model_copy(
-        update={"multimedia_generation_enabled": True}
-    )
+    service.settings = service.settings.model_copy(update={"multimedia_generation_enabled": True})
     app = create_app(
         auth_service=StubAuthService(),
         rate_limiter=object(),
@@ -856,7 +1026,7 @@ def test_feishu_webhook_logs_media_failure_and_submits_original_message() -> Non
                     "chat_id": "oc_chat",
                     "chat_type": "p2p",
                     "message_type": "image",
-                    "content": "{\"image_key\":\"img_bad\",\"mime_type\":\"image/png\"}",
+                    "content": '{"image_key":"img_bad","mime_type":"image/png"}',
                 },
             },
         },
@@ -1010,3 +1180,42 @@ def test_generic_channel_webhook_rejects_wrong_token(monkeypatch: pytest.MonkeyP
     assert response.status_code == 401
     assert response.json() == {"error": "invalid_channel_token", "channel": "custom_webhook"}
     assert gateway.messages == []
+
+
+def test_feishu_terminal_reply_summarizes_user_relevant_run_process() -> None:
+    sender = RecordingFeishuReplySender()
+    repository = StructuredRunRepository()
+    dispatcher = FeishuRunReplyDispatcher(
+        run_repository=cast(RunRepository, repository),
+        sender=sender,
+        poll_interval_seconds=0.01,
+        timeout_seconds=1.0,
+    )
+
+    async def run() -> None:
+        await dispatcher.reply_when_terminal(
+            tenant_id=TENANT_ID,
+            run_id=StructuredRunRepository.run_id,
+            source_message_id="om_process_summary",
+            settings=FeishuSettings(app_id="cli_saved_feishu", app_secret="secret"),
+        )
+
+    import asyncio
+
+    asyncio.run(run())
+
+    assert len(sender.replies) == 1
+    text = sender.replies[0][2]
+    assert "最终结果" in text
+    assert "最终方案：主题、流程、预算、风险和验收标准。" in text
+    assert "Agent 调度" in text
+    assert "主 Agent 模型: main-m3" in text
+    assert "子 Agent 输出" in text
+    assert "Planner(planner)[m3]: 给出活动流程和物料清单。" in text
+    assert "讨论情况" in text
+    assert "quality_reviewer[m3]: 需要补充天气和安全预案。" in text
+    assert "裁决情况" in text
+    assert "Quality Reviewer(quality_reviewer): approve - 已覆盖核心验收项。" in text
+    assert "checkpoint.saved" not in text
+    assert "model.started" not in text
+    assert "internal checkpoint" not in text

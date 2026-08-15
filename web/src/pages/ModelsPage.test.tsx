@@ -130,11 +130,11 @@ describe("ModelsPage", () => {
     expect(screen.getByRole("columnheader", { name: "逻辑模型" })).not.toBeNull();
     expect(screen.getByRole("columnheader", { name: "服务商" })).not.toBeNull();
     expect(screen.getByRole("columnheader", { name: "上游模型" })).not.toBeNull();
-    expect(screen.getByRole("columnheader", { name: "有效并发" })).not.toBeNull();
+    expect(screen.getByRole("columnheader", { name: "有效/最大并发" })).not.toBeNull();
     expect(screen.getByText("planner")).not.toBeNull();
     expect(screen.getByText("deepseek")).not.toBeNull();
     expect(screen.getByText("deepseek-v4-flash")).not.toBeNull();
-    expect(screen.getByText("1")).not.toBeNull();
+    expect(screen.getByText("1 / 1")).not.toBeNull();
     expect(screen.getByText("先排队，超时后降级")).not.toBeNull();
     expect(screen.getByText("同一服务商账号下的多个 Key 可能共享配额，不要把并发设置到跑满额度。")).not.toBeNull();
   });
@@ -206,6 +206,7 @@ describe("ModelsPage", () => {
     await user.type(screen.getByLabelText("Quota Scope"), "deepseek-account");
     await user.clear(screen.getByLabelText("最大并发"));
     await user.type(screen.getByLabelText("最大并发"), "4");
+    expect(screen.getByText(/预计有效并发槽 3 个/)).not.toBeNull();
     await user.click(screen.getByRole("button", { name: "测试并保存模型" }));
 
     await screen.findByText("模型已通过可用性测试并保存，Key 引用：secret_created");

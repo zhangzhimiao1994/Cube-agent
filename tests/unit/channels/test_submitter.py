@@ -11,7 +11,13 @@ from agent_hub.channels.base import (
     InboundAttachment,
     InboundMessage,
 )
-from agent_hub.channels.directives import ChannelDirectiveError, parse_channel_directives
+from agent_hub.channels.directives import (
+    ChannelDirectiveError,
+    apply_channel_command_aliases,
+    command_help_text,
+    parse_channel_directives,
+    parse_command_aliases,
+)
 from agent_hub.channels.submitter import RunServiceInboundSubmitter
 from agent_hub.domain.runs import TaskMode
 
@@ -178,7 +184,23 @@ async def test_submitter_parses_english_channel_language_directives_for_mode_and
     assert context["requested_channel_features"] == "vibe_coding"
 
 
-async def test_submitter_parses_chinese_channel_language_directives_and_rejects_disabled_vibe() -> None:
+def test_channel_directives_accept_custom_aliases_and_show_help() -> None:
+    aliases = parse_command_aliases("方案=//派单, 讨论=//讨论, 代码=//vi")
+
+    normalized = apply_channel_command_aliases("方案 写一个中秋晚会方案", aliases)
+    directives = parse_channel_directives(normalized)
+    help_text = command_help_text(aliases)
+
+    assert normalized == "//派单 写一个中秋晚会方案"
+    assert directives.mode is TaskMode.DISPATCH
+    assert directives.task_text == "写一个中秋晚会方案"
+    assert "方案=//派单" in help_text
+    assert "代码=//vi" in help_text
+
+
+async def test_submitter_parses_chinese_channel_language_directives_and_rejects_disabled_vibe() -> (
+    None
+):
     run_service = RecordingRunService()
     submitter = RunServiceInboundSubmitter(
         run_service=run_service,
@@ -208,7 +230,9 @@ async def test_submitter_parses_chinese_channel_language_directives_and_rejects_
     except ChannelDirectiveError as error:
         assert error.reason == "vibe_coding_disabled"
     else:  # pragma: no cover - assertion clarity
-        raise AssertionError("submitter accepted channel Vibe Coding while the system switch is off")
+        raise AssertionError(
+            "submitter accepted channel Vibe Coding while the system switch is off"
+        )
     assert run_service.calls == []
 
 

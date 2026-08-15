@@ -47,6 +47,7 @@ from agent_hub.evolution import (
     plan_evolution_next_round,
 )
 from agent_hub.models.capabilities import infer_model_capabilities
+from agent_hub.models.capacity import safe_operational_limit
 from agent_hub.models.gateway import ModelTransport
 from agent_hub.models.litellm_client import LiteLLMClient, ModelTransportError
 from agent_hub.models.registry import NoCapableDeployment
@@ -86,7 +87,9 @@ from agent_hub.skills.scanner import SkillScanner, SkillScanReport
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"], responses=BASE_ERROR_RESPONSES)
 _LOGGER = logging.getLogger(__name__)
 _MODEL_CHECK_STATUS_RE = re.compile(r"\bstatus[=_: ](?P<status>[1-5][0-9]{2})\b")
-_MODEL_CHECK_HINT = "检查 API Key 是否有效、API Base 是否可从服务器访问、模型名是否属于该服务商账号。"
+_MODEL_CHECK_HINT = (
+    "检查 API Key 是否有效、API Base 是否可从服务器访问、模型名是否属于该服务商账号。"
+)
 _DASHSCOPE_AUTH_HINT = (
     "DashScope/Qwen 返回 401 通常表示鉴权失败：请使用阿里云百炼/DashScope API Key，"
     "不要使用阿里云 AccessKey/Secret；确认该 Key 已开通对应模型权限；API Base 使用 "
@@ -127,6 +130,14 @@ class ModelDeploymentResponse(ModelDeploymentRequest):
     id: UUID
     effective_slots: int
     saturation_policy: str
+
+
+def _model_effective_slots(
+    max_concurrency: int,
+    target_utilization: float,
+    reserved_capacity: int,
+) -> int:
+    return safe_operational_limit(max_concurrency, target_utilization, reserved_capacity)
 
 
 class SecretCreateRequest(BaseModel):
@@ -381,6 +392,7 @@ class SkillBulkDeleteResponse(BaseModel):
     deleted: list[str]
     failed: list[BulkFailureResponse]
 
+
 class SkillArchiveSkippedResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -634,7 +646,9 @@ class OpenClawRemoteAdapterSettings(BaseModel):
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("OpenClaw adapter URL must be an HTTP(S) URL")
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise ValueError("OpenClaw adapter URL must not contain credentials, query, or fragment")
+            raise ValueError(
+                "OpenClaw adapter URL must not contain credentials, query, or fragment"
+            )
         normalized_path = parsed.path.rstrip("/")
         return urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))
 
@@ -659,7 +673,9 @@ class SystemSettingsRequest(BaseModel):
     openclaw_enabled: bool = False
     openclaw_mode: str = Field(default="ask", pattern=r"^(ask|read_only|auto_review|trusted_auto)$")
     openclaw_allowed_commands: list[list[str]] = Field(default_factory=list, max_length=64)
-    openclaw_remote_adapters: list[OpenClawRemoteAdapterSettings] = Field(default_factory=list, max_length=32)
+    openclaw_remote_adapters: list[OpenClawRemoteAdapterSettings] = Field(
+        default_factory=list, max_length=32
+    )
     temporary_agent_policy: str = Field(
         default="主 Agent 发现角色池缺少必要能力时，必须先说明原因并取得用户确认，再临时加入子 Agent。",
         max_length=10_000,
@@ -691,7 +707,9 @@ class OpenClawOperationRequest(BaseModel):
     argv: list[str] = Field(default_factory=list, max_length=32)
     risk_level: str = Field(default="medium", pattern=r"^(low|medium|high)$")
     reason: str = Field(min_length=1, max_length=2_000)
-    session_id: str | None = Field(default=None, max_length=128, pattern=r"^openclaw_session_[a-f0-9]+$")
+    session_id: str | None = Field(
+        default=None, max_length=128, pattern=r"^openclaw_session_[a-f0-9]+$"
+    )
 
     @field_validator("argv")
     @classmethod
@@ -980,7 +998,9 @@ def _openclaw_audit_details(request: OpenClawOperationRequest, mode: str) -> dic
     }
 
 
-def _openclaw_can_auto_approve(request: OpenClawOperationRequest, settings: SystemSettingsResponse) -> bool:
+def _openclaw_can_auto_approve(
+    request: OpenClawOperationRequest, settings: SystemSettingsResponse
+) -> bool:
     if settings.openclaw_mode not in {"auto_review", "trusted_auto"}:
         return False
     if request.risk_level != "low":
@@ -995,7 +1015,9 @@ def _openclaw_proposal_string(proposal: Mapping[str, JsonValue], key: str) -> st
     return value if isinstance(value, str) else ""
 
 
-def _openclaw_operation_request_from_run_detail(detail: RunDetailResponse) -> OpenClawOperationRequest:
+def _openclaw_operation_request_from_run_detail(
+    detail: RunDetailResponse,
+) -> OpenClawOperationRequest:
     proposal = detail.openclaw_proposal
     if detail.status != "waiting_approval" or proposal is None:
         raise PublicAPIError(
@@ -1011,7 +1033,11 @@ def _openclaw_operation_request_from_run_detail(detail: RunDetailResponse) -> Op
         target=_openclaw_proposal_string(proposal, "target"),
     )
     operation_text = _openclaw_proposal_string(proposal, "operation_text") or detail.request
-    source_conversation_id = _openclaw_proposal_string(proposal, "source_conversation_id") or detail.conversation_id or ""
+    source_conversation_id = (
+        _openclaw_proposal_string(proposal, "source_conversation_id")
+        or detail.conversation_id
+        or ""
+    )
     try:
         return OpenClawOperationRequest(
             platform=platform,
@@ -1166,27 +1192,66 @@ def _configured_openclaw_adapter_for_session(
     )
 
 
-def _openclaw_adapter_responses(settings: SystemSettingsResponse | None = None) -> tuple[OpenClawAdapterResponse, ...]:
+def _openclaw_adapter_responses(
+    settings: SystemSettingsResponse | None = None,
+) -> tuple[OpenClawAdapterResponse, ...]:
     descriptions = {
         ("linux", "server_command"): (
             "Runs exact allowlisted argv commands on the 魔方agent Linux server after approval."
         ),
-        ("linux", "desktop_action"): "Requires a connected Linux desktop OpenClaw adapter before execution.",
-        ("linux", "screen_read"): "Requires a connected Linux screen OpenClaw adapter before execution.",
-        ("linux", "file_read"): "Requires a connected Linux filesystem OpenClaw adapter before execution.",
-        ("windows", "server_command"): "Requires a connected Windows OpenClaw adapter before execution.",
-        ("windows", "desktop_action"): "Requires a connected Windows desktop OpenClaw adapter before execution.",
-        ("windows", "screen_read"): "Requires a connected Windows screen OpenClaw adapter before execution.",
-        ("windows", "file_read"): "Requires a connected Windows filesystem OpenClaw adapter before execution.",
-        ("macos", "server_command"): "Requires a connected macOS OpenClaw adapter before execution.",
-        ("macos", "desktop_action"): "Requires a connected macOS desktop OpenClaw adapter before execution.",
-        ("macos", "screen_read"): "Requires a connected macOS screen OpenClaw adapter before execution.",
-        ("macos", "file_read"): "Requires a connected macOS filesystem OpenClaw adapter before execution.",
+        (
+            "linux",
+            "desktop_action",
+        ): "Requires a connected Linux desktop OpenClaw adapter before execution.",
+        (
+            "linux",
+            "screen_read",
+        ): "Requires a connected Linux screen OpenClaw adapter before execution.",
+        (
+            "linux",
+            "file_read",
+        ): "Requires a connected Linux filesystem OpenClaw adapter before execution.",
+        (
+            "windows",
+            "server_command",
+        ): "Requires a connected Windows OpenClaw adapter before execution.",
+        (
+            "windows",
+            "desktop_action",
+        ): "Requires a connected Windows desktop OpenClaw adapter before execution.",
+        (
+            "windows",
+            "screen_read",
+        ): "Requires a connected Windows screen OpenClaw adapter before execution.",
+        (
+            "windows",
+            "file_read",
+        ): "Requires a connected Windows filesystem OpenClaw adapter before execution.",
+        (
+            "macos",
+            "server_command",
+        ): "Requires a connected macOS OpenClaw adapter before execution.",
+        (
+            "macos",
+            "desktop_action",
+        ): "Requires a connected macOS desktop OpenClaw adapter before execution.",
+        (
+            "macos",
+            "screen_read",
+        ): "Requires a connected macOS screen OpenClaw adapter before execution.",
+        (
+            "macos",
+            "file_read",
+        ): "Requires a connected macOS filesystem OpenClaw adapter before execution.",
     }
     adapters: list[OpenClawAdapterResponse] = []
     for platform in ("linux", "windows", "macos"):
         for kind in ("server_command", "desktop_action", "screen_read", "file_read"):
-            configured = None if settings is None else _configured_openclaw_adapter_for_kind(settings, platform=platform, kind=kind)
+            configured = (
+                None
+                if settings is None
+                else _configured_openclaw_adapter_for_kind(settings, platform=platform, kind=kind)
+            )
             local_linux = platform == "linux" and kind == "server_command"
             available = local_linux or configured is not None
             if configured is not None:
@@ -1213,7 +1278,9 @@ def _openclaw_adapter_responses(settings: SystemSettingsResponse | None = None) 
     return tuple(adapters)
 
 
-def _openclaw_session_host(request: OpenClawSessionRequest, settings: SystemSettingsResponse) -> str:
+def _openclaw_session_host(
+    request: OpenClawSessionRequest, settings: SystemSettingsResponse
+) -> str:
     if request.platform == "linux" and request.target_type == "server":
         return "agent-hub-server"
     configured = _configured_openclaw_adapter_for_session(settings, request)
@@ -1222,10 +1289,16 @@ def _openclaw_session_host(request: OpenClawSessionRequest, settings: SystemSett
     return f"remote-{request.platform}-host"
 
 
-def _openclaw_session_adapter_status(request: OpenClawSessionRequest, settings: SystemSettingsResponse) -> str:
+def _openclaw_session_adapter_status(
+    request: OpenClawSessionRequest, settings: SystemSettingsResponse
+) -> str:
     if request.platform == "linux" and request.target_type == "server":
         return "available"
-    return "available" if _configured_openclaw_adapter_for_session(settings, request) is not None else "adapter_unavailable"
+    return (
+        "available"
+        if _configured_openclaw_adapter_for_session(settings, request) is not None
+        else "adapter_unavailable"
+    )
 
 
 def _openclaw_session_response(
@@ -1285,7 +1358,9 @@ def _updated_openclaw_session(
             "OpenClaw session is already stopped",
         )
     if request.action == "stop":
-        return session.model_copy(update={"status": "stopped", "updated_at": now, "stopped_at": now})
+        return session.model_copy(
+            update={"status": "stopped", "updated_at": now, "stopped_at": now}
+        )
     if session.status == "adapter_unavailable":
         raise PublicAPIError(
             409,
@@ -1330,7 +1405,9 @@ def _attach_openclaw_operation_to_session_payload(
     operation_ids = list(session.operation_ids)
     if operation_id not in operation_ids:
         operation_ids.append(operation_id)
-    return session.model_copy(update={"operation_ids": operation_ids, "updated_at": datetime.now(UTC)})
+    return session.model_copy(
+        update={"operation_ids": operation_ids, "updated_at": datetime.now(UTC)}
+    )
 
 
 async def _execute_openclaw_operation(
@@ -1351,7 +1428,9 @@ async def _execute_openclaw_operation(
 
     request = OpenClawOperationRequest.model_validate(operation.operation)
     if settings.openclaw_mode == "read_only" and request.kind not in {"screen_read", "file_read"}:
-        raise PublicAPIError(403, "openclaw_read_only", "OpenClaw read-only mode blocks this operation")
+        raise PublicAPIError(
+            403, "openclaw_read_only", "OpenClaw read-only mode blocks this operation"
+        )
 
     if request.platform == "linux" and request.kind == "server_command":
         if not openclaw_command_allowed(request.argv, settings.openclaw_allowed_commands):
@@ -1369,7 +1448,9 @@ async def _execute_openclaw_operation(
                 "openclaw_adapter_unavailable",
                 "OpenClaw execution adapter is not available for this operation",
             )
-        if request.kind == "server_command" and not openclaw_command_allowed(request.argv, settings.openclaw_allowed_commands):
+        if request.kind == "server_command" and not openclaw_command_allowed(
+            request.argv, settings.openclaw_allowed_commands
+        ):
             raise PublicAPIError(
                 403,
                 "openclaw_command_denied",
@@ -1414,6 +1495,7 @@ async def _execute_openclaw_operation(
         result,
     )
 
+
 def _openclaw_execution_response(
     operation: OpenClawOperationResponse,
     result: OpenClawCommandResult,
@@ -1439,6 +1521,7 @@ class MainAgentModelConfig(BaseModel):
     upstream_model: str = Field(min_length=1, max_length=512)
     credential_ref: str = Field(min_length=1, max_length=128)
     capabilities: list[str] = Field(default_factory=lambda: ["text"], min_length=1, max_length=8)
+    max_concurrency: int = Field(default=1, ge=1, le=1024)
 
 
 class MainAgentConfigRequest(BaseModel):
@@ -1598,7 +1681,9 @@ class AdminResourceService(Protocol):
 
     async def list_workflows(self) -> tuple[WorkflowResourceResponse, ...]: ...
 
-    async def upsert_workflow(self, request: WorkflowResourceRequest) -> WorkflowResourceResponse: ...
+    async def upsert_workflow(
+        self, request: WorkflowResourceRequest
+    ) -> WorkflowResourceResponse: ...
 
     async def delete_workflow(self, workflow_id: str) -> None: ...
 
@@ -1625,7 +1710,6 @@ class AdminResourceService(Protocol):
     async def cancel_run(self, run_id: UUID) -> RunDetailResponse: ...
 
     async def delete_run(self, run_id: UUID) -> RunDeleteResponse: ...
-
 
     async def list_evolution_runs(self) -> tuple[EvolutionRunResponse, ...]: ...
 
@@ -1681,7 +1765,9 @@ class AdminResourceService(Protocol):
 
     async def upload_skill(self, request: SkillUploadRequest) -> SkillResponse: ...
 
-    async def upload_skill_archive(self, filename: str, archive_bytes: bytes) -> SkillArchiveUploadResponse: ...
+    async def upload_skill_archive(
+        self, filename: str, archive_bytes: bytes
+    ) -> SkillArchiveUploadResponse: ...
 
     async def approve_skill(self, skill_id: str) -> SkillResponse: ...
 
@@ -1699,7 +1785,9 @@ class AdminResourceService(Protocol):
         self, channel_id: str, request: ChannelConfigRequest
     ) -> ChannelConfigSaveResponse: ...
 
-    async def clear_channel_config(self, channel_id: str, *, actor: str) -> ChannelConfigSaveResponse: ...
+    async def clear_channel_config(
+        self, channel_id: str, *, actor: str
+    ) -> ChannelConfigSaveResponse: ...
 
     async def channel_runtime_config(self) -> dict[str, str]: ...
 
@@ -1707,11 +1795,15 @@ class AdminResourceService(Protocol):
 
     async def create_memory(self, request: MemoryCreateRequest) -> MemoryRecordResponse: ...
 
-    async def update_memory(self, memory_id: str, request: MemoryRecordRequest) -> MemoryRecordResponse: ...
+    async def update_memory(
+        self, memory_id: str, request: MemoryRecordRequest
+    ) -> MemoryRecordResponse: ...
 
     async def forget_memory(self, memory_id: str) -> None: ...
 
-    async def list_audit_events(self, action: str | None = None) -> tuple[AuditEventResponse, ...]: ...
+    async def list_audit_events(
+        self, action: str | None = None
+    ) -> tuple[AuditEventResponse, ...]: ...
 
     async def record_audit_event(
         self,
@@ -1821,16 +1913,22 @@ class _SkippedSkillArchive:
     reason: str
 
 
-def _scan_skill_archive_upload(filename: str, archive_bytes: bytes) -> tuple[bool, tuple[_ScannedSkillArchive, ...], tuple[_SkippedSkillArchive, ...]]:
+def _scan_skill_archive_upload(
+    filename: str, archive_bytes: bytes
+) -> tuple[bool, tuple[_ScannedSkillArchive, ...], tuple[_SkippedSkillArchive, ...]]:
     scanner = SkillScanner()
     try:
-        return False, (
-            _ScannedSkillArchive(
-                filename=filename,
-                archive_bytes=archive_bytes,
-                scan_report=scanner.scan(archive_bytes),
+        return (
+            False,
+            (
+                _ScannedSkillArchive(
+                    filename=filename,
+                    archive_bytes=archive_bytes,
+                    scan_report=scanner.scan(archive_bytes),
+                ),
             ),
-        ), ()
+            (),
+        )
     except InvalidSkillPackage:
         try:
             instruction_scan = _scan_instruction_skill_archive(filename, archive_bytes)
@@ -1856,7 +1954,9 @@ def _scan_skill_archive_upload(filename: str, archive_bytes: bytes) -> tuple[boo
                 try:
                     instruction_item = _scan_instruction_skill_archive(item_filename, item_bytes)
                 except InvalidSkillPackage as instruction_error:
-                    skipped.append(_SkippedSkillArchive(path=item_path, reason=str(instruction_error)))
+                    skipped.append(
+                        _SkippedSkillArchive(path=item_path, reason=str(instruction_error))
+                    )
                     continue
                 if instruction_item is None:
                     skipped.append(_SkippedSkillArchive(path=item_path, reason=str(scan_error)))
@@ -1867,7 +1967,9 @@ def _scan_skill_archive_upload(filename: str, archive_bytes: bytes) -> tuple[boo
         return len(scanned) + len(skipped) > 1, tuple(scanned), tuple(skipped)
 
 
-def _scan_instruction_skill_archive(filename: str, archive_bytes: bytes) -> _ScannedSkillArchive | None:
+def _scan_instruction_skill_archive(
+    filename: str, archive_bytes: bytes
+) -> _ScannedSkillArchive | None:
     members = _instruction_skill_members(archive_bytes)
     if members is None:
         return None
@@ -1895,7 +1997,9 @@ def _instruction_skill_members(archive_bytes: bytes) -> tuple[str, bytes] | None
                         continue
                     mode = (info.external_attr >> 16) & 0o777777
                     if _skill_bundle_mode_is_unsafe(mode):
-                        raise InvalidSkillPackage("instruction skill contains links or device files")
+                        raise InvalidSkillPackage(
+                            "instruction skill contains links or device files"
+                        )
                     path = _safe_skill_bundle_path(info.filename)
                     if _skill_bundle_path_is_ignored(path):
                         continue
@@ -1920,7 +2024,13 @@ def _instruction_skill_members(archive_bytes: bytes) -> tuple[str, bytes] | None
             for member in archive.getmembers():
                 if member.isdir():
                     continue
-                if member.issym() or member.islnk() or member.ischr() or member.isblk() or member.isfifo():
+                if (
+                    member.issym()
+                    or member.islnk()
+                    or member.ischr()
+                    or member.isblk()
+                    or member.isfifo()
+                ):
                     raise InvalidSkillPackage("instruction skill contains links or device files")
                 if not member.isfile():
                     raise InvalidSkillPackage("instruction skill contains unsupported file types")
@@ -1944,16 +2054,21 @@ def _instruction_skill_members(archive_bytes: bytes) -> tuple[str, bytes] | None
         raise InvalidSkillPackage("skill archive must be a valid zip or tar archive") from exc
 
 
-
 def _select_instruction_skill_path(candidates: Iterable[str]) -> str | None:
     ordered = tuple(candidates)
     if not ordered:
         return None
     shallowest_depth = min(len(PurePosixPath(candidate).parts) for candidate in ordered)
-    shallowest = [candidate for candidate in ordered if len(PurePosixPath(candidate).parts) == shallowest_depth]
+    shallowest = [
+        candidate
+        for candidate in ordered
+        if len(PurePosixPath(candidate).parts) == shallowest_depth
+    ]
     if len(shallowest) != 1:
         return None
     return shallowest[0]
+
+
 def _instruction_skill_fallback_name(filename: str, skill_md_path: str) -> str:
     parent = PurePosixPath(skill_md_path).parent
     if parent.as_posix() not in {"", "."}:
@@ -2002,7 +2117,9 @@ def _validate_instruction_skill_file(path: str) -> None:
         raise InvalidSkillPackage("instruction skill contains nested archives")
 
 
-def _skill_response_from_scan(filename: str, skill_id: str, scan_report: SkillScanReport) -> SkillResponse:
+def _skill_response_from_scan(
+    filename: str, skill_id: str, scan_report: SkillScanReport
+) -> SkillResponse:
     inspection = scan_report.inspection
     return SkillResponse(
         id=skill_id,
@@ -2017,7 +2134,9 @@ def _skill_response_from_scan(filename: str, skill_id: str, scan_report: SkillSc
     )
 
 
-def _skill_response_from_scanned_archive(scanned: _ScannedSkillArchive, skill_id: str) -> SkillResponse:
+def _skill_response_from_scanned_archive(
+    scanned: _ScannedSkillArchive, skill_id: str
+) -> SkillResponse:
     if scanned.scan_report is not None:
         return _skill_response_from_scan(scanned.filename, skill_id, scanned.scan_report)
     return SkillResponse(
@@ -2033,17 +2152,24 @@ def _skill_response_from_scanned_archive(scanned: _ScannedSkillArchive, skill_id
         requested_permissions=[],
     )
 
-def _skipped_skill_responses(skipped: tuple[_SkippedSkillArchive, ...]) -> list[SkillArchiveSkippedResponse]:
+
+def _skipped_skill_responses(
+    skipped: tuple[_SkippedSkillArchive, ...],
+) -> list[SkillArchiveSkippedResponse]:
     return [SkillArchiveSkippedResponse(path=item.path, reason=item.reason) for item in skipped]
 
 
-def _split_skill_bundle_archive(filename: str, archive_bytes: bytes) -> tuple[tuple[str, str, bytes], ...]:
+def _split_skill_bundle_archive(
+    filename: str, archive_bytes: bytes
+) -> tuple[tuple[str, str, bytes], ...]:
     if zipfile.is_zipfile(io.BytesIO(archive_bytes)):
         return _split_zip_skill_bundle(filename, archive_bytes)
     return _split_tar_skill_bundle(filename, archive_bytes)
 
 
-def _split_zip_skill_bundle(filename: str, archive_bytes: bytes) -> tuple[tuple[str, str, bytes], ...]:
+def _split_zip_skill_bundle(
+    filename: str, archive_bytes: bytes
+) -> tuple[tuple[str, str, bytes], ...]:
     try:
         with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
             entries: list[tuple[str, zipfile.ZipInfo]] = []
@@ -2070,14 +2196,22 @@ def _split_zip_skill_bundle(filename: str, archive_bytes: bytes) -> tuple[tuple[
         raise InvalidSkillPackage("skill archive must be a valid zip file") from exc
 
 
-def _split_tar_skill_bundle(filename: str, archive_bytes: bytes) -> tuple[tuple[str, str, bytes], ...]:
+def _split_tar_skill_bundle(
+    filename: str, archive_bytes: bytes
+) -> tuple[tuple[str, str, bytes], ...]:
     try:
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
             entries: list[tuple[str, tarfile.TarInfo]] = []
             for member in archive.getmembers():
                 if member.isdir():
                     continue
-                if member.issym() or member.islnk() or member.ischr() or member.isblk() or member.isfifo():
+                if (
+                    member.issym()
+                    or member.islnk()
+                    or member.ischr()
+                    or member.isblk()
+                    or member.isfifo()
+                ):
                     raise InvalidSkillPackage("skill bundle contains links or device files")
                 if not member.isfile():
                     raise InvalidSkillPackage("skill bundle contains unsupported file types")
@@ -2113,14 +2247,21 @@ def _safe_skill_bundle_path(name: str) -> str:
 
 
 def _skill_bundle_path_is_ignored(path: str) -> bool:
-    return any(part.startswith(".") or part in {"__MACOSX", "__pycache__"} for part in PurePosixPath(path).parts)
+    return any(
+        part.startswith(".") or part in {"__MACOSX", "__pycache__"}
+        for part in PurePosixPath(path).parts
+    )
 
 
-def _skill_bundle_groups[T](entries: list[tuple[str, T]]) -> tuple[tuple[str, list[tuple[str, T]]], ...]:
+def _skill_bundle_groups[T](
+    entries: list[tuple[str, T]],
+) -> tuple[tuple[str, list[tuple[str, T]]], ...]:
     roots: dict[str, None] = {}
     for path, _entry in entries:
         parts = PurePosixPath(path).parts
-        if len(parts) >= 2 and (parts[-1] in _SKILL_MANIFEST_NAMES or parts[-1].lower() in _SKILL_INSTRUCTION_NAMES):
+        if len(parts) >= 2 and (
+            parts[-1] in _SKILL_MANIFEST_NAMES or parts[-1].lower() in _SKILL_INSTRUCTION_NAMES
+        ):
             roots[PurePosixPath(*parts[:-1]).as_posix()] = None
     groups: list[tuple[str, list[tuple[str, T]]]] = []
     for root in _select_skill_bundle_roots(roots):
@@ -2134,7 +2275,6 @@ def _skill_bundle_groups[T](entries: list[tuple[str, T]]) -> tuple[tuple[str, li
             group_entries.append((inner_path, entry))
         groups.append((root, group_entries))
     return tuple(groups)
-
 
 
 def _select_skill_bundle_roots(roots: Iterable[str]) -> tuple[str, ...]:
@@ -2162,6 +2302,8 @@ def _skill_bundle_root_contains(parent: str, child: str) -> bool:
     parent_parts = PurePosixPath(parent).parts
     child_parts = PurePosixPath(child).parts
     return len(child_parts) > len(parent_parts) and child_parts[: len(parent_parts)] == parent_parts
+
+
 def _skill_bundle_group_filename(group: str) -> str:
     return "-".join(PurePosixPath(group).parts)
 
@@ -2177,7 +2319,9 @@ def _skill_bundle_mode_is_unsafe(mode: int) -> bool:
     }
 
 
-def _zip_group_to_skill_archive(archive: zipfile.ZipFile, entries: list[tuple[str, zipfile.ZipInfo]]) -> bytes:
+def _zip_group_to_skill_archive(
+    archive: zipfile.ZipFile, entries: list[tuple[str, zipfile.ZipInfo]]
+) -> bytes:
     if len(entries) > _MAX_SKILL_BUNDLE_ITEMS:
         raise InvalidSkillPackage("skill bundle item contains too many files")
     buffer = io.BytesIO()
@@ -2189,7 +2333,9 @@ def _zip_group_to_skill_archive(archive: zipfile.ZipFile, entries: list[tuple[st
     return buffer.getvalue()
 
 
-def _tar_group_to_skill_archive(archive: tarfile.TarFile, entries: list[tuple[str, tarfile.TarInfo]]) -> bytes:
+def _tar_group_to_skill_archive(
+    archive: tarfile.TarFile, entries: list[tuple[str, tarfile.TarInfo]]
+) -> bytes:
     if len(entries) > _MAX_SKILL_BUNDLE_ITEMS:
         raise InvalidSkillPackage("skill bundle item contains too many files")
     buffer = io.BytesIO()
@@ -2318,7 +2464,11 @@ class InMemoryAdminResourceService:
         response = ModelDeploymentResponse(
             **request.model_dump(),
             id=uuid4(),
-            effective_slots=max(0, request.max_concurrency - request.reserved_capacity),
+            effective_slots=_model_effective_slots(
+                request.max_concurrency,
+                request.target_utilization,
+                request.reserved_capacity,
+            ),
             saturation_policy="queue_first_then_fallback",
         )
         self.models[response.id] = response
@@ -2335,7 +2485,11 @@ class InMemoryAdminResourceService:
         response = ModelDeploymentResponse(
             **request.model_dump(),
             id=model_id,
-            effective_slots=max(0, request.max_concurrency - request.reserved_capacity),
+            effective_slots=_model_effective_slots(
+                request.max_concurrency,
+                request.target_utilization,
+                request.reserved_capacity,
+            ),
             saturation_policy="queue_first_then_fallback",
         )
         self.models[model_id] = response
@@ -2355,7 +2509,6 @@ class InMemoryAdminResourceService:
         response = MainAgentConfigResponse(**_normalize_main_agent_config(request).model_dump())
         self.main_agent_config = response
         return response
-
 
     async def create_secret(self, request: SecretCreateRequest) -> SecretReferenceResponse:
         raw = request.value.get_secret_value()
@@ -2513,9 +2666,10 @@ class InMemoryAdminResourceService:
         self.runs[run_id] = updated
         return updated
 
-
     async def list_evolution_runs(self) -> tuple[EvolutionRunResponse, ...]:
-        return tuple(sorted(self.evolution_runs.values(), key=lambda item: item.created_at, reverse=True))
+        return tuple(
+            sorted(self.evolution_runs.values(), key=lambda item: item.created_at, reverse=True)
+        )
 
     async def create_evolution_run(
         self,
@@ -2529,7 +2683,11 @@ class InMemoryAdminResourceService:
             actor=actor,
             action="evolution.create",
             resource=f"evolution:{response.id}",
-            details={"kind": response.kind, "mode": response.mode, "target_artifact_type": response.target_artifact_type},
+            details={
+                "kind": response.kind,
+                "mode": response.mode,
+                "target_artifact_type": response.target_artifact_type,
+            },
         )
         return response
 
@@ -2580,7 +2738,14 @@ class InMemoryAdminResourceService:
             queue_wait_ms=0,
             capacity_wait_ms=0,
             cost_usd="0",
-            events=[RunEventResponse(sequence=1, kind="queued", message="Evolution round execution queued.", created_at=now)],
+            events=[
+                RunEventResponse(
+                    sequence=1,
+                    kind="queued",
+                    message="Evolution round execution queued.",
+                    created_at=now,
+                )
+            ],
             artifacts=[],
             explicit_details={
                 "source": "evolution",
@@ -2642,7 +2807,9 @@ class InMemoryAdminResourceService:
             execution.explicit_details,
             expected_round=len(current.rounds) + 1,
         )
-        request = _evolution_round_request_from_artifacts(execution.artifacts, execution_run_id=execution_run_id)
+        request = _evolution_round_request_from_artifacts(
+            execution.artifacts, execution_run_id=execution_run_id
+        )
         updated = append_evolution_round(current, request)
         latest = updated.rounds[-1]
         self.evolution_runs[run_id] = updated
@@ -2697,7 +2864,11 @@ class InMemoryAdminResourceService:
         if current.status in {"stopped", "completed"}:
             raise PublicAPIError(409, "evolution_run_closed", "evolution run is already closed")
         if current.status == "waiting_approval":
-            raise PublicAPIError(409, "evolution_run_requires_approval", "evolution run requires approval before recording rounds")
+            raise PublicAPIError(
+                409,
+                "evolution_run_requires_approval",
+                "evolution run requires approval before recording rounds",
+            )
         updated = append_evolution_round(current, request)
         latest = updated.rounds[-1]
         self.evolution_runs[run_id] = updated
@@ -2731,9 +2902,13 @@ class InMemoryAdminResourceService:
         self.skills[response.id] = response
         return response
 
-    async def upload_skill_archive(self, filename: str, archive_bytes: bytes) -> SkillArchiveUploadResponse:
+    async def upload_skill_archive(
+        self, filename: str, archive_bytes: bytes
+    ) -> SkillArchiveUploadResponse:
         try:
-            bundle, scanned_archives, skipped_archives = _scan_skill_archive_upload(filename, archive_bytes)
+            bundle, scanned_archives, skipped_archives = _scan_skill_archive_upload(
+                filename, archive_bytes
+            )
         except InvalidSkillPackage as error:
             reason = _safe_model_check_detail(str(error))
             await self.record_log(
@@ -2750,7 +2925,12 @@ class InMemoryAdminResourceService:
             response = _skill_response_from_scanned_archive(scanned, f"skill_{uuid4().hex}")
             self.skills[response.id] = response
             items.append(response)
-        return SkillArchiveUploadResponse(filename=filename, bundle=bundle, items=items, skipped=_skipped_skill_responses(skipped_archives))
+        return SkillArchiveUploadResponse(
+            filename=filename,
+            bundle=bundle,
+            items=items,
+            skipped=_skipped_skill_responses(skipped_archives),
+        )
 
     async def approve_skill(self, skill_id: str) -> SkillResponse:
         current = self.skills[skill_id]
@@ -2793,7 +2973,9 @@ class InMemoryAdminResourceService:
         definition = _channel_definition(channel_id)
         cleaned = _clean_channel_config_values(definition, request.values)
         if not cleaned:
-            raise PublicAPIError(422, "request_validation", "at least one channel field is required")
+            raise PublicAPIError(
+                422, "request_validation", "at least one channel field is required"
+            )
         existing = dict(self.channel_config.get(channel_id, {}))
         existing.update(cleaned)
         self.channel_config[channel_id] = existing
@@ -2803,7 +2985,9 @@ class InMemoryAdminResourceService:
             status=_channel_status_from_definition(definition, self.channel_config),
         )
 
-    async def clear_channel_config(self, channel_id: str, *, actor: str) -> ChannelConfigSaveResponse:
+    async def clear_channel_config(
+        self, channel_id: str, *, actor: str
+    ) -> ChannelConfigSaveResponse:
         definition = _channel_definition(channel_id)
         self.channel_config.pop(channel_id, None)
         await self.record_audit_event(
@@ -3067,7 +3251,11 @@ class InMemoryAdminResourceService:
         entries = [
             *(_audit_log_entry(event) for event in self.audit_events),
             *self.logs,
-            *(_mode_error_log_from_run(run) for run in self.runs.values() if run.status == "failed"),
+            *(
+                _mode_error_log_from_run(run)
+                for run in self.runs.values()
+                if run.status == "failed"
+            ),
             *_channel_error_logs_from_configuration(self.channel_config),
         ]
         if category is not None:
@@ -3089,9 +3277,7 @@ class InMemoryAdminResourceService:
     async def delete_hermes_insight(self, insight_id: str) -> None:
         del self.hermes_insights[insight_id]
 
-    async def record_hermes_feedback(
-        self, request: HermesFeedbackRequest
-    ) -> HermesInsightResponse:
+    async def record_hermes_feedback(self, request: HermesFeedbackRequest) -> HermesInsightResponse:
         if _contains_sensitive_marker(request.lesson):
             await self.record_log(
                 category="feature_error",
@@ -3140,7 +3326,8 @@ class InMemoryAdminResourceService:
         recommended_skills = [
             skill
             for skill in request.skill_candidates
-            if skill.lower() in normalized_task or skill.lower().replace("-", " ") in normalized_task
+            if skill.lower() in normalized_task
+            or skill.lower().replace("-", " ") in normalized_task
         ][:3]
         if not recommended_skills and "skill" in normalized_task:
             recommended_skills = request.skill_candidates[:2]
@@ -3377,9 +3564,11 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             logical_definition["fallback_model"] = request.fallback
         models[request.logical_model] = logical_definition
         try:
-            checked_deployment = PlatformConfig.model_validate(document).models[
-                request.logical_model
-            ].deployments[deployment_index]
+            checked_deployment = (
+                PlatformConfig.model_validate(document)
+                .models[request.logical_model]
+                .deployments[deployment_index]
+            )
             await self._verify_model_availability(
                 checked_deployment.to_deployment(
                     deployment_id=f"{request.logical_model}_{deployment_index + 1}",
@@ -3464,9 +3653,11 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         updated_index = len(target_deployments) - 1
 
         try:
-            checked_deployment = PlatformConfig.model_validate(document).models[
-                request.logical_model
-            ].deployments[updated_index]
+            checked_deployment = (
+                PlatformConfig.model_validate(document)
+                .models[request.logical_model]
+                .deployments[updated_index]
+            )
             await self._verify_model_availability(
                 checked_deployment.to_deployment(
                     deployment_id=f"{request.logical_model}_{updated_index + 1}",
@@ -3542,7 +3733,10 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         else:
             del models[target_logical_model]
             for raw_definition in models.values():
-                if isinstance(raw_definition, dict) and raw_definition.get("fallback_model") == target_logical_model:
+                if (
+                    isinstance(raw_definition, dict)
+                    and raw_definition.get("fallback_model") == target_logical_model
+                ):
                     raw_definition.pop("fallback_model", None)
 
         try:
@@ -3724,7 +3918,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
 
     async def upsert_workflow(self, request: WorkflowResourceRequest) -> WorkflowResourceResponse:
         response = WorkflowResourceResponse(**request.model_dump())
-        if not await self._upsert_admin_payload("workflow", response.id, response.model_dump(mode="json")):
+        if not await self._upsert_admin_payload(
+            "workflow", response.id, response.model_dump(mode="json")
+        ):
             return await super().upsert_workflow(request)
         await self._record_audit("workflow.upsert", f"workflow:{response.id}", {"id": response.id})
         return response
@@ -3747,9 +3943,13 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
 
     async def update_settings(self, request: SystemSettingsRequest) -> SystemSettingsResponse:
         response = SystemSettingsResponse(**request.model_dump())
-        if not await self._upsert_admin_payload("setting", "system", response.model_dump(mode="json")):
+        if not await self._upsert_admin_payload(
+            "setting", "system", response.model_dump(mode="json")
+        ):
             return await super().update_settings(request)
-        await self._record_audit("settings.update", "settings:system", {"default_mode": response.default_mode})
+        await self._record_audit(
+            "settings.update", "settings:system", {"default_mode": response.default_mode}
+        )
         return response
 
     async def create_openclaw_operation(
@@ -3766,7 +3966,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             actor=actor,
             mode=mode,
         )
-        if not await self._upsert_admin_payload("openclaw", operation_id, response.model_dump(mode="json")):
+        if not await self._upsert_admin_payload(
+            "openclaw", operation_id, response.model_dump(mode="json")
+        ):
             return await super().create_openclaw_operation(request, actor=actor, mode=mode)
         await self.record_audit_event(
             actor=actor,
@@ -3807,7 +4009,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 "resolved_at": datetime.now(UTC),
             }
         )
-        if not await self._upsert_admin_payload("openclaw", operation_id, updated.model_dump(mode="json")):
+        if not await self._upsert_admin_payload(
+            "openclaw", operation_id, updated.model_dump(mode="json")
+        ):
             return await super().resolve_openclaw_operation(operation_id, request, actor=actor)
         await self.record_audit_event(
             actor=actor,
@@ -3831,7 +4035,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             actor=actor,
             adapter_token_resolver=self.resolve_secret_value,
         )
-        if not await self._upsert_admin_payload("openclaw", operation_id, updated.model_dump(mode="json")):
+        if not await self._upsert_admin_payload(
+            "openclaw", operation_id, updated.model_dump(mode="json")
+        ):
             return await super().execute_openclaw_operation(operation_id, settings, actor=actor)
         await self.record_audit_event(
             actor=actor,
@@ -3862,7 +4068,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             session_id,
             response.model_dump(mode="json"),
         ):
-            return await super().create_openclaw_session(request, actor=actor, mode=mode, settings=settings)
+            return await super().create_openclaw_session(
+                request, actor=actor, mode=mode, settings=settings
+            )
         await self.record_audit_event(
             actor=actor,
             action="openclaw.session_created",
@@ -3915,7 +4123,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
     ) -> OpenClawSessionResponse:
         payload = await self._get_admin_payload("openclaw_session", session_id)
         if payload is None:
-            return await super().attach_openclaw_operation_to_session(session_id, operation_id, request, actor=actor)
+            return await super().attach_openclaw_operation_to_session(
+                session_id, operation_id, request, actor=actor
+            )
         if not payload:
             raise PublicAPIError(404, "not_found", "not found")
         current = OpenClawSessionResponse.model_validate(payload)
@@ -3925,7 +4135,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             session_id,
             updated.model_dump(mode="json"),
         ):
-            return await super().attach_openclaw_operation_to_session(session_id, operation_id, request, actor=actor)
+            return await super().attach_openclaw_operation_to_session(
+                session_id, operation_id, request, actor=actor
+            )
         await self.record_audit_event(
             actor=actor,
             action="openclaw.session_operation_attached",
@@ -3974,7 +4186,6 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         )
         return response
 
-
     async def list_evolution_runs(self) -> tuple[EvolutionRunResponse, ...]:
         resources = await self._list_admin_payloads("evolution")
         if resources is None:
@@ -3989,13 +4200,19 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         actor: str,
     ) -> EvolutionRunResponse:
         response = create_evolution_run_response(request, actor=actor)
-        if not await self._upsert_admin_payload("evolution", response.id, response.model_dump(mode="json")):
+        if not await self._upsert_admin_payload(
+            "evolution", response.id, response.model_dump(mode="json")
+        ):
             return await super().create_evolution_run(request, actor=actor)
         await self.record_audit_event(
             actor=actor,
             action="evolution.create",
             resource=f"evolution:{response.id}",
-            details={"kind": response.kind, "mode": response.mode, "target_artifact_type": response.target_artifact_type},
+            details={
+                "kind": response.kind,
+                "mode": response.mode,
+                "target_artifact_type": response.target_artifact_type,
+            },
         )
         return response
 
@@ -4037,7 +4254,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         current = await self.get_evolution_run(run_id)
         plan = await self.plan_evolution_next_round(run_id, actor=actor)
         conversation_id = _evolution_execution_conversation_id(run_id, plan.round)
-        idempotency_key = request.idempotency_key or f"evolution:{run_id}:round:{plan.round}:execute"
+        idempotency_key = (
+            request.idempotency_key or f"evolution:{run_id}:round:{plan.round}:execute"
+        )
         record = await self._run_repository.create_run(
             tenant_id=self._tenant_id,
             actor_id=_uuid_or_default(actor, self._actor_id),
@@ -4079,7 +4298,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         actor: str,
     ) -> EvolutionRunResponse:
         if self._run_repository is None:
-            return await super().ingest_evolution_execution_run(run_id, execution_run_id, actor=actor)
+            return await super().ingest_evolution_execution_run(
+                run_id, execution_run_id, actor=actor
+            )
         current = await self.get_evolution_run(run_id)
         if current.status in {"stopped", "completed"}:
             raise PublicAPIError(409, "evolution_run_closed", "evolution run is already closed")
@@ -4107,11 +4328,17 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             expected_round=len(current.rounds) + 1,
         )
         artifacts = await self._run_repository.artifacts(self._tenant_id, execution_run_id)
-        request = _evolution_round_request_from_artifacts(artifacts, execution_run_id=execution_run_id)
+        request = _evolution_round_request_from_artifacts(
+            artifacts, execution_run_id=execution_run_id
+        )
         updated = append_evolution_round(current, request)
         latest = updated.rounds[-1]
-        if not await self._upsert_admin_payload("evolution", run_id, updated.model_dump(mode="json")):
-            return await super().ingest_evolution_execution_run(run_id, execution_run_id, actor=actor)
+        if not await self._upsert_admin_payload(
+            "evolution", run_id, updated.model_dump(mode="json")
+        ):
+            return await super().ingest_evolution_execution_run(
+                run_id, execution_run_id, actor=actor
+            )
         await self.record_audit_event(
             actor=actor,
             action="evolution.round_ingested",
@@ -4137,7 +4364,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
     ) -> EvolutionRunResponse:
         current = await self.get_evolution_run(run_id)
         updated = approve_evolution_run_response(current, request, actor=actor)
-        if not await self._upsert_admin_payload("evolution", run_id, updated.model_dump(mode="json")):
+        if not await self._upsert_admin_payload(
+            "evolution", run_id, updated.model_dump(mode="json")
+        ):
             return await super().approve_evolution_run(run_id, request, actor=actor)
         await self.record_audit_event(
             actor=actor,
@@ -4164,10 +4393,16 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         if current.status in {"stopped", "completed"}:
             raise PublicAPIError(409, "evolution_run_closed", "evolution run is already closed")
         if current.status == "waiting_approval":
-            raise PublicAPIError(409, "evolution_run_requires_approval", "evolution run requires approval before recording rounds")
+            raise PublicAPIError(
+                409,
+                "evolution_run_requires_approval",
+                "evolution run requires approval before recording rounds",
+            )
         updated = append_evolution_round(current, request)
         latest = updated.rounds[-1]
-        if not await self._upsert_admin_payload("evolution", run_id, updated.model_dump(mode="json")):
+        if not await self._upsert_admin_payload(
+            "evolution", run_id, updated.model_dump(mode="json")
+        ):
             return await super().record_evolution_round(run_id, request, actor=actor)
         await self.record_audit_event(
             actor=actor,
@@ -4199,14 +4434,22 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             scan_diff=["metadata recorded; package scan requires ZIP upload endpoint"],
             requested_permissions=["filesystem:read"],
         )
-        if not await self._upsert_admin_payload("skill", skill_id, response.model_dump(mode="json")):
+        if not await self._upsert_admin_payload(
+            "skill", skill_id, response.model_dump(mode="json")
+        ):
             return await super().upload_skill(request)
-        await self._record_audit("skill.upload", f"skill:{skill_id}", {"filename": request.filename})
+        await self._record_audit(
+            "skill.upload", f"skill:{skill_id}", {"filename": request.filename}
+        )
         return response
 
-    async def upload_skill_archive(self, filename: str, archive_bytes: bytes) -> SkillArchiveUploadResponse:
+    async def upload_skill_archive(
+        self, filename: str, archive_bytes: bytes
+    ) -> SkillArchiveUploadResponse:
         try:
-            bundle, scanned_archives, skipped_archives = _scan_skill_archive_upload(filename, archive_bytes)
+            bundle, scanned_archives, skipped_archives = _scan_skill_archive_upload(
+                filename, archive_bytes
+            )
         except InvalidSkillPackage as error:
             reason = _safe_model_check_detail(str(error))
             await self.record_log(
@@ -4244,12 +4487,21 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 source="skills.upload",
                 details={"feature": "skills", "filename": _safe_model_check_detail(filename)},
             )
-            raise PublicAPIError(503, "skill_store_unavailable", "skill store is unavailable") from None
+            raise PublicAPIError(
+                503, "skill_store_unavailable", "skill store is unavailable"
+            ) from None
         for response in items:
-            if not await self._upsert_admin_payload("skill", response.id, response.model_dump(mode="json")):
+            if not await self._upsert_admin_payload(
+                "skill", response.id, response.model_dump(mode="json")
+            ):
                 return await super().upload_skill_archive(filename, archive_bytes)
             await self._record_audit("skill.upload", f"skill:{response.id}", {"filename": filename})
-        return SkillArchiveUploadResponse(filename=filename, bundle=bundle, items=items, skipped=_skipped_skill_responses(skipped_archives))
+        return SkillArchiveUploadResponse(
+            filename=filename,
+            bundle=bundle,
+            items=items,
+            skipped=_skipped_skill_responses(skipped_archives),
+        )
 
     async def approve_skill(self, skill_id: str) -> SkillResponse:
         payload = await self._get_admin_payload("skill", skill_id)
@@ -4320,7 +4572,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             domain_allowlist=request.domain_allowlist,
             timeout_seconds=request.timeout_seconds,
         )
-        if not await self._upsert_admin_payload("mcp", response.id, response.model_dump(mode="json")):
+        if not await self._upsert_admin_payload(
+            "mcp", response.id, response.model_dump(mode="json")
+        ):
             return await super().upsert_mcp_server(request)
         await self._record_audit("mcp.upsert", f"mcp:{response.id}", {"id": response.id})
         return response
@@ -4349,7 +4603,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         definition = _channel_definition(channel_id)
         cleaned = _clean_channel_config_values(definition, request.values)
         if not cleaned:
-            raise PublicAPIError(422, "request_validation", "at least one channel field is required")
+            raise PublicAPIError(
+                422, "request_validation", "at least one channel field is required"
+            )
         existing = dict(config.get(channel_id, {}))
         existing.update(cleaned)
         config[channel_id] = existing
@@ -4367,7 +4623,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             status=_channel_status_from_definition(definition, config),
         )
 
-    async def clear_channel_config(self, channel_id: str, *, actor: str) -> ChannelConfigSaveResponse:
+    async def clear_channel_config(
+        self, channel_id: str, *, actor: str
+    ) -> ChannelConfigSaveResponse:
         config = await self._channel_config_values()
         if config is None:
             return await super().clear_channel_config(channel_id, actor=actor)
@@ -4514,9 +4772,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             return
         await self._record_audit("hermes.delete", f"hermes:{insight_id}", {"id": insight_id})
 
-    async def record_hermes_feedback(
-        self, request: HermesFeedbackRequest
-    ) -> HermesInsightResponse:
+    async def record_hermes_feedback(self, request: HermesFeedbackRequest) -> HermesInsightResponse:
         if _contains_sensitive_marker(request.lesson):
             await self.record_log(
                 category="feature_error",
@@ -4545,7 +4801,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             weight=request.weight,
             created_at=datetime.now(UTC),
         )
-        if not await self._upsert_admin_payload("hermes", insight_id, response.model_dump(mode="json")):
+        if not await self._upsert_admin_payload(
+            "hermes", insight_id, response.model_dump(mode="json")
+        ):
             return await super().record_hermes_feedback(request)
         await self._record_audit("hermes.feedback", f"hermes:{insight_id}", {"id": insight_id})
         return response
@@ -4565,7 +4823,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         ]
         if not matched:
             return HermesRecommendationResponse(
-                recommended_mode=request.mode_candidates[0] if request.mode_candidates else "dispatch",
+                recommended_mode=request.mode_candidates[0]
+                if request.mode_candidates
+                else "dispatch",
                 recommended_model=request.model_candidates[0] if request.model_candidates else None,
                 recommended_skills=request.skill_candidates[:2],
                 confidence=0.35,
@@ -4888,9 +5148,13 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         index: int,
         deployment: object,
     ) -> ModelDeploymentResponse:
-        parsed = PlatformConfig.model_validate(
-            {"models": {logical_model: {"deployments": [deployment]}}, "agents": []}
-        ).models[logical_model].deployments[0]
+        parsed = (
+            PlatformConfig.model_validate(
+                {"models": {logical_model: {"deployments": [deployment]}}, "agents": []}
+            )
+            .models[logical_model]
+            .deployments[0]
+        )
         response_id = uuid5(
             NAMESPACE_URL,
             ":".join(
@@ -4925,7 +5189,11 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             queue_timeout_seconds=60,
             fallback=fallback_model,
             weight=100,
-            effective_slots=max(0, parsed.max_concurrency - parsed.reserved_slots),
+            effective_slots=_model_effective_slots(
+                parsed.max_concurrency,
+                parsed.target_utilization,
+                parsed.reserved_slots,
+            ),
             saturation_policy="queue_first_then_fallback",
         )
 
@@ -4951,7 +5219,13 @@ def _multimedia_generation_executor(request: Request) -> MultimediaGenerationExe
 
 def _scheduler_service(request: Request) -> SchedulerServiceProtocol:
     service = getattr(request.app.state, "schedule_service", None)
-    required_methods = ("add_schedule", "create_schedule", "delete_schedule", "list_schedules", "tick")
+    required_methods = (
+        "add_schedule",
+        "create_schedule",
+        "delete_schedule",
+        "list_schedules",
+        "tick",
+    )
     if service is None or any(not hasattr(service, method) for method in required_methods):
         raise PublicAPIError(503, "scheduler_unavailable", "scheduler service is unavailable")
     return cast(SchedulerServiceProtocol, service)
@@ -4989,9 +5263,7 @@ def _schedule_from_payload(payload: Mapping[str, object]) -> ScheduleDefinition:
         )
     raw_next_fire_at = payload.get("next_fire_at")
     next_fire_at = (
-        None
-        if not isinstance(raw_next_fire_at, str)
-        else datetime.fromisoformat(raw_next_fire_at)
+        None if not isinstance(raw_next_fire_at, str) else datetime.fromisoformat(raw_next_fire_at)
     )
     raw_metadata = payload.get("metadata")
     metadata = cast(Mapping[str, object], raw_metadata) if isinstance(raw_metadata, dict) else {}
@@ -5027,9 +5299,7 @@ async def _restore_persisted_schedules(
     payloads = await cast(Any, resources)._list_admin_payloads("schedule")
     if payloads is None:
         return
-    existing_ids = {
-        schedule.id for schedule in await service.list_schedules(tenant_id=tenant_id)
-    }
+    existing_ids = {schedule.id for schedule in await service.list_schedules(tenant_id=tenant_id)}
     for payload in payloads:
         try:
             schedule = _schedule_from_payload(payload)
@@ -5184,7 +5454,9 @@ def _decode_upload_filename_header(value: str | None, encoding: str | None) -> s
     try:
         return unquote(value, errors="strict")
     except UnicodeDecodeError:
-        raise PublicAPIError(422, "request_validation", "invalid filename header encoding") from None
+        raise PublicAPIError(
+            422, "request_validation", "invalid filename header encoding"
+        ) from None
 
 
 def _safe_skill_upload_filename(value: str | None) -> str:
@@ -5230,7 +5502,9 @@ def _normalize_main_agent_config(request: MainAgentConfigRequest) -> MainAgentCo
     normalized = _normalized_model_api_base(request.model.api_protocol, request.model.api_base)
     if normalized == request.model.api_base:
         return request
-    return request.model_copy(update={"model": request.model.model_copy(update={"api_base": normalized})})
+    return request.model_copy(
+        update={"model": request.model.model_copy(update={"api_base": normalized})}
+    )
 
 
 def _main_agent_model_deployment(model: MainAgentModelConfig) -> Deployment:
@@ -5242,7 +5516,7 @@ def _main_agent_model_deployment(model: MainAgentModelConfig) -> Deployment:
         api_base=model.api_base,
         secret_ref=model.credential_ref,
         quota_scope_id="main-agent",
-        max_concurrency=1,
+        max_concurrency=model.max_concurrency,
         target_utilization=0.8,
         reserved_slots=0,
         capabilities=frozenset(ModelCapability(item) for item in model.capabilities),
@@ -5322,7 +5596,10 @@ def _model_check_failure_details(
 def _model_check_hint(provider: str, api_base: str, status_code: str) -> str:
     normalized_provider = provider.strip().lower()
     normalized_base = api_base.strip().lower()
-    if _is_dashscope_provider(normalized_provider, normalized_base) and status_code in {"401", "403"}:
+    if _is_dashscope_provider(normalized_provider, normalized_base) and status_code in {
+        "401",
+        "403",
+    }:
         return _DASHSCOPE_AUTH_HINT
     if status_code in {"401", "403"} and not _is_known_official_provider(
         normalized_provider, normalized_base
@@ -5338,7 +5615,10 @@ def _model_check_hint(provider: str, api_base: str, status_code: str) -> str:
 
 
 def _is_dashscope_provider(provider: str, api_base: str) -> bool:
-    return provider in {"qwen", "dashscope", "aliyun", "alibaba"} or "dashscope.aliyuncs.com" in api_base
+    return (
+        provider in {"qwen", "dashscope", "aliyun", "alibaba"}
+        or "dashscope.aliyuncs.com" in api_base
+    )
 
 
 def _is_known_official_provider(provider: str, api_base: str) -> bool:
@@ -5512,7 +5792,9 @@ def _run_debug_artifact(artifact: RunArtifactResponse) -> RunDebugArtifactRespon
     )
 
 
-def _safe_debug_preview(value: str | None, *, max_chars: int = _RUN_DEBUG_PREVIEW_CHARS) -> str | None:
+def _safe_debug_preview(
+    value: str | None, *, max_chars: int = _RUN_DEBUG_PREVIEW_CHARS
+) -> str | None:
     if value is None:
         return None
     stripped = value.strip()
@@ -5811,13 +6093,17 @@ def _channel_notes(
     if definition.id == "feishu":
         transport = _feishu_transport(config)
         if transport == "websocket":
-            notes.append("当前按飞书长连接配置：只要求 App ID 和 App Secret；不需要公网 Webhook URL。")
+            notes.append(
+                "当前按飞书长连接配置：只要求 App ID 和 App Secret；不需要公网 Webhook URL。"
+            )
         elif _feishu_app_type(config) == "bot_template":
             notes.append(
                 "当前按机器人模板应用配置：只要求 App ID 和 App Secret；公开事件回调仍需要飞书事件订阅校验信息或其他可信接入方式。"
             )
         else:
-            notes.append("当前按飞书 Webhook 配置：Verification Token 和公网 URL 必填；Encrypt Key 仅在飞书开启事件加密时填写。")
+            notes.append(
+                "当前按飞书 Webhook 配置：Verification Token 和公网 URL 必填；Encrypt Key 仅在飞书开启事件加密时填写。"
+            )
     return notes
 
 
@@ -5844,6 +6130,7 @@ def _channel_config_allowed_names(definition: ChannelDefinition) -> set[str]:
                 "FEISHU_ALLOWED_TENANT_KEYS",
                 "FEISHU_APP_TYPE",
                 "FEISHU_BOT_OPEN_ID",
+                "FEISHU_COMMAND_ALIASES",
                 "FEISHU_ENCRYPT_KEY",
                 "FEISHU_TIMESTAMP_TOLERANCE_SECONDS",
                 "FEISHU_TRANSPORT",
@@ -6056,7 +6343,9 @@ def _evolution_round_request_from_artifacts(
 ) -> EvolutionRoundRequest:
     last_validation_error: ValidationError | None = None
     for artifact in artifacts:
-        response = artifact if isinstance(artifact, RunArtifactResponse) else _admin_run_artifact(artifact)
+        response = (
+            artifact if isinstance(artifact, RunArtifactResponse) else _admin_run_artifact(artifact)
+        )
         if response.text is None:
             continue
         for candidate in _json_object_candidates(response.text):
@@ -6102,7 +6391,9 @@ def _json_object_candidates(text: str) -> tuple[dict[str, object], ...]:
             add(json.loads(stripped))
         except json.JSONDecodeError:
             pass
-    for match in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.IGNORECASE | re.DOTALL):
+    for match in re.finditer(
+        r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.IGNORECASE | re.DOTALL
+    ):
         try:
             add(json.loads(match.group(1)))
         except json.JSONDecodeError:
@@ -6133,7 +6424,10 @@ def _assert_evolution_execution_binding(
             "execution run is not linked to an Evolution run",
             details={"execution_run_id": str(execution_run_id)},
         )
-    if str(routing.get("source") or "") != "evolution" or str(routing.get("evolution_run_id") or "") != run_id:
+    if (
+        str(routing.get("source") or "") != "evolution"
+        or str(routing.get("evolution_run_id") or "") != run_id
+    ):
         raise PublicAPIError(
             409,
             "evolution_execution_mismatch",
@@ -6196,7 +6490,9 @@ def _evolution_execution_routing_decision(
         "baseline_agent_id": plan.baseline_agent_id,
         "candidate_agent_ids": plan.candidate_agent_ids,
         "evaluator_agent_id": plan.evaluator_agent_id,
-        "selected_agent_ids": list(dict.fromkeys([*plan.candidate_agent_ids, plan.evaluator_agent_id])),
+        "selected_agent_ids": list(
+            dict.fromkeys([*plan.candidate_agent_ids, plan.evaluator_agent_id])
+        ),
         "requested_skills": ", ".join(current.source_skill_ids),
         "reason": "approved_evolution_next_round_execution",
     }
@@ -6208,6 +6504,7 @@ def _evolution_execution_routing_details(
     conversation_id: str,
 ) -> dict[str, str]:
     return _routing_details(_evolution_execution_routing_decision(current, plan, conversation_id))
+
 
 def _routing_details(routing_decision: dict[str, object] | None) -> dict[str, str]:
     if not routing_decision:
@@ -6316,7 +6613,6 @@ def _temporary_agent_proposal(
     return safe or None
 
 
-
 def _evolution_proposal(
     routing_decision: Mapping[str, object] | None,
 ) -> dict[str, JsonValue] | None:
@@ -6368,14 +6664,20 @@ def _safe_proposal_json_value(value: object) -> JsonValue | None:
         return value
     if isinstance(value, list):
         return tuple(
-            converted for item in value if (converted := _safe_proposal_json_value(item)) is not None
+            converted
+            for item in value
+            if (converted := _safe_proposal_json_value(item)) is not None
         )
     if isinstance(value, dict):
         return _safe_proposal_json_mapping(value)
     return None
 
 
-@router.get("/models", response_model=list[ModelDeploymentResponse], responses=error_responses(401, 403, 422))
+@router.get(
+    "/models",
+    response_model=list[ModelDeploymentResponse],
+    responses=error_responses(401, 403, 422),
+)
 async def list_models(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
@@ -6384,7 +6686,9 @@ async def list_models(
     return list(await service.list_models())
 
 
-@router.post("/models", response_model=ModelDeploymentResponse, responses=error_responses(401, 403, 422))
+@router.post(
+    "/models", response_model=ModelDeploymentResponse, responses=error_responses(401, 403, 422)
+)
 async def create_model(
     body: ModelDeploymentRequest,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -6424,7 +6728,9 @@ async def update_model(
     return await service.update_model(model_id, body)
 
 
-@router.post("/models/probe", response_model=ProbeResponse, responses=error_responses(401, 403, 422))
+@router.post(
+    "/models/probe", response_model=ProbeResponse, responses=error_responses(401, 403, 422)
+)
 async def probe_model(
     body: ProbeRequest,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -6434,7 +6740,11 @@ async def probe_model(
     return await service.probe_concurrency(body)
 
 
-@router.post("/secrets", response_model=SecretReferenceResponse, responses=error_responses(401, 403, 409, 422))
+@router.post(
+    "/secrets",
+    response_model=SecretReferenceResponse,
+    responses=error_responses(401, 403, 409, 422),
+)
 async def create_secret(
     body: SecretCreateRequest,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -6447,7 +6757,11 @@ async def create_secret(
         raise PublicAPIError(409, "duplicate_secret", "secret is already registered") from None
 
 
-@router.get("/secrets/{ref}", response_model=SecretReferenceResponse, responses=error_responses(401, 403, 404, 422))
+@router.get(
+    "/secrets/{ref}",
+    response_model=SecretReferenceResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
 async def get_secret(
     ref: str,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -6460,7 +6774,9 @@ async def get_secret(
         raise PublicAPIError(404, "not_found", "not found") from None
 
 
-@router.put("/config/draft", response_model=PublishResponse, responses=error_responses(401, 403, 422))
+@router.put(
+    "/config/draft", response_model=PublishResponse, responses=error_responses(401, 403, 422)
+)
 async def save_draft(
     body: DraftRequest,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -6480,7 +6796,9 @@ async def diff_draft(
     return await service.diff_draft(body)
 
 
-@router.post("/config/publish", response_model=PublishResponse, responses=error_responses(401, 403, 409, 422))
+@router.post(
+    "/config/publish", response_model=PublishResponse, responses=error_responses(401, 403, 409, 422)
+)
 async def publish(
     body: PublishRequest,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -6493,7 +6811,11 @@ async def publish(
         raise PublicAPIError(409, "publish_conflict", "configuration changed") from None
 
 
-@router.post("/config/rollback/{version}", response_model=PublishResponse, responses=error_responses(401, 403, 422))
+@router.post(
+    "/config/rollback/{version}",
+    response_model=PublishResponse,
+    responses=error_responses(401, 403, 422),
+)
 async def rollback(
     version: int,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -6503,7 +6825,9 @@ async def rollback(
     return await service.rollback(version)
 
 
-@router.get("/agents", response_model=list[AgentResourceResponse], responses=error_responses(401, 403, 422))
+@router.get(
+    "/agents", response_model=list[AgentResourceResponse], responses=error_responses(401, 403, 422)
+)
 async def list_agents(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
@@ -6512,7 +6836,9 @@ async def list_agents(
     return list(await service.list_agents())
 
 
-@router.post("/agents", response_model=AgentResourceResponse, responses=error_responses(401, 403, 422))
+@router.post(
+    "/agents", response_model=AgentResourceResponse, responses=error_responses(401, 403, 422)
+)
 async def upsert_agent(
     body: AgentResourceRequest,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -6540,7 +6866,11 @@ async def delete_agent(
     return OperationStatusResponse(status="deleted")
 
 
-@router.get("/workflows", response_model=list[WorkflowResourceResponse], responses=error_responses(401, 403, 422))
+@router.get(
+    "/workflows",
+    response_model=list[WorkflowResourceResponse],
+    responses=error_responses(401, 403, 422),
+)
 async def list_workflows(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
@@ -6549,7 +6879,9 @@ async def list_workflows(
     return list(await service.list_workflows())
 
 
-@router.post("/workflows", response_model=WorkflowResourceResponse, responses=error_responses(401, 403, 422))
+@router.post(
+    "/workflows", response_model=WorkflowResourceResponse, responses=error_responses(401, 403, 422)
+)
 async def upsert_workflow(
     body: WorkflowResourceRequest,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -6577,7 +6909,9 @@ async def delete_workflow(
     return OperationStatusResponse(status="deleted")
 
 
-@router.get("/settings", response_model=SystemSettingsResponse, responses=error_responses(401, 403, 422))
+@router.get(
+    "/settings", response_model=SystemSettingsResponse, responses=error_responses(401, 403, 422)
+)
 async def get_settings(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
@@ -6586,7 +6920,9 @@ async def get_settings(
     return await service.get_settings()
 
 
-@router.put("/settings", response_model=SystemSettingsResponse, responses=error_responses(401, 403, 422))
+@router.put(
+    "/settings", response_model=SystemSettingsResponse, responses=error_responses(401, 403, 422)
+)
 async def update_settings(
     body: SystemSettingsRequest,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -6777,7 +7113,9 @@ async def get_multimedia_job(
     try:
         return _multimedia_job_response(executor.get_job(job_id))
     except KeyError as error:
-        raise PublicAPIError(404, "multimedia_job_not_found", "multimedia generation job not found") from error
+        raise PublicAPIError(
+            404, "multimedia_job_not_found", "multimedia generation job not found"
+        ) from error
 
 
 @router.post(
@@ -6799,9 +7137,13 @@ async def run_multimedia_job(
     try:
         job = await executor.run_job(job_id, executor_id=body.executor_id)
     except KeyError as error:
-        raise PublicAPIError(404, "multimedia_job_not_found", "multimedia generation job not found") from error
+        raise PublicAPIError(
+            404, "multimedia_job_not_found", "multimedia generation job not found"
+        ) from error
     except RuntimeError as error:
-        raise PublicAPIError(409, "multimedia_job_not_queued", "multimedia generation job is not queued") from error
+        raise PublicAPIError(
+            409, "multimedia_job_not_queued", "multimedia generation job is not queued"
+        ) from error
     except NoCapableDeployment as error:
         raise PublicAPIError(
             422,
@@ -6921,7 +7263,9 @@ async def create_openclaw_operation(
     if not settings.openclaw_enabled:
         raise PublicAPIError(409, "openclaw_disabled", "OpenClaw is disabled")
     if settings.openclaw_mode == "read_only" and body.kind not in {"screen_read", "file_read"}:
-        raise PublicAPIError(403, "openclaw_read_only", "OpenClaw read-only mode blocks this operation")
+        raise PublicAPIError(
+            403, "openclaw_read_only", "OpenClaw read-only mode blocks this operation"
+        )
     await _require_openclaw_bound_session_active(service, body)
     operation = await service.create_openclaw_operation(
         body,
@@ -6965,7 +7309,9 @@ async def create_openclaw_operation_from_run(
         raise PublicAPIError(404, "not_found", "not found") from None
     body = _openclaw_operation_request_from_run_detail(run)
     if settings.openclaw_mode == "read_only" and body.kind not in {"screen_read", "file_read"}:
-        raise PublicAPIError(403, "openclaw_read_only", "OpenClaw read-only mode blocks this operation")
+        raise PublicAPIError(
+            403, "openclaw_read_only", "OpenClaw read-only mode blocks this operation"
+        )
     operation = await service.create_openclaw_operation(
         body,
         actor=str(principal.user_id),
@@ -7103,7 +7449,9 @@ async def execute_openclaw_operation(
     )
 
 
-@router.get("/main-agent", response_model=MainAgentConfigResponse, responses=error_responses(401, 403, 422))
+@router.get(
+    "/main-agent", response_model=MainAgentConfigResponse, responses=error_responses(401, 403, 422)
+)
 async def get_main_agent_config(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
@@ -7112,7 +7460,9 @@ async def get_main_agent_config(
     return await service.get_main_agent_config()
 
 
-@router.put("/main-agent", response_model=MainAgentConfigResponse, responses=error_responses(401, 403, 422))
+@router.put(
+    "/main-agent", response_model=MainAgentConfigResponse, responses=error_responses(401, 403, 422)
+)
 async def update_main_agent_config(
     body: MainAgentConfigRequest,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -7180,7 +7530,11 @@ async def bulk_delete_operational_runs(
     return RunBulkDeleteResponse(deleted=deleted, failed=failed)
 
 
-@router.get("/runs/{run_id}", response_model=RunDetailResponse, responses=error_responses(401, 403, 404, 422))
+@router.get(
+    "/runs/{run_id}",
+    response_model=RunDetailResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
 async def get_operational_run(
     run_id: UUID,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -7210,7 +7564,11 @@ async def get_operational_run_debug(
         raise PublicAPIError(404, "not_found", "not found") from None
 
 
-@router.post("/runs/{run_id}/pause", response_model=RunDetailResponse, responses=error_responses(401, 403, 404, 422))
+@router.post(
+    "/runs/{run_id}/pause",
+    response_model=RunDetailResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
 async def pause_operational_run(
     run_id: UUID,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -7223,7 +7581,11 @@ async def pause_operational_run(
         raise PublicAPIError(404, "not_found", "not found") from None
 
 
-@router.post("/runs/{run_id}/resume", response_model=RunDetailResponse, responses=error_responses(401, 403, 404, 422))
+@router.post(
+    "/runs/{run_id}/resume",
+    response_model=RunDetailResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
 async def resume_operational_run(
     run_id: UUID,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -7236,7 +7598,11 @@ async def resume_operational_run(
         raise PublicAPIError(404, "not_found", "not found") from None
 
 
-@router.post("/runs/{run_id}/cancel", response_model=RunDetailResponse, responses=error_responses(401, 403, 404, 422))
+@router.post(
+    "/runs/{run_id}/cancel",
+    response_model=RunDetailResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
 async def cancel_operational_run(
     run_id: UUID,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -7266,8 +7632,11 @@ async def delete_operational_run(
         raise PublicAPIError(404, "not_found", "not found") from None
 
 
-
-@router.get("/evolution-runs", response_model=list[EvolutionRunResponse], responses=error_responses(401, 403, 422))
+@router.get(
+    "/evolution-runs",
+    response_model=list[EvolutionRunResponse],
+    responses=error_responses(401, 403, 422),
+)
 async def list_evolution_runs(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
@@ -7276,7 +7645,9 @@ async def list_evolution_runs(
     return list(await service.list_evolution_runs())
 
 
-@router.post("/evolution-runs", response_model=EvolutionRunResponse, responses=error_responses(401, 403, 422))
+@router.post(
+    "/evolution-runs", response_model=EvolutionRunResponse, responses=error_responses(401, 403, 422)
+)
 async def create_evolution_run(
     body: EvolutionRunRequest,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -7286,7 +7657,11 @@ async def create_evolution_run(
     return await service.create_evolution_run(body, actor=str(principal.user_id))
 
 
-@router.get("/evolution-runs/{run_id}", response_model=EvolutionRunResponse, responses=error_responses(401, 403, 404, 422))
+@router.get(
+    "/evolution-runs/{run_id}",
+    response_model=EvolutionRunResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
 async def get_evolution_run(
     run_id: str,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -7338,7 +7713,9 @@ async def ingest_evolution_execution_run(
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> EvolutionRunResponse:
     _require(principal, "skill:write")
-    return await service.ingest_evolution_execution_run(run_id, execution_run_id, actor=str(principal.user_id))
+    return await service.ingest_evolution_execution_run(
+        run_id, execution_run_id, actor=str(principal.user_id)
+    )
 
 
 @router.post(
@@ -7369,6 +7746,8 @@ async def record_evolution_round(
 ) -> EvolutionRunResponse:
     _require(principal, "skill:write")
     return await service.record_evolution_round(run_id, body, actor=str(principal.user_id))
+
+
 @router.get("/skills", response_model=list[SkillResponse], responses=error_responses(401, 403, 422))
 async def list_skills(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -7419,7 +7798,11 @@ async def upload_skill_archive(
         ) from None
 
 
-@router.post("/skills/{skill_id}/approve", response_model=SkillResponse, responses=error_responses(401, 403, 404, 422))
+@router.post(
+    "/skills/{skill_id}/approve",
+    response_model=SkillResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
 async def approve_skill(
     skill_id: str,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -7449,12 +7832,15 @@ async def bulk_delete_skills(
         try:
             await service.delete_skill(skill_id)
         except PublicAPIError as error:
-            failed.append(BulkFailureResponse(id=skill_id, code=error.code, message=error.public_message))
+            failed.append(
+                BulkFailureResponse(id=skill_id, code=error.code, message=error.public_message)
+            )
         except KeyError:
             failed.append(BulkFailureResponse(id=skill_id, code="not_found", message="not found"))
         else:
             deleted.append(skill_id)
     return SkillBulkDeleteResponse(deleted=deleted, failed=failed)
+
 
 @router.delete(
     "/skills/{skill_id}",
@@ -7474,7 +7860,9 @@ async def delete_skill(
     return OperationStatusResponse(status="deleted")
 
 
-@router.get("/mcp", response_model=list[McpServerResponse], responses=error_responses(401, 403, 422))
+@router.get(
+    "/mcp", response_model=list[McpServerResponse], responses=error_responses(401, 403, 422)
+)
 async def list_mcp_servers(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
@@ -7509,7 +7897,6 @@ async def delete_mcp_server(
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
     return OperationStatusResponse(status="deleted")
-
 
 
 def _channels_with_runtime_status(
@@ -7565,7 +7952,12 @@ def _runtime_metric_str(metrics: object | None, name: str) -> str | None:
     stripped = value.strip()
     return stripped or None
 
-@router.get("/channels", response_model=list[ChannelStatusResponse], responses=error_responses(401, 403, 422))
+
+@router.get(
+    "/channels",
+    response_model=list[ChannelStatusResponse],
+    responses=error_responses(401, 403, 422),
+)
 async def list_channels(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
@@ -7624,7 +8016,9 @@ async def _refresh_channel_runtime_config(
         await result
 
 
-@router.get("/memory", response_model=list[MemoryRecordResponse], responses=error_responses(401, 403, 422))
+@router.get(
+    "/memory", response_model=list[MemoryRecordResponse], responses=error_responses(401, 403, 422)
+)
 async def list_memory(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
@@ -7633,7 +8027,9 @@ async def list_memory(
     return list(await service.list_memory())
 
 
-@router.post("/memory", response_model=MemoryRecordResponse, responses=error_responses(401, 403, 422))
+@router.post(
+    "/memory", response_model=MemoryRecordResponse, responses=error_responses(401, 403, 422)
+)
 async def create_memory(
     body: MemoryCreateRequest,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -7643,7 +8039,11 @@ async def create_memory(
     return await service.create_memory(body)
 
 
-@router.patch("/memory/{memory_id}", response_model=MemoryRecordResponse, responses=error_responses(401, 403, 404, 422))
+@router.patch(
+    "/memory/{memory_id}",
+    response_model=MemoryRecordResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
 async def update_memory(
     memory_id: str,
     body: MemoryRecordRequest,
@@ -7675,7 +8075,9 @@ async def forget_memory(
     return OperationStatusResponse(status="forgotten")
 
 
-@router.get("/audit", response_model=list[AuditEventResponse], responses=error_responses(401, 403, 422))
+@router.get(
+    "/audit", response_model=list[AuditEventResponse], responses=error_responses(401, 403, 422)
+)
 async def list_audit_events(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
@@ -7685,7 +8087,9 @@ async def list_audit_events(
     return list(await service.list_audit_events(action))
 
 
-@router.get("/logs", response_model=list[LogEntryResponse], responses=error_responses(401, 403, 422))
+@router.get(
+    "/logs", response_model=list[LogEntryResponse], responses=error_responses(401, 403, 422)
+)
 async def list_logs(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
@@ -7704,7 +8108,9 @@ async def list_logs(
     return list(await service.list_logs(category))
 
 
-@router.get("/hermes", response_model=list[HermesInsightResponse], responses=error_responses(401, 403, 422))
+@router.get(
+    "/hermes", response_model=list[HermesInsightResponse], responses=error_responses(401, 403, 422)
+)
 async def list_hermes_insights(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
@@ -7713,7 +8119,11 @@ async def list_hermes_insights(
     return list(await service.list_hermes_insights())
 
 
-@router.post("/hermes/feedback", response_model=HermesInsightResponse, responses=error_responses(401, 403, 422))
+@router.post(
+    "/hermes/feedback",
+    response_model=HermesInsightResponse,
+    responses=error_responses(401, 403, 422),
+)
 async def record_hermes_feedback(
     body: HermesFeedbackRequest,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -7730,7 +8140,11 @@ async def record_hermes_feedback(
         ) from None
 
 
-@router.post("/hermes/recommend", response_model=HermesRecommendationResponse, responses=error_responses(401, 403, 422))
+@router.post(
+    "/hermes/recommend",
+    response_model=HermesRecommendationResponse,
+    responses=error_responses(401, 403, 422),
+)
 async def recommend_with_hermes(
     body: HermesRecommendationRequest,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -7796,7 +8210,11 @@ async def bulk_delete_hermes_insights(
     return HermesBulkDeleteResponse(deleted=deleted, failed=failed)
 
 
-@router.get("/hermes/{insight_id}", response_model=HermesInsightResponse, responses=error_responses(401, 403, 404, 422))
+@router.get(
+    "/hermes/{insight_id}",
+    response_model=HermesInsightResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
 async def get_hermes_insight(
     insight_id: str,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -7806,10 +8224,16 @@ async def get_hermes_insight(
     try:
         return await service.get_hermes_insight(insight_id)
     except KeyError:
-        raise PublicAPIError(404, "hermes_not_found", "Hermes learning record was not found") from None
+        raise PublicAPIError(
+            404, "hermes_not_found", "Hermes learning record was not found"
+        ) from None
 
 
-@router.post("/hermes/{insight_id}/confirm", response_model=HermesInsightResponse, responses=error_responses(401, 403, 404, 422))
+@router.post(
+    "/hermes/{insight_id}/confirm",
+    response_model=HermesInsightResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
 async def confirm_hermes_insight(
     insight_id: str,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
@@ -7819,7 +8243,9 @@ async def confirm_hermes_insight(
     try:
         return await service.confirm_hermes_insight(insight_id)
     except KeyError:
-        raise PublicAPIError(404, "hermes_not_found", "Hermes learning record was not found") from None
+        raise PublicAPIError(
+            404, "hermes_not_found", "Hermes learning record was not found"
+        ) from None
 
 
 @router.delete(
@@ -7836,7 +8262,9 @@ async def delete_hermes_insight(
     try:
         await service.delete_hermes_insight(insight_id)
     except KeyError:
-        raise PublicAPIError(404, "hermes_not_found", "Hermes learning record was not found") from None
+        raise PublicAPIError(
+            404, "hermes_not_found", "Hermes learning record was not found"
+        ) from None
     return OperationStatusResponse(status="deleted")
 
 

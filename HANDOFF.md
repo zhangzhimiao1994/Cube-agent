@@ -1,3 +1,45 @@
+## 2026-08-15 Feishu Command Aliases And Main Agent Concurrency Clarity
+
+### State
+- Fixed model concurrency reporting so API/UI use the same runtime capacity calculation as `safe_operational_limit`: `max_concurrency=2`, target utilization `0.8`, reserved `0` now shows 1 effective slot; `max_concurrency=3` shows 2 effective slots.
+- Added `max_concurrency` to the 主 Agent 专属模型/API configuration, so the dedicated main-agent deployment no longer hardcodes concurrency to 1. The main-agent UI now previews effective slots and shows `有效/最大并发`.
+- Kept dispatch concurrency semantics clear: sub-agents are already scheduled concurrently when ready; perceived serialization came from only one effective capacity slot on the selected model deployment.
+- Reduced accidental quality-reviewer selection by removing broad `generate/生成` matching from the role planner; explicit quality/review wording still selects the quality reviewer.
+- Standardized Feishu run replies so terminal messages include user-relevant sections only: final result, Agent 调度, 子 Agent 输出, discussion highlights, and review verdicts; internal checkpoint/model plumbing is filtered out.
+- Added channel command help and custom Feishu command aliases. `FEISHU_COMMAND_ALIASES` accepts entries such as `方案=//派单, 讨论=//讨论, 代码=//vi`; both Webhook and websocket receivers rewrite the first token before submission.
+- The Feishu channel settings UI now exposes `交互指令别名` and describes standard commands: `//自动`, `//直连`, `//派单`, `//讨论`, `//混合`, `//vi`.
+
+### Verification
+- `.\.venv\Scripts\python.exe -m pytest tests\api\test_channel_webhooks.py tests\unit\channels\test_submitter.py tests\unit\runtime\test_role_planner.py tests\api\test_admin_resources.py -q` -> 168 passed, only existing FastAPI/httpx deprecation and pytest cache ACL warnings.
+- `.\.venv\Scripts\python.exe -m pytest tests\contracts\feishu\test_receivers.py tests\unit\test_app_wiring.py tests\api\test_channel_webhooks.py tests\unit\channels\test_submitter.py -q` -> 66 passed, only existing warnings.
+- `.\.venv\Scripts\python.exe -m ruff check ...` on touched Python files -> passed.
+- `.\.venv\Scripts\python.exe -m mypy src` -> passed.
+- `npm test -- --run` from `web/` -> 14 files / 131 tests passed.
+- `npm run build` from `web/` -> passed with the existing Vite large chunk warning.
+- Full `.\.venv\Scripts\python.exe -m pytest tests -q` was attempted: non-integration/unit coverage progressed, but integration fixtures failed because local PostgreSQL/testcontainer at `127.0.0.1:54329` did not become ready within 30 seconds. This was an environment readiness blocker, not a failing assertion from this change.
+- Docker/WSL cleanup check after the integration attempt: `docker-desktop` was Stopped; only `wslservice` was present.
+
+### Server Deployment And Real Probe
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-feishu-command-aliases-20260815-081528.tgz` and uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`; server backup retained under `/opt/agent-hub/backups/p3-feishu-command-aliases-20260815-081528`.
+- Server archive retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-feishu-command-aliases-20260815-081528.tgz`.
+- Real server probe results:
+  - `alias_dispatch_mode=dispatch`
+  - `alias_task_text=写一个发布计划`
+  - `webhook_alias_text=//派单 写一个发布计划`
+  - `websocket_alias_text=//派单 写一个发布计划`
+  - `feishu_command_alias_allowed=true`
+  - `runtime_feishu_transport=websocket`
+  - `runtime_should_start_websocket=true`
+  - `safe_slots_2_08_0=1`, `safe_slots_3_08_0=2`
+  - API health live/ready both OK.
+  - `/channels` active frontend bundle `/assets/index-DJUjYSWk.js` contains `交互指令别名`, `标准指令支持`, and `有效/最大并发`.
+- Management API runtime probe: Feishu status `configured`, configured keys `FEISHU_APP_ID,FEISHU_APP_SECRET,FEISHU_TRANSPORT`, runtime `running`, `ready=true`, `failures=0`, `received_events=0`, `submitted_messages=0`.
+- Removed server `/tmp` deploy/probe/package files after verification.
+
+### Remaining / Next
+- If Feishu chat still produces no reply, the server side is ready but has received 0 events; next check is Feishu platform setup: bot installed/published in the target chat, receive-message event enabled, permissions granted, and app republished after changes.
+- Continue remaining P3 backlog after GitHub green: OpenClaw follow-ups, evolution execution/backlog UI, conversation right-side history drawer, broader UI layout/copy audit, missing button/function sweep, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 Channel Config Immediate Refresh And Feishu Runtime Probe
 
 ### State

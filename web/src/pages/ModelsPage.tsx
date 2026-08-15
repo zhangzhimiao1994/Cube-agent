@@ -451,6 +451,16 @@ function toPositiveNumber(value: string, fallback: number) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function effectiveModelSlots(maxConcurrency: number, targetUtilization = 0.8, reservedCapacity = 0) {
+  return Math.max(1, Math.min(Math.floor(maxConcurrency * targetUtilization), maxConcurrency - reservedCapacity));
+}
+
+function concurrencyNeededForSlots(slots: number, targetUtilization = 0.8, reservedCapacity = 0) {
+  const desired = Math.max(1, Math.ceil(slots));
+  let value = Math.max(1, desired + reservedCapacity);
+  while (effectiveModelSlots(value, targetUtilization, reservedCapacity) < desired) value += 1;
+  return value;
+}
 function toOptionalPositiveNumber(value: string) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
@@ -634,6 +644,9 @@ export function ModelsPage() {
   const isFreeformProvider = selectedProviderPreset?.modelEntryMode === "freeform";
   const isCustomModel = isCustomProvider || isFreeformProvider || selectedModel === CUSTOM_MODEL;
   const canChooseProtocol = isCustomProvider || isFreeformProvider;
+  const requestedMaxConcurrency = Math.max(1, Math.floor(toPositiveNumber(maxConcurrency, 1)));
+  const previewEffectiveSlots = effectiveModelSlots(requestedMaxConcurrency);
+  const maxConcurrencyForTwoSlots = concurrencyNeededForSlots(2);
 
   function resetModelForm(nextCategory: ModelCategory = "normal") {
     const presets = nextCategory === "normal" ? NORMAL_PROVIDERS : MULTIMEDIA_PROVIDERS;
@@ -1035,6 +1048,9 @@ export function ModelsPage() {
           {selectedProviderPreset?.concurrencyHelp ??
             "自定义服务商未提供官方预设；请查服务商控制台，或从并发 1 开始测试。"}
         </p>
+        <p className="field-hint">
+          当前按目标利用率 80% 和保留容量 0 计算，预计有效并发槽 {previewEffectiveSlots} 个；要让 2 个子 Agent 同时运行，最大并发至少填 {maxConcurrencyForTwoSlots}。
+        </p>
 
         <label htmlFor="rpm">RPM</label>
         <input id="rpm" type="number" min="1" value={rpm} onChange={(event) => setRpm(event.target.value)} />
@@ -1116,7 +1132,7 @@ export function ModelsPage() {
                     <th><SortHeader column="upstream" label="上游模型" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>上游模型</SortHeader></th>
                     <th><SortHeader column="apiBase" label="API Base" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>API Base</SortHeader></th>
                     <th><SortHeader column="capabilities" label="能力" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>能力</SortHeader></th>
-                    <th><SortHeader column="slots" label="有效并发" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>有效并发</SortHeader></th>
+                    <th><SortHeader column="slots" label="有效/最大并发" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>有效/最大并发</SortHeader></th>
                     <th>限流</th>
                     <th><SortHeader column="quota" label="Quota Scope" sort={modelSort} onSort={(column) => setModelSort((current) => nextSortState(current, column))}>Quota Scope</SortHeader></th>
                     <th>操作</th>
@@ -1151,7 +1167,7 @@ export function ModelsPage() {
                       <td>{model.upstream_model}</td>
                       <td>{model.api_base}</td>
                       <td>{modelCapabilitiesText(model)}</td>
-                      <td>{model.effective_slots}</td>
+                      <td>{model.effective_slots} / {model.max_concurrency}</td>
                       <td>
                         RPM {model.rpm ?? "未设置"} / TPM {model.tpm ?? "未设置"}
                       </td>

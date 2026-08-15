@@ -39,25 +39,29 @@ class RolePurpose(StrEnum):
 
 _SAFE_IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _MAX_TEXT = 2_000
-_DISCUSSION_SCHEMA = MappingProxyType({
-    "position": "approve | reject | needs_user",
-    "recommended_option": "string | null",
-    "confidence": "0.0-1.0",
-    "claims": "string[]",
-    "evidence": "string[]",
-    "objections": "string[]",
-    "risks": "string[]",
-    "questions_for_user": "string[]",
-    "verification_needed": "string[]",
-})
-_DISPATCH_SCHEMA = MappingProxyType({
-    "status": "done | blocked | needs_user",
-    "summary": "string",
-    "evidence": "string[]",
-    "risks": "string[]",
-    "artifacts": "string[]",
-    "verification": "string[]",
-})
+_DISCUSSION_SCHEMA = MappingProxyType(
+    {
+        "position": "approve | reject | needs_user",
+        "recommended_option": "string | null",
+        "confidence": "0.0-1.0",
+        "claims": "string[]",
+        "evidence": "string[]",
+        "objections": "string[]",
+        "risks": "string[]",
+        "questions_for_user": "string[]",
+        "verification_needed": "string[]",
+    }
+)
+_DISPATCH_SCHEMA = MappingProxyType(
+    {
+        "status": "done | blocked | needs_user",
+        "summary": "string",
+        "evidence": "string[]",
+        "risks": "string[]",
+        "artifacts": "string[]",
+        "verification": "string[]",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,10 +93,12 @@ class RoleAssignment:
             min_length=1,
         )
         skills = _normalize_identifier_tuple("skills", self.skills)
-        output_schema = MappingProxyType({
-            _require_schema_key(key): _require_schema_value(value)
-            for key, value in self.output_schema.items()
-        })
+        output_schema = MappingProxyType(
+            {
+                _require_schema_key(key): _require_schema_value(value)
+                for key, value in self.output_schema.items()
+            }
+        )
         _require_identifier("model", self.model)
         object.__setattr__(self, "must_answer", must_answer)
         object.__setattr__(self, "allowed_tools", allowed_tools)
@@ -125,13 +131,15 @@ class RolePlanningRequest:
             raise ValueError("high_risk must be a boolean")
         requested_skills = _normalize_identifier_tuple("requested_skills", self.requested_skills)
         _require_identifier("default_model", self.default_model)
-        overrides = MappingProxyType({
-            _require_identifier("model override role", role_id): _require_identifier(
-                "model override model",
-                model,
-            )
-            for role_id, model in self.model_overrides.items()
-        })
+        overrides = MappingProxyType(
+            {
+                _require_identifier("model override role", role_id): _require_identifier(
+                    "model override model",
+                    model,
+                )
+                for role_id, model in self.model_overrides.items()
+            }
+        )
         object.__setattr__(self, "requested_skills", requested_skills)
         object.__setattr__(self, "profiles", profiles)
         object.__setattr__(self, "model_overrides", overrides)
@@ -202,9 +210,7 @@ class RolePlanner:
                 _discussion_specs(profile, request.high_risk) for profile in request.profiles
             )
         else:
-            role_specs = _combined_specs(
-                _dispatch_specs(profile) for profile in request.profiles
-            )
+            role_specs = _combined_specs(_dispatch_specs(profile) for profile in request.profiles)
         catalog_specs = _catalog_specs_for_request(self._role_catalog, request)
         role_specs = (*role_specs, *_select_relevant_catalog_specs(request, catalog_specs))
         roles = tuple(_assignment(spec, request) for spec in role_specs)
@@ -422,7 +428,10 @@ def _discussion_specs(profile: TaskProfile, high_risk: bool) -> tuple[_RoleSpec,
                         "What network failure should be tested?",
                     ),
                     ("read_context",),
-                    ("do not change DNS or certificates directly", "do not expose private services"),
+                    (
+                        "do not change DNS or certificates directly",
+                        "do not expose private services",
+                    ),
                     ("ops",),
                     _DISCUSSION_SCHEMA,
                 ),
@@ -829,11 +838,7 @@ def _select_relevant_catalog_specs(
 ) -> tuple[_RoleSpec, ...]:
     if not specs:
         return ()
-    selected = [
-        spec
-        for spec in specs
-        if _role_matches_task(spec, request)
-    ]
+    selected = [spec for spec in specs if _role_matches_task(spec, request)]
     if selected:
         return tuple(selected)
     if request.requested_skills:
@@ -845,17 +850,74 @@ _BASELINE_CATALOG_ROLE_IDS = frozenset({"project_manager", "quality_reviewer", "
 
 _ROLE_TRIGGER_KEYWORDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
     {
-        "director": ("导演", "镜头", "分镜", "剧情", "短剧", "视频", "叙事", "即梦", "文生视频", "图生视频", "story", "shot"),
-        "copywriter": ("文案", "脚本", "短剧", "标题", "口播", "广告", "提示词", "prompt", "即梦", "slogan", "copy", "script"),
-        "video_editor": ("剪辑", "字幕", "转场", "视频", "素材", "节奏", "即梦", "文生视频", "图生视频", "edit", "caption"),
-        "multimedia_generator": ("generate", "generation", "image", "video", "media", "multimedia", "文生视频", "图生视频", "生成图片", "生成视频"),
+        "director": (
+            "导演",
+            "镜头",
+            "分镜",
+            "剧情",
+            "短剧",
+            "视频",
+            "叙事",
+            "即梦",
+            "文生视频",
+            "图生视频",
+            "story",
+            "shot",
+        ),
+        "copywriter": (
+            "文案",
+            "脚本",
+            "短剧",
+            "标题",
+            "口播",
+            "广告",
+            "提示词",
+            "prompt",
+            "即梦",
+            "slogan",
+            "copy",
+            "script",
+        ),
+        "video_editor": (
+            "剪辑",
+            "字幕",
+            "转场",
+            "视频",
+            "素材",
+            "节奏",
+            "即梦",
+            "文生视频",
+            "图生视频",
+            "edit",
+            "caption",
+        ),
+        "multimedia_generator": (
+            "generate",
+            "generation",
+            "image",
+            "video",
+            "media",
+            "multimedia",
+            "文生视频",
+            "图生视频",
+            "生成图片",
+            "生成视频",
+        ),
         "content_editor": ("润色", "校对", "编辑", "文案", "脚本", "改写", "polish", "edit"),
         "economic_analyst": ("经济", "市场", "需求", "定价", "宏观", "商业回报", "roi", "market"),
         "finance_analyst": ("预算", "成本", "收入", "财务", "回报", "roi", "budget", "cost"),
         "marketing_strategist": ("营销", "投放", "渠道", "增长", "转化", "用户", "campaign"),
         "product_manager": ("产品", "需求", "路线图", "优先级", "里程碑", "交付", "方案", "plan"),
         "operations_coordinator": ("交付", "清单", "排期", "运营", "协同", "执行", "handoff"),
-        "legal_compliance_reviewer": ("法律", "合规", "版权", "隐私", "许可", "免责声明", "compliance"),
+        "legal_compliance_reviewer": (
+            "法律",
+            "合规",
+            "版权",
+            "隐私",
+            "许可",
+            "免责声明",
+            "compliance",
+        ),
         "quality_reviewer": ("审核", "验收", "质量", "检查", "校验", "verify", "quality"),
         "designer": ("设计", "视觉", "海报", "界面", "ui", "品牌", "配色", "layout"),
         "sales_advisor": ("销售", "话术", "客户", "成交", "异议", "sales"),
@@ -872,7 +934,9 @@ def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
     if requested and requested.intersection(skills):
         return True
     task = request.task.casefold()
-    haystack = " ".join((role_id, role, mission, " ".join(must_answer), " ".join(skills))).casefold()
+    haystack = " ".join(
+        (role_id, role, mission, " ".join(must_answer), " ".join(skills))
+    ).casefold()
     triggers = _ROLE_TRIGGER_KEYWORDS.get(role_id, ())
     if any(keyword.casefold() in task for keyword in triggers):
         return True
@@ -898,12 +962,10 @@ def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
             "build",
             "prototype",
             "deliver",
-            "generate",
             "verify",
             "quality",
             "test",
             "prompt",
-            "生成",
             "验收",
             "质量",
             "检查",
@@ -915,7 +977,20 @@ def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
     ):
         return True
     if role_id == "copywriter" and any(
-        keyword in task for keyword in ("文案", "脚本", "标题", "口播", "短剧", "短视频", "营销", "广告", "提示词", "prompt", "即梦")
+        keyword in task
+        for keyword in (
+            "文案",
+            "脚本",
+            "标题",
+            "口播",
+            "短剧",
+            "短视频",
+            "营销",
+            "广告",
+            "提示词",
+            "prompt",
+            "即梦",
+        )
     ):
         return True
     if role_id == "economic_analyst" and any(
@@ -943,7 +1018,6 @@ def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
         for token in (*skills, role_id.replace("_", " "), role)
         if token.casefold() in haystack
     )
-
 
 
 _MULTIMEDIA_GENERATION_TERMS = (
@@ -1001,6 +1075,8 @@ def _is_multimedia_generation_request(task: str) -> bool:
     return any(term in normalized for term in _MULTIMEDIA_GENERATION_TERMS) and not any(
         negation in normalized for negation in _MULTIMEDIA_GENERATION_NEGATIONS
     )
+
+
 def _normalize_profiles(
     primary: TaskProfile,
     profiles: tuple[TaskProfile, ...],

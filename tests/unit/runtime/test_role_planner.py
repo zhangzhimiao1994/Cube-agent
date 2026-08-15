@@ -208,7 +208,6 @@ def test_multimedia_generation_dispatch_adds_dedicated_executor_role() -> None:
     assert "submit_video_to_text_only_model" in executor.forbidden_actions
 
 
-
 def test_multimedia_generator_is_not_selected_for_non_generation_tasks() -> None:
     plan = RolePlanner().plan(
         RolePlanningRequest(
@@ -222,6 +221,39 @@ def test_multimedia_generator_is_not_selected_for_non_generation_tasks() -> None
     role_ids = {role.id for role in plan.roles}
 
     assert "multimedia_generator" not in role_ids
+
+
+def test_general_generation_plan_does_not_select_quality_reviewer_by_default() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="给我生成一个中秋晚会的方案",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "product_manager" in role_ids
+    assert "project_manager" in role_ids
+    assert "quality_reviewer" not in role_ids
+
+
+def test_explicit_quality_check_still_selects_quality_reviewer() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="请对这个活动方案做质量检查和验收，确认是否可交付。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "quality_reviewer" in role_ids
+
 
 def test_role_catalog_can_be_extended_without_changing_role_planner_code() -> None:
     catalog = default_role_catalog().with_role(

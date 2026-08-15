@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from agent_hub.domain.runs import TaskMode
@@ -64,7 +65,10 @@ class ChannelDirectiveError(ValueError):
         super().__init__(reason)
 
 
-def parse_channel_directives(text: str) -> ChannelDirectives:
+def parse_channel_directives(
+    text: str, aliases: Mapping[str, str] | None = None
+) -> ChannelDirectives:
+    text = apply_channel_command_aliases(text, aliases)
     stripped = text.strip()
     if not stripped:
         return ChannelDirectives(mode=None, task_text="", invalid_reason="empty_message")
@@ -111,6 +115,7 @@ def parse_channel_directives(text: str) -> ChannelDirectives:
             pass
 
     task_text = " ".join(tokens[consumed:]).strip() if consumed else text
+    vibe_coding = any(token.casefold() in _VIBE_CODING_DIRECTIVES for token in tokens[:consumed])
     if not task_text:
         return ChannelDirectives(
             mode=mode,
@@ -118,7 +123,7 @@ def parse_channel_directives(text: str) -> ChannelDirectives:
             plugins=tuple(dict.fromkeys(plugins)),
             mcp_servers=tuple(dict.fromkeys(mcp_servers)),
             skills=tuple(dict.fromkeys(skills)),
-            vibe_coding=any(token.casefold() in _VIBE_CODING_DIRECTIVES for token in tokens[:consumed]),
+            vibe_coding=vibe_coding,
             invalid_reason="missing_task_text",
         )
     return ChannelDirectives(
@@ -127,11 +132,64 @@ def parse_channel_directives(text: str) -> ChannelDirectives:
         plugins=tuple(dict.fromkeys(plugins)),
         mcp_servers=tuple(dict.fromkeys(mcp_servers)),
         skills=tuple(dict.fromkeys(skills)),
-        vibe_coding=any(token.casefold() in _VIBE_CODING_DIRECTIVES for token in tokens[:consumed]),
+        vibe_coding=vibe_coding,
     )
 
 
-def directive_summary(directives: ChannelDirectives) -> str:
+def parse_command_aliases(value: str | None) -> dict[str, str]:
+    if not value:
+        return {}
+    aliases: dict[str, str] = {}
+    for chunk in re.split(r"[\n,;，；]+", value):
+        item = chunk.strip()
+        if not item:
+            continue
+        separator = "=" if "=" in item else ":" if ":" in item else None
+        if separator is None:
+            continue
+        alias, target = (part.strip() for part in item.split(separator, 1))
+        if not alias or re.search(r"\s", alias):
+            continue
+        normalized_target = _normalize_alias_target(target)
+        if normalized_target is None:
+            continue
+        aliases[alias.casefold()] = normalized_target
+    return aliases
+
+
+def apply_channel_command_aliases(text: str, aliases: Mapping[str, str] | None = None) -> str:
+    if not aliases:
+        return text
+    stripped = text.strip()
+    if not stripped:
+        return text
+    parts = stripped.split(maxsplit=1)
+    replacement = aliases.get(parts[0].casefold())
+    if replacement is None:
+        return text
+    if len(parts) == 1:
+        return replacement
+    return f"{replacement} {parts[1]}"
+
+
+def command_help_text(aliases: Mapping[str, str] | None = None) -> str:
+    alias_items = (
+        [] if not aliases else [f"{alias}={target}" for alias, target in sorted(aliases.items())]
+    )
+    lines = [
+        "可用指令：//自动、//直连、//派单、//讨论、//混合；//vi 开启 Vibe Coding。",
+        "扩展：&skill 指定 Skill，@plugin 指定插件，/#mcp 指定 MCP。",
+    ]
+    if alias_items:
+        lines.append("自定义别名：" + "，".join(alias_items[:8]))
+    else:
+        lines.append("可在通道配置里用“别名=标准指令”自定义，例如：方案=//派单。")
+    return "\n".join(lines)
+
+
+def directive_summary(
+    directives: ChannelDirectives, aliases: Mapping[str, str] | None = None
+) -> str:
     if directives.invalid_reason is not None:
         return "通道指令有误：" + _reason_text(directives.invalid_reason)
     mode = _mode_label(directives.mode)
@@ -145,6 +203,7 @@ def directive_summary(directives: ChannelDirectives) -> str:
     if directives.vibe_coding:
         lines.append("Vibe Coding: enabled")
     lines.append("我会按这些选择执行；若未指定模式，将由主 Agent 自动判断。")
+    lines.append(command_help_text(aliases))
     return "\n".join(lines)
 
 
@@ -197,6 +256,32 @@ def _looks_like_channel_directive(token: str) -> bool:
     return token.startswith(("//", "/#", "@", "&"))
 
 
+def _normalize_alias_target(target: str) -> str | None:
+    stripped = target.strip()
+    lowered = stripped.casefold()
+    shorthand = {
+        "auto": "//auto",
+        "自动": "//自动",
+        "direct": "//direct",
+        "直连": "//直连",
+        "直接": "//直接",
+        "dispatch": "//dispatch",
+        "派单": "//派单",
+        "分派": "//分派",
+        "discuss": "//discuss",
+        "讨论": "//讨论",
+        "hybrid": "//hybrid",
+        "混合": "//混合",
+        "vibe": "//vi",
+        "vi": "//vi",
+        "代码": "//vi",
+    }
+    stripped = shorthand.get(lowered, stripped)
+    if _parse_token(stripped) is None:
+        return None
+    return stripped
+
+
 def _mode_from_directive(token: str) -> TaskMode:
     if token in _LEGACY_MODES:
         return _LEGACY_MODES[token]
@@ -206,6 +291,9 @@ def _mode_from_directive(token: str) -> TaskMode:
 __all__ = [
     "ChannelDirectiveError",
     "ChannelDirectives",
+    "apply_channel_command_aliases",
+    "command_help_text",
     "directive_summary",
     "parse_channel_directives",
+    "parse_command_aliases",
 ]

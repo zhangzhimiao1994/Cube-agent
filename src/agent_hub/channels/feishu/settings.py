@@ -34,6 +34,7 @@ class FeishuSettings(BaseSettings):
     allowed_tenant_keys: frozenset[str] = Field(default=frozenset(), max_length=256)
     transport: FeishuTransport = FeishuTransport.WEBHOOK
     webhook_path: str = "/channels/feishu/events"
+    command_aliases: str = Field(default="", max_length=4096)
     timestamp_tolerance_seconds: int = Field(default=300, ge=1, le=3600)
     websocket_reconnect_min_seconds: float = Field(default=0.1, ge=0.0, le=60.0)
     websocket_reconnect_max_seconds: float = Field(default=5.0, ge=0.0, le=300.0)

@@ -252,6 +252,8 @@ describe("ChannelsPage", () => {
     expect(screen.getByText(/校验失败会返回明确错误/)).not.toBeNull();
     expect(screen.getByText("飞书长连接运行中")).not.toBeNull();
     expect(screen.getByText("连接次数 2 / 收到事件 3 / 已提交 2 / 失败 0")).not.toBeNull();
+    expect(screen.getByRole("textbox", { name: /交互指令别名 FEISHU_COMMAND_ALIASES/ })).not.toBeNull();
+    expect(screen.getByText(/标准指令支持 \/\/自动、\/\/直连、\/\/派单/)).not.toBeNull();
   });
 
   it("does not mark unconfigured optional channel fields as already configured", async () => {

@@ -157,9 +157,43 @@ async def test_receivers_produce_same_inbound_message(transport: str) -> None:
     assert gateway.messages == [message]
 
 
+@pytest.mark.parametrize("transport", ["webhook", "websocket"])
+async def test_receivers_apply_custom_command_aliases_before_submission(transport: str) -> None:
+    config = settings(command_aliases="方案=//派单, 代码=//vi")
+    gateway = RecordingGateway()
+    if transport == "webhook":
+        receiver = build_feishu_webhook_receiver(
+            config,
+            gateway=gateway,
+            clock=lambda: float(NOW),
+        )
+        verifier = FeishuVerifier(
+            app_id=config.app_id,
+            verification_token=config.verification_token_value(),
+            encrypt_key=config.encrypt_key_value(),
+            clock=lambda: float(NOW),
+        )
+        body, headers = signed_body(private_text_event(text="方案 写一个发布计划"), verifier)
+        result = await receiver.receive(body, headers=headers)
+        message = result.message
+    else:
+        receiver = build_feishu_websocket_receiver(
+            config,
+            gateway=gateway,
+            clock=lambda: float(NOW),
+        )
+        message = await receiver.receive(private_text_event(text="方案 写一个发布计划"))
+
+    assert message is not None
+    assert message.text == "//派单 写一个发布计划"
+    assert gateway.messages == [message]
+
+
 async def test_websocket_receiver_accepts_sdk_payload_without_verification_token() -> None:
     gateway = RecordingGateway()
-    receiver = build_feishu_websocket_receiver(settings(), gateway=gateway, clock=lambda: float(NOW))
+    receiver = build_feishu_websocket_receiver(
+        settings(), gateway=gateway, clock=lambda: float(NOW)
+    )
     payload = private_text_event()
     payload.pop("token")
 
@@ -335,8 +369,6 @@ async def test_websocket_reconnects_refreshes_credentials_and_shutdowns() -> Non
     assert connector.ready is False
 
 
-
-
 async def test_lark_oapi_websocket_client_streams_message_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -449,6 +481,7 @@ async def test_lark_oapi_disconnect_stops_running_sdk_loop(
     assert scheduled
     assert stopped == [True]
     assert 3 in joined
+
 
 def test_transport_selection_supports_webhook_websocket_and_both() -> None:
     assert settings(transport=FeishuTransport.WEBHOOK).enabled_transports() == {

@@ -230,6 +230,22 @@ function capabilitiesFor(provider: ProviderPreset | undefined, selectedModel: st
   return provider.models.find((model) => model.value === selectedModel)?.capabilities ?? provider.capabilities;
 }
 
+function toPositiveNumber(value: string, fallback: number) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function effectiveModelSlots(maxConcurrency: number, targetUtilization = 0.8, reservedCapacity = 0) {
+  return Math.max(1, Math.min(Math.floor(maxConcurrency * targetUtilization), maxConcurrency - reservedCapacity));
+}
+
+function concurrencyNeededForSlots(slots: number, targetUtilization = 0.8, reservedCapacity = 0) {
+  const desired = Math.max(1, Math.ceil(slots));
+  let value = Math.max(1, desired + reservedCapacity);
+  while (effectiveModelSlots(value, targetUtilization, reservedCapacity) < desired) value += 1;
+  return value;
+}
+
 function modelErrorDiagnostics(error: unknown) {
   if (!(error instanceof ApiError) || !error.details) return [];
   return Object.entries(error.details)
@@ -252,6 +268,7 @@ export function MainAgentPage() {
   const [apiBase, setApiBase] = useState(PROVIDERS[0].apiBase);
   const [credentialRef, setCredentialRef] = useState("");
   const [apiKey, setApiKey] = useState("");
+  const [maxConcurrency, setMaxConcurrency] = useState("1");
   const [controlMode, setControlMode] = useState<MainAgentConfig["control_mode"]>("supervisor");
   const [hermesPolicy, setHermesPolicy] = useState<MainAgentConfig["hermes_policy"]>("observe");
   const [decisionPolicy, setDecisionPolicy] = useState(DEFAULT_POLICY);
@@ -293,6 +310,7 @@ export function MainAgentPage() {
       setApiProtocol(model.api_protocol);
       setApiBase(model.api_base);
       setCredentialRef(model.credential_ref);
+      setMaxConcurrency(String(model.max_concurrency ?? 1));
     }
     setControlMode(config.data.control_mode);
     setHermesPolicy(config.data.hermes_policy);
@@ -310,6 +328,7 @@ export function MainAgentPage() {
       setCustomModel("");
       setApiBase("");
       setApiProtocol("openai_compatible");
+      setMaxConcurrency("1");
       return;
     }
     const preset = providerFor(nextProvider) ?? PROVIDERS[0];
@@ -319,6 +338,7 @@ export function MainAgentPage() {
     setCustomModel("");
     setApiBase(preset.apiBase);
     setApiProtocol(preset.apiProtocol);
+    setMaxConcurrency("1");
   }
 
   function changeModel(nextModel: string) {
@@ -336,6 +356,9 @@ export function MainAgentPage() {
     savedModel.api_protocol !== apiProtocol ||
     savedModel.api_base !== normalizedApiBase;
   const requiresNewApiKey = hasConnectionChanged && !apiKey.trim();
+  const configuredMaxConcurrency = Math.max(1, Math.floor(toPositiveNumber(maxConcurrency, 1)));
+  const previewEffectiveSlots = effectiveModelSlots(configuredMaxConcurrency);
+  const maxConcurrencyForTwoSlots = concurrencyNeededForSlots(2);
 
   const save = useMutation({
     mutationFn: async () => {
@@ -352,6 +375,7 @@ export function MainAgentPage() {
           upstream_model: resolvedModel,
           credential_ref: resolvedCredentialRef,
           capabilities: capabilitiesFor(selectedProviderPreset, selectedModel),
+          max_concurrency: configuredMaxConcurrency,
         },
         control_mode: controlMode,
         hermes_policy: hermesPolicy,
@@ -536,6 +560,21 @@ export function MainAgentPage() {
             {selectedProviderPreset?.concurrencyHelp ??
               "自定义服务商未提供官方预设；请以服务商控制台或中转站后台限流说明为准。"}
           </p>
+          <label htmlFor="main-agent-max-concurrency">
+            最大并发
+            <input
+              id="main-agent-max-concurrency"
+              data-testid="main-agent-max-concurrency"
+              type="number"
+              min="1"
+              value={maxConcurrency}
+              onChange={(event) => setMaxConcurrency(event.target.value)}
+              required
+            />
+          </label>
+          <p className="field-hint">
+            当前配置最大并发 {configuredMaxConcurrency}，按目标利用率 80% 计算，实际有效并发槽 {previewEffectiveSlots} 个。要让 2 个子 Agent 同时运行，最大并发至少填 {maxConcurrencyForTwoSlots}。
+          </p>
 
           <label htmlFor="main-agent-api-key">
             API Key（可选，保存后不回显）
@@ -679,6 +718,10 @@ export function MainAgentPage() {
               <div className="diagnostic-row">
                 <dt>上游模型</dt>
                 <dd>{savedModel.upstream_model}</dd>
+              </div>
+              <div className="diagnostic-row">
+                <dt>有效/最大并发</dt>
+                <dd>{effectiveModelSlots(savedModel.max_concurrency ?? 1)} / {savedModel.max_concurrency ?? 1}</dd>
               </div>
               <div className="diagnostic-row">
                 <dt>Key 状态</dt>

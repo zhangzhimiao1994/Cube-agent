@@ -209,10 +209,7 @@ def test_openclaw_adapters_expose_multisystem_execution_boundary() -> None:
     response = client().get("/api/v1/admin/openclaw/adapters", headers=headers())
 
     assert response.status_code == 200
-    adapters = {
-        (adapter["platform"], adapter["kind"]): adapter
-        for adapter in response.json()
-    }
+    adapters = {(adapter["platform"], adapter["kind"]): adapter for adapter in response.json()}
     assert adapters[("linux", "server_command")] == {
         "platform": "linux",
         "kind": "server_command",
@@ -250,7 +247,9 @@ def test_openclaw_operation_can_be_created_from_chat_proposal() -> None:
         queue_wait_ms=0,
         capacity_wait_ms=0,
         cost_usd="0",
-        events=[RunEventResponse(sequence=1, kind="queued", message="waiting approval", created_at=now)],
+        events=[
+            RunEventResponse(sequence=1, kind="queued", message="waiting approval", created_at=now)
+        ],
         artifacts=[],
         explicit_details={"conversation_id": "conv-openclaw-api-test"},
         openclaw_proposal={
@@ -312,6 +311,7 @@ def test_openclaw_operation_from_run_rejects_non_openclaw_proposal() -> None:
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "openclaw_proposal_missing"
+
 
 def test_openclaw_operation_creates_approval_request_when_enabled() -> None:
     api = client()
@@ -449,7 +449,9 @@ def test_openclaw_auto_review_approves_allowlisted_low_risk_linux_command() -> N
     assert operation["status"] == "approved"
     assert operation["requires_user_approval"] is False
 
-    executed = api.post(f"/api/v1/admin/openclaw/operations/{operation['id']}/execute", headers=headers())
+    executed = api.post(
+        f"/api/v1/admin/openclaw/operations/{operation['id']}/execute", headers=headers()
+    )
     assert executed.status_code == 200
     assert executed.json()["stdout"].strip() == "openclaw-auto-review-ok"
 
@@ -481,7 +483,9 @@ def test_openclaw_auto_review_keeps_unlisted_command_waiting_for_user_approval()
     assert operation["status"] == "waiting_user_approval"
     assert operation["requires_user_approval"] is True
 
-    executed = api.post(f"/api/v1/admin/openclaw/operations/{operation['id']}/execute", headers=headers())
+    executed = api.post(
+        f"/api/v1/admin/openclaw/operations/{operation['id']}/execute", headers=headers()
+    )
     assert executed.status_code == 409
     assert executed.json()["error"]["code"] == "openclaw_not_approved"
 
@@ -507,13 +511,18 @@ def test_openclaw_execute_denies_approved_unlisted_command() -> None:
         },
     )
     operation_id = created.json()["id"]
-    assert api.patch(
-        f"/api/v1/admin/openclaw/operations/{operation_id}",
-        headers=headers(),
-        json={"decision": "approve"},
-    ).status_code == 200
+    assert (
+        api.patch(
+            f"/api/v1/admin/openclaw/operations/{operation_id}",
+            headers=headers(),
+            json={"decision": "approve"},
+        ).status_code
+        == 200
+    )
 
-    response = api.post(f"/api/v1/admin/openclaw/operations/{operation_id}/execute", headers=headers())
+    response = api.post(
+        f"/api/v1/admin/openclaw/operations/{operation_id}/execute", headers=headers()
+    )
 
     assert response.status_code == 403
     assert response.json()["error"]["code"] == "openclaw_command_denied"
@@ -541,13 +550,18 @@ def test_openclaw_execute_runs_allowlisted_linux_command() -> None:
         },
     )
     operation_id = created.json()["id"]
-    assert api.patch(
-        f"/api/v1/admin/openclaw/operations/{operation_id}",
-        headers=headers(),
-        json={"decision": "approve"},
-    ).status_code == 200
+    assert (
+        api.patch(
+            f"/api/v1/admin/openclaw/operations/{operation_id}",
+            headers=headers(),
+            json={"decision": "approve"},
+        ).status_code
+        == 200
+    )
 
-    response = api.post(f"/api/v1/admin/openclaw/operations/{operation_id}/execute", headers=headers())
+    response = api.post(
+        f"/api/v1/admin/openclaw/operations/{operation_id}/execute", headers=headers()
+    )
 
     assert response.status_code == 200
     body = response.json()
@@ -584,13 +598,18 @@ def test_openclaw_execute_denies_shell_even_when_allowlisted() -> None:
         },
     )
     operation_id = created.json()["id"]
-    assert api.patch(
-        f"/api/v1/admin/openclaw/operations/{operation_id}",
-        headers=headers(),
-        json={"decision": "approve"},
-    ).status_code == 200
+    assert (
+        api.patch(
+            f"/api/v1/admin/openclaw/operations/{operation_id}",
+            headers=headers(),
+            json={"decision": "approve"},
+        ).status_code
+        == 200
+    )
 
-    response = api.post(f"/api/v1/admin/openclaw/operations/{operation_id}/execute", headers=headers())
+    response = api.post(
+        f"/api/v1/admin/openclaw/operations/{operation_id}/execute", headers=headers()
+    )
 
     assert response.status_code == 403
     assert response.json()["error"]["code"] == "openclaw_command_denied"
@@ -617,13 +636,18 @@ def test_openclaw_execute_returns_adapter_unavailable_for_windows_command() -> N
         },
     )
     operation_id = created.json()["id"]
-    assert api.patch(
-        f"/api/v1/admin/openclaw/operations/{operation_id}",
-        headers=headers(),
-        json={"decision": "approve"},
-    ).status_code == 200
+    assert (
+        api.patch(
+            f"/api/v1/admin/openclaw/operations/{operation_id}",
+            headers=headers(),
+            json={"decision": "approve"},
+        ).status_code
+        == 200
+    )
 
-    response = api.post(f"/api/v1/admin/openclaw/operations/{operation_id}/execute", headers=headers())
+    response = api.post(
+        f"/api/v1/admin/openclaw/operations/{operation_id}/execute", headers=headers()
+    )
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "openclaw_adapter_unavailable"
@@ -638,11 +662,13 @@ def test_openclaw_execute_uses_configured_remote_windows_adapter() -> None:
                 self.send_response(404)
                 self.end_headers()
                 return
-            payload = json.dumps({
-                "status": "ok",
-                "platform": "windows",
-                "capabilities": ["server_command"],
-            }).encode("utf-8")
+            payload = json.dumps(
+                {
+                    "status": "ok",
+                    "platform": "windows",
+                    "capabilities": ["server_command"],
+                }
+            ).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
@@ -704,7 +730,9 @@ def test_openclaw_execute_uses_configured_remote_windows_adapter() -> None:
 
         adapters = api.get("/api/v1/admin/openclaw/adapters", headers=headers()).json()
         windows_command = next(
-            item for item in adapters if item["platform"] == "windows" and item["kind"] == "server_command"
+            item
+            for item in adapters
+            if item["platform"] == "windows" and item["kind"] == "server_command"
         )
         assert windows_command["status"] == "available"
 
@@ -736,13 +764,18 @@ def test_openclaw_execute_uses_configured_remote_windows_adapter() -> None:
         )
         assert created.status_code == 202
         operation_id = created.json()["id"]
-        assert api.patch(
-            f"/api/v1/admin/openclaw/operations/{operation_id}",
-            headers=headers(),
-            json={"decision": "approve"},
-        ).status_code == 200
+        assert (
+            api.patch(
+                f"/api/v1/admin/openclaw/operations/{operation_id}",
+                headers=headers(),
+                json={"decision": "approve"},
+            ).status_code
+            == 200
+        )
 
-        executed = api.post(f"/api/v1/admin/openclaw/operations/{operation_id}/execute", headers=headers())
+        executed = api.post(
+            f"/api/v1/admin/openclaw/operations/{operation_id}/execute", headers=headers()
+        )
 
         assert executed.status_code == 200
         assert executed.json()["stdout"] == "windows-adapter-ok\n"
@@ -830,11 +863,14 @@ def test_openclaw_operation_rejects_inactive_session_binding() -> None:
         },
     )
     session_id = created_session.json()["id"]
-    assert api.patch(
-        f"/api/v1/admin/openclaw/sessions/{session_id}",
-        headers=headers(),
-        json={"action": "pause"},
-    ).status_code == 200
+    assert (
+        api.patch(
+            f"/api/v1/admin/openclaw/sessions/{session_id}",
+            headers=headers(),
+            json={"action": "pause"},
+        ).status_code
+        == 200
+    )
 
     created_operation = api.post(
         "/api/v1/admin/openclaw/operations",
@@ -852,6 +888,7 @@ def test_openclaw_operation_rejects_inactive_session_binding() -> None:
 
     assert created_operation.status_code == 409
     assert created_operation.json()["error"]["code"] == "openclaw_session_not_active"
+
 
 def test_openclaw_execute_rechecks_bound_session_is_active() -> None:
     api = client()
@@ -890,21 +927,30 @@ def test_openclaw_execute_rechecks_bound_session_is_active() -> None:
     )
     assert created_operation.status_code == 202
     operation_id = created_operation.json()["id"]
-    assert api.patch(
-        f"/api/v1/admin/openclaw/operations/{operation_id}",
-        headers=headers(),
-        json={"decision": "approve"},
-    ).status_code == 200
-    assert api.patch(
-        f"/api/v1/admin/openclaw/sessions/{session_id}",
-        headers=headers(),
-        json={"action": "pause"},
-    ).status_code == 200
+    assert (
+        api.patch(
+            f"/api/v1/admin/openclaw/operations/{operation_id}",
+            headers=headers(),
+            json={"decision": "approve"},
+        ).status_code
+        == 200
+    )
+    assert (
+        api.patch(
+            f"/api/v1/admin/openclaw/sessions/{session_id}",
+            headers=headers(),
+            json={"action": "pause"},
+        ).status_code
+        == 200
+    )
 
-    response = api.post(f"/api/v1/admin/openclaw/operations/{operation_id}/execute", headers=headers())
+    response = api.post(
+        f"/api/v1/admin/openclaw/operations/{operation_id}/execute", headers=headers()
+    )
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "openclaw_session_not_active"
+
 
 def test_openclaw_session_requires_feature_switch() -> None:
     response = client().post(
@@ -1062,6 +1108,7 @@ def test_openclaw_proposal_helper_preserves_safe_operation_details() -> None:
         "requires_user_confirmation": "true",
     }
     assert "unsafe" not in proposal
+
 
 def test_run_detail_response_can_expose_mode_decision_token() -> None:
     token = "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234"
@@ -1295,7 +1342,10 @@ def test_run_debug_snapshot_preserves_partial_output_and_failure_context() -> No
 
     assert debug.run_id == run_id
     assert debug.failed_stage == "runtime.failed"
-    assert debug.failure_reason == "hybrid discuss failed: model gateway failed: model transport failed"
+    assert (
+        debug.failure_reason
+        == "hybrid discuss failed: model gateway failed: model transport failed"
+    )
     assert debug.partial_output_available is True
     assert debug.artifacts[0].text_preview == "已经完成静态审查，发现 2 个高风险问题。"
     assert debug.events[0].payload["credential_ref"] == "[redacted]"
@@ -1729,6 +1779,7 @@ def instruction_bundle_with_very_large_skill_directory_zip() -> bytes:
         )
     return buffer.getvalue()
 
+
 def instruction_bundle_with_non_slug_frontmatter_name_zip() -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
@@ -1803,6 +1854,8 @@ def large_phone_wrapped_instruction_skill_bundle_archive() -> bytes:
                 info.size = len(content)
                 archive.addfile(info, io.BytesIO(content))
     return buffer.getvalue()
+
+
 def partially_invalid_instruction_skill_bundle_zip() -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
@@ -1826,6 +1879,15 @@ def test_model_pool_reports_serial_slot_and_queue_policy() -> None:
     assert body["upstream_model"] == "deepseek-chat"
     assert body["effective_slots"] == 1
     assert body["saturation_policy"] == "queue_first_then_fallback"
+
+
+def test_model_effective_slots_apply_target_utilization() -> None:
+    payload = {**model_payload(), "max_concurrency": 2, "target_utilization": 0.8}
+
+    response = client().post("/api/v1/admin/models", headers=headers(), json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["effective_slots"] == 1
 
 
 def test_model_create_auto_infers_known_video_generation_capability() -> None:
@@ -1895,9 +1957,9 @@ def test_multimedia_video_generation_requires_video_capable_model() -> None:
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "model_capability_unavailable"
-    assert gateway.requests[0].required_capabilities == frozenset({
-        ModelCapability.VIDEO_GENERATION
-    })
+    assert gateway.requests[0].required_capabilities == frozenset(
+        {ModelCapability.VIDEO_GENERATION}
+    )
 
 
 def test_multimedia_generation_daily_limit_returns_429() -> None:
@@ -1932,7 +1994,9 @@ def test_multimedia_generation_provider_failure_returns_502() -> None:
     payload["multimedia_generation_enabled"] = True
     assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
     gateway = FakeGenerationGateway(
-        error=VideoProviderGenerationError("MiniMax video submit failed: invalid api key", provider_code="2049")
+        error=VideoProviderGenerationError(
+            "MiniMax video submit failed: invalid api key", provider_code="2049"
+        )
     )
     cast(Any, api.app).state.multimedia_generation_executor = MultimediaGenerationExecutor(gateway)
 
@@ -1960,7 +2024,9 @@ def test_multimedia_generation_job_can_be_run_by_executor_agent_and_read_by_main
     payload = settings_response.json()
     payload["multimedia_generation_enabled"] = True
     assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
-    cast(Any, api.app).state.multimedia_generation_executor = MultimediaGenerationExecutor(FakeGenerationGateway())
+    cast(Any, api.app).state.multimedia_generation_executor = MultimediaGenerationExecutor(
+        FakeGenerationGateway()
+    )
 
     submitted = api.post(
         "/api/v1/admin/multimedia/jobs",
@@ -2017,6 +2083,7 @@ def test_main_agent_config_saves_dedicated_model_api_and_control_policy() -> Non
                 "upstream_model": "deepseek-chat",
                 "credential_ref": "secret://main-agent",
                 "capabilities": ["text", "tool_calling"],
+                "max_concurrency": 3,
             },
             "control_mode": "supervisor",
             "decision_policy": "choose mode first, then roles; main agent makes the final decision",
@@ -2031,6 +2098,7 @@ def test_main_agent_config_saves_dedicated_model_api_and_control_policy() -> Non
     assert fetched.json()["model"]["provider"] == "openai-compatible"
     assert fetched.json()["model"]["api_base"] == "https://gsykj.com/v1"
     assert fetched.json()["model"]["api_protocol"] == "openai_compatible"
+    assert fetched.json()["model"]["max_concurrency"] == 3
     assert fetched.json()["control_mode"] == "supervisor"
     assert fetched.json()["hermes_policy"] == "confirm_before_apply"
 
@@ -2159,12 +2227,12 @@ def test_agent_and_workflow_crud() -> None:
     assert agent.status_code == 200
     assert workflow.status_code == 200
     assert api.get("/api/v1/admin/agents", headers=headers()).json()[0]["id"] == "planner"
-    assert (
-        api.get("/api/v1/admin/workflows", headers=headers()).json()[0]["id"] == "dispatch"
-    )
+    assert api.get("/api/v1/admin/workflows", headers=headers()).json()[0]["id"] == "dispatch"
 
 
-def test_channel_status_exposes_feishu_setup_without_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_channel_status_exposes_feishu_setup_without_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("FEISHU_APP_ID", "cli_live")
     monkeypatch.setenv("FEISHU_APP_SECRET", "secret-live")
     monkeypatch.setenv("FEISHU_VERIFICATION_TOKEN", "verify-live")
@@ -2179,8 +2247,7 @@ def test_channel_status_exposes_feishu_setup_without_secrets(monkeypatch: pytest
     by_id = {item["id"]: item for item in payload}
     assert by_id["feishu"]["status"] == "configured"
     assert (
-        by_id["feishu"]["public_webhook_url"]
-        == "https://agent.example.com/channels/feishu/events"
+        by_id["feishu"]["public_webhook_url"] == "https://agent.example.com/channels/feishu/events"
     )
     assert by_id["feishu"]["missing"] == []
     assert {
@@ -2205,7 +2272,9 @@ def test_channel_status_exposes_feishu_setup_without_secrets(monkeypatch: pytest
     assert "encrypt-live" not in serialized
 
 
-def test_channel_status_supports_feishu_bot_template_app_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_channel_status_supports_feishu_bot_template_app_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     for name in (
         "AGENT_HUB_PUBLIC_URL",
         "FEISHU_VERIFICATION_TOKEN",
@@ -2228,7 +2297,9 @@ def test_channel_status_supports_feishu_bot_template_app_credentials(monkeypatch
     assert "template-secret" not in response.text
 
 
-def test_channel_status_defaults_feishu_to_websocket_two_parameter_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_channel_status_defaults_feishu_to_websocket_two_parameter_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     for name in (
         "AGENT_HUB_PUBLIC_URL",
         "FEISHU_APP_TYPE",
@@ -2254,7 +2325,9 @@ def test_channel_status_defaults_feishu_to_websocket_two_parameter_mode(monkeypa
     assert any("长连接" in note for note in by_id["feishu"]["notes"])
 
 
-def test_channel_status_treats_feishu_custom_app_token_as_required(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_channel_status_treats_feishu_custom_app_token_as_required(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     for name in (
         "AGENT_HUB_PUBLIC_URL",
         "FEISHU_APP_TYPE",
@@ -2275,7 +2348,9 @@ def test_channel_status_treats_feishu_custom_app_token_as_required(monkeypatch: 
     assert any("Webhook" in note for note in by_id["feishu"]["notes"])
 
 
-def test_channel_config_accepts_feishu_bot_template_app_type(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_channel_config_accepts_feishu_bot_template_app_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     for name in (
         "AGENT_HUB_PUBLIC_URL",
         "FEISHU_APP_ID",
@@ -2367,6 +2442,7 @@ def test_channel_status_reports_configured_sources_after_clear(
     assert cleared.json()["status"]["status"] == "configured"
     assert cleared.json()["status"]["configured_sources"] == {"CUSTOM_WEBHOOK_TOKEN": "environment"}
 
+
 def test_channel_config_can_be_cleared_after_save(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2444,6 +2520,7 @@ def test_channel_config_save_and_clear_refresh_runtime_config(
 
     assert cleared.status_code == 200
     assert refreshes[-1] == {}
+
 
 def test_all_channel_statuses_are_configured_when_required_env_exists(
     monkeypatch: pytest.MonkeyPatch,
@@ -2874,6 +2951,7 @@ def test_skill_archive_upload_scans_real_zip_package() -> None:
     assert any("content sha256" in entry for entry in item["scan_diff"])
     assert skills.json()[0]["id"] == item["id"]
 
+
 def test_skill_archive_upload_accepts_percent_encoded_filename_header() -> None:
     api = client()
     filename = "技能包.zip"
@@ -2941,9 +3019,15 @@ def test_skill_archive_upload_scans_wrapped_tar_gz_bundle_with_multiple_skill_di
     assert uploaded.status_code == 200
     body = uploaded.json()
     assert body["bundle"] is True
-    assert [item["name"] for item in body["items"]] == ["wrapped_writer_skill", "wrapped_reviewer_skill"]
+    assert [item["name"] for item in body["items"]] == [
+        "wrapped_writer_skill",
+        "wrapped_reviewer_skill",
+    ]
     assert body["items"][0]["requested_permissions"] == ["tool:filesystem.read"]
-    assert {item["name"] for item in skills.json()} == {"wrapped_writer_skill", "wrapped_reviewer_skill"}
+    assert {item["name"] for item in skills.json()} == {
+        "wrapped_writer_skill",
+        "wrapped_reviewer_skill",
+    }
 
 
 def test_skill_archive_upload_accepts_instruction_only_skill_package() -> None:
@@ -3051,6 +3135,7 @@ def test_skill_bulk_delete_removes_selected_skills_and_reports_missing() -> None
     }
     assert remaining.json() == []
 
+
 def test_skill_archive_upload_accepts_rich_instruction_skill_directory() -> None:
     api = client()
 
@@ -3089,6 +3174,7 @@ def test_skill_archive_upload_accepts_large_instruction_skill_directory() -> Non
         "large-research-skill",
         "compact-neighbor-skill",
     }
+
 
 def test_skill_archive_upload_uses_directory_slug_when_frontmatter_name_has_no_slug() -> None:
     api = client()
@@ -3153,6 +3239,8 @@ def test_skill_archive_upload_accepts_phone_wrapped_large_instruction_bundle_wit
     assert body["items"][0]["name"] == "phone-wrapped-skill-000"
     assert body["items"][-1]["name"] == "phone-wrapped-skill-098"
     assert len(skills.json()) == 99
+
+
 def test_skill_archive_upload_keeps_valid_bundle_items_when_one_item_is_invalid() -> None:
     api = client()
 
@@ -3375,6 +3463,7 @@ def test_hermes_bulk_actions_accept_large_mobile_selection() -> None:
     assert confirm.json()["failed"] == []
     assert delete.status_code == 200
     assert delete.json() == {"deleted": created_ids, "failed": []}
+
 
 def test_hermes_bulk_actions_accept_runtime_learning_ids() -> None:
     api = client()
@@ -3705,6 +3794,7 @@ async def test_persistent_admin_normalizes_anthropic_messages_api_base() -> None
     assert created.api_base == "https://toapis.com/v1/messages"
     assert created.api_protocol == "anthropic_messages"
     assert transport.calls[0][0].api_base == "https://toapis.com/v1/messages"
+    assert transport.calls[0][0].max_concurrency == 2
 
 
 @pytest.mark.asyncio
@@ -3729,6 +3819,7 @@ async def test_persistent_admin_verifies_dedicated_main_agent_model() -> None:
                 upstream_model="claude-sonnet-4-6",
                 credential_ref=f"secret://{SECRET_ID}",
                 capabilities=["text", "tool_calling"],
+                max_concurrency=3,
             ),
             control_mode="supervisor",
             hermes_policy="confirm_before_apply",
@@ -3743,6 +3834,7 @@ async def test_persistent_admin_verifies_dedicated_main_agent_model() -> None:
     assert response.model.api_base == "https://toapis.com/v1/messages"
     assert transport.calls[0][0].logical_model == "main_agent"
     assert transport.calls[0][0].api_base == "https://toapis.com/v1/messages"
+    assert transport.calls[0][0].max_concurrency == 3
     assert transport.calls[0][2] == "sk-live"
 
 
@@ -4101,6 +4193,7 @@ async def test_persistent_admin_secret_uses_sealed_secret_service() -> None:
     assert reference.last_four == "1234"
     assert secrets.values == ["sk-live-1234"]
 
+
 def test_evolution_run_records_skill_optimization_rounds_and_audit() -> None:
     api = client()
     created = api.post(
@@ -4225,7 +4318,9 @@ def test_evolution_next_round_plan_requires_approval_and_contains_execution_cont
     )
     run = created.json()
 
-    blocked = api.get(f"/api/v1/admin/evolution-runs/{run['id']}/next-round-plan", headers=headers())
+    blocked = api.get(
+        f"/api/v1/admin/evolution-runs/{run['id']}/next-round-plan", headers=headers()
+    )
 
     assert blocked.status_code == 409
     assert blocked.json()["error"]["code"] == "evolution_run_requires_approval"
@@ -4237,7 +4332,9 @@ def test_evolution_next_round_plan_requires_approval_and_contains_execution_cont
     )
     assert approved.status_code == 200
 
-    planned = api.get(f"/api/v1/admin/evolution-runs/{run['id']}/next-round-plan", headers=headers())
+    planned = api.get(
+        f"/api/v1/admin/evolution-runs/{run['id']}/next-round-plan", headers=headers()
+    )
 
     assert planned.status_code == 200
     plan = planned.json()
@@ -4251,6 +4348,7 @@ def test_evolution_next_round_plan_requires_approval_and_contains_execution_cont
     assert "darwin-skill" in plan["task_prompt"]
     assert "score_before" in plan["required_output_schema"]
     assert plan["memory_policy"] == "summarize_between_rounds"
+
 
 def test_evolution_next_round_execution_queues_real_run_with_metadata() -> None:
     api = client()
@@ -4272,7 +4370,9 @@ def test_evolution_next_round_execution_queues_real_run_with_metadata() -> None:
     )
     run = created.json()
 
-    blocked = api.post(f"/api/v1/admin/evolution-runs/{run['id']}/execute-next-round", headers=headers())
+    blocked = api.post(
+        f"/api/v1/admin/evolution-runs/{run['id']}/execute-next-round", headers=headers()
+    )
 
     assert blocked.status_code == 409
     assert blocked.json()["error"]["code"] == "evolution_run_requires_approval"
@@ -4284,7 +4384,9 @@ def test_evolution_next_round_execution_queues_real_run_with_metadata() -> None:
     )
     assert approved.status_code == 200
 
-    executed = api.post(f"/api/v1/admin/evolution-runs/{run['id']}/execute-next-round", headers=headers())
+    executed = api.post(
+        f"/api/v1/admin/evolution-runs/{run['id']}/execute-next-round", headers=headers()
+    )
 
     assert executed.status_code == 200
     execution = executed.json()
@@ -4303,7 +4405,9 @@ def test_evolution_next_round_execution_queues_real_run_with_metadata() -> None:
     assert detail["explicit_details"]["evolution_round"] == "1"
     assert detail["explicit_details"]["candidate_agent_ids"] == "agent-researcher, agent-reviewer"
 
-    audit = api.get("/api/v1/admin/audit?action=evolution.round_execution_queued", headers=headers())
+    audit = api.get(
+        "/api/v1/admin/audit?action=evolution.round_execution_queued", headers=headers()
+    )
     assert audit.status_code == 200
     assert audit.json()[0]["details"]["execution_run_id"] == execution["execution_run_id"]
 
@@ -4329,7 +4433,9 @@ def test_evolution_execution_result_ingest_records_round_from_artifact() -> None
         },
     )
     run = created.json()
-    executed = api.post(f"/api/v1/admin/evolution-runs/{run['id']}/execute-next-round", headers=headers())
+    executed = api.post(
+        f"/api/v1/admin/evolution-runs/{run['id']}/execute-next-round", headers=headers()
+    )
     execution = executed.json()
     execution_run_id = UUID(execution["execution_run_id"])
     queued = service.runs[execution_run_id]
@@ -4554,7 +4660,11 @@ async def test_persistent_evolution_execution_result_ingest_uses_run_repository_
                     "id": "round-result",
                     "type": "json",
                     "producer": "evaluator",
-                    "content": {"text": "result:\n```json\n" + json.dumps(artifact_payload, ensure_ascii=False) + "\n```"},
+                    "content": {
+                        "text": "result:\n```json\n"
+                        + json.dumps(artifact_payload, ensure_ascii=False)
+                        + "\n```"
+                    },
                 },
             )
 
@@ -4572,7 +4682,9 @@ async def test_persistent_evolution_execution_result_ingest_uses_run_repository_
         async def _get_admin_payload(self, kind: str, resource_id: str) -> dict[str, object] | None:
             return self.payloads.get((kind, resource_id), {})
 
-        async def _upsert_admin_payload(self, kind: str, resource_id: str, payload: dict[str, object]) -> bool:
+        async def _upsert_admin_payload(
+            self, kind: str, resource_id: str, payload: dict[str, object]
+        ) -> bool:
             self.payloads[(kind, resource_id)] = payload
             return True
 
@@ -4601,7 +4713,9 @@ async def test_persistent_evolution_execution_result_ingest_uses_run_repository_
         }
     )
 
-    updated = await service.ingest_evolution_execution_run(evolution.id, execution_run_id, actor=str(USER_ID))
+    updated = await service.ingest_evolution_execution_run(
+        evolution.id, execution_run_id, actor=str(USER_ID)
+    )
 
     assert updated.rounds[0].changed_dimension == "边界评测"
     assert updated.rounds[0].delta == 5.0

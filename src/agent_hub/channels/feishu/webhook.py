@@ -13,7 +13,12 @@ from pydantic import ValidationError
 
 from agent_hub.api.errors import error_responses
 from agent_hub.channels.base import AttachmentKind, InboundMessage
-from agent_hub.channels.directives import directive_summary, parse_channel_directives
+from agent_hub.channels.directives import (
+    apply_channel_command_aliases,
+    directive_summary,
+    parse_channel_directives,
+    parse_command_aliases,
+)
 from agent_hub.channels.feishu.media import FeishuMediaError, log_feishu_media_failure
 from agent_hub.channels.feishu.normalize import (
     UnsupportedFeishuEvent,
@@ -72,10 +77,12 @@ class FeishuWebhookReceiver:
         verifier: FeishuVerifier,
         gateway: ChannelGatewayProtocol | None,
         bot_open_id: str | None,
+        command_aliases: dict[str, str] | None = None,
     ) -> None:
         self._verifier = verifier
         self._gateway = gateway
         self._bot_open_id = bot_open_id
+        self._command_aliases = command_aliases or {}
 
     async def receive(
         self,
@@ -105,6 +112,9 @@ class FeishuWebhookReceiver:
                     header.get("tenant_key") or header.get("tenant_key_v2")
                 ),
             )
+        normalized_text = apply_channel_command_aliases(message.text, self._command_aliases)
+        if normalized_text != message.text:
+            message = message.model_copy(update={"text": normalized_text})
         submission: object | None = None
         if self._gateway is not None:
             submission = await self._gateway.handle(message)
@@ -129,6 +139,7 @@ def build_feishu_webhook_receiver(
         verifier=verifier,
         gateway=gateway,
         bot_open_id=settings.bot_open_id,
+        command_aliases=parse_command_aliases(settings.command_aliases),
     )
 
 
@@ -161,7 +172,8 @@ def create_lazy_feishu_webhook_router(
     *,
     settings_factory: Callable[[], FeishuSettings] = FeishuSettings,
     gateway_provider: Callable[[Request], ChannelGatewayProtocol | None],
-    runtime_config_provider: Callable[[Request], Awaitable[Mapping[str, str]] | Mapping[str, str]] | None = None,
+    runtime_config_provider: Callable[[Request], Awaitable[Mapping[str, str]] | Mapping[str, str]]
+    | None = None,
 ) -> APIRouter:
     """Create the main-app Feishu webhook route without loading env at import time."""
 
@@ -310,6 +322,7 @@ def _feishu_settings_from_runtime_config(
         "FEISHU_VERIFICATION_TOKEN": "verification_token",
         "FEISHU_ENCRYPT_KEY": "encrypt_key",
         "FEISHU_BOT_OPEN_ID": "bot_open_id",
+        "FEISHU_COMMAND_ALIASES": "command_aliases",
         "FEISHU_TRANSPORT": "transport",
         "FEISHU_WEBHOOK_PATH": "webhook_path",
         "FEISHU_TIMESTAMP_TOLERANCE_SECONDS": "timestamp_tolerance_seconds",
@@ -346,6 +359,7 @@ def _schedule_feishu_reply(
     if tenant_id is None:
         return
     log_service = getattr(request.app.state, "admin_resource_service", None)
+    aliases = parse_command_aliases(settings.command_aliases)
 
     async def task() -> None:
         try:
@@ -353,13 +367,15 @@ def _schedule_feishu_reply(
                 await dispatcher.sender.reply_text(
                     settings=settings,
                     message_id=message.message_id,
-                    text=directive_summary(parse_channel_directives(message.text)),
+                    text=directive_summary(
+                        parse_channel_directives(message.text, aliases), aliases
+                    ),
                 )
                 return
             await dispatcher.sender.reply_text(
                 settings=settings,
                 message_id=message.message_id,
-                text=directive_summary(parse_channel_directives(message.text)),
+                text=directive_summary(parse_channel_directives(message.text, aliases), aliases),
             )
             await dispatcher.reply_when_terminal(
                 tenant_id=tenant_id,

@@ -39,7 +39,11 @@ from agent_hub.auth.user_admin import PersistentUserAdminService
 from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
 from agent_hub.channels.base import InboundMessage
 from agent_hub.channels.dedup import InboundDedupRepository
-from agent_hub.channels.directives import directive_summary, parse_channel_directives
+from agent_hub.channels.directives import (
+    directive_summary,
+    parse_channel_directives,
+    parse_command_aliases,
+)
 from agent_hub.channels.feishu.media import FeishuOpenAPIMediaClient
 from agent_hub.channels.feishu.media_factory import build_feishu_media_service_factory
 from agent_hub.channels.feishu.reply import (
@@ -469,9 +473,7 @@ class _ConfigBackedMultimediaGenerationExecutor:
                     secret_ref,
                     await self._secret_service.fingerprint(self._tenant_id, secret_ref),
                 )
-                for secret_ref in dict.fromkeys(
-                    deployment.secret_ref for deployment in deployments
-                )
+                for secret_ref in dict.fromkeys(deployment.secret_ref for deployment in deployments)
             ]
         )
         return CapacityPool(self._redis_client, deployments=deployments, credentials=credentials)
@@ -513,7 +515,9 @@ def _multimedia_daily_limit(
 ) -> int | None:
     if kind is not MultimediaGenerationKind.VIDEO:
         return None
-    matching = [deployment for deployment in deployments if deployment.logical_model == logical_model]
+    matching = [
+        deployment for deployment in deployments if deployment.logical_model == logical_model
+    ]
     if any(_is_minimax_video_deployment(deployment) for deployment in matching):
         return 3
     return None
@@ -688,9 +692,7 @@ def create_app(
         active_mode_router = mode_router
         cleanup_callbacks: list[CleanupCallback] = []
         token_service = (
-            AccessTokenService(configured.jwt_signing_key_value())
-            if auth_service is None
-            else None
+            AccessTokenService(configured.jwt_signing_key_value()) if auth_service is None else None
         )
         try:
             application.state.settings = configured
@@ -711,8 +713,10 @@ def create_app(
                 cleanup_callbacks.append(("database", active_database.dispose))
                 active_sessions = active_database.session_factory
 
-            needs_redis = rate_limiter is None or redis_probe is None or (
-                run_service is None and active_runtime_registry is None
+            needs_redis = (
+                rate_limiter is None
+                or redis_probe is None
+                or (run_service is None and active_runtime_registry is None)
             )
             if active_redis is None and needs_redis:
                 active_redis = redis_factory(configured.redis_url_value())
@@ -754,9 +758,7 @@ def create_app(
                     skill_store_dir=configured.skill_store_dir,
                 )
             if user_admin_service is None and active_sessions is not None:
-                application.state.user_admin_service = PersistentUserAdminService(
-                    active_sessions
-                )
+                application.state.user_admin_service = PersistentUserAdminService(active_sessions)
             if run_service is None:
                 assert active_sessions is not None
                 if active_runtime_registry is None:
@@ -877,9 +879,7 @@ def create_app(
                         settings=settings
                     ),
                 )
-                cleanup_callbacks.append(
-                    ("feishu_media_service_factory", media_factory.aclose)
-                )
+                cleanup_callbacks.append(("feishu_media_service_factory", media_factory.aclose))
 
             await _start_feishu_websocket_connector_if_configured(
                 application,
@@ -891,9 +891,7 @@ def create_app(
                 hmac_key = hashlib.sha256(
                     configured.jwt_signing_key_value().encode("utf-8")
                 ).digest()
-                application.state.rate_limiter = RedisAuthRateLimiter(
-                    active_redis, hmac_key
-                )
+                application.state.rate_limiter = RedisAuthRateLimiter(active_redis, hmac_key)
 
             if database_probe is None and active_sessions is not None:
                 application.state.database_probe = _database_probe(active_sessions)
@@ -956,9 +954,7 @@ def create_app(
     application.add_exception_handler(PublicAPIError, public_error_handler)
     application.add_exception_handler(StarletteHTTPException, http_exception_handler)
 
-    async def validation_error_handler(
-        request: Request, error: Exception
-    ) -> JSONResponse:
+    async def validation_error_handler(request: Request, error: Exception) -> JSONResponse:
         del request
         assert isinstance(error, RequestValidationError)
         return JSONResponse(
@@ -1036,8 +1032,6 @@ def _feishu_gateway_from_request(request: Request) -> ChannelGatewayProtocol | N
     return cast(ChannelGatewayProtocol, gateway)
 
 
-
-
 async def _start_feishu_websocket_connector_if_configured(
     application: FastAPI,
     *,
@@ -1104,13 +1098,14 @@ def _schedule_feishu_websocket_reply(
         return
     run_id = getattr(submission, "run_id", None)
     log_service = getattr(application.state, "admin_resource_service", None)
+    aliases = parse_command_aliases(settings.command_aliases)
 
     async def task() -> None:
         try:
             await dispatcher.sender.reply_text(
                 settings=settings,
                 message_id=message.message_id,
-                text=directive_summary(parse_channel_directives(message.text)),
+                text=directive_summary(parse_channel_directives(message.text, aliases), aliases),
             )
             if run_id is not None:
                 await dispatcher.reply_when_terminal(
@@ -1200,6 +1195,7 @@ async def _channel_runtime_config_from_app(application: FastAPI) -> dict[str, st
     if isinstance(config, dict):
         return cast(dict[str, str], config)
     return {}
+
 
 async def _submit_scheduled_task(application: FastAPI, request: TaskRequest) -> object:
     run_service = getattr(application.state, "run_service", None)

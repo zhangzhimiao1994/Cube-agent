@@ -467,6 +467,7 @@ const MainAgentModelConfigSchema = z.object({
   upstream_model: z.string(),
   credential_ref: z.string(),
   capabilities: z.array(z.string()),
+  max_concurrency: z.number().default(1),
 });
 
 const MainAgentConfigSchema = z.object({

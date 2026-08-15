@@ -59,6 +59,7 @@ const CHANNEL_GUIDES: Record<string, ChannelGuide> = {
       { env: "FEISHU_VERIFICATION_TOKEN", label: "Verification Token", secret: true, placeholder: "自建应用事件订阅校验 token", source: "自建应用 → 事件与回调 → 加密策略 → Verification Token" },
       { env: "FEISHU_ENCRYPT_KEY", label: "Encrypt Key", secret: true, placeholder: "启用事件加密时填写", source: "自建应用 → 事件与回调 → 加密策略 → Encrypt Key；未启用加密可留空" },
       { env: "AGENT_HUB_PUBLIC_URL", label: "公网访问地址", placeholder: "https://agent.example.com", source: "Webhook 回调需要公网地址；长连接模式可留空" },
+      { env: "FEISHU_COMMAND_ALIASES", label: "交互指令别名", placeholder: "方案=//派单, 讨论=//讨论, 代码=//vi", source: "可选；多条用逗号、分号或换行分隔。标准指令支持 //自动、//直连、//派单、//讨论、//混合、//vi" },
     ],
     steps: [
       "推荐长连接：在飞书事件与回调中选择长连接模式，系统只需要 App ID 和 App Secret。",
