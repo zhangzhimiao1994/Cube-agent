@@ -374,6 +374,7 @@ describe("operational management pages", () => {
   let visibleConversationRuns = [runDetail];
   let visibleRunListItems = [runListItem];
   let visibleModels = models;
+  let visibleWorkflows = workflows;
   let deletedRunIds = new Set<string>();
   let deletedHermesIds = new Set<string>();
   let visibleEvolutionRuns = [evolutionRun];
@@ -388,6 +389,7 @@ describe("operational management pages", () => {
     visibleConversationRuns = [visibleRunDetail];
     visibleRunListItems = [visibleRunListItem];
     visibleModels = models;
+    visibleWorkflows = workflows;
     deletedRunIds = new Set<string>();
     deletedHermesIds = new Set<string>();
     visibleEvolutionRuns = [evolutionRun];
@@ -894,7 +896,7 @@ describe("operational management pages", () => {
           });
         }
         if (path === "/api/v1/admin/workflows") {
-          return jsonResponse(workflows);
+          return jsonResponse(visibleWorkflows);
         }
         if (path === "/api/v1/admin/hermes") {
           return jsonResponse([hermesInsight, secondHermesInsight].filter((item) => !deletedHermesIds.has(item.id)));
@@ -1075,6 +1077,49 @@ describe("operational management pages", () => {
     expect(screen.queryByLabelText("临时 Agent 补位规则")).toBeNull();
   });
 
+  it("filters and sorts saved workflows like an operational table", async () => {
+    const user = userEvent.setup();
+    visibleWorkflows = [
+      ...workflows,
+      {
+        ...workflows[0],
+        id: "research-hybrid",
+        name: "学术研究混合流程",
+        enabled: false,
+        mode: "hybrid",
+        task_type: "学术研究",
+        agent_ids: ["researcher", "critic"],
+        objective: "发现论文创新点并输出评审意见",
+      },
+    ];
+
+    render(<TestApp initialPath="/workflows" />);
+
+    expect(await screen.findByRole("table", { name: "已保存工作流列表" })).not.toBeNull();
+    expect(screen.getByRole("searchbox", { name: "快速搜索工作流" })).not.toBeNull();
+    expect(screen.getByLabelText("按工作流状态筛选")).not.toBeNull();
+    expect(screen.getByLabelText("按工作流默认模式筛选")).not.toBeNull();
+    expect(screen.getByText("显示 2 / 2")).not.toBeNull();
+
+    await user.type(screen.getByRole("searchbox", { name: "快速搜索工作流" }), "学术");
+    expect(screen.getByText("学术研究混合流程")).not.toBeNull();
+    expect(screen.queryByText("短视频派单")).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "清空工作流筛选" }));
+    expect(await screen.findByText("短视频派单")).not.toBeNull();
+
+    await user.selectOptions(screen.getByLabelText("按工作流默认模式筛选"), "hybrid");
+    expect(screen.getByText("学术研究混合流程")).not.toBeNull();
+    expect(screen.queryByText("短视频派单")).toBeNull();
+
+    await user.selectOptions(screen.getByLabelText("按工作流默认模式筛选"), "all");
+    await user.selectOptions(screen.getByLabelText("按工作流状态筛选"), "enabled");
+    expect(screen.getByText("短视频派单")).not.toBeNull();
+    expect(screen.queryByText("学术研究混合流程")).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "工作流排序" }));
+    expect(screen.getByRole("button", { name: "工作流排序" }).textContent).toContain("↓");
+  });
   it("loads an existing workflow into the form for editing", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/workflows" />);

@@ -1,3 +1,33 @@
+## 2026-08-15 Workflow List Search And Filters
+
+### State
+- Converted the saved workflow list on `/workflows` from large cards to a dense operational table so the page is easier to scan when many workflows exist.
+- Added global workflow search, per-column filters for status/name/task type/default mode/default roles/objective, sortable columns, a visible result count, and a clear-filter action.
+- Fixed the React hook ordering bug found during testing by keeping derived workflow list hooks before early loading/error returns.
+- Reconfirmed the Feishu robot channel command UX: `/channels` shows standard interaction commands, examples, currently effective custom aliases, and `FEISHU_COMMAND_ALIASES` remains the custom command field applied by webhook and websocket receivers.
+
+### Verification
+- Red check first failed on `/workflows` because `visibleWorkflows` was called after loading/error early returns, changing the React hook order.
+- `npm test -- --run src/pages/OperationalPages.test.tsx -t "filters and sorts saved workflows|loads an existing workflow|keeps live adjustment"` from `web/` -> 59 passed after the fix. The current Vitest invocation runs the full `OperationalPages.test.tsx` file.
+- `npm test -- --run src/pages/ChannelsPage.test.tsx` from `web/` -> 5 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests\unit\channels\test_submitter.py::test_channel_directives_accept_custom_aliases_and_show_help tests\contracts\feishu\test_receivers.py::test_receivers_apply_custom_command_aliases_before_submission tests\contracts\feishu\test_receivers.py::test_websocket_receiver_replies_to_help_alias_without_submission tests\api\test_channel_webhooks.py::test_saved_feishu_command_aliases_are_applied_before_submission tests\api\test_channel_webhooks.py::test_feishu_webhook_replies_to_help_alias_without_submission -q --tb=short` -> 6 passed, only existing FastAPI/httpx deprecation and pytest cache ACL warnings.
+- `npm run lint` from `web/` -> passed.
+- `npm run build` from `web/` -> passed with the existing Vite large chunk warning; active build files include `web/dist/assets/index-C1HbN4-Q.js` and `web/dist/assets/index-DvSJOsuV.css`.
+
+### Server Deployment And Real Probe
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-workflow-list-filters-20260815-111110.tgz` and uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`; server backup retained under `/opt/agent-hub/backups/p3-workflow-list-filters-20260815-111110`.
+- Server archive retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-workflow-list-filters-20260815-111110.tgz`.
+- Real server probe called `http://127.0.0.1:8000/health` and got `{"status":"ok"}`.
+- Loaded `/` and `/workflows` through Caddy, resolved active frontend asset `/assets/index-C1HbN4-Q.js`, and verified deployed bundle markers for `快速搜索工作流`, `按工作流默认模式筛选`, `清空工作流筛选`, `已保存工作流列表`, `当前生效的自定义指令`, and `飞书通道交互指令`.
+- `caddy` and `agent-hub-api` were active after deployment.
+- Removed server `/tmp/agent-hub-p3-runtime-incremental.tgz`, `/tmp/deploy-workflow-list-filters.sh`, `/tmp/probe-workflow-list-filters.sh`, and `/tmp/probe-api-health-workflow-list-filters.sh` after verification.
+
+### GitHub / Recovery
+- Pending this slice: commit, local GitHub recovery bundle, archive tag push, force-with-lease push to `mutilagent/main`, and Actions verification.
+
+### Remaining / Next
+- Continue remaining P3 backlog after GitHub green: OpenClaw follow-ups if requested, evolution and long-memory refinements, broader missing button/function sweep, overall UI copy/layout audit, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 Conversation History Drawer Compactness
 
 ### State

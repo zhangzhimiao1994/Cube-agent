@@ -1,7 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FormEvent, useState } from "react";
+import { FormEvent, useMemo, useState } from "react";
 
 import { api, formatApiError, type WorkflowResource } from "../api/client";
+import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
 
 const WORKFLOW_PRESETS: Array<
   Omit<WorkflowResource, "allow_main_agent_override" | "allow_temporary_agents" | "temporary_agent_policy"> & {
@@ -116,6 +117,82 @@ function toggle(list: string[], value: string) {
   return list.includes(value) ? list.filter((item) => item !== value) : [...list, value];
 }
 
+type WorkflowSortKey = "name" | "status" | "mode" | "taskType" | "roles" | "objective";
+
+type WorkflowColumnFilters = {
+  mode: "all" | NonNullable<WorkflowResource["mode"]>;
+  name: string;
+  objective: string;
+  roles: string;
+  status: "all" | "enabled" | "disabled";
+  taskType: string;
+};
+
+const EMPTY_WORKFLOW_FILTERS: WorkflowColumnFilters = {
+  mode: "all",
+  name: "",
+  objective: "",
+  roles: "",
+  status: "all",
+  taskType: "",
+};
+
+function workflowStatus(workflow: WorkflowResource) {
+  return workflow.enabled ? "已启用" : "已停用";
+}
+
+function workflowMode(workflow: WorkflowResource) {
+  return workflow.mode ?? "auto";
+}
+
+function workflowRoles(workflow: WorkflowResource) {
+  return (workflow.agent_ids ?? []).join(", ") || "未固定";
+}
+
+function workflowSearchText(workflow: WorkflowResource) {
+  return [
+    workflow.id,
+    workflow.name,
+    workflowStatus(workflow),
+    workflowMode(workflow),
+    workflow.task_type ?? "",
+    workflowRoles(workflow),
+    workflow.objective ?? "",
+    workflow.role_selection_policy ?? "",
+    workflow.decision_policy ?? "",
+    ...(workflow.steps ?? []),
+    ...(workflow.deliverables ?? []),
+  ].join(" ");
+}
+
+function matchesWorkflowSearch(workflow: WorkflowResource, query: string) {
+  return textContains(workflowSearchText(workflow), query);
+}
+
+function matchesWorkflowColumns(workflow: WorkflowResource, filters: WorkflowColumnFilters) {
+  return (
+    (filters.status === "all" || (filters.status === "enabled") === workflow.enabled) &&
+    (filters.mode === "all" || workflowMode(workflow) === filters.mode) &&
+    textContains(`${workflow.name} ${workflow.id}`, filters.name) &&
+    textContains(workflow.task_type ?? "", filters.taskType) &&
+    textContains(workflowRoles(workflow), filters.roles) &&
+    textContains(`${workflow.objective ?? ""} ${workflow.role_selection_policy ?? ""} ${workflow.decision_policy ?? ""}`, filters.objective)
+  );
+}
+
+function workflowSortValue(workflow: WorkflowResource, key: WorkflowSortKey) {
+  if (key === "status") return workflowStatus(workflow);
+  if (key === "mode") return workflowMode(workflow);
+  if (key === "taskType") return workflow.task_type ?? "";
+  if (key === "roles") return workflowRoles(workflow);
+  if (key === "objective") return workflow.objective ?? "";
+  return `${workflow.name} ${workflow.id}`;
+}
+
+function sortedWorkflows(items: WorkflowResource[], sort: SortState<WorkflowSortKey>) {
+  return [...items].sort((left, right) => compareText(workflowSortValue(left, sort.key), workflowSortValue(right, sort.key), sort.direction));
+}
+
 export function WorkflowsPage() {
   const queryClient = useQueryClient();
   const workflows = useQuery({ queryKey: ["workflows"], queryFn: () => api.workflows() });
@@ -134,6 +211,9 @@ export function WorkflowsPage() {
   const [deliverables, setDeliverables] = useState<string>(listToLines(preset.deliverables));
   const [decisionPolicy, setDecisionPolicy] = useState<string>(preset.decision_policy ?? "");
   const [message, setMessage] = useState<string | null>(null);
+  const [workflowSearchTerm, setWorkflowSearchTerm] = useState("");
+  const [workflowColumnFilters, setWorkflowColumnFilters] = useState<WorkflowColumnFilters>(EMPTY_WORKFLOW_FILTERS);
+  const [workflowSort, setWorkflowSort] = useState<SortState<WorkflowSortKey>>({ key: "name", direction: "asc" });
 
   const saveWorkflow = useMutation({
     mutationFn: () =>
@@ -219,12 +299,24 @@ export function WorkflowsPage() {
     deleteWorkflow.mutate(workflow.id);
   }
 
+  const savedWorkflows = workflows.data ?? [];
+  const savedAgents = agents.data ?? [];
+  const visibleWorkflows = useMemo(
+    () =>
+      sortedWorkflows(
+        savedWorkflows.filter(
+          (workflow) =>
+            matchesWorkflowSearch(workflow, workflowSearchTerm) &&
+            matchesWorkflowColumns(workflow, workflowColumnFilters),
+        ),
+        workflowSort,
+      ),
+    [savedWorkflows, workflowColumnFilters, workflowSearchTerm, workflowSort],
+  );
+
   if (workflows.isLoading || agents.isLoading) return <p>正在加载工作流配置...</p>;
   if (workflows.isError) return <p role="alert">{formatApiError(workflows.error, "工作流加载失败")}</p>;
   if (agents.isError) return <p role="alert">{formatApiError(agents.error, "Agent 列表加载失败")}</p>;
-
-  const savedWorkflows = workflows.data ?? [];
-  const savedAgents = agents.data ?? [];
 
   return (
     <section>
@@ -359,30 +451,147 @@ export function WorkflowsPage() {
             <p>从上方选择模板并补全细节，保存后即可在对话任务中选择。</p>
           </article>
         ) : (
-          <div className="card-grid">
-            {savedWorkflows.map((workflow) => (
-              <article key={workflow.id}>
-                <span className="eyebrow">{workflow.enabled ? "已启用" : "已停用"}</span>
-                <h3>{workflow.name}</h3>
-                <p>ID：{workflow.id}</p>
-                <p>任务类型：{workflow.task_type || "未设置"}</p>
-                <p>默认模式：{workflow.mode ?? "auto"}</p>
-                <p>默认角色：{(workflow.agent_ids ?? []).join(", ") || "未固定"}</p>
-                {workflow.objective ? <p>{workflow.objective}</p> : null}
-                <button type="button" onClick={() => editWorkflow(workflow)}>
-                  编辑工作流
-                </button>
-                <button
-                  type="button"
-                  className="danger-action"
-                  onClick={() => confirmDelete({ id: workflow.id, name: workflow.name })}
-                  disabled={deleteWorkflow.isPending}
-                >
-                  删除工作流
-                </button>
+          <>
+            <div className="list-toolbar">
+              <label>
+                快速搜索工作流
+                <input
+                  type="search"
+                  aria-label="快速搜索工作流"
+                  value={workflowSearchTerm}
+                  onChange={(event) => setWorkflowSearchTerm(event.currentTarget.value)}
+                  placeholder="名称、ID、任务类型、角色或裁决规则"
+                />
+              </label>
+              <button type="button" className="secondary-action" onClick={() => { setWorkflowSearchTerm(""); setWorkflowColumnFilters(EMPTY_WORKFLOW_FILTERS); }}>
+                清空工作流筛选
+              </button>
+              <small>显示 {visibleWorkflows.length} / {savedWorkflows.length}</small>
+            </div>
+            {visibleWorkflows.length === 0 ? (
+              <article>
+                <h4>当前筛选没有匹配工作流</h4>
+                <p>调整列筛选或清空筛选查看全部工作流。</p>
               </article>
-            ))}
-          </div>
+            ) : (
+              <table aria-label="已保存工作流列表" className="dense-table">
+                <thead>
+                  <tr>
+                    <th><SortHeader column="status" label="状态" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>状态</SortHeader></th>
+                    <th><SortHeader column="name" label="工作流" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>工作流</SortHeader></th>
+                    <th><SortHeader column="taskType" label="任务类型" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>任务类型</SortHeader></th>
+                    <th><SortHeader column="mode" label="默认模式" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>默认模式</SortHeader></th>
+                    <th><SortHeader column="roles" label="默认角色" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>默认角色</SortHeader></th>
+                    <th><SortHeader column="objective" label="目标" sort={workflowSort} onSort={(column) => setWorkflowSort((current) => nextSortState(current, column))}>目标</SortHeader></th>
+                    <th>操作</th>
+                  </tr>
+                  <tr className="table-filter-row">
+                    <th>
+                      <select
+                        aria-label="按工作流状态筛选"
+                        value={workflowColumnFilters.status}
+                        onChange={(event) => {
+                          const value = event.currentTarget.value as WorkflowColumnFilters["status"];
+                          setWorkflowColumnFilters((current) => ({ ...current, status: value }));
+                        }}
+                      >
+                        <option value="all">全部</option>
+                        <option value="enabled">已启用</option>
+                        <option value="disabled">已停用</option>
+                      </select>
+                    </th>
+                    <th>
+                      <input
+                        aria-label="按工作流名称筛选"
+                        value={workflowColumnFilters.name}
+                        onChange={(event) => {
+                          const value = event.currentTarget.value;
+                          setWorkflowColumnFilters((current) => ({ ...current, name: value }));
+                        }}
+                        placeholder="名称或 ID"
+                      />
+                    </th>
+                    <th>
+                      <input
+                        aria-label="按工作流任务类型筛选"
+                        value={workflowColumnFilters.taskType}
+                        onChange={(event) => {
+                          const value = event.currentTarget.value;
+                          setWorkflowColumnFilters((current) => ({ ...current, taskType: value }));
+                        }}
+                        placeholder="任务类型"
+                      />
+                    </th>
+                    <th>
+                      <select
+                        aria-label="按工作流默认模式筛选"
+                        value={workflowColumnFilters.mode}
+                        onChange={(event) => {
+                          const value = event.currentTarget.value as WorkflowColumnFilters["mode"];
+                          setWorkflowColumnFilters((current) => ({ ...current, mode: value }));
+                        }}
+                      >
+                        <option value="all">全部</option>
+                        <option value="auto">自动识别</option>
+                        <option value="direct">直接执行</option>
+                        <option value="dispatch">派单式</option>
+                        <option value="discuss">讨论式</option>
+                        <option value="hybrid">混合式</option>
+                      </select>
+                    </th>
+                    <th>
+                      <input
+                        aria-label="按工作流默认角色筛选"
+                        value={workflowColumnFilters.roles}
+                        onChange={(event) => {
+                          const value = event.currentTarget.value;
+                          setWorkflowColumnFilters((current) => ({ ...current, roles: value }));
+                        }}
+                        placeholder="Agent ID"
+                      />
+                    </th>
+                    <th>
+                      <input
+                        aria-label="按工作流目标筛选"
+                        value={workflowColumnFilters.objective}
+                        onChange={(event) => {
+                          const value = event.currentTarget.value;
+                          setWorkflowColumnFilters((current) => ({ ...current, objective: value }));
+                        }}
+                        placeholder="目标或规则"
+                      />
+                    </th>
+                    <th aria-label="工作流操作筛选占位" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {visibleWorkflows.map((workflow) => (
+                    <tr key={workflow.id}>
+                      <td>{workflowStatus(workflow)}</td>
+                      <td><strong>{workflow.name}</strong><br /><small>{workflow.id}</small></td>
+                      <td>{workflow.task_type || "未设置"}</td>
+                      <td>{workflowMode(workflow)}</td>
+                      <td>{workflowRoles(workflow)}</td>
+                      <td>{workflow.objective || "未设置"}</td>
+                      <td className="table-actions">
+                        <button type="button" onClick={() => editWorkflow(workflow)}>
+                          编辑工作流
+                        </button>
+                        <button
+                          type="button"
+                          className="danger-action"
+                          onClick={() => confirmDelete({ id: workflow.id, name: workflow.name })}
+                          disabled={deleteWorkflow.isPending}
+                        >
+                          删除工作流
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </>
         )}
         {deleteWorkflow.isError ? <p role="alert">{formatApiError(deleteWorkflow.error, "工作流删除失败")}</p> : null}
       </section>
