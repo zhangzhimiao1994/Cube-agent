@@ -23,6 +23,11 @@
 - Server probe in the deployed venv passed: `builtin_help=true`, `custom_help_alias=true`, `dispatch_alias=true`, `help_text_has_alias=true`, `websocket_help_handler_arg=true`, `webhook_help_callable=true`; `/health` returned `{"status":"ok"}`; `agent-hub-api` and `agent-hub-worker` were active.
 - Removed server `/tmp` deploy/probe/package files after verification.
 
+### GitHub / Recovery
+- Committed as `6da987a feat: add feishu channel help commands`.
+- Created local GitHub recovery bundle `.local-archives/github-recovery/mutilagent-main-before-20260815-090804-cabbbd6.bundle` and pushed GitHub archive tag `archive/mutilagent-main-before-20260815-090804-cabbbd6`.
+- Force-with-lease pushed `mutilagent/main`; GitHub again reported the repository has moved to `zhangzhimiao1994/CubeAgent.git`, but the configured `mutilagent` remote accepted the push.
+- GitHub Actions run `31855696337` (`quality`) passed.
 ### Remaining / Next
 - Continue remaining P3 backlog: evolution execution/backlog UI, conversation/history UI refinements, grounded Skill Creator workflows, remaining Skill archive edge cases if reproduced, bulk action/search/filter audit across dense pages, broader UI copy/layout audit, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 OpenClaw Dedicated Config Entry
