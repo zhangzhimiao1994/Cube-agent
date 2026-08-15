@@ -159,6 +159,37 @@ class StructuredRunRepository:
         )
 
 
+
+class LongFinalRunRepository(StructuredRunRepository):
+    async def artifacts(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
+        del tenant_id, run_id
+        return (
+            {
+                "id": "artifact-final-long",
+                "type": "text",
+                "producer": "final_synthesizer",
+                "content": {"text": "\n".join(f"第 {index} 条详细结论：需要完整发送给用户。" for index in range(260))},
+            },
+        )
+
+
+class TableFinalRunRepository(StructuredRunRepository):
+    async def artifacts(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
+        del tenant_id, run_id
+        return (
+            {
+                "id": "artifact-final-table",
+                "type": "table",
+                "producer": "final_synthesizer",
+                "content": {
+                    "columns": ["阶段", "负责人", "交付物"],
+                    "rows": [
+                        {"阶段": "调研", "负责人": "研究员", "交付物": "资料清单"},
+                        {"阶段": "审查", "负责人": "评审员", "交付物": "风险表"},
+                    ],
+                },
+            },
+        )
 class RecordingFeishuSkillHandler:
     def __init__(self, reply_text: str = "Skill 已扫描入库，待审批：writer") -> None:
         self.messages: list[InboundMessage] = []
@@ -1280,3 +1311,67 @@ def test_feishu_terminal_reply_summarizes_user_relevant_run_process() -> None:
     assert "checkpoint.saved" not in text
     assert "model.started" not in text
     assert "internal checkpoint" not in text
+
+def test_feishu_terminal_reply_splits_long_completed_output_into_multiple_bubbles() -> None:
+    sender = RecordingFeishuReplySender()
+    repository = LongFinalRunRepository()
+    dispatcher = FeishuRunReplyDispatcher(
+        run_repository=cast(RunRepository, repository),
+        sender=sender,
+        poll_interval_seconds=0.01,
+        timeout_seconds=1.0,
+    )
+
+    async def run() -> None:
+        await dispatcher.reply_when_terminal(
+            tenant_id=TENANT_ID,
+            run_id=StructuredRunRepository.run_id,
+            source_message_id="om_long_reply",
+            settings=FeishuSettings.model_validate(
+                {"app_id": "cli_saved_feishu", "app_secret": "secret"}
+            ),
+        )
+
+    import asyncio
+
+    asyncio.run(run())
+
+    assert len(sender.replies) > 1
+    assert all(reply[1] == "om_long_reply" for reply in sender.replies)
+    combined = "\n".join(reply[2] for reply in sender.replies)
+    assert "第 0 条详细结论" in combined
+    assert "第 259 条详细结论" in combined
+    assert "已截断" not in combined
+    assert all(len(reply[2]) <= 3800 for reply in sender.replies)
+
+
+def test_feishu_terminal_reply_formats_structured_table_artifact_as_markdown_table() -> None:
+    sender = RecordingFeishuReplySender()
+    repository = TableFinalRunRepository()
+    dispatcher = FeishuRunReplyDispatcher(
+        run_repository=cast(RunRepository, repository),
+        sender=sender,
+        poll_interval_seconds=0.01,
+        timeout_seconds=1.0,
+    )
+
+    async def run() -> None:
+        await dispatcher.reply_when_terminal(
+            tenant_id=TENANT_ID,
+            run_id=StructuredRunRepository.run_id,
+            source_message_id="om_table_reply",
+            settings=FeishuSettings.model_validate(
+                {"app_id": "cli_saved_feishu", "app_secret": "secret"}
+            ),
+        )
+
+    import asyncio
+
+    asyncio.run(run())
+
+    assert len(sender.replies) == 1
+    text = sender.replies[0][2]
+    assert "| 阶段 | 负责人 | 交付物 |" in text
+    assert "| --- | --- | --- |" in text
+    assert "| 调研 | 研究员 | 资料清单 |" in text
+    assert "| 审查 | 评审员 | 风险表 |" in text

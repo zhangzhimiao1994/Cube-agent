@@ -20,7 +20,7 @@ _DEFAULT_FEISHU_API_BASE = "https://open.feishu.cn/open-apis"
 _MAX_REPLY_TEXT_CHARS = 3800
 _MAX_SECTION_ITEMS = 6
 _MAX_LINE_CHARS = 520
-_MAX_FINAL_CHARS = 1100
+_MAX_FINAL_CHARS = 20000
 
 
 class FeishuReplyError(RuntimeError):
@@ -123,11 +123,12 @@ class FeishuRunReplyDispatcher:
                 RunStatus.WAITING_APPROVAL,
             }:
                 text = await self._reply_text_for_record(tenant_id, run_id, record)
-                await self.sender.reply_text(
-                    settings=settings,
-                    message_id=source_message_id,
-                    text=text,
-                )
+                for chunk in _reply_text_chunks(text):
+                    await self.sender.reply_text(
+                        settings=settings,
+                        message_id=source_message_id,
+                        text=chunk,
+                    )
                 return
             if asyncio.get_running_loop().time() >= deadline:
                 await self.sender.reply_text(
@@ -206,7 +207,7 @@ def _completed_reply_text(
     )
     lines.extend(_section("讨论情况", _discussion_lines(events), empty="未记录讨论过程。"))
     lines.extend(_section("裁决情况", _review_lines(events), empty="未记录单独裁决事件。"))
-    return _bounded_reply_text("\n".join(lines))
+    return "\n".join(lines).strip()
 
 
 def _section(title: str, lines: Sequence[str], *, empty: str | None = None) -> list[str]:
@@ -333,6 +334,40 @@ def _json_object(response: httpx.Response) -> dict[str, object]:
     return payload
 
 
+def _reply_text_chunks(text: str) -> tuple[str, ...]:
+    stripped = text.strip()
+    if not stripped:
+        return ("任务已完成。",)
+    chunks = _split_text(stripped, _MAX_REPLY_TEXT_CHARS)
+    if len(chunks) <= 1:
+        return tuple(chunks)
+    total = len(chunks)
+    numbered: list[str] = []
+    for index, chunk in enumerate(chunks, start=1):
+        prefix = f"（{index}/{total}）\n"
+        numbered.extend(prefix + part for part in _split_text(chunk, _MAX_REPLY_TEXT_CHARS - len(prefix)))
+    return tuple(numbered)
+
+
+def _split_text(text: str, maximum: int) -> list[str]:
+    remaining = text.strip()
+    chunks: list[str] = []
+    while len(remaining) > maximum:
+        boundary = remaining.rfind("\n\n", 0, maximum)
+        if boundary < maximum // 2:
+            boundary = remaining.rfind("\n", 0, maximum)
+        if boundary < maximum // 2:
+            boundary = remaining.rfind("。", 0, maximum)
+        if boundary < maximum // 2:
+            boundary = maximum
+        chunk = remaining[:boundary].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[boundary:].strip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks or ["任务已完成。"]
+
 def _bounded_reply_text(text: str) -> str:
     stripped = text.strip()
     if not stripped:
@@ -357,8 +392,11 @@ def _artifact_text(artifact: Mapping[str, object]) -> str | None:
     content = artifact.get("content")
     if not isinstance(content, Mapping):
         return None
+    table = _format_table_content(content)
+    if table is not None:
+        return table
     text = content.get("text")
-    return _safe_text(text)
+    return _safe_block_text(text)
 
 
 def _failure_reason(events: tuple[dict[str, object], ...]) -> str | None:
@@ -412,6 +450,89 @@ def _text_list(value: object) -> list[str]:
             result.append(text)
     return result
 
+
+def _format_table_content(content: Mapping[str, object]) -> str | None:
+    raw_table = content.get("table")
+    table = _mapping(raw_table) if isinstance(raw_table, Mapping) else dict(content)
+    rows = _table_rows(table.get("rows") or table.get("data"))
+    if not rows:
+        return None
+    columns = _table_columns(table.get("columns") or table.get("headers"), rows)
+    if not columns:
+        return None
+    header_labels = [label for _, label in columns]
+    lines = [
+        "| " + " | ".join(_escape_table_cell(label) for label in header_labels) + " |",
+        "| " + " | ".join("---" for _ in header_labels) + " |",
+    ]
+    for row in rows:
+        values: list[str] = []
+        if isinstance(row, Mapping):
+            for key, _label in columns:
+                values.append(_table_cell_text(row.get(key)))
+        else:
+            sequence = list(row)
+            for index, _column in enumerate(columns):
+                values.append(_table_cell_text(sequence[index] if index < len(sequence) else ""))
+        lines.append("| " + " | ".join(_escape_table_cell(value) for value in values) + " |")
+    return "\n".join(lines)
+
+
+def _table_rows(value: object) -> list[Mapping[str, object] | Sequence[object]]:
+    if isinstance(value, str | bytes | bytearray) or not isinstance(value, Sequence):
+        return []
+    rows: list[Mapping[str, object] | Sequence[object]] = []
+    for item in value[:50]:
+        if isinstance(item, Mapping) or (
+            not isinstance(item, str | bytes | bytearray) and isinstance(item, Sequence)
+        ):
+            rows.append(item)
+    return rows
+
+
+def _table_columns(
+    value: object, rows: Sequence[Mapping[str, object] | Sequence[object]]
+) -> list[tuple[str, str]]:
+    columns: list[tuple[str, str]] = []
+    if not isinstance(value, str | bytes | bytearray) and isinstance(value, Sequence):
+        for item in value[:20]:
+            if isinstance(item, Mapping):
+                key = _safe_text(item.get("key")) or _safe_text(item.get("id")) or _safe_text(item.get("name")) or _safe_text(item.get("label"))
+                label = _safe_text(item.get("label")) or _safe_text(item.get("name")) or key
+                if key and label:
+                    columns.append((key, label))
+            else:
+                text = _safe_text(item)
+                if text:
+                    columns.append((text, text))
+    if columns:
+        return columns
+    first = rows[0]
+    if isinstance(first, Mapping):
+        return [(str(key), str(key)) for key in list(first.keys())[:20] if isinstance(key, str)]
+    return [(str(index), f"列 {index + 1}") for index in range(min(len(first), 20))]
+
+
+def _table_cell_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return " ".join(value.split())
+    if isinstance(value, int | float | bool):
+        return str(value)
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _escape_table_cell(value: str) -> str:
+    return value.replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _safe_block_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    lines = [" ".join(line.split()) for line in value.strip().splitlines()]
+    block = "\n".join(line for line in lines if line)
+    return block or None
 
 def _safe_text(value: object) -> str | None:
     if not isinstance(value, str):

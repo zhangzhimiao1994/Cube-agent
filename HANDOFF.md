@@ -1,3 +1,42 @@
+# Handoff - 2026-08-15 13:34 CST - Feishu Table And Long Reply Adaptation
+
+## Current state
+- Completed the user-requested Feishu output adaptation and stopped scope expansion after this slice.
+- If a completed run result contains Markdown table text, line breaks are preserved instead of being collapsed into one line.
+- If a completed run result contains structured table-like artifact content (`columns`/`headers` plus `rows`/`data`, optionally nested under `table`), Feishu reply rendering converts it to a Markdown table.
+- Completed run replies are no longer squeezed into one Feishu bubble and truncated by the dispatcher. Long terminal replies are split into multiple numbered text replies, each staying under the existing Feishu single-message guard.
+
+## Changed
+- `src/agent_hub/channels/feishu/reply.py`
+  - `FeishuRunReplyDispatcher.reply_when_terminal` now sends all chunks from `_reply_text_chunks` instead of a single bounded reply.
+  - `_completed_reply_text` now returns the full assembled terminal summary for downstream chunking.
+  - `_artifact_text` now preserves block line breaks and formats table-like artifact content as Markdown table output.
+  - Added table helpers for common `columns`/`headers` + `rows`/`data` shapes and safe table-cell escaping.
+  - Cleaned up the table row branch to satisfy ruff `SIM114` after the first GitHub run failed.
+- `tests/api/test_channel_webhooks.py`
+  - Added regression tests for long completed output splitting into multiple Feishu replies without “已截断”.
+  - Added regression tests for structured table artifact rendering as Markdown table.
+
+## Verification
+- Local:
+  - `uv run ruff check src/agent_hub/channels/feishu/reply.py tests/api/test_channel_webhooks.py` -> passed.
+  - `uv run pytest tests/api/test_channel_webhooks.py -k "terminal_reply"` -> 3 passed.
+  - `uv run pytest tests/api/test_channel_webhooks.py` -> 29 passed.
+- Server incremental deployment:
+  - Initial archive: `.local-archives/server-incrementals/agent-hub-feishu-reply-splitting-20260815-132411.tgz`.
+  - Final archive after ruff cleanup: `.local-archives/server-incrementals/agent-hub-feishu-reply-splitting-20260815-133022.tgz`.
+  - Uploaded final package to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+  - Deployed into `/opt/agent-hub/current`.
+  - Final server backup: `/opt/agent-hub/backups/p3-feishu-reply-splitting-20260815-133022`.
+  - Final server retained archive: `/opt/agent-hub/archives/server-incrementals/agent-hub-feishu-reply-splitting-20260815-133022.tgz`.
+  - Cleaned `/tmp/agent-hub-p3-runtime-incremental.tgz`, `/tmp/deploy-feishu-reply-splitting.sh`, and `/tmp/probe-feishu-reply-splitting.sh`.
+- Server real-code probe:
+  - `feishu_long_reply_split_probe=ok` with `long_reply_chunks=2`.
+  - `feishu_table_reply_probe=ok`.
+
+## Remaining / next
+- Amend this slice, create/update GitHub recovery archive as needed, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
+- Per user instruction, after this adaptation and verification, stop instead of continuing the larger plan until the user resumes.
 # Handoff - 2026-08-15 13:18 CST - Channel Resource Selectors
 
 ## Current state
