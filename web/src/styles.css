@@ -2413,6 +2413,23 @@ article:hover {
   min-width: 0;
 }
 
+.channel-command-examples {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0.7rem 0 0.55rem;
+}
+
+.channel-command-examples code {
+  background: rgba(3, 10, 20, 0.42);
+  border: 1px solid rgba(123, 225, 255, 0.14);
+  border-radius: 0.55rem;
+  color: var(--text);
+  display: block;
+  font-size: 0.83rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  padding: 0.46rem 0.58rem;
+}
 
 .channel-config-actions {
   align-items: center;

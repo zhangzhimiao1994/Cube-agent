@@ -51,12 +51,25 @@ function sortedSkills(items: Skill[], sort: SortState<SkillSortKey>) {
   return [...items].sort((left, right) => compareText(skillColumnValue(left, sort.key), skillColumnValue(right, sort.key), sort.direction));
 }
 
+function skillCreatorObjective(goal: string, materials: string, checks: string) {
+  return [
+    `目标：${goal.trim()}`,
+    `资料来源：${materials.trim()}`,
+    `验收任务：${checks.trim()}`,
+    "交付要求：生成可安装的 SKILL.md，并按需要沉淀 references、scripts、assets；所有外部资料必须保留来源，候选 Skill 必须经过真实任务验收后才能审批启用。",
+  ].join("\n");
+}
+
 export function SkillsPage() {
   const [file, setFile] = useState<File | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [searchTerm, setSearchTerm] = useState("");
   const [columnFilters, setColumnFilters] = useState<SkillColumnFilters>(EMPTY_SKILL_FILTERS);
   const [sort, setSort] = useState<SortState<SkillSortKey>>({ key: "name", direction: "asc" });
+  const [creatorTopic, setCreatorTopic] = useState("AI 科研 Skill");
+  const [creatorGoal, setCreatorGoal] = useState("围绕 AI 方向完成资料检索、研究问题拆解、创新点发现和论文计划输出。");
+  const [creatorMaterials, setCreatorMaterials] = useState("由主 Agent 先制定检索计划，再拉取真实论文、项目和基准资料；用户可补充本地文献或链接。");
+  const [creatorChecks, setCreatorChecks] = useState("用 3 个真实研究任务验收：资料综述、创新点候选、论文实验计划。未通过则继续迭代。");
   const queryClient = useQueryClient();
   const skills = useQuery({ queryKey: ["skills"], queryFn: () => api.skills() });
   const upload = useMutation({
@@ -95,6 +108,31 @@ export function SkillsPage() {
       void queryClient.invalidateQueries({ queryKey: ["skills"] });
     },
   });
+  const createSkillTask = useMutation({
+    mutationFn: () =>
+      api.createEvolutionRun({
+        kind: "skill_distillation",
+        title: `创建 ${creatorTopic.trim()}`,
+        objective: skillCreatorObjective(creatorGoal, creatorMaterials, creatorChecks),
+        mode: "hybrid",
+        source_skill_ids: [],
+        target_artifact_type: "skill",
+        baseline_agent_id: "main-agent",
+        candidate_agent_ids: ["agent-researcher", "agent-skill-builder", "agent-evaluator"],
+        evaluator_agent_id: "evaluator-agent",
+        approval_policy: "ask",
+        iteration_policy: "score_gated",
+        memory_policy: "summarize_between_rounds",
+        max_rounds: 5,
+        min_delta: 2,
+        budget_tokens: 200000,
+        budget_minutes: 120,
+        rubric: ["资料真实性", "可执行 Skill 结构", "真实任务验收", "权限边界"],
+      }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["evolution-runs"] });
+    },
+  });
 
   function updateColumnFilter(key: keyof SkillColumnFilters, value: string) {
     setColumnFilters((current) => ({ ...current, [key]: value }));
@@ -128,7 +166,7 @@ export function SkillsPage() {
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.includes(id));
   const allVisibleApprovalSelected =
     visibleApprovalIds.length > 0 && visibleApprovalIds.every((id) => selectedIds.includes(id));
-  const busy = approve.isPending || deleteSkill.isPending || bulkApprove.isPending || bulkDelete.isPending;
+  const busy = approve.isPending || deleteSkill.isPending || bulkApprove.isPending || bulkDelete.isPending || createSkillTask.isPending;
   const skippedUploadItems = upload.data?.skipped ?? [];
 
   return (
@@ -139,6 +177,43 @@ export function SkillsPage() {
         Skill 必须上传压缩包并经过扫描，只有审批启用后才会进入可用列表。
         主 Agent 可以按任务分发给子 Agent，但不会绕过权限边界。
       </p>
+
+      <section className="resource-card skill-creator-panel" aria-label="创建 Skill 任务">
+        <div>
+          <span className="eyebrow">Skill Creator</span>
+          <h3>创建 Skill 任务</h3>
+          <p className="field-help">把科研、自媒体、人物/书籍蒸馏等需求先落成可验收的进化任务。主 Agent 会先规划资料、候选结构和评测口径，再进入多轮迭代。</p>
+        </div>
+        <div className="form-grid">
+          <label>
+            Skill 方向
+            <input value={creatorTopic} onChange={(event) => setCreatorTopic(event.currentTarget.value)} />
+          </label>
+          <label>
+            目标
+            <textarea value={creatorGoal} onChange={(event) => setCreatorGoal(event.currentTarget.value)} />
+          </label>
+          <label>
+            资料来源
+            <textarea value={creatorMaterials} onChange={(event) => setCreatorMaterials(event.currentTarget.value)} />
+          </label>
+          <label>
+            验收任务
+            <textarea value={creatorChecks} onChange={(event) => setCreatorChecks(event.currentTarget.value)} />
+          </label>
+        </div>
+        <div className="channel-config-actions" role="group" aria-label="Skill 创建操作">
+          <button
+            type="button"
+            disabled={createSkillTask.isPending || !creatorTopic.trim() || !creatorGoal.trim() || !creatorChecks.trim()}
+            onClick={() => createSkillTask.mutate()}
+          >
+            {createSkillTask.isPending ? "创建中..." : "创建并进入进化"}
+          </button>
+          {createSkillTask.isSuccess ? <span role="status">已创建进化任务：{createSkillTask.data.title}。到“对话与进化 / 进化”继续审批和执行。</span> : null}
+        </div>
+        {createSkillTask.isError ? <p role="alert">{formatApiError(createSkillTask.error, "Skill 创建任务创建失败")}</p> : null}
+      </section>
 
       <div className="two-column">
         <article>

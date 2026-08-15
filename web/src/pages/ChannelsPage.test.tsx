@@ -257,7 +257,12 @@ describe("ChannelsPage", () => {
     expect(screen.getByRole("region", { name: "飞书通道交互指令" })).not.toBeNull();
     expect(screen.getByText("//帮助")).not.toBeNull();
     expect(screen.getByText(/发送“帮助”“菜单”“指令”或“\/\/帮助”/)).not.toBeNull();
+    expect(screen.getByText("//讨论 评审这个方案的风险和下一步")).not.toBeNull();
+    expect(screen.getByText("//混合 &research @github 梳理这个仓库的改造计划")).not.toBeNull();
+    expect(screen.getByText("方案 写一个产品发布方案")).not.toBeNull();
+    expect(screen.getByText("代码 重构这个接口并说明测试结果")).not.toBeNull();
     expect(screen.getByText(/方案=\/\/派单, 代码=\/\/vi, 菜单=\/\/帮助/)).not.toBeNull();
+    expect(screen.getByText(/保存后飞书里的帮助菜单会同步显示这些别名/)).not.toBeNull();
   });
 
   it("does not mark unconfigured optional channel fields as already configured", async () => {

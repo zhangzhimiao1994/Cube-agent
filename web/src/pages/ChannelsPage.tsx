@@ -334,6 +334,14 @@ const FEISHU_STANDARD_COMMANDS = [
   { command: "//vi", description: "开启 Vibe Coding" },
   { command: "//帮助", description: "在飞书中返回这份指令菜单" },
 ];
+
+const FEISHU_COMMAND_EXAMPLES = [
+  "帮助",
+  "//讨论 评审这个方案的风险和下一步",
+  "//混合 &research @github 梳理这个仓库的改造计划",
+  "方案 写一个产品发布方案",
+  "代码 重构这个接口并说明测试结果",
+];
 type ChannelSortKey = "name" | "status" | "entry" | "missing";
 
 type ChannelColumnFilters = {
@@ -543,7 +551,15 @@ export function ChannelsPage() {
                     </div>
                   ))}
                 </div>
-                <p className="field-help">自定义格式：在“交互指令别名”填写“别名=标准指令”，例如“方案=//派单, 代码=//vi, 菜单=//帮助”。多条可用逗号、分号或换行分隔。</p>
+                <div className="channel-command-examples">
+                  <span className="eyebrow">可直接发送</span>
+                  {FEISHU_COMMAND_EXAMPLES.map((example) => (
+                    <code key={example}>{example}</code>
+                  ))}
+                </div>
+                <p className="field-help">
+                  自定义格式：在“交互指令别名”填写“别名=标准指令”，例如“方案=//派单, 代码=//vi, 菜单=//帮助”。多条可用逗号、分号或换行分隔；保存后飞书里的帮助菜单会同步显示这些别名。
+                </p>
               </section>
             ) : null}
             <article>

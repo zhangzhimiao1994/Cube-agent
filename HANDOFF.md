@@ -1,3 +1,30 @@
+## 2026-08-15 Grounded Skill Creator And Feishu Command Examples
+
+### State
+- Added a grounded Skill Creator entry on `/skills`: operators provide Skill direction, goal, source-material plan, and acceptance tasks, then create a `skill_distillation` Evolution run instead of installing an unverified generated Skill directly.
+- The Skill Creator run is wired to the existing Evolution workflow with `mode=hybrid`, `baseline_agent_id=main-agent`, builder/researcher/evaluator candidate agents, `approval_policy=ask`, `iteration_policy=score_gated`, `memory_policy=summarize_between_rounds`, and a rubric covering source truth, executable Skill structure, real-task acceptance, and permission boundaries.
+- Expanded `/channels` Feishu guidance with copyable interaction examples (`帮助`, `//讨论 ...`, `//混合 &research @github ...`, and custom aliases such as `方案 ...` / `代码 ...`) so bot users do not need to guess command syntax.
+- Kept custom Feishu command support on the existing backend path: `FEISHU_COMMAND_ALIASES` is still saved through channel config, applied before webhook/websocket submission, and shown in the Feishu help/menu response.
+
+### Verification
+- `npm test -- --run src/pages/ChannelsPage.test.tsx src/pages/SkillsPage.test.tsx` from `web/` -> 12 passed.
+- `npm run lint` from `web/` -> passed.
+- `.\.venv\Scripts\python.exe -m pytest tests/unit/channels/test_submitter.py tests/contracts/feishu/test_receivers.py tests/api/test_channel_webhooks.py -q` -> 51 passed, only existing FastAPI/httpx deprecation and pytest cache ACL warnings.
+- `npm run build` from `web/` -> passed with the existing Vite large chunk warning; active build files include `web/dist/assets/index-ByLKesA6.js` and `web/dist/assets/index-BDdmMSiI.css`.
+- `npm test -- --run` from `web/` -> 14 files / 127 tests passed.
+- `git diff --check` -> passed with only CRLF normalization warnings for touched files.
+
+### Server Deployment And Real Probe
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-skill-creator-feishu-commands-20260815-094755.tgz` and uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`; server backup retained under `/opt/agent-hub/backups/p3-skill-creator-feishu-commands-20260815-094755`.
+- Server archive retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-skill-creator-feishu-commands-20260815-094755.tgz`.
+- Real server probe called `/health`, loaded `/`, resolved active frontend asset `assets/index-ByLKesA6.js`, and verified deployed bundle markers for `创建 Skill 任务`, `生成可安装的 SKILL.md`, `真实任务验收`, `可直接发送`, `方案 写一个产品发布方案`, and `保存后飞书里的帮助菜单会同步显示这些别名`.
+- Probe output: `health={"status":"ok"}`, `index_has_root=yes`, all markers `yes`, `source_skill_creator=yes`, `source_feishu_examples=yes`, and `caddy=active api=active worker=active`.
+- Removed remote `/tmp` deploy/probe/package files after verification.
+
+### Remaining / Next
+- GitHub full push and Actions check still need to be completed for this slice.
+- Continue remaining P3 backlog after GitHub push: remaining Skill archive edge cases if reproduced, bulk action/search/filter audit across dense pages, broader UI copy/layout audit, README/README.zh-CN usage refresh, Docker readiness later, and OpenClaw follow-ups if requested.
 ## 2026-08-15 Evolution Dashboard And Feishu Channel Command Guide
 
 ### State

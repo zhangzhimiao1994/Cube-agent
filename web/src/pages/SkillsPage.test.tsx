@@ -76,6 +76,42 @@ describe("SkillsPage", () => {
             skipped: [{ path: "invalid-skill", reason: "instruction skill contains nested archives" }],
           });
         }
+        if (path === "/api/v1/admin/evolution-runs" && init?.method === "POST") {
+          const body = JSON.parse(String(init.body));
+          return jsonResponse({
+            id: "evolution_skill_creator_1",
+            kind: body.kind,
+            title: body.title,
+            objective: body.objective,
+            mode: body.mode,
+            source_skill_ids: body.source_skill_ids,
+            source_conversation_id: null,
+            source_run_id: null,
+            target_artifact_type: body.target_artifact_type,
+            baseline_agent_id: body.baseline_agent_id,
+            candidate_agent_ids: body.candidate_agent_ids,
+            evaluator_agent_id: body.evaluator_agent_id,
+            approval_policy: body.approval_policy,
+            approval_status: "pending",
+            approved_by: null,
+            approved_at: null,
+            approval_note: "",
+            iteration_policy: body.iteration_policy,
+            memory_policy: body.memory_policy,
+            next_action: "request_approval",
+            status: "waiting_approval",
+            max_rounds: body.max_rounds,
+            min_delta: body.min_delta,
+            budget_tokens: body.budget_tokens,
+            budget_minutes: body.budget_minutes,
+            rubric: body.rubric,
+            rounds: [],
+            created_by: owner.id,
+            created_at: "2026-08-15T01:00:00Z",
+            updated_at: "2026-08-15T01:00:00Z",
+            stop_reason: null,
+          });
+        }
         if (path.endsWith("/approve") && init?.method === "POST") {
           const id = path.split("/").at(-2) ?? "";
           return jsonResponse({ ...skills.find((skill) => skill.id === id), status: "enabled" });
@@ -98,6 +134,44 @@ describe("SkillsPage", () => {
     vi.unstubAllGlobals();
   });
 
+  it("creates a grounded Skill Creator evolution task from the skills page", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/skills" />);
+
+    await screen.findByRole("heading", { name: "技能管理" });
+    expect(screen.getByRole("region", { name: "创建 Skill 任务" })).not.toBeNull();
+    await user.clear(screen.getByLabelText("Skill 方向"));
+    await user.type(screen.getByLabelText("Skill 方向"), "自媒体视频 Skill");
+    await user.clear(screen.getByLabelText("目标"));
+    await user.type(screen.getByLabelText("目标"), "生成短视频选题、脚本、分镜和发布复盘流程。");
+    await user.clear(screen.getByLabelText("资料来源"));
+    await user.type(screen.getByLabelText("资料来源"), "检索平台规则、账号案例、爆款脚本和用户提供的历史素材。");
+    await user.clear(screen.getByLabelText("验收任务"));
+    await user.type(screen.getByLabelText("验收任务"), "用 2 个真实选题输出脚本和复盘指标，失败则继续迭代。");
+    await user.click(screen.getByRole("button", { name: "创建并进入进化" }));
+
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([path, init]) => path === "/api/v1/admin/evolution-runs" && init?.method === "POST");
+      expect(request).toBeTruthy();
+      const body = JSON.parse(String(request?.[1]?.body));
+      expect(body).toMatchObject({
+        kind: "skill_distillation",
+        title: "创建 自媒体视频 Skill",
+        target_artifact_type: "skill",
+        mode: "hybrid",
+        baseline_agent_id: "main-agent",
+        evaluator_agent_id: "evaluator-agent",
+        approval_policy: "ask",
+        iteration_policy: "score_gated",
+        memory_policy: "summarize_between_rounds",
+      });
+      expect(body.objective).toContain("真实选题输出脚本");
+      expect(body.objective).toContain("生成可安装的 SKILL.md");
+      expect(body.rubric).toEqual(["资料真实性", "可执行 Skill 结构", "真实任务验收", "权限边界"]);
+    });
+    expect(await screen.findByText(/已创建进化任务：创建 自媒体视频 Skill/)).not.toBeNull();
+  });
   it("supports selecting multiple skills and approving them in one action", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<TestApp initialPath="/skills" />);
