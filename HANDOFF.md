@@ -34,7 +34,10 @@
 - Removed server `/tmp/probe-skill-archive-feishu-commands.py`, `/tmp/deploy-skill-archive-feishu-commands.sh`, and `/tmp/agent-hub-p3-runtime-incremental.tgz` after verification.
 
 ### GitHub / Recovery
-- Pending: create local GitHub recovery bundle/tag, commit this slice, force-with-lease push `mutilagent/main`, then check GitHub Actions until green.
+- Committed as `6a6bee0 fix: accept large multi skill archives`.
+- Created local GitHub recovery bundle `.local-archives/github-recovery/mutilagent-main-before-20260815-103001-f9f7138.bundle` and pushed GitHub archive tag `archive/mutilagent-main-before-20260815-103001-f9f7138`.
+- Force-with-lease pushed `mutilagent/main`; GitHub again reported the repository has moved to `zhangzhimiao1994/CubeAgent.git`, but the configured `mutilagent` remote accepted the push.
+- GitHub Actions run `31859377345` (`quality`) passed.
 
 ### Remaining / Next
 - Continue remaining P3 backlog after GitHub green: OpenClaw follow-ups if requested, conversation/history drawer and UI compactness polish, bulk action/search/filter audit across dense pages, overall UI copy/layout audit, README/README.zh-CN usage refresh, and Docker readiness later.
