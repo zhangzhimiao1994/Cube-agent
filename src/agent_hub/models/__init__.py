@@ -26,6 +26,7 @@ from agent_hub.models.litellm_client import (
     ModelResponseError,
     ModelTransportError,
 )
+from agent_hub.models.profiles import infer_model_traits
 from agent_hub.models.registry import ModelRegistry, NoCapableDeployment
 from agent_hub.models.types import (
     Deployment,
@@ -68,5 +69,6 @@ __all__ = [
     "TokenUsage",
     "ToolCall",
     "infer_model_capabilities",
+    "infer_model_traits",
     "safe_operational_limit",
 ]

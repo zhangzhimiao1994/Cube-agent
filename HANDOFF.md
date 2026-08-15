@@ -1,3 +1,46 @@
+# Handoff - 2026-08-15 18:20 CST - Extensible Model Trait Profiles
+
+## Current state
+- Followed up on the model-routing requirement that future mainstream ordinary models also have distinct strengths, not only generation models.
+- Added a reusable model profile layer for routing hints. It infers traits from logical model name, provider, upstream model name, and declared capabilities.
+- The traits are deliberately routing hints, not hard request capabilities. Hard capabilities still come from deployment configuration and gateway checks.
+
+## Changed
+- `src/agent_hub/models/profiles.py`
+  - Added `infer_model_traits` and a profile rule table for mainstream families such as Gemini, OpenAI/GPT/o-series, Claude/Sonnet/Opus/Haiku, Qwen/DashScope/Bailian, GLM/Zhipu, DeepSeek, MiniMax, Kimi/Moonshot, Grok/xAI, Mistral/Codestral, Llama, Cohere, and Perplexity.
+  - Declared capabilities map to trait aliases such as `tool_calling -> tool`, `structured_output -> structured`, `vision -> multimodal`, and generation capabilities as output-generation hints.
+- `src/agent_hub/runtime/defaults.py`
+  - Replaced local hard-coded model trait checks with the shared `infer_model_traits` profile layer.
+  - Analysis scoring now separately rewards `analysis`, `reasoning`, `synthesis`, and structured output so role fit beats raw concurrency.
+- `src/agent_hub/models/__init__.py`
+  - Exported `infer_model_traits`.
+- `tests/unit/models/test_profiles.py`
+  - Added direct coverage for mainstream multimodal model traits, ordinary language model traits, and declared capability aliases.
+- `tests/unit/runtime/test_configured_runtime.py`
+  - Added a runtime regression proving a newly configured mainstream Gemini model can be selected for screenshot/UI understanding based on inferred traits.
+
+## Verification
+- Red tests before implementation:
+  - `uv run pytest tests/unit/models/test_profiles.py` -> failed with `ModuleNotFoundError: No module named 'agent_hub.models.profiles'`.
+  - `uv run pytest tests/unit/runtime/test_configured_runtime.py -k inferred_mainstream_model_traits` -> failed because screenshot/UI task selected `deepseek` instead of `gemini_pro`.
+- Local after fix:
+  - `uv run pytest tests/unit/models/test_profiles.py` -> 3 passed.
+  - `uv run pytest tests/unit/runtime/test_configured_runtime.py -k inferred_mainstream_model_traits` -> 1 passed.
+  - `uv run pytest tests/unit/models/test_profiles.py tests/unit/runtime/test_configured_runtime.py` -> 28 passed.
+  - `uv run ruff check src/agent_hub/models/profiles.py src/agent_hub/models/__init__.py src/agent_hub/runtime/defaults.py tests/unit/models/test_profiles.py tests/unit/runtime/test_configured_runtime.py` -> passed.
+
+## Server deployment
+- Uploaded `.local-archives/server-incrementals/agent-hub-model-profiles-20260815-182904.tgz` to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current` and restarted `agent-hub-api` plus `agent-hub-worker`.
+- Server backup: `/opt/agent-hub/backups/p3-model-profiles-20260815-182904`.
+- Server retained archive: `/opt/agent-hub/archives/server-incrementals/agent-hub-model-profiles-20260815-182904.tgz`.
+- Server service check: `agent-hub-api` active, `agent-hub-worker` active, `/health` returned `{"status":"ok"}`.
+- Server production-config probe: `{"status":"ok","published_version":73,"review_assigned":"sonnet5","general_assigned_models":["qwen","glm","minimax","deepseek"],"gemini_profile_assigned":"gemini_pro"}`.
+- Cleaned `/tmp/agent-hub-p3-runtime-incremental.tgz`, `/tmp/deploy-model-profiles.sh`, and `/tmp/probe-model-profiles.sh` after verification.
+
+## Remaining / next
+- Commit this slice, retain GitHub recovery archive/tag, push `mutilagent/main`, and verify Actions.
+
 # Handoff - 2026-08-15 18:05 CST - Model Trait Weighted Role Assignment
 
 ## Current state

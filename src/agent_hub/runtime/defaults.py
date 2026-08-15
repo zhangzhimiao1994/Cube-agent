@@ -20,6 +20,7 @@ from agent_hub.models.capacity import (
 )
 from agent_hub.models.gateway import CapacityController, ModelGateway, ModelTransport
 from agent_hub.models.litellm_client import LiteLLMClient
+from agent_hub.models.profiles import infer_model_traits
 from agent_hub.models.registry import ModelRegistry
 from agent_hub.models.types import Deployment
 from agent_hub.runtime.autogen.adapter import (
@@ -1111,41 +1112,13 @@ def _model_characteristics(
     logical_model: str,
     definition: LogicalModelDefinition,
 ) -> frozenset[str]:
-    joined = " ".join(
-        (
-            logical_model,
-            " ".join(
-                f"{deployment.provider} {deployment.model}"
-                for deployment in definition.deployments
-            ),
-        )
-    ).lower()
-    characteristics: set[str] = {"text", "general"}
-    for deployment in definition.deployments:
-        for capability in deployment.capabilities:
-            value = str(capability).lower()
-            characteristics.add(value)
-            if value == "tool_calling":
-                characteristics.add("tool")
-            if value == "structured_output":
-                characteristics.add("structured")
-            if value == "vision":
-                characteristics.update(("image", "multimodal"))
-            if value == "audio":
-                characteristics.update(("speech", "voice", "multimodal"))
-    if any(keyword in joined for keyword in ("qwen", "通义", "dashscope")):
-        characteristics.update(("chinese", "code", "tool", "structured", "general"))
-    if any(keyword in joined for keyword in ("glm", "zhipu", "智谱")):
-        characteristics.update(("chinese", "reasoning", "analysis", "structured", "general"))
-    if any(keyword in joined for keyword in ("claude", "sonnet", "anthropic")):
-        characteristics.update(("reasoning", "review", "writing", "code", "synthesis"))
-    if any(keyword in joined for keyword in ("kimi", "moonshot", "creative", "story")):
-        characteristics.update(("creative", "writing", "chinese", "general"))
-    if "deepseek" in joined:
-        characteristics.update(("reasoning", "analysis", "code", "general"))
-    if any(keyword in joined for keyword in ("minimax", "m3", "abab")):
-        characteristics.update(("chinese", "creative", "writing", "general"))
-    return frozenset(characteristics)
+    return infer_model_traits(
+        logical_model=logical_model,
+        deployments=(
+            (deployment.provider, deployment.model, deployment.capabilities)
+            for deployment in definition.deployments
+        ),
+    )
 
 
 def _task_characteristics(text: str) -> frozenset[str]:
@@ -1189,8 +1162,12 @@ def _task_characteristic_score(text: str, characteristics: frozenset[str]) -> in
         if "structured" in characteristics or "structured_output" in characteristics:
             score += 6
     if "analysis" in task_characteristics:
-        if "analysis" in characteristics or "reasoning" in characteristics:
+        if "analysis" in characteristics:
             score += 18
+        if "reasoning" in characteristics:
+            score += 8
+        if "synthesis" in characteristics:
+            score += 4
         if "structured" in characteristics or "structured_output" in characteristics:
             score += 8
     if "creative" in task_characteristics and (

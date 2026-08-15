@@ -1444,6 +1444,68 @@ def test_general_role_model_assignment_uses_more_configured_text_models() -> Non
     )
 
     assert len({role.model for role in assigned}) == 4
+
+
+def test_role_model_assignment_uses_inferred_mainstream_model_traits() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "deepseek": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-v4-flash",
+                            "api_base": "https://api.deepseek.com/v1",
+                            "credential_ref": "secret://deepseek",
+                            "quota_scope_id": "deepseek",
+                            "max_concurrency": 20,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "tool_calling", "structured_output"],
+                        }
+                    ]
+                },
+                "gemini_pro": {
+                    "deployments": [
+                        {
+                            "provider": "google",
+                            "model": "gemini-2.5-pro",
+                            "api_base": "https://generativelanguage.googleapis.com/v1beta/openai",
+                            "credential_ref": "secret://gemini",
+                            "quota_scope_id": "gemini",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text"],
+                        }
+                    ]
+                },
+            },
+            "agents": [],
+        }
+    )
+    role = RoleAssignment(
+        id="vision_reviewer",
+        role="截图理解",
+        purpose=RolePurpose.EXPERTISE,
+        mission="分析图片和截图中的界面问题。",
+        must_answer=("截图里的问题是什么？",),
+        allowed_tools=(),
+        forbidden_actions=("不要执行危险操作。",),
+        skills=(),
+        output_schema={},
+        model="deepseek",
+    )
+
+    assigned = _assign_models_to_roles(
+        (role,),
+        config,
+        default_model="deepseek",
+        task="请根据这张截图分析 UI 问题。",
+    )
+
+    assert assigned[0].model == "gemini_pro"
+
 def test_dispatch_parallelism_uses_model_capacity_without_unbounded_fanout() -> None:
     config = PlatformConfig.model_validate(
         {
