@@ -19,6 +19,12 @@
 - Server probe loaded `/config`, confirmed active frontend asset `/assets/index-B5IZcUVS.js`, confirmed deployed `web/src/pages/ConfigPage.tsx` contains `OpenClaw 配置入口` and no longer contains `openclaw-create-operation`, and confirmed the old `Start Linux server session` settings-console marker is absent from the active bundle.
 - Removed server `/tmp` deploy/probe files; `caddy`, `agent-hub-api`, and `agent-hub-worker` were active after deployment.
 
+### GitHub / Recovery
+- Committed as `7648a06 refactor: keep openclaw control on dedicated page`.
+- Created local GitHub recovery bundle `.local-archives/github-recovery/mutilagent-main-before-20260815-084351-4fbba05.bundle` and pushed GitHub archive tag `archive/mutilagent-main-before-20260815-084351-4fbba05`.
+- Force-with-lease pushed `mutilagent/main`; GitHub again reported the repository has moved to `zhangzhimiao1994/CubeAgent.git`, but the configured `mutilagent` remote accepted the push.
+- GitHub Actions run `31854508655` (`quality`) passed.
+
 ### Remaining / Next
 - Continue remaining P3 queue after GitHub green: evolution execution dashboard refinements, grounded Skill Creator workflows, remaining Skill archive edge cases if reproduced, bulk action/search/filter audit across dense pages, broader UI copy/layout audit, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 CI Mypy Follow-up For Feishu Alias Tests
