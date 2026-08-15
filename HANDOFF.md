@@ -1,3 +1,26 @@
+## 2026-08-15 OpenClaw Dedicated Config Entry
+
+### State
+- Consolidated OpenClaw management into the standalone `/openclaw` page. `/config` no longer embeds the OpenClaw operation console, allowlist editor, adapter editor, or session controls.
+- The system settings page now shows only an OpenClaw status summary with enabled state, permission mode, allowlist count, remote adapter count, and a direct `打开 OpenClaw 控制` link.
+- Kept the dedicated OpenClaw page as the single place for cross-platform computer/server control, remote adapters, approval policy, long-running sessions, and execution.
+
+### Verification
+- `npm test -- --run src/pages/ConfigPage.test.tsx src/pages/OpenClawPage.test.tsx` from `web/` -> 9 passed.
+- `npm run build` from `web/` -> passed with the existing Vite large chunk warning.
+- `npm run lint` from `web/` -> passed.
+- `git diff --check` -> passed with only CRLF normalization warnings for touched files.
+- `npm test -- --run` from `web/` -> 14 files / 126 tests passed.
+
+### Server Deployment And Real Probe
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-openclaw-config-entry-20260815-084027.tgz` and uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`; server backup retained under `/opt/agent-hub/backups/p3-openclaw-config-entry-20260815-084027`.
+- Server archive retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-openclaw-config-entry-20260815-084027.tgz`.
+- Server probe loaded `/config`, confirmed active frontend asset `/assets/index-B5IZcUVS.js`, confirmed deployed `web/src/pages/ConfigPage.tsx` contains `OpenClaw 配置入口` and no longer contains `openclaw-create-operation`, and confirmed the old `Start Linux server session` settings-console marker is absent from the active bundle.
+- Removed server `/tmp` deploy/probe files; `caddy`, `agent-hub-api`, and `agent-hub-worker` were active after deployment.
+
+### Remaining / Next
+- Continue remaining P3 queue after GitHub green: evolution execution dashboard refinements, grounded Skill Creator workflows, remaining Skill archive edge cases if reproduced, bulk action/search/filter audit across dense pages, broader UI copy/layout audit, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 CI Mypy Follow-up For Feishu Alias Tests
 
 ### State

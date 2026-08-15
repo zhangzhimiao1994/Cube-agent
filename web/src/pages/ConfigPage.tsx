@@ -7,9 +7,6 @@ import {
   api,
   formatApiError,
   type ConfigRevision,
-  type OpenClawAdapter,
-  type OpenClawOperation,
-  type OpenClawSession,
   type SystemSettings,
 } from "../api/client";
 
@@ -18,17 +15,7 @@ type EditableConfig = {
   agents: unknown[];
 };
 
-type OpenClawRemoteAdapterSetting = SystemSettings["openclaw_remote_adapters"][number];
-
 const EMPTY_CONFIG: EditableConfig = { models: {}, agents: [] };
-const DEFAULT_OPENCLAW_REMOTE_ADAPTER: OpenClawRemoteAdapterSetting = {
-  platform: "windows",
-  target_type: "computer",
-  target: "local-windows-pc",
-  base_url: "http://127.0.0.1:8765",
-  credential_ref: "secret://openclaw-local-adapter",
-};
-
 function formatDocument(document: EditableConfig) {
   return `${JSON.stringify(document, null, 2)}\n`;
 }
@@ -67,79 +54,6 @@ function toggle(list: string[], value: string) {
   return list.includes(value) ? list.filter((item) => item !== value) : [...list, value];
 }
 
-function formatJson(value: unknown) {
-  return JSON.stringify(value, null, 2);
-}
-
-function parseStringList(value: string, fieldName: string) {
-  const parsed: unknown = JSON.parse(value);
-  if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string" || item.trim() === "")) {
-    throw new Error(`${fieldName} must be a JSON string array.`);
-  }
-  return parsed;
-}
-
-function parseCommandList(value: string) {
-  const parsed: unknown = JSON.parse(value);
-  if (
-    !Array.isArray(parsed) ||
-    parsed.some(
-      (command) =>
-        !Array.isArray(command) ||
-        command.length === 0 ||
-        command.some((item) => typeof item !== "string" || item.trim() === ""),
-    )
-  ) {
-    throw new Error("OpenClaw allowed commands must be a JSON array of argv arrays.");
-  }
-  return parsed;
-}
-
-function parseOpenClawRemoteAdapters(value: string): SystemSettings["openclaw_remote_adapters"] {
-  const parsed: unknown = JSON.parse(value);
-  const platforms = new Set(["linux", "windows", "macos"]);
-  const targetTypes = new Set(["server", "computer", "desktop", "filesystem", "screen"]);
-  if (
-    !Array.isArray(parsed) ||
-    parsed.some(
-      (adapter) =>
-        typeof adapter !== "object" ||
-        adapter === null ||
-        Array.isArray(adapter) ||
-        !platforms.has(String((adapter as Record<string, unknown>).platform)) ||
-        !targetTypes.has(String((adapter as Record<string, unknown>).target_type)) ||
-        typeof (adapter as Record<string, unknown>).target !== "string" ||
-        String((adapter as Record<string, unknown>).target).trim() === "" ||
-        typeof (adapter as Record<string, unknown>).base_url !== "string" ||
-        String((adapter as Record<string, unknown>).base_url).trim() === "" ||
-        typeof (adapter as Record<string, unknown>).credential_ref !== "string" ||
-        String((adapter as Record<string, unknown>).credential_ref).trim() === "",
-    )
-  ) {
-    throw new Error("OpenClaw remote adapters must be JSON objects with platform, target_type, target, base_url, and credential_ref.");
-  }
-  return parsed as SystemSettings["openclaw_remote_adapters"];
-}
-
-function sortOpenClawAdapters(adapters: OpenClawAdapter[]) {
-  const platformRank = new Map([
-    ["linux", 0],
-    ["windows", 1],
-    ["macos", 2],
-  ]);
-  const kindRank = new Map([
-    ["server_command", 0],
-    ["desktop_action", 1],
-    ["screen_read", 2],
-    ["file_read", 3],
-  ]);
-  return [...adapters].sort(
-    (left, right) =>
-      (platformRank.get(left.platform) ?? 99) - (platformRank.get(right.platform) ?? 99) ||
-      (kindRank.get(left.kind) ?? 99) - (kindRank.get(right.kind) ?? 99),
-  );
-}
-
 export function ConfigPage() {
   const queryClient = useQueryClient();
   const current = useQuery({ queryKey: ["config-current"], queryFn: () => api.currentConfig() });
@@ -147,8 +61,6 @@ export function ConfigPage() {
   const agentsQuery = useQuery({ queryKey: ["agents"], queryFn: () => api.agents() });
   const workflowsQuery = useQuery({ queryKey: ["workflows"], queryFn: () => api.workflows() });
   const modelsQuery = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
-  const openClawAdaptersQuery = useQuery({ queryKey: ["openclaw-adapters"], queryFn: () => api.openClawAdapters() });
-  const openClawSessionsQuery = useQuery({ queryKey: ["openclaw-sessions"], queryFn: () => api.openClawSessions() });
   const document = useMemo(
     () => currentOrEmpty(current.data, current.error),
     [current.data, current.error],
@@ -158,14 +70,6 @@ export function ConfigPage() {
   const [published, setPublished] = useState<string | null>(null);
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [settingsLocalError, setSettingsLocalError] = useState<string | null>(null);
-  const [openClawAllowedCommandsText, setOpenClawAllowedCommandsText] = useState("[]");
-  const [openClawRemoteAdaptersText, setOpenClawRemoteAdaptersText] = useState("[]");
-  const [openClawAdapterDraft, setOpenClawAdapterDraft] = useState<OpenClawRemoteAdapterSetting>(DEFAULT_OPENCLAW_REMOTE_ADAPTER);
-  const [openClawArgvText, setOpenClawArgvText] = useState("[\"python\", \"--version\"]");
-  const [openClawReason, setOpenClawReason] = useState("Manual OpenClaw operation from settings console");
-  const [selectedOpenClawSessionId, setSelectedOpenClawSessionId] = useState("");
-  const [openClawOperation, setOpenClawOperation] = useState<OpenClawOperation | null>(null);
-  const [openClawExecutionOutput, setOpenClawExecutionOutput] = useState<string | null>(null);
 
   useEffect(() => {
     if (document) setJson(formatDocument(document));
@@ -174,91 +78,17 @@ export function ConfigPage() {
   useEffect(() => {
     if (settingsQuery.data) {
       setSettings(settingsQuery.data);
-      setOpenClawAllowedCommandsText(formatJson(settingsQuery.data.openclaw_allowed_commands));
-      setOpenClawRemoteAdaptersText(formatJson(settingsQuery.data.openclaw_remote_adapters));
     }
   }, [settingsQuery.data]);
 
-  const activeOpenClawSessions = useMemo(
-    () => (openClawSessionsQuery.data ?? []).filter((session) => session.status === "active"),
-    [openClawSessionsQuery.data],
-  );
-
-  const configuredOpenClawRemoteAdapters = useMemo(() => {
-    try {
-      return parseOpenClawRemoteAdapters(openClawRemoteAdaptersText);
-    } catch {
-      return [];
-    }
-  }, [openClawRemoteAdaptersText]);
-
-  function updateOpenClawAdapterDraft<K extends keyof OpenClawRemoteAdapterSetting>(
-    field: K,
-    value: OpenClawRemoteAdapterSetting[K],
-  ) {
-    setOpenClawAdapterDraft((current) => ({ ...current, [field]: value }));
-  }
-
-  function replaceOpenClawRemoteAdapters(next: OpenClawRemoteAdapterSetting[]) {
-    setOpenClawRemoteAdaptersText(formatJson(next));
-    setSettingsLocalError(null);
-  }
-
-  function addOpenClawRemoteAdapter() {
-    let current: OpenClawRemoteAdapterSetting[];
-    try {
-      current = parseOpenClawRemoteAdapters(openClawRemoteAdaptersText);
-    } catch (error) {
-      setSettingsLocalError(error instanceof Error ? error.message : "OpenClaw 远程适配器 JSON 无法解析。");
-      return;
-    }
-    const adapter: OpenClawRemoteAdapterSetting = {
-      platform: openClawAdapterDraft.platform,
-      target_type: openClawAdapterDraft.target_type,
-      target: openClawAdapterDraft.target.trim(),
-      base_url: openClawAdapterDraft.base_url.trim(),
-      credential_ref: openClawAdapterDraft.credential_ref.trim(),
-    };
-    if (!adapter.target || !adapter.base_url || !adapter.credential_ref) {
-      setSettingsLocalError("请填写 OpenClaw 适配器目标、Base URL 和凭据引用。");
-      return;
-    }
-    replaceOpenClawRemoteAdapters([...current, adapter]);
-    setOpenClawAdapterDraft({ ...adapter, target: "local-windows-pc" });
-  }
-
-  function removeOpenClawRemoteAdapter(index: number) {
-    let current: OpenClawRemoteAdapterSetting[];
-    try {
-      current = parseOpenClawRemoteAdapters(openClawRemoteAdaptersText);
-    } catch (error) {
-      setSettingsLocalError(error instanceof Error ? error.message : "OpenClaw 远程适配器 JSON 无法解析。");
-      return;
-    }
-    replaceOpenClawRemoteAdapters(current.filter((_, itemIndex) => itemIndex !== index));
-  }
-
-  useEffect(() => {
-    setSelectedOpenClawSessionId((currentSessionId) =>
-      currentSessionId && activeOpenClawSessions.some((session) => session.id === currentSessionId)
-        ? currentSessionId
-        : activeOpenClawSessions[0]?.id ?? "",
-    );
-  }, [activeOpenClawSessions]);
   const saveSettings = useMutation({
     mutationFn: async () => {
       if (!settings) throw new Error("设置尚未加载完成");
       setSettingsLocalError(null);
-      return api.updateSettings({
-        ...settings,
-        openclaw_allowed_commands: parseCommandList(openClawAllowedCommandsText),
-        openclaw_remote_adapters: parseOpenClawRemoteAdapters(openClawRemoteAdaptersText),
-      });
+      return api.updateSettings(settings);
     },
     onSuccess: async (saved) => {
       setSettings(saved);
-      setOpenClawAllowedCommandsText(formatJson(saved.openclaw_allowed_commands));
-      setOpenClawRemoteAdaptersText(formatJson(saved.openclaw_remote_adapters));
       await queryClient.invalidateQueries({ queryKey: ["settings"] });
     },
     onError: (error) => {
@@ -268,75 +98,6 @@ export function ConfigPage() {
     },
   });
 
-  const createOpenClawOperation = useMutation({
-    mutationFn: async () => {
-      setSettingsLocalError(null);
-      setOpenClawExecutionOutput(null);
-      return api.createOpenClawOperation({
-        platform: "linux",
-        kind: "server_command",
-        target: "agent-hub-server",
-        argv: parseStringList(openClawArgvText, "OpenClaw argv"),
-        risk_level: "low",
-        reason: openClawReason,
-        ...(selectedOpenClawSessionId ? { session_id: selectedOpenClawSessionId } : {}),
-      });
-    },
-    onSuccess: (operation) => setOpenClawOperation(operation),
-    onError: (error) => {
-      if (error instanceof Error && !(error instanceof ApiError)) {
-        setSettingsLocalError(error.message);
-      }
-    },
-  });
-
-  const approveOpenClawOperation = useMutation({
-    mutationFn: async () => {
-      if (!openClawOperation) throw new Error("OpenClaw operation is not ready.");
-      return api.resolveOpenClawOperation(openClawOperation.id, "approve");
-    },
-    onSuccess: (operation) => setOpenClawOperation(operation),
-  });
-
-  const rejectOpenClawOperation = useMutation({
-    mutationFn: async () => {
-      if (!openClawOperation) throw new Error("OpenClaw operation is not ready.");
-      return api.resolveOpenClawOperation(openClawOperation.id, "reject");
-    },
-    onSuccess: (operation) => setOpenClawOperation(operation),
-  });
-
-  const executeOpenClawOperation = useMutation({
-    mutationFn: async () => {
-      if (!openClawOperation) throw new Error("OpenClaw operation is not ready.");
-      return api.executeOpenClawOperation(openClawOperation.id);
-    },
-    onSuccess: (execution) => {
-      setOpenClawOperation(execution.operation);
-      setOpenClawExecutionOutput(execution.stdout || execution.stderr || `exit_code=${execution.exit_code}`);
-    },
-  });
-
-  const createOpenClawSession = useMutation({
-    mutationFn: () =>
-      api.createOpenClawSession({
-        platform: "linux",
-        target_type: "server",
-        target: "agent-hub-server",
-        purpose: "Keep a bounded OpenClaw control session for server maintenance",
-      }),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["openclaw-sessions"] });
-    },
-  });
-
-  const updateOpenClawSession = useMutation({
-    mutationFn: ({ id, action }: { id: string; action: "pause" | "resume" | "stop" }) =>
-      api.updateOpenClawSession(id, action),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["openclaw-sessions"] });
-    },
-  });
   const publish = useMutation({
     mutationFn: async () => {
       setLocalError(null);
@@ -363,9 +124,7 @@ export function ConfigPage() {
     settingsQuery.isLoading ||
     agentsQuery.isLoading ||
     workflowsQuery.isLoading ||
-    modelsQuery.isLoading ||
-    openClawAdaptersQuery.isLoading ||
-    openClawSessionsQuery.isLoading
+    modelsQuery.isLoading
   ) {
     return <p>正在加载系统设置...</p>;
   }
@@ -376,18 +135,10 @@ export function ConfigPage() {
   if (agentsQuery.isError) return <p role="alert">{formatApiError(agentsQuery.error, "Agent 列表加载失败")}</p>;
   if (workflowsQuery.isError) return <p role="alert">{formatApiError(workflowsQuery.error, "工作流列表加载失败")}</p>;
   if (modelsQuery.isError) return <p role="alert">{formatApiError(modelsQuery.error, "模型列表加载失败")}</p>;
-  if (openClawAdaptersQuery.isError) {
-    return <p role="alert">{formatApiError(openClawAdaptersQuery.error, "OpenClaw adapters loading failed")}</p>;
-  }
-  if (openClawSessionsQuery.isError) {
-    return <p role="alert">{formatApiError(openClawSessionsQuery.error, "OpenClaw sessions loading failed")}</p>;
-  }
   if (!settings) return <p role="alert">系统设置加载失败：后端没有返回设置内容。</p>;
 
   const agents = agentsQuery.data ?? [];
   const workflows = workflowsQuery.data ?? [];
-  const openClawAdapters = sortOpenClawAdapters(openClawAdaptersQuery.data ?? []);
-  const openClawSessions = openClawSessionsQuery.data ?? [];
   const modelCount = Object.keys(document?.models ?? {}).length || (modelsQuery.data ?? []).length;
   const agentCount = document?.agents.length || agents.length;
 
@@ -573,367 +324,16 @@ export function ConfigPage() {
             />
             多媒体生成开关
           </label>
-          <label className="inline-check">
-            <input
-              type="checkbox"
-              data-testid="openclaw-toggle"
-              checked={settings.openclaw_enabled}
-              onChange={(event) => updateSettings({ openclaw_enabled: event.target.checked })}
-            />
-            OpenClaw 长时间电脑操作开关
-          </label>
-          <label htmlFor="openclaw-mode">
-            OpenClaw 权限模式
-            <select
-              id="openclaw-mode"
-              value={settings.openclaw_mode}
-              onChange={(event) => updateSettings({ openclaw_mode: event.target.value as SystemSettings["openclaw_mode"] })}
-            >
-              <option value="ask">每次操作前审批</option>
-              <option value="read_only">只读</option>
-              <option value="auto_review">自动审核低风险操作</option>
-              <option value="trusted_auto">受信环境自动执行</option>
-            </select>
-          </label>
-          <label htmlFor="openclaw-allowed-commands">
-            OpenClaw allowed commands JSON
-            <textarea
-              id="openclaw-allowed-commands"
-              data-testid="openclaw-allowed-commands"
-              value={openClawAllowedCommandsText}
-              onChange={(event) => setOpenClawAllowedCommandsText(event.target.value)}
-              spellCheck={false}
-            />
-            <small>Only exact argv matches can execute after approval. Shell wrappers remain blocked.</small>
-          </label>
-          <div className="inline-guide" aria-label="OpenClaw remote adapters">
-            <h4>OpenClaw 远程适配器</h4>
+          <div className="inline-guide" role="region" aria-label="OpenClaw 配置入口">
+            <h4>OpenClaw 控制</h4>
             <p>
-              这里登记可长期连接的本机或远程 OpenClaw Adapter。Windows 电脑、桌面动作、文件和屏幕能力必须先接入 Adapter，执行时仍走开关、审批和 allowlist 边界。
+              当前{settings.openclaw_enabled ? `已启用，权限模式：${settings.openclaw_mode}` : "已关闭"}；
+              allowlist {settings.openclaw_allowed_commands.length} 条，远程适配器 {settings.openclaw_remote_adapters.length} 个。
+              跨平台电脑/服务器接管、会话、审批和执行统一在独立 OpenClaw 控制页管理。
             </p>
-            <div className="form-grid">
-              <label htmlFor="openclaw-adapter-platform">
-                平台
-                <select
-                  id="openclaw-adapter-platform"
-                  data-testid="openclaw-adapter-platform"
-                  value={openClawAdapterDraft.platform}
-                  onChange={(event) =>
-                    updateOpenClawAdapterDraft("platform", event.target.value as OpenClawRemoteAdapterSetting["platform"])
-                  }
-                >
-                  <option value="windows">Windows</option>
-                  <option value="linux">Linux</option>
-                  <option value="macos">macOS</option>
-                </select>
-              </label>
-              <label htmlFor="openclaw-adapter-target-type">
-                目标类型
-                <select
-                  id="openclaw-adapter-target-type"
-                  data-testid="openclaw-adapter-target-type"
-                  value={openClawAdapterDraft.target_type}
-                  onChange={(event) =>
-                    updateOpenClawAdapterDraft("target_type", event.target.value as OpenClawRemoteAdapterSetting["target_type"])
-                  }
-                >
-                  <option value="computer">本机电脑</option>
-                  <option value="desktop">桌面</option>
-                  <option value="server">服务器</option>
-                  <option value="filesystem">文件系统</option>
-                  <option value="screen">屏幕</option>
-                </select>
-              </label>
-              <label htmlFor="openclaw-adapter-target">
-                目标名称
-                <input
-                  id="openclaw-adapter-target"
-                  data-testid="openclaw-adapter-target"
-                  value={openClawAdapterDraft.target}
-                  onChange={(event) => updateOpenClawAdapterDraft("target", event.target.value)}
-                />
-              </label>
-              <label htmlFor="openclaw-adapter-base-url">
-                Adapter Base URL
-                <input
-                  id="openclaw-adapter-base-url"
-                  data-testid="openclaw-adapter-base-url"
-                  value={openClawAdapterDraft.base_url}
-                  onChange={(event) => updateOpenClawAdapterDraft("base_url", event.target.value)}
-                />
-              </label>
-              <label htmlFor="openclaw-adapter-credential-ref">
-                凭据引用
-                <input
-                  id="openclaw-adapter-credential-ref"
-                  data-testid="openclaw-adapter-credential-ref"
-                  value={openClawAdapterDraft.credential_ref}
-                  onChange={(event) => updateOpenClawAdapterDraft("credential_ref", event.target.value)}
-                />
-              </label>
-            </div>
-            <div className="action-row">
-              <button type="button" data-testid="openclaw-add-remote-adapter" onClick={addOpenClawRemoteAdapter}>
-                添加适配器
-              </button>
-            </div>
-            {configuredOpenClawRemoteAdapters.length === 0 ? (
-              <p className="field-help">还没有登记远程适配器。Linux 服务器本地执行不需要填写这里。</p>
-            ) : (
-              <div className="table-shell">
-                <table aria-label="Configured OpenClaw remote adapters">
-                  <thead>
-                    <tr>
-                      <th>平台</th>
-                      <th>目标</th>
-                      <th>Base URL</th>
-                      <th>凭据</th>
-                      <th>操作</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {configuredOpenClawRemoteAdapters.map((adapter, index) => (
-                      <tr key={`${adapter.platform}-${adapter.target_type}-${adapter.target}-${index}`}>
-                        <td>{adapter.platform}</td>
-                        <td>
-                          {adapter.target_type} · {adapter.target}
-                        </td>
-                        <td>{adapter.base_url}</td>
-                        <td>{adapter.credential_ref}</td>
-                        <td>
-                          <button
-                            type="button"
-                            className="danger-action"
-                            data-testid={`openclaw-remove-remote-adapter-${index}`}
-                            onClick={() => removeOpenClawRemoteAdapter(index)}
-                          >
-                            删除
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-            <details>
-              <summary>高级 JSON</summary>
-              <label htmlFor="openclaw-remote-adapters">
-                OpenClaw remote adapters JSON
-                <textarea
-                  id="openclaw-remote-adapters"
-                  data-testid="openclaw-remote-adapters"
-                  value={openClawRemoteAdaptersText}
-                  onChange={(event) => setOpenClawRemoteAdaptersText(event.target.value)}
-                  spellCheck={false}
-                />
-              </label>
-            </details>
-          </div>
-          <div className="inline-guide" aria-label="OpenClaw adapter status">
-            <h4>OpenClaw adapter status</h4>
-            <div className="openclaw-adapter-grid">
-              {openClawAdapters.map((adapter) => (
-                <article
-                  key={`${adapter.platform}-${adapter.kind}`}
-                  className={`openclaw-adapter-card openclaw-adapter-${adapter.status}`}
-                >
-                  <div className="openclaw-adapter-header">
-                    <strong>
-                      {adapter.platform} {adapter.kind}
-                    </strong>
-                    <span>{adapter.status}</span>
-                  </div>
-                  <p>{adapter.description}</p>
-                  <dl>
-                    <div>
-                      <dt>host</dt>
-                      <dd>{adapter.execution_host}</dd>
-                    </div>
-                    <div>
-                      <dt>approval</dt>
-                      <dd>{adapter.requires_user_approval ? "required" : "not required"}</dd>
-                    </div>
-                    <div>
-                      <dt>read-only</dt>
-                      <dd>{adapter.supports_read_only ? "supported" : "not supported"}</dd>
-                    </div>
-                  </dl>
-                </article>
-              ))}
-            </div>
-          </div>
-          <div className="inline-guide" aria-label="OpenClaw control sessions">
-            <h4>OpenClaw control sessions</h4>
-            <p>
-              会话用于登记长时间控制意图。Linux server 会话可以进入 active 状态；Windows、macOS、本机桌面会话在接入真实适配器前会显示 adapter_unavailable。
-            </p>
-            <div className="action-row">
-              <button
-                type="button"
-                data-testid="openclaw-create-session"
-                disabled={createOpenClawSession.isPending}
-                onClick={() => createOpenClawSession.mutate()}
-              >
-                Start Linux server session
-              </button>
-            </div>
-            {openClawSessions.length === 0 ? (
-              <p className="field-help">No OpenClaw control sessions have been created yet.</p>
-            ) : (
-              <div className="table-shell">
-                <table aria-label="OpenClaw control sessions">
-                  <thead>
-                    <tr>
-                      <th>Session</th>
-                      <th>Status</th>
-                      <th>Target</th>
-                      <th>Host</th>
-                      <th>Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {openClawSessions.map((session: OpenClawSession) => (
-                      <tr key={session.id}>
-                        <td>{session.id}</td>
-                        <td>{session.status}</td>
-                        <td>
-                          {session.platform} {session.target_type} {session.target}
-                        </td>
-                        <td>{session.execution_host}</td>
-                        <td>
-                          <div className="action-row compact-actions">
-                            <button
-                              type="button"
-                              data-testid={`openclaw-pause-session-${session.id}`}
-                              disabled={session.status !== "active" || updateOpenClawSession.isPending}
-                              onClick={() => updateOpenClawSession.mutate({ id: session.id, action: "pause" })}
-                            >
-                              Pause
-                            </button>
-                            <button
-                              type="button"
-                              data-testid={`openclaw-resume-session-${session.id}`}
-                              disabled={session.status !== "paused" || updateOpenClawSession.isPending}
-                              onClick={() => updateOpenClawSession.mutate({ id: session.id, action: "resume" })}
-                            >
-                              Resume
-                            </button>
-                            <button
-                              type="button"
-                              className="danger-action"
-                              data-testid={`openclaw-stop-session-${session.id}`}
-                              disabled={session.status === "stopped" || updateOpenClawSession.isPending}
-                              onClick={() => updateOpenClawSession.mutate({ id: session.id, action: "stop" })}
-                            >
-                              Stop
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-            {createOpenClawSession.isError ? (
-              <p role="alert">{formatApiError(createOpenClawSession.error, "OpenClaw session creation failed")}</p>
-            ) : null}
-            {updateOpenClawSession.isError ? (
-              <p role="alert">{formatApiError(updateOpenClawSession.error, "OpenClaw session update failed")}</p>
-            ) : null}
-          </div>
-          <div className="inline-guide" aria-label="OpenClaw operation console">
-            <h4>OpenClaw operation console</h4>
-            <label htmlFor="openclaw-operation-argv">
-              Operation argv JSON
-              <textarea
-                id="openclaw-operation-argv"
-                data-testid="openclaw-operation-argv"
-                value={openClawArgvText}
-                onChange={(event) => setOpenClawArgvText(event.target.value)}
-                spellCheck={false}
-              />
-            </label>
-            <label htmlFor="openclaw-operation-reason">
-              Reason
-              <input
-                id="openclaw-operation-reason"
-                value={openClawReason}
-                onChange={(event) => setOpenClawReason(event.target.value)}
-              />
-            </label>
-            <label htmlFor="openclaw-operation-session">
-              Control session
-              <select
-                id="openclaw-operation-session"
-                data-testid="openclaw-operation-session"
-                value={selectedOpenClawSessionId}
-                onChange={(event) => setSelectedOpenClawSessionId(event.target.value)}
-              >
-                <option value="">No session binding</option>
-                {activeOpenClawSessions.map((session) => (
-                  <option key={session.id} value={session.id}>
-                    {session.id} - {session.target}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <div className="action-row">
-              <button
-                type="button"
-                data-testid="openclaw-create-operation"
-                disabled={createOpenClawOperation.isPending}
-                onClick={() => createOpenClawOperation.mutate()}
-              >
-                Request approval
-              </button>
-              <button
-                type="button"
-                data-testid="openclaw-approve-operation"
-                disabled={!openClawOperation || openClawOperation.status !== "waiting_user_approval" || approveOpenClawOperation.isPending}
-                onClick={() => approveOpenClawOperation.mutate()}
-              >
-                Approve
-              </button>
-              <button
-                type="button"
-                data-testid="openclaw-reject-operation"
-                disabled={!openClawOperation || openClawOperation.status !== "waiting_user_approval" || rejectOpenClawOperation.isPending}
-                onClick={() => rejectOpenClawOperation.mutate()}
-              >
-                Reject
-              </button>
-              <button
-                type="button"
-                data-testid="openclaw-execute-operation"
-                disabled={!openClawOperation || openClawOperation.status !== "approved" || executeOpenClawOperation.isPending}
-                onClick={() => executeOpenClawOperation.mutate()}
-              >
-                Execute
-              </button>
-            </div>
-            {openClawOperation ? (
-              <p role="status">
-                OpenClaw operation {openClawOperation.id}: {openClawOperation.status}
-              </p>
-            ) : null}
-            {openClawExecutionOutput ? <pre data-testid="openclaw-execution-output">{openClawExecutionOutput}</pre> : null}
-            {createOpenClawOperation.isError ? (
-              <p role="alert">{formatApiError(createOpenClawOperation.error, "OpenClaw request failed")}</p>
-            ) : null}
-            {approveOpenClawOperation.isError ? (
-              <p role="alert">{formatApiError(approveOpenClawOperation.error, "OpenClaw approval failed")}</p>
-            ) : null}
-            {rejectOpenClawOperation.isError ? (
-              <p role="alert">{formatApiError(rejectOpenClawOperation.error, "OpenClaw rejection failed")}</p>
-            ) : null}
-            {executeOpenClawOperation.isError ? (
-              <p role="alert">{formatApiError(executeOpenClawOperation.error, "OpenClaw execution failed")}</p>
-            ) : null}
+            <Link className="secondary-action" to="/openclaw">打开 OpenClaw 控制</Link>
           </div>
         </fieldset>
-
         <h3>主 Agent 全局临场策略</h3>
         <p className="field-help">
           这里控制所有工作流共用的调度边界。工作流只定义模板；主 Agent 能不能临场调整、能不能申请临时子 Agent，

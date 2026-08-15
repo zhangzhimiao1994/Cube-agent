@@ -292,8 +292,6 @@ describe("ConfigPage", () => {
     await user.click(screen.getByLabelText("允许主 Agent 在能力不足时申请临时子 Agent"));
     await user.click(screen.getByTestId("vibe-coding-toggle"));
     await user.click(screen.getByTestId("multimedia-generation-toggle"));
-    await user.click(screen.getByTestId("openclaw-toggle"));
-    await user.selectOptions(screen.getByLabelText("OpenClaw 权限模式"), "read_only");
     fireEvent.change(screen.getByLabelText(/临时 Agent 补位规则/), {
       target: { value: "缺少专业能力时先申请临时 Agent，任务结束后询问是否永久保存。" },
     });
@@ -311,8 +309,6 @@ describe("ConfigPage", () => {
         allow_temporary_agents: true,
         vibe_coding_enabled: true,
         multimedia_generation_enabled: true,
-        openclaw_enabled: true,
-        openclaw_mode: "read_only",
         openclaw_allowed_commands: [],
         temporary_agent_policy: "缺少专业能力时先申请临时 Agent，任务结束后询问是否永久保存。",
       },
@@ -332,164 +328,14 @@ describe("ConfigPage", () => {
 
     expect((await screen.findByRole("alert")).textContent).toContain("JSON 解析失败");
   });
-  it("runs the OpenClaw approval and execution console from settings", async () => {
-    const user = userEvent.setup();
+  it("keeps OpenClaw management in the dedicated control page", async () => {
     render(<TestApp initialPath="/config" />);
 
-    const allowedCommands = await screen.findByTestId("openclaw-allowed-commands");
-    fireEvent.change(allowedCommands, { target: { value: `[["python","-c","print('ui-openclaw-ok')"]]` } });
-    await user.click(screen.getByTestId("save-system-settings"));
-
-    await waitFor(() => {
-      expect(requests.find((request) => request.path === "/api/v1/admin/settings")).toMatchObject({
-        method: "PUT",
-        body: {
-          ...settings,
-          openclaw_allowed_commands: [["python", "-c", "print('ui-openclaw-ok')"]],
-        },
-      });
-    });
-
-    fireEvent.change(screen.getByTestId("openclaw-operation-argv"), {
-      target: { value: `["python","-c","print('ui-openclaw-ok')"]` },
-    });
-    await user.click(screen.getByTestId("openclaw-create-operation"));
-    expect(await screen.findByText(/waiting_user_approval/)).not.toBeNull();
-
-    await user.click(screen.getByTestId("openclaw-approve-operation"));
-    expect(await screen.findByText(/approved/)).not.toBeNull();
-
-    await user.click(screen.getByTestId("openclaw-execute-operation"));
-    expect((await screen.findByTestId("openclaw-execution-output")).textContent).toContain("ui-openclaw-ok");
-  });
-
-  it("adds and removes OpenClaw remote adapters through dedicated controls", async () => {
-    const user = userEvent.setup();
-    render(<TestApp initialPath="/config" />);
-
-    await screen.findByRole("heading", { name: "系统设置" });
-    await user.selectOptions(screen.getByTestId("openclaw-adapter-platform"), "windows");
-    await user.selectOptions(screen.getByTestId("openclaw-adapter-target-type"), "computer");
-    fireEvent.change(screen.getByTestId("openclaw-adapter-target"), { target: { value: "reporting-pc" } });
-    fireEvent.change(screen.getByTestId("openclaw-adapter-base-url"), { target: { value: "http://127.0.0.1:8765" } });
-    fireEvent.change(screen.getByTestId("openclaw-adapter-credential-ref"), {
-      target: { value: "secret://openclaw-reporting-pc" },
-    });
-
-    await user.click(screen.getByTestId("openclaw-add-remote-adapter"));
-    expect(screen.getByText("computer · reporting-pc")).not.toBeNull();
-    await user.click(screen.getByTestId("save-system-settings"));
-
-    await waitFor(() => {
-      expect(requests.filter((request) => request.path === "/api/v1/admin/settings").at(-1)).toMatchObject({
-        method: "PUT",
-        body: expect.objectContaining({
-          openclaw_remote_adapters: [
-            {
-              platform: "windows",
-              target_type: "computer",
-              target: "reporting-pc",
-              base_url: "http://127.0.0.1:8765",
-              credential_ref: "secret://openclaw-reporting-pc",
-            },
-          ],
-        }),
-      });
-    });
-
-    await user.click(screen.getByTestId("openclaw-remove-remote-adapter-0"));
-    await user.click(screen.getByTestId("save-system-settings"));
-
-    await waitFor(() => {
-      expect(requests.filter((request) => request.path === "/api/v1/admin/settings").at(-1)).toMatchObject({
-        method: "PUT",
-        body: expect.objectContaining({ openclaw_remote_adapters: [] }),
-      });
-    });
-  });
-  it("saves configured OpenClaw remote adapters as secret references", async () => {
-    const user = userEvent.setup();
-    render(<TestApp initialPath="/config" />);
-
-    const remoteAdapters = [
-      {
-        platform: "windows",
-        target_type: "server",
-        target: "desktop",
-        base_url: "http://127.0.0.1:8765",
-        credential_ref: "secret://openclaw-adapter",
-      },
-    ];
-    fireEvent.change(await screen.findByTestId("openclaw-remote-adapters"), {
-      target: { value: JSON.stringify(remoteAdapters) },
-    });
-    await user.click(screen.getByTestId("save-system-settings"));
-
-    await waitFor(() => {
-      expect(requests.find((request) => request.path === "/api/v1/admin/settings")).toMatchObject({
-        method: "PUT",
-        body: expect.objectContaining({ openclaw_remote_adapters: remoteAdapters }),
-      });
-    });
-  });
-
-  it("shows OpenClaw adapter availability in settings", async () => {
-    render(<TestApp initialPath="/config" />);
-
-    expect(await screen.findByText("linux server_command")).not.toBeNull();
-    expect(screen.getByText("available")).not.toBeNull();
-    expect(screen.getByText("windows server_command")).not.toBeNull();
-    expect(screen.getByText("adapter_unavailable")).not.toBeNull();
-    expect(screen.getByText(/remote-windows-host/)).not.toBeNull();
-  });
-
-  it("binds OpenClaw operation requests to the selected active session", async () => {
-    const user = userEvent.setup();
-    render(<TestApp initialPath="/config" />);
-
-    await user.click(await screen.findByTestId("openclaw-create-session"));
-    expect((await screen.findAllByText(/openclaw_session_ui_test/)).length).toBeGreaterThan(0);
-    expect(screen.getByTestId("openclaw-operation-session")).toHaveProperty("value", "openclaw_session_ui_test");
-
-    const allowedCommands = screen.getByTestId("openclaw-allowed-commands");
-    fireEvent.change(allowedCommands, { target: { value: `[["python","-c","print('ui-openclaw-ok')"]]` } });
-    await user.click(screen.getByText("保存系统设置"));
-
-    fireEvent.change(screen.getByTestId("openclaw-operation-argv"), {
-      target: { value: `["python","-c","print('ui-openclaw-ok')"]` },
-    });
-    await user.click(screen.getByTestId("openclaw-create-operation"));
-
-    expect(requests.find((request) => request.path === "/api/v1/admin/openclaw/operations")).toMatchObject({
-      method: "POST",
-      body: expect.objectContaining({ session_id: "openclaw_session_ui_test" }),
-    });
-  });
-
-  it("manages OpenClaw control sessions from settings", async () => {
-    const user = userEvent.setup();
-    render(<TestApp initialPath="/config" />);
-
-    await user.click(await screen.findByTestId("openclaw-create-session"));
-    expect((await screen.findAllByText(/openclaw_session_ui_test/)).length).toBeGreaterThan(0);
-    expect(screen.getByText("active")).not.toBeNull();
-    expect(requests.find((request) => request.path === "/api/v1/admin/openclaw/sessions")).toMatchObject({
-      method: "POST",
-      body: {
-        platform: "linux",
-        target_type: "server",
-        target: "agent-hub-server",
-        purpose: "Keep a bounded OpenClaw control session for server maintenance",
-      },
-    });
-
-    await user.click(screen.getByTestId("openclaw-pause-session-openclaw_session_ui_test"));
-    expect(await screen.findByText("paused")).not.toBeNull();
-
-    await user.click(screen.getByTestId("openclaw-resume-session-openclaw_session_ui_test"));
-    expect(await screen.findByText("active")).not.toBeNull();
-
-    await user.click(screen.getByTestId("openclaw-stop-session-openclaw_session_ui_test"));
-    expect(await screen.findByText("stopped")).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "系统设置" })).not.toBeNull();
+    expect(screen.getByRole("region", { name: "OpenClaw 配置入口" })).not.toBeNull();
+    expect(screen.getByText(/allowlist 0 条，远程适配器 0 个/)).not.toBeNull();
+    expect(screen.getByRole("link", { name: "打开 OpenClaw 控制" }).getAttribute("href")).toBe("/openclaw");
+    expect(screen.queryByTestId("openclaw-create-operation")).toBeNull();
+    expect(screen.queryByTestId("openclaw-allowed-commands")).toBeNull();
   });
 });
