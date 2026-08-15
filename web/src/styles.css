@@ -3669,3 +3669,107 @@ article:hover {
     min-width: 7.5rem;
   }
 }
+
+/* P3 conversation history drawer compactness. */
+.conversation-list {
+  border-radius: 8px;
+  gap: 0.4rem;
+  padding: 0.6rem;
+  width: min(360px, calc(100vw - 1.5rem));
+}
+
+.conversation-bulk-actions {
+  align-items: center;
+  border-radius: 8px;
+  display: grid;
+  gap: 0.35rem;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 0.45rem;
+}
+
+.conversation-bulk-actions .inline-check {
+  font-size: 0.78rem;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.conversation-bulk-actions button {
+  border-radius: 8px;
+  font-size: 0.78rem;
+  min-height: 1.9rem;
+  padding: 0.3rem 0.5rem;
+  white-space: nowrap;
+}
+
+.conversation-bulk-actions small {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 850;
+  grid-column: 1 / -1;
+}
+
+.conversation-row {
+  border-radius: 8px;
+  gap: 0.28rem;
+  min-height: 3rem;
+  padding: 0.34rem;
+}
+
+.conversation-select {
+  height: 1rem;
+  margin: 0;
+  width: 1rem;
+}
+
+.conversation-item {
+  border-radius: 8px;
+  gap: 0.12rem;
+  overflow: hidden;
+  padding: 0.18rem 0.22rem;
+}
+
+.conversation-mode-chip,
+.conversation-meta-line {
+  line-height: 1.2;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversation-title-text {
+  font-size: 0.92rem;
+  line-height: 1.28;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  .conversation-list {
+    border-radius: 8px 0 0 8px;
+    bottom: 0;
+    max-height: none;
+    right: 0;
+    top: 4.45rem;
+    width: min(86vw, 360px);
+  }
+
+  .conversation-bulk-actions {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .conversation-row {
+    grid-template-columns: 1rem minmax(0, 1fr) auto;
+    min-height: 2.65rem;
+  }
+
+  .conversation-title-text {
+    font-size: 0.86rem;
+  }
+
+  .conversation-delete-button {
+    border-radius: 8px;
+  }
+}

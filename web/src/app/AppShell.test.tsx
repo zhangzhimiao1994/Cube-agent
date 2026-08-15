@@ -154,5 +154,9 @@ describe("AppShell presentation", () => {
     expect(stylesCss).toMatch(/@media \(max-width: 980px\)[\s\S]*\.nav-floating \.nav-list,[\s\S]*\.nav-floating \.nav-drawer\s*{[\s\S]*display:\s*none;/);
     expect(stylesCss).toMatch(/@media \(max-width: 980px\)[\s\S]*\.nav-floating \.mobile-nav-groups\s*{[\s\S]*display:\s*grid;/);
     expect(stylesCss).toMatch(/\.history-drawer-open \.chat-panel\s*{[\s\S]*opacity:\s*0\.38;[\s\S]*pointer-events:\s*none;/);
+    expect(stylesCss).toContain("P3 conversation history drawer compactness");
+    expect(stylesCss).toMatch(/\.conversation-list\s*{[\s\S]*border-radius:\s*8px;[\s\S]*width:\s*min\(360px, calc\(100vw - 1\.5rem\)\);/);
+    expect(stylesCss).toMatch(/\.conversation-title-text\s*{[\s\S]*text-overflow:\s*ellipsis;[\s\S]*white-space:\s*nowrap;/);
+    expect(stylesCss).toMatch(/@media \(max-width: 640px\)[\s\S]*\.conversation-list\s*{[\s\S]*width:\s*min\(86vw, 360px\);/);
   });
 });

@@ -1,3 +1,31 @@
+## 2026-08-15 Conversation History Drawer Compactness
+
+### State
+- Tightened the chat history right drawer on `/`: conversation rows now use compact 8px-radius list items instead of large rounded blocks, titles are single-line ellipsized, and mode/status text has dedicated classes for mobile-safe layout.
+- Shortened the conversation bulk-delete controls to `全选可删`, `删除已选（n）`, and `已选 n` while keeping the full accessible label `批量删除已选会话 n 条`.
+- Kept the right drawer behavior intact: opening history closes the left mobile navigation, the chat panel becomes a translucent inactive backdrop, and choosing a history item switches into that conversation.
+- Reconfirmed the Feishu robot channel command UX from the previous slice: `/channels` still shows standard interaction commands and currently effective custom aliases, and `FEISHU_COMMAND_ALIASES` remains the operator-configurable custom command field.
+
+### Verification
+- `npm test -- --run src/pages/OperationalPages.test.tsx src/app/AppShell.test.tsx` from `web/` -> 64 passed.
+- `npm test -- --run src/pages/ChannelsPage.test.tsx` from `web/` -> 5 passed.
+- `npm run lint` from `web/` -> passed.
+- `npm run build` from `web/` -> passed with the existing Vite large chunk warning; active build files include `web/dist/assets/index-BuvqNOgX.js` and `web/dist/assets/index-DvSJOsuV.css`.
+- `git diff --check` -> passed with only CRLF normalization warnings for touched frontend files.
+
+### Server Deployment And Real Probe
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-chat-history-compact-20260815-104706.tgz` and uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`; server backup retained under `/opt/agent-hub/backups/p3-chat-history-compact-20260815-104706`.
+- Server archive retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-chat-history-compact-20260815-104706.tgz`.
+- Real server probe called `/health`, loaded `/`, resolved active frontend assets, and verified deployed bundle markers for `全选可删`, `删除已选`, `批量删除已选会话`, `conversation-title-text`, `width:min(86vw,360px)`, `border-radius:8px 0 0 8px`, `飞书通道交互指令`, and `当前生效的自定义指令`.
+- `caddy`, `agent-hub-api`, and `agent-hub-worker` were active after deployment.
+- Removed server `/tmp/deploy-chat-history-compact.sh`, `/tmp/probe-chat-history-compact.py`, and `/tmp/agent-hub-p3-runtime-incremental.tgz` after verification.
+
+### GitHub / Recovery
+- Pending: commit, create local recovery bundle and GitHub archive tag, force-with-lease push `mutilagent/main`, then check GitHub Actions.
+
+### Remaining / Next
+- Continue remaining P3 backlog after GitHub green: OpenClaw follow-ups if requested, evolution and long-memory refinements, bulk action/search/filter audit across dense pages, overall UI copy/layout audit, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 Multi-Skill Archive And Feishu Command UX
 
 ### State

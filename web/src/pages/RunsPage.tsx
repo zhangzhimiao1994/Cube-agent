@@ -2188,17 +2188,18 @@ export function RunsPage() {
                   disabled={deletableConversationIds.length === 0 || bulkDeleteRuns.isPending}
                   onChange={toggleAllConversations}
                 />
-                全选可删除会话
+                全选可删
               </label>
               <button
                 type="button"
                 className="secondary-action"
+                aria-label={`批量删除已选会话 ${selectedDeletableConversationIds.length} 条`}
                 disabled={selectedDeletableConversationIds.length === 0 || bulkDeleteRuns.isPending}
                 onClick={deleteSelectedConversations}
               >
-                {bulkDeleteRuns.isPending ? "删除中..." : `批量删除已选会话（${selectedDeletableConversationIds.length}）`}
+                {bulkDeleteRuns.isPending ? "删除中..." : `删除已选（${selectedDeletableConversationIds.length}）`}
               </button>
-              <small>当前结果已选 {selectedDeletableConversationIds.length}</small>
+              <small>已选 {selectedDeletableConversationIds.length}</small>
             </div>
           ) : null}
           {items.length === 0 ? (
@@ -2231,9 +2232,9 @@ export function RunsPage() {
                       setHistoryOpen(false);
                     }}
                   >
-                    <span>{displayMode(run.mode)}</span>
-                    <strong>{title}</strong>
-                    <small>{run.status}</small>
+                    <span className="conversation-mode-chip">{displayMode(run.mode)}</span>
+                    <strong className="conversation-title-text">{title}</strong>
+                    <small className="conversation-meta-line">{run.status}</small>
                   </button>
                   <button
                     type="button"
