@@ -1230,6 +1230,220 @@ def test_role_model_assignment_balances_repeated_roles_across_available_capacity
     assert len(set(assigned_models)) >= 3
     assert assigned_models.count("deepseek") < len(assigned_models)
 
+
+def test_role_model_assignment_rewards_matching_model_capabilities() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "deepseek": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-v4-flash",
+                            "api_base": "https://api.deepseek.com/v1",
+                            "credential_ref": "secret://deepseek",
+                            "quota_scope_id": "deepseek",
+                            "max_concurrency": 20,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "tool_calling", "structured_output"],
+                        }
+                    ]
+                },
+                "qwen_audio": {
+                    "deployments": [
+                        {
+                            "provider": "qwen",
+                            "model": "qwen-audio-plus",
+                            "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                            "credential_ref": "secret://qwen",
+                            "quota_scope_id": "qwen",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "audio", "structured_output"],
+                        }
+                    ]
+                },
+            },
+            "agents": [],
+        }
+    )
+    role = RoleAssignment(
+        id="meeting_summarizer",
+        role="会议纪要整理",
+        purpose=RolePurpose.EXECUTE,
+        mission="理解录音内容，整理会议纪要和待办事项。",
+        must_answer=("会议结论和待办是什么？",),
+        allowed_tools=(),
+        forbidden_actions=("不要执行危险操作。",),
+        skills=(),
+        output_schema={},
+        model="deepseek",
+    )
+
+    assigned = _assign_models_to_roles(
+        (role,),
+        config,
+        default_model="deepseek",
+        task="请分析这段语音录音并整理会议纪要。",
+    )
+
+    assert assigned[0].model == "qwen_audio"
+
+
+
+def test_role_model_assignment_rewards_ordinary_model_characteristics() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "deepseek": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-v4-flash",
+                            "api_base": "https://api.deepseek.com/v1",
+                            "credential_ref": "secret://deepseek",
+                            "quota_scope_id": "deepseek",
+                            "max_concurrency": 20,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "tool_calling", "structured_output"],
+                        }
+                    ]
+                },
+                "sonnet5": {
+                    "deployments": [
+                        {
+                            "provider": "claude-code-relay",
+                            "model": "claude-sonnet-5",
+                            "api_base": "https://relay.example/v1",
+                            "credential_ref": "secret://sonnet",
+                            "quota_scope_id": "sonnet",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "tool_calling", "structured_output"],
+                        }
+                    ]
+                },
+            },
+            "agents": [],
+        }
+    )
+    role = RoleAssignment(
+        id="quality_reviewer",
+        role="质量审查",
+        purpose=RolePurpose.EXPERTISE,
+        mission="复核方案质量、证据链、风险和遗漏项。",
+        must_answer=("是否通过质量审查？",),
+        allowed_tools=(),
+        forbidden_actions=("不要执行危险操作。",),
+        skills=(),
+        output_schema={},
+        model="deepseek",
+    )
+
+    assigned = _assign_models_to_roles(
+        (role,),
+        config,
+        default_model="deepseek",
+        task="请对这个方案做质量审查、风险复核和遗漏检查。",
+    )
+
+    assert assigned[0].model == "sonnet5"
+def test_general_role_model_assignment_uses_more_configured_text_models() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "deepseek": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-v4-flash",
+                            "api_base": "https://api.deepseek.com/v1",
+                            "credential_ref": "secret://deepseek",
+                            "quota_scope_id": "deepseek",
+                            "max_concurrency": 20,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "tool_calling", "structured_output"],
+                        }
+                    ]
+                },
+                "qwen": {
+                    "deployments": [
+                        {
+                            "provider": "qwen",
+                            "model": "qwen3-max",
+                            "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                            "credential_ref": "secret://qwen",
+                            "quota_scope_id": "qwen",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "tool_calling", "structured_output"],
+                        }
+                    ]
+                },
+                "glm": {
+                    "deployments": [
+                        {
+                            "provider": "zhipu",
+                            "model": "glm-5.2",
+                            "api_base": "https://open.bigmodel.cn/api/paas/v4",
+                            "credential_ref": "secret://glm",
+                            "quota_scope_id": "glm",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "tool_calling", "structured_output"],
+                        }
+                    ]
+                },
+                "sonnet5": {
+                    "deployments": [
+                        {
+                            "provider": "claude-code-relay",
+                            "model": "claude-sonnet-5",
+                            "api_base": "https://relay.example/v1",
+                            "credential_ref": "secret://sonnet",
+                            "quota_scope_id": "sonnet",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "tool_calling", "structured_output"],
+                        }
+                    ]
+                },
+            },
+            "agents": [],
+        }
+    )
+    roles = tuple(
+        RoleAssignment(
+            id=f"general_{index}",
+            role="通用助手",
+            purpose=RolePurpose.EXECUTE,
+            mission="整理信息并给出可执行建议。",
+            must_answer=("建议是什么？",),
+            allowed_tools=(),
+            forbidden_actions=("不要执行危险操作。",),
+            skills=(),
+            output_schema={},
+            model="deepseek",
+        )
+        for index in range(4)
+    )
+
+    assigned = _assign_models_to_roles(
+        roles,
+        config,
+        default_model="deepseek",
+        task="帮我整理这个普通问题的思路和建议。",
+    )
+
+    assert len({role.model for role in assigned}) == 4
 def test_dispatch_parallelism_uses_model_capacity_without_unbounded_fanout() -> None:
     config = PlatformConfig.model_validate(
         {

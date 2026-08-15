@@ -1,3 +1,37 @@
+# Handoff - 2026-08-15 18:05 CST - Model Trait Weighted Role Assignment
+
+## Current state
+- Followed up on the capacity-aware role assignment fix after the user clarified that ordinary language models also have distinct strengths, not only multimedia/generation models.
+- Extended the role-model scorer from capacity balancing alone to three layers: task requirement traits, inferred model traits, then capacity/diversity adjustment.
+- The model trait inference now recognizes provider/model characteristics such as `qwen` for Chinese/code/tool use, `glm` for Chinese reasoning/analysis, `claude/sonnet` for review/reasoning/writing, `deepseek` for reasoning/analysis/code, `kimi/moonshot` for creative writing, and explicit capability fields such as `audio`, `vision`, `tool_calling`, and `structured_output`.
+- General text tasks now get an unused-model participation bonus so early roles cover more configured models when no specialist trait dominates.
+
+## Changed
+- `src/agent_hub/runtime/defaults.py`
+  - Added `_model_characteristics`, `_task_characteristics`, and `_task_characteristic_score`.
+  - Role ranking now rewards models whose inferred traits match the task and role text before applying capacity/diversity adjustment.
+  - Capacity adjustment now includes a first-use bonus so ordinary tasks make broader use of configured models.
+- `tests/unit/runtime/test_configured_runtime.py`
+  - Added tests for audio capability matching, ordinary model characteristic matching (`sonnet5` for quality review), and broad text-model participation for general tasks.
+
+## Verification
+- Red tests before implementation:
+  - `uv run pytest tests/unit/runtime/test_configured_runtime.py -k "matching_model_capabilities or ordinary_model_characteristics or general_role_model_assignment"` -> 3 failed: audio and review tasks selected `deepseek`, and ordinary task used only 3 of 4 models.
+- Local after fix:
+  - `uv run pytest tests/unit/runtime/test_configured_runtime.py -k "matching_model_capabilities or ordinary_model_characteristics or general_role_model_assignment"` -> 3 passed.
+  - `uv run pytest tests/unit/runtime/test_configured_runtime.py -k "role_model_selection or role_model_assignment or dispatch_parallelism"` -> 7 passed.
+  - `uv run ruff check src/agent_hub/runtime/defaults.py tests/unit/runtime/test_configured_runtime.py` -> passed.
+  - `uv run pytest tests/unit/runtime/test_configured_runtime.py` -> 24 passed.
+
+## Server deployment
+- Uploaded `.local-archives/server-incrementals/agent-hub-model-trait-routing-20260815-175756.tgz` to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current` and restarted `agent-hub-api` plus `agent-hub-worker`.
+- Server backup: `/opt/agent-hub/backups/p3-model-trait-routing-20260815-175756`.
+- Server retained archive: `/opt/agent-hub/archives/server-incrementals/agent-hub-model-trait-routing-20260815-175756.tgz`.
+- Server production-config probe: `{"status":"ok","published_version":73,"audio_assigned":"qwen","review_assigned":"sonnet5","general_assigned_models":["qwen","glm","minimax","deepseek"]}`.
+
+## Remaining / next
+- Commit this slice, retain GitHub recovery archive/tag, push `mutilagent/main`, and verify Actions.
 # Handoff - 2026-08-15 17:40 CST - Capacity-Aware Role Model Assignment
 
 ## Current state

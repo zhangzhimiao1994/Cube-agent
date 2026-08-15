@@ -9,7 +9,7 @@ from decimal import Decimal
 from typing import Protocol
 from uuid import UUID
 
-from agent_hub.config.schema import PlatformConfig
+from agent_hub.config.schema import LogicalModelDefinition, PlatformConfig
 from agent_hub.config.service import ConfigService
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.capacity import (
@@ -992,7 +992,8 @@ def _capacity_adjusted_model_score(
     score, length_tiebreaker, logical_model = ranked_item
     used = assigned_counts.get(logical_model, 0)
     capacity = max(1, capacities.get(logical_model, 1))
-    adjusted = score - min(used, capacity) * 6
+    unused_bonus = 10 if used == 0 else 0
+    adjusted = score + unused_bonus - min(used, capacity) * 6
     if used >= capacity:
         adjusted -= (used - capacity + 1) * 24
     return adjusted, -used, length_tiebreaker, logical_model
@@ -1076,6 +1077,8 @@ def _rank_logical_models_for_role(
         if logical_model == default_model:
             score += 1
         score += min(8, sum(deployment.max_concurrency for deployment in definition.deployments) // 2)
+        characteristics = _model_characteristics(logical_model, definition)
+        score += _task_characteristic_score(text, characteristics)
         if any(keyword in text for keyword in ("code", "代码", "网页", "web", "前端", "后端", "api", "github", "测试", "部署")):
             if any(keyword in haystack for keyword in ("coder", "code", "qwen", "program")):
                 score += 30
@@ -1103,6 +1106,102 @@ def _rank_logical_models_for_role(
     scored.sort(reverse=True)
     return scored
 
+
+def _model_characteristics(
+    logical_model: str,
+    definition: LogicalModelDefinition,
+) -> frozenset[str]:
+    joined = " ".join(
+        (
+            logical_model,
+            " ".join(
+                f"{deployment.provider} {deployment.model}"
+                for deployment in definition.deployments
+            ),
+        )
+    ).lower()
+    characteristics: set[str] = {"text", "general"}
+    for deployment in definition.deployments:
+        for capability in deployment.capabilities:
+            value = str(capability).lower()
+            characteristics.add(value)
+            if value == "tool_calling":
+                characteristics.add("tool")
+            if value == "structured_output":
+                characteristics.add("structured")
+            if value == "vision":
+                characteristics.update(("image", "multimodal"))
+            if value == "audio":
+                characteristics.update(("speech", "voice", "multimodal"))
+    if any(keyword in joined for keyword in ("qwen", "通义", "dashscope")):
+        characteristics.update(("chinese", "code", "tool", "structured", "general"))
+    if any(keyword in joined for keyword in ("glm", "zhipu", "智谱")):
+        characteristics.update(("chinese", "reasoning", "analysis", "structured", "general"))
+    if any(keyword in joined for keyword in ("claude", "sonnet", "anthropic")):
+        characteristics.update(("reasoning", "review", "writing", "code", "synthesis"))
+    if any(keyword in joined for keyword in ("kimi", "moonshot", "creative", "story")):
+        characteristics.update(("creative", "writing", "chinese", "general"))
+    if "deepseek" in joined:
+        characteristics.update(("reasoning", "analysis", "code", "general"))
+    if any(keyword in joined for keyword in ("minimax", "m3", "abab")):
+        characteristics.update(("chinese", "creative", "writing", "general"))
+    return frozenset(characteristics)
+
+
+def _task_characteristics(text: str) -> frozenset[str]:
+    characteristics: set[str] = set()
+    if any(keyword in text for keyword in ("语音", "录音", "音频", "听写", "转写", "speech", "audio", "voice")):
+        characteristics.add("audio")
+    if any(keyword in text for keyword in ("图片", "识图", "视觉", "图像", "截图", "image", "vision")):
+        characteristics.add("vision")
+    if any(keyword in text for keyword in ("code", "代码", "网页", "web", "前端", "后端", "api", "github", "测试", "部署")):
+        characteristics.add("code")
+    if any(keyword in text for keyword in ("质量", "审查", "复核", "验收", "评审", "review", "audit")):
+        characteristics.add("review")
+    if any(keyword in text for keyword in ("分析", "调研", "研究", "经济", "金融", "市场", "竞品", "风险")):
+        characteristics.add("analysis")
+    if any(keyword in text for keyword in ("文案", "脚本", "短剧", "视频", "导演", "剪辑", "prompt", "提示词", "creative", "story")):
+        characteristics.add("creative")
+    if any("\u4e00" <= char <= "\u9fff" for char in text):
+        characteristics.add("chinese")
+    if not characteristics:
+        characteristics.add("general")
+    return frozenset(characteristics)
+
+
+def _task_characteristic_score(text: str, characteristics: frozenset[str]) -> int:
+    task_characteristics = _task_characteristics(text)
+    score = 0
+    if "audio" in task_characteristics:
+        score += 36 if "audio" in characteristics else -18
+    if "vision" in task_characteristics:
+        score += 36 if "vision" in characteristics else -18
+    if "code" in task_characteristics:
+        if "code" in characteristics:
+            score += 18
+        if "tool_calling" in characteristics or "tool" in characteristics:
+            score += 8
+    if "review" in task_characteristics:
+        if "review" in characteristics:
+            score += 30
+        if "reasoning" in characteristics:
+            score += 8
+        if "structured" in characteristics or "structured_output" in characteristics:
+            score += 6
+    if "analysis" in task_characteristics:
+        if "analysis" in characteristics or "reasoning" in characteristics:
+            score += 18
+        if "structured" in characteristics or "structured_output" in characteristics:
+            score += 8
+    if "creative" in task_characteristics and (
+        "creative" in characteristics or "writing" in characteristics
+    ):
+        score += 18
+    if "chinese" in task_characteristics and "chinese" in characteristics:
+        score += 5
+    if "general" in task_characteristics and ("general" in characteristics or "text" in characteristics):
+        score += 4
+    return score
 
 def _requested_skills(context: TaskContext) -> tuple[str, ...]:
     value = context.routing_decision.get("requested_skills")
