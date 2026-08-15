@@ -22,7 +22,10 @@
 - Removed server `/tmp/deploy-chat-history-compact.sh`, `/tmp/probe-chat-history-compact.py`, and `/tmp/agent-hub-p3-runtime-incremental.tgz` after verification.
 
 ### GitHub / Recovery
-- Pending: commit, create local recovery bundle and GitHub archive tag, force-with-lease push `mutilagent/main`, then check GitHub Actions.
+- Committed as `332b49c fix: compact chat history drawer`.
+- Created local GitHub recovery bundle `.local-archives/github-recovery/mutilagent-main-before-20260815-104949-481797f.bundle` and pushed GitHub archive tag `archive/mutilagent-main-before-20260815-104949-481797f`.
+- Force-with-lease pushed `mutilagent/main`; GitHub again reported the repository has moved to `zhangzhimiao1994/CubeAgent.git`, but the configured `mutilagent` remote accepted the push.
+- GitHub Actions run `31860226366` (`quality`) passed.
 
 ### Remaining / Next
 - Continue remaining P3 backlog after GitHub green: OpenClaw follow-ups if requested, evolution and long-memory refinements, bulk action/search/filter audit across dense pages, overall UI copy/layout audit, README/README.zh-CN usage refresh, and Docker readiness later.
