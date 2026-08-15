@@ -1,3 +1,27 @@
+## 2026-08-15 README Usage Refresh
+
+### State
+- Updated `README.md` and `README.zh-CN.md` with clearer product usage guidance for the GitHub landing page.
+- Expanded the chat section into chat/evolution/modes: left/right drawers, first-question-plus-timestamp conversation names, independent Handoff and Vibe Coding toggles, framework-level long-context compaction, Evolution trigger boundaries, schedule proposals, and grounded Skill creation through chat.
+- Expanded the channel section with Feishu long-connection guidance, explicit interaction commands, and `FEISHU_COMMAND_ALIASES` custom alias examples.
+- This is documentation only; no runtime code changed.
+
+### Verification
+- Confirmed README-linked docs exist: installation, operations, model pools, skills/MCP, Hermes, Feishu setup, security, and troubleshooting.
+- Confirmed README markers exist for `FEISHU_COMMAND_ALIASES`, `//帮助`, conversation framework / 对话框架, Skill creation / Skill 创建, OpenClaw, and MiniMax.
+- `git diff --check README.md README.zh-CN.md` -> passed.
+
+### Server Deployment And Real Probe
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-readme-usage-refresh-20260815-115221.tgz` and uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`; server backup retained under `/opt/agent-hub/backups/p3-readme-usage-refresh-20260815-115221`.
+- Server archive retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-readme-usage-refresh-20260815-115221.tgz`.
+- Real server probe verified README markers for `Chat, Evolution, And Modes`, `FEISHU_COMMAND_ALIASES`, `//帮助`, `对话、进化和模式`, `对话框架`, and `方案=//派单`.
+- `http://127.0.0.1:8000/health` returned `{"status":"ok"}`, and `caddy` plus `agent-hub-api` were active after deployment.
+- Removed server `/tmp/agent-hub-p3-runtime-incremental.tgz`, `/tmp/deploy-readme-usage-refresh.sh`, and `/tmp/probe-readme-usage-refresh.sh` after verification.
+
+### Remaining / Next
+- Commit this docs slice, create a GitHub recovery bundle/tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
+- Continue remaining P3 backlog after GitHub green: broader missing button/function sweep, remaining Evolution long-memory/executor refinements if gaps are found, OpenClaw follow-ups if requested, final UI copy/layout audit after modules stabilize, and Docker readiness later.
 ## 2026-08-15 Channel Action Layout Fix
 
 ### State

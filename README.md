@@ -77,7 +77,9 @@ Models are split into two categories.
 
 MiniMax/Hailuo video generation is implemented by the current multimedia executor. Other preset providers are stored and routed by capability, and can be extended by adding provider clients behind the common multimedia provider interface.
 
-## Chat And Modes
+## Chat, Evolution, And Modes
+
+The first screen is the actual work surface. Use the left navigation drawer for modules and the right conversation drawer for historical chats. Conversation names use the first user request plus a timestamp, so repeated topics stay distinguishable.
 
 The chat page supports:
 
@@ -87,9 +89,15 @@ The chat page supports:
 - `discuss`: run a discussion-style workflow.
 - `hybrid`: combine dispatch and discussion.
 
-Handoff and Vibe Coding are independent toggles. They can be enabled together, disabled before send, and are recorded in the submitted run. If the context becomes too long, the system can start a compressed continuation branch based on the main agent model context window.
+Handoff and Vibe Coding are independent toggles. They can be enabled together, disabled before send, and are recorded in the submitted run. Handoff provides a reference conversation; Vibe Coding stays inside chat as a coding collaboration mode rather than a standalone system module.
+
+Long conversations are handled by the conversation framework, not by the Evolution module. When the history approaches the main agent model context window, Agent Hub compacts older turns, keeps the origin goal and latest decisions, and passes the compacted context into the next run.
+
+Evolution is for durable asset improvement: Skill distillation, Darwin-style iteration, agent/workflow/prompt improvement, and score-gated candidate testing. Normal Q&A, one-off plans, and ordinary research do not enter Evolution unless the request asks to improve or create a durable asset.
 
 Schedule-like messages such as daily or weekly reminders are detected as schedule proposals. The system shows the plan first and only creates the schedule after confirmation.
+
+Skill creation requests should also start in chat. For example: `I want to create a research Skill for AI papers`. The main agent should collect the goal, sources, acceptance tasks, and safety boundary, then create a grounded Evolution run instead of installing an unverified Skill directly.
 
 ## OpenClaw
 
@@ -128,6 +136,20 @@ MCP servers are configured separately with transport, command or URL, allowed to
 ## Channels
 
 The channel layer connects external chat platforms to the main agent. The console includes configuration surfaces for Feishu, DingTalk, WeCom, WeChat, Telegram, Slack, QQ, and custom webhook entries. Feishu has first-class setup documentation and runtime integration.
+
+Feishu supports long connection mode with App ID and App Secret. Webhook mode remains available as a fallback when you need platform-side URL verification or event encryption.
+
+Feishu users can send explicit command prefixes instead of guessing the route:
+
+- `//自动`: let the main agent choose.
+- `//直连`: direct model answer.
+- `//派单`: dispatch to role agents.
+- `//讨论`: multi-role discussion and decision.
+- `//混合`: dispatch, discussion, and review together.
+- `//vi`: Vibe Coding.
+- `//帮助`: show the command menu without creating a task.
+
+Operators can customize command aliases in the Feishu channel field `FEISHU_COMMAND_ALIASES`, for example `Plan=//派单, Code=//vi, Menu=//帮助`. Saved aliases are shown in the channel page and in Feishu help replies.
 
 See [docs/feishu-setup.md](docs/feishu-setup.md).
 
