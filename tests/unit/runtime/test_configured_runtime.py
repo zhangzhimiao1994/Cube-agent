@@ -1506,6 +1506,68 @@ def test_role_model_assignment_uses_inferred_mainstream_model_traits() -> None:
 
     assert assigned[0].model == "gemini_pro"
 
+
+
+def test_role_model_assignment_avoids_messages_endpoint_for_tool_roles() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "sonnet5": {
+                    "deployments": [
+                        {
+                            "provider": "claude-code-relay",
+                            "model": "claude-sonnet-5",
+                            "api_base": "https://gsykj.com/v1/messages",
+                            "credential_ref": "secret://sonnet",
+                            "quota_scope_id": "sonnet",
+                            "max_concurrency": 3,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "tool_calling", "structured_output"],
+                        }
+                    ]
+                },
+                "qwen": {
+                    "deployments": [
+                        {
+                            "provider": "qwen",
+                            "model": "qwen3-max",
+                            "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                            "credential_ref": "secret://qwen",
+                            "quota_scope_id": "qwen",
+                            "max_concurrency": 2,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "tool_calling", "structured_output"],
+                        }
+                    ]
+                },
+            },
+            "agents": [],
+        }
+    )
+    role = RoleAssignment(
+        id="planner",
+        role="Planner",
+        purpose=RolePurpose.EXECUTE,
+        mission="拆解任务、定义步骤和验收标准。",
+        must_answer=("步骤是什么？",),
+        allowed_tools=("read_context",),
+        forbidden_actions=("不要执行危险操作。",),
+        skills=(),
+        output_schema={},
+        model="sonnet5",
+    )
+
+    assigned = _assign_models_to_roles(
+        (role,),
+        config,
+        default_model="sonnet5",
+        task="用混合的模式，给我生成一个北京的防汛方案",
+    )
+
+    assert assigned[0].model == "qwen"
+
 def test_dispatch_parallelism_uses_model_capacity_without_unbounded_fanout() -> None:
     config = PlatformConfig.model_validate(
         {

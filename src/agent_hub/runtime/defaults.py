@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import replace
 from decimal import Decimal
 from typing import Protocol
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from agent_hub.config.schema import LogicalModelDefinition, PlatformConfig
@@ -1078,6 +1079,8 @@ def _rank_logical_models_for_role(
         if logical_model == default_model:
             score += 1
         score += min(8, sum(deployment.max_concurrency for deployment in definition.deployments) // 2)
+        if role.allowed_tools and not _logical_model_supports_tool_roles(definition):
+            score -= 1000
         characteristics = _model_characteristics(logical_model, definition)
         score += _task_characteristic_score(text, characteristics)
         if any(keyword in text for keyword in ("code", "代码", "网页", "web", "前端", "后端", "api", "github", "测试", "部署")):
@@ -1107,6 +1110,19 @@ def _rank_logical_models_for_role(
     scored.sort(reverse=True)
     return scored
 
+
+def _logical_model_supports_tool_roles(definition: LogicalModelDefinition) -> bool:
+    return any(
+        "tool_calling" in {str(capability).lower() for capability in deployment.capabilities}
+        and not _is_messages_endpoint_api_base(deployment.api_base)
+        for deployment in definition.deployments
+    )
+
+
+def _is_messages_endpoint_api_base(api_base: str | None) -> bool:
+    if api_base is None:
+        return False
+    return urlsplit(api_base).path.rstrip("/").endswith("/messages")
 
 def _model_characteristics(
     logical_model: str,

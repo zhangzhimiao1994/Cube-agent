@@ -1,3 +1,41 @@
+# Handoff - 2026-08-15 18:45 CST - Avoid Messages Endpoint For Tool Roles
+
+## Current state
+- Investigated failed production run `e187f2d2-9bea-4c65-8a1e-48aaa7c1710e` after the user reported `model gateway failed: model transport failed`.
+- Production events showed dispatch roles were assigned as `planner=sonnet5`, `reviewer=sonnet5`, `project_manager=qwen`, `product_manager=glm`, and the first failure was `planner_step` on `sonnet5`.
+- Worker logs in the run time window showed `model_transport_unexpected_failure deployment_id=sonnet5_1 error_type=ValueError` twice.
+- Root cause: `sonnet5` is configured with `api_base=https://gsykj.com/v1/messages`. The transport treats `/messages` as a direct Anthropic Messages endpoint and explicitly does not support tool definitions there. Planner/Reviewer roles carried `read_context`, so routing selected a model/endpoint shape that cannot execute the tool-bearing request.
+
+## Changed
+- `src/agent_hub/runtime/defaults.py`
+  - Added tool-role endpoint compatibility checks during logical model ranking.
+  - A role with `allowed_tools` now receives a large penalty for logical models whose deployments cannot support tool calls because they are `/messages` endpoints or lack `tool_calling`.
+- `tests/unit/runtime/test_configured_runtime.py`
+  - Added a regression test proving a role with `read_context` avoids a `sonnet5` `/messages` deployment and selects an OpenAI-compatible tool-capable model instead.
+
+## Verification
+- Red test before implementation:
+  - `uv run pytest tests/unit/runtime/test_configured_runtime.py -k avoids_messages_endpoint_for_tool_roles` -> failed because the role selected `sonnet5`.
+- Local after fix:
+  - `uv run pytest tests/unit/runtime/test_configured_runtime.py -k "avoids_messages_endpoint_for_tool_roles or role_model_selection or role_model_assignment"` -> 7 passed.
+  - `uv run pytest tests/unit/models/test_profiles.py tests/unit/runtime/test_configured_runtime.py` -> 29 passed.
+  - `uv run ruff check src/agent_hub/runtime/defaults.py tests/unit/runtime/test_configured_runtime.py` -> passed.
+- GitHub Actions status before this fix:
+  - Previous pushed commit `c88acd0` run `31879738940` completed successfully.
+
+## Server deployment
+- Uploaded `.local-archives/server-incrementals/agent-hub-tool-endpoint-routing-20260815-183821.tgz` to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current` and restarted `agent-hub-api` plus `agent-hub-worker`.
+- Server backup: `/opt/agent-hub/backups/p3-tool-endpoint-routing-20260815-183821`.
+- Server retained archive: `/opt/agent-hub/archives/server-incrementals/agent-hub-tool-endpoint-routing-20260815-183821.tgz`.
+- Server service check: `agent-hub-api` active, `agent-hub-worker` active, `/health` returned `{"status":"ok"}`.
+- Server production-config probe: `{"status":"ok","published_version":73,"planner_assigned":"glm","reviewer_assigned":"glm","messages_endpoint_models":["sonnet5"]}`.
+- Server real execution check: submitted and executed dispatch run `2f085d63-2419-4448-b0f6-c5b93de864cc`; final status `completed`, failed events `[]`; Planner used `qwen`, Reviewer used `deepseek`, and no tool-bearing role used `sonnet5`.
+- Cleaned `/tmp/agent-hub-p3-runtime-incremental.tgz`, `/tmp/deploy-tool-endpoint-routing.sh`, and `/tmp/probe-tool-endpoint-routing.sh` after verification.
+
+## Remaining / next
+- Commit this slice, retain GitHub recovery archive/tag, push `mutilagent/main`, and verify Actions.
+
 # Handoff - 2026-08-15 18:20 CST - Extensible Model Trait Profiles
 
 ## Current state
