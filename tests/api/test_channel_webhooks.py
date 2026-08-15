@@ -1197,7 +1197,9 @@ def test_feishu_terminal_reply_summarizes_user_relevant_run_process() -> None:
             tenant_id=TENANT_ID,
             run_id=StructuredRunRepository.run_id,
             source_message_id="om_process_summary",
-            settings=FeishuSettings(app_id="cli_saved_feishu", app_secret="secret"),
+            settings=FeishuSettings.model_validate(
+                {"app_id": "cli_saved_feishu", "app_secret": "secret"}
+            ),
         )
 
     import asyncio

@@ -1,3 +1,12 @@
+## 2026-08-15 CI Mypy Follow-up For Feishu Alias Tests
+
+### State
+- Fixed GitHub Actions strict mypy failures from the previous commit: the Feishu receiver contract test now uses separate `webhook_receiver` and `websocket_receiver` variables, and the Feishu reply summary test constructs `FeishuSettings` through `model_validate` so pydantic secret coercion is explicit to mypy.
+- Runtime/server code was unchanged in this follow-up, so no additional server deploy was required.
+
+### Verification
+- `.\.venv\Scripts\python.exe -m mypy --strict src tests` -> passed for 264 source files.
+- `.\.venv\Scripts\python.exe -m pytest tests\contracts\feishu\test_receivers.py tests\api\test_channel_webhooks.py::test_feishu_terminal_reply_summarizes_user_relevant_run_process -q` -> 18 passed, only existing warnings.
 ## 2026-08-15 Feishu Command Aliases And Main Agent Concurrency Clarity
 
 ### State
