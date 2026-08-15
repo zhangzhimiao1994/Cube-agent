@@ -24,7 +24,10 @@
 - Removed server `/tmp/agent-hub-p3-runtime-incremental.tgz`, `/tmp/deploy-workflow-list-filters.sh`, `/tmp/probe-workflow-list-filters.sh`, and `/tmp/probe-api-health-workflow-list-filters.sh` after verification.
 
 ### GitHub / Recovery
-- Pending this slice: commit, local GitHub recovery bundle, archive tag push, force-with-lease push to `mutilagent/main`, and Actions verification.
+- Committed as `83a4967 fix: add workflow list filters`.
+- Created local GitHub recovery bundle `.local-archives/github-recovery/mutilagent-main-before-20260815-111445-7ff2d24.bundle` and pushed GitHub archive tag `archive/mutilagent-main-before-20260815-111445-7ff2d24`.
+- Force-with-lease pushed `mutilagent/main`; GitHub again reported the repository has moved to `zhangzhimiao1994/CubeAgent.git`, but the configured `mutilagent` remote accepted the push.
+- GitHub Actions run `31861321181` (`quality`) passed.
 
 ### Remaining / Next
 - Continue remaining P3 backlog after GitHub green: OpenClaw follow-ups if requested, evolution and long-memory refinements, broader missing button/function sweep, overall UI copy/layout audit, README/README.zh-CN usage refresh, and Docker readiness later.
