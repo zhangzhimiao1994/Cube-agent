@@ -983,6 +983,52 @@ article:hover {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.evolution-dashboard {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0.9rem 0 1rem;
+}
+
+.evolution-dashboard div {
+  background: rgba(3, 10, 20, 0.34);
+  border: 1px solid rgba(123, 225, 255, 0.16);
+  border-radius: 0.7rem;
+  display: grid;
+  gap: 0.25rem;
+  min-width: 0;
+  padding: 0.75rem;
+}
+
+.evolution-dashboard span {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 850;
+}
+
+.evolution-dashboard strong {
+  color: var(--text);
+  font-size: 1.35rem;
+  line-height: 1;
+}
+
+.evolution-record-header {
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.evolution-record-filters {
+  align-items: center;
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: minmax(11rem, 1fr) minmax(9.5rem, max-content) max-content;
+  min-width: min(100%, 36rem);
+}
+
+.evolution-record-filters .secondary-action {
+  width: auto;
+}
 .evolution-run-list {
   display: grid;
   gap: 0.75rem;
@@ -2329,6 +2375,45 @@ article:hover {
   min-width: 0;
 }
 
+.channel-command-guide {
+  background: rgba(8, 17, 31, 0.56);
+}
+
+.channel-command-guide p {
+  margin: 0;
+}
+
+.channel-command-grid {
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0.45rem 0;
+}
+
+.channel-command-grid div {
+  align-items: center;
+  background: rgba(3, 10, 20, 0.36);
+  border: 1px solid rgba(123, 225, 255, 0.14);
+  border-radius: 0.65rem;
+  display: grid;
+  gap: 0.2rem;
+  grid-template-columns: max-content minmax(0, 1fr);
+  padding: 0.55rem 0.65rem;
+}
+
+.channel-command-grid code {
+  color: var(--accent-2);
+  font-size: 0.86rem;
+  font-weight: 900;
+}
+
+.channel-command-grid span {
+  color: var(--muted);
+  font-size: 0.82rem;
+  min-width: 0;
+}
+
+
 .channel-config-actions {
   align-items: center;
   display: flex;
@@ -2980,6 +3065,15 @@ article:hover {
 
   .channel-config-actions button {
     min-height: 2.7rem;
+    width: 100%;
+  }
+  .evolution-dashboard,
+  .evolution-record-filters,
+  .channel-command-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .evolution-record-filters .secondary-action {
     width: 100%;
   }
 

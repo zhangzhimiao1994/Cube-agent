@@ -2394,11 +2394,28 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "进化" })).not.toBeNull();
     expect(screen.getByText(/普通问答、方案规划和对话上下文压缩属于对话框架/)).not.toBeNull();
+    const dashboard = screen.getByRole("region", { name: "进化执行看板" });
+    expect(dashboard).not.toBeNull();
+    await waitFor(() => expect(within(dashboard).getByText("总任务").closest("div")?.textContent).toContain("1"));
+    expect(within(dashboard).getByText("运行中").closest("div")?.textContent).toContain("1");
+    expect(within(dashboard).getByText("待审批").closest("div")?.textContent).toContain("0");
+    expect(within(dashboard).getByText("待执行").closest("div")?.textContent).toContain("1");
     const records = await screen.findByRole("region", { name: "进化任务" });
     expect(await within(records).findByText("Darwin Skill 迭代")).not.toBeNull();
     expect(within(records).getByText("agent-main-m3")).not.toBeNull();
     expect(within(records).getByText("run_next_round")).not.toBeNull();
     expect(within(records).getByText(/第 1 轮/)).not.toBeNull();
+
+    await user.type(screen.getByRole("searchbox", { name: "搜索进化任务" }), "不存在的任务");
+    expect(within(records).queryByText("Darwin Skill 迭代")).toBeNull();
+    expect(screen.getByText("没有符合筛选条件的进化任务。")).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "清空进化筛选" }));
+    expect(await within(records).findByText("Darwin Skill 迭代")).not.toBeNull();
+    await user.selectOptions(screen.getByLabelText("按进化状态筛选"), "pending_approval");
+    expect(within(records).queryByText("Darwin Skill 迭代")).toBeNull();
+    await user.selectOptions(screen.getByLabelText("按进化状态筛选"), "needs_action");
+    expect(await within(records).findByText("Darwin Skill 迭代")).not.toBeNull();
+    await user.selectOptions(screen.getByLabelText("按进化状态筛选"), "all");
 
     await user.clear(screen.getByLabelText("任务名称"));
     await user.type(screen.getByLabelText("任务名称"), "学术研究进化");

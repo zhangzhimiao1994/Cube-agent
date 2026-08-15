@@ -25,6 +25,43 @@ type ApprovalDraft = {
 };
 
 type AcceptedChoice = "auto" | "accept" | "reject";
+type EvolutionRunFilter = "all" | "running" | "waiting_approval" | "stopped" | "completed" | "pending_approval" | "needs_action";
+
+const ACTIONABLE_EVOLUTION_STEPS = new Set(["run_next_round", "review_baseline", "rollback_candidate"]);
+
+function textContains(value: string, query: string) {
+  return value.toLowerCase().includes(query.trim().toLowerCase());
+}
+
+function isEvolutionRunActionable(run: EvolutionRun) {
+  return run.status === "running" && ACTIONABLE_EVOLUTION_STEPS.has(run.next_action);
+}
+
+function evolutionRunSearchText(run: EvolutionRun) {
+  return [
+    run.id,
+    run.kind,
+    run.title,
+    run.objective,
+    run.status,
+    run.approval_status,
+    run.next_action,
+    run.source_conversation_id ?? "",
+    run.source_run_id ?? "",
+    run.baseline_agent_id ?? "",
+    run.evaluator_agent_id ?? "",
+    ...run.source_skill_ids,
+    ...run.candidate_agent_ids,
+    ...run.rubric,
+  ].join(" ");
+}
+
+function matchesEvolutionRunFilter(run: EvolutionRun, filter: EvolutionRunFilter) {
+  if (filter === "all") return true;
+  if (filter === "pending_approval") return run.approval_status === "pending";
+  if (filter === "needs_action") return isEvolutionRunActionable(run);
+  return run.status === filter;
+}
 
 function defaultApprovalDraft(run: EvolutionRun): ApprovalDraft {
   return {
@@ -67,9 +104,16 @@ export function EvolutionPage() {
   const [artifactRefs, setArtifactRefs] = useState("");
   const [tokensUsed, setTokensUsed] = useState("0");
   const [elapsedSeconds, setElapsedSeconds] = useState("0");
+  const [evolutionSearchTerm, setEvolutionSearchTerm] = useState("");
+  const [evolutionStatusFilter, setEvolutionStatusFilter] = useState<EvolutionRunFilter>("all");
 
   const runs = evolutionRuns.data ?? [];
   const activeRuns = runs.filter((run) => run.status === "running");
+  const pendingApprovalRuns = runs.filter((run) => run.approval_status === "pending");
+  const actionableRuns = runs.filter(isEvolutionRunActionable);
+  const filteredRuns = runs.filter(
+    (run) => textContains(evolutionRunSearchText(run), evolutionSearchTerm) && matchesEvolutionRunFilter(run, evolutionStatusFilter),
+  );
   const selectedRoundRunId = roundRunId || activeRuns[0]?.id || runs[0]?.id || "";
   const selectedRoundRun = runs.find((run) => run.id === selectedRoundRunId) ?? null;
 
@@ -187,6 +231,25 @@ export function EvolutionPage() {
       <p className="compact-page-intro">
         这里管理 Skill 蒸馏、达尔文式迭代和需要评测门控的长期改进任务。普通问答、方案规划和对话上下文压缩属于对话框架，不会默认进入进化。候选结果先进入记录，经过评测和审批后再发布。
       </p>
+
+      <section className="evolution-dashboard" aria-label="进化执行看板">
+        <div>
+          <span>总任务</span>
+          <strong>{runs.length}</strong>
+        </div>
+        <div>
+          <span>运行中</span>
+          <strong>{activeRuns.length}</strong>
+        </div>
+        <div>
+          <span>待审批</span>
+          <strong>{pendingApprovalRuns.length}</strong>
+        </div>
+        <div>
+          <span>待执行</span>
+          <strong>{actionableRuns.length}</strong>
+        </div>
+      </section>
 
       <div className="resource-layout">
         <section className="resource-card" aria-label="创建进化任务">
@@ -328,17 +391,43 @@ export function EvolutionPage() {
       </div>
 
       <section className="resource-card" aria-label="进化任务">
-        <div className="conversation-list-header">
+        <div className="conversation-list-header evolution-record-header">
           <div>
             <h3>进化记录</h3>
-            <span>{runs.length} 条</span>
+            <span>{filteredRuns.length} / {runs.length} 条</span>
+          </div>
+          <div className="evolution-record-filters">
+            <input
+              aria-label="搜索进化任务"
+              type="search"
+              value={evolutionSearchTerm}
+              onChange={(event) => setEvolutionSearchTerm(event.currentTarget.value)}
+              placeholder="任务、Agent、Skill 或会话"
+            />
+            <select
+              aria-label="按进化状态筛选"
+              value={evolutionStatusFilter}
+              onChange={(event) => setEvolutionStatusFilter(event.currentTarget.value as EvolutionRunFilter)}
+            >
+              <option value="all">全部状态</option>
+              <option value="needs_action">待执行</option>
+              <option value="pending_approval">待审批</option>
+              <option value="running">运行中</option>
+              <option value="waiting_approval">等待审批</option>
+              <option value="stopped">已停止</option>
+              <option value="completed">已完成</option>
+            </select>
+            <button type="button" className="secondary-action" onClick={() => { setEvolutionSearchTerm(""); setEvolutionStatusFilter("all"); }}>
+              清空进化筛选
+            </button>
           </div>
         </div>
         {evolutionRuns.isLoading ? <p>正在加载进化记录...</p> : null}
         {evolutionRuns.isError ? <p role="alert">{formatApiError(evolutionRuns.error, "进化记录加载失败")}</p> : null}
         {runs.length === 0 && !evolutionRuns.isLoading ? <p className="field-help">还没有进化任务。</p> : null}
+        {runs.length > 0 && filteredRuns.length === 0 ? <p className="field-help">没有符合筛选条件的进化任务。</p> : null}
         <div className="evolution-run-list">
-          {runs.map((run) => {
+          {filteredRuns.map((run) => {
             const latest = latestRound(run);
             const draft = draftFor(run);
             const nextRoundPlan = nextRoundPlans[run.id] ?? null;

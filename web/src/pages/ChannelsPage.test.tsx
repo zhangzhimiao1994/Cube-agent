@@ -254,6 +254,10 @@ describe("ChannelsPage", () => {
     expect(screen.getByText("连接次数 2 / 收到事件 3 / 已提交 2 / 失败 0")).not.toBeNull();
     expect(screen.getByRole("textbox", { name: /交互指令别名 FEISHU_COMMAND_ALIASES/ })).not.toBeNull();
     expect(screen.getByText(/标准指令支持 \/\/自动、\/\/直连、\/\/派单/)).not.toBeNull();
+    expect(screen.getByRole("region", { name: "飞书通道交互指令" })).not.toBeNull();
+    expect(screen.getByText("//帮助")).not.toBeNull();
+    expect(screen.getByText(/发送“帮助”“菜单”“指令”或“\/\/帮助”/)).not.toBeNull();
+    expect(screen.getByText(/方案=\/\/派单, 代码=\/\/vi, 菜单=\/\/帮助/)).not.toBeNull();
   });
 
   it("does not mark unconfigured optional channel fields as already configured", async () => {

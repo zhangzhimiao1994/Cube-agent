@@ -1,3 +1,28 @@
+## 2026-08-15 Evolution Dashboard And Feishu Channel Command Guide
+
+### State
+- Added an Evolution execution dashboard on `/evolution` with total, running, pending approval, and actionable counts so long-running Darwin/Skill distillation work is visible before opening individual records.
+- Added search and status filters to the Evolution record list. Operators can search by task, agent, skill, conversation/run id, and rubric, then clear filters without affecting the round-registration form.
+- Made the Feishu channel instructions explicit in `/channels`: the Feishu detail page now shows standard interaction commands (`//自动`, `//直连`, `//派单`, `//讨论`, `//混合`, `//vi`, `//帮助`) and the custom alias format (`别名=标准指令`) so users do not have to guess bot commands.
+- Kept custom interaction command support on the existing backend path: `FEISHU_COMMAND_ALIASES` still rewrites the first token before submission, and help aliases such as `菜单=//帮助` return the command menu without creating a task.
+
+### Verification
+- `npm test -- --run src/pages/OperationalPages.test.tsx -t "shows evolution records"` from `web/` -> 58 passed. This command runs the whole OperationalPages file in the current Vitest setup.
+- `npm test -- --run src/pages/ChannelsPage.test.tsx -t "shows channel connection status"` from `web/` -> 5 passed. This command runs the whole ChannelsPage file in the current Vitest setup.
+- `npm run lint` from `web/` -> passed.
+- `npm run build` from `web/` -> passed with the existing Vite large chunk warning.
+- `git diff --check` -> passed with only CRLF normalization warnings for touched files.
+
+### Server Deployment And Real Probe
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-evolution-feishu-ui-20260815-092951.tgz` and uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`; server backup retained under `/opt/agent-hub/backups/p3-evolution-feishu-ui-20260815-092951`.
+- Server archive retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-evolution-feishu-ui-20260815-092951.tgz`.
+- Real server probe called `/health`, loaded `/evolution`, resolved active frontend asset `/assets/index-B1Tn0F6u.js`, and verified deployed bundle markers for `进化执行看板`, `搜索进化任务`, `没有符合筛选条件的进化任务`, `飞书通道交互指令`, `菜单=//帮助`, and `发送“帮助”“菜单”“指令”`.
+- Probe output: `health={"status":"ok"}`, `asset=/assets/index-B1Tn0F6u.js`, `markers=ok`; deployment reported `caddy=active`, `agent-hub-api=active`, and `agent-hub-worker=active`.
+- Removed remote `/tmp` deploy/probe/package files after verification.
+
+### Remaining / Next
+- Continue remaining P3 backlog after GitHub push: OpenClaw follow-ups if user requests more validation, grounded Skill Creator workflows, remaining Skill archive edge cases if reproduced, bulk action/search/filter audit across dense pages, broader UI copy/layout audit, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 Feishu Channel Help Commands
 
 ### State

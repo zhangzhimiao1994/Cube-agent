@@ -325,6 +325,15 @@ function envTemplate(channel: ChannelStatus, guide: ChannelGuide) {
     .join("\n");
 }
 
+const FEISHU_STANDARD_COMMANDS = [
+  { command: "//自动", description: "由主 Agent 判断模式" },
+  { command: "//直连", description: "直接回答，不分派子 Agent" },
+  { command: "//派单", description: "按角色派发给子 Agent" },
+  { command: "//讨论", description: "多角色讨论后裁决" },
+  { command: "//混合", description: "派单、讨论和复核组合执行" },
+  { command: "//vi", description: "开启 Vibe Coding" },
+  { command: "//帮助", description: "在飞书中返回这份指令菜单" },
+];
 type ChannelSortKey = "name" | "status" | "entry" | "missing";
 
 type ChannelColumnFilters = {
@@ -522,6 +531,21 @@ export function ChannelsPage() {
               )}
             </article>
 
+            {selected.id === "feishu" ? (
+              <section className="channel-command-guide" aria-label="飞书通道交互指令">
+                <h3>通道交互指令</h3>
+                <p>在飞书里先输入指令，再接任务正文。发送“帮助”“菜单”“指令”或“//帮助”会直接返回当前菜单，不会创建任务。</p>
+                <div className="channel-command-grid">
+                  {FEISHU_STANDARD_COMMANDS.map((item) => (
+                    <div key={item.command}>
+                      <code>{item.command}</code>
+                      <span>{item.description}</span>
+                    </div>
+                  ))}
+                </div>
+                <p className="field-help">自定义格式：在“交互指令别名”填写“别名=标准指令”，例如“方案=//派单, 代码=//vi, 菜单=//帮助”。多条可用逗号、分号或换行分隔。</p>
+              </section>
+            ) : null}
             <article>
               <h3>官方入口与点击路径</h3>
               <div className="link-actions">
