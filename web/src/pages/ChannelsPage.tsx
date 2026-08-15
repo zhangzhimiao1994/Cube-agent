@@ -668,8 +668,8 @@ export function ChannelsPage() {
                 >
                   {clearConfig.isPending ? "清空中..." : "清空当前通道配置"}
                 </button>
-                {saveNotice ? <span role="status">{saveNotice}</span> : null}
               </div>
+              {saveNotice ? <p className="channel-config-status" role="status">{saveNotice}</p> : null}
               {saveConfig.isError ? (
                 <p className="form-error" role="alert">
                   {formatApiError(saveConfig.error, "通道配置保存失败")}

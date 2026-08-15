@@ -1,3 +1,28 @@
+## 2026-08-15 Channel Action Layout Fix
+
+### State
+- Fixed the `/channels` configuration action area so `保存通道配置` and `清空当前通道配置` no longer share the same flex row with long save/clear status text.
+- Moved the save/clear notice into an independent `channel-config-status` block below the action buttons.
+- Added wrapped, bordered status styling so long Chinese notices do not cover button text or force cramped button rows on mobile.
+- Reconfirmed previous channel command UX remains intact: Feishu still shows standard interaction commands, examples, and custom alias guidance through `FEISHU_COMMAND_ALIASES`.
+
+### Verification
+- `npm test -- --run src/pages/ChannelsPage.test.tsx` from `web/` -> 5 passed.
+- `npm run lint` from `web/` -> passed.
+- `npm run build` from `web/` -> passed with the existing Vite large chunk warning; active build files include `web/dist/assets/index-BvZx-1XK.js` and `web/dist/assets/index-D0oFq7xj.css`.
+
+### Server Deployment And Real Probe
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-channel-actions-layout-20260815-114049.tgz` and uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`; server backup retained under `/opt/agent-hub/backups/p3-channel-actions-layout-20260815-114049`.
+- Server archive retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-channel-actions-layout-20260815-114049.tgz`.
+- Real server probe called `http://127.0.0.1:8000/health` and got `{"status":"ok"}`.
+- Loaded `/channels` through Caddy, resolved active frontend assets `/assets/index-BvZx-1XK.js` and `/assets/index-D0oFq7xj.css`, and verified deployed markers for `channel-config-status`, `通道配置已保存`, and `overflow-wrap:anywhere`.
+- `caddy` and `agent-hub-api` were active after deployment.
+- Removed server `/tmp/agent-hub-p3-runtime-incremental.tgz`, `/tmp/deploy-channel-actions-layout.sh`, and `/tmp/probe-channel-actions-layout.sh` after verification.
+
+### Remaining / Next
+- Commit this slice, create a GitHub recovery bundle/tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
+- Continue remaining P3 backlog after GitHub green: Evolution long-memory/executor refinements, broader missing button/function sweep, OpenClaw follow-ups if requested, overall UI copy/layout audit after modules stabilize, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 Main Agent Effective Concurrency Display
 
 ### State
