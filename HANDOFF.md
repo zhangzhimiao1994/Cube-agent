@@ -1,3 +1,44 @@
+# Handoff - 2026-08-15 13:18 CST - Channel Resource Selectors
+
+## Current state
+- Completed and deployed the channel resource selector wording/validation slice.
+- Channel messages now describe `@plugin`, `&skill`, and `#mcp` as leading resource selectors for the main Agent entry path, not as mandatory channel commands.
+- Parsing remains intentionally conservative: only a contiguous selector block at the start of the message becomes resource hints; normal body text like `@someone`, `#标题`, `C#`, or a standalone `&` is ignored.
+- Hermes bulk confirmation/deletion was also re-verified on the live server because the user had reproduced HTTP 422 from the mobile UI.
+
+## Changed
+- `src/agent_hub/channels/directives.py`
+  - Reworded channel help text to “飞书入口提示/资源选择器”.
+  - Reworded invalid selector summaries away from “channel directive”.
+  - Kept selector parsing behavior unchanged.
+- `web/src/pages/ChannelsPage.tsx`
+  - Updated the Feishu resource selector panel text so it says the channel no longer forces mode selection and the main Agent judges the entry.
+- `web/src/pages/ChannelsPage.test.tsx`
+  - Updated the expected UI copy.
+- `tests/unit/channels/test_directives.py`
+  - Added regression coverage for leading selector parsing, ignored body symbols, and new help/error wording.
+
+## Verification
+- Local:
+  - `uv run pytest tests/unit/channels/test_directives.py tests/unit/channels/test_submitter.py` -> 9 passed.
+  - `npm test -- ChannelsPage.test.tsx --run` -> 5 passed.
+  - `uv run pytest tests/api/test_admin_resources.py -k "hermes_bulk"` -> 4 passed.
+  - `npm run build` -> passed; Vite still reports the existing >500 kB chunk warning.
+- Server incremental deployment:
+  - Local archive: `.local-archives/server-incrementals/agent-hub-channel-resource-selectors-20260815-131059.tgz`.
+  - Uploaded to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+  - Deployed into `/opt/agent-hub/current`.
+  - Server backup: `/opt/agent-hub/backups/p3-channel-resource-selectors-20260815-131059`.
+  - Server retained archive: `/opt/agent-hub/archives/server-incrementals/agent-hub-channel-resource-selectors-20260815-131059.tgz`.
+  - Cleaned `/tmp/agent-hub-p3-runtime-incremental.tgz`, `/tmp/deploy-channel-resource-selectors.sh`, and `/tmp/probe-channel-resource-selectors.sh`.
+- Server real probes:
+  - `resource_selector_probe=ok`: verified leading `@github &deep-research #filesystem` produces hints and body `@/#/&` text is ignored.
+  - `hermes_bulk_http_probe=ok`: over real localhost HTTP API, created 3 Hermes records, bulk confirmed them, bulk deleted them, and confirmed they were gone; no 422.
+  - `frontend_probe=ok`: active `/channels` bundle contains `资源选择器`, `通道不会再强制选择运行模式`, and `正文开始后出现的 @、&、# 不会被当成调用`.
+
+## Remaining / next
+- Commit this slice, create a local GitHub recovery bundle and GitHub archive tag, force-with-lease push to `mutilagent/main`, then check GitHub Actions until green.
+- Continue the larger plan after this slice: OpenClaw final end-to-end verification, evolution/dialogue refinements, right-side conversation history drawer, UI text/layout audit, login/brand cleanup, scheduler mode, main Agent concurrency UI, Feishu reply formatting and timeout/concurrency behavior, final README EN/ZH, and Docker config readiness.
 ## 2026-08-15 Channel Main-Agent Entry And Resource Selectors
 
 - Scope: changed channel interactions so Feishu/channel messages are no longer routed by channel command prefixes. The channel layer now preserves the raw message, submits with `TaskMode.AUTO`, and lets the main Agent decide entry/mode/capability.

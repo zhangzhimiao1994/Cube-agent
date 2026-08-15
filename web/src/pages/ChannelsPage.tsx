@@ -550,7 +550,7 @@ export function ChannelsPage() {
                     <code key={example}>{example}</code>
                   ))}
                 </div>
-                <p className="field-help">运行模式不再由通道指令决定；如果已经在 Web 或会话中选择了模式，后续消息会沿用主 Agent 的入口判断，不需要反复输入模式。</p>
+                <p className="field-help">通道不会再强制选择运行模式；如果已经在 Web 或会话中选择了模式，后续消息会沿用主 Agent 的入口判断，不需要反复选择。</p>
               </section>
             ) : null}
             <article>

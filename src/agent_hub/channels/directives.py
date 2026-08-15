@@ -223,17 +223,17 @@ def command_help_text(aliases: Mapping[str, str] | None = None) -> str:
         [] if not aliases else [f"{alias}={target}" for alias, target in sorted(aliases.items())]
     )
     lines = [
-        "飞书交互指令：先写指令，再写任务正文。",
-        "模式：//自动、//直连、//派单、//讨论、//混合。",
-        "能力：//vi 开启 Vibe Coding；&skill 指定 Skill；@plugin 指定插件；/#mcp 指定 MCP。",
-        "帮助：发送 帮助、菜单、指令 或 //帮助，会返回这份菜单且不会创建任务。",
+        "飞书入口提示：消息会先交给主 Agent 判断模式、计划、OpenClaw 或 Vibe Coding。",
+        "资源选择器：只在消息开头连续写 @plugin、&skill、#mcp；正文开始后出现的 @、&、# 不会被当成调用。",
+        "示例：@github &research #filesystem 梳理这个仓库的改造计划。",
+        "帮助：发送 帮助、菜单 或 指令，会返回这份菜单且不会创建任务。",
     ]
     if alias_items:
-        lines.append("当前自定义指令：" + "，".join(alias_items[:12]))
+        lines.append("当前自定义入口别名：" + "，".join(alias_items[:12]))
         if len(alias_items) > 12:
             lines.append(f"还有 {len(alias_items) - 12} 条别名未展示，可在通道配置中查看。")
     else:
-        lines.append("自定义指令：在通道配置里填写“别名=标准指令”，例如：方案=//派单。")
+        lines.append("入口别名：可在通道配置里维护短别名，实际任务仍由主 Agent 判断入口。")
     return "\n".join(lines)
 
 
@@ -241,9 +241,9 @@ def directive_summary(
     directives: ChannelDirectives, aliases: Mapping[str, str] | None = None
 ) -> str:
     if directives.invalid_reason is not None:
-        return "通道指令有误：" + _reason_text(directives.invalid_reason)
+        return "入口提示有误：" + _reason_text(directives.invalid_reason)
     mode = _mode_label(directives.mode)
-    lines = [f"已收到，解析到本次通道指令：模式={mode}"]
+    lines = [f"已收到，主 Agent 将先判断入口；检测到模式提示={mode}"]
     if directives.skills:
         lines.append("Skills: " + ", ".join(directives.skills))
     if directives.mcp_servers:
@@ -252,7 +252,7 @@ def directive_summary(
         lines.append("Plugins: " + ", ".join(directives.plugins))
     if directives.vibe_coding:
         lines.append("Vibe Coding: enabled")
-    lines.append("我会按这些选择执行；若未指定模式，将由主 Agent 自动判断。")
+    lines.append("这些信息仅作为入口提示；最终仍由主 Agent 结合上下文判断。")
     lines.append(command_help_text(aliases))
     return "\n".join(lines)
 
@@ -278,8 +278,8 @@ def _reason_text(reason: str) -> str:
         return "消息内容为空。"
     if reason == "invalid_directive":
         return (
-            "Invalid channel directive format. Use /#name for MCP, &name for Skill, "
-            "and @name for plugin; names may contain letters, numbers, dot, underscore, and dash."
+            "资源选择器格式不正确。请在消息开头使用 #name 指定 MCP、&name 指定 Skill、"
+            "@name 指定插件；名称可以包含字母、数字、点、下划线和短横线。"
         )
     return reason
 

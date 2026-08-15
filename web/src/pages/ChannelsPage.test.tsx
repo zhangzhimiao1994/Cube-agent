@@ -261,7 +261,7 @@ describe("ChannelsPage", () => {
     expect(screen.getByText("@github &research #filesystem 梳理这个仓库的改造计划")).not.toBeNull();
     expect(screen.getByText("&pdf 总结附件中的论文并给出后续研究方向")).not.toBeNull();
     expect(screen.getByText(/正文开始后出现的 @、&、# 不会被当成调用/)).not.toBeNull();
-    expect(screen.getByText(/运行模式不再由通道指令决定/)).not.toBeNull();
+    expect(screen.getByText(/通道不会再强制选择运行模式/)).not.toBeNull();
     expect(screen.queryByText("当前生效的自定义指令")).toBeNull();
     expect(screen.queryByText("//帮助")).toBeNull();
   });
