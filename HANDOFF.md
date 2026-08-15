@@ -1,3 +1,22 @@
+# Handoff - 2026-08-15 13:48 CST - OpenClaw Final E2E Verification
+
+## Current state
+- Completed the queued OpenClaw final end-to-end verification on the live server without changing runtime code.
+- Verified OpenClaw is not just active at the port level: the probe used the real deployed API, real settings persistence, real admin auth, and real command execution path.
+- The live-server probe covered user-approval gating, approved Linux command execution, shell denial even when included in the configured allowlist, remote Windows-adapter-style execution through the OpenClaw local adapter service, and read-only mode blocking write/command operations.
+
+## Verification
+- Local:
+  - `uv run ruff check src/agent_hub/openclaw tests/unit/openclaw tests/api/test_admin_resources.py` -> passed.
+  - `uv run pytest tests/unit/openclaw tests/api/test_admin_resources.py -k "openclaw"` -> 42 passed, 100 deselected.
+- Server real-code probe:
+  - Uploaded `/tmp/openclaw_final_e2e_check.py`, sourced `/etc/agent-hub/secrets.env` and `/etc/agent-hub/agent-hub.env`, generated a short-lived token for an enabled real admin user from the production database, then called `http://127.0.0.1:8000/api/v1/admin`.
+  - Probe output: `{"status": "ok", "checked": ["approval_gate", "linux_execute", "shell_denied", "remote_adapter_execute", "read_only_block"]}`.
+  - The probe restored original system settings in `finally`, removed probe-created OpenClaw admin resources by target marker, terminated the temporary adapter process, and cleaned `/tmp/openclaw_*_check.py` files.
+
+## Remaining / next
+- This slice only updates handoff evidence. Deploy the handoff incrementally to the server, then force-with-lease push to `mutilagent/main` with recovery archives and verify GitHub Actions.
+- Continue remaining P3 backlog after green: evolution/dialogue refinements, broader missing button/function sweep, UI copy/layout audit, login/brand cleanup, scheduler mode, final README EN/ZH polishing, and Docker config readiness.
 # Handoff - 2026-08-15 13:34 CST - Feishu Table And Long Reply Adaptation
 
 ## Current state
