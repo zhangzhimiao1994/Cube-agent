@@ -1856,6 +1856,28 @@ def large_phone_wrapped_instruction_skill_bundle_archive() -> bytes:
     return buffer.getvalue()
 
 
+def phone_wrapped_instruction_bundle_with_tar_metadata_archive() -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        pax = tarfile.TarInfo("pax_global_header")
+        pax.type = tarfile.XGLTYPE
+        pax_data = b"24 comment=phone export\n"
+        pax.size = len(pax_data)
+        archive.addfile(pax, io.BytesIO(pax_data))
+        for index in range(3):
+            skill_name = f"phone-metadata-skill-{index:03d}"
+            content = (
+                "---\n"
+                f"name: {skill_name}\n"
+                "description: Phone export with tar metadata.\n"
+                "---\n\n"
+                "Use this instruction skill from a phone archive with tar metadata.\n"
+            ).encode()
+            info = tarfile.TarInfo(f"./all-skills_1/skills/{skill_name}/SKILL.md")
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+    return buffer.getvalue()
+
 def partially_invalid_instruction_skill_bundle_zip() -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
@@ -2238,6 +2260,7 @@ def test_channel_status_exposes_feishu_setup_without_secrets(
     monkeypatch.setenv("FEISHU_VERIFICATION_TOKEN", "verify-live")
     monkeypatch.setenv("FEISHU_ENCRYPT_KEY", "encrypt-live")
     monkeypatch.setenv("FEISHU_TRANSPORT", "webhook")
+    monkeypatch.setenv("FEISHU_COMMAND_ALIASES", "方案=//派单, 代码=//vi")
     monkeypatch.setenv("AGENT_HUB_PUBLIC_URL", "https://agent.example.com")
 
     response = client().get("/api/v1/admin/channels", headers=headers())
@@ -2250,6 +2273,7 @@ def test_channel_status_exposes_feishu_setup_without_secrets(
         by_id["feishu"]["public_webhook_url"] == "https://agent.example.com/channels/feishu/events"
     )
     assert by_id["feishu"]["missing"] == []
+    assert by_id["feishu"]["command_aliases"] == {"方案": "//派单", "代码": "//vi"}
     assert {
         "feishu",
         "dingtalk",
@@ -3240,6 +3264,30 @@ def test_skill_archive_upload_accepts_phone_wrapped_large_instruction_bundle_wit
     assert body["items"][-1]["name"] == "phone-wrapped-skill-098"
     assert len(skills.json()) == 99
 
+
+def test_skill_archive_upload_accepts_phone_wrapped_tar_metadata_bundle() -> None:
+    api = client()
+
+    uploaded = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "all-skills_1.tar.gz"},
+        content=phone_wrapped_instruction_bundle_with_tar_metadata_archive(),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert uploaded.status_code == 200
+    body = uploaded.json()
+    assert body["bundle"] is True
+    assert [item["name"] for item in body["items"]] == [
+        "phone-metadata-skill-000",
+        "phone-metadata-skill-001",
+        "phone-metadata-skill-002",
+    ]
+    assert [item["name"] for item in skills.json()] == [
+        "phone-metadata-skill-000",
+        "phone-metadata-skill-001",
+        "phone-metadata-skill-002",
+    ]
 
 def test_skill_archive_upload_keeps_valid_bundle_items_when_one_item_is_invalid() -> None:
     api = client()

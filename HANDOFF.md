@@ -1,3 +1,43 @@
+## 2026-08-15 Multi-Skill Archive And Feishu Command UX
+
+### State
+- Fixed multi-Skill archive handling for phone/exported bundles with nested paths such as `all-skills_1/skills/<skill>/SKILL.md`, including tar metadata members and large bundles with reference files.
+- Raised the Feishu Skill attachment download guard from 2 MB to 20 MB so multi-Skill archives sent from Feishu are not rejected before the protected Skill scanner runs.
+- The Skill scanner still preserves safety boundaries: invalid package members are skipped or rejected by the existing package checks; uploads remain pending/protected and do not grant execution permissions directly.
+- Expanded Feishu robot interaction guidance: help replies now say how to use channel commands, list standard modes, include Vibe/Skill/plugin/MCP selectors, and show configured custom aliases.
+- Added `command_aliases` to the channel status API and the `/channels` UI so operators can see the currently effective custom Feishu commands instead of guessing whether `FEISHU_COMMAND_ALIASES` parsed correctly.
+
+### Verification
+- `.\.venv\Scripts\python.exe -m pytest tests/unit/channels/feishu/test_commands.py::test_feishu_skill_install_accepts_large_multi_skill_archives_by_default tests/unit/channels/feishu/test_commands.py::test_feishu_skill_install_uploads_instruction_bundle_for_scan_only tests/unit/channels/feishu/test_commands.py::test_feishu_skill_install_uploads_attached_archive_for_scan_only -q --tb=short` -> 3 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests/api/test_admin_resources.py::test_skill_archive_upload_accepts_phone_wrapped_tar_metadata_bundle tests/api/test_admin_resources.py::test_skill_archive_upload_accepts_large_nested_instruction_bundle_tar_gz tests/api/test_admin_resources.py::test_skill_archive_upload_accepts_phone_wrapped_large_instruction_bundle_with_assets tests/api/test_admin_resources.py::test_skill_archive_upload_keeps_valid_bundle_items_when_one_item_is_invalid -q --tb=short` -> 4 passed.
+- `.\.venv\Scripts\python.exe -m pytest tests/unit/skills/test_package.py -q` -> 25 passed.
+- Final relevant backend suite: `.\.venv\Scripts\python.exe -m pytest tests/unit/channels/feishu/test_commands.py tests/unit/channels/test_submitter.py::test_channel_directives_accept_custom_aliases_and_show_help tests/contracts/feishu/test_receivers.py::test_receivers_apply_custom_command_aliases_before_submission tests/contracts/feishu/test_receivers.py::test_websocket_receiver_replies_to_help_alias_without_submission tests/api/test_channel_webhooks.py::test_saved_feishu_command_aliases_are_applied_before_submission tests/api/test_channel_webhooks.py::test_feishu_webhook_replies_to_help_alias_without_submission tests/api/test_channel_webhooks.py::test_feishu_webhook_routes_skill_file_command_to_protected_handler tests/api/test_admin_resources.py::test_channel_status_exposes_feishu_setup_without_secrets tests/api/test_admin_resources.py::test_skill_archive_upload_accepts_phone_wrapped_tar_metadata_bundle tests/api/test_admin_resources.py::test_skill_archive_upload_accepts_large_nested_instruction_bundle_tar_gz tests/api/test_admin_resources.py::test_skill_archive_upload_accepts_phone_wrapped_large_instruction_bundle_with_assets tests/api/test_admin_resources.py::test_skill_archive_upload_keeps_valid_bundle_items_when_one_item_is_invalid tests/unit/skills/test_package.py -q --tb=short` -> 54 passed.
+- `.\.venv\Scripts\python.exe -m ruff check ...` on touched Python files -> passed.
+- `.\.venv\Scripts\python.exe -m mypy src/agent_hub/channels/feishu/skill_install.py src/agent_hub/channels/directives.py src/agent_hub/api/routers/admin.py src/agent_hub/skills/package.py` -> passed.
+- `npm test -- ChannelsPage.test.tsx` from `web/` -> 5 passed.
+- `npm run build` from `web/` -> passed with the existing Vite large chunk warning.
+
+### Server Deployment And Real Probe
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-skill-archive-feishu-commands-20260815-102500.tgz` and uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`; server backup retained under `/opt/agent-hub/backups/p3-skill-archive-feishu-commands-20260815-102500`.
+- Server archive retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-skill-archive-feishu-commands-20260815-102500.tgz`.
+- Synchronized changed backend modules into active venv site-packages at `/opt/agent-hub/current/.venv/lib/python3.12/site-packages/agent_hub` to prevent runtime/source drift.
+- Real server probe used production settings, a short-lived super-admin JWT, and real API calls against `http://127.0.0.1:8000`:
+  - `/health` returned `{"status":"ok"}`.
+  - Uploaded a real 2,403,071-byte `all-skills_1.tar.gz` body to `POST /api/v1/admin/skills/upload` with 99 nested Skill directories and large reference files.
+  - API returned 99 Skill items from `probe-phone-bundle-...-00` through `...-98`.
+  - Cleanup via `POST /api/v1/admin/skills/bulk-delete` deleted all 99 probe items with 0 failures.
+  - Verified `FeishuSkillCommandHandler` default download limit is `20000000`.
+  - Verified Feishu help text includes custom aliases and `/api/v1/admin/channels` includes the `command_aliases` field.
+  - Loaded the active frontend bundle and confirmed markers for `当前生效的自定义指令` and `暂未配置自定义指令`.
+  - `agent-hub-api`, `agent-hub-worker`, and `caddy` were active after deployment.
+- Removed server `/tmp/probe-skill-archive-feishu-commands.py`, `/tmp/deploy-skill-archive-feishu-commands.sh`, and `/tmp/agent-hub-p3-runtime-incremental.tgz` after verification.
+
+### GitHub / Recovery
+- Pending: create local GitHub recovery bundle/tag, commit this slice, force-with-lease push `mutilagent/main`, then check GitHub Actions until green.
+
+### Remaining / Next
+- Continue remaining P3 backlog after GitHub green: OpenClaw follow-ups if requested, conversation/history drawer and UI compactness polish, bulk action/search/filter audit across dense pages, overall UI copy/layout audit, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 Grounded Skill Creator And Feishu Command Examples
 
 ### State

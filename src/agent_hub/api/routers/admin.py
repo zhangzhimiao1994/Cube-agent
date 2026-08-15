@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from agent_hub.api.dependencies import current_principal
 from agent_hub.api.errors import BASE_ERROR_RESPONSES, PublicAPIError, error_responses
 from agent_hub.auth.models import AuthenticatedPrincipal, Authorizer, PermissionDenied
+from agent_hub.channels.directives import parse_command_aliases
 from agent_hub.config.schema import PlatformConfig
 from agent_hub.config.service import ConfigService, ConfigValidationError
 from agent_hub.db.models import AdminResourceRow
@@ -467,6 +468,7 @@ class ChannelStatusResponse(BaseModel):
     missing: list[str] = Field(default_factory=list)
     configured: list[str] = Field(default_factory=list)
     configured_sources: dict[str, str] = Field(default_factory=dict)
+    command_aliases: dict[str, str] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
     runtime: ChannelRuntimeStatusResponse | None = None
 
@@ -1895,6 +1897,12 @@ _INSTRUCTION_SKILL_FORBIDDEN_EXTENSIONS = frozenset(
 _INSTRUCTION_SKILL_NESTED_ARCHIVE_EXTENSIONS = frozenset(
     {".zip", ".tar", ".tgz", ".gz", ".bz2", ".xz", ".7z", ".rar", ".whl"}
 )
+_TAR_METADATA_TYPES = frozenset({
+    tarfile.XHDTYPE,
+    tarfile.XGLTYPE,
+    tarfile.GNUTYPE_LONGNAME,
+    tarfile.GNUTYPE_LONGLINK,
+})
 _MAX_SKILL_BUNDLE_ITEMS = 4096
 
 
@@ -2022,6 +2030,8 @@ def _instruction_skill_members(archive_bytes: bytes) -> tuple[str, bytes] | None
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
             files = []
             for member in archive.getmembers():
+                if _tar_member_is_metadata(member):
+                    continue
                 if member.isdir():
                     continue
                 if (
@@ -2203,6 +2213,8 @@ def _split_tar_skill_bundle(
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
             entries: list[tuple[str, tarfile.TarInfo]] = []
             for member in archive.getmembers():
+                if _tar_member_is_metadata(member):
+                    continue
                 if member.isdir():
                     continue
                 if (
@@ -2318,6 +2330,9 @@ def _skill_bundle_mode_is_unsafe(mode: int) -> bool:
         stat.S_IFSOCK,
     }
 
+
+def _tar_member_is_metadata(member: tarfile.TarInfo) -> bool:
+    return member.type in _TAR_METADATA_TYPES
 
 def _zip_group_to_skill_archive(
     archive: zipfile.ZipFile, entries: list[tuple[str, zipfile.ZipInfo]]
@@ -6008,6 +6023,7 @@ def _channel_status_from_definition(
         missing=missing,
         configured=configured,
         configured_sources=configured_sources,
+        command_aliases=_channel_command_aliases(definition, config),
         notes=_channel_notes(definition, config),
     )
 
@@ -6054,6 +6070,15 @@ def _channel_config_source(
     if os.environ.get(name, ""):
         return "environment"
     return None
+
+
+def _channel_command_aliases(
+    definition: ChannelDefinition,
+    config: Mapping[str, Mapping[str, str]],
+) -> dict[str, str]:
+    if definition.id != "feishu":
+        return {}
+    return parse_command_aliases(_channel_config_value("FEISHU_COMMAND_ALIASES", "feishu", config))
 
 
 def _channel_required_env(

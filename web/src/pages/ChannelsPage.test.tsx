@@ -26,7 +26,8 @@ const channelPayload = [
     transports: ["webhook"],
     webhook_path: "/channels/feishu/events",
     public_webhook_url: "https://agent.example.com/channels/feishu/events",
-    configured: ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_TRANSPORT"],
+    configured: ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_TRANSPORT", "FEISHU_COMMAND_ALIASES"],
+    command_aliases: { "方案": "//派单", "代码": "//vi" },
     missing: [],
     notes: ["Webhook 已挂载在主 API 服务，不需要额外暴露 8001。"],
     runtime: {
@@ -262,6 +263,9 @@ describe("ChannelsPage", () => {
     expect(screen.getByText("方案 写一个产品发布方案")).not.toBeNull();
     expect(screen.getByText("代码 重构这个接口并说明测试结果")).not.toBeNull();
     expect(screen.getByText(/方案=\/\/派单, 代码=\/\/vi, 菜单=\/\/帮助/)).not.toBeNull();
+    expect(screen.getByText("当前生效的自定义指令")).not.toBeNull();
+    expect(screen.getByText("等同于 //派单")).not.toBeNull();
+    expect(screen.getByText("等同于 //vi")).not.toBeNull();
     expect(screen.getByText(/保存后飞书里的帮助菜单会同步显示这些别名/)).not.toBeNull();
   });
 

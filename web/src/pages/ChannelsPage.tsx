@@ -416,6 +416,10 @@ export function ChannelsPage() {
     return items.find((item) => item.id === selectedId) ?? items[0] ?? null;
   }, [channels.data, selectedId]);
   const guide = selected ? CHANNEL_GUIDES[selected.id] : null;
+  const effectiveFeishuAliases = useMemo(() => {
+    if (selected?.id !== "feishu") return [];
+    return Object.entries(selected.command_aliases ?? {}).sort(([left], [right]) => left.localeCompare(right, "zh-Hans-CN"));
+  }, [selected]);
 
   useEffect(() => {
     setDraftValues({});
@@ -556,6 +560,21 @@ export function ChannelsPage() {
                   {FEISHU_COMMAND_EXAMPLES.map((example) => (
                     <code key={example}>{example}</code>
                   ))}
+                </div>
+                <div className="channel-command-aliases">
+                  <span className="eyebrow">当前生效的自定义指令</span>
+                  {effectiveFeishuAliases.length > 0 ? (
+                    <div className="channel-command-grid">
+                      {effectiveFeishuAliases.map(([alias, target]) => (
+                        <div key={alias}>
+                          <code>{alias}</code>
+                          <span>等同于 {target}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="field-help">暂未配置自定义指令。可以先用标准指令，或在下方“交互指令别名”中新增。</p>
+                  )}
                 </div>
                 <p className="field-help">
                   自定义格式：在“交互指令别名”填写“别名=标准指令”，例如“方案=//派单, 代码=//vi, 菜单=//帮助”。多条可用逗号、分号或换行分隔；保存后飞书里的帮助菜单会同步显示这些别名。

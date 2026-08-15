@@ -9,6 +9,8 @@ from agent_hub.channels.base import AttachmentKind, InboundAttachment, InboundMe
 from agent_hub.channels.feishu.settings import FeishuSettings
 from agent_hub.skills.package import InvalidSkillPackage
 
+_DEFAULT_MAX_SKILL_DOWNLOAD_BYTES = 20_000_000
+
 
 class FeishuSkillMediaClient(Protocol):
     async def tenant_access_token(self, tenant_external_id: str) -> str: ...
@@ -43,7 +45,7 @@ class FeishuSkillCommandHandler:
         *,
         admin_service: FeishuSkillAdminService,
         media_client_factory: Callable[[FeishuSettings], FeishuSkillMediaClient],
-        max_download_bytes: int = 2_000_000,
+        max_download_bytes: int = _DEFAULT_MAX_SKILL_DOWNLOAD_BYTES,
     ) -> None:
         if max_download_bytes <= 0:
             raise ValueError("max_download_bytes must be positive")

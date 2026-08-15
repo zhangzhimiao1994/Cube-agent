@@ -171,6 +171,8 @@ class SkillPackageInspector:
         files: list[SkillPackageFile] = []
         total_size = 0
         for member in members:
+            if _tar_member_is_metadata(member):
+                continue
             normalized = _normalize_zip_path(member.name)
             if normalized in seen:
                 raise InvalidSkillPackage("skill archive contains duplicate paths")
@@ -242,6 +244,12 @@ _FORBIDDEN_EXTENSIONS = frozenset(
     {".exe", ".dll", ".dylib", ".so", ".pyc", ".pyo", ".bat", ".cmd", ".ps1", ".sh"}
 )
 _NESTED_ARCHIVE_EXTENSIONS = frozenset({".zip", ".tar", ".tgz", ".gz", ".bz2", ".xz", ".7z", ".rar", ".whl"})
+_TAR_METADATA_TYPES = frozenset({
+    tarfile.XHDTYPE,
+    tarfile.XGLTYPE,
+    tarfile.GNUTYPE_LONGNAME,
+    tarfile.GNUTYPE_LONGLINK,
+})
 _MANIFEST_NAMES = ("skill.yaml", "skill.yml", "skill.json")
 _DEPENDENCY_NAMES = ("requirements.txt", "requirements.lock", "dependencies.lock")
 _PINNED_REQUIREMENT_PATTERN = re.compile(
@@ -272,6 +280,10 @@ def _is_link_or_device(mode: int) -> bool:
         stat.S_IFIFO,
         stat.S_IFSOCK,
     }
+
+
+def _tar_member_is_metadata(member: tarfile.TarInfo) -> bool:
+    return member.type in _TAR_METADATA_TYPES
 
 
 def _manifest_name(names: list[str]) -> str | None:

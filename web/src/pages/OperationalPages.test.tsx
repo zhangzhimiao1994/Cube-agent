@@ -152,6 +152,7 @@ const baseChannels: ChannelStatus[] = [
     missing: ["FEISHU_APP_ID"],
     configured: ["FEISHU_TRANSPORT"],
     configured_sources: { FEISHU_TRANSPORT: "environment" },
+    command_aliases: {},
     notes: ["Webhook 已挂载在主 API 服务。"],
   },
   {
@@ -164,6 +165,7 @@ const baseChannels: ChannelStatus[] = [
     missing: ["CUSTOM_WEBHOOK_TOKEN"],
     configured: [],
     configured_sources: {},
+    command_aliases: {},
     notes: ["用于兼容其他支持 HTTP Webhook 的聊天软件。"],
   },
 ];

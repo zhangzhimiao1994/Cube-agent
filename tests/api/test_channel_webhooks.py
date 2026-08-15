@@ -777,7 +777,7 @@ def test_feishu_webhook_replies_to_help_alias_without_submission() -> None:
     assert gateway.messages == []
     assert len(reply_sender.replies) == 1
     assert reply_sender.replies[0][1] == "om_help_alias"
-    assert "可用指令" in reply_sender.replies[0][2]
+    assert "飞书交互指令" in reply_sender.replies[0][2]
     assert "菜单=//帮助" in reply_sender.replies[0][2]
 
 def test_feishu_webhook_appends_image_analysis_context() -> None:

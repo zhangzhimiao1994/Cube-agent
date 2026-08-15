@@ -188,17 +188,19 @@ def is_channel_help_request(text: str, aliases: Mapping[str, str] | None = None)
 
 
 def command_help_text(aliases: Mapping[str, str] | None = None) -> str:
-    alias_items = (
-        [] if not aliases else [f"{alias}={target}" for alias, target in sorted(aliases.items())]
-    )
+    alias_items = [] if not aliases else [f"{alias}={target}" for alias, target in sorted(aliases.items())]
     lines = [
-        "可用指令：//自动、//直连、//派单、//讨论、//混合；//vi 开启 Vibe Coding。",
-        "扩展：&skill 指定 Skill，@plugin 指定插件，/#mcp 指定 MCP。",
+        "飞书交互指令：先写指令，再写任务正文。",
+        "模式：//自动、//直连、//派单、//讨论、//混合。",
+        "能力：//vi 开启 Vibe Coding；&skill 指定 Skill；@plugin 指定插件；/#mcp 指定 MCP。",
+        "帮助：发送 帮助、菜单、指令 或 //帮助，会返回这份菜单且不会创建任务。",
     ]
     if alias_items:
-        lines.append("自定义别名：" + "，".join(alias_items[:8]))
+        lines.append("当前自定义指令：" + "，".join(alias_items[:12]))
+        if len(alias_items) > 12:
+            lines.append(f"还有 {len(alias_items) - 12} 条别名未展示，可在通道配置中查看。")
     else:
-        lines.append("可在通道配置里用“别名=标准指令”自定义，例如：方案=//派单。")
+        lines.append("自定义指令：在通道配置里填写“别名=标准指令”，例如：方案=//派单。")
     return "\n".join(lines)
 
 

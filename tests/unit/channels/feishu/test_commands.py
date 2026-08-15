@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import tarfile
 import zipfile
 from collections.abc import AsyncIterator
@@ -91,7 +92,7 @@ def skill_archive() -> bytes:
 def instruction_skill_bundle_archive() -> bytes:
     docs = {
         "writer": "---\nname: feishu-writer-skill\ndescription: Writer skill.\n---\n\nWrite drafts.\n",
-        "reviewer": "---\nname: feishu-reviewer-skill\ndescription: Reviewer skill.\n---\n\nReview drafts.\n",
+        "reviewer": "---\nname: feishu-reviewer-skill\ndescription: Review checklist.\n---\n\nReview outputs.\n",
     }
     buffer = BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
@@ -101,6 +102,31 @@ def instruction_skill_bundle_archive() -> bytes:
             info.size = len(data)
             archive.addfile(info, BytesIO(data))
     return buffer.getvalue()
+
+
+def large_instruction_skill_bundle_archive() -> bytes:
+    buffer = BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for index in range(2):
+            skill_name = f"feishu-large-skill-{index}"
+            skill_md = (
+                "---\n"
+                f"name: {skill_name}\n"
+                "description: Large Feishu Skill bundle.\n"
+                "---\n\n"
+                "Use this skill with large reference material.\n"
+            ).encode()
+            skill_info = tarfile.TarInfo(f"all-skills/{skill_name}/SKILL.md")
+            skill_info.size = len(skill_md)
+            archive.addfile(skill_info, BytesIO(skill_md))
+            reference = random.Random(index).randbytes(1_200_000)
+            ref_info = tarfile.TarInfo(f"all-skills/{skill_name}/references/source.txt")
+            ref_info.size = len(reference)
+            archive.addfile(ref_info, BytesIO(reference))
+    payload = buffer.getvalue()
+    assert len(payload) > 2_000_000
+    assert len(payload) < 20_000_000
+    return payload
 
 
 def inbound_skill_file_message(text: str, *, filename: str = "feishu-writer.zip") -> InboundMessage:
@@ -244,6 +270,26 @@ async def test_feishu_skill_install_uploads_instruction_bundle_for_scan_only() -
     skills = await service.list_skills()
     assert [skill.name for skill in skills] == ["feishu-writer-skill", "feishu-reviewer-skill"]
     assert all(skill.status == "scanned" for skill in skills)
+
+async def test_feishu_skill_install_accepts_large_multi_skill_archives_by_default() -> None:
+    service = InMemoryAdminResourceService()
+    file_client = FakeFeishuFileClient(large_instruction_skill_bundle_archive())
+    handler = FeishuSkillCommandHandler(
+        admin_service=service,
+        media_client_factory=lambda _settings: file_client,
+    )
+
+    result = await handler.handle(
+        inbound_skill_file_message("/skill install", filename="large-all-skills.tar.gz"),
+        settings=FeishuSettings(),
+    )
+
+    assert result is not None
+    assert result.handled is True
+    assert "feishu-large-skill-0" in result.reply_text
+    assert "feishu-large-skill-1" in result.reply_text
+    skills = await service.list_skills()
+    assert [skill.name for skill in skills] == ["feishu-large-skill-0", "feishu-large-skill-1"]
 
 
 async def test_feishu_skill_install_requires_file_attachment() -> None:
