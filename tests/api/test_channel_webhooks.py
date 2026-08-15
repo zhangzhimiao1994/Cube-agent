@@ -719,6 +719,67 @@ def test_saved_feishu_command_aliases_are_applied_before_submission() -> None:
     assert gateway.messages[0].text == "//派单 写一个中秋晚会方案"
 
 
+def test_feishu_webhook_replies_to_help_alias_without_submission() -> None:
+    gateway = RecordingGateway()
+    app = create_app(
+        auth_service=StubAuthService(),
+        rate_limiter=object(),
+        feishu_gateway=gateway,
+    )
+    app.state.admin_resource_service = InMemoryAdminResourceService()
+    reply_sender = RecordingFeishuReplySender()
+    app.state.feishu_reply_sender = reply_sender
+    api = TestClient(app)
+
+    saved = api.post(
+        "/api/v1/admin/channels/feishu/config",
+        headers={"Authorization": "Bearer valid-token"},
+        json={
+            "values": {
+                "AGENT_HUB_PUBLIC_URL": "https://agent.example.com",
+                "FEISHU_APP_ID": "cli_saved_feishu",
+                "FEISHU_APP_SECRET": "saved-secret",
+                "FEISHU_VERIFICATION_TOKEN": "saved-verification-token",
+                "FEISHU_ENCRYPT_KEY": "saved-encrypt-key",
+                "FEISHU_COMMAND_ALIASES": "菜单=//帮助, 方案=//派单",
+                "FEISHU_TRANSPORT": "webhook",
+            }
+        },
+    )
+    response = api.post(
+        "/channels/feishu/events",
+        json={
+            "schema": "2.0",
+            "header": {
+                "event_id": "evt_help_alias",
+                "event_type": "im.message.receive_v1",
+                "token": "saved-verification-token",
+                "app_id": "cli_saved_feishu",
+                "tenant_key": "tenant_1",
+                "create_time": str(int(time.time())),
+            },
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou_user"}},
+                "message": {
+                    "message_id": "om_help_alias",
+                    "chat_id": "oc_chat",
+                    "chat_type": "p2p",
+                    "message_type": "text",
+                    "content": '{"text":"菜单"}',
+                },
+            },
+        },
+    )
+
+    assert saved.status_code == 200
+    assert response.status_code == 202
+    assert response.json() == {"accepted": True}
+    assert gateway.messages == []
+    assert len(reply_sender.replies) == 1
+    assert reply_sender.replies[0][1] == "om_help_alias"
+    assert "可用指令" in reply_sender.replies[0][2]
+    assert "菜单=//帮助" in reply_sender.replies[0][2]
+
 def test_feishu_webhook_appends_image_analysis_context() -> None:
     gateway = RecordingGateway()
     service = InMemoryAdminResourceService()

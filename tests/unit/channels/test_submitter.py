@@ -15,6 +15,7 @@ from agent_hub.channels.directives import (
     ChannelDirectiveError,
     apply_channel_command_aliases,
     command_help_text,
+    is_channel_help_request,
     parse_channel_directives,
     parse_command_aliases,
 )
@@ -185,13 +186,16 @@ async def test_submitter_parses_english_channel_language_directives_for_mode_and
 
 
 def test_channel_directives_accept_custom_aliases_and_show_help() -> None:
-    aliases = parse_command_aliases("方案=//派单, 讨论=//讨论, 代码=//vi")
+    aliases = parse_command_aliases("方案=//派单, 讨论=//讨论, 代码=//vi, 菜单=//帮助")
 
     normalized = apply_channel_command_aliases("方案 写一个中秋晚会方案", aliases)
     directives = parse_channel_directives(normalized)
     help_text = command_help_text(aliases)
 
     assert normalized == "//派单 写一个中秋晚会方案"
+    assert apply_channel_command_aliases("菜单", aliases) == "//帮助"
+    assert is_channel_help_request("菜单", aliases)
+    assert is_channel_help_request("//help", aliases)
     assert directives.mode is TaskMode.DISPATCH
     assert directives.task_text == "写一个中秋晚会方案"
     assert "方案=//派单" in help_text

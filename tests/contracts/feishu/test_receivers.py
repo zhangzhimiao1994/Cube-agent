@@ -188,6 +188,27 @@ async def test_receivers_apply_custom_command_aliases_before_submission(transpor
     assert message.text == "//派单 写一个发布计划"
     assert gateway.messages == [message]
 
+async def test_websocket_receiver_replies_to_help_alias_without_submission() -> None:
+    config = settings(command_aliases="菜单=//帮助, 方案=//派单")
+    gateway = RecordingGateway()
+    help_replies: list[InboundMessage] = []
+
+    async def help_handler(message: InboundMessage) -> None:
+        help_replies.append(message)
+
+    websocket_receiver = build_feishu_websocket_receiver(
+        config,
+        gateway=gateway,
+        help_handler=help_handler,
+        clock=lambda: float(NOW),
+    )
+
+    message = await websocket_receiver.receive(private_text_event(text="菜单"))
+
+    assert message is not None
+    assert message.text == "//帮助"
+    assert gateway.messages == []
+    assert help_replies == [message]
 
 async def test_websocket_receiver_accepts_sdk_payload_without_verification_token() -> None:
     gateway = RecordingGateway()

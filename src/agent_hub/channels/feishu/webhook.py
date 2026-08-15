@@ -15,7 +15,9 @@ from agent_hub.api.errors import error_responses
 from agent_hub.channels.base import AttachmentKind, InboundMessage
 from agent_hub.channels.directives import (
     apply_channel_command_aliases,
+    command_help_text,
     directive_summary,
+    is_channel_help_request,
     parse_channel_directives,
     parse_command_aliases,
 )
@@ -209,6 +211,8 @@ def create_lazy_feishu_webhook_router(
         if result.message is None:
             await _record_feishu_ignored_event(request, result)
             return JSONResponse(content={"accepted": True, "ignored": True})
+        if await _reply_if_channel_help_requested(request, settings, result):
+            return JSONResponse(status_code=202, content={"accepted": True})
         if await _handle_feishu_skill_command(request, settings, result):
             return JSONResponse(status_code=202, content={"accepted": True})
         if await _reply_if_multimedia_disabled(request, settings, result):
@@ -222,6 +226,36 @@ def create_lazy_feishu_webhook_router(
         return JSONResponse(status_code=202, content={"accepted": True})
 
     return router
+
+
+async def _reply_if_channel_help_requested(
+    request: Request,
+    settings: FeishuSettings,
+    result: FeishuWebhookResult,
+) -> bool:
+    message = result.message
+    if message is None:
+        return False
+    aliases = parse_command_aliases(settings.command_aliases)
+    if not is_channel_help_request(message.text, aliases):
+        return False
+    reply_sender = _feishu_reply_sender(request)
+    if reply_sender is None:
+        return True
+    try:
+        await reply_sender.reply_text(
+            settings=settings,
+            message_id=message.message_id,
+            text=command_help_text(aliases),
+        )
+    except Exception as error:  # noqa: BLE001 - best-effort channel delivery boundary
+        await log_feishu_reply_failure(
+            log_service=getattr(request.app.state, "admin_resource_service", None),
+            run_id=None,
+            message_id=message.message_id,
+            error=error,
+        )
+    return True
 
 
 async def _reply_if_multimedia_disabled(

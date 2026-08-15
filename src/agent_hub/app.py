@@ -40,6 +40,7 @@ from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
 from agent_hub.channels.base import InboundMessage
 from agent_hub.channels.dedup import InboundDedupRepository
 from agent_hub.channels.directives import (
+    command_help_text,
     directive_summary,
     parse_channel_directives,
     parse_command_aliases,
@@ -1049,6 +1050,7 @@ async def _start_feishu_websocket_connector_if_configured(
         settings,
         gateway=cast(ChannelGatewayProtocol, gateway),
         submission_handler=_feishu_websocket_submission_handler(application, settings),
+            help_handler=_feishu_websocket_help_handler(application, settings),
     )
     resolved_factory = client_factory or create_lark_oapi_feishu_websocket_client
 
@@ -1075,6 +1077,37 @@ def _feishu_websocket_submission_handler(
 ) -> Callable[[InboundMessage, object], Awaitable[None]]:
     async def handle(message: InboundMessage, submission: object) -> None:
         _schedule_feishu_websocket_reply(application, settings, message, submission)
+
+    return handle
+
+
+
+def _feishu_websocket_help_handler(
+    application: FastAPI,
+    settings: FeishuSettings,
+) -> Callable[[InboundMessage], Awaitable[None]]:
+    async def handle(message: InboundMessage) -> None:
+        sender = getattr(application.state, "feishu_reply_sender", None)
+        if sender is None:
+            dispatcher = getattr(application.state, "feishu_reply_dispatcher", None)
+            if isinstance(dispatcher, FeishuRunReplyDispatcher):
+                sender = dispatcher.sender
+        if sender is None or getattr(sender, "reply_text", None) is None:
+            return
+        aliases = parse_command_aliases(settings.command_aliases)
+        try:
+            await sender.reply_text(
+                settings=settings,
+                message_id=message.message_id,
+                text=command_help_text(aliases),
+            )
+        except Exception as error:  # noqa: BLE001 - best-effort channel delivery boundary
+            await log_feishu_reply_failure(
+                log_service=getattr(application.state, "admin_resource_service", None),
+                run_id=None,
+                message_id=message.message_id,
+                error=error,
+            )
 
     return handle
 

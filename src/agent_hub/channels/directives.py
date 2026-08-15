@@ -46,6 +46,16 @@ _VIBE_CODING_DIRECTIVES = {
     "//编程",
     "//代码协作",
 }
+_HELP_DIRECTIVES = {
+    "help",
+    "帮助",
+    "菜单",
+    "指令",
+    "//help",
+    "//帮助",
+    "//菜单",
+    "//指令",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +182,11 @@ def apply_channel_command_aliases(text: str, aliases: Mapping[str, str] | None =
     return f"{replacement} {parts[1]}"
 
 
+def is_channel_help_request(text: str, aliases: Mapping[str, str] | None = None) -> bool:
+    normalized = apply_channel_command_aliases(text, aliases).strip().casefold()
+    return normalized in _HELP_DIRECTIVES
+
+
 def command_help_text(aliases: Mapping[str, str] | None = None) -> str:
     alias_items = (
         [] if not aliases else [f"{alias}={target}" for alias, target in sorted(aliases.items())]
@@ -275,8 +290,14 @@ def _normalize_alias_target(target: str) -> str | None:
         "vibe": "//vi",
         "vi": "//vi",
         "代码": "//vi",
+        "help": "//help",
+        "帮助": "//帮助",
+        "菜单": "//帮助",
+        "指令": "//帮助",
     }
     stripped = shorthand.get(lowered, stripped)
+    if stripped.casefold() in _HELP_DIRECTIVES:
+        return stripped
     if _parse_token(stripped) is None:
         return None
     return stripped
@@ -294,6 +315,7 @@ __all__ = [
     "apply_channel_command_aliases",
     "command_help_text",
     "directive_summary",
+    "is_channel_help_request",
     "parse_channel_directives",
     "parse_command_aliases",
 ]

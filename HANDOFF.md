@@ -1,3 +1,30 @@
+## 2026-08-15 Feishu Channel Help Commands
+
+### State
+- Added explicit Feishu channel help commands so users can send `//帮助`, `//help`, `帮助`, `菜单`, or `指令` to receive the current channel interaction guide without creating a run.
+- Custom Feishu aliases can now point to help commands, e.g. `菜单=//帮助`, alongside existing mode aliases such as `方案=//派单` and `代码=//vi`.
+- Webhook mode intercepts help requests before Skill install, media processing, or run submission; websocket mode uses a dedicated `help_handler` and also avoids submitting help messages to the run gateway.
+- Existing task messages still receive the normal directive summary before terminal run results, so operators see standard commands and configured aliases during Feishu interaction.
+
+### Verification
+- TDD red: the new submitter test first failed because `is_channel_help_request` did not exist.
+- `.\.venv\Scripts\python.exe -m pytest tests\unit\channels\test_submitter.py::test_channel_directives_accept_custom_aliases_and_show_help tests\contracts\feishu\test_receivers.py::test_websocket_receiver_replies_to_help_alias_without_submission tests\api\test_channel_webhooks.py::test_feishu_webhook_replies_to_help_alias_without_submission -q --tb=short` -> 3 passed after implementation.
+- `.\.venv\Scripts\python.exe -m pytest tests\unit\channels\test_submitter.py tests\contracts\feishu\test_receivers.py tests\api\test_channel_webhooks.py::test_saved_feishu_command_aliases_are_applied_before_submission tests\api\test_channel_webhooks.py::test_feishu_webhook_replies_to_help_alias_without_submission tests\api\test_channel_webhooks.py::test_feishu_terminal_reply_summarizes_user_relevant_run_process -q` -> 27 passed, only existing FastAPI/httpx deprecation and pytest cache ACL warnings.
+- `.\.venv\Scripts\python.exe -m ruff check ...` on touched Python files -> passed.
+- `.\.venv\Scripts\python.exe -m mypy src\agent_hub\channels\directives.py src\agent_hub\channels\feishu\webhook.py src\agent_hub\channels\feishu\websocket.py src\agent_hub\app.py` -> passed.
+- `npm test -- --run src/pages/ChannelsPage.test.tsx` from `web/` -> 5 passed.
+- `git diff --check` -> passed with only CRLF normalization warnings for a few touched files.
+
+### Server Deployment And Real Probe
+- Created local incremental archive `.local-archives/server-incrementals/agent-hub-feishu-channel-help-20260815-090310.tgz` and uploaded it to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+- Deployed incrementally into `/opt/agent-hub/current`; server backup retained under `/opt/agent-hub/backups/p3-feishu-channel-help-20260815-090310`; server archive retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-feishu-channel-help-20260815-090310.tgz`.
+- The first server venv import probe exposed an existing runtime-sync gap: `site-packages/agent_hub/channels/feishu/media.py` lacked `log_feishu_media_failure` while the deployed `webhook.py` imported it. API health was still OK because the service used the source tree, but the venv package copy was inconsistent.
+- Created and deployed a second incremental sync archive `.local-archives/server-incrementals/agent-hub-feishu-channel-help-runtime-sync-20260815-090528.tgz`, including `src/agent_hub/channels/feishu/media.py`; backup retained at `/opt/agent-hub/backups/p3-feishu-channel-help-runtime-sync-20260815-090528`, archive retained at `/opt/agent-hub/archives/server-incrementals/agent-hub-feishu-channel-help-runtime-sync-20260815-090528.tgz`.
+- Server probe in the deployed venv passed: `builtin_help=true`, `custom_help_alias=true`, `dispatch_alias=true`, `help_text_has_alias=true`, `websocket_help_handler_arg=true`, `webhook_help_callable=true`; `/health` returned `{"status":"ok"}`; `agent-hub-api` and `agent-hub-worker` were active.
+- Removed server `/tmp` deploy/probe/package files after verification.
+
+### Remaining / Next
+- Continue remaining P3 backlog: evolution execution/backlog UI, conversation/history UI refinements, grounded Skill Creator workflows, remaining Skill archive edge cases if reproduced, bulk action/search/filter audit across dense pages, broader UI copy/layout audit, README/README.zh-CN usage refresh, and Docker readiness later.
 ## 2026-08-15 OpenClaw Dedicated Config Entry
 
 ### State
