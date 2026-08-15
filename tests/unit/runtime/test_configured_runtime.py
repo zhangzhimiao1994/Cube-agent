@@ -25,6 +25,7 @@ from agent_hub.runtime.defaults import (
     ConfigBackedDispatchRuntime,
     ConfigBackedHybridRuntime,
     UnavailableRuntime,
+    _assign_models_to_roles,
     _discussion_plan,
     _dispatch_parallelism,
     _dispatch_plan,
@@ -1133,6 +1134,101 @@ def test_role_model_selection_uses_role_and_task_capabilities_not_user_choice() 
         == "analyst"
     )
 
+
+def test_role_model_assignment_balances_repeated_roles_across_available_capacity() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "deepseek": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-v4-flash",
+                            "api_base": "https://api.deepseek.com/v1",
+                            "credential_ref": "secret://deepseek",
+                            "quota_scope_id": "deepseek",
+                            "max_concurrency": 10,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "tool_calling", "structured_output"],
+                        }
+                    ]
+                },
+                "qwen": {
+                    "deployments": [
+                        {
+                            "provider": "qwen",
+                            "model": "qwen3-max",
+                            "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                            "credential_ref": "secret://qwen",
+                            "quota_scope_id": "qwen",
+                            "max_concurrency": 5,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "tool_calling", "structured_output"],
+                        }
+                    ]
+                },
+                "glm": {
+                    "deployments": [
+                        {
+                            "provider": "zhipu",
+                            "model": "glm-5.2",
+                            "api_base": "https://open.bigmodel.cn/api/paas/v4",
+                            "credential_ref": "secret://glm",
+                            "quota_scope_id": "glm",
+                            "max_concurrency": 3,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "tool_calling", "structured_output"],
+                        }
+                    ]
+                },
+                "sonnet5": {
+                    "deployments": [
+                        {
+                            "provider": "claude-code-relay",
+                            "model": "claude-sonnet-5",
+                            "api_base": "https://relay.example/v1",
+                            "credential_ref": "secret://sonnet",
+                            "quota_scope_id": "sonnet",
+                            "max_concurrency": 3,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text", "tool_calling", "structured_output"],
+                        }
+                    ]
+                },
+            },
+            "agents": [],
+        }
+    )
+    roles = tuple(
+        RoleAssignment(
+            id=f"analyst_{index}",
+            role="分析师",
+            purpose=RolePurpose.EXPERTISE,
+            mission="分析调研材料、风险和执行建议。",
+            must_answer=("关键判断是什么？",),
+            allowed_tools=(),
+            forbidden_actions=("不要执行危险操作。",),
+            skills=(),
+            output_schema={},
+            model="deepseek",
+        )
+        for index in range(6)
+    )
+
+    assigned = _assign_models_to_roles(
+        roles,
+        config,
+        default_model="deepseek",
+        task="调研产品机会，分析市场、风险和执行路径。",
+    )
+    assigned_models = [role.model for role in assigned]
+
+    assert len(set(assigned_models)) >= 3
+    assert assigned_models.count("deepseek") < len(assigned_models)
 
 def test_dispatch_parallelism_uses_model_capacity_without_unbounded_fanout() -> None:
     config = PlatformConfig.model_validate(

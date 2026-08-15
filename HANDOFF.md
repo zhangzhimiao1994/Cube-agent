@@ -1,3 +1,37 @@
+# Handoff - 2026-08-15 17:40 CST - Capacity-Aware Role Model Assignment
+
+## Current state
+- Investigated failed run `584d2965-0471-4fbe-919d-f5267478842f` after the UI showed `model gateway failed: model capacity unavailable`.
+- Production run evidence showed dispatch mode failed after multiple child roles selected `deepseek`; Planner completed, then Project Manager failed on a later model call with `model gateway failed: model capacity unavailable`.
+- Production published config version 73 contains multiple ordinary models (`deepseek`, `glm`, `minimax`, `qwen`, `sonnet5`) with effective slots across providers, so the issue was not missing model configuration.
+- Root cause: role model assignment scored each role independently. Analysis/research tasks strongly preferred `deepseek`, so repeated roles concentrated on one logical model instead of using configured alternatives and their capacity.
+
+## Changed
+- `src/agent_hub/runtime/defaults.py`
+  - Added capacity-aware global role assignment. Repeated roles now use the same capability scoring but are penalized by already-assigned count and effective logical-model capacity.
+  - Dispatch max parallelism now considers the actual models assigned to roles instead of only the main Agent model.
+  - Analysis/research scoring now recognizes `qwen` and `glm` as capable analytical models and gives structured-output models a stronger analysis bonus.
+- `tests/unit/runtime/test_configured_runtime.py`
+  - Added regression coverage proving repeated analysis roles are spread across at least three configured models instead of all selecting `deepseek`.
+
+## Verification
+- Reproduced the bug first: `uv run pytest tests/unit/runtime/test_configured_runtime.py -k "role_model_assignment_balances"` failed because all 6 roles selected `deepseek`.
+- Local after fix:
+  - `uv run pytest tests/unit/runtime/test_configured_runtime.py -k "role_model_selection or role_model_assignment_balances or dispatch_parallelism"` -> 4 passed.
+  - `uv run ruff check src/agent_hub/runtime/defaults.py tests/unit/runtime/test_configured_runtime.py` -> passed.
+  - `uv run pytest tests/unit/runtime/test_configured_runtime.py` -> 21 passed.
+- Server incremental deployment:
+  - Uploaded `.local-archives/server-incrementals/agent-hub-role-model-capacity-20260815-174039.tgz` to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+  - Deployed into `/opt/agent-hub/current` and restarted `agent-hub-worker` plus `agent-hub-api`.
+  - Server backup: `/opt/agent-hub/backups/p3-role-model-capacity-20260815-174039`.
+  - Server retained archive: `/opt/agent-hub/archives/server-incrementals/agent-hub-role-model-capacity-20260815-174039.tgz`.
+  - Cleaned `/tmp/agent-hub-p3-runtime-incremental.tgz`, `/tmp/deploy-role-model-capacity.sh`, and `/tmp/probe-role-model-capacity.sh` after verification.
+- Server production-config probe:
+  - `{"status": "ok", "published_version": 73, "assigned_models": ["deepseek", "qwen", "glm", "sonnet5", "minimax", "deepseek"], "distinct_models": ["deepseek", "glm", "minimax", "qwen", "sonnet5"], "dispatch_parallelism": 16}`.
+  - Confirmed the live published model config now distributes repeated analysis roles across the configured ordinary models instead of concentrating on `deepseek`.
+
+## Remaining / next
+- Commit this slice, retain GitHub recovery archive/tag, push `mutilagent/main`, and verify Actions.
 # Handoff - 2026-08-15 13:55 CST - Login Brand Copy And Logout Navigation
 
 ## Current state

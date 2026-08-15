@@ -334,7 +334,7 @@ class ConfigBackedDispatchRuntime:
         plan = _dispatch_plan(
             roles,
             context,
-            max_parallelism=_dispatch_parallelism(config, logical_model),
+            max_parallelism=_dispatch_parallelism(config, logical_model, roles),
             capability_gateway=self._capability_gateway,
         )
         return _PlannedRuntime(
@@ -577,7 +577,7 @@ class ConfigBackedHybridRuntime:
         dispatch_plan = _dispatch_plan(
             dispatch_roles,
             context,
-            max_parallelism=_dispatch_parallelism(config, logical_model),
+            max_parallelism=_dispatch_parallelism(config, logical_model, dispatch_roles),
             capability_gateway=self._capability_gateway,
         )
         discussion_plan = _discussion_plan(
@@ -955,18 +955,62 @@ def _assign_models_to_roles(
     default_model: str,
     task: object,
 ) -> tuple[RoleAssignment, ...]:
-    return tuple(
-        replace(
+    assigned_counts: dict[str, int] = {}
+    capacities = {
+        logical_model: _logical_model_capacity(config, logical_model)
+        for logical_model in config.models
+    }
+    assigned: list[RoleAssignment] = []
+    for role in roles:
+        ranked = _rank_logical_models_for_role(
             role,
-            model=_select_logical_model_for_role(
-                role,
-                config,
-                default_model=default_model,
-                task=task,
-            ),
+            config,
+            default_model=default_model,
+            task=task,
         )
-        for role in roles
+        selected = default_model
+        if ranked:
+            selected = max(
+                ranked,
+                key=lambda item: _capacity_adjusted_model_score(
+                    item,
+                    assigned_counts=assigned_counts,
+                    capacities=capacities,
+                ),
+            )[2]
+        assigned_counts[selected] = assigned_counts.get(selected, 0) + 1
+        assigned.append(replace(role, model=selected))
+    return tuple(assigned)
+
+
+def _capacity_adjusted_model_score(
+    ranked_item: tuple[int, int, str],
+    *,
+    assigned_counts: Mapping[str, int],
+    capacities: Mapping[str, int],
+) -> tuple[int, int, int, str]:
+    score, length_tiebreaker, logical_model = ranked_item
+    used = assigned_counts.get(logical_model, 0)
+    capacity = max(1, capacities.get(logical_model, 1))
+    adjusted = score - min(used, capacity) * 6
+    if used >= capacity:
+        adjusted -= (used - capacity + 1) * 24
+    return adjusted, -used, length_tiebreaker, logical_model
+
+
+def _logical_model_capacity(config: PlatformConfig, logical_model: str) -> int:
+    definition = config.models.get(logical_model)
+    if definition is None:
+        return 1
+    slots = sum(
+        safe_operational_limit(
+            deployment.max_concurrency,
+            deployment.target_utilization,
+            deployment.reserved_slots,
+        )
+        for deployment in definition.deployments
     )
+    return max(1, slots)
 
 
 def _string_or_default(value: object, default: str) -> str:
@@ -980,8 +1024,24 @@ def _select_logical_model_for_role(
     default_model: str,
     task: object,
 ) -> str:
+    ranked = _rank_logical_models_for_role(
+        role,
+        config,
+        default_model=default_model,
+        task=task,
+    )
+    return ranked[0][2] if ranked else default_model
+
+
+def _rank_logical_models_for_role(
+    role: RoleAssignment,
+    config: PlatformConfig,
+    *,
+    default_model: str,
+    task: object,
+) -> list[tuple[int, int, str]]:
     if not config.models:
-        return default_model
+        return []
     text = " ".join(
         (
             str(task),
@@ -1029,10 +1089,10 @@ def _select_logical_model_for_role(
             if any(keyword in haystack for keyword in ("coder", "code")):
                 score -= 4
         if any(keyword in text for keyword in ("分析", "调研", "研究", "经济", "金融", "市场", "竞品", "风险", "review", "audit")):
-            if any(keyword in haystack for keyword in ("analyst", "analysis", "reason", "max", "sonnet", "claude", "deepseek")):
+            if any(keyword in haystack for keyword in ("analyst", "analysis", "reason", "max", "sonnet", "claude", "deepseek", "qwen", "glm")):
                 score += 22
             if "structured_output" in haystack:
-                score += 3
+                score += 6
         if any(keyword in text for keyword in ("图片", "识图", "视觉", "image", "vision")) and "vision" in haystack:
             score += 28
         if any(
@@ -1041,7 +1101,7 @@ def _select_logical_model_for_role(
             score += 18
         scored.append((score, -len(logical_model), logical_model))
     scored.sort(reverse=True)
-    return scored[0][2] if scored else default_model
+    return scored
 
 
 def _requested_skills(context: TaskContext) -> tuple[str, ...]:
@@ -1165,18 +1225,19 @@ def _task_profiles(task: object) -> tuple[TaskProfile, ...]:
     return tuple(profiles)
 
 
-def _dispatch_parallelism(config: PlatformConfig, logical_model: str) -> int:
-    definition = config.models.get(logical_model)
-    if definition is None:
-        return 1
-    slots = sum(
-        safe_operational_limit(
-            deployment.max_concurrency,
-            deployment.target_utilization,
-            deployment.reserved_slots,
-        )
-        for deployment in definition.deployments
+def _dispatch_parallelism(
+    config: PlatformConfig,
+    logical_model: str,
+    roles: tuple[RoleAssignment, ...] | None = None,
+) -> int:
+    logical_models = (
+        {role.model for role in roles if role.model in config.models}
+        if roles is not None
+        else set()
     )
+    if not logical_models:
+        logical_models = {logical_model}
+    slots = sum(_logical_model_capacity(config, item) for item in logical_models)
     return max(1, min(slots, 16))
 
 
