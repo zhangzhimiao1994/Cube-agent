@@ -163,7 +163,7 @@ def parse_command_aliases(value: str | None) -> dict[str, str]:
         normalized_target = _normalize_alias_target(target)
         if normalized_target is None:
             continue
-        aliases[alias.casefold()] = normalized_target
+        aliases[alias] = normalized_target
     return aliases
 
 
@@ -174,7 +174,8 @@ def apply_channel_command_aliases(text: str, aliases: Mapping[str, str] | None =
     if not stripped:
         return text
     parts = stripped.split(maxsplit=1)
-    replacement = aliases.get(parts[0].casefold())
+    alias_lookup = {alias.casefold(): target for alias, target in aliases.items()}
+    replacement = alias_lookup.get(parts[0].casefold())
     if replacement is None:
         return text
     if len(parts) == 1:

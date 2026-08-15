@@ -202,6 +202,18 @@ def test_channel_directives_accept_custom_aliases_and_show_help() -> None:
     assert "代码=//vi" in help_text
 
 
+def test_channel_command_aliases_preserve_operator_labels_but_match_case_insensitively() -> None:
+    aliases = parse_command_aliases("Plan=//派单, Menu=//帮助")
+
+    help_text = command_help_text(aliases)
+
+    assert apply_channel_command_aliases("plan 写一个发布方案", aliases) == "//派单 写一个发布方案"
+    assert is_channel_help_request("MENU", aliases)
+    assert "Plan=//派单" in help_text
+    assert "Menu=//帮助" in help_text
+    assert "plan=//派单" not in help_text
+
+
 async def test_submitter_parses_chinese_channel_language_directives_and_rejects_disabled_vibe() -> (
     None
 ):

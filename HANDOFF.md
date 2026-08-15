@@ -1,3 +1,27 @@
+## 2026-08-15 Feishu Channel Command Alias Display
+
+- Scope: refined Feishu/channel interaction command aliases so custom aliases keep the operator-entered label in help text while matching user messages case-insensitively.
+- Code changes:
+  - `src/agent_hub/channels/directives.py`: `parse_command_aliases()` now preserves alias labels instead of storing only case-folded keys; `apply_channel_command_aliases()` builds a case-folded lookup at match time.
+  - `tests/unit/channels/test_submitter.py`: added coverage for `Plan=//派单, Menu=//帮助`, proving `plan` and `MENU` work while help output still shows `Plan` and `Menu`.
+- Local verification:
+  - `uv run pytest tests\unit\channels\test_submitter.py -q` -> 7 passed.
+  - `uv run pytest tests\contracts\feishu\test_receivers.py -q` -> 18 passed.
+  - `uv run pytest tests\api\test_channel_webhooks.py -q` -> 27 passed.
+  - `uv run pytest tests\unit\channels\test_submitter.py tests\contracts\feishu\test_receivers.py tests\api\test_channel_webhooks.py -q` -> 52 passed.
+  - `uv run ruff check src tests` -> passed.
+  - `npm test -- --run src\pages\ChannelsPage.test.tsx` from `web/` -> 5 passed.
+  - `npm run lint` from `web/` -> passed.
+  - `npm run build` from `web/` -> passed, with the existing Vite chunk-size warning.
+- Server deployment:
+  - Incremental archive: `.local-archives/server-incrementals/agent-hub-feishu-command-aliases-20260815-120500.tgz` uploaded to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+  - Deployed to `/opt/agent-hub/current`; backup: `/opt/agent-hub/backups/p3-feishu-command-aliases-20260815-120500`.
+  - Server retained archive: `/opt/agent-hub/archives/server-incrementals/agent-hub-feishu-command-aliases-20260815-120500.tgz`.
+  - Server probe in real deployed environment verified `Plan=//派单, Menu=//帮助`: `plan ...` normalizes to `//派单 ...`, `MENU` triggers help, help text preserves `Menu=//帮助，Plan=//派单`; `/health` returned `{"status":"ok"}` and `agent-hub-api` was active.
+  - Cleaned `/tmp/agent-hub-p3-runtime-incremental.tgz`, `/tmp/deploy-feishu-command-aliases.sh`, and `/tmp/probe-feishu-command-aliases.sh`.
+- Remaining / Next:
+  - Commit and push this slice with a GitHub recovery bundle/tag, then check the triggered quality run.
+  - Continue broader missing button/function sweep and later OpenClaw/Evolution/UI audit tasks from the active plan.
 ## 2026-08-15 README Usage Refresh
 
 ### State
