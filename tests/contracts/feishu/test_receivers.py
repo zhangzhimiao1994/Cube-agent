@@ -158,7 +158,9 @@ async def test_receivers_produce_same_inbound_message(transport: str) -> None:
 
 
 @pytest.mark.parametrize("transport", ["webhook", "websocket"])
-async def test_receivers_apply_custom_command_aliases_before_submission(transport: str) -> None:
+async def test_receivers_keep_configured_command_alias_text_for_main_agent_entry(
+    transport: str,
+) -> None:
     config = settings(command_aliases="方案=//派单, 代码=//vi")
     gateway = RecordingGateway()
     if transport == "webhook":
@@ -185,10 +187,11 @@ async def test_receivers_apply_custom_command_aliases_before_submission(transpor
         message = await websocket_receiver.receive(private_text_event(text="方案 写一个发布计划"))
 
     assert message is not None
-    assert message.text == "//派单 写一个发布计划"
+    assert message.text == "方案 写一个发布计划"
     assert gateway.messages == [message]
 
-async def test_websocket_receiver_replies_to_help_alias_without_submission() -> None:
+
+async def test_websocket_receiver_submits_help_text_to_main_agent_entry() -> None:
     config = settings(command_aliases="菜单=//帮助, 方案=//派单")
     gateway = RecordingGateway()
     help_replies: list[InboundMessage] = []
@@ -206,9 +209,10 @@ async def test_websocket_receiver_replies_to_help_alias_without_submission() -> 
     message = await websocket_receiver.receive(private_text_event(text="菜单"))
 
     assert message is not None
-    assert message.text == "//帮助"
-    assert gateway.messages == []
-    assert help_replies == [message]
+    assert message.text == "菜单"
+    assert gateway.messages == [message]
+    assert help_replies == []
+
 
 async def test_websocket_receiver_accepts_sdk_payload_without_verification_token() -> None:
     gateway = RecordingGateway()

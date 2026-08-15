@@ -253,20 +253,17 @@ describe("ChannelsPage", () => {
     expect(screen.getByText(/校验失败会返回明确错误/)).not.toBeNull();
     expect(screen.getByText("飞书长连接运行中")).not.toBeNull();
     expect(screen.getByText("连接次数 2 / 收到事件 3 / 已提交 2 / 失败 0")).not.toBeNull();
-    expect(screen.getByRole("textbox", { name: /交互指令别名 FEISHU_COMMAND_ALIASES/ })).not.toBeNull();
-    expect(screen.getByText(/标准指令支持 \/\/自动、\/\/直连、\/\/派单/)).not.toBeNull();
-    expect(screen.getByRole("region", { name: "飞书通道交互指令" })).not.toBeNull();
-    expect(screen.getByText("//帮助")).not.toBeNull();
-    expect(screen.getByText(/发送“帮助”“菜单”“指令”或“\/\/帮助”/)).not.toBeNull();
-    expect(screen.getByText("//讨论 评审这个方案的风险和下一步")).not.toBeNull();
-    expect(screen.getByText("//混合 &research @github 梳理这个仓库的改造计划")).not.toBeNull();
-    expect(screen.getByText("方案 写一个产品发布方案")).not.toBeNull();
-    expect(screen.getByText("代码 重构这个接口并说明测试结果")).not.toBeNull();
-    expect(screen.getByText(/方案=\/\/派单, 代码=\/\/vi, 菜单=\/\/帮助/)).not.toBeNull();
-    expect(screen.getByText("当前生效的自定义指令")).not.toBeNull();
-    expect(screen.getByText("等同于 //派单")).not.toBeNull();
-    expect(screen.getByText("等同于 //vi")).not.toBeNull();
-    expect(screen.getByText(/保存后飞书里的帮助菜单会同步显示这些别名/)).not.toBeNull();
+    expect(screen.getByRole("region", { name: "飞书资源选择器" })).not.toBeNull();
+    expect(screen.getByText("@github")).not.toBeNull();
+    expect(screen.getByText("&research")).not.toBeNull();
+    expect(screen.getByText("#filesystem")).not.toBeNull();
+    expect(screen.getByText(/默认先交给主 Agent 判断入口/)).not.toBeNull();
+    expect(screen.getByText("@github &research #filesystem 梳理这个仓库的改造计划")).not.toBeNull();
+    expect(screen.getByText("&pdf 总结附件中的论文并给出后续研究方向")).not.toBeNull();
+    expect(screen.getByText(/正文开始后出现的 @、&、# 不会被当成调用/)).not.toBeNull();
+    expect(screen.getByText(/运行模式不再由通道指令决定/)).not.toBeNull();
+    expect(screen.queryByText("当前生效的自定义指令")).toBeNull();
+    expect(screen.queryByText("//帮助")).toBeNull();
   });
 
   it("does not mark unconfigured optional channel fields as already configured", async () => {

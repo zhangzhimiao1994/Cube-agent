@@ -11,14 +11,6 @@ from agent_hub.channels.base import (
     InboundAttachment,
     InboundMessage,
 )
-from agent_hub.channels.directives import (
-    ChannelDirectiveError,
-    apply_channel_command_aliases,
-    command_help_text,
-    is_channel_help_request,
-    parse_channel_directives,
-    parse_command_aliases,
-)
 from agent_hub.channels.submitter import RunServiceInboundSubmitter
 from agent_hub.domain.runs import TaskMode
 
@@ -75,19 +67,27 @@ class StubSettingsService:
         return self.settings
 
 
-async def test_submitter_forwards_agent_hub_attachment_ids_and_manifest() -> None:
-    run_service = RecordingRunService()
-    submitter = RunServiceInboundSubmitter(run_service=run_service, tenant_id=TENANT_ID)
-    message = InboundMessage(
-        channel=Channel.CUSTOM_WEBHOOK,
+def _message(text: str, *, attachments: tuple[InboundAttachment, ...] = ()) -> InboundMessage:
+    return InboundMessage(
+        channel=Channel.FEISHU,
         tenant_external_id="tenant_1",
         sender_external_id="user_1",
         conversation_external_id="conv_1",
         message_id="msg_1",
         event_id="evt_1",
         conversation_type=ConversationType.PRIVATE,
-        text="/dispatch Review this image",
+        text=text,
         mentions_bot=True,
+        attachments=attachments,
+        received_at=datetime(2026, 8, 11, tzinfo=UTC),
+    )
+
+
+async def test_submitter_forwards_channel_text_to_main_agent_entry_with_attachments() -> None:
+    run_service = RecordingRunService()
+    submitter = RunServiceInboundSubmitter(run_service=run_service, tenant_id=TENANT_ID)
+    message = _message(
+        "/dispatch Review this image",
         attachments=(
             InboundAttachment(
                 kind=AttachmentKind.IMAGE,
@@ -102,7 +102,6 @@ async def test_submitter_forwards_agent_hub_attachment_ids_and_manifest() -> Non
                 declared_mime="text/plain",
             ),
         ),
-        received_at=datetime(2026, 8, 11, tzinfo=UTC),
     )
 
     run_id = await submitter.submit(message, idempotency_key="idem_1")
@@ -110,171 +109,95 @@ async def test_submitter_forwards_agent_hub_attachment_ids_and_manifest() -> Non
     assert run_id == RUN_ID
     assert len(run_service.calls) == 1
     call = run_service.calls[0]
-    assert call["mode"] is TaskMode.DISPATCH
+    assert call["mode"] is TaskMode.AUTO
     assert call["attachment_ids"] == ("att_0123456789abcdef0123456789abcdef",)
-    assert "Review this image" in str(call["message"])
+    assert "/dispatch Review this image" in str(call["message"])
     assert "Channel attachments:" in str(call["message"])
     assert "filename=screen.png" in str(call["message"])
     assert "external_key=platform_file_1" in str(call["message"])
     context = call["channel_context"]
     assert isinstance(context, dict)
-    assert context["source_channel"] == "custom_webhook"
+    assert context["source_channel"] == "feishu"
+    assert context["channel_entry_policy"] == "main_agent_decides"
     assert context["channel_message_id"] == "msg_1"
 
 
-async def test_submitter_parses_channel_directives_for_mode_skills_mcp_and_plugins() -> None:
+async def test_submitter_extracts_leading_resource_hints_without_changing_message_text() -> None:
     run_service = RecordingRunService()
     submitter = RunServiceInboundSubmitter(run_service=run_service, tenant_id=TENANT_ID)
-    message = InboundMessage(
-        channel=Channel.FEISHU,
-        tenant_external_id="tenant_1",
-        sender_external_id="user_1",
-        conversation_external_id="conv_1",
-        message_id="msg_1",
-        event_id="evt_1",
-        conversation_type=ConversationType.PRIVATE,
-        text="/dispatch &deep-research &pdf /#filesystem @github Review this repo",
-        mentions_bot=True,
-        received_at=datetime(2026, 8, 11, tzinfo=UTC),
+
+    await submitter.submit(
+        _message("@github &deep-research &pdf #filesystem Review this repo"),
+        idempotency_key="idem_1",
     )
 
-    await submitter.submit(message, idempotency_key="idem_1")
-
     call = run_service.calls[0]
-    assert call["mode"] is TaskMode.DISPATCH
-    assert call["message"] == "Review this repo"
+    assert call["mode"] is TaskMode.AUTO
+    assert call["message"] == "@github &deep-research &pdf #filesystem Review this repo"
     context = call["channel_context"]
     assert isinstance(context, dict)
+    assert context["channel_entry_policy"] == "main_agent_decides"
     assert context["requested_skills"] == "deep-research,pdf"
     assert context["requested_mcp_servers"] == "filesystem"
     assert context["requested_plugins"] == "github"
 
 
-async def test_submitter_parses_english_channel_language_directives_for_mode_and_vibe() -> None:
+async def test_submitter_ignores_resource_symbols_after_task_text_begins() -> None:
+    run_service = RecordingRunService()
+    submitter = RunServiceInboundSubmitter(run_service=run_service, tenant_id=TENANT_ID)
+
+    await submitter.submit(
+        _message("请分析 @someone 的账号、#一级标题、C# 示例和 & 符号，不要当成资源调用"),
+        idempotency_key="idem_1",
+    )
+
+    call = run_service.calls[0]
+    assert call["mode"] is TaskMode.AUTO
+    context = call["channel_context"]
+    assert isinstance(context, dict)
+    assert context["channel_entry_policy"] == "main_agent_decides"
+    assert "requested_skills" not in context
+    assert "requested_mcp_servers" not in context
+    assert "requested_plugins" not in context
+
+
+async def test_submitter_keeps_channel_language_directives_as_raw_text_for_main_agent() -> None:
     run_service = RecordingRunService()
     submitter = RunServiceInboundSubmitter(
         run_service=run_service,
         tenant_id=TENANT_ID,
         settings_service=StubSettingsService(vibe_coding_enabled=True),
     )
-    message = InboundMessage(
-        channel=Channel.FEISHU,
-        tenant_external_id="tenant_1",
-        sender_external_id="user_1",
-        conversation_external_id="conv_1",
-        message_id="msg_1",
-        event_id="evt_1",
-        conversation_type=ConversationType.PRIVATE,
-        text="//hybrid //vi Refactor this module with context compression",
-        mentions_bot=True,
-        received_at=datetime(2026, 8, 11, tzinfo=UTC),
+
+    await submitter.submit(
+        _message("//hybrid //vi Refactor this module with context compression"),
+        idempotency_key="idem_1",
     )
 
-    directives = parse_channel_directives(message.text)
-    await submitter.submit(message, idempotency_key="idem_1")
-
-    assert directives.mode is TaskMode.HYBRID
-    assert directives.vibe_coding is True
-    assert directives.task_text == "Refactor this module with context compression"
     call = run_service.calls[0]
-    assert call["mode"] is TaskMode.HYBRID
-    assert call["vibe_coding"] is True
-    assert call["message"] == "Refactor this module with context compression"
+    assert call["mode"] is TaskMode.AUTO
+    assert call["vibe_coding"] is False
+    assert call["message"] == "//hybrid //vi Refactor this module with context compression"
     context = call["channel_context"]
     assert isinstance(context, dict)
-    assert context["requested_channel_features"] == "vibe_coding"
+    assert context["channel_entry_policy"] == "main_agent_decides"
+    assert "requested_channel_features" not in context
 
 
-def test_channel_directives_accept_custom_aliases_and_show_help() -> None:
-    aliases = parse_command_aliases("方案=//派单, 讨论=//讨论, 代码=//vi, 菜单=//帮助")
-
-    normalized = apply_channel_command_aliases("方案 写一个中秋晚会方案", aliases)
-    directives = parse_channel_directives(normalized)
-    help_text = command_help_text(aliases)
-
-    assert normalized == "//派单 写一个中秋晚会方案"
-    assert apply_channel_command_aliases("菜单", aliases) == "//帮助"
-    assert is_channel_help_request("菜单", aliases)
-    assert is_channel_help_request("//help", aliases)
-    assert directives.mode is TaskMode.DISPATCH
-    assert directives.task_text == "写一个中秋晚会方案"
-    assert "方案=//派单" in help_text
-    assert "代码=//vi" in help_text
-
-
-def test_channel_command_aliases_preserve_operator_labels_but_match_case_insensitively() -> None:
-    aliases = parse_command_aliases("Plan=//派单, Menu=//帮助")
-
-    help_text = command_help_text(aliases)
-
-    assert apply_channel_command_aliases("plan 写一个发布方案", aliases) == "//派单 写一个发布方案"
-    assert is_channel_help_request("MENU", aliases)
-    assert "Plan=//派单" in help_text
-    assert "Menu=//帮助" in help_text
-    assert "plan=//派单" not in help_text
-
-
-async def test_submitter_parses_chinese_channel_language_directives_and_rejects_disabled_vibe() -> (
-    None
-):
+async def test_submitter_no_longer_rejects_disabled_vibe_channel_keyword() -> None:
     run_service = RecordingRunService()
     submitter = RunServiceInboundSubmitter(
         run_service=run_service,
         tenant_id=TENANT_ID,
         settings_service=StubSettingsService(vibe_coding_enabled=False),
     )
-    message = InboundMessage(
-        channel=Channel.FEISHU,
-        tenant_external_id="tenant_1",
-        sender_external_id="user_1",
-        conversation_external_id="conv_1",
-        message_id="msg_1",
-        event_id="evt_1",
-        conversation_type=ConversationType.PRIVATE,
-        text="//讨论 //代码协作 评审这个实现方案",
-        mentions_bot=True,
-        received_at=datetime(2026, 8, 11, tzinfo=UTC),
-    )
 
-    directives = parse_channel_directives(message.text)
+    await submitter.submit(_message("//讨论 //代码协作 评审这个实现方案"), idempotency_key="idem_1")
 
-    assert directives.mode is TaskMode.DISCUSS
-    assert directives.vibe_coding is True
-    assert directives.task_text == "评审这个实现方案"
-    try:
-        await submitter.submit(message, idempotency_key="idem_1")
-    except ChannelDirectiveError as error:
-        assert error.reason == "vibe_coding_disabled"
-    else:  # pragma: no cover - assertion clarity
-        raise AssertionError(
-            "submitter accepted channel Vibe Coding while the system switch is off"
-        )
-    assert run_service.calls == []
-
-
-async def test_submitter_rejects_malformed_channel_directives() -> None:
-    run_service = RecordingRunService()
-    submitter = RunServiceInboundSubmitter(run_service=run_service, tenant_id=TENANT_ID)
-    message = InboundMessage(
-        channel=Channel.FEISHU,
-        tenant_external_id="tenant_1",
-        sender_external_id="user_1",
-        conversation_external_id="conv_1",
-        message_id="msg_1",
-        event_id="evt_1",
-        conversation_type=ConversationType.PRIVATE,
-        text="/dispatch /#bad! &skill_ok @github Review this repo",
-        mentions_bot=True,
-        received_at=datetime(2026, 8, 11, tzinfo=UTC),
-    )
-
-    directives = parse_channel_directives(message.text)
-
-    assert directives.invalid_reason == "invalid_directive"
-    try:
-        await submitter.submit(message, idempotency_key="idem_1")
-    except ChannelDirectiveError as error:
-        assert error.reason == "invalid_directive"
-    else:  # pragma: no cover - assertion clarity
-        raise AssertionError("submitter accepted malformed channel directive")
-    assert run_service.calls == []
+    call = run_service.calls[0]
+    assert call["mode"] is TaskMode.AUTO
+    assert call["vibe_coding"] is False
+    assert call["message"] == "//讨论 //代码协作 评审这个实现方案"
+    context = call["channel_context"]
+    assert isinstance(context, dict)
+    assert context["channel_entry_policy"] == "main_agent_decides"

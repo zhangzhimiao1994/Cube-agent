@@ -277,9 +277,7 @@ def ready_decision(mode: TaskMode) -> RouteDecision:
         mode=mode,
         needs_user_choice=False,
         status="ready",
-        assessments=(
-            assessment(mode, confidence=0.95),
-        ),
+        assessments=(assessment(mode, confidence=0.95),),
         clarification_reason=None,
         options=(),
         decision_token=None,
@@ -352,6 +350,45 @@ async def test_submit_persists_vibe_coding_capability_metadata() -> None:
 
 
 @pytest.mark.asyncio
+async def test_submit_persists_safe_channel_entry_policy_metadata() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    queue = RecordingQueue()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=None,
+        task_queue=queue,
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="@github &research #filesystem 梳理仓库",
+        mode=TaskMode.AUTO,
+        channel_context={
+            "source_channel": "feishu",
+            "channel_entry_policy": "main_agent_decides",
+            "requested_plugins": "github",
+            "requested_skills": "research",
+            "requested_mcp_servers": "filesystem",
+            "unsafe_extra": "should-not-persist",
+        },
+    )
+
+    routing = repository.records[submitted.id].routing_decision
+
+    assert routing is not None
+    assert routing["source_channel"] == "feishu"
+    assert routing["channel_entry_policy"] == "main_agent_decides"
+    assert routing["requested_plugins"] == "github"
+    assert routing["requested_skills"] == "research"
+    assert routing["requested_mcp_servers"] == "filesystem"
+    assert "unsafe_extra" not in routing
+
+
+@pytest.mark.asyncio
 async def test_schedule_intent_returns_confirmation_proposal_without_enqueue() -> None:
     tenant_id = uuid4()
     actor_id = uuid4()
@@ -387,6 +424,7 @@ async def test_schedule_intent_returns_confirmation_proposal_without_enqueue() -
     assert routing["approval_kind"] == "schedule_creation"
     assert routing["schedule_proposal"] == submitted.schedule_proposal
 
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "message",
@@ -420,6 +458,7 @@ async def test_normal_planning_request_does_not_become_schedule_task(message: st
     routing = repository.records[submitted.id].routing_decision
     assert routing is not None
     assert "schedule_proposal" not in routing
+
 
 @pytest.mark.asyncio
 async def test_evolution_intent_returns_confirmation_proposal_without_enqueue() -> None:
@@ -776,9 +815,7 @@ async def test_dispatch_requires_user_approval_before_temporary_agent_is_queued(
     )
 
     assert approved.status is RunStatus.QUEUED
-    assert repository.outbox == [
-        (submitted.id, f"{tenant_id}:{submitted.id}:temporary-agent:1")
-    ]
+    assert repository.outbox == [(submitted.id, f"{tenant_id}:{submitted.id}:temporary-agent:1")]
     decision = repository.records[submitted.id].routing_decision
     assert decision is not None
     assert decision["temporary_agent_approved"] is True
@@ -829,7 +866,10 @@ async def test_user_can_reject_temporary_agent_with_feedback_and_continue() -> N
     assert "不要加工程师" in record.request
     assert record.routing_decision is not None
     assert record.routing_decision["temporary_agent_rejected"] is True
-    assert record.routing_decision["temporary_agent_feedback"] == "不要加工程师，先让产品经理重新拆需求。"
+    assert (
+        record.routing_decision["temporary_agent_feedback"]
+        == "不要加工程师，先让产品经理重新拆需求。"
+    )
     assert repository.outbox == [
         (submitted.id, f"{tenant_id}:{submitted.id}:temporary-agent-revision:1")
     ]

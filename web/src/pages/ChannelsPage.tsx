@@ -59,7 +59,6 @@ const CHANNEL_GUIDES: Record<string, ChannelGuide> = {
       { env: "FEISHU_VERIFICATION_TOKEN", label: "Verification Token", secret: true, placeholder: "自建应用事件订阅校验 token", source: "自建应用 → 事件与回调 → 加密策略 → Verification Token" },
       { env: "FEISHU_ENCRYPT_KEY", label: "Encrypt Key", secret: true, placeholder: "启用事件加密时填写", source: "自建应用 → 事件与回调 → 加密策略 → Encrypt Key；未启用加密可留空" },
       { env: "AGENT_HUB_PUBLIC_URL", label: "公网访问地址", placeholder: "https://agent.example.com", source: "Webhook 回调需要公网地址；长连接模式可留空" },
-      { env: "FEISHU_COMMAND_ALIASES", label: "交互指令别名", placeholder: "方案=//派单, 讨论=//讨论, 代码=//vi", source: "可选；多条用逗号、分号或换行分隔。标准指令支持 //自动、//直连、//派单、//讨论、//混合、//vi" },
     ],
     steps: [
       "推荐长连接：在飞书事件与回调中选择长连接模式，系统只需要 App ID 和 App Secret。",
@@ -325,22 +324,16 @@ function envTemplate(channel: ChannelStatus, guide: ChannelGuide) {
     .join("\n");
 }
 
-const FEISHU_STANDARD_COMMANDS = [
-  { command: "//自动", description: "由主 Agent 判断模式" },
-  { command: "//直连", description: "直接回答，不分派子 Agent" },
-  { command: "//派单", description: "按角色派发给子 Agent" },
-  { command: "//讨论", description: "多角色讨论后裁决" },
-  { command: "//混合", description: "派单、讨论和复核组合执行" },
-  { command: "//vi", description: "开启 Vibe Coding" },
-  { command: "//帮助", description: "在飞书中返回这份指令菜单" },
+const FEISHU_RESOURCE_SELECTORS = [
+  { command: "@github", description: "消息开头选择插件" },
+  { command: "&research", description: "消息开头选择 Skill" },
+  { command: "#filesystem", description: "消息开头选择 MCP" },
 ];
 
-const FEISHU_COMMAND_EXAMPLES = [
-  "帮助",
-  "//讨论 评审这个方案的风险和下一步",
-  "//混合 &research @github 梳理这个仓库的改造计划",
-  "方案 写一个产品发布方案",
-  "代码 重构这个接口并说明测试结果",
+const FEISHU_RESOURCE_EXAMPLES = [
+  "@github &research #filesystem 梳理这个仓库的改造计划",
+  "&pdf 总结附件中的论文并给出后续研究方向",
+  "请分析 @someone 的账号、#标题 和 C# 示例，不要当成资源调用",
 ];
 type ChannelSortKey = "name" | "status" | "entry" | "missing";
 
@@ -416,10 +409,6 @@ export function ChannelsPage() {
     return items.find((item) => item.id === selectedId) ?? items[0] ?? null;
   }, [channels.data, selectedId]);
   const guide = selected ? CHANNEL_GUIDES[selected.id] : null;
-  const effectiveFeishuAliases = useMemo(() => {
-    if (selected?.id !== "feishu") return [];
-    return Object.entries(selected.command_aliases ?? {}).sort(([left], [right]) => left.localeCompare(right, "zh-Hans-CN"));
-  }, [selected]);
 
   useEffect(() => {
     setDraftValues({});
@@ -544,11 +533,11 @@ export function ChannelsPage() {
             </article>
 
             {selected.id === "feishu" ? (
-              <section className="channel-command-guide" aria-label="飞书通道交互指令">
-                <h3>通道交互指令</h3>
-                <p>在飞书里先输入指令，再接任务正文。发送“帮助”“菜单”“指令”或“//帮助”会直接返回当前菜单，不会创建任务。</p>
+              <section className="channel-command-guide" aria-label="飞书资源选择器">
+                <h3>资源选择器</h3>
+                <p>飞书消息默认先交给主 Agent 判断入口、模式和是否需要计划、OpenClaw 或 Vibe Coding。需要指定资源时，只在消息开头连续写资源选择器；正文开始后出现的 @、&、# 不会被当成调用。</p>
                 <div className="channel-command-grid">
-                  {FEISHU_STANDARD_COMMANDS.map((item) => (
+                  {FEISHU_RESOURCE_SELECTORS.map((item) => (
                     <div key={item.command}>
                       <code>{item.command}</code>
                       <span>{item.description}</span>
@@ -556,29 +545,12 @@ export function ChannelsPage() {
                   ))}
                 </div>
                 <div className="channel-command-examples">
-                  <span className="eyebrow">可直接发送</span>
-                  {FEISHU_COMMAND_EXAMPLES.map((example) => (
+                  <span className="eyebrow">示例</span>
+                  {FEISHU_RESOURCE_EXAMPLES.map((example) => (
                     <code key={example}>{example}</code>
                   ))}
                 </div>
-                <div className="channel-command-aliases">
-                  <span className="eyebrow">当前生效的自定义指令</span>
-                  {effectiveFeishuAliases.length > 0 ? (
-                    <div className="channel-command-grid">
-                      {effectiveFeishuAliases.map(([alias, target]) => (
-                        <div key={alias}>
-                          <code>{alias}</code>
-                          <span>等同于 {target}</span>
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="field-help">暂未配置自定义指令。可以先用标准指令，或在下方“交互指令别名”中新增。</p>
-                  )}
-                </div>
-                <p className="field-help">
-                  自定义格式：在“交互指令别名”填写“别名=标准指令”，例如“方案=//派单, 代码=//vi, 菜单=//帮助”。多条可用逗号、分号或换行分隔；保存后飞书里的帮助菜单会同步显示这些别名。
-                </p>
+                <p className="field-help">运行模式不再由通道指令决定；如果已经在 Web 或会话中选择了模式，后续消息会沿用主 Agent 的入口判断，不需要反复输入模式。</p>
               </section>
             ) : null}
             <article>

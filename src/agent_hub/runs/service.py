@@ -166,6 +166,7 @@ class EvolutionProposal:
             },
         }
 
+
 @dataclass(frozen=True, slots=True)
 class OpenClawProposal:
     kind: str
@@ -190,6 +191,7 @@ class OpenClawProposal:
                 "requires_user_confirmation": "true",
             },
         }
+
 
 @dataclass(frozen=True, slots=True)
 class TemporaryAgentProposal:
@@ -776,9 +778,7 @@ class RunService:
         return await self._repository.events(tenant_id, run_id)
 
     async def pause(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
-        record = await self._repository.update_control_status(
-            tenant_id, run_id, RunStatus.PAUSED
-        )
+        record = await self._repository.update_control_status(tenant_id, run_id, RunStatus.PAUSED)
         return await self._summary(record)
 
     async def resume(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
@@ -838,9 +838,7 @@ class RunService:
             runtime = self._runtime_registry.get(mode)
             if checkpoint is not None:
                 await runtime.restore_checkpoint(checkpoint)
-            token_budget = _runtime_token_budget(
-                mode, configured_tokens=self._runtime_token_budget
-            )
+            token_budget = _runtime_token_budget(mode, configured_tokens=self._runtime_token_budget)
             context = TaskContext(
                 run_id=run_id,
                 tenant_id=tenant_id,
@@ -1322,10 +1320,25 @@ def _local_evolution_proposal(
     if intent is None:
         return None
     lowered = message.lower()
-    kind = "skill_distillation" if intent == "skill_creation" or any(token in lowered for token in ("distill", "蒸馏")) else "skill_optimization"
-    target_artifact_type = "skill" if intent == "skill_creation" or "skill" in lowered or "技能" in message or "蒸馏" in message else "custom"
+    kind = (
+        "skill_distillation"
+        if intent == "skill_creation" or any(token in lowered for token in ("distill", "蒸馏"))
+        else "skill_optimization"
+    )
+    target_artifact_type = (
+        "skill"
+        if intent == "skill_creation"
+        or "skill" in lowered
+        or "技能" in message
+        or "蒸馏" in message
+        else "custom"
+    )
     source_skill_ids = _evolution_source_skill_ids(message)
-    if not source_skill_ids and target_artifact_type == "skill" and ("darwin" in lowered or "达尔文" in message):
+    if (
+        not source_skill_ids
+        and target_artifact_type == "skill"
+        and ("darwin" in lowered or "达尔文" in message)
+    ):
         source_skill_ids = ("darwin-skill",)
     if intent == "skill_creation":
         title = "Skill 创建任务"
@@ -1375,6 +1388,7 @@ def _evolution_source_skill_ids(message: str) -> tuple[str, ...]:
         if value not in candidates:
             candidates.append(value)
     return tuple(candidates[:8])
+
 
 _OPENCLAW_NAME_RE = re.compile(
     "(openclaw|\u63a5\u7ba1\u7535\u8111|\u64cd\u4f5c\u7535\u8111|\u63a7\u5236\u7535\u8111|\u670d\u52a1\u5668\u64cd\u4f5c|\u7ec8\u7aef\u63a7\u5236|\u7535\u8111\u64cd\u4f5c)",
@@ -1430,7 +1444,12 @@ def _openclaw_kind(message: str) -> str:
 
 def _openclaw_platform(message: str) -> str:
     lowered = message.lower()
-    if "windows" in lowered or "win" in lowered or "\u7535\u8111" in message or "\u672c\u673a" in message:
+    if (
+        "windows" in lowered
+        or "win" in lowered
+        or "\u7535\u8111" in message
+        or "\u672c\u673a" in message
+    ):
         return "windows"
     if "mac" in lowered or "macos" in lowered:
         return "macos"
@@ -1534,7 +1553,9 @@ def _local_schedule_proposal(
             cron=f"{minute} {hour} * * *",
             summary=f"每天 {hour:02d}:{minute:02d} 执行。",
         )
-    run_at = (datetime.now(UTC) + timedelta(days=1)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+    run_at = (datetime.now(UTC) + timedelta(days=1)).replace(
+        hour=hour, minute=minute, second=0, microsecond=0
+    )
     return ScheduleProposal(
         name="chat-one-time-schedule",
         message=message,
@@ -1554,7 +1575,9 @@ def _looks_like_schedule_intent(message: str, lowered: str) -> bool:
         return False
     if _SCHEDULE_TRIGGER_RE.search(message):
         return True
-    has_recurrence = _contains_daily_intent(message, lowered) or _contains_weekly_intent(message, lowered)
+    has_recurrence = _contains_daily_intent(message, lowered) or _contains_weekly_intent(
+        message, lowered
+    )
     has_time_anchor = bool(
         _SCHEDULE_TIME_RE.search(message)
         or "明天" in message
@@ -1562,11 +1585,18 @@ def _looks_like_schedule_intent(message: str, lowered: str) -> bool:
         or "tomorrow" in lowered
     )
     has_execution = _SCHEDULE_EXECUTION_RE.search(message) is not None
-    return bool((has_recurrence and (has_time_anchor or has_execution)) or (has_time_anchor and has_execution))
+    return bool(
+        (has_recurrence and (has_time_anchor or has_execution))
+        or (has_time_anchor and has_execution)
+    )
 
 
 def _contains_daily_intent(message: str, lowered: str) -> bool:
-    return any(token in message for token in ("每天", "每日")) or "daily" in lowered or "every day" in lowered
+    return (
+        any(token in message for token in ("每天", "每日"))
+        or "daily" in lowered
+        or "every day" in lowered
+    )
 
 
 def _contains_weekly_intent(message: str, lowered: str) -> bool:
@@ -1594,6 +1624,7 @@ def _schedule_weekday(message: str) -> int:
 
 def _weekday_label(weekday: int) -> str:
     return ["日", "一", "二", "三", "四", "五", "六"][weekday]
+
 
 def _decision_token() -> str:
     return f"decision-{uuid4().hex}{uuid4().hex}"
@@ -1717,8 +1748,7 @@ def _auto_resolvable_route_decision(decision: RouteDecision | None) -> bool:
     if decision.risk is RiskLevel.HIGH or decision.requires_approval:
         return False
     if any(
-        item.estimated_cost_usd > _AUTO_RESOLVE_MAX_SINGLE_COST_USD
-        for item in decision.assessments
+        item.estimated_cost_usd > _AUTO_RESOLVE_MAX_SINGLE_COST_USD for item in decision.assessments
     ):
         return False
     return (
@@ -1939,6 +1969,7 @@ def _safe_channel_context(channel_context: Mapping[str, str]) -> dict[str, str]:
         "channel_message_id",
         "channel_event_id",
         "channel_conversation_type",
+        "channel_entry_policy",
         "requested_skills",
         "requested_mcp_servers",
         "requested_plugins",

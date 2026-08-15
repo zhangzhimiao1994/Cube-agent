@@ -139,17 +139,17 @@ The channel layer connects external chat platforms to the main agent. The consol
 
 Feishu supports long connection mode with App ID and App Secret. Webhook mode remains available as a fallback when you need platform-side URL verification or event encryption.
 
-Feishu users can send explicit command prefixes instead of guessing the route:
+Channel messages now enter the main agent first. The channel layer does not choose Direct, Dispatch, Discussion, Hybrid, Vibe Coding, Help, OpenClaw, or schedule mode by command text; the main agent judges the entry and route from the full message.
 
-- `//自动`: let the main agent choose.
-- `//直连`: direct model answer.
-- `//派单`: dispatch to role agents.
-- `//讨论`: multi-role discussion and decision.
-- `//混合`: dispatch, discussion, and review together.
-- `//vi`: Vibe Coding.
-- `//帮助`: show the command menu without creating a task.
+When a user needs to request specific resources, place a contiguous selector block at the very beginning of the message:
 
-Operators can customize command aliases in the Feishu channel field `FEISHU_COMMAND_ALIASES`, for example `Plan=//派单, Code=//vi, Menu=//帮助`. Saved aliases are shown in the channel page and in Feishu help replies.
+- `@github`: request a plugin.
+- `&research`: request a Skill.
+- `#filesystem`: request an MCP server.
+
+For example, `@github &research #filesystem Review this repository plan` attaches resource hints while preserving the original message text. `@`, `&`, and `#` appearing after normal text are treated as ordinary content, so phrases like `C#`, `#heading`, or `@someone` do not become resource calls.
+
+The legacy Feishu field `FEISHU_COMMAND_ALIASES` is kept only for backward-compatible configuration storage. Saved aliases are no longer active routing commands and are not shown as effective channel commands.
 
 See [docs/feishu-setup.md](docs/feishu-setup.md).
 

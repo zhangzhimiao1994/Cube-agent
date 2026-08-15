@@ -29,7 +29,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from agent_hub.api.dependencies import current_principal
 from agent_hub.api.errors import BASE_ERROR_RESPONSES, PublicAPIError, error_responses
 from agent_hub.auth.models import AuthenticatedPrincipal, Authorizer, PermissionDenied
-from agent_hub.channels.directives import parse_command_aliases
 from agent_hub.config.schema import PlatformConfig
 from agent_hub.config.service import ConfigService, ConfigValidationError
 from agent_hub.db.models import AdminResourceRow
@@ -1897,12 +1896,14 @@ _INSTRUCTION_SKILL_FORBIDDEN_EXTENSIONS = frozenset(
 _INSTRUCTION_SKILL_NESTED_ARCHIVE_EXTENSIONS = frozenset(
     {".zip", ".tar", ".tgz", ".gz", ".bz2", ".xz", ".7z", ".rar", ".whl"}
 )
-_TAR_METADATA_TYPES = frozenset({
-    tarfile.XHDTYPE,
-    tarfile.XGLTYPE,
-    tarfile.GNUTYPE_LONGNAME,
-    tarfile.GNUTYPE_LONGLINK,
-})
+_TAR_METADATA_TYPES = frozenset(
+    {
+        tarfile.XHDTYPE,
+        tarfile.XGLTYPE,
+        tarfile.GNUTYPE_LONGNAME,
+        tarfile.GNUTYPE_LONGLINK,
+    }
+)
 _MAX_SKILL_BUNDLE_ITEMS = 4096
 
 
@@ -2333,6 +2334,7 @@ def _skill_bundle_mode_is_unsafe(mode: int) -> bool:
 
 def _tar_member_is_metadata(member: tarfile.TarInfo) -> bool:
     return member.type in _TAR_METADATA_TYPES
+
 
 def _zip_group_to_skill_archive(
     archive: zipfile.ZipFile, entries: list[tuple[str, zipfile.ZipInfo]]
@@ -6076,9 +6078,8 @@ def _channel_command_aliases(
     definition: ChannelDefinition,
     config: Mapping[str, Mapping[str, str]],
 ) -> dict[str, str]:
-    if definition.id != "feishu":
-        return {}
-    return parse_command_aliases(_channel_config_value("FEISHU_COMMAND_ALIASES", "feishu", config))
+    del definition, config
+    return {}
 
 
 def _channel_required_env(

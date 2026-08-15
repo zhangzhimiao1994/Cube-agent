@@ -39,12 +39,6 @@ from agent_hub.auth.user_admin import PersistentUserAdminService
 from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
 from agent_hub.channels.base import InboundMessage
 from agent_hub.channels.dedup import InboundDedupRepository
-from agent_hub.channels.directives import (
-    command_help_text,
-    directive_summary,
-    parse_channel_directives,
-    parse_command_aliases,
-)
 from agent_hub.channels.feishu.media import FeishuOpenAPIMediaClient
 from agent_hub.channels.feishu.media_factory import build_feishu_media_service_factory
 from agent_hub.channels.feishu.reply import (
@@ -1050,7 +1044,6 @@ async def _start_feishu_websocket_connector_if_configured(
         settings,
         gateway=cast(ChannelGatewayProtocol, gateway),
         submission_handler=_feishu_websocket_submission_handler(application, settings),
-            help_handler=_feishu_websocket_help_handler(application, settings),
     )
     resolved_factory = client_factory or create_lark_oapi_feishu_websocket_client
 
@@ -1081,37 +1074,6 @@ def _feishu_websocket_submission_handler(
     return handle
 
 
-
-def _feishu_websocket_help_handler(
-    application: FastAPI,
-    settings: FeishuSettings,
-) -> Callable[[InboundMessage], Awaitable[None]]:
-    async def handle(message: InboundMessage) -> None:
-        sender = getattr(application.state, "feishu_reply_sender", None)
-        if sender is None:
-            dispatcher = getattr(application.state, "feishu_reply_dispatcher", None)
-            if isinstance(dispatcher, FeishuRunReplyDispatcher):
-                sender = dispatcher.sender
-        if sender is None or getattr(sender, "reply_text", None) is None:
-            return
-        aliases = parse_command_aliases(settings.command_aliases)
-        try:
-            await sender.reply_text(
-                settings=settings,
-                message_id=message.message_id,
-                text=command_help_text(aliases),
-            )
-        except Exception as error:  # noqa: BLE001 - best-effort channel delivery boundary
-            await log_feishu_reply_failure(
-                log_service=getattr(application.state, "admin_resource_service", None),
-                run_id=None,
-                message_id=message.message_id,
-                error=error,
-            )
-
-    return handle
-
-
 def _schedule_feishu_websocket_reply(
     application: FastAPI,
     settings: FeishuSettings,
@@ -1131,14 +1093,13 @@ def _schedule_feishu_websocket_reply(
         return
     run_id = getattr(submission, "run_id", None)
     log_service = getattr(application.state, "admin_resource_service", None)
-    aliases = parse_command_aliases(settings.command_aliases)
 
     async def task() -> None:
         try:
             await dispatcher.sender.reply_text(
                 settings=settings,
                 message_id=message.message_id,
-                text=directive_summary(parse_channel_directives(message.text, aliases), aliases),
+                text="已收到，主 Agent 正在判断入口、模式和可用资源。",
             )
             if run_id is not None:
                 await dispatcher.reply_when_terminal(

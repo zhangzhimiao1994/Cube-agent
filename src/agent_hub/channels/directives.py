@@ -69,6 +69,36 @@ class ChannelDirectives:
     invalid_reason: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ChannelResourceHints:
+    plugins: tuple[str, ...] = ()
+    mcp_servers: tuple[str, ...] = ()
+    skills: tuple[str, ...] = ()
+
+
+def parse_channel_resource_hints(text: str) -> ChannelResourceHints:
+    """Extract only the leading @plugin, &skill, and #mcp selector block."""
+    plugins: list[str] = []
+    mcp_servers: list[str] = []
+    skills: list[str] = []
+    for token in text.strip().split():
+        parsed = _parse_resource_token(token)
+        if parsed is None:
+            break
+        kind, value = parsed
+        if kind == "plugin":
+            plugins.append(value)
+        elif kind == "mcp":
+            mcp_servers.append(value)
+        elif kind == "skill":
+            skills.append(value)
+    return ChannelResourceHints(
+        plugins=tuple(dict.fromkeys(plugins)),
+        mcp_servers=tuple(dict.fromkeys(mcp_servers)),
+        skills=tuple(dict.fromkeys(skills)),
+    )
+
+
 class ChannelDirectiveError(ValueError):
     def __init__(self, reason: str) -> None:
         self.reason = reason
@@ -189,7 +219,9 @@ def is_channel_help_request(text: str, aliases: Mapping[str, str] | None = None)
 
 
 def command_help_text(aliases: Mapping[str, str] | None = None) -> str:
-    alias_items = [] if not aliases else [f"{alias}={target}" for alias, target in sorted(aliases.items())]
+    alias_items = (
+        [] if not aliases else [f"{alias}={target}" for alias, target in sorted(aliases.items())]
+    )
     lines = [
         "飞书交互指令：先写指令，再写任务正文。",
         "模式：//自动、//直连、//派单、//讨论、//混合。",
@@ -252,6 +284,22 @@ def _reason_text(reason: str) -> str:
     return reason
 
 
+def _parse_resource_token(token: str) -> tuple[str, str] | None:
+    if token.startswith("/#"):
+        value = token[2:]
+        return ("mcp", value) if _DIRECTIVE_RE.fullmatch(value) else None
+    if token.startswith("#"):
+        value = token[1:]
+        return ("mcp", value) if _DIRECTIVE_RE.fullmatch(value) else None
+    if token.startswith("@"):
+        value = token[1:]
+        return ("plugin", value) if _DIRECTIVE_RE.fullmatch(value) else None
+    if token.startswith("&"):
+        value = token[1:]
+        return ("skill", value) if _DIRECTIVE_RE.fullmatch(value) else None
+    return None
+
+
 def _parse_token(token: str) -> tuple[str, str] | None:
     lowered = token.casefold()
     if token in _LEGACY_MODES or lowered in _CHANNEL_LANGUAGE_MODES:
@@ -260,6 +308,9 @@ def _parse_token(token: str) -> tuple[str, str] | None:
         return ("vibe_coding", token)
     if token.startswith("/#"):
         value = token[2:]
+        return ("mcp", value) if _DIRECTIVE_RE.fullmatch(value) else None
+    if token.startswith("#"):
+        value = token[1:]
         return ("mcp", value) if _DIRECTIVE_RE.fullmatch(value) else None
     if token.startswith("@"):
         value = token[1:]
@@ -271,7 +322,7 @@ def _parse_token(token: str) -> tuple[str, str] | None:
 
 
 def _looks_like_channel_directive(token: str) -> bool:
-    return token.startswith(("//", "/#", "@", "&"))
+    return token.startswith(("//", "/#", "#", "@", "&"))
 
 
 def _normalize_alias_target(target: str) -> str | None:
@@ -315,10 +366,12 @@ def _mode_from_directive(token: str) -> TaskMode:
 __all__ = [
     "ChannelDirectiveError",
     "ChannelDirectives",
+    "ChannelResourceHints",
     "apply_channel_command_aliases",
     "command_help_text",
     "directive_summary",
     "is_channel_help_request",
     "parse_channel_directives",
+    "parse_channel_resource_hints",
     "parse_command_aliases",
 ]

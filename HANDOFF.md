@@ -1,3 +1,35 @@
+## 2026-08-15 Channel Main-Agent Entry And Resource Selectors
+
+- Scope: changed channel interactions so Feishu/channel messages are no longer routed by channel command prefixes. The channel layer now preserves the raw message, submits with `TaskMode.AUTO`, and lets the main Agent decide entry/mode/capability.
+- Resource selector behavior:
+  - Leading selectors are parsed as hints only when they form a contiguous block at the start of the message: `@plugin`, `&skill`, `#mcp` (legacy `/#mcp` remains accepted internally).
+  - The original message text is preserved for the run. Symbols after normal text, such as `@someone`, `#heading`, or `C#`, are treated as ordinary text and do not become resource calls.
+  - `FEISHU_COMMAND_ALIASES` remains accepted as a saved config field for backward compatibility but no longer rewrites messages or appears as an effective command map.
+- Code changes:
+  - `src/agent_hub/channels/submitter.py`: submits raw channel text to the run service as `AUTO`, adds `channel_entry_policy=main_agent_decides`, and includes parsed resource hints in `channel_context`.
+  - `src/agent_hub/channels/directives.py`: added `ChannelResourceHints` and `parse_channel_resource_hints()` for leading resource selector parsing.
+  - `src/agent_hub/channels/feishu/webhook.py`, `src/agent_hub/channels/feishu/websocket.py`, and `src/agent_hub/app.py`: removed channel-layer command alias rewriting and direct help replies; immediate Feishu replies now say the main Agent is judging entry/mode/resources.
+  - `src/agent_hub/runs/service.py`: added `channel_entry_policy` to the safe channel context whitelist so the real run record keeps this audit signal.
+  - `src/agent_hub/api/routers/admin.py`: returns an empty effective `command_aliases` map while keeping old config storage compatible.
+  - `web/src/pages/ChannelsPage.tsx`: replaced Feishu command UX with resource selector guidance.
+  - `README.md` and `README.zh-CN.md`: updated channel usage docs for main-Agent entry judgment and `@` / `&` / `#` resource selectors.
+- Local verification:
+  - Red test observed first: `uv run pytest tests\unit\runs\test_temporary_agent.py::test_submit_persists_safe_channel_entry_policy_metadata -q` failed with missing `channel_entry_policy`, then passed after the whitelist fix.
+  - `uv run pytest tests\unit\runs\test_temporary_agent.py::test_submit_persists_safe_channel_entry_policy_metadata tests\unit\channels\test_submitter.py tests\contracts\feishu\test_receivers.py tests\api\test_channel_webhooks.py tests\api\test_admin_resources.py::test_channel_status_exposes_feishu_setup_without_secrets -q` -> 52 passed, only existing FastAPI/httpx deprecation and pytest cache ACL warnings.
+  - `uv run ruff check src tests` -> passed.
+  - `npm test -- --run src\pages\ChannelsPage.test.tsx` from `web/` -> 5 passed.
+  - `npm run lint` from `web/` -> passed.
+  - `npm run build` from `web/` -> passed, with the existing Vite chunk-size warning.
+  - `git diff --check` -> passed, with expected CRLF normalization warnings.
+- Server deployment and real probe:
+  - Incremental archive: `.local-archives/server-incrementals/agent-hub-channel-main-agent-entry-20260815-124717.tgz` uploaded to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+  - Deployed to `/opt/agent-hub/current`; backup: `/opt/agent-hub/backups/p3-channel-main-agent-entry-20260815-124717`.
+  - Server retained archive: `/opt/agent-hub/archives/server-incrementals/agent-hub-channel-main-agent-entry-20260815-124717.tgz`.
+  - Real server probe hit `/health`, loaded deployed `/channels` frontend asset `/assets/index-BIlvA9es.js`, verified resource selector markers, and created a real channel-submitted run through `RunServiceInboundSubmitter` against the production database. Probe verified raw text was preserved and routing metadata contained `source_channel=feishu`, `channel_entry_policy=main_agent_decides`, `requested_plugins=github`, `requested_skills=research`, and `requested_mcp_servers=filesystem`. Probe run id: `1b26d281-b2dd-42bf-a93e-c27dda55c0ae`.
+  - Cleaned server temp files: `/tmp/agent-hub-p3-runtime-incremental.tgz`, `/tmp/deploy-channel-main-agent-entry.sh`, `/tmp/probe-channel-main-agent-entry.sh`, and temporary debug probe scripts.
+- Remaining / Next:
+  - Commit this slice, create a GitHub recovery bundle/tag, force-with-lease push to `mutilagent/main`, and check the triggered GitHub run until green.
+  - Continue the active project plan after this slice: OpenClaw remaining work, evolution/dialogue refinements, UI/layout/text audit, missing bulk actions, and final README usage polish.
 ## 2026-08-15 Feishu Channel Command Alias Display
 
 - Scope: refined Feishu/channel interaction command aliases so custom aliases keep the operator-entered label in help text while matching user messages case-insensitively.

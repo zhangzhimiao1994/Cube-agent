@@ -655,7 +655,7 @@ def test_feishu_webhook_accepts_token_only_event_when_signature_headers_are_abse
     assert gateway.messages[0].text == "/direct hello"
 
 
-def test_saved_feishu_command_aliases_are_applied_before_submission() -> None:
+def test_saved_feishu_command_aliases_do_not_rewrite_channel_text() -> None:
     gateway = RecordingGateway()
     app = create_app(
         auth_service=StubAuthService(),
@@ -716,10 +716,10 @@ def test_saved_feishu_command_aliases_are_applied_before_submission() -> None:
         "FEISHU_TRANSPORT",
     }
     assert response.status_code == 202
-    assert gateway.messages[0].text == "//派单 写一个中秋晚会方案"
+    assert gateway.messages[0].text == "方案 写一个中秋晚会方案"
 
 
-def test_feishu_webhook_replies_to_help_alias_without_submission() -> None:
+def test_feishu_webhook_submits_help_text_to_main_agent_entry() -> None:
     gateway = RecordingGateway()
     app = create_app(
         auth_service=StubAuthService(),
@@ -774,11 +774,9 @@ def test_feishu_webhook_replies_to_help_alias_without_submission() -> None:
     assert saved.status_code == 200
     assert response.status_code == 202
     assert response.json() == {"accepted": True}
-    assert gateway.messages == []
-    assert len(reply_sender.replies) == 1
-    assert reply_sender.replies[0][1] == "om_help_alias"
-    assert "飞书交互指令" in reply_sender.replies[0][2]
-    assert "菜单=//帮助" in reply_sender.replies[0][2]
+    assert gateway.messages[0].text == "菜单"
+    assert reply_sender.replies == []
+
 
 def test_feishu_webhook_appends_image_analysis_context() -> None:
     gateway = RecordingGateway()

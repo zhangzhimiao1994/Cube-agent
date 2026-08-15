@@ -1878,6 +1878,7 @@ def phone_wrapped_instruction_bundle_with_tar_metadata_archive() -> bytes:
             archive.addfile(info, io.BytesIO(content))
     return buffer.getvalue()
 
+
 def partially_invalid_instruction_skill_bundle_zip() -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
@@ -2273,7 +2274,7 @@ def test_channel_status_exposes_feishu_setup_without_secrets(
         by_id["feishu"]["public_webhook_url"] == "https://agent.example.com/channels/feishu/events"
     )
     assert by_id["feishu"]["missing"] == []
-    assert by_id["feishu"]["command_aliases"] == {"方案": "//派单", "代码": "//vi"}
+    assert by_id["feishu"]["command_aliases"] == {}
     assert {
         "feishu",
         "dingtalk",
@@ -3288,6 +3289,7 @@ def test_skill_archive_upload_accepts_phone_wrapped_tar_metadata_bundle() -> Non
         "phone-metadata-skill-001",
         "phone-metadata-skill-002",
     ]
+
 
 def test_skill_archive_upload_keeps_valid_bundle_items_when_one_item_is_invalid() -> None:
     api = client()

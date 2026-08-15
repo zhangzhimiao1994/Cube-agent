@@ -7,11 +7,6 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from agent_hub.channels.base import InboundMessage
-from agent_hub.channels.directives import (
-    apply_channel_command_aliases,
-    is_channel_help_request,
-    parse_command_aliases,
-)
 from agent_hub.channels.feishu.normalize import (
     UnsupportedFeishuEvent,
     normalize_feishu_event,
@@ -52,14 +47,12 @@ class FeishuWebSocketReceiver:
         gateway: ChannelGatewayProtocol | None,
         bot_open_id: str | None,
         submission_handler: FeishuWebSocketSubmissionHandler | None = None,
-        command_aliases: dict[str, str] | None = None,
         help_handler: FeishuWebSocketHelpHandler | None = None,
     ) -> None:
         self._verifier = verifier
         self._gateway = gateway
         self._bot_open_id = bot_open_id
         self._submission_handler = submission_handler
-        self._command_aliases = command_aliases or {}
         self._help_handler = help_handler
 
     async def receive(self, payload: dict[str, object]) -> InboundMessage | None:
@@ -70,13 +63,6 @@ class FeishuWebSocketReceiver:
             message = normalize_feishu_event(verified.payload, bot_open_id=self._bot_open_id)
         except UnsupportedFeishuEvent:
             return None
-        normalized_text = apply_channel_command_aliases(message.text, self._command_aliases)
-        if normalized_text != message.text:
-            message = message.model_copy(update={"text": normalized_text})
-        if is_channel_help_request(message.text, self._command_aliases):
-            if self._help_handler is not None:
-                await self._help_handler(message)
-            return message
         if self._gateway is not None:
             submission = await self._gateway.handle(message)
             if self._submission_handler is not None:
@@ -177,7 +163,6 @@ def build_feishu_websocket_receiver(
         gateway=gateway,
         bot_open_id=settings.bot_open_id,
         submission_handler=submission_handler,
-        command_aliases=parse_command_aliases(settings.command_aliases),
         help_handler=help_handler,
     )
 
