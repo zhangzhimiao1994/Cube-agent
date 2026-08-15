@@ -22,9 +22,14 @@
 - Probe output: `health={"status":"ok"}`, `index_has_root=yes`, all markers `yes`, `source_skill_creator=yes`, `source_feishu_examples=yes`, and `caddy=active api=active worker=active`.
 - Removed remote `/tmp` deploy/probe/package files after verification.
 
+### GitHub / Recovery
+- Committed as `db85c38 feat: ground skill creator and feishu commands`.
+- Created local GitHub recovery bundle `.local-archives/github-recovery/mutilagent-main-before-20260815-095122-07b40ac.bundle` and pushed GitHub archive tag `archive/mutilagent-main-before-20260815-095122-07b40ac`.
+- Force-with-lease pushed `mutilagent/main`; GitHub again reported the repository has moved to `zhangzhimiao1994/CubeAgent.git`, but the configured `mutilagent` remote accepted the push.
+- GitHub Actions run `31857650957` (`quality`) passed.
+
 ### Remaining / Next
-- GitHub full push and Actions check still need to be completed for this slice.
-- Continue remaining P3 backlog after GitHub push: remaining Skill archive edge cases if reproduced, bulk action/search/filter audit across dense pages, broader UI copy/layout audit, README/README.zh-CN usage refresh, Docker readiness later, and OpenClaw follow-ups if requested.
+- Continue remaining P3 backlog: remaining Skill archive edge cases if reproduced, bulk action/search/filter audit across dense pages, broader UI copy/layout audit, README/README.zh-CN usage refresh, Docker readiness later, and OpenClaw follow-ups if requested.
 ## 2026-08-15 Evolution Dashboard And Feishu Channel Command Guide
 
 ### State
