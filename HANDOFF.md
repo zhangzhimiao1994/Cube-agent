@@ -1,3 +1,35 @@
+# Handoff - 2026-08-15 13:55 CST - Login Brand Copy And Logout Navigation
+
+## Current state
+- Continued after OpenClaw final verification with the next queued UI cleanup slice.
+- Login still uses the `魔方agent` logo/brand, but the hero copy is now less mechanical and describes the product as one entry for conversation, Agent dispatch, model/tool permissions, and auditable execution.
+- The login form eyebrow now says `欢迎回来`, with a short continuation-oriented helper line.
+- Logout is now represented as the final account navigation area (`aria-label="账号操作"`) and the action text is `退出当前账号`, making it clearer in the floating/mobile navigation.
+
+## Changed
+- `web/src/pages/LoginPage.tsx`: updated login hero and form copy.
+- `web/src/app/AppShell.tsx`: changed the session block from a generic `div` to a labeled account `nav`, and renamed the logout action.
+- `web/src/pages/LoginPage.test.tsx` and `web/src/app/AppShell.test.tsx`: added assertions for the new copy and account navigation logout action.
+
+## Verification
+- Local:
+  - `npm test -- --run src/pages/LoginPage.test.tsx src/app/AppShell.test.tsx` from `web/` -> 12 passed.
+  - `npm run lint` from `web/` -> passed.
+  - `npm run build` from `web/` -> passed; Vite still reports the existing >500 kB chunk warning.
+- Server incremental deployment:
+  - Uploaded `.local-archives/server-incrementals/agent-hub-login-brand-logout-20260815-135317.tgz` to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+  - Deployed into `/opt/agent-hub/current`.
+  - Server backup: `/opt/agent-hub/backups/p3-login-brand-logout-20260815-135317`.
+  - Server retained archive: `/opt/agent-hub/archives/server-incrementals/agent-hub-login-brand-logout-20260815-135317.tgz`.
+  - Cleaned `/tmp/agent-hub-p3-runtime-incremental.tgz`, `/tmp/deploy-login-brand-logout.sh`, and `/tmp/probe-login-brand-logout.sh` after verification.
+- Server frontend probe:
+  - `login_brand_logout_probe=ok`.
+  - Confirmed served production assets contain the new login copy, `账号操作`, `退出当前账号`, and `nav-session` styling marker.
+  - Served assets: `assets/index-tDDIFh10.js`, `assets/index-D0oFq7xj.css`.
+
+## Remaining / next
+- Commit this frontend slice, create/update GitHub recovery archive/tag, force-with-lease push to `mutilagent/main`, and verify GitHub Actions.
+- Continue remaining P3 backlog after green: evolution/dialogue refinements, broader missing button/function sweep, UI layout/text audit across all pages, scheduler refinements, final README EN/ZH polishing, and Docker config readiness.
 # Handoff - 2026-08-15 13:48 CST - OpenClaw Final E2E Verification
 
 ## Current state

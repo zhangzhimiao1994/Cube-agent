@@ -135,12 +135,12 @@ export function AppShell() {
                 );
               })}
             </nav>
-            <div className="nav-session">
+            <nav className="nav-session" aria-label="账号操作">
               <span>{auth.user?.username}</span>
               <button type="button" onClick={() => void auth.logout()}>
-                退出登录
+                退出当前账号
               </button>
-            </div>
+            </nav>
           </div>
           {drawerGroup ? (
             <section className={`nav-drawer nav-drawer-${drawerGroup.tone}`} aria-label={`${drawerGroup.label}二级导航`}>

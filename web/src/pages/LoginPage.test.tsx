@@ -94,6 +94,8 @@ describe("LoginPage", () => {
     render(<TestApp initialPath="/login" />);
     expect(await screen.findByRole("heading", { name: "魔方agent" })).not.toBeNull();
     expect(screen.getByRole("heading", { name: "进入魔方agent" })).not.toBeNull();
+    expect(screen.getByText("从一个入口发起对话、调度 Agent、管理模型和工具权限。每一次执行都有过程记录，关键操作先确认再落地。")).not.toBeNull();
+    expect(screen.getByText("登录后继续上次的对话、任务编排和系统配置。")).not.toBeNull();
     expect(screen.getByAltText("魔方agent")).not.toBeNull();
     await userEvent.type(screen.getByLabelText("Username"), "owner");
     await userEvent.type(screen.getByLabelText("Password"), "correct horse battery staple");

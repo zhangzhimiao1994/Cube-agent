@@ -68,6 +68,8 @@ describe("AppShell presentation", () => {
     expect(screen.getByRole("link", { name: "对话与进化" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "编排" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "系统" })).not.toBeNull();
+    const accountNavigation = screen.getByRole("navigation", { name: "账号操作" });
+    expect(within(accountNavigation).getByRole("button", { name: "退出当前账号" })).not.toBeNull();
     expect(screen.queryByText("实时调度")).toBeNull();
     expect(screen.queryByText("工具防护")).toBeNull();
     expect(screen.queryByText("沉淀经验，但不绕过审核")).toBeNull();

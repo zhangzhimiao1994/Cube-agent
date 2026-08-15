@@ -33,12 +33,13 @@ export function LoginPage() {
         <img className="auth-brand-logo" src={APP_BRAND_LOGO_SRC} alt={APP_BRAND_NAME} />
         <span className="eyebrow">{APP_BRAND_NAME}</span>
         <h1>魔方agent</h1>
-        <p>把模型、角色、工具和审批放进同一个工作台。发起任务、确认风险、沉淀经验，整个执行过程都有记录可追。</p>
+        <p>从一个入口发起对话、调度 Agent、管理模型和工具权限。每一次执行都有过程记录，关键操作先确认再落地。</p>
       </div>
       <form className="auth-card" onSubmit={(event) => void submit(event)}>
         <div>
-          <span className="eyebrow">工作台登录</span>
+          <span className="eyebrow">欢迎回来</span>
           <h2>进入魔方agent</h2>
+          <p className="field-help">登录后继续上次的对话、任务编排和系统配置。</p>
         </div>
         <label>
           用户名
