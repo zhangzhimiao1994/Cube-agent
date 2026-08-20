@@ -17,6 +17,7 @@ from agent_hub.models.capacity import (
     CapacityConfigurationError,
     CapacityLease,
     CapacityPool,
+    CapacityQueueFull,
     CapacityUnavailable,
     CapacityWaitTimeout,
 )
@@ -302,7 +303,7 @@ class ModelGateway:
                     self._capacity_wait_timeout,
                     estimated_tokens=estimated_tokens,
                 )
-            except CapacityWaitTimeout:
+            except (CapacityWaitTimeout, CapacityQueueFull):
                 continue
             selected = next((item for item in candidates if item.id == lease.deployment_id), None)
             if selected is None or selected.quota_scope_id != lease.quota_scope_id:

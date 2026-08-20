@@ -923,14 +923,10 @@ async def test_fallback_must_satisfy_request_capabilities() -> None:
     assert len([event for event in capacity.events if event[0] == "acquire"]) == 1  # type: ignore[index]
 
 
-@pytest.mark.parametrize(
-    "failure",
-    [CapacityQueueFull("full"), CapacityBackendError("backend unavailable")],
-)
-async def test_immediate_capacity_failure_does_not_fallback(failure: Exception) -> None:
+async def test_queue_full_tries_fallback_model_when_available() -> None:
     primary = deployment("primary-key")
     backup = deployment("backup-key", "backup")
-    capacity = CapacityStub([failure])
+    capacity = CapacityStub([CapacityQueueFull("full"), lease("backup-key")])
     gateway = ModelGateway(
         ModelRegistry([primary, backup]),
         capacity,
@@ -939,10 +935,31 @@ async def test_immediate_capacity_failure_does_not_fallback(failure: Exception) 
         fallbacks={"primary": "backup"},
     )
 
-    with pytest.raises(type(failure)):
+    completion = await gateway.complete_with_context(request())
+
+    assert completion.response.text == "ok"
+    assert completion.deployment_id == "backup-key"
+    acquire_events = [event for event in capacity.events if event[0] == "acquire"]  # type: ignore[index]
+    assert len(acquire_events) == 2
+    assert acquire_events[0][1] == ("primary-key",)  # type: ignore[index]
+    assert acquire_events[1][1] == ("backup-key",)  # type: ignore[index]
+
+
+async def test_capacity_backend_failure_does_not_fallback() -> None:
+    primary = deployment("primary-key")
+    backup = deployment("backup-key", "backup")
+    capacity = CapacityStub([CapacityBackendError("backend unavailable")])
+    gateway = ModelGateway(
+        ModelRegistry([primary, backup]),
+        capacity,
+        SecretStub(capacity.events),
+        TransportStub(capacity.events),
+        fallbacks={"primary": "backup"},
+    )
+
+    with pytest.raises(CapacityBackendError):
         await gateway.complete(request())
     assert len([event for event in capacity.events if event[0] == "acquire"]) == 1  # type: ignore[index]
-
 
 @pytest.mark.parametrize(
     "fallbacks, message",
