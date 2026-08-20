@@ -1,4 +1,4 @@
-﻿import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -986,6 +986,16 @@ describe("operational management pages", () => {
               source: "admin.audit",
               details: { resource: "configuration", actor: "system" },
               created_at: "2026-08-07T00:03:00Z",
+            },
+            {
+              id: "audit-login-1",
+              category: "audit",
+              level: "info",
+              title: "审计日志",
+              message: "auth.login",
+              source: "auth.login",
+              details: { action: "auth.login", actor: "owner", user_id: "owner", ip: "127.0.0.1" },
+              created_at: "2026-08-07T00:03:10Z",
             },
             {
               id: "audit-run-submit-1",
@@ -2736,6 +2746,17 @@ describe("operational management pages", () => {
     const auditTable = screen.getByRole("table", { name: "审计日志列表" });
     expect(within(auditTable).getByText("对话提交")).not.toBeNull();
     expect(within(auditTable).queryByText("config.publish")).toBeNull();
+    cleanup();
+    render(<TestApp initialPath="/logs/audit?details=auth.login" />);
+    const loginAuditTable = await screen.findByRole("table", { name: "审计日志列表" });
+    expect(within(loginAuditTable).getAllByText("auth.login").length).toBeGreaterThan(0);
+    expect(within(loginAuditTable).queryByText("对话提交")).toBeNull();
+
+    cleanup();
+    render(<TestApp initialPath="/logs/audit?details=run.submit" />);
+    const conversationAuditTable = await screen.findByRole("table", { name: "审计日志列表" });
+    expect(within(conversationAuditTable).getByText("对话提交")).not.toBeNull();
+    expect(within(conversationAuditTable).queryByText("auth.login")).toBeNull();
   });
 
   it("shows Hermes learning by time and conversation id with detail confirmation", async () => {

@@ -235,8 +235,8 @@ export const MODULE_GROUPS: ModuleGroup[] = [
         description: "查看登录、对话审计、调度、模型、通道、Agent 和系统日志。",
         permission: "audit:read",
         children: [
-          { to: "/logs/audit", label: "登录日志", permission: "audit:read" },
-          { to: "/logs/audit", label: "对话审计", permission: "audit:read" },
+          { to: "/logs/audit?details=auth.login", label: "登录日志", permission: "audit:read" },
+          { to: "/logs/audit?details=run.submit", label: "对话审计", permission: "audit:read" },
           { to: "/logs/mode", label: "调度日志", permission: "audit:read" },
           { to: "/logs/model", label: "模型调用日志", permission: "audit:read" },
           { to: "/logs/channel", label: "通道日志", permission: "audit:read" },

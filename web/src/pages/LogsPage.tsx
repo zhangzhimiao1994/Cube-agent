@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 
 import { api, formatApiError, type LogEntry } from "../api/client";
 import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
@@ -116,6 +116,25 @@ const EMPTY_LOG_FILTERS: LogColumnFilters = {
   title: "",
 };
 
+function logLevelFromSearchParam(value: string | null): "all" | LogEntry["level"] {
+  return value === "info" || value === "warning" || value === "error" ? value : "all";
+}
+
+function logFiltersFromSearchParams(searchParams: URLSearchParams) {
+  return {
+    columnFilters: {
+      ...EMPTY_LOG_FILTERS,
+      details: searchParams.get("details") ?? "",
+      level: logLevelFromSearchParam(searchParams.get("level")),
+      source: searchParams.get("source") ?? "",
+      time: searchParams.get("time") ?? "",
+      title: searchParams.get("title") ?? "",
+    },
+    levelFilter: logLevelFromSearchParam(searchParams.get("level")),
+    searchTerm: searchParams.get("q") ?? "",
+  };
+}
+
 function matchesLogColumns(entry: LogEntry, filters: LogColumnFilters) {
   return (
     (filters.level === "all" || entry.level === filters.level) &&
@@ -165,11 +184,22 @@ export function LogsPage() {
 }
 
 function LogModulePage({ module }: { module: (typeof LOG_MODULES)[number] }) {
+  const [searchParams] = useSearchParams();
+  const searchParamsKey = searchParams.toString();
+  const initialFilters = logFiltersFromSearchParams(searchParams);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const [searchTerm, setSearchTerm] = useState("");
-  const [levelFilter, setLevelFilter] = useState<"all" | LogEntry["level"]>("all");
-  const [columnFilters, setColumnFilters] = useState<LogColumnFilters>(EMPTY_LOG_FILTERS);
+  const [searchTerm, setSearchTerm] = useState(initialFilters.searchTerm);
+  const [levelFilter, setLevelFilter] = useState<"all" | LogEntry["level"]>(initialFilters.levelFilter);
+  const [columnFilters, setColumnFilters] = useState<LogColumnFilters>(initialFilters.columnFilters);
   const [sort, setSort] = useState<SortState<LogSortKey>>({ key: "time", direction: "desc" });
+
+  useEffect(() => {
+    const next = logFiltersFromSearchParams(searchParams);
+    setSearchTerm(next.searchTerm);
+    setLevelFilter(next.levelFilter);
+    setColumnFilters(next.columnFilters);
+    setSelectedIds([]);
+  }, [module.category, searchParamsKey]);
   const logs = useQuery({
     queryKey: ["logs", module.category],
     queryFn: () => api.logs(module.category),
