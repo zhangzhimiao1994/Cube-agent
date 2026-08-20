@@ -1539,7 +1539,7 @@ def _openclaw_platform(message: str) -> str:
         return "macos"
     if "linux" in lowered or "server" in lowered or "\u670d\u52a1\u5668" in message:
         return "linux"
-    return "auto"
+    return "windows"
 
 
 def _openclaw_target_type(kind: str, platform: str) -> str:

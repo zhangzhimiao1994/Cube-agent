@@ -626,6 +626,33 @@ async def test_openclaw_command_request_returns_confirmation_proposal_without_en
 
 
 @pytest.mark.asyncio
+async def test_openclaw_desktop_action_defaults_to_windows_adapter_boundary() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="请用 OpenClaw 点击确认按钮。",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-openclaw-computer",
+    )
+
+    assert submitted.status is RunStatus.WAITING_APPROVAL
+    assert submitted.openclaw_proposal is not None
+    assert submitted.openclaw_proposal["kind"] == "desktop_action"
+    assert submitted.openclaw_proposal["platform"] == "windows"
+    assert submitted.openclaw_proposal["target_type"] == "computer"
+    assert submitted.openclaw_proposal["target"] == "windows-computer"
+
+@pytest.mark.asyncio
 async def test_openclaw_explanation_request_does_not_create_operation_proposal() -> None:
     tenant_id = uuid4()
     actor_id = uuid4()
