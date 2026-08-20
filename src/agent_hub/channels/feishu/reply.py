@@ -279,7 +279,13 @@ def _section(title: str, lines: Sequence[str], *, empty: str | None = None) -> l
     content = [line for line in lines if line.strip()]
     if not content and empty is not None:
         content = [empty]
-    return ["", title, *content]
+    return ["", _section_title(title), *content]
+
+
+def _section_title(title: str) -> str:
+    if title in {"子 Agent 输出", "已产生内容"}:
+        return f"【中间产物｜{title}】"
+    return f"【{title}】"
 
 
 def _routing_lines(record: RunRecord, events: tuple[dict[str, object], ...]) -> list[str]:

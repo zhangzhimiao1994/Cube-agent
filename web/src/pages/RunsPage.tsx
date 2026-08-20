@@ -479,6 +479,7 @@ type ProcessDetailTarget = {
   id: string;
   title: string;
   message: string;
+  badge: string;
   rows: Array<{ label: string; value: string }>;
   createdAt: string | null;
 };
@@ -1095,6 +1096,19 @@ function modelRowsForEvent(
   return rows;
 }
 
+function processBadgeForEvent(event: RunEvent) {
+  if (event.kind === "artifact.created" || event.kind === "message.created" || event.kind === "step.completed") {
+    return "中间产物";
+  }
+  if (event.kind === "review.completed" || event.kind.startsWith("decision.")) return "裁决过程";
+  if (event.kind.startsWith("discussion.")) return "讨论过程";
+  if (event.kind.startsWith("tool.")) return "工具过程";
+  if (event.kind.startsWith("model.")) return "模型调用";
+  if (event.kind.startsWith("dispatch.")) return "调度过程";
+  if (event.kind === "step.started") return "任务分解";
+  return "过程记录";
+}
+
 function processItemsForEvent(
   detail: RunDetail,
   event: RunEvent,
@@ -1112,6 +1126,7 @@ function processItemsForEvent(
     id: `${detail.id}-event-${event.sequence}-${index}`,
     title: displayEventTitle(event, agentNames),
     message: eventSummaryText(event, agentNames, artifact),
+    badge: processBadgeForEvent(event),
     rows: baseRows,
     createdAt: event.created_at,
   };
@@ -1121,6 +1136,7 @@ function processItemsForEvent(
     id: `${detail.id}-event-${event.sequence}-${index}-opinion-${opinionIndex}`,
     title: `${opinion.actor} 给出讨论意见`,
     message: `${opinion.actor} 意见：${conciseProcessText(opinion.value, "给出意见")}`,
+    badge: "讨论意见",
     rows: [
       ...modelRowsForEvent(event, detail.events, agentNames),
       { label: "发言角色", value: opinion.actor },
@@ -1138,6 +1154,7 @@ function processItemsForEvent(
       id: `${detail.id}-event-${event.sequence}-${index}-decision`,
       title: "主 Agent 完成裁决",
       message: `主 Agent 裁决：${conciseProcessText(judgement, "完成裁决")}`,
+      badge: "裁决过程",
       rows: baseRows,
       createdAt: event.created_at,
     },
@@ -1158,6 +1175,7 @@ function runProcessItems(
             id: `${detail.id}-routing`,
             title: "主 Agent 调度判断",
             message: `主 Agent 选择${displayMode(detail.mode)}${routingAgentPool ? `：${routingAgentPool}` : ""}`,
+            badge: "调度判断",
             rows: routingRows,
             createdAt: null,
           },
@@ -1196,8 +1214,9 @@ function RunProcessSummary({
       </div>
       <div className="agent-cluster-actions">
         {items.map((item) => (
-          <button key={item.id} type="button" className="run-process-toggle" onClick={() => onOpen(item)}>
+          <button key={item.id} type="button" className="run-process-toggle process-intermediate-card" onClick={() => onOpen(item)}>
             <span aria-hidden="true">›</span>
+            <small className="process-card-badge">{item.badge}</small>
             <strong>{item.message}</strong>
           </button>
         ))}
@@ -1225,7 +1244,7 @@ function RunProcessDrawer({
         <div className="process-drawer-handle" aria-hidden="true" />
         <div className="process-drawer-header">
           <div>
-            <span className="eyebrow">运行过程</span>
+            <span className="eyebrow">{target.badge}</span>
             <h3>{target.title}</h3>
           </div>
           <button type="button" className="secondary-action" onClick={onClose}>

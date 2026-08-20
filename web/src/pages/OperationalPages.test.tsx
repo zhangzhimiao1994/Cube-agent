@@ -1772,6 +1772,23 @@ describe("operational management pages", () => {
     expect(within(drawer).getByText("qwen-max")).not.toBeNull();
   });
 
+  it("marks intermediate process outputs in labeled boxes while keeping the final reply merged", async () => {
+    const user = userEvent.setup();
+    const view = render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    expect(within(stream).getAllByText(/这是最终回复正文/).length).toBeGreaterThan(0);
+
+    const processCards = Array.from(view.container.querySelectorAll(".process-intermediate-card"));
+    const outputCard = processCards.find((card) => card.textContent?.includes("文案生成 输出"));
+    expect(outputCard).not.toBeNull();
+    expect(within(outputCard as HTMLElement).getByText("中间产物")).not.toBeNull();
+    expect(outputCard?.textContent).toContain("得到一版可拍摄脚本文案");
+  });
+
   it("renders agent process steps as an ordered timeline with concrete per-step details", async () => {
     const user = userEvent.setup();
     const timelineRunDetail = {

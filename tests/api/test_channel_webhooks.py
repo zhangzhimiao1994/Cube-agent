@@ -1464,6 +1464,38 @@ def test_feishu_terminal_reply_summarizes_user_relevant_run_process() -> None:
     assert "internal checkpoint" not in text
 
 
+def test_feishu_terminal_reply_marks_intermediate_sections_with_box_titles() -> None:
+    sender = RecordingFeishuReplySender()
+    repository = StructuredRunRepository()
+    dispatcher = FeishuRunReplyDispatcher(
+        run_repository=cast(RunRepository, repository),
+        sender=sender,
+        poll_interval_seconds=0.01,
+        timeout_seconds=1.0,
+    )
+
+    async def run() -> None:
+        await dispatcher.reply_when_terminal(
+            tenant_id=TENANT_ID,
+            run_id=StructuredRunRepository.run_id,
+            source_message_id="om_process_boxes",
+            settings=FeishuSettings.model_validate(
+                {"app_id": "cli_saved_feishu", "app_secret": "secret"}
+            ),
+        )
+
+    import asyncio
+
+    asyncio.run(run())
+
+    text = sender.replies[0][2]
+    assert "【Agent 调度】" in text
+    assert "【讨论情况】" in text
+    assert "【裁决情况】" in text
+    assert "【中间产物｜子 Agent 输出】" in text
+    assert "【最终结果】" in text
+    assert text.index("【中间产物｜子 Agent 输出】") < text.index("【最终结果】")
+
 def test_feishu_failed_reply_includes_partial_outputs_and_error_reason() -> None:
     sender = RecordingFeishuReplySender()
     repository = FailedPartialRunRepository()

@@ -1487,6 +1487,38 @@ article:hover {
   white-space: nowrap;
 }
 
+.process-intermediate-card {
+  background: rgba(3, 10, 20, 0.34);
+  border: 1px solid rgba(123, 225, 255, 0.16);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.32rem;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  margin: 0.1rem 0;
+  padding: 0.42rem 0.55rem;
+}
+
+.process-intermediate-card:hover,
+.process-intermediate-card:focus-visible {
+  background: rgba(85, 215, 255, 0.08);
+  border-color: rgba(85, 215, 255, 0.32);
+  box-shadow: none;
+  transform: none;
+}
+
+.process-card-badge {
+  align-self: center;
+  background: rgba(85, 215, 255, 0.12);
+  border: 1px solid rgba(85, 215, 255, 0.2);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 0.72rem;
+  font-weight: 900;
+  line-height: 1;
+  padding: 0.25rem 0.42rem;
+  white-space: nowrap;
+}
+
 .run-process-toggle small {
   color: rgba(178, 194, 216, 0.72);
 }
