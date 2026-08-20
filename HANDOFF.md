@@ -1,6 +1,6 @@
 ## 2026-08-20 P3 Low-Token Run Observer Foundation
 
-Status: server deployed and verified; GitHub full sync is pending.
+Status: server deployed and verified; GitHub full sync completed and Actions are green.
 
 Changed in this slice:
 - `src/agent_hub/runs/observer.py`: added `ObserverPolicy`, `RunMonitor`, and `ObserverDecision` for event-driven, low-token observation. The monitor uses event metadata/counters only, detects model capacity pressure, empty model responses, repeated failures, retry pressure, and context-compaction thresholds, and never stores prompts/messages/artifact text in observer payloads.
@@ -27,8 +27,13 @@ Server deployment and verification:
 - Server real DB probe passed using the live deployed venv and `/etc/agent-hub/secrets.env`: `server_observer_probe=ok ... status=failed kinds=step.failed,runtime.failed,observer.notice trigger=model_capacity_pressure`. It created a temporary live DB run, executed a temporary capacity-failure runtime through `RunService`, verified original runtime events were preserved and `observer.notice` was appended at sequence 3, then cleaned probe rows.
 - Cleaned server temp files: `/tmp/agent-hub-p3-runtime-incremental.tgz`, `/tmp/deploy-observer-policy.sh`, `/tmp/probe-observer-policy.py`, `/tmp/probe-observer-policy-inspect.py`, and observer backup logs under `/tmp`.
 
+GitHub sync:
+- Created local recovery bundle `.local-archives/github-pushes/mutilagent-main-before-20260820-140935-c9ff4ee.bundle`.
+- Created/pushed recovery tag `recovery-before-observer-policy-20260820-140935`.
+- Committed `addf073 Add low-token run observer notices` and pushed `main` to `mutilagent` with `--force-with-lease`; repository warned it has moved to `git@github.com:zhangzhimiao1994/CubeAgent.git`, but the configured `mutilagent` remote accepted the push.
+- GitHub Actions run `32338504675` passed all steps: ruff, mypy, docker-backed pytest, web lint/test/build, shellcheck/bats, and docker compose config.
+
 Next required action:
-- Create a recovery archive/tag, perform the full GitHub push to `mutilagent main`, and check GitHub Actions until green.
 - Continue the backlog after green: OpenClaw/evolution refinements, UI layout/text audit, remaining bulk/search/filter checks, and final README refresh.
 
 ## 2026-08-20 P3 Channel Choice / Failure Recovery / Gateway Fallback Server Deployment
