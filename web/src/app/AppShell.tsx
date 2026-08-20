@@ -5,6 +5,22 @@ import { APP_BRAND_LOGO_SRC, APP_BRAND_NAME } from "./brand";
 import { MODULE_GROUPS, type ModuleItem } from "./navigation";
 import { useAuth } from "../auth/AuthProvider";
 
+function dispatchTertiaryNavigation(to: string) {
+  const section = sectionFromNavigationTarget(to);
+  if (!section) return;
+  window.dispatchEvent(new CustomEvent("agent-hub:navigate-section", { detail: { section } }));
+}
+
+function sectionFromNavigationTarget(to: string): string | null {
+  const query = to.split("?", 2)[1];
+  if (!query) return null;
+  const params = new URLSearchParams(query);
+  for (const name of ["type", "section", "category", "status", "provider", "mode"]) {
+    const value = params.get(name);
+    if (value) return value;
+  }
+  return null;
+}
 export function AppShell() {
   const auth = useAuth();
   const location = useLocation();
@@ -140,7 +156,14 @@ export function AppShell() {
                           {module.children && module.children.length > 0 ? (
                             <div className="mobile-nav-tertiary" aria-label={`${module.label}三级导航`}>
                               {module.children.map((child) => (
-                                <Link key={`${child.to}-${child.label}`} to={child.to} onClick={() => setMobileNavOpen(false)}>
+                                <Link
+                                  key={`${child.to}-${child.label}`}
+                                  to={child.to}
+                                  onClick={() => {
+                                    dispatchTertiaryNavigation(child.to);
+                                    setMobileNavOpen(false);
+                                  }}
+                                >
                                   {child.label}
                                 </Link>
                               ))}
@@ -177,7 +200,7 @@ export function AppShell() {
                     {module.children && module.children.length > 0 ? (
                       <div className="nav-tertiary-links" aria-label={`${module.label}三级导航`}>
                         {module.children.map((child) => (
-                          <Link key={`${child.to}-${child.label}`} to={child.to}>
+                          <Link key={`${child.to}-${child.label}`} to={child.to} onClick={() => dispatchTertiaryNavigation(child.to)}>
                             {child.label}
                           </Link>
                         ))}

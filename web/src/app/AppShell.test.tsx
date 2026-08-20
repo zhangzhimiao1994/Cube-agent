@@ -134,6 +134,26 @@ describe("AppShell presentation", () => {
     });
   });
 
+  it("scrolls a matching third-level section when clicking the same-page tertiary link", async () => {
+    const user = userEvent.setup();
+    const scrollIntoView = vi.fn();
+    const original = window.HTMLElement.prototype.scrollIntoView;
+    window.HTMLElement.prototype.scrollIntoView = scrollIntoView;
+    try {
+      render(<TestApp initialPath="/evolution?type=skill" />);
+
+      expect(await screen.findByRole("heading", { name: "进化" })).not.toBeNull();
+      await waitFor(() => expect(document.querySelector('[data-nav-section="skill"]')).not.toBeNull());
+      scrollIntoView.mockClear();
+
+      const drawer = screen.getByLabelText("对话与进化二级导航");
+      await user.click(within(drawer).getByRole("link", { name: "Skill 进化" }));
+
+      await waitFor(() => expect(scrollIntoView).toHaveBeenCalled());
+    } finally {
+      window.HTMLElement.prototype.scrollIntoView = original;
+    }
+  });
   it("activates evolution third-level sections from type query", async () => {
     render(<TestApp initialPath="/evolution?type=scheduler-policy" />);
 
