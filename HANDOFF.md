@@ -1,6 +1,6 @@
 ## 2026-08-20 P3 Run Observer Detail UI
 
-Status: server deployed and verified; GitHub full sync is next.
+Status: server deployed and verified; GitHub full sync completed and Actions are green.
 
 Changed in this slice:
 - `web/src/pages/RunDetailPage.tsx`: renders `observer.notice` events as a dedicated `调度观察` section on the run detail page instead of leaving them buried in the raw event log. The section localizes known observer triggers/actions such as model capacity pressure, empty model response, repeated failure, retry watching, and context compaction recommendations.
@@ -22,8 +22,14 @@ Server deployment and verification:
 - Real deployed frontend probe loaded `/`, resolved active asset `/assets/index-Bk1E0AOJ.js`, and confirmed the deployed bundle contains `调度观察` and `模型容量拥堵`.
 - Cleaned server temp files: `/tmp/agent-hub-p3-runtime-incremental.tgz` and `/tmp/deploy-run-observer-detail-ui.sh`.
 
-Remaining for this slice:
-- Create a recovery archive/tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
+GitHub sync:
+- Created local recovery bundle `.local-archives/github-pushes/mutilagent-main-before-20260820-1447-ecd4168.bundle`.
+- Created/pushed recovery tag `recovery-before-run-observer-detail-ui-20260820-1447`.
+- Committed `793ca34 Show run observer notices in detail UI` and pushed `main` to `mutilagent` with `--force-with-lease`; repository warned it has moved to `git@github.com:zhangzhimiao1994/CubeAgent.git`, but the configured `mutilagent` remote accepted the push.
+- GitHub Actions run `32340863343` passed all steps for commit `793ca3414476dfba8c34446bfb98a1d9536e07df`.
+
+Next required action:
+- Continue the backlog: Hermes category split for conversation memory vs scheduler observations, evolution module tertiary navigation for scheduler-policy evolution, model scheduling policy improvements, channel output refinements, and broader UI/function audits.
 ## 2026-08-20 P3 Low-Token Run Observer Foundation
 
 Status: server deployed and verified; GitHub full sync completed and Actions are green.
