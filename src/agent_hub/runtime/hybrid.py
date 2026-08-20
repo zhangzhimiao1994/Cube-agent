@@ -217,14 +217,15 @@ class HybridRuntime:
             raise
         except (ArtifactRepositoryError, RuntimeExecutionError, ValueError, TypeError) as error:
             failure_reason = _safe_failure_reason(error, fallback="hybrid_failed")
-            if _can_complete_with_partial_hybrid(artifacts, failure_reason):
+            partial_reason = _partial_hybrid_completion_reason(artifacts, failure_reason)
+            if partial_reason is not None:
                 checkpoint = self._checkpoint(
                     context,
                     artifacts=tuple(artifacts),
                     next_sequence=sequence + 1,
                     next_stage=len(self._stages()),
                     terminal=True,
-                    reason="partial_hybrid_after_discussion_failure",
+                    reason=partial_reason,
                 )
                 self._last_checkpoint = checkpoint
                 yield RunEvent(
@@ -238,7 +239,7 @@ class HybridRuntime:
                     kind=EventKind.RUNTIME_COMPLETED,
                     sequence=sequence,
                     run_id=context.run_id,
-                    reason="partial_hybrid_after_discussion_failure",
+                    reason=partial_reason,
                 )
                 return
             yield RunEvent(
@@ -518,13 +519,17 @@ def _discussion_handoff_artifacts(artifacts: tuple[Artifact, ...]) -> tuple[Arti
     )
 
 
-def _can_complete_with_partial_hybrid(
+def _partial_hybrid_completion_reason(
     artifacts: list[Artifact],
     failure_reason: str,
-) -> bool:
+) -> str | None:
     if not artifacts:
-        return False
-    return failure_reason.startswith("hybrid discuss failed: model gateway failed")
+        return None
+    if failure_reason.startswith("hybrid discuss failed: model gateway failed"):
+        return "partial_hybrid_after_discussion_failure"
+    if failure_reason.startswith("hybrid direct failed: model gateway failed"):
+        return "partial_hybrid_after_synthesis_failure"
+    return None
 
 
 __all__ = ["HybridPlan", "HybridRuntime", "HybridUpgrade", "RuntimeExecutionError"]

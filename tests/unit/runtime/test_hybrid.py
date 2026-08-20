@@ -279,6 +279,39 @@ async def test_hybrid_runtime_completes_partial_when_discussion_gateway_fails_af
 
 
 @pytest.mark.asyncio
+async def test_hybrid_runtime_completes_partial_when_synthesis_gateway_fails() -> None:
+    run_id = uuid4()
+    dispatch_output = artifact("planner", "dispatch result")
+    discussion_output = artifact("critic", "review result")
+    runtime = HybridRuntime(
+        MultiArtifactRuntime(TaskMode.DISPATCH, (dispatch_output,)),
+        MultiArtifactRuntime(TaskMode.DISCUSS, (discussion_output,)),
+        FailingRuntime(TaskMode.DIRECT, "model gateway failed: model response text is empty"),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=run_id,
+                tenant_id=uuid4(),
+                mode=TaskMode.HYBRID,
+                request="build a plan",
+            )
+        )
+    ]
+
+    assert any(
+        event.kind is EventKind.ARTIFACT_CREATED and event.artifact == dispatch_output
+        for event in events
+    )
+    assert any(
+        event.kind is EventKind.ARTIFACT_CREATED and event.artifact == discussion_output
+        for event in events
+    )
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].reason == "partial_hybrid_after_synthesis_failure"
+@pytest.mark.asyncio
 async def test_hybrid_runtime_redacts_sensitive_child_failure_reason() -> None:
     run_id = uuid4()
     runtime = HybridRuntime(
