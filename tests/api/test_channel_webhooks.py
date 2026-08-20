@@ -16,7 +16,7 @@ from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
 from agent_hub.channels.base import InboundMessage
 from agent_hub.channels.feishu.media import FeishuMediaError
-from agent_hub.channels.feishu.reply import FeishuRunReplyDispatcher
+from agent_hub.channels.feishu.reply import FeishuRunReplyDispatcher, _reply_payload_for_text
 from agent_hub.channels.feishu.settings import FeishuSettings
 from agent_hub.channels.feishu.verify import FeishuVerifier
 from agent_hub.domain.runs import RunStatus, TaskMode
@@ -1402,6 +1402,26 @@ def test_generic_channel_webhook_rejects_wrong_token(monkeypatch: pytest.MonkeyP
     assert response.json() == {"error": "invalid_channel_token", "channel": "custom_webhook"}
     assert gateway.messages == []
 
+
+def test_feishu_openapi_reply_uses_post_markdown_for_table_text() -> None:
+    payload = _reply_payload_for_text(
+        "对比如下：\n\n"
+        "| 类型 | 能做 | 不能做 |\n"
+        "| --- | --- | --- |\n"
+        "| 个股 | 深度分析 | 主动推荐 |"
+    )
+
+    assert payload["msg_type"] == "post"
+    assert "tag\": \"md\"" in str(payload["content"])
+    assert "| 类型 | 能做 | 不能做 |" in str(payload["content"])
+    assert "```text" not in str(payload["content"])
+
+
+def test_feishu_openapi_reply_keeps_plain_text_for_non_table_text() -> None:
+    payload = _reply_payload_for_text("普通回复")
+
+    assert payload["msg_type"] == "text"
+    assert payload["content"] == '{"text": "普通回复"}'
 
 def test_feishu_terminal_reply_summarizes_user_relevant_run_process() -> None:
     sender = RecordingFeishuReplySender()

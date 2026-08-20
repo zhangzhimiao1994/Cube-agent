@@ -54,13 +54,13 @@ class FeishuOpenAPIReplySender:
         text: str,
     ) -> None:
         token = await self._tenant_access_token(settings)
-        content = json.dumps({"text": _bounded_reply_text(text)}, ensure_ascii=False)
+        reply_payload = _reply_payload_for_text(text)
         url = f"{self._api_base}/im/v1/messages/{quote(message_id, safe='')}/reply"
         async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:
             response = await client.post(
                 url,
                 headers={"Authorization": f"Bearer {token}"},
-                json={"msg_type": "text", "content": content},
+                json=reply_payload,
             )
         if response.status_code >= 400:
             raise FeishuReplyError(f"reply request failed status={response.status_code}")
@@ -415,6 +415,30 @@ def _decision_role_ids(events: tuple[dict[str, object], ...]) -> set[str]:
             role_ids.add(role_id)
     return role_ids
 
+
+def _reply_payload_for_text(text: str) -> dict[str, str]:
+    bounded = _bounded_reply_text(text)
+    if _contains_markdown_table(bounded):
+        return {
+            "msg_type": "post",
+            "content": json.dumps(
+                {
+                    "post": {
+                        "zh_cn": {
+                            "title": "魔方agent",
+                            "content": [[{"tag": "md", "text": bounded}]],
+                        }
+                    }
+                },
+                ensure_ascii=False,
+            ),
+        }
+    return {"msg_type": "text", "content": json.dumps({"text": bounded}, ensure_ascii=False)}
+
+
+def _contains_markdown_table(text: str) -> bool:
+    lines = text.splitlines()
+    return any(_is_markdown_table_start(lines, index) for index in range(max(0, len(lines) - 1)))
 
 def _json_object(response: httpx.Response) -> dict[str, object]:
     try:
