@@ -56,20 +56,21 @@ class FeishuOpenAPIReplySender:
         text: str,
     ) -> None:
         token = await self._tenant_access_token(settings)
-        reply_payload = _reply_payload_for_text(text)
         url = f"{self._api_base}/im/v1/messages/{quote(message_id, safe='')}/reply"
+        chunks = _reply_text_chunks(text)
         async with httpx.AsyncClient(timeout=self._timeout_seconds, transport=self._transport) as client:
-            response = await client.post(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-                json=reply_payload,
-            )
-        if response.status_code >= 400:
-            raise FeishuReplyError(f"reply request failed status={response.status_code}")
-        payload = _json_object(response)
-        code = payload.get("code")
-        if code not in {0, None}:
-            raise FeishuReplyError(f"reply request rejected code={code}")
+            for chunk in chunks:
+                response = await client.post(
+                    url,
+                    headers={"Authorization": f"Bearer {token}"},
+                    json=_reply_payload_for_text(chunk),
+                )
+                if response.status_code >= 400:
+                    raise FeishuReplyError(f"reply request failed status={response.status_code}")
+                payload = _json_object(response)
+                code = payload.get("code")
+                if code not in {0, None}:
+                    raise FeishuReplyError(f"reply request rejected code={code}")
 
     async def _tenant_access_token(self, settings: FeishuSettings) -> str:
         url = f"{self._api_base}/auth/v3/tenant_access_token/internal"
@@ -485,6 +486,75 @@ def _reply_text_chunks(text: str) -> tuple[str, ...]:
 
 
 def _split_text(text: str, maximum: int) -> list[str]:
+    blocks = _markdown_table_aware_blocks(text.strip(), maximum)
+    chunks: list[str] = []
+    current = ""
+    for block in blocks:
+        candidate = block if not current else f"{current}\n\n{block}"
+        if len(candidate) <= maximum:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        if len(block) <= maximum:
+            current = block
+            continue
+        chunks.extend(_plain_text_chunks(block, maximum))
+        current = ""
+    if current:
+        chunks.append(current)
+    return chunks or ["任务已完成。"]
+
+
+def _markdown_table_aware_blocks(text: str, maximum: int) -> list[str]:
+    lines = text.splitlines()
+    blocks: list[str] = []
+    pending: list[str] = []
+    index = 0
+    while index < len(lines):
+        if _is_markdown_table_start(lines, index):
+            if pending:
+                blocks.extend(_plain_text_chunks("\n".join(pending).strip(), maximum))
+                pending = []
+            table_lines: list[str] = []
+            while index < len(lines) and "|" in lines[index]:
+                table_lines.append(lines[index].strip())
+                index += 1
+            blocks.extend(_markdown_table_chunks(table_lines, maximum))
+            continue
+        pending.append(lines[index])
+        index += 1
+    if pending:
+        blocks.extend(_plain_text_chunks("\n".join(pending).strip(), maximum))
+    return [block for block in blocks if block.strip()]
+
+
+def _markdown_table_chunks(table_lines: Sequence[str], maximum: int) -> list[str]:
+    if len(table_lines) < 2:
+        return _plain_text_chunks("\n".join(table_lines), maximum)
+    header = table_lines[0]
+    separator = table_lines[1]
+    rows = list(table_lines[2:])
+    base = [header, separator]
+    chunks: list[str] = []
+    current = base.copy()
+    for row in rows:
+        candidate = "\n".join([*current, row])
+        if len(candidate) <= maximum:
+            current.append(row)
+            continue
+        if len(current) > len(base):
+            chunks.append("\n".join(current))
+            current = [*base, row]
+            continue
+        chunks.extend(_plain_text_chunks("\n".join([*base, row]), maximum))
+        current = base.copy()
+    if len(current) > len(base) or not chunks:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+def _plain_text_chunks(text: str, maximum: int) -> list[str]:
     remaining = text.strip()
     chunks: list[str] = []
     while len(remaining) > maximum:
@@ -501,7 +571,7 @@ def _split_text(text: str, maximum: int) -> list[str]:
         remaining = remaining[boundary:].strip()
     if remaining:
         chunks.append(remaining)
-    return chunks or ["任务已完成。"]
+    return chunks
 
 
 def _bounded_reply_text(text: str) -> str:
