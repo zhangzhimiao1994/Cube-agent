@@ -364,7 +364,12 @@ async def test_transport_failure_tries_fallback_model_when_available() -> None:
     assert completion.response.text == "backup ok"
     assert completion.deployment_id == "backup-key"
     assert [record[3] for record in capacity.records] == [False, True]
-    assert [event for event in capacity.events if event[0] == "transport"] == [
+    transport_events = [
+        event
+        for event in capacity.events
+        if isinstance(event, tuple) and event[:1] == ("transport",)
+    ]
+    assert transport_events == [
         ("transport", "primary-key"),
         ("transport", "backup-key"),
     ]
