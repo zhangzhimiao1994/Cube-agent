@@ -685,8 +685,10 @@ async def test_persistent_hermes_records_scheduler_notice_details(
     assert payload["outcome"] == "failure"
     assert "调度观察" in str(payload["summary"])
     assert "model_capacity_pressure" in str(payload["lesson"])
-    assert "reschedule_or_reassign_model" in payload["tags"]
-    assert "planner" in payload["tags"]
+    tags = payload["tags"]
+    assert isinstance(tags, list)
+    assert "reschedule_or_reassign_model" in tags
+    assert "planner" in tags
 
 async def test_persistent_hermes_runtime_advice_uses_only_confirmed_lessons(
     run_session_factory: async_sessionmaker[AsyncSession],
