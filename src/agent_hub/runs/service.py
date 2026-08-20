@@ -255,6 +255,7 @@ class HermesRunOutcome:
     workflow_id: str | None
     conversation_id: str | None
     agent_ids: tuple[str, ...]
+    scheduler_notices: tuple[dict[str, object], ...] = ()
 
 
 class HermesAdvisorProtocol(Protocol):
@@ -978,6 +979,7 @@ class RunService:
         terminal = RunStatus.RUNNING
         monitor = RunMonitor(self._observer_policy)
         observer_decisions: list[ObserverDecision] = []
+        scheduler_notice_payloads: list[dict[str, object]] = []
         try:
             runtime = self._runtime_registry.get(mode)
             if checkpoint is not None:
@@ -1067,12 +1069,14 @@ class RunService:
             async with await self._repository.run_transaction() as session, session.begin():
                 sequence = await self._repository.next_event_sequence(session, run_id)
                 for observer_decision in observer_decisions:
+                    observer_event = observer_decision.to_event(run_id=run_id, sequence=sequence)
                     await self._repository.persist_event(
                         session,
                         tenant_id=tenant_id,
                         run_id=run_id,
-                        event=observer_decision.to_event(run_id=run_id, sequence=sequence),
+                        event=observer_event,
                     )
+                    scheduler_notice_payloads.append(dict(observer_event.payload))
                     sequence += 1
         if terminal in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
             await self._safe_record_hermes_outcome(
@@ -1082,6 +1086,7 @@ class RunService:
                 status=terminal,
                 mode=mode,
                 routing_decision=routing_decision,
+                scheduler_notices=tuple(scheduler_notice_payloads),
             )
             await self._safe_notify_terminal_hooks(
                 tenant_id=tenant_id,
@@ -1122,6 +1127,7 @@ class RunService:
         status: RunStatus,
         mode: TaskMode | None,
         routing_decision: dict[str, object] | None,
+        scheduler_notices: tuple[dict[str, object], ...] = (),
     ) -> None:
         if not self._terminal_run_hooks:
             return
@@ -1390,6 +1396,7 @@ class RunService:
         status: RunStatus,
         mode: TaskMode | None,
         routing_decision: dict[str, object] | None,
+        scheduler_notices: tuple[dict[str, object], ...] = (),
     ) -> None:
         if self._hermes_advisor is None:
             return
@@ -1405,6 +1412,7 @@ class RunService:
                     workflow_id=_string_or_none(decision.get("workflow_id")),
                     conversation_id=_string_or_none(decision.get("conversation_id")),
                     agent_ids=_string_tuple(decision.get("selected_agent_ids")),
+                    scheduler_notices=scheduler_notices,
                 )
             )
         except Exception:

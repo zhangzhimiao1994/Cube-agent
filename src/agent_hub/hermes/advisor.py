@@ -75,19 +75,45 @@ class PersistentHermesRunAdvisor:
         conversation_id = outcome.conversation_id or "unknown-conversation"
         status = outcome.status.value
         lesson_id = f"hermes_run_{uuid4().hex}"
-        lesson = f"Run {status} with mode={mode}, workflow={workflow}."
+        scheduler_notices = _safe_scheduler_notices(outcome.scheduler_notices)
+        if scheduler_notices:
+            lesson = _scheduler_notice_lesson(
+                status=status,
+                mode=mode,
+                workflow=workflow,
+                notices=scheduler_notices,
+            )
+            tags = _unique_tags(
+                [
+                    status,
+                    mode,
+                    workflow,
+                    *outcome.agent_ids[:8],
+                    *_scheduler_notice_tags(scheduler_notices),
+                ]
+            )
+            weight = min(10, 5 + len(scheduler_notices))
+            summary = (
+                f"调度观察：Hermes learned from conversation {conversation_id}: "
+                f"{lesson} Tags: {', '.join(tags) or 'none'}. Weight: {weight}."
+            )
+        else:
+            lesson = f"Run {status} with mode={mode}, workflow={workflow}."
+            tags = _unique_tags([status, mode, workflow, *outcome.agent_ids[:8]])
+            weight = 4 if outcome.status is RunStatus.COMPLETED else 2
+            summary = (
+                f"Hermes learned from conversation {conversation_id}: "
+                f"{lesson} Tags: {status}, {mode}, {workflow}. "
+                f"Weight: {weight}."
+            )
         payload: dict[str, object] = {
             "id": lesson_id,
             "category": "scheduler",
             "outcome": "success" if outcome.status is RunStatus.COMPLETED else "failure",
             "lesson": lesson,
-            "summary": (
-                f"Hermes learned from conversation {conversation_id}: "
-                f"{lesson} Tags: {status}, {mode}, {workflow}. "
-                f"Weight: {4 if outcome.status is RunStatus.COMPLETED else 2}."
-            ),
-            "tags": [status, mode, workflow, *outcome.agent_ids[:8]],
-            "weight": 4 if outcome.status is RunStatus.COMPLETED else 2,
+            "summary": summary,
+            "tags": tags,
+            "weight": weight,
             "created_at": datetime.now(UTC).isoformat(),
             "run_id": str(outcome.run_id),
             "conversation_id": outcome.conversation_id,
@@ -203,3 +229,55 @@ def _recommended_mode(lesson: dict[str, object], lowered_message: str) -> TaskMo
     if any(token in haystack for token in ("direct", "直接")):
         return TaskMode.DIRECT
     return TaskMode.DISPATCH
+
+def _safe_scheduler_notices(
+    notices: tuple[dict[str, object], ...],
+) -> tuple[dict[str, str], ...]:
+    safe: list[dict[str, str]] = []
+    allowed_keys = ("trigger", "action", "severity", "source_kind", "actor")
+    for notice in notices[:4]:
+        item: dict[str, str] = {}
+        for key in allowed_keys:
+            value = notice.get(key)
+            if isinstance(value, str) and value.strip():
+                item[key] = value.strip()[:96]
+        if item:
+            safe.append(item)
+    return tuple(safe)
+
+
+def _scheduler_notice_lesson(
+    *,
+    status: str,
+    mode: str,
+    workflow: str,
+    notices: tuple[dict[str, str], ...],
+) -> str:
+    notice_text = "; ".join(
+        ", ".join(f"{key}={value}" for key, value in notice.items()) for notice in notices
+    )
+    return f"Run {status} with mode={mode}, workflow={workflow}. Scheduler notices: {notice_text}."
+
+
+def _scheduler_notice_tags(notices: tuple[dict[str, str], ...]) -> list[str]:
+    tags: list[str] = []
+    for notice in notices:
+        for key in ("trigger", "action", "severity", "source_kind", "actor"):
+            value = notice.get(key)
+            if value:
+                tags.append(value)
+    return tags
+
+
+def _unique_tags(tags: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for tag in tags:
+        cleaned = tag.strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        result.append(cleaned)
+        if len(result) >= 16:
+            break
+    return result

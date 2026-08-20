@@ -641,6 +641,53 @@ async def test_persistent_hermes_runtime_outcome_is_scheduler_observation(
     assert payload["conversation_id"] == "conv-scheduler-observe"
     assert payload["run_id"] == str(run_id)
 
+async def test_persistent_hermes_records_scheduler_notice_details(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    run_id = uuid4()
+    advisor = PersistentHermesRunAdvisor(run_session_factory)
+
+    await advisor.record_outcome(
+        HermesRunOutcome(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            run_id=run_id,
+            status=RunStatus.FAILED,
+            mode=TaskMode.DISPATCH,
+            workflow_id="short-video-dispatch",
+            conversation_id="conv-scheduler-notice",
+            agent_ids=("planner",),
+            scheduler_notices=(
+                {
+                    "trigger": "model_capacity_pressure",
+                    "action": "reschedule_or_reassign_model",
+                    "severity": "warning",
+                    "source_kind": "step.failed",
+                    "actor": "planner",
+                },
+            ),
+        )
+    )
+
+    async with run_session_factory() as session:
+        row = (
+            await session.execute(
+                select(AdminResourceRow)
+                .where(AdminResourceRow.tenant_id == tenant_id)
+                .where(AdminResourceRow.kind == "hermes")
+            )
+        ).scalar_one()
+
+    payload = dict(row.payload)
+    assert payload["category"] == "scheduler"
+    assert payload["outcome"] == "failure"
+    assert "调度观察" in str(payload["summary"])
+    assert "model_capacity_pressure" in str(payload["lesson"])
+    assert "reschedule_or_reassign_model" in payload["tags"]
+    assert "planner" in payload["tags"]
+
 async def test_persistent_hermes_runtime_advice_uses_only_confirmed_lessons(
     run_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

@@ -10,7 +10,7 @@ import pytest
 
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import RunRecord
-from agent_hub.runs.service import RunService
+from agent_hub.runs.service import HermesRunOutcome, RunService
 from agent_hub.runtime.contracts import EventKind, RunEvent, RuntimeCheckpoint, TaskContext
 from agent_hub.runtime.registry import RuntimeRegistry
 
@@ -36,7 +36,8 @@ class FakeTransaction:
         return self
 
     async def __aexit__(self, *args: object) -> None:
-        return None
+        pass
+
 
     def begin(self) -> FakeTransaction:
         return self
@@ -185,6 +186,16 @@ class RuntimeReportsCapacityPressure:
         raise AssertionError("not used")
 
 
+class RecordingHermesAdvisor:
+    def __init__(self) -> None:
+        self.outcomes: list[HermesRunOutcome] = []
+
+    async def advise(self, **kwargs: object) -> None:
+        del kwargs
+
+    async def record_outcome(self, outcome: HermesRunOutcome) -> None:
+        self.outcomes.append(outcome)
+
 class RecordingHook:
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
@@ -290,3 +301,40 @@ async def test_execute_persists_observer_notice_for_capacity_pressure() -> None:
     assert notice.payload["source_sequence"] == 1
     assert "message" not in notice.payload
     assert "prompt" not in notice.payload
+
+@pytest.mark.asyncio
+async def test_execute_records_observer_notices_in_hermes_scheduler_outcome() -> None:
+    repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
+    hermes = RecordingHermesAdvisor()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeReportsCapacityPressure(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+        hermes_advisor=hermes
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.FAILED
+    assert len(hermes.outcomes) == 1
+    outcome = hermes.outcomes[0]
+    assert outcome.status is RunStatus.FAILED
+    assert outcome.scheduler_notices == (
+        {
+            "schema_version": 1,
+            "trigger": "model_capacity_pressure",
+            "action": "reschedule_or_reassign_model",
+            "severity": "warning",
+            "source_kind": "step.failed",
+            "source_sequence": 1,
+            "event_count": 1,
+            "failure_events": 1,
+            "retry_events": 0,
+            "message_events": 0,
+            "artifact_events": 0,
+            "actor": "planner",
+        },
+    )
+    assert "正文" not in repr(outcome.scheduler_notices)
+    assert "prompt" not in repr(outcome.scheduler_notices)
