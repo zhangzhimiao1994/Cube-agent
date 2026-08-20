@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from agent_hub.channels.base import InboundMessage
@@ -18,6 +18,19 @@ class SubmittedRunLike(Protocol):
     id: UUID
 
 
+@runtime_checkable
+class ConversationChoiceService(Protocol):
+    async def choose_latest_choice_for_conversation(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        conversation_id: str,
+        choice_key: str,
+        operator_note: str | None = None,
+    ) -> SubmittedRunLike | None: ...
+
+
 class RunSubmissionService(Protocol):
     async def submit(
         self,
@@ -27,6 +40,7 @@ class RunSubmissionService(Protocol):
         message: str,
         mode: TaskMode,
         attachment_ids: tuple[str, ...] = (),
+        conversation_id: str | None = None,
         channel_context: dict[str, str] | None = None,
         vibe_coding: bool = False,
         idempotency_key: str | None = None,
@@ -49,20 +63,52 @@ class RunServiceInboundSubmitter:
         task_text = message.text.strip()
         if not task_text:
             raise ChannelDirectiveError("empty_message")
+        conversation_id = _channel_conversation_id(message)
+        actor_id = _channel_actor_id(message)
+        choice_key = _numeric_choice_key(task_text)
+        if choice_key is not None and isinstance(self.run_service, ConversationChoiceService):
+            chosen = await self.run_service.choose_latest_choice_for_conversation(
+                tenant_id=self.tenant_id,
+                actor_id=actor_id,
+                conversation_id=conversation_id,
+                choice_key=choice_key,
+                operator_note="channel_numeric_choice",
+            )
+            if chosen is not None:
+                return chosen.id
         hints = parse_channel_resource_hints(task_text)
         attachment_ids = _agent_hub_attachment_ids(message)
         task_text = _message_with_attachment_manifest(task_text, message)
         submitted = await self.run_service.submit(
             tenant_id=self.tenant_id,
-            actor_id=_channel_actor_id(message),
+            actor_id=actor_id,
             message=task_text,
             mode=TaskMode.AUTO,
             attachment_ids=attachment_ids,
+            conversation_id=conversation_id,
             channel_context=_channel_context(message, hints=hints),
             vibe_coding=False,
             idempotency_key=idempotency_key,
         )
         return submitted.id
+
+
+def _numeric_choice_key(text: str) -> str | None:
+    stripped = text.strip()
+    if re.fullmatch(r"[1-9][0-9]{0,2}", stripped) is None:
+        return None
+    return stripped
+
+
+def _channel_conversation_id(message: InboundMessage) -> str:
+    conversation_uuid = uuid5(
+        NAMESPACE_URL,
+        (
+            f"agent-hub:channel-conversation:{message.channel.value}:"
+            f"{message.tenant_external_id}:{message.conversation_external_id}"
+        ),
+    )
+    return f"ch-{message.channel.value}-{conversation_uuid.hex}"
 
 
 def _channel_actor_id(message: InboundMessage) -> UUID:

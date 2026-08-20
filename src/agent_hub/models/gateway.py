@@ -101,6 +101,27 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _retryable_model_failure(error: BaseException) -> bool:
+    if isinstance(error, ModelTransportError):
+        return error.status_code is None or error.status_code in {
+            408,
+            409,
+            425,
+            429,
+            500,
+            502,
+            503,
+            504,
+        }
+    if isinstance(error, ModelGatewayError):
+        return str(error) in {
+            "model transport failed",
+            "model response text is empty",
+            "model response is empty",
+        }
+    return False
+
+
 class SecretResolver(Protocol):
     async def resolve(self, secret_ref: str) -> str: ...
 
@@ -266,8 +287,7 @@ class ModelGateway:
         if type(estimated_tokens) is not int or estimated_tokens <= 0:
             raise ValueError("token estimator must return a strict positive integer")
         models = self._fallback_chain(request.logical_model, request.allow_fallback)
-        lease: CapacityLease | None = None
-        selected: Deployment | None = None
+        last_retryable_error: BaseException | None = None
         for logical_model in models:
             try:
                 candidates = self._registry.candidates(logical_model, request.required_capabilities)
@@ -292,18 +312,24 @@ class ModelGateway:
                 if cleanup_error is not None:
                     raise CapacityBackendError("model capacity release failed") from None
                 raise CapacityBackendError("model capacity returned an unknown deployment")
-            break
-        if lease is None or selected is None:
-            raise CapacityUnavailable("model capacity unavailable") from None
-        response = await self._complete_leased(selected, lease, request)
-        return GatewayCompletion(
-            response=response,
-            deployment_id=selected.id,
-            logical_model=selected.logical_model,
-            provider_id=selected.provider_model.split("/", 1)[0],
-            provider_model=selected.provider_model,
-            cost_usd=self._cost_usd(selected, response),
-        )
+            try:
+                response = await self._complete_leased(selected, lease, request)
+            except (ModelTransportError, ModelGatewayError) as error:
+                if not _retryable_model_failure(error):
+                    raise
+                last_retryable_error = error
+                continue
+            return GatewayCompletion(
+                response=response,
+                deployment_id=selected.id,
+                logical_model=selected.logical_model,
+                provider_id=selected.provider_model.split("/", 1)[0],
+                provider_model=selected.provider_model,
+                cost_usd=self._cost_usd(selected, response),
+            )
+        if last_retryable_error is not None:
+            raise last_retryable_error from None
+        raise CapacityUnavailable("model capacity unavailable") from None
 
     def _cost_usd(self, deployment: Deployment, response: ModelResponse) -> Decimal | None:
         pricing = self._pricing.get(deployment.id)
@@ -368,7 +394,16 @@ class ModelGateway:
                             status_code = outcome.error.status_code
                         should_record = True
                     else:
-                        response = outcome
+                        if (
+                            outcome.text is not None
+                            and not outcome.text.strip()
+                            and not outcome.tool_calls
+                        ):
+                            primary_error = ModelGatewayError("model response text is empty")
+                        elif outcome.text is None and not outcome.tool_calls:
+                            primary_error = ModelGatewayError("model response is empty")
+                        else:
+                            response = outcome
                         status_code = 200
                         should_record = True
                 except asyncio.CancelledError as error:

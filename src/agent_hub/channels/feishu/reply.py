@@ -20,7 +20,6 @@ _DEFAULT_FEISHU_API_BASE = "https://open.feishu.cn/open-apis"
 _MAX_REPLY_TEXT_CHARS = 3800
 _MAX_SECTION_ITEMS = 6
 _MAX_LINE_CHARS = 520
-_MAX_FINAL_CHARS = 20000
 
 
 class FeishuReplyError(RuntimeError):
@@ -151,12 +150,7 @@ class FeishuRunReplyDispatcher:
             events = await self.run_repository.events(tenant_id, run_id)
             return _completed_reply_text(record, artifacts, events)
         if status is RunStatus.WAITING_USER_MODE:
-            return (
-                "这个任务需要你选择执行模式后才能继续。\n"
-                "可回复：/direct、/dispatch、/discuss 或 /hybrid 加上任务内容；"
-                "也可以到 Web UI 的运行详情中选择模式。\n"
-                f"Run ID: {run_id}"
-            )
+            return _waiting_choice_reply_text(record)
         if status is RunStatus.WAITING_APPROVAL:
             return (
                 "这个任务需要你确认主 Agent 的调整建议后才能继续，"
@@ -165,11 +159,80 @@ class FeishuRunReplyDispatcher:
             )
         if status is RunStatus.CANCELLED:
             return f"任务已取消。\nRun ID: {run_id}"
+        artifacts = await self.run_repository.artifacts(tenant_id, run_id)
         events = await self.run_repository.events(tenant_id, run_id)
-        reason = _failure_reason(events)
-        if reason:
-            return f"任务执行失败：{reason}\nRun ID: {run_id}"
-        return f"任务执行失败，请在 Web UI 的日志中心查看详情。\nRun ID: {run_id}"
+        return _failed_reply_text(record, artifacts, events)
+
+
+def _waiting_choice_reply_text(record: RunRecord) -> str:
+    lines = [
+        "这个任务需要你先选择下一步处理方式。",
+        f"Run ID: {record.id}",
+    ]
+    choices = _channel_choice_lines(record)
+    if choices:
+        lines.extend(["", "可直接回复本次选项编号：", *choices])
+    else:
+        lines.extend(["", "请到 Web UI 的运行详情中完成选择。"])
+    return "\n".join(lines).strip()
+
+
+def _failed_reply_text(
+    record: RunRecord,
+    artifacts: tuple[dict[str, object], ...],
+    events: tuple[dict[str, object], ...],
+) -> str:
+    reason = _failure_reason(events) or "请在 Web UI 的日志中心查看详情。"
+    final_text = _final_artifact_text(artifacts)
+    lines = [
+        "任务执行失败",
+        f"Run ID: {record.id}",
+    ]
+    if record.mode is not None:
+        lines.append(f"执行模式: {record.mode.value}")
+    lines.append(f"用户请求: {_clip_inline(record.request, 220)}")
+    lines.extend(_section("错误原因", [_clip_inline(reason, _MAX_LINE_CHARS)]))
+    lines.extend(
+        _section("Agent 调度", _routing_lines(record, events), empty="未记录单独调度计划。")
+    )
+    lines.extend(_section("讨论情况", _discussion_lines(events), empty="未记录讨论过程。"))
+    lines.extend(_section("裁决情况", _review_lines(events), empty="未记录单独裁决事件。"))
+    produced = _child_output_lines(events, artifacts)
+    if final_text:
+        produced.append(f"- 最近产物: {_clip_inline(final_text, _MAX_LINE_CHARS)}")
+    lines.extend(_section("已产生内容", produced, empty="失败前没有保存可发送的产物。"))
+    return "\n".join(lines).strip()
+
+
+def _channel_choice_lines(record: RunRecord) -> list[str]:
+    routing = record.routing_decision or {}
+    raw_choices = routing.get("channel_choices")
+    if not isinstance(raw_choices, Sequence) or isinstance(raw_choices, str | bytes | bytearray):
+        return []
+    lines: list[str] = []
+    for raw_choice in raw_choices:
+        if not isinstance(raw_choice, Mapping):
+            continue
+        key = _safe_text(raw_choice.get("key"))
+        label = _safe_text(raw_choice.get("label"))
+        value = _safe_text(raw_choice.get("value"))
+        choice_type = _safe_text(raw_choice.get("type"))
+        if key is None:
+            continue
+        text = label or value or choice_type or "选项"
+        details: list[str] = []
+        confidence = raw_choice.get("confidence")
+        risk = _safe_text(raw_choice.get("risk"))
+        reason = _safe_text(raw_choice.get("reason"))
+        if isinstance(confidence, int | float):
+            details.append(f"置信度 {confidence:.2f}")
+        if risk is not None:
+            details.append(f"风险 {risk}")
+        if reason is not None:
+            details.append(_clip_inline(reason, 80))
+        suffix = f"（{'；'.join(details)}）" if details else ""
+        lines.append(f"{key}. {text}{suffix}")
+    return lines[:_MAX_SECTION_ITEMS]
 
 
 def _completed_reply_text(
@@ -188,16 +251,10 @@ def _completed_reply_text(
     lines.append(f"用户请求: {_clip_inline(record.request, 220)}")
 
     lines.extend(
-        _section(
-            "最终结果",
-            [_clip_block(final_text, _MAX_FINAL_CHARS)]
-            if final_text
-            else ["没有生成可直接发送的文本结果，请到 Web UI 查看完整运行详情。"],
-        )
-    )
-    lines.extend(
         _section("Agent 调度", _routing_lines(record, events), empty="未记录单独调度计划。")
     )
+    lines.extend(_section("讨论情况", _discussion_lines(events), empty="未记录讨论过程。"))
+    lines.extend(_section("裁决情况", _review_lines(events), empty="未记录单独裁决事件。"))
     lines.extend(
         _section(
             "子 Agent 输出",
@@ -205,9 +262,15 @@ def _completed_reply_text(
             empty="未记录子 Agent 分步输出。",
         )
     )
-    lines.extend(_section("讨论情况", _discussion_lines(events), empty="未记录讨论过程。"))
-    lines.extend(_section("裁决情况", _review_lines(events), empty="未记录单独裁决事件。"))
-    return "\n".join(lines).strip()
+    lines.extend(
+        _section(
+            "最终结果",
+            [final_text]
+            if final_text
+            else ["没有生成可直接发送的文本结果，请到 Web UI 查看完整运行详情。"],
+        )
+    )
+    return "\n".join(lines).strip().strip()
 
 
 def _section(title: str, lines: Sequence[str], *, empty: str | None = None) -> list[str]:
@@ -304,24 +367,53 @@ def _discussion_lines(events: tuple[dict[str, object], ...]) -> list[str]:
 
 def _review_lines(events: tuple[dict[str, object], ...]) -> list[str]:
     lines: list[str] = []
+    decision_roles = _decision_role_ids(events)
     for event in events:
-        if event.get("kind") != "review.completed":
-            continue
+        kind = event.get("kind")
         payload = _mapping(event.get("payload"))
         actor = _safe_text(event.get("actor")) or "unknown"
         role = _safe_text(payload.get("role")) or actor
-        verdict = _safe_text(payload.get("verdict")) or "unknown"
-        feedback = (
-            _safe_text(payload.get("feedback"))
-            or _safe_text(payload.get("warning"))
-            or _safe_text(payload.get("rationale"))
-            or _safe_text(payload.get("summary"))
-        )
-        line = f"- {role}({actor}): {verdict}"
-        if feedback is not None:
-            line += f" - {_clip_inline(feedback, _MAX_LINE_CHARS)}"
-        lines.append(line)
+        model = _safe_text(payload.get("logical_model"))
+        if kind == "review.completed":
+            verdict = _safe_text(payload.get("verdict")) or "unknown"
+            feedback = (
+                _safe_text(payload.get("feedback"))
+                or _safe_text(payload.get("warning"))
+                or _safe_text(payload.get("rationale"))
+                or _safe_text(payload.get("summary"))
+            )
+            line = f"- {role}({actor}): {verdict}"
+            if feedback is not None:
+                line += f" - {_clip_inline(feedback, _MAX_LINE_CHARS)}"
+            lines.append(line)
+            continue
+        if kind != "step.completed" or actor not in decision_roles:
+            continue
+        output = _safe_text(payload.get("output")) or _safe_text(payload.get("summary"))
+        if output is None:
+            continue
+        prefix = f"- {role}({actor})"
+        if model is not None:
+            prefix += f"[{model}]"
+        lines.append(f"{prefix}: {_clip_inline(output, _MAX_LINE_CHARS)}")
     return lines[:_MAX_SECTION_ITEMS]
+
+
+def _decision_role_ids(events: tuple[dict[str, object], ...]) -> set[str]:
+    decision_purposes = {"verify", "critique", "risk_review", "record_decision", "synthesize"}
+    role_ids: set[str] = {"final_synthesizer"}
+    for role in _mapping_items(_main_agent_plan(events).get("roles")):
+        role_id = _safe_text(role.get("id"))
+        purpose = _safe_text(role.get("purpose"))
+        role_name = (_safe_text(role.get("role")) or "").casefold()
+        if role_id is None:
+            continue
+        if purpose in decision_purposes or any(
+            marker in role_name
+            for marker in ("review", "审查", "复核", "裁决", "synthesizer", "综合")
+        ):
+            role_ids.add(role_id)
+    return role_ids
 
 
 def _json_object(response: httpx.Response) -> dict[str, object]:
@@ -338,15 +430,18 @@ def _reply_text_chunks(text: str) -> tuple[str, ...]:
     stripped = text.strip()
     if not stripped:
         return ("任务已完成。",)
-    chunks = _split_text(stripped, _MAX_REPLY_TEXT_CHARS)
-    if len(chunks) <= 1:
-        return tuple(chunks)
-    total = len(chunks)
-    numbered: list[str] = []
-    for index, chunk in enumerate(chunks, start=1):
-        prefix = f"（{index}/{total}）\n"
-        numbered.extend(prefix + part for part in _split_text(chunk, _MAX_REPLY_TEXT_CHARS - len(prefix)))
-    return tuple(numbered)
+    if len(stripped) <= _MAX_REPLY_TEXT_CHARS:
+        return (stripped,)
+    chunks = _split_text(stripped, _MAX_REPLY_TEXT_CHARS - 32)
+    while True:
+        total = len(chunks)
+        prefix_len = max(len(f"（{index}/{total}）\n") for index in range(1, total + 1))
+        next_chunks = _split_text(stripped, _MAX_REPLY_TEXT_CHARS - prefix_len)
+        if len(next_chunks) == total:
+            return tuple(
+                f"（{index}/{total}）\n{chunk}" for index, chunk in enumerate(next_chunks, start=1)
+            )
+        chunks = next_chunks
 
 
 def _split_text(text: str, maximum: int) -> list[str]:
@@ -368,6 +463,7 @@ def _split_text(text: str, maximum: int) -> list[str]:
         chunks.append(remaining)
     return chunks or ["任务已完成。"]
 
+
 def _bounded_reply_text(text: str) -> str:
     stripped = text.strip()
     if not stripped:
@@ -385,7 +481,7 @@ def _final_artifact_text(artifacts: tuple[dict[str, object], ...]) -> str | None
             candidates.append(text)
     if not candidates:
         return None
-    return candidates[-1]
+    return _stabilize_markdown_table_blocks(candidates[-1])
 
 
 def _artifact_text(artifact: Mapping[str, object]) -> str | None:
@@ -397,6 +493,40 @@ def _artifact_text(artifact: Mapping[str, object]) -> str | None:
         return table
     text = content.get("text")
     return _safe_block_text(text)
+
+
+def _stabilize_markdown_table_blocks(text: str) -> str:
+    lines = text.splitlines()
+    result: list[str] = []
+    index = 0
+    while index < len(lines):
+        if _is_markdown_table_start(lines, index):
+            table_lines: list[str] = []
+            while index < len(lines) and "|" in lines[index]:
+                table_lines.append(lines[index].strip())
+                index += 1
+            if result and result[-1].strip():
+                result.append("")
+            result.append("```text")
+            result.extend(table_lines)
+            result.append("```")
+            continue
+        result.append(lines[index])
+        index += 1
+    return "\n".join(result).strip()
+
+
+def _is_markdown_table_start(lines: Sequence[str], index: int) -> bool:
+    if index + 1 >= len(lines):
+        return False
+    header = lines[index].strip()
+    separator = lines[index + 1].strip()
+    if header.startswith("```"):
+        return False
+    if header.count("|") < 2 or separator.count("|") < 2:
+        return False
+    normalized = separator.replace("|", "").replace(" ", "").replace(":", "")
+    return bool(normalized) and set(normalized) <= {"-"}
 
 
 def _failure_reason(events: tuple[dict[str, object], ...]) -> str | None:
@@ -475,7 +605,7 @@ def _format_table_content(content: Mapping[str, object]) -> str | None:
             for index, _column in enumerate(columns):
                 values.append(_table_cell_text(sequence[index] if index < len(sequence) else ""))
         lines.append("| " + " | ".join(_escape_table_cell(value) for value in values) + " |")
-    return "\n".join(lines)
+    return "```text\n" + "\n".join(lines) + "\n```"
 
 
 def _table_rows(value: object) -> list[Mapping[str, object] | Sequence[object]]:
@@ -497,7 +627,12 @@ def _table_columns(
     if not isinstance(value, str | bytes | bytearray) and isinstance(value, Sequence):
         for item in value[:20]:
             if isinstance(item, Mapping):
-                key = _safe_text(item.get("key")) or _safe_text(item.get("id")) or _safe_text(item.get("name")) or _safe_text(item.get("label"))
+                key = (
+                    _safe_text(item.get("key"))
+                    or _safe_text(item.get("id"))
+                    or _safe_text(item.get("name"))
+                    or _safe_text(item.get("label"))
+                )
                 label = _safe_text(item.get("label")) or _safe_text(item.get("name")) or key
                 if key and label:
                     columns.append((key, label))
@@ -534,6 +669,7 @@ def _safe_block_text(value: object) -> str | None:
     block = "\n".join(line for line in lines if line)
     return block or None
 
+
 def _safe_text(value: object) -> str | None:
     if not isinstance(value, str):
         return None
@@ -546,15 +682,6 @@ def _clip_inline(text: str, limit: int) -> str:
     if len(compact) <= limit:
         return compact
     return compact[: max(1, limit - 1)] + "…"
-
-
-def _clip_block(text: str | None, limit: int) -> str:
-    if text is None:
-        return ""
-    stripped = text.strip()
-    if len(stripped) <= limit:
-        return stripped
-    return stripped[: max(1, limit - 1)] + "…"
 
 
 async def log_feishu_reply_failure(

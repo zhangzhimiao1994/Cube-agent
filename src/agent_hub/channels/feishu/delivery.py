@@ -59,13 +59,13 @@ class FeishuDelivery:
             options=clarification.options,
             reason=clarification.reason,
         )
+        self._pending_text[clarification.conversation_id] = _PendingTextChoice(
+            clarification=clarification,
+            expires_at=self._monotonic() + self._text_choice_ttl_seconds,
+        )
         try:
             await self._api.send_card(clarification.conversation_id, card)
         except FeishuDeliveryError:
-            self._pending_text[clarification.conversation_id] = _PendingTextChoice(
-                clarification=clarification,
-                expires_at=self._monotonic() + self._text_choice_ttl_seconds,
-            )
             await self._api.send_text(
                 clarification.conversation_id,
                 _clarification_text(clarification),

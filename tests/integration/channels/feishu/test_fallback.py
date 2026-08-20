@@ -104,7 +104,7 @@ async def test_text_choice_binds_to_pending_conversation_and_user() -> None:
     )
 
 
-async def test_card_success_does_not_register_text_choice() -> None:
+async def test_card_success_still_registers_text_choice() -> None:
     api = FakeFeishuApi()
     delivery = FeishuDelivery(
         api=api,
@@ -121,7 +121,7 @@ async def test_card_success_does_not_register_text_choice() -> None:
             sender_user_id=USER_ID,
             text="1",
         )
-        is None
+        is TaskMode.DIRECT
     )
 
 

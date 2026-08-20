@@ -333,6 +333,76 @@ async def test_429_status_and_latency_are_recorded_and_release_occurs() -> None:
     assert len(capacity.releases) == 1
 
 
+class DeploymentAwareTransport:
+    def __init__(self, events: list[object]) -> None:
+        self.events = events
+
+    async def complete(
+        self, deployment: Deployment, model_request: ModelRequest, api_key: str
+    ) -> ModelResponse:
+        del model_request, api_key
+        self.events.append(("transport", deployment.id))
+        if deployment.id == "primary-key":
+            raise ModelTransportError("primary busy", status_code=429)
+        return ModelResponse(text="backup ok")
+
+
+async def test_transport_failure_tries_fallback_model_when_available() -> None:
+    primary = deployment("primary-key")
+    backup = deployment("backup-key", "backup")
+    capacity = CapacityStub([lease("primary-key"), lease("backup-key")])
+    gateway = ModelGateway(
+        ModelRegistry([primary, backup]),
+        capacity,
+        SecretStub(capacity.events),
+        DeploymentAwareTransport(capacity.events),
+        fallbacks={"primary": "backup"},
+    )
+
+    completion = await gateway.complete_with_context(request())
+
+    assert completion.response.text == "backup ok"
+    assert completion.deployment_id == "backup-key"
+    assert [record[3] for record in capacity.records] == [False, True]
+    assert [event for event in capacity.events if event[0] == "transport"] == [
+        ("transport", "primary-key"),
+        ("transport", "backup-key"),
+    ]
+
+
+class EmptyPrimaryTransport:
+    def __init__(self, events: list[object]) -> None:
+        self.events = events
+
+    async def complete(
+        self, deployment: Deployment, model_request: ModelRequest, api_key: str
+    ) -> ModelResponse:
+        del model_request, api_key
+        self.events.append(("transport", deployment.id))
+        if deployment.id == "primary-key":
+            return ModelResponse(text="")
+        return ModelResponse(text="backup ok")
+
+
+async def test_empty_model_response_tries_fallback_model_when_available() -> None:
+    primary = deployment("primary-key")
+    backup = deployment("backup-key", "backup")
+    capacity = CapacityStub([lease("primary-key"), lease("backup-key")])
+    gateway = ModelGateway(
+        ModelRegistry([primary, backup]),
+        capacity,
+        SecretStub(capacity.events),
+        EmptyPrimaryTransport(capacity.events),
+        fallbacks={"primary": "backup"},
+    )
+
+    completion = await gateway.complete_with_context(request())
+
+    assert completion.response.text == "backup ok"
+    assert completion.deployment_id == "backup-key"
+    assert [record[3] for record in capacity.records] == [False, True]
+
+
 @pytest.mark.parametrize("status_code", [None, 500])
 async def test_transport_failure_never_records_success(status_code: int | None) -> None:
     selected = deployment("selected")

@@ -630,6 +630,7 @@ class RunService:
                     routing_decision={
                         "reason": "router_unavailable",
                         "decision_token": token,
+                        "channel_choices": _channel_mode_choices(None),
                         "decision": None,
                         **(
                             {"hermes": _hermes_advice_payload(hermes_advice)}
@@ -662,6 +663,7 @@ class RunService:
                 routing_decision={
                     "reason": clarification_reason,
                     "decision_token": token,
+                    "channel_choices": _channel_mode_choices(decision),
                     "decision": None if decision is None else decision.model_dump(mode="json"),
                     **(
                         {"hermes": _hermes_advice_payload(hermes_advice)}
@@ -769,6 +771,69 @@ class RunService:
             operator_note=cleaned_operator_note[:2000] if cleaned_operator_note else None,
         )
         return _submitted(record)
+
+    async def choose_latest_choice_for_conversation(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        conversation_id: str,
+        choice_key: str,
+        operator_note: str | None = None,
+    ) -> SubmittedRun | None:
+        record = await self._repository.latest_waiting_choice_for_conversation(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            conversation_id=conversation_id,
+        )
+        if record is None:
+            return None
+        selected_mode = _mode_for_channel_choice(record, choice_key)
+        if selected_mode is None:
+            return None
+        routing_decision = record.routing_decision or {}
+        decision_token = routing_decision.get("decision_token")
+        if not isinstance(decision_token, str) or not decision_token:
+            return None
+        return await self.choose_mode(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            run_id=record.id,
+            mode=selected_mode,
+            decision_token=decision_token,
+            version=record.version,
+            operator_note=operator_note,
+        )
+
+    async def choose_latest_mode_for_conversation(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        conversation_id: str,
+        mode: TaskMode,
+        operator_note: str | None = None,
+    ) -> SubmittedRun | None:
+        record = await self._repository.latest_waiting_mode_for_conversation(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            conversation_id=conversation_id,
+        )
+        if record is None:
+            return None
+        routing_decision = record.routing_decision or {}
+        decision_token = routing_decision.get("decision_token")
+        if not isinstance(decision_token, str) or not decision_token:
+            return None
+        return await self.choose_mode(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            run_id=record.id,
+            mode=mode,
+            decision_token=decision_token,
+            version=record.version,
+            operator_note=operator_note,
+        )
 
     async def get(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
         record = await self._repository.get(tenant_id, run_id)
@@ -1626,6 +1691,67 @@ def _weekday_label(weekday: int) -> str:
     return ["日", "一", "二", "三", "四", "五", "六"][weekday]
 
 
+def _channel_mode_choices(decision: RouteDecision | None) -> list[dict[str, object]]:
+    options = _channel_mode_options(decision)
+    assessments = {item.mode: item for item in (() if decision is None else decision.assessments)}
+    choices: list[dict[str, object]] = []
+    for index, mode in enumerate(options, start=1):
+        item: dict[str, object] = {
+            "key": str(index),
+            "type": "mode",
+            "value": mode.value,
+            "label": _mode_choice_label(mode),
+        }
+        assessment = assessments.get(mode)
+        if assessment is not None:
+            item["confidence"] = assessment.confidence
+            item["risk"] = assessment.risk.value
+            item["reason"] = assessment.reason
+        choices.append(item)
+    return choices
+
+
+def _channel_mode_options(decision: RouteDecision | None) -> tuple[TaskMode, ...]:
+    if decision is not None and decision.options:
+        return decision.options
+    return (TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID)
+
+
+def _mode_choice_label(mode: TaskMode) -> str:
+    labels = {
+        TaskMode.DIRECT: "直接回答",
+        TaskMode.DISPATCH: "分派给角色执行",
+        TaskMode.DISCUSS: "多角色讨论",
+        TaskMode.HYBRID: "混合执行",
+    }
+    return labels.get(mode, mode.value)
+
+
+def _mode_for_channel_choice(record: RunRecord, choice_key: str) -> TaskMode | None:
+    routing = record.routing_decision or {}
+    raw_choices = routing.get("channel_choices")
+    if not isinstance(raw_choices, list):
+        return None
+    for raw_choice in raw_choices:
+        if not isinstance(raw_choice, dict):
+            continue
+        if str(raw_choice.get("key", "")).strip() != choice_key:
+            continue
+        if raw_choice.get("type") != "mode":
+            return None
+        value = raw_choice.get("value")
+        if not isinstance(value, str):
+            return None
+        try:
+            mode = TaskMode(value)
+        except ValueError:
+            return None
+        if mode in {TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID}:
+            return mode
+        return None
+    return None
+
+
 def _decision_token() -> str:
     return f"decision-{uuid4().hex}{uuid4().hex}"
 
@@ -1799,6 +1925,10 @@ def _main_agent_adjusted_ready_mode(
     attachment_ids: tuple[str, ...],
 ) -> TaskMode:
     local_mode = _local_main_agent_auto_mode(message, attachment_ids)
+    if local_mode is TaskMode.HYBRID:
+        return TaskMode.HYBRID
+    if {router_mode, local_mode} == {TaskMode.DISPATCH, TaskMode.DISCUSS}:
+        return TaskMode.HYBRID
     if router_mode is TaskMode.DIRECT and local_mode is not TaskMode.DIRECT:
         return local_mode
     return router_mode
@@ -1806,65 +1936,64 @@ def _main_agent_adjusted_ready_mode(
 
 def _local_main_agent_auto_mode(message: str, attachment_ids: tuple[str, ...]) -> TaskMode:
     text = message.lower()
-    if any(
-        marker in text
-        for marker in (
-            "先讨论",
-            "再执行",
-            "完整流程",
-            "端到端",
-            "调研",
-            "代码",
-            "开发",
-            "落地",
-            "审查",
-            "github",
-            "仓库",
-            "跨领域",
-            "multi-step",
-            "end-to-end",
-            "code review",
-        )
+    execution_markers = (
+        "文案",
+        "脚本",
+        "剪辑",
+        "导演",
+        "设计",
+        "报告",
+        "方案",
+        "计划",
+        "策划",
+        "活动",
+        "生成",
+        "制作",
+        "分析",
+        "整理",
+        "撰写",
+        "调研",
+        "代码",
+        "开发",
+        "落地",
+        "github",
+        "仓库",
+        "spreadsheet",
+        "presentation",
+    )
+    discussion_markers = (
+        "讨论",
+        "评审",
+        "审查",
+        "复核",
+        "争论",
+        "分歧",
+        "决策",
+        "裁决",
+        "对比",
+        "优缺点",
+        "review",
+        "debate",
+        "code review",
+    )
+    explicit_hybrid_markers = (
+        "先讨论",
+        "再执行",
+        "完整流程",
+        "端到端",
+        "跨领域",
+        "multi-step",
+        "end-to-end",
+    )
+    has_execution = bool(attachment_ids) or any(marker in text for marker in execution_markers)
+    has_discussion = any(marker in text for marker in discussion_markers)
+    if any(marker in text for marker in explicit_hybrid_markers) or (
+        has_execution and has_discussion
     ):
         return TaskMode.HYBRID
-    if any(
-        marker in text
-        for marker in (
-            "讨论",
-            "评审",
-            "争论",
-            "分歧",
-            "决策",
-            "裁决",
-            "对比",
-            "优缺点",
-            "review",
-            "debate",
-        )
-    ):
+    if has_discussion:
         return TaskMode.DISCUSS
-    if attachment_ids or any(
-        marker in text
-        for marker in (
-            "文案",
-            "脚本",
-            "剪辑",
-            "导演",
-            "设计",
-            "报告",
-            "方案",
-            "计划",
-            "策划",
-            "活动",
-            "生成",
-            "制作",
-            "分析",
-            "整理",
-            "撰写",
-            "spreadsheet",
-            "presentation",
-        )
-    ):
+    if has_execution:
         return TaskMode.DISPATCH
     return TaskMode.DIRECT
 

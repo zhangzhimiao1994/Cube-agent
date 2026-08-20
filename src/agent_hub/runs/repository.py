@@ -153,6 +153,38 @@ class RunRepository:
                 raise RunNotFound("run was not found")
             return self._record(row)
 
+    async def latest_waiting_choice_for_conversation(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        conversation_id: str,
+    ) -> RunRecord | None:
+        async with self._session_factory() as session:
+            row = await session.scalar(
+                select(RunRow)
+                .where(RunRow.tenant_id == tenant_id)
+                .where(RunRow.actor_id == actor_id)
+                .where(RunRow.status == RunStatus.WAITING_USER_MODE.value)
+                .where(RunRow.routing_decision["conversation_id"].astext == conversation_id)
+                .order_by(RunRow.created_at.desc(), RunRow.id.desc())
+                .limit(1)
+            )
+            return None if row is None else self._record(row)
+
+    async def latest_waiting_mode_for_conversation(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        conversation_id: str,
+    ) -> RunRecord | None:
+        return await self.latest_waiting_choice_for_conversation(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            conversation_id=conversation_id,
+        )
+
     async def list_recent(self, tenant_id: UUID, *, limit: int = 100) -> tuple[RunRecord, ...]:
         if type(limit) is not int or not 1 <= limit <= 500:
             raise ValueError("run list limit must be between 1 and 500")
@@ -188,7 +220,9 @@ class RunRepository:
                 await session.execute(
                     delete(table).where(table.tenant_id == tenant_id, table.run_id == run_id)
                 )
-            await session.execute(delete(RunRow).where(RunRow.tenant_id == tenant_id, RunRow.id == run_id))
+            await session.execute(
+                delete(RunRow).where(RunRow.tenant_id == tenant_id, RunRow.id == run_id)
+            )
 
     async def get_for_update(self, session: AsyncSession, run_id: UUID) -> RunRow:
         row = await session.scalar(select(RunRow).where(RunRow.id == run_id).with_for_update())
@@ -286,7 +320,11 @@ class RunRepository:
             selected_model = _safe_temporary_agent_model(proposal)
             proposal = {**proposal, "model": selected_model}
             selected = routing_decision.get("selected_agent_ids")
-            selected_agent_ids = [item for item in selected if isinstance(item, str)] if isinstance(selected, list) else []
+            selected_agent_ids = (
+                [item for item in selected if isinstance(item, str)]
+                if isinstance(selected, list)
+                else []
+            )
             proposal_id = proposal["id"]
             if proposal_id not in selected_agent_ids:
                 selected_agent_ids.append(proposal_id)
@@ -640,8 +678,9 @@ class RunRepository:
     ) -> tuple[ConversationContextItem, ...]:
         async with self._session_factory() as session:
             current = await session.scalar(
-                select(RunRow.created_at)
-                .where(RunRow.tenant_id == tenant_id, RunRow.id == before_run_id)
+                select(RunRow.created_at).where(
+                    RunRow.tenant_id == tenant_id, RunRow.id == before_run_id
+                )
             )
             if current is None:
                 raise RunNotFound("run was not found")
@@ -675,7 +714,9 @@ class RunRepository:
                     .order_by(RunArtifactRow.created_at, RunArtifactRow.id)
                 )
             ).all()
-            artifacts_by_run: dict[UUID, list[dict[str, object]]] = {run_id: [] for run_id in run_ids}
+            artifacts_by_run: dict[UUID, list[dict[str, object]]] = {
+                run_id: [] for run_id in run_ids
+            }
             for artifact in artifact_rows:
                 artifacts_by_run.setdefault(artifact.run_id, []).append(
                     _public_artifact_payload(dict(artifact.payload))
@@ -819,7 +860,7 @@ class RunRepository:
                 content_sha256=artifact.content_sha256,
                 payload=artifact.to_payload(),
             )
-            .on_conflict_do_nothing(index_elements=[RunArtifactRow.id])
+            .on_conflict_do_nothing()
         )
 
     @staticmethod
@@ -888,7 +929,8 @@ class RunRepository:
         assert event.provider_id is not None
         assert event.cost_usd is not None
         await session.execute(
-            insert(RunUsageRow).values(
+            insert(RunUsageRow)
+            .values(
                 id=uuid4(),
                 tenant_id=tenant_id,
                 run_id=run_id,
@@ -902,11 +944,15 @@ class RunRepository:
 
 
 def _public_event_payload(payload: dict[str, object]) -> dict[str, object]:
-    return {key: _sanitize_public_json(value) for key, value in payload.items() if _is_public_key(key)}
+    return {
+        key: _sanitize_public_json(value) for key, value in payload.items() if _is_public_key(key)
+    }
 
 
 def _public_artifact_payload(payload: dict[str, object]) -> dict[str, object]:
-    return {key: _sanitize_public_json(value) for key, value in payload.items() if _is_public_key(key)}
+    return {
+        key: _sanitize_public_json(value) for key, value in payload.items() if _is_public_key(key)
+    }
 
 
 def _sanitize_public_json(value: object) -> object:

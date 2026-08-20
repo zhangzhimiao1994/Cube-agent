@@ -1,3 +1,66 @@
+## 2026-08-20 P3 Channel Choice / Failure Recovery / Gateway Fallback Server Deployment
+
+Status: server deployed and verified; GitHub push is still pending and should be the next sync step when continuing the release flow.
+
+Changed in this slice:
+- `src/agent_hub/channels/submitter.py`: channel numeric replies are no longer hard-coded as mode `1-4`. The submitter now treats a pure number as a generic `choice_key` only when the same channel conversation has a current waiting choice; otherwise it passes the number through as a normal user message. Stable channel conversation IDs are preserved across turns.
+- `src/agent_hub/runs/service.py` and `src/agent_hub/runs/repository.py`: waiting mode runs now persist `routing_decision.channel_choices`; `RunService.choose_latest_choice_for_conversation(...)` resolves the current waiting run and maps the submitted key through server-authoritative choices. The old `latest_waiting_mode_for_conversation` remains as a compatibility wrapper.
+- `src/agent_hub/channels/feishu/reply.py`: waiting replies render the current `channel_choices`; failed terminal replies now include error reason plus user-relevant Agent routing, discussion, review/decision, and outputs saved before the failure.
+- `src/agent_hub/models/gateway.py`: retryable model transport failures (`429/5xx/etc.`) and empty model text now try configured fallback models before surfacing failure; failed primary attempts are recorded as failed capacity outcomes.
+- Tests updated/added for channel choice handling, stable channel conversation IDs, failed Feishu replies with partial output, model fallback on transport failure/empty text, duplicate artifact idempotency, and mode-choice `channel_choices` metadata.
+
+Local verification:
+- `./.venv/Scripts/python.exe -m pytest tests/api/test_channel_webhooks.py tests/unit/channels/test_submitter.py tests/unit/models/test_gateway.py -q --tb=short` -> 92 passed; only existing FastAPI/httpx deprecation and pytest cache ACL warnings.
+- `./.venv/Scripts/python.exe -m pytest tests/unit/runs/test_temporary_agent.py -q --tb=short` -> 20 passed; pytest cache ACL warning only.
+- `./.venv/Scripts/python.exe -m ruff check ...` on modified backend/test files -> passed.
+- `./.venv/Scripts/python.exe -m mypy --strict src/agent_hub/channels/submitter.py src/agent_hub/runs/repository.py src/agent_hub/runs/service.py src/agent_hub/channels/feishu/reply.py src/agent_hub/models/gateway.py` -> passed.
+
+Server deployment and verification:
+- Local incremental archive retained: `.local-archives/server-incrementals/agent-hub-choice-failure-gateway-20260820-125324.tgz`.
+- Uploaded to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed incrementally into `/opt/agent-hub/current`.
+- Server backup retained: `/opt/agent-hub/backups/p3-choice-failure-gateway-20260820-125447`.
+- Server archive retained: `/opt/agent-hub/archives/server-incrementals/agent-hub-choice-failure-gateway-20260820-125447.tgz`.
+- Synced changed backend modules into active `.venv/lib/python3.12/site-packages`; server probe exposed site-packages drift for `agent_hub/channels/directives.py`, so that dependency was also synced into the active venv and services were restarted.
+- `agent-hub-api` and `agent-hub-worker` are active; `GET http://127.0.0.1:8000/health` returned `{"status":"ok"}`.
+- Server self-contained probe passed using the live deployed venv: `server_probe=ok choice=ok failed_reply=ok gateway_fallback=ok`. It verified generic channel numeric choice, failed Feishu reply with partial outputs, and gateway fallback for both transport 429 and empty model response. The expected logged traceback for the primary 429 was followed by successful fallback to `backup-key`.
+- Server real DB probe passed using `/etc/agent-hub/secrets.env`: `server_db_probe=ok ... artifacts=1`. It created a temporary live DB run, persisted two artifacts with different IDs but identical content for the same run, confirmed only one artifact row remained, then cleaned probe rows.
+- Cleaned server temp files: `/tmp/agent-hub-p3-runtime-incremental.tgz`, `/tmp/deploy-choice-failure-gateway.sh`, `/tmp/verify-compile-choice-failure-gateway.sh`, `/tmp/sync-directives.sh`, `/tmp/probe-choice-failure-gateway.py`, and `/tmp/probe-db-duplicate-artifact.py`.
+
+Main Agent observer/token note:
+- For the requested "continuous observation/scheduling" behavior, avoid a token-heavy loop that repeatedly feeds full context to the main Agent. The intended system pattern is event-driven: watch structured run events, `channel_choices`, capacity outcomes, empty-output failures, timeout signals, and artifact hashes; only trigger a main-Agent re-evaluation when a guarded condition fires. Normal progress should use persisted state and summaries, not repeated full-context model calls.
+- Remaining deeper work: formalize this as an ObserverPolicy/RunMonitor layer so main Agent can actively reschedule blocked roles, change model allocation, or ask the user for approval without reading the full conversation every time.
+
+Next required action:
+- GitHub full sync/push to `mutilagent main` with recovery archive/tag remains pending. After pushing, check GitHub Actions and fix any red run before continuing the backlog.
+## 2026-08-15 P3 Feishu Output / Hybrid Routing Server-Only Deployment
+
+Status: server deployed and verified; GitHub push intentionally deferred because the user said quota is running out. On the next session, the first action should be GitHub full sync/push with recovery archive/tag, then check GitHub Actions.
+
+Changes staged in the working tree but not pushed:
+- `src/agent_hub/channels/feishu/reply.py`: Feishu terminal replies now place process sections before the final answer, split long output without pre-truncating the final artifact, record review/decision from `review.completed` and decision-role `step.completed` events, and fence structured/markdown table blocks for stable Feishu rendering.
+- `src/agent_hub/runtime/defaults.py`: dispatch plans now make post-product roles (`verify`, `critique`, `risk_review`, `record_decision`, `release`) depend on producer roles, so reviewer roles are not started by the same parallel fanout as content producers.
+- `src/agent_hub/runs/service.py`: main-agent automatic mode adjustment now upgrades router `dispatch` to `hybrid` when the task combines generation/execution with discussion/review/decision signals.
+- Tests added/updated in `tests/api/test_channel_webhooks.py`, `tests/unit/runs/test_temporary_agent.py`, and `tests/unit/runtime/test_configured_runtime.py`.
+
+Local verification:
+- RED first: targeted tests failed for router dispatch->hybrid upgrade, reviewer dependency ordering, Feishu step-based decision recording, long final output truncation, and table code-fence rendering.
+- `./.venv/Scripts/python.exe -m pytest tests/api/test_channel_webhooks.py tests/unit/runs/test_temporary_agent.py tests/unit/runtime/test_configured_runtime.py -q --tb=short` -> 78 passed, only existing FastAPI/httpx deprecation and pytest cache ACL warnings.
+- `./.venv/Scripts/python.exe -m ruff check src/agent_hub/channels/feishu/reply.py src/agent_hub/runtime/defaults.py src/agent_hub/runs/service.py tests/api/test_channel_webhooks.py tests/unit/runtime/test_configured_runtime.py tests/unit/runs/test_temporary_agent.py` -> passed.
+- `./.venv/Scripts/python.exe -m mypy --strict src/agent_hub/channels/feishu/reply.py src/agent_hub/runtime/defaults.py src/agent_hub/runs/service.py` -> passed.
+
+Server deployment and verification:
+- Uploaded incremental package to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz`.
+- Server backup: `/opt/agent-hub/backups/p3-feishu-output-routing-20260815-191243/changed-files-before.tgz`.
+- Server retained archive: `/opt/agent-hub/archives/server-incrementals/agent-hub-feishu-output-routing-20260815-191243.tgz`.
+- Deployed changed files into `/opt/agent-hub/current`, copied changed backend modules into active `.venv/lib/python3.12/site-packages`, restarted `agent-hub-api` and `agent-hub-worker`.
+- Also synced existing `src/agent_hub/models/profiles.py` and `src/agent_hub/models/__init__.py` into active venv because a direct server venv import probe exposed site-packages drift after updating `runtime/defaults.py`.
+- Server Feishu reply behavior probe passed: `chunked=True`, `has_last_line=True`, `has_discussion=True`, `has_decision=True`, `table_fenced=True`, `not_truncated=True`, `max_chunk=3797`, `chunks=9`.
+- Server routing/dispatch behavior probe passed: router `dispatch` + generation/review task resolves to `hybrid`; `quality_reviewer_step` depends on producer steps; `final_response_step` depends on all role steps; `/health` returned `{"status":"ok"}`; `agent-hub-api` and `agent-hub-worker` are active.
+- Cleaned `/tmp/server_probe_feishu.py` and `/tmp/server_probe_routing.py`; `/tmp/agent-hub-p3-runtime-incremental.tgz` remains as the authorized deployment package.
+
+Next required action:
+- Do not forget: first thing next session is GitHub full sync/push to `mutilagent main` with recovery archive/tag, then check GitHub Actions. No GitHub push was done in this slice.
+
 # Handoff - 2026-08-15 18:45 CST - Avoid Messages Endpoint For Tool Roles
 
 ## Current state

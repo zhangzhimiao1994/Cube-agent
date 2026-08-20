@@ -717,6 +717,9 @@ def _dispatch_plan(
         300.0,
     )
     final_step_timeout = min(max(context.timeout_seconds * 0.45, 90.0), 300.0)
+    producer_step_ids = tuple(
+        f"{role.id}_step" for role in selected_roles if not _is_post_product_role(role)
+    )
     role_steps = tuple(
         DispatchStep(
             id=f"{role.id}_step",
@@ -726,7 +729,7 @@ def _dispatch_plan(
                 f"User task: {request_text}\n"
                 "Return only the role-specific result, evidence, risks, and verification."
             ),
-            depends_on=(),
+            depends_on=producer_step_ids if _is_post_product_role(role) else (),
             tools=_role_allowed_tools(
                 role,
                 context,
@@ -763,6 +766,15 @@ def _dispatch_plan(
         total_cost_usd=Decimal(0),
     )
 
+
+def _is_post_product_role(role: RoleAssignment) -> bool:
+    return role.purpose in {
+        RolePurpose.CRITIQUE,
+        RolePurpose.RISK_REVIEW,
+        RolePurpose.RECORD_DECISION,
+        RolePurpose.VERIFY,
+        RolePurpose.RELEASE,
+    }
 
 def _dispatch_role_payload(plan: DispatchPlan) -> tuple[Mapping[str, JsonValue], ...]:
     step_purposes = {

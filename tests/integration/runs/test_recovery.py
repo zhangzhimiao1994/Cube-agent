@@ -1018,6 +1018,61 @@ async def test_usage_events_are_idempotent_by_run_sequence(
     assert summary.usage_cost_usd == Decimal("0.25")
 
 
+async def test_duplicate_artifact_content_for_same_run_is_idempotent(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    repository = RunRepository(run_session_factory)
+    submitted = await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=uuid4(),
+        request="persist duplicate artifacts",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.RUNNING,
+        idempotency_key="client-request-duplicate-artifact",
+        enqueue=False,
+    )
+    first = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="planner",
+        content={"text": "same content"},
+    )
+    duplicate_content = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="planner",
+        content={"text": "same content"},
+    )
+
+    async with await repository.run_transaction() as session, session.begin():
+        await repository.persist_event(
+            session,
+            tenant_id=tenant_id,
+            run_id=submitted.id,
+            event=RunEvent(
+                kind=EventKind.ARTIFACT_CREATED,
+                sequence=1,
+                run_id=submitted.id,
+                artifact=first,
+            ),
+        )
+        await repository.persist_event(
+            session,
+            tenant_id=tenant_id,
+            run_id=submitted.id,
+            event=RunEvent(
+                kind=EventKind.ARTIFACT_CREATED,
+                sequence=2,
+                run_id=submitted.id,
+                artifact=duplicate_content,
+            ),
+        )
+
+    artifacts = await repository.artifacts(tenant_id, submitted.id)
+    assert len(artifacts) == 1
+
+
 async def test_public_events_sanitize_sensitive_persisted_payload_keys(
     run_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

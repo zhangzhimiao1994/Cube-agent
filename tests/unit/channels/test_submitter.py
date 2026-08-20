@@ -26,6 +26,8 @@ class SubmittedRun:
 class RecordingRunService:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
+        self.choice_calls: list[dict[str, object]] = []
+        self.choice_run_id: UUID | None = None
 
     async def submit(
         self,
@@ -35,6 +37,7 @@ class RecordingRunService:
         message: str,
         mode: TaskMode,
         attachment_ids: tuple[str, ...] = (),
+        conversation_id: str | None = None,
         channel_context: dict[str, str] | None = None,
         vibe_coding: bool = False,
         idempotency_key: str | None = None,
@@ -46,12 +49,35 @@ class RecordingRunService:
                 "message": message,
                 "mode": mode,
                 "attachment_ids": attachment_ids,
+                "conversation_id": conversation_id,
                 "channel_context": channel_context,
                 "vibe_coding": vibe_coding,
                 "idempotency_key": idempotency_key,
             }
         )
         return SubmittedRun(RUN_ID)
+
+    async def choose_latest_choice_for_conversation(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        conversation_id: str,
+        choice_key: str,
+        operator_note: str | None = None,
+    ) -> SubmittedRun | None:
+        self.choice_calls.append(
+            {
+                "tenant_id": tenant_id,
+                "actor_id": actor_id,
+                "conversation_id": conversation_id,
+                "choice_key": choice_key,
+                "operator_note": operator_note,
+            }
+        )
+        if self.choice_run_id is None:
+            return None
+        return SubmittedRun(self.choice_run_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +137,8 @@ async def test_submitter_forwards_channel_text_to_main_agent_entry_with_attachme
     call = run_service.calls[0]
     assert call["mode"] is TaskMode.AUTO
     assert call["attachment_ids"] == ("att_0123456789abcdef0123456789abcdef",)
+    assert isinstance(call["conversation_id"], str)
+    assert str(call["conversation_id"]).startswith("ch-feishu-")
     assert "/dispatch Review this image" in str(call["message"])
     assert "Channel attachments:" in str(call["message"])
     assert "filename=screen.png" in str(call["message"])
@@ -120,6 +148,39 @@ async def test_submitter_forwards_channel_text_to_main_agent_entry_with_attachme
     assert context["source_channel"] == "feishu"
     assert context["channel_entry_policy"] == "main_agent_decides"
     assert context["channel_message_id"] == "msg_1"
+
+
+async def test_submitter_uses_same_internal_conversation_for_same_channel_thread() -> None:
+    run_service = RecordingRunService()
+    submitter = RunServiceInboundSubmitter(run_service=run_service, tenant_id=TENANT_ID)
+
+    await submitter.submit(_message("第一轮"), idempotency_key="idem_1")
+    await submitter.submit(_message("第二轮"), idempotency_key="idem_2")
+
+    assert run_service.calls[0]["conversation_id"] == run_service.calls[1]["conversation_id"]
+
+
+async def test_submitter_consumes_numeric_choice_when_waiting_run_exists() -> None:
+    run_service = RecordingRunService()
+    run_service.choice_run_id = RUN_ID
+    submitter = RunServiceInboundSubmitter(run_service=run_service, tenant_id=TENANT_ID)
+
+    run_id = await submitter.submit(_message("2"), idempotency_key="idem_choice")
+
+    assert run_id == RUN_ID
+    assert run_service.calls == []
+    assert len(run_service.choice_calls) == 1
+    assert run_service.choice_calls[0]["choice_key"] == "2"
+
+
+async def test_submitter_keeps_numeric_text_as_message_without_waiting_run() -> None:
+    run_service = RecordingRunService()
+    submitter = RunServiceInboundSubmitter(run_service=run_service, tenant_id=TENANT_ID)
+
+    await submitter.submit(_message("2"), idempotency_key="idem_plain")
+
+    assert run_service.choice_calls[0]["choice_key"] == "2"
+    assert run_service.calls[0]["message"] == "2"
 
 
 async def test_submitter_extracts_leading_resource_hints_without_changing_message_text() -> None:

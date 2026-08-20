@@ -859,6 +859,70 @@ def test_dispatch_plan_accepts_localized_role_display_names_but_keeps_safe_ids()
     assert plan.max_parallelism == 1
 
 
+def test_dispatch_plan_runs_review_roles_after_producer_roles() -> None:
+    roles = (
+        RoleAssignment(
+            id="product_manager",
+            role="Product Manager",
+            purpose=RolePurpose.EXECUTE,
+            mission="Produce the product plan.",
+            must_answer=("What is the plan?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="writer",
+            role="Writer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Write the proposal.",
+            must_answer=("What was written?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="quality_reviewer",
+            role="Quality Reviewer",
+            purpose=RolePurpose.VERIFY,
+            mission="Review the completed proposal.",
+            must_answer=("Does the proposal pass review?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="生成一个活动方案并进行质量审查。",
+        ),
+        max_parallelism=3,
+    )
+
+    steps = {step.id: step for step in plan.steps}
+    assert steps["product_manager_step"].depends_on == ()
+    assert steps["writer_step"].depends_on == ()
+    assert steps["quality_reviewer_step"].depends_on == (
+        "product_manager_step",
+        "writer_step",
+    )
+    assert steps["final_response_step"].depends_on == (
+        "product_manager_step",
+        "writer_step",
+        "quality_reviewer_step",
+    )
+
 def test_dispatch_plan_preserves_selected_roles_and_controls_concurrency() -> None:
     roles = tuple(
         RoleAssignment(

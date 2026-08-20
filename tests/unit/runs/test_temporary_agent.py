@@ -318,6 +318,34 @@ async def test_auto_ready_direct_is_promoted_for_generation_work() -> None:
 
 
 @pytest.mark.asyncio
+async def test_auto_ready_dispatch_is_promoted_to_hybrid_for_generation_with_review() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    queue = RecordingQueue()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=WaitingRouter(ready_decision(TaskMode.DISPATCH)),
+        task_queue=queue,
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="请生成一个完整活动方案，并让审查角色讨论风险后给出裁决。",
+        mode=TaskMode.AUTO,
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.HYBRID
+    routing = repository.records[submitted.id].routing_decision
+    assert routing is not None
+    assert routing["router_selected_mode"] == "dispatch"
+    assert routing["main_agent_selected_mode"] == "hybrid"
+    assert routing["main_agent_adjusted"] is True
+
+
 async def test_submit_persists_vibe_coding_capability_metadata() -> None:
     tenant_id = uuid4()
     actor_id = uuid4()
@@ -743,6 +771,11 @@ async def test_auto_mode_waits_for_user_choice_when_router_is_unavailable() -> N
     assert routing is not None
     assert routing["reason"] == "router_unavailable"
     assert routing["decision_token"] == submitted.decision_token
+    choices = routing["channel_choices"]
+    assert isinstance(choices, list)
+    assert choices[0]["key"] == "1"
+    assert choices[0]["type"] == "mode"
+    assert choices[0]["value"] == "direct"
 
 
 @pytest.mark.asyncio
@@ -772,6 +805,12 @@ async def test_auto_mode_still_requires_user_choice_for_high_risk_router_decisio
     assert submitted.status is RunStatus.WAITING_USER_MODE
     assert submitted.mode is None
     assert submitted.decision_token is not None
+    routing = repository.records[submitted.id].routing_decision
+    assert routing is not None
+    choices = routing["channel_choices"]
+    assert isinstance(choices, list)
+    dispatch_choice = next(choice for choice in choices if choice["value"] == "dispatch")
+    assert dispatch_choice["confidence"] == 0.92
     assert repository.outbox == []
 
 

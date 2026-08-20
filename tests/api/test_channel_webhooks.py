@@ -159,7 +159,6 @@ class StructuredRunRepository:
         )
 
 
-
 class LongFinalRunRepository(StructuredRunRepository):
     async def artifacts(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
         del tenant_id, run_id
@@ -168,7 +167,137 @@ class LongFinalRunRepository(StructuredRunRepository):
                 "id": "artifact-final-long",
                 "type": "text",
                 "producer": "final_synthesizer",
-                "content": {"text": "\n".join(f"第 {index} 条详细结论：需要完整发送给用户。" for index in range(260))},
+                "content": {
+                    "text": "\n".join(
+                        f"第 {index} 条详细结论：需要完整发送给用户。" for index in range(1400)
+                    )
+                },
+            },
+        )
+
+
+class StepDecisionRunRepository(StructuredRunRepository):
+    async def events(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
+        del tenant_id, run_id
+        return (
+            {
+                "kind": "step.started",
+                "step_id": "main_agent_plan",
+                "actor": "main_agent",
+                "payload": {
+                    "main_agent_model": "main-m3",
+                    "roles": [
+                        {
+                            "id": "product_manager",
+                            "role": "Product Manager",
+                            "purpose": "execute",
+                            "logical_model": "m3",
+                        },
+                        {
+                            "id": "quality_reviewer",
+                            "role": "质量审查",
+                            "purpose": "verify",
+                            "logical_model": "m3",
+                        },
+                        {
+                            "id": "final_synthesizer",
+                            "role": "Final Synthesizer",
+                            "purpose": "synthesize",
+                            "logical_model": "m3",
+                        },
+                    ],
+                },
+            },
+            {
+                "kind": "step.completed",
+                "step_id": "product_manager_step",
+                "actor": "product_manager",
+                "payload": {
+                    "role": "Product Manager",
+                    "logical_model": "m3",
+                    "output": "已产出目标、里程碑和风险清单。",
+                },
+            },
+            {
+                "kind": "step.completed",
+                "step_id": "quality_reviewer_step",
+                "actor": "quality_reviewer",
+                "payload": {
+                    "role": "质量审查",
+                    "logical_model": "m3",
+                    "output": "确认方案完整，提醒补充验收口径。",
+                },
+            },
+            {
+                "kind": "step.completed",
+                "step_id": "final_response_step",
+                "actor": "final_synthesizer",
+                "payload": {
+                    "role": "Final Synthesizer",
+                    "logical_model": "m3",
+                    "output": "综合各角色产出后，采用产品经理方案并加入审查建议。",
+                },
+            },
+        )
+
+
+class FailedPartialRunRepository(StructuredRunRepository):
+    async def get(self, tenant_id: UUID, run_id: UUID) -> RunRecord:
+        record = await super().get(tenant_id, run_id)
+        return RunRecord(
+            id=record.id,
+            tenant_id=record.tenant_id,
+            actor_id=record.actor_id,
+            request=record.request,
+            mode=record.mode,
+            status=RunStatus.FAILED,
+            version=record.version,
+            created_at=record.created_at,
+            routing_decision=record.routing_decision,
+        )
+
+    async def artifacts(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
+        del tenant_id, run_id
+        return (
+            {
+                "id": "artifact-planner",
+                "type": "text",
+                "producer": "planner",
+                "content": {"text": "失败前已经完成活动流程草案。"},
+            },
+        )
+
+    async def events(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
+        base_events = await super().events(tenant_id, run_id)
+        return (
+            *base_events,
+            {
+                "kind": "runtime.failed",
+                "actor": "system",
+                "reason": "model gateway failed: model response text is empty",
+                "payload": {"stage": "final_synthesis"},
+            },
+        )
+
+
+class MarkdownTableFinalRunRepository(StructuredRunRepository):
+    async def artifacts(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
+        del tenant_id, run_id
+        return (
+            {
+                "id": "artifact-final-markdown-table",
+                "type": "text",
+                "producer": "final_synthesizer",
+                "content": {
+                    "text": (
+                        "方案如下：\n\n"
+                        "| 阶段 | 负责人 | 交付物 |\n"
+                        "| --- | --- | --- |\n"
+                        "| 调研 | 研究员 | 资料清单 |\n"
+                        "| 审查 | 评审员 | 风险表 |\n\n"
+                        "请按表执行。"
+                    )
+                },
             },
         )
 
@@ -190,6 +319,8 @@ class TableFinalRunRepository(StructuredRunRepository):
                 },
             },
         )
+
+
 class RecordingFeishuSkillHandler:
     def __init__(self, reply_text: str = "Skill 已扫描入库，待审批：writer") -> None:
         self.messages: list[InboundMessage] = []
@@ -1312,6 +1443,75 @@ def test_feishu_terminal_reply_summarizes_user_relevant_run_process() -> None:
     assert "model.started" not in text
     assert "internal checkpoint" not in text
 
+
+def test_feishu_failed_reply_includes_partial_outputs_and_error_reason() -> None:
+    sender = RecordingFeishuReplySender()
+    repository = FailedPartialRunRepository()
+    dispatcher = FeishuRunReplyDispatcher(
+        run_repository=cast(RunRepository, repository),
+        sender=sender,
+        poll_interval_seconds=0.01,
+        timeout_seconds=1.0,
+    )
+
+    async def run() -> None:
+        await dispatcher.reply_when_terminal(
+            tenant_id=TENANT_ID,
+            run_id=StructuredRunRepository.run_id,
+            source_message_id="om_failed_partial",
+            settings=FeishuSettings.model_validate(
+                {"app_id": "cli_saved_feishu", "app_secret": "secret"}
+            ),
+        )
+
+    import asyncio
+
+    asyncio.run(run())
+
+    assert len(sender.replies) == 1
+    text = sender.replies[0][2]
+    assert "任务执行失败" in text
+    assert "错误原因" in text
+    assert "model response text is empty" in text
+    assert "Agent 调度" in text
+    assert "讨论情况" in text
+    assert "裁决情况" in text
+    assert "已产生内容" in text
+    assert "Planner(planner)[m3]: 给出活动流程和物料清单。" in text
+    assert "最近产物: 失败前已经完成活动流程草案。" in text
+
+
+def test_feishu_terminal_reply_records_step_based_review_and_decision() -> None:
+    sender = RecordingFeishuReplySender()
+    repository = StepDecisionRunRepository()
+    dispatcher = FeishuRunReplyDispatcher(
+        run_repository=cast(RunRepository, repository),
+        sender=sender,
+        poll_interval_seconds=0.01,
+        timeout_seconds=1.0,
+    )
+
+    async def run() -> None:
+        await dispatcher.reply_when_terminal(
+            tenant_id=TENANT_ID,
+            run_id=StructuredRunRepository.run_id,
+            source_message_id="om_step_decision",
+            settings=FeishuSettings.model_validate(
+                {"app_id": "cli_saved_feishu", "app_secret": "secret"}
+            ),
+        )
+
+    import asyncio
+
+    asyncio.run(run())
+
+    text = sender.replies[0][2]
+    assert "裁决情况" in text
+    assert "质量审查(quality_reviewer)[m3]: 确认方案完整，提醒补充验收口径。" in text
+    assert "Final Synthesizer(final_synthesizer)[m3]: 综合各角色产出后" in text
+    assert "未记录单独裁决事件" not in text
+
+
 def test_feishu_terminal_reply_splits_long_completed_output_into_multiple_bubbles() -> None:
     sender = RecordingFeishuReplySender()
     repository = LongFinalRunRepository()
@@ -1340,9 +1540,41 @@ def test_feishu_terminal_reply_splits_long_completed_output_into_multiple_bubble
     assert all(reply[1] == "om_long_reply" for reply in sender.replies)
     combined = "\n".join(reply[2] for reply in sender.replies)
     assert "第 0 条详细结论" in combined
-    assert "第 259 条详细结论" in combined
+    assert "第 1399 条详细结论" in combined
     assert "已截断" not in combined
+    assert "…" not in combined
     assert all(len(reply[2]) <= 3800 for reply in sender.replies)
+
+
+def test_feishu_terminal_reply_stabilizes_markdown_table_blocks() -> None:
+    sender = RecordingFeishuReplySender()
+    repository = MarkdownTableFinalRunRepository()
+    dispatcher = FeishuRunReplyDispatcher(
+        run_repository=cast(RunRepository, repository),
+        sender=sender,
+        poll_interval_seconds=0.01,
+        timeout_seconds=1.0,
+    )
+
+    async def run() -> None:
+        await dispatcher.reply_when_terminal(
+            tenant_id=TENANT_ID,
+            run_id=StructuredRunRepository.run_id,
+            source_message_id="om_markdown_table_reply",
+            settings=FeishuSettings.model_validate(
+                {"app_id": "cli_saved_feishu", "app_secret": "secret"}
+            ),
+        )
+
+    import asyncio
+
+    asyncio.run(run())
+
+    text = sender.replies[0][2]
+    assert "方案如下" in text
+    assert "```text\n| 阶段 | 负责人 | 交付物 |" in text
+    assert "| 审查 | 评审员 | 风险表 |\n```" in text
+    assert "请按表执行" in text
 
 
 def test_feishu_terminal_reply_formats_structured_table_artifact_as_markdown_table() -> None:
@@ -1371,6 +1603,7 @@ def test_feishu_terminal_reply_formats_structured_table_artifact_as_markdown_tab
 
     assert len(sender.replies) == 1
     text = sender.replies[0][2]
+    assert "```text" in text
     assert "| 阶段 | 负责人 | 交付物 |" in text
     assert "| --- | --- | --- |" in text
     assert "| 调研 | 研究员 | 资料清单 |" in text
