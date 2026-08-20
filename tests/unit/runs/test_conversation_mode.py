@@ -128,6 +128,60 @@ async def test_auto_submission_reuses_previous_mode_for_same_conversation_withou
     }
 
 
+async def test_auto_reuses_previous_mode_when_discussion_is_context() -> None:
+    repository = ConversationModeRepository(TaskMode.HYBRID)
+    router = WaitingRouter()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.HYBRID),)),
+        router=router,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="继续刚刚的方案，用上一轮讨论结论补充执行细节",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-1",
+        idempotency_key="idem-continuation-discussion-word",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.HYBRID
+    assert router.calls == 0
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "conversation_mode_continuation"
+
+
+async def test_auto_reuses_previous_mode_when_mixed_model_is_context() -> None:
+    repository = ConversationModeRepository(TaskMode.HYBRID)
+    router = WaitingRouter()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.HYBRID),)),
+        router=router,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="继续解释刚刚说的混合模型为什么会被识别错",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-1",
+        idempotency_key="idem-continuation-mixed-model-word",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.HYBRID
+    assert router.calls == 0
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "conversation_mode_continuation"
+
+
 async def test_auto_submission_switches_mode_when_user_explicitly_requests_it() -> None:
     repository = ConversationModeRepository(TaskMode.HYBRID)
     router = WaitingRouter()

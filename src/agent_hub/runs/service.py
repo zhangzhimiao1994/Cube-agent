@@ -1892,7 +1892,7 @@ def _explicit_conversation_mode_switch(message: str) -> TaskMode | None:
         ),
         (
             TaskMode.DISCUSS,
-            ("讨论模式", "讨论", "评审模式", "审查模式", "discuss mode", "discussion mode"),
+            ("讨论模式", "评审模式", "审查模式", "discuss mode", "discussion mode"),
         ),
         (
             TaskMode.DISPATCH,

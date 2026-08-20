@@ -95,9 +95,16 @@ class RunServiceInboundSubmitter:
 
 def _numeric_choice_key(text: str) -> str | None:
     stripped = text.strip()
-    if re.fullmatch(r"[1-9][0-9]{0,2}", stripped) is None:
+    if not stripped:
         return None
-    return stripped
+    exact = re.fullmatch(r"([1-9][0-9]{0,2})", stripped)
+    if exact is not None:
+        return exact.group(1)
+    decorated = re.fullmatch(
+        r"(?:选|选择)?\s*第?\s*([1-9][0-9]{0,2})\s*(?:项|个|号)?[.。)、，,、]?",
+        stripped,
+    )
+    return None if decorated is None else decorated.group(1)
 
 
 def _channel_conversation_id(message: InboundMessage) -> str:

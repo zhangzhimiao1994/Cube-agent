@@ -173,6 +173,20 @@ async def test_submitter_consumes_numeric_choice_when_waiting_run_exists() -> No
     assert run_service.choice_calls[0]["choice_key"] == "2"
 
 
+async def test_submitter_consumes_common_numeric_choice_phrases() -> None:
+    for text in ("选2", "选 2", "2.", "2、", "第2项"):
+        run_service = RecordingRunService()
+        run_service.choice_run_id = RUN_ID
+        submitter = RunServiceInboundSubmitter(run_service=run_service, tenant_id=TENANT_ID)
+
+        run_id = await submitter.submit(_message(text), idempotency_key=f"idem_choice_{text}")
+
+        assert run_id == RUN_ID
+        assert run_service.calls == []
+        assert len(run_service.choice_calls) == 1
+        assert run_service.choice_calls[0]["choice_key"] == "2"
+
+
 async def test_submitter_keeps_numeric_text_as_message_without_waiting_run() -> None:
     run_service = RecordingRunService()
     submitter = RunServiceInboundSubmitter(run_service=run_service, tenant_id=TENANT_ID)
