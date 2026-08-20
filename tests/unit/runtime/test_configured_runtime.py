@@ -1872,6 +1872,83 @@ def test_selected_agent_ids_are_resolved_from_config_without_extra_roles() -> No
     ]
 
 
+
+def test_selected_dispatch_reviewer_runs_after_selected_producers() -> None:
+    config = PlatformConfig.model_validate(
+        {
+            "models": {
+                "creative": {
+                    "deployments": [
+                        {
+                            "provider": "kimi",
+                            "model": "kimi-k2-latest",
+                            "api_base": "https://api.moonshot.cn/v1",
+                            "credential_ref": "secret://creative",
+                            "quota_scope_id": "kimi",
+                            "max_concurrency": 4,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text"],
+                        }
+                    ]
+                },
+                "review": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-v4-flash",
+                            "api_base": "https://api.deepseek.com/v1",
+                            "credential_ref": "secret://review",
+                            "quota_scope_id": "deepseek",
+                            "max_concurrency": 4,
+                            "target_utilization": 0.8,
+                            "reserved_slots": 0,
+                            "capabilities": ["text"],
+                        }
+                    ]
+                },
+            },
+            "agents": [
+                {
+                    "id": "copywriter",
+                    "role": "文案生成",
+                    "prompt": "负责活动文案和脚本。",
+                    "model": "creative",
+                    "skills": [],
+                },
+                {
+                    "id": "quality_reviewer",
+                    "role": "质量审查",
+                    "prompt": "负责检查风险、遗漏和验收标准。",
+                    "model": "review",
+                    "skills": [],
+                },
+            ],
+        }
+    )
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="写一个中秋活动方案并进行质量审查。",
+        routing_decision={"selected_agent_ids": ("copywriter", "quality_reviewer")},
+    )
+
+    roles = _selected_config_role_assignments(
+        context,
+        config,
+        purpose=RolePurpose.EXECUTE,
+        output_schema={"summary": "string"},
+    )
+    plan = _dispatch_plan(roles, context, max_parallelism=3)
+
+    steps = {step.id: step for step in plan.steps}
+    assert steps["copywriter_step"].depends_on == ()
+    assert steps["quality_reviewer_step"].depends_on == ("copywriter_step",)
+    assert steps["final_response_step"].depends_on == (
+        "copywriter_step",
+        "quality_reviewer_step",
+    )
 def test_configured_runtime_registry_registers_all_production_modes() -> None:
     registry = configured_runtime_registry(
         config_service=FakeConfigService(None),  # type: ignore[arg-type]

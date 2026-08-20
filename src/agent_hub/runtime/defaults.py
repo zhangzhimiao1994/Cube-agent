@@ -10,7 +10,7 @@ from typing import Protocol
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from agent_hub.config.schema import LogicalModelDefinition, PlatformConfig
+from agent_hub.config.schema import AgentDefinition, LogicalModelDefinition, PlatformConfig
 from agent_hub.config.service import ConfigService
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.capacity import (
@@ -899,11 +899,12 @@ def _selected_config_role_assignments(
         agent = agents_by_id.get(agent_id)
         if agent is None:
             continue
+        role_purpose = _selected_config_agent_purpose(agent, default=purpose)
         assignments.append(
             RoleAssignment(
                 id=agent.id,
                 role=agent.role,
-                purpose=purpose,
+                purpose=role_purpose,
                 mission=agent.prompt,
                 must_answer=("What did this agent contribute and what evidence supports it?",),
                 allowed_tools=(),
@@ -915,6 +916,38 @@ def _selected_config_role_assignments(
         )
     return tuple(assignments)
 
+
+def _selected_config_agent_purpose(
+    agent: AgentDefinition,
+    *,
+    default: RolePurpose,
+) -> RolePurpose:
+    if default is not RolePurpose.EXECUTE:
+        return default
+    text = f"{agent.id} {agent.role} {agent.prompt}".casefold()
+    if any(keyword in text for keyword in ("合规", "法律", "隐私", "版权", "compliance")):
+        return RolePurpose.RISK_REVIEW
+    if any(
+        keyword in text
+        for keyword in (
+            "review",
+            "reviewer",
+            "审查",
+            "审核",
+            "复核",
+            "评审",
+            "质量",
+            "验收",
+            "检查",
+            "校验",
+            "risk",
+            "风险",
+        )
+    ):
+        return RolePurpose.VERIFY
+    if any(keyword in text for keyword in ("裁决", "决策", "decision", "record")):
+        return RolePurpose.RECORD_DECISION
+    return default
 
 def _temporary_role_assignments(
     context: TaskContext,
