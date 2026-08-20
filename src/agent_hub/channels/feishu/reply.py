@@ -42,9 +42,11 @@ class FeishuOpenAPIReplySender:
         *,
         api_base: str = _DEFAULT_FEISHU_API_BASE,
         timeout_seconds: float = 10.0,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._api_base = api_base.rstrip("/")
         self._timeout_seconds = timeout_seconds
+        self._transport = transport
 
     async def reply_text(
         self,
@@ -56,7 +58,7 @@ class FeishuOpenAPIReplySender:
         token = await self._tenant_access_token(settings)
         reply_payload = _reply_payload_for_text(text)
         url = f"{self._api_base}/im/v1/messages/{quote(message_id, safe='')}/reply"
-        async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:
+        async with httpx.AsyncClient(timeout=self._timeout_seconds, transport=self._transport) as client:
             response = await client.post(
                 url,
                 headers={"Authorization": f"Bearer {token}"},
@@ -71,7 +73,7 @@ class FeishuOpenAPIReplySender:
 
     async def _tenant_access_token(self, settings: FeishuSettings) -> str:
         url = f"{self._api_base}/auth/v3/tenant_access_token/internal"
-        async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:
+        async with httpx.AsyncClient(timeout=self._timeout_seconds, transport=self._transport) as client:
             response = await client.post(
                 url,
                 json={
