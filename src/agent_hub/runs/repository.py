@@ -185,6 +185,32 @@ class RunRepository:
             conversation_id=conversation_id,
         )
 
+    async def latest_resolved_mode_for_conversation(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        conversation_id: str,
+    ) -> TaskMode | None:
+        async with self._session_factory() as session:
+            value = await session.scalar(
+                select(RunRow.mode)
+                .where(RunRow.tenant_id == tenant_id)
+                .where(RunRow.actor_id == actor_id)
+                .where(RunRow.mode.is_not(None))
+                .where(RunRow.routing_decision["conversation_id"].astext == conversation_id)
+                .where(RunRow.status != RunStatus.WAITING_USER_MODE.value)
+                .order_by(RunRow.created_at.desc(), RunRow.id.desc())
+                .limit(1)
+            )
+        if not isinstance(value, str):
+            return None
+        try:
+            mode = TaskMode(value)
+        except ValueError:
+            return None
+        return None if mode is TaskMode.AUTO else mode
+
     async def list_recent(self, tenant_id: UUID, *, limit: int = 100) -> tuple[RunRecord, ...]:
         if type(limit) is not int or not 1 <= limit <= 500:
             raise ValueError("run list limit must be between 1 and 500")

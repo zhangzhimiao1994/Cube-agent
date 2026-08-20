@@ -125,7 +125,15 @@ def _clarification_text(clarification: FeishuClarification) -> str:
     lines = [f"请选择执行模式：{clarification.reason}"]
     for index, mode in enumerate(clarification.options, start=1):
         lines.append(f"{index}. {mode.value}")
-    lines.append("请直接回复数字完成选择。")
+    lines.extend(
+        [
+            "",
+            "使用提示：默认会继续当前飞书会话。",
+            "新建对话：可说“新建对话”“换个话题”“重新开始”。",
+            "切换模式：可说“切换到讨论模式/混合模式/派发模式/直接模式”。",
+            "也可以直接回复数字完成本次选择。",
+        ]
+    )
     return "\n".join(lines)
 
 

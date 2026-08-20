@@ -331,6 +331,9 @@ def test_mode_card_action_is_one_time_and_bound_to_actor() -> None:
         options=(TaskMode.DIRECT, TaskMode.DISPATCH),
         reason="low_confidence",
     )
+    assert "默认会继续当前飞书会话" in str(card.payload["usage_hint"])
+    assert "新建对话" in str(card.payload["usage_hint"])
+    assert "切换到讨论模式" in str(card.payload["usage_hint"])
     actions = card.payload["actions"]
     assert isinstance(actions, list)
     action = actions[0]
@@ -382,6 +385,7 @@ def test_approval_card_action_expires() -> None:
         approval_id="approval_1",
         summary="read external URL",
     )
+
     actions = card.payload["actions"]
     assert isinstance(actions, list)
     action = actions[0]

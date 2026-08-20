@@ -392,6 +392,50 @@ class RunService:
                 operator_selection=operator_selection,
             )
         if mode is TaskMode.AUTO:
+            explicit_mode = _explicit_conversation_mode_switch(message)
+            if explicit_mode is not None:
+                routing_payload = {
+                    "reason": "conversation_mode_switch",
+                    "main_agent_selected_mode": explicit_mode.value,
+                    "mode_source": "explicit_user_request",
+                    **operator_selection,
+                }
+                record = await self._repository.create_run(
+                    tenant_id=tenant_id,
+                    actor_id=actor_id,
+                    request=message,
+                    mode=explicit_mode,
+                    status=RunStatus.QUEUED,
+                    idempotency_key=idempotency_key,
+                    routing_decision=routing_payload,
+                    enqueue=True,
+                )
+                return _submitted(record)
+            continuation_mode = await self._conversation_continuation_mode(
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                conversation_id=effective_conversation_id,
+                message=message,
+            )
+            if continuation_mode is not None:
+                routing_payload = {
+                    "reason": "conversation_mode_continuation",
+                    "main_agent_selected_mode": continuation_mode.value,
+                    "mode_source": "previous_conversation_run",
+                    **operator_selection,
+                }
+                record = await self._repository.create_run(
+                    tenant_id=tenant_id,
+                    actor_id=actor_id,
+                    request=message,
+                    mode=continuation_mode,
+                    status=RunStatus.QUEUED,
+                    idempotency_key=idempotency_key,
+                    routing_decision=routing_payload,
+                    enqueue=True,
+                )
+                return _submitted(record)
+        if mode is TaskMode.AUTO:
             decision: RouteDecision | None = None
             if self._router is not None:
                 decision = await _safe_route(
@@ -837,6 +881,36 @@ class RunService:
             version=record.version,
             operator_note=operator_note,
         )
+
+    async def _conversation_continuation_mode(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        conversation_id: str,
+        message: str,
+    ) -> TaskMode | None:
+        if _explicit_conversation_mode_switch(message) is not None:
+            return None
+        if _explicit_new_conversation_request(message):
+            return None
+        getter = getattr(self._repository, "latest_resolved_mode_for_conversation", None)
+        if not callable(getter):
+            return None
+        try:
+            mode = await getter(
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                conversation_id=conversation_id,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "conversation_mode_lookup_failed tenant_id=%s conversation_id=%s",
+                tenant_id,
+                conversation_id,
+            )
+            return None
+        return mode if type(mode) is TaskMode and mode is not TaskMode.AUTO else None
 
     async def get(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
         record = await self._repository.get(tenant_id, run_id)
@@ -1708,6 +1782,123 @@ def _schedule_weekday(message: str) -> int:
 
 def _weekday_label(weekday: int) -> str:
     return ["日", "一", "二", "三", "四", "五", "六"][weekday]
+
+
+def _explicit_new_conversation_request(message: str) -> bool:
+    normalized = re.sub(r"\s+", " ", message).strip().casefold()
+    if not normalized:
+        return False
+    negative_markers = (
+        "不是新对话",
+        "不用新开",
+        "不要新开",
+        "别新开",
+        "不用重新开始",
+        "不要重新开始",
+        "继续当前对话",
+        "继续这个对话",
+        "not a new chat",
+        "do not start over",
+        "don't start over",
+        "keep this conversation",
+        "continue this conversation",
+    )
+    if any(marker in normalized for marker in negative_markers):
+        return False
+    new_conversation_markers = (
+        "新开对话",
+        "新开一个对话",
+        "新建对话",
+        "新建一个对话",
+        "开启新对话",
+        "开一个新对话",
+        "另开一轮",
+        "另起一轮",
+        "另起话题",
+        "换个话题",
+        "重新开始",
+        "重开对话",
+        "从头开始",
+        "start a new chat",
+        "new chat",
+        "new conversation",
+        "start over",
+        "different topic",
+        "change topic",
+    )
+    return any(marker in normalized for marker in new_conversation_markers)
+
+
+def _explicit_conversation_mode_switch(message: str) -> TaskMode | None:
+    normalized = re.sub(r"\s+", " ", message).strip().casefold()
+    if not normalized:
+        return None
+    negative_markers = (
+        "不要切换",
+        "不用切换",
+        "别切换",
+        "不切换",
+        "无需切换",
+        "不要换",
+        "不用换",
+        "别换",
+        "do not switch",
+        "dont switch",
+        "don't switch",
+        "no switch",
+    )
+    if any(marker in normalized for marker in negative_markers):
+        return None
+    switch_markers = (
+        "切换",
+        "切到",
+        "换成",
+        "换为",
+        "改成",
+        "改为",
+        "改用",
+        "使用",
+        "选择",
+        "设为",
+        "走",
+        "用",
+        "switch",
+        "change to",
+        "use",
+        "select",
+        "set to",
+    )
+    if not any(marker in normalized for marker in switch_markers):
+        return None
+    mode_markers: tuple[tuple[TaskMode, tuple[str, ...]], ...] = (
+        (
+            TaskMode.HYBRID,
+            (
+                "混合模式",
+                "混合模型",
+                "hybrid mode",
+                "hybrid",
+                "先讨论再执行",
+                "讨论后执行",
+            ),
+        ),
+        (
+            TaskMode.DISCUSS,
+            ("讨论模式", "讨论", "评审模式", "审查模式", "discuss mode", "discussion mode"),
+        ),
+        (
+            TaskMode.DISPATCH,
+            ("派发模式", "调度模式", "执行模式", "工作流模式", "dispatch mode", "workflow mode"),
+        ),
+        (
+            TaskMode.DIRECT,
+            ("直接模式", "直接回复", "直接回答", "普通对话", "direct mode", "direct"),
+        ),
+    )
+    for mode, markers in mode_markers:
+        if any(marker in normalized for marker in markers):
+            return mode
+    return None
 
 
 def _channel_mode_choices(decision: RouteDecision | None) -> list[dict[str, object]]:

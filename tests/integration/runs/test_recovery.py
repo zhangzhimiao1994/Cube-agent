@@ -117,6 +117,45 @@ class WaitingModeRouter:
         )
 
 
+class UserChoiceRouter:
+    async def route(self, task_text: object) -> RouteDecision:
+        del task_text
+        return RouteDecision(
+            mode=None,
+            needs_user_choice=True,
+            status="waiting_user_mode",
+            assessments=(),
+            clarification_reason="routing_requires_user_choice",
+            options=EXECUTABLE_MODES,
+            decision_token="safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+            version=1,
+            risk=RiskLevel.LOW,
+            requires_approval=True,
+            permissions_still_apply=True,
+        )
+
+
+class CountingUserChoiceRouter:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def route(self, task_text: object) -> RouteDecision:
+        self.calls += 1
+        del task_text
+        return RouteDecision(
+            mode=None,
+            needs_user_choice=True,
+            status="waiting_user_mode",
+            assessments=(),
+            clarification_reason="routing_requires_user_choice",
+            options=EXECUTABLE_MODES,
+            decision_token="safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+            version=1,
+            risk=RiskLevel.LOW,
+            requires_approval=True,
+            permissions_still_apply=True,
+        )
+
 class RecordingTemporaryAgentPolicy:
     def __init__(self, proposal: TemporaryAgentProposal | None) -> None:
         self.proposal = proposal
@@ -845,6 +884,46 @@ async def test_choose_mode_persists_choice_and_enqueues_waiting_run(
     assert await service.publish_pending() == 1
     assert await service.publish_pending() == 0
     assert queue.enqueued == [waiting.id]
+
+
+async def test_auto_submission_reuses_recent_conversation_mode_for_continuation(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    conversation_id = "conv-channel-continuation"
+    queue = RecordingQueue([])
+    router = CountingUserChoiceRouter()
+    service = RunService(
+        RunRepository(run_session_factory),
+        runtime_registry=RuntimeRegistry((FakeRuntime(),)),
+        router=router,
+        task_queue=queue,
+    )
+
+    selected = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="用户已选择混合模式的起始任务",
+        mode=TaskMode.HYBRID,
+        conversation_id=conversation_id,
+        idempotency_key="client-request-conversation-mode-1",
+    )
+    assert selected.status is RunStatus.QUEUED
+
+    continued = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="继续把刚刚这个方案展开",
+        mode=TaskMode.AUTO,
+        conversation_id=conversation_id,
+        idempotency_key="client-request-conversation-mode-2",
+    )
+
+    assert continued.status is RunStatus.QUEUED
+    assert continued.mode is TaskMode.HYBRID
+    assert continued.clarification_reason is None
+    assert router.calls == 0
 
 
 async def test_outbox_is_not_marked_delivered_when_queue_enqueue_fails(

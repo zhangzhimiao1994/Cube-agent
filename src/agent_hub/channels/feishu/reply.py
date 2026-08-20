@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import json
@@ -176,6 +176,14 @@ def _waiting_choice_reply_text(record: RunRecord) -> str:
         lines.extend(["", "可直接回复本次选项编号：", *choices])
     else:
         lines.extend(["", "请到 Web UI 的运行详情中完成选择。"])
+    lines.extend(
+        [
+            "",
+            "使用提示：默认会继续当前飞书会话。",
+            "新建对话：可说“新建对话”“换个话题”“重新开始”。",
+            "切换模式：可说“切换到讨论模式/混合模式/派发模式/直接模式”。",
+        ]
+    )
     return "\n".join(lines).strip()
 
 

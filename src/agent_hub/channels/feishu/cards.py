@@ -147,6 +147,7 @@ class FeishuCardBuilder:
                 "title": "请选择执行模式",
                 "reason": reason,
                 "run_id": str(run_id),
+                "usage_hint": _mode_choice_usage_hint(),
                 "actions": actions,
             }
         )
@@ -189,6 +190,14 @@ class FeishuCardBuilder:
                 "actions": actions,
             }
         )
+
+
+def _mode_choice_usage_hint() -> str:
+    return (
+        "默认会继续当前飞书会话；需要新开时可说“新建对话”“换个话题”“重新开始”；"
+        "需要换模式时可说“切换到讨论模式/混合模式/派发模式/直接模式”；"
+        "也可以直接回复本次选项编号。"
+    )
 
 
 def consume_mode_action(
