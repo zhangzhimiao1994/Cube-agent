@@ -453,6 +453,40 @@ async def test_schedule_intent_returns_confirmation_proposal_without_enqueue() -
     assert routing["schedule_proposal"] == submitted.schedule_proposal
 
 
+
+@pytest.mark.asyncio
+async def test_specific_date_action_returns_schedule_confirmation() -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    queue = RecordingQueue()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=None,
+        task_queue=queue,
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message="9月3号给我生成一个方案",
+        mode=TaskMode.AUTO,
+    )
+
+    assert submitted.status is RunStatus.WAITING_APPROVAL
+    assert submitted.mode is TaskMode.DISPATCH
+    assert submitted.clarification_reason == "schedule_requires_user_confirmation"
+    assert submitted.schedule_proposal is not None
+    assert submitted.schedule_proposal["kind"] == "one_time"
+    run_at = submitted.schedule_proposal["run_at"]
+    assert isinstance(run_at, str)
+    assert "-09-03T09:00:00" in run_at
+    routing = repository.records[submitted.id].routing_decision
+    assert routing is not None
+    assert routing["approval_kind"] == "schedule_creation"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "message",
@@ -554,6 +588,44 @@ async def test_normal_research_or_plan_request_does_not_become_evolution_task() 
     )
 
     assert submitted.status is RunStatus.QUEUED
+    assert submitted.evolution_proposal is None
+    routing = repository.records[submitted.id].routing_decision
+    assert routing is not None
+    assert "evolution_proposal" not in routing
+
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "现在又出现进化任务的问题，就是一对话就进进化任务",
+        "进化模块，不是什么都要进行进化的，正常问问题不要进入进化",
+        "对话界面的 UI 还需要优化一下，历史对话按钮太占地方",
+        "咨询一下，Darwin skill 的进化记录能不能用于评估调度，不要先创建任务",
+    ),
+)
+@pytest.mark.asyncio
+async def test_evolution_keywords_in_meta_or_ui_requests_do_not_create_evolution_task(message: str) -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    repository = FakeRepository()
+    queue = RecordingQueue()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
+        router=FailingRouter(),
+        task_queue=queue,
+    )
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        message=message,
+        mode=TaskMode.AUTO,
+        conversation_id="conv-evolution-keyword-meta",
+    )
+
+    assert submitted.status is not RunStatus.WAITING_APPROVAL
     assert submitted.evolution_proposal is None
     routing = repository.records[submitted.id].routing_decision
     assert routing is not None

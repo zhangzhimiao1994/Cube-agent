@@ -1468,11 +1468,23 @@ _EVOLUTION_ASSET_RE = re.compile(
     r"(skill|技能|agent|智能体|工具|工作流|流程|prompt|提示词|知识库|能力|产物|模板)",
     re.IGNORECASE,
 )
+_EVOLUTION_EXECUTION_REQUEST_RE = re.compile(
+    r"(帮我|请|需要|我要|我想|给我|为我|把|将|用|使用|启动|开始|创建|新建|生成|执行|运行|加入|建立|开启|进行|"
+    r"run|start|create|launch|execute|use|apply)",
+    re.IGNORECASE,
+)
+_EVOLUTION_META_OR_FIX_RE = re.compile(
+    r"(问题|报错|失败|误触发|不该|不是|不要|不能|缺少|修复|修正|调整|检查|排查|"
+    r"咨询|问一下|为什么|怎么|如何|有没有|当前|现在|后续|界面|按钮|文案|文字|布局|"
+    r"issue|bug|error|fail|broken|fix|debug|why|how)",
+    re.IGNORECASE,
+)
 _SKILL_CREATION_RE = re.compile(
     r"((生成|创建|新建|制作|构建|开发|沉淀|打包|create|build|generate|make).{0,24}(skill|技能)|"
     r"(skill|技能).{0,24}(生成|创建|新建|制作|构建|开发|沉淀|打包|create|build|generate|make))",
     re.IGNORECASE,
 )
+_EVOLUTION_NEGATION_RE = re.compile(r"(不要|别|不需要|无需|先不|暂不|not|do not|don't)", re.IGNORECASE)
 _SKILL_ID_RE = re.compile(r"\b([a-z0-9][a-z0-9_-]{1,80}-skill)\b", re.IGNORECASE)
 
 
@@ -1537,12 +1549,19 @@ def _local_evolution_proposal(
 
 
 def _evolution_intent(message: str) -> str | None:
+    if _EVOLUTION_NEGATION_RE.search(message) is not None:
+        return None
     if _SKILL_CREATION_RE.search(message) is not None:
         return "skill_creation"
+    if _EVOLUTION_META_OR_FIX_RE.search(message) is not None:
+        return None
     has_asset = _EVOLUTION_ASSET_RE.search(message) is not None
-    if has_asset and _EVOLUTION_EXPLICIT_ACTION_RE.search(message) is not None:
+    has_execution_request = _EVOLUTION_EXECUTION_REQUEST_RE.search(message) is not None
+    if not has_asset or not has_execution_request:
+        return None
+    if _EVOLUTION_EXPLICIT_ACTION_RE.search(message) is not None:
         return "evolution"
-    if has_asset and _EVOLUTION_ITERATION_ACTION_RE.search(message) is not None:
+    if _EVOLUTION_ITERATION_ACTION_RE.search(message) is not None:
         return "evolution"
     return None
 
@@ -1664,6 +1683,11 @@ _SCHEDULE_TIME_RE = re.compile(
     r"(?P<hour>[01]?\d|2[0-3])(?:\s*点|:)(?P<minute>[0-5]\d)?|(?P<hour_en>[01]?\d|2[0-3])\s*(?:am|pm)",
     re.IGNORECASE,
 )
+_SCHEDULE_DATE_RE = re.compile(
+    r"(?:(?P<year>20\d{2})年)?(?P<month>1[0-2]|0?[1-9])月(?P<day>3[01]|[12]\d|0?[1-9])(?:日|号)?|"
+    r"(?P<iso_year>20\d{2})-(?P<iso_month>1[0-2]|0?[1-9])-(?P<iso_day>3[01]|[12]\d|0?[1-9])",
+    re.IGNORECASE,
+)
 _WEEKDAY_BY_TEXT = {
     "周日": 0,
     "星期日": 0,
@@ -1723,9 +1747,13 @@ def _local_schedule_proposal(
             cron=f"{minute} {hour} * * *",
             summary=f"每天 {hour:02d}:{minute:02d} 执行。",
         )
-    run_at = (datetime.now(UTC) + timedelta(days=1)).replace(
-        hour=hour, minute=minute, second=0, microsecond=0
-    )
+    schedule_date = _schedule_date(message)
+    if schedule_date is not None:
+        run_at = schedule_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    else:
+        run_at = (datetime.now(UTC) + timedelta(days=1)).replace(
+            hour=hour, minute=minute, second=0, microsecond=0
+        )
     return ScheduleProposal(
         name="chat-one-time-schedule",
         message=message,
@@ -1746,13 +1774,17 @@ def _looks_like_schedule_intent(message: str, lowered: str) -> bool:
     has_recurrence = _contains_daily_intent(message, lowered) or _contains_weekly_intent(
         message, lowered
     )
+    has_specific_date = _SCHEDULE_DATE_RE.search(message) is not None
     has_time_anchor = bool(
         has_recurrence
+        or has_specific_date
         or _SCHEDULE_TIME_RE.search(message)
         or any(token in message for token in ("今天", "明天", "后天"))
         or any(token in lowered for token in ("today", "tomorrow"))
     )
-    has_schedule_cue = _SCHEDULE_TRIGGER_RE.search(message) is not None or has_recurrence
+    has_schedule_cue = (
+        _SCHEDULE_TRIGGER_RE.search(message) is not None or has_recurrence or has_specific_date
+    )
     has_execution = bool(
         _SCHEDULE_EXECUTION_RE.search(message) or _SCHEDULE_REMINDER_ACTION_RE.search(message)
     )
@@ -1769,6 +1801,28 @@ def _contains_daily_intent(message: str, lowered: str) -> bool:
 
 def _contains_weekly_intent(message: str, lowered: str) -> bool:
     return "每周" in message or "weekly" in lowered or "every week" in lowered
+
+
+def _schedule_date(message: str) -> datetime | None:
+    match = _SCHEDULE_DATE_RE.search(message)
+    if match is None:
+        return None
+    now = datetime.now(UTC)
+    if match.group("iso_year"):
+        year = int(match.group("iso_year"))
+        month = int(match.group("iso_month") or "1")
+        day = int(match.group("iso_day") or "1")
+    else:
+        year = int(match.group("year") or str(now.year))
+        month = int(match.group("month") or "1")
+        day = int(match.group("day") or "1")
+    try:
+        candidate = datetime(year, month, day, tzinfo=UTC)
+    except ValueError:
+        return None
+    if match.group("year") is None and match.group("iso_year") is None and candidate.date() < now.date():
+        candidate = datetime(year + 1, month, day, tzinfo=UTC)
+    return candidate
 
 
 def _schedule_time(message: str) -> tuple[int, int]:
@@ -1792,7 +1846,6 @@ def _schedule_weekday(message: str) -> int:
 
 def _weekday_label(weekday: int) -> str:
     return ["日", "一", "二", "三", "四", "五", "六"][weekday]
-
 
 def _explicit_new_conversation_request(message: str) -> bool:
     normalized = re.sub(r"\s+", " ", message).strip().casefold()
