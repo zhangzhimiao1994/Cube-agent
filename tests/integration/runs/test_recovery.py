@@ -567,6 +567,41 @@ async def test_completed_run_records_bounded_hermes_outcome(
     ]
 
 
+async def test_persistent_hermes_runtime_outcome_is_scheduler_observation(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    run_id = uuid4()
+    advisor = PersistentHermesRunAdvisor(run_session_factory)
+
+    await advisor.record_outcome(
+        HermesRunOutcome(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            run_id=run_id,
+            status=RunStatus.FAILED,
+            mode=TaskMode.HYBRID,
+            workflow_id="quality-review",
+            conversation_id="conv-scheduler-observe",
+            agent_ids=("planner", "reviewer"),
+        )
+    )
+
+    async with run_session_factory() as session:
+        row = (
+            await session.execute(
+                select(AdminResourceRow)
+                .where(AdminResourceRow.tenant_id == tenant_id)
+                .where(AdminResourceRow.kind == "hermes")
+            )
+        ).scalar_one()
+
+    payload = dict(row.payload)
+    assert payload["category"] == "scheduler"
+    assert payload["conversation_id"] == "conv-scheduler-observe"
+    assert payload["run_id"] == str(run_id)
+
 async def test_persistent_hermes_runtime_advice_uses_only_confirmed_lessons(
     run_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

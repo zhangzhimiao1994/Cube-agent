@@ -845,6 +845,7 @@ export type LogEntry = z.infer<typeof LogEntrySchema>;
 
 const HermesInsightSchema = z.object({
   id: z.string(),
+  category: z.enum(["conversation", "scheduler"]).default("conversation"),
   outcome: z.string(),
   lesson: z.string(),
   summary: z.string(),
@@ -1631,6 +1632,7 @@ export const api = {
   recordHermesFeedback(payload: {
     run_id?: string | null;
     conversation_id?: string | null;
+    category?: "conversation" | "scheduler";
     outcome: "success" | "failure" | "neutral";
     lesson: string;
     tags: string[];

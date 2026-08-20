@@ -1,13 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { api, formatApiError, type HermesInsight } from "../api/client";
 import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
 
-type HermesSortKey = "created" | "conversation" | "summary" | "outcome" | "status";
+type HermesSortKey = "created" | "category" | "conversation" | "summary" | "outcome" | "status";
 
 type HermesColumnFilters = {
+  category: "all" | "conversation" | "scheduler";
   conversation: string;
   created: string;
   outcome: string;
@@ -16,6 +17,7 @@ type HermesColumnFilters = {
 };
 
 const EMPTY_HERMES_FILTERS: HermesColumnFilters = {
+  category: "all",
   conversation: "",
   created: "",
   outcome: "all",
@@ -34,12 +36,25 @@ function statusLabel(confirmedAt: string | null) {
   return confirmedAt ? "已确认" : "待确认";
 }
 
+function categoryLabel(category: HermesInsight["category"]) {
+  return category === "scheduler" ? "调度观察" : "对话记忆";
+}
+
+function normalizeCategory(value: string | null): HermesColumnFilters["category"] {
+  return value === "conversation" || value === "scheduler" ? value : "all";
+}
+
+function normalizeStatus(value: string | null): HermesColumnFilters["status"] {
+  return value === "pending" || value === "confirmed" ? value : "all";
+}
+
 function toggle(values: string[], value: string) {
   return values.includes(value) ? values.filter((item) => item !== value) : [...values, value];
 }
 
 function hermesColumnValue(insight: HermesInsight, key: HermesSortKey) {
   if (key === "created") return insight.created_at;
+  if (key === "category") return categoryLabel(insight.category);
   if (key === "conversation") return insight.conversation_id ?? "未关联";
   if (key === "summary") return insight.summary;
   if (key === "outcome") return insight.outcome;
@@ -52,6 +67,7 @@ function matchesHermesSearch(insight: HermesInsight, query: string) {
       insight.id,
       insight.run_id ?? "",
       insight.conversation_id ?? "",
+      categoryLabel(insight.category),
       insight.outcome,
       insight.summary,
       insight.lesson,
@@ -67,6 +83,7 @@ function matchesHermesColumns(insight: HermesInsight, filters: HermesColumnFilte
   const status = insight.confirmed_at ? "confirmed" : "pending";
   return (
     textContains(insight.created_at, filters.created) &&
+    (filters.category === "all" || insight.category === filters.category) &&
     textContains(insight.conversation_id ?? "未关联", filters.conversation) &&
     textContains(insight.summary, filters.summary) &&
     (filters.outcome === "all" || insight.outcome === filters.outcome) &&
@@ -86,16 +103,22 @@ export function HermesPage() {
 
 function HermesLearningTable() {
   const queryClient = useQueryClient();
+  const [searchParams] = useSearchParams();
   const [conversationId, setConversationId] = useState("");
   const [lesson, setLesson] = useState(
     "When agents disagree, ask the main agent to compare evidence, risk, and output quality before deciding.",
   );
   const [tags, setTags] = useState("decision,review");
   const [outcome, setOutcome] = useState<"success" | "failure" | "neutral">("success");
+  const [feedbackCategory, setFeedbackCategory] = useState<HermesInsight["category"]>("conversation");
   const [weight, setWeight] = useState("5");
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [searchTerm, setSearchTerm] = useState("");
-  const [columnFilters, setColumnFilters] = useState<HermesColumnFilters>(EMPTY_HERMES_FILTERS);
+  const [columnFilters, setColumnFilters] = useState<HermesColumnFilters>({
+    ...EMPTY_HERMES_FILTERS,
+    category: normalizeCategory(searchParams.get("category")),
+    status: normalizeStatus(searchParams.get("status")),
+  });
   const [sort, setSort] = useState<SortState<HermesSortKey>>({ key: "created", direction: "desc" });
 
   const insights = useQuery({
@@ -106,6 +129,7 @@ function HermesLearningTable() {
     mutationFn: () =>
       api.recordHermesFeedback({
         conversation_id: conversationId.trim() || null,
+        category: feedbackCategory,
         outcome,
         lesson,
         tags: parseList(tags),
@@ -287,6 +311,7 @@ function HermesLearningTable() {
                   <thead>
                     <tr>
                       <th>选择</th>
+                      <th><SortHeader column="category" label="分类" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>分类</SortHeader></th>
                       <th><SortHeader column="created" label="时间" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>时间</SortHeader></th>
                       <th><SortHeader column="conversation" label="对话 ID" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>对话 ID</SortHeader></th>
                       <th><SortHeader column="summary" label="学习总结" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>学习总结</SortHeader></th>
@@ -296,6 +321,13 @@ function HermesLearningTable() {
                     </tr>
                     <tr className="table-filter-row">
                       <th></th>
+                      <th>
+                        <select aria-label="按 Hermes 分类筛选" value={columnFilters.category} onChange={(event) => updateColumnFilter("category", event.currentTarget.value)}>
+                          <option value="all">全部</option>
+                          <option value="conversation">对话记忆</option>
+                          <option value="scheduler">调度观察</option>
+                        </select>
+                      </th>
                       <th><input aria-label="按 Hermes 时间筛选" value={columnFilters.created} onChange={(event) => updateColumnFilter("created", event.currentTarget.value)} placeholder="时间" /></th>
                       <th><input aria-label="按 Hermes 对话 ID 筛选" value={columnFilters.conversation} onChange={(event) => updateColumnFilter("conversation", event.currentTarget.value)} placeholder="对话 ID" /></th>
                       <th><input aria-label="按 Hermes 学习总结筛选" value={columnFilters.summary} onChange={(event) => updateColumnFilter("summary", event.currentTarget.value)} placeholder="总结关键词" /></th>
@@ -329,6 +361,7 @@ function HermesLearningTable() {
                             onChange={() => setSelectedIds((current) => toggle(current, insight.id))}
                           />
                         </td>
+                        <td>{categoryLabel(insight.category)}</td>
                         <td>
                           <time dateTime={insight.created_at}>{insight.created_at}</time>
                         </td>
@@ -395,6 +428,13 @@ function HermesLearningTable() {
               <option value="success">成功</option>
               <option value="failure">失败</option>
               <option value="neutral">中性</option>
+            </select>
+          </label>
+          <label>
+            经验分类
+            <select value={feedbackCategory} onChange={(event) => setFeedbackCategory(event.target.value as HermesInsight["category"])}>
+              <option value="conversation">对话记忆</option>
+              <option value="scheduler">调度观察</option>
             </select>
           </label>
           <label>
@@ -465,6 +505,10 @@ function HermesInsightDetail({ insightId }: { insightId: string }) {
         <h3>{item.summary}</h3>
         <p>{item.lesson}</p>
         <dl className="detail-list">
+          <div>
+            <dt>分类</dt>
+            <dd>{categoryLabel(item.category)}</dd>
+          </div>
           <div>
             <dt>对话 ID</dt>
             <dd>{item.conversation_id ?? "未关联"}</dd>

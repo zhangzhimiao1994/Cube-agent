@@ -1568,6 +1568,7 @@ class HermesFeedbackRequest(BaseModel):
 
     run_id: UUID | None = None
     conversation_id: str | None = Field(default=None, max_length=128)
+    category: str = Field(default="conversation", pattern=r"^(conversation|scheduler)$")
     outcome: str = Field(pattern=r"^(success|failure|neutral)$")
     lesson: str = Field(min_length=1, max_length=4000)
     tags: list[str] = Field(default_factory=list, max_length=12)
@@ -1578,6 +1579,7 @@ class HermesInsightResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
+    category: str = Field(default="conversation", pattern=r"^(conversation|scheduler)$")
     outcome: str
     lesson: str
     summary: str
@@ -2457,6 +2459,7 @@ class InMemoryAdminResourceService:
         if not self.hermes_insights:
             self.hermes_insights["hermes-1"] = HermesInsightResponse(
                 id="hermes-1",
+                category="conversation",
                 outcome="success",
                 lesson="Use dispatch mode when the request has clear deliverables and separable steps.",
                 summary=_hermes_feedback_summary(
@@ -4803,6 +4806,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         insight_id = f"hermes_{uuid4().hex}"
         response = HermesInsightResponse(
             id=insight_id,
+            category=request.category,
             outcome=request.outcome,
             lesson=request.lesson,
             summary=_hermes_feedback_summary(
@@ -5908,6 +5912,8 @@ def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightRe
     normalized_tags = [str(tag) for tag in tags] if isinstance(tags, list) else []
     weight = raw_weight if type(raw_weight) is int else 1
     outcome = str(payload.get("outcome", "neutral"))
+    raw_category = payload.get("category", "conversation")
+    category = str(raw_category) if raw_category in {"conversation", "scheduler"} else "conversation"
     lesson = str(payload.get("lesson", ""))
     raw_summary = payload.get("summary")
     run_id = _uuid_from_json(payload.get("run_id"))
@@ -5915,6 +5921,7 @@ def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightRe
     raw_confirmed_at = payload.get("confirmed_at")
     return HermesInsightResponse(
         id=str(payload.get("id", "")),
+        category=category,
         outcome=outcome,
         lesson=lesson,
         summary=raw_summary

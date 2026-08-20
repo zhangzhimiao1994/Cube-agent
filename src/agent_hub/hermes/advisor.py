@@ -78,6 +78,7 @@ class PersistentHermesRunAdvisor:
         lesson = f"Run {status} with mode={mode}, workflow={workflow}."
         payload: dict[str, object] = {
             "id": lesson_id,
+            "category": "scheduler",
             "outcome": "success" if outcome.status is RunStatus.COMPLETED else "failure",
             "lesson": lesson,
             "summary": (

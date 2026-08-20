@@ -3371,6 +3371,7 @@ def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
 
     assert feedback.status_code == 200
     insight_id = feedback.json()["id"]
+    assert feedback.json()["category"] == "conversation"
     assert feedback.json()["conversation_id"] == "conv-architecture-1"
     assert feedback.json()["confirmed_at"] is None
     assert feedback.json()["summary"] == (
@@ -3392,6 +3393,7 @@ def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
     assert any(
         insight["lesson"] == "Use group chat when debate review is required."
         and insight["summary"].startswith("Learned success pattern:")
+        and insight["category"] == "conversation"
         for insight in insights.json()
     )
 

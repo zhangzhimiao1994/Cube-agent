@@ -180,6 +180,7 @@ const secondRunListItem: RunListItem = {
 const hermesInsight = {
   id: "hermes_run_11111111111111111111111111111111",
   outcome: "success",
+  category: "conversation",
   lesson: "Use group chat when debate review is required.",
   summary: "Learned success pattern: Use group chat when debate review is required. Tags: debate, review. Weight: 5.",
   run_id: runId,
@@ -194,6 +195,7 @@ const secondHermesInsight = {
   ...hermesInsight,
   id: "hermes_run_22222222222222222222222222222222",
   outcome: "failure",
+  category: "scheduler",
   lesson: "Ask for confirmation before changing the workflow role pool.",
   summary: "Learned failure pattern: Ask for confirmation before changing the workflow role pool. Tags: workflow, approval. Weight: 4.",
   conversation_id: "conv-workflow-2",
@@ -2712,6 +2714,25 @@ describe("operational management pages", () => {
     await waitFor(() => expect(screen.getByText("2026-08-07T00:05:00Z")).not.toBeNull());
   });
 
+  it("separates Hermes conversation memory from scheduler observations", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/hermes?category=scheduler" />);
+
+    const table = await screen.findByRole("table", { name: /Hermes/ });
+    expect(within(table).getByRole("cell", { name: "调度观察" })).not.toBeNull();
+    expect(within(table).getByText("conv-workflow-2")).not.toBeNull();
+    expect(within(table).queryByText("conv-architecture-1")).toBeNull();
+
+    await user.click(screen.getByRole("checkbox", { name: "Select all visible Hermes learning records" }));
+    await user.click(screen.getByRole("button", { name: /批量确认待确认学习/ }));
+
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === "/api/v1/admin/hermes/bulk-confirm")).toMatchObject({
+        method: "POST",
+        body: { ids: ["hermes_run_22222222222222222222222222222222"] },
+      }),
+    );
+  });
   it("bulk selects Hermes learning records and confirms them through one batch API call", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/hermes" />);
