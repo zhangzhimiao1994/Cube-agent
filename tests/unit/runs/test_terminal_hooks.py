@@ -92,6 +92,11 @@ class ExecutableFakeRepository:
         assert run_id == self.run_id
         self.events.append(event)
 
+    async def next_event_sequence(self, session: FakeTransaction, run_id: UUID) -> int:
+        del session
+        assert run_id == self.run_id
+        return max((event.sequence for event in self.events), default=0) + 1
+
     async def update_status(
         self,
         tenant_id: UUID,
@@ -129,7 +134,9 @@ class ExecutableFakeRepository:
             status=RunStatus(self.row.status),
             version=self.row.version,
             created_at=self.row.created_at,
-            routing_decision=None if self.row.routing_decision is None else dict(self.row.routing_decision),
+            routing_decision=None
+            if self.row.routing_decision is None
+            else dict(self.row.routing_decision),
         )
 
 
@@ -138,6 +145,35 @@ class RuntimeCompletes:
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
         yield RunEvent(kind=EventKind.RUNTIME_COMPLETED, sequence=1, run_id=context.run_id)
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        del checkpoint
+
+    async def cancel(self) -> None:
+        raise AssertionError("not used")
+
+
+class RuntimeReportsCapacityPressure:
+    mode = TaskMode.DISPATCH
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        yield RunEvent(
+            kind=EventKind.STEP_FAILED,
+            sequence=1,
+            run_id=context.run_id,
+            actor="planner",
+            step_id="planner_step",
+            reason="model gateway failed: model capacity unavailable",
+        )
+        yield RunEvent(
+            kind=EventKind.RUNTIME_FAILED,
+            sequence=2,
+            run_id=context.run_id,
+            reason="model gateway failed: model capacity unavailable",
+        )
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
         raise AssertionError("not used")
@@ -225,3 +261,32 @@ async def test_terminal_hook_failure_does_not_fail_completed_run() -> None:
 
     assert submitted.status is RunStatus.COMPLETED
     assert hook.calls
+
+
+@pytest.mark.asyncio
+async def test_execute_persists_observer_notice_for_capacity_pressure() -> None:
+    repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeReportsCapacityPressure(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.FAILED
+    notices = [event for event in repository.events if event.kind == "observer.notice"]
+    assert len(notices) == 1
+    notice = notices[0]
+    assert [event.kind for event in repository.events] == [
+        EventKind.STEP_FAILED,
+        EventKind.RUNTIME_FAILED,
+        "observer.notice",
+    ]
+    assert notice.sequence == 3
+    assert notice.payload["trigger"] == "model_capacity_pressure"
+    assert notice.payload["action"] == "reschedule_or_reassign_model"
+    assert notice.payload["source_sequence"] == 1
+    assert "message" not in notice.payload
+    assert "prompt" not in notice.payload

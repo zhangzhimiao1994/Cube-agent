@@ -17,6 +17,7 @@ from agent_hub.context.builder import ContextBuildInput, estimate_tokens
 from agent_hub.context.compaction import ContextCompactor
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.routing.types import RiskLevel, RouteAssessment, RouteDecision
+from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
 from agent_hub.runs.repository import RunAlreadyActive, RunRecord, RunRepository
 from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext
 from agent_hub.runtime.failure_reason import safe_runtime_failure_reason
@@ -287,6 +288,7 @@ class RunService:
         runtime_token_budget: int = 1_000_000,
         main_agent_context_window_getter: Callable[[], Awaitable[int | None]] | None = None,
         terminal_run_hooks: tuple[TerminalRunHook, ...] = (),
+        observer_policy: ObserverPolicy | None = None,
     ) -> None:
         self._repository = repository
         self._runtime_registry = runtime_registry
@@ -302,6 +304,7 @@ class RunService:
         )
         self._main_agent_context_window_getter = main_agent_context_window_getter
         self._terminal_run_hooks = terminal_run_hooks
+        self._observer_policy = observer_policy or ObserverPolicy()
 
     async def submit(
         self,
@@ -899,6 +902,8 @@ class RunService:
             routing_decision = {} if row.routing_decision is None else dict(row.routing_decision)
 
         terminal = RunStatus.RUNNING
+        monitor = RunMonitor(self._observer_policy)
+        observer_decisions: list[ObserverDecision] = []
         try:
             runtime = self._runtime_registry.get(mode)
             if checkpoint is not None:
@@ -940,6 +945,9 @@ class RunService:
                         run_id=run_id,
                         event=event,
                     )
+                    observer_decision = monitor.observe(event)
+                    if observer_decision is not None:
+                        observer_decisions.append(observer_decision)
                     if event.kind is EventKind.RUNTIME_COMPLETED:
                         terminal = RunStatus.COMPLETED
                     elif event.kind is EventKind.RUNTIME_CANCELLED:
@@ -981,6 +989,17 @@ class RunService:
         if terminal is RunStatus.RUNNING:
             terminal = RunStatus.COMPLETED
             await self._repository.update_status(tenant_id, run_id, terminal)
+        if observer_decisions:
+            async with await self._repository.run_transaction() as session, session.begin():
+                sequence = await self._repository.next_event_sequence(session, run_id)
+                for observer_decision in observer_decisions:
+                    await self._repository.persist_event(
+                        session,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        event=observer_decision.to_event(run_id=run_id, sequence=sequence),
+                    )
+                    sequence += 1
         if terminal in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
             await self._safe_record_hermes_outcome(
                 tenant_id=tenant_id,

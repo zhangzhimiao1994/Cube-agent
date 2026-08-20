@@ -1,3 +1,36 @@
+## 2026-08-20 P3 Low-Token Run Observer Foundation
+
+Status: server deployed and verified; GitHub full sync is pending.
+
+Changed in this slice:
+- `src/agent_hub/runs/observer.py`: added `ObserverPolicy`, `RunMonitor`, and `ObserverDecision` for event-driven, low-token observation. The monitor uses event metadata/counters only, detects model capacity pressure, empty model responses, repeated failures, retry pressure, and context-compaction thresholds, and never stores prompts/messages/artifact text in observer payloads.
+- `src/agent_hub/runs/service.py`: `RunService.execute(...)` now observes runtime events and appends `observer.notice` events after the runtime event stream is safely persisted, avoiding sequence collisions with runtime-native events.
+- `src/agent_hub/runs/repository.py`: added `next_event_sequence(...)` for append-only observer events.
+- `tests/unit/runs/test_observer.py` and `tests/unit/runs/test_terminal_hooks.py`: added monitor behavior tests plus service-level coverage proving capacity failures persist both original runtime failure events and an appended observer notice.
+
+Local verification:
+- `./.venv/Scripts/python.exe -m pytest tests/unit/runs/test_observer.py tests/unit/runs/test_terminal_hooks.py -q --tb=short` -> 7 passed; pytest cache ACL warning only.
+- `./.venv/Scripts/python.exe -m pytest tests/unit/runs -q --tb=short` -> 41 passed; pytest cache ACL warning only.
+- `./.venv/Scripts/python.exe -m ruff check src/agent_hub/runs/observer.py src/agent_hub/runs/repository.py src/agent_hub/runs/service.py tests/unit/runs/test_observer.py tests/unit/runs/test_terminal_hooks.py` -> passed.
+- `./.venv/Scripts/python.exe -m mypy --strict src/agent_hub/runs/observer.py src/agent_hub/runs/repository.py src/agent_hub/runs/service.py tests/unit/runs/test_observer.py tests/unit/runs/test_terminal_hooks.py` -> passed.
+
+Implementation note:
+- Observer notices are currently appended after the runtime loop reaches a terminal or natural completion state. This intentionally avoids consuming sequence numbers that a runtime may emit later. Future real-time scheduler intervention should use a separate observer/scheduler table or a dedicated side-channel queue rather than sharing the runtime event sequence.
+
+Server deployment and verification:
+- Local incremental archive retained: `.local-archives/server-incrementals/agent-hub-observer-policy-20260820-140203.tgz`.
+- Uploaded to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed incrementally into `/opt/agent-hub/current`.
+- Server backup retained: `/opt/agent-hub/backups/p3-observer-policy-20260820-140318`.
+- Server archive retained: `/opt/agent-hub/archives/server-incrementals/agent-hub-observer-policy-20260820-140318.tgz`.
+- Synced changed backend modules into active `.venv/lib/python3.12/site-packages`; restarted `agent-hub-api` and `agent-hub-worker`.
+- Server health verified: `GET http://127.0.0.1:8000/health` returned `{"status":"ok"}` and both services are active.
+- Server real DB probe passed using the live deployed venv and `/etc/agent-hub/secrets.env`: `server_observer_probe=ok ... status=failed kinds=step.failed,runtime.failed,observer.notice trigger=model_capacity_pressure`. It created a temporary live DB run, executed a temporary capacity-failure runtime through `RunService`, verified original runtime events were preserved and `observer.notice` was appended at sequence 3, then cleaned probe rows.
+- Cleaned server temp files: `/tmp/agent-hub-p3-runtime-incremental.tgz`, `/tmp/deploy-observer-policy.sh`, `/tmp/probe-observer-policy.py`, `/tmp/probe-observer-policy-inspect.py`, and observer backup logs under `/tmp`.
+
+Next required action:
+- Create a recovery archive/tag, perform the full GitHub push to `mutilagent main`, and check GitHub Actions until green.
+- Continue the backlog after green: OpenClaw/evolution refinements, UI layout/text audit, remaining bulk/search/filter checks, and final README refresh.
+
 ## 2026-08-20 P3 Channel Choice / Failure Recovery / Gateway Fallback Server Deployment
 
 Status: server deployed and verified; GitHub full sync completed and Actions are green.

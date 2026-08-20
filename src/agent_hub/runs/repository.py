@@ -759,6 +759,14 @@ class RunRepository:
             return None
         return RuntimeCheckpoint.from_payload(dict(row.payload))
 
+    async def next_event_sequence(self, session: AsyncSession, run_id: UUID) -> int:
+        return (
+            await session.scalar(
+                select(func.max(RunEventRow.sequence)).where(RunEventRow.run_id == run_id)
+            )
+            or 0
+        ) + 1
+
     async def persist_event(
         self,
         session: AsyncSession,
