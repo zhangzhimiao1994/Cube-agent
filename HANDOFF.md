@@ -1,6 +1,6 @@
 ## 2026-08-20 P3 Channel Choice / Failure Recovery / Gateway Fallback Server Deployment
 
-Status: server deployed and verified; GitHub push is still pending and should be the next sync step when continuing the release flow.
+Status: server deployed and verified; GitHub full sync completed and Actions are green.
 
 Changed in this slice:
 - `src/agent_hub/channels/submitter.py`: channel numeric replies are no longer hard-coded as mode `1-4`. The submitter now treats a pure number as a generic `choice_key` only when the same channel conversation has a current waiting choice; otherwise it passes the number through as a normal user message. Stable channel conversation IDs are preserved across turns.
@@ -30,8 +30,15 @@ Main Agent observer/token note:
 - For the requested "continuous observation/scheduling" behavior, avoid a token-heavy loop that repeatedly feeds full context to the main Agent. The intended system pattern is event-driven: watch structured run events, `channel_choices`, capacity outcomes, empty-output failures, timeout signals, and artifact hashes; only trigger a main-Agent re-evaluation when a guarded condition fires. Normal progress should use persisted state and summaries, not repeated full-context model calls.
 - Remaining deeper work: formalize this as an ObserverPolicy/RunMonitor layer so main Agent can actively reschedule blocked roles, change model allocation, or ask the user for approval without reading the full conversation every time.
 
+GitHub sync:
+- Created/pushed recovery tags `recovery-before-p3-choice-failure-gateway-20260820-1259` and `recovery-before-gateway-test-typing-20260820-1307`.
+- Pushed `main` to `mutilagent` with `--force-with-lease`; repository warned it has moved to `git@github.com:zhangzhimiao1994/CubeAgent.git`, but the configured `mutilagent` remote accepted the push.
+- First GitHub run `32334159312` failed at `uv run mypy --strict src tests` due to a test-only type issue in `tests/unit/models/test_gateway.py`.
+- Fixed the test event typing and pushed commit `d0dcd6c`.
+- GitHub run `32334353078` passed all steps: ruff, mypy, docker-backed pytest, web lint/test/build, shellcheck/bats, and docker compose config.
+
 Next required action:
-- GitHub full sync/push to `mutilagent main` with recovery archive/tag remains pending. After pushing, check GitHub Actions and fix any red run before continuing the backlog.
+- Continue the remaining backlog: formal ObserverPolicy/RunMonitor for low-token continuous scheduling, broader UI/layout/text audit, remaining button/bulk-action checks, and planned OpenClaw/evolution refinements.
 ## 2026-08-15 P3 Feishu Output / Hybrid Routing Server-Only Deployment
 
 Status: server deployed and verified; GitHub push intentionally deferred because the user said quota is running out. On the next session, the first action should be GitHub full sync/push with recovery archive/tag, then check GitHub Actions.
