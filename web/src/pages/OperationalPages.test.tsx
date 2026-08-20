@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+﻿import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -1273,6 +1273,31 @@ describe("operational management pages", () => {
     expect(within(stream).queryByText("产物：短视频脚本")).toBeNull();
   });
 
+  it("renders markdown tables inside assistant chat replies as real tables", async () => {
+    visibleRunDetail = {
+      ...runDetail,
+      artifacts: [
+        {
+          id: "artifact-table-reply",
+          kind: "markdown",
+          title: "回复",
+          text: "对比如下：\n\n| 类型 | 能做 | 不能做 |\n| --- | --- | --- |\n| 个股 | 深度分析 | 主动推荐 |\n| 大类资产 | 趋势分析 | 实时下单 |\n\n请按这个边界使用。",
+        },
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const table = within(stream).getByRole("table", { name: "回复表格 1" });
+    expect(within(table).getByRole("columnheader", { name: "类型" })).not.toBeNull();
+    expect(within(table).getByRole("cell", { name: "深度分析" })).not.toBeNull();
+    expect(within(table).getByRole("cell", { name: "实时下单" })).not.toBeNull();
+    expect(within(stream).getByText("请按这个边界使用。")).not.toBeNull();
+  });
   it("does not show internal decision-review artifacts as the final assistant reply", async () => {
     visibleRunDetail = {
       ...runDetail,

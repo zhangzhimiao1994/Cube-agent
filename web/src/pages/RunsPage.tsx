@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+﻿import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
@@ -1294,6 +1294,99 @@ function ModeEntryPanel({
   );
 }
 
+type MessageBodyBlock =
+  | { kind: "paragraph"; text: string }
+  | { kind: "table"; headers: string[]; rows: string[][] };
+
+function markdownMessageBlocks(text: string): MessageBodyBlock[] {
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const blocks: MessageBodyBlock[] = [];
+  let paragraph: string[] = [];
+  let index = 0;
+
+  function flushParagraph() {
+    const value = paragraph.join("\n").trim();
+    if (value) blocks.push({ kind: "paragraph", text: value });
+    paragraph = [];
+  }
+
+  while (index < lines.length) {
+    if (isMarkdownTableStart(lines, index)) {
+      flushParagraph();
+      const headers = markdownTableCells(lines[index]);
+      index += 2;
+      const rows: string[][] = [];
+      while (index < lines.length && markdownTableCells(lines[index]).length >= headers.length && lines[index].includes("|")) {
+        rows.push(markdownTableCells(lines[index]).slice(0, headers.length));
+        index += 1;
+      }
+      if (headers.length > 0 && rows.length > 0) {
+        blocks.push({ kind: "table", headers, rows });
+        continue;
+      }
+    }
+    paragraph.push(lines[index]);
+    index += 1;
+  }
+  flushParagraph();
+  return blocks;
+}
+
+function isMarkdownTableStart(lines: string[], index: number) {
+  if (index + 1 >= lines.length) return false;
+  const header = markdownTableCells(lines[index]);
+  const separator = markdownTableCells(lines[index + 1]);
+  if (header.length < 2 || separator.length !== header.length) return false;
+  return separator.every((cell) => /^:?-{3,}:?$/.test(cell.trim()));
+}
+
+function markdownTableCells(line: string) {
+  const trimmed = line.trim();
+  if (!trimmed.includes("|")) return [];
+  const body = trimmed.startsWith("|") ? trimmed.slice(1) : trimmed;
+  const normalized = body.endsWith("|") ? body.slice(0, -1) : body;
+  return normalized.split("|").map((cell) => cell.replace(/\\\|/g, "|").trim());
+}
+
+function MessageBody({ text, title }: { text: string; title: string }) {
+  const blocks = markdownMessageBlocks(text);
+  if (blocks.length === 0) return null;
+  let tableIndex = 0;
+  return (
+    <div className="message-body">
+      {blocks.map((block, index) => {
+        if (block.kind === "paragraph") {
+          return <p key={`paragraph-${index}`}>{block.text}</p>;
+        }
+        tableIndex += 1;
+        return (
+          <div className="message-table-wrap" key={`table-${index}`}>
+            <table aria-label={`${title}表格 ${tableIndex}`} className="message-table">
+              <thead>
+                <tr>
+                  {block.headers.map((header, headerIndex) => (
+                    <th key={`${header}-${headerIndex}`} scope="col">
+                      {header}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {block.rows.map((row, rowIndex) => (
+                  <tr key={`row-${rowIndex}`}>
+                    {block.headers.map((_header, cellIndex) => (
+                      <td key={`cell-${rowIndex}-${cellIndex}`}>{row[cellIndex] ?? ""}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 export function RunsPage() {
   const queryClient = useQueryClient();
   const runs = useQuery({ queryKey: ["runs"], queryFn: () => api.runs() });
@@ -2501,7 +2594,7 @@ export function RunsPage() {
                 <article className={`chat-message ${item.role}`}>
                   <span className="eyebrow">{item.role === "user" ? "你" : APP_BRAND_NAME}</span>
                   <h3>{item.title}</h3>
-                  <p>{item.body}</p>
+                  <MessageBody text={item.body} title={item.title} />
                 </article>
                 {item.id.endsWith("-request") && item.run ? (
                   <RunProcessSummary

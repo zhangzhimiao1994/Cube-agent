@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import hmac
 import time
@@ -1546,7 +1546,7 @@ def test_feishu_terminal_reply_splits_long_completed_output_into_multiple_bubble
     assert all(len(reply[2]) <= 3800 for reply in sender.replies)
 
 
-def test_feishu_terminal_reply_stabilizes_markdown_table_blocks() -> None:
+def test_feishu_terminal_reply_preserves_markdown_table_blocks() -> None:
     sender = RecordingFeishuReplySender()
     repository = MarkdownTableFinalRunRepository()
     dispatcher = FeishuRunReplyDispatcher(
@@ -1572,8 +1572,10 @@ def test_feishu_terminal_reply_stabilizes_markdown_table_blocks() -> None:
 
     text = sender.replies[0][2]
     assert "方案如下" in text
-    assert "```text\n| 阶段 | 负责人 | 交付物 |" in text
-    assert "| 审查 | 评审员 | 风险表 |\n```" in text
+    assert "```text" not in text
+    assert "| 阶段 | 负责人 | 交付物 |" in text
+    assert "| --- | --- | --- |" in text
+    assert "| 审查 | 评审员 | 风险表 |" in text
     assert "请按表执行" in text
 
 
@@ -1603,7 +1605,7 @@ def test_feishu_terminal_reply_formats_structured_table_artifact_as_markdown_tab
 
     assert len(sender.replies) == 1
     text = sender.replies[0][2]
-    assert "```text" in text
+    assert "```text" not in text
     assert "| 阶段 | 负责人 | 交付物 |" in text
     assert "| --- | --- | --- |" in text
     assert "| 调研 | 研究员 | 资料清单 |" in text

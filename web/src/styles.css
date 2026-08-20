@@ -1,4 +1,4 @@
-:root {
+﻿:root {
   color: #e8fbff;
   background: #050811;
   font-family:
@@ -3854,4 +3854,66 @@ article:hover {
   outline: 2px solid rgba(85, 215, 255, 0.7);
   outline-offset: 0.35rem;
   scroll-margin-top: 1rem;
+}
+
+.message-body {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.message-body p {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.message-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid rgba(148, 163, 184, 0.32);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.28);
+}
+
+.message-table {
+  width: 100%;
+  min-width: 360px;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+  line-height: 1.5;
+}
+
+.message-table th,
+.message-table td {
+  padding: 0.55rem 0.7rem;
+  border-right: 1px solid rgba(148, 163, 184, 0.24);
+  border-bottom: 1px solid rgba(148, 163, 184, 0.24);
+  text-align: left;
+  vertical-align: top;
+}
+
+.message-table th:last-child,
+.message-table td:last-child {
+  border-right: 0;
+}
+
+.message-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.message-table th {
+  color: #e5faff;
+  font-weight: 800;
+  background: rgba(20, 184, 166, 0.13);
+}
+
+@media (max-width: 640px) {
+  .message-table {
+    min-width: 320px;
+    font-size: 0.86rem;
+  }
+
+  .message-table th,
+  .message-table td {
+    padding: 0.46rem 0.55rem;
+  }
 }

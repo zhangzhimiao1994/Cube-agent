@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import json
@@ -507,9 +507,9 @@ def _stabilize_markdown_table_blocks(text: str) -> str:
                 index += 1
             if result and result[-1].strip():
                 result.append("")
-            result.append("```text")
             result.extend(table_lines)
-            result.append("```")
+            if index < len(lines) and lines[index].strip():
+                result.append("")
             continue
         result.append(lines[index])
         index += 1
@@ -605,7 +605,7 @@ def _format_table_content(content: Mapping[str, object]) -> str | None:
             for index, _column in enumerate(columns):
                 values.append(_table_cell_text(sequence[index] if index < len(sequence) else ""))
         lines.append("| " + " | ".join(_escape_table_cell(value) for value in values) + " |")
-    return "```text\n" + "\n".join(lines) + "\n```"
+    return "\n".join(lines)
 
 
 def _table_rows(value: object) -> list[Mapping[str, object] | Sequence[object]]:
