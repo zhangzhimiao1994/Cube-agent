@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
 import { api, formatApiError, type Skill } from "../api/client";
+import { useNavSection } from "../app/navSections";
 import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
 
 type SkillSortKey = "name" | "status" | "scan" | "permissions";
@@ -61,6 +62,7 @@ function skillCreatorObjective(goal: string, materials: string, checks: string) 
 }
 
 export function SkillsPage() {
+  const { navTargetProps } = useNavSection(["view"]);
   const [file, setFile] = useState<File | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [searchTerm, setSearchTerm] = useState("");
@@ -216,7 +218,7 @@ export function SkillsPage() {
       </section>
 
       <div className="two-column">
-        <article>
+        <article {...navTargetProps("upload")}>
           <h3>上传并扫描 Skill</h3>
           <label>
             Skill 压缩包
@@ -260,7 +262,7 @@ export function SkillsPage() {
         </article>
       </div>
 
-      <section aria-label="已上传 Skill">
+      <section aria-label="已上传 Skill" {...navTargetProps("installed")}>
         <h3>已上传 Skill</h3>
         {items.length === 0 ? (
           <article>
@@ -287,7 +289,7 @@ export function SkillsPage() {
                 显示 {visibleItems.length} / {items.length}
               </small>
             </div>
-            <div className="bulk-action-bar">
+            <div {...navTargetProps("bulk", "bulk-action-bar")}>
               <label className="inline-check compact-check">
                 <input
                   type="checkbox"
@@ -298,7 +300,7 @@ export function SkillsPage() {
                 />
                 全选当前结果
               </label>
-              <label className="inline-check compact-check">
+              <label {...navTargetProps("permissions", "inline-check compact-check")}>
                 <input
                   type="checkbox"
                   aria-label="全选当前待审批 Skill"

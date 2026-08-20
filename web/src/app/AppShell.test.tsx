@@ -45,6 +45,15 @@ describe("AppShell presentation", () => {
             channel_entry: "web",
           });
         }
+        if (path === "/api/v1/admin/main-agent") {
+          return jsonResponse({
+            model: null,
+            control_mode: "supervisor",
+            decision_policy: "choose mode first, then roles; main agent makes the final decision",
+            hermes_policy: "observe",
+            max_review_rounds: 2,
+          });
+        }
         if (path.startsWith("/api/v1/admin/logs")) return jsonResponse([]);
         return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
       }),
@@ -109,6 +118,19 @@ describe("AppShell presentation", () => {
     const workspaceDrawer = screen.getByLabelText("对话与进化二级导航");
     expect(within(workspaceDrawer).getByRole("link", { name: "Skill 进化" }).getAttribute("href")).toBe("/evolution?type=skill");
     expect(within(workspaceDrawer).getByRole("link", { name: "调度策略进化" }).getAttribute("href")).toBe("/evolution?type=scheduler-policy");
+  });
+
+  it("activates the matching page section after a third-level menu click", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/main-agent" />);
+
+    expect(await screen.findByRole("heading", { name: "魔方agent" })).not.toBeNull();
+    const drawer = screen.getByLabelText("编排二级导航");
+    await user.click(within(drawer).getByRole("link", { name: "调度策略" }));
+
+    await waitFor(() => {
+      expect(document.querySelector('[data-nav-section="scheduler"]')?.getAttribute("data-nav-active")).toBe("true");
+    });
   });
   it("makes top-level navigation enter the default module directly while keeping drawer links", async () => {
     render(<TestApp initialPath="/skills" />);

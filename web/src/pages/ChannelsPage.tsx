@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { api, formatApiError, type ChannelStatus } from "../api/client";
+import { useNavSection } from "../app/navSections";
 import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
 
 type ChannelGuide = {
@@ -396,6 +397,7 @@ function mergeChannelStatus(channels: ChannelStatus[] | undefined, status: Chann
 }
 export function ChannelsPage() {
   const queryClient = useQueryClient();
+  const { activeSection, navTargetProps } = useNavSection(["provider", "section", "mode"]);
   const channels = useQuery({ queryKey: ["channels"], queryFn: () => api.channels() });
   const [selectedId, setSelectedId] = useState("feishu");
   const [draftValues, setDraftValues] = useState<Record<string, string>>({});
@@ -404,11 +406,13 @@ export function ChannelsPage() {
   const [channelColumnFilters, setChannelColumnFilters] = useState<ChannelColumnFilters>(EMPTY_CHANNEL_FILTERS);
   const [channelSort, setChannelSort] = useState<SortState<ChannelSortKey>>({ key: "name", direction: "asc" });
 
-  const selected = useMemo(() => {
-    const items = channels.data ?? [];
-    return items.find((item) => item.id === selectedId) ?? items[0] ?? null;
-  }, [channels.data, selectedId]);
+  const items = channels.data ?? [];
+  const selected = useMemo(() => items.find((item) => item.id === selectedId) ?? items[0] ?? null, [items, selectedId]);
   const guide = selected ? CHANNEL_GUIDES[selected.id] : null;
+
+  useEffect(() => {
+    if (activeSection && items.some((channel) => channel.id === activeSection)) setSelectedId(activeSection);
+  }, [activeSection, items]);
 
   useEffect(() => {
     setDraftValues({});
@@ -452,8 +456,6 @@ export function ChannelsPage() {
   if (channels.isError) {
     return <p role="alert">{formatApiError(channels.error, "通道状态加载失败")}</p>;
   }
-
-  const items = channels.data ?? [];
   const visibleChannels = sortedChannels(
     items.filter((channel) => textContains(channelSearchText(channel), channelSearchTerm) && matchesChannelColumns(channel, channelColumnFilters)),
     channelSort,
@@ -491,7 +493,7 @@ export function ChannelsPage() {
 
         {selected && guide ? (
           <div className="channel-detail">
-            <article>
+            <article {...navTargetProps(selected.id)}>
               <span className="eyebrow">{selected.id}</span>
               <h3>{selected.name}</h3>
               <p>{guide.purpose}</p>
@@ -533,7 +535,7 @@ export function ChannelsPage() {
             </article>
 
             {selected.id === "feishu" ? (
-              <section className="channel-command-guide" aria-label="飞书资源选择器">
+              <section {...navTargetProps("resources", "channel-command-guide")} aria-label="飞书资源选择器">
                 <h3>资源选择器</h3>
                 <p>飞书消息默认先交给主 Agent 判断入口、模式和是否需要计划、OpenClaw 或 Vibe Coding。需要指定资源时，只在消息开头连续写资源选择器；正文开始后出现的 @、&、# 不会被当成调用。</p>
                 <div className="channel-command-grid">
@@ -572,7 +574,7 @@ export function ChannelsPage() {
               </ol>
             </article>
 
-            <article>
+            <article {...navTargetProps("reply")}>
               <h3>配置内容</h3>
               <p className="field-help">
 可直接在这里填写并保存；已配置的密钥不会回显。输入新值会覆盖旧配置，留空不会修改已有配置。需要重新接入时可以清空本页保存的通道配置。
@@ -679,7 +681,7 @@ export function ChannelsPage() {
         ) : null}
       </div>
 
-      <section aria-label="通道支持矩阵">
+      <section aria-label="通道支持矩阵" {...navTargetProps("test")}>
         <h3>通道支持矩阵</h3>
         <div className="list-toolbar">
           <label>

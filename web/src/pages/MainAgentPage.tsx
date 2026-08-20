@@ -3,6 +3,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { ApiError, api, formatApiError, type MainAgentConfig } from "../api/client";
+import { useNavSection } from "../app/navSections";
 
 type ApiProtocol = "openai_compatible" | "anthropic_messages";
 
@@ -259,6 +260,7 @@ function modelErrorDiagnostics(error: unknown) {
 
 export function MainAgentPage() {
   const queryClient = useQueryClient();
+  const { navTargetProps } = useNavSection();
   const config = useQuery({ queryKey: ["main-agent"], queryFn: () => api.mainAgent() });
   const [provider, setProvider] = useState(PROVIDERS[0].value);
   const [customProvider, setCustomProvider] = useState("");
@@ -449,7 +451,7 @@ export function MainAgentPage() {
       </div>
 
       <form onSubmit={submit} aria-label="主 Agent 配置" className="settings-form">
-        <h3>主 Agent 专属模型/API</h3>
+        <h3 {...navTargetProps("model")}>主 Agent 专属模型/API</h3>
         <p className="field-hint">
           这里和“模型与 API”页面保持同一套注册流程：先选服务商，再选模型；中转站和自定义服务商可以直接填写后台给出的模型 ID。
         </p>
@@ -560,7 +562,7 @@ export function MainAgentPage() {
             {selectedProviderPreset?.concurrencyHelp ??
               "自定义服务商未提供官方预设；请以服务商控制台或中转站后台限流说明为准。"}
           </p>
-          <label htmlFor="main-agent-max-concurrency">
+          <label htmlFor="main-agent-max-concurrency" {...navTargetProps("concurrency")}>
             最大并发
             <input
               id="main-agent-max-concurrency"
@@ -592,7 +594,7 @@ export function MainAgentPage() {
               required={requiresNewApiKey}
             />
           </label>
-          <label htmlFor="main-agent-control-mode">
+          <label htmlFor="main-agent-control-mode" {...navTargetProps("scheduler")}>
             整体把控方式
             <select
               id="main-agent-control-mode"
@@ -607,7 +609,7 @@ export function MainAgentPage() {
               ))}
             </select>
           </label>
-          <label htmlFor="main-agent-hermes-policy">
+          <label htmlFor="main-agent-hermes-policy" {...navTargetProps("hermes")}>
             Hermes 介入策略
             <select
               id="main-agent-hermes-policy"

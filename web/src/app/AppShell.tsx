@@ -140,7 +140,7 @@ export function AppShell() {
                           {module.children && module.children.length > 0 ? (
                             <div className="mobile-nav-tertiary" aria-label={`${module.label}三级导航`}>
                               {module.children.map((child) => (
-                                <Link key={child.to} to={child.to} onClick={() => setMobileNavOpen(false)}>
+                                <Link key={`${child.to}-${child.label}`} to={child.to} onClick={() => setMobileNavOpen(false)}>
                                   {child.label}
                                 </Link>
                               ))}
@@ -177,7 +177,7 @@ export function AppShell() {
                     {module.children && module.children.length > 0 ? (
                       <div className="nav-tertiary-links" aria-label={`${module.label}三级导航`}>
                         {module.children.map((child) => (
-                          <Link key={child.to} to={child.to}>
+                          <Link key={`${child.to}-${child.label}`} to={child.to}>
                             {child.label}
                           </Link>
                         ))}

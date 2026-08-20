@@ -93,10 +93,11 @@ describe("LoginPage", () => {
   it("logs in and opens the run dashboard", async () => {
     render(<TestApp initialPath="/login" />);
     expect(await screen.findByRole("heading", { name: "魔方agent" })).not.toBeNull();
-    expect(screen.getByRole("heading", { name: "进入魔方agent" })).not.toBeNull();
-    expect(screen.getByText("从一个入口发起对话、调度 Agent、管理模型和工具权限。每一次执行都有过程记录，关键操作先确认再落地。")).not.toBeNull();
-    expect(screen.getByText("登录后继续上次的对话、任务编排和系统配置。")).not.toBeNull();
+    expect(screen.getByRole("heading", { name: "登录工作台" })).not.toBeNull();
+    expect(screen.getByText("把对话、模型、工具和自动化任务放进同一个工作台，关键操作可追踪、可审批、可恢复。")).not.toBeNull();
+    expect(screen.getByText("继续处理对话、计划任务、工具审批和系统配置。")).not.toBeNull();
     expect(screen.getByAltText("魔方agent")).not.toBeNull();
+    expect(screen.queryByText(/Agent Hub/i)).toBeNull();
     await userEvent.type(screen.getByLabelText("Username"), "owner");
     await userEvent.type(screen.getByLabelText("Password"), "correct horse battery staple");
     await userEvent.click(screen.getByRole("button", { name: "进入工作台" }));
@@ -119,7 +120,9 @@ describe("LoginPage", () => {
     render(<TestApp initialPath="/setup" />);
     expect(await screen.findByText("魔方agent")).not.toBeNull();
     expect(screen.getByAltText("魔方agent")).not.toBeNull();
-    expect(screen.getByText("使用安装脚本打印的一次性设置码创建第一个管理员账号。")).not.toBeNull();
+    expect(screen.getByText("创建第一个管理员后，就可以接入模型、通道、Skill 和 OpenClaw 工具。")).not.toBeNull();
+    expect(screen.getByText("设置码只用于首次启用，使用后立即失效。")).not.toBeNull();
+    expect(screen.queryByText(/Agent Hub/i)).toBeNull();
     expect(screen.getByText("安装依赖")).not.toBeNull();
     expect(screen.getByText("部署版本")).not.toBeNull();
     expect(screen.getByText("执行迁移")).not.toBeNull();

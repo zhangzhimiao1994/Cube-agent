@@ -12,6 +12,7 @@ import {
   type OpenClawSessionRequest,
   type SystemSettings,
 } from "../api/client";
+import { useNavSection } from "../app/navSections";
 
 type OpenClawRemoteAdapterSetting = SystemSettings["openclaw_remote_adapters"][number];
 
@@ -158,6 +159,7 @@ function sortOpenClawAdapters(adapters: OpenClawAdapter[]) {
 
 export function OpenClawPage() {
   const queryClient = useQueryClient();
+  const { navTargetProps } = useNavSection();
   const settingsQuery = useQuery({ queryKey: ["settings"], queryFn: () => api.settings() });
   const adaptersQuery = useQuery({ queryKey: ["openclaw-adapters"], queryFn: () => api.openClawAdapters() });
   const sessionsQuery = useQuery({ queryKey: ["openclaw-sessions"], queryFn: () => api.openClawSessions() });
@@ -429,7 +431,7 @@ export function OpenClawPage() {
         </article>
       </div>
 
-      <form onSubmit={submitSettings} aria-label="保存 OpenClaw 设置" className="settings-form">
+      <form onSubmit={submitSettings} aria-label="保存 OpenClaw 设置" {...navTargetProps("policy", "settings-form")}>
         <fieldset>
           <legend>权限与边界</legend>
           <label className="inline-check">
@@ -490,7 +492,7 @@ export function OpenClawPage() {
           </div>
         </fieldset>
 
-        <fieldset>
+        <fieldset {...navTargetProps("targets")}>
           <legend>远程适配器</legend>
           <p className="field-help">Windows 电脑、桌面动作、屏幕读取和远程文件能力必须先接入 Adapter，再由 OpenClaw 审批执行。</p>
           <div className="form-grid">
@@ -625,7 +627,7 @@ export function OpenClawPage() {
         </div>
       </div>
 
-      <div className="inline-guide" aria-label="OpenClaw 控制会话">
+      <div {...navTargetProps("sessions", "inline-guide")} aria-label="OpenClaw 控制会话">
         <h3>控制会话</h3>
         <p>会话用于登记长时间控制意图。服务器、本机电脑和桌面会话都必须经过 OpenClaw 策略和适配器状态约束。</p>
         <div className="form-grid">
@@ -709,7 +711,7 @@ export function OpenClawPage() {
         {updateSession.isError ? <p role="alert">{formatApiError(updateSession.error, "OpenClaw 会话更新失败")}</p> : null}
       </div>
 
-      <div className="inline-guide" aria-label="OpenClaw 操作控制台">
+      <div {...navTargetProps("schedules", "inline-guide")} aria-label="OpenClaw 操作控制台">
         <h3>审批执行控制台</h3>
         <div className="form-grid">
           <label htmlFor="openclaw-page-operation-platform">

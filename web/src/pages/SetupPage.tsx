@@ -38,8 +38,8 @@ export function SetupPage() {
         <img className="auth-brand-logo" src={APP_BRAND_LOGO_SRC} alt={APP_BRAND_NAME} />
         <span className="eyebrow">{APP_BRAND_NAME}</span>
         <h1>初始化 {APP_BRAND_NAME}</h1>
-        <p>使用安装脚本打印的一次性设置码创建第一个管理员账号。</p>
-        <p>设置码使用后会立即失效。如果失败，页面会显示后端错误码和错误 ID。</p>
+        <p>创建第一个管理员后，就可以接入模型、通道、Skill 和 OpenClaw 工具。</p>
+        <p>设置码只用于首次启用，使用后立即失效。</p>
         <div className="setup-timeline" aria-label="安装流程">
           {INSTALL_STEPS.map(([title, detail], index) => (
             <article key={title} className="timeline-step">
@@ -54,7 +54,7 @@ export function SetupPage() {
       </div>
       <form className="auth-card" onSubmit={(event) => void submit(event)}>
         <div>
-          <span className="eyebrow">Administrator</span>
+          <span className="eyebrow">首次启用</span>
           <h2>创建第一个账号</h2>
         </div>
         <label>

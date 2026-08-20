@@ -1,7 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 
 import { ApiError, api, formatApiError, type ModelDeployment } from "../api/client";
+import { useNavSection } from "../app/navSections";
 import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
 
 const CUSTOM_PROVIDER = "custom";
@@ -612,6 +613,7 @@ function sortedSavedModels(models: ModelDeployment[], sort: SortState<ModelSortK
 
 export function ModelsPage() {
   const queryClient = useQueryClient();
+  const { activeSection, navTargetProps } = useNavSection(["category", "section"]);
   const models = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
   const [modelCategory, setModelCategory] = useState<ModelCategory>("normal");
   const [provider, setProvider] = useState(NORMAL_PROVIDERS[0].value);
@@ -668,6 +670,11 @@ export function ModelsPage() {
     setTpm(String(preset.defaultTpm ?? 100000));
     setEditingModel(null);
   }
+
+  useEffect(() => {
+    if (activeSection === "text" && modelCategory !== "normal") resetModelForm("normal");
+    if (activeSection === "multimedia" && modelCategory !== "multimedia") resetModelForm("multimedia");
+  }, [activeSection, modelCategory]);
 
   const saveModel = useMutation({
     mutationFn: async () => {
@@ -857,7 +864,7 @@ export function ModelsPage() {
       <p>保存模型前系统会自动发起一次最小请求测试；测试失败不会发布该模型配置。</p>
       <p>同一服务商账号下的多个 Key 可能共享配额，不要把并发设置到跑满额度。</p>
 
-      <article>
+      <article {...navTargetProps("presets")}>
         <h3>填写指引</h3>
         <div className="detail-grid">
           <div>
@@ -880,7 +887,7 @@ export function ModelsPage() {
       </article>
 
       <form onSubmit={submit} aria-label="添加或编辑模型配置">
-        <h3>{editingModel ? "编辑模型配置" : "添加模型配置"}</h3>
+        <h3 {...navTargetProps(modelCategory === "multimedia" ? "multimedia" : "text")}>{editingModel ? "编辑模型配置" : "添加模型配置"}</h3>
         {editingModel ? (
           <p className="field-hint">
             正在编辑已保存模型：{editingModel.logical_model} / {editingModel.upstream_model}。不填写新 API Key
@@ -1020,7 +1027,7 @@ export function ModelsPage() {
           placeholder="同一账号/同一配额池使用相同 scope"
         />
 
-        <fieldset>
+        <fieldset {...navTargetProps("capabilities")}>
           <legend>能力</legend>
           {capabilityOptions.map((capability) => (
             <label key={capability.value}>
@@ -1035,7 +1042,7 @@ export function ModelsPage() {
           ))}
         </fieldset>
 
-        <label htmlFor="max-concurrency">最大并发</label>
+        <label htmlFor="max-concurrency" {...navTargetProps("capacity")}>最大并发</label>
         <input
           id="max-concurrency"
           type="number"
