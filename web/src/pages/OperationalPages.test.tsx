@@ -1519,6 +1519,21 @@ describe("operational management pages", () => {
     );
     expect(await screen.findByText(/已加入进化/)).not.toBeNull();
   });
+  it("can cancel a chat-detected evolution proposal before creating it", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "请进化 darwin-skill，做多轮迭代");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(await screen.findByRole("status", { name: "进化任务确认" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "取消进化" }));
+
+    await waitFor(() => expect(screen.queryByRole("status", { name: "进化任务确认" })).toBeNull());
+    expect(requests.find((request) => request.path === "/api/v1/admin/evolution-runs" && request.method === "POST")).toBeUndefined();
+    expect(await screen.findByText("已取消进化任务创建，后续消息会继续作为普通对话处理。")).not.toBeNull();
+  });
   it("shows an OpenClaw operation proposal from chat and links to OpenClaw control", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);

@@ -1449,6 +1449,7 @@ export function RunsPage() {
     createdScheduleId: string | null;
   } | null>(null);
   const [dismissedScheduleApprovalRunIds, setDismissedScheduleApprovalRunIds] = useState<string[]>([]);
+  const [dismissedEvolutionApprovalRunIds, setDismissedEvolutionApprovalRunIds] = useState<string[]>([]);
   const [evolutionApproval, setEvolutionApproval] = useState<{
     runId: string;
     proposal: EvolutionProposal;
@@ -1573,7 +1574,7 @@ export function RunsPage() {
       );
     }
     const proposedEvolution = evolutionApprovalFromRunDetail(selectedRun.data);
-    if (proposedEvolution) {
+    if (proposedEvolution && !dismissedEvolutionApprovalRunIds.includes(proposedEvolution.runId)) {
       setModeSelection(null);
       setTemporaryApproval(null);
       setScheduleApproval(null);
@@ -1592,7 +1593,7 @@ export function RunsPage() {
         current && current.runId === proposedOpenClaw.runId ? current : proposedOpenClaw,
       );
     }
-  }, [dismissedScheduleApprovalRunIds, modeSelection, selectedRun.data, temporaryApproval]);
+  }, [dismissedEvolutionApprovalRunIds, dismissedScheduleApprovalRunIds, modeSelection, selectedRun.data, temporaryApproval]);
 
   useEffect(() => {
     setProcessDetailTarget(null);
@@ -1694,6 +1695,7 @@ export function RunsPage() {
         setTemporaryApproval(null);
         setScheduleApproval(null);
         setOpenClawApproval(null);
+        setDismissedEvolutionApprovalRunIds((current) => current.filter((id) => id !== run.id));
         setEvolutionApproval({ runId: run.id, proposal: run.evolution_proposal, createdEvolutionId: null });
         setSubmitNotice("主 Agent 已识别为进化任务，确认后会加入进化记录。");
       } else if (run.temporary_agent_proposal && run.decision_token) {
@@ -1792,6 +1794,14 @@ export function RunsPage() {
       await queryClient.invalidateQueries({ queryKey: ["schedules"] });
     },
   });
+  const cancelEvolutionApproval = () => {
+    if (!evolutionApproval) return;
+    setDismissedEvolutionApprovalRunIds((current) =>
+      current.includes(evolutionApproval.runId) ? current : [...current, evolutionApproval.runId],
+    );
+    setEvolutionApproval(null);
+    setSubmitNotice("已取消进化任务创建，后续消息会继续作为普通对话处理。");
+  };
   const createEvolutionFromProposal = useMutation({
     mutationFn: () => {
       if (!evolutionApproval) throw new Error("evolution approval is unavailable");
@@ -2694,9 +2704,14 @@ export function RunsPage() {
                     查看进化任务
                   </Link>
                 ) : (
-                  <button type="button" onClick={() => createEvolutionFromProposal.mutate()} disabled={createEvolutionFromProposal.isPending}>
-                    {createEvolutionFromProposal.isPending ? "加入中..." : "加入进化"}
-                  </button>
+                  <div className="composer-card-actions">
+                    <button type="button" onClick={() => createEvolutionFromProposal.mutate()} disabled={createEvolutionFromProposal.isPending}>
+                      {createEvolutionFromProposal.isPending ? "加入中..." : "加入进化"}
+                    </button>
+                    <button type="button" className="secondary-action" disabled={createEvolutionFromProposal.isPending} onClick={cancelEvolutionApproval}>
+                      取消进化
+                    </button>
+                  </div>
                 )}
               </aside>
             ) : null}
