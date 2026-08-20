@@ -1281,7 +1281,7 @@ describe("operational management pages", () => {
           id: "artifact-table-reply",
           kind: "markdown",
           title: "回复",
-          text: "对比如下：\n\n| 类型 | 能做 | 不能做 |\n| --- | --- | --- |\n| 个股 | 深度分析 | 主动推荐 |\n| 大类资产 | 趋势分析 | 实时下单 |\n\n请按这个边界使用。",
+          text: "对比如下：\n\n| 类型 | 能做 | 不能做 |\n| -- | -- | -- |\n| 个股 | 深度分析 | 主动推荐 |\n| 大类资产 | 趋势分析 | 实时下单 |\n\n请按这个边界使用。",
         },
       ],
     };

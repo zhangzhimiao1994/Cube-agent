@@ -1356,7 +1356,7 @@ function isMarkdownTableStart(lines: string[], index: number) {
   const header = markdownTableCells(lines[index]);
   const separator = markdownTableCells(lines[index + 1]);
   if (header.length < 2 || separator.length !== header.length) return false;
-  return separator.every((cell) => /^:?-{3,}:?$/.test(cell.trim()));
+  return separator.every((cell) => /^:?-{2,}:?$/.test(cell.trim()));
 }
 
 function markdownTableCells(line: string) {
