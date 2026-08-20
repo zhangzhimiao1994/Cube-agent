@@ -18,6 +18,7 @@ from agent_hub.runs.repository import RunNotFound, RunRecord, RunRepository
 _LOGGER = logging.getLogger(__name__)
 _DEFAULT_FEISHU_API_BASE = "https://open.feishu.cn/open-apis"
 _MAX_REPLY_TEXT_CHARS = 3800
+_MAX_REPLY_TABLE_CHARS = 20000
 _MAX_SECTION_ITEMS = 6
 _MAX_LINE_CHARS = 520
 
@@ -499,6 +500,10 @@ def _split_text(text: str, maximum: int) -> list[str]:
         if len(block) <= maximum:
             current = block
             continue
+        if _contains_markdown_table(block):
+            chunks.append(block)
+            current = ""
+            continue
         chunks.extend(_plain_text_chunks(block, maximum))
         current = ""
     if current:
@@ -513,14 +518,14 @@ def _markdown_table_aware_blocks(text: str, maximum: int) -> list[str]:
     index = 0
     while index < len(lines):
         if _is_markdown_table_start(lines, index):
-            if pending:
-                blocks.extend(_plain_text_chunks("\n".join(pending).strip(), maximum))
-                pending = []
+            lead_text = "\n".join(pending).strip()
+            pending = []
             table_lines: list[str] = []
             while index < len(lines) and "|" in lines[index]:
                 table_lines.append(lines[index].strip())
                 index += 1
-            blocks.extend(_markdown_table_chunks(table_lines, maximum))
+            table_text = "\n".join(table_lines)
+            blocks.append(f"{lead_text}\n\n{table_text}" if lead_text else table_text)
             continue
         pending.append(lines[index])
         index += 1
@@ -528,30 +533,6 @@ def _markdown_table_aware_blocks(text: str, maximum: int) -> list[str]:
         blocks.extend(_plain_text_chunks("\n".join(pending).strip(), maximum))
     return [block for block in blocks if block.strip()]
 
-
-def _markdown_table_chunks(table_lines: Sequence[str], maximum: int) -> list[str]:
-    if len(table_lines) < 2:
-        return _plain_text_chunks("\n".join(table_lines), maximum)
-    header = table_lines[0]
-    separator = table_lines[1]
-    rows = list(table_lines[2:])
-    base = [header, separator]
-    chunks: list[str] = []
-    current = base.copy()
-    for row in rows:
-        candidate = "\n".join([*current, row])
-        if len(candidate) <= maximum:
-            current.append(row)
-            continue
-        if len(current) > len(base):
-            chunks.append("\n".join(current))
-            current = [*base, row]
-            continue
-        chunks.extend(_plain_text_chunks("\n".join([*base, row]), maximum))
-        current = base.copy()
-    if len(current) > len(base) or not chunks:
-        chunks.append("\n".join(current))
-    return chunks
 
 
 def _plain_text_chunks(text: str, maximum: int) -> list[str]:
@@ -578,9 +559,10 @@ def _bounded_reply_text(text: str) -> str:
     stripped = text.strip()
     if not stripped:
         return "任务已完成。"
-    if len(stripped) <= _MAX_REPLY_TEXT_CHARS:
+    limit = _MAX_REPLY_TABLE_CHARS if _contains_markdown_table(stripped) else _MAX_REPLY_TEXT_CHARS
+    if len(stripped) <= limit:
         return stripped
-    return stripped[:_MAX_REPLY_TEXT_CHARS] + "\n\n……内容较长，已截断；请到 Web UI 查看完整结果。"
+    return stripped[:limit] + "\n\n……内容较长，已截断；请到 Web UI 查看完整结果。"
 
 
 def _final_artifact_text(artifacts: tuple[dict[str, object], ...]) -> str | None:

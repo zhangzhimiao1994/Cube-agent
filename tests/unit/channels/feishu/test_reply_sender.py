@@ -81,7 +81,7 @@ def test_feishu_openapi_sender_splits_long_direct_text_without_truncation() -> N
     assert all(len(json.loads(json.loads(request.content)["content"])["text"]) <= 3800 for request in reply_requests)
 
 
-def test_feishu_openapi_sender_splits_long_markdown_table_as_rich_posts() -> None:
+def test_feishu_openapi_sender_keeps_long_markdown_table_as_one_rich_post() -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -108,18 +108,14 @@ def test_feishu_openapi_sender_splits_long_markdown_table_as_rich_posts() -> Non
     )
 
     reply_requests = [request for request in requests if request.url.path.endswith("/reply")]
-    assert len(reply_requests) > 1
-    rendered_chunks: list[str] = []
-    for request in reply_requests:
-        payload = json.loads(request.content)
-        assert payload["msg_type"] == "post"
-        content = json.loads(payload["content"])
-        rendered = content["post"]["zh_cn"]["content"][0][0]["text"]
-        rendered_chunks.append(rendered)
-        assert "| -- | 能做 | 不能做 |" in rendered
-        assert "| --- | --- | --- |" in rendered
-        assert len(rendered) <= 3800
-    combined = "\n".join(rendered_chunks)
-    assert "第 0 行" in combined
-    assert "第 359 行" in combined
-    assert "已截断" not in combined
+    assert len(reply_requests) == 1
+    payload = json.loads(reply_requests[0].content)
+    assert payload["msg_type"] == "post"
+    content = json.loads(payload["content"])
+    rendered = content["post"]["zh_cn"]["content"][0][0]["text"]
+    assert "| -- | 能做 | 不能做 |" in rendered
+    assert "| --- | --- | --- |" in rendered
+    assert "第 0 行" in rendered
+    assert "第 359 行" in rendered
+    assert "已截断" not in rendered
+    assert len(rendered) > 3800
