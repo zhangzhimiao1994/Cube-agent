@@ -584,6 +584,11 @@ article:hover {
   gap: 0.65rem;
 }
 
+.nav-drawer-item {
+  display: grid;
+  gap: 0.38rem;
+}
+
 .nav-drawer-link {
   background: rgba(255, 255, 255, 0.045);
   border: 1px solid rgba(255, 255, 255, 0.09);
@@ -608,6 +613,31 @@ article:hover {
   color: var(--muted);
   font-size: 0.82rem;
   line-height: 1.45;
+}
+
+.nav-tertiary-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.32rem;
+  padding: 0 0.15rem;
+}
+
+.nav-tertiary-links a {
+  background: rgba(var(--drawer-accent), 0.08);
+  border: 1px solid rgba(var(--drawer-accent), 0.18);
+  border-radius: 0.55rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 900;
+  line-height: 1.15;
+  padding: 0.34rem 0.48rem;
+  text-decoration: none;
+}
+
+.nav-tertiary-links a:hover,
+.nav-tertiary-links a:focus-visible {
+  background: rgba(var(--drawer-accent), 0.14);
+  color: var(--ink);
 }
 
 .module-hub {
@@ -2990,6 +3020,11 @@ article:hover {
     display: none;
   }
 
+  .mobile-nav-submenu-item {
+    display: grid;
+    gap: 0.12rem;
+  }
+
   .mobile-nav-submenu-link {
     background: transparent;
     border-radius: 0.55rem;
@@ -3010,6 +3045,30 @@ article:hover {
 
   .mobile-nav-submenu-link span {
     display: none;
+  }
+
+  .mobile-nav-tertiary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.28rem;
+    padding: 0 0.35rem 0.25rem;
+  }
+
+  .mobile-nav-tertiary a {
+    background: rgba(31, 35, 40, 0.05);
+    border-radius: 0.48rem;
+    color: #57606a;
+    font-size: 0.78rem;
+    font-weight: 850;
+    line-height: 1.1;
+    padding: 0.32rem 0.42rem;
+    text-decoration: none;
+  }
+
+  .mobile-nav-tertiary a:hover,
+  .mobile-nav-tertiary a:focus-visible {
+    background: rgba(31, 35, 40, 0.09);
+    color: #1f2328;
   }
 
   .brand-card {

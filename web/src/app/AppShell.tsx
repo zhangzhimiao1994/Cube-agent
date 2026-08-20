@@ -2,7 +2,7 @@ import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import { useEffect, useMemo, useState } from "react";
 
 import { APP_BRAND_LOGO_SRC, APP_BRAND_NAME } from "./brand";
-import { MODULE_GROUPS } from "./navigation";
+import { MODULE_GROUPS, type ModuleItem } from "./navigation";
 import { useAuth } from "../auth/AuthProvider";
 
 export function AppShell() {
@@ -13,14 +13,22 @@ export function AppShell() {
   const [expandedMobileGroupId, setExpandedMobileGroupId] = useState<string | null>(null);
   const visibleGroups = MODULE_GROUPS.map((group) => ({
     ...group,
-    modules: group.modules.filter((module) => hasPermission(auth.user?.permissions ?? [], module.permission)),
+    modules: group.modules.flatMap((module) => {
+      if (!hasPermission(auth.user?.permissions ?? [], module.permission)) return [];
+      return [
+        {
+          ...module,
+          children: module.children?.filter((child) => hasPermission(auth.user?.permissions ?? [], child.permission)),
+        },
+      ];
+    }),
   })).filter((group) => group.modules.length > 0);
   const activeGroup = useMemo(
     () =>
       visibleGroups.find(
         (group) =>
           location.pathname === group.to ||
-          group.modules.some((module) => module.to === location.pathname || location.pathname.startsWith(`${module.to}/`)),
+          group.modules.some((module) => moduleMatchesPath(module, location.pathname)),
       ) ?? visibleGroups[0],
     [location.pathname, visibleGroups],
   );
@@ -120,15 +128,25 @@ export function AppShell() {
                     </button>
                     <div id={submenuId} className="mobile-nav-submenu" hidden={!expanded}>
                       {group.modules.map((module) => (
-                        <Link
-                          key={module.to}
-                          to={module.to}
-                          className="mobile-nav-submenu-link"
-                          onClick={() => setMobileNavOpen(false)}
-                        >
-                          <strong>{module.label}</strong>
-                          <span>{module.description}</span>
-                        </Link>
+                        <div key={module.to} className="mobile-nav-submenu-item">
+                          <Link
+                            to={module.to}
+                            className="mobile-nav-submenu-link"
+                            onClick={() => setMobileNavOpen(false)}
+                          >
+                            <strong>{module.label}</strong>
+                            <span>{module.description}</span>
+                          </Link>
+                          {module.children && module.children.length > 0 ? (
+                            <div className="mobile-nav-tertiary" aria-label={`${module.label}三级导航`}>
+                              {module.children.map((child) => (
+                                <Link key={child.to} to={child.to} onClick={() => setMobileNavOpen(false)}>
+                                  {child.label}
+                                </Link>
+                              ))}
+                            </div>
+                          ) : null}
+                        </div>
                       ))}
                     </div>
                   </section>
@@ -151,10 +169,21 @@ export function AppShell() {
               </div>
               <div className="nav-drawer-links" role="list">
                 {drawerGroup.modules.map((module) => (
-                  <Link key={module.to} to={module.to} className="nav-drawer-link">
-                    <strong>{module.label}</strong>
-                    <span>{module.description}</span>
-                  </Link>
+                  <div key={module.to} className="nav-drawer-item" role="listitem">
+                    <Link to={module.to} className="nav-drawer-link">
+                      <strong>{module.label}</strong>
+                      <span>{module.description}</span>
+                    </Link>
+                    {module.children && module.children.length > 0 ? (
+                      <div className="nav-tertiary-links" aria-label={`${module.label}三级导航`}>
+                        {module.children.map((child) => (
+                          <Link key={child.to} to={child.to}>
+                            {child.label}
+                          </Link>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
                 ))}
               </div>
             </section>
@@ -177,6 +206,11 @@ export function AppShell() {
       </div>
     </div>
   );
+}
+
+function moduleMatchesPath(module: ModuleItem, pathname: string): boolean {
+  if (module.to === pathname || pathname.startsWith(`${module.to}/`)) return true;
+  return Boolean(module.children?.some((child) => child.to.split("?")[0] === pathname));
 }
 
 function hasPermission(grants: string[], permission: string): boolean {

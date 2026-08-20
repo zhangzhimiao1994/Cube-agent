@@ -99,6 +99,17 @@ describe("AppShell presentation", () => {
     expect(within(drawer).getByRole("link", { name: /工作流配置/ })).not.toBeNull();
   });
 
+  it("shows tertiary navigation under module drawers without adding top-level entries", async () => {
+    render(<TestApp initialPath="/evolution" />);
+
+    expect(await screen.findByRole("heading", { name: "魔方agent" })).not.toBeNull();
+    const navigation = screen.getByRole("navigation", { name: "Main navigation" });
+    expect(within(navigation).getAllByRole("link")).toHaveLength(6);
+
+    const workspaceDrawer = screen.getByLabelText("对话与进化二级导航");
+    expect(within(workspaceDrawer).getByRole("link", { name: "Skill 进化" }).getAttribute("href")).toBe("/evolution?type=skill");
+    expect(within(workspaceDrawer).getByRole("link", { name: "调度策略进化" }).getAttribute("href")).toBe("/evolution?type=scheduler-policy");
+  });
   it("makes top-level navigation enter the default module directly while keeping drawer links", async () => {
     render(<TestApp initialPath="/skills" />);
 
