@@ -21,6 +21,8 @@ _MAX_REPLY_TEXT_CHARS = 3800
 _MAX_REPLY_TABLE_CHARS = 20000
 _MAX_SECTION_ITEMS = 6
 _MAX_LINE_CHARS = 520
+_RICH_POST_SECTION_MARKERS = ("【Agent 调度】", "【讨论情况】", "【裁决情况】", "【中间产物｜")
+_BLOCKQUOTE_SECTION_TITLES = {"Agent 调度", "讨论情况", "裁决情况", "子 Agent 输出", "已产生内容"}
 
 
 class FeishuReplyError(RuntimeError):
@@ -289,7 +291,18 @@ def _section(title: str, lines: Sequence[str], *, empty: str | None = None) -> l
     content = [line for line in lines if line.strip()]
     if not content and empty is not None:
         content = [empty]
+    if title in _BLOCKQUOTE_SECTION_TITLES:
+        content = [_blockquote_line(line) for line in content]
     return ["", _section_title(title), *content]
+
+
+def _blockquote_line(line: str) -> str:
+    stripped = line.strip()
+    if not stripped:
+        return ">"
+    if stripped.startswith(">"):
+        return stripped
+    return f"> {stripped}"
 
 
 def _section_title(title: str) -> str:
@@ -436,7 +449,7 @@ def _decision_role_ids(events: tuple[dict[str, object], ...]) -> set[str]:
 
 def _reply_payload_for_text(text: str) -> dict[str, str]:
     bounded = _bounded_reply_text(text)
-    if _contains_markdown_table(bounded):
+    if _should_send_rich_post(bounded):
         return {
             "msg_type": "post",
             "content": json.dumps(
@@ -452,6 +465,10 @@ def _reply_payload_for_text(text: str) -> dict[str, str]:
             ),
         }
     return {"msg_type": "text", "content": json.dumps({"text": bounded}, ensure_ascii=False)}
+
+
+def _should_send_rich_post(text: str) -> bool:
+    return _contains_markdown_table(text) or any(marker in text for marker in _RICH_POST_SECTION_MARKERS)
 
 
 def _contains_markdown_table(text: str) -> bool:

@@ -1423,6 +1423,22 @@ def test_feishu_openapi_reply_keeps_plain_text_for_non_table_text() -> None:
     assert payload["msg_type"] == "text"
     assert payload["content"] == '{"text": "普通回复"}'
 
+
+def test_feishu_openapi_reply_uses_rich_post_for_structured_run_sections() -> None:
+    payload = _reply_payload_for_text(
+        "任务执行完成\n\n"
+        "【中间产物｜子 Agent 输出】\n"
+        "> - Planner(planner)[m3]: 给出活动流程和物料清单。\n\n"
+        "【最终结果】\n"
+        "最终方案：主题、流程、预算、风险和验收标准。"
+    )
+
+    assert payload["msg_type"] == "post"
+    assert "tag\": \"md\"" in str(payload["content"])
+    assert "【中间产物｜子 Agent 输出】" in str(payload["content"])
+    assert "> - Planner(planner)[m3]" in str(payload["content"])
+
+
 def test_feishu_terminal_reply_summarizes_user_relevant_run_process() -> None:
     sender = RecordingFeishuReplySender()
     repository = StructuredRunRepository()
@@ -1493,6 +1509,7 @@ def test_feishu_terminal_reply_marks_intermediate_sections_with_box_titles() -> 
     assert "【讨论情况】" in text
     assert "【裁决情况】" in text
     assert "【中间产物｜子 Agent 输出】" in text
+    assert "\n> - Planner(planner)[m3]: 给出活动流程和物料清单。" in text
     assert "【最终结果】" in text
     assert text.index("【中间产物｜子 Agent 输出】") < text.index("【最终结果】")
 
