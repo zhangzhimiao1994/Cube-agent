@@ -1,7 +1,8 @@
 import { useEffect } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useLocation, useSearchParams } from "react-router-dom";
 
 export function useNavSection(paramNames: string[] = ["section"]) {
+  const location = useLocation();
   const [searchParams] = useSearchParams();
   const activeSection = paramNames
     .map((name) => searchParams.get(name))
@@ -9,13 +10,32 @@ export function useNavSection(paramNames: string[] = ["section"]) {
 
   useEffect(() => {
     if (!activeSection) return;
-    const target = Array.from(document.querySelectorAll<HTMLElement>("[data-nav-section]")).find(
-      (item) => item.dataset.navSection === activeSection,
-    );
-    if (!target) return;
-    target.scrollIntoView?.({ block: "start", behavior: "smooth" });
-    target.focus({ preventScroll: true });
-  }, [activeSection]);
+    let cancelled = false;
+    let timeoutId: number | undefined;
+    let attempts = 0;
+
+    const scrollToTarget = () => {
+      if (cancelled) return;
+      const target = Array.from(document.querySelectorAll<HTMLElement>("[data-nav-section]")).find(
+        (item) => item.dataset.navSection === activeSection,
+      );
+      if (target) {
+        target.scrollIntoView?.({ block: "start", behavior: "smooth" });
+        target.focus({ preventScroll: true });
+        return;
+      }
+      attempts += 1;
+      if (attempts < 8) {
+        timeoutId = window.setTimeout(scrollToTarget, 50);
+      }
+    };
+
+    timeoutId = window.setTimeout(scrollToTarget, 0);
+    return () => {
+      cancelled = true;
+      if (timeoutId !== undefined) window.clearTimeout(timeoutId);
+    };
+  }, [activeSection, location.pathname, location.search]);
 
   function navTargetProps(section: string, className?: string) {
     const active = activeSection === section;

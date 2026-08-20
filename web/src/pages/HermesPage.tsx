@@ -1,7 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 
+import { useNavSection } from "../app/navSections";
 import { api, formatApiError, type HermesInsight } from "../api/client";
 import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
 
@@ -104,6 +105,8 @@ export function HermesPage() {
 function HermesLearningTable() {
   const queryClient = useQueryClient();
   const [searchParams] = useSearchParams();
+  const { activeSection, navTargetProps } = useNavSection(["category", "status"]);
+  const searchParamKey = searchParams.toString();
   const [conversationId, setConversationId] = useState("");
   const [lesson, setLesson] = useState(
     "When agents disagree, ask the main agent to compare evidence, risk, and output quality before deciding.",
@@ -120,6 +123,15 @@ function HermesLearningTable() {
     status: normalizeStatus(searchParams.get("status")),
   });
   const [sort, setSort] = useState<SortState<HermesSortKey>>({ key: "created", direction: "desc" });
+
+  useEffect(() => {
+    setColumnFilters((current) => ({
+      ...current,
+      category: normalizeCategory(searchParams.get("category")),
+      status: normalizeStatus(searchParams.get("status")),
+    }));
+    setSelectedIds([]);
+  }, [searchParamKey, searchParams]);
 
   const insights = useQuery({
     queryKey: ["hermes"],
@@ -212,6 +224,7 @@ function HermesLearningTable() {
   const allVisibleConfirmableSelected =
     visibleConfirmableIds.length > 0 && visibleConfirmableIds.every((id) => selectedIds.includes(id));
   const busy = bulkConfirm.isPending || bulkDelete.isPending || confirmInsight.isPending || deleteInsight.isPending;
+  const ledgerNavSection = activeSection ?? "ledger";
 
   return (
     <section>
@@ -222,7 +235,7 @@ function HermesLearningTable() {
         点击后进入详情查看和确认。学习建议不会直接挤到对话界面，也不会绕过主 Agent 的审批策略。
       </p>
 
-      <section aria-label="Hermes 学习台账">
+      <section aria-label="Hermes 学习台账" {...navTargetProps(ledgerNavSection)}>
         <h3>学习台账</h3>
         {items.length === 0 ? (
           <article>

@@ -33,6 +33,7 @@ describe("AppShell presentation", () => {
         if (path === "/api/v1/admin/evolution-runs") return jsonResponse([]);
         if (path === "/api/v1/admin/agents") return jsonResponse([]);
         if (path === "/api/v1/admin/workflows") return jsonResponse([]);
+        if (path === "/api/v1/admin/hermes") return jsonResponse([]);
         if (path === "/api/v1/admin/settings") {
           return jsonResponse({
             default_mode: "auto",
@@ -130,6 +131,33 @@ describe("AppShell presentation", () => {
 
     await waitFor(() => {
       expect(document.querySelector('[data-nav-section="scheduler"]')?.getAttribute("data-nav-active")).toBe("true");
+    });
+  });
+
+  it("activates evolution third-level sections from type query", async () => {
+    render(<TestApp initialPath="/evolution?type=scheduler-policy" />);
+
+    expect(await screen.findByRole("heading", { name: "进化" })).not.toBeNull();
+    await waitFor(() => {
+      expect(document.querySelector('[data-nav-section="scheduler-policy"]')?.getAttribute("data-nav-active")).toBe("true");
+    });
+  });
+
+  it("activates workflow third-level sections from section query", async () => {
+    render(<TestApp initialPath="/workflows?section=review" />);
+
+    expect(await screen.findByRole("heading", { name: "工作流配置" })).not.toBeNull();
+    await waitFor(() => {
+      expect(document.querySelector('[data-nav-section="review"]')?.getAttribute("data-nav-active")).toBe("true");
+    });
+  });
+
+  it("activates Hermes third-level filters from category and status query", async () => {
+    render(<TestApp initialPath="/hermes?status=pending" />);
+
+    expect(await screen.findByRole("heading", { name: "Hermes 学习" })).not.toBeNull();
+    await waitFor(() => {
+      expect(document.querySelector('[data-nav-section="pending"]')?.getAttribute("data-nav-active")).toBe("true");
     });
   });
   it("makes top-level navigation enter the default module directly while keeping drawer links", async () => {

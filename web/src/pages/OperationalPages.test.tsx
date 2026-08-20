@@ -453,6 +453,16 @@ describe("operational management pages", () => {
         if (path === `/api/v1/admin/runs/${runId}/pause`) {
           return jsonResponse({ ...runDetail, status: "paused" });
         }
+        if (path === `/api/v1/admin/runs/${runId}/cancel`) {
+          visibleRunListItems = visibleRunListItems.map((item) =>
+            item.id === runId ? { ...item, status: "cancelled" } : item,
+          );
+          visibleRunDetail = { ...visibleRunDetail, status: "cancelled" };
+          visibleConversationRuns = visibleConversationRuns.map((item) =>
+            item.id === runId ? { ...item, status: "cancelled" } : item,
+          );
+          return jsonResponse(visibleRunDetail);
+        }
         if (path === "/api/v1/runs" && method === "POST") {
           const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
           const message = String(body.message ?? "");
@@ -1091,6 +1101,21 @@ describe("operational management pages", () => {
     expect(screen.getByText(/来源：step\.failed #4/)).not.toBeNull();
     expect(screen.queryByText("null")).toBeNull();
   });
+  it("stops the current running chat from the conversation composer", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(await screen.findByRole("button", { name: conversationOpenButtonName }));
+    await user.click(await screen.findByRole("button", { name: "停止生成" }));
+
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === `/api/v1/admin/runs/${runId}/cancel`)).toMatchObject({
+        method: "POST",
+      }),
+    );
+    expect(await screen.findByText("已停止当前运行。你可以继续发送新消息。")).not.toBeNull();
+  });
   it("keeps run detail access inside the center chat stream and sends selected workflow roles", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
@@ -1448,6 +1473,21 @@ describe("operational management pages", () => {
       }),
     );
     expect(await screen.findByText(/已加入计划/)).not.toBeNull();
+  });
+  it("can cancel a chat-detected schedule proposal before creating it", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "每天9点提醒我填写日报");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(await screen.findByRole("status", { name: "计划任务确认" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "取消计划" }));
+
+    await waitFor(() => expect(screen.queryByRole("status", { name: "计划任务确认" })).toBeNull());
+    expect(requests.find((request) => request.path === "/api/v1/admin/schedules" && request.method === "POST")).toBeUndefined();
+    expect(await screen.findByText("已取消计划任务创建，后续消息会继续作为普通对话处理。")).not.toBeNull();
   });
   it("creates an evolution run from a chat-detected evolution plan after user confirmation", async () => {
     const user = userEvent.setup();

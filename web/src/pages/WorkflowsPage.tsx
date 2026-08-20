@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useMemo, useState } from "react";
 
+import { useNavSection } from "../app/navSections";
 import { api, formatApiError, type WorkflowResource } from "../api/client";
 import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
 
@@ -195,6 +196,7 @@ function sortedWorkflows(items: WorkflowResource[], sort: SortState<WorkflowSort
 
 export function WorkflowsPage() {
   const queryClient = useQueryClient();
+  const { navTargetProps } = useNavSection();
   const workflows = useQuery({ queryKey: ["workflows"], queryFn: () => api.workflows() });
   const agents = useQuery({ queryKey: ["agents"], queryFn: () => api.agents() });
   const [presetId, setPresetId] = useState<string>(WORKFLOW_PRESETS[0].id);
@@ -376,7 +378,7 @@ export function WorkflowsPage() {
             <textarea id="workflow-objective" value={objective} onChange={(event) => setObjective(event.target.value)} required />
           </label>
 
-          <fieldset>
+          <fieldset {...navTargetProps("roles")}>
             <legend>默认参与角色</legend>
             <p className="field-help">
               同一个模式可以有不同派单对象。这里选择的是该任务类型默认会派给哪些角色。
@@ -405,17 +407,19 @@ export function WorkflowsPage() {
             <textarea id="workflow-role-selection" value={roleSelectionPolicy} onChange={(event) => setRoleSelectionPolicy(event.target.value)} required />
           </label>
 
-          <label htmlFor="workflow-steps">
-            执行步骤（每行一个）
-            <textarea id="workflow-steps" value={steps} onChange={(event) => setSteps(event.target.value)} required />
-          </label>
+          <div {...navTargetProps("execution", "nav-form-section")}>
+            <label htmlFor="workflow-steps">
+              执行步骤（每行一个）
+              <textarea id="workflow-steps" value={steps} onChange={(event) => setSteps(event.target.value)} required />
+            </label>
 
-          <label htmlFor="workflow-deliverables">
-            交付物（每行一个）
-            <textarea id="workflow-deliverables" value={deliverables} onChange={(event) => setDeliverables(event.target.value)} required />
-          </label>
+            <label htmlFor="workflow-deliverables">
+              交付物（每行一个）
+              <textarea id="workflow-deliverables" value={deliverables} onChange={(event) => setDeliverables(event.target.value)} required />
+            </label>
+          </div>
 
-          <label htmlFor="workflow-decision-policy">
+          <label htmlFor="workflow-decision-policy" {...navTargetProps("review")}>
             分歧裁决规则
             <textarea id="workflow-decision-policy" value={decisionPolicy} onChange={(event) => setDecisionPolicy(event.target.value)} required />
           </label>
@@ -443,7 +447,7 @@ export function WorkflowsPage() {
         </article>
       </div>
 
-      <section aria-label="已保存工作流">
+      <section aria-label="已保存工作流" {...navTargetProps("list")}>
         <h3>已保存工作流</h3>
         {savedWorkflows.length === 0 ? (
           <article>

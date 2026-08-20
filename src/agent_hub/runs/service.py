@@ -1652,6 +1652,10 @@ _SCHEDULE_EXECUTION_RE = re.compile(
     r"(执行|运行|提交|发送|填写|填报|打开|检查|触发|通知|生成|创建|更新|写|execute|run|submit|send|fill|open|check|generate|create|update)",
     re.IGNORECASE,
 )
+_SCHEDULE_REMINDER_ACTION_RE = re.compile(
+    r"(提醒我|通知我|叫我|remind\s+me|notify\s+me|ping\s+me|alarm\s+me)",
+    re.IGNORECASE,
+)
 _SCHEDULE_NEGATION_RE = re.compile(
     r"(不要|不需要|不用|无需|别)(?!忘).{0,16}(加入|创建|保存|列入|放入)?(日程|计划任务|提醒|闹钟|schedule|reminder|alarm)",
     re.IGNORECASE,
@@ -1739,22 +1743,20 @@ def _local_schedule_proposal(
 def _looks_like_schedule_intent(message: str, lowered: str) -> bool:
     if _SCHEDULE_NEGATION_RE.search(message):
         return False
-    if _SCHEDULE_TRIGGER_RE.search(message):
-        return True
     has_recurrence = _contains_daily_intent(message, lowered) or _contains_weekly_intent(
         message, lowered
     )
     has_time_anchor = bool(
-        _SCHEDULE_TIME_RE.search(message)
-        or "明天" in message
-        or "后天" in message
-        or "tomorrow" in lowered
+        has_recurrence
+        or _SCHEDULE_TIME_RE.search(message)
+        or any(token in message for token in ("今天", "明天", "后天"))
+        or any(token in lowered for token in ("today", "tomorrow"))
     )
-    has_execution = _SCHEDULE_EXECUTION_RE.search(message) is not None
-    return bool(
-        (has_recurrence and (has_time_anchor or has_execution))
-        or (has_time_anchor and has_execution)
+    has_schedule_cue = _SCHEDULE_TRIGGER_RE.search(message) is not None or has_recurrence
+    has_execution = bool(
+        _SCHEDULE_EXECUTION_RE.search(message) or _SCHEDULE_REMINDER_ACTION_RE.search(message)
     )
+    return has_schedule_cue and has_time_anchor and has_execution
 
 
 def _contains_daily_intent(message: str, lowered: str) -> bool:

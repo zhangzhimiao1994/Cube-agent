@@ -1,4 +1,4 @@
-﻿import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
@@ -1448,6 +1448,7 @@ export function RunsPage() {
     proposal: ScheduleProposal;
     createdScheduleId: string | null;
   } | null>(null);
+  const [dismissedScheduleApprovalRunIds, setDismissedScheduleApprovalRunIds] = useState<string[]>([]);
   const [evolutionApproval, setEvolutionApproval] = useState<{
     runId: string;
     proposal: EvolutionProposal;
@@ -1562,7 +1563,7 @@ export function RunsPage() {
       );
     }
     const proposedSchedule = scheduleApprovalFromRunDetail(selectedRun.data);
-    if (proposedSchedule) {
+    if (proposedSchedule && !dismissedScheduleApprovalRunIds.includes(proposedSchedule.runId)) {
       setModeSelection(null);
       setTemporaryApproval(null);
       setEvolutionApproval(null);
@@ -1591,7 +1592,7 @@ export function RunsPage() {
         current && current.runId === proposedOpenClaw.runId ? current : proposedOpenClaw,
       );
     }
-  }, [modeSelection, selectedRun.data, temporaryApproval]);
+  }, [dismissedScheduleApprovalRunIds, modeSelection, selectedRun.data, temporaryApproval]);
 
   useEffect(() => {
     setProcessDetailTarget(null);
@@ -1685,6 +1686,7 @@ export function RunsPage() {
         setTemporaryApproval(null);
         setEvolutionApproval(null);
         setOpenClawApproval(null);
+        setDismissedScheduleApprovalRunIds((current) => current.filter((id) => id !== run.id));
         setScheduleApproval({ runId: run.id, proposal: run.schedule_proposal, createdScheduleId: null });
         setSubmitNotice("主 Agent 已识别为计划任务，确认后会加入计划任务列表。");
       } else if (run.evolution_proposal) {
@@ -1769,6 +1771,14 @@ export function RunsPage() {
     },
   });
 
+  const cancelScheduleApproval = () => {
+    if (!scheduleApproval) return;
+    setDismissedScheduleApprovalRunIds((current) =>
+      current.includes(scheduleApproval.runId) ? current : [...current, scheduleApproval.runId],
+    );
+    setScheduleApproval(null);
+    setSubmitNotice("已取消计划任务创建，后续消息会继续作为普通对话处理。");
+  };
   const createScheduleFromProposal = useMutation({
     mutationFn: () => {
       if (!scheduleApproval) throw new Error("schedule approval is unavailable");
@@ -1806,6 +1816,19 @@ export function RunsPage() {
         current ? { ...current, createdOperationId: operation.id } : current,
       );
       setSubmitNotice(`已创建 OpenClaw 待审批操作：${operation.id}。请到 OpenClaw 控制页审批和执行。`);
+    },
+  });
+
+  const stopCurrentRun = useMutation({
+    mutationFn: (runId: string) => api.cancelRun(runId),
+    onSuccess: async (run) => {
+      setSubmitNotice("已停止当前运行。你可以继续发送新消息。");
+      await queryClient.invalidateQueries({ queryKey: ["runs"] });
+      await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
+      const stoppedConversationId = runConversationId(run) ?? activeConversationId;
+      if (stoppedConversationId) {
+        await queryClient.invalidateQueries({ queryKey: ["conversation", stoppedConversationId] });
+      }
     },
   });
   const promoteTemporaryAgent = useMutation({
@@ -2173,6 +2196,7 @@ export function RunsPage() {
   const openClawApprovalVisibleInMessages =
     !!openClawApproval && messages.some((item) => item.id === `${openClawApproval.runId}-openclaw-approval`);
   const latestVisibleRun = visibleRuns.at(-1) ?? selectedRun.data;
+  const canStopLatestRun = Boolean(latestVisibleRun && !TERMINAL_STATUSES.has(latestVisibleRun.status));
   const registeredModelIds = new Set(savedModels.map((model) => model.logical_model));
   const directModelDeployment = savedModels.find((model) => model.logical_model === directModel) ?? null;
   const directModelName = directModelDeployment?.logical_model ?? (directModel || "未指定");
@@ -2717,9 +2741,14 @@ export function RunsPage() {
                     查看计划任务
                   </Link>
                 ) : (
-                  <button type="button" disabled={createScheduleFromProposal.isPending} onClick={() => createScheduleFromProposal.mutate()}>
-                    {createScheduleFromProposal.isPending ? "加入中..." : "加入计划"}
-                  </button>
+                  <div className="composer-card-actions">
+                    <button type="button" disabled={createScheduleFromProposal.isPending} onClick={() => createScheduleFromProposal.mutate()}>
+                      {createScheduleFromProposal.isPending ? "加入中..." : "加入计划"}
+                    </button>
+                    <button type="button" className="secondary-action" disabled={createScheduleFromProposal.isPending} onClick={cancelScheduleApproval}>
+                      取消计划
+                    </button>
+                  </div>
                 )}
               </aside>
             ) : null}
@@ -2858,6 +2887,16 @@ export function RunsPage() {
                 </span>
               </div>
               <div className="composer-send-row">
+                {canStopLatestRun && latestVisibleRun ? (
+                  <button
+                    type="button"
+                    className="secondary-action composer-stop-button"
+                    disabled={stopCurrentRun.isPending}
+                    onClick={() => stopCurrentRun.mutate(latestVisibleRun.id)}
+                  >
+                    {stopCurrentRun.isPending ? "停止中..." : "停止生成"}
+                  </button>
+                ) : null}
                 <button
                   type="submit"
                   disabled={createRun.isPending || message.trim().length === 0 || Boolean(directSendBlockedReason)}
@@ -2883,6 +2922,7 @@ export function RunsPage() {
               </p>
             ) : null}
             {createRun.isError ? <p role="alert">{formatApiError(createRun.error, "消息发送失败")}</p> : null}
+            {stopCurrentRun.isError ? <p role="alert">{formatApiError(stopCurrentRun.error, "停止运行失败")}</p> : null}
           </form>
         </div>
       </div>

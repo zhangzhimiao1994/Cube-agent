@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useState } from "react";
 
+import { useNavSection } from "../app/navSections";
 import { api, formatApiError, type EvolutionNextRoundExecution, type EvolutionNextRoundPlan, type EvolutionRun } from "../api/client";
 
 function latestRound(run: EvolutionRun) {
@@ -28,6 +29,34 @@ type AcceptedChoice = "auto" | "accept" | "reject";
 type EvolutionRunFilter = "all" | "running" | "waiting_approval" | "stopped" | "completed" | "pending_approval" | "needs_action";
 
 const ACTIONABLE_EVOLUTION_STEPS = new Set(["run_next_round", "review_baseline", "rollback_candidate"]);
+
+const EVOLUTION_SCOPE_CARDS = [
+  {
+    id: "skill",
+    title: "Skill 进化",
+    body: "面向 Skill 蒸馏、评测、版本候选和发布审批。",
+  },
+  {
+    id: "agent",
+    title: "Agent/角色进化",
+    body: "评估基准 Agent、候选 Agent、角色提示词和能力边界。",
+  },
+  {
+    id: "workflow",
+    title: "工作流进化",
+    body: "围绕协作模式、步骤、交付物和裁决规则做迭代。",
+  },
+  {
+    id: "scheduler-policy",
+    title: "调度策略进化",
+    body: "复盘主 Agent 调度、并发、降级和模型匹配策略。",
+  },
+  {
+    id: "context-memory",
+    title: "多轮记忆策略",
+    body: "评估长期对话、上下文压缩和记忆保持策略。",
+  },
+];
 
 function textContains(value: string, query: string) {
   return value.toLowerCase().includes(query.trim().toLowerCase());
@@ -79,6 +108,7 @@ function acceptedValue(choice: AcceptedChoice) {
 
 export function EvolutionPage() {
   const queryClient = useQueryClient();
+  const { navTargetProps } = useNavSection(["type"]);
   const evolutionRuns = useQuery({ queryKey: ["evolution-runs"], queryFn: () => api.evolutionRuns() });
   const [title, setTitle] = useState("Skill 进化任务");
   const [objective, setObjective] = useState("用固定评测集验证候选版本，未达标不发布。");
@@ -248,6 +278,18 @@ export function EvolutionPage() {
         <div>
           <span>待执行</span>
           <strong>{actionableRuns.length}</strong>
+        </div>
+      </section>
+
+      <section className="resource-card" aria-label="进化范围导航">
+        <h3>进化范围</h3>
+        <div className="detail-grid">
+          {EVOLUTION_SCOPE_CARDS.map((scope) => (
+            <div key={scope.id} {...navTargetProps(scope.id)}>
+              <strong>{scope.title}</strong>
+              <p>{scope.body}</p>
+            </div>
+          ))}
         </div>
       </section>
 

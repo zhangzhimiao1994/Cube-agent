@@ -459,6 +459,8 @@ async def test_schedule_intent_returns_confirmation_proposal_without_enqueue() -
     [
         "请帮我规划明天的 AI 科研资料检索计划",
         "请给我一个每日学习计划，不要加入日程表",
+        "计划任务存在问题，为什么普通问题也会被归类成任务？",
+        "帮我看看计划任务功能应该怎么设计，不要直接创建。",
     ],
 )
 async def test_normal_planning_request_does_not_become_schedule_task(message: str) -> None:

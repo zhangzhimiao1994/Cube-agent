@@ -1877,6 +1877,17 @@ article:hover {
   justify-self: start;
 }
 
+.composer-card-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+}
+
+.composer-card-actions .secondary-action {
+  min-height: 2.35rem;
+}
+
 .composer-inline-picker {
   align-items: end;
   background: rgba(8, 17, 35, 0.7);
