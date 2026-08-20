@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 
-import { api, formatApiError } from "../api/client";
+import { api, formatApiError, type RunDetail } from "../api/client";
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
 const MANUAL_RUN_MODES = [
@@ -12,6 +12,91 @@ const MANUAL_RUN_MODES = [
 ] as const;
 
 type ManualRunMode = (typeof MANUAL_RUN_MODES)[number]["value"];
+type RunEvent = RunDetail["events"][number];
+
+type ObserverNotice = {
+  sequence: number;
+  trigger: string;
+  action: string;
+  severity: string;
+  sourceKind: string | null;
+  sourceSequence: number | null;
+  actor: string | null;
+  failureEvents: number | null;
+  retryEvents: number | null;
+  messageEvents: number | null;
+  artifactEvents: number | null;
+};
+
+const OBSERVER_TRIGGER_LABELS: Record<string, string> = {
+  model_capacity_pressure: "模型容量拥堵",
+  empty_model_response: "模型空响应",
+  repeated_failure: "连续失败",
+  step_retrying: "正在重试",
+  context_compaction_recommended: "建议压缩上下文",
+};
+
+const OBSERVER_ACTION_LABELS: Record<string, string> = {
+  reschedule_or_reassign_model: "建议改派模型或重新调度",
+  retry_fallback_or_reassign_model: "建议重试、切换备用模型或改派",
+  pause_and_request_scheduler_review: "建议暂停并等待调度复核",
+  preserve_partial_outputs: "保留失败前产物用于复盘",
+  watch_retry_budget: "继续观察重试预算",
+  compact_context_before_next_model_call: "下次模型调用前压缩上下文",
+};
+
+const OBSERVER_SEVERITY_LABELS: Record<string, string> = {
+  info: "提示",
+  warning: "警告",
+  error: "错误",
+};
+
+function payloadString(payload: Record<string, unknown>, key: string) {
+  const value = payload[key];
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function payloadNumber(payload: Record<string, unknown>, key: string) {
+  const value = payload[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function collectObserverNotices(events: RunEvent[]): ObserverNotice[] {
+  return events.flatMap((event) => {
+    if (event.kind !== "observer.notice") return [];
+    const trigger = payloadString(event.payload, "trigger");
+    const action = payloadString(event.payload, "action");
+    const severity = payloadString(event.payload, "severity") ?? "info";
+    if (!trigger || !action) return [];
+    return [
+      {
+        sequence: event.sequence,
+        trigger,
+        action,
+        severity,
+        sourceKind: payloadString(event.payload, "source_kind"),
+        sourceSequence: payloadNumber(event.payload, "source_sequence"),
+        actor: event.actor ?? null,
+        failureEvents: payloadNumber(event.payload, "failure_events"),
+        retryEvents: payloadNumber(event.payload, "retry_events"),
+        messageEvents: payloadNumber(event.payload, "message_events"),
+        artifactEvents: payloadNumber(event.payload, "artifact_events"),
+      },
+    ];
+  });
+}
+
+function observerTriggerLabel(trigger: string) {
+  return OBSERVER_TRIGGER_LABELS[trigger] ?? trigger;
+}
+
+function observerActionLabel(action: string) {
+  return OBSERVER_ACTION_LABELS[action] ?? action;
+}
+
+function observerSeverityLabel(severity: string) {
+  return OBSERVER_SEVERITY_LABELS[severity] ?? severity;
+}
 
 export function RunDetailPage() {
   const { runId = "" } = useParams();
@@ -62,6 +147,7 @@ export function RunDetailPage() {
   const canResume = run.data.status === "paused";
   const canCancel = !TERMINAL_STATUSES.has(run.data.status);
   const isWaitingForMode = run.data.status === "waiting_user_mode" && Boolean(run.data.decision_token);
+  const observerNotices = collectObserverNotices(run.data.events);
 
   return (
     <section>
@@ -131,6 +217,29 @@ export function RunDetailPage() {
         {control.isError ? <p role="alert">{formatApiError(control.error, "运行控制失败")}</p> : null}
         {chooseMode.isError ? <p role="alert">{formatApiError(chooseMode.error, "运行模式确认失败")}</p> : null}
       </article>
+
+      {observerNotices.length > 0 ? (
+        <article>
+          <h3>调度观察</h3>
+          <p className="field-help">主 Agent 运行监视器记录了需要关注的调度信号，优先用于排查模型拥堵、空响应和重试预算。</p>
+          <ul className="compact-list">
+            {observerNotices.map((notice) => (
+              <li key={notice.sequence}>
+                <strong>{observerTriggerLabel(notice.trigger)}</strong>
+                <span>{observerSeverityLabel(notice.severity)}</span>
+                <strong>{observerActionLabel(notice.action)}</strong>
+                {notice.sourceKind && notice.sourceSequence !== null ? (
+                  <small>来源：{notice.sourceKind} #{notice.sourceSequence}</small>
+                ) : null}
+                {notice.actor ? <small>角色：{notice.actor}</small> : null}
+                <small>
+                  运行信号：失败 {notice.failureEvents ?? 0} / 重试 {notice.retryEvents ?? 0} / 消息 {notice.messageEvents ?? 0} / 产物 {notice.artifactEvents ?? 0}
+                </small>
+              </li>
+            ))}
+          </ul>
+        </article>
+      ) : null}
 
       <article>
         <h3>事件日志</h3>

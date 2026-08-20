@@ -1039,6 +1039,46 @@ describe("operational management pages", () => {
     await waitFor(() => expect(screen.getByText("paused")).not.toBeNull());
   });
 
+  it("shows observer notices as scheduler guidance on the detail page", async () => {
+    visibleRunDetail = {
+      ...runDetail,
+      events: [
+        ...runDetail.events,
+        {
+          sequence: 5,
+          kind: "observer.notice",
+          message: "observer.notice",
+          created_at: "2026-08-07T00:00:03Z",
+          actor: "reviewer",
+          participants: [],
+          tool_name: null,
+          step_id: null,
+          action: null,
+          decision: null,
+          payload: {
+            trigger: "model_capacity_pressure",
+            action: "reschedule_or_reassign_model",
+            severity: "warning",
+            source_kind: "step.failed",
+            source_sequence: 4,
+            failure_events: 1,
+            retry_events: 0,
+            message_events: 3,
+            artifact_events: 1,
+          },
+        },
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    expect(await screen.findByRole("heading", { name: "调度观察" })).not.toBeNull();
+    expect(screen.getByText("模型容量拥堵")).not.toBeNull();
+    expect(screen.getByText("建议改派模型或重新调度")).not.toBeNull();
+    expect(screen.getByText(/来源：step\.failed #4/)).not.toBeNull();
+    expect(screen.queryByText("null")).toBeNull();
+  });
   it("keeps run detail access inside the center chat stream and sends selected workflow roles", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);

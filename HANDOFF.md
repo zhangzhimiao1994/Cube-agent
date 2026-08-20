@@ -1,3 +1,29 @@
+## 2026-08-20 P3 Run Observer Detail UI
+
+Status: server deployed and verified; GitHub full sync is next.
+
+Changed in this slice:
+- `web/src/pages/RunDetailPage.tsx`: renders `observer.notice` events as a dedicated `调度观察` section on the run detail page instead of leaving them buried in the raw event log. The section localizes known observer triggers/actions such as model capacity pressure, empty model response, repeated failure, retry watching, and context compaction recommendations.
+- `web/src/pages/OperationalPages.test.tsx`: added regression coverage proving an `observer.notice` payload is shown as scheduler guidance, includes the source event reference, and does not leak `null` placeholders.
+- Plan update: OpenClaw already has an independent navigation/config entry, so the remaining OpenClaw backlog now only tracks approval policy refinement, Windows/Linux long-running operation support, and scheduled-task integration.
+
+Local verification:
+- `npm.cmd test -- --run src/pages/OperationalPages.test.tsx -t "observer notices"` from `web/` failed first as expected before implementation, then passed after the UI change.
+- `npm.cmd test -- --run src/pages/OperationalPages.test.tsx` from `web/` -> 60 passed.
+- `npm.cmd run lint` from `web/` -> passed.
+- `npm.cmd run build` from `web/` -> passed, with the existing Vite large-chunk warning only.
+
+Server deployment and verification:
+- Local incremental archive retained: `.local-archives/server-incrementals/agent-hub-run-observer-detail-ui-20260820-143957.tgz`.
+- Uploaded to `root@103.236.98.133:/tmp/agent-hub-p3-runtime-incremental.tgz` and deployed incrementally into `/opt/agent-hub/current`.
+- Server backup retained: `/opt/agent-hub/backups/p3-run-observer-detail-ui-20260820-143957`.
+- Server archive retained: `/opt/agent-hub/archives/server-incrementals/agent-hub-run-observer-detail-ui-20260820-143957.tgz`.
+- Reloaded Caddy; server health probe returned `{"status":"ok"}`.
+- Real deployed frontend probe loaded `/`, resolved active asset `/assets/index-Bk1E0AOJ.js`, and confirmed the deployed bundle contains `调度观察` and `模型容量拥堵`.
+- Cleaned server temp files: `/tmp/agent-hub-p3-runtime-incremental.tgz` and `/tmp/deploy-run-observer-detail-ui.sh`.
+
+Remaining for this slice:
+- Create a recovery archive/tag, force-with-lease push to `mutilagent/main`, and check GitHub Actions until green.
 ## 2026-08-20 P3 Low-Token Run Observer Foundation
 
 Status: server deployed and verified; GitHub full sync completed and Actions are green.
