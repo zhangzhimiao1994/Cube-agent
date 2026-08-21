@@ -92,11 +92,11 @@ describe("LoginPage", () => {
 
   it("logs in and opens the run dashboard", async () => {
     render(<TestApp initialPath="/login" />);
-    expect(await screen.findByRole("heading", { name: "魔方agent" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "魔方 agent" })).not.toBeNull();
     expect(screen.getByRole("heading", { name: "登录工作台" })).not.toBeNull();
     expect(screen.getByText("把对话、模型、工具和自动化任务放进同一个工作台，关键操作可追踪、可审批、可恢复。")).not.toBeNull();
     expect(screen.getByText("继续处理对话、计划任务、工具审批和系统配置。")).not.toBeNull();
-    expect(screen.getByAltText("魔方agent")).not.toBeNull();
+    expect(screen.getByAltText("魔方 agent")).not.toBeNull();
     expect(screen.queryByText(/Agent Hub/i)).toBeNull();
     await userEvent.type(screen.getByLabelText("Username"), "owner");
     await userEvent.type(screen.getByLabelText("Password"), "correct horse battery staple");
@@ -118,8 +118,8 @@ describe("LoginPage", () => {
 
   it("creates the first admin through setup", async () => {
     render(<TestApp initialPath="/setup" />);
-    expect(await screen.findByText("魔方agent")).not.toBeNull();
-    expect(screen.getByAltText("魔方agent")).not.toBeNull();
+    expect(await screen.findByText("魔方 agent")).not.toBeNull();
+    expect(screen.getByAltText("魔方 agent")).not.toBeNull();
     expect(screen.getByText("创建第一个管理员后，就可以接入模型、通道、Skill 和 OpenClaw 工具。")).not.toBeNull();
     expect(screen.getByText("设置码只用于首次启用，使用后立即失效。")).not.toBeNull();
     expect(screen.queryByText(/Agent Hub/i)).toBeNull();
@@ -151,8 +151,8 @@ describe("LoginPage", () => {
   it("protects the dashboard while session is missing", async () => {
     render(<TestApp initialPath="/" />);
 
-    await waitFor(() => expect(screen.getByRole("heading", { name: "魔方agent" })).not.toBeNull());
-    expect(screen.getByAltText("魔方agent")).not.toBeNull();
+    await waitFor(() => expect(screen.getByRole("heading", { name: "魔方 agent" })).not.toBeNull());
+    expect(screen.getByAltText("魔方 agent")).not.toBeNull();
   });
 
   it("keeps module groups visible and lets viewers use installed tool capabilities", async () => {

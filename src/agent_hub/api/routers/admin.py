@@ -1198,7 +1198,7 @@ def _openclaw_adapter_responses(
 ) -> tuple[OpenClawAdapterResponse, ...]:
     descriptions = {
         ("linux", "server_command"): (
-            "Runs exact allowlisted argv commands on the 魔方agent Linux server after approval."
+            "Runs exact allowlisted argv commands on the 魔方 agent Linux server after approval."
         ),
         (
             "linux",

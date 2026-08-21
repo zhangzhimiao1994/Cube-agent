@@ -383,6 +383,7 @@ describe("operational management pages", () => {
   let visibleChannels = baseChannels;
   let createdEvolutionRun: typeof evolutionRun | null = null;
   let failNextAttachmentUpload = false;
+  let holdActiveConversationRequest = false;
 
   beforeEach(() => {
     requests.length = 0;
@@ -398,6 +399,7 @@ describe("operational management pages", () => {
     visibleChannels = baseChannels;
     createdEvolutionRun = null;
     failNextAttachmentUpload = false;
+    holdActiveConversationRequest = false;
     vi.stubGlobal("confirm", vi.fn(() => true));
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
@@ -448,6 +450,9 @@ describe("operational management pages", () => {
           return jsonResponse({ conversation_id: "conv-previous", runs: visibleConversationRuns });
         }
         if (path === `/api/v1/admin/conversations/${runDetail.explicit_details.conversation_id}`) {
+          if (holdActiveConversationRequest) {
+            return new Promise<Response>(() => undefined);
+          }
           return jsonResponse({ conversation_id: runDetail.explicit_details.conversation_id, runs: visibleConversationRuns });
         }
         if (path === `/api/v1/admin/runs/${runId}/pause`) {
@@ -1361,6 +1366,20 @@ describe("operational management pages", () => {
     expect(within(stream).getByText(/这轮只生成了内部审查或裁决内容/)).not.toBeNull();
   });
 
+  it("does not keep the conversation loading skeleton when selected run detail is already visible", async () => {
+    const user = userEvent.setup();
+    holdActiveConversationRequest = true;
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(await screen.findByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    expect(await within(stream).findByText("给我做一个短视频脚本方案。")).not.toBeNull();
+    expect(within(stream).queryByText("正在读取当前会话...")).toBeNull();
+  });
   it("keeps older conversation messages when a later run is appended", async () => {
     visibleConversationRuns = [
       runDetail,

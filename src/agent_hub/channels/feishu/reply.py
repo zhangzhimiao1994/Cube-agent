@@ -456,7 +456,7 @@ def _reply_payload_for_text(text: str) -> dict[str, str]:
                 {
                     "post": {
                         "zh_cn": {
-                            "title": "魔方agent",
+                            "title": "魔方 agent",
                             "content": [[{"tag": "md", "text": bounded}]],
                         }
                     }

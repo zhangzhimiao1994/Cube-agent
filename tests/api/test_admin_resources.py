@@ -218,7 +218,7 @@ def test_openclaw_adapters_expose_multisystem_execution_boundary() -> None:
         "execution_host": "agent-hub-server",
         "requires_user_approval": True,
         "supports_read_only": False,
-        "description": "Runs exact allowlisted argv commands on the 魔方agent Linux server after approval.",
+        "description": "Runs exact allowlisted argv commands on the 魔方 agent Linux server after approval.",
     }
     assert adapters[("windows", "server_command")]["status"] == "adapter_unavailable"
     assert adapters[("windows", "server_command")]["execution_host"] == "remote-windows-host"

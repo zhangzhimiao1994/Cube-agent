@@ -70,10 +70,10 @@ describe("AppShell presentation", () => {
   it("renders the operations shell without global capability cards above every page", async () => {
     render(<TestApp initialPath="/" />);
 
-    expect(await screen.findAllByText("魔方agent")).not.toHaveLength(0);
-    expect(screen.getAllByAltText("魔方agent")).not.toHaveLength(0);
+    expect(await screen.findAllByText("魔方 agent")).not.toHaveLength(0);
+    expect(screen.getAllByAltText("魔方 agent")).not.toHaveLength(0);
 
-    expect(await screen.findByRole("heading", { name: "魔方agent" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "魔方 agent" })).not.toBeNull();
     expect(screen.getAllByText("工作台").length).toBeGreaterThan(0);
     expect(screen.getByRole("link", { name: "对话与进化" })).not.toBeNull();
     expect(screen.getByRole("link", { name: "编排" })).not.toBeNull();
@@ -88,7 +88,7 @@ describe("AppShell presentation", () => {
   it("groups navigation into six module hubs with colored module cards", async () => {
     render(<TestApp initialPath="/orchestration" />);
 
-    expect(await screen.findByRole("heading", { name: "魔方agent" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "魔方 agent" })).not.toBeNull();
     const navigation = screen.getByRole("navigation", { name: "Main navigation" });
     expect(within(navigation).getAllByRole("link")).toHaveLength(6);
     expect(within(navigation).getByRole("link", { name: "对话与进化" })).not.toBeNull();
@@ -112,7 +112,7 @@ describe("AppShell presentation", () => {
   it("shows tertiary navigation under module drawers without adding top-level entries", async () => {
     render(<TestApp initialPath="/evolution" />);
 
-    expect(await screen.findByRole("heading", { name: "魔方agent" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "魔方 agent" })).not.toBeNull();
     const navigation = screen.getByRole("navigation", { name: "Main navigation" });
     expect(within(navigation).getAllByRole("link")).toHaveLength(6);
 
@@ -125,7 +125,7 @@ describe("AppShell presentation", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/main-agent" />);
 
-    expect(await screen.findByRole("heading", { name: "魔方agent" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "魔方 agent" })).not.toBeNull();
     const drawer = screen.getByLabelText("编排二级导航");
     await user.click(within(drawer).getByRole("link", { name: "调度策略" }));
 
@@ -183,7 +183,7 @@ describe("AppShell presentation", () => {
   it("makes top-level navigation enter the default module directly while keeping drawer links", async () => {
     render(<TestApp initialPath="/skills" />);
 
-    expect(await screen.findByRole("heading", { name: "魔方agent" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "魔方 agent" })).not.toBeNull();
     const navigation = screen.getByRole("navigation", { name: "Main navigation" });
     expect(within(navigation).getByRole("link", { name: "对话与进化" }).getAttribute("href")).toBe("/");
     expect(within(navigation).getByRole("link", { name: "编排" }).getAttribute("href")).toBe("/main-agent");
@@ -197,7 +197,7 @@ describe("AppShell presentation", () => {
   it("does not expose fixed navigation controls", async () => {
     render(<TestApp initialPath="/models" />);
 
-    expect(await screen.findByRole("heading", { name: "魔方agent" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "魔方 agent" })).not.toBeNull();
     expect(document.querySelector(".app-shell")?.className).toContain("nav-floating");
     expect(document.querySelector(".app-shell")?.className).not.toContain("nav-pinned");
     expect(screen.queryByRole("button", { name: "固定导航栏" })).toBeNull();
@@ -209,7 +209,7 @@ describe("AppShell presentation", () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/models" />);
 
-    expect(await screen.findByRole("heading", { name: "魔方agent" })).not.toBeNull();
+    expect(await screen.findByRole("heading", { name: "魔方 agent" })).not.toBeNull();
     const shell = document.querySelector(".app-shell");
     const mobileTrigger = screen.getByRole("button", { name: "打开导航栏" });
 

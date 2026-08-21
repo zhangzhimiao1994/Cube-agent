@@ -217,7 +217,7 @@ export function AppShell() {
         <header className="topbar">
           <div>
             <p className="eyebrow">工作台</p>
-            <h2>魔方agent</h2>
+            <h2>{APP_BRAND_NAME}</h2>
           </div>
           <div className="user-chip">
             <span>{auth.user?.username}</span>

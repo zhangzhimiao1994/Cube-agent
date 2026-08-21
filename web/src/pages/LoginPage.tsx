@@ -22,7 +22,7 @@ export function LoginPage() {
       setError(
         caught instanceof ApiError && caught.code === "invalid_credentials"
           ? "账号或密码不对，请再检查一次。"
-          : formatApiError(caught, "进入魔方agent失败"),
+          : formatApiError(caught, `进入${APP_BRAND_NAME} 失败`),
       );
     }
   }
@@ -32,7 +32,7 @@ export function LoginPage() {
       <div className="auth-hero">
         <img className="auth-brand-logo" src={APP_BRAND_LOGO_SRC} alt={APP_BRAND_NAME} />
         <span className="eyebrow">{APP_BRAND_NAME}</span>
-        <h1>魔方agent</h1>
+        <h1>{APP_BRAND_NAME}</h1>
         <p>把对话、模型、工具和自动化任务放进同一个工作台，关键操作可追踪、可审批、可恢复。</p>
       </div>
       <form className="auth-card" onSubmit={(event) => void submit(event)}>
