@@ -119,3 +119,43 @@ def test_feishu_openapi_sender_keeps_long_markdown_table_as_one_rich_post() -> N
     assert "第 359 行" in rendered
     assert "已截断" not in rendered
     assert len(rendered) > 3800
+
+
+def test_feishu_openapi_sender_truncates_oversized_markdown_table_on_row_boundary() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/open-apis/auth/v3/tenant_access_token/internal":
+            return httpx.Response(200, json={"code": 0, "tenant_access_token": "tenant-token"})
+        if request.url.path == "/open-apis/im/v1/messages/om_huge_table/reply":
+            return httpx.Response(200, json={"code": 0})
+        return httpx.Response(404, json={"code": 404})
+
+    sender = FeishuOpenAPIReplySender(
+        api_base="https://open.feishu.cn/open-apis",
+        transport=httpx.MockTransport(handler),
+    )
+    rows = "\n".join(
+        f"| 第 {index:03d} 行 | {'x' * 120} | {'y' * 80} |" for index in range(300)
+    )
+    table = "超长表格：\n\n| 行 | 说明 | 备注 |\n| --- | --- | --- |\n" + rows
+
+    asyncio.run(
+        sender.reply_text(
+            settings=FeishuSettings.model_validate({"app_id": "app", "app_secret": "secret"}),
+            message_id="om_huge_table",
+            text=table,
+        )
+    )
+
+    reply_requests = [request for request in requests if request.url.path.endswith("/reply")]
+    assert len(reply_requests) == 1
+    payload = json.loads(reply_requests[0].content)
+    assert payload["msg_type"] == "post"
+    content = json.loads(payload["content"])
+    rendered = content["post"]["zh_cn"]["content"][0][0]["text"]
+    table_part, notice = rendered.split("\n\n……", 1)
+    table_lines = [line for line in table_part.splitlines() if line.startswith("|")]
+    assert table_lines[-1].endswith(" |")
+    assert "内容较长" in notice

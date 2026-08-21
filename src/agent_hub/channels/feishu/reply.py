@@ -579,7 +579,16 @@ def _bounded_reply_text(text: str) -> str:
     limit = _MAX_REPLY_TABLE_CHARS if _contains_markdown_table(stripped) else _MAX_REPLY_TEXT_CHARS
     if len(stripped) <= limit:
         return stripped
+    if _contains_markdown_table(stripped):
+        return _truncate_markdown_table_reply(stripped, limit)
     return stripped[:limit] + "\n\n……内容较长，已截断；请到 Web UI 查看完整结果。"
+
+
+def _truncate_markdown_table_reply(text: str, limit: int) -> str:
+    boundary = text.rfind("\n", 0, limit)
+    if boundary <= 0:
+        boundary = limit
+    return text[:boundary].rstrip() + "\n\n……内容较长，已截断；请到 Web UI 查看完整结果。"
 
 
 def _final_artifact_text(artifacts: tuple[dict[str, object], ...]) -> str | None:
