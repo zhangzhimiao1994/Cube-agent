@@ -14,7 +14,7 @@ It combines a Web console, Feishu/channel entry points, model pools, workflow an
 - Use MiniMax/Hailuo text-to-video through the multimedia executor when a valid deployment and key are configured.
 - Upload single-skill or multi-skill `.zip`, `.tar`, `.tar.gz`, and `.tgz` archives for scan, review, approval, use, and deletion.
 - Run OpenClaw operations through a system switch, approval mode, allowlisted commands, sessions, and local or remote adapters.
-- Create one-time or cron schedules. Chat-detected schedule requests become proposals that require user confirmation.
+- Create one-time or cron schedules. Chat-detected dated tasks, reminders, and recurring requests become proposals that require user confirmation before creation.
 - Review Hermes learning, logs, and audit records. `run.submit` audit records include the user, role, run, conversation, mode, attachments, and a message hash.
 
 ## Quick Install
@@ -89,13 +89,13 @@ The chat page supports:
 - `discuss`: run a discussion-style workflow.
 - `hybrid`: combine dispatch and discussion.
 
-Handoff and Vibe Coding are independent toggles. They can be enabled together, disabled before send, and are recorded in the submitted run. Handoff provides a reference conversation; Vibe Coding stays inside chat as a coding collaboration mode rather than a standalone system module.
+Handoff and Vibe Coding are independent toggles. They can be enabled together, disabled before send, and are recorded in the submitted run. Handoff provides a reference conversation; Vibe Coding stays inside chat as a coding collaboration mode rather than a standalone system module. A running chat can be stopped from the composer, and detected schedule or Evolution proposals can be cancelled before they create durable records.
 
 Long conversations are handled by the conversation framework, not by the Evolution module. When the history approaches the main agent model context window, Agent Hub compacts older turns, keeps the origin goal and latest decisions, and passes the compacted context into the next run.
 
 Evolution is for durable asset improvement: Skill distillation, Darwin-style iteration, agent/workflow/prompt improvement, and score-gated candidate testing. Normal Q&A, one-off plans, and ordinary research do not enter Evolution unless the request asks to improve or create a durable asset.
 
-Schedule-like messages such as daily or weekly reminders are detected as schedule proposals. The system shows the plan first and only creates the schedule after confirmation.
+Schedule-like messages with a concrete time, date, or recurrence plus an executable action are detected as schedule proposals. The system shows the plan first and only creates the schedule after confirmation. Ordinary questions about schedule design or bugs stay in the conversation.
 
 Skill creation requests should also start in chat. For example: `I want to create a research Skill for AI papers`. The main agent should collect the goal, sources, acceptance tasks, and safety boundary, then create a grounded Evolution run instead of installing an unverified Skill directly.
 
@@ -139,7 +139,7 @@ The channel layer connects external chat platforms to the main agent. The consol
 
 Feishu supports long connection mode with App ID and App Secret. Webhook mode remains available as a fallback when you need platform-side URL verification or event encryption.
 
-Channel messages now enter the main agent first. The channel layer does not choose Direct, Dispatch, Discussion, Hybrid, Vibe Coding, Help, OpenClaw, or schedule mode by command text; the main agent judges the entry and route from the full message.
+Channel messages now enter the main agent first. The channel layer does not choose Direct, Dispatch, Discussion, Hybrid, Vibe Coding, Help, OpenClaw, or schedule mode by command text; the main agent judges the entry and route from the full message. Follow-up turns in the same channel conversation continue the latest resolved mode by default. Explicit phrases such as switching to discussion mode change mode, while explicit new-topic/new-conversation phrases return to fresh main-agent routing.
 
 When a user needs to request specific resources, place a contiguous selector block at the very beginning of the message:
 
@@ -148,6 +148,8 @@ When a user needs to request specific resources, place a contiguous selector blo
 - `#filesystem`: request an MCP server.
 
 For example, `@github &research #filesystem Review this repository plan` attaches resource hints while preserving the original message text. `@`, `&`, and `#` appearing after normal text are treated as ordinary content, so phrases like `C#`, `#heading`, or `@someone` do not become resource calls.
+
+Feishu replies use rich post payloads for structured run sections and markdown tables. Long plain text is split across reply bubbles, while oversized markdown tables are truncated at complete row boundaries with a notice so table formatting is not cut mid-row.
 
 The legacy Feishu field `FEISHU_COMMAND_ALIASES` is kept only for backward-compatible configuration storage. Saved aliases are no longer active routing commands and are not shown as effective channel commands.
 
@@ -166,7 +168,7 @@ Audit records cover administrative changes and user-triggered conversation submi
 - workflow, selected agents, direct model, Vibe Coding flag, and attachment count
 - message preview and `message_sha256`
 
-Hermes stores learning records separately from chat. Records can be confirmed or deleted individually or in bulk.
+Hermes stores learning records separately from chat. Conversation memory and scheduler observations are separated into distinct record categories, and records can be filtered, sorted, confirmed, or deleted individually or in bulk.
 
 ## Operations
 
