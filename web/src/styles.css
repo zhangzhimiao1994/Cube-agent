@@ -157,12 +157,20 @@ textarea {
   background: rgba(3, 10, 20, 0.64);
   box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.03) inset;
   color: var(--ink);
+  max-width: 100%;
   min-height: 2.8rem;
+  min-width: 0;
   padding: 0.78rem 0.92rem;
   transition:
     border-color 160ms var(--ease),
     box-shadow 160ms var(--ease),
     background 160ms var(--ease);
+  width: 100%;
+}
+
+input[type="checkbox"],
+input[type="radio"] {
+  width: auto;
 }
 
 textarea {
@@ -2342,6 +2350,11 @@ article:hover {
   display: grid;
   gap: 1rem;
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.form-grid > *,
+.settings-form label {
+  min-width: 0;
 }
 
 .status-chip {

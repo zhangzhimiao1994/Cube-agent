@@ -1,5 +1,6 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TestApp } from "../app/router";
@@ -242,5 +243,14 @@ describe("MainAgentPage", () => {
     expect(screen.getByText("https://bad-relay.example/v1/messages")).not.toBeNull();
     expect(screen.getByText("provider returned status=401")).not.toBeNull();
     expect(screen.getByRole("link", { name: "查看模型日志" })).not.toBeNull();
+  });
+
+  it("keeps long main agent form controls inside dense grids", () => {
+    const stylesCss = readFileSync("src/styles.css", "utf8");
+
+    expect(stylesCss).toMatch(/\.form-grid\s*{[\s\S]*grid-template-columns:\s*repeat\(auto-fit, minmax\(240px, 1fr\)\);/);
+    expect(stylesCss).toMatch(/\.form-grid > \*,[\s\S]*\.settings-form label\s*{[\s\S]*min-width:\s*0;/);
+    expect(stylesCss).toMatch(/input,[\s\S]*select,[\s\S]*textarea\s*{[\s\S]*max-width:\s*100%;[\s\S]*min-width:\s*0;[\s\S]*width:\s*100%;/);
+    expect(stylesCss).toMatch(/input\[type="checkbox"\],[\s\S]*input\[type="radio"\]\s*{[\s\S]*width:\s*auto;/);
   });
 });
