@@ -2152,20 +2152,16 @@ export function RunsPage() {
     setSubmitNotice("已新建空白对话。选一个模式或直接发送，主 Agent 会按当前设置处理。");
   }
 
-  function startHandoffConversation(sourceRun?: RunDetail | null) {
-    if (handoffActive) {
-      setReferenceConversationId("");
-      setSubmitNotice("已取消 Handoff 参考会话。");
-      return;
-    }
-    const sourceConversationId = runConversationId(sourceRun ?? selectedRun.data) ?? conversationId;
-    if (!sourceConversationId) {
-      setSubmitNotice("当前没有可 Handoff 的会话。");
+  function startBranchConversation(sourceConversationId?: string | null) {
+    const trimmedSourceConversationId = sourceConversationId?.trim() || runConversationId(selectedRun.data) || conversationId.trim();
+    if (!trimmedSourceConversationId) {
+      setSubmitNotice("当前没有可引用的会话。");
       return;
     }
     setSelectedRunId(null);
     setShowModeEntry(false);
-    setReferenceConversationId(sourceConversationId);
+    setHistoryOpen(false);
+    setReferenceConversationId(trimmedSourceConversationId);
     setConversationId(newConversationId());
     setMessage("");
     setDirectModel("");
@@ -2175,7 +2171,12 @@ export function RunsPage() {
     setOpenClawApproval(null);
     setModeSelection(null);
     setProcessDetailTarget(null);
-    setSubmitNotice(`已按原思路开启新对话：新对话会读取 ${sourceConversationId} 作为参考上下文。`);
+    setSubmitNotice(`已按原思路新建分支：新对话会读取 ${trimmedSourceConversationId} 作为参考上下文。`);
+  }
+
+  function cancelBranchReference() {
+    setReferenceConversationId("");
+    setSubmitNotice("已取消引用会话。");
   }
 
   function loadReferenceConversation() {
@@ -2381,6 +2382,16 @@ export function RunsPage() {
                     <span className="conversation-mode-chip">{displayMode(run.mode)}</span>
                     <strong className="conversation-title-text">{title}</strong>
                     <small className="conversation-meta-line">{run.status}</small>
+                  </button>
+                  <button
+                    type="button"
+                    className="conversation-branch-button"
+                    aria-label={`按原思路新建分支 ${title}`}
+                    title={run.conversation_id ? "引用这段会话新建分支" : "这条运行没有会话 ID"}
+                    disabled={!run.conversation_id}
+                    onClick={() => startBranchConversation(run.conversation_id)}
+                  >
+                    分支
                   </button>
                   <button
                     type="button"
@@ -2843,7 +2854,7 @@ export function RunsPage() {
               required
             />
             <div className="composer-actions">
-              <div className="composer-tool-row" aria-label="消息工具">
+              <div className={`composer-tool-row${handoffActive ? " composer-tool-row-reference" : ""}`} aria-label="消息工具">
                 <label className="composer-upload-button">
                   <span>附件</span>
                   <input
@@ -2857,20 +2868,20 @@ export function RunsPage() {
                     }}
                   />
                 </label>
+                {handoffActive ? (
+                  <button
+                    type="button"
+                    className="composer-reference-button composer-toggle-active"
+                    aria-label="取消引用会话"
+                    title="取消本次新分支的参考会话"
+                    onClick={cancelBranchReference}
+                  >
+                    取消引用
+                  </button>
+                ) : null}
                 <button
                   type="button"
-                  className={`composer-handoff-button${handoffActive ? " composer-toggle-active" : ""}`}
-                  aria-label="按照原思路"
-                  aria-pressed={handoffActive}
-                  title="按照原思路开启新对话"
-                  disabled={!latestVisibleRun && !handoffActive}
-                  onClick={() => startHandoffConversation(latestVisibleRun)}
-                >
-                  原思路
-                </button>
-                <button
-                  type="button"
-                  className={`composer-handoff-button${vibeCoding ? " composer-toggle-active" : ""}`}
+                  className={`composer-vibe-button${vibeCoding ? " composer-toggle-active composer-vibe-active" : ""}`}
                   aria-label="Vibe Coding"
                   aria-pressed={vibeCoding}
                   title={settings.data?.vibe_coding_enabled ? "在当前对话中启用代码协作上下文" : "系统设置未启用 Vibe Coding"}

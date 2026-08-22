@@ -1180,7 +1180,7 @@ article:hover {
   border-radius: 0.72rem;
   display: grid;
   gap: 0.35rem;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
   padding: 0.42rem;
 }
 
@@ -1208,21 +1208,39 @@ article:hover {
   box-shadow: 0 0 28px rgba(125, 255, 189, 0.12);
 }
 
+.conversation-branch-button,
 .conversation-delete-button {
   align-self: center;
-  background: rgba(255, 109, 122, 0.12);
-  border: 1px solid rgba(255, 109, 122, 0.36);
   border-radius: 0.55rem;
-  color: #ffb4bd;
   cursor: pointer;
   font-size: 0.78rem;
   font-weight: 900;
-  min-height: 1.85rem;
   justify-self: end;
+  min-height: 1.85rem;
   padding: 0.32rem 0.48rem;
+  white-space: nowrap;
   width: auto;
 }
 
+.conversation-branch-button {
+  background: rgba(85, 215, 255, 0.12);
+  border: 1px solid rgba(85, 215, 255, 0.42);
+  color: #baf2ff;
+}
+
+.conversation-branch-button:hover:not(:disabled),
+.conversation-branch-button:focus-visible {
+  border-color: rgba(85, 215, 255, 0.78);
+  box-shadow: 0 0 0 1px rgba(85, 215, 255, 0.18), 0 0 18px rgba(85, 215, 255, 0.12);
+}
+
+.conversation-delete-button {
+  background: rgba(255, 109, 122, 0.12);
+  border: 1px solid rgba(255, 109, 122, 0.36);
+  color: #ffb4bd;
+}
+
+.conversation-branch-button:disabled,
 .conversation-delete-button:disabled {
   background: rgba(148, 163, 184, 0.08);
   border-color: rgba(148, 163, 184, 0.2);
@@ -1782,7 +1800,8 @@ article:hover {
   box-shadow: 0 0 18px rgba(42, 195, 255, 0.16);
 }
 
-.composer-handoff-button,
+.composer-reference-button,
+.composer-vibe-button,
 .composer-answerer-button {
   align-items: center;
   background: rgba(125, 255, 189, 0.11);
@@ -1806,7 +1825,8 @@ article:hover {
   border-color: rgba(85, 215, 255, 0.3);
 }
 
-.composer-handoff-button:hover:not(:disabled),
+.composer-reference-button:hover:not(:disabled),
+.composer-vibe-button:hover:not(:disabled),
 .composer-answerer-button:hover:not(:disabled) {
   border-color: rgba(125, 255, 189, 0.58);
   box-shadow: 0 0 18px rgba(125, 255, 189, 0.14);
@@ -1819,7 +1839,25 @@ article:hover {
   color: #f7fffb;
 }
 
-.composer-handoff-button:disabled,
+.composer-vibe-active {
+  border-color: rgba(85, 215, 255, 0.88);
+  box-shadow: 0 0 0 2px rgba(85, 215, 255, 0.22), 0 0 24px rgba(85, 215, 255, 0.18);
+  position: relative;
+}
+
+.composer-vibe-active::after {
+  background: #55d7ff;
+  border-radius: 999px;
+  content: "";
+  height: 0.5rem;
+  position: absolute;
+  right: 0.42rem;
+  top: 0.38rem;
+  width: 0.5rem;
+}
+
+.composer-reference-button:disabled,
+.composer-vibe-button:disabled,
 .composer-answerer-button:disabled {
   cursor: not-allowed;
   opacity: 0.48;
@@ -3460,6 +3498,10 @@ article:hover {
   .composer-tool-row {
     display: grid;
     gap: 0.45rem;
+    grid-template-columns: minmax(4.2rem, 0.85fr) minmax(4.4rem, 1fr) 2.75rem;
+  }
+
+  .composer-tool-row-reference {
     grid-template-columns: minmax(4.2rem, 0.85fr) minmax(0, 1fr) minmax(0, 1fr) 2.75rem;
   }
 
@@ -3477,7 +3519,8 @@ article:hover {
   }
 
   .composer-tool-row .composer-upload-button,
-  .composer-tool-row .composer-handoff-button {
+  .composer-tool-row .composer-reference-button,
+  .composer-tool-row .composer-vibe-button {
     max-width: none;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -3621,6 +3664,7 @@ article:hover {
     font-size: 0.88rem;
   }
 
+  .conversation-branch-button,
   .conversation-delete-button {
     font-size: 0.72rem;
     min-height: 1.7rem;
@@ -3665,6 +3709,10 @@ article:hover {
 
   .composer-tool-row {
     gap: 0.35rem;
+    grid-template-columns: minmax(3.5rem, 0.65fr) minmax(3.8rem, 0.9fr) 2.35rem;
+  }
+
+  .composer-tool-row-reference {
     grid-template-columns: minmax(3.5rem, 0.65fr) minmax(4.4rem, 1fr) minmax(3.8rem, 0.8fr) 2.35rem;
   }
 
@@ -3673,7 +3721,8 @@ article:hover {
   }
 
   .composer-tool-row .composer-upload-button,
-  .composer-tool-row .composer-handoff-button,
+  .composer-tool-row .composer-reference-button,
+  .composer-tool-row .composer-vibe-button,
   .composer-tool-row .composer-plus-button {
     font-size: 0.78rem;
     height: 2.25rem;
@@ -3879,7 +3928,7 @@ article:hover {
   }
 
   .conversation-row {
-    grid-template-columns: 1rem minmax(0, 1fr) auto;
+    grid-template-columns: 1rem minmax(0, 1fr) auto auto;
     min-height: 2.65rem;
   }
 
@@ -3887,6 +3936,7 @@ article:hover {
     font-size: 0.86rem;
   }
 
+  .conversation-branch-button,
   .conversation-delete-button {
     border-radius: 8px;
   }

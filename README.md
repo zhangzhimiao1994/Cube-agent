@@ -8,7 +8,7 @@ It combines a Web console, Feishu/channel entry points, model pools, workflow an
 
 ## What You Can Do
 
-- Chat with the main agent in Web or supported channels, continue historical conversations, attach files, and use Handoff or Vibe Coding as independent conversation toggles.
+- Chat with the main agent in Web or supported channels, continue historical conversations, branch from prior context, attach files, and enable Vibe Coding inside chat.
 - Configure normal chat/tool models separately from multimedia AI models.
 - Route image/video/audio generation only to models marked with the matching generation capability.
 - Use MiniMax/Hailuo text-to-video through the multimedia executor when a valid deployment and key are configured.
@@ -89,7 +89,7 @@ The chat page supports:
 - `discuss`: run a discussion-style workflow.
 - `hybrid`: combine dispatch and discussion.
 
-Handoff and Vibe Coding are independent toggles. They can be enabled together, disabled before send, and are recorded in the submitted run. Handoff provides a reference conversation; Vibe Coding stays inside chat as a coding collaboration mode rather than a standalone system module. A running chat can be stopped from the composer, and detected schedule or Evolution proposals can be cancelled before they create durable records.
+Historical conversations expose a branch action for continuing with prior context; once a branch reference is active, the composer shows an explicit cancel control instead of requiring a per-message Handoff toggle. Vibe Coding stays as an in-chat coding collaboration mode with a visible selected state and can be disabled before send. A running chat can be stopped from the composer, and detected schedule or Evolution proposals can be cancelled before they create durable records.
 
 Long conversations are handled by the conversation framework, not by the Evolution module. When the history approaches the main agent model context window, Cube Agent compacts older turns, keeps the origin goal and latest decisions, and passes the compacted context into the next run.
 

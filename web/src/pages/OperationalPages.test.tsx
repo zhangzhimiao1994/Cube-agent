@@ -21,6 +21,7 @@ const conversationTimestamp = new Date(conversationCreatedAt)
 const conversationHistoryTitle = `给我做一个短视频脚本方案。 · ${conversationTimestamp}`;
 const escapedConversationHistoryTitle = conversationHistoryTitle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const conversationOpenButtonName = new RegExp(`进入会话 ${escapedConversationHistoryTitle}`);
+const conversationBranchButtonName = new RegExp(`按原思路新建分支 ${escapedConversationHistoryTitle}`);
 const conversationDeleteButtonName = new RegExp(`删除会话 ${escapedConversationHistoryTitle}`);
 const runListItem: RunListItem = {
   id: runId,
@@ -1620,14 +1621,13 @@ describe("operational management pages", () => {
     expect(composer.querySelector(".composer-send-row")).not.toBeNull();
   });
 
-  it("submits handoff context and Vibe Coding together when both toggles are enabled", async () => {
+  it("submits branch reference context and Vibe Coding together", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
-    await screen.findByText(/会话：conv-previous/);
-    await user.click(screen.getByRole("button", { name: "按照原思路" }));
+    await user.click(screen.getByRole("button", { name: conversationBranchButtonName }));
+    await screen.findByText(/已按原思路新建分支/);
     await user.click(screen.getByRole("button", { name: "Vibe Coding" }));
     await user.type(screen.getByPlaceholderText(/输入消息/), "沿用上一轮方向。");
     await user.click(screen.getByRole("button", { name: "发送" }));
@@ -1642,15 +1642,15 @@ describe("operational management pages", () => {
     });
   });
 
-  it("can cancel handoff mode before sending a message", async () => {
+  it("can cancel branch reference before sending a message", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
-    await screen.findByText(/会话：conv-previous/);
-    await user.click(screen.getByRole("button", { name: "按照原思路" }));
-    await user.click(screen.getByRole("button", { name: "按照原思路" }));
+    await user.click(screen.getByRole("button", { name: conversationBranchButtonName }));
+    await screen.findByText(/已按原思路新建分支/);
+    expect(screen.queryByRole("button", { name: "按照原思路" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "取消引用会话" }));
     await user.type(screen.getByPlaceholderText(/输入消息/), "不引用上一轮。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
@@ -1683,29 +1683,28 @@ describe("operational management pages", () => {
     });
   });
 
-  it("keeps Handoff and Vibe Coding as independent composer toggles", async () => {
+  it("keeps branch reference and Vibe Coding as independent composer states", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
-    await screen.findByText(/会话：conv-previous/);
+    await user.click(screen.getByRole("button", { name: conversationBranchButtonName }));
+    await screen.findByText(/已按原思路新建分支/);
 
-    const handoffButton = screen.getByRole("button", { name: "按照原思路" });
     const vibeButton = screen.getByRole("button", { name: "Vibe Coding" });
 
-    await user.click(handoffButton);
     await user.click(vibeButton);
-    expect(handoffButton.getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByRole("button", { name: "取消引用会话" })).not.toBeNull();
+    expect(vibeButton.getAttribute("aria-pressed")).toBe("true");
+    expect(vibeButton.className).toContain("composer-vibe-active");
+
+    await user.click(screen.getByRole("button", { name: "取消引用会话" }));
+    expect(screen.queryByRole("button", { name: "取消引用会话" })).toBeNull();
     expect(vibeButton.getAttribute("aria-pressed")).toBe("true");
 
-    await user.click(handoffButton);
-    expect(handoffButton.getAttribute("aria-pressed")).toBe("false");
-    expect(vibeButton.getAttribute("aria-pressed")).toBe("true");
-
     await user.click(vibeButton);
-    expect(handoffButton.getAttribute("aria-pressed")).toBe("false");
     expect(vibeButton.getAttribute("aria-pressed")).toBe("false");
+    expect(vibeButton.className).not.toContain("composer-vibe-active");
   });
 
   it("keeps multiple follow-up messages in the active conversation until the user starts a new chat", async () => {
@@ -1773,9 +1772,8 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
-    await screen.findByText(/会话：conv-previous/);
-    await user.click(screen.getByRole("button", { name: "按照原思路" }));
+    await user.click(screen.getByRole("button", { name: conversationBranchButtonName }));
+    await screen.findByText(/已按原思路新建分支/);
     expect(screen.queryByRole("button", { name: "自动" })).toBeNull();
     expect(screen.queryByRole("button", { name: "直连" })).toBeNull();
     await user.type(screen.getByPlaceholderText(/输入消息/), "接着前面的方向继续。");
