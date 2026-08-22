@@ -41,7 +41,7 @@ class PersistentHermesRunAdvisor:
         policy = await self._main_agent_hermes_policy(tenant_id)
         if policy in {"off", "observe"}:
             return None
-        lessons = await self._lessons(tenant_id)
+        lessons = [lesson for lesson in await self._lessons(tenant_id) if _lesson_is_conversation_advice(lesson)]
         if not lessons:
             return None
 
@@ -186,6 +186,11 @@ class PersistentHermesRunAdvisor:
         )
         async with self._session_factory() as session, session.begin():
             await session.execute(statement)
+
+
+def _lesson_is_conversation_advice(lesson: dict[str, object]) -> bool:
+    category = lesson.get("category")
+    return category in {None, "conversation"}
 
 
 def _lesson_matches(lowered_message: str, lesson: dict[str, object], workflow_id: str | None) -> bool:
