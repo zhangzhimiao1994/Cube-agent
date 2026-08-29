@@ -671,8 +671,8 @@ class RunService:
                             routing_decision=routing_payload,
                         ),
                         enqueue=True,
-                )
-                return _submitted(record)
+                    )
+                    return _submitted(record)
 
             if _auto_resolvable_route_decision(decision):
                 assert decision is not None
@@ -748,7 +748,12 @@ class RunService:
                         mode=local_mode,
                         status=RunStatus.QUEUED,
                         idempotency_key=idempotency_key,
-                        routing_decision=routing_payload,
+                        routing_decision=self._with_harness_decision(
+                            tenant_id=tenant_id,
+                            message=message,
+                            mode=local_mode,
+                            routing_decision=routing_payload,
+                        ),
                         enqueue=True,
                     )
                     return _submitted(record)

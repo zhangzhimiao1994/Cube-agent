@@ -267,6 +267,47 @@ async def test_auto_local_resolution_stamps_harness_decision_after_mode_selectio
     }
 
 
+async def test_auto_direct_fallback_after_hermes_check_stamps_harness_decision() -> None:
+    repository = RecordingRepository()
+    scheduler = RecordingHarnessScheduler()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=RecordingQueue(),
+        harness_scheduler=scheduler,
+    )
+
+    submitted = await service.submit(
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        message="普通问题",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-auto-direct",
+        idempotency_key="idem-harness-auto-direct",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DIRECT
+    assert len(scheduler.calls) == 1
+    assert scheduler.calls[0]["mode"] is TaskMode.DIRECT
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["main_agent_selected_mode"] == "direct"
+    assert routing["harness_decision"] == {
+        "tenant_id": str(TENANT_ID),
+        "mode": "direct",
+        "selected_provider": "deepseek",
+        "selected_model": "deepseek-chat",
+        "selected_logical_model": "main",
+        "requires_approval": False,
+        "capability_reasons": ["supports_streamed_tool_call_delta"],
+        "policy_reasons": ["provider_allowed:deepseek"],
+        "context_reasons": ["hermes_context_match"],
+        "fallbacks_considered": ["openai"],
+    }
+
+
 async def test_submit_without_harness_scheduler_preserves_existing_payload_shape() -> None:
     repository = RecordingRepository()
     service = RunService(
