@@ -59,6 +59,97 @@ sudo env AGENT_HUB_PUBLIC_URL=https://agent.example.com \
 
 After installation, the script prints a management URL ending in `/setup` and a one-time setup code. Create the first super admin there.
 
+## Offline Docker Initial Deployment Package
+
+If the target machine cannot reach the public internet but can run Docker, build and export the images on an online machine first. This package starts a new empty system. It does not include the current production database, users, model configuration, Hermes+ memories, attachments, or secrets.
+
+### 1. Prepare configuration on the online build machine
+
+```bash
+cd CubeAgent
+cp deploy/compose/.env.example deploy/compose/.env
+```
+
+Edit `deploy/compose/.env` and replace at least these placeholder values:
+
+- `AGENT_HUB_MASTER_KEY`
+- `AGENT_HUB_JWT_SIGNING_KEY`
+- `POSTGRES_PASSWORD`
+- `LITELLM_MASTER_KEY`
+- `AGENT_HUB_SETUP_CODE`
+
+You can generate random values with:
+
+```bash
+openssl rand -base64 32
+openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
+```
+
+`deploy/compose/litellm.yaml` starts with an empty model list:
+
+```yaml
+model_list: []
+litellm_settings:
+  drop_params: true
+  request_timeout: 600
+```
+
+For model calls in an offline environment, configure a local model service, an internal OpenAI-compatible relay, or another reachable provider from the Web console. A disconnected machine does not automatically have external model access.
+
+### 2. Build and pull all required images
+
+```bash
+docker compose -f deploy/compose/docker-compose.yml --env-file deploy/compose/.env build
+docker compose -f deploy/compose/docker-compose.yml --env-file deploy/compose/.env pull postgres redis caddy litellm
+```
+
+The offline image set must include:
+
+- `agent-hub:latest`
+- `postgres:16-alpine`
+- `redis:7-alpine`
+- `caddy:2-alpine`
+- `ghcr.io/berriai/litellm:main-stable`
+
+### 3. Export the images and compose configuration
+
+```bash
+docker save \
+  agent-hub:latest \
+  postgres:16-alpine \
+  redis:7-alpine \
+  caddy:2-alpine \
+  ghcr.io/berriai/litellm:main-stable \
+  -o mofang-agent-offline-images.tar
+
+tar -czf mofang-agent-offline-compose.tgz \
+  deploy/compose/docker-compose.yml \
+  deploy/compose/Caddyfile \
+  deploy/compose/healthcheck.sh \
+  deploy/compose/litellm.yaml \
+  deploy/compose/.env
+```
+
+`mofang-agent-offline-compose.tgz` contains `.env`; treat it as a secret file. Do not commit it to Git or send it to untrusted locations.
+
+### 4. Import and start on the offline target machine
+
+```bash
+mkdir -p /opt/mofang-agent
+cd /opt/mofang-agent
+
+docker load -i /path/to/mofang-agent-offline-images.tar
+tar -xzf /path/to/mofang-agent-offline-compose.tgz --strip-components=2
+
+chmod 600 .env
+docker compose --env-file .env up -d
+docker compose --env-file .env ps
+```
+
+On first startup, the `migrate` service runs `alembic upgrade head` to create an empty database schema. The `bootstrap` service uses `AGENT_HUB_SETUP_CODE` from `.env` to prepare the first-admin setup flow. Open `AGENT_HUB_PUBLIC_URL/setup` and create the first super admin.
+
+If you only need an offline fresh install, you do not need to export production database dumps or Docker volumes.
+
 ## First Setup
 
 1. Sign in to the Web console.

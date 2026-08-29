@@ -59,6 +59,97 @@ sudo env AGENT_HUB_PUBLIC_URL=https://agent.example.com \
 
 安装完成后，脚本会输出管理地址 `/setup` 和一次性初始化码。进入 `/setup` 创建第一个超级管理员。
 
+## Docker 离线初始部署包
+
+如果目标机器不能访问公网，但可以运行 Docker，可以先在一台有网络的机器上构建并打包镜像。这个离线包用于启动一个全新的空系统；它不会包含当前服务器的历史数据库、用户、模型配置、Hermes+ 记忆、附件或密钥。
+
+### 1. 在有网络的构建机器准备配置
+
+```bash
+cd CubeAgent
+cp deploy/compose/.env.example deploy/compose/.env
+```
+
+编辑 `deploy/compose/.env`，至少替换这些占位值：
+
+- `AGENT_HUB_MASTER_KEY`
+- `AGENT_HUB_JWT_SIGNING_KEY`
+- `POSTGRES_PASSWORD`
+- `LITELLM_MASTER_KEY`
+- `AGENT_HUB_SETUP_CODE`
+
+可以用下面的命令生成随机值：
+
+```bash
+openssl rand -base64 32
+openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
+```
+
+`deploy/compose/litellm.yaml` 默认是空模型列表：
+
+```yaml
+model_list: []
+litellm_settings:
+  drop_params: true
+  request_timeout: 600
+```
+
+离线环境如果要调用模型，需要在 Web 控制台配置本地模型、内网中转站或可访问的供应商 API。断网环境不会自动拥有外部模型能力。
+
+### 2. 构建和拉取所有镜像
+
+```bash
+docker compose -f deploy/compose/docker-compose.yml --env-file deploy/compose/.env build
+docker compose -f deploy/compose/docker-compose.yml --env-file deploy/compose/.env pull postgres redis caddy litellm
+```
+
+需要离线带走的镜像包括：
+
+- `agent-hub:latest`
+- `postgres:16-alpine`
+- `redis:7-alpine`
+- `caddy:2-alpine`
+- `ghcr.io/berriai/litellm:main-stable`
+
+### 3. 导出离线镜像包和部署配置
+
+```bash
+docker save \
+  agent-hub:latest \
+  postgres:16-alpine \
+  redis:7-alpine \
+  caddy:2-alpine \
+  ghcr.io/berriai/litellm:main-stable \
+  -o mofang-agent-offline-images.tar
+
+tar -czf mofang-agent-offline-compose.tgz \
+  deploy/compose/docker-compose.yml \
+  deploy/compose/Caddyfile \
+  deploy/compose/healthcheck.sh \
+  deploy/compose/litellm.yaml \
+  deploy/compose/.env
+```
+
+`mofang-agent-offline-compose.tgz` 里包含 `.env`，应按密钥文件处理，不要提交到 Git，也不要发到不可信位置。
+
+### 4. 在离线目标机器导入并启动
+
+```bash
+mkdir -p /opt/mofang-agent
+cd /opt/mofang-agent
+
+docker load -i /path/to/mofang-agent-offline-images.tar
+tar -xzf /path/to/mofang-agent-offline-compose.tgz --strip-components=2
+
+chmod 600 .env
+docker compose --env-file .env up -d
+docker compose --env-file .env ps
+```
+
+第一次启动时，`migrate` 服务会执行 `alembic upgrade head` 创建空数据库结构，`bootstrap` 服务会用 `.env` 里的 `AGENT_HUB_SETUP_CODE` 准备初始化入口。进入 `AGENT_HUB_PUBLIC_URL/setup` 创建第一个超级管理员。
+
+如果你只想离线启动基础系统，不需要迁移线上状态，就不需要导出生产数据库或 Docker volumes。
+
 ## 首次配置顺序
 
 1. 登录 Web 控制台。
