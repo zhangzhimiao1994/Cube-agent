@@ -16,6 +16,13 @@ from uuid import UUID, uuid4
 from agent_hub.context.builder import ContextBuildInput, estimate_tokens
 from agent_hub.context.compaction import ContextCompactor
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.harness.scheduler import HarnessSchedulingError
+from agent_hub.harness.types import (
+    HarnessDecision,
+    HarnessPolicy,
+    HarnessTaskRequirements,
+    HermesContextHint,
+)
 from agent_hub.routing.types import RiskLevel, RouteAssessment, RouteDecision
 from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
 from agent_hub.runs.repository import RunAlreadyActive, RunRecord, RunRepository
@@ -80,6 +87,18 @@ class TerminalRunHook(Protocol):
         mode: TaskMode | None,
         routing_decision: dict[str, object],
     ) -> None: ...
+
+
+class HarnessSchedulerProtocol(Protocol):
+    def select(
+        self,
+        *,
+        tenant_id: UUID,
+        mode: TaskMode,
+        requirements: HarnessTaskRequirements,
+        policy: HarnessPolicy,
+        hermes_hint: HermesContextHint | None,
+    ) -> HarnessDecision: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,6 +309,7 @@ class RunService:
         main_agent_context_window_getter: Callable[[], Awaitable[int | None]] | None = None,
         terminal_run_hooks: tuple[TerminalRunHook, ...] = (),
         observer_policy: ObserverPolicy | None = None,
+        harness_scheduler: HarnessSchedulerProtocol | None = None,
     ) -> None:
         self._repository = repository
         self._runtime_registry = runtime_registry
@@ -306,6 +326,7 @@ class RunService:
         self._main_agent_context_window_getter = main_agent_context_window_getter
         self._terminal_run_hooks = terminal_run_hooks
         self._observer_policy = observer_policy or ObserverPolicy()
+        self._harness_scheduler = harness_scheduler
 
     async def submit(
         self,
@@ -408,7 +429,12 @@ class RunService:
                     mode=explicit_mode,
                     status=RunStatus.QUEUED,
                     idempotency_key=idempotency_key,
-                    routing_decision=routing_payload,
+                    routing_decision=self._with_harness_decision(
+                        tenant_id=tenant_id,
+                        message=message,
+                        mode=explicit_mode,
+                        routing_decision=routing_payload,
+                    ),
                     enqueue=True,
                 )
                 return _submitted(record)
@@ -432,7 +458,12 @@ class RunService:
                     mode=continuation_mode,
                     status=RunStatus.QUEUED,
                     idempotency_key=idempotency_key,
-                    routing_decision=routing_payload,
+                    routing_decision=self._with_harness_decision(
+                        tenant_id=tenant_id,
+                        message=message,
+                        mode=continuation_mode,
+                        routing_decision=routing_payload,
+                    ),
                     enqueue=True,
                 )
                 return _submitted(record)
@@ -484,7 +515,12 @@ class RunService:
                     mode=selected_mode,
                     status=RunStatus.QUEUED,
                     idempotency_key=idempotency_key,
-                    routing_decision=routing_payload,
+                    routing_decision=self._with_harness_decision(
+                        tenant_id=tenant_id,
+                        message=message,
+                        mode=selected_mode,
+                        routing_decision=routing_payload,
+                    ),
                     enqueue=True,
                 )
                 return _submitted(record)
@@ -524,7 +560,12 @@ class RunService:
                         mode=local_mode,
                         status=RunStatus.QUEUED,
                         idempotency_key=idempotency_key,
-                        routing_decision=routing_payload,
+                        routing_decision=self._with_harness_decision(
+                            tenant_id=tenant_id,
+                            message=message,
+                            mode=local_mode,
+                            routing_decision=routing_payload,
+                        ),
                         enqueue=True,
                     )
                     return _submitted(record)
@@ -570,7 +611,12 @@ class RunService:
                     mode=hermes_advice.recommended_mode,
                     status=RunStatus.QUEUED,
                     idempotency_key=idempotency_key,
-                    routing_decision=routing_payload,
+                    routing_decision=self._with_harness_decision(
+                        tenant_id=tenant_id,
+                        message=message,
+                        mode=hermes_advice.recommended_mode,
+                        routing_decision=routing_payload,
+                    ),
                     enqueue=True,
                 )
                 return _submitted(record)
@@ -613,7 +659,12 @@ class RunService:
                         mode=local_mode,
                         status=RunStatus.QUEUED,
                         idempotency_key=idempotency_key,
-                        routing_decision=routing_payload,
+                        routing_decision=self._with_harness_decision(
+                            tenant_id=tenant_id,
+                            message=message,
+                            mode=local_mode,
+                            routing_decision=routing_payload,
+                        ),
                         enqueue=True,
                     )
                     return _submitted(record)
@@ -661,7 +712,12 @@ class RunService:
                     mode=selected.mode,
                     status=RunStatus.QUEUED,
                     idempotency_key=idempotency_key,
-                    routing_decision=routing_payload,
+                    routing_decision=self._with_harness_decision(
+                        tenant_id=tenant_id,
+                        message=message,
+                        mode=selected.mode,
+                        routing_decision=routing_payload,
+                    ),
                     enqueue=True,
                 )
                 return _submitted(record)
@@ -751,10 +807,48 @@ class RunService:
             mode=mode,
             status=RunStatus.QUEUED,
             idempotency_key=idempotency_key,
-            routing_decision=operator_selection,
+            routing_decision=self._with_harness_decision(
+                tenant_id=tenant_id,
+                message=message,
+                mode=mode,
+                routing_decision=operator_selection,
+            ),
             enqueue=True,
         )
         return _submitted(record)
+
+    def _with_harness_decision(
+        self,
+        *,
+        tenant_id: UUID,
+        message: str,
+        mode: TaskMode,
+        routing_decision: dict[str, object],
+    ) -> dict[str, object]:
+        scheduler = self._harness_scheduler
+        if scheduler is None:
+            return routing_decision
+        if mode is TaskMode.AUTO:
+            return routing_decision
+        try:
+            decision = scheduler.select(
+                tenant_id=tenant_id,
+                mode=mode,
+                requirements=_harness_task_requirements(
+                    message=message,
+                    mode=mode,
+                    routing_decision=routing_decision,
+                ),
+                policy=HarnessPolicy(),
+                hermes_hint=_harness_context_hint(routing_decision),
+            )
+        except HarnessSchedulingError:
+            _LOGGER.warning("harness_scheduler_selection_failed tenant_id=%s", tenant_id)
+            return {**routing_decision, "harness_unavailable": "scheduling_failed"}
+        return {
+            **routing_decision,
+            "harness_decision": dict(decision.to_payload()),
+        }
 
     async def approve_temporary_agent(
         self,
@@ -1454,6 +1548,114 @@ def _submitted(record: RunRecord) -> SubmittedRun:
         if isinstance(openclaw_proposal, dict)
         else None,
     )
+
+
+def _harness_task_requirements(
+    *,
+    message: str,
+    mode: TaskMode,
+    routing_decision: Mapping[str, object],
+) -> HarnessTaskRequirements:
+    capabilities = {"text"}
+    needs_tool_calls = _message_suggests_tool_use(message) or mode in {
+        TaskMode.DISPATCH,
+        TaskMode.HYBRID,
+    }
+    if needs_tool_calls:
+        capabilities.add("tool_calling")
+    token_estimate = estimate_tokens(message)
+    return HarnessTaskRequirements(
+        required_capabilities=frozenset(capabilities),
+        required_logical_model=_string_or_none(routing_decision.get("direct_model")),
+        needs_reasoning=mode in {TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID},
+        needs_streamed_tool_calls=needs_tool_calls,
+        needs_parallel_tool_calls=mode in {TaskMode.DISPATCH, TaskMode.HYBRID},
+        needs_long_running=mode in {TaskMode.DISPATCH, TaskMode.HYBRID}
+        and _message_suggests_long_running(message),
+        requires_sandbox=_message_suggests_sandbox(message),
+        privacy_sensitive=_message_suggests_sensitive_context(message),
+        estimated_input_tokens=token_estimate,
+        prefers_prefix_cache=token_estimate >= 32_000 or _message_suggests_large_context(message),
+    )
+
+
+def _harness_context_hint(routing_decision: Mapping[str, object]) -> HermesContextHint | None:
+    conversation_id = _string_or_none(routing_decision.get("conversation_id"))
+    project_id = _string_or_none(routing_decision.get("project_id"))
+    if conversation_id is None and project_id is None:
+        return None
+    return HermesContextHint(project_id=project_id, conversation_id=conversation_id, confidence=0.75)
+
+
+def _message_suggests_tool_use(message: str) -> bool:
+    text = message.casefold()
+    markers = (
+        "工具",
+        "读取",
+        "读一下",
+        "打开",
+        "文件",
+        "部署",
+        "执行",
+        "运行",
+        "搜索",
+        "调用",
+        "tool",
+        "read",
+        "open",
+        "file",
+        "deploy",
+        "execute",
+        "run",
+        "search",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _message_suggests_long_running(message: str) -> bool:
+    text = message.casefold()
+    markers = (
+        "部署",
+        "端到端",
+        "完整",
+        "全量",
+        "长期",
+        "持续",
+        "deploy",
+        "end-to-end",
+        "full",
+        "long-running",
+        "continuous",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _message_suggests_sandbox(message: str) -> bool:
+    text = message.casefold()
+    markers = ("部署", "执行", "运行", "shell", "终端", "sandbox", "deploy", "execute", "run")
+    return any(marker in text for marker in markers)
+
+
+def _message_suggests_sensitive_context(message: str) -> bool:
+    text = message.casefold()
+    markers = (
+        "密钥",
+        "凭证",
+        "生产",
+        "服务器",
+        "secret",
+        "credential",
+        "token",
+        "production",
+        "server",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _message_suggests_large_context(message: str) -> bool:
+    text = message.casefold()
+    markers = ("大上下文", "长上下文", "全仓", "整个仓库", "large context", "long context")
+    return any(marker in text for marker in markers)
 
 
 _EVOLUTION_EXPLICIT_ACTION_RE = re.compile(

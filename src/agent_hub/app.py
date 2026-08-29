@@ -66,10 +66,12 @@ from agent_hub.channels.submitter import (
     RunServiceInboundSubmitter,
     RunSubmissionService,
 )
+from agent_hub.config.schema import PlatformConfig
 from agent_hub.config.service import ConfigService
 from agent_hub.db.models import TenantRow
 from agent_hub.db.session import build_database
 from agent_hub.domain.runs import TaskMode
+from agent_hub.harness.config import harness_scheduler_from_config
 from agent_hub.hermes import PersistentHermesRunAdvisor
 from agent_hub.models.capabilities import is_known_video_generation_model
 from agent_hub.models.capacity import CapacityPool, CredentialDescriptor, CredentialRegistry
@@ -99,7 +101,12 @@ from agent_hub.routing.types import (
     RouteSource,
 )
 from agent_hub.runs.repository import RunRepository
-from agent_hub.runs.service import ModeRouterProtocol, RunService, TaskQueue
+from agent_hub.runs.service import (
+    HarnessSchedulerProtocol,
+    ModeRouterProtocol,
+    RunService,
+    TaskQueue,
+)
 from agent_hub.runs.temporary_agents import AdminResourceTemporaryAgentPolicy
 from agent_hub.runtime.defaults import TenantSecretResolver, configured_runtime_registry
 from agent_hub.runtime.registry import RuntimeRegistry
@@ -131,6 +138,10 @@ class RedisResource(Protocol):
     async def aclose(self) -> None: ...
 
     def ping(self, **kwargs: Any) -> Any: ...
+
+
+class CurrentConfigService(Protocol):
+    async def get_current(self, tenant_id: UUID) -> object | None: ...
 
 
 RouterCapacityFactory = Callable[
@@ -283,6 +294,26 @@ class _MainAgentContextWindowGetter:
             config.model.provider,
             config.model.upstream_model,
         )
+
+
+async def _harness_scheduler_from_current_config(
+    config_service: CurrentConfigService,
+    tenant_id: UUID,
+) -> HarnessSchedulerProtocol | None:
+    try:
+        revision = await config_service.get_current(tenant_id)
+        if revision is None:
+            return None
+        document = getattr(revision, "document", None)
+        if not isinstance(document, Mapping):
+            return None
+        return harness_scheduler_from_config(PlatformConfig.model_validate(document))
+    except Exception as error:  # noqa: BLE001 - startup harness must degrade safely.
+        _LOGGER.warning(
+            "harness_scheduler_config_unavailable error_type=%s",
+            type(error).__name__,
+        )
+        return None
 
 
 class _ConfigBackedMultimediaGenerationExecutor:
@@ -785,11 +816,21 @@ def create_app(
                         redis_client=active_redis,
                     )
                 queue = task_queue if task_queue is not None else InProcessRunQueue()
+                active_harness_scheduler = await _harness_scheduler_from_current_config(
+                    cast(
+                        CurrentConfigService,
+                        config_service
+                        if config_service is not None
+                        else application.state.config_service,
+                    ),
+                    configured.bootstrap_tenant_id,
+                )
                 application.state.run_service = RunService(
                     RunRepository(active_sessions),
                     runtime_registry=active_runtime_registry,
                     router=active_mode_router,
                     task_queue=queue,
+                    harness_scheduler=active_harness_scheduler,
                     hermes_advisor=PersistentHermesRunAdvisor(active_sessions),
                     temporary_agent_policy=AdminResourceTemporaryAgentPolicy(active_sessions),
                     runtime_timeout_seconds=configured.runtime_timeout_seconds,

@@ -1,7 +1,7 @@
 import asyncio
 import base64
 import threading
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Self
@@ -30,6 +30,9 @@ from agent_hub.channels.feishu.media import FeishuMediaService
 from agent_hub.channels.feishu.media_factory import build_feishu_media_service_factory
 from agent_hub.channels.feishu.settings import FeishuSettings
 from agent_hub.channels.feishu.websocket import FeishuWebSocketClient
+from agent_hub.config.repository import ConfigRevision, ConfigStatus
+from agent_hub.domain.runs import TaskMode
+from agent_hub.harness.types import HarnessPolicy, HarnessTaskRequirements
 from agent_hub.models.capacity import CapacityLease
 from agent_hub.models.gateway import CapacityController
 from agent_hub.models.registry import NoCapableDeployment
@@ -38,6 +41,8 @@ from agent_hub.multimodal.generation import MultimediaGenerationKind
 from agent_hub.multimodal.minimax import MiniMaxGeneratedVideo
 from agent_hub.multimodal.video_providers import TextToVideoProviderRouter
 from agent_hub.routing.types import RiskLevel
+from agent_hub.runtime.contracts import RunEvent, RuntimeCheckpoint, TaskContext
+from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.settings import Settings
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
@@ -57,6 +62,46 @@ class StubRateLimiter:
 class StubConfigService:
     async def get_current(self, tenant_id: UUID) -> None:
         assert tenant_id == TENANT_ID
+
+
+class PublishedConfigService:
+    def __init__(self, document: dict[str, object]) -> None:
+        self.document = document
+
+    async def get_current(self, tenant_id: UUID) -> ConfigRevision | None:
+        assert tenant_id == TENANT_ID
+        return ConfigRevision(
+            id=uuid4(),
+            tenant_id=tenant_id,
+            version=1,
+            status=ConfigStatus.PUBLISHED,
+            document=self.document,
+            created_by=tenant_id,
+            created_at=datetime.now(UTC),
+        )
+
+
+class NoopDirectRuntime:
+    mode = TaskMode.DIRECT
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        del context
+        if False:
+            yield RunEvent(
+                kind="runtime.completed",
+                sequence=1,
+                run_id=TENANT_ID,
+                payload={},
+            )
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        del checkpoint
+
+    async def cancel(self) -> None:
+        return None
 
 
 class FakeSession:
@@ -344,6 +389,61 @@ def test_create_app_wires_production_multimedia_generation_executor(tmp_path: Pa
         executor = getattr(application.state, "multimedia_generation_executor", None)
 
     assert isinstance(executor, _ConfigBackedMultimediaGenerationExecutor)
+
+
+def test_create_app_wires_harness_scheduler_from_published_config(tmp_path: Path) -> None:
+    config_service = PublishedConfigService(
+        {
+            "models": {
+                "main": {
+                    "deployments": [
+                        {
+                            "provider": "deepseek",
+                            "model": "deepseek-chat",
+                            "credential_ref": "secret://deepseek",
+                            "quota_scope_id": "deepseek-account",
+                            "max_concurrency": 4,
+                            "capabilities": ["text", "tool_calling"],
+                        }
+                    ]
+                }
+            },
+            "agents": [
+                {
+                    "id": "main-agent",
+                    "role": "Main Agent",
+                    "prompt": "Help with coding work.",
+                    "model": "main",
+                }
+            ],
+        }
+    )
+    application = create_app(
+        settings=valid_settings(tmp_path),
+        database=FakeDatabase(),
+        redis_client=FakeRedis(),
+        auth_service=StubAuthService(),
+        rate_limiter=StubRateLimiter(),
+        config_service=config_service,
+        admin_resource_service=InMemoryAdminResourceService(),
+        user_admin_service=object(),
+        runtime_registry=RuntimeRegistry((NoopDirectRuntime(),)),
+    )
+
+    with TestClient(application):
+        service = application.state.run_service
+        scheduler = service._harness_scheduler
+
+    assert scheduler is not None
+    assert scheduler.select(
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DIRECT,
+        requirements=HarnessTaskRequirements(
+            required_capabilities=frozenset({"text", "tool_calling"})
+        ),
+        policy=HarnessPolicy(),
+        hermes_hint=None,
+    ).selected_provider == "deepseek"
 
 
 def test_feishu_media_factory_uses_memory_store_in_development(tmp_path: Path) -> None:
