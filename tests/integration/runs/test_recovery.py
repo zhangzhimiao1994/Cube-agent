@@ -130,7 +130,7 @@ class UserChoiceRouter:
             decision_token="safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
             version=1,
             risk=RiskLevel.LOW,
-            requires_approval=True,
+            requires_approval=False,
             permissions_still_apply=True,
         )
 
