@@ -372,16 +372,45 @@ Run focused gateway/harness tests first, then broaden to backend static gates be
 
 Observed: added `ModelGateway.stream_openai_compatible_events(...)` with scoped capacity, secret resolution, heartbeat, provider fallback before the first emitted event only, deterministic stream cleanup, outcome recording, and lease release. Focused verification passed: `pytest tests\unit\models\test_gateway.py tests\unit\harness\test_streaming.py -q` -> 66 passed; scoped `ruff` passed; scoped `mypy --strict` passed.
 
-### Task 11: Harness Tool Execution Boundary Recon
+### Task 11: Harness Tool Execution Boundary In Runtime Loop
 
 **Files:**
-- Inspect: existing capability/runtime/tool execution modules
-- Modify later only after a TDD plan is written
+- `src/agent_hub/runtime/crew/adapter.py`
+- `src/agent_hub/harness/tool_gateway.py`
+- `tests/unit/runtime/crew/test_adapter_failure_reason.py`
+- `tests/unit/harness/test_tool_gateway.py`
+- `tests/integration/runtime/test_crew_adapter.py`
 
-- [ ] **Step 1: Identify existing approval/sandbox/tool execution surfaces**
+- [x] **Step 1: Identify existing approval/sandbox/tool execution surfaces**
 
 Map where `HarnessToolCallRequest` and `HarnessToolCallResult` should connect without bypassing existing capability approvals.
 
-- [ ] **Step 2: Produce a test-first implementation plan**
+- [x] **Step 2: Write failing runtime envelope tests**
 
 Define the next minimal tool-boundary behavior that can be deployed and server-probed.
+
+- [x] **Step 3: Implement runtime harness tool invocation**
+
+Route CrewDispatchRuntime model tool calls through `HarnessToolCallRequest` and a `HarnessToolGateway` wrapper while preserving step allowlists, idempotency keys, checkpoint tool ledger coordinates, replay-safe checks, and artifact provenance.
+
+- [x] **Step 4: Preserve deterministic failed vs uncertain outcomes**
+
+Record explicit harness `failed` results as deterministic tool failures instead of replay-blocking `uncertain`; keep cancellation and backend/serialization uncertainty fail-closed as `CapabilityOutcomeUncertain`.
+
+- [x] **Step 5: Verify locally**
+
+Observed: focused Crew/harness unit tests passed (`75 passed`); broad backend non-DB gate passed (`1613 passed, 13 skipped, 2 warnings`); `ruff check .`, `mypy --strict src tests`, and `git diff --check` passed. Integration `tests/integration/runtime/test_crew_adapter.py` still requires the local PostgreSQL fixture at `127.0.0.1:54329` and was not used as the local gate for this slice.
+
+### Task 12: Trusted Tool Policy Identity Wiring
+
+**Files:**
+- Inspect: `src/agent_hub/runs/service.py`, runtime registry construction, worker/app composition, capability policy gateway
+- Modify later with RED tests first
+
+- [ ] **Step 1: Add a trusted runtime identity source**
+
+Carry submitter `user_id` and a trustworthy role/policy context into runtime execution without relying on untrusted model or routing payloads.
+
+- [ ] **Step 2: Wire policy-backed HarnessToolGateway in production composition**
+
+Create and inject `HarnessToolGateway(RuntimeCapabilityGateway, policy_gateway=...)` once runtime identity is available; verify approval/deny never calls the backend and allowed execution preserves idempotency.

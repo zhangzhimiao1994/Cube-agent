@@ -14,7 +14,9 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from agent_hub.auth.models import Role
 from agent_hub.domain.runs import TaskMode
+from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.capacity import CapacityLease
 from agent_hub.models.gateway import DeploymentPricing, GatewayCompletion
 from agent_hub.models.gateway import ModelGateway as LeasedModelGateway
@@ -344,6 +346,7 @@ def make_runtime(
     dispatch_plan: DispatchPlan | None = None,
     *,
     capability_gateway: CapabilityGateway | None = None,
+    harness_tool_gateway: object | None = None,
     crew_factory: CrewObjectFactory | None = None,
     artifact_repository: ArtifactRepository | None = None,
 ) -> CrewDispatchRuntime:
@@ -351,6 +354,8 @@ def make_runtime(
         "capability_gateway": capability_gateway,
         "crew_factory": crew_factory or FastFactory(),
     }
+    if harness_tool_gateway is not None:
+        kwargs["harness_tool_gateway"] = harness_tool_gateway
     if artifact_repository is not None:
         kwargs["artifact_repository"] = artifact_repository
     return CrewDispatchRuntime(gateway, dispatch_plan or plan(), **kwargs)  # type: ignore[arg-type]
@@ -1557,6 +1562,91 @@ async def test_tool_calls_only_cross_the_capability_gateway() -> None:
         index for index, event in enumerate(events) if event.kind is EventKind.TOOL_COMPLETED
     )
     assert events[tool_completed_index + 1].kind is EventKind.CHECKPOINT_SAVED
+
+
+async def test_tool_calls_cross_the_harness_tool_gateway_envelope() -> None:
+    class RecordingHarnessToolGateway:
+        def __init__(self) -> None:
+            self.calls: list[tuple[UUID, HarnessToolCallRequest]] = []
+
+        async def invoke(
+            self,
+            tenant_id: UUID,
+            request: HarnessToolCallRequest,
+            *,
+            user_id: UUID | None = None,
+            role: Role | None = None,
+        ) -> HarnessToolCallResult:
+            assert user_id is None
+            assert role is None
+            self.calls.append((tenant_id, request))
+            return HarnessToolCallResult(
+                call_id=request.call_id,
+                tool_name=request.tool_name,
+                status="succeeded",
+                payload={"items": ("harness result",)},
+            )
+
+    tool_plan = DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+                allowed_tools=("web.search",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                tools=("web.search",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=("web.search",),
+        total_token_budget=100,
+    )
+    capabilities = FakeCapabilities()
+    harness = RecordingHarnessToolGateway()
+    events = await collect(
+        make_runtime(
+            ToolGateway(),
+            tool_plan,
+            capability_gateway=capabilities,
+            harness_tool_gateway=harness,
+        ),
+        context(),
+    )
+
+    assert capabilities.calls == []
+    assert len(harness.calls) == 1
+    tenant_id, request = harness.calls[0]
+    assert tenant_id == TENANT_ID
+    assert request.run_id == RUN_ID
+    assert request.actor == "writer"
+    assert request.tool_name == "web.search"
+    assert request.arguments == {"q": "safe"}
+    assert request.approval_required is False
+    assert request.sandbox == "restricted"
+    assert request.call_id == f"call-{request.idempotency_key[:32]}"
+    checkpoint = next(
+        event.checkpoint for event in reversed(events) if event.checkpoint is not None
+    )
+    tool_states = cast(Mapping[str, Mapping[str, object]], checkpoint.state["tools"])
+    assert set(tool_states) == {request.idempotency_key}
+    tool_artifact = next(
+        event.artifact
+        for event in events
+        if event.artifact and event.artifact.type == "tool_result"
+    )
+    assert tool_artifact is not None
+    result = tool_artifact.content["result"]
+    assert isinstance(result, Mapping)
+    assert result["items"] == ("harness result",)
 
 
 async def test_succeeded_tool_is_preserved_when_following_model_is_uncertain() -> None:

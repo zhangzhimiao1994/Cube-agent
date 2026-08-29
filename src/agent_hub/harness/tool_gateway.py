@@ -39,9 +39,11 @@ class HarnessToolGateway:
         backend: RuntimeToolBackend,
         *,
         policy_gateway: HarnessCapabilityPolicyGateway | None = None,
+        raise_backend_errors: bool = False,
     ) -> None:
         self._backend = backend
         self._policy_gateway = policy_gateway
+        self._raise_backend_errors = raise_backend_errors
 
     async def invoke(
         self,
@@ -74,10 +76,12 @@ class HarnessToolGateway:
                 arguments=request.arguments,
                 idempotency_key=request.idempotency_key,
             )
-        except Exception as error:  # noqa: BLE001 - keep provider/tool details out of events
+        except Exception as error:
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None
+            if self._raise_backend_errors:
+                raise
             return self._failure(request, "tool execution failed")
         return HarnessToolCallResult(
             call_id=request.call_id,
@@ -149,9 +153,9 @@ def _capability_request(
 
 
 def _capability_parts(request: HarnessToolCallRequest) -> tuple[str, str, str]:
-    if request.tool_name in {"calculator", "calculator_evaluate"}:
+    if request.tool_name in {"calculator", "calculator_evaluate", "calculator.evaluate"}:
         return "calculator", "evaluate", "calculator"
-    if request.tool_name == "workspace_read":
+    if request.tool_name in {"workspace_read", "workspace.read"}:
         path = request.arguments.get("path")
         return "file", "read", path if isinstance(path, str) else "workspace"
     if request.tool_name == "read_context":

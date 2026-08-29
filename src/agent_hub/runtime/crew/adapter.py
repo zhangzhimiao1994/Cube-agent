@@ -27,7 +27,10 @@ from pathlib import Path
 from typing import Any, Never, Protocol, cast
 from uuid import UUID, uuid4
 
+from agent_hub.auth.models import Role
 from agent_hub.domain.runs import TaskMode
+from agent_hub.harness import HarnessToolGateway
+from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import (
     ModelCapability,
@@ -262,6 +265,14 @@ def _tool_definitions(internal_names: tuple[str, ...]) -> tuple[ToolDefinition, 
     )
 
 
+def _tool_sandbox(name: str) -> str:
+    if name in {"read_context", "workspace_read", "workspace.read"}:
+        return "read_only"
+    if name in {"calculator", "calculator_evaluate", "calculator.evaluate"}:
+        return "none"
+    return "restricted"
+
+
 def _map_completion_tool_names(
     completion: GatewayCompletion,
     external_to_internal: Mapping[str, str],
@@ -407,6 +418,47 @@ class CapabilityGateway(Protocol):
     ) -> Mapping[str, JsonValue]: ...
 
     def is_replay_safe(self, name: str) -> bool: ...
+
+
+class HarnessToolInvoker(Protocol):
+    async def invoke(
+        self,
+        tenant_id: UUID,
+        request: HarnessToolCallRequest,
+        *,
+        user_id: UUID | None = None,
+        role: Role | None = None,
+    ) -> HarnessToolCallResult: ...
+
+
+class _CapabilityHarnessBackend:
+    def __init__(self, gateway: CapabilityGateway) -> None:
+        self._gateway = gateway
+
+    def is_available(self, tenant_id: UUID, name: str) -> bool:
+        available = getattr(self._gateway, "is_available", None)
+        if callable(available):
+            return bool(available(tenant_id, name))
+        return True
+
+    async def execute(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        return await self._gateway.execute(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            actor=actor,
+            name=name,
+            arguments=arguments,
+            idempotency_key=idempotency_key,
+        )
 
 
 class CapabilityOutcomeUncertain(RuntimeExecutionError):
@@ -831,12 +883,19 @@ class CrewDispatchRuntime:
         plan: DispatchPlan,
         *,
         capability_gateway: CapabilityGateway | None = None,
+        harness_tool_gateway: HarnessToolInvoker | None = None,
         crew_factory: CrewObjectFactory | None = None,
         artifact_repository: ArtifactRepository | None = None,
     ) -> None:
         self._gateway = gateway
         self._plan = plan
         self._capabilities = capability_gateway
+        self._tool_gateway = harness_tool_gateway
+        if self._tool_gateway is None and capability_gateway is not None:
+            self._tool_gateway = HarnessToolGateway(
+                _CapabilityHarnessBackend(capability_gateway),
+                raise_backend_errors=True,
+            )
         self._factory = crew_factory or CrewAIObjectFactory(
             storage_dir=self._default_crewai_storage_dir()
         )
@@ -2063,7 +2122,7 @@ class CrewDispatchRuntime:
             assert response is not None
             if not response.tool_calls:
                 return completion
-            if self._capabilities is None or not step.tools:
+            if self._capabilities is None or self._tool_gateway is None or not step.tools:
                 _fail("step requested an unavailable capability")
             if _round == _MAX_TOOL_ROUNDS:
                 _fail("step capability round limit exceeded")
@@ -2151,24 +2210,73 @@ class CrewDispatchRuntime:
                 tool_running["status"] = "running"
                 await tool_boundary(idempotency_key, tool_running, None)
                 try:
+                    tool_request = HarnessToolCallRequest(
+                        run_id=context.run_id,
+                        actor=step.agent,
+                        tool_name=tool_call.name,
+                        arguments=tool_call.arguments,
+                        approval_required=False,
+                        sandbox=_tool_sandbox(tool_call.name),
+                        idempotency_key=idempotency_key,
+                        call_id=call_id,
+                    )
+                except (TypeError, ValueError):
+                    await emit(
+                        kind=EventKind.TOOL_FAILED,
+                        actor=step.agent,
+                        tool_call_id=call_id,
+                        tool_name=tool_call.name,
+                        reason="capability execution failed",
+                    )
+                    failed = dict(tool_running)
+                    failed["status"] = "failed"
+                    await tool_boundary(idempotency_key, failed, None)
+                    raise RuntimeExecutionError("capability execution failed") from None
+                try:
                     async with asyncio.timeout(self._remaining_timeout(run_state, step_deadline)):
-                        result = await self._capabilities.execute(
-                            tenant_id=context.tenant_id,
-                            run_id=context.run_id,
-                            actor=step.agent,
-                            name=tool_call.name,
-                            arguments=tool_call.arguments,
-                            idempotency_key=idempotency_key,
+                        tool_result = await self._tool_gateway.invoke(
+                            context.tenant_id,
+                            tool_request,
                         )
-                    encoded = json.dumps(result, ensure_ascii=False, allow_nan=False)
-                    if len(encoded.encode("utf-8")) > _MAX_OUTPUT_BYTES:
-                        _fail("capability result exceeds limit")
                 except asyncio.CancelledError:
                     if not replay_safe:
                         uncertain = dict(tool_running)
                         uncertain["status"] = "uncertain"
                         await asyncio.shield(tool_boundary(idempotency_key, uncertain, None))
                     raise
+                except Exception as error:  # noqa: BLE001
+                    error.__traceback__ = None
+                    del error
+                    await emit(
+                        kind=EventKind.TOOL_FAILED,
+                        actor=step.agent,
+                        tool_call_id=call_id,
+                        tool_name=tool_call.name,
+                        reason="capability execution failed",
+                    )
+                    uncertain = dict(tool_running)
+                    uncertain["status"] = "uncertain"
+                    await tool_boundary(idempotency_key, uncertain, None)
+                    raise CapabilityOutcomeUncertain(
+                        "capability outcome requires confirmation"
+                    ) from None
+                if tool_result.status != "succeeded":
+                    await emit(
+                        kind=EventKind.TOOL_FAILED,
+                        actor=step.agent,
+                        tool_call_id=call_id,
+                        tool_name=tool_call.name,
+                        reason=tool_result.failure_reason or "capability execution failed",
+                    )
+                    failed = dict(tool_running)
+                    failed["status"] = "failed"
+                    await tool_boundary(idempotency_key, failed, None)
+                    raise RuntimeExecutionError("capability execution failed") from None
+                try:
+                    result = cast(Mapping[str, JsonValue], _mutable_json(tool_result.payload))
+                    encoded = json.dumps(result, ensure_ascii=False, allow_nan=False)
+                    if len(encoded.encode("utf-8")) > _MAX_OUTPUT_BYTES:
+                        _fail("capability result exceeds limit")
                 except Exception as error:  # noqa: BLE001
                     error.__traceback__ = None
                     del error
@@ -3183,7 +3291,7 @@ class CrewDispatchRuntime:
             arguments_sha256 = value["arguments_sha256"]
             trigger_model_artifact_id = value["trigger_model_artifact_id"]
             if (
-                status not in {"prepared", "running", "succeeded", "uncertain"}
+                status not in {"prepared", "running", "succeeded", "failed", "uncertain"}
                 or type(tool_step_id) is not str
                 or tool_step_id not in steps
                 or type(attempt) is not int

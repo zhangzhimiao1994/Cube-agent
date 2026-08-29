@@ -109,6 +109,18 @@ def read_context_file_request() -> HarnessToolCallRequest:
     )
 
 
+def workspace_dot_file_request() -> HarnessToolCallRequest:
+    return HarnessToolCallRequest(
+        run_id=RUN_ID,
+        actor="main_agent",
+        tool_name="workspace.read",
+        arguments={"path": "workspace/docs/a.md"},
+        approval_required=False,
+        sandbox="read_only",
+        idempotency_key="workspace_dot_1",
+    )
+
+
 async def test_harness_tool_gateway_executes_approved_available_tools() -> None:
     runtime = FakeRuntimeCapabilityGateway()
     gateway = HarnessToolGateway(runtime)
@@ -172,6 +184,26 @@ async def test_harness_tool_gateway_maps_read_context_path_to_file_read_policy()
     result = await gateway.invoke(
         TENANT_ID,
         read_context_file_request(),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    capability_request = policy.requests[0][0]
+    assert capability_request.capability == "file"
+    assert capability_request.operation == "read"
+    assert capability_request.resource == "workspace/docs/a.md"
+    assert runtime.calls == []
+
+
+async def test_harness_tool_gateway_maps_workspace_dot_name_to_file_read_policy() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    policy = FakePolicyGateway(CapabilityStatus.DENIED, reason="capability denied")
+    gateway = HarnessToolGateway(runtime, policy_gateway=policy)
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        workspace_dot_file_request(),
         user_id=USER_ID,
         role=Role.OPERATOR,
     )
@@ -273,3 +305,15 @@ async def test_harness_tool_gateway_redacts_backend_failures() -> None:
     assert result.status == "failed"
     assert result.failure_reason == "tool execution failed"
     assert "raw provider" not in repr(result)
+
+
+async def test_harness_tool_gateway_can_preserve_backend_uncertainty_for_runtime() -> None:
+    runtime = FakeRuntimeCapabilityGateway(fail=True)
+    gateway = HarnessToolGateway(runtime, raise_backend_errors=True)
+
+    try:
+        await gateway.invoke(TENANT_ID, request())
+    except RuntimeError as error:
+        assert "raw provider" in str(error)
+    else:
+        raise AssertionError("backend uncertainty should be re-raised for runtime ledgers")

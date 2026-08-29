@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
 
+from agent_hub.auth.models import Role
 from agent_hub.domain.runs import TaskMode
+from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
-from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent, TaskContext
+from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, RunEvent, TaskContext
 from agent_hub.runtime.crew.adapter import (
+    CapabilityOutcomeUncertain,
     CrewAgentDefinition,
     CrewDispatchRuntime,
     CrewLLMBridge,
@@ -18,6 +22,7 @@ from agent_hub.runtime.crew.adapter import (
     RuntimeExecutionError,
     _artifact_final_synthesis_payload,
     _artifact_prompt_payload,
+    _tool_sandbox,
 )
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 
@@ -32,8 +37,122 @@ class UnusedGateway:
             deployment_id="primary",
             logical_model=request.logical_model,
             provider_id="deepseek",
-            provider_model="deepseek-v4-flash",
+            provider_model="deepseek/deepseek-v4-flash",
             cost_usd=Decimal(0),
+        )
+
+
+class ToolGateway:
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        response = (
+            ModelResponse(
+                text=None,
+                tool_calls=(
+                    ToolCall(id="provider-call", name="web_search", arguments={"q": "safe"}),
+                ),
+                usage=TokenUsage(1, 1, 2),
+            )
+            if len(self.requests) == 1
+            else ModelResponse(text="tool-grounded answer", usage=TokenUsage(1, 1, 2))
+        )
+        return GatewayCompletion(
+            response=response,
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
+class FakeCapabilities:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    async def execute(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        del tenant_id, run_id, arguments, idempotency_key
+        self.calls.append((actor, name))
+        return {"items": ("legacy result",)}
+
+    def is_replay_safe(self, name: str) -> bool:
+        return name == "web.search"
+
+
+class RaisingCapabilities(FakeCapabilities):
+    async def execute(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        del tenant_id, run_id, actor, name, arguments, idempotency_key
+        raise RuntimeError("commit status unavailable")
+
+    def is_replay_safe(self, name: str) -> bool:
+        del name
+        return False
+
+
+class RecordingHarnessToolGateway:
+    def __init__(self) -> None:
+        self.calls: list[tuple[UUID, HarnessToolCallRequest]] = []
+
+    async def invoke(
+        self,
+        tenant_id: UUID,
+        request: HarnessToolCallRequest,
+        *,
+        user_id: UUID | None = None,
+        role: Role | None = None,
+    ) -> HarnessToolCallResult:
+        assert user_id is None
+        assert role is None
+        self.calls.append((tenant_id, request))
+        return HarnessToolCallResult(
+            call_id=request.call_id,
+            tool_name=request.tool_name,
+            status="succeeded",
+            payload={"items": ("harness result",)},
+        )
+
+
+class FailingHarnessToolGateway:
+    def __init__(self) -> None:
+        self.calls: list[HarnessToolCallRequest] = []
+
+    async def invoke(
+        self,
+        tenant_id: UUID,
+        request: HarnessToolCallRequest,
+        *,
+        user_id: UUID | None = None,
+        role: Role | None = None,
+    ) -> HarnessToolCallResult:
+        del tenant_id, user_id, role
+        self.calls.append(request)
+        return HarnessToolCallResult(
+            call_id=request.call_id,
+            tool_name=request.tool_name,
+            status="failed",
+            payload={},
+            failure_reason="tool unavailable",
         )
 
 
@@ -91,6 +210,33 @@ class TimeoutFactory(CrewObjectFactory):
         return TimeoutGeneration()
 
 
+class FastGeneration:
+    async def execute(
+        self,
+        step_id: str,
+        prompt: str,
+        bridge: CrewLLMBridge,
+        *,
+        agent_id: str | None = None,
+        storage_scope: tuple[UUID, UUID],
+    ) -> str:
+        del step_id, agent_id, storage_scope
+        return await bridge.complete([{"role": "system", "content": prompt}])
+
+
+class FastFactory(CrewObjectFactory):
+    def build(
+        self,
+        agents: tuple[CrewAgentDefinition, ...],
+        tasks: tuple[CrewTaskDefinition, ...],
+        *,
+        share_crew: bool,
+        telemetry_disabled: bool,
+    ) -> FastGeneration:
+        del agents, tasks, share_crew, telemetry_disabled
+        return FastGeneration()
+
+
 def _one_step_plan() -> DispatchPlan:
     return DispatchPlan(
         agents=(
@@ -105,6 +251,32 @@ def _one_step_plan() -> DispatchPlan:
                 token_budget=100,
             ),
         ),
+        total_token_budget=100,
+    )
+
+
+def _tool_plan() -> DispatchPlan:
+    return DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+                allowed_tools=("web.search",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                tools=("web.search",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=("web.search",),
         total_token_budget=100,
     )
 
@@ -154,6 +326,109 @@ def test_text_only_empty_model_response_still_fails() -> None:
 
 async def _collect(runtime: CrewDispatchRuntime) -> list[RunEvent]:
     return [event async for event in runtime.run(_context())]
+
+
+async def test_tool_calls_cross_the_harness_tool_gateway_envelope() -> None:
+    capabilities = FakeCapabilities()
+    harness = RecordingHarnessToolGateway()
+    runtime = CrewDispatchRuntime(
+        ToolGateway(),
+        _tool_plan(),
+        capability_gateway=capabilities,
+        harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+
+    events = await _collect(runtime)
+
+    assert capabilities.calls == []
+    assert len(harness.calls) == 1
+    tenant_id, request = harness.calls[0]
+    assert tenant_id == TENANT_ID
+    assert request.run_id == RUN_ID
+    assert request.actor == "writer"
+    assert request.tool_name == "web.search"
+    assert request.arguments == {"q": "safe"}
+    assert request.approval_required is False
+    assert request.sandbox == "restricted"
+    assert request.call_id == f"call-{request.idempotency_key[:32]}"
+    tool_artifact = next(
+        event.artifact for event in events if event.artifact and event.artifact.type == "tool_result"
+    )
+    result = tool_artifact.content["result"]
+    assert isinstance(result, Mapping)
+    assert result["items"] == ("harness result",)
+
+
+async def test_failed_harness_tool_result_records_failed_not_uncertain() -> None:
+    capabilities = FakeCapabilities()
+    harness = FailingHarnessToolGateway()
+    runtime = CrewDispatchRuntime(
+        ToolGateway(),
+        _tool_plan(),
+        capability_gateway=capabilities,
+        harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+    events: list[RunEvent] = []
+
+    with pytest.raises(RuntimeExecutionError, match="capability execution failed"):
+        async for event in runtime.run(_context()):
+            events.append(event)
+
+    assert capabilities.calls == []
+    assert len(harness.calls) == 1
+    assert [event.reason for event in events if event.kind is EventKind.TOOL_FAILED] == [
+        "tool unavailable"
+    ]
+    checkpoint = await runtime.save_checkpoint()
+    tool_states = checkpoint.state["tools"]
+    assert isinstance(tool_states, Mapping)
+    state = next(iter(tool_states.values()))
+    assert isinstance(state, Mapping)
+    assert state["status"] == "failed"
+    assert state["artifact_id"] is None
+    assert state["sha256"] is None
+    resumed = CrewDispatchRuntime(
+        ToolGateway(),
+        _tool_plan(),
+        capability_gateway=capabilities,
+        harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+    await resumed.restore_checkpoint(checkpoint)
+
+
+async def test_default_harness_wrapper_preserves_backend_uncertainty() -> None:
+    runtime = CrewDispatchRuntime(
+        ToolGateway(),
+        _tool_plan(),
+        capability_gateway=RaisingCapabilities(),
+        crew_factory=FastFactory(),
+    )
+    events: list[RunEvent] = []
+
+    with pytest.raises(CapabilityOutcomeUncertain):
+        async for event in runtime.run(_context()):
+            events.append(event)
+
+    assert [event.reason for event in events if event.kind is EventKind.TOOL_FAILED] == [
+        "capability execution failed"
+    ]
+    checkpoint = await runtime.save_checkpoint()
+    tool_states = checkpoint.state["tools"]
+    assert isinstance(tool_states, Mapping)
+    state = next(iter(tool_states.values()))
+    assert isinstance(state, Mapping)
+    assert state["status"] == "uncertain"
+
+
+def test_tool_sandbox_accepts_dot_and_underscore_builtin_names() -> None:
+    assert _tool_sandbox("workspace.read") == "read_only"
+    assert _tool_sandbox("workspace_read") == "read_only"
+    assert _tool_sandbox("calculator.evaluate") == "none"
+    assert _tool_sandbox("calculator_evaluate") == "none"
+    assert _tool_sandbox("web.search") == "restricted"
 
 
 async def test_dispatch_framework_failure_records_safe_root_cause() -> None:
