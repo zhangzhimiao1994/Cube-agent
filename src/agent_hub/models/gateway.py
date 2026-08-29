@@ -288,17 +288,29 @@ class ModelGateway:
         if type(estimated_tokens) is not int or estimated_tokens <= 0:
             raise ValueError("token estimator must return a strict positive integer")
         models = self._fallback_chain(request.logical_model, request.allow_fallback)
-        last_retryable_error: BaseException | None = None
+        candidate_groups: list[tuple[str, tuple[Deployment, ...]]] = []
         for logical_model in models:
             try:
-                candidates = self._registry.candidates(logical_model, request.required_capabilities)
+                candidates = self._registry.candidates(
+                    logical_model, request.required_capabilities
+                )
             except NoCapableDeployment:
                 if logical_model == request.logical_model:
                     raise
                 break
+            candidate_groups.append((logical_model, candidates))
+        relevant_deployments = tuple(
+            deployment
+            for _logical_model, candidates in candidate_groups
+            for deployment in candidates
+        )
+        scoped = getattr(self._capacity, "scoped", None)
+        capacity = self._capacity if scoped is None else scoped(relevant_deployments)
+        last_retryable_error: BaseException | None = None
+        for _logical_model, candidates in candidate_groups:
             try:
-                await self._capacity.initialize()
-                lease = await self._capacity.acquire(
+                await capacity.initialize()
+                lease = await capacity.acquire(
                     candidates,
                     self._capacity_wait_timeout,
                     estimated_tokens=estimated_tokens,
@@ -307,14 +319,14 @@ class ModelGateway:
                 continue
             selected = next((item for item in candidates if item.id == lease.deployment_id), None)
             if selected is None or selected.quota_scope_id != lease.quota_scope_id:
-                cleanup_error = await self._release_cleanup(lease)
+                cleanup_error = await self._release_cleanup(capacity, lease)
                 if isinstance(cleanup_error, asyncio.CancelledError):
                     raise cleanup_error
                 if cleanup_error is not None:
                     raise CapacityBackendError("model capacity release failed") from None
                 raise CapacityBackendError("model capacity returned an unknown deployment")
             try:
-                response = await self._complete_leased(selected, lease, request)
+                response = await self._complete_leased(capacity, selected, lease, request)
             except (ModelTransportError, ModelGatewayError) as error:
                 if not _retryable_model_failure(error):
                     raise
@@ -364,7 +376,11 @@ class ModelGateway:
         return tuple(chain)
 
     async def _complete_leased(
-        self, deployment: Deployment, lease: CapacityLease, request: ModelRequest
+        self,
+        capacity: CapacityController | CapacityPool,
+        deployment: Deployment,
+        lease: CapacityLease,
+        request: ModelRequest,
     ) -> ModelResponse:
         primary_error: BaseException | None = None
         response: ModelResponse | None = None
@@ -381,7 +397,7 @@ class ModelGateway:
             else:
                 transport_started = self._monotonic()
                 invocation = asyncio.create_task(
-                    self._invoke_with_heartbeat(deployment, request, api_key, lease)
+                    self._invoke_with_heartbeat(capacity, deployment, request, api_key, lease)
                 )
                 del api_key
                 try:
@@ -420,7 +436,7 @@ class ModelGateway:
                     raise ModelGatewayError("model transport timing unavailable")
                 latency = max(0.0, self._monotonic() - transport_started)
                 try:
-                    await self._capacity.record_outcome(
+                    await capacity.record_outcome(
                         lease.quota_scope_id,
                         status_code=status_code,
                         latency_seconds=latency,
@@ -433,7 +449,7 @@ class ModelGateway:
                     if primary_error is None:
                         primary_error = ModelGatewayError("model outcome recording failed")
         finally:
-            release_error = await self._release_cleanup(lease)
+            release_error = await self._release_cleanup(capacity, lease)
             if release_error is not None and primary_error is None:
                 if isinstance(release_error, asyncio.CancelledError):
                     primary_error = release_error
@@ -448,6 +464,7 @@ class ModelGateway:
 
     async def _invoke_with_heartbeat(
         self,
+        capacity: CapacityController | CapacityPool,
         deployment: Deployment,
         request: ModelRequest,
         api_key: str,
@@ -457,7 +474,7 @@ class ModelGateway:
             self._call_transport_safely(deployment, request, api_key)
         )
         del api_key
-        heartbeat_task = asyncio.create_task(self._heartbeat(lease))
+        heartbeat_task = asyncio.create_task(self._heartbeat(capacity, lease))
         try:
             done, _pending = await asyncio.wait(
                 {transport_task, heartbeat_task}, return_when=asyncio.FIRST_COMPLETED
@@ -510,7 +527,9 @@ class ModelGateway:
         del api_key, request
         return outcome
 
-    async def _heartbeat(self, lease: CapacityLease) -> ModelResponse:
+    async def _heartbeat(
+        self, capacity: CapacityController | CapacityPool, lease: CapacityLease
+    ) -> ModelResponse:
         current = lease
         immediate_renewals = 0
         while True:
@@ -522,13 +541,15 @@ class ModelGateway:
             else:
                 immediate_renewals = 0
             await asyncio.sleep(delay)
-            renewed = await self._capacity.renew(current)
+            renewed = await capacity.renew(current)
             if renewed is None:
                 raise CapacityBackendError("model capacity lease expired")
             current = renewed
 
-    async def _release_cleanup(self, lease: CapacityLease) -> BaseException | None:
-        release_task = asyncio.create_task(self._capacity.release(lease))
+    async def _release_cleanup(
+        self, capacity: CapacityController | CapacityPool, lease: CapacityLease
+    ) -> BaseException | None:
+        release_task = asyncio.create_task(capacity.release(lease))
         try:
             await asyncio.shield(release_task)
         except asyncio.CancelledError as error:

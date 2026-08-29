@@ -1,7 +1,11 @@
-from collections.abc import AsyncIterator, Mapping, Sequence
+import sys
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import ClassVar, cast
 from uuid import UUID, uuid4
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 import pytest
 
@@ -744,7 +748,29 @@ async def test_configured_runtime_registry_supplies_secret_fingerprints_to_capac
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     created: list[object] = []
+    scoped_deployment_ids: list[tuple[str, ...]] = []
+    initialized_scope_ids: list[tuple[str, ...]] = []
     secret_ref = "secret://33333333-3333-4333-8333-333333333333"
+    unrelated_secret_ref = "secret://44444444-4444-4444-8444-444444444444"
+
+    class ScopedCapacityPool(ImmediateCapacity):
+        def __init__(
+            self,
+            deployments: tuple[Deployment, ...],
+            fingerprint_resolver: Callable[[str], Awaitable[str]],
+        ) -> None:
+            super().__init__(deployments)
+            self.fingerprint_resolver = fingerprint_resolver
+
+        async def initialize(self) -> None:
+            assert secrets.fingerprinted == []
+            initialized_scope_ids.append(
+                tuple(deployment.id for deployment in self.deployments)
+            )
+            for reference in dict.fromkeys(
+                deployment.secret_ref for deployment in self.deployments
+            ):
+                await self.fingerprint_resolver(reference)
 
     class SpyCapacityPool(ImmediateCapacity):
         def __init__(
@@ -753,13 +779,25 @@ async def test_configured_runtime_registry_supplies_secret_fingerprints_to_capac
             *,
             deployments: tuple[Deployment, ...],
             credentials: object | None = None,
+            fingerprint_resolver: Callable[[str], Awaitable[str]],
         ) -> None:
             del redis_client
-            if credentials is None:
-                raise AssertionError("configured runtime must pass credential fingerprints")
-            self.credentials = credentials
+            assert credentials is None
+            assert secrets.fingerprinted == []
+            self.fingerprint_resolver = fingerprint_resolver
             created.append(self)
             super().__init__(tuple(deployments))
+
+        async def initialize(self) -> None:
+            raise AssertionError("the unscoped capacity pool must not be initialized")
+
+        def scoped(self, deployments: Sequence[Deployment]) -> ScopedCapacityPool:
+            assert secrets.fingerprinted == []
+            configured = tuple(deployments)
+            scoped_deployment_ids.append(
+                tuple(deployment.id for deployment in configured)
+            )
+            return ScopedCapacityPool(configured, self.fingerprint_resolver)
 
     monkeypatch.setattr(defaults_module, "CapacityPool", SpyCapacityPool)
     secrets = FakeSecretService()
@@ -775,6 +813,21 @@ async def test_configured_runtime_registry_supplies_secret_fingerprints_to_capac
                                 "api_base": "https://api.minimax.chat/v1",
                                 "credential_ref": secret_ref,
                                 "quota_scope_id": "minimax_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                    "unrelated": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-chat",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": unrelated_secret_ref,
+                                "quota_scope_id": "deepseek_account",
                                 "max_concurrency": 2,
                                 "target_utilization": 0.8,
                                 "reserved_slots": 0,
@@ -806,8 +859,8 @@ async def test_configured_runtime_registry_supplies_secret_fingerprints_to_capac
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     assert secrets.fingerprinted == [(TENANT_ID, secret_ref)]
     assert len(created) == 1
-    credentials = created[0].credentials  # type: ignore[attr-defined]
-    assert credentials.fingerprint_for(secret_ref) == "a" * 64
+    assert scoped_deployment_ids == [("main_1",)]
+    assert initialized_scope_ids == [("main_1",)]
 
 
 def test_dispatch_plan_accepts_localized_role_display_names_but_keeps_safe_ids() -> None:

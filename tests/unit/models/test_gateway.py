@@ -1,9 +1,13 @@
 import asyncio
 import json
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from uuid import NAMESPACE_DNS, uuid5
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 import pytest
 
@@ -150,6 +154,38 @@ class CapacityStub:
             raise self.record_error
 
 
+class FingerprintSensitiveCapacity(CapacityStub):
+    """Catalog template whose scoped pool validates only selected credentials."""
+
+    def __init__(
+        self,
+        *,
+        failing_deployment_id: str,
+        full_catalog_fails: bool,
+    ) -> None:
+        super().__init__([lease("selected")])
+        self.failing_deployment_id = failing_deployment_id
+        self.full_catalog_fails = full_catalog_fails
+        self.scoped_ids: tuple[str, ...] | None = None
+        self.scoped_capacity: CapacityStub | None = None
+
+    async def initialize(self) -> None:
+        if self.full_catalog_fails:
+            raise CapacityConfigurationError("credential fingerprint resolution failed")
+        await super().initialize()
+
+    def scoped(self, deployments: Sequence[Deployment]) -> CapacityStub:
+        self.scoped_ids = tuple(deployment.id for deployment in deployments)
+        scoped = CapacityStub([lease("selected")])
+        if self.failing_deployment_id in self.scoped_ids:
+            async def fail_initialize() -> None:
+                raise CapacityConfigurationError("credential fingerprint resolution failed")
+
+            scoped.initialize = fail_initialize  # type: ignore[method-assign]
+        self.scoped_capacity = scoped
+        return scoped
+
+
 class SecretStub:
     def __init__(self, events: list[object], failure: Exception | None = None) -> None:
         self.events = events
@@ -292,6 +328,51 @@ async def test_gateway_acquires_before_resolving_selected_deployment_secret() ->
     assert capacity.releases == [selected_lease]
     assert capacity.configured == (alpha, beta)
     assert capacity.initialize_calls == 1
+
+
+async def test_unrelated_deployment_fingerprint_failure_does_not_block_request() -> None:
+    selected = deployment("selected")
+    unrelated = deployment("unrelated", "other")
+    capacity = FingerprintSensitiveCapacity(
+        failing_deployment_id="unrelated",
+        full_catalog_fails=True,
+    )
+    transport = TransportStub([])
+    gateway = ModelGateway(
+        ModelRegistry([selected, unrelated]),
+        capacity,
+        SecretStub([]),
+        transport,
+    )
+
+    completion = await gateway.complete_with_context(request())
+
+    assert completion.deployment_id == "selected"
+    assert capacity.scoped_ids == ("selected",)
+    assert transport.calls[0][0] is selected
+
+
+async def test_selected_deployment_fingerprint_failure_remains_fail_closed() -> None:
+    selected = deployment("selected")
+    unrelated = deployment("unrelated", "other")
+    capacity = FingerprintSensitiveCapacity(
+        failing_deployment_id="selected",
+        full_catalog_fails=False,
+    )
+    gateway = ModelGateway(
+        ModelRegistry([selected, unrelated]),
+        capacity,
+        SecretStub([]),
+        TransportStub([]),
+    )
+
+    with pytest.raises(
+        CapacityConfigurationError,
+        match="credential fingerprint resolution failed",
+    ):
+        await gateway.complete_with_context(request())
+
+    assert capacity.scoped_ids == ("selected",)
 
 
 async def test_secret_resolution_failure_is_redacted_and_releases() -> None:

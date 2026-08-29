@@ -15,8 +15,6 @@ from agent_hub.config.service import ConfigService
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.capacity import (
     CapacityPool,
-    CredentialDescriptor,
-    CredentialRegistry,
     safe_operational_limit,
 )
 from agent_hub.models.gateway import CapacityController, ModelGateway, ModelTransport
@@ -1451,15 +1449,14 @@ def configured_runtime_registry(
         tenant_id: UUID,
         deployments: tuple[Deployment, ...],
     ) -> CapacityPool:
-        credentials = CredentialRegistry(
-            [
-                CredentialDescriptor(secret_ref, await secret_service.fingerprint(tenant_id, secret_ref))
-                for secret_ref in dict.fromkeys(
-                    deployment.secret_ref for deployment in deployments
-                )
-            ]
+        async def resolve_fingerprint(secret_ref: str) -> str:
+            return await secret_service.fingerprint(tenant_id, secret_ref)
+
+        return CapacityPool(
+            redis_client,
+            deployments=deployments,
+            fingerprint_resolver=resolve_fingerprint,
         )
-        return CapacityPool(redis_client, deployments=deployments, credentials=credentials)
 
     return RuntimeRegistry(
         (
