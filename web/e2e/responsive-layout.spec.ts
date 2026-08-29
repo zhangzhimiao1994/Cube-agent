@@ -538,3 +538,39 @@ for (const viewport of viewports) {
     }
   });
 }
+
+test.describe("desktop floating navigation hover stability", () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  test("hovering the resources rail item keeps its drawer out of the workspace content lane", async ({ page }) => {
+    await mockLayoutApi(page);
+    await page.goto("/main-agent");
+    await page.waitForLoadState("networkidle");
+
+    const resourcesLink = page.getByRole("navigation", { name: "Main navigation" }).getByRole("link", { name: "资源" });
+    await expect(resourcesLink).toBeVisible();
+    await page.waitForFunction(() => {
+      const resources = Array.from(document.querySelectorAll("nav[aria-label='Main navigation'] a")).find(
+        (link) => link.textContent === "资源",
+      );
+      if (!resources) return false;
+      const rect = resources.getBoundingClientRect();
+      const elementAtCenter = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      return elementAtCenter?.closest("a") === resources;
+    });
+    await expect
+      .poll(async () => {
+        const resourcesBox = await resourcesLink.boundingBox();
+        expect(resourcesBox).not.toBeNull();
+        await page.mouse.move(resourcesBox!.x + resourcesBox!.width / 2, resourcesBox!.y + resourcesBox!.height / 2, { steps: 1 });
+        return page.locator(".nav-drawer-title").textContent();
+      })
+      .toBe("资源");
+    await expect(page.getByRole("region", { name: "资源二级导航" })).toBeVisible();
+    const drawer = await page.getByRole("region", { name: "资源二级导航" }).boundingBox();
+    const workspace = await page.locator(".workspace").boundingBox();
+    expect(drawer).not.toBeNull();
+    expect(workspace).not.toBeNull();
+    expect(drawer!.x + drawer!.width).toBeLessThanOrEqual(workspace!.x);
+  });
+});

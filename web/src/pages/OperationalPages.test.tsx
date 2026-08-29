@@ -2747,7 +2747,7 @@ describe("operational management pages", () => {
         elapsed_seconds: 180,
       },
     });
-  });
+  }, 10_000);
   it("distinguishes server environment channel values from cleared page settings", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/channels" />);

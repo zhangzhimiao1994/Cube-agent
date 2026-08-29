@@ -310,8 +310,9 @@ article:hover {
 }
 
 .app-shell {
+  --desktop-nav-column: 27rem;
   display: grid;
-  grid-template-columns: 112px minmax(0, 1fr);
+  grid-template-columns: var(--desktop-nav-column) minmax(0, 1fr);
   min-height: 100dvh;
 }
 
