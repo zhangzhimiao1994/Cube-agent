@@ -96,6 +96,7 @@ _CREWAI_BOUND_TASKS: weakref.WeakKeyDictionary[asyncio.Task[Any], int] = weakref
 _CREWAI_BOUND_TASKS_LOCK = threading.Lock()
 _CREWAI_INVOCATION_THREAD = threading.local()
 _CREWAI_DEFAULT_STORAGE_PATH: Any | None = None
+_CREWAI_DEFAULT_SECURE_STORAGE_PATH: Any | None = None
 _CREWAI_DEFAULT_TRACE_SETUP: Any | None = None
 _CREWAI_DEFAULT_TELEMETRY_CHECK: Any | None = None
 _CREWAI_STORAGE_MODULES = (
@@ -120,6 +121,20 @@ def _contextual_crewai_storage_path() -> str:
     if fallback is None:
         raise RuntimeError("CrewAI storage router is unavailable")
     return cast(str, fallback())
+
+
+def _contextual_crewai_secure_storage_path() -> Path:
+    scoped = _CREWAI_STORAGE_CONTEXT.get()
+    if scoped is not None:
+        credentials_path = scoped / ".credentials"
+        credentials_path.mkdir(parents=True, exist_ok=True)
+        return credentials_path
+    if _is_agent_hub_crewai_invocation():
+        raise RuntimeError("CrewAI credential context propagation is unavailable")
+    fallback = _CREWAI_DEFAULT_SECURE_STORAGE_PATH
+    if fallback is None:
+        raise RuntimeError("CrewAI credential storage router is unavailable")
+    return cast(Path, fallback())
 
 
 def _contextual_crewai_trace_setup(listener: object, event_bus: object) -> None:
@@ -606,6 +621,7 @@ class CrewAIObjectFactory:
         telemetry_disabled: bool,
     ) -> CrewStepGeneration:
         global _CREWAI_DEFAULT_STORAGE_PATH
+        global _CREWAI_DEFAULT_SECURE_STORAGE_PATH
         global _CREWAI_DEFAULT_TELEMETRY_CHECK
         global _CREWAI_DEFAULT_TRACE_SETUP
         if share_crew or not telemetry_disabled:
@@ -614,9 +630,13 @@ class CrewAIObjectFactory:
             raise ValueError("unsafe CrewAI agent configuration")
         with _CREWAI_IMPORT_LOCK:
             core_paths = importlib.import_module("crewai_core.paths")
+            token_manager_module = importlib.import_module("crewai_core.token_manager")
             original_storage_path = core_paths.__dict__["db_storage_path"]
             if original_storage_path is not _contextual_crewai_storage_path:
                 _CREWAI_DEFAULT_STORAGE_PATH = original_storage_path
+            original_secure_storage_path = token_manager_module.TokenManager._get_secure_storage_path
+            if original_secure_storage_path is not _contextual_crewai_secure_storage_path:
+                _CREWAI_DEFAULT_SECURE_STORAGE_PATH = original_secure_storage_path
             import_storage = self._storage_dir / ".imports"
             import_environment = {
                 "OTEL_SDK_DISABLED": "true",
@@ -631,7 +651,15 @@ class CrewAIObjectFactory:
                 import_storage.mkdir(parents=True, exist_ok=True)
                 return str(import_storage)
 
+            def import_secure_storage_path() -> Path:
+                credentials_path = import_storage / ".credentials"
+                credentials_path.mkdir(parents=True, exist_ok=True)
+                return credentials_path
+
             core_paths.__dict__["db_storage_path"] = import_storage_path
+            token_manager_module.TokenManager._get_secure_storage_path = staticmethod(
+                import_secure_storage_path
+            )
             try:
                 os.environ.update(import_environment)
                 crewai_module = importlib.import_module("crewai")
@@ -656,6 +684,9 @@ class CrewAIObjectFactory:
                     else:
                         os.environ[key] = value
                 core_paths.__dict__["db_storage_path"] = _contextual_crewai_storage_path
+                token_manager_module.TokenManager._get_secure_storage_path = staticmethod(
+                    _contextual_crewai_secure_storage_path
+                )
                 for module_name in _CREWAI_STORAGE_MODULES:
                     module = sys.modules.get(module_name)
                     if module is not None and "db_storage_path" in module.__dict__:

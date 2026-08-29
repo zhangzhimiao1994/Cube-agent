@@ -1,3 +1,4 @@
+import importlib
 from pathlib import Path
 
 from agent_hub.runtime.crew.adapter import CrewAIObjectFactory, CrewDispatchRuntime
@@ -25,3 +26,11 @@ def test_dispatch_runtime_uses_crewai_state_directory_by_default(monkeypatch) ->
     runtime = CrewDispatchRuntime.__new__(CrewDispatchRuntime)
 
     assert runtime._default_crewai_storage_dir() == Path("/var/lib/agent-hub/crewai").resolve()
+
+
+def test_crewai_secure_credentials_use_active_storage_scope(tmp_path: Path) -> None:
+    adapter = importlib.import_module("agent_hub.runtime.crew.adapter")
+    scope = tmp_path / "crewai-scope"
+
+    with adapter._active_crewai_scope(scope):
+        assert adapter._contextual_crewai_secure_storage_path() == scope / ".credentials"
