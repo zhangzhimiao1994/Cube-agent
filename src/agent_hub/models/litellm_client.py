@@ -2,8 +2,8 @@ import asyncio
 import json
 import logging
 import re
-from collections.abc import Mapping, Sequence
-from typing import Protocol, cast
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from typing import Any, Protocol, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -184,6 +184,52 @@ def _sensitive_values(request: ModelRequest, api_key: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(value for value in values if value))
 
 
+def _validate_transport_request(
+    deployment: Deployment,
+    request: ModelRequest,
+    api_key: str,
+) -> Exception | None:
+    if not api_key or not api_key.strip():
+        return ValueError("API key must not be blank")
+    if request.response_schema is not None and (
+        ModelCapability.STRUCTURED_OUTPUT not in deployment.capabilities
+    ):
+        return ValueError("deployment lacks structured_output capability")
+    if request.tools and ModelCapability.TOOL_CALLING not in deployment.capabilities:
+        return ValueError("deployment lacks tool_calling capability")
+    if request.tools and _is_messages_endpoint(deployment.api_base):
+        return ValueError("messages endpoint tool definitions are not supported")
+    return None
+
+
+def _chat_completion_create_kwargs(
+    deployment: Deployment,
+    request: ModelRequest,
+    *,
+    stream: bool,
+) -> dict[str, object]:
+    create_kwargs: dict[str, object] = {
+        "model": deployment.request_model or deployment.provider_model,
+        "messages": _messages(request),
+        "max_completion_tokens": request.max_output_tokens,
+        "timeout": request.timeout_seconds,
+        "stream": stream,
+    }
+    if request.response_schema is not None:
+        create_kwargs["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": request.response_schema.name,
+                "schema": _json_mutable(cast(JsonValue, request.response_schema.schema)),
+                "strict": True,
+            },
+        }
+    if request.tools:
+        create_kwargs["tools"] = _tools(request.tools)
+        create_kwargs["tool_choice"] = "auto"
+    return create_kwargs
+
+
 def _parse_usage(raw_usage: object, deployment_id: str) -> TokenUsage | None:
     if raw_usage is None:
         return None
@@ -360,6 +406,97 @@ async def _close_ignoring_failures(client: _OpenAIClient | None) -> bool:
     return False
 
 
+async def _async_chunks(stream: object) -> AsyncIterator[object]:
+    if not hasattr(stream, "__aiter__"):
+        raise TypeError("stream response is not async iterable")
+    async for chunk in cast(AsyncIterator[object], stream):
+        yield chunk
+
+
+class _OpenAICompatibleChunkStream:
+    def __init__(
+        self,
+        start: Callable[[], Awaitable[tuple[_OpenAIClient, object]]],
+        *,
+        deployment_id: str,
+        sensitive_values: Sequence[str],
+    ) -> None:
+        self._start: Callable[[], Awaitable[tuple[_OpenAIClient, object]]] | None = start
+        self._deployment_id = deployment_id
+        self._sensitive_values = tuple(sensitive_values)
+        self._client: _OpenAIClient | None = None
+        self._iterator: AsyncIterator[object] | None = None
+        self._closed = False
+
+    def __aiter__(self) -> "_OpenAICompatibleChunkStream":
+        return self
+
+    async def __anext__(self) -> object:
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            if self._iterator is None:
+                if self._start is None:  # pragma: no cover - defensive invariant
+                    raise StopAsyncIteration
+                client, stream = await self._start()
+                self._start = None
+                self._client = client
+                self._iterator = _async_chunks(stream).__aiter__()
+            return await self._iterator.__anext__()
+        except StopAsyncIteration:
+            await self.aclose()
+            raise
+        except asyncio.CancelledError:
+            if await self._close_client_ignoring_failure():
+                raise
+            raise
+        except ModelTransportError as error:
+            await self._close_client_ignoring_failure()
+            raise error from None
+        except Exception as error:  # noqa: BLE001 - redact every SDK/network failure
+            safe_error = _transport_error(
+                self._deployment_id,
+                error,
+                self._sensitive_values,
+            )
+            await self._close_client_ignoring_failure()
+            raise safe_error from None
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        close_failure: ModelTransportError | None = None
+        try:
+            if self._iterator is not None:
+                await cast(Any, self._iterator).aclose()
+            if self._client is not None:
+                await self._client.close()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - close failures are provider failures
+            close_failure = _transport_error(
+                self._deployment_id,
+                error,
+                self._sensitive_values,
+            )
+        finally:
+            self._closed = True
+            self._start = None
+            self._client = None
+            self._iterator = None
+        if close_failure is not None:
+            raise close_failure from None
+
+    async def _close_client_ignoring_failure(self) -> bool:
+        try:
+            return await _close_ignoring_failures(self._client)
+        finally:
+            self._closed = True
+            self._start = None
+            self._client = None
+            self._iterator = None
+
+
 async def _aclose_ignoring_failures(client: _HTTPClient | None) -> bool:
     if client is None:
         return False
@@ -405,22 +542,33 @@ class LiteLLMClient:
             raise outcome
         return outcome
 
+    def stream_openai_compatible_chunks(
+        self,
+        deployment: Deployment,
+        request: ModelRequest,
+        api_key: str,
+    ) -> AsyncIterator[object]:
+        validation_error = _validate_transport_request(deployment, request, api_key)
+        if validation_error is not None:
+            raise validation_error
+        if _is_messages_endpoint(deployment.api_base):
+            raise ValueError("messages endpoint streaming is not supported")
+        sensitive_values = _sensitive_values(request, api_key)
+        return _OpenAICompatibleChunkStream(
+            lambda: self._start_stream(deployment, request, api_key, sensitive_values),
+            deployment_id=deployment.id,
+            sensitive_values=sensitive_values,
+        )
+
     async def _complete_outcome(
         self,
         deployment: Deployment,
         request: ModelRequest,
         api_key: str,
     ) -> ModelResponse | Exception | _CancelledOutcome:
-        if not api_key or not api_key.strip():
-            return ValueError("API key must not be blank")
-        if request.response_schema is not None and (
-            ModelCapability.STRUCTURED_OUTPUT not in deployment.capabilities
-        ):
-            return ValueError("deployment lacks structured_output capability")
-        if request.tools and ModelCapability.TOOL_CALLING not in deployment.capabilities:
-            return ValueError("deployment lacks tool_calling capability")
-        if request.tools and _is_messages_endpoint(deployment.api_base):
-            return ValueError("messages endpoint tool definitions are not supported")
+        validation_error = _validate_transport_request(deployment, request, api_key)
+        if validation_error is not None:
+            return validation_error
         if _is_messages_endpoint(deployment.api_base):
             return await self._messages_outcome(deployment, request, api_key)
 
@@ -436,25 +584,11 @@ class LiteLLMClient:
                 base_url=deployment.api_base,
                 max_retries=0,
             )
-            create_kwargs = {
-                "model": deployment.request_model or deployment.provider_model,
-                "messages": _messages(request),
-                "max_completion_tokens": request.max_output_tokens,
-                "timeout": request.timeout_seconds,
-                "stream": False,
-            }
-            if request.response_schema is not None:
-                create_kwargs["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": request.response_schema.name,
-                        "schema": _json_mutable(cast(JsonValue, request.response_schema.schema)),
-                        "strict": True,
-                    },
-                }
-            if request.tools:
-                create_kwargs["tools"] = _tools(request.tools)
-                create_kwargs["tool_choice"] = "auto"
+            create_kwargs = _chat_completion_create_kwargs(
+                deployment,
+                request,
+                stream=False,
+            )
             response = await client.chat.completions.create(**create_kwargs)
             parsed = _parse_response(response, deployment.id, sensitive_values)
         except asyncio.CancelledError:
@@ -529,6 +663,71 @@ class LiteLLMClient:
         except Exception as error:  # noqa: BLE001 - close failures are provider failures
             return _transport_error(deployment.id, error, sensitive_values)
         return parsed
+
+    async def _start_stream(
+        self,
+        deployment: Deployment,
+        request: ModelRequest,
+        api_key: str,
+        sensitive_values: Sequence[str],
+    ) -> tuple[_OpenAIClient, object]:
+        client = self._client_factory(
+            api_key=api_key,
+            base_url=deployment.api_base,
+            max_retries=0,
+        )
+        create_kwargs = _chat_completion_create_kwargs(deployment, request, stream=True)
+        try:
+            stream = await client.chat.completions.create(**create_kwargs)
+            return client, stream
+        except asyncio.CancelledError:
+            await _close_ignoring_failures(client)
+            raise
+        except Exception as error:  # noqa: BLE001 - startup failures need compatibility retries
+            if _should_retry_with_legacy_max_tokens(error):
+                legacy_kwargs = dict(create_kwargs)
+                legacy_kwargs["max_tokens"] = legacy_kwargs.pop("max_completion_tokens")
+                try:
+                    stream = await client.chat.completions.create(**legacy_kwargs)
+                    return client, stream
+                except asyncio.CancelledError:
+                    await _close_ignoring_failures(client)
+                    raise
+                except Exception as retry_error:  # noqa: BLE001 - redact retry failure
+                    if await _close_ignoring_failures(client):
+                        raise asyncio.CancelledError
+                    raise _transport_error(
+                        deployment.id,
+                        retry_error,
+                        sensitive_values,
+                    ) from None
+            if _should_retry_root_base_with_v1(error, deployment.api_base):
+                if await _close_ignoring_failures(client):
+                    raise asyncio.CancelledError
+                client = self._client_factory(
+                    api_key=api_key,
+                    base_url=cast(str, _api_base_with_v1(deployment.api_base)),
+                    max_retries=0,
+                )
+                try:
+                    stream = await client.chat.completions.create(
+                        **create_kwargs
+                    )
+                    return client, stream
+                except asyncio.CancelledError:
+                    await _close_ignoring_failures(client)
+                    raise
+                except Exception as retry_error:  # noqa: BLE001 - redact retry failure
+                    if await _close_ignoring_failures(client):
+                        raise asyncio.CancelledError
+                    raise _transport_error(
+                        deployment.id,
+                        retry_error,
+                        sensitive_values,
+                    ) from None
+            if await _close_ignoring_failures(client):
+                raise asyncio.CancelledError
+            raise _transport_error(deployment.id, error, sensitive_values) from None
 
     async def _messages_outcome(
         self,

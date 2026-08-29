@@ -1,7 +1,8 @@
 import asyncio
 import traceback
+from collections.abc import Sequence
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -79,6 +80,19 @@ def mock_transport(
     )
     factory = MagicMock(return_value=sdk_client)
     return LiteLLMClient(client_factory=factory), factory, create, close
+
+
+class AsyncChunkStream:
+    def __init__(self, chunks: Sequence[object]) -> None:
+        self._chunks = list(chunks)
+
+    def __aiter__(self) -> "AsyncChunkStream":
+        return self
+
+    async def __anext__(self) -> object:
+        if not self._chunks:
+            raise StopAsyncIteration
+        return self._chunks.pop(0)
 
 
 def deployment(**overrides: object) -> Deployment:
@@ -403,6 +417,267 @@ async def test_retries_with_legacy_max_tokens_for_openai_compatible_relays() -> 
     assert second_call.kwargs["max_tokens"] == 321
     assert "max_completion_tokens" not in second_call.kwargs
     close.assert_awaited_once_with()
+
+
+async def test_streams_openai_compatible_chunks_with_existing_request_shape() -> None:
+    chunks = [
+        SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="hel"))]),
+        SimpleNamespace(
+            choices=[SimpleNamespace(delta=SimpleNamespace(reasoning_content="thinking"))]
+        ),
+    ]
+    stream = AsyncChunkStream(chunks)
+    create = AsyncMock(return_value=stream)
+    close = AsyncMock()
+    sdk_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        close=close,
+    )
+    factory = MagicMock(return_value=sdk_client)
+    transport = LiteLLMClient(client_factory=factory)
+    tool = ToolDefinition(
+        name="lookup",
+        description="Look up approved internal context.",
+        parameters={"type": "object", "properties": {"query": {"type": "string"}}},
+    )
+
+    streamed = [
+        chunk
+        async for chunk in transport.stream_openai_compatible_chunks(
+            deployment(capabilities={ModelCapability.TEXT, ModelCapability.TOOL_CALLING}),
+            request(tools=[tool], required_capabilities={ModelCapability.TOOL_CALLING}),
+            API_KEY,
+        )
+    ]
+
+    assert streamed == chunks
+    factory.assert_called_once_with(
+        api_key=API_KEY,
+        base_url="https://proxy.example.com/v1",
+        max_retries=0,
+    )
+    create.assert_awaited_once_with(
+        model="deepseek/deepseek-chat",
+        messages=[{"role": "user", "content": PROMPT}],
+        max_completion_tokens=4096,
+        timeout=12,
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "Look up approved internal context.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+        tool_choice="auto",
+    )
+    close.assert_awaited_once_with()
+
+
+async def test_stream_provider_error_closes_and_redacts_runtime_secrets() -> None:
+    class ProviderFailure(RuntimeError):
+        status_code = 503
+        request_id = "req_stream_safe"
+
+    class FailingStream:
+        def __aiter__(self) -> "FailingStream":
+            return self
+
+        async def __anext__(self) -> object:
+            raise ProviderFailure(RAW_ERROR + API_KEY + PROMPT)
+
+    create = AsyncMock(return_value=FailingStream())
+    close = AsyncMock()
+    sdk_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        close=close,
+    )
+    transport = LiteLLMClient(client_factory=MagicMock(return_value=sdk_client))
+
+    with pytest.raises(ModelTransportError) as caught:
+        [
+            chunk
+            async for chunk in transport.stream_openai_compatible_chunks(
+                deployment(),
+                request(),
+                API_KEY,
+            )
+        ]
+
+    close.assert_awaited_once_with()
+    assert "status=503" in str(caught.value)
+    assert "request_id=req_stream_safe" in str(caught.value)
+    rendered = captured_traceback(caught.value)
+    for sensitive in (RAW_ERROR, API_KEY, PROMPT):
+        assert sensitive not in rendered
+
+
+async def test_stream_retries_with_legacy_max_tokens_for_openai_compatible_relays() -> None:
+    provider_error = RuntimeError("unknown parameter: max_completion_tokens")
+    provider_error.status_code = 400  # type: ignore[attr-defined]
+    stream = AsyncChunkStream(
+        [SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="hello"))])]
+    )
+    create = AsyncMock(side_effect=[provider_error, stream])
+    close = AsyncMock()
+    sdk_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        close=close,
+    )
+    transport = LiteLLMClient(client_factory=MagicMock(return_value=sdk_client))
+
+    streamed = [
+        chunk
+        async for chunk in transport.stream_openai_compatible_chunks(
+            deployment(),
+            request(max_output_tokens=321),
+            API_KEY,
+        )
+    ]
+
+    assert len(streamed) == 1
+    assert create.await_count == 2
+    first_call, second_call = create.await_args_list
+    assert first_call.kwargs["max_completion_tokens"] == 321
+    assert "max_tokens" not in first_call.kwargs
+    assert second_call.kwargs["max_tokens"] == 321
+    assert "max_completion_tokens" not in second_call.kwargs
+    assert first_call.kwargs["stream"] is True
+    assert second_call.kwargs["stream"] is True
+    close.assert_awaited_once_with()
+
+
+async def test_stream_retries_root_relay_base_with_v1_suffix_when_route_is_missing() -> None:
+    not_found = RuntimeError("not found")
+    not_found.status_code = 404  # type: ignore[attr-defined]
+    first_create = AsyncMock(side_effect=not_found)
+    second_create = AsyncMock(
+        return_value=AsyncChunkStream(
+            [SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="hello"))])]
+        )
+    )
+    first_close = AsyncMock()
+    second_close = AsyncMock()
+    clients = [
+        SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=first_create)),
+            close=first_close,
+        ),
+        SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=second_create)),
+            close=second_close,
+        ),
+    ]
+    factory = MagicMock(side_effect=clients)
+    transport = LiteLLMClient(client_factory=factory)
+
+    streamed = [
+        chunk
+        async for chunk in transport.stream_openai_compatible_chunks(
+            deployment(api_base="https://inferaiapi.com"),
+            request(max_output_tokens=321),
+            API_KEY,
+        )
+    ]
+
+    assert len(streamed) == 1
+    assert [call.kwargs["base_url"] for call in factory.call_args_list] == [
+        "https://inferaiapi.com",
+        "https://inferaiapi.com/v1",
+    ]
+    first_create.assert_awaited_once()
+    second_create.assert_awaited_once()
+    first_close.assert_awaited_once_with()
+    second_close.assert_awaited_once_with()
+
+
+async def test_stream_closes_client_when_consumer_stops_early() -> None:
+    first_chunk = SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="hel"))])
+    stream = AsyncChunkStream(
+        [
+            first_chunk,
+            SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="lo"))]),
+        ]
+    )
+    create = AsyncMock(return_value=stream)
+    close = AsyncMock()
+    sdk_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        close=close,
+    )
+    transport = LiteLLMClient(client_factory=MagicMock(return_value=sdk_client))
+
+    chunks = transport.stream_openai_compatible_chunks(deployment(), request(), API_KEY)
+    assert await chunks.__anext__() is first_chunk
+    await cast(Any, chunks).aclose()
+
+    close.assert_awaited_once_with()
+
+
+async def test_stream_early_close_failure_maps_to_safe_transport_error() -> None:
+    class CloseFailure(RuntimeError):
+        status_code = 503
+        request_id = "req-stream-close-safe"
+
+    first_chunk = SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="hel"))])
+    create = AsyncMock(
+        return_value=AsyncChunkStream(
+            [
+                first_chunk,
+                SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="lo"))]),
+            ]
+        )
+    )
+    close = AsyncMock(side_effect=CloseFailure(RAW_ERROR + API_KEY + PROMPT))
+    sdk_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        close=close,
+    )
+    transport = LiteLLMClient(client_factory=MagicMock(return_value=sdk_client))
+
+    chunks = transport.stream_openai_compatible_chunks(
+        deployment(),
+        sensitive_request(),
+        API_KEY,
+    )
+    assert await chunks.__anext__() is first_chunk
+    with pytest.raises(ModelTransportError) as caught:
+        await cast(Any, chunks).aclose()
+
+    close.assert_awaited_once_with()
+    assert "status=503" in str(caught.value)
+    assert "request_id=req-stream-close-safe" in str(caught.value)
+    rendered = captured_traceback(caught.value)
+    for sensitive in (RAW_ERROR, API_KEY, PROMPT, MULTIMODAL_TEXT, IMAGE_URL):
+        assert sensitive not in rendered
+
+
+async def test_stream_rejects_messages_endpoint_before_constructing_clients() -> None:
+    openai_factory = MagicMock()
+    http_factory = MagicMock()
+    transport = LiteLLMClient(
+        client_factory=openai_factory,
+        http_client_factory=http_factory,
+    )
+
+    with pytest.raises(ValueError, match="messages endpoint streaming is not supported"):
+        [
+            chunk
+            async for chunk in transport.stream_openai_compatible_chunks(
+                deployment(api_base="https://toapis.com/v1/messages"),
+                request(),
+                API_KEY,
+            )
+        ]
+
+    openai_factory.assert_not_called()
+    http_factory.assert_not_called()
 
 
 async def test_retries_root_relay_base_with_v1_suffix_when_route_is_missing() -> None:
