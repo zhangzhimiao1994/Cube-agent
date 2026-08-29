@@ -19,7 +19,36 @@ jobs:
       - run: uv run ruff check .
       - run: uv run mypy --strict src tests
       - run: docker compose -f tests/compose.yml up -d --wait
-      - run: uv run pytest -q
+      - name: Run uv run pytest -q
+        shell: bash
+        run: |
+          set +e
+          uv run pytest -q --tb=short --disable-warnings 2>&1 | tee pytest-output.txt
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            python - <<'PY'
+          import re
+          from pathlib import Path
+
+          output = Path("pytest-output.txt").read_text(encoding="utf-8", errors="replace")
+          emitted = 0
+          patterns = (
+              re.compile(r"^(FAILED|ERROR) (?P<nodeid>tests/[^\\s:]+(?:::[^\\s]+)*)", re.MULTILINE),
+              re.compile(r"^_{3,}\\s+(?P<nodeid>tests/[^\\s]+)\\s+_{3,}$", re.MULTILINE),
+          )
+          for pattern in patterns:
+              for match in pattern.finditer(output):
+                  nodeid = match.group("nodeid")
+                  path = nodeid.split("::", 1)[0]
+                  print(f"::error file={path},title=pytest failure::{nodeid}")
+                  emitted += 1
+                  if emitted >= 20:
+                      raise SystemExit
+          if emitted == 0:
+              print("::error title=pytest failure::uv run pytest -q failed; raw job logs are required for full traceback")
+          PY
+          fi
+          exit "$status"
       - if: always()
         run: docker compose -f tests/compose.yml down -v --remove-orphans
       - run: npm ci
