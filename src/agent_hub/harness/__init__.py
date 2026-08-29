@@ -11,6 +11,7 @@ from agent_hub.harness.provider import (
     estimate_prefix_cache_reuse,
 )
 from agent_hub.harness.scheduler import CapabilityAwareHarnessScheduler, HarnessSchedulingError
+from agent_hub.harness.tool_gateway import HarnessToolGateway, RuntimeToolBackend
 from agent_hub.harness.types import (
     HarnessDecision,
     HarnessPolicy,
@@ -30,6 +31,7 @@ __all__ = [
     "HarnessTaskRequirements",
     "HarnessToolCallRequest",
     "HarnessToolCallResult",
+    "HarnessToolGateway",
     "HermesContextHint",
     "NormalizedProviderEvent",
     "PrefixCacheEstimate",
@@ -38,6 +40,7 @@ __all__ = [
     "ProviderStreamDelta",
     "ProviderStreamNormalizer",
     "RuntimeHealth",
+    "RuntimeToolBackend",
     "estimate_prefix_cache_reuse",
     "gateway_completion_events",
     "harness_scheduler_from_config",
