@@ -42,6 +42,8 @@ type RunSubmissionOverride = {
   directModel?: string;
   mode?: RunMode;
   vibeCoding?: boolean;
+  skipEvolutionProposal?: boolean;
+  successNotice?: string;
 };
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
@@ -1643,6 +1645,7 @@ export function RunsPage() {
         reference_conversation_id: referenceConversationId.trim() || null,
         attachment_ids: attachmentDraft?.attachment ? [attachmentDraft.attachment.id] : [],
         vibe_coding: override?.vibeCoding ?? vibeCoding,
+        skip_evolution_proposal: override?.skipEvolutionProposal === true ? true : undefined,
       });
     },
     onSuccess: async (run, override) => {
@@ -1725,7 +1728,7 @@ export function RunsPage() {
         setEvolutionApproval(null);
         setOpenClawApproval(null);
         setModeSelection(null);
-        setSubmitNotice(explainActualMode(run));
+        setSubmitNotice(override?.successNotice ?? explainActualMode(run));
       }
       setMessage("");
       setAttachmentDraft(null);
@@ -1795,12 +1798,19 @@ export function RunsPage() {
     },
   });
   const cancelEvolutionApproval = () => {
-    if (!evolutionApproval) return;
+    const approval = evolutionApproval;
+    if (!approval) return;
     setDismissedEvolutionApprovalRunIds((current) =>
-      current.includes(evolutionApproval.runId) ? current : [...current, evolutionApproval.runId],
+      current.includes(approval.runId) ? current : [...current, approval.runId],
     );
     setEvolutionApproval(null);
-    setSubmitNotice("已取消进化任务创建，后续消息会继续作为普通对话处理。");
+    setSubmitNotice("已取消进化任务创建，正在按普通对话继续执行原消息。");
+    createRun.mutate({
+      message: approval.proposal.objective,
+      mode: "auto",
+      skipEvolutionProposal: true,
+      successNotice: "已取消进化任务创建，已按普通对话继续执行原消息。",
+    });
   };
   const createEvolutionFromProposal = useMutation({
     mutationFn: () => {
