@@ -42,6 +42,24 @@ class WaitingRouter:
         )
 
 
+class UserChoiceRouter:
+    async def route(self, task_text: object) -> RouteDecision:
+        del task_text
+        return RouteDecision(
+            mode=None,
+            needs_user_choice=True,
+            status="waiting_user_mode",
+            assessments=(),
+            clarification_reason="routing_requires_user_choice",
+            options=EXECUTABLE_MODES,
+            decision_token="safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+            version=1,
+            risk=RiskLevel.LOW,
+            requires_approval=False,
+            permissions_still_apply=True,
+        )
+
+
 class ConversationModeRepository:
     def __init__(self, previous_mode: TaskMode | None) -> None:
         self.previous_mode = previous_mode
@@ -302,6 +320,33 @@ async def test_auto_submission_queues_local_direct_when_router_cannot_classify()
     assert routing["reason"] == "main_agent_local_resolution"
     assert routing["main_agent_selected_mode"] == "direct"
     assert routing["router_clarification_reason"] == "classification_unavailable"
+
+
+async def test_auto_submission_waits_when_router_requires_user_choice() -> None:
+    repository = ConversationModeRepository(None)
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=UserChoiceRouter(),
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="ambiguous workflow",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-1",
+        idempotency_key="idem-router-user-choice",
+    )
+
+    assert submitted.status is RunStatus.WAITING_USER_MODE
+    assert submitted.mode is None
+    assert submitted.decision_token == "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234"
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "routing_requires_user_choice"
+    assert "main_agent_selected_mode" not in routing
 
 
 async def test_auto_submission_uses_hermes_before_local_direct_router_fallback() -> None:

@@ -32,6 +32,14 @@ jobs:
 
           output = Path("pytest-output.txt").read_text(encoding="utf-8", errors="replace")
           emitted = 0
+          failure_sections = {
+              match.group("nodeid"): match.group("body").strip()[:3500]
+              for match in re.finditer(
+                  r"^_{3,}\s+(?P<nodeid>tests/[^\s]+)\s+_{3,}\n(?P<body>.*?)(?=^_{3,}\s+tests/|\n=+ short test summary info =+|\Z)",
+                  output,
+                  re.MULTILINE | re.DOTALL,
+              )
+          }
           patterns = (
               re.compile(r"^(FAILED|ERROR) (?P<nodeid>tests/[^\s:]+(?:::[^\s]+)*)", re.MULTILINE),
               re.compile(r"^_{3,}\s+(?P<nodeid>tests/[^\s]+)\s+_{3,}$", re.MULTILINE),
@@ -40,7 +48,9 @@ jobs:
               for match in pattern.finditer(output):
                   nodeid = match.group("nodeid")
                   path = nodeid.split("::", 1)[0]
-                  print(f"::error file={path},title=pytest failure::{nodeid}")
+                  detail = failure_sections.get(nodeid, nodeid)
+                  detail = detail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                  print(f"::error file={path},title=pytest failure::{detail}")
                   emitted += 1
                   if emitted >= 20:
                       raise SystemExit
