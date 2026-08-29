@@ -78,9 +78,9 @@ async function mockRunApi(page: Page) {
 test("operator inspects run detail and cancels safely", async ({ page }) => {
   await mockRunApi(page);
   await page.goto(`/runs/${runId}`);
-  await expect(page.getByText("Queue wait: 120 ms")).toBeVisible();
-  await expect(page.getByText("Capacity wait: 40 ms")).toBeVisible();
+  await expect(page.getByText("排队等待")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "120 ms" })).toBeVisible();
   await expect(page.getByText("Readiness report")).toBeVisible();
-  await page.getByRole("button", { name: "Cancel" }).click();
-  await expect(page.getByText("Status: cancelled")).toBeVisible();
+  await page.getByRole("button", { name: "取消" }).click();
+  await expect(page.getByRole("heading", { name: "cancelled" })).toBeVisible();
 });

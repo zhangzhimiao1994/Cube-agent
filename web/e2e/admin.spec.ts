@@ -109,13 +109,35 @@ async function mockAdminApi(page: Page) {
       });
       return;
     }
+    if (path === "/api/v1/admin/logs") {
+      await route.fulfill({
+        json: [
+          {
+            id: "audit-log-1",
+            category: "audit",
+            level: "info",
+            title: "config.publish",
+            message: "configuration published",
+            source: "audit",
+            details: { resource: "configuration", actor: "system" },
+            created_at: "2026-08-07T00:00:00Z",
+          },
+        ],
+      });
+      return;
+    }
     if (path === "/api/v1/admin/hermes" && request.method() === "GET") {
       await route.fulfill({
         json: [
           {
             id: "hermes-1",
+            category: "conversation",
             outcome: "success",
             lesson: "Use dispatch mode when the request has clear deliverables.",
+            summary: "Matched dispatch mode for concrete deliverables.",
+            run_id: runId,
+            conversation_id: "conversation-1",
+            confirmed_at: null,
             tags: ["dispatch"],
             weight: 3,
             created_at: "2026-08-07T00:00:00Z",
@@ -146,24 +168,25 @@ test("administrator uploads and approves a skill", async ({ page }) => {
   await page.goto("/skills");
   await page.getByLabel("Skill 压缩包").setInputFiles("e2e/fixtures/safe-skill.zip");
   await page.getByRole("button", { name: "上传并扫描" }).click();
-  await expect(page.getByText("scanned")).toBeVisible();
+  await expect(page.getByRole("row", { name: /safe-skill/ }).getByRole("cell", { name: "scanned" })).toBeVisible();
   await page.getByRole("button", { name: "审批启用" }).click();
-  await expect(page.getByText("enabled")).toBeVisible();
+  await expect(page.getByRole("row", { name: /safe-skill/ }).getByRole("cell", { name: "enabled" })).toBeVisible();
 });
 
 test("administrator can inspect MCP and export safe audit view", async ({ page }) => {
   await mockAdminApi(page);
   await page.goto("/mcp");
-  await expect(page.getByText("Health: healthy")).toBeVisible();
-  await page.goto("/audit");
+  const mcpCard = page.getByRole("article").filter({ hasText: "Filesystem MCP" });
+  await expect(mcpCard.getByText("healthy")).toBeVisible();
+  await page.goto("/logs/audit");
   await expect(page.getByText("config.publish")).toBeVisible();
   await expect(page.getByText(/api_key|hidden_reasoning|fingerprint/i)).toHaveCount(0);
 });
 
-test("administrator asks Hermes for a safe recommendation", async ({ page }) => {
+test("administrator reviews Hermes learning records", async ({ page }) => {
   await mockAdminApi(page);
   await page.goto("/hermes");
-  await page.getByRole("button", { name: "Ask Hermes" }).click();
-  await expect(page.getByText("Mode: group_chat")).toBeVisible();
-  await expect(page.getByText("Requires approval: no")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Hermes 学习" })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "Matched dispatch mode for concrete deliverables." })).toBeVisible();
+  await expect(page.getByRole("button", { name: "确认 Hermes 学习 hermes-1" })).toBeVisible();
 });
