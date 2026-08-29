@@ -1477,22 +1477,18 @@ describe("operational management pages", () => {
     });
   });
 
-  it("sends a conversation-integrated Vibe Coding flag when enabled from the composer", async () => {
+  it("does not expose Vibe Coding in the composer or send it for ordinary messages", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "Vibe Coding" }));
+    expect(screen.queryByRole("button", { name: "Vibe Coding" })).toBeNull();
     await user.type(screen.getByPlaceholderText(/输入消息/), "审查这个代码附件。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
-    expect(requests.slice().reverse().find((request) => request.path === "/api/v1/runs")).toMatchObject({
-      method: "POST",
-      body: {
-        message: "审查这个代码附件。",
-        vibe_coding: true,
-      },
-    });
+    const request = requests.slice().reverse().find((item) => item.path === "/api/v1/runs");
+    expect(request).toMatchObject({ method: "POST", body: { message: "审查这个代码附件。" } });
+    expect(request?.body).not.toHaveProperty("vibe_coding", true);
   });
 
   it("creates a schedule from a chat-detected plan after user confirmation", async () => {
@@ -1660,14 +1656,13 @@ describe("operational management pages", () => {
     expect(composer.querySelector(".composer-send-row")).not.toBeNull();
   });
 
-  it("submits branch reference context and Vibe Coding together", async () => {
+  it("submits branch reference context without Vibe Coding", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationBranchButtonName }));
     await screen.findByText(/已按原思路新建分支/);
-    await user.click(screen.getByRole("button", { name: "Vibe Coding" }));
     await user.type(screen.getByPlaceholderText(/输入消息/), "沿用上一轮方向。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
@@ -1676,7 +1671,6 @@ describe("operational management pages", () => {
       body: {
         message: "沿用上一轮方向。",
         reference_conversation_id: "conv-previous",
-        vibe_coding: true,
       },
     });
   });
@@ -1701,49 +1695,6 @@ describe("operational management pages", () => {
         reference_conversation_id: null,
       },
     });
-  });
-
-  it("can cancel Vibe Coding mode before sending a message", async () => {
-    const user = userEvent.setup();
-    render(<TestApp initialPath="/" />);
-
-    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: "Vibe Coding" }));
-    await user.click(screen.getByRole("button", { name: "Vibe Coding" }));
-    await user.type(screen.getByPlaceholderText(/输入消息/), "正常对话。");
-    await user.click(screen.getByRole("button", { name: "发送" }));
-
-    expect(requests.slice().reverse().find((request) => request.path === "/api/v1/runs")).toMatchObject({
-      method: "POST",
-      body: {
-        message: "正常对话。",
-        vibe_coding: false,
-      },
-    });
-  });
-
-  it("keeps branch reference and Vibe Coding as independent composer states", async () => {
-    const user = userEvent.setup();
-    render(<TestApp initialPath="/" />);
-
-    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
-    await user.click(screen.getByRole("button", { name: conversationBranchButtonName }));
-    await screen.findByText(/已按原思路新建分支/);
-
-    const vibeButton = screen.getByRole("button", { name: "Vibe Coding" });
-
-    await user.click(vibeButton);
-    expect(screen.getByRole("button", { name: "取消引用会话" })).not.toBeNull();
-    expect(vibeButton.getAttribute("aria-pressed")).toBe("true");
-    expect(vibeButton.className).toContain("composer-vibe-active");
-
-    await user.click(screen.getByRole("button", { name: "取消引用会话" }));
-    expect(screen.queryByRole("button", { name: "取消引用会话" })).toBeNull();
-    expect(vibeButton.getAttribute("aria-pressed")).toBe("true");
-
-    await user.click(vibeButton);
-    expect(vibeButton.getAttribute("aria-pressed")).toBe("false");
-    expect(vibeButton.className).not.toContain("composer-vibe-active");
   });
 
   it("keeps multiple follow-up messages in the active conversation until the user starts a new chat", async () => {

@@ -283,6 +283,8 @@ describe("ConfigPage", () => {
 
     expect(await screen.findByRole("heading", { name: "系统设置" })).not.toBeNull();
     expect(screen.getByText("版本 3")).not.toBeNull();
+    expect(screen.queryByText("Vibe Coding")).toBeNull();
+    expect(screen.queryByTestId("vibe-coding-toggle")).toBeNull();
     expect(view.container.querySelectorAll(".settings-shortcut-card")).toHaveLength(6);
 
     await user.selectOptions(screen.getByLabelText("默认运行模式"), "dispatch");
@@ -290,7 +292,6 @@ describe("ConfigPage", () => {
     await user.click(screen.getByLabelText(/导演/));
     await user.click(screen.getByLabelText("允许主 Agent 提出临场调整，执行前必须向用户核对"));
     await user.click(screen.getByLabelText("允许主 Agent 在能力不足时申请临时子 Agent"));
-    await user.click(screen.getByTestId("vibe-coding-toggle"));
     await user.click(screen.getByTestId("multimedia-generation-toggle"));
     fireEvent.change(screen.getByLabelText(/临时 Agent 补位规则/), {
       target: { value: "缺少专业能力时先申请临时 Agent，任务结束后询问是否永久保存。" },
@@ -307,7 +308,6 @@ describe("ConfigPage", () => {
         default_agent_ids: ["director"],
         allow_main_agent_override: true,
         allow_temporary_agents: true,
-        vibe_coding_enabled: true,
         multimedia_generation_enabled: true,
         openclaw_allowed_commands: [],
         temporary_agent_policy: "缺少专业能力时先申请临时 Agent，任务结束后询问是否永久保存。",

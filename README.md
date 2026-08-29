@@ -8,7 +8,7 @@ It combines a Web console, Feishu/channel entry points, model pools, workflow an
 
 ## What You Can Do
 
-- Chat with the main agent in Web or supported channels, continue historical conversations, branch from prior context, attach files, and enable Vibe Coding inside chat.
+- Chat with the main agent in Web or supported channels, continue historical conversations, branch from prior context, and attach files. Project-level Vibe Coding is reserved for a future harness/runtime; the current UI does not expose a Vibe Coding button, while backend metadata remains available for future integration.
 - Configure normal chat/tool models separately from multimedia AI models.
 - Route image/video/audio generation only to models marked with the matching generation capability.
 - Use MiniMax/Hailuo text-to-video through the multimedia executor when a valid deployment and key are configured.
@@ -155,7 +155,7 @@ If you only need an offline fresh install, you do not need to export production 
 1. Sign in to the Web console.
 2. Open **Models** and add at least one normal model for the main agent.
 3. Open **Main Agent** and choose the model, control mode, decision policy, Hermes policy, and review limits.
-4. Open **System Settings** and enable only the system features you need: Vibe Coding, multimedia generation, and OpenClaw.
+4. Open **System Settings** and enable only the system features you need: multimedia generation and OpenClaw. Project-level Vibe Coding is not exposed in the current UI; its backend metadata field is retained for a future harness/runtime integration.
 5. Configure optional modules: Skills, MCP, channels, multimedia models, schedules, memories, and users.
 
 ## Models
@@ -180,7 +180,7 @@ The chat page supports:
 - `discuss`: run a discussion-style workflow.
 - `hybrid`: combine dispatch and discussion.
 
-Historical conversations expose a branch action for continuing with prior context; once a branch reference is active, the composer shows an explicit cancel control instead of requiring a per-message Handoff toggle. Vibe Coding stays as an in-chat coding collaboration mode with a visible selected state and can be disabled before send. A running chat can be stopped from the composer, and detected schedule or Evolution proposals can be cancelled before they create durable records.
+Historical conversations expose a branch action for continuing with prior context; once a branch reference is active, the composer shows an explicit cancel control instead of requiring a per-message Handoff toggle. Project-level Vibe Coding (generate a project, read/write code, run tests, review, debug, and verify again) is reserved for a future harness/runtime integration: the current UI does not expose a Vibe Coding button, while the backend metadata field remains for future compatibility. A running chat can be stopped from the composer, and detected schedule or Evolution proposals can be cancelled before they create durable records.
 
 Long conversations are handled by the conversation framework, not by the Evolution module. When the history approaches the main agent model context window, Cube Agent compacts older turns, keeps the origin goal and latest decisions, and passes the compacted context into the next run.
 
@@ -256,7 +256,7 @@ Audit records cover administrative changes and user-triggered conversation submi
 - `run_id`
 - `conversation_id` and `reference_conversation_id`
 - requested mode and accepted mode
-- workflow, selected agents, direct model, Vibe Coding flag, and attachment count
+- workflow, selected agents, direct model, the backend-compatible Vibe Coding metadata flag, and attachment count
 - message preview and `message_sha256`
 
 Hermes stores learning records separately from chat. Conversation memory and scheduler observations are separated into distinct record categories, and records can be filtered, sorted, confirmed, or deleted individually or in bulk.
