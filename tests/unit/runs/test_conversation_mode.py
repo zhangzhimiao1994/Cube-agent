@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteDecision
 from agent_hub.runs.repository import RunRecord
-from agent_hub.runs.service import RunService
+from agent_hub.runs.service import HermesRunAdvice, HermesRunOutcome, RunService
 from agent_hub.runtime.defaults import UnavailableRuntime
 from agent_hub.runtime.registry import RuntimeRegistry
 
@@ -89,6 +89,37 @@ class ConversationModeRepository:
             created_at=datetime.now(UTC),
             routing_decision=routing_decision,
         )
+
+
+class RecordingHermesAdvisor:
+    def __init__(self, advice: HermesRunAdvice | None) -> None:
+        self.advice = advice
+        self.calls: list[dict[str, object]] = []
+
+    async def advise(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        message: str,
+        mode: TaskMode,
+        agent_ids: tuple[str, ...],
+        workflow_id: str | None,
+    ) -> HermesRunAdvice | None:
+        self.calls.append(
+            {
+                "tenant_id": tenant_id,
+                "actor_id": actor_id,
+                "message": message,
+                "mode": mode,
+                "agent_ids": agent_ids,
+                "workflow_id": workflow_id,
+            }
+        )
+        return self.advice
+
+    async def record_outcome(self, outcome: HermesRunOutcome) -> None:
+        del outcome
 
 
 async def test_auto_submission_reuses_previous_mode_for_same_conversation_without_reasking() -> None:
@@ -271,6 +302,42 @@ async def test_auto_submission_queues_local_direct_when_router_cannot_classify()
     assert routing["reason"] == "main_agent_local_resolution"
     assert routing["main_agent_selected_mode"] == "direct"
     assert routing["router_clarification_reason"] == "classification_unavailable"
+
+
+async def test_auto_submission_uses_hermes_before_local_direct_router_fallback() -> None:
+    repository = ConversationModeRepository(None)
+    advisor = RecordingHermesAdvisor(
+        HermesRunAdvice(
+            recommended_mode=TaskMode.DISPATCH,
+            confidence=0.86,
+            reasons=("matched previous execution pattern",),
+            recommended_skills=("script-review",),
+            requires_approval=False,
+        )
+    )
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DISPATCH),)),
+        router=None,
+        task_queue=RecordingQueue(),
+        hermes_advisor=advisor,
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="short video script",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-1",
+        idempotency_key="idem-hermes-before-direct-fallback",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DISPATCH
+    assert len(advisor.calls) == 1
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "hermes_recommendation"
 
 
 async def test_declined_evolution_proposal_can_continue_through_auto_mode() -> None:

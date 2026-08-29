@@ -532,7 +532,7 @@ class RunService:
 
             if decision is None:
                 local_mode = _local_main_agent_auto_mode(message, attachment_ids)
-                if local_mode in EXECUTABLE_MODES:
+                if local_mode is not TaskMode.DIRECT and local_mode in EXECUTABLE_MODES:
                     routing_payload = {
                         "reason": "main_agent_local_resolution",
                         "main_agent_selected_mode": local_mode.value,
@@ -671,8 +671,8 @@ class RunService:
                             routing_decision=routing_payload,
                         ),
                         enqueue=True,
-                    )
-                    return _submitted(record)
+                )
+                return _submitted(record)
 
             if _auto_resolvable_route_decision(decision):
                 assert decision is not None
@@ -728,6 +728,31 @@ class RunService:
                 return _submitted(record)
 
             if decision is None:
+                local_mode = _local_main_agent_auto_mode(message, attachment_ids)
+                if local_mode in EXECUTABLE_MODES:
+                    routing_payload = {
+                        "reason": "main_agent_local_resolution",
+                        "main_agent_selected_mode": local_mode.value,
+                        "router_unavailable": self._router is None,
+                        **(
+                            {"hermes": _hermes_advice_payload(hermes_advice)}
+                            if hermes_advice is not None
+                            else {}
+                        ),
+                        **operator_selection,
+                    }
+                    record = await self._repository.create_run(
+                        tenant_id=tenant_id,
+                        actor_id=actor_id,
+                        request=message,
+                        mode=local_mode,
+                        status=RunStatus.QUEUED,
+                        idempotency_key=idempotency_key,
+                        routing_decision=routing_payload,
+                        enqueue=True,
+                    )
+                    return _submitted(record)
+
                 token = _decision_token()
                 record = await self._repository.create_run(
                     tenant_id=tenant_id,
