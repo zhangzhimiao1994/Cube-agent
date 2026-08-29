@@ -13,6 +13,7 @@ from agent_hub.memory.types import (
     MemoryCategory,
     MemoryLayer,
     MemoryRecord,
+    MemorySummaryPeriod,
 )
 
 _SECRET_PATTERNS = (
@@ -58,6 +59,9 @@ class MemoryService:
         stable_fact: bool = False,
         user_confirmed: bool = False,
         from_external_content: bool = False,
+        project_id: str | None = None,
+        conversation_id: str | None = None,
+        metadata: dict[str, str] | None = None,
     ) -> MemoryAddResult:
         normalized = _normalize_text(text)
         if _looks_sensitive(normalized):
@@ -95,6 +99,9 @@ class MemoryService:
             source_event_id=source_event_id,
             created_at=now,
             updated_at=now,
+            project_id=project_id,
+            conversation_id=conversation_id,
+            metadata=metadata or {},
             expires_at=expires_at,
         )
         await self._repository.upsert(record)
@@ -108,6 +115,9 @@ class MemoryService:
         user_id: UUID,
         query: str,
         limit: int = 10,
+        project_id: str | None = None,
+        conversation_id: str | None = None,
+        reinforce: bool = False,
     ) -> tuple[MemoryRecord, ...]:
         if limit < 1 or limit > 100:
             raise ValueError("memory search limit must be between 1 and 100")
@@ -117,9 +127,36 @@ class MemoryService:
         for record in records:
             score = len(query_terms & _terms(record.text))
             if score:
-                scored.append((score, record))
+                scope_score = _scope_score(record, project_id, conversation_id)
+                weighted = (
+                    score * 1000
+                    + scope_score
+                    + int(record.heat * 100)
+                    + int(record.confidence * 50)
+                    + (100 if record.layer is MemoryLayer.CORE else 0)
+                    + (75 if record.locked else 0)
+                )
+                scored.append((weighted, record))
         scored.sort(key=lambda item: (-item[0], -item[1].confidence, item[1].created_at))
-        return tuple(record for _, record in scored[:limit])
+        results = tuple(record for _, record in scored[:limit])
+        if not reinforce:
+            return results
+        reinforced: list[MemoryRecord] = []
+        for record in results:
+            now = self._now()
+            updated = _validated_update(
+                record,
+                {
+                    "heat": min(1.0, record.heat + 0.1),
+                    "recall_count": record.recall_count + 1,
+                    "last_recalled_at": now,
+                    "updated_at": now,
+                },
+            )
+            await self._repository.upsert(updated)
+            await self._audit("memory.recalled", tenant_id, user_id, record.id, "recalled")
+            reinforced.append(updated)
+        return tuple(reinforced)
 
     async def inspect(
         self,
@@ -203,6 +240,100 @@ class MemoryService:
                 )
                 expired += 1
         return expired
+
+    async def lock(self, memory_id: UUID, *, tenant_id: UUID, user_id: UUID) -> MemoryRecord:
+        record = await self._owned_record(memory_id, tenant_id, user_id)
+        updated = _validated_update(record, {"locked": True, "updated_at": self._now()})
+        await self._repository.upsert(updated)
+        await self._audit("memory.locked", tenant_id, user_id, memory_id, "locked")
+        return updated
+
+    async def unlock(self, memory_id: UUID, *, tenant_id: UUID, user_id: UUID) -> MemoryRecord:
+        record = await self._owned_record(memory_id, tenant_id, user_id)
+        updated = _validated_update(record, {"locked": False, "updated_at": self._now()})
+        await self._repository.upsert(updated)
+        await self._audit("memory.unlocked", tenant_id, user_id, memory_id, "unlocked")
+        return updated
+
+    async def decay_due(
+        self, *, days: int = 30, heat_loss: float = 0.1, tombstone_below: float = 0.05
+    ) -> int:
+        if days < 1 or not 0 <= heat_loss <= 1 or not 0 <= tombstone_below <= 1:
+            raise ValueError("memory decay settings are invalid")
+        changed = 0
+        now = self._now()
+        for record in await self._repository.list_all():
+            if record.deleted_at is not None or record.locked or record.layer is MemoryLayer.CORE:
+                continue
+            last_activity = record.last_recalled_at or record.updated_at
+            if (now - last_activity).days < days:
+                continue
+            next_heat = max(0.0, record.heat - heat_loss)
+            updates: dict[str, object] = {"heat": next_heat, "updated_at": now}
+            if next_heat <= tombstone_below:
+                updates["deleted_at"] = now
+                updates["tombstone_reason"] = "memory_decay_expired"
+            updated = _validated_update(record, updates)
+            await self._repository.upsert(updated)
+            await self._audit(
+                "memory.decayed",
+                record.tenant_id,
+                record.user_id,
+                record.id,
+                "decayed",
+                reason=updated.tombstone_reason,
+            )
+            changed += 1
+        return changed
+
+    async def consolidate(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        period: MemorySummaryPeriod,
+        project_id: str | None = None,
+        conversation_id: str | None = None,
+        limit: int = 12,
+    ) -> MemoryRecord:
+        if period is MemorySummaryPeriod.NONE:
+            raise ValueError("summary period must be day, week, or month")
+        if limit < 1 or limit > 100:
+            raise ValueError("memory consolidation limit must be between 1 and 100")
+        records = [
+            record
+            for record in await self._active_records(tenant_id, user_id)
+            if record.summary_period is MemorySummaryPeriod.NONE
+            and (project_id is None or record.project_id == project_id)
+            and (conversation_id is None or record.conversation_id == conversation_id)
+        ]
+        records.sort(key=lambda record: (-record.heat, -record.confidence, record.created_at))
+        selected = records[:limit]
+        if not selected:
+            raise ValueError("no memories available for consolidation")
+        bullet_text = "; ".join(record.text for record in selected)
+        text = f"{period.value} summary: {bullet_text}"
+        now = self._now()
+        summary = MemoryRecord(
+            id=uuid4(),
+            tenant_id=tenant_id,
+            user_id=user_id,
+            layer=MemoryLayer.EPISODIC,
+            category=MemoryCategory.SUMMARY,
+            text=text[:4096],
+            confidence=min(0.95, max(record.confidence for record in selected)),
+            created_at=now,
+            updated_at=now,
+            heat=0.8,
+            locked=True,
+            project_id=project_id,
+            conversation_id=conversation_id,
+            summary_period=period,
+            metadata={"source_count": str(len(selected))},
+        )
+        await self._repository.upsert(summary)
+        await self._audit("memory.consolidated", tenant_id, user_id, summary.id, "consolidated")
+        return summary
 
     async def audit_events(
         self,
@@ -288,6 +419,19 @@ def _looks_sensitive(text: str) -> bool:
 
 def _looks_prompt_like(text: str) -> bool:
     return _PROMPT_LIKE.search(text) is not None
+
+
+def _scope_score(
+    record: MemoryRecord, project_id: str | None, conversation_id: str | None
+) -> int:
+    score = 0
+    if project_id is not None and record.project_id == project_id:
+        score += 400
+    if conversation_id is not None and record.conversation_id == conversation_id:
+        score += 600
+    if record.project_id is None and record.conversation_id is None and record.layer is MemoryLayer.CORE:
+        score += 150
+    return score
 
 
 def _validated_update(record: MemoryRecord, updates: dict[str, object]) -> MemoryRecord:

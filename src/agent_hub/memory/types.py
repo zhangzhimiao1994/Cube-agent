@@ -17,7 +17,17 @@ class MemoryCategory(StrEnum):
     PREFERENCE = "preference"
     FACT = "fact"
     TASK = "task"
+    SUMMARY = "summary"
+    DECISION = "decision"
+    LESSON = "lesson"
     OTHER = "other"
+
+
+class MemorySummaryPeriod(StrEnum):
+    NONE = "none"
+    DAY = "day"
+    WEEK = "week"
+    MONTH = "month"
 
 
 class MemoryAddStatus(StrEnum):
@@ -54,6 +64,14 @@ class MemoryRecord(BaseModel):
     source_event_id: UUID | None = None
     created_at: datetime
     updated_at: datetime
+    heat: float = Field(default=0.5, ge=0, le=1)
+    last_recalled_at: datetime | None = None
+    recall_count: int = Field(default=0, ge=0)
+    locked: bool = False
+    project_id: str | None = Field(default=None, min_length=1, max_length=128)
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=128)
+    summary_period: MemorySummaryPeriod = MemorySummaryPeriod.NONE
+    metadata: dict[str, str] = Field(default_factory=dict, max_length=16)
     expires_at: datetime | None = None
     deleted_at: datetime | None = None
     tombstone_reason: str | None = Field(default=None, max_length=256)
@@ -65,7 +83,31 @@ class MemoryRecord(BaseModel):
             raise ValueError("memory text must be non-empty unpadded printable text")
         return value
 
-    @field_validator("created_at", "updated_at", "expires_at", "deleted_at")
+    @field_validator("project_id", "conversation_id")
+    @classmethod
+    def validate_scope_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if value != value.strip() or any(ch.isspace() for ch in value):
+            raise ValueError("memory scope identifiers must be unpadded non-whitespace strings")
+        return value
+
+    @field_validator("metadata")
+    @classmethod
+    def validate_metadata(cls, value: dict[str, str]) -> dict[str, str]:
+        for key, item in value.items():
+            if (
+                key != key.strip()
+                or item != item.strip()
+                or not key
+                or len(key) > 64
+                or len(item) > 256
+                or any(ord(ch) < 32 for ch in key + item)
+            ):
+                raise ValueError("memory metadata must contain bounded printable strings")
+        return value
+
+    @field_validator("created_at", "updated_at", "last_recalled_at", "expires_at", "deleted_at")
     @classmethod
     def require_aware_datetime(cls, value: datetime | None) -> datetime | None:
         if value is not None and value.tzinfo is None:

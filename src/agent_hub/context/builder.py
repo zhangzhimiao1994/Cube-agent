@@ -68,12 +68,12 @@ def _candidate_sections(value: ContextBuildInput) -> list[ContextSection]:
     if value.checkpoint:
         sections.append(_section("checkpoint", value.checkpoint, 51))
     sections.extend(
-        _section("core_memory", memory.text, 60)
+        _section("core_memory", _render_memory(memory), 60)
         for memory in value.memories
         if memory.layer is MemoryLayer.CORE
     )
     sections.extend(
-        _section("episodic_memory", memory.text, 70)
+        _section("episodic_memory", _render_memory(memory), 70)
         for memory in value.memories
         if memory.layer is MemoryLayer.EPISODIC
     )
@@ -115,6 +115,20 @@ def _render_knowledge_hit(hit: KnowledgeHit) -> str:
         f"{text}\n"
         "</UNTRUSTED_KNOWLEDGE>"
     )
+
+
+def _render_memory(memory: MemoryRecord) -> str:
+    labels = [f"heat:{memory.heat:.2f}"]
+    if memory.locked:
+        labels.append("locked")
+    if memory.project_id:
+        labels.append(f"project:{escape(memory.project_id, quote=False)}")
+    if memory.conversation_id:
+        labels.append(f"conversation:{escape(memory.conversation_id, quote=False)}")
+    if memory.summary_period.value != "none":
+        labels.append(f"summary:{memory.summary_period.value}")
+    prefix = " ".join(f"[{label}]" for label in labels)
+    return f"{prefix} {memory.text}"
 
 
 def _trim_protected(sections: list[ContextSection], budget: int) -> list[ContextSection]:

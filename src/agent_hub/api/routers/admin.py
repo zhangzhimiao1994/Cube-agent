@@ -590,6 +590,13 @@ class MemoryRecordRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     value: str = Field(min_length=1, max_length=20_000)
+    heat: float = Field(default=0.5, ge=0, le=1)
+    locked: bool = False
+    project_id: str | None = Field(default=None, min_length=1, max_length=128)
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=128)
+    summary_period: str = Field(default="none", pattern=r"^(none|day|week|month)$")
+    recall_count: int = Field(default=0, ge=0)
+    last_recalled_at: str | None = None
 
 
 class MemoryCreateRequest(MemoryRecordRequest):
@@ -603,6 +610,13 @@ class MemoryRecordResponse(BaseModel):
     id: str
     scope: str
     value: str
+    heat: float = Field(default=0.5, ge=0, le=1)
+    locked: bool = False
+    project_id: str | None = Field(default=None, min_length=1, max_length=128)
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=128)
+    summary_period: str = Field(default="none", pattern=r"^(none|day|week|month)$")
+    recall_count: int = Field(default=0, ge=0)
+    last_recalled_at: str | None = None
 
 
 class AuditEventResponse(BaseModel):
@@ -3029,7 +3043,7 @@ class InMemoryAdminResourceService:
         return tuple(self.memory.values())
 
     async def create_memory(self, request: MemoryCreateRequest) -> MemoryRecordResponse:
-        response = MemoryRecordResponse(id=request.id, scope=request.scope, value=request.value)
+        response = MemoryRecordResponse(**request.model_dump())
         self.memory[response.id] = response
         return response
 
@@ -3037,7 +3051,7 @@ class InMemoryAdminResourceService:
         self, memory_id: str, request: MemoryRecordRequest
     ) -> MemoryRecordResponse:
         current = self.memory[memory_id]
-        updated = current.model_copy(update={"value": request.value})
+        updated = current.model_copy(update=request.model_dump(exclude_unset=True))
         self.memory[memory_id] = updated
         return updated
 
@@ -4678,7 +4692,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         return tuple(MemoryRecordResponse.model_validate(payload) for payload in resources)
 
     async def create_memory(self, request: MemoryCreateRequest) -> MemoryRecordResponse:
-        response = MemoryRecordResponse(id=request.id, scope=request.scope, value=request.value)
+        response = MemoryRecordResponse(**request.model_dump())
         if not await self._upsert_admin_payload(
             "memory", response.id, response.model_dump(mode="json")
         ):
@@ -4695,7 +4709,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         if not existing:
             raise KeyError(memory_id)
         current = MemoryRecordResponse.model_validate(existing)
-        response = MemoryRecordResponse(id=current.id, scope=current.scope, value=request.value)
+        response = current.model_copy(update=request.model_dump(exclude_unset=True))
         await self._upsert_admin_payload("memory", memory_id, response.model_dump(mode="json"))
         await self._record_audit("memory.update", f"memory:{memory_id}", {"id": memory_id})
         return response
@@ -8090,6 +8104,36 @@ async def update_memory(
         raise PublicAPIError(404, "not_found", "not found") from None
 
 
+@router.post(
+    "/memory/{memory_id}/lock",
+    response_model=MemoryRecordResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def lock_memory(
+    memory_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> MemoryRecordResponse:
+    _require(principal, "memory:write")
+    current = await _admin_memory_or_404(service, memory_id)
+    return await service.update_memory(memory_id, _memory_request_from_response(current, locked=True))
+
+
+@router.post(
+    "/memory/{memory_id}/unlock",
+    response_model=MemoryRecordResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def unlock_memory(
+    memory_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> MemoryRecordResponse:
+    _require(principal, "memory:write")
+    current = await _admin_memory_or_404(service, memory_id)
+    return await service.update_memory(memory_id, _memory_request_from_response(current, locked=False))
+
+
 @router.delete(
     "/memory/{memory_id}",
     response_model=OperationStatusResponse,
@@ -8106,6 +8150,26 @@ async def forget_memory(
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
     return OperationStatusResponse(status="forgotten")
+
+
+async def _admin_memory_or_404(
+    service: AdminResourceService, memory_id: str
+) -> MemoryRecordResponse:
+    for item in await service.list_memory():
+        if item.id == memory_id:
+            return item
+    raise PublicAPIError(404, "not_found", "not found")
+
+
+def _memory_request_from_response(
+    current: MemoryRecordResponse,
+    **updates: object,
+) -> MemoryRecordRequest:
+    data = current.model_dump()
+    data.pop("id", None)
+    data.pop("scope", None)
+    data.update(updates)
+    return MemoryRecordRequest.model_validate(data)
 
 
 @router.get(

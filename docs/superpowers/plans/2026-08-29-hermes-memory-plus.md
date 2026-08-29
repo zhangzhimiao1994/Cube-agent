@@ -30,7 +30,7 @@
 - Modify: `src/agent_hub/memory/types.py`
 - Test: `tests/integration/memory/test_memory.py`
 
-- [ ] **Step 1: Write failing record validation tests**
+- [x] **Step 1: Write failing record validation tests**
 
 Add tests to `tests/integration/memory/test_memory.py`:
 
@@ -67,7 +67,7 @@ from agent_hub.memory.types import (
 )
 ```
 
-- [ ] **Step 2: Run the failing test**
+- [x] **Step 2: Run the failing test**
 
 Run:
 
@@ -78,7 +78,7 @@ $env:PYTHONPATH = (Resolve-Path src).Path
 
 Expected: FAIL because `MemorySummaryPeriod` and the new fields do not exist.
 
-- [ ] **Step 3: Implement type fields**
+- [x] **Step 3: Implement type fields**
 
 In `src/agent_hub/memory/types.py`, add:
 
@@ -139,13 +139,13 @@ Add validators:
         return value
 ```
 
-- [ ] **Step 4: Run the test to verify green**
+- [x] **Step 4: Run the test to verify green**
 
 Run the same command from Step 2.
 
 Expected: PASS.
 
-- [ ] **Step 5: Run mypy target**
+- [x] **Step 5: Run mypy target**
 
 Run:
 
@@ -162,7 +162,7 @@ Expected: success.
 - Modify: `src/agent_hub/memory/service.py`
 - Test: `tests/integration/memory/test_memory.py`
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Add:
 
@@ -230,7 +230,7 @@ async def test_search_can_reinforce_returned_memories() -> None:
     assert (await service.audit_events(tenant_id=TENANT_A))[-1].kind == "memory.recalled"
 ```
 
-- [ ] **Step 2: Run failing tests**
+- [x] **Step 2: Run failing tests**
 
 Run:
 
@@ -241,7 +241,7 @@ $env:PYTHONPATH = (Resolve-Path src).Path
 
 Expected: FAIL because search does not accept `project_id`, `conversation_id`, or `reinforce`.
 
-- [ ] **Step 3: Implement add/search parameters and ranking**
+- [x] **Step 3: Implement add/search parameters and ranking**
 
 In `MemoryService.add_candidate`, add keyword parameters:
 
@@ -315,7 +315,7 @@ If `reinforce` is true, update each returned record:
         return results
 ```
 
-- [ ] **Step 4: Run targeted tests**
+- [x] **Step 4: Run targeted tests**
 
 Run Step 2 command again.
 
@@ -327,7 +327,7 @@ Expected: PASS.
 - Modify: `src/agent_hub/memory/service.py`
 - Test: `tests/integration/memory/test_memory.py`
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Add:
 
@@ -369,7 +369,7 @@ async def test_low_heat_unlocked_episodic_memory_decays_to_tombstone() -> None:
     assert tombstones[0].tombstone_reason == "memory_decay_expired"
 ```
 
-- [ ] **Step 2: Run failing tests**
+- [x] **Step 2: Run failing tests**
 
 Run:
 
@@ -380,7 +380,7 @@ $env:PYTHONPATH = (Resolve-Path src).Path
 
 Expected: FAIL because `lock` and `decay_due` do not exist.
 
-- [ ] **Step 3: Implement lock/unlock/decay**
+- [x] **Step 3: Implement lock/unlock/decay**
 
 Add methods to `MemoryService`:
 
@@ -431,7 +431,7 @@ Add methods to `MemoryService`:
         return changed
 ```
 
-- [ ] **Step 4: Run targeted tests**
+- [x] **Step 4: Run targeted tests**
 
 Run Step 2 command again.
 
@@ -443,7 +443,7 @@ Expected: PASS.
 - Modify: `src/agent_hub/memory/service.py`
 - Test: `tests/integration/memory/test_memory.py`
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Add:
 
@@ -481,7 +481,7 @@ async def test_consolidation_creates_summary_memory() -> None:
     assert (await service.audit_events(tenant_id=TENANT_A))[-1].kind == "memory.consolidated"
 ```
 
-- [ ] **Step 2: Run failing test**
+- [x] **Step 2: Run failing test**
 
 Run:
 
@@ -492,7 +492,7 @@ $env:PYTHONPATH = (Resolve-Path src).Path
 
 Expected: FAIL because `consolidate` does not exist.
 
-- [ ] **Step 3: Implement consolidation**
+- [x] **Step 3: Implement consolidation**
 
 Add method:
 
@@ -551,7 +551,7 @@ Update imports in `service.py`:
 from agent_hub.memory.types import MemorySummaryPeriod
 ```
 
-- [ ] **Step 4: Run targeted test**
+- [x] **Step 4: Run targeted test**
 
 Run Step 2 command again.
 
@@ -563,7 +563,7 @@ Expected: PASS.
 - Modify: `src/agent_hub/context/builder.py`
 - Test: `tests/unit/context/test_builder.py`
 
-- [ ] **Step 1: Write failing test**
+- [x] **Step 1: Write failing test**
 
 Add:
 
@@ -590,7 +590,7 @@ def test_context_builder_renders_hermes_plus_memory_labels() -> None:
     assert "[summary:week]" in rendered
 ```
 
-- [ ] **Step 2: Run failing test**
+- [x] **Step 2: Run failing test**
 
 Run:
 
@@ -601,7 +601,7 @@ $env:PYTHONPATH = (Resolve-Path src).Path
 
 Expected: FAIL because memory labels are not rendered.
 
-- [ ] **Step 3: Implement memory rendering helper**
+- [x] **Step 3: Implement memory rendering helper**
 
 In `src/agent_hub/context/builder.py`, replace direct `memory.text` rendering with `_render_memory(memory)`.
 
@@ -633,7 +633,7 @@ and:
         _section("episodic_memory", _render_memory(memory), 70)
 ```
 
-- [ ] **Step 4: Run targeted test**
+- [x] **Step 4: Run targeted test**
 
 Run Step 2 command again.
 
@@ -645,7 +645,7 @@ Expected: PASS.
 - Modify: `src/agent_hub/api/routers/admin.py`
 - Test: `tests/api/test_admin_resources.py`
 
-- [ ] **Step 1: Write failing API test**
+- [x] **Step 1: Write failing API test**
 
 Add:
 
@@ -678,7 +678,7 @@ def test_memory_api_exposes_hermes_plus_fields_and_lock_controls(api: TestClient
     assert unlocked.json()["locked"] is False
 ```
 
-- [ ] **Step 2: Run failing test**
+- [x] **Step 2: Run failing test**
 
 Run:
 
@@ -689,7 +689,7 @@ $env:PYTHONPATH = (Resolve-Path src).Path
 
 Expected: FAIL because response schema and endpoints do not exist.
 
-- [ ] **Step 3: Extend admin schemas**
+- [x] **Step 3: Extend admin schemas**
 
 In `MemoryRecordRequest`, add optional fields:
 
@@ -705,7 +705,7 @@ In `MemoryRecordRequest`, add optional fields:
 
 Mirror the fields in `MemoryRecordResponse`.
 
-- [ ] **Step 4: Preserve fields in create/update and add endpoints**
+- [x] **Step 4: Preserve fields in create/update and add endpoints**
 
 Update create/update methods in `InMemoryAdminResourceService` and `PersistentAdminResourceService` to store all request fields.
 
@@ -734,7 +734,7 @@ async def unlock_memory(memory_id: str, principal: Principal = Depends(require_p
 
 Keep route formatting consistent with nearby endpoints.
 
-- [ ] **Step 5: Run targeted API test**
+- [x] **Step 5: Run targeted API test**
 
 Run Step 2 command again.
 
@@ -747,7 +747,7 @@ Expected: PASS.
 - Modify: `web/src/pages/MemoryPage.tsx`
 - Test: `web/src/pages/OperationalPages.test.tsx`
 
-- [ ] **Step 1: Write failing UI test**
+- [x] **Step 1: Write failing UI test**
 
 In `web/src/pages/OperationalPages.test.tsx`, extend the `/api/v1/admin/memory` mock record with:
 
@@ -771,7 +771,7 @@ expect(screen.getByText("摘要 week")).toBeInTheDocument();
 expect(screen.getByText("召回 3 次")).toBeInTheDocument();
 ```
 
-- [ ] **Step 2: Run failing UI test**
+- [x] **Step 2: Run failing UI test**
 
 Run:
 
@@ -783,7 +783,7 @@ from `E:\code_x\mofang agent\web`.
 
 Expected: FAIL because the UI does not render Hermes+ fields.
 
-- [ ] **Step 3: Extend Zod schema and client methods**
+- [x] **Step 3: Extend Zod schema and client methods**
 
 In `web/src/api/client.ts`, extend `MemoryRecordSchema`:
 
@@ -808,7 +808,7 @@ Add API methods:
   },
 ```
 
-- [ ] **Step 4: Render fields in MemoryPage**
+- [x] **Step 4: Render fields in MemoryPage**
 
 In `MemoryPage.tsx`, render badges in each record card:
 
@@ -830,7 +830,7 @@ Add lock/unlock button:
 </button>
 ```
 
-- [ ] **Step 5: Run targeted UI test**
+- [x] **Step 5: Run targeted UI test**
 
 Run Step 2 command again.
 
@@ -844,7 +844,7 @@ Expected: PASS.
 - Modify: `findings.md`
 - Modify: `progress.md`
 
-- [ ] **Step 1: Run backend gates**
+- [x] **Step 1: Run backend gates**
 
 Run:
 
@@ -857,7 +857,7 @@ $env:PYTHONPATH = (Resolve-Path src).Path
 
 Expected: all pass.
 
-- [ ] **Step 2: Run frontend gates**
+- [x] **Step 2: Run frontend gates**
 
 Run from `E:\code_x\mofang agent\web`:
 

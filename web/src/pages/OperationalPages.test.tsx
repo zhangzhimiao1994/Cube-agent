@@ -959,7 +959,20 @@ describe("operational management pages", () => {
           return jsonResponse([{ id: "filesystem", name: "Filesystem MCP", health: "healthy", allowed_tools: ["read_file"] }]);
         }
         if (path === "/api/v1/admin/memory") {
-          return jsonResponse([{ id: "project-policy", scope: "tenant", value: "Only non-dangerous operations may run without approval." }]);
+          return jsonResponse([
+            {
+              id: "project-policy",
+              scope: "tenant",
+              value: "Only non-dangerous operations may run without approval.",
+              heat: 0.82,
+              locked: true,
+              project_id: "cube-agent",
+              conversation_id: "handoff",
+              summary_period: "week",
+              recall_count: 3,
+              last_recalled_at: "2026-08-29T09:00:00Z",
+            },
+          ]);
         }
         if (path.startsWith("/api/v1/admin/logs")) {
           const logs = [
@@ -2776,6 +2789,11 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/memory" />);
     expect(await screen.findByText("project-policy")).not.toBeNull();
     expect(screen.getByText("tenant")).not.toBeNull();
+    expect(await screen.findByText("热度 0.82")).not.toBeNull();
+    expect(screen.getByText("已锁定")).not.toBeNull();
+    expect(screen.getByText("项目 cube-agent")).not.toBeNull();
+    expect(screen.getByText("摘要 week")).not.toBeNull();
+    expect(screen.getByText("召回 3 次")).not.toBeNull();
 
     cleanup();
     const logsView = render(<TestApp initialPath="/logs" />);

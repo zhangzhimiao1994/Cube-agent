@@ -815,6 +815,13 @@ const MemoryRecordSchema = z.object({
   id: z.string(),
   scope: z.string(),
   value: z.string(),
+  heat: z.number().default(0.5),
+  locked: z.boolean().default(false),
+  project_id: z.string().nullable().default(null),
+  conversation_id: z.string().nullable().default(null),
+  summary_period: z.enum(["none", "day", "week", "month"]).default("none"),
+  recall_count: z.number().default(0),
+  last_recalled_at: z.string().nullable().default(null),
 });
 
 export type MemoryRecord = z.infer<typeof MemoryRecordSchema>;
@@ -1587,13 +1594,27 @@ export const api = {
   },
   updateMemory(id: string, value: string): Promise<MemoryRecord> {
     return request(
-      `/api/v1/admin/memory/${id}`,
+      `/api/v1/admin/memory/${encodeURIComponent(id)}`,
       { method: "PATCH", body: JSON.stringify({ value }) },
       MemoryRecordSchema,
     );
   },
+  lockMemory(id: string): Promise<MemoryRecord> {
+    return request(
+      `/api/v1/admin/memory/${encodeURIComponent(id)}/lock`,
+      { method: "POST" },
+      MemoryRecordSchema,
+    );
+  },
+  unlockMemory(id: string): Promise<MemoryRecord> {
+    return request(
+      `/api/v1/admin/memory/${encodeURIComponent(id)}/unlock`,
+      { method: "POST" },
+      MemoryRecordSchema,
+    );
+  },
   async forgetMemory(id: string): Promise<void> {
-    await requestNoContent(`/api/v1/admin/memory/${id}`, { method: "DELETE" });
+    await requestNoContent(`/api/v1/admin/memory/${encodeURIComponent(id)}`, { method: "DELETE" });
   },
   audit(action?: string): Promise<AuditEvent[]> {
     const query = action ? `?action=${encodeURIComponent(action)}` : "";

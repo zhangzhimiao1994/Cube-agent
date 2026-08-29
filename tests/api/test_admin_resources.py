@@ -2876,6 +2876,35 @@ def test_skill_upload_approve_mcp_memory_and_audit_are_safe() -> None:
         assert forbidden not in serialized.lower()
 
 
+def test_memory_api_exposes_hermes_plus_fields_and_lock_controls() -> None:
+    api = client()
+    created = api.post(
+        "/api/v1/admin/memory",
+        headers=headers(),
+        json={
+            "id": "hermes-plus-policy",
+            "scope": "cube-agent",
+            "value": "Hermes+ must finish before harness refactor.",
+            "heat": 0.7,
+            "project_id": "cube-agent",
+            "conversation_id": "handoff",
+        },
+    )
+    assert created.status_code == 200
+    body = created.json()
+    assert body["heat"] == 0.7
+    assert body["locked"] is False
+    assert body["summary_period"] == "none"
+
+    locked = api.post("/api/v1/admin/memory/hermes-plus-policy/lock", headers=headers())
+    assert locked.status_code == 200
+    assert locked.json()["locked"] is True
+
+    unlocked = api.post("/api/v1/admin/memory/hermes-plus-policy/unlock", headers=headers())
+    assert unlocked.status_code == 200
+    assert unlocked.json()["locked"] is False
+
+
 def test_unified_logs_include_audit_model_mode_and_feature_errors() -> None:
     api = client()
     app = cast(Any, api.app)

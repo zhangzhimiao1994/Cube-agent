@@ -8,7 +8,7 @@ import pytest
 from agent_hub.context.builder import ContextBuilder, ContextBuildInput
 from agent_hub.context.compaction import ContextCompactor
 from agent_hub.knowledge.retrieval import KnowledgeHit
-from agent_hub.memory.types import MemoryCategory, MemoryLayer, MemoryRecord
+from agent_hub.memory.types import MemoryCategory, MemoryLayer, MemoryRecord, MemorySummaryPeriod
 
 TENANT_ID = UUID("55555555-5555-4555-8555-555555555555")
 USER_ID = UUID("66666666-6666-4666-8666-666666666666")
@@ -118,6 +118,28 @@ def test_knowledge_prompt_injection_is_labeled_in_context() -> None:
     rendered = "\n".join(section.content for section in context.sections)
     assert "PROMPT_INJECTION_RISK" in rendered
     assert "<UNTRUSTED_KNOWLEDGE" in rendered
+
+
+def test_context_builder_renders_hermes_plus_memory_labels() -> None:
+    hot = memory("deploy to prod-web-01", MemoryLayer.EPISODIC).model_copy(
+        update={
+            "heat": 0.9,
+            "locked": True,
+            "project_id": "cube-agent",
+            "summary_period": MemorySummaryPeriod.WEEK,
+        }
+    )
+
+    context = ContextBuilder().build(
+        ContextBuildInput(system_policy="system", current_user_request="request", memories=(hot,)),
+        token_budget=100,
+    )
+
+    rendered = "\n".join(section.content for section in context.sections)
+    assert "[locked]" in rendered
+    assert "[heat:0.90]" in rendered
+    assert "[project:cube-agent]" in rendered
+    assert "[summary:week]" in rendered
 
 
 def test_knowledge_rendering_escapes_delimiter_breaking_text() -> None:

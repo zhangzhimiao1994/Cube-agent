@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from agent_hub.memory.service import MemoryForbidden, MemoryService
-from agent_hub.memory.types import MemoryAddStatus, MemoryCategory, MemoryLayer
+from agent_hub.memory.types import MemoryAddStatus, MemoryCategory, MemoryLayer, MemorySummaryPeriod
 
 TENANT_A = UUID("11111111-aaaa-4aaa-8aaa-111111111111")
 TENANT_B = UUID("22222222-bbbb-4bbb-8bbb-222222222222")
@@ -17,6 +17,27 @@ USER_2 = UUID("44444444-2222-4222-8222-444444444444")
 def memory_service_with_clock() -> tuple[MemoryService, list[datetime]]:
     now = [datetime(2026, 8, 6, tzinfo=UTC)]
     return MemoryService(now=lambda: now[0]), now
+
+
+async def test_hermes_plus_record_defaults_are_safe() -> None:
+    service, _ = memory_service_with_clock()
+
+    added = await service.add_candidate(
+        tenant_id=TENANT_A,
+        user_id=USER_1,
+        text="prefers implementation plans before large changes",
+        category=MemoryCategory.PREFERENCE,
+    )
+
+    assert added.record is not None
+    assert added.record.heat == 0.5
+    assert added.record.recall_count == 0
+    assert added.record.last_recalled_at is None
+    assert added.record.locked is False
+    assert added.record.project_id is None
+    assert added.record.conversation_id is None
+    assert added.record.summary_period is MemorySummaryPeriod.NONE
+    assert added.record.metadata == {}
 
 
 async def test_memory_is_tenant_and_user_isolated() -> None:
@@ -202,3 +223,136 @@ async def test_audit_events_can_be_scoped_by_tenant_and_user() -> None:
     with pytest.raises(ValueError):
         await service.audit_events()
     assert len(await service.audit_events(include_all=True)) == 3
+
+
+async def test_scope_aware_search_prioritizes_conversation_project_and_core() -> None:
+    service, _ = memory_service_with_clock()
+    await service.add_candidate(
+        tenant_id=TENANT_A,
+        user_id=USER_1,
+        text="prefers pytest for backend verification",
+        project_id="cube-agent",
+        conversation_id="thread-a",
+    )
+    await service.add_candidate(
+        tenant_id=TENANT_A,
+        user_id=USER_1,
+        text="prefers pytest for older backend work",
+        project_id="cube-agent",
+        conversation_id="thread-b",
+    )
+    await service.add_candidate(
+        tenant_id=TENANT_A,
+        user_id=USER_1,
+        text="prefers pytest for all projects",
+        layer=MemoryLayer.CORE,
+        user_confirmed=True,
+    )
+
+    results = await service.search(
+        tenant_id=TENANT_A,
+        user_id=USER_1,
+        query="pytest backend",
+        project_id="cube-agent",
+        conversation_id="thread-a",
+    )
+
+    assert [record.text for record in results] == [
+        "prefers pytest for backend verification",
+        "prefers pytest for older backend work",
+        "prefers pytest for all projects",
+    ]
+
+
+async def test_search_can_reinforce_returned_memories() -> None:
+    service, now = memory_service_with_clock()
+    added = await service.add_candidate(
+        tenant_id=TENANT_A,
+        user_id=USER_1,
+        text="likes concise deployment reports",
+    )
+    assert added.record is not None
+    now[0] = now[0] + timedelta(minutes=5)
+
+    recalled = await service.search(
+        tenant_id=TENANT_A,
+        user_id=USER_1,
+        query="deployment reports",
+        reinforce=True,
+    )
+
+    assert recalled[0].id == added.record.id
+    assert recalled[0].recall_count == 1
+    assert recalled[0].last_recalled_at == now[0]
+    assert recalled[0].heat > added.record.heat
+    assert (await service.audit_events(tenant_id=TENANT_A))[-1].kind == "memory.recalled"
+
+
+async def test_locked_memory_does_not_decay() -> None:
+    service, now = memory_service_with_clock()
+    added = await service.add_candidate(
+        tenant_id=TENANT_A,
+        user_id=USER_1,
+        text="never decay this important preference",
+    )
+    assert added.record is not None
+    locked = await service.lock(added.record.id, tenant_id=TENANT_A, user_id=USER_1)
+    assert locked.locked is True
+    now[0] = now[0] + timedelta(days=30)
+
+    assert await service.decay_due() == 0
+    visible = await service.inspect(tenant_id=TENANT_A, user_id=USER_1)
+    assert visible[0].locked is True
+    assert visible[0].deleted_at is None
+
+
+async def test_low_heat_unlocked_episodic_memory_decays_to_tombstone() -> None:
+    service, now = memory_service_with_clock()
+    added = await service.add_candidate(
+        tenant_id=TENANT_A,
+        user_id=USER_1,
+        text="temporary old implementation detail",
+        confidence=0.2,
+    )
+    assert added.record is not None
+    now[0] = now[0] + timedelta(days=90)
+
+    expired = await service.decay_due(days=30, heat_loss=0.6, tombstone_below=0.05)
+
+    assert expired == 1
+    tombstones = await service.inspect(tenant_id=TENANT_A, user_id=USER_1, include_deleted=True)
+    assert tombstones[0].deleted_at is not None
+    assert tombstones[0].tombstone_reason == "memory_decay_expired"
+
+
+async def test_consolidation_creates_summary_memory() -> None:
+    service, _ = memory_service_with_clock()
+    await service.add_candidate(
+        tenant_id=TENANT_A,
+        user_id=USER_1,
+        text="deployments go to prod-web-01",
+        category=MemoryCategory.FACT,
+        project_id="cube-agent",
+    )
+    await service.add_candidate(
+        tenant_id=TENANT_A,
+        user_id=USER_1,
+        text="Hermes+ must finish before harness refactor",
+        category=MemoryCategory.DECISION,
+        project_id="cube-agent",
+    )
+
+    summary = await service.consolidate(
+        tenant_id=TENANT_A,
+        user_id=USER_1,
+        period=MemorySummaryPeriod.DAY,
+        project_id="cube-agent",
+    )
+
+    assert summary.category is MemoryCategory.SUMMARY
+    assert summary.summary_period is MemorySummaryPeriod.DAY
+    assert summary.project_id == "cube-agent"
+    assert "deployments go to prod-web-01" in summary.text
+    assert "Hermes+ must finish before harness refactor" in summary.text
+    assert summary.locked is True
+    assert (await service.audit_events(tenant_id=TENANT_A))[-1].kind == "memory.consolidated"

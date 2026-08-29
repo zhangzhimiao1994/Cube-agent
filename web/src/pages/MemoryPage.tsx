@@ -26,6 +26,14 @@ export function MemoryPage() {
     mutationFn: (id: string) => api.forgetMemory(id),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["memory"] }),
   });
+  const lock = useMutation({
+    mutationFn: (id: string) => api.lockMemory(id),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["memory"] }),
+  });
+  const unlock = useMutation({
+    mutationFn: (id: string) => api.unlockMemory(id),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["memory"] }),
+  });
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -86,6 +94,8 @@ export function MemoryPage() {
 
       {update.isError ? <p role="alert">{formatApiError(update.error, "记忆更新失败")}</p> : null}
       {forget.isError ? <p role="alert">{formatApiError(forget.error, "记忆删除失败")}</p> : null}
+      {lock.isError ? <p role="alert">{formatApiError(lock.error, "记忆锁定失败")}</p> : null}
+      {unlock.isError ? <p role="alert">{formatApiError(unlock.error, "记忆解锁失败")}</p> : null}
 
       <section aria-label="已保存记忆">
         <h3>已保存记忆</h3>
@@ -100,6 +110,14 @@ export function MemoryPage() {
               <article key={record.id}>
                 <span className="eyebrow">{record.scope}</span>
                 <h3>{record.id}</h3>
+                <div className="inline-status-list">
+                  <span>热度 {record.heat.toFixed(2)}</span>
+                  <span>{record.locked ? "已锁定" : "未锁定"}</span>
+                  {record.project_id ? <span>项目 {record.project_id}</span> : null}
+                  {record.conversation_id ? <span>对话 {record.conversation_id}</span> : null}
+                  {record.summary_period !== "none" ? <span>摘要 {record.summary_period}</span> : null}
+                  <span>召回 {record.recall_count} 次</span>
+                </div>
                 <label>
                   内容
                   <textarea
@@ -110,6 +128,15 @@ export function MemoryPage() {
                     }
                   />
                 </label>
+                <button
+                  type="button"
+                  onClick={() =>
+                    record.locked ? unlock.mutate(record.id) : lock.mutate(record.id)
+                  }
+                  disabled={lock.isPending || unlock.isPending}
+                >
+                  {record.locked ? "解除锁定" : "锁定记忆"}
+                </button>
                 <button type="button" onClick={() => forget.mutate(record.id)}>
                   删除记忆
                 </button>
