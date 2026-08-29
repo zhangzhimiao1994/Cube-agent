@@ -1,17 +1,22 @@
 """The sole leased, redacted path from model requests to model transports."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import math
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal
 from types import MappingProxyType
-from typing import Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
+if TYPE_CHECKING:
+    from agent_hub.harness.provider import NormalizedProviderEvent
+    from agent_hub.harness.streaming import OpenAICompatibleChunkTransport
 from agent_hub.models.capacity import (
     CapacityBackendError,
     CapacityConfigurationError,
@@ -344,6 +349,79 @@ class ModelGateway:
             raise last_retryable_error from None
         raise CapacityUnavailable("model capacity unavailable") from None
 
+    async def stream_openai_compatible_events(
+        self, request: ModelRequest
+    ) -> AsyncIterator[NormalizedProviderEvent]:
+        streaming_transport = self._streaming_transport()
+        estimated_tokens = self._token_estimator.estimate(request)
+        if type(estimated_tokens) is not int or estimated_tokens <= 0:
+            raise ValueError("token estimator must return a strict positive integer")
+        models = self._fallback_chain(request.logical_model, request.allow_fallback)
+        candidate_groups: list[tuple[str, tuple[Deployment, ...]]] = []
+        last_retryable_error: BaseException | None = None
+        for logical_model in models:
+            try:
+                candidates = self._registry.candidates(
+                    logical_model, request.required_capabilities
+                )
+            except NoCapableDeployment:
+                if logical_model == request.logical_model:
+                    raise
+                break
+            candidate_groups.append((logical_model, candidates))
+        relevant_deployments = tuple(
+            deployment
+            for _logical_model, candidates in candidate_groups
+            for deployment in candidates
+        )
+        scoped = getattr(self._capacity, "scoped", None)
+        capacity = self._capacity if scoped is None else scoped(relevant_deployments)
+        for _logical_model, candidates in candidate_groups:
+            try:
+                await capacity.initialize()
+                lease = await capacity.acquire(
+                    candidates,
+                    self._capacity_wait_timeout,
+                    estimated_tokens=estimated_tokens,
+                )
+            except (CapacityWaitTimeout, CapacityQueueFull):
+                continue
+            selected = next((item for item in candidates if item.id == lease.deployment_id), None)
+            if selected is None or selected.quota_scope_id != lease.quota_scope_id:
+                cleanup_error = await self._release_cleanup(capacity, lease)
+                if isinstance(cleanup_error, asyncio.CancelledError):
+                    raise cleanup_error
+                if cleanup_error is not None:
+                    raise CapacityBackendError("model capacity release failed") from None
+                raise CapacityBackendError("model capacity returned an unknown deployment")
+            yielded = False
+            events = self._stream_openai_compatible_leased(
+                capacity,
+                selected,
+                lease,
+                request,
+                streaming_transport,
+            )
+            try:
+                while True:
+                    try:
+                        event = await anext(events)
+                    except StopAsyncIteration:
+                        break
+                    yielded = True
+                    yield event
+            except (ModelTransportError, ModelGatewayError) as error:
+                if yielded or not _retryable_model_failure(error):
+                    raise
+                last_retryable_error = error
+                continue
+            finally:
+                await cast(Any, events).aclose()
+            return
+        if last_retryable_error is not None:
+            raise last_retryable_error from None
+        raise CapacityUnavailable("model capacity unavailable") from None
+
     def _cost_usd(self, deployment: Deployment, response: ModelResponse) -> Decimal | None:
         pricing = self._pricing.get(deployment.id)
         if (
@@ -374,6 +452,187 @@ class ModelGateway:
                 current = self._fallbacks[current]
                 chain.append(current)
         return tuple(chain)
+
+    def _streaming_transport(self) -> OpenAICompatibleChunkTransport:
+        stream_chunks = getattr(self._transport, "stream_openai_compatible_chunks", None)
+        if not callable(stream_chunks):
+            raise ModelGatewayError("model transport streaming unavailable")
+        return cast("OpenAICompatibleChunkTransport", self._transport)
+
+    async def _stream_openai_compatible_leased(
+        self,
+        capacity: CapacityController | CapacityPool,
+        deployment: Deployment,
+        lease: CapacityLease,
+        request: ModelRequest,
+        transport: OpenAICompatibleChunkTransport,
+    ) -> AsyncIterator[NormalizedProviderEvent]:
+        primary_error: BaseException | None = None
+        transport_started: float | None = None
+        should_record = False
+        status_code: int | None = None
+        succeeded = False
+        try:
+            try:
+                api_key = await self._secret_resolver.resolve(deployment.secret_ref)
+            except asyncio.CancelledError as error:
+                primary_error = error
+            except Exception:  # noqa: BLE001 - redact resolver details at the boundary
+                primary_error = ModelGatewayError("model credential resolution failed")
+            else:
+                transport_started = self._monotonic()
+                should_record = True
+                stream_primary_error: BaseException | None = None
+                events = self._iterate_stream_with_heartbeat(
+                    capacity,
+                    deployment,
+                    lease,
+                    request,
+                    transport,
+                    api_key,
+                )
+                try:
+                    while True:
+                        try:
+                            event = await anext(events)
+                        except StopAsyncIteration:
+                            break
+                        yield event
+                    succeeded = True
+                    status_code = 200
+                except GeneratorExit as error:
+                    stream_primary_error = error
+                    primary_error = error
+                    raise
+                except asyncio.CancelledError as error:
+                    stream_primary_error = error
+                    primary_error = error
+                except ModelTransportError as error:
+                    stream_primary_error = error
+                    status_code = error.status_code
+                    primary_error = ModelTransportError(
+                        "model transport failed",
+                        status_code=error.status_code,
+                    )
+                    error.__traceback__ = None
+                    error.__context__ = None
+                    error.__cause__ = None
+                    del error
+                except (CapacityBackendError, CapacityConfigurationError) as error:
+                    stream_primary_error = error
+                    primary_error = error
+                except Exception as error:  # noqa: BLE001 - redact arbitrary stream failures
+                    stream_primary_error = error
+                    _LOGGER.error(
+                        "model_stream_unexpected_failure deployment_id=%s error_type=%s",
+                        deployment.id,
+                        type(error).__name__,
+                    )
+                    error.__traceback__ = None
+                    del error
+                    primary_error = ModelGatewayError("model transport failed")
+                finally:
+                    close_error = await self._stream_close_cleanup(events)
+                    if close_error is not None and stream_primary_error is None:
+                        primary_error = ModelGatewayError("model stream cleanup failed")
+                    del api_key
+        finally:
+            if should_record:
+                if transport_started is None:  # pragma: no cover - invariant
+                    raise ModelGatewayError("model transport timing unavailable")
+                latency = max(0.0, self._monotonic() - transport_started)
+                try:
+                    await capacity.record_outcome(
+                        lease.quota_scope_id,
+                        status_code=status_code,
+                        latency_seconds=latency,
+                        succeeded=succeeded,
+                    )
+                except asyncio.CancelledError as error:
+                    if primary_error is None:
+                        primary_error = error
+                except Exception:  # noqa: BLE001 - preserve any primary model failure
+                    if primary_error is None:
+                        primary_error = ModelGatewayError("model outcome recording failed")
+            release_error = await self._release_cleanup(capacity, lease)
+            if release_error is not None and primary_error is None:
+                if isinstance(release_error, asyncio.CancelledError):
+                    primary_error = release_error
+                else:
+                    primary_error = ModelGatewayError("model capacity release failed")
+
+        if primary_error is not None:
+            raise primary_error from None
+
+    async def _iterate_stream_with_heartbeat(
+        self,
+        capacity: CapacityController | CapacityPool,
+        deployment: Deployment,
+        lease: CapacityLease,
+        request: ModelRequest,
+        transport: OpenAICompatibleChunkTransport,
+        api_key: str,
+    ) -> AsyncIterator[NormalizedProviderEvent]:
+        from agent_hub.harness.streaming import transport_openai_compatible_stream_events
+
+        events = transport_openai_compatible_stream_events(
+            transport,
+            deployment,
+            request,
+            api_key,
+            provider=deployment.provider_model.split("/", 1)[0],
+        )
+        heartbeat_task = asyncio.create_task(self._heartbeat(capacity, lease))
+        primary_error: BaseException | None = None
+        next_event: asyncio.Task[NormalizedProviderEvent] | None = None
+        try:
+            while True:
+                next_event = asyncio.create_task(self._next_stream_event(events))
+                done, _pending = await asyncio.wait(
+                    {next_event, heartbeat_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if next_event in done:
+                    try:
+                        event = next_event.result()
+                    except StopAsyncIteration:
+                        return
+                    next_event = None
+                    yield event
+                else:
+                    next_event.cancel()
+                    await asyncio.gather(next_event, return_exceptions=True)
+                    next_event = None
+                    await heartbeat_task
+                    raise CapacityBackendError("model capacity heartbeat stopped")
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            if next_event is not None and not next_event.done():
+                next_event.cancel()
+                await asyncio.gather(next_event, return_exceptions=True)
+            if not heartbeat_task.done():
+                heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+            close_error = await self._stream_close_cleanup(events)
+            if close_error is not None and primary_error is None:
+                raise ModelGatewayError("model stream cleanup failed") from None
+
+    async def _next_stream_event(
+        self, events: AsyncIterator[NormalizedProviderEvent]
+    ) -> NormalizedProviderEvent:
+        return await anext(events)
+
+    async def _stream_close_cleanup(self, events: object) -> BaseException | None:
+        aclose = getattr(events, "aclose", None)
+        if not callable(aclose):
+            return None
+        try:
+            await cast(Any, events).aclose()
+        except BaseException as error:  # noqa: BLE001 - caller preserves primary failures
+            return error
+        return None
 
     async def _complete_leased(
         self,

@@ -18,7 +18,11 @@ from agent_hub.harness.streaming import (
     openai_compatible_stream_events,
     transport_openai_compatible_stream_events,
 )
-from agent_hub.harness.tool_gateway import HarnessToolGateway, RuntimeToolBackend
+from agent_hub.harness.tool_gateway import (
+    HarnessCapabilityPolicyGateway,
+    HarnessToolGateway,
+    RuntimeToolBackend,
+)
 from agent_hub.harness.types import (
     ContextWindowAssessment,
     HarnessDecision,
@@ -35,6 +39,7 @@ from agent_hub.harness.types import (
 __all__ = [
     "CapabilityAwareHarnessScheduler",
     "ContextWindowAssessment",
+    "HarnessCapabilityPolicyGateway",
     "HarnessDecision",
     "HarnessPolicy",
     "HarnessSchedulingError",

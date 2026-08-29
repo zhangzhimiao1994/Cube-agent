@@ -27,6 +27,7 @@ async def openai_compatible_stream_events(
 ) -> AsyncIterator[NormalizedProviderEvent]:
     decoder = OpenAICompatibleStreamDecoder()
     session = ProviderStreamSession(provider=provider)
+    primary_error: BaseException | None = None
     try:
         async for chunk in chunks:
             for delta in decoder.decode(chunk):
@@ -34,10 +35,13 @@ async def openai_compatible_stream_events(
                     yield event
         for event in session.finish():
             yield event
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        aclose = getattr(chunks, "aclose", None)
-        if callable(aclose):
-            await cast(Any, chunks).aclose()
+        close_error = await _close_async_iterable(chunks)
+        if close_error is not None and primary_error is None:
+            raise close_error
 
 
 async def transport_openai_compatible_stream_events(
@@ -49,13 +53,32 @@ async def transport_openai_compatible_stream_events(
     provider: str,
 ) -> AsyncIterator[NormalizedProviderEvent]:
     chunks = transport.stream_openai_compatible_chunks(deployment, request, api_key)
+    events = openai_compatible_stream_events(chunks, provider=provider)
+    primary_error: BaseException | None = None
     try:
-        async for event in openai_compatible_stream_events(chunks, provider=provider):
-            yield event
+        while True:
+            try:
+                yield await anext(events)
+            except StopAsyncIteration:
+                return
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        aclose = getattr(chunks, "aclose", None)
-        if callable(aclose):
-            await cast(Any, chunks).aclose()
+        close_error = await _close_async_iterable(events)
+        if close_error is not None and primary_error is None:
+            raise close_error
+
+
+async def _close_async_iterable(stream: object) -> BaseException | None:
+    aclose = getattr(stream, "aclose", None)
+    if not callable(aclose):
+        return None
+    try:
+        await cast(Any, stream).aclose()
+    except BaseException as error:  # noqa: BLE001 - callers preserve primary failures
+        return error
+    return None
 
 
 __all__ = [

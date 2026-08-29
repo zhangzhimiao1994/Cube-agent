@@ -343,6 +343,45 @@ Observed: `caddy`, `agent-hub-api`, `agent-hub-worker`, and `agent-hub-litellm` 
 
 Observed: deployed venv probe passed with `server_harness_core_probe_ok selected_model=deepseek-chat fail_open_status=queued`.
 
-- [ ] **Step 4: Push GitHub and inspect checks**
+- [x] **Step 4: Push GitHub and inspect checks**
 
-Required before continuing the next harness batch.
+Observed: branch `codex/mofang-harness-core` pushed to `zhangzhimiao1994/Cube-agent` with `git push`; GitHub `quality` run `33276623663` completed successfully for commit `2aba1544583218358d4401fd0aee7b4abd92461e`.
+
+### Task 10: Provider Stream Adapter Runtime Wiring
+
+**Files:**
+- Modify: `src/agent_hub/models/gateway.py`
+- Modify as needed: `src/agent_hub/models/transport.py` or existing transport protocols
+- Test: `tests/unit/models/test_gateway.py` or a focused new gateway stream test
+
+- [x] **Step 1: Map current gateway and transport streaming boundaries**
+
+Identify the smallest production path that can expose harness-normalized OpenAI-compatible stream events without breaking existing non-streaming completion behavior.
+
+- [x] **Step 2: Write failing runtime wiring test**
+
+Add a test proving a gateway/harness integration can consume a transport's raw OpenAI-compatible stream chunks and produce normalized events preserving text, reasoning deltas, tool-call aggregation, selected deployment, and capacity release.
+
+- [x] **Step 3: Implement minimal runtime wiring**
+
+Wire the already-tested harness provider stream bridge into the actual model gateway path behind a typed method or adapter. Preserve existing `complete()` behavior and provider fallback semantics.
+
+- [x] **Step 4: Verify locally**
+
+Run focused gateway/harness tests first, then broaden to backend static gates before deployment.
+
+Observed: added `ModelGateway.stream_openai_compatible_events(...)` with scoped capacity, secret resolution, heartbeat, provider fallback before the first emitted event only, deterministic stream cleanup, outcome recording, and lease release. Focused verification passed: `pytest tests\unit\models\test_gateway.py tests\unit\harness\test_streaming.py -q` -> 66 passed; scoped `ruff` passed; scoped `mypy --strict` passed.
+
+### Task 11: Harness Tool Execution Boundary Recon
+
+**Files:**
+- Inspect: existing capability/runtime/tool execution modules
+- Modify later only after a TDD plan is written
+
+- [ ] **Step 1: Identify existing approval/sandbox/tool execution surfaces**
+
+Map where `HarnessToolCallRequest` and `HarnessToolCallResult` should connect without bypassing existing capability approvals.
+
+- [ ] **Step 2: Produce a test-first implementation plan**
+
+Define the next minimal tool-boundary behavior that can be deployed and server-probed.

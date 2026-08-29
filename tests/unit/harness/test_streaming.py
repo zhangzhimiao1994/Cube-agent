@@ -21,16 +21,28 @@ class AsyncChunkStream:
     async def __anext__(self) -> object:
         if not self._chunks:
             raise StopAsyncIteration
-        return self._chunks.pop(0)
+        chunk = self._chunks.pop(0)
+        if isinstance(chunk, BaseException):
+            raise chunk
+        return chunk
 
 
 class CloseTrackingAsyncChunkStream(AsyncChunkStream):
     def __init__(self, chunks: list[object]) -> None:
         super().__init__(chunks)
         self.closed = False
+        self.close_count = 0
 
     async def aclose(self) -> None:
         self.closed = True
+        self.close_count += 1
+
+
+class CloseFailingAsyncChunkStream(CloseTrackingAsyncChunkStream):
+    async def aclose(self) -> None:
+        self.closed = True
+        self.close_count += 1
+        raise RuntimeError("close leaked private-key")
 
 
 class FakeTransport:
@@ -138,6 +150,24 @@ async def test_openai_compatible_stream_events_close_underlying_chunks_on_early_
     assert chunks.closed is True
 
 
+async def test_openai_compatible_stream_events_preserve_primary_error_when_close_fails() -> None:
+    chunks = CloseFailingAsyncChunkStream(
+        [
+            RuntimeError("primary stream failure"),
+        ]
+    )
+    events = openai_compatible_stream_events(chunks, provider="deepseek")
+
+    try:
+        await events.__anext__()
+    except RuntimeError as error:
+        assert str(error) == "primary stream failure"
+    else:  # pragma: no cover - test guard
+        raise AssertionError("expected primary stream failure")
+
+    assert chunks.closed is True
+
+
 async def test_openai_compatible_stream_events_keep_interleaved_tool_calls_separate() -> None:
     events = [
         event
@@ -232,6 +262,7 @@ async def test_transport_stream_bridge_uses_litellm_chunk_method() -> None:
     assert len(events) == 1
     assert events[0].kind == "model.text_delta"
     assert events[0].payload == {"text": "hello"}
+    assert transport.stream.close_count == 1
 
 
 async def test_transport_stream_bridge_closes_underlying_chunks_on_early_stop() -> None:

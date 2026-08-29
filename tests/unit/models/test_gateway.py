@@ -1,10 +1,11 @@
 import asyncio
 import json
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Any, cast
 from uuid import NAMESPACE_DNS, uuid5
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
@@ -38,6 +39,49 @@ from agent_hub.models.types import (
     StructuredResponseSchema,
     TokenUsage,
 )
+
+
+class AsyncChunkStream:
+    def __init__(self, chunks: Sequence[object]) -> None:
+        self._chunks = list(chunks)
+        self.closed = False
+        self.yielded = 0
+        self.close_error: Exception | None = None
+
+    def __aiter__(self) -> "AsyncChunkStream":
+        return self
+
+    async def __anext__(self) -> object:
+        if not self._chunks:
+            raise StopAsyncIteration
+        self.yielded += 1
+        chunk = self._chunks.pop(0)
+        if isinstance(chunk, BaseException):
+            raise chunk
+        return chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class BlockingAsyncChunkStream(AsyncChunkStream):
+    def __init__(self, chunks: Sequence[object]) -> None:
+        super().__init__(chunks)
+        self.block = asyncio.Event()
+        self.waiting = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def __anext__(self) -> object:
+        if self.yielded > 0:
+            self.waiting.set()
+            try:
+                await self.block.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+        return await super().__anext__()
 
 
 def test_gateway_completion_is_exported_from_models_package() -> None:
@@ -232,6 +276,31 @@ class TransportStub:
         return self.response
 
 
+class StreamingTransportStub(TransportStub):
+    def __init__(self, events: list[object], chunks: Sequence[object]) -> None:
+        super().__init__(events)
+        self.stream = AsyncChunkStream(chunks)
+        self.stream_calls: list[tuple[Deployment, ModelRequest, str]] = []
+
+    def stream_openai_compatible_chunks(
+        self,
+        deployment: Deployment,
+        model_request: ModelRequest,
+        api_key: str,
+    ) -> AsyncIterator[object]:
+        self.events.append(("stream", deployment.id))
+        self.stream_calls.append((deployment, model_request, api_key))
+        return self.stream
+
+
+class BlockingStreamingTransportStub(StreamingTransportStub):
+    stream: BlockingAsyncChunkStream
+
+    def __init__(self, events: list[object], chunks: Sequence[object]) -> None:
+        super().__init__(events, chunks)
+        self.stream = BlockingAsyncChunkStream(chunks)
+
+
 class EstimatorStub:
     def estimate(self, model_request: ModelRequest) -> int:
         assert model_request.messages[0].content == "private prompt"
@@ -350,6 +419,269 @@ async def test_unrelated_deployment_fingerprint_failure_does_not_block_request()
     assert completion.deployment_id == "selected"
     assert capacity.scoped_ids == ("selected",)
     assert transport.calls[0][0] is selected
+
+
+async def test_streaming_gateway_yields_normalized_events_and_releases_capacity() -> None:
+    selected = deployment("selected", provider_model="deepseek/deepseek-chat")
+    selected_lease = lease("selected")
+    capacity = CapacityStub([selected_lease])
+    transport = StreamingTransportStub(
+        capacity.events,
+        [
+            {"choices": [{"delta": {"reasoning_content": "plan"}}]},
+            {"choices": [{"delta": {"content": "answer"}}]},
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "function": {
+                                        "name": "workspace_read",
+                                        "arguments": '{"path":"README',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {"arguments": '.md"}'},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        ],
+    )
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        SecretStub(capacity.events),
+        transport,
+        token_estimator=EstimatorStub(),
+        monotonic=monotonic([20.0, 20.5]),
+    )
+
+    events = [event async for event in gateway.stream_openai_compatible_events(request())]
+
+    assert [(event.kind, dict(event.payload)) for event in events] == [
+        ("model.reasoning_delta", {"text": "plan"}),
+        ("model.text_delta", {"text": "answer"}),
+        (
+            "tool.requested",
+            {"id": "call_1", "name": "workspace_read", "arguments": {"path": "README.md"}},
+        ),
+    ]
+    assert transport.stream_calls[0][0] is selected
+    assert transport.stream_calls[0][2] == "key-for-secret://selected"
+    assert capacity.records == [("scope-selected", 200, 0.5, True)]
+    assert capacity.releases == [selected_lease]
+    assert transport.stream.closed is True
+
+
+async def test_streaming_gateway_falls_back_when_primary_fails_before_first_event() -> None:
+    primary = deployment("primary-key", provider_model="deepseek/deepseek-chat")
+    backup = deployment("backup-key", "backup", provider_model="openai/gpt-5")
+    capacity = CapacityStub([lease("primary-key"), lease("backup-key")])
+    transport = StreamingTransportStub(
+        capacity.events,
+        [
+            ModelTransportError("primary busy private-key", status_code=429),
+            {"choices": [{"delta": {"content": "backup answer"}}]},
+        ],
+    )
+    gateway = ModelGateway(
+        ModelRegistry([primary, backup]),
+        capacity,
+        SecretStub(capacity.events),
+        transport,
+        fallbacks={"primary": "backup"},
+        monotonic=monotonic([30.0, 30.2, 31.0, 31.3]),
+    )
+
+    events = [event async for event in gateway.stream_openai_compatible_events(request())]
+
+    assert [(event.kind, dict(event.payload)) for event in events] == [
+        ("model.text_delta", {"text": "backup answer"}),
+    ]
+    assert [call[0].id for call in transport.stream_calls] == ["primary-key", "backup-key"]
+    assert [(scope, status, succeeded) for scope, status, _latency, succeeded in capacity.records] == [
+        ("scope-primary-key", 429, False),
+        ("scope-backup-key", 200, True),
+    ]
+    assert [record[2] for record in capacity.records] == [pytest.approx(0.2), pytest.approx(0.3)]
+    assert [item.deployment_id for item in capacity.releases] == ["primary-key", "backup-key"]
+    assert transport.stream.closed is True
+
+
+async def test_streaming_gateway_does_not_fallback_after_partial_output() -> None:
+    primary = deployment("primary-key", provider_model="deepseek/deepseek-chat")
+    backup = deployment("backup-key", "backup", provider_model="openai/gpt-5")
+    capacity = CapacityStub([lease("primary-key"), lease("backup-key")])
+    transport = StreamingTransportStub(
+        capacity.events,
+        [
+            {"choices": [{"delta": {"content": "partial"}}]},
+            ModelTransportError("later busy private-key", status_code=429),
+            {"choices": [{"delta": {"content": "backup answer"}}]},
+        ],
+    )
+    gateway = ModelGateway(
+        ModelRegistry([primary, backup]),
+        capacity,
+        SecretStub(capacity.events),
+        transport,
+        fallbacks={"primary": "backup"},
+        monotonic=monotonic([40.0, 40.4]),
+    )
+    stream = gateway.stream_openai_compatible_events(request())
+
+    first = await stream.__anext__()
+    assert first.kind == "model.text_delta"
+    assert first.payload == {"text": "partial"}
+    with pytest.raises(ModelTransportError, match="model transport failed"):
+        await stream.__anext__()
+
+    assert [call[0].id for call in transport.stream_calls] == ["primary-key"]
+    assert [(scope, status, succeeded) for scope, status, _latency, succeeded in capacity.records] == [
+        ("scope-primary-key", 429, False)
+    ]
+    assert capacity.records[0][2] == pytest.approx(0.4)
+    assert [item.deployment_id for item in capacity.releases] == ["primary-key"]
+    assert transport.stream.closed is True
+
+
+async def test_streaming_gateway_reports_capacity_unavailable_when_all_candidates_are_busy() -> None:
+    primary = deployment("primary-key", provider_model="deepseek/deepseek-chat")
+    backup = deployment("backup-key", "backup", provider_model="openai/gpt-5")
+    capacity = CapacityStub([CapacityWaitTimeout("busy"), CapacityQueueFull("full")])
+    transport = StreamingTransportStub(
+        capacity.events,
+        [{"choices": [{"delta": {"content": "should not run"}}]}],
+    )
+    gateway = ModelGateway(
+        ModelRegistry([primary, backup]),
+        capacity,
+        SecretStub(capacity.events),
+        transport,
+        fallbacks={"primary": "backup"},
+    )
+
+    with pytest.raises(CapacityUnavailable, match="model capacity unavailable"):
+        _events = [event async for event in gateway.stream_openai_compatible_events(request())]
+
+    assert transport.stream_calls == []
+    assert capacity.releases == []
+
+
+async def test_streaming_gateway_early_close_records_failure_and_releases_capacity() -> None:
+    selected = deployment("selected", provider_model="deepseek/deepseek-chat")
+    selected_lease = lease("selected")
+    capacity = CapacityStub([selected_lease])
+    transport = StreamingTransportStub(
+        capacity.events,
+        [
+            {"choices": [{"delta": {"content": "first"}}]},
+            {"choices": [{"delta": {"content": "later"}}]},
+        ],
+    )
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        SecretStub(capacity.events),
+        transport,
+        monotonic=monotonic([50.0, 50.25]),
+    )
+    stream = gateway.stream_openai_compatible_events(request())
+
+    first = await stream.__anext__()
+    await cast(Any, stream).aclose()
+
+    assert first.kind == "model.text_delta"
+    assert first.payload == {"text": "first"}
+    assert capacity.records == [("scope-selected", None, 0.25, False)]
+    assert capacity.releases == [selected_lease]
+    assert transport.stream.closed is True
+
+
+async def test_streaming_gateway_close_failure_does_not_replace_transport_error() -> None:
+    selected = deployment("selected", provider_model="deepseek/deepseek-chat")
+    capacity = CapacityStub([lease("selected")])
+    transport = StreamingTransportStub(
+        capacity.events,
+        [ModelTransportError("primary busy private-key", status_code=429)],
+    )
+    transport.stream.close_error = RuntimeError("close leaked private-key")
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        SecretStub(capacity.events),
+        transport,
+        monotonic=monotonic([60.0, 60.2]),
+    )
+
+    with pytest.raises(ModelTransportError) as captured:
+        _events = [event async for event in gateway.stream_openai_compatible_events(request())]
+
+    assert str(captured.value) == "model transport failed"
+    assert "private-key" not in repr(captured.value)
+    assert transport.stream.closed is True
+    assert [(scope, status, succeeded) for scope, status, _latency, succeeded in capacity.records] == [
+        ("scope-selected", 429, False)
+    ]
+    assert capacity.records[0][2] == pytest.approx(0.2)
+    assert len(capacity.releases) == 1
+
+
+async def test_streaming_gateway_cancellation_while_waiting_cleans_pending_chunk_task() -> None:
+    selected = deployment("selected", provider_model="deepseek/deepseek-chat")
+    selected_lease = lease("selected")
+    capacity = CapacityStub([selected_lease])
+    transport = BlockingStreamingTransportStub(
+        capacity.events,
+        [
+            {"choices": [{"delta": {"content": "first"}}]},
+            {"choices": [{"delta": {"content": "later"}}]},
+        ],
+    )
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        SecretStub(capacity.events),
+        transport,
+        monotonic=monotonic([70.0, 70.4]),
+    )
+
+    async def consume() -> None:
+        async for _event in gateway.stream_openai_compatible_events(request()):
+            pass
+
+    task = asyncio.create_task(consume())
+    while not transport.stream.waiting.is_set():
+        await asyncio.sleep(0)
+    task.cancel("caller disconnected")
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert [(scope, status, succeeded) for scope, status, _latency, succeeded in capacity.records] == [
+        ("scope-selected", None, False)
+    ]
+    assert capacity.records[0][2] == pytest.approx(0.4)
+    assert capacity.releases == [selected_lease]
+    assert transport.stream.closed is True
+    assert transport.stream.cancelled.is_set()
 
 
 async def test_selected_deployment_fingerprint_failure_remains_fail_closed() -> None:
