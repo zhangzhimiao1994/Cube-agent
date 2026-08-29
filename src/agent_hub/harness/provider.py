@@ -121,40 +121,64 @@ class ProviderStreamNormalizer:
         self,
         deltas: Iterable[ProviderStreamDelta],
     ) -> Iterable[NormalizedProviderEvent]:
-        builders: dict[str, _ToolCallBuilder] = {}
+        session = ProviderStreamSession(provider=self._provider)
         for delta in deltas:
-            if not isinstance(delta, ProviderStreamDelta):
-                raise TypeError("stream deltas must be ProviderStreamDelta values")
-            if delta.reasoning_content is not None:
-                yield NormalizedProviderEvent(
-                    kind="model.reasoning_delta",
-                    payload={"text": delta.reasoning_content},
-                )
-            if delta.content is not None:
-                yield NormalizedProviderEvent(
-                    kind="model.text_delta",
-                    payload={"text": delta.content},
-                )
-            if delta.tool_call_id is not None:
-                builder = builders.setdefault(delta.tool_call_id, _ToolCallBuilder(delta.tool_call_id))
-                if delta.tool_name is not None:
-                    builder.name = delta.tool_name
-                if delta.tool_arguments_delta is not None:
-                    builder.append_arguments(delta.tool_arguments_delta)
-        for tool_call_id in sorted(builders):
-            yield builders[tool_call_id].event()
+            yield from session.feed(delta)
+        yield from session.finish()
 
 
-def openai_compatible_stream_deltas(
-    chunks: Iterable[object],
-) -> Iterable[ProviderStreamDelta]:
-    """Convert OpenAI-compatible stream chunks into provider deltas."""
+class ProviderStreamSession:
+    """Stateful normalizer for async provider streams."""
 
-    tool_ids_by_index: dict[int, str] = {}
-    for chunk in chunks:
+    def __init__(self, *, provider: str) -> None:
+        _require_safe_provider(provider)
+        self._provider = provider
+        self._builders: dict[str, _ToolCallBuilder] = {}
+        self._finished = False
+
+    def feed(self, delta: ProviderStreamDelta) -> Iterable[NormalizedProviderEvent]:
+        if self._finished:
+            raise RuntimeError("provider stream session is finished")
+        if not isinstance(delta, ProviderStreamDelta):
+            raise TypeError("stream deltas must be ProviderStreamDelta values")
+        if delta.reasoning_content is not None:
+            yield NormalizedProviderEvent(
+                kind="model.reasoning_delta",
+                payload={"text": delta.reasoning_content},
+            )
+        if delta.content is not None:
+            yield NormalizedProviderEvent(
+                kind="model.text_delta",
+                payload={"text": delta.content},
+            )
+        if delta.tool_call_id is not None:
+            builder = self._builders.setdefault(
+                delta.tool_call_id,
+                _ToolCallBuilder(delta.tool_call_id),
+            )
+            if delta.tool_name is not None:
+                builder.name = delta.tool_name
+            if delta.tool_arguments_delta is not None:
+                builder.append_arguments(delta.tool_arguments_delta)
+
+    def finish(self) -> Iterable[NormalizedProviderEvent]:
+        if self._finished:
+            return
+        self._finished = True
+        for tool_call_id in sorted(self._builders):
+            yield self._builders[tool_call_id].event()
+
+
+class OpenAICompatibleStreamDecoder:
+    """Decode stateful OpenAI-compatible stream chunks into provider deltas."""
+
+    def __init__(self) -> None:
+        self._tool_ids_by_index: dict[int, str] = {}
+
+    def decode(self, chunk: object) -> Iterable[ProviderStreamDelta]:
         delta = _first_choice_delta(chunk)
         if delta is None:
-            continue
+            return
         reasoning_content = _optional_text_field(delta, "reasoning_content")
         if reasoning_content is not None:
             yield ProviderStreamDelta(reasoning_content=reasoning_content)
@@ -164,16 +188,16 @@ def openai_compatible_stream_deltas(
 
         raw_tool_calls = _field(delta, "tool_calls")
         if raw_tool_calls is None:
-            continue
+            return
         if not isinstance(raw_tool_calls, Sequence) or isinstance(raw_tool_calls, str | bytes):
             raise TypeError("stream tool_calls must be a sequence")
         for raw_tool_call in raw_tool_calls:
             index = _tool_call_index(raw_tool_call)
             tool_call_id = _optional_text_field(raw_tool_call, "id")
             if tool_call_id is not None:
-                tool_ids_by_index[index] = tool_call_id
+                self._tool_ids_by_index[index] = tool_call_id
             else:
-                tool_call_id = tool_ids_by_index.get(index)
+                tool_call_id = self._tool_ids_by_index.get(index)
             if tool_call_id is None:
                 raise ValueError("streamed tool call is missing an id")
             function = _field(raw_tool_call, "function")
@@ -182,6 +206,16 @@ def openai_compatible_stream_deltas(
                 tool_name=_optional_text_field(function, "name"),
                 tool_arguments_delta=_optional_text_field(function, "arguments"),
             )
+
+
+def openai_compatible_stream_deltas(
+    chunks: Iterable[object],
+) -> Iterable[ProviderStreamDelta]:
+    """Convert OpenAI-compatible stream chunks into provider deltas."""
+
+    decoder = OpenAICompatibleStreamDecoder()
+    for chunk in chunks:
+        yield from decoder.decode(chunk)
 
 
 @dataclass(slots=True)
@@ -315,10 +349,12 @@ def _freeze_json_object(value: Mapping[str, JsonValue]) -> Mapping[str, JsonValu
 
 __all__ = [
     "NormalizedProviderEvent",
+    "OpenAICompatibleStreamDecoder",
     "PrefixCacheEstimate",
     "ProviderErrorEnvelope",
     "ProviderStreamDelta",
     "ProviderStreamNormalizer",
+    "ProviderStreamSession",
     "estimate_prefix_cache_reuse",
     "openai_compatible_stream_deltas",
 ]
