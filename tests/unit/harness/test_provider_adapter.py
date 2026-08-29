@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from agent_hub.harness.provider import (
@@ -5,6 +7,7 @@ from agent_hub.harness.provider import (
     ProviderStreamDelta,
     ProviderStreamNormalizer,
     estimate_prefix_cache_reuse,
+    openai_compatible_stream_deltas,
 )
 
 
@@ -60,6 +63,74 @@ def test_normalizer_rejects_oversized_streamed_tool_arguments() -> None:
                 )
             )
         )
+
+
+def test_openai_compatible_stream_chunks_feed_normalized_harness_events() -> None:
+    normalizer = ProviderStreamNormalizer(provider="deepseek")
+    chunks = (
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "reasoning_content": "先想清楚。",
+                    }
+                }
+            ]
+        },
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content="答案：",
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id="call_1",
+                                function=SimpleNamespace(
+                                    name="workspace_read",
+                                    arguments='{"path":"README',
+                                ),
+                            )
+                        ],
+                    )
+                )
+            ]
+        ),
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "content": "已读取。",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {
+                                    "arguments": '.md"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        },
+    )
+
+    events = tuple(normalizer.normalize(openai_compatible_stream_deltas(chunks)))
+
+    assert tuple(event.kind for event in events) == (
+        "model.reasoning_delta",
+        "model.text_delta",
+        "model.text_delta",
+        "tool.requested",
+    )
+    assert events[0].payload == {"text": "先想清楚。"}
+    assert events[1].payload == {"text": "答案："}
+    assert events[2].payload == {"text": "已读取。"}
+    assert events[3].payload == {
+        "id": "call_1",
+        "name": "workspace_read",
+        "arguments": {"path": "README.md"},
+    }
 
 
 def test_prefix_cache_estimate_rewards_stable_prompt_prefixes() -> None:

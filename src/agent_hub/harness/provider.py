@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Literal, cast
@@ -145,6 +145,45 @@ class ProviderStreamNormalizer:
             yield builders[tool_call_id].event()
 
 
+def openai_compatible_stream_deltas(
+    chunks: Iterable[object],
+) -> Iterable[ProviderStreamDelta]:
+    """Convert OpenAI-compatible stream chunks into provider deltas."""
+
+    tool_ids_by_index: dict[int, str] = {}
+    for chunk in chunks:
+        delta = _first_choice_delta(chunk)
+        if delta is None:
+            continue
+        reasoning_content = _optional_text_field(delta, "reasoning_content")
+        if reasoning_content is not None:
+            yield ProviderStreamDelta(reasoning_content=reasoning_content)
+        content = _optional_text_field(delta, "content")
+        if content is not None:
+            yield ProviderStreamDelta(content=content)
+
+        raw_tool_calls = _field(delta, "tool_calls")
+        if raw_tool_calls is None:
+            continue
+        if not isinstance(raw_tool_calls, Sequence) or isinstance(raw_tool_calls, str | bytes):
+            raise TypeError("stream tool_calls must be a sequence")
+        for raw_tool_call in raw_tool_calls:
+            index = _tool_call_index(raw_tool_call)
+            tool_call_id = _optional_text_field(raw_tool_call, "id")
+            if tool_call_id is not None:
+                tool_ids_by_index[index] = tool_call_id
+            else:
+                tool_call_id = tool_ids_by_index.get(index)
+            if tool_call_id is None:
+                raise ValueError("streamed tool call is missing an id")
+            function = _field(raw_tool_call, "function")
+            yield ProviderStreamDelta(
+                tool_call_id=tool_call_id,
+                tool_name=_optional_text_field(function, "name"),
+                tool_arguments_delta=_optional_text_field(function, "arguments"),
+            )
+
+
 @dataclass(slots=True)
 class _ToolCallBuilder:
     id: str
@@ -204,6 +243,39 @@ def _require_safe_provider(value: str) -> None:
         raise ValueError("provider must be a safe identifier")
 
 
+def _first_choice_delta(chunk: object) -> object | None:
+    choices = _field(chunk, "choices")
+    if choices is None:
+        return None
+    if not isinstance(choices, Sequence) or isinstance(choices, str | bytes) or not choices:
+        raise TypeError("stream choices must be a nonempty sequence")
+    return _field(choices[0], "delta")
+
+
+def _field(value: object, name: str) -> object:
+    if isinstance(value, Mapping):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def _optional_text_field(value: object, name: str) -> str | None:
+    field_value = _field(value, name)
+    if field_value is None:
+        return None
+    if type(field_value) is not str:
+        raise TypeError(f"stream {name} must be text")
+    return field_value
+
+
+def _tool_call_index(value: object) -> int:
+    raw_index = _field(value, "index")
+    if type(raw_index) is not int:
+        raise TypeError("stream tool call index must be an integer")
+    if raw_index < 0 or raw_index > 1024:
+        raise ValueError("stream tool call index is out of bounds")
+    return raw_index
+
+
 def _freeze_json_object(value: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
     if not isinstance(value, Mapping):
         raise TypeError("payload must be a JSON object")
@@ -248,4 +320,5 @@ __all__ = [
     "ProviderStreamDelta",
     "ProviderStreamNormalizer",
     "estimate_prefix_cache_reuse",
+    "openai_compatible_stream_deltas",
 ]
