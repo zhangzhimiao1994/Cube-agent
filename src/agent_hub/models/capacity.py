@@ -5,7 +5,7 @@ import hashlib
 import math
 import re
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib.resources import files
@@ -127,6 +127,14 @@ class _ScopePolicy:
     tpm: int | None
 
 
+@dataclass(slots=True)
+class _RegistrationState:
+    initialized: bool = False
+    valid_until: float = 0.0
+    refresh_in_progress: bool = False
+    next_metadata_refresh: float = 0.0
+
+
 def safe_operational_limit(
     max_concurrency: int, target_utilization: float, reserved_slots: int
 ) -> int:
@@ -192,6 +200,7 @@ class CapacityPool:
         *,
         deployments: Iterable[Deployment] = (),
         credentials: CredentialRegistry | None = None,
+        fingerprint_resolver: Callable[[str], Awaitable[str]] | None = None,
         key_prefix: str = "agent-hub:model-capacity:",
         lease_seconds: float = 30,
         poll_interval: float = 0.05,
@@ -256,6 +265,7 @@ class CapacityPool:
             raise ValueError("capacity owner_id must be a canonical UUID")
         self._redis = cast(RedisCapacityClient, redis_client)
         self._credentials = credentials
+        self._fingerprint_resolver = fingerprint_resolver
         self._key_prefix = key_prefix
         self._lease_ms = lease_ms
         self._poll_interval = float(poll_interval)
@@ -279,8 +289,30 @@ class CapacityPool:
         self._next_metadata_refresh = 0.0
         self._observed_loads: dict[str, int] = {}
         self._weights: dict[str, int] = {}
+        self._fingerprint_cache: dict[str, str] = {}
+        self._scoped_registration_states: dict[tuple[str, ...], _RegistrationState] = {}
         configured = tuple(deployments)
         self.validate_configuration(configured)
+
+    def scoped(self, deployments: Sequence[Deployment]) -> "_CapacityScopeView":
+        """Create a catalog-scoped view that shares runtime capacity state."""
+        configured = tuple(deployments)
+        if not configured:
+            raise CapacityConfigurationError("model capacity catalog is empty")
+        for deployment in configured:
+            if self._catalog_by_id.get(deployment.id) != deployment:
+                raise CapacityConfigurationError("deployment is outside capacity catalog")
+        return _CapacityScopeView(self, configured)
+
+    def _registration_state_for(
+        self, catalog_by_id: Mapping[str, Deployment]
+    ) -> _RegistrationState:
+        key = tuple(sorted(catalog_by_id))
+        state = self._scoped_registration_states.get(key)
+        if state is None:
+            state = _RegistrationState()
+            self._scoped_registration_states[key] = state
+        return state
 
     def validate_configuration(self, deployments: Iterable[Deployment]) -> None:
         for deployment in deployments:
@@ -321,7 +353,7 @@ class CapacityPool:
     async def _ensure_registration(self, *, force: bool) -> None:
         if not self._catalog_by_id:
             raise CapacityConfigurationError("model capacity catalog is empty")
-        if self._credentials is None:
+        if self._credentials is None and self._fingerprint_resolver is None:
             raise CapacityConfigurationError("credential fingerprints are required")
         now = self._clock_now()
         if (
@@ -346,6 +378,8 @@ class CapacityPool:
             self._refresh_in_progress = True
             try:
                 valid_until = await self._register_metadata(
+                    catalog_by_id=self._catalog_by_id,
+                    scope_policies=self._scope_policies,
                     prior_registration_current=prior_registration_current
                 )
             except BaseException:
@@ -363,14 +397,18 @@ class CapacityPool:
             finally:
                 self._refresh_in_progress = False
 
-    async def _register_metadata(self, *, prior_registration_current: bool) -> float:
+    async def _register_metadata(
+        self,
+        *,
+        catalog_by_id: Mapping[str, Deployment],
+        scope_policies: Mapping[str, _ScopePolicy],
+        prior_registration_current: bool,
+    ) -> float:
         registration_started = self._clock_now()
-        credentials = self._credentials
-        if credentials is None:  # pragma: no cover - initialize validates before entry
-            raise CapacityConfigurationError("credential fingerprints are required")
+        credentials = await self._resolved_credentials(catalog_by_id.values())
         fingerprint_scopes: dict[str, str] = {}
         deployment_fingerprints: list[tuple[Deployment, str]] = []
-        for deployment in self._catalog_by_id.values():
+        for deployment in catalog_by_id.values():
             fingerprint = credentials.fingerprint_for(deployment.secret_ref)
             if fingerprint is None:
                 raise CapacityConfigurationError("credential fingerprint metadata is incomplete")
@@ -387,7 +425,7 @@ class CapacityPool:
             )
         )
         planned_policy_keys = [
-            self._keys(quota_scope_id) for quota_scope_id in self._scope_policies
+            self._keys(quota_scope_id) for quota_scope_id in scope_policies
         ]
         fingerprint_keys: list[tuple[str, str]] = []
         policy_keys: list[Mapping[str, str]] = []
@@ -420,7 +458,7 @@ class CapacityPool:
                     fingerprint_keys.append(claim_keys)
                 if cancellation is not None:
                     raise cancellation
-            for quota_scope_id, policy in self._scope_policies.items():
+            for quota_scope_id, policy in scope_policies.items():
                 keys = self._keys(quota_scope_id)
                 result, cancellation = await self._registration_eval(
                     _REGISTER_SCOPE_SCRIPT,
@@ -455,6 +493,39 @@ class CapacityPool:
                 raise
             raise CapacityBackendError("model capacity backend unavailable") from None
         return valid_until
+
+    async def _resolved_credentials(
+        self, deployments: Iterable[Deployment]
+    ) -> CredentialRegistry:
+        if self._credentials is not None:
+            return self._credentials
+        resolver = self._fingerprint_resolver
+        if resolver is None:  # pragma: no cover - initialize validates before entry
+            raise CapacityConfigurationError("credential fingerprints are required")
+        resolution_failed = False
+        try:
+            secret_refs = tuple(
+                dict.fromkeys(deployment.secret_ref for deployment in deployments)
+            )
+            descriptors = [
+                CredentialDescriptor(secret_ref, self._fingerprint_cache[secret_ref])
+                for secret_ref in secret_refs
+                if secret_ref in self._fingerprint_cache
+            ]
+            for secret_ref in secret_refs:
+                if secret_ref in self._fingerprint_cache:
+                    continue
+                fingerprint = await resolver(secret_ref)
+                self._fingerprint_cache[secret_ref] = fingerprint
+                descriptors.append(CredentialDescriptor(secret_ref, fingerprint))
+            return CredentialRegistry(descriptors)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - redact secret backend details at the boundary
+            resolution_failed = True
+        if resolution_failed:
+            raise CapacityConfigurationError("credential fingerprint resolution failed")
+        raise CapacityConfigurationError("credential fingerprint resolution failed")
 
     def _registration_deadline(self, started: float) -> float:
         ttl_seconds = self._metadata_ttl_ms / 1000
@@ -857,3 +928,189 @@ class CapacityPool:
         if not isinstance(result, list | tuple) or len(result) != length:
             raise CapacityBackendError("model capacity backend returned invalid state")
         return tuple(CapacityPool._strict_redis_int(value) for value in result)
+
+
+class _CapacityScopeView:
+    """Scoped capacity controller that reuses a root pool's mutable runtime state."""
+
+    def __init__(self, root: CapacityPool, deployments: Sequence[Deployment]) -> None:
+        self._root = root
+        self._catalog_by_id = {deployment.id: deployment for deployment in deployments}
+        self._scope_policies = {
+            quota_scope_id: root._scope_policies[quota_scope_id]
+            for quota_scope_id in dict.fromkeys(
+                deployment.quota_scope_id for deployment in deployments
+            )
+        }
+        self._registration_state = root._registration_state_for(self._catalog_by_id)
+
+    def validate_configuration(self, deployments: Iterable[Deployment]) -> None:
+        for deployment in deployments:
+            if not isinstance(deployment, Deployment):
+                raise TypeError("deployments must contain only Deployment values")
+            if self._catalog_by_id.get(deployment.id) != deployment:
+                raise CapacityConfigurationError("deployment is outside capacity catalog")
+
+    async def initialize(self) -> None:
+        await self._ensure_registration(force=False)
+
+    async def _ensure_registration(self, *, force: bool) -> None:
+        root = self._root
+        if not self._catalog_by_id:
+            raise CapacityConfigurationError("model capacity catalog is empty")
+        if root._credentials is None and root._fingerprint_resolver is None:
+            raise CapacityConfigurationError("credential fingerprints are required")
+        now = root._clock_now()
+        state = self._registration_state
+        if (
+            not force
+            and state.initialized
+            and now < state.next_metadata_refresh
+            and now < state.valid_until
+        ):
+            return
+        async with root._registration_lock:
+            now = root._clock_now()
+            if (
+                not force
+                and state.initialized
+                and now < state.next_metadata_refresh
+                and now < state.valid_until
+            ):
+                return
+            prior_registration_current = (
+                state.initialized and now < state.valid_until
+            )
+            state.refresh_in_progress = True
+            try:
+                valid_until = await root._register_metadata(
+                    catalog_by_id=self._catalog_by_id,
+                    scope_policies=self._scope_policies,
+                    prior_registration_current=prior_registration_current,
+                )
+            except BaseException:
+                state.initialized = False
+                if not prior_registration_current:
+                    state.valid_until = 0.0
+                raise
+            else:
+                state.initialized = True
+                root._catalog_frozen = True
+                state.valid_until = valid_until
+                state.next_metadata_refresh = (
+                    root._clock_now() + root._metadata_refresh_interval
+                )
+            finally:
+                state.refresh_in_progress = False
+
+    def _require_initialized(self) -> None:
+        root = self._root
+        state = self._registration_state
+        if (
+            not state.initialized
+            or state.refresh_in_progress
+            or root._clock_now() >= state.valid_until
+        ):
+            state.initialized = False
+            raise CapacityConfigurationError("model capacity pool is not initialized")
+
+    async def acquire(
+        self,
+        candidates: Sequence[Deployment],
+        wait_timeout: float,
+        *,
+        estimated_tokens: int,
+    ) -> CapacityLease:
+        ordered = tuple(candidates)
+        if not ordered:
+            raise ValueError("capacity candidates must not be empty")
+        if not all(isinstance(candidate, Deployment) for candidate in ordered):
+            raise TypeError("capacity candidates must contain only Deployment values")
+        if (
+            isinstance(wait_timeout, bool)
+            or not isinstance(wait_timeout, int | float)
+            or not math.isfinite(wait_timeout)
+            or wait_timeout < 0
+        ):
+            raise ValueError("wait_timeout must be nonnegative and finite")
+        if type(estimated_tokens) is not int or estimated_tokens <= 0:
+            raise ValueError("estimated_tokens must be a strict positive integer")
+        self._require_initialized()
+        for candidate in ordered:
+            if self._catalog_by_id.get(candidate.id) != candidate:
+                raise CapacityConfigurationError("candidate is outside initialized catalog")
+        root = self._root
+        async with root._waiter_lock:
+            if root._waiters >= root._max_waiters:
+                raise CapacityQueueFull("model capacity queue is full")
+            root._waiters += 1
+        try:
+            deadline = asyncio.get_running_loop().time() + float(wait_timeout)
+            while True:
+                for deployment in root._ordered_candidates(ordered):
+                    lease = await root._try_acquire(deployment, estimated_tokens)
+                    if lease is not None:
+                        return lease
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise CapacityWaitTimeout("model capacity queue timeout")
+                await asyncio.sleep(min(root._poll_interval, remaining))
+        finally:
+            async with root._waiter_lock:
+                root._waiters -= 1
+
+    async def release(self, lease: CapacityLease) -> bool:
+        return await self._root.release(lease)
+
+    async def renew(self, lease: CapacityLease) -> CapacityLease | None:
+        if not isinstance(lease, CapacityLease):
+            raise TypeError("lease must be a CapacityLease")
+        deployment = self._catalog_by_id.get(lease.deployment_id)
+        if deployment is None or deployment.quota_scope_id != lease.quota_scope_id:
+            raise CapacityConfigurationError("lease is outside initialized catalog")
+        await self._ensure_registration(force=True)
+        root = self._root
+        key = root._keys(lease.quota_scope_id)["leases"]
+        started = root._clock_now()
+        try:
+            result = await root._redis.eval(
+                _RENEW_SCRIPT, 1, key, lease.id, root._lease_ms, _STATE_TTL_MS
+            )
+            expires_ms = root._strict_redis_int(result)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - capacity must fail closed and redact Redis details
+            raise CapacityBackendError("model capacity backend unavailable") from None
+        if expires_ms == 0:
+            return None
+        if expires_ms < 0:
+            raise CapacityBackendError("model capacity backend returned invalid state")
+        return CapacityLease(
+            id=lease.id,
+            deployment_id=lease.deployment_id,
+            quota_scope_id=lease.quota_scope_id,
+            expires_at=datetime.fromtimestamp(expires_ms / 1000, tz=UTC),
+            renew_after_seconds=root._safe_renewal_delay(started),
+        )
+
+    async def record_outcome(
+        self,
+        quota_scope_id: str,
+        *,
+        status_code: int | None,
+        latency_seconds: float,
+        succeeded: bool,
+    ) -> None:
+        if quota_scope_id not in self._scope_policies:
+            raise ValueError("unknown quota scope")
+        await self._root.record_outcome(
+            quota_scope_id,
+            status_code=status_code,
+            latency_seconds=latency_seconds,
+            succeeded=succeeded,
+        )
+
+    async def effective_limit(self, quota_scope_id: str) -> int:
+        if quota_scope_id not in self._scope_policies:
+            raise ValueError("unknown quota scope")
+        return await self._root.effective_limit(quota_scope_id)
