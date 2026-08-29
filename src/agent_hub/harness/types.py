@@ -159,6 +159,71 @@ class ProviderCapabilityProfile:
 
 
 @dataclass(frozen=True, slots=True)
+class ContextWindowAssessment:
+    estimated_input_tokens: int
+    max_context_tokens: int
+    headroom_tokens: int
+    usage_ratio: float
+    risk_level: Literal["unknown", "fits", "near_limit", "exceeded"]
+    fits: bool
+
+    def __post_init__(self) -> None:
+        for name in ("estimated_input_tokens", "max_context_tokens", "headroom_tokens"):
+            value = getattr(self, name)
+            if type(value) is not int:
+                raise TypeError(f"{name} must be an integer")
+        if self.estimated_input_tokens < 0:
+            raise ValueError("estimated_input_tokens must be nonnegative")
+        if self.max_context_tokens <= 0:
+            raise ValueError("max_context_tokens must be positive")
+        if (
+            isinstance(self.usage_ratio, bool)
+            or not isinstance(self.usage_ratio, int | float)
+            or not math.isfinite(self.usage_ratio)
+            or self.usage_ratio < 0
+        ):
+            raise ValueError("usage_ratio must be finite and nonnegative")
+        if self.risk_level not in {"unknown", "fits", "near_limit", "exceeded"}:
+            raise ValueError("risk_level is invalid")
+        if type(self.fits) is not bool:
+            raise ValueError("fits must be a boolean")
+        if self.fits and self.risk_level == "exceeded":
+            raise ValueError("exceeded context windows must not fit")
+
+
+def assess_context_window(
+    profile: ProviderCapabilityProfile,
+    requirements: HarnessTaskRequirements,
+) -> ContextWindowAssessment:
+    if not isinstance(profile, ProviderCapabilityProfile):
+        raise TypeError("profile must be ProviderCapabilityProfile")
+    if not isinstance(requirements, HarnessTaskRequirements):
+        raise TypeError("requirements must be HarnessTaskRequirements")
+    estimated = requirements.estimated_input_tokens
+    maximum = profile.max_context_tokens
+    headroom = maximum - estimated
+    if estimated == 0:
+        risk_level: Literal["unknown", "fits", "near_limit", "exceeded"] = "unknown"
+        ratio = 0.0
+    else:
+        ratio = estimated / maximum
+        if estimated > maximum:
+            risk_level = "exceeded"
+        elif ratio >= 0.9:
+            risk_level = "near_limit"
+        else:
+            risk_level = "fits"
+    return ContextWindowAssessment(
+        estimated_input_tokens=estimated,
+        max_context_tokens=maximum,
+        headroom_tokens=headroom,
+        usage_ratio=ratio,
+        risk_level=risk_level,
+        fits=risk_level != "exceeded",
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class HarnessTaskRequirements:
     required_capabilities: frozenset[str]
     required_logical_model: str | None = None

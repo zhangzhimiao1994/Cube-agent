@@ -20,6 +20,7 @@ from agent_hub.harness.streaming import (
 )
 from agent_hub.harness.tool_gateway import HarnessToolGateway, RuntimeToolBackend
 from agent_hub.harness.types import (
+    ContextWindowAssessment,
     HarnessDecision,
     HarnessPolicy,
     HarnessTaskRequirements,
@@ -28,10 +29,12 @@ from agent_hub.harness.types import (
     HermesContextHint,
     ProviderCapabilityProfile,
     RuntimeHealth,
+    assess_context_window,
 )
 
 __all__ = [
     "CapabilityAwareHarnessScheduler",
+    "ContextWindowAssessment",
     "HarnessDecision",
     "HarnessPolicy",
     "HarnessSchedulingError",
@@ -51,6 +54,7 @@ __all__ = [
     "ProviderStreamSession",
     "RuntimeHealth",
     "RuntimeToolBackend",
+    "assess_context_window",
     "estimate_prefix_cache_reuse",
     "gateway_completion_events",
     "harness_scheduler_from_config",

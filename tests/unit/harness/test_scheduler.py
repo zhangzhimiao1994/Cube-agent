@@ -5,11 +5,13 @@ import pytest
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.scheduler import CapabilityAwareHarnessScheduler, HarnessSchedulingError
 from agent_hub.harness.types import (
+    ContextWindowAssessment,
     HarnessPolicy,
     HarnessTaskRequirements,
     HermesContextHint,
     ProviderCapabilityProfile,
     RuntimeHealth,
+    assess_context_window,
 )
 
 TENANT_ID = UUID("22222222-2222-4222-8222-222222222222")
@@ -142,3 +144,120 @@ def test_runtime_health_can_demote_an_otherwise_good_provider() -> None:
 
     assert decision.selected_provider == "openai"
     assert "provider_health_degraded:deepseek" in decision.fallbacks_considered
+
+
+def test_context_window_assessment_reports_near_limit_and_overflow() -> None:
+    profile = ProviderCapabilityProfile.deepseek("deepseek-chat", logical_model="main")
+
+    unknown = assess_context_window(
+        profile,
+        HarnessTaskRequirements(required_capabilities=frozenset({"text"})),
+    )
+    fits = assess_context_window(
+        profile,
+        HarnessTaskRequirements(
+            required_capabilities=frozenset({"text"}),
+            estimated_input_tokens=64_000,
+        ),
+    )
+    near_limit = assess_context_window(
+        profile,
+        HarnessTaskRequirements(
+            required_capabilities=frozenset({"text"}),
+            estimated_input_tokens=120_000,
+        ),
+    )
+    overflow = assess_context_window(
+        profile,
+        HarnessTaskRequirements(
+            required_capabilities=frozenset({"text"}),
+            estimated_input_tokens=130_000,
+        ),
+    )
+
+    assert near_limit == ContextWindowAssessment(
+        estimated_input_tokens=120_000,
+        max_context_tokens=128_000,
+        headroom_tokens=8_000,
+        usage_ratio=0.9375,
+        risk_level="near_limit",
+        fits=True,
+    )
+    assert unknown.fits is True
+    assert unknown.risk_level == "unknown"
+    assert fits.fits is True
+    assert fits.risk_level == "fits"
+    assert overflow.fits is False
+    assert overflow.risk_level == "exceeded"
+    assert overflow.headroom_tokens == -2_000
+
+
+def test_scheduler_filters_context_window_overflow_before_scoring() -> None:
+    scheduler = CapabilityAwareHarnessScheduler(
+        profiles=(
+            ProviderCapabilityProfile.deepseek("deepseek-chat", logical_model="main"),
+            ProviderCapabilityProfile.openai_codex("gpt-5", logical_model="main"),
+        )
+    )
+
+    decision = scheduler.select(
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        requirements=HarnessTaskRequirements(
+            required_capabilities=frozenset({"text", "tool_calling"}),
+            needs_reasoning=True,
+            needs_streamed_tool_calls=True,
+            estimated_input_tokens=200_000,
+            prefers_prefix_cache=True,
+        ),
+        policy=HarnessPolicy(allowed_providers=frozenset({"deepseek", "openai"})),
+        hermes_hint=None,
+    )
+
+    assert decision.selected_provider == "openai"
+    assert "context_window_exceeded:deepseek" in decision.fallbacks_considered
+
+
+def test_scheduler_never_lets_context_overflow_win_from_hints_or_cost() -> None:
+    scheduler = CapabilityAwareHarnessScheduler(
+        profiles=(
+            ProviderCapabilityProfile.deepseek("deepseek-chat", logical_model="main"),
+            ProviderCapabilityProfile.openai_codex("gpt-5", logical_model="main"),
+        )
+    )
+
+    decision = scheduler.select(
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        requirements=HarnessTaskRequirements(
+            required_capabilities=frozenset({"text", "tool_calling"}),
+            estimated_input_tokens=200_000,
+            prefers_prefix_cache=True,
+        ),
+        policy=HarnessPolicy(
+            allowed_providers=frozenset({"deepseek", "openai"}),
+            prefer_low_cost=True,
+        ),
+        hermes_hint=HermesContextHint(preferred_provider="deepseek", confidence=0.99),
+    )
+
+    assert decision.selected_provider == "openai"
+    assert "context_window_exceeded:deepseek" in decision.fallbacks_considered
+
+
+def test_scheduler_rejects_when_all_context_windows_are_exceeded() -> None:
+    scheduler = CapabilityAwareHarnessScheduler(
+        profiles=(ProviderCapabilityProfile.deepseek("deepseek-chat", logical_model="main"),)
+    )
+
+    with pytest.raises(HarnessSchedulingError, match="context window"):
+        scheduler.select(
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            requirements=HarnessTaskRequirements(
+                required_capabilities=frozenset({"text"}),
+                estimated_input_tokens=200_000,
+            ),
+            policy=HarnessPolicy(),
+            hermes_hint=None,
+        )

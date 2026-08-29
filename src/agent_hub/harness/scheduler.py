@@ -10,6 +10,7 @@ from agent_hub.harness.types import (
     HarnessTaskRequirements,
     HermesContextHint,
     ProviderCapabilityProfile,
+    assess_context_window,
 )
 
 
@@ -69,6 +70,10 @@ class CapabilityAwareHarnessScheduler:
                 for capability in sorted(missing):
                     fallbacks.append(f"missing_capability:{profile.provider}:{capability}")
                 continue
+            context_window = assess_context_window(profile, requirements)
+            if not context_window.fits:
+                fallbacks.append(f"context_window_exceeded:{profile.provider}")
+                continue
             candidates.append(
                 self._score(
                     profile,
@@ -80,6 +85,8 @@ class CapabilityAwareHarnessScheduler:
                 )
             )
         if not candidates:
+            if any(item.startswith("context_window_exceeded:") for item in fallbacks):
+                raise HarnessSchedulingError("no harness provider satisfies context window")
             raise HarnessSchedulingError("no harness provider satisfies policy and capabilities")
         selected = max(
             candidates,
@@ -141,9 +148,10 @@ class CapabilityAwareHarnessScheduler:
             score += 6
             capability_reasons.append("supports_prefix_cache")
         if requirements.estimated_input_tokens:
-            if requirements.estimated_input_tokens > profile.max_context_tokens:
-                score -= 10
-                fallbacks.append(f"context_pressure:{profile.provider}")
+            context_window = assess_context_window(profile, requirements)
+            if context_window.risk_level == "near_limit":
+                fallbacks.append(f"context_window_near_limit:{profile.provider}")
+                capability_reasons.append("context_window_near_limit")
             else:
                 score += 1
                 capability_reasons.append("context_window_fits")
