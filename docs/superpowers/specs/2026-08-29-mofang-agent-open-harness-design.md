@@ -12,7 +12,14 @@ The user asked to continue the handoff plan, integrate kiwi-mem ideas into Herme
 
 ## Design position
 
-Do not rewrite the current/original repository as part of the Hermes+ delivery. Treat this document as the future `Cube-agent` repository route. After the original repository reaches a verified Hermes+ state and is pushed to `Cube-agent`, refactor it incrementally into a reusable harness architecture:
+Do not rewrite the current/original repository as part of the Hermes+ delivery. Treat this document as the future `Cube-agent` repository route. After the original repository reaches a verified Hermes+ state and is pushed to `Cube-agent`, refactor it incrementally into a reusable harness architecture.
+
+The compatibility goal is not a lowest-common-denominator merge. The two harness directions should raise capability together:
+
+- OpenAI/Codex-style harness improves platform execution: long-running state, approvals, sandbox policy, tool orchestration, event streaming, resumability, and operational records.
+- DeepSeek-style harness improves provider execution: reasoning stream normalization, streamed tool-call aggregation, context-window protection, prefix-cache-friendly prompt layout, and low-cost/high-throughput routing.
+
+Mofang should keep a shared protocol for safety and observability, then let provider adapters declare enhanced capabilities so the scheduler can use each model where it is strongest.
 
 1. Keep current production behavior stable.
 2. Put a narrow, typed harness protocol around the existing run loop.
@@ -63,6 +70,19 @@ Each model provider implements the same interface:
 - Normalize errors without leaking secrets.
 - Expose provider feature flags.
 
+Adapters should also expose a capability profile, for example:
+
+- `supports_reasoning_delta`
+- `supports_streamed_tool_call_delta`
+- `supports_parallel_tool_calls`
+- `supports_prefix_cache`
+- `max_context_tokens`
+- `preferred_prompt_layout`
+- `cost_latency_tier`
+- `tool_schema_strictness`
+
+The scheduler can then route tasks by capability instead of flattening all providers into the same behavior.
+
 DeepSeek-specific behavior belongs here, not in workflows/UI:
 
 - thinking defaults
@@ -73,9 +93,34 @@ DeepSeek-specific behavior belongs here, not in workflows/UI:
 - cache-friendly prompt layout
 - sensitive header/error redaction
 
-DeepSeek should be the first adapter hardened because the handoff explicitly called it out and provider behavior has high blast radius.
+DeepSeek should be the first adapter hardened because the handoff explicitly called it out and provider behavior has high blast radius. The goal is to preserve DeepSeek's advantages inside the adapter rather than forcing it to behave like an OpenAI clone.
 
-### 4. Tool / Capability Gateway
+OpenAI/Codex-style execution should likewise preserve its platform strengths in the harness kernel rather than being reduced to only a chat-completions adapter.
+
+### 4. Capability-Aware Scheduler
+
+The scheduler should be defined by Mofang Harness Core, not by any single provider adapter, UI page, or workflow. Its job is to choose the best available execution path from explicit inputs:
+
+1. Product policy: tenant configuration, cost/latency preference, safety posture, approval requirements, allowed providers, and admin overrides.
+2. Task requirements: requested mode, tool intensity, context length, reasoning depth, streaming needs, privacy sensitivity, and deadline.
+3. Provider capability profiles: features declared by adapters, such as reasoning deltas, streamed tool-call support, prefix cache, context window, tool schema strictness, cost tier, and reliability tier.
+4. Runtime feedback: recent errors, queue saturation, rate limits, observed latency, budget usage, and fallback health.
+5. Hermes+ context hints: project/conversation memory, prior successful modes, and confirmed lessons; Hermes+ may influence ranking but must not bypass policy.
+
+The scheduler should output a transparent decision envelope:
+
+- selected provider/deployment
+- selected runtime mode
+- capability reasons
+- policy constraints applied
+- fallbacks considered
+- whether user approval is required
+
+Provider adapters can declare strengths, but they cannot select themselves. UI/admin configuration can set policy, but it should not duplicate selection logic. Workflows can request requirements, but the scheduler decides within policy.
+
+This keeps OpenAI/Codex-style platform strengths and DeepSeek-style provider strengths additive: the core chooses by capability, while adapters preserve their own advantages behind a common contract.
+
+### 5. Tool / Capability Gateway
 
 All operational capabilities should pass through one gateway:
 
@@ -97,7 +142,7 @@ The gateway enforces:
 
 This matches the open-harness idea that the product owns its tools and operational boundaries while the harness coordinates calls.
 
-### 5. Hermes Memory+
+### 6. Hermes Memory+
 
 Keep Hermes as the native memory system. Borrow kiwi-mem concepts without copying AGPL code:
 
@@ -110,7 +155,7 @@ Keep Hermes as the native memory system. Borrow kiwi-mem concepts without copyin
 
 Hermes Memory+ should be completed in the original repository first. The future harness should then consume it through a context-provider interface, not as a special case buried in prompts.
 
-### 6. Entry Points
+### 7. Entry Points
 
 Expose the same harness through multiple hosts:
 
@@ -137,6 +182,9 @@ Before broad implementation, add provider/harness contract tests:
 - memory retrieval and memory write events
 - secret redaction in provider errors
 - replay from event log/checkpoint
+- capability-aware model routing
+- provider-specific enhanced behavior remaining available through normalized events
+- scheduler decision envelopes include policy reasons, provider capability reasons, and safe fallbacks
 
 CI should run the contract suite on mocked providers first, then allow optional real-provider tests when credentials/quota are explicitly available.
 
@@ -178,6 +226,7 @@ Add CLI/MCP/channel entrypoints over the same harness protocol, then update UI o
 
 - Big-bang rewrite risk: avoid by wrapping existing behavior first.
 - Provider regressions: mitigate with contract tests and replay fixtures.
+- Lowest-common-denominator risk: avoid by keeping a shared protocol plus provider capability profiles, rather than erasing provider advantages.
 - Memory privacy and prompt-injection risk: keep current Hermes filtering/confirmation/audit rules.
 - AGPL contamination risk from kiwi-mem: borrow ideas and protocols, not implementation code, unless license obligations are explicitly accepted.
 - CI/production drift: resolve current CI failure before merging broader changes.
