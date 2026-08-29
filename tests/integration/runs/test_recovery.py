@@ -869,7 +869,7 @@ async def test_submission_writes_run_and_outbox_atomically_then_publisher_delive
     service = RunService(
         RunRepository(run_session_factory),
         runtime_registry=RuntimeRegistry((FakeRuntime(),)),
-        router=WaitingModeRouter(),
+        router=UserChoiceRouter(),
         task_queue=queue,
     )
 
