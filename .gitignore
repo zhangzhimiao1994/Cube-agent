@@ -11,3 +11,6 @@ dist/
 .env
 *.log
 HANDOFF.md
+task_plan.md
+findings.md
+progress.md
