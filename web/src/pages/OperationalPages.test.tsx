@@ -472,6 +472,20 @@ describe("operational management pages", () => {
         if (path === "/api/v1/runs" && method === "POST") {
           const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
           const message = String(body.message ?? "");
+          if (body.skip_evolution_proposal === true) {
+            return jsonResponse({
+              id: secondRunId,
+              tenant_id: "33333333-3333-4333-8333-333333333333",
+              status: "queued",
+              mode: body.mode === "auto" ? "dispatch" : body.mode,
+              decision_token: null,
+              version: 1,
+              clarification_reason: null,
+              conversation_id: typeof body.conversation_id === "string" ? body.conversation_id : null,
+              reference_conversation_id:
+                typeof body.reference_conversation_id === "string" ? body.reference_conversation_id : null,
+            });
+          }
           if (message.includes("二次确认")) {
             return jsonResponse({
               id: runId,
@@ -1565,7 +1579,19 @@ describe("operational management pages", () => {
 
     await waitFor(() => expect(screen.queryByRole("status", { name: "进化任务确认" })).toBeNull());
     expect(requests.find((request) => request.path === "/api/v1/admin/evolution-runs" && request.method === "POST")).toBeUndefined();
-    expect(await screen.findByText("已取消进化任务创建，后续消息会继续作为普通对话处理。")).not.toBeNull();
+    await waitFor(() =>
+      expect(
+        requests.filter((request) => request.path === "/api/v1/runs" && request.method === "POST"),
+      ).toHaveLength(2),
+    );
+    expect(requests.filter((request) => request.path === "/api/v1/runs" && request.method === "POST")[1]).toMatchObject({
+      body: {
+        message: "请进化 darwin-skill，做多轮迭代",
+        mode: "auto",
+        skip_evolution_proposal: true,
+      },
+    });
+    expect(await screen.findByText("已取消进化任务创建，已按普通对话继续执行原消息。")).not.toBeNull();
   });
   it("shows an OpenClaw operation proposal from chat and links to OpenClaw control", async () => {
     const user = userEvent.setup();

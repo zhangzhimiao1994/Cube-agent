@@ -63,6 +63,7 @@ class StubRunService:
             str | None,
             str | None,
             tuple[str, ...],
+            bool,
         ]
     ]
     enqueue_count: int = 0
@@ -84,6 +85,7 @@ class StubRunService:
         attachment_ids: tuple[str, ...] = (),
         direct_model: str | None = None,
         vibe_coding: bool = False,
+        skip_evolution_proposal: bool = False,
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         del idempotency_key
@@ -103,9 +105,10 @@ class StubRunService:
                 conversation_id,
                 reference_conversation_id,
                 attachment_ids,
+                skip_evolution_proposal,
             )
         )
-        if "进化 darwin-skill" in message:
+        if not skip_evolution_proposal and "进化 darwin-skill" in message:
             return SubmittedRun(
                 id=uuid4(),
                 tenant_id=tenant_id,
@@ -140,7 +143,7 @@ class StubRunService:
                     "metadata": {"source": "chat_evolution_proposal", "requires_user_confirmation": "true"},
                 },
             )
-        if "生成一个相关的 skill" in message:
+        if not skip_evolution_proposal and "生成一个相关的 skill" in message:
             return SubmittedRun(
                 id=uuid4(),
                 tenant_id=tenant_id,
@@ -377,6 +380,7 @@ def test_low_confidence_submission_returns_202_waiting_user_mode_and_does_not_en
             None,
             None,
             (),
+            False,
         )
     ]
     assert service.enqueue_count == 0
@@ -447,6 +451,40 @@ def test_direct_submission_forwards_selected_model_without_agent_ids() -> None:
             None,
             None,
             (),
+            False,
+        )
+    ]
+
+
+def test_run_submission_forwards_skip_evolution_proposal_flag() -> None:
+    client, service, principal = _client()
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": "请进化 darwin-skill，做多轮迭代",
+            "mode": "auto",
+            "skip_evolution_proposal": True,
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "waiting_user_mode"
+    assert response.json().get("evolution_proposal") is None
+    assert service.submitted == [
+        (
+            principal.tenant_id,
+            principal.user_id,
+            "请进化 darwin-skill，做多轮迭代",
+            TaskMode.AUTO,
+            (),
+            None,
+            False,
+            None,
+            None,
+            (),
+            True,
         )
     ]
 
@@ -496,6 +534,7 @@ def test_vibe_coding_submission_is_forwarded_when_system_switch_is_enabled() -> 
             "conv-vibe-coding",
             None,
             (),
+            False,
         )
     ]
 
@@ -620,6 +659,7 @@ def test_submission_forwards_selected_workflow_and_agents() -> None:
             "conv-short-video",
             "conv-previous",
             (),
+            False,
         )
     ]
 
@@ -838,6 +878,7 @@ def test_submission_forwards_attachment_ids() -> None:
             None,
             None,
             ("att_0123456789abcdef0123456789abcdef",),
+            False,
         )
     ]
 

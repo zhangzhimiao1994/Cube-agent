@@ -23,7 +23,7 @@ from agent_hub.harness.types import (
     HarnessTaskRequirements,
     HermesContextHint,
 )
-from agent_hub.routing.types import RiskLevel, RouteAssessment, RouteDecision
+from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteAssessment, RouteDecision
 from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
 from agent_hub.runs.repository import RunAlreadyActive, RunRecord, RunRepository
 from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext
@@ -343,6 +343,7 @@ class RunService:
         attachment_ids: tuple[str, ...] = (),
         direct_model: str | None = None,
         vibe_coding: bool = False,
+        skip_evolution_proposal: bool = False,
         channel_context: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
@@ -366,13 +367,17 @@ class RunService:
         if vibe_coding:
             operator_selection["vibe_coding"] = True
             operator_selection["capability"] = "vibe_coding"
+        if skip_evolution_proposal:
+            operator_selection["skip_evolution_proposal"] = True
         if channel_context:
             operator_selection.update(_safe_channel_context(channel_context))
-        evolution_proposal = _local_evolution_proposal(
-            message=message,
-            mode=TaskMode.HYBRID if mode is TaskMode.AUTO else mode,
-            conversation_id=effective_conversation_id,
-        )
+        evolution_proposal = None
+        if not skip_evolution_proposal:
+            evolution_proposal = _local_evolution_proposal(
+                message=message,
+                mode=TaskMode.HYBRID if mode is TaskMode.AUTO else mode,
+                conversation_id=effective_conversation_id,
+            )
         if evolution_proposal is not None:
             return await self._create_evolution_approval_run(
                 tenant_id=tenant_id,
@@ -527,7 +532,7 @@ class RunService:
 
             if decision is None:
                 local_mode = _local_main_agent_auto_mode(message, attachment_ids)
-                if local_mode is not TaskMode.DIRECT:
+                if local_mode in EXECUTABLE_MODES:
                     routing_payload = {
                         "reason": "main_agent_local_resolution",
                         "main_agent_selected_mode": local_mode.value,
@@ -624,7 +629,7 @@ class RunService:
             if _local_resolvable_unavailable_route_decision(decision):
                 assert decision is not None
                 local_mode = _local_main_agent_auto_mode(message, attachment_ids)
-                if local_mode is not TaskMode.DIRECT:
+                if local_mode in EXECUTABLE_MODES:
                     routing_payload = {
                         "reason": "main_agent_local_resolution",
                         "main_agent_selected_mode": local_mode.value,

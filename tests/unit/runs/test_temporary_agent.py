@@ -846,7 +846,7 @@ async def test_auto_mode_resolves_low_risk_router_uncertainty_through_main_agent
 
 
 @pytest.mark.asyncio
-async def test_auto_mode_waits_for_user_choice_when_router_is_unavailable() -> None:
+async def test_auto_mode_uses_local_main_agent_when_router_is_unavailable() -> None:
     tenant_id = uuid4()
     actor_id = uuid4()
     repository = FakeRepository()
@@ -864,19 +864,15 @@ async def test_auto_mode_waits_for_user_choice_when_router_is_unavailable() -> N
         mode=TaskMode.AUTO,
     )
 
-    assert submitted.status is RunStatus.WAITING_USER_MODE
-    assert submitted.mode is None
-    assert submitted.decision_token is not None
-    assert repository.outbox == []
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DIRECT
+    assert submitted.decision_token is None
+    assert repository.outbox == [(submitted.id, f"{tenant_id}:{submitted.id}")]
     routing = repository.records[submitted.id].routing_decision
     assert routing is not None
-    assert routing["reason"] == "router_unavailable"
-    assert routing["decision_token"] == submitted.decision_token
-    choices = routing["channel_choices"]
-    assert isinstance(choices, list)
-    assert choices[0]["key"] == "1"
-    assert choices[0]["type"] == "mode"
-    assert choices[0]["value"] == "direct"
+    assert routing["reason"] == "main_agent_local_resolution"
+    assert routing["main_agent_selected_mode"] == "direct"
+    assert routing["router_unavailable"] is True
 
 
 @pytest.mark.asyncio

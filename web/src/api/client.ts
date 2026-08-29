@@ -1352,6 +1352,7 @@ export const api = {
     reference_conversation_id?: string | null;
     attachment_ids?: string[];
     vibe_coding?: boolean;
+    skip_evolution_proposal?: boolean;
   }): Promise<SubmittedRun> {
     return request(
       "/api/v1/runs",

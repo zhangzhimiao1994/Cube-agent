@@ -76,6 +76,7 @@ class RunServiceProtocol(Protocol):
         attachment_ids: tuple[str, ...] = (),
         direct_model: str | None = None,
         vibe_coding: bool = False,
+        skip_evolution_proposal: bool = False,
         idempotency_key: str | None = None,
     ) -> SubmittedRun: ...
 
@@ -138,6 +139,7 @@ class CreateRunRequest(BaseModel):
     reference_conversation_id: str | None = Field(default=None, min_length=4, max_length=128)
     attachment_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
     vibe_coding: bool = False
+    skip_evolution_proposal: bool = False
 
     @field_validator("attachment_ids", mode="before")
     @classmethod
@@ -768,6 +770,7 @@ async def create_run(
         attachment_ids=body.attachment_ids,
         direct_model=body.direct_model,
         vibe_coding=body.vibe_coding,
+        skip_evolution_proposal=body.skip_evolution_proposal,
         idempotency_key=idempotency_key,
     )
     await _record_run_submit_audit(request, principal, body, submitted)

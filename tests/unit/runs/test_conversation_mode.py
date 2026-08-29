@@ -218,7 +218,7 @@ async def test_auto_submission_switches_mode_when_user_explicitly_requests_it() 
     }
 
 
-async def test_auto_submission_does_not_reuse_mode_when_user_requests_new_conversation() -> None:
+async def test_auto_submission_does_not_reuse_previous_mode_when_user_requests_new_conversation() -> None:
     repository = ConversationModeRepository(TaskMode.HYBRID)
     router = WaitingRouter()
     service = RunService(
@@ -237,7 +237,66 @@ async def test_auto_submission_does_not_reuse_mode_when_user_requests_new_conver
         idempotency_key="idem-new-conversation",
     )
 
-    assert submitted.status is RunStatus.WAITING_USER_MODE
-    assert submitted.mode is None
-    assert submitted.clarification_reason == "classification_unavailable"
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DIRECT
+    assert submitted.clarification_reason is None
     assert router.calls == 1
+
+
+async def test_auto_submission_queues_local_direct_when_router_cannot_classify() -> None:
+    repository = ConversationModeRepository(None)
+    router = WaitingRouter()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=router,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="为什么刚才任务停住了",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-1",
+        idempotency_key="idem-auto-direct-fallback",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DIRECT
+    assert submitted.clarification_reason is None
+    assert router.calls == 1
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "main_agent_local_resolution"
+    assert routing["main_agent_selected_mode"] == "direct"
+    assert routing["router_clarification_reason"] == "classification_unavailable"
+
+
+async def test_declined_evolution_proposal_can_continue_through_auto_mode() -> None:
+    repository = ConversationModeRepository(None)
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=RecordingQueue(),
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="请进化 darwin-skill，做多轮迭代",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-1",
+        skip_evolution_proposal=True,
+        idempotency_key="idem-declined-evolution-continue",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DIRECT
+    assert submitted.evolution_proposal is None
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == "main_agent_local_resolution"
+    assert routing["main_agent_selected_mode"] == "direct"
+    assert routing["skip_evolution_proposal"] is True
