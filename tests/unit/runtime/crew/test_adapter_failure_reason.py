@@ -56,6 +56,26 @@ class LargeCandidateGateway:
         )
 
 
+class ReviewAwareGateway:
+    def __init__(self, reviewer_responses: tuple[str, ...] = ('{"verdict":"approve"}',)) -> None:
+        self._reviewer_responses = list(reviewer_responses)
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        prompt = " ".join(cast(str, message.content) for message in request.messages)
+        if "REVIEWER" in prompt:
+            text = self._reviewer_responses.pop(0)
+        else:
+            text = "draft output " * 200
+        return GatewayCompletion(
+            response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
 class FailingGeneration:
     async def execute(
         self,
@@ -120,10 +140,31 @@ class ReviewerTimeoutGeneration:
         agent_id: str | None = None,
         storage_scope: tuple[UUID, UUID],
     ) -> str:
-        del step_id, prompt, storage_scope
+        del step_id, storage_scope
         if agent_id == "critic":
             raise TimeoutError
-        return await bridge.complete([{"role": "user", "content": "draft"}])
+        return await bridge.complete([{"role": "user", "content": prompt}])
+
+
+class ReviewerTimeoutOnceGeneration:
+    def __init__(self) -> None:
+        self.review_calls = 0
+
+    async def execute(
+        self,
+        step_id: str,
+        prompt: str,
+        bridge: CrewLLMBridge,
+        *,
+        agent_id: str | None = None,
+        storage_scope: tuple[UUID, UUID],
+    ) -> str:
+        del step_id, storage_scope
+        if agent_id == "critic":
+            self.review_calls += 1
+            if self.review_calls == 1:
+                raise TimeoutError
+        return await bridge.complete([{"role": "user", "content": prompt}])
 
 
 class ReviewerTimeoutFactory(CrewObjectFactory):
@@ -137,6 +178,22 @@ class ReviewerTimeoutFactory(CrewObjectFactory):
     ) -> ReviewerTimeoutGeneration:
         del agents, tasks, share_crew, telemetry_disabled
         return ReviewerTimeoutGeneration()
+
+
+class ReviewerTimeoutOnceFactory(CrewObjectFactory):
+    def __init__(self) -> None:
+        self.generation = ReviewerTimeoutOnceGeneration()
+
+    def build(
+        self,
+        agents: tuple[CrewAgentDefinition, ...],
+        tasks: tuple[CrewTaskDefinition, ...],
+        *,
+        share_crew: bool,
+        telemetry_disabled: bool,
+    ) -> ReviewerTimeoutOnceGeneration:
+        del agents, tasks, share_crew, telemetry_disabled
+        return self.generation
 
 
 class CapturingGeneration:
@@ -201,6 +258,27 @@ def _reviewed_plan() -> DispatchPlan:
                 agent="writer",
                 task="Draft",
                 reviewer="critic",
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        total_token_budget=200,
+    )
+
+
+def _reviewed_plan_with_retry_budget(reviewer_retries: int = 1) -> DispatchPlan:
+    return DispatchPlan(
+        agents=(
+            AgentSpec(id="writer", role="writer", goal="Write", logical_model="general"),
+            AgentSpec(id="critic", role="critic", goal="Review", logical_model="general"),
+        ),
+        steps=(
+            DispatchStep(
+                id="draft",
+                agent="writer",
+                task="Draft",
+                reviewer="critic",
+                reviewer_retries=reviewer_retries,
                 final_synthesizer=True,
                 token_budget=100,
             ),
@@ -369,6 +447,50 @@ async def test_reviewer_timeout_is_recorded_and_dispatch_continues() -> None:
     assert review.payload["error_code"] == "crew.step_timeout"
     assert review.payload["step_id"] == "draft.review"
     assert review.payload["actor"] == "critic"
+
+
+async def test_reviewer_timeout_retries_before_skip() -> None:
+    factory = ReviewerTimeoutOnceFactory()
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        _reviewed_plan_with_retry_budget(),
+        crew_factory=factory,
+    )
+
+    events = [event async for event in runtime.run(_context())]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert factory.generation.review_calls == 2
+    retry = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retry.actor == "critic"
+    assert retry.reason == "reviewer execution failed; retrying review"
+    assert retry.payload["review_attempt"] == 2
+    review = next(event for event in events if event.kind is EventKind.REVIEW_COMPLETED)
+    assert review.payload["verdict"] == "approve"
+    assert "review_status" not in review.payload
+
+
+async def test_reviewer_invalid_json_retries_with_optimized_prompt_before_skip() -> None:
+    factory = CapturingFactory()
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(("not json", '{"verdict":"approve"}')),
+        _reviewed_plan_with_retry_budget(),
+        crew_factory=factory,
+    )
+
+    events = [event async for event in runtime.run(_context())]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    reviewer_prompts = [prompt for prompt in factory.generation.prompts if "REVIEWER" in prompt]
+    assert len(reviewer_prompts) == 2
+    assert "Previous reviewer failure" in reviewer_prompts[1]
+    assert "Return strict JSON only" in reviewer_prompts[1]
+    assert len(reviewer_prompts[1].encode("utf-8")) < len(reviewer_prompts[0].encode("utf-8"))
+    retry = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retry.actor == "critic"
+    assert retry.payload["strategy"] == "optimized_retry"
+    review = next(event for event in events if event.kind is EventKind.REVIEW_COMPLETED)
+    assert review.payload["verdict"] == "approve"
 
 
 def test_artifact_prompt_payload_truncates_large_text_without_mutating_artifact() -> None:
