@@ -20,7 +20,7 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import yaml
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
 from sqlalchemy import delete, func, select
@@ -8492,6 +8492,10 @@ async def upload_skill_archive(
     request: Request,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
+    strategy: Annotated[
+        str | None,
+        Query(description="Same-name upload strategy: overwrite or new_version."),
+    ] = None,
 ) -> SkillArchiveUploadResponse:
     _require(principal, "skill:write")
     filename = _safe_skill_upload_filename(
@@ -8503,11 +8507,11 @@ async def upload_skill_archive(
     archive_bytes = await request.body()
     if not archive_bytes:
         raise PublicAPIError(422, "request_validation", "skill archive is empty")
-    strategy = _skill_upload_strategy_or_error(request.query_params.get("strategy"))
-    if strategy is not None:
+    upload_strategy = _skill_upload_strategy_or_error(strategy)
+    if upload_strategy is not None:
         _require(principal, "skill:approve")
     try:
-        return await service.upload_skill_archive(filename, archive_bytes, strategy=strategy)
+        return await service.upload_skill_archive(filename, archive_bytes, strategy=upload_strategy)
     except InvalidSkillPackage as error:
         raise PublicAPIError(
             422,

@@ -3526,6 +3526,15 @@ def test_skill_archive_upload_strategy_requires_approve_permission(monkeypatch: 
     assert denied.json()["error"]["code"] == "permission_denied"
 
 
+def test_skill_archive_upload_openapi_exposes_strategy_query_parameter() -> None:
+    api = client()
+
+    schema = api.get("/openapi.json").json()
+    parameters = schema["paths"]["/api/v1/admin/skills/upload"]["post"]["parameters"]
+
+    assert any(parameter["name"] == "strategy" and parameter["in"] == "query" for parameter in parameters)
+
+
 def test_skill_version_activation_selects_requested_version() -> None:
     api = client()
     first = api.post(
