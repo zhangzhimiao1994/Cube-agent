@@ -58,6 +58,16 @@ type RunExecutionIntent = {
   tone: "pending" | "retry" | "replay" | "repair" | "done";
 };
 
+type DetailFailureDiagnostic = {
+  id: string;
+  label: "工具执行失败" | "模型链路失败" | "运行阶段失败" | "等待人工确认";
+  title: string;
+  detail: string;
+  recommendation: string;
+  meta: string[];
+  tone: "tool" | "model" | "runtime" | "approval";
+};
+
 const OBSERVER_TRIGGER_LABELS: Record<string, string> = {
   model_capacity_pressure: "模型容量拥堵",
   empty_model_response: "模型空响应",
@@ -145,6 +155,24 @@ function payloadNumber(payload: Record<string, unknown>, key: string) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function payloadDisplayValue(value: unknown) {
+  if (value === null || typeof value === "undefined") return "";
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return "";
+}
+
+function safeDiagnosticIdentifier(value: unknown, fallback: string) {
+  const text = payloadDisplayValue(value);
+  if (!text || text.length > 80) return fallback;
+  return /^[A-Za-z0-9_.:/@-]+$/.test(text) ? text : fallback;
+}
+
+function safeDiagnosticFailureKind(value: unknown) {
+  const text = safeDiagnosticIdentifier(value, "");
+  return text && /^[A-Za-z0-9_.-]+$/.test(text) ? text : "";
+}
+
 function displayRunStatus(status: string) {
   return RUN_STATUS_LABELS[status] ?? status;
 }
@@ -159,6 +187,12 @@ function displayToolStatus(status: string) {
 
 function displayToolOperation(kind: string) {
   return TOOL_OPERATION_LABELS[kind] ?? kind;
+}
+
+function displayDetailActor(actor: string | null | undefined) {
+  if (!actor) return "";
+  if (actor === "main_agent" || actor === "main") return "主 Agent";
+  return actor;
 }
 
 function collectObserverNotices(events: RunEvent[]): ObserverNotice[] {
@@ -396,12 +430,214 @@ function safeIntentValue(event: RunEvent, keys: string[]) {
   return "";
 }
 
+function safeIntentIdentifier(event: RunEvent, keys: string[], fallback = "") {
+  for (const key of keys) {
+    const text = safeDiagnosticIdentifier(event.payload[key], "");
+    if (text) return text;
+  }
+  return fallback;
+}
+
 function isRepairIntentEvent(event: RunEvent) {
   const kind = event.kind.toLowerCase();
   if (kind.includes("repair") || kind.includes("remediation")) return true;
   return ["repair_action", "repair_kind", "self_repair", "remediation_action"].some((key) =>
     hasPositiveIntentSignal(event.payload[key]),
   );
+}
+
+function eventFailureStatus(event: RunEvent) {
+  const candidates = [payloadDisplayValue(event.payload.status_code), payloadDisplayValue(event.payload.http_status), event.message];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const statusMatch = candidate.match(/\bstatus=(\d{3})\b/i) ?? candidate.match(/\bhttp\s*(\d{3})\b/i);
+    if (statusMatch?.[1]) return `status=${statusMatch[1]}`;
+    if (/^\d{3}$/.test(candidate)) return `status=${candidate}`;
+  }
+  return "";
+}
+
+function eventModelName(event: RunEvent) {
+  return (
+    safeDiagnosticIdentifier(event.payload.logical_model, "") ||
+    safeDiagnosticIdentifier(event.payload.model, "") ||
+    safeDiagnosticIdentifier(event.payload.upstream_model, "")
+  );
+}
+
+function isModelFailureEvent(event: RunEvent) {
+  if (event.kind.startsWith("model.") && event.kind.endsWith(".failed")) return true;
+  const text = [
+    event.message,
+    payloadDisplayValue(event.payload.failure_kind),
+    payloadDisplayValue(event.payload.provider),
+    eventModelName(event),
+  ]
+    .join(" ")
+    .toLowerCase();
+  return (
+    text.includes("model") ||
+    text.includes("gateway") ||
+    text.includes("transport") ||
+    text.includes("provider") ||
+    text.includes("litellm") ||
+    Boolean(eventFailureStatus(event) && eventModelName(event))
+  );
+}
+
+function isActionEventForDiagnostics(event: RunEvent) {
+  if (["model.reasoning_delta", "model.text_delta", "checkpoint.saved", "cost.recorded"].includes(event.kind)) return false;
+  return true;
+}
+
+function isWrappedToolFailureEvent(event: RunEvent, events: RunEvent[]) {
+  if (event.kind !== "runtime.failed" && event.kind !== "step.failed") return false;
+  if (isModelFailureEvent(event)) return false;
+  return events.some((candidate) => {
+    if (candidate.kind !== "tool.failed" || candidate.sequence > event.sequence) return false;
+    if (candidate.step_id && event.step_id && candidate.step_id === event.step_id) return true;
+    return !events.some(
+      (between) =>
+        between.sequence > candidate.sequence &&
+        between.sequence < event.sequence &&
+        isActionEventForDiagnostics(between),
+    );
+  });
+}
+
+function diagnosticLabel(category: string): DetailFailureDiagnostic["label"] {
+  if (category === "tool") return "工具执行失败";
+  if (category === "model") return "模型链路失败";
+  if (category === "approval") return "等待人工确认";
+  return "运行阶段失败";
+}
+
+function diagnosticTone(category: string): DetailFailureDiagnostic["tone"] {
+  if (category === "tool") return "tool";
+  if (category === "model") return "model";
+  if (category === "approval") return "approval";
+  return "runtime";
+}
+
+function diagnosticRecommendation(category: string, fallback: string) {
+  if (fallback.trim()) return fallback;
+  if (category === "tool") return "检查工具权限、参数和运行环境，再决定是否重试或改派。";
+  if (category === "model") return "检查模型配置、API Key、上游状态码和限流，再重试或切换模型。";
+  if (category === "approval") return "处理审批或拒绝高风险动作，再继续执行。";
+  return "按失败阶段查看上下文，优先保留已有产物并缩小重试范围。";
+}
+
+function pushUniqueDiagnostic(diagnostics: DetailFailureDiagnostic[], diagnostic: DetailFailureDiagnostic) {
+  const key = `${diagnostic.label}:${diagnostic.title}:${diagnostic.detail}:${diagnostic.meta.join("|")}`;
+  if (diagnostics.some((existing) => `${existing.label}:${existing.title}:${existing.detail}:${existing.meta.join("|")}` === key)) return;
+  diagnostics.push(diagnostic);
+}
+
+function detailDiagnosticFromApi(
+  runId: string,
+  diagnostic: RunDetail["failure_diagnostics"][number],
+  index: number,
+): DetailFailureDiagnostic {
+  const label = diagnosticLabel(diagnostic.category);
+  const actor = displayDetailActor(diagnostic.actor);
+  const statusCode = diagnostic.status_code ? `status=${diagnostic.status_code}` : "";
+  const detail = [diagnostic.failure_kind, statusCode, diagnostic.reason]
+    .filter(Boolean)
+    .filter((value, position, list) => list.indexOf(value) === position)
+    .join("；");
+  return {
+    id: `${runId}-api-diagnostic-${diagnostic.sequence}-${index}`,
+    label,
+    title: diagnostic.tool_name || diagnostic.logical_model || diagnostic.action || actor || label,
+    detail: detail || "已记录结构化故障摘要",
+    recommendation: diagnosticRecommendation(diagnostic.category, diagnostic.recommendation),
+    meta: [
+      actor,
+      diagnostic.step_id ? `步骤 ${diagnostic.step_id}` : "",
+      diagnostic.approval_id ? `审批 ${diagnostic.approval_id}` : "",
+      diagnostic.wrapped_by ? `包装于 #${diagnostic.wrapped_by}` : "",
+      `#${diagnostic.sequence}`,
+    ].filter(Boolean),
+    tone: diagnosticTone(diagnostic.category),
+  };
+}
+
+function pendingApprovalDiagnostics(detail: RunDetail): DetailFailureDiagnostic[] {
+  return approvalStateFromEvents(detail.events).pending.map((event) => ({
+    id: `${detail.id}-diagnostic-approval-${event.approval_id ?? event.sequence}`,
+    label: "等待人工确认",
+    title: safeDiagnosticIdentifier(event.action, "需要确认"),
+    detail:
+      safeDiagnosticIdentifier(event.action, "") ||
+      safeDiagnosticIdentifier(event.payload.decision, "") ||
+      safeDiagnosticIdentifier(event.payload.status, "") ||
+      "需要确认后继续",
+    recommendation: "处理审批或拒绝高风险动作，再继续执行。",
+    meta: [
+      event.approval_id ? `审批 ${event.approval_id}` : "",
+      displayDetailActor(event.actor),
+      replaySafetyLabel(event.payload.replay_safe),
+    ].filter(Boolean),
+    tone: "approval",
+  }));
+}
+
+function failureDiagnosticsForDetail(detail: RunDetail): DetailFailureDiagnostic[] {
+  if (detail.failure_diagnostics.length > 0) {
+    return detail.failure_diagnostics.map((diagnostic, index) => detailDiagnosticFromApi(detail.id, diagnostic, index));
+  }
+
+  const diagnostics: DetailFailureDiagnostic[] = [];
+  detail.events.forEach((event) => {
+    if (event.kind === "tool.failed") {
+      const toolName = safeDiagnosticIdentifier(event.tool_name, safeDiagnosticIdentifier(event.payload.name, "工具"));
+      const failureKind = safeDiagnosticFailureKind(event.payload.failure_kind);
+      const exitCode = payloadDisplayValue(event.payload.exit_code);
+      const outputBytes = payloadDisplayValue(event.payload.output_bytes);
+      pushUniqueDiagnostic(diagnostics, {
+        id: `${detail.id}-diagnostic-tool-${toolLifecycleKey(event)}`,
+        label: "工具执行失败",
+        title: toolName,
+        detail:
+          [
+            failureKind ? `失败类型 ${failureKind}` : "工具调用未完成",
+            exitCode ? `退出码 ${exitCode}` : "",
+            outputBytes ? `输出 ${outputBytes} 字节` : "",
+          ]
+            .filter(Boolean)
+            .join("；") || "工具调用未完成",
+        recommendation: "检查工具权限、参数和运行环境，再决定是否重试或改派。",
+        meta: [displayDetailActor(event.actor), event.step_id ? `步骤 ${event.step_id}` : "", `#${event.sequence}`].filter(Boolean),
+        tone: "tool",
+      });
+      return;
+    }
+
+    if (!["runtime.failed", "step.failed", "model.failed"].includes(event.kind) || isWrappedToolFailureEvent(event, detail.events)) return;
+
+    const actor = displayDetailActor(event.actor) || "运行时";
+    const status = eventFailureStatus(event);
+    const model = eventModelName(event);
+    const failureKind = safeDiagnosticFailureKind(event.payload.failure_kind);
+    const label = isModelFailureEvent(event) ? "模型链路失败" : "运行阶段失败";
+    pushUniqueDiagnostic(diagnostics, {
+      id: `${detail.id}-diagnostic-${event.sequence}`,
+      label,
+      title: label === "模型链路失败" ? model || "模型链路" : actor,
+      detail:
+        [failureKind, status, model && label !== "模型链路失败" ? model : ""].filter(Boolean).join("；") ||
+        (label === "模型链路失败" ? "模型调用失败" : "运行失败，已记录安全摘要"),
+      recommendation:
+        label === "模型链路失败"
+          ? "检查模型配置、API Key、上游状态码和限流，再重试或切换模型。"
+          : "按失败阶段查看上下文，优先保留已有产物并缩小重试范围。",
+      meta: [actor, event.step_id ? `步骤 ${event.step_id}` : "", `#${event.sequence}`].filter(Boolean),
+      tone: label === "模型链路失败" ? "model" : "runtime",
+    });
+  });
+
+  pendingApprovalDiagnostics(detail).forEach((diagnostic) => pushUniqueDiagnostic(diagnostics, diagnostic));
+  return diagnostics;
 }
 
 function approvalStateFromEvents(events: RunEvent[]) {
@@ -453,7 +689,7 @@ function executionIntentsForDetail(detail: RunDetail): RunExecutionIntent[] {
       id: `${detail.id}-intent-replay-${key}`,
       label: "回放意图",
       title: replayLabel,
-      detail: finalEvent.tool_name ?? payloadString(finalEvent.payload, "name") ?? "工具调用",
+      detail: safeDiagnosticIdentifier(finalEvent.tool_name, safeDiagnosticIdentifier(finalEvent.payload.name, "工具调用")),
       meta: [displayToolOperation(operationKind), displayToolStatus(payloadString(finalEvent.payload, "status") ?? finalEvent.kind.replace("tool.", ""))],
       tone: replayLabel === "不可回放" ? "replay" : "done",
     });
@@ -465,7 +701,10 @@ function executionIntentsForDetail(detail: RunDetail): RunExecutionIntent[] {
       id: `${detail.id}-intent-approval-${event.approval_id ?? event.sequence}`,
       label: "审批意图",
       title: "等待确认",
-      detail: event.action || safeIntentValue(event, ["decision", "status"]) || "需要确认后继续",
+      detail:
+        safeDiagnosticIdentifier(event.action, "") ||
+        safeIntentIdentifier(event, ["decision", "status"]) ||
+        "需要确认后继续",
       meta: [
         event.approval_id ? `审批 ${event.approval_id}` : "",
         replaySafetyLabel(event.payload.replay_safe),
@@ -479,7 +718,10 @@ function executionIntentsForDetail(detail: RunDetail): RunExecutionIntent[] {
       id: `${detail.id}-intent-approval-resolved-${event.approval_id ?? event.sequence}`,
       label: "审批意图",
       title: "确认已处理",
-      detail: event.decision || safeIntentValue(event, ["decision", "status"]) || "已处理",
+      detail:
+        safeDiagnosticIdentifier(event.decision, "") ||
+        safeIntentIdentifier(event, ["decision", "status"]) ||
+        "已处理",
       meta: [event.approval_id ? `审批 ${event.approval_id}` : ""].filter(Boolean),
       tone: "done",
     });
@@ -493,10 +735,13 @@ function executionIntentsForDetail(detail: RunDetail): RunExecutionIntent[] {
         id: `${detail.id}-intent-retry-${event.step_id ?? event.sequence}`,
         label: "重试意图",
         title: "准备重试",
-        detail: event.action || safeIntentValue(event, ["failure_kind", "status"]) || "失败后重试",
+        detail:
+          safeDiagnosticIdentifier(event.action, "") ||
+          safeIntentIdentifier(event, ["failure_kind", "status"]) ||
+          "失败后重试",
         meta: [
           attempt ? `第 ${attempt} 次` : "",
-          safeIntentValue(event, ["failure_kind", "status"]),
+          safeIntentIdentifier(event, ["failure_kind", "status"]),
           replaySafetyLabel(event.payload.replay_safe),
         ].filter(Boolean),
         tone: "retry",
@@ -504,15 +749,19 @@ function executionIntentsForDetail(detail: RunDetail): RunExecutionIntent[] {
       return;
     }
     if (isRepairIntentEvent(event)) {
-      const repairAction = safeIntentValue(event, ["repair_action", "repair_kind", "remediation_action"]) || event.action || "修复方案";
+      const repairAction =
+        safeIntentIdentifier(event, ["repair_action", "repair_kind", "remediation_action"]) ||
+        safeDiagnosticIdentifier(event.action, "") ||
+        "修复方案";
+      const eventAction = safeDiagnosticIdentifier(event.action, "");
       pushUniqueIntent(intents, {
         id: `${detail.id}-intent-repair-${event.step_id ?? event.sequence}`,
         label: "修复意图",
         title: repairAction,
-        detail: event.action && event.action !== repairAction ? event.action : safeIntentValue(event, ["failure_kind", "status"]) || "等待执行",
+        detail: eventAction && eventAction !== repairAction ? eventAction : safeIntentIdentifier(event, ["failure_kind", "status"]) || "等待执行",
         meta: [
           isPayloadFlagTrue(event.payload.requires_approval) ? "需要确认" : "",
-          safeIntentValue(event, ["failure_kind"]),
+          safeIntentIdentifier(event, ["failure_kind"]),
           replaySafetyLabel(event.payload.replay_safe),
         ].filter(Boolean),
         tone: "repair",
@@ -585,6 +834,7 @@ export function RunDetailPage() {
   const posture = detailPosture(run.data);
   const explicitRows = explicitDetailRows(run.data.explicit_details);
   const executionIntents = executionIntentsForDetail(run.data);
+  const failureDiagnostics = failureDiagnosticsForDetail(run.data);
 
   return (
     <section>
@@ -622,7 +872,7 @@ export function RunDetailPage() {
         <ul aria-label="运行详情指标">
           <li>事件 <strong>{run.data.events.length}</strong></li>
           <li>工具 <strong>{toolLifecycles.length}</strong></li>
-          <li>故障 <strong>{run.data.failure_diagnostics.length}</strong></li>
+          <li>故障 <strong>{failureDiagnostics.length}</strong></li>
           <li>产物 <strong>{run.data.artifacts.length}</strong></li>
         </ul>
       </div>
@@ -692,26 +942,27 @@ export function RunDetailPage() {
         </article>
       ) : null}
 
-      {run.data.failure_diagnostics.length > 0 ? (
+      {failureDiagnostics.length > 0 ? (
         <section className="run-failure-diagnostics" aria-label="故障诊断">
           <div className="run-failure-diagnostics-header">
             <span>Failure diagnostics</span>
             <strong>故障诊断</strong>
-            <small>{run.data.failure_diagnostics.length} 条</small>
+            <small>{failureDiagnostics.length} 条</small>
           </div>
           <div className="run-failure-diagnostic-list">
-            {run.data.failure_diagnostics.map((diagnostic) => (
-              <article key={`${diagnostic.sequence}-${diagnostic.category}`} className="run-failure-diagnostic diagnostic-tool">
-                <small>{diagnostic.category}</small>
-                <strong>{diagnostic.tool_name ?? diagnostic.logical_model ?? diagnostic.stage}</strong>
-                <span>{diagnostic.reason}</span>
+            {failureDiagnostics.map((diagnostic) => (
+              <article key={diagnostic.id} className={`run-failure-diagnostic diagnostic-${diagnostic.tone}`}>
+                <small>{diagnostic.label}</small>
+                <strong>{diagnostic.title}</strong>
+                <span>{diagnostic.detail}</span>
                 <p>{diagnostic.recommendation}</p>
-                <div aria-label="故障元数据">
-                  <em>#{diagnostic.sequence}</em>
-                  {diagnostic.step_id ? <em>步骤 {diagnostic.step_id}</em> : null}
-                  {diagnostic.failure_kind ? <em>{diagnostic.failure_kind}</em> : null}
-                  {diagnostic.status_code ? <em>status {diagnostic.status_code}</em> : null}
-                </div>
+                {diagnostic.meta.length > 0 ? (
+                  <div aria-label="故障元数据">
+                    {diagnostic.meta.map((meta) => (
+                      <em key={meta}>{meta}</em>
+                    ))}
+                  </div>
+                ) : null}
               </article>
             ))}
           </div>

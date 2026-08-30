@@ -1246,7 +1246,7 @@ describe("operational management pages", () => {
           created_at: "2026-08-07T00:00:01Z",
           actor: "engineer",
           participants: [],
-          tool_name: "run_safe_command",
+          tool_name: "run_safe_command private-token",
           tool_call_id: "call_terminal",
           step_id: "engineer_step",
           action: null,
@@ -1332,6 +1332,122 @@ describe("operational management pages", () => {
     expect(within(intentRegion).getByText("switch_model")).not.toBeNull();
     expect(intentRegion.textContent).not.toContain("private-token");
     expect(intentRegion.textContent).not.toContain("private output");
+  });
+
+  it("falls back to separated run-detail diagnostics from events without raw leakage", async () => {
+    visibleRunDetail = {
+      ...runDetail,
+      status: "failed",
+      failure_diagnostics: [],
+      events: [
+        {
+          sequence: 1,
+          kind: "tool.failed",
+          message: "cat private-token.txt failed with private output",
+          summary: "terminal failed",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: "run_safe_command private-token",
+          tool_call_id: "call_terminal",
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: {
+            status: "failed",
+            operation_kind: "terminal",
+            failure_kind: "nonzero_exit private output",
+            exit_code: 1,
+            output_bytes: 128,
+            name: "run_safe_command private output",
+            stdout: "private output",
+          },
+        },
+        {
+          sequence: 2,
+          kind: "step.failed",
+          message: "wrapped tool failure",
+          summary: "wrapped tool failure",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: null,
+          tool_call_id: null,
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: {},
+        },
+        {
+          sequence: 3,
+          kind: "runtime.failed",
+          message: "model gateway failed: status=503 private-token",
+          summary: "model gateway failed",
+          created_at: "2026-08-07T00:00:03Z",
+          actor: "reviewer",
+          participants: [],
+          tool_name: null,
+          tool_call_id: null,
+          step_id: "review_step",
+          action: null,
+          decision: null,
+          payload: {
+            logical_model: "qwen-max private-token",
+            status_code: "503",
+            traceback: "private output",
+          },
+        },
+        {
+          sequence: 4,
+          kind: "approval.requested",
+          message: "approval.requested",
+          summary: "approval requested",
+          created_at: "2026-08-07T00:00:04Z",
+          actor: "main_agent",
+          participants: [],
+          tool_name: null,
+          tool_call_id: null,
+          step_id: null,
+          approval_id: "approval_retry_terminal",
+          action: "retry_terminal private output",
+          decision: null,
+          payload: { requires_approval: true, replay_safe: false },
+        },
+        {
+          sequence: 5,
+          kind: "model.failed",
+          message: "model failed with secret prompt private-token",
+          summary: "model failed",
+          created_at: "2026-08-07T00:00:05Z",
+          actor: "planner",
+          participants: [],
+          tool_name: null,
+          tool_call_id: null,
+          step_id: "planner_step",
+          action: null,
+          decision: null,
+          payload: {
+            logical_model: "deepseek-r1 private-token",
+            status_code: 429,
+            prompt: "private output",
+          },
+        },
+      ],
+      artifacts: [],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const diagnostics = await screen.findByRole("region", { name: "故障诊断" });
+    expect(within(diagnostics).getByText("工具执行失败")).not.toBeNull();
+    expect(within(diagnostics).getAllByText("模型链路失败")).toHaveLength(2);
+    expect(within(diagnostics).getByText("等待人工确认")).not.toBeNull();
+    expect(within(diagnostics).getByText("工具")).not.toBeNull();
+    expect(within(diagnostics).getAllByText("模型链路")).toHaveLength(2);
+    expect(within(diagnostics).getByText(/审批 approval_retry_terminal/)).not.toBeNull();
+    expect(diagnostics.textContent).not.toContain("private-token");
+    expect(diagnostics.textContent).not.toContain("private output");
   });
 
   it("shows observer notices as scheduler guidance on the detail page", async () => {
