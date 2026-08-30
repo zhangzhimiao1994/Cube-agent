@@ -28,6 +28,29 @@ const skills = [
     source_filename: "deep-research.zip",
     package_version_id: "pkg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     content_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    current_version_id: "version-a",
+    versions: [
+      {
+        id: "version-a",
+        status: "quarantined",
+        source_filename: "deep-research.zip",
+        package_version_id: "pkg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        content_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        created_at: "2026-08-29T01:00:00Z",
+        updated_at: "2026-08-29T01:00:00Z",
+        is_current: true,
+      },
+      {
+        id: "version-b",
+        status: "scanned",
+        source_filename: "deep-research-v2.zip",
+        package_version_id: "pkg_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        content_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        created_at: "2026-08-30T01:00:00Z",
+        updated_at: "2026-08-30T01:00:00Z",
+        is_current: false,
+      },
+    ],
   },
   {
     id: "docx",
@@ -46,7 +69,10 @@ const skills = [
 ];
 
 describe("SkillsPage", () => {
+  let conflictOnFirstUpload = false;
+
   beforeEach(() => {
+    conflictOnFirstUpload = false;
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
       "fetch",
@@ -63,7 +89,23 @@ describe("SkillsPage", () => {
         if (path === "/api/v1/admin/skills" && (!init?.method || init.method === "GET")) {
           return jsonResponse(skills);
         }
-        if (path === "/api/v1/admin/skills/upload" && init?.method === "POST") {
+        if (path.startsWith("/api/v1/admin/skills/upload") && init?.method === "POST") {
+          if (conflictOnFirstUpload && !path.includes("strategy=")) {
+            return jsonResponse(
+              {
+                error: {
+                  code: "skill_version_choice_required",
+                  message: "skill already exists with different content",
+                  details: {
+                    skill_name: "deep-research",
+                    current_version_id: "version-a",
+                    new_content_sha256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                  },
+                },
+              },
+              { status: 409 },
+            );
+          }
           return jsonResponse({
             filename: "all-skills.tar.gz",
             bundle: true,
@@ -80,6 +122,20 @@ describe("SkillsPage", () => {
               },
             ],
             skipped: [{ path: "invalid-skill", reason: "instruction skill contains nested archives" }],
+          });
+        }
+        if (path === "/api/v1/admin/skills/deep-research/versions/version-b/activate" && init?.method === "POST") {
+          return jsonResponse({
+            ...skills[0]!,
+            status: "scanned",
+            source_filename: "deep-research-v2.zip",
+            package_version_id: "pkg_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            content_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            current_version_id: "version-b",
+            versions: (skills[0]!.versions ?? []).map((version) => ({
+              ...version,
+              is_current: version.id === "version-b",
+            })),
           });
         }
         if (path === "/api/v1/admin/evolution-runs" && init?.method === "POST") {
@@ -269,6 +325,47 @@ describe("SkillsPage", () => {
     expect(screen.getByText("来源：deep-research.zip")).not.toBeNull();
     expect(screen.getByText("版本：pkg_aaaaaaaa...")).not.toBeNull();
     expect(screen.getByText("aaaaaaaaaaaa...")).not.toBeNull();
+  });
+
+  it("activates another version from the compact version selector", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/skills" />);
+
+    await screen.findByRole("heading", { name: "技能管理" });
+    const selector = screen.getByLabelText("切换 deep-research 版本");
+    expect(within(selector).getByRole("option", { name: /deep-research-v2\.zip/ })).not.toBeNull();
+    await user.selectOptions(selector, "version-b");
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/admin/skills/deep-research/versions/version-b/activate",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
+  });
+
+  it("asks how to handle same-name upload conflicts and retries with the selected strategy", async () => {
+    conflictOnFirstUpload = true;
+    const fetchMock = vi.mocked(fetch);
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/skills" />);
+
+    await screen.findByRole("heading", { name: "技能管理" });
+    const file = new File(["skill-bytes-v2"], "all-skills.tar.gz", { type: "application/gzip" });
+    await user.upload(screen.getByLabelText("Skill 压缩包"), file);
+    await user.click(screen.getByRole("button", { name: "上传并扫描" }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain("deep-research");
+    expect(screen.getByText(/cccccccccccc/)).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "保存为新版本" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/admin/skills/upload?strategy=new_version",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
   });
 
   it("searches skills by source filename and content hash", async () => {

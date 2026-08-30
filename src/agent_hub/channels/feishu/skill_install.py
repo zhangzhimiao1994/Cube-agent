@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from agent_hub.api.errors import PublicAPIError
 from agent_hub.channels.base import AttachmentKind, InboundAttachment, InboundMessage
 from agent_hub.channels.feishu.settings import FeishuSettings
 from agent_hub.skills.package import InvalidSkillPackage
@@ -86,6 +87,18 @@ class FeishuSkillCommandHandler:
                 handled=True,
                 reply_text=f"Skill 压缩包无效：{error}",
             )
+        except PublicAPIError as error:
+            if error.status_code == 409 and error.code == "skill_version_choice_required":
+                skill_name = error.details.get("skill_name") if error.details else None
+                target = f"「{skill_name}」" if skill_name else "同名 Skill"
+                return FeishuSkillCommandResult(
+                    handled=True,
+                    reply_text=(
+                        f"检测到 {target} 已存在且内容不同。请在 Web 管理端选择"
+                        "“覆盖当前版本”或“保存为新版本”。"
+                    ),
+                )
+            raise
         items = _skill_upload_items(uploaded)
         if not items:
             return FeishuSkillCommandResult(

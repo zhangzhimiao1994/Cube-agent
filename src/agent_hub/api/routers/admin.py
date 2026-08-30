@@ -23,7 +23,7 @@ import yaml
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -401,6 +401,19 @@ class SkillUploadRequest(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
 
 
+class SkillVersionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    status: str
+    source_filename: str | None = None
+    package_version_id: str | None = None
+    content_sha256: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    is_current: bool = False
+
+
 class SkillResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -412,6 +425,8 @@ class SkillResponse(BaseModel):
     source_filename: str | None = None
     package_version_id: str | None = None
     content_sha256: str | None = None
+    current_version_id: str | None = None
+    versions: list[SkillVersionResponse] = Field(default_factory=list)
 
 
 class SkillBulkDeleteRequest(BaseModel):
@@ -1821,8 +1836,10 @@ class AdminResourceService(Protocol):
     async def upload_skill(self, request: SkillUploadRequest) -> SkillResponse: ...
 
     async def upload_skill_archive(
-        self, filename: str, archive_bytes: bytes
+        self, filename: str, archive_bytes: bytes, *, strategy: str | None = None
     ) -> SkillArchiveUploadResponse: ...
+
+    async def activate_skill_version(self, skill_id: str, version_id: str) -> SkillResponse: ...
 
     async def approve_skill(self, skill_id: str) -> SkillResponse: ...
 
@@ -2250,6 +2267,11 @@ def _skill_id_from_scanned_archive(scanned: _ScannedSkillArchive) -> str:
     return _stable_skill_id("instruction", name, "instruction-only")
 
 
+def _skill_version_id_from_scanned_archive(scanned: _ScannedSkillArchive) -> str:
+    response = _skill_response_from_scanned_archive(scanned, "skill_pending")
+    return _stable_skill_id("version", response.name, response.content_sha256 or response.id)
+
+
 def _manual_skill_upload_id(filename: str) -> str:
     name = _skill_name_slug(PurePosixPath(filename).stem)
     return _stable_skill_id("manual", name, "metadata-only")
@@ -2260,6 +2282,152 @@ def _stable_skill_id(kind: str, name: str, version: str) -> str:
     version_slug = _skill_name_slug(version)
     digest = hashlib.sha256(f"{kind}:{slug}:{version_slug}".encode()).hexdigest()[:16]
     return f"skill_{slug}_{digest}"
+
+
+@dataclass(frozen=True, slots=True)
+class _SkillVersionRecord:
+    response: SkillResponse
+    created_at: datetime | None
+    updated_at: datetime | None
+    ordinal: int
+
+
+def _skill_response_from_payload(
+    payload: Mapping[str, object], *, resource_id: str | None = None
+) -> SkillResponse:
+    data = dict(payload)
+    if resource_id is not None and not isinstance(data.get("id"), str):
+        data["id"] = resource_id
+    return SkillResponse.model_validate(data)
+
+
+def _group_skill_records(
+    records: Iterable[_SkillVersionRecord],
+    active_versions: Mapping[str, str],
+) -> tuple[SkillResponse, ...]:
+    groups: dict[str, list[_SkillVersionRecord]] = {}
+    group_order: list[str] = []
+    for record in records:
+        name = record.response.name
+        if name not in groups:
+            groups[name] = []
+            group_order.append(name)
+        groups[name].append(record)
+
+    grouped: list[SkillResponse] = []
+    for name in group_order:
+        versions = sorted(groups[name], key=_skill_version_sort_key, reverse=True)
+        active_id = active_versions.get(name)
+        current = next(
+            (record for record in versions if record.response.id == active_id),
+            versions[0],
+        )
+        current_id = current.response.id
+        version_responses = [
+            SkillVersionResponse(
+                id=record.response.id,
+                status=record.response.status,
+                source_filename=record.response.source_filename,
+                package_version_id=record.response.package_version_id,
+                content_sha256=record.response.content_sha256,
+                created_at=record.created_at,
+                updated_at=record.updated_at,
+                is_current=record.response.id == current_id,
+            )
+            for record in versions
+        ]
+        grouped.append(
+            current.response.model_copy(
+                update={
+                    "current_version_id": current_id,
+                    "versions": version_responses,
+                }
+            )
+        )
+    return tuple(grouped)
+
+
+def _skill_version_sort_key(record: _SkillVersionRecord) -> tuple[datetime, int]:
+    timestamp = record.updated_at or record.created_at or datetime.min.replace(tzinfo=UTC)
+    return timestamp, record.ordinal
+
+
+_SKILL_ACTIVE_VERSIONS_SETTING_ID = "skill-active-versions"
+
+
+def _skill_upload_strategy_or_error(strategy: str | None) -> str | None:
+    if strategy in {None, "", "overwrite", "new_version"}:
+        return strategy or None
+    raise PublicAPIError(
+        422,
+        "request_validation",
+        "skill upload strategy must be overwrite or new_version",
+    )
+
+
+def _matching_skill_content(
+    versions: Iterable[SkillResponse], content_sha256: str | None
+) -> SkillResponse | None:
+    if not content_sha256:
+        return None
+    return next((skill for skill in versions if skill.content_sha256 == content_sha256), None)
+
+
+def _current_skill_for_name(
+    versions: Iterable[SkillResponse],
+    active_versions: Mapping[str, str],
+    name: str,
+) -> SkillResponse:
+    version_list = list(versions)
+    active_id = active_versions.get(name)
+    if active_id:
+        active = next((skill for skill in version_list if skill.id == active_id), None)
+        if active is not None:
+            return active
+    return version_list[-1]
+
+
+def _skill_version_choice_error(
+    candidate: SkillResponse, current: SkillResponse
+) -> PublicAPIError:
+    return PublicAPIError(
+        409,
+        "skill_version_choice_required",
+        "same-name skill already exists; choose overwrite or new_version",
+        details={
+            "skill_name": candidate.name,
+            "current_version_id": current.id,
+            "new_content_sha256": candidate.content_sha256 or "",
+        },
+    )
+
+
+def _active_skill_versions_from_payload(payload: Mapping[str, object]) -> dict[str, str]:
+    value = payload.get("active_versions")
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(name): str(version_id)
+        for name, version_id in value.items()
+        if isinstance(name, str) and isinstance(version_id, str)
+    }
+
+
+def _skill_response_with_archive_identity(
+    response: SkillResponse, archive_path: Path
+) -> SkillResponse:
+    if response.content_sha256 and response.package_version_id and response.source_filename:
+        return response
+    if not archive_path.is_file():
+        return response
+    content_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+    return response.model_copy(
+        update={
+            "source_filename": response.source_filename or archive_path.name,
+            "package_version_id": response.package_version_id or f"pkg_{content_sha256}",
+            "content_sha256": response.content_sha256 or content_sha256,
+        }
+    )
 
 
 def _skipped_skill_responses(
@@ -2480,6 +2648,7 @@ class InMemoryAdminResourceService:
     main_agent_config: MainAgentConfigResponse = field(default_factory=MainAgentConfigResponse)
     runs: dict[UUID, RunDetailResponse] = field(default_factory=dict)
     skills: dict[str, SkillResponse] = field(default_factory=dict)
+    skill_active_versions: dict[str, str] = field(default_factory=dict)
     mcp_servers: dict[str, McpServerResponse] = field(default_factory=dict)
     channel_config: dict[str, dict[str, str]] = field(default_factory=dict)
     memory: dict[str, MemoryRecordResponse] = field(default_factory=dict)
@@ -3012,7 +3181,11 @@ class InMemoryAdminResourceService:
         return updated
 
     async def list_skills(self) -> tuple[SkillResponse, ...]:
-        return tuple(self.skills.values())
+        records = [
+            _SkillVersionRecord(response=skill, created_at=None, updated_at=None, ordinal=index)
+            for index, skill in enumerate(self.skills.values())
+        ]
+        return _group_skill_records(records, self.skill_active_versions)
 
     async def upload_skill(self, request: SkillUploadRequest) -> SkillResponse:
         skill_id = _manual_skill_upload_id(request.filename)
@@ -3027,8 +3200,9 @@ class InMemoryAdminResourceService:
         return response
 
     async def upload_skill_archive(
-        self, filename: str, archive_bytes: bytes
+        self, filename: str, archive_bytes: bytes, *, strategy: str | None = None
     ) -> SkillArchiveUploadResponse:
+        strategy = _skill_upload_strategy_or_error(strategy)
         try:
             bundle, scanned_archives, skipped_archives = _scan_skill_archive_upload(
                 filename, archive_bytes
@@ -3059,7 +3233,39 @@ class InMemoryAdminResourceService:
                 continue
             seen_skill_ids.add(skill_id)
             response = _skill_response_from_scanned_archive(scanned, skill_id)
+            existing_versions = [
+                skill for skill in self.skills.values() if skill.name == response.name
+            ]
+            matching_content = _matching_skill_content(existing_versions, response.content_sha256)
+            if matching_content is not None:
+                items.append(matching_content)
+                continue
+            if existing_versions:
+                current = _current_skill_for_name(
+                    existing_versions, self.skill_active_versions, response.name
+                )
+                if strategy is None:
+                    raise _skill_version_choice_error(response, current)
+                if strategy == "overwrite":
+                    skill_id = current.id
+                else:
+                    skill_id = _skill_version_id_from_scanned_archive(scanned)
+                response = _skill_response_from_scanned_archive(scanned, skill_id)
+            if response.id != skill_id and response.id in seen_skill_ids:
+                skipped.append(
+                    _SkippedSkillArchive(
+                        path=scanned.filename,
+                        reason="duplicate skill identity skipped",
+                    )
+                )
+                continue
+            seen_skill_ids.add(response.id)
+            response = _skill_response_from_scanned_archive(scanned, skill_id)
             self.skills[response.id] = response
+            if strategy == "new_version" and existing_versions:
+                self.skill_active_versions[response.name] = response.id
+            if strategy == "overwrite" and existing_versions:
+                self.skill_active_versions[response.name] = response.id
             items.append(response)
         return SkillArchiveUploadResponse(
             filename=filename,
@@ -3073,6 +3279,22 @@ class InMemoryAdminResourceService:
         updated = current.model_copy(update={"status": "enabled"})
         self.skills[skill_id] = updated
         return updated
+
+    async def activate_skill_version(self, skill_id: str, version_id: str) -> SkillResponse:
+        try:
+            skill = self.skills[skill_id]
+            version = self.skills[version_id]
+        except KeyError as exc:
+            raise KeyError(str(exc)) from None
+        if skill.name != version.name:
+            raise PublicAPIError(
+                409,
+                "skill_version_mismatch",
+                "skill version does not belong to this skill",
+            )
+        self.skill_active_versions[skill.name] = version.id
+        grouped = await self.list_skills()
+        return next(item for item in grouped if item.name == skill.name)
 
     async def delete_skill(self, skill_id: str) -> None:
         del self.skills[skill_id]
@@ -4607,10 +4829,35 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         return updated
 
     async def list_skills(self) -> tuple[SkillResponse, ...]:
-        resources = await self._list_admin_payloads("skill")
-        if resources is None:
-            return await super().list_skills()
-        return tuple(SkillResponse.model_validate(payload) for payload in resources)
+        rows = await self._list_admin_payloads_with_metadata("skill")
+        if rows is None:
+            resources = await self._list_admin_payloads("skill")
+            if resources is None:
+                return await super().list_skills()
+            records = [
+                _SkillVersionRecord(
+                    response=_skill_response_from_payload(payload),
+                    created_at=None,
+                    updated_at=None,
+                    ordinal=index,
+                )
+                for index, payload in enumerate(resources)
+            ]
+        else:
+            records = [
+                _SkillVersionRecord(
+                    response=_skill_response_with_archive_identity(
+                        _skill_response_from_payload(payload, resource_id=resource_id),
+                        self._skill_archive_path(resource_id),
+                    ),
+                    created_at=created_at,
+                    updated_at=updated_at,
+                    ordinal=index,
+                )
+                for index, (resource_id, payload, created_at, updated_at) in enumerate(rows)
+            ]
+        active_versions = await self._active_skill_versions()
+        return _group_skill_records(records, active_versions)
 
     async def upload_skill(self, request: SkillUploadRequest) -> SkillResponse:
         skill_id = _manual_skill_upload_id(request.filename)
@@ -4631,8 +4878,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         return response
 
     async def upload_skill_archive(
-        self, filename: str, archive_bytes: bytes
+        self, filename: str, archive_bytes: bytes, *, strategy: str | None = None
     ) -> SkillArchiveUploadResponse:
+        strategy = _skill_upload_strategy_or_error(strategy)
         try:
             bundle, scanned_archives, skipped_archives = _scan_skill_archive_upload(
                 filename, archive_bytes
@@ -4659,6 +4907,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             ) from None
         items: list[SkillResponse] = []
         seen_skill_ids: set[str] = set()
+        active_upload_ids: set[str] = set()
         skipped = list(skipped_archives)
         try:
             for scanned in scanned_archives:
@@ -4672,10 +4921,42 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                     )
                     continue
                 seen_skill_ids.add(skill_id)
-                archive_path = self._skill_archive_path(skill_id)
+                response = _skill_response_from_scanned_archive(scanned, skill_id)
+                existing_versions = await self._skill_versions_by_name(response.name)
+                matching_content = _matching_skill_content(
+                    (record.response for record in existing_versions),
+                    response.content_sha256,
+                )
+                if matching_content is not None:
+                    items.append(matching_content)
+                    continue
+                if existing_versions:
+                    current = _current_skill_for_name(
+                        (record.response for record in existing_versions),
+                        await self._active_skill_versions(),
+                        response.name,
+                    )
+                    if strategy is None:
+                        raise _skill_version_choice_error(response, current)
+                    if strategy == "overwrite":
+                        skill_id = current.id
+                    else:
+                        skill_id = _skill_version_id_from_scanned_archive(scanned)
+                    response = _skill_response_from_scanned_archive(scanned, skill_id)
+                if response.id != skill_id and response.id in seen_skill_ids:
+                    skipped.append(
+                        _SkippedSkillArchive(
+                            path=scanned.filename,
+                            reason="duplicate skill identity skipped",
+                        )
+                    )
+                    continue
+                seen_skill_ids.add(response.id)
+                archive_path = self._skill_archive_path(response.id)
                 archive_path.parent.mkdir(parents=True, exist_ok=True)
                 archive_path.write_bytes(scanned.archive_bytes)
-                items.append(_skill_response_from_scanned_archive(scanned, skill_id))
+                active_upload_ids.add(response.id)
+                items.append(response)
         except OSError:
             await self.record_log(
                 category="feature_error",
@@ -4689,10 +4970,14 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 503, "skill_store_unavailable", "skill store is unavailable"
             ) from None
         for response in items:
+            if response.id not in active_upload_ids:
+                continue
             if not await self._upsert_admin_payload(
                 "skill", response.id, response.model_dump(mode="json")
             ):
                 return await super().upload_skill_archive(filename, archive_bytes)
+            if response.id in active_upload_ids:
+                await self._set_active_skill_version(response.name, response.id)
             await self._record_audit("skill.upload", f"skill:{response.id}", {"filename": filename})
         return SkillArchiveUploadResponse(
             filename=filename,
@@ -4700,6 +4985,30 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             items=items,
             skipped=_skipped_skill_responses(tuple(skipped)),
         )
+
+    async def activate_skill_version(self, skill_id: str, version_id: str) -> SkillResponse:
+        skill_payload = await self._get_admin_payload("skill", skill_id)
+        version_payload = await self._get_admin_payload("skill", version_id)
+        if skill_payload is None or version_payload is None:
+            return await super().activate_skill_version(skill_id, version_id)
+        if not skill_payload or not version_payload:
+            raise KeyError(skill_id if not skill_payload else version_id)
+        skill = _skill_response_from_payload(skill_payload, resource_id=skill_id)
+        version = _skill_response_from_payload(version_payload, resource_id=version_id)
+        if skill.name != version.name:
+            raise PublicAPIError(
+                409,
+                "skill_version_mismatch",
+                "skill version does not belong to this skill",
+            )
+        await self._set_active_skill_version(skill.name, version.id)
+        await self._record_audit(
+            "skill.version.activate",
+            f"skill:{skill.id}",
+            {"version_id": version.id, "skill_name": skill.name},
+        )
+        grouped = await self.list_skills()
+        return next(item for item in grouped if item.name == skill.name)
 
     async def approve_skill(self, skill_id: str) -> SkillResponse:
         payload = await self._get_admin_payload("skill", skill_id)
@@ -5095,6 +5404,69 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             ).scalars()
             return [dict(row.payload) for row in rows]
 
+    async def _list_admin_payloads_with_metadata(
+        self, kind: str
+    ) -> list[tuple[str, dict[str, object], datetime | None, datetime | None]] | None:
+        if self._session_factory is None:
+            return None
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(AdminResourceRow)
+                    .where(AdminResourceRow.tenant_id == self._tenant_id)
+                    .where(AdminResourceRow.kind == kind)
+                    .order_by(AdminResourceRow.created_at)
+                )
+            ).scalars()
+            return [
+                (row.resource_id, dict(row.payload), row.created_at, row.updated_at)
+                for row in rows
+            ]
+
+    async def _active_skill_versions(self) -> dict[str, str]:
+        payload = await self._get_admin_payload("setting", _SKILL_ACTIVE_VERSIONS_SETTING_ID)
+        if not payload:
+            return {}
+        return _active_skill_versions_from_payload(payload)
+
+    async def _set_active_skill_version(self, name: str, version_id: str) -> None:
+        active_versions = await self._active_skill_versions()
+        active_versions[name] = version_id
+        await self._upsert_admin_payload(
+            "setting",
+            _SKILL_ACTIVE_VERSIONS_SETTING_ID,
+            {
+                "id": _SKILL_ACTIVE_VERSIONS_SETTING_ID,
+                "active_versions": active_versions,
+            },
+        )
+
+    async def _skill_versions_by_name(self, name: str) -> tuple[_SkillVersionRecord, ...]:
+        rows = await self._list_admin_payloads_with_metadata("skill")
+        if rows is None:
+            resources = await self._list_admin_payloads("skill")
+            if resources is None:
+                return tuple(
+                    _SkillVersionRecord(skill, None, None, index)
+                    for index, skill in enumerate(await super().list_skills())
+                    if skill.name == name
+                )
+            payload_records = []
+            for index, payload in enumerate(resources):
+                response = _skill_response_from_payload(payload)
+                if response.name == name:
+                    payload_records.append(_SkillVersionRecord(response, None, None, index))
+            return tuple(payload_records)
+        row_records: list[_SkillVersionRecord] = []
+        for index, (resource_id, payload, created_at, updated_at) in enumerate(rows):
+            response = _skill_response_with_archive_identity(
+                _skill_response_from_payload(payload, resource_id=resource_id),
+                self._skill_archive_path(resource_id),
+            )
+            if response.name == name:
+                row_records.append(_SkillVersionRecord(response, created_at, updated_at, index))
+        return tuple(row_records)
+
     async def _channel_config_values(self) -> dict[str, dict[str, str]] | None:
         resources = await self._list_admin_payloads("channel")
         if resources is None:
@@ -5146,7 +5518,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                     AdminResourceRow.kind,
                     AdminResourceRow.resource_id,
                 ],
-                set_={"payload": payload},
+                set_={"payload": payload, "updated_at": func.now()},
             )
         )
         async with self._session_factory() as session, session.begin():
@@ -8114,7 +8486,7 @@ async def upload_skill(
 @router.post(
     "/skills/upload",
     response_model=SkillArchiveUploadResponse,
-    responses=error_responses(401, 403, 413, 422, 503),
+    responses=error_responses(401, 403, 409, 413, 422, 503),
 )
 async def upload_skill_archive(
     request: Request,
@@ -8131,8 +8503,11 @@ async def upload_skill_archive(
     archive_bytes = await request.body()
     if not archive_bytes:
         raise PublicAPIError(422, "request_validation", "skill archive is empty")
+    strategy = _skill_upload_strategy_or_error(request.query_params.get("strategy"))
+    if strategy is not None:
+        _require(principal, "skill:approve")
     try:
-        return await service.upload_skill_archive(filename, archive_bytes)
+        return await service.upload_skill_archive(filename, archive_bytes, strategy=strategy)
     except InvalidSkillPackage as error:
         raise PublicAPIError(
             422,
@@ -8140,6 +8515,24 @@ async def upload_skill_archive(
             "skill package is invalid",
             details={"reason": _safe_model_check_detail(str(error))},
         ) from None
+
+
+@router.post(
+    "/skills/{skill_id}/versions/{version_id}/activate",
+    response_model=SkillResponse,
+    responses=error_responses(401, 403, 404, 409, 422),
+)
+async def activate_skill_version(
+    skill_id: str,
+    version_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> SkillResponse:
+    _require(principal, "skill:approve")
+    try:
+        return await service.activate_skill_version(skill_id, version_id)
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
 
 
 @router.post(

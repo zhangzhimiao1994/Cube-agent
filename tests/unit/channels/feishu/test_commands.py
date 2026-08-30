@@ -67,7 +67,7 @@ class FakeFeishuFileClient:
         yield self.payload
 
 
-def skill_archive() -> bytes:
+def skill_archive(entry_body: str = "print('ok')\n") -> bytes:
     manifest = (
         "name: feishu_writer\n"
         "version: 1.0.0\n"
@@ -85,7 +85,7 @@ def skill_archive() -> bytes:
     buffer = BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("skill.yaml", manifest)
-        archive.writestr("main.py", "print('ok')\n")
+        archive.writestr("main.py", entry_body)
     return buffer.getvalue()
 
 
@@ -248,6 +248,27 @@ async def test_feishu_skill_install_uploads_attached_archive_for_scan_only() -> 
     assert len(skills) == 1
     assert skills[0].name == "feishu_writer"
     assert skills[0].status == "scanned"
+
+
+async def test_feishu_skill_install_same_name_conflict_prompts_web_choice() -> None:
+    service = InMemoryAdminResourceService()
+    await service.upload_skill_archive("feishu-writer.zip", skill_archive("print('one')\n"))
+    file_client = FakeFeishuFileClient(skill_archive("print('two')\n"))
+    handler = FeishuSkillCommandHandler(
+        admin_service=service,
+        media_client_factory=lambda _settings: file_client,
+    )
+
+    result = await handler.handle(
+        inbound_skill_file_message("/skill install"),
+        settings=FeishuSettings(),
+    )
+
+    assert result is not None
+    assert result.handled is True
+    assert "已存在且内容不同" in result.reply_text
+    assert "覆盖当前版本" in result.reply_text
+    assert "保存为新版本" in result.reply_text
 
 
 async def test_feishu_skill_install_uploads_instruction_bundle_for_scan_only() -> None:

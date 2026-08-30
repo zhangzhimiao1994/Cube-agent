@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
-import { api, formatApiError, type Skill } from "../api/client";
+import { ApiError, api, formatApiError, type Skill, type SkillVersion } from "../api/client";
 import { useNavSection } from "../app/navSections";
 import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
 
@@ -12,6 +12,13 @@ type SkillColumnFilters = {
   permissions: string;
   scan: string;
   status: string;
+};
+
+type SkillUploadStrategy = "overwrite" | "new_version";
+
+type SkillUploadConflict = {
+  skillName: string;
+  newContentSha256: string;
 };
 
 const EMPTY_SKILL_FILTERS: SkillColumnFilters = {
@@ -89,6 +96,26 @@ function shortHash(value?: string | null) {
   return value ? `${value.slice(0, 12)}...` : "";
 }
 
+function currentSkillVersionId(skill: Skill) {
+  return skill.current_version_id ?? skill.versions.find((version) => version.is_current)?.id ?? "";
+}
+
+function versionLabel(version: SkillVersion) {
+  const identity = version.content_sha256 ?? version.package_version_id ?? version.id;
+  const filename = version.source_filename ? ` · ${version.source_filename}` : "";
+  return `${version.is_current ? "当前 · " : ""}${version.status}${filename}${identity ? ` · ${shortHash(identity)}` : ""}`;
+}
+
+function uploadConflictFromError(error: unknown, file: File | null): SkillUploadConflict | null {
+  if (!(error instanceof ApiError) || error.status !== 409 || error.code !== "skill_version_choice_required" || !file) {
+    return null;
+  }
+  return {
+    skillName: String(error.details?.skill_name ?? "同名 Skill"),
+    newContentSha256: String(error.details?.new_content_sha256 ?? ""),
+  };
+}
+
 export function SkillsPage() {
   const { navTargetProps } = useNavSection(["view"]);
   const [file, setFile] = useState<File | null>(null);
@@ -100,17 +127,26 @@ export function SkillsPage() {
   const [creatorGoal, setCreatorGoal] = useState("围绕 AI 方向完成资料检索、研究问题拆解、创新点发现和论文计划输出。");
   const [creatorMaterials, setCreatorMaterials] = useState("由主 Agent 先制定检索计划，再拉取真实论文、项目和基准资料；用户可补充本地文献或链接。");
   const [creatorChecks, setCreatorChecks] = useState("用 3 个真实研究任务验收：资料综述、创新点候选、论文实验计划。未通过则继续迭代。");
+  const [uploadConflict, setUploadConflict] = useState<SkillUploadConflict | null>(null);
   const queryClient = useQueryClient();
   const skills = useQuery({ queryKey: ["skills"], queryFn: () => api.skills() });
   const upload = useMutation({
-    mutationFn: () => {
+    mutationFn: (strategy?: SkillUploadStrategy) => {
       if (!file) throw new Error("请选择 Skill 压缩包");
-      return api.uploadSkillArchive(file);
+      return api.uploadSkillArchive(file, strategy);
     },
     onSuccess: () => {
       setFile(null);
+      setUploadConflict(null);
       void queryClient.invalidateQueries({ queryKey: ["skills"] });
     },
+    onError: (error) => {
+      setUploadConflict(uploadConflictFromError(error, file));
+    },
+  });
+  const activateVersion = useMutation({
+    mutationFn: ({ skillId, versionId }: { skillId: string; versionId: string }) => api.activateSkillVersion(skillId, versionId),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["skills"] }),
   });
   const approve = useMutation({
     mutationFn: (id: string) => api.approveSkill(id),
@@ -196,7 +232,7 @@ export function SkillsPage() {
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.includes(id));
   const allVisibleApprovalSelected =
     visibleApprovalIds.length > 0 && visibleApprovalIds.every((id) => selectedIds.includes(id));
-  const busy = approve.isPending || deleteSkill.isPending || bulkApprove.isPending || bulkDelete.isPending || createSkillTask.isPending;
+  const busy = approve.isPending || deleteSkill.isPending || bulkApprove.isPending || bulkDelete.isPending || createSkillTask.isPending || activateVersion.isPending;
   const skippedUploadItems = upload.data?.skipped ?? [];
 
   return (
@@ -254,16 +290,35 @@ export function SkillsPage() {
               aria-label="Skill 压缩包"
               type="file"
               accept=".zip,.tar,.tar.gz,.tgz"
-              onChange={(event) => setFile(event.currentTarget.files?.[0] ?? null)}
+              onChange={(event) => {
+                setFile(event.currentTarget.files?.[0] ?? null);
+                setUploadConflict(null);
+              }}
             />
           </label>
           <p className="field-help">
             支持 `.zip`、`.tar`、`.tar.gz`、`.tgz`。可以上传单个 Skill，也可以上传包含多个 Skill 目录的归档；多层外层文件夹会自动识别，每个指令型 Skill 目录需包含 `SKILL.md`。
           </p>
-          <button type="button" disabled={!file || upload.isPending} onClick={() => upload.mutate()}>
+          <button type="button" disabled={!file || upload.isPending} onClick={() => upload.mutate(undefined)}>
             {upload.isPending ? "正在扫描..." : "上传并扫描"}
           </button>
-          {upload.isError ? <p role="alert">{formatApiError(upload.error, "Skill 上传失败")}</p> : null}
+          {uploadConflict ? (
+            <div role="alert" className="inline-alert">
+              <p>
+                Skill「{uploadConflict.skillName}」已存在。新包 SHA256：<code>{shortHash(uploadConflict.newContentSha256)}</code>。
+                请选择覆盖当前版本，或保存为新版本。
+              </p>
+              <div className="channel-config-actions">
+                <button type="button" disabled={upload.isPending} onClick={() => upload.mutate("overwrite")}>
+                  覆盖当前版本
+                </button>
+                <button type="button" className="secondary-action" disabled={upload.isPending} onClick={() => upload.mutate("new_version")}>
+                  保存为新版本
+                </button>
+              </div>
+            </div>
+          ) : null}
+          {upload.isError && !uploadConflict ? <p role="alert">{formatApiError(upload.error, "Skill 上传失败")}</p> : null}
           {upload.isSuccess ? (
             <p role="status">
               已扫描 {upload.data.items.length} 个 Skill
@@ -272,6 +327,7 @@ export function SkillsPage() {
           ) : null}
           {approve.isError ? <p role="alert">{formatApiError(approve.error, "Skill 审批失败")}</p> : null}
           {deleteSkill.isError ? <p role="alert">{formatApiError(deleteSkill.error, "Skill 删除失败")}</p> : null}
+          {activateVersion.isError ? <p role="alert">{formatApiError(activateVersion.error, "Skill 版本切换失败")}</p> : null}
           {bulkApprove.isError ? <p role="alert">{formatApiError(bulkApprove.error, "Skill 批量审批失败")}</p> : null}
           {bulkDelete.isError ? <p role="alert">{formatApiError(bulkDelete.error, "Skill 批量删除失败")}</p> : null}
           {bulkDelete.isSuccess && bulkDelete.data.failed.length > 0 ? (
@@ -427,6 +483,23 @@ export function SkillsPage() {
                             <p className="field-help">
                               SHA256：<code>{shortHash(skill.content_sha256)}</code>
                             </p>
+                          ) : null}
+                          {skill.versions.length > 1 ? (
+                            <label className="field-help">
+                              版本选择
+                              <select
+                                aria-label={`切换 ${skill.name} 版本`}
+                                value={currentSkillVersionId(skill)}
+                                disabled={busy}
+                                onChange={(event) => activateVersion.mutate({ skillId: skill.id, versionId: event.currentTarget.value })}
+                              >
+                                {skill.versions.map((version) => (
+                                  <option key={version.id} value={version.id}>
+                                    {versionLabel(version)}
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
                           ) : null}
                         </td>
                         <td>{skill.status}</td>

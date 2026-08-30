@@ -656,6 +656,17 @@ const ConversationSchema = z.object({
 
 export type Conversation = z.infer<typeof ConversationSchema>;
 
+const SkillVersionSchema = z.object({
+  id: z.string(),
+  status: z.string(),
+  source_filename: z.string().nullable().optional(),
+  package_version_id: z.string().nullable().optional(),
+  content_sha256: z.string().nullable().optional(),
+  created_at: z.string().nullable().optional(),
+  updated_at: z.string().nullable().optional(),
+  is_current: z.boolean(),
+});
+
 const SkillSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -665,9 +676,12 @@ const SkillSchema = z.object({
   source_filename: z.string().nullable().optional(),
   package_version_id: z.string().nullable().optional(),
   content_sha256: z.string().nullable().optional(),
+  current_version_id: z.string().nullable().optional(),
+  versions: z.array(SkillVersionSchema).default([]),
 });
 
 export type Skill = z.infer<typeof SkillSchema>;
+export type SkillVersion = z.infer<typeof SkillVersionSchema>;
 
 const SkillBulkDeleteSchema = z.object({
   deleted: z.array(z.string()),
@@ -1505,10 +1519,11 @@ export const api = {
       SkillSchema,
     );
   },
-  uploadSkillArchive(file: File): Promise<SkillArchiveUpload> {
+  uploadSkillArchive(file: File, strategy?: "overwrite" | "new_version"): Promise<SkillArchiveUpload> {
     const filename = encodedFilenameHeader(file.name);
+    const query = strategy ? `?strategy=${encodeURIComponent(strategy)}` : "";
     return requestBinary(
-      "/api/v1/admin/skills/upload",
+      `/api/v1/admin/skills/upload${query}`,
       {
         method: "POST",
         body: file,
@@ -1519,6 +1534,13 @@ export const api = {
         },
       },
       SkillArchiveUploadSchema,
+    );
+  },
+  activateSkillVersion(skillId: string, versionId: string): Promise<Skill> {
+    return request(
+      `/api/v1/admin/skills/${encodeURIComponent(skillId)}/versions/${encodeURIComponent(versionId)}/activate`,
+      { method: "POST" },
+      SkillSchema,
     );
   },
   approveSkill(id: string): Promise<Skill> {

@@ -17,6 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
+import agent_hub.api.routers.admin as admin_router
 from agent_hub.api.errors import PublicAPIError
 from agent_hub.api.routers.admin import (
     AgentResourceRequest,
@@ -40,7 +41,7 @@ from agent_hub.api.routers.admin import (
     _run_debug_from_detail,
 )
 from agent_hub.app import create_app
-from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
+from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, PermissionDenied, Role
 from agent_hub.config.repository import ConfigRevision, ConfigStatus
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.evolution import EvolutionNextRoundExecutionRequest, EvolutionRunRequest
@@ -3416,7 +3417,7 @@ def test_skill_archive_upload_replaces_same_identity_without_duplicating() -> No
         content=first_archive,
     )
     second = api.post(
-        "/api/v1/admin/skills/upload",
+        "/api/v1/admin/skills/upload?strategy=overwrite",
         headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
         content=second_archive,
     )
@@ -3433,6 +3434,135 @@ def test_skill_archive_upload_replaces_same_identity_without_duplicating() -> No
     assert [item["id"] for item in skills.json()] == [second_item["id"]]
     assert skills.json()[0]["scan_diff"] == second_item["scan_diff"]
     assert skills.json()[0]["content_sha256"] == second_item["content_sha256"]
+
+
+def test_skill_archive_upload_same_name_requires_strategy() -> None:
+    api = client()
+    first_archive = skill_archive_variant(entry_body="print('one')\n")
+    second_archive = skill_archive_variant(entry_body="print('two')\n")
+    third_archive = skill_archive_variant(entry_body="print('three')\n")
+
+    first = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=first_archive,
+    )
+    conflict = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=second_archive,
+    )
+
+    assert first.status_code == 200
+    first_item = first.json()["items"][0]
+    assert conflict.status_code == 409
+    error = conflict.json()["error"]
+    assert error["code"] == "skill_version_choice_required"
+    assert error["details"]["skill_name"] == "safe_skill"
+    assert error["details"]["current_version_id"] == first_item["id"]
+    assert error["details"]["new_content_sha256"]
+
+    overwritten = api.post(
+        "/api/v1/admin/skills/upload?strategy=overwrite",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=second_archive,
+    )
+    new_version = api.post(
+        "/api/v1/admin/skills/upload?strategy=new_version",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=third_archive,
+    )
+    repeated = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill-copy.zip"},
+        content=third_archive,
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert overwritten.status_code == 200
+    overwritten_item = overwritten.json()["items"][0]
+    assert overwritten_item["id"] == first_item["id"]
+    assert overwritten_item["content_sha256"] != first_item["content_sha256"]
+    assert new_version.status_code == 200
+    new_version_item = new_version.json()["items"][0]
+    assert new_version_item["id"] != first_item["id"]
+    assert repeated.status_code == 200
+    assert repeated.json()["items"][0]["id"] == new_version_item["id"]
+    listed = skills.json()
+    assert len(listed) == 1
+    assert listed[0]["id"] == new_version_item["id"]
+    assert listed[0]["current_version_id"] == new_version_item["id"]
+    assert [version["id"] for version in listed[0]["versions"]] == [
+        new_version_item["id"],
+        first_item["id"],
+    ]
+
+
+def test_skill_archive_upload_strategy_requires_approve_permission(monkeypatch: pytest.MonkeyPatch) -> None:
+    class WriteOnlyAuthorizer:
+        def require(self, principal: AuthenticatedPrincipal, permission: str) -> AuthenticatedPrincipal:
+            if permission == "skill:approve":
+                raise PermissionDenied("permission denied")
+            return principal
+
+    monkeypatch.setattr(admin_router, "Authorizer", WriteOnlyAuthorizer)
+    api = client()
+    first_archive = skill_archive_variant(entry_body="print('one')\n")
+    second_archive = skill_archive_variant(entry_body="print('two')\n")
+
+    first = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=first_archive,
+    )
+    denied = api.post(
+        "/api/v1/admin/skills/upload?strategy=overwrite",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=second_archive,
+    )
+
+    assert first.status_code == 200
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "permission_denied"
+
+
+def test_skill_version_activation_selects_requested_version() -> None:
+    api = client()
+    first = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=skill_archive_variant(entry_body="print('one')\n"),
+    ).json()["items"][0]
+    second = api.post(
+        "/api/v1/admin/skills/upload?strategy=new_version",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=skill_archive_variant(entry_body="print('two')\n"),
+    ).json()["items"][0]
+    other = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "other-skill.zip"},
+        content=skill_archive_variant(name="other_skill"),
+    ).json()["items"][0]
+
+    activated = api.post(
+        f"/api/v1/admin/skills/{second['id']}/versions/{first['id']}/activate",
+        headers=headers(),
+    )
+    mismatch = api.post(
+        f"/api/v1/admin/skills/{first['id']}/versions/{other['id']}/activate",
+        headers=headers(),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers()).json()
+
+    assert activated.status_code == 200
+    assert activated.json()["id"] == first["id"]
+    assert activated.json()["current_version_id"] == first["id"]
+    assert mismatch.status_code == 409
+    assert mismatch.json()["error"]["code"] == "skill_version_mismatch"
+    safe_skill = next(item for item in skills if item["name"] == "safe_skill")
+    assert safe_skill["id"] == first["id"]
+    assert safe_skill["current_version_id"] == first["id"]
+    assert [version["is_current"] for version in safe_skill["versions"]] == [False, True]
 
 
 def test_skill_archive_upload_skips_duplicate_identity_inside_bundle() -> None:
@@ -3496,6 +3626,7 @@ async def test_persistent_skill_archive_upload_upserts_stable_identity(tmp_path:
     second = await service.upload_skill_archive(
         "safe-skill.zip",
         skill_archive_variant(entry_body="print('two')\n"),
+        strategy="overwrite",
     )
     listed = await service.list_skills()
 
@@ -3507,6 +3638,267 @@ async def test_persistent_skill_archive_upload_upserts_stable_identity(tmp_path:
     assert listed[0].package_version_id == f"pkg_{listed[0].content_sha256}"
     assert (tmp_path / str(TENANT_ID) / f"{skill_id}.zip").is_file()
     assert len([key for key in service.payloads if key[0] == "skill"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_persistent_skill_list_groups_same_name_versions_and_defaults_latest(
+    tmp_path: Path,
+) -> None:
+    old_id = "skill_versioned_old"
+    new_id = "skill_versioned_new"
+    old_created = datetime(2026, 1, 1, tzinfo=UTC)
+    new_created = datetime(2026, 1, 2, tzinfo=UTC)
+
+    class StoredPersistentSkillService(PersistentAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__(
+                config_service=FakeConfigService(),  # type: ignore[arg-type]
+                secret_service=FakeSecretService(),  # type: ignore[arg-type]
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+                skill_store_dir=tmp_path,
+            )
+            self.payloads: dict[tuple[str, str], dict[str, object]] = {
+                (
+                    "skill",
+                    old_id,
+                ): {
+                    "id": old_id,
+                    "name": "versioned_skill",
+                    "status": "enabled",
+                    "scan_diff": ["legacy row"],
+                    "requested_permissions": [],
+                },
+                (
+                    "skill",
+                    new_id,
+                ): {
+                    "id": new_id,
+                    "name": "versioned_skill",
+                    "status": "scanned",
+                    "scan_diff": ["new row"],
+                    "requested_permissions": ["tool:filesystem.read"],
+                    "source_filename": "versioned-skill.zip",
+                    "package_version_id": "pkg_new",
+                    "content_sha256": "sha-new",
+                },
+            }
+            self.metadata = {
+                old_id: (old_created, old_created),
+                new_id: (new_created, new_created),
+            }
+
+        async def _list_admin_payloads(self, kind: str) -> list[dict[str, object]] | None:
+            return [
+                payload
+                for (stored_kind, _resource_id), payload in self.payloads.items()
+                if stored_kind == kind
+            ]
+
+        async def _list_admin_payloads_with_metadata(
+            self, kind: str
+        ) -> list[tuple[str, dict[str, object], datetime | None, datetime | None]] | None:
+            return [
+                (
+                    resource_id,
+                    payload,
+                    self.metadata[resource_id][0],
+                    self.metadata[resource_id][1],
+                )
+                for (stored_kind, resource_id), payload in self.payloads.items()
+                if stored_kind == kind
+            ]
+
+    archive_path = tmp_path / str(TENANT_ID) / f"{old_id}.zip"
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    archive_path.write_bytes(
+        skill_archive_variant(name="versioned_skill", entry_body="print('legacy')\n")
+    )
+    service = StoredPersistentSkillService()
+
+    listed = await service.list_skills()
+
+    assert len(listed) == 1
+    current = listed[0]
+    assert current.id == new_id
+    assert current.current_version_id == new_id
+    assert [version.id for version in current.versions] == [new_id, old_id]
+    assert [version.is_current for version in current.versions] == [True, False]
+    old_version = current.versions[1]
+    assert old_version.content_sha256
+    assert old_version.package_version_id == f"pkg_{old_version.content_sha256}"
+    assert old_version.source_filename == f"{old_id}.zip"
+
+
+@pytest.mark.asyncio
+async def test_persistent_skill_archive_upload_strategy_preserves_versions(
+    tmp_path: Path,
+) -> None:
+    class StoredPersistentSkillService(PersistentAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__(
+                config_service=FakeConfigService(),  # type: ignore[arg-type]
+                secret_service=FakeSecretService(),  # type: ignore[arg-type]
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+                skill_store_dir=tmp_path,
+            )
+            self.payloads: dict[tuple[str, str], dict[str, object]] = {}
+            self.metadata: dict[str, tuple[datetime, datetime]] = {}
+            self.tick = 0
+
+        async def _list_admin_payloads(self, kind: str) -> list[dict[str, object]] | None:
+            return [
+                payload
+                for (stored_kind, _resource_id), payload in self.payloads.items()
+                if stored_kind == kind
+            ]
+
+        async def _get_admin_payload(self, kind: str, resource_id: str) -> dict[str, object] | None:
+            return self.payloads.get((kind, resource_id), {})
+
+        async def _upsert_admin_payload(
+            self, kind: str, resource_id: str, payload: dict[str, object]
+        ) -> bool:
+            self.payloads[(kind, resource_id)] = payload
+            self.tick += 1
+            current = datetime(2026, 1, self.tick, tzinfo=UTC)
+            created, _updated = self.metadata.get(resource_id, (current, current))
+            self.metadata[resource_id] = (created, current)
+            return True
+
+        async def _list_admin_payloads_with_metadata(
+            self, kind: str
+        ) -> list[tuple[str, dict[str, object], datetime | None, datetime | None]] | None:
+            return [
+                (
+                    resource_id,
+                    payload,
+                    self.metadata.get(resource_id, (None, None))[0],
+                    self.metadata.get(resource_id, (None, None))[1],
+                )
+                for (stored_kind, resource_id), payload in self.payloads.items()
+                if stored_kind == kind
+            ]
+
+    service = StoredPersistentSkillService()
+    first = await service.upload_skill_archive(
+        "safe-skill.zip",
+        skill_archive_variant(entry_body="print('one')\n"),
+    )
+    first_item = first.items[0]
+
+    with pytest.raises(PublicAPIError) as conflict:
+        await service.upload_skill_archive(
+            "safe-skill.zip",
+            skill_archive_variant(entry_body="print('two')\n"),
+        )
+
+    assert conflict.value.status_code == 409
+    assert conflict.value.code == "skill_version_choice_required"
+    assert conflict.value.details
+    assert conflict.value.details["skill_name"] == "safe_skill"
+    assert conflict.value.details["current_version_id"] == first_item.id
+    assert conflict.value.details["new_content_sha256"]
+
+    overwritten = await service.upload_skill_archive(
+        "safe-skill.zip",
+        skill_archive_variant(entry_body="print('two')\n"),
+        strategy="overwrite",
+    )
+    overwritten_item = overwritten.items[0]
+    assert overwritten_item.id == first_item.id
+    assert overwritten_item.content_sha256 != first_item.content_sha256
+    assert len([key for key in service.payloads if key[0] == "skill"]) == 1
+
+    new_version = await service.upload_skill_archive(
+        "safe-skill.zip",
+        skill_archive_variant(entry_body="print('three')\n"),
+        strategy="new_version",
+    )
+    new_item = new_version.items[0]
+    repeated = await service.upload_skill_archive(
+        "safe-skill-copy.zip",
+        skill_archive_variant(entry_body="print('three')\n"),
+    )
+    listed = await service.list_skills()
+
+    assert new_item.id != first_item.id
+    assert repeated.items[0].id == new_item.id
+    assert len([key for key in service.payloads if key[0] == "skill"]) == 2
+    assert [item.id for item in listed] == [new_item.id]
+    assert [version.id for version in listed[0].versions] == [new_item.id, first_item.id]
+
+
+@pytest.mark.asyncio
+async def test_persistent_skill_archive_repeat_upload_does_not_change_current_version(
+    tmp_path: Path,
+) -> None:
+    class StoredPersistentSkillService(PersistentAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__(
+                config_service=FakeConfigService(),  # type: ignore[arg-type]
+                secret_service=FakeSecretService(),  # type: ignore[arg-type]
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+                skill_store_dir=tmp_path,
+            )
+            self.payloads: dict[tuple[str, str], dict[str, object]] = {}
+            self.metadata: dict[str, tuple[datetime, datetime]] = {}
+            self.tick = 0
+
+        async def _list_admin_payloads(self, kind: str) -> list[dict[str, object]] | None:
+            return [
+                payload
+                for (stored_kind, _resource_id), payload in self.payloads.items()
+                if stored_kind == kind
+            ]
+
+        async def _get_admin_payload(self, kind: str, resource_id: str) -> dict[str, object] | None:
+            return self.payloads.get((kind, resource_id), {})
+
+        async def _upsert_admin_payload(
+            self, kind: str, resource_id: str, payload: dict[str, object]
+        ) -> bool:
+            self.payloads[(kind, resource_id)] = payload
+            self.tick += 1
+            current = datetime(2026, 1, self.tick, tzinfo=UTC)
+            created, _updated = self.metadata.get(resource_id, (current, current))
+            self.metadata[resource_id] = (created, current)
+            return True
+
+        async def _list_admin_payloads_with_metadata(
+            self, kind: str
+        ) -> list[tuple[str, dict[str, object], datetime | None, datetime | None]] | None:
+            return [
+                (
+                    resource_id,
+                    payload,
+                    self.metadata.get(resource_id, (None, None))[0],
+                    self.metadata.get(resource_id, (None, None))[1],
+                )
+                for (stored_kind, resource_id), payload in self.payloads.items()
+                if stored_kind == kind
+            ]
+
+    service = StoredPersistentSkillService()
+    first_archive = skill_archive_variant(entry_body="print('one')\n")
+    first = await service.upload_skill_archive("safe-skill.zip", first_archive)
+    first_item = first.items[0]
+    second = await service.upload_skill_archive(
+        "safe-skill.zip",
+        skill_archive_variant(entry_body="print('two')\n"),
+        strategy="new_version",
+    )
+    second_item = second.items[0]
+
+    repeated = await service.upload_skill_archive("safe-skill-copy.zip", first_archive)
+    listed = await service.list_skills()
+
+    assert repeated.items[0].id == first_item.id
+    assert listed[0].id == second_item.id
+    assert listed[0].current_version_id == second_item.id
+    assert [version.id for version in listed[0].versions] == [second_item.id, first_item.id]
 
 
 def test_skill_archive_upload_accepts_percent_encoded_filename_header() -> None:
@@ -3615,7 +4007,7 @@ def test_instruction_skill_hash_changes_when_reference_file_changes() -> None:
         content=instruction_skill_archive_with_reference("Original reference.\n"),
     )
     second = api.post(
-        "/api/v1/admin/skills/upload",
+        "/api/v1/admin/skills/upload?strategy=overwrite",
         headers={**headers(), "X-Agent-Hub-Skill-Filename": "codex-writer-skill.zip"},
         content=instruction_skill_archive_with_reference("Updated reference.\n"),
     )
