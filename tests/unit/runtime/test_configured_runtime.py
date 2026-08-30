@@ -1151,6 +1151,40 @@ def test_dispatch_plan_filters_unavailable_skills_from_executable_steps() -> Non
     assert plan.allowed_tools == ("read_context",)
 
 
+def test_dispatch_plan_keeps_available_project_zip_tool() -> None:
+    roles = (
+        RoleAssignment(
+            id="implementer",
+            role="Implementer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Create a downloadable project.",
+            must_answer=("What archive was generated?",),
+            allowed_tools=("read_context", "project.generate_zip"),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="生成一个最简单的 hello world Python 项目并提供 zip。",
+        ),
+        capability_gateway=FakeCapabilityAvailability({"project.generate_zip"}),
+    )
+
+    implementer = next(agent for agent in plan.agents if agent.id == "implementer")
+    implementer_step = next(step for step in plan.steps if step.agent == "implementer")
+    assert "project.generate_zip" in implementer.allowed_tools
+    assert "project.generate_zip" in implementer_step.tools
+    assert "project.generate_zip" in plan.allowed_tools
+
+
 def test_dispatch_plan_reserves_more_time_for_final_synthesis() -> None:
     roles = tuple(
         RoleAssignment(
