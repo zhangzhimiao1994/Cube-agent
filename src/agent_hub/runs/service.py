@@ -17,6 +17,7 @@ from agent_hub.auth.models import Role
 from agent_hub.context.builder import ContextBuildInput, estimate_tokens
 from agent_hub.context.compaction import ContextCompactor
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.harness.events import harness_started_event
 from agent_hub.harness.scheduler import HarnessSchedulingError
 from agent_hub.harness.types import (
     HarnessDecision,
@@ -27,7 +28,7 @@ from agent_hub.harness.types import (
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteAssessment, RouteDecision
 from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
 from agent_hub.runs.repository import RunAlreadyActive, RunRecord, RunRepository
-from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext
+from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, RunEvent, TaskContext
 from agent_hub.runtime.failure_reason import safe_runtime_failure_reason
 from agent_hub.runtime.registry import RuntimeRegistry
 
@@ -1158,6 +1159,20 @@ class RunService:
                 ),
                 token_budget=token_budget,
             )
+            started_event = harness_started_event(
+                routing_decision=routing_decision,
+                run_id=run_id,
+                start_sequence=1,
+            )
+            if started_event is not None:
+                async with await self._repository.run_transaction() as session, session.begin():
+                    sequence = await self._repository.next_event_sequence(session, run_id)
+                    await self._repository.persist_event(
+                        session,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        event=_event_at_sequence(started_event, run_id=run_id, sequence=sequence),
+                    )
             async for event in runtime.run(context):
                 async with await self._repository.run_transaction() as session, session.begin():
                     locked = await self._repository.get_for_update(session, run_id)
@@ -1172,6 +1187,8 @@ class RunService:
                     if current_status is RunStatus.WAITING_APPROVAL:
                         terminal = RunStatus.WAITING_APPROVAL
                         break
+                    sequence = await self._repository.next_event_sequence(session, run_id)
+                    event = _event_at_sequence(event, run_id=run_id, sequence=sequence)
                     await self._repository.persist_event(
                         session,
                         tenant_id=tenant_id,
@@ -2686,6 +2703,12 @@ def _safe_channel_context(channel_context: Mapping[str, str]) -> dict[str, str]:
 
 def _runtime_failure_reason(error: Exception) -> str:
     return safe_runtime_failure_reason(error)
+
+
+def _event_at_sequence(event: RunEvent, *, run_id: UUID, sequence: int) -> RunEvent:
+    if event.sequence == sequence and event.run_id == run_id:
+        return event
+    return event.model_copy(update={"run_id": run_id, "sequence": sequence})
 
 
 __all__ = [

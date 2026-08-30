@@ -353,6 +353,110 @@ async def test_execute_forwards_persisted_actor_identity_to_runtime_context() ->
 
 
 @pytest.mark.asyncio
+async def test_execute_persists_harness_started_event_before_vibe_runtime_events() -> None:
+    repository = ExecutableFakeRepository(
+        routing_decision={
+            "source": "manual",
+            "vibe_coding": True,
+            "harness_decision": {
+                "mode": "dispatch",
+                "selected_provider": "openai",
+                "selected_model": "gpt-5.6-sol",
+                "selected_logical_model": "vibe_engineer",
+                "requires_approval": False,
+                "capability_reasons": [
+                    "supports_reasoning_delta",
+                    "supports_parallel_tool_calls",
+                ],
+                "policy_reasons": ["policy_allows_restricted_sandbox"],
+                "context_reasons": ["context_window_fits"],
+                "fallbacks_considered": ["deepseek"],
+            },
+        }
+    )
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeCompletes(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.COMPLETED
+    assert [event.kind for event in repository.events] == [
+        "harness.started",
+        EventKind.RUNTIME_COMPLETED,
+    ]
+    assert [event.sequence for event in repository.events] == [1, 2]
+    assert repository.events[0].payload == {
+        "schema_version": 1,
+        "phase": "started",
+        "mode": "dispatch",
+        "provider": "openai",
+        "model": "gpt-5.6-sol",
+        "logical_model": "vibe_engineer",
+        "requires_approval": False,
+        "capabilities": (
+            "supports_reasoning_delta",
+            "supports_parallel_tool_calls",
+        ),
+        "policy": ("policy_allows_restricted_sandbox",),
+        "context": ("context_window_fits",),
+        "fallbacks": ("deepseek",),
+    }
+
+
+@pytest.mark.asyncio
+async def test_execute_without_harness_decision_keeps_runtime_event_sequence() -> None:
+    repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeCompletes(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.COMPLETED
+    assert [event.kind for event in repository.events] == [EventKind.RUNTIME_COMPLETED]
+    assert [event.sequence for event in repository.events] == [1]
+
+
+@pytest.mark.asyncio
+async def test_execute_does_not_emit_harness_started_event_with_sensitive_profile() -> None:
+    repository = ExecutableFakeRepository(
+        routing_decision={
+            "source": "manual",
+            "vibe_coding": True,
+            "harness_decision": {
+                "mode": "dispatch",
+                "selected_provider": "openai",
+                "selected_model": "sk-secret-model-token",
+                "selected_logical_model": "vibe_engineer",
+                "requires_approval": False,
+                "capability_reasons": ["supports_parallel_tool_calls"],
+                "policy_reasons": ["authorization bypass"],
+            },
+        }
+    )
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeCompletes(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.COMPLETED
+    assert [event.kind for event in repository.events] == [EventKind.RUNTIME_COMPLETED]
+    assert "sk-secret-model-token" not in repr(repository.events)
+    assert "authorization bypass" not in repr(repository.events)
+
+
+@pytest.mark.asyncio
 async def test_execute_preserves_waiting_approval_status_set_by_capability_policy() -> None:
     repository = ApprovalWaitingRepository(routing_decision={})
     hook = RecordingHook()

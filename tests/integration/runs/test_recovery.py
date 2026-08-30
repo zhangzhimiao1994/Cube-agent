@@ -15,7 +15,7 @@ from agent_hub.db.models import AdminResourceRow, RunArtifactRow, RunEventRow, R
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.hermes import PersistentHermesRunAdvisor
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteDecision
-from agent_hub.runs.repository import RunConflict, RunNotFound, RunRepository
+from agent_hub.runs.repository import RunConflict, RunNotFound, RunRecord, RunRepository
 from agent_hub.runs.service import (
     HermesRunAdvice,
     HermesRunOutcome,
@@ -369,6 +369,59 @@ async def test_worker_resumes_from_latest_safe_checkpoint_without_duplicate_arti
     assert sum(event["kind"] == "artifact.created" for event in events) == 1
     assert runtime.calls == 2
     assert len(runtime.restored) == 1
+
+
+async def test_recovery_ignores_harness_started_marker_before_first_checkpoint(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    user_id = uuid4()
+    repository = RunRepository(run_session_factory)
+    submitted = await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        request="continue with vibe engineer harness",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.RUNNING,
+        idempotency_key=None,
+        routing_decision={"vibe_coding": True},
+        enqueue=False,
+    )
+
+    async with await repository.run_transaction() as session, session.begin():
+        await repository.persist_event(
+            session,
+            tenant_id=tenant_id,
+            run_id=submitted.id,
+            event=RunEvent(
+                kind="harness.started",
+                sequence=1,
+                run_id=submitted.id,
+                payload={
+                    "schema_version": 1,
+                    "phase": "started",
+                    "mode": "dispatch",
+                    "provider": "openai",
+                    "model": "gpt-5.6-sol",
+                    "logical_model": "vibe_engineer",
+                    "requires_approval": False,
+                    "capabilities": ("supports_parallel_tool_calls",),
+                    "policy": (),
+                    "context": (),
+                    "fallbacks": (),
+                },
+            ),
+        )
+        claimed = await repository.claim_for_execution(
+            session,
+            submitted.id,
+            allow_running_recovery=True,
+        )
+
+    assert not isinstance(claimed, RunRecord)
+    row, checkpoint = claimed
+    assert row.status == RunStatus.RUNNING.value
+    assert checkpoint is None
 
 
 async def test_conversation_context_keeps_origin_anchor_when_history_exceeds_window(

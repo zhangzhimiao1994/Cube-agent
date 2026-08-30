@@ -201,6 +201,7 @@ function displayEventTitle(event: RunDetail["events"][number], agentNames: Map<s
     "runtime.started": "开始执行本次对话",
     "runtime.completed": "完成本次对话",
     "runtime.failed": "本次对话中断",
+    "harness.started": "Harness 已启动",
     "message.created": actor ? `${actor} 输出阶段消息` : "输出阶段消息",
     "artifact.created": actor ? `${actor} 产出阶段内容` : "产出阶段内容",
     "dispatch.started": "主 Agent 开始拆解并派单",
@@ -237,6 +238,7 @@ function displayEventMessage(event: RunDetail["events"][number]) {
     "runtime.started": "运行时已启动，正在按模式执行。",
     "runtime.completed": "运行完成，已汇总结果。",
     "runtime.failed": readableMessage ?? "运行失败，请查看日志中心的模式运行错误。",
+    "harness.started": "Harness 已完成模型、能力和策略选择，运行进入工程执行面。",
     "message.created": readableMessage ?? "运行过程中产生了一条可公开消息。",
     "artifact.created": "已生成一个可查看的结果或中间产物。",
     "dispatch.started": "主 Agent 正在拆解任务，并准备派给合适角色。",
@@ -393,6 +395,12 @@ function eventPayloadLabel(key: string) {
     model_deployment: "模型部署",
     deployment: "模型部署",
     provider: "服务商",
+    phase: "阶段",
+    capabilities: "工程能力",
+    policy: "策略原因",
+    context: "上下文信号",
+    fallbacks: "备选路径",
+    requires_approval: "审批要求",
     role: "角色",
     agent: "Agent",
     artifact_id: "产物 ID",
@@ -1050,6 +1058,11 @@ function eventSummaryText(
   if (event.kind === "model.started") {
     return `${subject} 调用模型${modelSignal ? `：${conciseProcessText(modelSignal, "模型")}` : ""}`;
   }
+  if (event.kind === "harness.started") {
+    const logicalModel = formatEventPayloadValue(event.payload.logical_model) || "harness";
+    const provider = formatEventPayloadValue(event.payload.provider);
+    return `Harness 启动：${conciseProcessText(logicalModel, "模型")}${provider ? ` / ${provider}` : ""}`;
+  }
   if (event.kind === "step.started") {
     return `${subject} 接收任务：${conciseProcessText(instructionSignal, "开始执行")}`;
   }
@@ -1131,6 +1144,7 @@ function processBadgeForEvent(event: RunEvent) {
   if (event.kind === "review.completed" || event.kind.startsWith("decision.")) return "裁决过程";
   if (event.kind.startsWith("discussion.")) return "讨论过程";
   if (event.kind.startsWith("tool.")) return "工具过程";
+  if (event.kind.startsWith("harness.")) return "Harness";
   if (event.kind.startsWith("model.")) return "模型调用";
   if (event.kind.startsWith("dispatch.")) return "调度过程";
   if (event.kind === "step.started") return "任务分解";

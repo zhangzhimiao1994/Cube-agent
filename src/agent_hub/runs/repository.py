@@ -27,6 +27,8 @@ from agent_hub.db.models import (
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent, RuntimeCheckpoint
 
+_RECOVERY_REPLAYABLE_EVENT_KINDS = frozenset({"harness.started"})
+
 
 @dataclass(frozen=True, slots=True)
 class RunRecord:
@@ -488,7 +490,10 @@ class RunRepository:
                 or 0
             )
             latest_event_sequence = await session.scalar(
-                select(func.max(RunEventRow.sequence)).where(RunEventRow.run_id == row.id)
+                select(func.max(RunEventRow.sequence)).where(
+                    RunEventRow.run_id == row.id,
+                    ~RunEventRow.kind.in_(_RECOVERY_REPLAYABLE_EVENT_KINDS),
+                )
             )
             if latest_event_sequence is not None and latest_event_sequence > checkpoint_sequence:
                 row.status = RunStatus.FAILED.value
@@ -985,6 +990,10 @@ class RunRepository:
             )
             .on_conflict_do_nothing(index_elements=[RunUsageRow.run_id, RunUsageRow.sequence])
         )
+
+
+def _is_recovery_replayable_event_kind(kind: str) -> bool:
+    return kind in _RECOVERY_REPLAYABLE_EVENT_KINDS
 
 
 def _public_event_payload(payload: dict[str, object]) -> dict[str, object]:

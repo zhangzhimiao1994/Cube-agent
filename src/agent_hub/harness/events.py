@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from uuid import UUID
 
@@ -8,6 +9,13 @@ from agent_hub.harness.types import HarnessToolCallRequest, JsonValue
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ToolCall
 from agent_hub.runtime.contracts import RunEvent
+
+_SENSITIVE_TEXT = re.compile(
+    r"(?:sk-[a-z0-9_-]{8,}|bearer\s+|authorization|password|secret|token)",
+    re.IGNORECASE,
+)
+_MAX_PROFILE_ITEMS = 6
+_MAX_PROFILE_TEXT = 160
 
 
 def provider_events_to_run_events(
@@ -31,6 +39,50 @@ def provider_events_to_run_events(
         sequence += 1
 
 
+def harness_started_event(
+    *,
+    routing_decision: Mapping[str, object],
+    run_id: UUID,
+    start_sequence: int,
+) -> RunEvent | None:
+    """Project the selected harness profile into a public lifecycle event."""
+
+    decision = routing_decision.get("harness_decision")
+    if not isinstance(decision, Mapping):
+        return None
+    provider = _safe_text(decision.get("selected_provider"))
+    model = _safe_text(decision.get("selected_model"))
+    logical_model = _safe_text(decision.get("selected_logical_model"))
+    mode = _safe_text(decision.get("mode"))
+    requires_approval = decision.get("requires_approval")
+    if (
+        provider is None
+        or model is None
+        or logical_model is None
+        or mode is None
+        or type(requires_approval) is not bool
+    ):
+        return None
+    return RunEvent(
+        kind="harness.started",
+        sequence=start_sequence,
+        run_id=run_id,
+        payload={
+            "schema_version": 1,
+            "phase": "started",
+            "mode": mode,
+            "provider": provider,
+            "model": model,
+            "logical_model": logical_model,
+            "requires_approval": requires_approval,
+            "capabilities": _safe_text_tuple(decision.get("capability_reasons")),
+            "policy": _safe_text_tuple(decision.get("policy_reasons")),
+            "context": _safe_text_tuple(decision.get("context_reasons")),
+            "fallbacks": _safe_text_tuple(decision.get("fallbacks_considered")),
+        },
+    )
+
+
 def gateway_completion_events(
     completion: GatewayCompletion,
     *,
@@ -48,6 +100,31 @@ def gateway_completion_events(
         run_id=run_id,
         payload=_completion_payload(completion, actor=actor),
     )
+
+
+def _safe_text(value: object) -> str | None:
+    if type(value) is not str:
+        return None
+    text = value.strip()
+    if not text or _SENSITIVE_TEXT.search(text):
+        return None
+    if len(text) > _MAX_PROFILE_TEXT:
+        return f"{text[:_MAX_PROFILE_TEXT]}..."
+    return text
+
+
+def _safe_text_tuple(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list | tuple):
+        return ()
+    result: list[str] = []
+    for item in value:
+        text = _safe_text(item)
+        if text is None:
+            continue
+        result.append(text)
+        if len(result) >= _MAX_PROFILE_ITEMS:
+            break
+    return tuple(result)
 
 
 def _completion_payload(
@@ -101,5 +178,6 @@ def _tool_call_payload(call: ToolCall) -> Mapping[str, JsonValue]:
 
 __all__ = [
     "gateway_completion_events",
+    "harness_started_event",
     "provider_events_to_run_events",
 ]

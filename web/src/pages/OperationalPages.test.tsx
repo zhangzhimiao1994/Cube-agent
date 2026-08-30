@@ -1879,6 +1879,54 @@ describe("operational management pages", () => {
     expect(within(drawer).getByText(/supports_streamed_tool_call_delta/)).not.toBeNull();
   });
 
+  it("renders harness lifecycle events as explicit process cards", async () => {
+    const user = userEvent.setup();
+    visibleRunDetail = {
+      ...runDetail,
+      events: [
+        {
+          sequence: 1,
+          kind: "harness.started",
+          message: "harness.started",
+          created_at: conversationCreatedAt,
+          participants: [],
+          payload: {
+            schema_version: 1,
+            phase: "started",
+            mode: "dispatch",
+            provider: "openai",
+            model: "gpt-5.6-sol",
+            logical_model: "vibe_engineer",
+            requires_approval: false,
+            capabilities: ["supports_reasoning_delta", "supports_parallel_tool_calls"],
+            policy: ["policy_allows_restricted_sandbox"],
+            context: ["context_window_fits"],
+            fallbacks: ["deepseek"],
+          },
+        },
+        ...runDetail.events.map((event) => ({ ...event, sequence: event.sequence + 1 })),
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const harnessCard = within(stream).getByRole("button", {
+      name: /Harness 启动：vibe_engineer \/ openai/,
+    });
+    expect(harnessCard).not.toBeNull();
+    await user.click(harnessCard);
+
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).getByText("Harness 已启动")).not.toBeNull();
+    expect(within(drawer).getByText("工程能力")).not.toBeNull();
+    expect(within(drawer).getByText(/supports_parallel_tool_calls/)).not.toBeNull();
+  });
+
   it("marks intermediate process outputs in labeled boxes while keeping the final reply merged", async () => {
     const user = userEvent.setup();
     const view = render(<TestApp initialPath="/" />);
