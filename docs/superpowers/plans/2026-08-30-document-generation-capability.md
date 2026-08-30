@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add offline-capable Word and PowerPoint generation as real downloadable run artifacts with built-in PPT templates.
+**Goal:** Add a reusable generated-file delivery framework, then plug offline-capable Word and PowerPoint generation into it as real downloadable run artifacts with built-in PPT templates.
 
-**Architecture:** Implement deterministic OOXML builders and a tenant/run-scoped generated file store, expose them through the existing runtime capability gateway, project downloadable artifact metadata through the admin run API, and render file artifact cards in the frontend. Treat DOCX/PPTX as tool capabilities, not model capabilities.
+**Architecture:** Implement the file delivery layer first: a tenant/run/artifact-scoped generated file store, safe metadata contract, authenticated download endpoint, and UI file cards. Then implement deterministic OOXML builders and expose DOCX/PPTX generation through the existing runtime capability gateway. Treat DOCX/PPTX as tool capabilities, not model capabilities.
 
 **Tech Stack:** Python 3.12 standard library OOXML generation (`zipfile`, XML escaping), existing FastAPI/FileResponse APIs, existing runtime `Artifact` JSON contract, React/Vitest frontend.
 
@@ -12,6 +12,9 @@
 
 ## File Structure
 
+- Create `src/agent_hub/files/__init__.py`: package marker for reusable generated-file delivery.
+- Create `src/agent_hub/files/generated.py`: generated-file storage, metadata, MIME allowlist, path safety, and download resolution.
+- Create `tests/unit/files/test_generated_files.py`: unit tests for filename/path/metadata safety.
 - Create `src/agent_hub/documents/__init__.py`: package marker.
 - Create `src/agent_hub/documents/ooxml.py`: shared OOXML zip helpers, XML escaping, safe filenames, file metadata.
 - Create `src/agent_hub/documents/docx.py`: DOCX blueprint validation and builder.
@@ -94,20 +97,32 @@ def test_build_pptx_uses_requested_builtin_template(tmp_path):
 - [ ] Implement the smallest DOCX/PPTX builders using Python standard library only.
 - [ ] Re-run both document tests until they pass.
 
-## Task 2: Generated file store and capability gateway
+## Task 2: Generated file delivery framework
+
+- [ ] Write failing tests in `tests/unit/files/test_generated_files.py` proving:
+  - a generated file is stored under `<root>/<tenant_id>/<run_id>/<artifact_id>/<safe_filename>`;
+  - unsafe filenames such as `../report.docx`, absolute paths, blank names, and control characters are rejected or sanitized;
+  - only allowlisted MIME types can be stored;
+  - metadata includes `filename`, `mime_type`, `size_bytes`, `sha256`, `storage_key`, and `download_url`;
+  - resolving metadata cannot escape the generated artifact root.
+- [ ] Run the test and confirm RED because `agent_hub.files.generated` does not exist.
+- [ ] Implement `GeneratedFileStore` and `GeneratedFileMetadata`.
+- [ ] Add `generated_artifact_dir` to `src/agent_hub/settings.py`, defaulting to `/var/lib/agent-hub/generated-artifacts`.
+- [ ] Re-run file framework tests until GREEN.
+
+## Task 3: Capability gateway DOCX/PPTX tools
 
 - [ ] Write failing tests in `tests/unit/capabilities/test_runtime_gateway.py` proving:
   - `document.generate_docx` is available and replay-safe.
   - `presentation.generate_pptx` is available and replay-safe.
   - each capability returns `artifact_id`, `filename`, `mime_type`, `size_bytes`, `sha256`, `storage_key`, and `download_url`.
   - invalid empty titles are rejected.
-- [ ] Implement `GeneratedArtifactStore` in `src/agent_hub/documents/store.py`.
 - [ ] Modify `RuntimeCapabilityGateway` to accept `generated_artifact_dir`.
 - [ ] Add `_execute_generate_docx()` and `_execute_generate_pptx()`.
 - [ ] Add both capability names to `_REPLAY_SAFE` and built-in registry.
 - [ ] Re-run capability tests until they pass.
 
-## Task 3: Runtime artifact metadata preservation and API download
+## Task 4: Runtime artifact metadata preservation and API download
 
 - [ ] Write failing tests in `tests/api/test_admin_resources.py` proving `_admin_run_artifact()` exposes safe file metadata for `tool_result` content and that the new download endpoint returns the file with correct media type.
 - [ ] Add optional fields to `RunArtifactResponse`.
@@ -116,7 +131,7 @@ def test_build_pptx_uses_requested_builtin_template(tmp_path):
 - [ ] Ensure the download endpoint resolves only files under the generated artifact root and enforces tenant/run ownership.
 - [ ] Re-run admin API tests until they pass.
 
-## Task 4: Frontend artifact cards
+## Task 5: Frontend artifact cards
 
 - [ ] Write failing tests in `web/src/pages/OperationalPages.test.tsx` and `web/src/pages/RunDetailPage.test.tsx` proving DOCX/PPTX artifacts render as file cards with type badge, filename, size, and download link.
 - [ ] Extend `RunArtifactSchema` and event artifact schema in `web/src/api/client.ts`.
@@ -124,7 +139,7 @@ def test_build_pptx_uses_requested_builtin_template(tmp_path):
 - [ ] Render file artifacts in chat messages, run detail, and sub-agent workforce drawer.
 - [ ] Re-run targeted frontend tests until they pass.
 
-## Task 5: Routing, docs, and verification
+## Task 6: Routing, docs, and verification
 
 - [ ] Add role/task routing hints for Word/PPT generation without adding new `ModelCapability` values.
 - [ ] Update README files with:

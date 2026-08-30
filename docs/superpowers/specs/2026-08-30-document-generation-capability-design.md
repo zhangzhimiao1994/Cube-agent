@@ -8,10 +8,13 @@ Approved for implementation under the user's standing instruction to continue wi
 
 Mofang Agent can currently produce text artifacts and can accept `.docx`/`.pptx` as attachments, but it cannot reliably generate real Word or PowerPoint files. A Markdown answer with a filename is not sufficient. Users need downloadable Office files that work after a fresh clone or Docker image build, including offline use.
 
+There is also a deeper delivery gap: the system does not have a unified generated-file delivery framework. Even if a runtime produces a file on disk, the UI cannot consistently show it, authorize it, download it, or clean it up. This slice must therefore build the file delivery layer first, then plug DOCX/PPTX generation into it.
+
 ## Scope
 
 Phase 18 adds a first production-grade document generation slice:
 
+- Add a reusable generated-file delivery framework for runtime artifacts.
 - Generate real `.docx` files.
 - Generate real `.pptx` files.
 - Include professional PPT template support instead of only a blank default deck.
@@ -34,12 +37,45 @@ Document generation is a built-in runtime tool capability, not a model capabilit
 The system adds:
 
 1. `agent_hub.documents`: deterministic OOXML builders and template definitions.
-2. Runtime capability names:
+2. `agent_hub.files`: generated-file storage, metadata, path safety, and download resolution.
+3. Runtime capability names:
    - `document.generate_docx`
    - `presentation.generate_pptx`
-3. A tenant/run-scoped generated artifact file store under the configured runtime data directory.
-4. Run artifact projection fields for downloadable files.
-5. Frontend file artifact cards in chat, run detail, and sub-agent work detail views.
+4. A tenant/run-scoped generated artifact file store under the configured runtime data directory.
+5. Run artifact projection fields for downloadable files.
+6. Frontend file artifact cards in chat, run detail, and sub-agent work detail views.
+
+## File Delivery Framework
+
+The file delivery framework is a reusable capability boundary for any future generated file, not only Office files.
+
+Responsibilities:
+
+- Allocate a tenant/run/artifact-scoped file path.
+- Sanitize generated filenames.
+- Persist only safe metadata in runtime artifact JSON.
+- Compute and expose SHA-256 and size.
+- Produce stable authenticated download URLs.
+- Resolve download requests back to one file under the generated artifact root.
+- Reject path traversal, unknown MIME types, missing files, and run/tenant mismatches.
+
+The framework uses this metadata contract inside `Artifact.content`:
+
+```json
+{
+  "file": {
+    "filename": "project-report.docx",
+    "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "size_bytes": 12345,
+    "sha256": "64 lowercase hex chars",
+    "storage_key": "tenant/run/artifact/project-report.docx",
+    "download_url": "/api/v1/admin/runs/<run_id>/artifacts/<artifact_id>/download"
+  },
+  "summary": "Generated Word document: project-report.docx"
+}
+```
+
+The UI should render any artifact with `file` metadata as a file card. DOCX/PPTX are the first users of the framework, but later PDF, ZIP, image exports, reports, logs, and generated code packages can reuse the same contract.
 
 ## PPT Template Model
 
