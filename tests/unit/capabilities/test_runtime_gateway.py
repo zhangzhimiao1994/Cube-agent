@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 from uuid import UUID
+from zipfile import ZipFile
 
-from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
+import pytest
+
+from agent_hub.capabilities.runtime import RuntimeCapabilityError, RuntimeCapabilityGateway
 from agent_hub.skills.sandbox.base import SkillInvocation, SkillResult
 from tests.unit.skills.test_package import skill_zip
 
@@ -186,6 +189,113 @@ async def test_runtime_gateway_keeps_explicit_final_file_presentation(tmp_path: 
     )
 
     assert result["presentation"] == "final_attachment"
+
+
+async def test_runtime_gateway_generates_project_zip_final_artifact(tmp_path: Path) -> None:
+    generated_dir = tmp_path / "generated"
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=generated_dir,
+    )
+
+    result = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="engineer",
+        name="project.generate_zip",
+        arguments={
+            "title": "Hello World",
+            "files": {
+                "main.py": "print('hello world')\n",
+                "README.md": "# Hello World\n\nRun `python main.py`.\n",
+            },
+        },
+        idempotency_key="project_zip_1",
+    )
+
+    file_payload = result["file"]
+    assert isinstance(file_payload, dict)
+    assert file_payload["filename"] == "hello-world.zip"
+    assert file_payload["mime_type"] == "application/zip"
+    assert result["presentation"] == "final_attachment"
+    stored_path = (
+        generated_dir
+        / str(TENANT_ID)
+        / str(RUN_ID)
+        / str(result["artifact_id"])
+        / "hello-world.zip"
+    )
+    assert stored_path.is_file()
+    with ZipFile(stored_path) as archive:
+        assert archive.namelist() == ["README.md", "main.py"]
+        assert archive.read("main.py") == b"print('hello world')\n"
+
+
+async def test_runtime_gateway_rejects_unsafe_project_zip_paths(tmp_path: Path) -> None:
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=tmp_path / "generated",
+    )
+
+    for index, path in enumerate(("../main.py", "/tmp/main.py", "src/../../main.py", "NUL.txt")):
+        with pytest.raises(RuntimeCapabilityError, match="file path|reserved"):
+            await gateway.execute(
+                tenant_id=TENANT_ID,
+                run_id=RUN_ID,
+                actor="engineer",
+                name="project.generate_zip",
+                arguments={"title": "Unsafe", "files": {path: "content"}},
+                idempotency_key=f"unsafe_{index}",
+            )
+
+
+@pytest.mark.parametrize(
+    ("files", "message"),
+    [
+        ({}, "files must contain 1 to 64 entries"),
+        ({f"file-{index}.txt": "x" for index in range(65)}, "files must contain 1 to 64 entries"),
+        ({"large.txt": "x" * 256_001}, "file content is too large"),
+        ({f"chunk-{index}.txt": "x" * 250_000 for index in range(9)}, "project content is too large"),
+    ],
+)
+async def test_runtime_gateway_rejects_oversized_project_zip_payloads(
+    tmp_path: Path, files: dict[str, str], message: str
+) -> None:
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=tmp_path / "generated",
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match=message):
+        await gateway.execute(
+            tenant_id=TENANT_ID,
+            run_id=RUN_ID,
+            actor="engineer",
+            name="project.generate_zip",
+            arguments={"title": "Oversized", "files": files},
+            idempotency_key="project_zip_limits",
+        )
+
+
+async def test_runtime_gateway_rejects_invalid_project_zip_presentation(tmp_path: Path) -> None:
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=tmp_path / "generated",
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="presentation must be step_detail or final_attachment"):
+        await gateway.execute(
+            tenant_id=TENANT_ID,
+            run_id=RUN_ID,
+            actor="engineer",
+            name="project.generate_zip",
+            arguments={
+                "title": "Invalid Presentation",
+                "files": {"main.py": "print('hello')\n"},
+                "presentation": "chat_inline",
+            },
+            idempotency_key="project_zip_bad_presentation",
+        )
 
 
 async def test_runtime_gateway_read_context_accepts_query_without_workspace(tmp_path: Path) -> None:

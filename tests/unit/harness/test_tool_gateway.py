@@ -145,6 +145,18 @@ def document_create_request() -> HarnessToolCallRequest:
     )
 
 
+def project_zip_create_request() -> HarnessToolCallRequest:
+    return HarnessToolCallRequest(
+        run_id=RUN_ID,
+        actor="engineer",
+        tool_name="project.generate_zip",
+        arguments={"title": "Hello World", "files": {"main.py": "print('hello')\n"}},
+        approval_required=False,
+        sandbox="restricted",
+        idempotency_key="project_zip_1",
+    )
+
+
 async def test_harness_tool_gateway_executes_approved_available_tools() -> None:
     runtime = FakeRuntimeCapabilityGateway()
     gateway = HarnessToolGateway(runtime)
@@ -277,6 +289,26 @@ async def test_harness_tool_gateway_maps_office_generation_to_file_create_policy
     assert capability_request.capability == "file"
     assert capability_request.operation == "create"
     assert capability_request.resource == "generated/document.generate_docx"
+    assert runtime.calls == []
+
+
+async def test_harness_tool_gateway_maps_project_zip_to_file_create_policy() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    policy = FakePolicyGateway(CapabilityStatus.DENIED, reason="capability denied")
+    gateway = HarnessToolGateway(runtime, policy_gateway=policy)
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        project_zip_create_request(),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    capability_request = policy.requests[0][0]
+    assert capability_request.capability == "file"
+    assert capability_request.operation == "create"
+    assert capability_request.resource == "generated/project.generate_zip"
     assert runtime.calls == []
 
 

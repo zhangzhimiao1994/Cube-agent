@@ -1789,6 +1789,7 @@ describe("operational management pages", () => {
 
     expect(within(stream).queryByRole("status", { name: /任务态势/ })).toBeNull();
     expect(within(stream).queryByRole("link", { name: /下载 delivery-plan\.docx/ })).toBeNull();
+    expect(within(stream).queryByText("附件：delivery-plan.docx")).toBeNull();
     expect(within(stream).queryByRole("link", { name: "查看运行详情" })).toBeNull();
 
     await user.click(within(stream).getByRole("button", { name: /文案生成 输出：生成交付文档/ }));

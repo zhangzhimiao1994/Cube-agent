@@ -113,6 +113,7 @@ def build_worker_service(
         run_repository=run_repository,
         skill_store_dir=settings.skill_store_dir,
         workspace_root=settings.attachment_store_dir,
+        generated_artifact_dir=settings.generated_artifact_dir,
     )
     secret_service = SecretService(
         database.session_factory,

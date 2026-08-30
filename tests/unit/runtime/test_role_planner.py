@@ -74,6 +74,21 @@ def test_dispatch_deployment_task_gets_execution_roles_not_discussion_only_roles
     assert "delete_file" in plan.role("installer").forbidden_actions
 
 
+def test_dispatch_software_task_allows_implementer_to_generate_project_zip() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="生成一个最简单的 hello world 项目，并提供可下载文件",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.SOFTWARE,
+            default_model="code-model",
+        )
+    )
+
+    implementer = plan.role("implementer")
+
+    assert "project.generate_zip" in implementer.allowed_tools
+
+
 def test_research_discussion_includes_data_source_and_writer_roles() -> None:
     plan = RolePlanner().plan(
         RolePlanningRequest(
