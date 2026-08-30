@@ -238,3 +238,19 @@ def test_runtime_failure_diagnostic_classifies_runtime_infrastructure_failures(
     assert diagnostic["error_category"] == error_category
     assert diagnostic["error_code"] == error_code
     assert diagnostic["retryable"] is False
+
+
+def test_runtime_failure_diagnostic_classifies_crewai_step_timeout() -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason(
+        "CrewAI step timed out: step=quality_reviewer_step actor=quality_reviewer"
+    )
+
+    assert diagnostic["error_summary"] == (
+        "CrewAI step timed out: step=quality_reviewer_step actor=quality_reviewer"
+    )
+    assert diagnostic["error_stage"] == "crew_step"
+    assert diagnostic["error_category"] == "step_timeout"
+    assert diagnostic["error_code"] == "crew.step_timeout"
+    assert diagnostic["retryable"] is True
+    assert diagnostic["step_id"] == "quality_reviewer_step"
+    assert diagnostic["actor"] == "quality_reviewer"

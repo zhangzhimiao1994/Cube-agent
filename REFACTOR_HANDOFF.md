@@ -326,3 +326,16 @@ Git 状态：
 - Tests: added Vitest coverage in `web/src/pages/OperationalPages.test.tsx` for main chat download href, process drawer download href, and run detail download href/size display.
 - Verification: `npm test -- OperationalPages.test.tsx --run` passed with 70 tests; `npm run lint` passed via `tsc -p tsconfig.json --noEmit`.
 - Notes: no Docker/WSL work was used for this task. Other agents had concurrent backend/admin changes in the worktree; this task did not modify or revert them.
+
+## 2026-08-30 Phase20 CrewAI Timeout Resilience
+
+- Scope: fix `CrewAI step timed out: step=quality_reviewer_step actor=quality_reviewer` style failures so the location is diagnosable and large review/final prompts are less likely to time out.
+- Changed: `src/agent_hub/runtime/failure_reason.py` classifies CrewAI step timeouts as `crew.step_timeout`, extracts `step_id` and `actor`, and marks them retryable.
+- Changed: `src/agent_hub/runtime/defaults.py` now reserves more timeout budget for post-product/review roles and final synthesis than for producer steps, capped at 600 seconds.
+- Changed: `src/agent_hub/runtime/crew/adapter.py` now emits structured diagnostics on `STEP_FAILED`, uses bounded `artifact_review_packet` payloads for reviewer/final source artifacts, and soft-fails reviewer timeouts as `review_status=timeout_skipped` instead of failing the whole dispatch.
+- Tests: added/updated unit coverage in `tests/unit/runtime/test_failure_reason.py`, `tests/unit/runtime/test_configured_runtime.py`, and `tests/unit/runtime/crew/test_adapter_failure_reason.py`.
+- Verification: `.venv\Scripts\python.exe -m pytest tests\unit\runtime\test_failure_reason.py tests\unit\runtime\test_configured_runtime.py tests\unit\runtime\crew\test_adapter_failure_reason.py -q` passed with 70 tests.
+- Verification: `.venv\Scripts\python.exe -m ruff check src tests` passed.
+- Verification: `git diff --check` passed with only the existing Git CRLF-to-LF warning for `src/agent_hub/runtime/crew/adapter.py`.
+- Feishu identity note: WS submissions are currently isolated by derived actor UUID from `channel + tenant_external_id + sender_external_id`, but this does not resolve through `agent_hub_users.feishu_open_id`; user management therefore will not show a Feishu-bound user unless a persistent bind/unbind and channel identity resolver are added.
+- Remaining TODO: implement Feishu identity binding as a follow-up: persistent lookup by Feishu `open_id`, explicit unbound-user fallback policy, user-management bind/unbind API, and Web UI display/edit controls.
