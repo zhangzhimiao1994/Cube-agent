@@ -30,6 +30,7 @@ from uuid import UUID, uuid4
 from agent_hub.auth.models import Role
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness import HarnessToolGateway
+from agent_hub.harness.events import safe_tool_event_payload
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import (
@@ -2162,11 +2163,21 @@ class CrewDispatchRuntime:
                     artifact = tool_ledger.artifacts.get(idempotency_key)
                     if artifact is None:
                         _fail("capability result artifact is unavailable")
+                    existing_replay_safe = existing.get("replay_safe")
                     await emit(
                         kind=EventKind.TOOL_COMPLETED,
                         actor=step.agent,
                         tool_call_id=call_id,
                         tool_name=tool_call.name,
+                        payload=safe_tool_event_payload(
+                            name=tool_call.name,
+                            status="succeeded",
+                            result=cast(Mapping[str, JsonValue], artifact.content["result"]),
+                            artifact_id=str(artifact.id),
+                            replay_safe=existing_replay_safe
+                            if type(existing_replay_safe) is bool
+                            else None,
+                        ),
                         artifact=artifact,
                     )
                     results.append(
@@ -2206,6 +2217,13 @@ class CrewDispatchRuntime:
                     actor=step.agent,
                     tool_call_id=call_id,
                     tool_name=tool_call.name,
+                    payload=safe_tool_event_payload(
+                        name=tool_call.name,
+                        status="running",
+                        arguments=tool_call.arguments,
+                        sandbox=_tool_sandbox(tool_call.name),
+                        replay_safe=replay_safe,
+                    ),
                 )
                 tool_running = dict(tool_prepared)
                 tool_running["status"] = "running"
@@ -2227,6 +2245,14 @@ class CrewDispatchRuntime:
                         actor=step.agent,
                         tool_call_id=call_id,
                         tool_name=tool_call.name,
+                        payload=safe_tool_event_payload(
+                            name=tool_call.name,
+                            status="failed",
+                            arguments=tool_call.arguments,
+                            sandbox=_tool_sandbox(tool_call.name),
+                            replay_safe=replay_safe,
+                            failure_kind="invalid_request",
+                        ),
                         reason="capability execution failed",
                     )
                     failed = dict(tool_running)
@@ -2255,6 +2281,14 @@ class CrewDispatchRuntime:
                         actor=step.agent,
                         tool_call_id=call_id,
                         tool_name=tool_call.name,
+                        payload=safe_tool_event_payload(
+                            name=tool_call.name,
+                            status="failed",
+                            arguments=tool_call.arguments,
+                            sandbox=_tool_sandbox(tool_call.name),
+                            replay_safe=replay_safe,
+                            failure_kind="uncertain",
+                        ),
                         reason="capability execution failed",
                     )
                     uncertain = dict(tool_running)
@@ -2264,12 +2298,21 @@ class CrewDispatchRuntime:
                         "capability outcome requires confirmation"
                     ) from None
                 if tool_result.status != "succeeded":
+                    failed_reason = tool_result.failure_reason or "capability execution failed"
                     await emit(
                         kind=EventKind.TOOL_FAILED,
                         actor=step.agent,
                         tool_call_id=call_id,
                         tool_name=tool_call.name,
-                        reason=tool_result.failure_reason or "capability execution failed",
+                        payload=safe_tool_event_payload(
+                            name=tool_call.name,
+                            status="failed",
+                            arguments=tool_call.arguments,
+                            sandbox=_tool_sandbox(tool_call.name),
+                            replay_safe=replay_safe,
+                            failure_kind="capability_failed",
+                        ),
+                        reason=failed_reason,
                     )
                     failed = dict(tool_running)
                     failed["status"] = "failed"
@@ -2288,6 +2331,14 @@ class CrewDispatchRuntime:
                         actor=step.agent,
                         tool_call_id=call_id,
                         tool_name=tool_call.name,
+                        payload=safe_tool_event_payload(
+                            name=tool_call.name,
+                            status="failed",
+                            arguments=tool_call.arguments,
+                            sandbox=_tool_sandbox(tool_call.name),
+                            replay_safe=replay_safe,
+                            failure_kind="uncertain",
+                        ),
                         reason="capability execution failed",
                     )
                     uncertain = dict(tool_running)
@@ -2308,6 +2359,13 @@ class CrewDispatchRuntime:
                     actor=step.agent,
                     tool_call_id=call_id,
                     tool_name=tool_call.name,
+                    payload=safe_tool_event_payload(
+                        name=tool_call.name,
+                        status="succeeded",
+                        result=result,
+                        artifact_id=str(artifact.id),
+                        replay_safe=replay_safe,
+                    ),
                     artifact=artifact,
                 )
                 succeeded = dict(tool_running)

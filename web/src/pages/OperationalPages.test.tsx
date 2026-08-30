@@ -2270,6 +2270,125 @@ describe("operational management pages", () => {
     expect(within(textDrawer).queryByText("partial answer with private context")).toBeNull();
   });
 
+  it("renders tool progress rows from safe metadata without raw command or output text", async () => {
+    const user = userEvent.setup();
+    visibleRunDetail = {
+      ...runDetail,
+      events: [
+        {
+          sequence: 1,
+          kind: "tool.started",
+          message: "cat secret-token.txt",
+          created_at: conversationCreatedAt,
+          actor: "copywriter",
+          participants: [],
+          tool_call_id: "call_terminal",
+          tool_name: "run_safe_command",
+          step_id: "compile-check",
+          action: null,
+          decision: null,
+          payload: {
+            status: "running",
+            command: "cat secret-token.txt",
+            command_bytes: 20,
+          },
+        },
+        {
+          sequence: 2,
+          kind: "tool.completed",
+          message: "terminal output contained sk-secret123",
+          created_at: conversationCreatedAt,
+          actor: "copywriter",
+          participants: [],
+          tool_call_id: "call_terminal",
+          tool_name: "run_safe_command",
+          step_id: "compile-check",
+          action: null,
+          decision: null,
+          payload: {
+            status: "succeeded",
+            exit_code: 0,
+            output: "terminal output contained sk-secret123",
+            result: { text: "private terminal output" },
+            output_bytes: 41,
+            artifact_id: "artifact-tool-result",
+          },
+        },
+        {
+          sequence: 3,
+          kind: "tool.failed",
+          message: "secret file content should stay hidden",
+          created_at: conversationCreatedAt,
+          actor: "copywriter",
+          participants: [],
+          tool_call_id: "call_edit",
+          tool_name: "edit_file",
+          step_id: "patch-client",
+          action: null,
+          decision: null,
+          payload: {
+            status: "failed",
+            failure_kind: "invalid_request",
+            path: "client.py",
+            content: "secret file content should stay hidden",
+            content_bytes: 38,
+          },
+        },
+        ...runDetail.events.map((event) => ({ ...event, sequence: event.sequence + 3 })),
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const startedCard = within(stream).getByRole("button", {
+      name: /文案生成 运行终端：run_safe_command/,
+    });
+    const completedCard = within(stream).getByRole("button", {
+      name: /文案生成 运行终端完成：run_safe_command/,
+    });
+    const failedCard = within(stream).getByRole("button", {
+      name: /文案生成 编辑文件失败：edit_file/,
+    });
+    expect(within(stream).queryByText("cat secret-token.txt")).toBeNull();
+    expect(within(stream).queryByText("terminal output contained sk-secret123")).toBeNull();
+    expect(within(stream).queryByText("private terminal output")).toBeNull();
+    expect(within(stream).queryByText("secret file content should stay hidden")).toBeNull();
+
+    await user.click(startedCard);
+    const startedDrawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(startedDrawer).getByText("操作类型")).not.toBeNull();
+    expect(within(startedDrawer).getAllByText("运行终端").length).toBeGreaterThan(0);
+    expect(within(startedDrawer).getByText("工具状态")).not.toBeNull();
+    expect(within(startedDrawer).getByText("开始")).not.toBeNull();
+    expect(within(startedDrawer).getByText("命令字节数")).not.toBeNull();
+    expect(within(startedDrawer).getByText("20")).not.toBeNull();
+    expect(within(startedDrawer).queryByText("cat secret-token.txt")).toBeNull();
+    await user.click(within(startedDrawer).getByRole("button", { name: "关闭" }));
+
+    await user.click(completedCard);
+    const completedDrawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(completedDrawer).getByText("完成")).not.toBeNull();
+    expect(within(completedDrawer).getByText("退出码")).not.toBeNull();
+    expect(within(completedDrawer).getByText("0")).not.toBeNull();
+    expect(within(completedDrawer).getByText("输出字节数")).not.toBeNull();
+    expect(within(completedDrawer).getByText("41")).not.toBeNull();
+    expect(within(completedDrawer).queryByText("terminal output contained sk-secret123")).toBeNull();
+    expect(within(completedDrawer).queryByText("private terminal output")).toBeNull();
+    await user.click(within(completedDrawer).getByRole("button", { name: "关闭" }));
+
+    await user.click(failedCard);
+    const failedDrawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(failedDrawer).getByText("失败")).not.toBeNull();
+    expect(within(failedDrawer).getByText("内容字节数")).not.toBeNull();
+    expect(within(failedDrawer).getByText("38")).not.toBeNull();
+    expect(within(failedDrawer).queryByText("secret file content should stay hidden")).toBeNull();
+  });
+
   it("marks intermediate process outputs in labeled boxes while keeping the final reply merged", async () => {
     const user = userEvent.setup();
     const view = render(<TestApp initialPath="/" />);

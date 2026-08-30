@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any
@@ -98,13 +99,14 @@ async def test_gateway_capability_tool_routes_through_harness_with_actor_identit
         finalize,
         run_id=ctx.run_id,
     )
+    records: list[Any] = []
     tool = GatewayCapabilityTool(
         ReplayGateway(),
         tenant_id=ctx.tenant_id,
         run_id=ctx.run_id,
         actor="analyst",
         name="web.search",
-        records=[],
+        records=records,
         durability=durability,
         harness_tool_gateway=harness_gateway,
         user_id=ctx.actor_id,
@@ -125,6 +127,25 @@ async def test_gateway_capability_tool_routes_through_harness_with_actor_identit
     assert request.call_id == "call_1"
     assert user_id == actor_id
     assert role is Role.OPERATOR
+    assert [record.kind for record in records] == [
+        EventKind.TOOL_STARTED,
+        EventKind.TOOL_COMPLETED,
+    ]
+    started = records[0]
+    assert started.payload["schema_version"] == 1
+    assert started.payload["status"] == "running"
+    assert started.payload["operation_kind"] == "generic"
+    assert started.payload["sandbox"] == "restricted"
+    assert started.payload["argument_keys"] == ("query",)
+    assert started.payload["argument_key_count"] == 1
+    assert started.payload["argument_bytes"] > 0
+    assert "evidence" not in json.dumps(started.payload)
+    completed = records[1]
+    assert completed.payload["schema_version"] == 1
+    assert completed.payload["status"] == "succeeded"
+    assert completed.payload["result_bytes"] > 0
+    assert completed.payload["artifact_id"] == str(completed.artifact.id)
+    assert "source-a" not in json.dumps(completed.payload)
 
 
 async def test_gateway_capability_tool_preserves_deterministic_harness_failure() -> None:
@@ -209,6 +230,13 @@ async def test_gateway_capability_tool_preserves_deterministic_harness_failure()
         (EventKind.TOOL_STARTED, None),
         (EventKind.TOOL_FAILED, "capability denied"),
     ]
+    failed = records[1]
+    assert failed.payload["schema_version"] == 1
+    assert failed.payload["status"] == "failed"
+    assert failed.payload["failure_kind"] == "capability_failed"
+    assert failed.payload["argument_keys"] == ("query",)
+    assert "arguments" not in failed.payload
+    assert '"evidence"' not in json.dumps(dict(failed.payload))
 
 
 async def test_autogen_runtime_yields_tool_failure_before_runtime_failure() -> None:

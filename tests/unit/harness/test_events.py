@@ -7,6 +7,7 @@ import pytest
 from agent_hub.harness.events import (
     gateway_completion_events,
     provider_events_to_run_events,
+    safe_tool_event_payload,
 )
 from agent_hub.harness.provider import NormalizedProviderEvent
 from agent_hub.models.gateway import GatewayCompletion
@@ -190,6 +191,31 @@ def test_provider_tool_event_projection_redacts_sensitive_argument_keys() -> Non
     assert event.payload["argument_keys"] == ("path",)
     assert event.payload["argument_key_count"] == 2
     assert event.payload["redacted_argument_key_count"] == 1
+
+
+def test_safe_tool_event_payload_projects_terminal_result_metadata_only() -> None:
+    payload = safe_tool_event_payload(
+        name="run_safe_command",
+        status="succeeded",
+        result={
+            "exit_code": 0,
+            "stdout": "private terminal output",
+            "stderr": "secret warning",
+            "result": {"ok": True},
+        },
+        artifact_id="artifact-tool-result",
+    )
+
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    assert payload["operation_kind"] == "terminal"
+    assert payload["exit_code"] == 0
+    assert payload["stdout_bytes"] == len(b"private terminal output")
+    assert payload["stderr_bytes"] == len(b"secret warning")
+    assert payload["output_bytes"] == len(b"private terminal outputsecret warning")
+    assert payload["result_bytes"] > 0
+    assert "private terminal output" not in serialized
+    assert "secret warning" not in serialized
+    assert '"result"' not in serialized
 
 
 def test_gateway_completion_projects_safe_model_completed_event() -> None:

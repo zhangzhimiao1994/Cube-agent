@@ -464,7 +464,15 @@ def test_known_future_events_enforce_kind_specific_semantics() -> None:
             actor="researcher",
             tool_call_id="call-1",
             tool_name="search",
-            payload={"query": "safe"},
+            payload={
+                "schema_version": 1,
+                "status": "running",
+                "operation_kind": "generic",
+                "argument_keys": ("query",),
+                "argument_key_count": 1,
+                "redacted_argument_key_count": 0,
+                "argument_bytes": 16,
+            },
         ),
         RunEvent(
             kind=EventKind.TOOL_COMPLETED,
@@ -505,6 +513,16 @@ def test_known_future_events_enforce_kind_specific_semantics() -> None:
     assert len(events) == 7
     with pytest.raises(ValidationError):
         RunEvent(kind=EventKind.TOOL_STARTED, sequence=8, run_id=RUN_ID, actor="main")
+    with pytest.raises(ValidationError):
+        RunEvent(
+            kind=EventKind.TOOL_STARTED,
+            sequence=8,
+            run_id=RUN_ID,
+            actor="researcher",
+            tool_call_id="call-1",
+            tool_name="search",
+            payload={"arguments": {"query": "private"}},
+        )
     with pytest.raises(ValidationError):
         RunEvent(
             kind=EventKind.COST_RECORDED,

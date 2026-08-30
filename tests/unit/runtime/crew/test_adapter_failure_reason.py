@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from decimal import Decimal
 from uuid import UUID, uuid4
@@ -375,9 +376,26 @@ async def test_tool_calls_cross_the_harness_tool_gateway_envelope() -> None:
     assert request.approval_required is False
     assert request.sandbox == "restricted"
     assert request.call_id == f"call-{request.idempotency_key[:32]}"
+    tool_started = next(event for event in events if event.kind is EventKind.TOOL_STARTED)
+    assert tool_started.payload["schema_version"] == 1
+    assert tool_started.payload["status"] == "running"
+    assert tool_started.payload["operation_kind"] == "generic"
+    assert tool_started.payload["sandbox"] == "restricted"
+    assert tool_started.payload["argument_keys"] == ("q",)
+    assert tool_started.payload["argument_key_count"] == 1
+    assert tool_started.payload["argument_bytes"] > 0
+    assert "arguments" not in tool_started.payload
+    assert '"safe"' not in json.dumps(dict(tool_started.payload))
     tool_artifact = next(
         event.artifact for event in events if event.artifact and event.artifact.type == "tool_result"
     )
+    tool_completed = next(event for event in events if event.kind is EventKind.TOOL_COMPLETED)
+    assert tool_completed.payload["schema_version"] == 1
+    assert tool_completed.payload["status"] == "succeeded"
+    assert tool_completed.payload["result_bytes"] > 0
+    assert tool_completed.payload["artifact_id"] == str(tool_artifact.id)
+    assert "result" not in tool_completed.payload
+    assert "harness result" not in json.dumps(dict(tool_completed.payload))
     result = tool_artifact.content["result"]
     assert isinstance(result, Mapping)
     assert result["items"] == ("harness result",)
@@ -436,6 +454,13 @@ async def test_failed_harness_tool_result_records_failed_not_uncertain() -> None
     assert [event.reason for event in events if event.kind is EventKind.TOOL_FAILED] == [
         "tool unavailable"
     ]
+    failed_event = next(event for event in events if event.kind is EventKind.TOOL_FAILED)
+    assert failed_event.payload["schema_version"] == 1
+    assert failed_event.payload["status"] == "failed"
+    assert failed_event.payload["failure_kind"] == "capability_failed"
+    assert failed_event.payload["argument_keys"] == ("q",)
+    assert "arguments" not in failed_event.payload
+    assert '"safe"' not in json.dumps(dict(failed_event.payload))
     checkpoint = await runtime.save_checkpoint()
     tool_states = checkpoint.state["tools"]
     assert isinstance(tool_states, Mapping)

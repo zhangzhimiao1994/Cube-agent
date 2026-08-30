@@ -175,9 +175,108 @@ def _provider_delta_payload(event: NormalizedProviderEvent) -> Mapping[str, Json
     return payload
 
 
+def safe_tool_event_payload(
+    *,
+    name: str,
+    status: str,
+    arguments: Mapping[str, JsonValue] | None = None,
+    result: Mapping[str, JsonValue] | None = None,
+    sandbox: str | None = None,
+    artifact_id: str | None = None,
+    replay_safe: bool | None = None,
+    failure_kind: str | None = None,
+) -> Mapping[str, JsonValue]:
+    payload: dict[str, JsonValue] = {
+        "schema_version": 1,
+        "status": status,
+        "operation_kind": _tool_operation_kind(name),
+    }
+    if sandbox is not None:
+        safe_sandbox = _safe_text(sandbox)
+        if safe_sandbox is not None:
+            payload["sandbox"] = safe_sandbox
+    if replay_safe is not None:
+        payload["replay_safe"] = replay_safe
+    if arguments is not None:
+        argument_keys = tuple(sorted(key for key in arguments if isinstance(key, str)))
+        safe_argument_keys = tuple(key for key in argument_keys if _safe_text(key) is not None)
+        payload.update(
+            argument_keys=safe_argument_keys,
+            argument_key_count=len(argument_keys),
+            redacted_argument_key_count=len(argument_keys) - len(safe_argument_keys),
+        )
+        argument_bytes = _encoded_json_bytes(arguments)
+        if argument_bytes is not None:
+            payload["argument_bytes"] = argument_bytes
+    if result is not None:
+        exit_code = result.get("exit_code")
+        if type(exit_code) is int:
+            payload["exit_code"] = exit_code
+        stdout = result.get("stdout")
+        stderr = result.get("stderr")
+        output = result.get("output")
+        if type(stdout) is str:
+            payload["stdout_bytes"] = len(stdout.encode("utf-8"))
+        if type(stderr) is str:
+            payload["stderr_bytes"] = len(stderr.encode("utf-8"))
+        if type(output) is str:
+            payload["output_bytes"] = len(output.encode("utf-8"))
+        elif type(stdout) is str or type(stderr) is str:
+            payload["output_bytes"] = len(
+                (
+                    (stdout if type(stdout) is str else "")
+                    + (stderr if type(stderr) is str else "")
+                ).encode("utf-8")
+            )
+        truncated = result.get("truncated")
+        if type(truncated) is bool:
+            payload["truncated"] = truncated
+        result_bytes = _encoded_json_bytes(result)
+        if result_bytes is not None:
+            payload["result_bytes"] = result_bytes
+    if artifact_id is not None:
+        safe_artifact_id = _safe_text(artifact_id)
+        if safe_artifact_id is not None:
+            payload["artifact_id"] = safe_artifact_id
+    if failure_kind is not None:
+        safe_failure_kind = _safe_text(failure_kind)
+        if safe_failure_kind is not None:
+            payload["failure_kind"] = safe_failure_kind
+    return payload
+
+
+def _tool_operation_kind(name: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", name.casefold()).strip("_")
+    if any(token in normalized for token in ("run_safe_command", "terminal", "shell", "exec")):
+        return "terminal"
+    if any(token in normalized for token in ("edit", "write", "patch")):
+        return "file_edit"
+    if any(token in normalized for token in ("read", "context", "workspace")):
+        return "file_read"
+    if any(token in normalized for token in ("browser", "click", "screen")):
+        return "browser"
+    return "generic"
+
+
+def _encoded_json_bytes(value: Mapping[str, JsonValue]) -> int | None:
+    try:
+        encoded = json.dumps(
+            _mutable_json(value),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return len(encoded)
+
+
 def _mutable_json(value: object) -> object:
     if isinstance(value, Mapping):
         return {key: _mutable_json(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_mutable_json(item) for item in value]
     if isinstance(value, tuple):
         return [_mutable_json(item) for item in value]
     return value

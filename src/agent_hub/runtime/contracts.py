@@ -55,6 +55,27 @@ _SENSITIVE_KEYS = frozenset(
         "cot",
     }
 )
+_SAFE_TOOL_EVENT_PAYLOAD_KEYS = frozenset(
+    {
+        "schema_version",
+        "status",
+        "operation_kind",
+        "sandbox",
+        "replay_safe",
+        "argument_keys",
+        "argument_key_count",
+        "redacted_argument_key_count",
+        "argument_bytes",
+        "result_bytes",
+        "output_bytes",
+        "stdout_bytes",
+        "stderr_bytes",
+        "exit_code",
+        "truncated",
+        "artifact_id",
+        "failure_kind",
+    }
+)
 
 
 def _mutable_json(value: JsonValue) -> object:
@@ -712,6 +733,8 @@ class RunEvent(_RuntimeContractModel):
             self.actor is None or self.tool_call_id is None or self.tool_name is None
         ):
             raise ValueError("tool events require actor, call id, and tool name")
+        if self.kind in tool_kinds and set(self.payload) - _SAFE_TOOL_EVENT_PAYLOAD_KEYS:
+            raise ValueError("tool event payload contains unsafe keys")
         if self.kind is EventKind.TOOL_COMPLETED and self.artifact is None and not self.payload:
             raise ValueError("tool.completed requires an artifact or result payload")
         if self.kind is EventKind.APPROVAL_REQUESTED and (

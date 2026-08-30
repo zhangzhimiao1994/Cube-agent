@@ -410,6 +410,14 @@ function eventPayloadLabel(key: string) {
     redacted_argument_key_count: "已隐藏字段数",
     argument_bytes: "参数字节数",
     arguments_sha256: "参数摘要",
+    status: "状态",
+    exit_code: "退出码",
+    command_bytes: "命令字节数",
+    output_bytes: "输出字节数",
+    stdout_bytes: "标准输出字节数",
+    stderr_bytes: "标准错误字节数",
+    result_bytes: "结果字节数",
+    content_bytes: "内容字节数",
     delta_kind: "Delta 类型",
     text_bytes: "内容字节数",
     chunk_index: "分片序号",
@@ -489,31 +497,94 @@ function isModelDeltaEvent(event: RunDetail["events"][number]) {
   return event.kind === "model.reasoning_delta" || event.kind === "model.text_delta";
 }
 
+function isToolEvent(event: RunDetail["events"][number]) {
+  return event.kind === "tool.requested" || event.kind === "tool.started" || event.kind === "tool.completed" || event.kind === "tool.failed";
+}
+
+const RAW_TOOL_PAYLOAD_KEYS = new Set([
+  "arguments",
+  "arguments_sha256",
+  "body",
+  "command",
+  "content",
+  "input",
+  "output",
+  "prompt",
+  "result",
+  "role_message",
+  "stderr",
+  "stdout",
+  "summary",
+  "text",
+]);
+
+function toolEventName(event: RunDetail["events"][number]) {
+  return event.tool_name || formatEventPayloadValue(event.payload.name) || "工具";
+}
+
+function toolOperationLabel(toolName: string) {
+  const normalized = toolName.toLowerCase().replace(/[.\s-]+/g, "_");
+  if (
+    normalized.includes("run_safe_command") ||
+    normalized.includes("command") ||
+    normalized.includes("terminal") ||
+    normalized.includes("shell") ||
+    normalized.includes("exec")
+  ) {
+    return "运行终端";
+  }
+  if (normalized.includes("edit") || normalized.includes("write") || normalized.includes("patch")) {
+    return "编辑文件";
+  }
+  if (normalized.includes("read") || normalized.includes("context") || normalized.includes("workspace")) {
+    return "读取文件";
+  }
+  if (normalized.includes("browser") || normalized.includes("click") || normalized.includes("screen")) {
+    return "浏览操作";
+  }
+  return "使用工具";
+}
+
+function toolStatusLabel(event: RunDetail["events"][number]) {
+  if (event.kind === "tool.requested") return "请求";
+  if (event.kind === "tool.started") return "开始";
+  if (event.kind === "tool.completed") return "完成";
+  if (event.kind === "tool.failed") return "失败";
+  return "记录";
+}
+
 function eventDetailRows(event: RunDetail["events"][number], agentNames: Map<string, string>) {
   const rows: Array<{ label: string; value: string }> = [];
   const actor = displayEventActor(event.actor, agentNames);
   const participants = displayEventParticipants(event.participants, agentNames);
   const isModelDelta = isModelDeltaEvent(event);
+  const isTool = isToolEvent(event);
   const readableMessage =
     !isModelDelta &&
+    !isTool &&
     event.message &&
     event.message !== event.kind &&
     !/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(event.message)
       ? event.message
       : "";
   if (actor) rows.push({ label: "执行者", value: actor });
+  if (isTool) {
+    rows.push({ label: "操作类型", value: toolOperationLabel(toolEventName(event)) });
+    rows.push({ label: "工具状态", value: toolStatusLabel(event) });
+  }
   const payloadParticipants = displayPayloadParticipants(event.payload, agentNames);
   if (participants || payloadParticipants) rows.push({ label: "参与者", value: participants ?? payloadParticipants ?? "" });
   const participantModels = displayPayloadParticipantModels(event.payload, agentNames);
   if (participantModels) rows.push({ label: "模型分配", value: participantModels });
   if (event.tool_name) rows.push({ label: "工具", value: event.tool_name });
+  if (event.tool_call_id) rows.push({ label: "调用 ID", value: event.tool_call_id });
   if (event.step_id) rows.push({ label: "步骤", value: event.step_id });
   if (event.action) rows.push({ label: "动作", value: event.action });
   if (event.decision) rows.push({ label: "决策", value: event.decision });
   if (readableMessage) rows.push({ label: "事件内容", value: readableMessage });
   orderedEventPayloadEntries(event.payload).forEach(([key, value]) => {
     if (key === "participants" || key === "participant_models") return;
-    if (event.kind === "tool.requested" && (key === "arguments" || key === "arguments_sha256")) return;
+    if (isTool && RAW_TOOL_PAYLOAD_KEYS.has(key)) return;
     if (isModelDelta && key === "text") return;
     const formatted = formatEventPayloadValue(value);
     if (formatted) {
@@ -1194,6 +1265,18 @@ function eventSummaryText(
     const requestedTool = formatEventPayloadValue(event.payload.name) || event.tool_name || "工具";
     return `工具请求：${conciseProcessText(requestedTool, "工具")}`;
   }
+  if (event.kind === "tool.started") {
+    const toolName = toolEventName(event);
+    return `${subject} ${toolOperationLabel(toolName)}：${toolName}`;
+  }
+  if (event.kind === "tool.completed") {
+    const toolName = toolEventName(event);
+    return `${subject} ${toolOperationLabel(toolName)}完成：${toolName}`;
+  }
+  if (event.kind === "tool.failed") {
+    const toolName = toolEventName(event);
+    return `${subject} ${toolOperationLabel(toolName)}失败：${toolName}`;
+  }
   if (event.kind === "step.started") {
     return `${subject} 接收任务：${conciseProcessText(instructionSignal, "开始执行")}`;
   }
@@ -1223,13 +1306,7 @@ function eventSummaryText(
   if (event.kind === "dispatch.completed") {
     return `派单汇总：${conciseProcessText(outputSignal || discussionSignal, "完成派单汇总")}`;
   }
-  if (event.kind === "tool.started") {
-    return `${subject} 使用工具：${event.tool_name ?? "工具"}`;
-  }
-  if (event.kind === "tool.completed") {
-    return `${subject} 工具结果：${conciseProcessText(outputSignal || readableMessage, event.tool_name ?? "工具完成")}`;
-  }
-  if (event.kind === "tool.failed" || event.kind === "step.failed" || event.kind === "runtime.failed") {
+  if (event.kind === "step.failed" || event.kind === "runtime.failed") {
     return `${subject} 失败：${conciseProcessText(readableMessage || outputSignal, "执行失败")}`;
   }
   if (event.kind === "approval.requested") {
@@ -1276,6 +1353,9 @@ function processBadgeForEvent(event: RunEvent) {
   if (event.kind.startsWith("discussion.")) return "讨论过程";
   if (event.kind === "model.reasoning_delta") return "思考过程";
   if (event.kind === "model.text_delta") return "输出进度";
+  if (event.kind === "tool.started" || event.kind === "tool.completed" || event.kind === "tool.failed") {
+    return toolOperationLabel(toolEventName(event));
+  }
   if (event.kind.startsWith("model.")) return "模型调用";
   if (event.kind.startsWith("tool.")) return "工具过程";
   if (event.kind.startsWith("harness.")) return "Harness";

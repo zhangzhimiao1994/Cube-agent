@@ -1136,9 +1136,10 @@ def test_admin_run_event_exposes_safe_process_details_without_secrets() -> None:
         {
             "sequence": 7,
             "kind": "tool.completed",
-            "message": "read repository summary",
+            "message": "cat secret-token.txt and print private output",
             "actor": "reviewer",
             "participants": ["reviewer", "security-reviewer"],
+            "tool_call_id": "call_1",
             "tool_name": "github_reader",
             "step_id": "collect-context",
             "action": "inspect",
@@ -1150,14 +1151,19 @@ def test_admin_run_event_exposes_safe_process_details_without_secrets() -> None:
         }
     )
 
+    serialized = json.dumps(response.model_dump(mode="json"), ensure_ascii=False)
     assert response.actor == "reviewer"
     assert response.participants == ["reviewer", "security-reviewer"]
+    assert response.tool_call_id == "call_1"
     assert response.tool_name == "github_reader"
     assert response.step_id == "collect-context"
     assert response.action == "inspect"
-    assert response.payload["command"] == "git diff --stat"
-    assert response.payload["api_key"] == "[redacted]"
-    assert response.payload["nested"] == {"token": "[redacted]", "result": "ok"}
+    assert response.message == "tool.completed"
+    assert response.payload == {}
+    assert "git diff --stat" not in serialized
+    assert "sk-should-not-leak" not in serialized
+    assert "secret-token" not in serialized
+    assert "result" not in serialized
 
 
 @pytest.mark.parametrize(

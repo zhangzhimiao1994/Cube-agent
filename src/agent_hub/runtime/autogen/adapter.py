@@ -53,6 +53,7 @@ from pydantic import BaseModel, ConfigDict
 from agent_hub.auth.models import Role
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness import HarnessToolGateway
+from agent_hub.harness.events import safe_tool_event_payload
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import (
@@ -645,6 +646,7 @@ class _ToolRecord:
     actor: str
     call_id: str
     name: str
+    payload: Mapping[str, JsonValue] = field(default_factory=dict)
     artifact: Artifact | None = None
     reason: str | None = None
 
@@ -733,7 +735,19 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
             replay_safe=replay_safe,
         )
         self._records.append(
-            _ToolRecord(EventKind.TOOL_STARTED, self._actor, safe_call_id, self.name)
+            _ToolRecord(
+                EventKind.TOOL_STARTED,
+                self._actor,
+                safe_call_id,
+                self.name,
+                payload=safe_tool_event_payload(
+                    name=self.name,
+                    status="running",
+                    arguments=cast(Mapping[str, JsonValue], arguments),
+                    sandbox=_tool_sandbox(self.name),
+                    replay_safe=replay_safe,
+                ),
+            )
         )
         if replayed is not None:
             artifact = Artifact(
@@ -748,6 +762,13 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                     self._actor,
                     safe_call_id,
                     self.name,
+                    payload=safe_tool_event_payload(
+                        name=self.name,
+                        status="succeeded",
+                        result=replayed,
+                        artifact_id=str(artifact.id),
+                        replay_safe=replay_safe,
+                    ),
                     artifact=artifact,
                 )
             )
@@ -770,6 +791,14 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                     self._actor,
                     safe_call_id,
                     self.name,
+                    payload=safe_tool_event_payload(
+                        name=self.name,
+                        status="failed",
+                        arguments=cast(Mapping[str, JsonValue], arguments),
+                        sandbox=_tool_sandbox(self.name),
+                        replay_safe=replay_safe,
+                        failure_kind="invalid_request",
+                    ),
                     reason="capability execution failed",
                 )
             )
@@ -796,6 +825,14 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                     self._actor,
                     safe_call_id,
                     self.name,
+                    payload=safe_tool_event_payload(
+                        name=self.name,
+                        status="failed",
+                        arguments=cast(Mapping[str, JsonValue], arguments),
+                        sandbox=_tool_sandbox(self.name),
+                        replay_safe=replay_safe,
+                        failure_kind="uncertain",
+                    ),
                     reason="capability execution failed",
                 )
             )
@@ -807,6 +844,14 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                     self._actor,
                     safe_call_id,
                     self.name,
+                    payload=safe_tool_event_payload(
+                        name=self.name,
+                        status="failed",
+                        arguments=cast(Mapping[str, JsonValue], arguments),
+                        sandbox=_tool_sandbox(self.name),
+                        replay_safe=replay_safe,
+                        failure_kind="capability_failed",
+                    ),
                     reason=tool_result.failure_reason or "capability execution failed",
                 )
             )
@@ -823,6 +868,13 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                 self._actor,
                 safe_call_id,
                 self.name,
+                payload=safe_tool_event_payload(
+                    name=self.name,
+                    status="succeeded",
+                    result=tool_result.payload,
+                    artifact_id=str(artifact.id),
+                    replay_safe=replay_safe,
+                ),
                 artifact=artifact,
             )
         )
@@ -1257,6 +1309,7 @@ class AutoGenDiscussionRuntime:
                             actor=record.actor,
                             tool_call_id=record.call_id,
                             tool_name=record.name,
+                            payload=record.payload,
                             artifact=record.artifact,
                             reason=record.reason,
                         )

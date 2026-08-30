@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Mapping
 from decimal import Decimal
 from typing import Any, cast
@@ -682,8 +683,21 @@ async def test_autogen_tool_calls_forward_trusted_identity_to_harness_gateway() 
     assert request.call_id == "call_1"
     assert user_id == actor_id
     assert role is Role.OPERATOR
-    assert any(event.kind is EventKind.TOOL_STARTED for event in events)
-    assert any(event.kind is EventKind.TOOL_COMPLETED for event in events)
+    tool_started = next(event for event in events if event.kind is EventKind.TOOL_STARTED)
+    assert tool_started.payload["schema_version"] == 1
+    assert tool_started.payload["status"] == "running"
+    assert tool_started.payload["operation_kind"] == "generic"
+    assert tool_started.payload["sandbox"] == "restricted"
+    assert tool_started.payload["argument_keys"] == ("query",)
+    assert tool_started.payload["argument_key_count"] == 1
+    assert tool_started.payload["argument_bytes"] > 0
+    assert "evidence" not in json.dumps(tool_started.payload)
+    tool_completed = next(event for event in events if event.kind is EventKind.TOOL_COMPLETED)
+    assert tool_completed.payload["schema_version"] == 1
+    assert tool_completed.payload["status"] == "succeeded"
+    assert tool_completed.payload["result_bytes"] > 0
+    assert tool_completed.payload["artifact_id"] == str(tool_completed.artifact.id)
+    assert "source-a" not in json.dumps(tool_completed.payload)
     assert events[-1].reason == "explicit_completion"
 
 

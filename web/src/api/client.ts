@@ -596,6 +596,7 @@ const RunEventSchema = z.object({
   created_at: z.string(),
   actor: z.string().nullable().optional(),
   participants: z.array(z.string()).default([]),
+  tool_call_id: z.string().nullable().optional(),
   tool_name: z.string().nullable().optional(),
   step_id: z.string().nullable().optional(),
   action: z.string().nullable().optional(),
