@@ -51,6 +51,12 @@ def test_python_project_zip_request_is_profiled_as_software() -> None:
     assert TaskProfile.SOFTWARE in profiles
 
 
+def test_plain_zip_delivery_request_is_not_profiled_as_software_engineering() -> None:
+    profiles = defaults_module._task_profiles("把这份材料整理成一个可下载 zip 压缩包。")
+
+    assert TaskProfile.SOFTWARE not in profiles
+
+
 class FakeConfigService:
     def __init__(self, document: dict[str, object] | None) -> None:
         self.document = document

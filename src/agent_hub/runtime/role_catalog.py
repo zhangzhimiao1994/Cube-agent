@@ -194,6 +194,33 @@ def _daily_work_roles() -> tuple[RoleDefinition, ...]:
             profiles=general_dispatch,
         ),
         RoleDefinition(
+            id="project_packager",
+            role="Project Packager",
+            purpose="execute",
+            mission=(
+                "Generate a downloadable source/project archive through project.generate_zip "
+                "when the user requests file delivery. This is packaging and code artifact "
+                "generation only; do not claim full coding, test execution, debugging, or "
+                "workspace modification without an agent harness."
+            ),
+            must_answer=(
+                "What source/project archive was requested?",
+                "What files should project.generate_zip receive?",
+                "What generated file artifact was produced?",
+                "Which engineering checks require a harness and were not executed?",
+            ),
+            allowed_tools=("read_context", "project.generate_zip"),
+            forbidden_actions=(
+                "do not claim tests or debugging ran unless a harness executed them",
+                "do not claim workspace code was modified by this role",
+                "do not claim a downloadable archive exists until project.generate_zip returns an artifact",
+            ),
+            skills=("artifact-packaging",),
+            output_schema=dispatch_schema,
+            modes=frozenset({"dispatch", "hybrid"}),
+            profiles=general_dispatch,
+        ),
+        RoleDefinition(
             id="multimedia_generator",
             role="Multimedia Generator",
             purpose="execute",

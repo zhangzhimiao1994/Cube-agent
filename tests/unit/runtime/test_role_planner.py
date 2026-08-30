@@ -423,6 +423,42 @@ def test_general_generation_plan_does_not_select_quality_reviewer_by_default() -
     assert "quality_reviewer" not in role_ids
 
 
+def test_project_zip_delivery_uses_packager_not_software_implementer_tool() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=(
+                "生成一个最简单的 hello world Python 项目，"
+                "必须产出可下载 zip，zip 内包含 main.py。"
+            ),
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.SOFTWARE,
+            default_model="main-agent",
+        )
+    )
+
+    assert "project.generate_zip" not in plan.role("implementer").allowed_tools
+    packager = plan.role("project_packager")
+    assert packager.purpose is RolePurpose.EXECUTE
+    assert packager.allowed_tools == ("read_context", "project.generate_zip")
+    assert "without an agent harness" in packager.mission
+    assert any("do not claim tests or debugging ran" in action for action in packager.forbidden_actions)
+
+
+def test_project_packager_is_not_selected_when_zip_generation_is_negated() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="设计一个 Python 项目结构，但不需要 zip 压缩包。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.SOFTWARE,
+            default_model="main-agent",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "project_packager" not in role_ids
+
+
 def test_explicit_quality_check_still_selects_quality_reviewer() -> None:
     plan = RolePlanner().plan(
         RolePlanningRequest(
