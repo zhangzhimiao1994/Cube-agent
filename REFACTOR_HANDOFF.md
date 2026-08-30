@@ -355,3 +355,21 @@ Git 状态：
 - Verification: `npm test -- UsersPage.test.tsx --run` passed with 6 tests.
 - Verification: `npm run lint` passed.
 - Remaining TODO: commit/push, wait for GitHub Actions, then deploy to prod-web-01 so future Feishu messages use the new bound admin user id instead of the previous derived channel actor id.
+
+## 2026-08-30 Phase21 Production Deployment Closeout
+
+- GitHub author/committer policy: commits for this pass use `zhangzhimiao <41898282+zhangzhimiao1994@users.noreply.github.com>`.
+- Pushed branch: `codex/mofang-continuation` to `ssh://git@ssh.github.com:443/zhangzhimiao1994/CubeAgent.git`.
+- Latest deployed code commit: `8c80b8f20e39963b61a82e0ade9612f4d9b9c5e0` (`Bind Feishu senders to managed users`).
+- GitHub Actions: workflow `quality`, run `33315900968`, completed successfully for commit `8c80b8f20e39963b61a82e0ade9612f4d9b9c5e0`.
+- Production release: `/opt/agent-hub/releases/20260830-8c80b8f-feishu-user-binding`; `/opt/agent-hub/current` points to this release.
+- Deployment note: the full native installer could not be used because existing production secrets set `AGENT_HUB_PUBLIC_URL=http://127.0.0.1`, which the installer rejects as not externally reachable. Deployed by creating a clean release from the Git archive, reusing the prior production `.venv` and `.litellm-venv`, installing the locally built `web/dist`, running migrations with `python -m alembic upgrade head`, and restarting services.
+- Production verification:
+  - `agent-hub-api.service`, `agent-hub-worker.service`, `agent-hub-litellm.service`, and `caddy.service` are active.
+  - `http://127.0.0.1:8000/health/live` returns `{"status":"ok"}`.
+  - `http://127.0.0.1:8000/health/ready` returns `{"status":"ok"}` after LiteLLM startup completed.
+  - `/opt/agent-hub/current/src/agent_hub/channels/identity.py` exists on production.
+  - Production OpenAPI contains `/api/v1/users/{user_id}/feishu`.
+  - Production frontend bundle contains `bindUserFeishu`, `绑定飞书`, and `解绑飞书`.
+  - Production DB shows username `admin`, id `6e197aa7-3423-4def-b8aa-7c84df0ea41a`, role `super_admin`, disabled `false`, bound to Feishu open_id `ou_6409212c78893c199c61e32deb60c347`.
+- Remaining risk: historical Feishu runs keep their old derived actor id; new Feishu submissions after this deployment should resolve through the bound admin user id.
