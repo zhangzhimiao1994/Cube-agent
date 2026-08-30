@@ -662,6 +662,9 @@ const SkillSchema = z.object({
   status: z.string(),
   scan_diff: z.array(z.string()),
   requested_permissions: z.array(z.string()),
+  source_filename: z.string().nullable().optional(),
+  package_version_id: z.string().nullable().optional(),
+  content_sha256: z.string().nullable().optional(),
 });
 
 export type Skill = z.infer<typeof SkillSchema>;

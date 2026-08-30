@@ -26,7 +26,15 @@ function toggle(values: string[], value: string) {
 }
 
 function skillColumnValue(skill: Skill, key: SkillSortKey) {
-  if (key === "name") return `${skill.name} ${skill.id}`;
+  if (key === "name") {
+    return [
+      skill.name,
+      skill.id,
+      skill.source_filename ?? "",
+      skill.package_version_id ?? "",
+      skill.content_sha256 ?? "",
+    ].join(" ");
+  }
   if (key === "status") return skill.status;
   if (key === "scan") return skill.scan_diff.join("; ");
   return skill.requested_permissions.join(", ");
@@ -34,14 +42,30 @@ function skillColumnValue(skill: Skill, key: SkillSortKey) {
 
 function matchesSkillSearch(skill: Skill, query: string) {
   return textContains(
-    [skill.id, skill.name, skill.status, ...skill.scan_diff, ...skill.requested_permissions].join(" "),
+    [
+      skill.id,
+      skill.name,
+      skill.status,
+      skill.source_filename ?? "",
+      skill.package_version_id ?? "",
+      skill.content_sha256 ?? "",
+      ...skill.scan_diff,
+      ...skill.requested_permissions,
+    ].join(" "),
     query,
   );
 }
 
 function matchesSkillColumns(skill: Skill, filters: SkillColumnFilters) {
+  const identity = [
+    skill.name,
+    skill.id,
+    skill.source_filename ?? "",
+    skill.package_version_id ?? "",
+    skill.content_sha256 ?? "",
+  ].join(" ");
   return (
-    textContains(`${skill.name} ${skill.id}`, filters.name) &&
+    textContains(identity, filters.name) &&
     (filters.status === "all" || skill.status === filters.status) &&
     textContains(skill.scan_diff.join("; "), filters.scan) &&
     textContains(skill.requested_permissions.join(", "), filters.permissions)
@@ -59,6 +83,10 @@ function skillCreatorObjective(goal: string, materials: string, checks: string) 
     `验收任务：${checks.trim()}`,
     "交付要求：生成可安装的 SKILL.md，并按需要沉淀 references、scripts、assets；所有外部资料必须保留来源，候选 Skill 必须经过真实任务验收后才能审批启用。",
   ].join("\n");
+}
+
+function shortHash(value?: string | null) {
+  return value ? `${value.slice(0, 12)}...` : "";
 }
 
 export function SkillsPage() {
@@ -389,6 +417,17 @@ export function SkillsPage() {
                         <td>
                           <strong>{skill.name}</strong>
                           <p className="field-help">ID：{skill.id}</p>
+                          {skill.source_filename ? (
+                            <p className="field-help">来源：{skill.source_filename}</p>
+                          ) : null}
+                          {skill.package_version_id ? (
+                            <p className="field-help">版本：{shortHash(skill.package_version_id)}</p>
+                          ) : null}
+                          {skill.content_sha256 ? (
+                            <p className="field-help">
+                              SHA256：<code>{shortHash(skill.content_sha256)}</code>
+                            </p>
+                          ) : null}
                         </td>
                         <td>{skill.status}</td>
                         <td>{skill.scan_diff.join("; ") || "无"}</td>

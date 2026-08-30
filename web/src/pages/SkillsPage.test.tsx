@@ -25,6 +25,9 @@ const skills = [
     status: "quarantined",
     scan_diff: ["manifest loaded"],
     requested_permissions: ["network:http"],
+    source_filename: "deep-research.zip",
+    package_version_id: "pkg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    content_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   },
   {
     id: "docx",
@@ -71,6 +74,9 @@ describe("SkillsPage", () => {
                 status: "scanned",
                 scan_diff: ["SKILL.md detected"],
                 requested_permissions: [],
+                source_filename: "all-skills-research-writer.zip",
+                package_version_id: "pkg_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                content_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
               },
             ],
             skipped: [{ path: "invalid-skill", reason: "instruction skill contains nested archives" }],
@@ -252,6 +258,27 @@ describe("SkillsPage", () => {
     expect(screen.getByText("docx")).not.toBeNull();
     expect(screen.queryByText("deep-research")).toBeNull();
     expect(screen.queryByText("pdf")).toBeNull();
+    expect(screen.getByText("显示 1 / 3")).not.toBeNull();
+  });
+
+  it("shows structured package identity fields for duplicate and version review", async () => {
+    render(<TestApp initialPath="/skills" />);
+
+    await screen.findByRole("heading", { name: "技能管理" });
+
+    expect(screen.getByText("来源：deep-research.zip")).not.toBeNull();
+    expect(screen.getByText("版本：pkg_aaaaaaaa...")).not.toBeNull();
+    expect(screen.getByText("aaaaaaaaaaaa...")).not.toBeNull();
+  });
+
+  it("searches skills by source filename and content hash", async () => {
+    render(<TestApp initialPath="/skills" />);
+
+    await screen.findByRole("heading", { name: "技能管理" });
+    await userEvent.type(screen.getByRole("searchbox", { name: "快速搜索 Skill" }), "aaaaaaaa");
+
+    expect(screen.getByText("deep-research")).not.toBeNull();
+    expect(screen.queryByText("docx")).toBeNull();
     expect(screen.getByText("显示 1 / 3")).not.toBeNull();
   });
 

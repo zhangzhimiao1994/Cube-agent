@@ -3366,6 +3366,9 @@ def test_skill_archive_upload_scans_real_zip_package() -> None:
     assert item["status"] == "scanned"
     assert item["requested_permissions"] == ["tool:filesystem.read"]
     assert any("content sha256" in entry for entry in item["scan_diff"])
+    assert item["source_filename"] == "safe-skill.zip"
+    assert item["content_sha256"]
+    assert item["package_version_id"] == f"pkg_{item['content_sha256']}"
     assert skills.json()[0]["id"] == item["id"]
 
 
@@ -3414,8 +3417,11 @@ def test_skill_archive_upload_replaces_same_identity_without_duplicating() -> No
     assert second.status_code == 200
     assert first_item["id"] == second_item["id"]
     assert first_item["scan_diff"] != second_item["scan_diff"]
+    assert first_item["content_sha256"] != second_item["content_sha256"]
+    assert first_item["package_version_id"] != second_item["package_version_id"]
     assert [item["id"] for item in skills.json()] == [second_item["id"]]
     assert skills.json()[0]["scan_diff"] == second_item["scan_diff"]
+    assert skills.json()[0]["content_sha256"] == second_item["content_sha256"]
 
 
 def test_skill_archive_upload_skips_duplicate_identity_inside_bundle() -> None:
@@ -3486,6 +3492,8 @@ async def test_persistent_skill_archive_upload_upserts_stable_identity(tmp_path:
     assert second.items[0].id == skill_id
     assert [item.id for item in listed] == [skill_id]
     assert listed[0].scan_diff == second.items[0].scan_diff
+    assert listed[0].content_sha256 == second.items[0].content_sha256
+    assert listed[0].package_version_id == f"pkg_{listed[0].content_sha256}"
     assert (tmp_path / str(TENANT_ID) / f"{skill_id}.zip").is_file()
     assert len([key for key in service.payloads if key[0] == "skill"]) == 1
 

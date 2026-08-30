@@ -409,6 +409,9 @@ class SkillResponse(BaseModel):
     status: str
     scan_diff: list[str]
     requested_permissions: list[str]
+    source_filename: str | None = None
+    package_version_id: str | None = None
+    content_sha256: str | None = None
 
 
 class SkillBulkDeleteRequest(BaseModel):
@@ -2193,6 +2196,9 @@ def _skill_response_from_scan(
             f"content sha256: {inspection.content_sha256}",
         ],
         requested_permissions=list(inspection.requested_capabilities),
+        source_filename=filename,
+        package_version_id=f"pkg_{inspection.content_sha256}",
+        content_sha256=inspection.content_sha256,
     )
 
 
@@ -2212,6 +2218,9 @@ def _skill_response_from_scanned_archive(
             f"content sha256: {scanned.instruction_sha256}",
         ],
         requested_permissions=[],
+        source_filename=scanned.filename,
+        package_version_id=f"pkg_{scanned.instruction_sha256}",
+        content_sha256=scanned.instruction_sha256,
     )
 
 
