@@ -1858,10 +1858,12 @@ function RunProcessDrawer({
     "";
   const [selectedAgentId, setSelectedAgentId] = useState(initialAgentId);
   const [selectedView, setSelectedView] = useState<AgentWorkView>("activity");
+  const [activityDetail, setActivityDetail] = useState<AgentWorkActivity | null>(null);
 
   useEffect(() => {
     setSelectedAgentId(initialAgentId);
     setSelectedView("activity");
+    setActivityDetail(null);
   }, [initialAgentId, target.runId, target.conversationId, target.selectedActivityId]);
 
   const selectedAgent = target.workItems.find((item) => item.id === selectedAgentId) ?? target.workItems[0];
@@ -1957,6 +1959,7 @@ function RunProcessDrawer({
                   <AgentActivityList
                     activities={selectedAgent.activity.filter((activity) => activity.event && hasComputerEvidence(activity.event))}
                     selectedActivityId={selectedActivity?.id}
+                    onOpen={setActivityDetail}
                   />
                 </section>
               ) : (
@@ -1964,14 +1967,14 @@ function RunProcessDrawer({
                   <section className="agent-workforce-section">
                     <h5>输出</h5>
                     {selectedAgent.outputs.length > 0 ? (
-                      <AgentActivityList activities={selectedAgent.outputs} selectedActivityId={selectedActivity?.id} />
+                      <AgentActivityList activities={selectedAgent.outputs} selectedActivityId={selectedActivity?.id} onOpen={setActivityDetail} />
                     ) : (
                       <p className="agent-workforce-empty">暂无独立输出，查看活动轨迹里的阶段记录。</p>
                     )}
                   </section>
                   <section className="agent-workforce-section">
                     <h5>活动轨迹</h5>
-                    <AgentActivityList activities={selectedAgent.activity} selectedActivityId={selectedActivity?.id} />
+                    <AgentActivityList activities={selectedAgent.activity} selectedActivityId={selectedActivity?.id} onOpen={setActivityDetail} />
                   </section>
                 </>
               )}
@@ -1980,6 +1983,7 @@ function RunProcessDrawer({
             <p className="agent-workforce-empty">这次运行还没有可展示的子 Agent 记录。</p>
           )}
         </div>
+        {activityDetail ? <AgentActivityDetailDrawer activity={activityDetail} onClose={() => setActivityDetail(null)} /> : null}
       </section>
     </div>
   );
@@ -1988,37 +1992,91 @@ function RunProcessDrawer({
 function AgentActivityList({
   activities,
   selectedActivityId,
+  onOpen,
 }: {
   activities: AgentWorkActivity[];
   selectedActivityId?: string;
+  onOpen: (activity: AgentWorkActivity) => void;
 }) {
   if (activities.length === 0) return <p className="agent-workforce-empty">暂无可展示记录。</p>;
   return (
     <div className="agent-workforce-activity-list">
       {activities.map((activity, index) => (
-        <article
+        <button
+          type="button"
           key={`${activity.id}-${index}`}
-          className={`agent-workforce-activity${activity.id === selectedActivityId ? " is-selected" : ""}`}
+          className={`agent-workforce-activity-card${activity.id === selectedActivityId ? " is-selected" : ""}`}
+          aria-label={`打开活动详情：${activity.title}`}
+          onClick={() => onOpen(activity)}
         >
           <div>
             <small>{activity.kind}</small>
             <strong>{activity.title}</strong>
           </div>
           <p>{activity.summary}</p>
-          {activity.rows.length > 0 ? (
-            <dl>
-              {activity.rows.map((row, rowIndex) => (
-                <Fragment key={`${activity.id}-${row.label}-${rowIndex}`}>
-                  <dt>{row.label}</dt>
-                  <dd>{row.value}</dd>
-                </Fragment>
-              ))}
-            </dl>
-          ) : null}
-          {hasArtifactDownload(activity.artifact) ? <ArtifactFileCard artifact={activity.artifact} compact /> : null}
-          {activity.createdAt ? <time dateTime={activity.createdAt}>{activity.createdAt}</time> : null}
-        </article>
+          <span className="agent-workforce-activity-meta">
+            <span>{activity.category}</span>
+            {activity.createdAt ? <time dateTime={activity.createdAt}>{activity.createdAt}</time> : null}
+          </span>
+        </button>
       ))}
+    </div>
+  );
+}
+
+function AgentActivityDetailDrawer({
+  activity,
+  onClose,
+}: {
+  activity: AgentWorkActivity;
+  onClose: () => void;
+}) {
+  return (
+    <div
+      className="activity-detail-backdrop"
+      role="presentation"
+      onClick={(event) => {
+        event.stopPropagation();
+        onClose();
+      }}
+    >
+      <section
+        className="activity-detail-drawer"
+        role="dialog"
+        aria-label="活动详情"
+        aria-modal="true"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="process-drawer-header">
+          <div>
+            <span className="eyebrow">{activity.kind}</span>
+            <h3>{activity.title}</h3>
+            <p className="agent-workforce-scope">{activity.summary}</p>
+          </div>
+          <button type="button" className="secondary-action" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+        <dl className="activity-detail-list">
+          <div>
+            <dt>摘要分类</dt>
+            <dd>{activity.category}</dd>
+          </div>
+          {activity.createdAt ? (
+            <div>
+              <dt>时间</dt>
+              <dd>{activity.createdAt}</dd>
+            </div>
+          ) : null}
+          {activity.rows.map((row, rowIndex) => (
+            <div key={`${activity.id}-${row.label}-${rowIndex}`}>
+              <dt>{row.label}</dt>
+              <dd>{row.value}</dd>
+            </div>
+          ))}
+        </dl>
+        {hasArtifactDownload(activity.artifact) ? <ArtifactFileCard artifact={activity.artifact} compact /> : null}
+      </section>
     </div>
   );
 }

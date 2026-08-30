@@ -1493,9 +1493,11 @@ describe("operational management pages", () => {
 
     await user.click(within(stream).getByRole("button", { name: /文案生成 输出：短视频脚本成稿/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
-    const drawerDownloads = within(drawer).getAllByRole("link", { name: /下载 short-video-script\.docx/ });
-    expect(drawerDownloads.length).toBeGreaterThan(0);
-    expect(drawerDownloads.every((link) => link.getAttribute("href") === fileArtifact.download_url)).toBe(true);
+    expect(within(drawer).queryByRole("link", { name: /下载 short-video-script\.docx/ })).toBeNull();
+    await user.click(within(drawer).getAllByRole("button", { name: /打开活动详情：文案生成 输出/ })[0]);
+    const artifactDetail = await screen.findByRole("dialog", { name: "活动详情" });
+    const drawerDownload = within(artifactDetail).getByRole("link", { name: /下载 short-video-script\.docx/ });
+    expect(drawerDownload.getAttribute("href")).toBe(fileArtifact.download_url);
   });
 
   it("renders markdown tables inside assistant chat replies as real tables", async () => {
@@ -2011,9 +2013,14 @@ describe("operational management pages", () => {
     expect(within(drawer).queryByText("任务已进入队列，等待 Worker 调度执行。")).toBeNull();
     expect(within(drawer).queryByText("model.started")).toBeNull();
     expect(within(drawer).queryByText("模型请求已开始。")).toBeNull();
-    expect(within(drawer).getAllByText("得到一版可拍摄脚本文案").length).toBeGreaterThan(0);
-    expect(within(drawer).getAllByText("调用模型").length).toBeGreaterThan(0);
-    expect(within(drawer).getAllByText("qwen-max").length).toBeGreaterThan(0);
+    expect(within(drawer).getAllByText(/得到一版可拍摄脚本文案/).length).toBeGreaterThan(0);
+    expect(within(drawer).queryByText("模型使用者")).toBeNull();
+    expect(within(drawer).queryByText("详情：api_key")).toBeNull();
+    await user.click(within(drawer).getAllByRole("button", { name: /打开活动详情：文案生成 产出阶段内容/ })[0]);
+    const activityDetail = await screen.findByRole("dialog", { name: "活动详情" });
+    expect(within(activityDetail).getAllByText("调用模型").length).toBeGreaterThan(0);
+    expect(within(activityDetail).getAllByText("qwen-max").length).toBeGreaterThan(0);
+    expect(within(activityDetail).getByText("详情：api_key")).not.toBeNull();
   });
 
   it("marks intermediate process outputs in labeled boxes while keeping the final reply merged", async () => {
@@ -2334,8 +2341,12 @@ describe("operational management pages", () => {
     expect(within(drawer).getByRole("button", { name: "活动轨迹" }).getAttribute("aria-pressed")).toBe("true");
     await user.click(within(drawer).getByRole("button", { name: "电脑视图" }));
     expect(within(drawer).getByRole("button", { name: "电脑视图" }).getAttribute("aria-pressed")).toBe("true");
-    expect(within(drawer).getByText("MJPEG stream healthy")).not.toBeNull();
-    expect(within(drawer).getByText("/tmp/mofang/screen.jpg")).not.toBeNull();
+    expect(within(drawer).queryByText("MJPEG stream healthy")).toBeNull();
+    expect(within(drawer).queryByText("/tmp/mofang/screen.jpg")).toBeNull();
+    await user.click(within(drawer).getByRole("button", { name: /打开活动详情：工具执行完成：screen_probe/ }));
+    const screenDetail = await screen.findByRole("dialog", { name: "活动详情" });
+    expect(within(screenDetail).getByText("MJPEG stream healthy")).not.toBeNull();
+    expect(within(screenDetail).getByText("/tmp/mofang/screen.jpg")).not.toBeNull();
   });
 
   it("renders agent process steps as an ordered timeline with concrete per-step details", async () => {
@@ -2498,17 +2509,17 @@ describe("operational management pages", () => {
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     expect(within(drawer).getByText("子 Agent 工作席")).not.toBeNull();
     expect(within(drawer).getAllByText("文案生成").length).toBeGreaterThan(0);
-    expect(within(drawer).getAllByText("执行者").length).toBeGreaterThan(0);
     expect(within(drawer).getAllByText("文案生成").length).toBeGreaterThan(0);
-    expect(within(drawer).getAllByText("调用模型").length).toBeGreaterThan(0);
-    expect(within(drawer).getAllByText("qwen-max").length).toBeGreaterThan(0);
-    expect(within(drawer).getAllByText("输出内容").length).toBeGreaterThan(0);
+    expect(within(drawer).queryByText("执行者")).toBeNull();
+    expect(within(drawer).queryByText("调用模型")).toBeNull();
+    expect(within(drawer).queryByText("输出内容")).toBeNull();
+    expect(within(drawer).getAllByText(/qwen-max/).length).toBeGreaterThan(0);
     expect(within(drawer).getAllByText(/中秋灯谜游园会/).length).toBeGreaterThan(0);
 
     const activitySections = Array.from(drawer.querySelectorAll(".agent-workforce-section"));
     const activitySection = activitySections.find((item) => item.textContent?.startsWith("活动轨迹"));
     expect(activitySection).not.toBeNull();
-    const copywriterActivities = Array.from(activitySection!.querySelectorAll(".agent-workforce-activity"));
+    const copywriterActivities = Array.from(activitySection!.querySelectorAll(".agent-workforce-activity-card"));
     const copywriterStarted = copywriterActivities.find((item) => item.textContent?.includes("输出中秋节活动主题"));
     const copywriterModel = copywriterActivities.find((item) => item.textContent?.includes("qwen-max"));
     const copywriterArtifact = copywriterActivities.find((item) => item.textContent?.includes("文案生成输出：中秋灯谜游园会"));
@@ -2520,10 +2531,13 @@ describe("operational management pages", () => {
 
     await user.click(within(drawer).getByRole("button", { name: /导演/ }));
     const opinionDrawer = screen.getByRole("dialog", { name: "运行过程详情" });
-    expect(within(opinionDrawer).getAllByText("发言角色").length).toBeGreaterThan(0);
+    expect(within(opinionDrawer).queryByText("发言角色")).toBeNull();
     expect(within(opinionDrawer).getAllByText("导演").length).toBeGreaterThan(0);
-    expect(within(opinionDrawer).getAllByText("导演意见").length).toBeGreaterThan(0);
-    expect(within(opinionDrawer).getAllByText("导演建议压缩签到环节，避免排队。").length).toBeGreaterThan(0);
+    expect(within(opinionDrawer).getAllByText(/导演 意见：导演建议压缩签到环节/).length).toBeGreaterThan(0);
+    await user.click(within(opinionDrawer).getByRole("button", { name: /打开活动详情：导演 给出讨论意见/ }));
+    const opinionDetail = await screen.findByRole("dialog", { name: "活动详情" });
+    expect(within(opinionDetail).getAllByText("发言角色").length).toBeGreaterThan(0);
+    expect(within(opinionDetail).getAllByText("导演意见").length).toBeGreaterThan(0);
   });
 
   it("uses ordered artifacts for process rows instead of vague generated-result summaries", async () => {
@@ -2618,12 +2632,17 @@ describe("operational management pages", () => {
 
     await user.click(directorOutput);
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
-    expect(within(drawer).getAllByText("执行者").length).toBeGreaterThan(0);
+    expect(within(drawer).queryByText("执行者")).toBeNull();
     expect(within(drawer).getAllByText("导演").length).toBeGreaterThan(0);
-    expect(within(drawer).getAllByText("调用模型").length).toBeGreaterThan(0);
-    expect(within(drawer).getAllByText("deepseek-v4-flash").length).toBeGreaterThan(0);
-    expect(within(drawer).getAllByText("输出内容").length).toBeGreaterThan(0);
-    expect(within(drawer).getAllByText("导演输出：压缩主持人串场，保留抽奖互动。").length).toBeGreaterThan(0);
+    expect(within(drawer).queryByText("调用模型")).toBeNull();
+    expect(within(drawer).getAllByText(/deepseek-v4-flash/).length).toBeGreaterThan(0);
+    expect(within(drawer).queryByText("输出内容")).toBeNull();
+    expect(within(drawer).getAllByText(/导演输出：压缩主持人串场，保留抽奖互动/).length).toBeGreaterThan(0);
+    await user.click(within(drawer).getAllByRole("button", { name: /打开活动详情：导演 产出阶段内容/ })[0]);
+    const activityDetail = await screen.findByRole("dialog", { name: "活动详情" });
+    expect(within(activityDetail).getAllByText("执行者").length).toBeGreaterThan(0);
+    expect(within(activityDetail).getAllByText("调用模型").length).toBeGreaterThan(0);
+    expect(within(activityDetail).getAllByText("输出内容").length).toBeGreaterThan(0);
   });
 
   it("falls back to concrete artifact titles when upstream artifact text is generic", async () => {
@@ -2673,8 +2692,12 @@ describe("operational management pages", () => {
 
     await user.click(outputRow);
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
-    expect(within(drawer).getAllByText("产物标题").length).toBeGreaterThan(0);
+    expect(within(drawer).queryByText("产物标题")).toBeNull();
     expect(within(drawer).getAllByText("中秋活动文案初稿").length).toBeGreaterThan(0);
+    await user.click(within(drawer).getByRole("button", { name: /打开活动详情：文案生成 输出/ }));
+    const activityDetail = await screen.findByRole("dialog", { name: "活动详情" });
+    expect(within(activityDetail).getAllByText("产物标题").length).toBeGreaterThan(0);
+    expect(within(activityDetail).getAllByText("中秋活动文案初稿").length).toBeGreaterThan(0);
     expect(within(drawer).queryByText(/已生成一个可查看的结果或中间产物/)).toBeNull();
   });
 
@@ -2689,18 +2712,19 @@ describe("operational management pages", () => {
     await user.click(within(stream).getByRole("button", { name: /讨论完成：形成 1 个结论、1 个决策、3 条意见/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
 
-    expect(within(drawer).getAllByText("参与者").length).toBeGreaterThan(0);
-    expect(within(drawer).getAllByText("导演、文案生成、剪辑师").length).toBeGreaterThan(0);
+    expect(within(drawer).queryByText("参与者")).toBeNull();
     expect(within(drawer).queryByText(/生成了结果/)).toBeNull();
     expect(within(drawer).getAllByText(/多角色完成讨论/).length).toBeGreaterThan(0);
-    expect(within(drawer).getAllByText(/采用可拍摄性最高的方案/).length).toBeGreaterThan(0);
+    expect(within(drawer).getAllByText(/主 Agent 选择可拍摄性最高且风险最低/).length).toBeGreaterThan(0);
+    await user.click(within(drawer).getByRole("button", { name: /打开活动详情：多角色完成讨论/ }));
+    const activityDetail = await screen.findByRole("dialog", { name: "活动详情" });
+    expect(within(activityDetail).getAllByText("参与者").length).toBeGreaterThan(0);
+    expect(within(activityDetail).getAllByText("导演、文案生成、剪辑师").length).toBeGreaterThan(0);
     expect(within(drawer).getAllByText("导演认为要优先可拍摄性。").length).toBeGreaterThan(0);
     expect(within(drawer).getAllByText("文案建议强化开头钩子。").length).toBeGreaterThan(0);
     expect(within(drawer).getAllByText("剪辑师建议三段式节奏。").length).toBeGreaterThan(0);
     expect(within(drawer).getAllByText("主 Agent 选择可拍摄性最高且风险最低的方案。").length).toBeGreaterThan(0);
-    expect(within(drawer).getAllByText("执行者").length).toBeGreaterThan(0);
-    expect(within(drawer).getAllByText("参与者").length).toBeGreaterThan(0);
-    expect(within(drawer).getAllByText("导演、文案生成、剪辑师").length).toBeGreaterThan(0);
+    expect(within(activityDetail).getAllByText("执行者").length).toBeGreaterThan(0);
     expect(within(drawer).queryByText("artifact.created")).toBeNull();
   });
 

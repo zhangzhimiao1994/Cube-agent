@@ -71,6 +71,9 @@ _MAX_OUTPUT_BYTES = 65_536
 _MAX_TOOL_ROUNDS = 8
 _MAX_TOOL_CALLS_PER_RESPONSE = 16
 _MAX_TOOL_ARGUMENT_BYTES = 32_768
+_STEP_TIMEOUT_RECOVERY_RETRIES = 1
+_STEP_TIMEOUT_RETRY_MIN_REMAINING_SECONDS = 1.0
+_COMPACT_RETRY_SOURCE_PREVIEW_BYTES = 360
 _MAX_AUDITED_TOKENS = 100_000_000
 _MAX_AUDITED_COST_USD = Decimal(64000000)
 _TASK_CANCELLATION_GRACE_SECONDS = 0.25
@@ -1644,7 +1647,8 @@ class CrewDispatchRuntime:
         )
         feedback = cast(str | None, feedback_value)
         step_deadline = asyncio.get_running_loop().time() + min(
-            step.timeout_seconds, self._remaining_timeout(run_state)
+            step.timeout_seconds * (1 + _STEP_TIMEOUT_RECOVERY_RETRIES),
+            self._remaining_timeout(run_state),
         )
         while True:
             attempt_sources = self._ordered_artifacts(
@@ -1894,119 +1898,183 @@ class CrewDispatchRuntime:
         run_state: _RunState,
         step_deadline: float,
     ) -> tuple[GatewayCompletion, tuple[Artifact, ...]]:
-        use_review_packets = step.final_synthesizer or bool(step.depends_on)
-        source_payload = [
-            (
-                _artifact_review_packet_payload(artifact)
-                if use_review_packets
-                else _artifact_prompt_payload(artifact)
-            )
-            for artifact in sources
-        ]
-        user = {
-            "request": context.request,
-            "task": step.task,
-            "untrusted_source_artifacts": source_payload,
-        }
-        if feedback is not None:
-            user["untrusted_reviewer_feedback"] = feedback
-        user_text = json.dumps(user, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        if len(user_text.encode("utf-8")) > _MAX_PROMPT_BYTES:
-            _fail("dispatch prompt exceeds limit")
         generation = run_state.crew_generation
         if generation is None:
             _fail("CrewAI generation is unavailable")
-        last_completion: GatewayCompletion | None = None
-        evidence: list[Artifact] = []
-        call_cursor = _ModelCallCursor()
-        runtime = self
-
-        class StepBridge:
-            async def complete(self, crew_messages: object) -> str:
-                nonlocal last_completion
-                last_completion = await runtime._complete_gateway_messages(
-                    context,
-                    step,
-                    agent,
-                    crew_messages,
-                    emit,
-                    checkpoint_boundary,
-                    tool_boundary,
-                    model_state_boundary,
-                    usage_boundary,
-                    tool_ledger,
-                    model_ledger,
-                    call_cursor,
-                    evidence,
-                    sources,
-                    retries,
-                    run_state,
-                    step_deadline,
+        framework_attempt = 0
+        while True:
+            compact_retry = framework_attempt > 0
+            use_review_packets = compact_retry or step.final_synthesizer or bool(step.depends_on)
+            source_payload = [
+                (
+                    _artifact_review_packet_payload(
+                        artifact,
+                        max_preview_bytes=(
+                            _COMPACT_RETRY_SOURCE_PREVIEW_BYTES if compact_retry else 1_200
+                        ),
+                    )
+                    if use_review_packets
+                    else _artifact_prompt_payload(artifact)
                 )
-                text = last_completion.response.text
-                if text is None:
-                    _fail("model response is unsupported")
-                return text
+                for artifact in sources
+            ]
+            user: dict[str, object] = {
+                "request": context.request,
+                "task": step.task,
+                "untrusted_source_artifacts": source_payload,
+            }
+            if feedback is not None:
+                user["untrusted_reviewer_feedback"] = feedback
+            if compact_retry:
+                user["recovery"] = {
+                    "strategy": "compact_retry",
+                    "previous_failure": (
+                        f"CrewAI step timed out: step={step.id} actor={agent.id}"
+                    ),
+                    "instructions": (
+                        "Use compact source previews only. Split any oversized work into the "
+                        "smallest useful subtask, produce a directly usable result, and avoid "
+                        "expanding the context with long intermediate reasoning."
+                    ),
+                }
+            user_text = json.dumps(
+                user, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            if compact_retry:
+                user_text = _truncate_prompt_text(user_text, max_bytes=_MAX_PROMPT_BYTES)
+            if len(user_text.encode("utf-8")) > _MAX_PROMPT_BYTES:
+                _fail("dispatch prompt exceeds limit")
+            last_completion: GatewayCompletion | None = None
+            evidence: list[Artifact] = []
+            call_cursor = _ModelCallCursor()
+            attempt_deadline = min(
+                step_deadline,
+                asyncio.get_running_loop().time() + step.timeout_seconds,
+            )
 
-        try:
-            async with asyncio.timeout(self._remaining_timeout(run_state, step_deadline)):
-                raw = await generation.execute(
+            class StepBridge:
+                async def complete(
+                    self,
+                    crew_messages: object,
+                    _runtime: CrewDispatchRuntime = self,
+                    _call_cursor: _ModelCallCursor = call_cursor,
+                    _evidence: list[Artifact] = evidence,
+                    _attempt_deadline: float = attempt_deadline,
+                ) -> str:
+                    nonlocal last_completion
+                    last_completion = await _runtime._complete_gateway_messages(
+                        context,
+                        step,
+                        agent,
+                        crew_messages,
+                        emit,
+                        checkpoint_boundary,
+                        tool_boundary,
+                        model_state_boundary,
+                        usage_boundary,
+                        tool_ledger,
+                        model_ledger,
+                        _call_cursor,
+                        _evidence,
+                        sources,
+                        retries,
+                        run_state,
+                        _attempt_deadline,
+                    )
+                    text = last_completion.response.text
+                    if text is None:
+                        _fail("model response is unsupported")
+                    return text
+
+            try:
+                async with asyncio.timeout(self._remaining_timeout(run_state, attempt_deadline)):
+                    raw = await generation.execute(
+                        step.id,
+                        user_text,
+                        StepBridge(),
+                        agent_id=agent.id,
+                        storage_scope=(context.tenant_id, context.run_id),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except RuntimeExecutionError:
+                raise
+            except TimeoutError as error:
+                failure_reason = f"CrewAI step timed out: step={step.id} actor={agent.id}"
+                _LOGGER.warning(
+                    "crewai_step_execution_failed step_id=%s agent_id=%s error_type=%s safe_reason=%s",
                     step.id,
-                    user_text,
-                    StepBridge(),
-                    storage_scope=(context.tenant_id, context.run_id),
+                    agent.id,
+                    type(error).__name__,
+                    failure_reason,
                 )
-        except asyncio.CancelledError:
-            raise
-        except RuntimeExecutionError:
-            raise
-        except TimeoutError as error:
-            failure_reason = f"CrewAI step timed out: step={step.id} actor={agent.id}"
-            _LOGGER.warning(
-                "crewai_step_execution_failed step_id=%s agent_id=%s error_type=%s safe_reason=%s",
-                step.id,
-                agent.id,
-                type(error).__name__,
-                failure_reason,
-            )
-            error.__traceback__ = None
-            error.__context__ = None
-            error.__cause__ = None
-            del error
-            _fail(failure_reason)
-        except Exception as error:  # noqa: BLE001 - private framework boundary
-            failure_reason = _framework_failure_reason("CrewAI step execution failed", error)
-            _LOGGER.warning(
-                "crewai_step_execution_failed step_id=%s agent_id=%s error_type=%s safe_reason=%s",
-                step.id,
-                agent.id,
-                type(error).__name__,
-                failure_reason,
-            )
-            error.__traceback__ = None
-            error.__context__ = None
-            error.__cause__ = None
-            del error
-            _fail(failure_reason)
-        completion = last_completion
-        if completion is None:
-            _fail("CrewAI bypassed the ModelGateway bridge")
-        if raw != completion.response.text:
-            response = completion.response
-            completion = GatewayCompletion(
-                response=ModelResponse(
-                    text=raw,
-                    tool_calls=(),
-                    usage=response.usage,
-                    provider_metadata=response.provider_metadata,
-                ),
-                deployment_id=completion.deployment_id,
-                logical_model=completion.logical_model,
-                provider_id=completion.provider_id,
-                provider_model=completion.provider_model,
-                cost_usd=completion.cost_usd,
-            )
-        return completion, tuple(evidence)
+                error.__traceback__ = None
+                error.__context__ = None
+                error.__cause__ = None
+                del error
+                remaining = self._remaining_timeout(run_state, step_deadline)
+                retry_threshold = min(
+                    _STEP_TIMEOUT_RETRY_MIN_REMAINING_SECONDS,
+                    max(step.timeout_seconds * 0.1, 0.001),
+                )
+                if (
+                    framework_attempt < _STEP_TIMEOUT_RECOVERY_RETRIES
+                    and remaining > retry_threshold
+                ):
+                    framework_attempt += 1
+                    diagnostic = runtime_failure_diagnostic_from_reason(failure_reason)
+                    await emit(
+                        kind=EventKind.STEP_RETRYING,
+                        step_id=step.id,
+                        actor=step.agent,
+                        reason="step execution timed out; retrying with compact recovery",
+                        payload={
+                            "attempt": framework_attempt + 1,
+                            "strategy": "compact_retry",
+                            "fallback_policy": "fail_if_retry_exhausted",
+                            "allow_model_fallback": True,
+                            "input_policy": "compact_source_previews",
+                            "work_policy": "split_large_step_if_needed",
+                            "timeout_policy": "use_remaining_step_budget",
+                            "warning": failure_reason,
+                            **diagnostic,
+                        },
+                    )
+                    continue
+                _fail(failure_reason)
+            except Exception as error:  # noqa: BLE001 - private framework boundary
+                failure_reason = _framework_failure_reason("CrewAI step execution failed", error)
+                _LOGGER.warning(
+                    "crewai_step_execution_failed step_id=%s agent_id=%s error_type=%s safe_reason=%s",
+                    step.id,
+                    agent.id,
+                    type(error).__name__,
+                    failure_reason,
+                )
+                error.__traceback__ = None
+                error.__context__ = None
+                error.__cause__ = None
+                del error
+                _fail(failure_reason)
+            completion = last_completion
+            if completion is None:
+                _fail("CrewAI bypassed the ModelGateway bridge")
+            if raw != completion.response.text:
+                response = completion.response
+                completion = GatewayCompletion(
+                    response=ModelResponse(
+                        text=raw,
+                        tool_calls=(),
+                        usage=response.usage,
+                        provider_metadata=response.provider_metadata,
+                    ),
+                    deployment_id=completion.deployment_id,
+                    logical_model=completion.logical_model,
+                    provider_id=completion.provider_id,
+                    provider_model=completion.provider_model,
+                    cost_usd=completion.cost_usd,
+                )
+            return completion, tuple(evidence)
 
     async def _complete_gateway_messages(
         self,

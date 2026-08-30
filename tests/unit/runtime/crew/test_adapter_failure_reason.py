@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 from typing import cast
 from uuid import UUID, uuid4
@@ -130,6 +131,108 @@ class TimeoutFactory(CrewObjectFactory):
         return TimeoutGeneration()
 
 
+class StepTimeoutOnceGeneration:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.prompts: list[str] = []
+
+    async def execute(
+        self,
+        step_id: str,
+        prompt: str,
+        bridge: CrewLLMBridge,
+        *,
+        agent_id: str | None = None,
+        storage_scope: tuple[UUID, UUID],
+    ) -> str:
+        del step_id, agent_id, storage_scope
+        self.calls += 1
+        self.prompts.append(prompt)
+        if self.calls == 1:
+            raise TimeoutError
+        return await bridge.complete([{"role": "user", "content": prompt}])
+
+
+class StepTimeoutOnceFactory(CrewObjectFactory):
+    def __init__(self) -> None:
+        self.generation = StepTimeoutOnceGeneration()
+
+    def build(
+        self,
+        agents: tuple[CrewAgentDefinition, ...],
+        tasks: tuple[CrewTaskDefinition, ...],
+        *,
+        share_crew: bool,
+        telemetry_disabled: bool,
+    ) -> StepTimeoutOnceGeneration:
+        del agents, tasks, share_crew, telemetry_disabled
+        return self.generation
+
+
+class SlowStepGeneration:
+    async def execute(
+        self,
+        step_id: str,
+        prompt: str,
+        bridge: CrewLLMBridge,
+        *,
+        agent_id: str | None = None,
+        storage_scope: tuple[UUID, UUID],
+    ) -> str:
+        del step_id, prompt, bridge, agent_id, storage_scope
+        await asyncio.sleep(1)
+        return "late"
+
+
+class SlowStepFactory(CrewObjectFactory):
+    def build(
+        self,
+        agents: tuple[CrewAgentDefinition, ...],
+        tasks: tuple[CrewTaskDefinition, ...],
+        *,
+        share_crew: bool,
+        telemetry_disabled: bool,
+    ) -> SlowStepGeneration:
+        del agents, tasks, share_crew, telemetry_disabled
+        return SlowStepGeneration()
+
+
+class SlowThenFastStepGeneration:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def execute(
+        self,
+        step_id: str,
+        prompt: str,
+        bridge: CrewLLMBridge,
+        *,
+        agent_id: str | None = None,
+        storage_scope: tuple[UUID, UUID],
+    ) -> str:
+        del step_id, prompt, agent_id, storage_scope
+        self.calls += 1
+        if self.calls == 1:
+            await asyncio.sleep(1)
+        return await bridge.complete([{"role": "user", "content": "recover"}])
+
+
+class SlowThenFastStepFactory(CrewObjectFactory):
+    def __init__(self) -> None:
+        self.generation = SlowThenFastStepGeneration()
+
+    def build(
+        self,
+        agents: tuple[CrewAgentDefinition, ...],
+        tasks: tuple[CrewTaskDefinition, ...],
+        *,
+        share_crew: bool,
+        telemetry_disabled: bool,
+    ) -> SlowThenFastStepGeneration:
+        del agents, tasks, share_crew, telemetry_disabled
+        return self.generation
+
+
 class ReviewerTimeoutGeneration:
     async def execute(
         self,
@@ -230,7 +333,7 @@ class CapturingFactory(CrewObjectFactory):
         return self.generation
 
 
-def _one_step_plan() -> DispatchPlan:
+def _one_step_plan(*, timeout_seconds: float = 60.0) -> DispatchPlan:
     return DispatchPlan(
         agents=(AgentSpec(id="writer", role="writer", goal="Write", logical_model="general"),),
         steps=(
@@ -240,9 +343,11 @@ def _one_step_plan() -> DispatchPlan:
                 task="Answer",
                 final_synthesizer=True,
                 token_budget=100,
+                timeout_seconds=timeout_seconds,
             ),
         ),
         total_token_budget=100,
+        total_timeout_seconds=max(60.0, timeout_seconds * 4),
     )
 
 
@@ -287,13 +392,14 @@ def _reviewed_plan_with_retry_budget(reviewer_retries: int = 1) -> DispatchPlan:
     )
 
 
-def _context(*, artifacts: tuple[Artifact, ...] = ()) -> TaskContext:
+def _context(*, artifacts: tuple[Artifact, ...] = (), timeout_seconds: float = 60.0) -> TaskContext:
     return TaskContext(
         run_id=RUN_ID,
         tenant_id=TENANT_ID,
         mode=TaskMode.DISPATCH,
         request="Write a short answer",
         artifacts=artifacts,
+        timeout_seconds=timeout_seconds,
         token_budget=1000,
     )
 
@@ -381,6 +487,76 @@ async def test_dispatch_framework_timeout_names_the_step_and_actor() -> None:
         and event.payload["actor"] == "writer"
         for event in events
     )
+
+
+async def test_dispatch_step_timeout_retries_with_compact_recovery_prompt() -> None:
+    artifact = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="researcher",
+        content={"text": "large source context " * 500},
+    )
+    factory = StepTimeoutOnceFactory()
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        _one_step_plan(),
+        crew_factory=factory,
+    )
+
+    events = [event async for event in runtime.run(_context(artifacts=(artifact,)))]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert factory.generation.calls == 2
+    retry = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retry.actor == "writer"
+    assert retry.reason == "step execution timed out; retrying with compact recovery"
+    assert retry.payload["attempt"] == 2
+    assert retry.payload["strategy"] == "compact_retry"
+    assert retry.payload["fallback_policy"] == "fail_if_retry_exhausted"
+    assert retry.payload["error_code"] == "crew.step_timeout"
+    assert retry.payload["step_id"] == "final"
+    assert retry.payload["actor"] == "writer"
+    assert "compact_retry" in factory.generation.prompts[1]
+    assert len(factory.generation.prompts[1].encode("utf-8")) < len(
+        factory.generation.prompts[0].encode("utf-8")
+    )
+
+
+async def test_dispatch_step_timeout_recovery_keeps_each_attempt_on_step_deadline() -> None:
+    factory = SlowThenFastStepFactory()
+    runtime = CrewDispatchRuntime(
+        ReviewAwareGateway(),
+        _one_step_plan(timeout_seconds=0.05),
+        crew_factory=factory,
+    )
+
+    events = [event async for event in runtime.run(_context(timeout_seconds=1.0))]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert factory.generation.calls == 2
+    retry = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retry.payload["timeout_policy"] == "use_remaining_step_budget"
+
+
+async def test_dispatch_step_retry_is_suppressed_when_runtime_budget_is_exhausted() -> None:
+    runtime = CrewDispatchRuntime(
+        UnusedGateway(),
+        _one_step_plan(),
+        crew_factory=SlowStepFactory(),
+    )
+    context = _context(timeout_seconds=0.05)
+    events: list[RunEvent] = []
+
+    with pytest.raises(RuntimeExecutionError) as caught:
+        async for event in runtime.run(context):
+            events.append(event)
+
+    assert str(caught.value) in {
+        "dispatch deadline exhausted",
+        "CrewAI step timed out: step=final actor=writer",
+    }
+    assert not any(event.kind is EventKind.STEP_RETRYING for event in events)
+    assert events[-1].kind is EventKind.RUNTIME_FAILED
 
 
 async def test_final_step_prompt_uses_review_packet_for_source_artifacts() -> None:

@@ -1851,28 +1851,43 @@ article:hover {
   gap: 0.5rem;
 }
 
-.agent-workforce-activity {
+.agent-workforce-activity,
+.agent-workforce-activity-card {
   background: rgba(255, 255, 255, 0.035);
   border: 1px solid rgba(123, 225, 255, 0.1);
   border-radius: 0.85rem;
+  color: inherit;
+  cursor: pointer;
   display: grid;
   gap: 0.45rem;
   padding: 0.65rem;
+  text-align: left;
+  width: 100%;
 }
 
-.agent-workforce-activity.is-selected {
+.agent-workforce-activity-card:hover,
+.agent-workforce-activity-card:focus-visible {
+  border-color: rgba(85, 215, 255, 0.34);
+  outline: none;
+}
+
+.agent-workforce-activity.is-selected,
+.agent-workforce-activity-card.is-selected {
   border-color: rgba(85, 215, 255, 0.36);
   box-shadow: inset 3px 0 0 rgba(85, 215, 255, 0.72);
 }
 
-.agent-workforce-activity div {
+.agent-workforce-activity div,
+.agent-workforce-activity-card div {
   align-items: center;
   display: flex;
   gap: 0.5rem;
   min-width: 0;
 }
 
-.agent-workforce-activity small {
+.agent-workforce-activity small,
+.agent-workforce-activity-card small,
+.agent-workforce-activity-meta span {
   background: rgba(85, 215, 255, 0.1);
   border: 1px solid rgba(85, 215, 255, 0.18);
   border-radius: 999px;
@@ -1882,17 +1897,41 @@ article:hover {
   white-space: nowrap;
 }
 
-.agent-workforce-activity strong {
+.agent-workforce-activity strong,
+.agent-workforce-activity-card strong {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.agent-workforce-activity p {
+.agent-workforce-activity p,
+.agent-workforce-activity-card p {
   color: var(--text);
   margin: 0;
   white-space: pre-wrap;
+}
+
+.agent-workforce-activity-card p {
+  display: -webkit-box;
+  line-clamp: 2;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.agent-workforce-activity-meta {
+  align-items: center;
+  color: rgba(178, 194, 216, 0.72);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 0.8rem;
+  gap: 0.5rem;
+}
+
+.agent-workforce-activity-meta time {
+  color: rgba(178, 194, 216, 0.72);
+  font-size: 0.8rem;
 }
 
 .agent-workforce-activity dl {
@@ -1910,6 +1949,60 @@ article:hover {
 }
 
 .agent-workforce-activity dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.activity-detail-backdrop {
+  align-items: stretch;
+  background: rgba(0, 0, 0, 0.28);
+  display: flex;
+  inset: 0;
+  justify-content: flex-end;
+  padding: 1rem;
+  position: fixed;
+  z-index: 45;
+}
+
+.activity-detail-drawer {
+  background:
+    linear-gradient(180deg, rgba(15, 24, 46, 0.98), rgba(5, 10, 22, 0.99)),
+    var(--panel);
+  border: 1px solid rgba(123, 225, 255, 0.22);
+  border-radius: 1.2rem;
+  box-shadow: 0 24px 90px rgba(0, 0, 0, 0.48);
+  display: grid;
+  gap: 0.85rem;
+  max-width: 560px;
+  overflow-y: auto;
+  padding: 1rem;
+  width: min(100%, 560px);
+}
+
+.activity-detail-list {
+  display: grid;
+  gap: 0.65rem;
+  margin: 0;
+}
+
+.activity-detail-list div {
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(123, 225, 255, 0.1);
+  border-radius: 0.75rem;
+  padding: 0.6rem;
+}
+
+.activity-detail-list dt {
+  color: var(--danger);
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.76rem;
+  font-weight: 850;
+  margin-bottom: 0.25rem;
+}
+
+.activity-detail-list dd {
   margin: 0;
   min-width: 0;
   overflow-wrap: anywhere;
@@ -3951,6 +4044,19 @@ article:hover {
 
   .process-drawer {
     max-height: 72dvh;
+    width: 100%;
+  }
+
+  .activity-detail-backdrop {
+    align-items: flex-end;
+    justify-content: center;
+    padding: 0;
+  }
+
+  .activity-detail-drawer {
+    border-radius: 1.1rem 1.1rem 0 0;
+    max-height: 72dvh;
+    max-width: 100%;
     width: 100%;
   }
 
