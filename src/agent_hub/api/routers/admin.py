@@ -15,12 +15,13 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Any, Protocol, cast
+from typing import Annotated, Any, Protocol, TypedDict, cast
 from urllib.parse import unquote, urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import yaml
 from fastapi import APIRouter, Depends, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert
@@ -45,6 +46,11 @@ from agent_hub.evolution import (
     approve_evolution_run_response,
     create_evolution_run_response,
     plan_evolution_next_round,
+)
+from agent_hub.files.generated import (
+    ALLOWED_GENERATED_FILE_MIME_TYPES,
+    GeneratedFileStore,
+    safe_generated_filename,
 )
 from agent_hub.models.capabilities import infer_model_capabilities
 from agent_hub.models.capacity import safe_operational_limit
@@ -271,6 +277,31 @@ class RunArtifactResponse(BaseModel):
     kind: str
     title: str
     text: str | None = None
+    filename: str | None = None
+    mime_type: str | None = None
+    size_bytes: int | None = Field(default=None, ge=0)
+    sha256: str | None = None
+    download_url: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GeneratedArtifactDownload:
+    path: Path
+    filename: str
+    mime_type: str
+
+
+class PublicFileMetadata(TypedDict):
+    filename: str
+    mime_type: str
+    size_bytes: int
+    sha256: str
+    download_url: str
+
+
+class ValidatedFileMetadata(PublicFileMetadata):
+    artifact_id: UUID
+    storage_key: str
 
 
 class RunEventResponse(BaseModel):
@@ -1718,6 +1749,10 @@ class AdminResourceService(Protocol):
 
     async def get_run(self, run_id: UUID) -> RunDetailResponse: ...
 
+    async def download_run_artifact(
+        self, run_id: UUID, artifact_id: UUID
+    ) -> GeneratedArtifactDownload: ...
+
     async def get_conversation(self, conversation_id: str) -> ConversationResponse: ...
 
     async def pause_run(self, run_id: UUID) -> RunDetailResponse: ...
@@ -2663,6 +2698,14 @@ class InMemoryAdminResourceService:
     async def get_run(self, run_id: UUID) -> RunDetailResponse:
         return self.runs[run_id]
 
+    async def download_run_artifact(
+        self, run_id: UUID, artifact_id: UUID
+    ) -> GeneratedArtifactDownload:
+        del artifact_id
+        if run_id not in self.runs:
+            raise KeyError(run_id)
+        raise KeyError("artifact")
+
     async def get_conversation(self, conversation_id: str) -> ConversationResponse:
         return ConversationResponse(
             conversation_id=conversation_id,
@@ -3403,6 +3446,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         run_repository: RunRepository | None = None,
         session_factory: async_sessionmaker[AsyncSession] | None = None,
         skill_store_dir: Path | None = None,
+        generated_artifact_dir: Path | None = None,
     ) -> None:
         super().__init__()
         self._config_service = config_service
@@ -3413,6 +3457,11 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         self._run_repository = run_repository
         self._session_factory = session_factory
         self._skill_store_dir = skill_store_dir or Path("/var/lib/agent-hub/skills")
+        self._generated_file_store = (
+            GeneratedFileStore(generated_artifact_dir)
+            if generated_artifact_dir is not None
+            else None
+        )
 
     async def list_runs(self) -> tuple[RunListItem, ...]:
         if self._run_repository is None:
@@ -3431,6 +3480,37 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         except RunNotFound:
             raise KeyError(run_id) from None
         return await self._run_detail(record)
+
+    async def download_run_artifact(
+        self, run_id: UUID, artifact_id: UUID
+    ) -> GeneratedArtifactDownload:
+        if self._run_repository is None:
+            return await super().download_run_artifact(run_id, artifact_id)
+        try:
+            await self._run_repository.get(self._tenant_id, run_id)
+        except (RunNotFound, KeyError):
+            raise KeyError(run_id) from None
+
+        artifacts = await self._admin_run_artifacts(run_id)
+        file_metadata = _find_file_metadata(artifacts, run_id=run_id, artifact_id=artifact_id)
+        if file_metadata is None:
+            raise KeyError(artifact_id)
+        if self._generated_file_store is None:
+            raise KeyError(artifact_id)
+        try:
+            path = self._generated_file_store.resolve_for(
+                self._tenant_id,
+                run_id,
+                artifact_id,
+                file_metadata["storage_key"],
+            )
+        except (FileNotFoundError, ValueError):
+            raise KeyError(artifact_id) from None
+        return GeneratedArtifactDownload(
+            path=path,
+            filename=file_metadata["filename"],
+            mime_type=file_metadata["mime_type"],
+        )
 
     async def get_conversation(self, conversation_id: str) -> ConversationResponse:
         if self._run_repository is None:
@@ -3543,11 +3623,11 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         assert self._run_repository is not None
         list_item = await self._run_list_item(record)
         events = await self._run_repository.events(self._tenant_id, record.id)
-        artifacts = await self._run_repository.artifacts(self._tenant_id, record.id)
+        artifacts = await self._admin_run_artifacts(record.id)
         return RunDetailResponse(
             **list_item.model_dump(),
             events=[_admin_run_event(event) for event in events],
-            artifacts=[_admin_run_artifact(artifact) for artifact in artifacts],
+            artifacts=[_admin_run_artifact(artifact, run_id=record.id) for artifact in artifacts],
             explicit_details={
                 "source": "database",
                 "version": str(record.version),
@@ -3559,6 +3639,13 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             evolution_proposal=_evolution_proposal(record.routing_decision),
             openclaw_proposal=_openclaw_proposal(record.routing_decision),
         )
+
+    async def _admin_run_artifacts(self, run_id: UUID) -> tuple[dict[str, object], ...]:
+        assert self._run_repository is not None
+        raw_artifacts = getattr(self._run_repository, "raw_artifacts", None)
+        if callable(raw_artifacts):
+            return cast(tuple[dict[str, object], ...], await raw_artifacts(self._tenant_id, run_id))
+        return await self._run_repository.artifacts(self._tenant_id, run_id)
 
     async def list_models(self) -> tuple[ModelDeploymentResponse, ...]:
         revision = await self._config_service.get_current(self._tenant_id)
@@ -6349,18 +6436,123 @@ def _is_sensitive_event_detail_key(key: str) -> bool:
     return any(sensitive in lowered for sensitive in _SENSITIVE_EVENT_DETAIL_KEYS)
 
 
-def _admin_run_artifact(artifact: dict[str, object]) -> RunArtifactResponse:
+def _admin_run_artifact(
+    artifact: dict[str, object],
+    *,
+    run_id: UUID | None = None,
+) -> RunArtifactResponse:
     artifact_id = artifact.get("id")
     artifact_type = artifact.get("type")
     producer = artifact.get("producer")
     content = artifact.get("content")
     title = producer if type(producer) is str and producer else artifact_id
     text = _artifact_text(content)
+    file_metadata = _validated_file_metadata(
+        _artifact_file_metadata(content),
+        run_id=run_id,
+        fallback_artifact_id=artifact_id if type(artifact_id) is str else None,
+    )
     return RunArtifactResponse(
         id=artifact_id if type(artifact_id) is str and artifact_id else "artifact",
         kind=artifact_type if type(artifact_type) is str and artifact_type else "artifact",
         title=title if type(title) is str and title else "artifact",
         text=text,
+        filename=None if file_metadata is None else file_metadata["filename"],
+        mime_type=None if file_metadata is None else file_metadata["mime_type"],
+        size_bytes=None if file_metadata is None else file_metadata["size_bytes"],
+        sha256=None if file_metadata is None else file_metadata["sha256"],
+        download_url=None if file_metadata is None else file_metadata["download_url"],
+    )
+
+
+def _find_file_metadata(
+    artifacts: Iterable[dict[str, object]],
+    *,
+    run_id: UUID,
+    artifact_id: UUID,
+) -> ValidatedFileMetadata | None:
+    for artifact in artifacts:
+        outer_artifact_id = artifact.get("id")
+        metadata = _validated_file_metadata(
+            _artifact_file_metadata(artifact.get("content")),
+            run_id=run_id,
+            fallback_artifact_id=outer_artifact_id if type(outer_artifact_id) is str else None,
+        )
+        if metadata is not None and metadata["artifact_id"] == artifact_id:
+            return metadata
+    return None
+
+
+def _artifact_file_metadata(content: object) -> Mapping[str, object] | None:
+    if not isinstance(content, Mapping):
+        return None
+    candidates: list[object] = [content.get("file")]
+    result = content.get("result")
+    if isinstance(result, Mapping):
+        candidates.append(result.get("file"))
+        candidates.append(result.get("metadata"))
+        metadata = result.get("metadata")
+        if isinstance(metadata, Mapping):
+            candidates.append(metadata.get("file"))
+    for candidate in candidates:
+        if isinstance(candidate, Mapping):
+            return candidate
+    return None
+
+
+def _validated_file_metadata(
+    metadata: Mapping[str, object] | None,
+    *,
+    run_id: UUID | None,
+    fallback_artifact_id: str | None,
+) -> ValidatedFileMetadata | None:
+    if metadata is None:
+        return None
+    if run_id is None:
+        return None
+    raw_artifact_id = metadata.get("artifact_id")
+    if type(raw_artifact_id) is not str or not raw_artifact_id:
+        raw_artifact_id = fallback_artifact_id
+    if type(raw_artifact_id) is not str or not raw_artifact_id:
+        return None
+    try:
+        artifact_id = UUID(raw_artifact_id)
+    except ValueError:
+        return None
+
+    filename = metadata.get("filename")
+    mime_type = metadata.get("mime_type")
+    size_bytes = metadata.get("size_bytes")
+    digest = metadata.get("sha256")
+    storage_key = metadata.get("storage_key")
+    if (
+        type(filename) is not str
+        or type(mime_type) is not str
+        or type(size_bytes) is not int
+        or type(digest) is not str
+        or type(storage_key) is not str
+        or size_bytes < 0
+        or mime_type not in ALLOWED_GENERATED_FILE_MIME_TYPES
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+    ):
+        return None
+    try:
+        safe_filename = safe_generated_filename(filename)
+    except ValueError:
+        return None
+    download_url = (
+        f"/api/v1/admin/runs/{run_id}/artifacts/{artifact_id}/download"
+        if run_id is not None
+        else ""
+    )
+    return ValidatedFileMetadata(
+        artifact_id=artifact_id,
+        filename=safe_filename,
+        mime_type=mime_type,
+        size_bytes=size_bytes,
+        sha256=digest,
+        download_url=download_url,
+        storage_key=storage_key,
     )
 
 
@@ -7592,6 +7784,29 @@ async def get_operational_run(
         return await service.get_run(run_id)
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
+
+
+@router.get(
+    "/runs/{run_id}/artifacts/{artifact_id}/download",
+    response_model=None,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def download_operational_run_artifact(
+    run_id: UUID,
+    artifact_id: UUID,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> FileResponse:
+    _require(principal, "run:read")
+    try:
+        download = await service.download_run_artifact(run_id, artifact_id)
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+    return FileResponse(
+        download.path,
+        media_type=download.mime_type,
+        filename=download.filename,
+    )
 
 
 @router.get(

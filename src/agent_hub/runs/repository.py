@@ -72,6 +72,7 @@ _SENSITIVE_PUBLIC_KEYS = frozenset(
         "authorization",
         "secret",
         "secret_ref",
+        "storage_key",
         "credential_ref",
         "hidden_reasoning",
         "chain_of_thought",
@@ -693,6 +694,18 @@ class RunRepository:
                 )
             ).all()
             return tuple(_public_artifact_payload(dict(row.payload)) for row in rows)
+
+    async def raw_artifacts(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
+        async with self._session_factory() as session:
+            await self._assert_run(session, tenant_id, run_id)
+            rows = (
+                await session.scalars(
+                    select(RunArtifactRow)
+                    .where(RunArtifactRow.tenant_id == tenant_id, RunArtifactRow.run_id == run_id)
+                    .order_by(RunArtifactRow.created_at, RunArtifactRow.id)
+                )
+            ).all()
+            return tuple(dict(row.payload) for row in rows)
 
     async def conversation_context(
         self,

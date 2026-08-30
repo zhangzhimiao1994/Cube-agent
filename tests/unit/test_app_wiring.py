@@ -98,11 +98,16 @@ class BlockingFeishuClient:
             self.cancelled.set()
 
 
-def valid_settings(attachment_store_dir: Path | None = None) -> Settings:
+def valid_settings(
+    attachment_store_dir: Path | None = None,
+    generated_artifact_dir: Path | None = None,
+) -> Settings:
     key = base64.urlsafe_b64encode(b"x" * 32).decode("ascii").rstrip("=")
     values: dict[str, object] = {"jwt_signing_key": "base64url:" + key}
     if attachment_store_dir is not None:
         values["attachment_store_dir"] = attachment_store_dir
+    if generated_artifact_dir is not None:
+        values["generated_artifact_dir"] = generated_artifact_dir
     return Settings.model_validate(values)
 
 
@@ -163,6 +168,25 @@ def test_create_app_wires_production_feishu_media_service_factory(tmp_path: Path
         )
 
     assert isinstance(service, FeishuMediaService)
+
+
+def test_create_app_wires_admin_generated_artifact_store(tmp_path: Path) -> None:
+    generated_artifact_dir = tmp_path / "generated"
+    application = create_app(
+        settings=valid_settings(tmp_path / "attachments", generated_artifact_dir),
+        database=FakeDatabase(),
+        redis_client=FakeRedis(),
+        auth_service=StubAuthService(),
+        rate_limiter=StubRateLimiter(),
+        config_service=StubConfigService(),
+        user_admin_service=object(),
+        run_service=object(),
+    )
+
+    with TestClient(application):
+        service = application.state.admin_resource_service
+
+    assert service._generated_file_store._root == generated_artifact_dir.resolve()
 
 
 

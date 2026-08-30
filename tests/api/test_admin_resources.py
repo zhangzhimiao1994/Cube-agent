@@ -8,6 +8,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, cast
 from urllib.parse import quote
 from uuid import UUID, uuid4
@@ -43,6 +44,7 @@ from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Ro
 from agent_hub.config.repository import ConfigRevision, ConfigStatus
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.evolution import EvolutionNextRoundExecutionRequest, EvolutionRunRequest
+from agent_hub.files.generated import GeneratedFileStore
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.registry import NoCapableDeployment
 from agent_hub.models.types import (
@@ -57,7 +59,7 @@ from agent_hub.multimodal.generation import (
     MultimediaGenerationExecutor,
 )
 from agent_hub.multimodal.video_providers import VideoProviderGenerationError
-from agent_hub.runs.repository import RunRecord
+from agent_hub.runs.repository import RunRecord, _public_artifact_payload
 from agent_hub.scheduler.service import SchedulerService
 from agent_hub.scheduler.types import TaskRequest
 from agent_hub.security.secrets import SecretReference
@@ -1411,6 +1413,79 @@ def headers() -> dict[str, str]:
     return {"Authorization": "Bearer valid-token"}
 
 
+def _client_with_file_artifact(
+    generated_artifact_dir: Path,
+    run_id: UUID,
+    outer_artifact_id: UUID,
+    file_metadata: dict[str, str | int],
+) -> TestClient:
+    class FakeRunRepository:
+        async def get(self, tenant_id: UUID, requested_run_id: UUID) -> RunRecord:
+            assert tenant_id == TENANT_ID
+            if requested_run_id != run_id:
+                raise KeyError(requested_run_id)
+            return RunRecord(
+                id=run_id,
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+                request="Generate a downloadable report.",
+                mode=TaskMode.DISPATCH,
+                status=RunStatus.COMPLETED,
+                version=1,
+                created_at=datetime.now(UTC),
+                routing_decision=None,
+            )
+
+        async def usage_cost(self, tenant_id: UUID, requested_run_id: UUID) -> str:
+            assert tenant_id == TENANT_ID
+            assert requested_run_id == run_id
+            return "0"
+
+        async def events(
+            self, tenant_id: UUID, requested_run_id: UUID
+        ) -> tuple[dict[str, object], ...]:
+            assert tenant_id == TENANT_ID
+            assert requested_run_id == run_id
+            return ()
+
+        async def artifacts(
+            self, tenant_id: UUID, requested_run_id: UUID
+        ) -> tuple[dict[str, object], ...]:
+            return tuple(
+                _public_artifact_payload(dict(artifact))
+                for artifact in await self.raw_artifacts(tenant_id, requested_run_id)
+            )
+
+        async def raw_artifacts(
+            self, tenant_id: UUID, requested_run_id: UUID
+        ) -> tuple[dict[str, object], ...]:
+            assert tenant_id == TENANT_ID
+            assert requested_run_id == run_id
+            return (
+                {
+                    "id": str(outer_artifact_id),
+                    "type": "tool_result",
+                    "producer": "document.generate_docx",
+                    "content": {"result": {"file": file_metadata}},
+                },
+            )
+
+    service = PersistentAdminResourceService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        run_repository=FakeRunRepository(),  # type: ignore[arg-type]
+        generated_artifact_dir=generated_artifact_dir,
+    )
+    app = create_app(
+        auth_service=StubAuthService(),
+        rate_limiter=object(),
+        admin_resource_service=service,
+    )
+    return TestClient(app)
+
+
 @dataclass(frozen=True, slots=True)
 class SubmittedScheduleRun:
     id: UUID
@@ -2707,6 +2782,170 @@ def test_admin_run_artifact_does_not_expose_sensitive_text() -> None:
     )
 
     assert artifact.text is None
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        {
+            "file": {
+                "filename": "report.docx",
+                "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "size_bytes": 9,
+                "sha256": "a" * 64,
+                "artifact_id": "33333333-3333-4333-8333-333333333333",
+                "storage_key": (
+                    "00000000-0000-4000-8000-000000000001/"
+                    "22222222-2222-4222-8222-222222222222/"
+                    "33333333-3333-4333-8333-333333333333/report.docx"
+                ),
+                "download_url": "https://attacker.example/download",
+            }
+        },
+        {
+            "result": {
+                "file": {
+                    "filename": "deck.pptx",
+                    "mime_type": (
+                        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                    ),
+                    "size_bytes": 10,
+                    "sha256": "b" * 64,
+                    "artifact_id": "33333333-3333-4333-8333-333333333333",
+                    "storage_key": (
+                        "00000000-0000-4000-8000-000000000001/"
+                        "22222222-2222-4222-8222-222222222222/"
+                        "33333333-3333-4333-8333-333333333333/deck.pptx"
+                    ),
+                    "download_url": "https://attacker.example/download",
+                }
+            }
+        },
+        {
+            "result": {
+                "metadata": {
+                    "filename": "memo.docx",
+                    "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "size_bytes": 11,
+                    "sha256": "c" * 64,
+                    "artifact_id": "33333333-3333-4333-8333-333333333333",
+                    "storage_key": (
+                        "00000000-0000-4000-8000-000000000001/"
+                        "22222222-2222-4222-8222-222222222222/"
+                        "33333333-3333-4333-8333-333333333333/memo.docx"
+                    ),
+                    "download_url": "https://attacker.example/download",
+                }
+            }
+        },
+    ],
+)
+def test_admin_run_artifact_exposes_public_file_metadata_without_storage_key(
+    content: dict[str, object],
+) -> None:
+    artifact = _admin_run_artifact(
+        {
+            "id": "33333333-3333-4333-8333-333333333333",
+            "type": "tool_result",
+            "producer": "document.generate_docx",
+            "content": content,
+        },
+        run_id=UUID("22222222-2222-4222-8222-222222222222"),
+    )
+
+    assert artifact.filename is not None
+    assert artifact.mime_type is not None
+    assert artifact.size_bytes is not None
+    assert artifact.sha256 is not None
+    assert (
+        artifact.download_url
+        == "/api/v1/admin/runs/22222222-2222-4222-8222-222222222222/"
+        "artifacts/33333333-3333-4333-8333-333333333333/download"
+    )
+    assert "storage_key" not in artifact.model_dump(exclude_none=True)
+
+
+def test_admin_run_artifact_ignores_invalid_file_metadata() -> None:
+    artifact = _admin_run_artifact(
+        {
+            "id": "33333333-3333-4333-8333-333333333333",
+            "type": "tool_result",
+            "producer": "document.generate_docx",
+            "content": {
+                "file": {
+                    "filename": "../escape.docx",
+                    "mime_type": "text/html",
+                    "size_bytes": -1,
+                    "sha256": "not-a-digest",
+                    "storage_key": "invalid",
+                    "download_url": "https://attacker.example/download",
+                }
+            },
+        },
+        run_id=UUID("22222222-2222-4222-8222-222222222222"),
+    )
+
+    assert artifact.filename is None
+    assert artifact.mime_type is None
+    assert artifact.size_bytes is None
+    assert artifact.sha256 is None
+    assert artifact.download_url is None
+
+
+def test_admin_run_artifact_download_returns_stored_file(tmp_path: Path) -> None:
+    run_id = UUID("22222222-2222-4222-8222-222222222222")
+    artifact_id = UUID("33333333-3333-4333-8333-333333333333")
+    outer_artifact_id = UUID("55555555-5555-4555-8555-555555555555")
+    data = b"docx-bytes"
+    metadata = GeneratedFileStore(tmp_path).store_bytes(
+        tenant_id=TENANT_ID,
+        run_id=run_id,
+        artifact_id=artifact_id,
+        filename="report.docx",
+        mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        data=data,
+    )
+    file_metadata = metadata.to_content_file()
+    file_metadata["artifact_id"] = str(artifact_id)
+    api = _client_with_file_artifact(tmp_path, run_id, outer_artifact_id, file_metadata)
+
+    response = api.get(
+        f"/api/v1/admin/runs/{run_id}/artifacts/{artifact_id}/download",
+        headers=headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.content == data
+    assert response.headers["content-type"].startswith(metadata.mime_type)
+    assert "report.docx" in response.headers["content-disposition"]
+
+
+def test_admin_run_artifact_download_rejects_storage_key_from_other_artifact(
+    tmp_path: Path,
+) -> None:
+    run_id = UUID("22222222-2222-4222-8222-222222222222")
+    artifact_id = UUID("33333333-3333-4333-8333-333333333333")
+    other_artifact_id = UUID("44444444-4444-4444-8444-444444444444")
+    outer_artifact_id = UUID("55555555-5555-4555-8555-555555555555")
+    metadata = GeneratedFileStore(tmp_path).store_bytes(
+        tenant_id=TENANT_ID,
+        run_id=run_id,
+        artifact_id=other_artifact_id,
+        filename="other.docx",
+        mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        data=b"wrong-context",
+    )
+    file_metadata = metadata.to_content_file()
+    file_metadata["artifact_id"] = str(artifact_id)
+    api = _client_with_file_artifact(tmp_path, run_id, outer_artifact_id, file_metadata)
+
+    response = api.get(
+        f"/api/v1/admin/runs/{run_id}/artifacts/{artifact_id}/download",
+        headers=headers(),
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
 
 
 def test_conversation_can_be_loaded_by_session_id() -> None:
