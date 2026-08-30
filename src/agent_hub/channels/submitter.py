@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from agent_hub.auth.models import Role
 from agent_hub.channels.base import InboundMessage
 from agent_hub.channels.directives import (
     ChannelDirectiveError,
@@ -37,6 +38,7 @@ class RunSubmissionService(Protocol):
         *,
         tenant_id: UUID,
         actor_id: UUID,
+        actor_role: Role | None = None,
         message: str,
         mode: TaskMode,
         attachment_ids: tuple[str, ...] = (),
@@ -82,6 +84,7 @@ class RunServiceInboundSubmitter:
         submitted = await self.run_service.submit(
             tenant_id=self.tenant_id,
             actor_id=actor_id,
+            actor_role=Role.OPERATOR,
             message=task_text,
             mode=TaskMode.AUTO,
             attachment_ids=attachment_ids,

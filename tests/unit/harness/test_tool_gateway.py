@@ -121,6 +121,18 @@ def workspace_dot_file_request() -> HarnessToolCallRequest:
     )
 
 
+def workspace_relative_file_request() -> HarnessToolCallRequest:
+    return HarnessToolCallRequest(
+        run_id=RUN_ID,
+        actor="main_agent",
+        tool_name="workspace.read",
+        arguments={"path": "README.md"},
+        approval_required=False,
+        sandbox="read_only",
+        idempotency_key="workspace_relative_1",
+    )
+
+
 async def test_harness_tool_gateway_executes_approved_available_tools() -> None:
     runtime = FakeRuntimeCapabilityGateway()
     gateway = HarnessToolGateway(runtime)
@@ -216,6 +228,26 @@ async def test_harness_tool_gateway_maps_workspace_dot_name_to_file_read_policy(
     assert runtime.calls == []
 
 
+async def test_harness_tool_gateway_maps_relative_workspace_path_to_policy_namespace() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    policy = FakePolicyGateway(CapabilityStatus.DENIED, reason="capability denied")
+    gateway = HarnessToolGateway(runtime, policy_gateway=policy)
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        workspace_relative_file_request(),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    capability_request = policy.requests[0][0]
+    assert capability_request.capability == "file"
+    assert capability_request.operation == "read"
+    assert capability_request.resource == "workspace/README.md"
+    assert runtime.calls == []
+
+
 async def test_harness_tool_gateway_denies_before_runtime_execute() -> None:
     runtime = FakeRuntimeCapabilityGateway()
     policy = FakePolicyGateway(CapabilityStatus.DENIED, reason="capability denied")
@@ -237,6 +269,30 @@ async def test_harness_tool_gateway_denies_before_runtime_execute() -> None:
     assert capability_request.resource == "calculator"
     assert capability_request.arguments == {"expression": "2+3*4"}
     assert capability_request.idempotency_key == "calc_1"
+
+
+async def test_policy_gated_harness_fails_closed_when_actor_identity_is_missing() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    policy = FakePolicyGateway(CapabilityStatus.ALLOWED)
+    gateway = HarnessToolGateway(runtime, policy_gateway=policy)
+
+    result = await gateway.invoke(TENANT_ID, request())
+
+    assert result.status == "failed"
+    assert result.failure_reason == "capability identity unavailable"
+    assert policy.requests == []
+    assert runtime.calls == []
+
+
+async def test_identity_required_harness_fails_closed_without_policy_gateway() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    gateway = HarnessToolGateway(runtime, require_actor_identity=True)
+
+    result = await gateway.invoke(TENANT_ID, request())
+
+    assert result.status == "failed"
+    assert result.failure_reason == "capability identity unavailable"
+    assert runtime.calls == []
 
 
 async def test_harness_tool_gateway_waiting_approval_does_not_execute_backend() -> None:

@@ -306,9 +306,12 @@ class HybridRuntime:
         child_context = TaskContext(
             run_id=parent.run_id,
             tenant_id=parent.tenant_id,
+            actor_id=parent.actor_id,
+            actor_role=parent.actor_role,
             mode=mode,
             request=parent.request,
             artifacts=artifacts,
+            routing_decision=parent.routing_decision,
             timeout_seconds=parent.timeout_seconds,
             token_budget=parent.token_budget,
         )

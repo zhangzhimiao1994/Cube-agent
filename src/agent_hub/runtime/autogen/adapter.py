@@ -50,7 +50,10 @@ from autogen_core.tools import BaseTool, Tool, ToolSchema
 from opentelemetry.trace import NoOpTracerProvider
 from pydantic import BaseModel, ConfigDict
 
+from agent_hub.auth.models import Role
 from agent_hub.domain.runs import TaskMode
+from agent_hub.harness import HarnessToolGateway
+from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import (
     ModelCapability,
@@ -461,6 +464,55 @@ class CapabilityGateway(Protocol):
     def is_replay_safe(self, name: str) -> bool: ...
 
 
+class HarnessToolInvoker(Protocol):
+    async def invoke(
+        self,
+        tenant_id: UUID,
+        request: HarnessToolCallRequest,
+        *,
+        user_id: UUID | None = None,
+        role: Role | None = None,
+    ) -> HarnessToolCallResult: ...
+
+
+class _CapabilityHarnessBackend:
+    def __init__(self, gateway: CapabilityGateway) -> None:
+        self._gateway = gateway
+
+    def is_available(self, tenant_id: UUID, name: str) -> bool:
+        available = getattr(self._gateway, "is_available", None)
+        if callable(available):
+            return bool(available(tenant_id, name))
+        return True
+
+    async def execute(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        return await self._gateway.execute(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            actor=actor,
+            name=name,
+            arguments=arguments,
+            idempotency_key=idempotency_key,
+        )
+
+
+def _tool_sandbox(name: str) -> str:
+    if name in {"read_context", "workspace_read", "workspace.read"}:
+        return "read_only"
+    if name in {"calculator", "calculator_evaluate", "calculator.evaluate"}:
+        return "none"
+    return "restricted"
+
+
 def _safe_id(value: str, name: str) -> str:
     if type(value) is not str or _ID.fullmatch(value) is None:
         raise ValueError(f"{name} must be a safe identifier")
@@ -598,7 +650,7 @@ class _ToolRecord:
 
 
 class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult]):
-    """AutoGen tool facade with no execution path outside CapabilityGateway."""
+    """AutoGen tool facade with no execution path outside HarnessToolGateway."""
 
     def __init__(
         self,
@@ -610,6 +662,9 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
         name: str,
         records: list[_ToolRecord],
         durability: _DiscussionDurability,
+        harness_tool_gateway: HarnessToolInvoker,
+        user_id: UUID | None = None,
+        role: Role | None = None,
     ) -> None:
         super().__init__(
             _DynamicToolArguments,
@@ -623,6 +678,9 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
         self._actor = actor
         self._records = records
         self._durability = durability
+        self._tool_gateway = harness_tool_gateway
+        self._user_id = user_id
+        self._role = role
 
     async def run(
         self, args: _DynamicToolArguments, cancellation_token: CancellationToken
@@ -694,25 +752,39 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                 )
             )
             return _DynamicToolResult(result=cast(dict[str, object], dict(replayed)))
-        task = asyncio.create_task(
-            self._gateway.execute(
-                tenant_id=self._tenant_id,
+        try:
+            tool_request = HarnessToolCallRequest(
                 run_id=self._run_id,
                 actor=self._actor,
-                name=self.name,
+                tool_name=self.name,
                 arguments=cast(Mapping[str, JsonValue], arguments),
+                approval_required=False,
+                sandbox=_tool_sandbox(self.name),
                 idempotency_key=idempotency_key,
+                call_id=safe_call_id,
+            )
+        except (TypeError, ValueError):
+            self._records.append(
+                _ToolRecord(
+                    EventKind.TOOL_FAILED,
+                    self._actor,
+                    safe_call_id,
+                    self.name,
+                    reason="capability execution failed",
+                )
+            )
+            raise RuntimeExecutionError("capability execution failed") from None
+        task = asyncio.create_task(
+            self._tool_gateway.invoke(
+                self._tenant_id,
+                tool_request,
+                user_id=self._user_id,
+                role=self._role,
             )
         )
         cancellation_token.link_future(task)
         try:
-            result = await task
-            artifact = Artifact(
-                id=uuid4(),
-                type="tool_result",
-                producer=self._actor,
-                content={"result": result},
-            )
+            tool_result = await task
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001 - hostile capability boundary
@@ -728,6 +800,23 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                 )
             )
             raise RuntimeExecutionError("capability outcome is uncertain") from None
+        if tool_result.status != "succeeded":
+            self._records.append(
+                _ToolRecord(
+                    EventKind.TOOL_FAILED,
+                    self._actor,
+                    safe_call_id,
+                    self.name,
+                    reason=tool_result.failure_reason or "capability execution failed",
+                )
+            )
+            raise RuntimeExecutionError("capability execution failed") from None
+        artifact = Artifact(
+            id=uuid4(),
+            type="tool_result",
+            producer=self._actor,
+            content={"result": tool_result.payload},
+        )
         self._records.append(
             _ToolRecord(
                 EventKind.TOOL_COMPLETED,
@@ -738,7 +827,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
             )
         )
         await self._durability.succeed_tool(artifact)
-        return _DynamicToolResult(result=cast(dict[str, object], dict(result)))
+        return _DynamicToolResult(result=cast(dict[str, object], dict(tool_result.payload)))
 
 
 class GatewayChatCompletionClient(ChatCompletionClient):
@@ -988,6 +1077,7 @@ class AutoGenDiscussionRuntime:
         plan: DiscussionPlan,
         *,
         capability_gateway: CapabilityGateway | None = None,
+        harness_tool_gateway: HarnessToolInvoker | None = None,
         artifact_repository: ArtifactRepository | None = None,
     ) -> None:
         if (
@@ -1003,6 +1093,13 @@ class AutoGenDiscussionRuntime:
         ):
             raise ValueError("configured discussion tools require CapabilityGateway")
         self._capabilities = capability_gateway
+        self._tool_gateway = harness_tool_gateway
+        if self._tool_gateway is None and capability_gateway is not None:
+            self._tool_gateway = HarnessToolGateway(
+                _CapabilityHarnessBackend(capability_gateway),
+                require_actor_identity=True,
+                raise_backend_errors=True,
+            )
         self._repository = artifact_repository or InMemoryArtifactRepository()
         self._active_task: asyncio.Task[Any] | None = None
         self._cancel_token: CancellationToken | None = None
@@ -1146,6 +1243,27 @@ class AutoGenDiscussionRuntime:
                 durability=durability,
             )
             tool_records: list[_ToolRecord] = []
+
+            def drain_tool_records() -> tuple[RunEvent, ...]:
+                nonlocal sequence
+                events: list[RunEvent] = []
+                while tool_records:
+                    record = tool_records.pop(0)
+                    events.append(
+                        RunEvent(
+                            kind=record.kind,
+                            sequence=sequence,
+                            run_id=context.run_id,
+                            actor=record.actor,
+                            tool_call_id=record.call_id,
+                            tool_name=record.name,
+                            artifact=record.artifact,
+                            reason=record.reason,
+                        )
+                    )
+                    sequence += 1
+                return tuple(events)
+
             agents: list[ChatAgent | Team] = [
                 cast(
                     ChatAgent,
@@ -1162,6 +1280,11 @@ class AutoGenDiscussionRuntime:
                                     name=name,
                                     records=tool_records,
                                     durability=durability,
+                                    harness_tool_gateway=cast(
+                                        HarnessToolInvoker, self._tool_gateway
+                                    ),
+                                    user_id=context.actor_id,
+                                    role=context.actor_role,
                                 )
                                 for name in participant.allowed_tools
                             ]
@@ -1244,19 +1367,15 @@ class AutoGenDiscussionRuntime:
                         item = item_task.result()
                     except StopAsyncIteration:
                         break
-                    while tool_records:
-                        record = tool_records.pop(0)
-                        yield RunEvent(
-                            kind=record.kind,
-                            sequence=sequence,
-                            run_id=context.run_id,
-                            actor=record.actor,
-                            tool_call_id=record.call_id,
-                            tool_name=record.name,
-                            artifact=record.artifact,
-                            reason=record.reason,
-                        )
-                        sequence += 1
+                    except RuntimeExecutionError:
+                        for event in drain_tool_records():
+                            yield event
+                        raise
+                    drained_tool_events = drain_tool_records()
+                    for event in drained_tool_events:
+                        yield event
+                    if any(event.kind is EventKind.TOOL_FAILED for event in drained_tool_events):
+                        raise RuntimeExecutionError("capability execution failed") from None
                     if isinstance(item, BaseChatMessage) and item.source != "user":
                         text = item.to_text()
                         artifact = Artifact(

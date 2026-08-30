@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from agent_hub.auth.models import Role
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.routing.types import (
     EXECUTABLE_MODES,
@@ -65,10 +66,11 @@ class FakeRepository:
         mode: TaskMode | None,
         status: RunStatus,
         idempotency_key: str | None,
+        actor_role: Role | None = None,
         routing_decision: dict[str, object] | None = None,
         enqueue: bool,
     ) -> RunRecord:
-        del idempotency_key
+        del idempotency_key, actor_role
         run_id = uuid4()
         record = RunRecord(
             id=run_id,

@@ -13,6 +13,7 @@ from decimal import Decimal
 from typing import Protocol, cast
 from uuid import UUID, uuid4
 
+from agent_hub.auth.models import Role
 from agent_hub.context.builder import ContextBuildInput, estimate_tokens
 from agent_hub.context.compaction import ContextCompactor
 from agent_hub.domain.runs import RunStatus, TaskMode
@@ -333,6 +334,7 @@ class RunService:
         *,
         tenant_id: UUID,
         actor_id: UUID,
+        actor_role: Role | None = None,
         message: str,
         mode: TaskMode,
         agent_ids: tuple[str, ...] = (),
@@ -382,6 +384,7 @@ class RunService:
             return await self._create_evolution_approval_run(
                 tenant_id=tenant_id,
                 actor_id=actor_id,
+                actor_role=actor_role,
                 message=message,
                 mode=evolution_proposal.mode,
                 proposal=evolution_proposal,
@@ -397,6 +400,7 @@ class RunService:
             return await self._create_schedule_approval_run(
                 tenant_id=tenant_id,
                 actor_id=actor_id,
+                actor_role=actor_role,
                 message=message,
                 mode=schedule_proposal.mode,
                 proposal=schedule_proposal,
@@ -412,6 +416,7 @@ class RunService:
             return await self._create_openclaw_approval_run(
                 tenant_id=tenant_id,
                 actor_id=actor_id,
+                actor_role=actor_role,
                 message=message,
                 mode=TaskMode.DISPATCH if mode is TaskMode.AUTO else mode,
                 proposal=openclaw_proposal,
@@ -430,6 +435,7 @@ class RunService:
                 record = await self._repository.create_run(
                     tenant_id=tenant_id,
                     actor_id=actor_id,
+                    actor_role=actor_role,
                     request=message,
                     mode=explicit_mode,
                     status=RunStatus.QUEUED,
@@ -459,6 +465,7 @@ class RunService:
                 record = await self._repository.create_run(
                     tenant_id=tenant_id,
                     actor_id=actor_id,
+                    actor_role=actor_role,
                     request=message,
                     mode=continuation_mode,
                     status=RunStatus.QUEUED,
@@ -507,6 +514,7 @@ class RunService:
                     return await self._create_temporary_agent_approval_run(
                         tenant_id=tenant_id,
                         actor_id=actor_id,
+                        actor_role=actor_role,
                         message=message,
                         mode=selected_mode,
                         proposal=proposal,
@@ -516,6 +524,7 @@ class RunService:
                 record = await self._repository.create_run(
                     tenant_id=tenant_id,
                     actor_id=actor_id,
+                    actor_role=actor_role,
                     request=message,
                     mode=selected_mode,
                     status=RunStatus.QUEUED,
@@ -552,6 +561,7 @@ class RunService:
                         return await self._create_temporary_agent_approval_run(
                             tenant_id=tenant_id,
                             actor_id=actor_id,
+                            actor_role=actor_role,
                             message=message,
                             mode=local_mode,
                             proposal=proposal,
@@ -561,6 +571,7 @@ class RunService:
                     record = await self._repository.create_run(
                         tenant_id=tenant_id,
                         actor_id=actor_id,
+                        actor_role=actor_role,
                         request=message,
                         mode=local_mode,
                         status=RunStatus.QUEUED,
@@ -603,6 +614,7 @@ class RunService:
                     return await self._create_temporary_agent_approval_run(
                         tenant_id=tenant_id,
                         actor_id=actor_id,
+                        actor_role=actor_role,
                         message=message,
                         mode=hermes_advice.recommended_mode,
                         proposal=proposal,
@@ -612,6 +624,7 @@ class RunService:
                 record = await self._repository.create_run(
                     tenant_id=tenant_id,
                     actor_id=actor_id,
+                    actor_role=actor_role,
                     request=message,
                     mode=hermes_advice.recommended_mode,
                     status=RunStatus.QUEUED,
@@ -651,6 +664,7 @@ class RunService:
                         return await self._create_temporary_agent_approval_run(
                             tenant_id=tenant_id,
                             actor_id=actor_id,
+                            actor_role=actor_role,
                             message=message,
                             mode=local_mode,
                             proposal=proposal,
@@ -660,6 +674,7 @@ class RunService:
                     record = await self._repository.create_run(
                         tenant_id=tenant_id,
                         actor_id=actor_id,
+                        actor_role=actor_role,
                         request=message,
                         mode=local_mode,
                         status=RunStatus.QUEUED,
@@ -704,6 +719,7 @@ class RunService:
                     return await self._create_temporary_agent_approval_run(
                         tenant_id=tenant_id,
                         actor_id=actor_id,
+                        actor_role=actor_role,
                         message=message,
                         mode=selected.mode,
                         proposal=proposal,
@@ -713,6 +729,7 @@ class RunService:
                 record = await self._repository.create_run(
                     tenant_id=tenant_id,
                     actor_id=actor_id,
+                    actor_role=actor_role,
                     request=message,
                     mode=selected.mode,
                     status=RunStatus.QUEUED,
@@ -744,6 +761,7 @@ class RunService:
                     record = await self._repository.create_run(
                         tenant_id=tenant_id,
                         actor_id=actor_id,
+                        actor_role=actor_role,
                         request=message,
                         mode=local_mode,
                         status=RunStatus.QUEUED,
@@ -762,6 +780,7 @@ class RunService:
                 record = await self._repository.create_run(
                     tenant_id=tenant_id,
                     actor_id=actor_id,
+                    actor_role=actor_role,
                     request=message,
                     mode=None,
                     status=RunStatus.WAITING_USER_MODE,
@@ -795,6 +814,7 @@ class RunService:
             record = await self._repository.create_run(
                 tenant_id=tenant_id,
                 actor_id=actor_id,
+                actor_role=actor_role,
                 request=message,
                 mode=None,
                 status=RunStatus.WAITING_USER_MODE,
@@ -828,6 +848,7 @@ class RunService:
             return await self._create_temporary_agent_approval_run(
                 tenant_id=tenant_id,
                 actor_id=actor_id,
+                actor_role=actor_role,
                 message=message,
                 mode=mode,
                 proposal=proposal,
@@ -838,6 +859,7 @@ class RunService:
         record = await self._repository.create_run(
             tenant_id=tenant_id,
             actor_id=actor_id,
+            actor_role=actor_role,
             request=message,
             mode=mode,
             status=RunStatus.QUEUED,
@@ -1100,6 +1122,7 @@ class RunService:
             row, checkpoint = claimed
             tenant_id = row.tenant_id
             actor_id = row.actor_id
+            actor_role = _actor_role_from_row(row)
             assert row.mode is not None
             mode = TaskMode(row.mode)
             request = row.request
@@ -1117,6 +1140,8 @@ class RunService:
             context = TaskContext(
                 run_id=run_id,
                 tenant_id=tenant_id,
+                actor_id=actor_id,
+                actor_role=actor_role,
                 mode=mode,
                 request=request,
                 artifacts=await self._conversation_artifacts(
@@ -1143,6 +1168,9 @@ class RunService:
                         break
                     if current_status is RunStatus.PAUSED:
                         terminal = RunStatus.PAUSED
+                        break
+                    if current_status is RunStatus.WAITING_APPROVAL:
+                        terminal = RunStatus.WAITING_APPROVAL
                         break
                     await self._repository.persist_event(
                         session,
@@ -1174,6 +1202,8 @@ class RunService:
                 run_id,
                 reason=_runtime_failure_reason(error),
             )
+            if failed.status is RunStatus.WAITING_APPROVAL:
+                return _submitted(failed)
             await self._safe_record_hermes_outcome(
                 tenant_id=failed.tenant_id,
                 actor_id=failed.actor_id,
@@ -1397,6 +1427,7 @@ class RunService:
         *,
         tenant_id: UUID,
         actor_id: UUID,
+        actor_role: Role | None,
         message: str,
         mode: TaskMode,
         proposal: TemporaryAgentProposal,
@@ -1408,6 +1439,7 @@ class RunService:
         record = await self._repository.create_run(
             tenant_id=tenant_id,
             actor_id=actor_id,
+            actor_role=actor_role,
             request=message,
             mode=mode,
             status=RunStatus.WAITING_APPROVAL,
@@ -1428,6 +1460,7 @@ class RunService:
         *,
         tenant_id: UUID,
         actor_id: UUID,
+        actor_role: Role | None,
         message: str,
         mode: TaskMode,
         proposal: EvolutionProposal,
@@ -1439,6 +1472,7 @@ class RunService:
         record = await self._repository.create_run(
             tenant_id=tenant_id,
             actor_id=actor_id,
+            actor_role=actor_role,
             request=message,
             mode=mode,
             status=RunStatus.WAITING_APPROVAL,
@@ -1459,6 +1493,7 @@ class RunService:
         *,
         tenant_id: UUID,
         actor_id: UUID,
+        actor_role: Role | None,
         message: str,
         mode: TaskMode,
         proposal: ScheduleProposal,
@@ -1470,6 +1505,7 @@ class RunService:
         record = await self._repository.create_run(
             tenant_id=tenant_id,
             actor_id=actor_id,
+            actor_role=actor_role,
             request=message,
             mode=mode,
             status=RunStatus.WAITING_APPROVAL,
@@ -1490,6 +1526,7 @@ class RunService:
         *,
         tenant_id: UUID,
         actor_id: UUID,
+        actor_role: Role | None,
         message: str,
         mode: TaskMode,
         proposal: OpenClawProposal,
@@ -1501,6 +1538,7 @@ class RunService:
         record = await self._repository.create_run(
             tenant_id=tenant_id,
             actor_id=actor_id,
+            actor_role=actor_role,
             request=message,
             mode=mode,
             status=RunStatus.WAITING_APPROVAL,
@@ -1546,6 +1584,17 @@ class RunService:
             )
         except Exception:
             _LOGGER.exception("hermes_outcome_record_failed run_id=%s", run_id)
+
+
+def _actor_role_from_row(row: object) -> Role | None:
+    raw_role = getattr(row, "actor_role", None)
+    if raw_role is None:
+        return None
+    if isinstance(raw_role, Role):
+        return raw_role
+    if isinstance(raw_role, str):
+        return Role(raw_role)
+    raise TypeError("run actor_role must be a role value")
 
 
 def _submitted(record: RunRecord) -> SubmittedRun:

@@ -7,11 +7,13 @@ from uuid import uuid4
 
 import pytest
 
+from agent_hub.auth.models import Role
 from agent_hub.domain.runs import TaskMode
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
+    JsonValue,
     RunEvent,
     RuntimeCheckpoint,
     TaskContext,
@@ -70,14 +72,16 @@ def artifact(
     )
 
 
-def context(inputs: tuple[Artifact, ...] = ()) -> TaskContext:
-    return TaskContext(
-        run_id=uuid4(),
-        tenant_id=uuid4(),
-        mode=TaskMode.HYBRID,
-        request="Resolve the question.",
-        artifacts=inputs,
-    )
+def context(inputs: tuple[Artifact, ...] = (), **changes: object) -> TaskContext:
+    payload = {
+        "run_id": uuid4(),
+        "tenant_id": uuid4(),
+        "mode": TaskMode.HYBRID,
+        "request": "Resolve the question.",
+        "artifacts": inputs,
+        **changes,
+    }
+    return TaskContext.model_validate(payload)
 
 
 async def collect(runtime: HybridRuntime, ctx: TaskContext) -> list[Any]:
@@ -102,6 +106,37 @@ async def test_hybrid_passes_only_artifacts_between_fresh_framework_contexts() -
     started = next(event for event in events if event.kind is EventKind.DISCUSSION_STARTED)
     assert started.inputs == (dispatch_output,)
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_hybrid_child_context_preserves_actor_identity_and_routing_decision() -> None:
+    actor_id = uuid4()
+    routing: dict[str, JsonValue] = {
+        "source": "trusted-api",
+        "selected_agent_ids": ("researcher",),
+    }
+    dispatch_output = artifact("researcher", "evidence")
+    discussion_output = artifact("critic", "review", sources=(str(dispatch_output.id),))
+    final_output = artifact("main", "answer", sources=(str(discussion_output.id),))
+    dispatch = RecordingRuntime(TaskMode.DISPATCH, dispatch_output)
+    discussion = RecordingRuntime(TaskMode.DISCUSS, discussion_output)
+    synthesis = RecordingRuntime(TaskMode.DIRECT, final_output)
+    runtime = HybridRuntime(dispatch, discussion, synthesis)
+
+    await collect(
+        runtime,
+        context(actor_id=actor_id, actor_role=Role.OPERATOR, routing_decision=routing),
+    )
+
+    child_contexts = (
+        dispatch.contexts[0],
+        discussion.contexts[0],
+        synthesis.contexts[0],
+    )
+    for child in child_contexts:
+        assert child.actor_id == actor_id
+        assert child.actor_role is Role.OPERATOR
+        assert child.routing_decision == routing
+        assert child.checkpoint is None
 
 
 async def test_dispatch_to_hybrid_upgrade_does_not_repeat_existing_artifacts() -> None:

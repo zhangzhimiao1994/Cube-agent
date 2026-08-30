@@ -148,12 +148,17 @@ class RunRow(Base):
             "mode IS NULL OR mode IN ('direct', 'dispatch', 'discuss', 'hybrid')",
             name="ck_agent_hub_runs_mode",
         ),
+        CheckConstraint(
+            "actor_role IS NULL OR actor_role IN ('super_admin', 'admin', 'operator', 'viewer')",
+            name="ck_agent_hub_runs_actor_role",
+        ),
         Index("ix_agent_hub_runs_tenant_status", "tenant_id", "status"),
     )
 
     id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
     tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
     actor_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=True)
+    actor_role: Mapped[str | None] = mapped_column(String(32), nullable=True)
     request: Mapped[str] = mapped_column(Text)
     mode: Mapped[str | None] = mapped_column(String(20), nullable=True)
     status: Mapped[str] = mapped_column(String(32))

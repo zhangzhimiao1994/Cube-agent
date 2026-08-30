@@ -69,12 +69,14 @@ class StubRunService:
     enqueue_count: int = 0
     direct_models: list[str | None] | None = None
     vibe_coding_flags: list[bool] | None = None
+    actor_roles: list[Role | None] = field(default_factory=list)
 
     async def submit(
         self,
         *,
         tenant_id: UUID,
         actor_id: UUID,
+        actor_role: Role | None = None,
         message: str,
         mode: TaskMode,
         agent_ids: tuple[str, ...] = (),
@@ -89,6 +91,7 @@ class StubRunService:
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         del idempotency_key
+        self.actor_roles.append(actor_role)
         if self.direct_models is not None:
             self.direct_models.append(direct_model)
         if self.vibe_coding_flags is not None:
@@ -426,6 +429,7 @@ def test_run_submission_records_user_conversation_audit_event() -> None:
     assert details["message_preview"] == "请分析这个产品方案并给出下一步。"
     assert isinstance(details["message_sha256"], str)
     assert service.enqueue_count == 1
+    assert service.actor_roles == [principal.role]
 
 def test_direct_submission_forwards_selected_model_without_agent_ids() -> None:
     client, service, principal = _client()

@@ -178,9 +178,11 @@ class ProbeDispatchRuntime:
         plan: object,
         *,
         capability_gateway: object | None = None,
+        harness_tool_gateway: object | None = None,
     ) -> None:
         del gateway, capability_gateway
         self.plan = plan
+        self.harness_tool_gateway = harness_tool_gateway
         self.contexts: list[TaskContext] = []
         self.instances.append(self)
 
@@ -215,7 +217,9 @@ class ProbeHybridRuntime(ProbeDispatchRuntime):
     instances: ClassVar[list["ProbeDispatchRuntime"]] = []
 
     def __init__(self, dispatch: object, discussion: object, direct: object) -> None:
-        del dispatch, discussion, direct
+        del direct
+        self.dispatch = dispatch
+        self.discussion = discussion
         self.contexts: list[TaskContext] = []
         self.instances.append(self)
 
@@ -398,6 +402,173 @@ async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
     )
     assert events[1].kind is EventKind.RUNTIME_COMPLETED
     assert events[1].sequence == 2
+
+
+@pytest.mark.asyncio
+async def test_config_backed_dispatch_runtime_injects_harness_tool_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    harness = object()
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    }
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id, deployments
+        ),
+        transport=FakeTransport(),
+        harness_tool_gateway=harness,  # type: ignore[arg-type]
+    )
+
+    _ = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request="Use a runtime tool.",
+            )
+        )
+    ]
+
+    assert ProbeDispatchRuntime.instances[-1].harness_tool_gateway is harness
+
+
+@pytest.mark.asyncio
+async def test_config_backed_discussion_runtime_injects_harness_tool_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDiscussionRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
+    harness = object()
+    runtime = ConfigBackedDiscussionRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    }
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id, deployments
+        ),
+        transport=FakeTransport(),
+        harness_tool_gateway=harness,  # type: ignore[arg-type]
+    )
+
+    _ = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISCUSS,
+                request="Use a runtime tool.",
+            )
+        )
+    ]
+
+    assert ProbeDiscussionRuntime.instances[-1].harness_tool_gateway is harness
+
+
+@pytest.mark.asyncio
+async def test_config_backed_hybrid_runtime_injects_harness_tool_gateway_into_children(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    ProbeDiscussionRuntime.instances.clear()
+    ProbeHybridRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    monkeypatch.setattr(defaults_module, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
+    monkeypatch.setattr(defaults_module, "HybridRuntime", ProbeHybridRuntime)
+    harness = object()
+    runtime = ConfigBackedHybridRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    }
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id, deployments
+        ),
+        transport=FakeTransport(),
+        harness_tool_gateway=harness,  # type: ignore[arg-type]
+    )
+
+    _ = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.HYBRID,
+                request="Use runtime tools in each stage.",
+            )
+        )
+    ]
+
+    assert ProbeDispatchRuntime.instances[-1].harness_tool_gateway is harness
+    assert ProbeDiscussionRuntime.instances[-1].harness_tool_gateway is harness
+    hybrid = cast(ProbeHybridRuntime, ProbeHybridRuntime.instances[-1])
+    assert hybrid.dispatch is ProbeDispatchRuntime.instances[-1]
+    assert hybrid.discussion is ProbeDiscussionRuntime.instances[-1]
 
 
 @pytest.mark.asyncio

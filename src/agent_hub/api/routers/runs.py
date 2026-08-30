@@ -22,7 +22,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from agent_hub.api.dependencies import require_permission
 from agent_hub.api.errors import PublicAPIError, error_responses
-from agent_hub.auth.models import AuthenticatedPrincipal
+from agent_hub.auth.models import AuthenticatedPrincipal, Role
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import RunConflict, RunNotFound
 from agent_hub.runs.service import RunSummary, SubmittedRun
@@ -66,6 +66,7 @@ class RunServiceProtocol(Protocol):
         *,
         tenant_id: UUID,
         actor_id: UUID,
+        actor_role: Role | None = None,
         message: str,
         mode: TaskMode,
         agent_ids: tuple[str, ...] = (),
@@ -760,6 +761,7 @@ async def create_run(
     submitted = await service.submit(
         tenant_id=principal.tenant_id,
         actor_id=principal.user_id,
+        actor_role=principal.role,
         message=body.message,
         mode=body.mode,
         agent_ids=body.agent_ids,

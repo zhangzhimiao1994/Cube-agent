@@ -156,6 +156,27 @@ class FailingHarnessToolGateway:
         )
 
 
+class IdentityRecordingHarnessToolGateway:
+    def __init__(self) -> None:
+        self.calls: list[tuple[UUID, HarnessToolCallRequest, UUID | None, Role | None]] = []
+
+    async def invoke(
+        self,
+        tenant_id: UUID,
+        request: HarnessToolCallRequest,
+        *,
+        user_id: UUID | None = None,
+        role: Role | None = None,
+    ) -> HarnessToolCallResult:
+        self.calls.append((tenant_id, request, user_id, role))
+        return HarnessToolCallResult(
+            call_id=request.call_id,
+            tool_name=request.tool_name,
+            status="succeeded",
+            payload={"items": ("identity result",)},
+        )
+
+
 class FailingGeneration:
     async def execute(
         self,
@@ -281,14 +302,16 @@ def _tool_plan() -> DispatchPlan:
     )
 
 
-def _context() -> TaskContext:
-    return TaskContext(
-        run_id=RUN_ID,
-        tenant_id=TENANT_ID,
-        mode=TaskMode.DISPATCH,
-        request="Write a short answer",
-        token_budget=1000,
-    )
+def _context(**changes: object) -> TaskContext:
+    values: dict[str, object] = {
+        "run_id": RUN_ID,
+        "tenant_id": TENANT_ID,
+        "mode": TaskMode.DISPATCH,
+        "request": "Write a short answer",
+        "token_budget": 1000,
+    }
+    values.update(changes)
+    return TaskContext.model_validate(values, strict=True)
 
 
 def test_openai_tool_call_response_can_have_empty_text() -> None:
@@ -360,6 +383,38 @@ async def test_tool_calls_cross_the_harness_tool_gateway_envelope() -> None:
     assert result["items"] == ("harness result",)
 
 
+async def test_tool_calls_forward_trusted_actor_identity_to_harness_gateway() -> None:
+    user_id = UUID("00000000-0000-4000-8000-000000000003")
+    harness = IdentityRecordingHarnessToolGateway()
+    runtime = CrewDispatchRuntime(
+        ToolGateway(),
+        _tool_plan(),
+        capability_gateway=FakeCapabilities(),
+        harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            _context(actor_id=user_id, actor_role=Role.OPERATOR)
+        )
+    ]
+
+    assert len(harness.calls) == 1
+    tenant_id, request, recorded_user_id, recorded_role = harness.calls[0]
+    assert tenant_id == TENANT_ID
+    assert request.actor == "writer"
+    assert recorded_user_id == user_id
+    assert recorded_role is Role.OPERATOR
+    result = next(
+        event.artifact.content["result"]
+        for event in events
+        if event.artifact and event.artifact.type == "tool_result"
+    )
+    assert result == {"items": ("identity result",)}
+
+
 async def test_failed_harness_tool_result_records_failed_not_uncertain() -> None:
     capabilities = FakeCapabilities()
     harness = FailingHarnessToolGateway()
@@ -399,6 +454,26 @@ async def test_failed_harness_tool_result_records_failed_not_uncertain() -> None
     await resumed.restore_checkpoint(checkpoint)
 
 
+async def test_default_harness_wrapper_fails_closed_without_actor_identity() -> None:
+    capabilities = FakeCapabilities()
+    runtime = CrewDispatchRuntime(
+        ToolGateway(),
+        _tool_plan(),
+        capability_gateway=capabilities,
+        crew_factory=FastFactory(),
+    )
+    events: list[RunEvent] = []
+
+    with pytest.raises(RuntimeExecutionError, match="capability execution failed"):
+        async for event in runtime.run(_context()):
+            events.append(event)
+
+    assert capabilities.calls == []
+    assert [event.reason for event in events if event.kind is EventKind.TOOL_FAILED] == [
+        "capability identity unavailable"
+    ]
+
+
 async def test_default_harness_wrapper_preserves_backend_uncertainty() -> None:
     runtime = CrewDispatchRuntime(
         ToolGateway(),
@@ -409,7 +484,9 @@ async def test_default_harness_wrapper_preserves_backend_uncertainty() -> None:
     events: list[RunEvent] = []
 
     with pytest.raises(CapabilityOutcomeUncertain):
-        async for event in runtime.run(_context()):
+        async for event in runtime.run(
+            _context(actor_id=uuid4(), actor_role=Role.OPERATOR)
+        ):
             events.append(event)
 
     assert [event.reason for event in events if event.kind is EventKind.TOOL_FAILED] == [

@@ -329,6 +329,8 @@ def context(  # type: ignore[no-untyped-def]
     return TaskContext(
         run_id=RUN_ID,
         tenant_id=TENANT_ID,
+        actor_id=UUID("00000000-0000-4000-8000-000000000003"),
+        actor_role=Role.OPERATOR,
         mode=TaskMode.DISPATCH,
         request="Do bounded research",
         checkpoint=checkpoint,

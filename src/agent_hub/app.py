@@ -31,12 +31,13 @@ from agent_hub.api.errors import (
 )
 from agent_hub.api.middleware import RequestBodyLimitMiddleware, SafeExceptionMiddleware
 from agent_hub.api.routers import admin, auth, config, runs, system, users
+from agent_hub.auth.models import Role
 from agent_hub.auth.passwords import PasswordService
 from agent_hub.auth.rate_limit import RedisAuthRateLimiter
 from agent_hub.auth.service import AuthService
 from agent_hub.auth.tokens import AccessTokenService
 from agent_hub.auth.user_admin import PersistentUserAdminService
-from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
+from agent_hub.capabilities.defaults import build_runtime_capability_stack
 from agent_hub.channels.base import InboundMessage
 from agent_hub.channels.dedup import InboundDedupRepository
 from agent_hub.channels.feishu.media import FeishuOpenAPIMediaClient
@@ -790,7 +791,9 @@ def create_app(
                 if active_runtime_registry is None:
                     assert active_redis is not None
                     assert active_secret_service is not None
-                    runtime_capabilities = RuntimeCapabilityGateway(
+                    runtime_capability_stack = build_runtime_capability_stack(
+                        tenant_id=configured.bootstrap_tenant_id,
+                        run_repository=RunRepository(active_sessions),
                         skill_store_dir=configured.skill_store_dir,
                         workspace_root=configured.attachment_store_dir,
                     )
@@ -798,7 +801,8 @@ def create_app(
                         config_service=ConfigService(active_sessions),
                         secret_service=active_secret_service,
                         redis_client=active_redis,
-                        capability_gateway=runtime_capabilities,
+                        capability_gateway=runtime_capability_stack.runtime_gateway,
+                        harness_tool_gateway=runtime_capability_stack.harness_tool_gateway,
                     )
                 if active_mode_router is None and active_secret_service is not None:
                     assert active_redis is not None
@@ -1240,6 +1244,7 @@ async def _submit_scheduled_task(application: FastAPI, request: TaskRequest) -> 
     return await cast(Any, run_service).submit(
         tenant_id=request.tenant_id,
         actor_id=request.actor_id,
+        actor_role=Role.OPERATOR,
         message=request.message,
         mode=request.mode,
         workflow_id=request.workflow,

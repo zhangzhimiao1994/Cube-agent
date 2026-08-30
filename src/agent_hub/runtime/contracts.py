@@ -23,6 +23,7 @@ from pydantic import (
     model_validator,
 )
 
+from agent_hub.auth.models import Role
 from agent_hub.domain.runs import TaskMode
 
 type JsonScalar = None | bool | int | float | str
@@ -892,6 +893,8 @@ class TaskContext(_RuntimeContractModel):
 
     run_id: UUID
     tenant_id: UUID
+    actor_id: UUID | None = None
+    actor_role: Role | None = None
     mode: TaskMode
     request: str = Field(repr=False)
     artifacts: tuple[Artifact, ...] = Field(default=(), max_length=64)
@@ -955,6 +958,8 @@ class TaskContext(_RuntimeContractModel):
         return {
             "run_id": str(self.run_id),
             "tenant_id": str(self.tenant_id),
+            "actor_id": None if self.actor_id is None else str(self.actor_id),
+            "actor_role": None if self.actor_role is None else self.actor_role.value,
             "mode": self.mode.value,
             "request": self.request,
             "artifacts": [Artifact.to_payload(item) for item in self.artifacts],

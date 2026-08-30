@@ -11,7 +11,9 @@ from autogen_agentchat.teams import SelectorGroupChat
 from autogen_core.models import UserMessage
 from opentelemetry import trace
 
+from agent_hub.auth.models import Role
 from agent_hub.domain.runs import TaskMode
+from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.litellm_client import ModelTransportError
 from agent_hub.models.types import ModelCapability, ModelRequest, ModelResponse, TokenUsage
@@ -94,14 +96,18 @@ def plan(
     )
 
 
-def context(*, token_budget: int = 100) -> TaskContext:
-    return TaskContext(
-        run_id=uuid4(),
-        tenant_id=uuid4(),
-        mode=TaskMode.DISCUSS,
-        request="Compare the evidence.",
-        token_budget=token_budget,
-    )
+def context(*, token_budget: int = 100, **changes: object) -> TaskContext:
+    payload = {
+        "run_id": uuid4(),
+        "tenant_id": uuid4(),
+        "actor_id": uuid4(),
+        "actor_role": Role.OPERATOR,
+        "mode": TaskMode.DISCUSS,
+        "request": "Compare the evidence.",
+        "token_budget": token_budget,
+        **changes,
+    }
+    return TaskContext.model_validate(payload)
 
 
 async def collect(runtime: AutoGenDiscussionRuntime, ctx: TaskContext) -> list[Any]:
@@ -573,6 +579,111 @@ async def test_autogen_tool_calls_use_only_capability_gateway() -> None:
     assert any(event.kind is EventKind.TOOL_STARTED for event in events)
     assert any(event.kind is EventKind.TOOL_COMPLETED for event in events)
     assert ModelCapability.TOOL_CALLING in gateway.requests[1].required_capabilities
+    assert events[-1].reason == "explicit_completion"
+
+
+async def test_autogen_tool_calls_forward_trusted_identity_to_harness_gateway() -> None:
+    class ToolGateway(ScriptedGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            response = (
+                ModelResponse(
+                    text="analyst",
+                    usage=TokenUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+                )
+                if len(self.requests) == 1
+                else ModelResponse(
+                    text=None,
+                    tool_calls=(
+                        GatewayToolCall(
+                            id="call_1", name="web.search", arguments={"query": "evidence"}
+                        ),
+                    ),
+                    usage=TokenUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+                )
+                if len(self.requests) == 2
+                else ModelResponse(
+                    text="[COMPLETE] verified",
+                    usage=TokenUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+                )
+            )
+            return GatewayCompletion(
+                response=response,
+                deployment_id="shared",
+                logical_model=request.logical_model,
+                provider_id="openai",
+                provider_model="openai/test",
+                cost_usd=Decimal(0),
+            )
+
+    class HarnessGateway:
+        def __init__(self) -> None:
+            self.calls: list[tuple[UUID, HarnessToolCallRequest, UUID | None, Role | None]] = []
+
+        async def invoke(
+            self,
+            tenant_id: UUID,
+            request: HarnessToolCallRequest,
+            *,
+            user_id: UUID | None = None,
+            role: Role | None = None,
+        ) -> HarnessToolCallResult:
+            self.calls.append((tenant_id, request, user_id, role))
+            return HarnessToolCallResult(
+                call_id=request.call_id,
+                tool_name=request.tool_name,
+                status="succeeded",
+                payload={"items": ("source-a",)},
+            )
+
+    class ReplayPolicy:
+        def is_replay_safe(self, name: str) -> bool:
+            return name == "web.search"
+
+        async def execute(
+            self,
+            *,
+            tenant_id: UUID,
+            run_id: UUID,
+            actor: str,
+            name: str,
+            arguments: Mapping[str, JsonValue],
+            idempotency_key: str,
+        ) -> Mapping[str, JsonValue]:
+            del tenant_id, run_id, actor, name, arguments, idempotency_key
+            raise AssertionError("AutoGen tools must be routed through harness gateway")
+
+    participant = DiscussionParticipant(
+        id="analyst",
+        role="Analyst",
+        goal="Search",
+        logical_model="shared",
+        allowed_tools=("web.search",),
+    )
+    actor_id = uuid4()
+    harness_gateway = HarnessGateway()
+    ctx = context(actor_id=actor_id, actor_role=Role.OPERATOR)
+    runtime = AutoGenDiscussionRuntime(
+        ToolGateway([]),
+        plan(participants=(participant, plan().participants[1])),
+        capability_gateway=ReplayPolicy(),
+        harness_tool_gateway=harness_gateway,
+    )
+
+    events = await collect(runtime, ctx)
+
+    assert len(harness_gateway.calls) == 1
+    tenant_id, request, user_id, role = harness_gateway.calls[0]
+    assert tenant_id == ctx.tenant_id
+    assert request.run_id == ctx.run_id
+    assert request.actor == "analyst"
+    assert request.tool_name == "web.search"
+    assert request.arguments == {"query": "evidence"}
+    assert request.call_id == "call_1"
+    assert user_id == actor_id
+    assert role is Role.OPERATOR
+    assert any(event.kind is EventKind.TOOL_STARTED for event in events)
+    assert any(event.kind is EventKind.TOOL_COMPLETED for event in events)
     assert events[-1].reason == "explicit_completion"
 
 

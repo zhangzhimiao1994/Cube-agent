@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 import pytest
 from pydantic import ValidationError
 
+from agent_hub.auth.models import Role
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.gateway import GatewayCompletion, ModelGatewayError
 from agent_hub.models.litellm_client import ModelTransportError
@@ -102,6 +103,19 @@ def context(**changes: object) -> TaskContext:
     }
     values.update(changes)
     return TaskContext.model_validate(values, strict=True)
+
+
+def test_task_context_preserves_trusted_actor_identity() -> None:
+    actor_id = UUID("33333333-3333-4333-8333-333333333333")
+
+    original = context(actor_id=actor_id, actor_role=Role.OPERATOR)
+    payload = original.to_payload()
+    restored = TaskContext.from_payload(payload)
+
+    assert payload["actor_id"] == str(actor_id)
+    assert payload["actor_role"] == "operator"
+    assert restored.actor_id == actor_id
+    assert restored.actor_role is Role.OPERATOR
 
 
 async def collect(runtime: DirectRuntime, value: TaskContext) -> list[RunEvent]:

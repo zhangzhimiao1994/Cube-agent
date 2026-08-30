@@ -62,6 +62,35 @@ async def test_runtime_gateway_reads_only_configured_workspace(tmp_path: Path) -
     assert result == {"path": "note.txt", "text": "safe", "truncated": False}
 
 
+async def test_runtime_gateway_accepts_harness_builtin_tool_aliases(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "note.txt").write_text("safe", encoding="utf-8")
+    gateway = RuntimeCapabilityGateway(skill_store_dir=tmp_path / "skills", workspace_root=workspace)
+
+    calculator = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="planner",
+        name="calculator.evaluate",
+        arguments={"expression": "2 + 3 * 4"},
+        idempotency_key="calc_1",
+    )
+    workspace_read = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="researcher",
+        name="workspace.read",
+        arguments={"path": "note.txt"},
+        idempotency_key="read_1",
+    )
+
+    assert gateway.is_available(TENANT_ID, "calculator.evaluate") is True
+    assert gateway.is_replay_safe("workspace.read") is True
+    assert calculator == {"value": "14"}
+    assert workspace_read == {"path": "note.txt", "text": "safe", "truncated": False}
+
+
 async def test_runtime_gateway_read_context_accepts_query_without_workspace(tmp_path: Path) -> None:
     gateway = RuntimeCapabilityGateway(skill_store_dir=tmp_path / "skills")
 

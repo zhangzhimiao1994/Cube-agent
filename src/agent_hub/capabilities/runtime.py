@@ -19,9 +19,15 @@ _SAFE_CAPABILITY_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _REPLAY_SAFE = frozenset({
     "calculator",
     "calculator_evaluate",
+    "calculator.evaluate",
     "read_context",
     "workspace_read",
+    "workspace.read",
 })
+_BUILTIN_ALIASES = {
+    "calculator.evaluate": "calculator",
+    "workspace.read": "workspace_read",
+}
 
 
 class RuntimeCapabilityError(RuntimeError):
@@ -48,11 +54,12 @@ class RuntimeCapabilityGateway:
         return name in _REPLAY_SAFE
 
     def is_available(self, tenant_id: UUID, name: str) -> bool:
-        if name in _REPLAY_SAFE:
+        normalized_name = _normalize_tool_name(name)
+        if normalized_name in _REPLAY_SAFE:
             return True
-        if _SAFE_CAPABILITY_NAME.fullmatch(name) is None:
+        if _SAFE_CAPABILITY_NAME.fullmatch(normalized_name) is None:
             return False
-        return self._skill_package_path(tenant_id, name).is_file()
+        return self._skill_package_path(tenant_id, normalized_name).is_file()
 
     async def execute(
         self,
@@ -65,19 +72,20 @@ class RuntimeCapabilityGateway:
         idempotency_key: str,
     ) -> Mapping[str, JsonValue]:
         _require_safe("actor", actor)
-        _require_safe("capability name", name)
+        normalized_name = _normalize_tool_name(name)
+        _require_safe("capability name", normalized_name)
         _require_safe("idempotency key", idempotency_key, max_length=160)
-        if name in {"calculator", "calculator_evaluate"}:
+        if normalized_name in {"calculator", "calculator_evaluate"}:
             return self._execute_calculator(arguments)
-        if name == "read_context":
+        if normalized_name == "read_context":
             return self._execute_read_context(arguments)
-        if name == "workspace_read":
+        if normalized_name == "workspace_read":
             return self._execute_workspace_read(arguments)
         return await self._execute_skill(
             tenant_id=tenant_id,
             run_id=run_id,
             actor=actor,
-            skill_id=name,
+            skill_id=normalized_name,
             arguments=arguments,
             idempotency_key=idempotency_key,
         )
@@ -185,6 +193,10 @@ def _require_safe(name: str, value: str, *, max_length: int = 128) -> None:
         or _SAFE_CAPABILITY_NAME.fullmatch(value) is None
     ):
         raise RuntimeCapabilityError(f"{name} is invalid")
+
+
+def _normalize_tool_name(name: str) -> str:
+    return _BUILTIN_ALIASES.get(name, name)
 
 
 def _execution_id(actor: str, skill_id: str, idempotency_key: str) -> str:

@@ -894,6 +894,7 @@ class CrewDispatchRuntime:
         if self._tool_gateway is None and capability_gateway is not None:
             self._tool_gateway = HarnessToolGateway(
                 _CapabilityHarnessBackend(capability_gateway),
+                require_actor_identity=True,
                 raise_backend_errors=True,
             )
         self._factory = crew_factory or CrewAIObjectFactory(
@@ -2237,6 +2238,8 @@ class CrewDispatchRuntime:
                         tool_result = await self._tool_gateway.invoke(
                             context.tenant_id,
                             tool_request,
+                            user_id=context.actor_id,
+                            role=context.actor_role,
                         )
                 except asyncio.CancelledError:
                     if not replay_safe:

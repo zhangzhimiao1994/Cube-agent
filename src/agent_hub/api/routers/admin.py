@@ -28,7 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.api.dependencies import current_principal
 from agent_hub.api.errors import BASE_ERROR_RESPONSES, PublicAPIError, error_responses
-from agent_hub.auth.models import AuthenticatedPrincipal, Authorizer, PermissionDenied
+from agent_hub.auth.models import AuthenticatedPrincipal, Authorizer, PermissionDenied, Role
 from agent_hub.config.schema import PlatformConfig
 from agent_hub.config.service import ConfigService, ConfigValidationError
 from agent_hub.db.models import AdminResourceRow
@@ -4294,6 +4294,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         record = await self._run_repository.create_run(
             tenant_id=self._tenant_id,
             actor_id=_uuid_or_default(actor, self._actor_id),
+            actor_role=Role.OPERATOR,
             request=plan.task_prompt,
             mode=TaskMode(current.mode),
             status=RunStatus.QUEUED,

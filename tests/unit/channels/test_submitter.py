@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID
 
+from agent_hub.auth.models import Role
 from agent_hub.channels.base import (
     AttachmentKind,
     Channel,
@@ -34,6 +35,7 @@ class RecordingRunService:
         *,
         tenant_id: UUID,
         actor_id: UUID,
+        actor_role: Role | None = None,
         message: str,
         mode: TaskMode,
         attachment_ids: tuple[str, ...] = (),
@@ -46,6 +48,7 @@ class RecordingRunService:
             {
                 "tenant_id": tenant_id,
                 "actor_id": actor_id,
+                "actor_role": actor_role,
                 "message": message,
                 "mode": mode,
                 "attachment_ids": attachment_ids,
@@ -135,6 +138,7 @@ async def test_submitter_forwards_channel_text_to_main_agent_entry_with_attachme
     assert run_id == RUN_ID
     assert len(run_service.calls) == 1
     call = run_service.calls[0]
+    assert call["actor_role"] is Role.OPERATOR
     assert call["mode"] is TaskMode.AUTO
     assert call["attachment_ids"] == ("att_0123456789abcdef0123456789abcdef",)
     assert isinstance(call["conversation_id"], str)

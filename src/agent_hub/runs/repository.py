@@ -13,6 +13,7 @@ from sqlalchemy import Select, delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from agent_hub.auth.models import Role
 from agent_hub.db.models import (
     RunApprovalRow,
     RunArtifactRow,
@@ -38,6 +39,7 @@ class RunRecord:
     version: int
     created_at: datetime
     routing_decision: dict[str, object] | None
+    actor_role: Role | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +101,7 @@ class RunRepository:
         *,
         tenant_id: UUID,
         actor_id: UUID,
+        actor_role: Role | None = None,
         request: str,
         mode: TaskMode | None,
         status: RunStatus,
@@ -123,6 +126,7 @@ class RunRepository:
                 id=run_id,
                 tenant_id=tenant_id,
                 actor_id=actor_id,
+                actor_role=None if actor_role is None else actor_role.value,
                 request=request,
                 mode=None if mode is None else mode.value,
                 status=status.value,
@@ -583,7 +587,12 @@ class RunRepository:
         async with self._session_factory() as session, session.begin():
             row = await self.get_for_update(session, run_id)
             current = RunStatus(row.status)
-            if current in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
+            if current in {
+                RunStatus.COMPLETED,
+                RunStatus.FAILED,
+                RunStatus.CANCELLED,
+                RunStatus.WAITING_APPROVAL,
+            }:
                 return self._record(row)
             sequence = (
                 await session.scalar(
@@ -834,6 +843,7 @@ class RunRepository:
             id=row.id,
             tenant_id=row.tenant_id,
             actor_id=row.actor_id,
+            actor_role=None if row.actor_role is None else Role(row.actor_role),
             request=row.request,
             mode=None if row.mode is None else TaskMode(row.mode),
             status=RunStatus(row.status),

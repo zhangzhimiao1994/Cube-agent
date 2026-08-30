@@ -10,9 +10,11 @@ from typing import Protocol
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from agent_hub.auth.models import Role
 from agent_hub.config.schema import AgentDefinition, LogicalModelDefinition, PlatformConfig
 from agent_hub.config.service import ConfigService
 from agent_hub.domain.runs import TaskMode
+from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.capacity import (
     CapacityPool,
     safe_operational_limit,
@@ -67,6 +69,17 @@ class RuntimeCapabilityGatewayProtocol(Protocol):
     ) -> Mapping[str, JsonValue]: ...
 
     def is_replay_safe(self, name: str) -> bool: ...
+
+
+class HarnessToolInvoker(Protocol):
+    async def invoke(
+        self,
+        tenant_id: UUID,
+        request: HarnessToolCallRequest,
+        *,
+        user_id: UUID | None = None,
+        role: Role | None = None,
+    ) -> HarnessToolCallResult: ...
 
 
 CapacityFactory = Callable[
@@ -262,6 +275,7 @@ class ConfigBackedDispatchRuntime:
         transport: ModelTransport | None = None,
         role_planner: RolePlanner | None = None,
         capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
+        harness_tool_gateway: HarnessToolInvoker | None = None,
     ) -> None:
         self._config_service = config_service
         self._secret_service = secret_service
@@ -269,6 +283,7 @@ class ConfigBackedDispatchRuntime:
         self._transport = transport or LiteLLMClient()
         self._role_planner = role_planner or RolePlanner()
         self._capability_gateway = capability_gateway
+        self._harness_tool_gateway = harness_tool_gateway
         self._pending_checkpoints: dict[UUID, RuntimeCheckpoint] = {}
         self._active: dict[UUID, ExecutionRuntime] = {}
 
@@ -342,6 +357,7 @@ class ConfigBackedDispatchRuntime:
                 gateway,
                 plan,
                 capability_gateway=self._capability_gateway,
+                harness_tool_gateway=self._harness_tool_gateway,
             ),
             mode=TaskMode.DISPATCH,
             main_agent_model=logical_model,
@@ -364,6 +380,7 @@ class ConfigBackedDiscussionRuntime:
         transport: ModelTransport | None = None,
         role_planner: RolePlanner | None = None,
         capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
+        harness_tool_gateway: HarnessToolInvoker | None = None,
     ) -> None:
         self._config_service = config_service
         self._secret_service = secret_service
@@ -371,6 +388,7 @@ class ConfigBackedDiscussionRuntime:
         self._transport = transport or LiteLLMClient()
         self._role_planner = role_planner or RolePlanner()
         self._capability_gateway = capability_gateway
+        self._harness_tool_gateway = harness_tool_gateway
         self._pending_checkpoints: dict[UUID, RuntimeCheckpoint] = {}
         self._active: dict[UUID, ExecutionRuntime] = {}
 
@@ -444,6 +462,7 @@ class ConfigBackedDiscussionRuntime:
                 gateway,
                 plan,
                 capability_gateway=self._capability_gateway,
+                harness_tool_gateway=self._harness_tool_gateway,
             ),
             mode=TaskMode.DISCUSS,
             main_agent_model=logical_model,
@@ -466,6 +485,7 @@ class ConfigBackedHybridRuntime:
         transport: ModelTransport | None = None,
         role_planner: RolePlanner | None = None,
         capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
+        harness_tool_gateway: HarnessToolInvoker | None = None,
     ) -> None:
         self._config_service = config_service
         self._secret_service = secret_service
@@ -473,6 +493,7 @@ class ConfigBackedHybridRuntime:
         self._transport = transport or LiteLLMClient()
         self._role_planner = role_planner or RolePlanner()
         self._capability_gateway = capability_gateway
+        self._harness_tool_gateway = harness_tool_gateway
         self._pending_checkpoints: dict[UUID, RuntimeCheckpoint] = {}
         self._active: dict[UUID, ExecutionRuntime] = {}
 
@@ -592,11 +613,13 @@ class ConfigBackedHybridRuntime:
                     gateway,
                     dispatch_plan,
                     capability_gateway=self._capability_gateway,
+                    harness_tool_gateway=self._harness_tool_gateway,
                 ),
                 AutoGenDiscussionRuntime(
                     gateway,
                     discussion_plan,
                     capability_gateway=self._capability_gateway,
+                    harness_tool_gateway=self._harness_tool_gateway,
                 ),
                 DirectRuntime(gateway, logical_model=logical_model),
             ),
@@ -1444,6 +1467,7 @@ def configured_runtime_registry(
     redis_client: object,
     transport: ModelTransport | None = None,
     capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
+    harness_tool_gateway: HarnessToolInvoker | None = None,
 ) -> RuntimeRegistry:
     async def capacity_factory(
         tenant_id: UUID,
@@ -1472,6 +1496,7 @@ def configured_runtime_registry(
                 capacity_factory=capacity_factory,
                 transport=transport,
                 capability_gateway=capability_gateway,
+                harness_tool_gateway=harness_tool_gateway,
             ),
             ConfigBackedDiscussionRuntime(
                 config_service=config_service,
@@ -1479,6 +1504,7 @@ def configured_runtime_registry(
                 capacity_factory=capacity_factory,
                 transport=transport,
                 capability_gateway=capability_gateway,
+                harness_tool_gateway=harness_tool_gateway,
             ),
             ConfigBackedHybridRuntime(
                 config_service=config_service,
@@ -1486,6 +1512,7 @@ def configured_runtime_registry(
                 capacity_factory=capacity_factory,
                 transport=transport,
                 capability_gateway=capability_gateway,
+                harness_tool_gateway=harness_tool_gateway,
             ),
         )
     )

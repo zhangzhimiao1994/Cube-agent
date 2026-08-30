@@ -39,10 +39,12 @@ class HarnessToolGateway:
         backend: RuntimeToolBackend,
         *,
         policy_gateway: HarnessCapabilityPolicyGateway | None = None,
+        require_actor_identity: bool = False,
         raise_backend_errors: bool = False,
     ) -> None:
         self._backend = backend
         self._policy_gateway = policy_gateway
+        self._require_actor_identity = require_actor_identity
         self._raise_backend_errors = raise_backend_errors
 
     async def invoke(
@@ -98,10 +100,12 @@ class HarnessToolGateway:
         user_id: UUID | None,
         role: Role | None,
     ) -> HarnessToolCallResult | None:
+        if type(user_id) is not UUID or not isinstance(role, Role):
+            if self._policy_gateway is not None or self._require_actor_identity:
+                return self._failure(request, "capability identity unavailable")
+            return None
         if self._policy_gateway is None:
             return None
-        if type(user_id) is not UUID or not isinstance(role, Role):
-            raise TypeError("user_id and role are required for policy-gated harness tools")
         decision = await self._policy_gateway.invoke(
             _capability_request(tenant_id, user_id, request),
             role=role,
@@ -157,13 +161,22 @@ def _capability_parts(request: HarnessToolCallRequest) -> tuple[str, str, str]:
         return "calculator", "evaluate", "calculator"
     if request.tool_name in {"workspace_read", "workspace.read"}:
         path = request.arguments.get("path")
-        return "file", "read", path if isinstance(path, str) else "workspace"
+        return "file", "read", _workspace_policy_resource(path)
     if request.tool_name == "read_context":
         path = request.arguments.get("path")
         if isinstance(path, str):
-            return "file", "read", path
+            return "file", "read", _workspace_policy_resource(path)
         return "context", "read", "context"
     return "skill", "use", f"skill/{request.tool_name}"
+
+
+def _workspace_policy_resource(path: object) -> str:
+    if not isinstance(path, str) or not path:
+        return "workspace"
+    normalized = path.replace("\\", "/").lstrip("/")
+    if normalized == "workspace" or normalized.startswith("workspace/"):
+        return normalized
+    return f"workspace/{normalized}"
 
 
 def _capability_failure_reason(status: CapabilityStatus) -> str:

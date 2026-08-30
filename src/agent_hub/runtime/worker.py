@@ -11,7 +11,7 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.api.routers import admin
-from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
+from agent_hub.capabilities.defaults import build_runtime_capability_stack
 from agent_hub.config.service import ConfigService
 from agent_hub.db.session import Database, build_database
 from agent_hub.evolution_hooks import EvolutionExecutionIngestHook
@@ -108,6 +108,12 @@ def build_worker_service(
     queue = LocalRunQueue()
     config_service = ConfigService(database.session_factory)
     run_repository = RunRepository(database.session_factory)
+    runtime_capability_stack = build_runtime_capability_stack(
+        tenant_id=settings.bootstrap_tenant_id,
+        run_repository=run_repository,
+        skill_store_dir=settings.skill_store_dir,
+        workspace_root=settings.attachment_store_dir,
+    )
     secret_service = SecretService(
         database.session_factory,
         SecretCipher(settings.master_key_bytes()),
@@ -118,10 +124,8 @@ def build_worker_service(
             config_service=config_service,
             secret_service=secret_service,
             redis_client=redis_client,
-            capability_gateway=RuntimeCapabilityGateway(
-                skill_store_dir=settings.skill_store_dir,
-                workspace_root=settings.attachment_store_dir,
-            ),
+            capability_gateway=runtime_capability_stack.runtime_gateway,
+            harness_tool_gateway=runtime_capability_stack.harness_tool_gateway,
         ),
         router=None,
         task_queue=queue,

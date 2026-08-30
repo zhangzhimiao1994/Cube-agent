@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from agent_hub.auth.models import Role
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import RunRecord
 from agent_hub.runs.service import HermesRunOutcome, RunService
@@ -23,6 +24,7 @@ class FakeRunRow:
     id: UUID
     tenant_id: UUID
     actor_id: UUID | None
+    actor_role: str | None
     request: str
     mode: str | None
     status: str
@@ -50,6 +52,7 @@ class ExecutableFakeRepository:
             id=self.run_id,
             tenant_id=TENANT_ID,
             actor_id=ACTOR_ID,
+            actor_role=None,
             request="run evolution round",
             mode=TaskMode.DISPATCH.value,
             status=RunStatus.QUEUED.value,
@@ -116,6 +119,8 @@ class ExecutableFakeRepository:
     async def fail_run(self, run_id: UUID, *, reason: str) -> RunRecord:
         del reason
         assert run_id == self.run_id
+        if self.row.status == RunStatus.WAITING_APPROVAL.value:
+            return self._record()
         self.row.status = RunStatus.FAILED.value
         self.row.version += 1
         return self._record()
@@ -130,6 +135,7 @@ class ExecutableFakeRepository:
             id=self.row.id,
             tenant_id=self.row.tenant_id,
             actor_id=self.row.actor_id,
+            actor_role=None if self.row.actor_role is None else Role(self.row.actor_role),
             request=self.row.request,
             mode=None if self.row.mode is None else TaskMode(self.row.mode),
             status=RunStatus(self.row.status),
@@ -139,6 +145,15 @@ class ExecutableFakeRepository:
             if self.row.routing_decision is None
             else dict(self.row.routing_decision),
         )
+
+
+class ApprovalWaitingRepository(ExecutableFakeRepository):
+    async def get_for_update(self, session: FakeTransaction, run_id: UUID) -> FakeRunRow:
+        row = await super().get_for_update(session, run_id)
+        if row.status == RunStatus.RUNNING.value:
+            row.status = RunStatus.WAITING_APPROVAL.value
+            row.version += 1
+        return row
 
 
 class RuntimeCompletes:
@@ -184,6 +199,69 @@ class RuntimeReportsCapacityPressure:
 
     async def cancel(self) -> None:
         raise AssertionError("not used")
+
+
+class RuntimeReportsToolFailure:
+    mode = TaskMode.DISPATCH
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        yield RunEvent(
+            kind=EventKind.TOOL_FAILED,
+            sequence=1,
+            run_id=context.run_id,
+            actor="planner",
+            tool_call_id="call_1",
+            tool_name="workspace_read",
+            reason="awaiting approval",
+        )
+        yield RunEvent(
+            kind=EventKind.RUNTIME_FAILED,
+            sequence=2,
+            run_id=context.run_id,
+            reason="capability execution failed",
+        )
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        del checkpoint
+
+    async def cancel(self) -> None:
+        raise AssertionError("not used")
+
+
+class RuntimeWaitsForApprovalThenRaises:
+    mode = TaskMode.DISPATCH
+
+    def __init__(self, repository: ExecutableFakeRepository) -> None:
+        self._repository = repository
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        assert context.run_id == self._repository.run_id
+        self._repository.row.status = RunStatus.WAITING_APPROVAL.value
+        self._repository.row.version += 1
+        raise RuntimeError("capability approval boundary interrupted")
+        yield RunEvent(kind=EventKind.RUNTIME_COMPLETED, sequence=1, run_id=context.run_id)
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        del checkpoint
+
+    async def cancel(self) -> None:
+        raise AssertionError("not used")
+
+
+class ContextRecordingRuntime(RuntimeCompletes):
+    def __init__(self) -> None:
+        self.contexts: list[TaskContext] = []
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        self.contexts.append(context)
+        async for event in super().run(context):
+            yield event
 
 
 class RecordingHermesAdvisor:
@@ -252,6 +330,71 @@ async def test_execute_notifies_terminal_hooks_after_completed_run() -> None:
             "routing_decision": {"source": "evolution", "evolution_run_id": "evolution_1"},
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_execute_forwards_persisted_actor_identity_to_runtime_context() -> None:
+    repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
+    repository.row.actor_role = Role.OPERATOR.value
+    runtime = ContextRecordingRuntime()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.COMPLETED
+    assert len(runtime.contexts) == 1
+    assert runtime.contexts[0].actor_id == ACTOR_ID
+    assert runtime.contexts[0].actor_role is Role.OPERATOR
+
+
+@pytest.mark.asyncio
+async def test_execute_preserves_waiting_approval_status_set_by_capability_policy() -> None:
+    repository = ApprovalWaitingRepository(routing_decision={})
+    hook = RecordingHook()
+    hermes = RecordingHermesAdvisor()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeReportsToolFailure(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+        hermes_advisor=hermes,
+        terminal_run_hooks=(hook,),
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.WAITING_APPROVAL
+    assert repository.events == []
+    assert hermes.outcomes == []
+    assert hook.calls == []
+
+
+@pytest.mark.asyncio
+async def test_execute_exception_does_not_overwrite_waiting_approval_status() -> None:
+    repository = ExecutableFakeRepository(routing_decision={})
+    runtime = RuntimeWaitsForApprovalThenRaises(repository)
+    hook = RecordingHook()
+    hermes = RecordingHermesAdvisor()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((runtime,)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+        hermes_advisor=hermes,
+        terminal_run_hooks=(hook,),
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.WAITING_APPROVAL
+    assert repository.events == []
+    assert hermes.outcomes == []
+    assert hook.calls == []
 
 
 @pytest.mark.asyncio

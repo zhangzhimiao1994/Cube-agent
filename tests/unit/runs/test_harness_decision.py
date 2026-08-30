@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
+from agent_hub.auth.models import Role
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.harness.scheduler import CapabilityAwareHarnessScheduler, HarnessSchedulingError
 from agent_hub.harness.types import (
@@ -43,10 +44,11 @@ class RecordingRepository:
         mode: TaskMode | None,
         status: RunStatus,
         idempotency_key: str | None,
+        actor_role: Role | None = None,
         routing_decision: dict[str, object] | None = None,
         enqueue: bool,
     ) -> RunRecord:
-        del idempotency_key, enqueue
+        del idempotency_key, actor_role, enqueue
         self.created.append(
             {
                 "request": request,

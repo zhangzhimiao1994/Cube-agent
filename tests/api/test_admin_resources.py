@@ -13,6 +13,7 @@ from urllib.parse import quote
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
@@ -38,7 +39,7 @@ from agent_hub.api.routers.admin import (
     _routing_details,
     _run_debug_from_detail,
 )
-from agent_hub.app import create_app
+from agent_hub.app import _submit_scheduled_task, create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
 from agent_hub.config.repository import ConfigRevision, ConfigStatus
 from agent_hub.domain.runs import RunStatus, TaskMode
@@ -1425,6 +1426,42 @@ class RecordingScheduleSubmitter:
         return SubmittedScheduleRun(uuid4())
 
 
+@dataclass(frozen=True, slots=True)
+class SubmittedTaskRun:
+    id: UUID
+
+
+class RecordingScheduledRunService:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def submit(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        actor_role: Role | None = None,
+        message: str,
+        mode: TaskMode,
+        workflow_id: str | None = None,
+        channel_context: dict[str, str] | None = None,
+        idempotency_key: str | None = None,
+    ) -> SubmittedTaskRun:
+        self.calls.append(
+            {
+                "tenant_id": tenant_id,
+                "actor_id": actor_id,
+                "actor_role": actor_role,
+                "message": message,
+                "mode": mode,
+                "workflow_id": workflow_id,
+                "channel_context": channel_context,
+                "idempotency_key": idempotency_key,
+            }
+        )
+        return SubmittedTaskRun(uuid4())
+
+
 class PersistentScheduleResourceService(InMemoryAdminResourceService):
     def __init__(self) -> None:
         super().__init__()
@@ -1459,6 +1496,30 @@ def scheduler_client(
     app.state.admin_resource_service = resource_service or InMemoryAdminResourceService()
     app.state.schedule_service = SchedulerService(submitter.submit)
     return TestClient(app)
+
+
+@pytest.mark.asyncio
+async def test_scheduled_task_submission_records_operator_role_snapshot() -> None:
+    app = FastAPI()
+    run_service = RecordingScheduledRunService()
+    app.state.run_service = run_service
+    request = TaskRequest(
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        message="execute scheduled workflow",
+        mode=TaskMode.DISPATCH,
+        workflow="nightly_check",
+        budget=16_384,
+        idempotency_key="schedule:test",
+        metadata={"source": "scheduler"},
+    )
+
+    submitted = await _submit_scheduled_task(app, request)
+
+    assert isinstance(submitted, SubmittedTaskRun)
+    assert run_service.calls[0]["actor_role"] is Role.OPERATOR
+    assert run_service.calls[0]["workflow_id"] == "nightly_check"
+    assert run_service.calls[0]["channel_context"] == {"source": "scheduler"}
 
 
 def model_payload() -> dict[str, object]:
@@ -4621,6 +4682,7 @@ async def test_persistent_evolution_next_round_execution_enqueues_run_repository
             *,
             tenant_id: UUID,
             actor_id: UUID,
+            actor_role: Role | None = None,
             request: str,
             mode: TaskMode | None,
             status: RunStatus,
@@ -4632,6 +4694,7 @@ async def test_persistent_evolution_next_round_execution_enqueues_run_repository
                 {
                     "tenant_id": tenant_id,
                     "actor_id": actor_id,
+                    "actor_role": actor_role,
                     "request": request,
                     "mode": mode,
                     "status": status,
@@ -4644,6 +4707,7 @@ async def test_persistent_evolution_next_round_execution_enqueues_run_repository
                 id=execution_run_id,
                 tenant_id=tenant_id,
                 actor_id=actor_id,
+                actor_role=actor_role,
                 request=request,
                 mode=mode,
                 status=status,
@@ -4688,6 +4752,7 @@ async def test_persistent_evolution_next_round_execution_enqueues_run_repository
     call = repository.calls[0]
     assert call["tenant_id"] == TENANT_ID
     assert call["actor_id"] == USER_ID
+    assert call["actor_role"] is Role.OPERATOR
     assert call["mode"] is TaskMode.HYBRID
     assert call["status"] is RunStatus.QUEUED
     assert call["idempotency_key"] == "evolution-test-key"
