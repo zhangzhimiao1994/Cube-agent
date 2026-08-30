@@ -14,6 +14,7 @@ web/test-results/
 .env
 *.log
 HANDOFF.md
+REFACTOR_HANDOFF.md
 task_plan.md
 findings.md
 progress.md
