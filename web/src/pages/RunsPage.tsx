@@ -895,6 +895,51 @@ function payloadBooleanValue(payload: Record<string, unknown>, key: string) {
   return typeof value === "boolean" ? value : null;
 }
 
+const ERROR_STAGE_LABELS: Record<string, string> = {
+  artifact_storage: "产物存储",
+  model_capacity: "模型容量",
+  model_configuration: "模型配置",
+  model_gateway: "模型网关",
+  model_provider: "模型供应商",
+  model_routing: "模型路由",
+  runtime: "运行时",
+  runtime_accounting: "运行账本",
+  runtime_configuration: "运行时配置",
+};
+
+const ERROR_CATEGORY_LABELS: Record<string, string> = {
+  accounting_guardrail: "账本保护",
+  authentication: "认证或权限",
+  backend: "后端服务",
+  bad_request: "请求参数",
+  configuration: "配置错误",
+  gateway: "网关错误",
+  internal: "内部错误",
+  invalid_response: "响应格式",
+  missing_runtime: "运行时缺失",
+  model_not_found: "模型不存在",
+  no_capable_model: "无可用模型",
+  payload_too_large: "请求过大",
+  queue_full: "队列已满",
+  queue_timeout: "排队超时",
+  quota_or_billing: "额度或账单",
+  rate_limited: "供应商限流",
+  rollback_failed: "回滚失败",
+  timeout: "超时",
+  transient: "临时失败",
+  transport: "网络连接",
+  unavailable: "不可用",
+  upstream_unavailable: "上游不可用",
+};
+
+function errorStageLabel(value: string | null) {
+  return value ? (ERROR_STAGE_LABELS[value] ?? value) : null;
+}
+
+function errorCategoryLabel(value: string | null) {
+  return value ? (ERROR_CATEGORY_LABELS[value] ?? value) : null;
+}
+
 function isFailedEvent(event: RunDetail["events"][number]) {
   return event.kind === "runtime.failed" || event.kind === "step.failed" || event.kind === "tool.failed";
 }
@@ -910,7 +955,9 @@ function failedEventSummary(event: RunDetail["events"][number]) {
   const suggestedAction = payloadText(event.payload, "suggested_action");
   const parts = [`原因：${summary || "未记录具体原因"}`];
   if (code) parts.push(`错误码：${code}`);
-  if (stage || category) parts.push(`位置：${[stage, category].filter(Boolean).join(" / ")}`);
+  const stageLabel = errorStageLabel(stage);
+  const categoryLabel = errorCategoryLabel(category);
+  if (stageLabel || categoryLabel) parts.push(`位置：${[stageLabel, categoryLabel].filter(Boolean).join(" / ")}`);
   if (statusCode !== null) parts.push(`状态码：${statusCode}`);
   if (retryable !== null) parts.push(`可重试：${retryable ? "是" : "否"}`);
   if (suggestedAction) parts.push(`建议：${suggestedAction}`);

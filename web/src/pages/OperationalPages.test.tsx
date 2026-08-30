@@ -1185,7 +1185,7 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "失败诊断" })).not.toBeNull();
     expect(screen.getByText("model gateway failed: model transport failed (status=401)")).not.toBeNull();
     expect(screen.getByText("错误码：model.provider_auth_failed")).not.toBeNull();
-    expect(screen.getByText("位置：model_provider / authentication")).not.toBeNull();
+    expect(screen.getByText("位置：模型供应商 / 认证或权限")).not.toBeNull();
     expect(screen.getByText("状态码：401")).not.toBeNull();
     expect(screen.getByText("可重试：否")).not.toBeNull();
     expect(screen.getByText(/检查模型 API Key/)).not.toBeNull();
@@ -1974,6 +1974,7 @@ describe("operational management pages", () => {
     expect(within(stream).getByText(/中断前输出已保留/)).not.toBeNull();
     expect(within(stream).getByText(/model transport failed/)).not.toBeNull();
     expect(within(stream).getByText(/错误码：model\.provider_transport_failed/)).not.toBeNull();
+    expect(within(stream).getByText(/位置：模型供应商 \/ 网络连接/)).not.toBeNull();
     expect(within(stream).getByText(/建议：检查 API Base/)).not.toBeNull();
   });
 
