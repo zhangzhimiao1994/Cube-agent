@@ -8,6 +8,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, cast
 from urllib.parse import quote
 from uuid import UUID, uuid4
@@ -3385,6 +3386,101 @@ def test_admin_run_artifact_does_not_expose_sensitive_text() -> None:
     )
 
     assert artifact.text is None
+
+
+def test_admin_run_artifact_exposes_safe_generated_file_metadata() -> None:
+    run_id = UUID("33333333-3333-4333-8333-333333333333")
+    artifact_id = UUID("44444444-4444-4444-8444-444444444444")
+    artifact = _admin_run_artifact(
+        {
+            "id": str(artifact_id),
+            "type": "tool_result",
+            "producer": "document_writer",
+            "content": {
+                "result": {
+                    "file": {
+                        "artifact_id": str(artifact_id),
+                        "filename": "delivery-plan.docx",
+                        "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        "size_bytes": 123,
+                        "sha256": "a" * 64,
+                        "download_url": f"/api/v1/admin/runs/{run_id}/artifacts/{artifact_id}/download",
+                    },
+                    "metadata": {
+                        "artifact_id": str(artifact_id),
+                        "filename": "delivery-plan.docx",
+                        "storage_key": "tenant/run/artifact/delivery-plan.docx",
+                    },
+                }
+            },
+        },
+        run_id=run_id,
+    )
+
+    assert artifact.filename == "delivery-plan.docx"
+    assert artifact.mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    assert artifact.size_bytes == 123
+    assert artifact.sha256 == "a" * 64
+    assert artifact.download_url == f"/api/v1/admin/runs/{run_id}/artifacts/{artifact_id}/download"
+    assert "storage_key" not in artifact.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("filename", "mime_type", "data"),
+    [
+        (
+            "delivery-plan.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            b"docx-bytes",
+        ),
+        ("chart.png", "image/png", b"\x89PNG\r\n\x1a\n"),
+        ("bundle.zip", "application/zip", b"PK\x03\x04"),
+    ],
+)
+def test_download_run_artifact_returns_generated_file(
+    tmp_path: Path, filename: str, mime_type: str, data: bytes
+) -> None:
+    api = client()
+    service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)
+    run_id = UUID("33333333-3333-4333-8333-333333333333")
+    artifact_id = UUID("44444444-4444-4444-8444-444444444444")
+    path = tmp_path / filename
+    path.write_bytes(data)
+    service.generated_artifacts[(run_id, artifact_id)] = (
+        path,
+        filename,
+        mime_type,
+    )
+
+    response = api.get(
+        f"/api/v1/admin/runs/{run_id}/artifacts/{artifact_id}/download",
+        headers=headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.content == data
+    assert response.headers["content-type"].startswith(mime_type)
+
+
+def test_download_run_artifact_rejects_mime_extension_mismatch(tmp_path: Path) -> None:
+    api = client()
+    service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)
+    run_id = UUID("33333333-3333-4333-8333-333333333333")
+    artifact_id = UUID("44444444-4444-4444-8444-444444444444")
+    path = tmp_path / "installer.exe"
+    path.write_bytes(b"not-an-image")
+    service.generated_artifacts[(run_id, artifact_id)] = (
+        path,
+        "installer.exe",
+        "image/png",
+    )
+
+    response = api.get(
+        f"/api/v1/admin/runs/{run_id}/artifacts/{artifact_id}/download",
+        headers=headers(),
+    )
+
+    assert response.status_code == 404
 
 
 def test_conversation_can_be_loaded_by_session_id() -> None:

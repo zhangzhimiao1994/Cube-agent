@@ -13,6 +13,7 @@ const MANUAL_RUN_MODES = [
 
 type ManualRunMode = (typeof MANUAL_RUN_MODES)[number]["value"];
 type RunEvent = RunDetail["events"][number];
+type RunArtifact = RunDetail["artifacts"][number];
 
 type ObserverNotice = {
   sequence: number;
@@ -187,6 +188,28 @@ function displayToolStatus(status: string) {
 
 function displayToolOperation(kind: string) {
   return TOOL_OPERATION_LABELS[kind] ?? kind;
+}
+
+function formatArtifactSize(size: number | null | undefined) {
+  if (typeof size !== "number" || !Number.isFinite(size) || size < 0) return "";
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(size < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(size / 1024 / 1024).toFixed(size < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
+
+function artifactFileSummary(artifact: RunArtifact) {
+  return [artifact.mime_type, formatArtifactSize(artifact.size_bytes)].filter(Boolean).join(" · ");
+}
+
+function ArtifactDownloadLink({ artifact }: { artifact: RunArtifact }) {
+  if (!artifact.download_url || !artifact.filename) return null;
+  const summary = artifactFileSummary(artifact);
+  return (
+    <a className="artifact-file-link" href={artifact.download_url} download={artifact.filename}>
+      <span>下载 {artifact.filename}</span>
+      {summary ? <small>{summary}</small> : null}
+    </a>
+  );
 }
 
 function displayDetailActor(actor: string | null | undefined) {
@@ -1062,7 +1085,9 @@ export function RunDetailPage() {
           <ul>
             {run.data.artifacts.map((artifact) => (
               <li key={artifact.id}>
-                {artifact.kind}：{artifact.title}
+                <strong>{artifact.kind}：{artifact.title}</strong>
+                {artifact.filename ? <small>{artifact.filename}</small> : null}
+                <ArtifactDownloadLink artifact={artifact} />
               </li>
             ))}
           </ul>

@@ -783,6 +783,7 @@ def create_app(
                     actor_id=configured.bootstrap_tenant_id,
                     session_factory=active_sessions,
                     skill_store_dir=configured.skill_store_dir,
+                    generated_artifact_dir=configured.generated_artifact_dir,
                 )
             if user_admin_service is None and active_sessions is not None:
                 application.state.user_admin_service = PersistentUserAdminService(active_sessions)
@@ -796,6 +797,7 @@ def create_app(
                         run_repository=RunRepository(active_sessions),
                         skill_store_dir=configured.skill_store_dir,
                         workspace_root=configured.attachment_store_dir,
+                        generated_artifact_dir=configured.generated_artifact_dir,
                     )
                     active_runtime_registry = configured_runtime_registry(
                         config_service=ConfigService(active_sessions),

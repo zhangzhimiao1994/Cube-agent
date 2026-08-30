@@ -91,6 +91,80 @@ async def test_runtime_gateway_accepts_harness_builtin_tool_aliases(tmp_path: Pa
     assert workspace_read == {"path": "note.txt", "text": "safe", "truncated": False}
 
 
+async def test_runtime_gateway_generates_docx_file_artifact(tmp_path: Path) -> None:
+    generated_dir = tmp_path / "generated"
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=generated_dir,
+    )
+
+    result = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="document_writer",
+        name="document.generate_docx",
+        arguments={
+            "title": "Delivery Plan",
+            "sections": ({"heading": "Scope", "paragraphs": ("Ship the harness.",)},),
+        },
+        idempotency_key="docx_1",
+    )
+
+    file_payload = result["file"]
+    assert isinstance(file_payload, dict)
+    assert file_payload["filename"] == "delivery-plan.docx"
+    assert file_payload["mime_type"] == (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+    assert file_payload["size_bytes"] > 0
+    assert gateway.is_available(TENANT_ID, "document.generate_docx") is True
+    stored_path = (
+        generated_dir
+        / str(TENANT_ID)
+        / str(RUN_ID)
+        / str(result["artifact_id"])
+        / "delivery-plan.docx"
+    )
+    assert stored_path.is_file()
+
+
+async def test_runtime_gateway_generates_pptx_file_artifact(tmp_path: Path) -> None:
+    generated_dir = tmp_path / "generated"
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=generated_dir,
+    )
+
+    result = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="presentation_designer",
+        name="presentation.generate_pptx",
+        arguments={
+            "title": "Launch Review",
+            "slides": ({"title": "Status", "bullets": ("Ready", "Verified")},),
+        },
+        idempotency_key="pptx_1",
+    )
+
+    file_payload = result["file"]
+    assert isinstance(file_payload, dict)
+    assert file_payload["filename"] == "launch-review.pptx"
+    assert file_payload["mime_type"] == (
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    )
+    assert file_payload["size_bytes"] > 0
+    assert gateway.is_available(TENANT_ID, "presentation.generate_pptx") is True
+    stored_path = (
+        generated_dir
+        / str(TENANT_ID)
+        / str(RUN_ID)
+        / str(result["artifact_id"])
+        / "launch-review.pptx"
+    )
+    assert stored_path.is_file()
+
+
 async def test_runtime_gateway_read_context_accepts_query_without_workspace(tmp_path: Path) -> None:
     gateway = RuntimeCapabilityGateway(skill_store_dir=tmp_path / "skills")
 

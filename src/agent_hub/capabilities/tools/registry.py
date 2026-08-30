@@ -20,6 +20,8 @@ class ToolRegistry:
 def create_builtin_tool_registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register("calculator.evaluate", object())
+    registry.register("document.generate_docx", object())
     registry.register("http.read", object())
+    registry.register("presentation.generate_pptx", object())
     registry.register("workspace.read", object())
     return registry

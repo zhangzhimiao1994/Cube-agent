@@ -60,6 +60,7 @@ def default_capability_policy(tenant_id: UUID) -> CapabilityPolicy:
             for capability, operation, resource_prefix in (
                 ("calculator", "evaluate", "calculator"),
                 ("file", "read", "workspace"),
+                ("file", "create", "generated"),
                 ("context", "read", "context"),
                 ("skill", "use", "skill"),
             )
@@ -73,10 +74,12 @@ def build_runtime_capability_stack(
     run_repository: object,
     skill_store_dir: Path,
     workspace_root: Path | None,
+    generated_artifact_dir: Path | None = None,
 ) -> RuntimeCapabilityStack:
     runtime_gateway = RuntimeCapabilityGateway(
         skill_store_dir=skill_store_dir,
         workspace_root=workspace_root,
+        generated_artifact_dir=generated_artifact_dir,
     )
     del tenant_id
     policy_gateway = DefaultRuntimeCapabilityPolicyGateway(

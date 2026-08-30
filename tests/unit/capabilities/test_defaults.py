@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -34,10 +35,14 @@ def test_default_capability_policy_allows_safe_runtime_tools_for_operators() -> 
 
     calculator = policy.evaluate(request("calculator", "evaluate", "calculator"), Role.OPERATOR)
     read = policy.evaluate(request("file", "read", "workspace/docs/a.md"), Role.OPERATOR)
+    create = policy.evaluate(
+        request("file", "create", "generated/document.generate_docx"), Role.OPERATOR
+    )
     skill = policy.evaluate(request("skill", "use", "skill/docx"), Role.OPERATOR)
 
     assert calculator.effect is PolicyEffect.ALLOW
     assert read.effect is PolicyEffect.ALLOW
+    assert create.effect is PolicyEffect.ALLOW
     assert skill.effect is PolicyEffect.ALLOW
 
 
@@ -77,3 +82,41 @@ async def test_default_runtime_capability_stack_authorizes_request_tenant(
 
     assert result.status == "succeeded"
     assert result.payload == {"value": "5"}
+
+
+async def test_default_runtime_capability_stack_wires_generated_artifact_store(
+    tmp_path: Path,
+) -> None:
+    generated_dir = tmp_path / "generated"
+    stack = build_runtime_capability_stack(
+        tenant_id=TENANT_ID,
+        run_repository=object(),
+        skill_store_dir=tmp_path / "skills",
+        workspace_root=tmp_path / "workspace",
+        generated_artifact_dir=generated_dir,
+    )
+
+    result = await stack.harness_tool_gateway.invoke(
+        TENANT_ID,
+        HarnessToolCallRequest(
+            run_id=RUN_ID,
+            actor="document_writer",
+            tool_name="document.generate_docx",
+            arguments={"title": "Delivery Plan"},
+            approval_required=False,
+            sandbox="restricted",
+            idempotency_key="docx-stack",
+        ),
+        user_id=uuid4(),
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "succeeded"
+    file_payload = result.payload["file"]
+    assert isinstance(file_payload, Mapping)
+    assert file_payload["filename"] == "delivery-plan.docx"
+    assert "storage_key" not in file_payload
+    metadata = result.payload["metadata"]
+    assert isinstance(metadata, Mapping)
+    assert isinstance(metadata["storage_key"], str)
+    assert (generated_dir / metadata["storage_key"]).is_file()

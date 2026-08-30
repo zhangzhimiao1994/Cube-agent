@@ -1145,6 +1145,35 @@ describe("operational management pages", () => {
     await waitFor(() => expect(screen.getByRole("heading", { name: "已暂停" })).not.toBeNull());
   });
 
+  it("shows generated artifact downloads on the run detail artifact archive", async () => {
+    visibleRunDetail = {
+      ...runDetail,
+      artifacts: [
+        {
+          id: "artifact-final-docx",
+          kind: "tool_result",
+          title: "交付文档",
+          text: null,
+          filename: "delivery-plan.docx",
+          mime_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          size_bytes: 4096,
+          sha256: "a".repeat(64),
+          download_url: `/api/v1/admin/runs/${runId}/artifacts/artifact-final-docx/download`,
+        },
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    expect(await screen.findByRole("heading", { name: "运行详情" })).not.toBeNull();
+    const archive = screen.getByRole("heading", { name: "产物" }).closest("article");
+    expect(archive).not.toBeNull();
+    const download = within(archive as HTMLElement).getByRole("link", { name: /下载 delivery-plan\.docx/ });
+    expect(download.getAttribute("href")).toBe(`/api/v1/admin/runs/${runId}/artifacts/artifact-final-docx/download`);
+    expect(within(archive as HTMLElement).getByText(/4\.0 KB/)).not.toBeNull();
+  });
+
   it("renders run detail as a Vibe Engineer debugging summary", async () => {
     visibleRunDetail = {
       ...runDetail,
@@ -1686,9 +1715,9 @@ describe("operational management pages", () => {
     await user.type(screen.getByPlaceholderText(/输入消息/), "给我做一个短视频脚本方案。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
-    const link = await screen.findByRole("link", { name: "查看运行详情" });
-    expect(link.getAttribute("href")).toBe(`/runs/${runId}`);
-    expect(link.closest(".chat-stream")).not.toBeNull();
+    await screen.findByText(/这是最终回复正文/);
+    expect(screen.queryByRole("link", { name: "查看运行详情" })).toBeNull();
+    expect(screen.queryByRole("status", { name: /任务态势/ })).toBeNull();
     expect(screen.getByText(/这轮回复使用/)).not.toBeNull();
     expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
       method: "POST",
@@ -1700,6 +1729,70 @@ describe("operational management pages", () => {
         agent_ids: ["director", "copywriter", "editor"],
       },
     });
+  });
+
+  it("places generated downloads on artifacts without repeating run status in chat", async () => {
+    const user = userEvent.setup();
+    visibleRunDetail = {
+      ...runDetail,
+      artifacts: [
+        {
+          id: "artifact-final-docx",
+          kind: "tool_result",
+          title: "交付文档",
+          text: null,
+          filename: "delivery-plan.docx",
+          mime_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          size_bytes: 4096,
+          sha256: "a".repeat(64),
+          download_url: `/api/v1/admin/runs/${runId}/artifacts/artifact-final-docx/download`,
+        },
+      ],
+      events: [
+        ...runDetail.events,
+        {
+          sequence: 5,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: "2026-08-07T00:00:03Z",
+          actor: "copywriter",
+          participants: [],
+          tool_name: "document.generate_docx",
+          step_id: "write-script",
+          artifact: {
+            id: "artifact-final-docx",
+            kind: "tool_result",
+            title: "交付文档",
+            text: null,
+            filename: "delivery-plan.docx",
+            mime_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            size_bytes: 4096,
+            sha256: "a".repeat(64),
+            download_url: `/api/v1/admin/runs/${runId}/artifacts/artifact-final-docx/download`,
+          },
+          payload: {
+            artifact_id: "artifact-final-docx",
+            summary: "生成交付文档",
+          },
+        },
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+
+    expect(within(stream).queryByRole("status", { name: /任务态势/ })).toBeNull();
+    const chatDownload = within(stream).getByRole("link", { name: /下载 delivery-plan\.docx/ });
+    expect(chatDownload.getAttribute("href")).toBe(`/api/v1/admin/runs/${runId}/artifacts/artifact-final-docx/download`);
+    expect(within(stream).queryByRole("link", { name: "查看运行详情" })).toBeNull();
+
+    await user.click(within(stream).getByRole("button", { name: /文案生成 输出：生成交付文档/ }));
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).getByRole("link", { name: /下载 delivery-plan\.docx/ })).not.toBeNull();
   });
 
   it("keeps live adjustment and temporary-agent switches out of workflow configuration", async () => {
@@ -1799,7 +1892,7 @@ describe("operational management pages", () => {
     await user.type(screen.getByPlaceholderText(/输入消息/), "1 帮我写一段口播。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
-    await screen.findByRole("link", { name: "查看运行详情" });
+    await screen.findByText(/这是最终回复正文/);
     expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
       method: "POST",
       body: {
@@ -3567,16 +3660,11 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    const posture = within(stream).getByRole("status", { name: /任务态势，等待确认/ });
-
-    expect(within(posture).getByText("任务态势")).not.toBeNull();
-    expect(within(posture).getByText("等待确认")).not.toBeNull();
-    expect(within(posture).getByText("助手 2")).not.toBeNull();
-    expect(within(posture).getByText("工具 1")).not.toBeNull();
-    expect(within(posture).getByText("产物 1")).not.toBeNull();
-    expect(within(posture).getByText("异常 1")).not.toBeNull();
-    expect(within(posture).getByText("确认 1")).not.toBeNull();
-    expect(within(posture).getByText("思考 1")).not.toBeNull();
+    expect(within(stream).queryByRole("status", { name: /任务态势/ })).toBeNull();
+    expect(within(stream).getByRole("status", { name: /Agent 集群/ })).not.toBeNull();
+    expect(within(stream).getByRole("region", { name: "助手派单状态" })).not.toBeNull();
+    expect(within(stream).getByRole("region", { name: "故障诊断" })).not.toBeNull();
+    expect(within(stream).getByRole("region", { name: "执行意图" })).not.toBeNull();
   });
 
   it("surfaces execution intent rows for approvals, retries, and replay safety", async () => {
@@ -3990,8 +4078,7 @@ describe("operational management pages", () => {
     const stream = screen.getByRole("region", { name: "主对话内容" });
 
     expect(within(stream).getAllByRole("button", { name: /run_safe_command/ })).toHaveLength(1);
-    const posture = within(stream).getByRole("status", { name: /任务态势，运行中/ });
-    expect(within(posture).getByText("工具 1")).not.toBeNull();
+    expect(within(stream).queryByRole("status", { name: /任务态势/ })).toBeNull();
   });
 
   it("does not double-count artifacts already attached to process events", async () => {
@@ -4031,9 +4118,9 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    const posture = within(stream).getByRole("status", { name: /任务态势，任务已结束/ });
 
-    expect(within(posture).getByText("产物 1")).not.toBeNull();
+    expect(within(stream).queryByRole("status", { name: /任务态势/ })).toBeNull();
+    expect(within(stream).getAllByText(/工程执行日志正文/).length).toBeGreaterThan(0);
   });
 
   it("shows queued run posture even before process actions arrive", async () => {
@@ -4053,7 +4140,8 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
 
-    expect(within(stream).getByRole("status", { name: /任务态势，已排队/ })).not.toBeNull();
+    expect(within(stream).queryByRole("status", { name: /任务态势/ })).toBeNull();
+    expect(within(stream).getByText("给我做一个短视频脚本方案。")).not.toBeNull();
   });
 
   it("keeps later independent runtime failures separate from tool failure wrappers", async () => {
@@ -4116,8 +4204,7 @@ describe("operational management pages", () => {
 
     expect(within(stream).getByText(/independent review model transport failed/)).not.toBeNull();
     expect(within(stream).getByRole("button", { name: /reviewer 失败：model gateway failed/ })).not.toBeNull();
-    const posture = within(stream).getByRole("status", { name: /任务态势，执行异常/ });
-    expect(within(posture).getByText("异常 2")).not.toBeNull();
+    expect(within(stream).queryByRole("status", { name: /任务态势/ })).toBeNull();
   });
 
   it("separates mixed failure causes into actionable diagnostics", async () => {
@@ -4389,10 +4476,9 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    const posture = within(stream).getByRole("status", { name: /任务态势，运行中/ });
     const intentRegion = within(stream).getByRole("region", { name: "执行意图" });
 
-    expect(within(posture).queryByText(/确认 1/)).toBeNull();
+    expect(within(stream).queryByRole("status", { name: /任务态势/ })).toBeNull();
     expect(within(intentRegion).queryByText("等待确认")).toBeNull();
     expect(within(intentRegion).getByText("确认已处理")).not.toBeNull();
     expect(within(stream).queryByRole("region", { name: "故障诊断" })).toBeNull();
@@ -4636,7 +4722,7 @@ describe("operational management pages", () => {
     await user.type(screen.getByPlaceholderText(/输入消息/), "请让多个角色评审这个方案。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
-    await screen.findByRole("link", { name: "查看运行详情" });
+    await waitFor(() => expect(requests.find((request) => request.path === "/api/v1/runs")).toBeTruthy());
     expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
       method: "POST",
       body: {
@@ -4660,7 +4746,7 @@ describe("operational management pages", () => {
     await user.type(screen.getByPlaceholderText(/输入消息/), "讨论 请让多个角色评审这个方案。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
-    await screen.findByRole("link", { name: "查看运行详情" });
+    await waitFor(() => expect(requests.find((request) => request.path === "/api/v1/runs")).toBeTruthy());
     expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
       method: "POST",
       body: {
@@ -4739,7 +4825,7 @@ describe("operational management pages", () => {
     await user.type(screen.getByPlaceholderText(/输入消息/), "请根据图片说明问题");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
-    await screen.findByRole("link", { name: "查看运行详情" });
+    await waitFor(() => expect(requests.find((request) => request.path === "/api/v1/runs")).toBeTruthy());
     expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
       method: "POST",
       body: {

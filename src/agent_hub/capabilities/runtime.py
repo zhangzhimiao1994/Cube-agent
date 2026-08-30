@@ -2,20 +2,38 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import shutil
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from agent_hub.capabilities.tools.calculator import Calculator
 from agent_hub.capabilities.tools.workspace_read import WorkspaceReader
+from agent_hub.documents.docx import DocxBlueprint, build_docx
+from agent_hub.documents.pptx import PptxBlueprint, build_pptx
+from agent_hub.files.generated import (
+    DOCX_MIME_TYPE,
+    PPTX_MIME_TYPE,
+    GeneratedFileStore,
+    safe_generated_filename,
+)
 from agent_hub.runtime.contracts import JsonValue
 from agent_hub.skills.sandbox.base import SkillInvocation, SkillSandbox
 from agent_hub.skills.sandbox.systemd import SystemdSkillSandbox
 
 _SAFE_CAPABILITY_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
+_DOCX_TOOL = "document.generate_docx"
+_PPTX_TOOL = "presentation.generate_pptx"
+_DOTTED_BUILT_INS = frozenset({
+    "calculator.evaluate",
+    "workspace.read",
+    _DOCX_TOOL,
+    _PPTX_TOOL,
+})
 _REPLAY_SAFE = frozenset({
     "calculator",
     "calculator_evaluate",
@@ -23,6 +41,8 @@ _REPLAY_SAFE = frozenset({
     "read_context",
     "workspace_read",
     "workspace.read",
+    _DOCX_TOOL,
+    _PPTX_TOOL,
 })
 _BUILTIN_ALIASES = {
     "calculator.evaluate": "calculator",
@@ -42,16 +62,21 @@ class RuntimeCapabilityGateway:
         *,
         skill_store_dir: Path,
         workspace_root: Path | None = None,
+        generated_artifact_dir: Path | None = None,
         skill_sandbox: SkillSandbox | None = None,
         calculator: Calculator | None = None,
     ) -> None:
         self._skill_store_dir = skill_store_dir
         self._workspace_root = workspace_root
+        self._generated_file_store = (
+            GeneratedFileStore(generated_artifact_dir) if generated_artifact_dir is not None else None
+        )
         self._skill_sandbox = skill_sandbox or SystemdSkillSandbox()
         self._calculator = calculator or Calculator()
 
     def is_replay_safe(self, name: str) -> bool:
-        return name in _REPLAY_SAFE
+        normalized_name = _normalize_tool_name(name)
+        return normalized_name in _REPLAY_SAFE
 
     def is_available(self, tenant_id: UUID, name: str) -> bool:
         normalized_name = _normalize_tool_name(name)
@@ -81,6 +106,10 @@ class RuntimeCapabilityGateway:
             return self._execute_read_context(arguments)
         if normalized_name == "workspace_read":
             return self._execute_workspace_read(arguments)
+        if normalized_name == _DOCX_TOOL:
+            return self._execute_generate_docx(tenant_id, run_id, arguments)
+        if normalized_name == _PPTX_TOOL:
+            return self._execute_generate_pptx(tenant_id, run_id, arguments)
         return await self._execute_skill(
             tenant_id=tenant_id,
             run_id=run_id,
@@ -125,6 +154,86 @@ class RuntimeCapabilityGateway:
             "text": result.text,
             "truncated": result.truncated,
         }
+
+    def _execute_generate_docx(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        arguments: Mapping[str, JsonValue],
+    ) -> Mapping[str, JsonValue]:
+        store = self._require_generated_file_store()
+        title = _required_string(arguments, "title")
+        blueprint = DocxBlueprint(
+            title=title,
+            subtitle=_optional_string(arguments, "subtitle"),
+            sections=_optional_mapping_list(arguments, "sections"),
+        )
+        filename = _filename(arguments, title=title, extension=".docx")
+        artifact_id = uuid4()
+        with tempfile.TemporaryDirectory(prefix="agent-hub-docx-") as temporary_dir:
+            output = Path(temporary_dir) / filename
+            try:
+                build_docx(blueprint, output)
+            except ValueError as error:
+                raise RuntimeCapabilityError(str(error)) from None
+            metadata = store.store_bytes(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                artifact_id=artifact_id,
+                filename=filename,
+                mime_type=DOCX_MIME_TYPE,
+                data=output.read_bytes(),
+            )
+        return _file_result(
+            artifact_id=artifact_id,
+            public_metadata=metadata.to_public_dict(),
+            internal_metadata=metadata.to_content_file(),
+            summary=f"Generated DOCX artifact {metadata.filename}.",
+        )
+
+    def _execute_generate_pptx(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        arguments: Mapping[str, JsonValue],
+    ) -> Mapping[str, JsonValue]:
+        store = self._require_generated_file_store()
+        title = _required_string(arguments, "title")
+        blueprint = PptxBlueprint(
+            title=title,
+            subtitle=_optional_string(arguments, "subtitle"),
+            template_id=_optional_string(arguments, "template_id") or "consulting-clean",
+            slides=_optional_mapping_list(arguments, "slides"),
+        )
+        filename = _filename(arguments, title=title, extension=".pptx")
+        artifact_id = uuid4()
+        with tempfile.TemporaryDirectory(prefix="agent-hub-pptx-") as temporary_dir:
+            output = Path(temporary_dir) / filename
+            try:
+                build_pptx(blueprint, output)
+            except ValueError as error:
+                if str(error).startswith("unknown PPTX template:"):
+                    raise RuntimeCapabilityError("template_id is invalid") from None
+                raise RuntimeCapabilityError(str(error)) from None
+            metadata = store.store_bytes(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                artifact_id=artifact_id,
+                filename=filename,
+                mime_type=PPTX_MIME_TYPE,
+                data=output.read_bytes(),
+            )
+        return _file_result(
+            artifact_id=artifact_id,
+            public_metadata=metadata.to_public_dict(),
+            internal_metadata=metadata.to_content_file(),
+            summary=f"Generated PPTX artifact {metadata.filename}.",
+        )
+
+    def _require_generated_file_store(self) -> GeneratedFileStore:
+        if self._generated_file_store is None:
+            raise RuntimeCapabilityError("generated artifact store is not configured")
+        return self._generated_file_store
 
     async def _execute_skill(
         self,
@@ -187,6 +296,8 @@ class RuntimeCapabilityGateway:
 
 
 def _require_safe(name: str, value: str, *, max_length: int = 128) -> None:
+    if name == "capability name" and value in _DOTTED_BUILT_INS:
+        return
     if (
         not isinstance(value, str)
         or len(value) > max_length
@@ -197,6 +308,82 @@ def _require_safe(name: str, value: str, *, max_length: int = 128) -> None:
 
 def _normalize_tool_name(name: str) -> str:
     return _BUILTIN_ALIASES.get(name, name)
+
+
+def _required_string(arguments: Mapping[str, JsonValue], field_name: str) -> str:
+    value = arguments.get(field_name)
+    if not isinstance(value, str):
+        raise RuntimeCapabilityError(f"{field_name} must be a string")
+    if not value.strip():
+        raise RuntimeCapabilityError(f"{field_name} must not be empty")
+    return value
+
+
+def _optional_string(arguments: Mapping[str, JsonValue], field_name: str) -> str | None:
+    value = arguments.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise RuntimeCapabilityError(f"{field_name} must be a string")
+    return value
+
+
+def _optional_mapping_list(
+    arguments: Mapping[str, JsonValue],
+    field_name: str,
+) -> list[dict[str, object]]:
+    value = arguments.get(field_name)
+    if value is None:
+        return []
+    if not isinstance(value, list | tuple):
+        raise RuntimeCapabilityError(f"{field_name} must be a list")
+    items: list[dict[str, object]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise RuntimeCapabilityError(f"{field_name} items must be objects")
+        items.append(dict(item))
+    return items
+
+
+def _filename(arguments: Mapping[str, JsonValue], *, title: str, extension: str) -> str:
+    value = arguments.get("filename")
+    if value is not None:
+        if not isinstance(value, str):
+            raise RuntimeCapabilityError("filename must be a string")
+        try:
+            return safe_generated_filename(value)
+        except ValueError as error:
+            raise RuntimeCapabilityError(str(error)) from None
+    basename = re.sub(r"[^a-z0-9]+", "-", title.casefold()).strip("-")
+    if not basename:
+        basename = "artifact"
+    try:
+        return safe_generated_filename(f"{basename[:80]}{extension}")
+    except ValueError as error:
+        raise RuntimeCapabilityError(str(error)) from None
+
+
+def _file_result(
+    *,
+    artifact_id: UUID,
+    public_metadata: dict[str, str | int],
+    internal_metadata: dict[str, str | int],
+    summary: str,
+) -> Mapping[str, JsonValue]:
+    public_payload: dict[str, JsonValue] = {
+        "artifact_id": str(artifact_id),
+        **public_metadata,
+    }
+    internal_payload: dict[str, JsonValue] = {
+        "artifact_id": str(artifact_id),
+        **internal_metadata,
+    }
+    return {
+        "artifact_id": str(artifact_id),
+        "file": public_payload,
+        "metadata": internal_payload,
+        "summary": summary,
+    }
 
 
 def _execution_id(actor: str, skill_id: str, idempotency_key: str) -> str:
@@ -219,4 +406,18 @@ def _parse_stdout(value: str) -> JsonValue:
         parsed = json.loads(value)
     except json.JSONDecodeError:
         return value
-    return cast(JsonValue, parsed)
+    return _normalize_json_value(parsed)
+
+
+def _normalize_json_value(value: object) -> JsonValue:
+    if value is None or type(value) in {bool, int, str}:
+        return cast(JsonValue, value)
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise RuntimeCapabilityError("skill stdout is not JSON serializable")
+        return value
+    if isinstance(value, list):
+        return tuple(_normalize_json_value(item) for item in value)
+    if isinstance(value, Mapping):
+        return {str(key): _normalize_json_value(item) for key, item in value.items()}
+    raise RuntimeCapabilityError("skill stdout is not JSON serializable")

@@ -318,10 +318,77 @@ function formatEventPayloadValue(value: unknown): string {
 
 type RunEvent = RunDetail["events"][number];
 type RunArtifact = RunDetail["artifacts"][number];
+type DownloadableArtifact = (RunArtifact | NonNullable<RunEvent["artifact"]>) & {
+  download_url: string;
+  filename: string;
+};
+type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  title: string;
+  body: string;
+  artifact?: DownloadableArtifact;
+  run?: RunDetail;
+};
 type EventGroupItem = {
   event: RunEvent;
   index: number;
 };
+
+function isDownloadableArtifact(
+  artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null | undefined,
+): artifact is DownloadableArtifact {
+  return Boolean(artifact?.download_url && artifact.filename);
+}
+
+function formatArtifactSize(size: number | null | undefined) {
+  if (typeof size !== "number" || !Number.isFinite(size) || size < 0) return "";
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(size < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(size / 1024 / 1024).toFixed(size < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
+
+function artifactFileSummary(artifact: DownloadableArtifact) {
+  return [artifact.mime_type, formatArtifactSize(artifact.size_bytes)].filter(Boolean).join(" · ");
+}
+
+function ArtifactDownloadLink({ artifact }: { artifact: DownloadableArtifact }) {
+  const summary = artifactFileSummary(artifact);
+  return (
+    <a className="artifact-file-link" href={artifact.download_url ?? "#"} download={artifact.filename ?? undefined}>
+      <span>下载 {artifact.filename}</span>
+      {summary ? <small>{summary}</small> : null}
+    </a>
+  );
+}
+
+function downloadArtifactMessage(artifact: DownloadableArtifact): ChatMessage {
+  return {
+    id: `download-${artifact.id}`,
+    role: "assistant",
+    title: `附件：${artifact.filename}`,
+    body: artifactFileSummary(artifact) || artifact.kind,
+    artifact,
+  };
+}
+
+function artifactMessage(artifact: RunArtifact): ChatMessage {
+  if (isDownloadableArtifact(artifact)) {
+    return {
+      id: `artifact-${artifact.id}`,
+      role: "assistant",
+      title: `附件：${artifact.filename}`,
+      body: artifactFileSummary(artifact) || artifact.kind,
+      artifact,
+    };
+  }
+  return {
+    id: `artifact-${artifact.id}`,
+    role: "assistant",
+    title: `附件：${artifact.title}`,
+    body: artifact.kind,
+  };
+}
 
 function isGenericArtifactText(value: string | null | undefined) {
   const normalized = value?.replace(/\s+/g, " ").trim();
@@ -683,6 +750,7 @@ type ProcessDetailTarget = {
   badge: string;
   rows: Array<{ label: string; value: string }>;
   createdAt: string | null;
+  artifact?: DownloadableArtifact;
 };
 
 type AgentDispatchCard = {
@@ -701,11 +769,6 @@ type TaskChainStep = {
   status: "等待确认" | "异常" | "已完成" | "进行中" | "已安排" | "等待上游";
   summary: string;
   dependsOn: string[];
-};
-
-type RunProcessPosture = {
-  status: "等待确认" | "执行异常" | "任务已结束" | "运行中" | "已排队";
-  metrics: Array<{ label: string; value: number }>;
 };
 
 type RunExecutionIntent = {
@@ -865,32 +928,6 @@ function plannedTaskChain(detail: RunDetail, agentNames: Map<string, string>): T
   });
 }
 
-function uniqueToolCallCount(events: RunDetail["events"]) {
-  const calls = new Set<string>();
-  events
-    .filter(isToolEvent)
-    .forEach((event) => {
-      calls.add(toolLifecycleKey(event));
-    });
-  return calls.size;
-}
-
-function artifactProgressCount(detail: RunDetail) {
-  const artifacts = new Set<string>();
-  detail.artifacts.forEach((artifact) => artifacts.add(artifact.id));
-  detail.events
-    .filter((event) => event.kind === "artifact.created" || event.kind === "message.created")
-    .forEach((event) => {
-      const artifactId = event.artifact?.id || formatEventPayloadValue(event.payload.artifact_id);
-      if (artifactId) {
-        artifacts.add(artifactId);
-      } else if (detail.artifacts.length === 0) {
-        artifacts.add(`event:${event.sequence}`);
-      }
-    });
-  return artifacts.size;
-}
-
 function approvalStateFromEvents(events: RunDetail["events"]): ApprovalState {
   const pending: RunEvent[] = [];
   const resolved: RunEvent[] = [];
@@ -910,39 +947,6 @@ function approvalStateFromEvents(events: RunDetail["events"]): ApprovalState {
     if (event.kind === "approval.requested") pending.push(event);
   });
   return { pending, resolved };
-}
-
-function pendingApprovalCount(events: RunDetail["events"]) {
-  return approvalStateFromEvents(events).pending.length;
-}
-
-function failureCount(events: RunDetail["events"]) {
-  return events.filter((event) => (event.kind.endsWith(".failed") || event.kind === "runtime.failed") && !isWrappedToolFailureEvent(event, events)).length;
-}
-
-function runProcessPosture(detail: RunDetail, itemCount: number, assistantCount: number): RunProcessPosture {
-  const pendingApprovals = detail.status === "waiting_approval" ? Math.max(1, pendingApprovalCount(detail.events)) : pendingApprovalCount(detail.events);
-  const failures = failureCount(detail.events);
-  const status =
-    pendingApprovals > 0
-      ? "等待确认"
-      : detail.status === "failed" || failures > 0
-        ? "执行异常"
-        : TERMINAL_STATUSES.has(detail.status)
-          ? "任务已结束"
-          : detail.status === "queued"
-            ? "已排队"
-            : "运行中";
-  const metrics = [
-    { label: "动作", value: itemCount },
-    { label: "助手", value: assistantCount },
-    { label: "工具", value: uniqueToolCallCount(detail.events) },
-    { label: "产物", value: artifactProgressCount(detail) },
-    { label: "异常", value: failures },
-    { label: "确认", value: pendingApprovals },
-    { label: "思考", value: detail.events.filter((event) => event.kind === "model.reasoning_delta").length },
-  ].filter((metric) => metric.value > 0);
-  return { status, metrics };
 }
 
 const SAFE_INTENT_PAYLOAD_KEYS = [
@@ -1475,35 +1479,35 @@ function temporaryAgentApprovalBody(proposal: TemporaryAgentProposal) {
   ].join("\n\n");
 }
 
-function detailMessages(detail: RunDetail | undefined) {
+function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
   if (!detail) return [];
   const textArtifacts = dedupeTextArtifacts(detail.artifacts);
   const replyArtifact = preferredReplyArtifact(textArtifacts);
   const internalNotice = internalArtifactNotice(detail);
   const failureReason = failureReasonFromEvents(detail.events);
+  const downloadableArtifacts = detail.artifacts.filter(isDownloadableArtifact);
   const artifactMessages = replyArtifact
     ? [
         {
           id: `artifact-${replyArtifact.id}`,
-          role: "assistant",
+          role: "assistant" as const,
           title: "回复",
           body:
             textArtifacts.length > 1
               ? `${replyArtifact.text?.trim() ?? ""}\n\n（另有 ${
                   textArtifacts.length - 1
-                } 条角色产物，可点“查看运行详情”查看。）`
+                } 条角色产物，可在对应 Agent 动作卡片中展开查看。）`
               : replyArtifact.text?.trim() ?? "",
+          artifact: isDownloadableArtifact(replyArtifact) ? replyArtifact : undefined,
         },
+        ...downloadableArtifacts
+          .filter((artifact) => artifact.id !== replyArtifact.id)
+          .map(downloadArtifactMessage),
       ]
     : detail.artifacts
         .filter((artifact) => !artifact.text?.trim())
-        .map((artifact) => ({
-          id: `artifact-${artifact.id}`,
-          role: "assistant",
-          title: `附件：${artifact.title}`,
-          body: artifact.kind,
-        }));
-  const failureMessages =
+        .map(artifactMessage);
+  const failureMessages: ChatMessage[] =
     detail.status === "failed"
       ? [
           {
@@ -1522,7 +1526,7 @@ function detailMessages(detail: RunDetail | undefined) {
   return [
     {
       id: "request",
-      role: "user",
+      role: "user" as const,
       title: "你",
       body: detail.request,
     },
@@ -1530,7 +1534,7 @@ function detailMessages(detail: RunDetail | undefined) {
       ? [
           {
             id: `${detail.id}-temporary-agent-approval`,
-            role: "assistant",
+            role: "assistant" as const,
             title: detail.temporary_agent_proposal.name,
             body: temporaryAgentApprovalBody(detail.temporary_agent_proposal),
           },
@@ -1540,7 +1544,7 @@ function detailMessages(detail: RunDetail | undefined) {
       ? [
           {
             id: `${detail.id}-schedule-approval`,
-            role: "assistant",
+            role: "assistant" as const,
             title: "计划任务确认",
             body: scheduleProposalBody(detail.schedule_proposal),
           },
@@ -1550,7 +1554,7 @@ function detailMessages(detail: RunDetail | undefined) {
       ? [
           {
             id: `${detail.id}-evolution-approval`,
-            role: "assistant",
+            role: "assistant" as const,
             title: "进化任务确认",
             body: evolutionProposalBody(detail.evolution_proposal),
           },
@@ -1560,7 +1564,7 @@ function detailMessages(detail: RunDetail | undefined) {
       ? [
           {
             id: `${detail.id}-openclaw-approval`,
-            role: "assistant",
+            role: "assistant" as const,
             title: "OpenClaw 操作确认",
             body: openClawProposalBody(detail.openclaw_proposal),
           },
@@ -1570,7 +1574,7 @@ function detailMessages(detail: RunDetail | undefined) {
       ? [
           {
             id: `${detail.id}-repair-approval`,
-            role: "assistant",
+            role: "assistant" as const,
             title: detail.repair_proposal.title,
             body: repairProposalBody(detail.repair_proposal),
           },
@@ -1676,7 +1680,7 @@ function conversationTitle(run: RunListItem, items: RunListItem[]) {
   return timestamp ? `${question} · ${timestamp}` : question;
 }
 
-function conversationMessages(runs: RunDetail[]) {
+function conversationMessages(runs: RunDetail[]): ChatMessage[] {
   return runs.flatMap((run) =>
     detailMessages(run).map((message) => ({
       ...message,
@@ -1715,7 +1719,7 @@ function mergeConversationRuns(previous: RunDetail[] | undefined, incoming: RunD
   return merged;
 }
 
-function internalArtifactNotice(detail: RunDetail) {
+function internalArtifactNotice(detail: RunDetail): ChatMessage | null {
   const textArtifacts = dedupeTextArtifacts(detail.artifacts);
   if (textArtifacts.length === 0) return null;
   if (preferredReplyArtifact(textArtifacts)) return null;
@@ -1723,7 +1727,7 @@ function internalArtifactNotice(detail: RunDetail) {
     id: "internal-artifacts",
     role: "assistant",
     title: "回复待生成",
-    body: "这轮只生成了内部审查或裁决内容，没有生成可直接交付给你的正式回复。请点运行过程查看原因，或继续补充要求让主 Agent 重新生成。",
+    body: "这轮只生成了内部审查或裁决内容，没有生成可直接交付给你的正式回复。可展开对应 Agent 动作查看来源，或继续补充要求让主 Agent 重新生成。",
   };
 }
 
@@ -1791,6 +1795,11 @@ function eventArtifactRows(artifact: RunArtifact | NonNullable<RunEvent["artifac
   if (!artifact) return rows;
   if (artifact.title) rows.push({ label: "产物标题", value: artifact.title });
   if (artifact.kind) rows.push({ label: "产物类型", value: artifact.kind });
+  if (artifact.filename) rows.push({ label: "文件名", value: artifact.filename });
+  if (artifact.mime_type) rows.push({ label: "文件类型", value: artifact.mime_type });
+  const size = formatArtifactSize(artifact.size_bytes);
+  if (size) rows.push({ label: "文件大小", value: size });
+  if (artifact.sha256) rows.push({ label: "SHA-256", value: artifact.sha256 });
   const text = eventArtifactText(artifact);
   if (text) rows.push({ label: "输出内容", value: text });
   return rows;
@@ -2206,6 +2215,7 @@ function processItemsForToolLifecycle(
       badge: processBadgeForEvent(lastEvent),
       rows,
       createdAt: lastEvent.created_at,
+      artifact: isDownloadableArtifact(artifact) ? artifact : undefined,
     },
   ];
 }
@@ -2230,6 +2240,7 @@ function processItemsForEvent(
     badge: processBadgeForEvent(event),
     rows: baseRows,
     createdAt: event.created_at,
+    artifact: isDownloadableArtifact(artifact) ? artifact : undefined,
   };
   if (event.kind !== "discussion.completed") return [baseItem];
 
@@ -2361,14 +2372,12 @@ function RunProcessSummary({
   const taskChain = plannedTaskChain(detail, agentNames);
   const failureDiagnostics = failureDiagnosticsForRun(detail, agentNames);
   const executionIntents = executionIntentsForRun(detail, agentNames);
-  const posture = runProcessPosture(detail, items.length, dispatchCards.length);
   const shouldShowSummary =
     items.length > 0 ||
     dispatchCards.length > 0 ||
     taskChain.length > 0 ||
     failureDiagnostics.length > 0 ||
-    executionIntents.length > 0 ||
-    ["queued", "running", "waiting_approval", "failed"].includes(detail.status);
+    executionIntents.length > 0;
   if (!shouldShowSummary) return null;
   return (
     <section className="run-process-summary" aria-label="Agent 集群动作">
@@ -2379,20 +2388,6 @@ function RunProcessSummary({
           <small>{items.length} 个关键动作</small>
         </div>
       ) : null}
-      <div className="run-process-posture" role="status" aria-label={`任务态势，${posture.status}`}>
-        <div>
-          <span aria-hidden="true">◎</span>
-          <strong>任务态势</strong>
-          <small>{posture.status}</small>
-        </div>
-        <ul aria-label="任务态势指标">
-          {posture.metrics.map((metric) => (
-            <li key={metric.label}>
-              {metric.label} {metric.value}
-            </li>
-          ))}
-        </ul>
-      </div>
       {taskChain.length > 0 ? (
         <section className="run-task-chain" aria-label="任务链路">
           <div className="run-task-chain-header">
@@ -2501,6 +2496,7 @@ function RunProcessSummary({
               <span aria-hidden="true">›</span>
               <small className="process-card-badge">{item.badge}</small>
               <strong>{item.message}</strong>
+              {item.artifact ? <small>{item.artifact.filename}</small> : null}
             </button>
           ))}
         </div>
@@ -2538,6 +2534,11 @@ function RunProcessDrawer({
         <div className="run-process-detail">
           <article>
             <p>{target.message}</p>
+            {target.artifact ? (
+              <div className="artifact-download-list" aria-label="中间产物">
+                <ArtifactDownloadLink artifact={target.artifact} />
+              </div>
+            ) : null}
             {target.rows.length > 0 ? (
               <dl>
                 {target.rows.map((row, index) => (
@@ -4029,6 +4030,11 @@ export function RunsPage() {
                   <span className="eyebrow">{item.role === "user" ? "你" : APP_BRAND_NAME}</span>
                   <h3>{item.title}</h3>
                   <MessageBody text={item.body} title={item.title} />
+                  {item.artifact ? (
+                    <div className="artifact-download-list" aria-label="附件">
+                      <ArtifactDownloadLink artifact={item.artifact} />
+                    </div>
+                  ) : null}
                 </article>
                 {item.id.endsWith("-request") && item.run ? (
                   <RunProcessSummary
@@ -4040,14 +4046,6 @@ export function RunsPage() {
                 ) : null}
               </Fragment>
             ))}
-            {latestVisibleRun ? (
-              <div className="chat-detail-action">
-                <Link to={`/runs/${latestVisibleRun.id}`} className="secondary-action">
-                  查看运行详情
-                </Link>
-                <span>打开完整事件、产物、错误和运行控制。</span>
-              </div>
-            ) : null}
           </div>
           {processDetailTarget ? (
             <RunProcessDrawer

@@ -624,6 +624,11 @@ const RunEventSchema = z.object({
       kind: z.string(),
       title: z.string(),
       text: z.string().nullable().optional(),
+      filename: z.string().nullable().optional(),
+      mime_type: z.string().nullable().optional(),
+      size_bytes: z.number().nullable().optional(),
+      sha256: z.string().nullable().optional(),
+      download_url: z.string().nullable().optional(),
     })
     .nullable()
     .optional(),
@@ -634,6 +639,11 @@ const RunArtifactSchema = z.object({
   kind: z.string(),
   title: z.string(),
   text: z.string().nullable().optional(),
+  filename: z.string().nullable().optional(),
+  mime_type: z.string().nullable().optional(),
+  size_bytes: z.number().nullable().optional(),
+  sha256: z.string().nullable().optional(),
+  download_url: z.string().nullable().optional(),
 });
 
 const FailureDiagnosticSchema = z.object({

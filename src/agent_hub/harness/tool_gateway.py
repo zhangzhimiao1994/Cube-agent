@@ -159,6 +159,8 @@ def _capability_request(
 def _capability_parts(request: HarnessToolCallRequest) -> tuple[str, str, str]:
     if request.tool_name in {"calculator", "calculator_evaluate", "calculator.evaluate"}:
         return "calculator", "evaluate", "calculator"
+    if request.tool_name in {"document.generate_docx", "presentation.generate_pptx"}:
+        return "file", "create", f"generated/{request.tool_name}"
     if request.tool_name in {"workspace_read", "workspace.read"}:
         path = request.arguments.get("path")
         return "file", "read", _workspace_policy_resource(path)

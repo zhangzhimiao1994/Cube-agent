@@ -133,6 +133,18 @@ def workspace_relative_file_request() -> HarnessToolCallRequest:
     )
 
 
+def document_create_request() -> HarnessToolCallRequest:
+    return HarnessToolCallRequest(
+        run_id=RUN_ID,
+        actor="document_writer",
+        tool_name="document.generate_docx",
+        arguments={"title": "Delivery Plan"},
+        approval_required=False,
+        sandbox="restricted",
+        idempotency_key="docx_1",
+    )
+
+
 async def test_harness_tool_gateway_executes_approved_available_tools() -> None:
     runtime = FakeRuntimeCapabilityGateway()
     gateway = HarnessToolGateway(runtime)
@@ -245,6 +257,26 @@ async def test_harness_tool_gateway_maps_relative_workspace_path_to_policy_names
     assert capability_request.capability == "file"
     assert capability_request.operation == "read"
     assert capability_request.resource == "workspace/README.md"
+    assert runtime.calls == []
+
+
+async def test_harness_tool_gateway_maps_office_generation_to_file_create_policy() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    policy = FakePolicyGateway(CapabilityStatus.DENIED, reason="capability denied")
+    gateway = HarnessToolGateway(runtime, policy_gateway=policy)
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        document_create_request(),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    capability_request = policy.requests[0][0]
+    assert capability_request.capability == "file"
+    assert capability_request.operation == "create"
+    assert capability_request.resource == "generated/document.generate_docx"
     assert runtime.calls == []
 
 
