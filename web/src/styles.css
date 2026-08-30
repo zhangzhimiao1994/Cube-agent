@@ -1643,6 +1643,13 @@ article:hover {
   margin: 0.1rem 0 0;
 }
 
+.agent-workforce-scope {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+  margin: 0.18rem 0 0;
+}
+
 .agent-workforce-layout {
   display: grid;
   gap: 0.85rem;

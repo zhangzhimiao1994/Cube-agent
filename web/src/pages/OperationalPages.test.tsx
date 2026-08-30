@@ -2008,6 +2008,100 @@ describe("operational management pages", () => {
     expect(within(drawer).queryByText(/checkpoint\.saved/)).toBeNull();
   });
 
+  it("scopes subagent work seats to the owning conversation and run", async () => {
+    const user = userEvent.setup();
+    const firstRunDetail = {
+      ...runDetail,
+      status: "completed",
+      mode: "dispatch",
+      explicit_details: {
+        ...runDetail.explicit_details,
+        conversation_id: "conv-previous",
+        selected_agent_ids: "copywriter",
+      },
+      events: [
+        {
+          sequence: 1,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "copywriter",
+          participants: [],
+          tool_name: "artifact_writer",
+          step_id: "write-script",
+          action: null,
+          decision: null,
+          payload: { result: "第一对话输出：活动开场口播。" },
+          artifact: {
+            id: "artifact-first-dialog",
+            kind: "markdown",
+            title: "copywriter",
+            text: "第一对话输出：活动开场口播。",
+          },
+        },
+      ],
+      artifacts: [
+        {
+          id: "artifact-first-dialog",
+          kind: "markdown",
+          title: "copywriter",
+          text: "第一对话输出：活动开场口播。",
+        },
+      ],
+    };
+    const secondRunDetail = {
+      ...firstRunDetail,
+      id: secondRunId,
+      conversation_id: "conv-other",
+      request: "给我做另一个对话的短视频脚本方案。",
+      explicit_details: {
+        ...firstRunDetail.explicit_details,
+        conversation_id: "conv-other",
+      },
+      events: [
+        {
+          ...firstRunDetail.events[0],
+          payload: { result: "第二对话输出：产品发布口播。" },
+          artifact: {
+            id: "artifact-second-dialog",
+            kind: "markdown",
+            title: "copywriter",
+            text: "第二对话输出：产品发布口播。",
+          },
+        },
+      ],
+      artifacts: [
+        {
+          id: "artifact-second-dialog",
+          kind: "markdown",
+          title: "copywriter",
+          text: "第二对话输出：产品发布口播。",
+        },
+      ],
+    };
+    visibleRunListItem = { ...runListItem, status: "completed", mode: "dispatch" };
+    visibleRunDetail = firstRunDetail;
+    visibleConversationRuns = [firstRunDetail, secondRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+
+    await user.click(within(stream).getAllByRole("button", { name: /第一对话输出/ })[0]);
+    let drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).getByText(`会话 conv-previous · 运行 ${runId.slice(0, 8)}`)).not.toBeNull();
+    expect(within(drawer).getAllByText("第一对话输出：活动开场口播。").length).toBeGreaterThan(0);
+
+    await user.click(within(drawer).getByRole("button", { name: "关闭" }));
+    await user.click(within(stream).getAllByRole("button", { name: /第二对话输出/ })[0]);
+    drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).getByText(`会话 conv-other · 运行 ${secondRunId.slice(0, 8)}`)).not.toBeNull();
+    expect(within(drawer).getAllByText("第二对话输出：产品发布口播。").length).toBeGreaterThan(0);
+    expect(within(drawer).queryAllByText("第一对话输出：活动开场口播。")).toHaveLength(0);
+  });
+
   it("shows computer view only when an agent has concrete screen evidence", async () => {
     const user = userEvent.setup();
     const screenRunDetail = {

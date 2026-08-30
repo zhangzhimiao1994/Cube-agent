@@ -504,6 +504,8 @@ type AgentWorkActivity = {
 
 type AgentWorkItem = {
   id: string;
+  agentKey: string;
+  scopeLabel: string;
   label: string;
   role: string;
   status: AgentWorkStatus;
@@ -515,6 +517,9 @@ type AgentWorkItem = {
 };
 
 type ProcessDrawerTarget = {
+  runId: string;
+  conversationId: string | null;
+  scopeLabel: string;
   workItems: AgentWorkItem[];
   selectedAgentId?: string;
   selectedActivityId?: string;
@@ -806,6 +811,15 @@ function preferredReplyArtifact(artifacts: RunDetail["artifacts"]) {
 
 function runConversationId(detail: RunDetail | undefined) {
   return detail?.explicit_details.conversation_id?.trim() || null;
+}
+
+function runSeatScope(detail: RunDetail) {
+  const conversationId = runConversationId(detail) ?? "未记录";
+  return `会话 ${conversationId} · 运行 ${detail.id.slice(0, 8)}`;
+}
+
+function scopedAgentSeatId(detail: RunDetail, agentKey: string) {
+  return `${runConversationId(detail) ?? "conversation-unknown"}:${detail.id}:${agentKey}`;
 }
 
 function normalizeConversationQuestion(value: string | undefined, fallback: string) {
@@ -1423,6 +1437,7 @@ function buildAgentWorkItems(
     });
 
   const runDone = TERMINAL_STATUSES.has(detail.status) && detail.status !== "failed";
+  const scopeLabel = runSeatScope(detail);
   return [...groups.values()]
     .map((group) => {
       const failed = group.events.some((event) => event.kind.includes("failed") || event.kind.includes("error"));
@@ -1447,7 +1462,9 @@ function buildAgentWorkItems(
       const availableViews: AgentWorkView[] = ["activity"];
       if (group.events.some(hasComputerEvidence)) availableViews.push("computer");
       return {
-        id: group.key,
+        id: scopedAgentSeatId(detail, group.key),
+        agentKey: group.key,
+        scopeLabel,
         label: group.label,
         role: group.role,
         status,
@@ -1459,8 +1476,8 @@ function buildAgentWorkItems(
       };
     })
     .sort((left, right) => {
-      if (left.id === "main-agent" || left.id === "main" || left.id === "main_agent") return -1;
-      if (right.id === "main-agent" || right.id === "main" || right.id === "main_agent") return 1;
+      if (left.agentKey === "main-agent" || left.agentKey === "main" || left.agentKey === "main_agent") return -1;
+      if (right.agentKey === "main-agent" || right.agentKey === "main" || right.agentKey === "main_agent") return 1;
       return left.label.localeCompare(right.label, "zh-CN");
     });
 }
@@ -1528,14 +1545,34 @@ function RunProcessSummary({
             key={`${item.agentId}-${item.kind}-${item.id}-${index}`}
             type="button"
             className="run-process-toggle process-intermediate-card"
-            onClick={() => onOpen({ workItems, selectedAgentId: item.agentId, selectedActivityId: item.id })}
+            onClick={() =>
+              onOpen({
+                runId: detail.id,
+                conversationId: runConversationId(detail),
+                scopeLabel: runSeatScope(detail),
+                workItems,
+                selectedAgentId: item.agentId,
+                selectedActivityId: item.id,
+              })
+            }
           >
             <span aria-hidden="true">›</span>
             <small className="process-card-badge">{item.kind}</small>
             <strong>{item.summary}</strong>
           </button>
         ))}
-        <button type="button" className="run-process-toggle process-open-workforce" onClick={() => onOpen({ workItems })}>
+        <button
+          type="button"
+          className="run-process-toggle process-open-workforce"
+          onClick={() =>
+            onOpen({
+              runId: detail.id,
+              conversationId: runConversationId(detail),
+              scopeLabel: runSeatScope(detail),
+              workItems,
+            })
+          }
+        >
           查看子 Agent 工作席
         </button>
       </div>
@@ -1561,7 +1598,7 @@ function RunProcessDrawer({
   useEffect(() => {
     setSelectedAgentId(initialAgentId);
     setSelectedView("activity");
-  }, [initialAgentId, target.selectedActivityId]);
+  }, [initialAgentId, target.runId, target.conversationId, target.selectedActivityId]);
 
   const selectedAgent = target.workItems.find((item) => item.id === selectedAgentId) ?? target.workItems[0];
   const selectedActivity = selectedAgent
@@ -1584,6 +1621,7 @@ function RunProcessDrawer({
           <div>
             <span className="eyebrow">活动轨迹</span>
             <h3>子 Agent 工作席</h3>
+            <p className="agent-workforce-scope">{target.scopeLabel}</p>
           </div>
           <button type="button" className="secondary-action" onClick={onClose}>
             关闭
@@ -1950,6 +1988,9 @@ export function RunsPage() {
     window.addEventListener("agent-hub:close-history-drawer", closeHistoryDrawer);
     return () => window.removeEventListener("agent-hub:close-history-drawer", closeHistoryDrawer);
   }, []);
+  useEffect(() => {
+    setProcessDetailTarget(null);
+  }, [activeConversationId]);
   useEffect(() => {
     if (!settings.data) return;
     if (!userSelectedMode.current) {
