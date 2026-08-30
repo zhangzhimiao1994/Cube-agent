@@ -593,6 +593,7 @@ const RunEventSchema = z.object({
   sequence: z.number(),
   kind: z.string(),
   message: z.string(),
+  summary: z.string().nullable().optional(),
   created_at: z.string(),
   actor: z.string().nullable().optional(),
   participants: z.array(z.string()).default([]),

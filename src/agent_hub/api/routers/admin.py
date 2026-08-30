@@ -287,6 +287,7 @@ class RunEventResponse(BaseModel):
     sequence: int = Field(ge=1)
     kind: str
     message: str
+    summary: str | None = None
     created_at: datetime
     actor: str | None = None
     participants: list[str] = Field(default_factory=list)
@@ -6569,21 +6570,27 @@ def _admin_run_event(event: dict[str, object]) -> RunEventResponse:
     message = event.get("reason") or event.get("message") or kind_text
     payload = event.get("payload")
     artifact = event.get("artifact")
+    actor = _optional_event_string(event.get("actor"))
+    action = _optional_event_action(event.get("action"))
+    decision = _optional_event_string(event.get("decision"))
+    safe_payload = _tool_event_payload(payload) if kind_text.startswith("tool.") else _event_payload(payload)
+    safe_artifact = _admin_run_artifact(artifact) if isinstance(artifact, dict) else None
     return RunEventResponse(
         sequence=sequence if type(sequence) is int else 1,
         kind=kind_text,
         message=_event_message(kind_text, message),
         created_at=datetime.now(UTC),
-        actor=_optional_event_string(event.get("actor")),
+        summary=_event_summary(kind_text, actor=actor, action=action, decision=decision, payload=safe_payload),
+        actor=actor,
         participants=_event_string_list(event.get("participants")),
         tool_call_id=_optional_event_string(event.get("tool_call_id")),
         tool_name=_optional_event_string(event.get("tool_name")),
         step_id=_optional_event_string(event.get("step_id")),
         approval_id=_optional_event_string(event.get("approval_id")),
-        action=_optional_event_action(event.get("action")),
-        decision=_optional_event_string(event.get("decision")),
-        payload=_tool_event_payload(payload) if kind_text.startswith("tool.") else _event_payload(payload),
-        artifact=_admin_run_artifact(artifact) if isinstance(artifact, dict) else None,
+        action=action,
+        decision=decision,
+        payload=safe_payload,
+        artifact=safe_artifact,
     )
 
 
@@ -6593,6 +6600,41 @@ def _event_message(kind: str, value: object) -> str:
     if type(value) is not str:
         return "event recorded"
     return _safe_model_check_detail(value)
+
+
+def _event_summary(
+    kind: str,
+    *,
+    actor: str | None,
+    action: str | None,
+    decision: str | None,
+    payload: Mapping[str, JsonValue],
+) -> str:
+    actor_label = actor or "agent"
+    if kind == "review.completed":
+        return _safe_model_check_detail(f"{actor_label} completed review")
+    if kind == "approval.requested":
+        return _safe_model_check_detail(f"approval requested: {action or 'approval_required'}")
+    if kind == "approval.resolved":
+        return _safe_model_check_detail(f"approval resolved: {decision or 'handled'}")
+    if kind == "step.retrying":
+        attempt = payload.get("attempt")
+        suffix = f" attempt {attempt}" if type(attempt) in {str, int, float} else ""
+        return _safe_model_check_detail(f"{actor_label} retrying step{suffix}")
+    if kind == "runtime.failed":
+        return "runtime failure was redacted"
+    if kind == "step.failed":
+        return "step failure was redacted"
+    if kind == "artifact.created":
+        return _safe_model_check_detail(f"{actor_label} produced artifact")
+    if kind == "message.created":
+        return _safe_model_check_detail(f"{actor_label} produced message")
+    candidate = payload.get("summary")
+    if type(candidate) is str:
+        summary = _safe_model_check_detail(candidate)
+        if summary != "redacted":
+            return summary
+    return _safe_model_check_detail(f"{actor_label} recorded {kind}")
 
 
 _SENSITIVE_EVENT_DETAIL_KEYS = frozenset(
@@ -6607,6 +6649,7 @@ _SENSITIVE_EVENT_DETAIL_KEYS = frozenset(
         "secret",
         "secret_ref",
         "token",
+        "traceback",
     }
 )
 
@@ -6678,6 +6721,8 @@ def _safe_event_detail(value: object, *, key: str | None = None, depth: int = 0)
         return "[redacted]"
     if depth >= 6:
         return "[truncated]"
+    if type(value) is str and _contains_sensitive_marker(value):
+        return "[redacted]"
     if value is None or type(value) in {str, int, float, bool}:
         return cast(JsonValue, value)
     if isinstance(value, Mapping):

@@ -1433,6 +1433,34 @@ def test_failure_diagnostics_respect_approval_resolution_order() -> None:
     assert response.failure_diagnostics[0].approval_id == "approval_retry"
 
 
+def test_admin_run_event_projects_safe_timeline_summary_without_raw_payload_text() -> None:
+    event = _admin_run_event(
+        {
+            "sequence": 1,
+            "kind": "review.completed",
+            "message": "review completed: cat private-token.txt printed private output",
+            "created_at": datetime.now(UTC),
+            "actor": "reviewer",
+            "payload": {
+                "result": "private output should not be copied into timeline",
+                "traceback": "Traceback includes private-token",
+                "summary": "safe review summary",
+                "logical_model": "qwen-max",
+            },
+        }
+    )
+
+    serialized = json.dumps(event.model_dump(mode="json"), ensure_ascii=False)
+
+    assert event.summary == "reviewer completed review"
+    assert event.message == "redacted"
+    assert event.payload["result"] == "[redacted]"
+    assert event.payload["traceback"] == "[redacted]"
+    assert event.payload["summary"] == "safe review summary"
+    assert "private-token" not in serialized
+    assert "private output" not in serialized
+
+
 @pytest.mark.parametrize(
     ("mode", "reason"),
     [

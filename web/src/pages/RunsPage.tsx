@@ -543,8 +543,29 @@ const INTENT_RAW_PAYLOAD_KEYS = new Set([
   "traceback",
 ]);
 
+const SUMMARY_BACKED_RAW_PAYLOAD_KEYS = new Set([
+  ...RAW_TOOL_PAYLOAD_KEYS,
+  "assigned_task",
+  "command",
+  "details",
+  "error",
+  "feedback",
+  "input",
+  "instructions",
+  "output",
+  "prompt",
+  "result",
+  "role_message",
+  "task",
+  "traceback",
+]);
+
 function isIntentEventWithRestrictedPayload(event: RunDetail["events"][number]) {
   return event.kind === "step.retrying" || event.kind.startsWith("approval.") || isRepairIntentEvent(event);
+}
+
+function eventSafeSummary(event: RunDetail["events"][number]) {
+  return formatEventPayloadValue(event.summary);
 }
 
 function toolEventName(event: RunDetail["events"][number]) {
@@ -613,9 +634,17 @@ function eventDetailRows(event: RunDetail["events"][number], agentNames: Map<str
   if (event.approval_id) rows.push({ label: "审批 ID", value: event.approval_id });
   if (event.action) rows.push({ label: "动作", value: event.action });
   if (event.decision) rows.push({ label: "决策", value: event.decision });
+  const safeSummary = eventSafeSummary(event);
+  if (safeSummary) rows.push({ label: "安全摘要", value: safeSummary });
   if (readableMessage) rows.push({ label: "事件内容", value: readableMessage });
   orderedEventPayloadEntries(event.payload).forEach(([key, value]) => {
     if (key === "participants" || key === "participant_models") return;
+    if (safeSummary && key === "summary") {
+      const formatted = formatEventPayloadValue(value);
+      if (formatted && formatted !== safeSummary) rows.push({ label: eventPayloadLabel(key), value: formatted });
+      return;
+    }
+    if (safeSummary && SUMMARY_BACKED_RAW_PAYLOAD_KEYS.has(key)) return;
     if (isTool && RAW_TOOL_PAYLOAD_KEYS.has(key)) return;
     if (isIntentEventWithRestrictedPayload(event) && INTENT_RAW_PAYLOAD_KEYS.has(key)) return;
     if (isModelDelta && key === "text") return;
@@ -1737,6 +1766,8 @@ function eventSummaryText(
   agentNames: Map<string, string>,
   artifact?: RunArtifact | NonNullable<RunEvent["artifact"]> | null,
 ) {
+  const safeSummary = eventSafeSummary(event);
+  if (safeSummary) return safeSummary;
   const actor = displayEventActor(event.actor, agentNames);
   const participants = displayEventParticipants(event.participants, agentNames) ?? displayPayloadParticipants(event.payload, agentNames);
   const readableMessage =

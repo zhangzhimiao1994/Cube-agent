@@ -2601,6 +2601,56 @@ describe("operational management pages", () => {
     expect(within(opinionDrawer).getByText("导演建议压缩签到环节，避免排队。")).not.toBeNull();
   });
 
+  it("uses backend safe timeline summaries instead of raw event payload text", async () => {
+    const user = userEvent.setup();
+    const summarizedRunDetail = {
+      ...runDetail,
+      events: [
+        {
+          sequence: 1,
+          kind: "review.completed",
+          message: "redacted",
+          summary: "reviewer completed review",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "reviewer",
+          participants: [],
+          tool_name: null,
+          step_id: "review_step",
+          action: null,
+          decision: null,
+          payload: {
+            result: "private output should not be visible",
+            traceback: "Traceback includes private-token",
+            summary: "safe review summary",
+            logical_model: "qwen-max",
+          },
+        },
+      ],
+      artifacts: [],
+    };
+    visibleRunDetail = summarizedRunDetail;
+    visibleConversationRuns = [summarizedRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const reviewCard = within(stream).getByRole("button", { name: /reviewer completed review/ });
+
+    expect(stream.textContent).toContain("reviewer completed review");
+    expect(stream.textContent).not.toContain("private-token");
+    expect(stream.textContent).not.toContain("private output");
+
+    await user.click(reviewCard);
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).getByText("安全摘要")).not.toBeNull();
+    expect(within(drawer).getAllByText("reviewer completed review").length).toBeGreaterThan(0);
+    expect(drawer.textContent).toContain("safe review summary");
+    expect(drawer.textContent).not.toContain("private-token");
+    expect(drawer.textContent).not.toContain("private output");
+  });
+
   it("summarizes Vibe engineer run posture from real process events", async () => {
     const user = userEvent.setup();
     const postureRunDetail = {
