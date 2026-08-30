@@ -38,7 +38,9 @@ class RolePurpose(StrEnum):
 
 
 _SAFE_IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
-_DOTTED_BUILT_IN_TOOL_NAMES = frozenset({"document.generate_docx", "presentation.generate_pptx"})
+_DOTTED_BUILT_IN_TOOL_NAMES = frozenset(
+    {"document.generate_docx", "presentation.generate_pptx", "project.generate_zip"}
+)
 _MAX_TEXT = 2_000
 _DISCUSSION_SCHEMA = MappingProxyType(
     {
@@ -706,7 +708,7 @@ def _dispatch_specs(profile: TaskProfile) -> tuple[_RoleSpec, ...]:
                 RolePurpose.EXECUTE,
                 "按计划实现代码改动。",
                 ("实现了什么？", "影响范围是什么？", "如何验证？"),
-                ("read_context", "edit_file", "run_safe_command"),
+                ("read_context", "edit_file", "run_safe_command", "project.generate_zip"),
                 ("delete_file", "send_external_message"),
                 (),
                 _DISPATCH_SCHEMA,
