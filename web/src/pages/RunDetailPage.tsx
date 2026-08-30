@@ -28,6 +28,10 @@ type ObserverNotice = {
   artifactEvents: number | null;
 };
 
+type DetailTimelineItem =
+  | { type: "event"; event: RunEvent }
+  | { type: "model_delta_group"; events: RunEvent[] };
+
 const OBSERVER_TRIGGER_LABELS: Record<string, string> = {
   model_capacity_pressure: "模型容量拥堵",
   empty_model_response: "模型空响应",
@@ -105,6 +109,78 @@ function runEventTimestamp(value: string) {
   return parsed.toISOString().replace(".000Z", "Z");
 }
 
+function durationBetween(first: string | null | undefined, last: string | null | undefined) {
+  if (!first || !last) return "";
+  const start = Date.parse(first);
+  const end = Date.parse(last);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return "";
+  const milliseconds = end - start;
+  if (milliseconds < 1000) return `${milliseconds}ms`;
+  return `${(milliseconds / 1000).toFixed(milliseconds < 10_000 ? 1 : 0)}s`;
+}
+
+function isModelDeltaEvent(event: RunEvent) {
+  return event.kind === "model.reasoning_delta" || event.kind === "model.text_delta";
+}
+
+function formatPayloadValue(value: unknown) {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : "";
+}
+
+function numericPayloadValue(event: RunEvent, key: string) {
+  const value = event.payload[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function modelDeltaGroupKey(event: RunEvent) {
+  return [
+    event.kind,
+    event.actor ?? "",
+    event.step_id ?? "",
+    formatPayloadValue(event.payload.phase),
+    formatPayloadValue(event.payload.delta_kind),
+  ].join("|");
+}
+
+function modelDeltaEventsCanMerge(left: RunEvent, right: RunEvent) {
+  return modelDeltaGroupKey(left) === modelDeltaGroupKey(right);
+}
+
+function modelDeltaActivityLabel(event: RunEvent) {
+  return event.kind === "model.reasoning_delta" ? "模型正在分析" : "模型正在生成";
+}
+
+function modelDeltaSummary(events: RunEvent[]) {
+  const lastEvent = events.at(-1);
+  if (!lastEvent) return "模型流式进度已记录";
+  const totalBytes = events.reduce((total, event) => total + numericPayloadValue(event, "text_bytes"), 0);
+  const duration = durationBetween(events[0]?.created_at, lastEvent.created_at);
+  const parts = [`${events.length} 个分片`];
+  if (totalBytes > 0) parts.push(`${totalBytes} bytes`);
+  if (duration) parts.push(duration);
+  return `${modelDeltaActivityLabel(lastEvent)}，${parts.join("，")}`;
+}
+
+function detailTimelineItems(events: RunEvent[]): DetailTimelineItem[] {
+  const items: DetailTimelineItem[] = [];
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index];
+    if (!isModelDeltaEvent(event)) {
+      items.push({ type: "event", event });
+      continue;
+    }
+    const group = [event];
+    while (index + 1 < events.length) {
+      const next = events[index + 1];
+      if (!isModelDeltaEvent(next) || !modelDeltaEventsCanMerge(group.at(-1) ?? event, next)) break;
+      group.push(next);
+      index += 1;
+    }
+    items.push(group.length > 1 ? { type: "model_delta_group", events: group } : { type: "event", event });
+  }
+  return items;
+}
+
 function isGenericEventMessage(event: RunEvent) {
   return event.message === event.kind || /^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(event.message);
 }
@@ -169,6 +245,7 @@ export function RunDetailPage() {
   const canCancel = !TERMINAL_STATUSES.has(run.data.status);
   const isWaitingForMode = run.data.status === "waiting_user_mode" && Boolean(run.data.decision_token);
   const observerNotices = collectObserverNotices(run.data.events);
+  const timelineItems = detailTimelineItems(run.data.events);
 
   return (
     <section>
@@ -264,18 +341,34 @@ export function RunDetailPage() {
 
       <article>
         <h3>事件日志</h3>
-        {run.data.events.length === 0 ? (
+        {timelineItems.length === 0 ? (
           <p>暂无事件。</p>
         ) : (
           <ol className="event-log-list">
-            {run.data.events.map((event) => (
-              <li key={event.sequence}>
-                <span className="event-log-sequence">#{event.sequence}</span>
-                <time dateTime={event.created_at}>{runEventTimestamp(event.created_at)}</time>
-                <strong>{event.kind}</strong>
-                <span>{safeDetailEventSummary(event)}</span>
-              </li>
-            ))}
+            {timelineItems.map((item) => {
+              if (item.type === "model_delta_group") {
+                const firstEvent = item.events[0];
+                const lastEvent = item.events.at(-1) ?? firstEvent;
+                const sequence =
+                  item.events.length > 1 ? `#${firstEvent.sequence}-${lastEvent.sequence}` : `#${firstEvent.sequence}`;
+                return (
+                  <li key={`model-delta-${firstEvent.sequence}-${lastEvent.sequence}`}>
+                    <span className="event-log-sequence">{sequence}</span>
+                    <time dateTime={lastEvent.created_at}>{runEventTimestamp(lastEvent.created_at)}</time>
+                    <strong>{lastEvent.kind}</strong>
+                    <span>{modelDeltaSummary(item.events)}</span>
+                  </li>
+                );
+              }
+              return (
+                <li key={item.event.sequence}>
+                  <span className="event-log-sequence">#{item.event.sequence}</span>
+                  <time dateTime={item.event.created_at}>{runEventTimestamp(item.event.created_at)}</time>
+                  <strong>{item.event.kind}</strong>
+                  <span>{safeDetailEventSummary(item.event)}</span>
+                </li>
+              );
+            })}
           </ol>
         )}
       </article>

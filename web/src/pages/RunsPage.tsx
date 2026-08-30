@@ -317,6 +317,10 @@ function formatEventPayloadValue(value: unknown): string {
 
 type RunEvent = RunDetail["events"][number];
 type RunArtifact = RunDetail["artifacts"][number];
+type EventGroupItem = {
+  event: RunEvent;
+  index: number;
+};
 
 function isGenericArtifactText(value: string | null | undefined) {
   const normalized = value?.replace(/\s+/g, " ").trim();
@@ -508,6 +512,21 @@ function orderedEventPayloadEntries(payload: Record<string, unknown>) {
 
 function isModelDeltaEvent(event: RunDetail["events"][number]) {
   return event.kind === "model.reasoning_delta" || event.kind === "model.text_delta";
+}
+
+function modelDeltaGroupKey(event: RunEvent) {
+  const phase = formatEventPayloadValue(event.payload.phase);
+  const deltaKind = formatEventPayloadValue(event.payload.delta_kind);
+  return [event.kind, event.actor ?? "", event.step_id ?? "", phase, deltaKind].join("|");
+}
+
+function modelDeltaEventsCanMerge(left: RunEvent, right: RunEvent) {
+  return modelDeltaGroupKey(left) === modelDeltaGroupKey(right);
+}
+
+function numericPayloadValue(event: RunEvent, key: string) {
+  const value = event.payload[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
 function isToolEvent(event: RunDetail["events"][number]) {
@@ -2015,6 +2034,68 @@ function durationBetween(first: string | null | undefined, last: string | null |
   return `${(milliseconds / 1000).toFixed(milliseconds < 10_000 ? 1 : 0)}s`;
 }
 
+function modelDeltaActivityLabel(event: RunEvent) {
+  return event.kind === "model.reasoning_delta" ? "模型正在分析" : "模型正在生成";
+}
+
+function modelDeltaSummaryText(events: RunEvent[]) {
+  const lastEvent = events.at(-1);
+  if (!lastEvent) return "模型流式进度已记录";
+  const totalBytes = events.reduce((total, event) => total + numericPayloadValue(event, "text_bytes"), 0);
+  const duration = durationBetween(events[0]?.created_at, lastEvent.created_at);
+  const parts = [`${events.length} 个分片`];
+  if (totalBytes > 0) parts.push(`${totalBytes} bytes`);
+  if (duration) parts.push(duration);
+  return `${modelDeltaActivityLabel(lastEvent)}，${parts.join("，")}`;
+}
+
+function modelDeltaPhaseLabel(events: RunEvent[]) {
+  const phases = [
+    ...new Set(
+      events
+        .map((event) => formatEventPayloadValue(event.payload.phase))
+        .filter((value) => value.trim().length > 0),
+    ),
+  ];
+  return phases.join("、");
+}
+
+function processItemsForModelDeltaGroup(
+  detail: RunDetail,
+  events: RunEvent[],
+  index: number,
+  agentNames: Map<string, string>,
+): ProcessDetailTarget[] {
+  const lastEvent = events.at(-1);
+  if (!lastEvent) return [];
+  const totalBytes = events.reduce((total, event) => total + numericPayloadValue(event, "text_bytes"), 0);
+  const duration = durationBetween(events[0]?.created_at, lastEvent.created_at);
+  const phase = modelDeltaPhaseLabel(events);
+  const actor = displayEventActor(lastEvent.actor, agentNames);
+  const deltaKind = formatEventPayloadValue(lastEvent.payload.delta_kind);
+  const rows = [
+    ...modelRowsForEvent(lastEvent, detail.events, agentNames),
+    actor ? { label: "执行者", value: actor } : null,
+    lastEvent.step_id ? { label: "步骤", value: lastEvent.step_id } : null,
+    deltaKind ? { label: "Delta 类型", value: deltaKind } : null,
+    { label: "分片数", value: String(events.length) },
+    totalBytes > 0 ? { label: "内容字节数", value: String(totalBytes) } : null,
+    duration ? { label: "耗时", value: duration } : null,
+    phase ? { label: "阶段", value: phase } : null,
+    { label: "事件范围", value: `#${events[0]?.sequence}-${lastEvent.sequence}` },
+  ].filter((row): row is { label: string; value: string } => Boolean(row));
+  return [
+    {
+      id: `${detail.id}-model-delta-${modelDeltaGroupKey(lastEvent)}-${index}`,
+      title: displayEventTitle(lastEvent, agentNames),
+      message: `${displayEventTitle(lastEvent, agentNames)}：${modelDeltaSummaryText(events)}`,
+      badge: processBadgeForEvent(lastEvent),
+      rows,
+      createdAt: lastEvent.created_at,
+    },
+  ];
+}
+
 function safeLifecyclePayloadRows(events: RunEvent[], existingLabels: Set<string>) {
   const rows: Array<{ label: string; value: string }> = [];
   const safeKeys = [
@@ -2158,38 +2239,65 @@ function runProcessItems(
         ]
       : [];
   const consumedArtifactIds = new Set<string>();
-  const toolGroups = new Map<string, Array<{ event: RunEvent; index: number }>>();
+  const toolGroups = new Map<string, EventGroupItem[]>();
   detail.events.forEach((event, index) => {
     if (!isToolEvent(event)) return;
     const key = toolLifecycleKey(event);
     toolGroups.set(key, [...(toolGroups.get(key) ?? []), { event, index }]);
   });
-  const finalToolEvents = new Map<RunEvent, Array<{ event: RunEvent; index: number }>>();
+  const finalToolEvents = new Map<RunEvent, EventGroupItem[]>();
   toolGroups.forEach((group) => {
     const finalEvent = group.at(-1)?.event;
     if (finalEvent) finalToolEvents.set(finalEvent, group);
   });
-  const eventItems = detail.events
-    .filter(isActionEvent)
-    .flatMap((event, index) => {
-      if (isToolEvent(event)) {
-        const group = finalToolEvents.get(event);
-        if (!group) return [];
-        const finalEvent = group.at(-1)?.event ?? event;
-        const artifact = fallbackArtifactForEvent(finalEvent, detail.artifacts, consumedArtifactIds);
-        return processItemsForToolLifecycle(
+  const actionEvents = detail.events.flatMap((event, index) => (isActionEvent(event) ? [{ event, index }] : []));
+  const eventItems: ProcessDetailTarget[] = [];
+  for (let index = 0; index < actionEvents.length; index += 1) {
+    const { event, index: eventIndex } = actionEvents[index];
+    if (isModelDeltaEvent(event)) {
+      const group: EventGroupItem[] = [{ event, index: eventIndex }];
+      while (index + 1 < actionEvents.length) {
+        const next = actionEvents[index + 1];
+        if (!isModelDeltaEvent(next.event) || !modelDeltaEventsCanMerge(group.at(-1)?.event ?? event, next.event)) break;
+        group.push(next);
+        index += 1;
+      }
+      if (group.length === 1) {
+        const artifact = fallbackArtifactForEvent(event, detail.artifacts, consumedArtifactIds);
+        eventItems.push(...processItemsForEvent(detail, event, eventIndex, agentNames, artifact));
+        continue;
+      }
+      eventItems.push(
+        ...processItemsForModelDeltaGroup(
           detail,
           group.map((item) => item.event),
-          group[0]?.index ?? index,
+          group[0]?.index ?? eventIndex,
+          agentNames,
+        ),
+      );
+      continue;
+    }
+    if (isToolEvent(event)) {
+      const group = finalToolEvents.get(event);
+      if (!group) continue;
+      const finalEvent = group.at(-1)?.event ?? event;
+      const artifact = fallbackArtifactForEvent(finalEvent, detail.artifacts, consumedArtifactIds);
+      eventItems.push(
+        ...processItemsForToolLifecycle(
+          detail,
+          group.map((item) => item.event),
+          group[0]?.index ?? eventIndex,
           agentNames,
           artifact,
-        );
-      }
-      if (isWrappedToolFailureEvent(event, detail.events)) return [];
-      const artifact = fallbackArtifactForEvent(event, detail.artifacts, consumedArtifactIds);
-      if (event.kind === "artifact.created" && !artifact && !hasUsefulPayload(event)) return [];
-      return processItemsForEvent(detail, event, index, agentNames, artifact);
-    });
+        ),
+      );
+      continue;
+    }
+    if (isWrappedToolFailureEvent(event, detail.events)) continue;
+    const artifact = fallbackArtifactForEvent(event, detail.artifacts, consumedArtifactIds);
+    if (event.kind === "artifact.created" && !artifact && !hasUsefulPayload(event)) continue;
+    eventItems.push(...processItemsForEvent(detail, event, eventIndex, agentNames, artifact));
+  }
   return [...routingItem, ...eventItems];
 }
 

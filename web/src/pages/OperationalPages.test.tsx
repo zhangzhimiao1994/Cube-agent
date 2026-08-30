@@ -1195,6 +1195,65 @@ describe("operational management pages", () => {
     expect(screen.queryByText(/private output/)).toBeNull();
   });
 
+  it("aggregates model delta chunks in the run detail timeline", async () => {
+    visibleRunDetail = {
+      ...runDetail,
+      events: [
+        {
+          sequence: 1,
+          kind: "model.text_delta",
+          message: "first private output chunk",
+          summary: "text chunk",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: null,
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: {
+            delta_kind: "visible_text",
+            text_bytes: 64,
+            chunk_index: 1,
+            phase: "implementation",
+            text: "private output",
+          },
+        },
+        {
+          sequence: 2,
+          kind: "model.text_delta",
+          message: "second private output chunk",
+          summary: "text chunk",
+          created_at: "2026-08-07T00:00:03Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: null,
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: {
+            delta_kind: "visible_text",
+            text_bytes: 32,
+            chunk_index: 2,
+            phase: "implementation",
+            text: "private output",
+          },
+        },
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    expect(await screen.findByRole("heading", { name: "事件日志" })).not.toBeNull();
+    expect(screen.getByText("#1-2")).not.toBeNull();
+    expect(screen.getByText("model.text_delta")).not.toBeNull();
+    expect(screen.getByText("模型正在生成，2 个分片，96 bytes，2.0s")).not.toBeNull();
+    expect(screen.queryByText("#1")).toBeNull();
+    expect(screen.queryByText("#2")).toBeNull();
+    expect(screen.queryByText(/private output/)).toBeNull();
+  });
+
   it("stops the current running chat from the conversation composer", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
@@ -2709,6 +2768,86 @@ describe("operational management pages", () => {
     expect(drawer.textContent).toContain("safe review summary");
     expect(drawer.textContent).not.toContain("private-token");
     expect(drawer.textContent).not.toContain("private output");
+  });
+
+  it("aggregates model delta chunks in the conversation process summary", async () => {
+    const user = userEvent.setup();
+    const deltaRunDetail = {
+      ...runDetail,
+      events: [
+        {
+          sequence: 1,
+          kind: "model.reasoning_delta",
+          message: "private hidden reasoning one",
+          summary: "reasoning chunk",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: null,
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: { delta_kind: "reasoning", text_bytes: 64, chunk_index: 1, phase: "implementation", text: "private reasoning" },
+        },
+        {
+          sequence: 2,
+          kind: "model.reasoning_delta",
+          message: "private hidden reasoning two",
+          summary: "reasoning chunk",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: null,
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: { delta_kind: "reasoning", text_bytes: 96, chunk_index: 2, phase: "implementation", text: "private reasoning" },
+        },
+        {
+          sequence: 3,
+          kind: "model.text_delta",
+          message: "private output one",
+          summary: "text chunk",
+          created_at: "2026-08-07T00:00:03Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: null,
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: { delta_kind: "visible_text", text_bytes: 32, chunk_index: 1, phase: "implementation", text: "private answer" },
+        },
+        {
+          sequence: 4,
+          kind: "model.text_delta",
+          message: "private output two",
+          summary: "text chunk",
+          created_at: "2026-08-07T00:00:04Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: null,
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: { delta_kind: "visible_text", text_bytes: 64, chunk_index: 2, phase: "implementation", text: "private answer" },
+        },
+      ],
+      artifacts: [],
+    };
+    visibleRunDetail = deltaRunDetail;
+    visibleConversationRuns = [deltaRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+
+    expect(within(stream).getByRole("button", { name: /思考过程：模型正在分析，2 个分片，160 bytes/ })).not.toBeNull();
+    expect(within(stream).getByRole("button", { name: /输出进度：模型正在生成，2 个分片，96 bytes/ })).not.toBeNull();
+    expect(within(stream).getAllByRole("button", { name: /个分片/ })).toHaveLength(2);
+    expect(stream.textContent).not.toContain("private hidden reasoning");
+    expect(stream.textContent).not.toContain("private output");
   });
 
   it("shows planned task chain status from safe run events", async () => {
