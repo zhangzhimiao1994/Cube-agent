@@ -56,7 +56,7 @@ async def test_disabled_and_revoked_skills_are_terminal() -> None:
     with pytest.raises(InvalidSkillTransition):
         await service.activate(disabled.id)
 
-    another_active = await activate_valid_skill(service)
+    another_active = await activate_valid_skill(service, entry_body=b"print('another')\n")
     revoked = await service.revoke(another_active.id)
     assert revoked.status == SkillStatus.REVOKED
     with pytest.raises(InvalidSkillTransition):
@@ -100,8 +100,12 @@ async def test_approval_audit_fields_must_be_printable_unpadded(
         await service.approve(scanned.id, reviewer=reviewer, diff_summary=diff_summary)
 
 
-async def activate_valid_skill(service: InMemorySkillService) -> SkillRecord:
-    uploaded = await service.upload(valid_skill_zip())
+async def activate_valid_skill(
+    service: InMemorySkillService,
+    *,
+    entry_body: bytes = b"print('ok')\n",
+) -> SkillRecord:
+    uploaded = await service.upload(valid_skill_zip(entry_body=entry_body))
     scanned = await service.scan(uploaded.id)
     approved = await service.approve(scanned.id, reviewer="admin", diff_summary="ok")
     return await service.activate(approved.id)
