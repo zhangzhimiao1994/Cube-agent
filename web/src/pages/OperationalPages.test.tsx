@@ -2019,6 +2019,8 @@ describe("operational management pages", () => {
     expect(within(drawer).queryByText("详情：api_key")).toBeNull();
     await user.click(within(drawer).getAllByRole("button", { name: /打开活动详情：文案生成 产出阶段内容/ })[0]);
     const activityDetail = await screen.findByRole("dialog", { name: "活动详情" });
+    expect(within(activityDetail).queryByText("调用模型")).toBeNull();
+    await user.click(within(activityDetail).getByRole("button", { name: /查看完整字段/ }));
     expect(within(activityDetail).getAllByText("调用模型").length).toBeGreaterThan(0);
     expect(within(activityDetail).getAllByText("qwen-max").length).toBeGreaterThan(0);
     expect(within(activityDetail).getByText("详情：api_key")).not.toBeNull();
@@ -2346,6 +2348,8 @@ describe("operational management pages", () => {
     expect(within(drawer).queryByText("/tmp/mofang/screen.jpg")).toBeNull();
     await user.click(within(drawer).getByRole("button", { name: /打开活动详情：工具执行完成：screen_probe/ }));
     const screenDetail = await screen.findByRole("dialog", { name: "活动详情" });
+    expect(within(screenDetail).queryByText("MJPEG stream healthy")).toBeNull();
+    await user.click(within(screenDetail).getByRole("button", { name: /查看完整字段/ }));
     expect(within(screenDetail).getByText("MJPEG stream healthy")).not.toBeNull();
     expect(within(screenDetail).getByText("/tmp/mofang/screen.jpg")).not.toBeNull();
   });
@@ -2517,18 +2521,23 @@ describe("operational management pages", () => {
     expect(within(drawer).getAllByText(/qwen-max/).length).toBeGreaterThan(0);
     expect(within(drawer).getAllByText(/中秋灯谜游园会/).length).toBeGreaterThan(0);
 
-    const activitySections = Array.from(drawer.querySelectorAll(".agent-workforce-section"));
-    const activitySection = activitySections.find((item) => item.textContent?.startsWith("活动轨迹"));
-    expect(activitySection).not.toBeNull();
-    const copywriterActivities = Array.from(activitySection!.querySelectorAll(".agent-workforce-activity-card"));
+    expect(within(drawer).queryByRole("heading", { name: "输出" })).toBeNull();
+    expect(within(drawer).queryByRole("heading", { name: "活动轨迹" })).toBeNull();
+    expect(within(drawer).getByRole("heading", { name: "分类摘要" })).not.toBeNull();
+    expect(within(drawer).getAllByText("产物").length).toBeGreaterThan(0);
+    expect(within(drawer).getAllByText("证据").length).toBeGreaterThan(0);
+    const copywriterActivities = Array.from(drawer.querySelectorAll(".agent-workforce-activity-card"));
     const copywriterStarted = copywriterActivities.find((item) => item.textContent?.includes("输出中秋节活动主题"));
     const copywriterModel = copywriterActivities.find((item) => item.textContent?.includes("qwen-max"));
     const copywriterArtifact = copywriterActivities.find((item) => item.textContent?.includes("文案生成输出：中秋灯谜游园会"));
     expect(copywriterStarted).not.toBeNull();
     expect(copywriterModel).not.toBeNull();
     expect(copywriterArtifact).not.toBeNull();
-    expect(copywriterStarted!.compareDocumentPosition(copywriterModel!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(copywriterModel!.compareDocumentPosition(copywriterArtifact!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const startedBucket = copywriterStarted!.closest(".agent-activity-bucket");
+    const artifactBucket = copywriterArtifact!.closest(".agent-activity-bucket");
+    expect(startedBucket?.textContent).toContain("产物");
+    expect(artifactBucket?.textContent).toContain("产物");
+    expect(copywriterModel!.closest(".agent-activity-bucket")?.textContent).toContain("证据");
 
     await user.click(within(drawer).getByRole("button", { name: /导演/ }));
     const opinionDrawer = screen.getByRole("dialog", { name: "运行过程详情" });
@@ -2537,6 +2546,9 @@ describe("operational management pages", () => {
     expect(within(opinionDrawer).getAllByText(/导演 意见：导演建议压缩签到环节/).length).toBeGreaterThan(0);
     await user.click(within(opinionDrawer).getByRole("button", { name: /打开活动详情：导演 给出讨论意见/ }));
     const opinionDetail = await screen.findByRole("dialog", { name: "活动详情" });
+    expect(within(opinionDetail).getByText("分类")).not.toBeNull();
+    expect(within(opinionDetail).queryByText("发言角色")).toBeNull();
+    await user.click(within(opinionDetail).getByRole("button", { name: /查看完整字段/ }));
     expect(within(opinionDetail).getAllByText("发言角色").length).toBeGreaterThan(0);
     expect(within(opinionDetail).getAllByText("导演意见").length).toBeGreaterThan(0);
   });
@@ -2641,9 +2653,116 @@ describe("operational management pages", () => {
     expect(within(drawer).getAllByText(/导演输出：压缩主持人串场，保留抽奖互动/).length).toBeGreaterThan(0);
     await user.click(within(drawer).getAllByRole("button", { name: /打开活动详情：导演 产出阶段内容/ })[0]);
     const activityDetail = await screen.findByRole("dialog", { name: "活动详情" });
+    expect(within(activityDetail).queryByText("执行者")).toBeNull();
+    expect(within(activityDetail).queryByText("调用模型")).toBeNull();
+    expect(within(activityDetail).queryByText("输出内容")).toBeNull();
+    await user.click(within(activityDetail).getByRole("button", { name: /查看完整字段/ }));
     expect(within(activityDetail).getAllByText("执行者").length).toBeGreaterThan(0);
     expect(within(activityDetail).getAllByText("调用模型").length).toBeGreaterThan(0);
     expect(within(activityDetail).getAllByText("输出内容").length).toBeGreaterThan(0);
+  });
+
+  it("keeps an open subagent work drawer synced with new process events", async () => {
+    const user = userEvent.setup();
+    const firstSnapshot = {
+      ...runDetail,
+      events: [
+        {
+          sequence: 1,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "copywriter",
+          participants: [],
+          tool_name: null,
+          step_id: "copywriting_step",
+          action: null,
+          decision: null,
+          payload: {},
+          artifact: {
+            id: "artifact-first-snapshot",
+            kind: "markdown",
+            title: "第一版输出",
+            text: "第一版输出：先完成主题。",
+          },
+        },
+      ],
+      artifacts: [
+        {
+          id: "artifact-first-snapshot",
+          kind: "markdown",
+          title: "第一版输出",
+          text: "第一版输出：先完成主题。",
+        },
+      ],
+    };
+    const secondSnapshot = {
+      ...firstSnapshot,
+      events: [
+        ...firstSnapshot.events,
+        {
+          sequence: 2,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: "2026-08-07T00:00:04Z",
+          actor: "copywriter",
+          participants: [],
+          tool_name: null,
+          step_id: "copywriting_step",
+          action: null,
+          decision: null,
+          payload: {},
+          artifact: {
+            id: "artifact-second-snapshot",
+            kind: "markdown",
+            title: "第二版输出",
+            text: "第二版输出：补充预算和验收。",
+          },
+        },
+      ],
+      artifacts: [
+        ...firstSnapshot.artifacts,
+        {
+          id: "artifact-second-snapshot",
+          kind: "markdown",
+          title: "第二版输出",
+          text: "第二版输出：补充预算和验收。",
+        },
+      ],
+    };
+    visibleRunDetail = firstSnapshot;
+    visibleConversationRuns = [firstSnapshot];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await user.click(within(stream).getByRole("button", { name: /文案生成 输出：第一版输出/ }));
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).queryByText(/第二版输出/)).toBeNull();
+
+    visibleRunDetail = secondSnapshot;
+    visibleConversationRuns = [secondSnapshot];
+
+    await waitFor(() => expect(within(drawer).getAllByText(/第二版输出/).length).toBeGreaterThan(0), { timeout: 2500 });
+  });
+
+  it("closes the subagent work drawer from the backdrop and locks background scrolling", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await user.click(within(stream).getByRole("button", { name: /讨论完成：形成 1 个结论、1 个决策、3 条意见/ }));
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(document.body.style.overflow).toBe("hidden");
+
+    await user.click(drawer.parentElement as HTMLElement);
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "运行过程详情" })).toBeNull());
+    expect(document.body.style.overflow).toBe("");
   });
 
   it("falls back to concrete artifact titles when upstream artifact text is generic", async () => {
@@ -2697,6 +2816,8 @@ describe("operational management pages", () => {
     expect(within(drawer).getAllByText("中秋活动文案初稿").length).toBeGreaterThan(0);
     await user.click(within(drawer).getByRole("button", { name: /打开活动详情：文案生成 输出/ }));
     const activityDetail = await screen.findByRole("dialog", { name: "活动详情" });
+    expect(within(activityDetail).queryByText("产物标题")).toBeNull();
+    await user.click(within(activityDetail).getByRole("button", { name: /查看完整字段/ }));
     expect(within(activityDetail).getAllByText("产物标题").length).toBeGreaterThan(0);
     expect(within(activityDetail).getAllByText("中秋活动文案初稿").length).toBeGreaterThan(0);
     expect(within(drawer).queryByText(/已生成一个可查看的结果或中间产物/)).toBeNull();
@@ -2719,6 +2840,8 @@ describe("operational management pages", () => {
     expect(within(drawer).getAllByText(/主 Agent 选择可拍摄性最高且风险最低/).length).toBeGreaterThan(0);
     await user.click(within(drawer).getByRole("button", { name: /打开活动详情：多角色完成讨论/ }));
     const activityDetail = await screen.findByRole("dialog", { name: "活动详情" });
+    expect(within(activityDetail).queryByText("参与者")).toBeNull();
+    await user.click(within(activityDetail).getByRole("button", { name: /查看完整字段/ }));
     expect(within(activityDetail).getAllByText("参与者").length).toBeGreaterThan(0);
     expect(within(activityDetail).getAllByText("导演、文案生成、剪辑师").length).toBeGreaterThan(0);
     expect(within(drawer).getAllByText("导演认为要优先可拍摄性。").length).toBeGreaterThan(0);
@@ -2752,6 +2875,7 @@ describe("operational management pages", () => {
     const conversationOpenButton = screen.getByRole("button", { name: conversationOpenButtonName });
     expect(conversationOpenButton).not.toBeNull();
     expect(conversationOpenButton.querySelector(".conversation-title-text")?.textContent).toBe(conversationHistoryTitle);
+    expect(conversationOpenButton.querySelector(".conversation-meta-line")).toBeNull();
     expect(screen.getByText("全选可删")).not.toBeNull();
     expect(screen.getByRole("button", { name: /批量删除已选会话 0 条/ })).not.toBeNull();
     expect(screen.getByText("删除已选（0）")).not.toBeNull();
@@ -3019,9 +3143,9 @@ describe("operational management pages", () => {
     const stream = screen.getByRole("region", { name: "主对话内容" });
     const recruitmentCard = within(stream).getByRole("button", { name: /打开 Temporary Web Engineer 招募详情/ });
     expect(recruitmentCard).not.toBeNull();
-    expect(within(recruitmentCard).getByText("Temporary Web Engineer")).not.toBeNull();
+    expect(within(recruitmentCard).getAllByText("Temporary Web Engineer").length).toBeGreaterThan(0);
     expect(within(recruitmentCard).getByText("职责")).not.toBeNull();
-    expect(within(recruitmentCard).getByText("software_engineering")).not.toBeNull();
+    expect(within(recruitmentCard).getByText(/software_engineering/)).not.toBeNull();
     expect(within(recruitmentCard).getByText("模型")).not.toBeNull();
     expect(within(recruitmentCard).getByText("coder")).not.toBeNull();
     expect(within(recruitmentCard).getByText("状态")).not.toBeNull();

@@ -4,7 +4,7 @@ import { Link } from "react-router-dom";
 
 import { ApiError, api, formatApiError, type AttachmentUpload, type ModelDeployment, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
-import { ArtifactFileCard, hasArtifactDownload } from "../components/ArtifactFileCard";
+import { ArtifactFileCard, artifactFileName, hasArtifactDownload } from "../components/ArtifactFileCard";
 
 const RUN_MODES = [
   { value: "auto", label: "自动", description: "主 Agent 判断应使用直连、派单、讨论或混合；不确定时向你确认。" },
@@ -552,6 +552,7 @@ type AgentWorkActivity = {
   summary: string;
   rows: Array<{ label: string; value: string }>;
   createdAt: string | null;
+  sequence: number | null;
   event?: RunEvent;
   artifact?: RunArtifact | NonNullable<RunEvent["artifact"]>;
 };
@@ -569,6 +570,30 @@ type AgentWorkItem = {
   activity: AgentWorkActivity[];
   availableViews: AgentWorkView[];
 };
+
+const AGENT_WORK_CATEGORIES: AgentWorkCategory[] = ["结论", "产物", "阻塞", "决策", "证据"];
+
+function compareAgentActivities(left: AgentWorkActivity, right: AgentWorkActivity) {
+  if (left.sequence !== null && right.sequence !== null && left.sequence !== right.sequence) {
+    return left.sequence - right.sequence;
+  }
+  if (left.sequence !== null && right.sequence === null) return -1;
+  if (left.sequence === null && right.sequence !== null) return 1;
+  if (left.createdAt && right.createdAt && left.createdAt !== right.createdAt) return left.createdAt.localeCompare(right.createdAt);
+  if (left.createdAt && !right.createdAt) return -1;
+  if (!left.createdAt && right.createdAt) return 1;
+  return `${left.kind}:${left.title}`.localeCompare(`${right.kind}:${right.title}`, "zh-CN");
+}
+
+function dedupeAgentActivities(agent: AgentWorkItem) {
+  const seen = new Set<string>();
+  return [...agent.activity, ...agent.outputs].sort(compareAgentActivities).filter((activity) => {
+    const key = `${activity.category}:${activity.kind}:${activity.title}:${activity.summary}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return Boolean(activity.summary.trim() || activity.title.trim());
+  });
+}
 
 type ProcessDrawerTarget = {
   runId: string;
@@ -1491,6 +1516,7 @@ function activityFromTarget(target: ProcessDetailTarget): AgentWorkActivity {
     summary: target.message,
     rows: target.rows,
     createdAt: target.createdAt,
+    sequence: target.event?.sequence ?? null,
     event: target.event,
     artifact: target.artifact,
   };
@@ -1531,6 +1557,7 @@ function outputActivityFromArtifact(
     summary,
     rows: eventArtifactRows(artifact),
     createdAt: null,
+    sequence: null,
     artifact,
   };
 }
@@ -1670,15 +1697,8 @@ function selectedAgentForActivity(workItems: AgentWorkItem[], activityId: string
 }
 
 function categorizedAgentHighlights(agent: AgentWorkItem) {
-  const categories: AgentWorkCategory[] = ["结论", "产物", "阻塞", "决策", "证据"];
-  const seen = new Set<string>();
-  const activities = [...agent.outputs, ...agent.activity].filter((activity) => {
-    const key = `${activity.category}:${activity.summary}:${activity.title}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return Boolean(activity.summary.trim());
-  });
-  return categories
+  const activities = dedupeAgentActivities(agent);
+  return AGENT_WORK_CATEGORIES
     .map((category) => ({
       category,
       items: activities.filter((activity) => activity.category === category).slice(0, 2),
@@ -1709,17 +1729,16 @@ function AgentSummaryBuckets({ agent }: { agent: AgentWorkItem }) {
 }
 
 function categorizedRunHighlights(workItems: AgentWorkItem[]) {
-  const categories: AgentWorkCategory[] = ["结论", "产物", "阻塞", "决策", "证据"];
   const seen = new Set<string>();
   const activities = workItems
-    .flatMap((agent) => [...agent.outputs, ...agent.activity].map((activity) => ({ ...activity, agentLabel: agent.label })))
+    .flatMap((agent) => dedupeAgentActivities(agent).map((activity) => ({ ...activity, agentLabel: agent.label })))
     .filter((activity) => {
       const key = `${activity.category}:${activity.agentLabel}:${activity.summary}:${activity.title}`;
       if (seen.has(key)) return false;
       seen.add(key);
       return Boolean(activity.summary.trim());
     });
-  return categories
+  return AGENT_WORK_CATEGORIES
     .map((category) => ({
       category,
       items: activities.filter((activity) => activity.category === category).slice(0, 2),
@@ -1874,12 +1893,22 @@ function RunProcessDrawer({
   const activeView = canShowComputerView ? selectedView : "activity";
 
   return (
-    <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
+    <div
+      className="process-drawer-backdrop"
+      role="presentation"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
       <section
         className="process-drawer"
         role="dialog"
         aria-label="运行过程详情"
         aria-modal="true"
+        onPointerDown={(event) => event.stopPropagation()}
         onClick={(event) => event.stopPropagation()}
       >
         <div className="process-drawer-handle" aria-hidden="true" />
@@ -1963,20 +1992,7 @@ function RunProcessDrawer({
                   />
                 </section>
               ) : (
-                <>
-                  <section className="agent-workforce-section">
-                    <h5>输出</h5>
-                    {selectedAgent.outputs.length > 0 ? (
-                      <AgentActivityList activities={selectedAgent.outputs} selectedActivityId={selectedActivity?.id} onOpen={setActivityDetail} />
-                    ) : (
-                      <p className="agent-workforce-empty">暂无独立输出，查看活动轨迹里的阶段记录。</p>
-                    )}
-                  </section>
-                  <section className="agent-workforce-section">
-                    <h5>活动轨迹</h5>
-                    <AgentActivityList activities={selectedAgent.activity} selectedActivityId={selectedActivity?.id} onOpen={setActivityDetail} />
-                  </section>
-                </>
+                <AgentActivityBuckets agent={selectedAgent} selectedActivityId={selectedActivity?.id} onOpen={setActivityDetail} />
               )}
             </div>
           ) : (
@@ -1986,6 +2002,39 @@ function RunProcessDrawer({
         {activityDetail ? <AgentActivityDetailDrawer activity={activityDetail} onClose={() => setActivityDetail(null)} /> : null}
       </section>
     </div>
+  );
+}
+
+function AgentActivityBuckets({
+  agent,
+  selectedActivityId,
+  onOpen,
+}: {
+  agent: AgentWorkItem;
+  selectedActivityId?: string;
+  onOpen: (activity: AgentWorkActivity) => void;
+}) {
+  const activities = dedupeAgentActivities(agent);
+  const buckets = AGENT_WORK_CATEGORIES.map((category) => ({
+    category,
+    items: activities.filter((activity) => activity.category === category),
+  })).filter((bucket) => bucket.items.length > 0);
+  if (buckets.length === 0) return <p className="agent-workforce-empty">暂无可展示记录。</p>;
+  return (
+    <section className="agent-workforce-section agent-workforce-cards" aria-label={`${agent.label} 分类摘要`}>
+      <h5>分类摘要</h5>
+      <div className="agent-activity-buckets">
+        {buckets.map((bucket) => (
+          <article key={bucket.category} className={`agent-activity-bucket bucket-${bucket.category}`}>
+            <div className="agent-activity-bucket-head">
+              <strong>{bucket.category}</strong>
+              <span>{bucket.items.length} 条</span>
+            </div>
+            <AgentActivityList activities={bucket.items} selectedActivityId={selectedActivityId} onOpen={onOpen} />
+          </article>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -2031,13 +2080,23 @@ function AgentActivityDetailDrawer({
   activity: AgentWorkActivity;
   onClose: () => void;
 }) {
+  const [showFullFields, setShowFullFields] = useState(false);
+  const summaryRows = [
+    { label: "分类", value: activity.category },
+    { label: "来源", value: activity.kind },
+    activity.createdAt ? { label: "时间", value: activity.createdAt } : null,
+    hasArtifactDownload(activity.artifact) ? { label: "下载", value: artifactFileName(activity.artifact) } : null,
+  ].filter((row): row is { label: string; value: string } => Boolean(row));
+
   return (
     <div
       className="activity-detail-backdrop"
       role="presentation"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
       onClick={(event) => {
-        event.stopPropagation();
-        onClose();
+        if (event.target === event.currentTarget) onClose();
       }}
     >
       <section
@@ -2045,6 +2104,7 @@ function AgentActivityDetailDrawer({
         role="dialog"
         aria-label="活动详情"
         aria-modal="true"
+        onPointerDown={(event) => event.stopPropagation()}
         onClick={(event) => event.stopPropagation()}
       >
         <div className="process-drawer-header">
@@ -2057,25 +2117,42 @@ function AgentActivityDetailDrawer({
             关闭
           </button>
         </div>
-        <dl className="activity-detail-list">
-          <div>
-            <dt>摘要分类</dt>
-            <dd>{activity.category}</dd>
-          </div>
-          {activity.createdAt ? (
+        <section className="activity-detail-summary" aria-label="分类摘要">
+          <h4>分类摘要</h4>
+          <dl className="activity-summary-cards" aria-label="活动摘要">
+            {summaryRows.map((row) => (
+              <div key={`${activity.id}-summary-${row.label}`}>
+                <dt>{row.label}</dt>
+                <dd>{row.value}</dd>
+              </div>
+            ))}
             <div>
-              <dt>时间</dt>
-              <dd>{activity.createdAt}</dd>
+              <dt>摘要</dt>
+              <dd>{activity.summary}</dd>
             </div>
-          ) : null}
-          {activity.rows.map((row, rowIndex) => (
-            <div key={`${activity.id}-${row.label}-${rowIndex}`}>
-              <dt>{row.label}</dt>
-              <dd>{row.value}</dd>
-            </div>
-          ))}
-        </dl>
+          </dl>
+        </section>
         {hasArtifactDownload(activity.artifact) ? <ArtifactFileCard artifact={activity.artifact} compact /> : null}
+        {activity.rows.length > 0 ? (
+          <button
+            type="button"
+            className="secondary-action activity-detail-fields-toggle"
+            onClick={() => setShowFullFields((current) => !current)}
+            aria-expanded={showFullFields}
+          >
+            {showFullFields ? "收起完整字段" : `查看完整字段（${activity.rows.length}）`}
+          </button>
+        ) : null}
+        {showFullFields ? (
+          <dl className="activity-detail-list">
+            {activity.rows.map((row, rowIndex) => (
+              <div key={`${activity.id}-${row.label}-${rowIndex}`}>
+                <dt>{row.label}</dt>
+                <dd>{row.value}</dd>
+              </div>
+            ))}
+          </dl>
+        ) : null}
       </section>
     </div>
   );
@@ -2126,8 +2203,12 @@ function TemporaryAgentRecruitmentCard({
       </div>
       <dl className="temporary-agent-recruitment-meta">
         <div>
+          <dt>名称</dt>
+          <dd>{proposal.name}</dd>
+        </div>
+        <div>
           <dt>职责</dt>
-          <dd>{proposal.missing_capability}</dd>
+          <dd>{proposal.role}</dd>
         </div>
         <div>
           <dt>模型</dt>
@@ -2198,12 +2279,22 @@ function TemporaryAgentDetailDialog({
   onClose: () => void;
 }) {
   return (
-    <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
+    <div
+      className="process-drawer-backdrop"
+      role="presentation"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
       <section
         className="temporary-agent-detail-dialog"
         role="dialog"
         aria-label="临时 Agent 招募详情"
         aria-modal="true"
+        onPointerDown={(event) => event.stopPropagation()}
         onClick={(event) => event.stopPropagation()}
       >
         <div className="process-drawer-header">
@@ -2494,6 +2585,20 @@ export function RunsPage() {
   useEffect(() => {
     setProcessDetailTarget(null);
   }, [activeConversationId]);
+  useEffect(() => {
+    if (!processDetailTarget && !temporaryAgentDetail) return;
+    const previousBodyOverflow = document.body.style.overflow;
+    const previousBodyTouchAction = document.body.style.touchAction;
+    const previousDocumentOverflow = document.documentElement.style.overflow;
+    document.body.style.overflow = "hidden";
+    document.body.style.touchAction = "none";
+    document.documentElement.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previousBodyOverflow;
+      document.body.style.touchAction = previousBodyTouchAction;
+      document.documentElement.style.overflow = previousDocumentOverflow;
+    };
+  }, [processDetailTarget, temporaryAgentDetail]);
   useEffect(() => {
     if (!settings.data) return;
     if (!userSelectedMode.current) {
@@ -3262,6 +3367,20 @@ export function RunsPage() {
         : directModel && !registeredModelIds.has(directModel)
             ? "所选直连模型/API 未注册或未通过配置，请先到模型页面修正。"
           : null;
+  const refreshedRunForProcessDetail = processDetailTarget
+    ? visibleRuns.find((run) => run.id === processDetailTarget.runId) ??
+      (selectedRun.data?.id === processDetailTarget.runId ? selectedRun.data : null)
+    : null;
+  const refreshedProcessDetailTarget =
+    processDetailTarget && refreshedRunForProcessDetail
+      ? {
+          ...processDetailTarget,
+          conversationId: runConversationId(refreshedRunForProcessDetail),
+          scopeLabel: runSeatScope(refreshedRunForProcessDetail),
+          workItems: buildAgentWorkItems(refreshedRunForProcessDetail, agentNameMap, mainAgentModelName),
+        }
+      : processDetailTarget;
+
   const deletableConversationIds = items
     .filter((run) => TERMINAL_STATUSES.has(run.status))
     .map((run) => run.id);
@@ -3421,7 +3540,6 @@ export function RunsPage() {
                   >
                     <span className="conversation-mode-chip">{displayMode(run.mode)}</span>
                     <strong className="conversation-title-text">{title}</strong>
-                    <small className="conversation-meta-line">{run.status}</small>
                   </button>
                   <button
                     type="button"
@@ -3730,9 +3848,9 @@ export function RunsPage() {
               </Fragment>
             ))}
           </div>
-          {processDetailTarget ? (
+          {refreshedProcessDetailTarget ? (
             <RunProcessDrawer
-              target={processDetailTarget}
+              target={refreshedProcessDetailTarget}
               onClose={() => setProcessDetailTarget(null)}
             />
           ) : null}
