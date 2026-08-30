@@ -519,6 +519,7 @@ const TemporaryAgentProposalSchema = z.object({
   reason: z.string(),
   missing_capability: z.string(),
   model: z.string().optional(),
+  recommended_model: z.string().optional(),
   suggested_skills: z.array(z.string()),
   permanentizable: z.boolean(),
 });

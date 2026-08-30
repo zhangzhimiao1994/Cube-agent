@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Fragment, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, FormEvent, KeyboardEvent, MouseEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { ApiError, api, formatApiError, type AttachmentUpload, type ModelDeployment, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun } from "../api/client";
@@ -339,6 +339,7 @@ type ChatMessage = {
   title: string;
   body: string;
   artifact?: RunArtifact | NonNullable<RunEvent["artifact"]>;
+  temporaryAgentProposal?: TemporaryAgentProposal;
 };
 
 function isGenericArtifactText(value: string | null | undefined) {
@@ -541,11 +542,13 @@ type ProcessDetailTarget = {
 
 type AgentWorkStatus = "working" | "waiting" | "done" | "failed";
 type AgentWorkView = "activity" | "computer";
+type AgentWorkCategory = "结论" | "产物" | "阻塞" | "决策" | "证据";
 
 type AgentWorkActivity = {
   id: string;
   title: string;
   kind: string;
+  category: AgentWorkCategory;
   summary: string;
   rows: Array<{ label: string; value: string }>;
   createdAt: string | null;
@@ -724,17 +727,12 @@ function scheduleProposalCreatePayload(proposal: ScheduleProposal) {
     metadata: proposal.metadata,
   };
 }
-function temporaryAgentApprovalBody(proposal: TemporaryAgentProposal) {
-  const skills =
-    proposal.suggested_skills.length > 0 ? `\n建议 Skill：${proposal.suggested_skills.join("、")}` : "";
-  return [
-    "主 Agent 判断当前角色池缺少一个临时子 Agent。主 Agent 已生成角色和提示词；模型/API 不需要你选，主 Agent 会按角色能力、任务要求和模型并发情况自动选择模型/API。",
-    `拟加入：${proposal.name}（${proposal.id}）`,
-    `缺少能力：${proposal.missing_capability}`,
-    `加入原因：${proposal.reason}`,
-    `角色边界：${proposal.prompt}${skills}`,
-    "请直接回复：\n1 同意临时加入\n2 不加入，按现有角色继续\n3 你的修改意见\n4 保存为永久 Agent（需先同意并运行过）",
-  ].join("\n\n");
+function temporaryAgentModel(proposal: TemporaryAgentProposal) {
+  return proposal.model?.trim() || proposal.recommended_model?.trim() || "主 Agent 自动选择";
+}
+
+function temporaryAgentSummary(proposal: TemporaryAgentProposal) {
+  return `主 Agent 判断缺少 ${proposal.missing_capability} 能力，建议招募 ${proposal.name} 负责 ${proposal.role}。`;
 }
 
 function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
@@ -809,7 +807,8 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
             id: `${detail.id}-temporary-agent-approval`,
             role: "assistant" as const,
             title: detail.temporary_agent_proposal.name,
-            body: temporaryAgentApprovalBody(detail.temporary_agent_proposal),
+            body: temporaryAgentSummary(detail.temporary_agent_proposal),
+            temporaryAgentProposal: detail.temporary_agent_proposal,
           },
         ]
       : []),
@@ -1190,6 +1189,18 @@ function eventOpinionEntries(event: RunEvent, agentNames: Map<string, string>) {
     });
 }
 
+function discussionCompactSummary(event: RunEvent, agentNames: Map<string, string>) {
+  const conclusionCount = formatEventPayloadValue(event.payload.result) || formatEventPayloadValue(event.payload.conclusion) ? 1 : 0;
+  const decisionCount = eventDecisionSignal(event) ? 1 : 0;
+  const opinionCount = eventOpinionEntries(event, agentNames).length;
+  const parts = [
+    conclusionCount > 0 ? `${conclusionCount} 个结论` : "",
+    decisionCount > 0 ? `${decisionCount} 个决策` : "",
+    opinionCount > 0 ? `${opinionCount} 条意见` : "",
+  ].filter(Boolean);
+  return `讨论完成：形成 ${parts.length > 0 ? parts.join("、") : "关键摘要"}`;
+}
+
 function eventSummaryText(
   event: RunDetail["events"][number],
   agentNames: Map<string, string>,
@@ -1240,7 +1251,7 @@ function eventSummaryText(
     return `${participants || "多角色"} 开始讨论`;
   }
   if (event.kind === "discussion.completed") {
-    return `讨论结论：${conciseProcessText(discussionSignal, "完成讨论")}`;
+    return discussionCompactSummary(event, agentNames);
   }
   if (event.kind === "decision.started") {
     return `主 Agent 开始决策${instructionSignal ? `：${conciseProcessText(instructionSignal, "开始裁决")}` : ""}`;
@@ -1476,12 +1487,31 @@ function activityFromTarget(target: ProcessDetailTarget): AgentWorkActivity {
     id: target.id,
     title: target.title,
     kind: target.badge,
+    category: categoryForTarget(target),
     summary: target.message,
     rows: target.rows,
     createdAt: target.createdAt,
     event: target.event,
     artifact: target.artifact,
   };
+}
+
+function categoryForTarget(target: ProcessDetailTarget): AgentWorkCategory {
+  const eventKind = target.event?.kind ?? "";
+  const text = `${target.badge} ${target.title} ${target.message}`.toLowerCase();
+  if (eventKind.includes("failed") || eventKind.includes("error") || text.includes("失败") || text.includes("阻塞")) {
+    return "阻塞";
+  }
+  if (target.artifact || target.badge.includes("产物") || target.badge === "输出" || text.includes("输出") || text.includes("产出")) {
+    return "产物";
+  }
+  if (eventKind.startsWith("decision.") || target.badge.includes("裁决") || text.includes("决策") || text.includes("裁决")) {
+    return "决策";
+  }
+  if (eventKind === "discussion.completed" || text.includes("结论")) {
+    return "结论";
+  }
+  return "证据";
 }
 
 function outputActivityFromArtifact(
@@ -1497,6 +1527,7 @@ function outputActivityFromArtifact(
     id: `${detail.id}-agent-${agent.key}-artifact-${artifact.id || index}`,
     title: `${agent.label} 输出`,
     kind: "输出",
+    category: "产物",
     summary,
     rows: eventArtifactRows(artifact),
     createdAt: null,
@@ -1636,6 +1667,88 @@ function buildAgentWorkItems(
 function selectedAgentForActivity(workItems: AgentWorkItem[], activityId: string | undefined) {
   if (!activityId) return undefined;
   return workItems.find((item) => item.outputs.some((output) => output.id === activityId) || item.activity.some((activity) => activity.id === activityId))?.id;
+}
+
+function categorizedAgentHighlights(agent: AgentWorkItem) {
+  const categories: AgentWorkCategory[] = ["结论", "产物", "阻塞", "决策", "证据"];
+  const seen = new Set<string>();
+  const activities = [...agent.outputs, ...agent.activity].filter((activity) => {
+    const key = `${activity.category}:${activity.summary}:${activity.title}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return Boolean(activity.summary.trim());
+  });
+  return categories
+    .map((category) => ({
+      category,
+      items: activities.filter((activity) => activity.category === category).slice(0, 2),
+    }))
+    .filter((bucket) => bucket.items.length > 0);
+}
+
+function AgentSummaryBuckets({ agent }: { agent: AgentWorkItem }) {
+  const buckets = categorizedAgentHighlights(agent);
+  if (buckets.length === 0) return null;
+  return (
+    <section className="agent-workforce-section agent-workforce-summary" aria-label={`${agent.label} 重点摘要`}>
+      <h5>重点摘要</h5>
+      <div className="agent-summary-grid">
+        {buckets.map((bucket) => (
+          <article key={bucket.category} className={`agent-summary-bucket bucket-${bucket.category}`}>
+            <strong>{bucket.category}</strong>
+            <ul>
+              {bucket.items.map((item) => (
+                <li key={item.id}>{conciseProcessText(item.summary, item.title)}</li>
+              ))}
+            </ul>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function categorizedRunHighlights(workItems: AgentWorkItem[]) {
+  const categories: AgentWorkCategory[] = ["结论", "产物", "阻塞", "决策", "证据"];
+  const seen = new Set<string>();
+  const activities = workItems
+    .flatMap((agent) => [...agent.outputs, ...agent.activity].map((activity) => ({ ...activity, agentLabel: agent.label })))
+    .filter((activity) => {
+      const key = `${activity.category}:${activity.agentLabel}:${activity.summary}:${activity.title}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return Boolean(activity.summary.trim());
+    });
+  return categories
+    .map((category) => ({
+      category,
+      items: activities.filter((activity) => activity.category === category).slice(0, 2),
+    }))
+    .filter((bucket) => bucket.items.length > 0);
+}
+
+function RunSummaryBuckets({ workItems }: { workItems: AgentWorkItem[] }) {
+  const buckets = categorizedRunHighlights(workItems);
+  if (buckets.length === 0) return null;
+  return (
+    <section className="agent-workforce-section agent-workforce-summary run-workforce-summary" aria-label="运行重点摘要">
+      <h5>重点摘要</h5>
+      <div className="agent-summary-grid">
+        {buckets.map((bucket) => (
+          <article key={bucket.category} className={`agent-summary-bucket bucket-${bucket.category}`}>
+            <strong>{bucket.category}</strong>
+            <ul>
+              {bucket.items.map((item) => (
+                <li key={`${item.agentLabel}-${item.id}`}>
+                  <span>{item.agentLabel}</span>：{conciseProcessText(item.summary, item.title)}
+                </li>
+              ))}
+            </ul>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
 }
 
 function RunProcessSummary({
@@ -1778,6 +1891,7 @@ function RunProcessDrawer({
             关闭
           </button>
         </div>
+        <RunSummaryBuckets workItems={target.workItems} />
         <div className="agent-workforce-layout">
           <aside className="agent-workforce-roster" aria-label="子 Agent 列表">
             {target.workItems.map((agent) => (
@@ -1833,6 +1947,8 @@ function RunProcessDrawer({
                   )}
                 </div>
               </div>
+
+              <AgentSummaryBuckets agent={selectedAgent} />
 
               {activeView === "computer" ? (
                 <section className="agent-workforce-section">
@@ -1903,6 +2019,181 @@ function AgentActivityList({
           {activity.createdAt ? <time dateTime={activity.createdAt}>{activity.createdAt}</time> : null}
         </article>
       ))}
+    </div>
+  );
+}
+
+function TemporaryAgentRecruitmentCard({
+  proposal,
+  approved,
+  onOpen,
+  onApprove,
+  onReject,
+  onRevise,
+  onPersist,
+  disabled = false,
+}: {
+  proposal: TemporaryAgentProposal;
+  approved: boolean;
+  onOpen: () => void;
+  onApprove: () => void;
+  onReject: () => void;
+  onRevise: () => void;
+  onPersist: () => void;
+  disabled?: boolean;
+}) {
+  const status = approved ? "已招募" : "待确认";
+  const stopAction = (event: MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+  };
+  const handleKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      onOpen();
+    }
+  };
+  return (
+    <article
+      className="temporary-agent-recruitment-card"
+      role="button"
+      tabIndex={0}
+      aria-label={`打开 ${proposal.name} 招募详情`}
+      onClick={onOpen}
+      onKeyDown={handleKeyDown}
+    >
+      <span className="eyebrow">子 Agent 招募</span>
+      <div className="temporary-agent-recruitment-head">
+        <h3>{proposal.name}</h3>
+        <em className={`agent-workforce-status ${approved ? "status-done" : "status-working"}`}>{status}</em>
+      </div>
+      <dl className="temporary-agent-recruitment-meta">
+        <div>
+          <dt>职责</dt>
+          <dd>{proposal.missing_capability}</dd>
+        </div>
+        <div>
+          <dt>模型</dt>
+          <dd>{temporaryAgentModel(proposal)}</dd>
+        </div>
+        <div>
+          <dt>状态</dt>
+          <dd>{status}</dd>
+        </div>
+      </dl>
+      <p>{temporaryAgentSummary(proposal)}</p>
+      <div className="temporary-agent-choice-grid" aria-label="临时 Agent 选择">
+        <button
+          type="button"
+          onClick={(event) => {
+            stopAction(event);
+            onApprove();
+          }}
+          disabled={disabled || approved}
+        >
+          同意加入
+        </button>
+        <button
+          type="button"
+          className="secondary-action"
+          onClick={(event) => {
+            stopAction(event);
+            onReject();
+          }}
+          disabled={disabled}
+        >
+          不加入
+        </button>
+        <button
+          type="button"
+          className="secondary-action"
+          onClick={(event) => {
+            stopAction(event);
+            onRevise();
+          }}
+          disabled={disabled}
+        >
+          提修改
+        </button>
+        {proposal.permanentizable ? (
+          <button
+            type="button"
+            className="secondary-action"
+            onClick={(event) => {
+              stopAction(event);
+              onPersist();
+            }}
+            disabled={disabled || !approved}
+          >
+            保存永久
+          </button>
+        ) : null}
+      </div>
+    </article>
+  );
+}
+
+function TemporaryAgentDetailDialog({
+  proposal,
+  onClose,
+}: {
+  proposal: TemporaryAgentProposal;
+  onClose: () => void;
+}) {
+  return (
+    <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
+      <section
+        className="temporary-agent-detail-dialog"
+        role="dialog"
+        aria-label="临时 Agent 招募详情"
+        aria-modal="true"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="process-drawer-header">
+          <div>
+            <span className="eyebrow">子 Agent 招募详情</span>
+            <h3>{proposal.name}</h3>
+          </div>
+          <button type="button" className="secondary-action" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+        <dl className="temporary-agent-detail-list">
+          <div>
+            <dt>名称</dt>
+            <dd>{proposal.name}</dd>
+          </div>
+          <div>
+            <dt>职责</dt>
+            <dd>{proposal.role}</dd>
+          </div>
+          <div>
+            <dt>模型</dt>
+            <dd>{temporaryAgentModel(proposal)}</dd>
+          </div>
+          <div>
+            <dt>缺少能力</dt>
+            <dd>{proposal.missing_capability}</dd>
+          </div>
+          <div>
+            <dt>招募原因</dt>
+            <dd>{proposal.reason}</dd>
+          </div>
+          <div>
+            <dt>角色边界</dt>
+            <dd>{proposal.prompt}</dd>
+          </div>
+          {proposal.suggested_skills.length > 0 ? (
+            <div>
+              <dt>建议 Skill</dt>
+              <dd>{proposal.suggested_skills.join("、")}</dd>
+            </div>
+          ) : null}
+          <div>
+            <dt>选择方式</dt>
+            <dd>可在招募卡片中直接选择同意加入、不加入、提修改，或在同意并运行后保存为永久 Agent。</dd>
+          </div>
+        </dl>
+      </section>
     </div>
   );
 }
@@ -2064,6 +2355,7 @@ export function RunsPage() {
   const [showModeEntry, setShowModeEntry] = useState(true);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [processDetailTarget, setProcessDetailTarget] = useState<ProcessDrawerTarget | null>(null);
+  const [temporaryAgentDetail, setTemporaryAgentDetail] = useState<TemporaryAgentProposal | null>(null);
   const [modeSelection, setModeSelection] = useState<ModeSelection | null>(null);
   const [skillInstallCandidate, setSkillInstallCandidate] = useState<SkillInstallCandidate | null>(null);
   const [skillUploadConflict, setSkillUploadConflict] = useState<SkillUploadConflict | null>(null);
@@ -2234,6 +2526,7 @@ export function RunsPage() {
 
   useEffect(() => {
     setProcessDetailTarget(null);
+    setTemporaryAgentDetail(null);
   }, [selectedRunId]);
 
   useEffect(() => {
@@ -2494,7 +2787,12 @@ export function RunsPage() {
         enabled: true,
         role: temporaryApproval.proposal.role,
         prompt: temporaryApproval.proposal.prompt,
-        model: temporaryApproval.proposal.model ?? (savedModels.find((model) => model.logical_model === "main")?.logical_model ?? savedModels[0]?.logical_model ?? "main"),
+        model:
+          temporaryApproval.proposal.model ??
+          temporaryApproval.proposal.recommended_model ??
+          (savedModels.find((model) => model.logical_model === "main")?.logical_model ??
+            savedModels[0]?.logical_model ??
+            "main"),
         skills: temporaryApproval.proposal.suggested_skills,
       });
     },
@@ -2521,6 +2819,37 @@ export function RunsPage() {
       await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
     },
   });
+
+  const approveTemporaryAgentFromCard = () => {
+    if (!temporaryApproval) return;
+    if (temporaryApproval.approved) {
+      setSubmitNotice("这个临时 Agent 已经加入。本轮完成后可保存为永久 Agent。");
+      return;
+    }
+    setSubmitNotice("已选择同意临时加入，正在继续这轮对话。");
+    approveTemporaryAgent.mutate();
+  };
+
+  const rejectTemporaryAgentFromCard = () => {
+    if (!temporaryApproval) return;
+    setSubmitNotice("已选择不加入临时 Agent，正在按现有角色继续。");
+    reviseTemporaryAgent.mutate("不加入，按现有角色继续");
+  };
+
+  const requestTemporaryAgentRevisionFromCard = () => {
+    setMessage((current) => (current.trim() ? current : "3 "));
+    setSubmitNotice("请在输入框补充修改意见后发送。");
+  };
+
+  const persistTemporaryAgentFromCard = () => {
+    if (!temporaryApproval) return;
+    if (!temporaryApproval.approved) {
+      setSubmitNotice("保存为永久 Agent 前，需要先同意临时加入并完成本轮运行。");
+      return;
+    }
+    setSubmitNotice("正在把这个临时 Agent 保存为永久 Agent。");
+    promoteTemporaryAgent.mutate();
+  };
 
   const deleteRun = useMutation({
     mutationFn: (runId: string) => api.deleteRun(runId),
@@ -3286,11 +3615,16 @@ export function RunsPage() {
               </article>
             ) : null}
             {temporaryApproval && !temporaryApprovalVisibleInMessages ? (
-              <article className="chat-message assistant" aria-label="临时 Agent 文字确认">
-                <span className="eyebrow">{APP_BRAND_NAME}</span>
-                <h3>{temporaryApproval.proposal.name}</h3>
-                <p>{temporaryAgentApprovalBody(temporaryApproval.proposal)}</p>
-              </article>
+              <TemporaryAgentRecruitmentCard
+                proposal={temporaryApproval.proposal}
+                approved={temporaryApproval.approved}
+                onOpen={() => setTemporaryAgentDetail(temporaryApproval.proposal)}
+                onApprove={approveTemporaryAgentFromCard}
+                onReject={rejectTemporaryAgentFromCard}
+                onRevise={requestTemporaryAgentRevisionFromCard}
+                onPersist={persistTemporaryAgentFromCard}
+                disabled={approveTemporaryAgent.isPending || reviseTemporaryAgent.isPending || promoteTemporaryAgent.isPending}
+              />
             ) : null}
             {scheduleApproval && !scheduleApprovalVisibleInMessages ? (
               <article className="chat-message assistant" aria-label="计划任务文字确认">
@@ -3308,12 +3642,25 @@ export function RunsPage() {
             ) : null}
             {messages.map((item, index) => (
               <Fragment key={item.id}>
-                <article className={`chat-message ${item.role}`}>
-                  <span className="eyebrow">{item.role === "user" ? "你" : APP_BRAND_NAME}</span>
-                  <h3>{item.title}</h3>
-                  <MessageBody text={item.body} title={item.title} />
-                  {hasArtifactDownload(item.artifact) ? <ArtifactFileCard artifact={item.artifact} /> : null}
-                </article>
+                {item.temporaryAgentProposal ? (
+                  <TemporaryAgentRecruitmentCard
+                    proposal={item.temporaryAgentProposal}
+                    approved={temporaryApproval?.runId === item.run?.id ? temporaryApproval.approved : false}
+                    onOpen={() => setTemporaryAgentDetail(item.temporaryAgentProposal ?? null)}
+                    onApprove={approveTemporaryAgentFromCard}
+                    onReject={rejectTemporaryAgentFromCard}
+                    onRevise={requestTemporaryAgentRevisionFromCard}
+                    onPersist={persistTemporaryAgentFromCard}
+                    disabled={approveTemporaryAgent.isPending || reviseTemporaryAgent.isPending || promoteTemporaryAgent.isPending}
+                  />
+                ) : (
+                  <article className={`chat-message ${item.role}`}>
+                    <span className="eyebrow">{item.role === "user" ? "你" : APP_BRAND_NAME}</span>
+                    <h3>{item.title}</h3>
+                    <MessageBody text={item.body} title={item.title} />
+                    {hasArtifactDownload(item.artifact) ? <ArtifactFileCard artifact={item.artifact} /> : null}
+                  </article>
+                )}
                 {item.id.endsWith("-request") && item.run ? (
                   <RunProcessSummary
                     detail={item.run}
@@ -3337,6 +3684,12 @@ export function RunsPage() {
             <RunProcessDrawer
               target={processDetailTarget}
               onClose={() => setProcessDetailTarget(null)}
+            />
+          ) : null}
+          {temporaryAgentDetail ? (
+            <TemporaryAgentDetailDialog
+              proposal={temporaryAgentDetail}
+              onClose={() => setTemporaryAgentDetail(null)}
             />
           ) : null}
 

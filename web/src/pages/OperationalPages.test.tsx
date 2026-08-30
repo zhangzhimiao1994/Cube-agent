@@ -606,6 +606,7 @@ describe("operational management pages", () => {
                 prompt: "把方案落成网页并说明验证步骤。",
                 reason: "当前角色池缺少 software_engineering 能力。",
                 missing_capability: "software_engineering",
+                recommended_model: "coder",
                 suggested_skills: ["frontend"],
                 permanentizable: true,
               },
@@ -1997,11 +1998,15 @@ describe("operational management pages", () => {
     expect(within(stream).getByRole("status", { name: /Agent 工作席/ })).not.toBeNull();
     expect(within(stream).queryByRole("button", { name: /生成了结果/ })).toBeNull();
     expect(within(stream).getByRole("button", { name: /文案生成 输出：得到一版可拍摄脚本文案/ })).not.toBeNull();
-    expect(within(stream).getByRole("button", { name: /讨论结论：.*采用可拍摄性最高的方案/ })).not.toBeNull();
+    expect(within(stream).getByRole("button", { name: /讨论完成：形成 1 个结论、1 个决策、3 条意见/ })).not.toBeNull();
     await user.click(within(stream).getByRole("button", { name: /文案生成 输出：得到一版可拍摄脚本文案/ }));
     expect(within(stream).queryByText("任务已进入队列，等待 Worker 调度执行。")).toBeNull();
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     expect(within(drawer).getByText("子 Agent 工作席")).not.toBeNull();
+    expect(within(drawer).getAllByText("重点摘要").length).toBeGreaterThanOrEqual(1);
+    expect(within(drawer).getAllByText("结论").length).toBeGreaterThanOrEqual(1);
+    expect(within(drawer).getAllByText("产物").length).toBeGreaterThanOrEqual(1);
+    expect(within(drawer).getAllByText("决策").length).toBeGreaterThanOrEqual(1);
     expect(within(drawer).getAllByText("活动轨迹").length).toBeGreaterThan(0);
     expect(within(drawer).queryByText("任务已进入队列，等待 Worker 调度执行。")).toBeNull();
     expect(within(drawer).queryByText("model.started")).toBeNull();
@@ -2681,7 +2686,7 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    await user.click(within(stream).getByRole("button", { name: /讨论结论：.*采用可拍摄性最高的方案/ }));
+    await user.click(within(stream).getByRole("button", { name: /讨论完成：形成 1 个结论、1 个决策、3 条意见/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
 
     expect(within(drawer).getAllByText("参与者").length).toBeGreaterThan(0);
@@ -2981,8 +2986,31 @@ describe("operational management pages", () => {
     await user.click(composer.querySelector('button[type="submit"]') as HTMLButtonElement);
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    expect(within(stream).getByText("Temporary Web Engineer")).not.toBeNull();
+    const recruitmentCard = within(stream).getByRole("button", { name: /打开 Temporary Web Engineer 招募详情/ });
+    expect(recruitmentCard).not.toBeNull();
+    expect(within(recruitmentCard).getByText("Temporary Web Engineer")).not.toBeNull();
+    expect(within(recruitmentCard).getByText("职责")).not.toBeNull();
+    expect(within(recruitmentCard).getByText("software_engineering")).not.toBeNull();
+    expect(within(recruitmentCard).getByText("模型")).not.toBeNull();
+    expect(within(recruitmentCard).getByText("coder")).not.toBeNull();
+    expect(within(recruitmentCard).getByText("状态")).not.toBeNull();
+    expect(within(recruitmentCard).getAllByText("待确认").length).toBeGreaterThan(0);
+    expect(within(recruitmentCard).getByRole("button", { name: "同意加入" })).not.toBeNull();
+    expect(within(recruitmentCard).getByRole("button", { name: "不加入" })).not.toBeNull();
+    expect(within(recruitmentCard).getByRole("button", { name: "提修改" })).not.toBeNull();
+    expect(within(stream).getByText(/主 Agent 判断缺少 software_engineering 能力/)).not.toBeNull();
+    expect(within(stream).queryByText("把方案落成网页并说明验证步骤。")).toBeNull();
+    expect(within(stream).queryByText("当前角色池缺少 software_engineering 能力。")).toBeNull();
+    expect(within(stream).queryByRole("button", { name: /查看详情/ })).toBeNull();
     expect(screen.queryByRole("dialog", { name: "临时 Agent 确认提醒" })).toBeNull();
+    await user.click(recruitmentCard);
+    const detailDialog = await screen.findByRole("dialog", { name: "临时 Agent 招募详情" });
+    expect(within(detailDialog).getByText("招募原因")).not.toBeNull();
+    expect(within(detailDialog).getByText("当前角色池缺少 software_engineering 能力。")).not.toBeNull();
+    expect(within(detailDialog).getByText("角色边界")).not.toBeNull();
+    expect(within(detailDialog).getByText("把方案落成网页并说明验证步骤。")).not.toBeNull();
+    await user.click(detailDialog.parentElement as HTMLElement);
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "临时 Agent 招募详情" })).toBeNull());
     await user.clear(composer.querySelector("textarea") as HTMLTextAreaElement);
     await user.type(composer.querySelector("textarea") as HTMLTextAreaElement, "3 do not add an engineer yet");
     await user.click(composer.querySelector('button[type="submit"]') as HTMLButtonElement);
@@ -3011,13 +3039,13 @@ describe("operational management pages", () => {
     await user.click(composer.querySelector('button[type="submit"]') as HTMLButtonElement);
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    expect(within(stream).getByText(/主 Agent 已生成角色和提示词/)).not.toBeNull();
-    expect(within(stream).getByText(/主 Agent 会按角色能力、任务要求和模型并发情况自动选择模型/)).not.toBeNull();
+    const recruitmentCard = within(stream).getByRole("button", { name: /打开 Temporary Web Engineer 招募详情/ });
+    expect(within(recruitmentCard).getByText("模型")).not.toBeNull();
+    expect(within(recruitmentCard).getByText("coder")).not.toBeNull();
+    expect(within(stream).queryByText(/主 Agent 已生成角色和提示词/)).toBeNull();
+    expect(within(stream).queryByText(/主 Agent 会按角色能力、任务要求和模型并发情况自动选择模型/)).toBeNull();
     expect(within(stream).queryByLabelText("运行模型")).toBeNull();
-    expect(within(stream).queryByText(/建议模型\/API：coder/)).toBeNull();
-    await user.clear(composer.querySelector("textarea") as HTMLTextAreaElement);
-    await user.type(composer.querySelector("textarea") as HTMLTextAreaElement, "1");
-    await user.click(composer.querySelector('button[type="submit"]') as HTMLButtonElement);
+    await user.click(within(recruitmentCard).getByRole("button", { name: "同意加入" }));
     await waitFor(() =>
       expect(requests.find((request) => request.path === `/api/v1/runs/${runId}/approve-temporary-agent`)).toMatchObject({
         body: {
@@ -3037,7 +3065,7 @@ describe("operational management pages", () => {
           name: "Temporary Web Engineer",
           role: "Web Engineer",
           prompt: "把方案落成网页并说明验证步骤。",
-          model: "main",
+          model: "coder",
           skills: ["frontend"],
         },
       }),
