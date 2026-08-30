@@ -115,6 +115,7 @@ const runDetail: RunDetail = {
     conversation_id: "conv-previous",
   },
   failure_diagnostics: [],
+  tool_lifecycle: [],
 };
 
 const settings = {
@@ -1124,6 +1125,26 @@ describe("operational management pages", () => {
           wrapped_by: null,
         },
       ],
+      tool_lifecycle: [
+        {
+          tool_call_id: "call_terminal",
+          tool_name: "run_safe_command",
+          status: "failed",
+          operation_kind: "terminal",
+          actor: "engineer",
+          step_id: "implementation",
+          started_sequence: 2,
+          terminal_sequence: 4,
+          sequences: [2, 4],
+          approval_id: "approval_terminal",
+          replay_safe: false,
+          argument_bytes: 42,
+          output_bytes: 128,
+          exit_code: 1,
+          artifact_id: "artifact_terminal",
+          failure_kind: "nonzero_exit",
+        },
+      ],
       events: [
         {
           sequence: 1,
@@ -1201,6 +1222,9 @@ describe("operational management pages", () => {
     expect(within(toolSection).getByText("run_safe_command")).not.toBeNull();
     expect(within(toolSection).getByText("终端")).not.toBeNull();
     expect(within(toolSection).getByText("退出码 1")).not.toBeNull();
+    expect(within(toolSection).getByText("审批 approval_terminal")).not.toBeNull();
+    expect(within(toolSection).getByText("不可回放")).not.toBeNull();
+    expect(within(toolSection).getByText("产物 artifact_terminal")).not.toBeNull();
     expect(screen.getByRole("region", { name: "故障诊断" })).not.toBeNull();
     expect(screen.getByText("查看工具链路中的失败步骤，然后重试或改派。")).not.toBeNull();
     expect(screen.getByText("Harness 服务商")).not.toBeNull();
@@ -1208,6 +1232,106 @@ describe("operational management pages", () => {
     expect(screen.queryByText("credential_ref")).toBeNull();
     expect(screen.queryByText("secret://private")).toBeNull();
     expect(screen.queryByText("private-token output")).toBeNull();
+  });
+
+  it("surfaces run-detail execution intents without raw payload leakage", async () => {
+    visibleRunDetail = {
+      ...runDetail,
+      status: "waiting_approval",
+      events: [
+        {
+          sequence: 1,
+          kind: "tool.started",
+          message: "tool.started",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: "run_safe_command",
+          tool_call_id: "call_terminal",
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: {
+            status: "running",
+            operation_kind: "terminal",
+            replay_safe: false,
+            command: "cat private-token.txt",
+          },
+        },
+        {
+          sequence: 2,
+          kind: "step.retrying",
+          message: "step.retrying",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "main_agent",
+          participants: ["engineer"],
+          tool_name: null,
+          tool_call_id: null,
+          step_id: "engineer_step",
+          action: "retry_terminal",
+          decision: null,
+          payload: {
+            attempt: 2,
+            reason: "private output should stay hidden",
+            replay_safe: false,
+          },
+        },
+        {
+          sequence: 3,
+          kind: "approval.requested",
+          message: "approval.requested",
+          created_at: "2026-08-07T00:00:03Z",
+          actor: "main_agent",
+          participants: [],
+          tool_name: null,
+          tool_call_id: null,
+          step_id: null,
+          approval_id: "approval_retry_terminal",
+          action: "retry_terminal",
+          decision: null,
+          payload: {
+            requires_approval: true,
+            replay_safe: false,
+            task: "是否允许重试终端命令",
+          },
+        },
+        {
+          sequence: 4,
+          kind: "self_repair.proposed",
+          message: "self_repair.proposed",
+          created_at: "2026-08-07T00:00:04Z",
+          actor: "main_agent",
+          participants: ["engineer"],
+          tool_name: null,
+          tool_call_id: null,
+          step_id: "engineer_step",
+          action: "retry_with_fallback",
+          decision: null,
+          payload: {
+            repair_action: "switch_model",
+            failure_kind: "model_timeout",
+            requires_approval: true,
+            output: "private output",
+          },
+        },
+      ],
+      artifacts: [],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    expect(await screen.findByRole("heading", { name: "运行详情" })).not.toBeNull();
+    const intentRegion = screen.getByRole("region", { name: "执行意图" });
+    expect(within(intentRegion).getByText("回放意图")).not.toBeNull();
+    expect(within(intentRegion).getByText("重试意图")).not.toBeNull();
+    expect(within(intentRegion).getByText("审批意图")).not.toBeNull();
+    expect(within(intentRegion).getByText("修复意图")).not.toBeNull();
+    expect(within(intentRegion).getAllByText("不可回放").length).toBeGreaterThan(0);
+    expect(within(intentRegion).getAllByText("retry_terminal").length).toBeGreaterThan(0);
+    expect(within(intentRegion).getByText("switch_model")).not.toBeNull();
+    expect(intentRegion.textContent).not.toContain("private-token");
+    expect(intentRegion.textContent).not.toContain("private output");
   });
 
   it("shows observer notices as scheduler guidance on the detail page", async () => {

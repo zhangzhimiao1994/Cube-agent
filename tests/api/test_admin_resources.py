@@ -1268,6 +1268,161 @@ def test_run_detail_response_exposes_structured_failure_diagnostics_without_raw_
     assert "private output" not in serialized
 
 
+def test_run_detail_response_exposes_tool_lifecycle_without_raw_payloads() -> None:
+    response = RunDetailResponse(
+        id=uuid4(),
+        status="failed",
+        mode="dispatch",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="hello",
+        events=[
+            _admin_run_event(
+                {
+                    "sequence": 1,
+                    "kind": "tool.started",
+                    "message": "tool.started",
+                    "created_at": datetime.now(UTC),
+                    "actor": "engineer",
+                    "tool_name": "run_safe_command",
+                    "tool_call_id": "call_terminal",
+                    "step_id": "engineer_step",
+                    "payload": {
+                        "operation_kind": "terminal",
+                        "status": "started",
+                        "argument_bytes": 42,
+                        "replay_safe": False,
+                        "command": "cat private-token.txt",
+                    },
+                },
+            ),
+            _admin_run_event(
+                {
+                    "sequence": 2,
+                    "kind": "approval.requested",
+                    "message": "approval.requested",
+                    "created_at": datetime.now(UTC),
+                    "actor": "main_agent",
+                    "approval_id": "approval_terminal",
+                    "step_id": "engineer_step",
+                    "action": "retry_terminal",
+                    "payload": {"requires_approval": True, "replay_safe": False},
+                },
+            ),
+            _admin_run_event(
+                {
+                    "sequence": 3,
+                    "kind": "approval.resolved",
+                    "message": "approval.resolved",
+                    "created_at": datetime.now(UTC),
+                    "actor": "main_agent",
+                    "approval_id": "approval_terminal",
+                    "step_id": "engineer_step",
+                    "decision": "approved",
+                },
+            ),
+            _admin_run_event(
+                {
+                    "sequence": 4,
+                    "kind": "tool.failed",
+                    "message": "tool.failed",
+                    "created_at": datetime.now(UTC),
+                    "actor": "engineer",
+                    "tool_name": "run_safe_command",
+                    "tool_call_id": "call_terminal",
+                    "step_id": "engineer_step",
+                    "payload": {
+                        "operation_kind": "terminal",
+                        "status": "failed",
+                        "exit_code": 1,
+                        "output_bytes": 128,
+                        "artifact_id": "artifact_terminal",
+                        "failure_kind": "nonzero_exit",
+                        "stdout": "private output",
+                    },
+                },
+            ),
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    serialized = json.dumps(response.model_dump(mode="json"), ensure_ascii=False)
+
+    assert len(response.tool_lifecycle) == 1
+    lifecycle = response.tool_lifecycle[0]
+    assert lifecycle.tool_call_id == "call_terminal"
+    assert lifecycle.tool_name == "run_safe_command"
+    assert lifecycle.status == "failed"
+    assert lifecycle.operation_kind == "terminal"
+    assert lifecycle.actor == "engineer"
+    assert lifecycle.step_id == "engineer_step"
+    assert lifecycle.started_sequence == 1
+    assert lifecycle.terminal_sequence == 4
+    assert lifecycle.sequences == [1, 2, 3, 4]
+    assert lifecycle.approval_id == "approval_terminal"
+    assert lifecycle.replay_safe is False
+    assert lifecycle.argument_bytes == 42
+    assert lifecycle.output_bytes == 128
+    assert lifecycle.exit_code == 1
+    assert lifecycle.artifact_id == "artifact_terminal"
+    assert lifecycle.failure_kind == "nonzero_exit"
+    assert "private-token" not in serialized
+    assert "private output" not in serialized
+
+
+def test_tool_lifecycle_does_not_attach_unscoped_approval_to_every_tool() -> None:
+    response = RunDetailResponse(
+        id=uuid4(),
+        status="waiting_approval",
+        mode="dispatch",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="hello",
+        events=[
+            RunEventResponse(
+                sequence=1,
+                kind="tool.started",
+                message="tool.started",
+                created_at=datetime.now(UTC),
+                actor="engineer",
+                tool_name="first_tool",
+                tool_call_id="call_first",
+                step_id="first_step",
+                payload={"status": "started", "operation_kind": "terminal"},
+            ),
+            RunEventResponse(
+                sequence=2,
+                kind="tool.started",
+                message="tool.started",
+                created_at=datetime.now(UTC),
+                actor="reviewer",
+                tool_name="second_tool",
+                tool_call_id="call_second",
+                step_id="second_step",
+                payload={"status": "started", "operation_kind": "file_read"},
+            ),
+            RunEventResponse(
+                sequence=3,
+                kind="approval.requested",
+                message="approval.requested",
+                created_at=datetime.now(UTC),
+                actor="main_agent",
+                approval_id="approval_global",
+                action="retry_terminal",
+                payload={"requires_approval": True},
+            ),
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    assert [item.approval_id for item in response.tool_lifecycle] == [None, None]
+    assert [item.sequences for item in response.tool_lifecycle] == [[1], [2]]
+
+
 def test_failure_diagnostics_redact_sensitive_approval_action() -> None:
     response = RunDetailResponse(
         id=uuid4(),

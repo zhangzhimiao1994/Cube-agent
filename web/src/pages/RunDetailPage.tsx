@@ -44,6 +44,18 @@ type ToolLifecycle = {
   outputBytes: number | null;
   exitCode: number | null;
   failureKind: string | null;
+  approvalId: string | null;
+  replaySafe: boolean | null;
+  artifactId: string | null;
+};
+
+type RunExecutionIntent = {
+  id: string;
+  label: string;
+  title: string;
+  detail: string;
+  meta: string[];
+  tone: "pending" | "retry" | "replay" | "repair" | "done";
 };
 
 const OBSERVER_TRIGGER_LABELS: Record<string, string> = {
@@ -89,6 +101,7 @@ const RUN_MODE_LABELS: Record<string, string> = {
 };
 
 const TOOL_STATUS_LABELS: Record<string, string> = {
+  running: "进行中",
   started: "进行中",
   completed: "已完成",
   succeeded: "已完成",
@@ -307,6 +320,9 @@ function collectToolLifecycles(events: RunEvent[]): ToolLifecycle[] {
       outputBytes: null,
       exitCode: null,
       failureKind: null,
+      approvalId: null,
+      replaySafe: null,
+      artifactId: null,
     };
     next.status = status;
     next.operationKind = operationKind;
@@ -317,9 +333,32 @@ function collectToolLifecycles(events: RunEvent[]): ToolLifecycle[] {
     next.outputBytes = payloadNumber(event.payload, "output_bytes") ?? next.outputBytes;
     next.exitCode = payloadNumber(event.payload, "exit_code") ?? next.exitCode;
     next.failureKind = payloadString(event.payload, "failure_kind") ?? next.failureKind;
+    next.approvalId = payloadString(event.payload, "approval_id") ?? next.approvalId;
+    next.replaySafe = typeof event.payload.replay_safe === "boolean" ? event.payload.replay_safe : next.replaySafe;
+    next.artifactId = payloadString(event.payload, "artifact_id") ?? next.artifactId;
     lifecycles.set(key, next);
   }
   return Array.from(lifecycles.values());
+}
+
+function toolLifecycleFromApi(detail: RunDetail): ToolLifecycle[] {
+  if (detail.tool_lifecycle.length === 0) return collectToolLifecycles(detail.events);
+  return detail.tool_lifecycle.map((item) => ({
+    key: item.tool_call_id,
+    toolName: item.tool_name,
+    status: item.status,
+    operationKind: item.operation_kind,
+    actor: item.actor ?? null,
+    stepId: item.step_id ?? null,
+    sequences: item.sequences,
+    argumentBytes: item.argument_bytes ?? null,
+    outputBytes: item.output_bytes ?? null,
+    exitCode: item.exit_code ?? null,
+    failureKind: item.failure_kind ?? null,
+    approvalId: item.approval_id ?? null,
+    replaySafe: item.replay_safe ?? null,
+    artifactId: item.artifact_id ?? null,
+  }));
 }
 
 function detailPosture(detail: RunDetail) {
@@ -327,6 +366,160 @@ function detailPosture(detail: RunDetail) {
     return "执行异常";
   }
   return displayRunStatus(detail.status);
+}
+
+function replaySafetyLabel(value: unknown) {
+  if (value === false || value === "false") return "不可回放";
+  if (value === true || value === "true") return "可回放";
+  return "";
+}
+
+function isPayloadFlagTrue(value: unknown) {
+  if (value === true || value === 1) return true;
+  if (typeof value !== "string") return false;
+  return ["1", "true", "yes", "y", "需要", "需要确认"].includes(value.trim().toLowerCase());
+}
+
+function hasPositiveIntentSignal(value: unknown) {
+  if (value === false || value === null || typeof value === "undefined") return false;
+  if (typeof value === "string") return !["", "0", "false", "no", "off"].includes(value.trim().toLowerCase());
+  return typeof value === "number" ? value !== 0 : true;
+}
+
+function safeIntentValue(event: RunEvent, keys: string[]) {
+  for (const key of keys) {
+    const value = event.payload[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+    if (typeof value === "boolean") return value ? "true" : "false";
+  }
+  return "";
+}
+
+function isRepairIntentEvent(event: RunEvent) {
+  const kind = event.kind.toLowerCase();
+  if (kind.includes("repair") || kind.includes("remediation")) return true;
+  return ["repair_action", "repair_kind", "self_repair", "remediation_action"].some((key) =>
+    hasPositiveIntentSignal(event.payload[key]),
+  );
+}
+
+function approvalStateFromEvents(events: RunEvent[]) {
+  const pending: RunEvent[] = [];
+  const resolved: RunEvent[] = [];
+  events.forEach((event) => {
+    if (event.kind === "approval.resolved" && event.approval_id) {
+      let resolvedIndex = -1;
+      for (let index = pending.length - 1; index >= 0; index -= 1) {
+        if (pending[index].approval_id === event.approval_id) {
+          resolvedIndex = index;
+          break;
+        }
+      }
+      if (resolvedIndex >= 0) pending.splice(resolvedIndex, 1);
+      resolved.push(event);
+      return;
+    }
+    if (event.kind === "approval.requested") pending.push(event);
+  });
+  return { pending, resolved };
+}
+
+function pushUniqueIntent(intents: RunExecutionIntent[], intent: RunExecutionIntent) {
+  const key = `${intent.label}:${intent.title}:${intent.detail}:${intent.meta.join("|")}`;
+  if (intents.some((existing) => `${existing.label}:${existing.title}:${existing.detail}:${existing.meta.join("|")}` === key)) return;
+  intents.push(intent);
+}
+
+function executionIntentsForDetail(detail: RunDetail): RunExecutionIntent[] {
+  const intents: RunExecutionIntent[] = [];
+  const toolGroups = new Map<string, RunEvent[]>();
+  detail.events.forEach((event) => {
+    if (!event.kind.startsWith("tool.")) return;
+    const key = toolLifecycleKey(event);
+    toolGroups.set(key, [...(toolGroups.get(key) ?? []), event]);
+  });
+
+  toolGroups.forEach((events, key) => {
+    const finalEvent = events.at(-1);
+    if (!finalEvent) return;
+    const replaySafe = events
+      .map((event) => event.payload.replay_safe)
+      .find((value) => value !== null && typeof value !== "undefined");
+    const replayLabel = replaySafetyLabel(replaySafe);
+    if (!replayLabel) return;
+    const operationKind = payloadString(finalEvent.payload, "operation_kind") ?? "generic";
+    pushUniqueIntent(intents, {
+      id: `${detail.id}-intent-replay-${key}`,
+      label: "回放意图",
+      title: replayLabel,
+      detail: finalEvent.tool_name ?? payloadString(finalEvent.payload, "name") ?? "工具调用",
+      meta: [displayToolOperation(operationKind), displayToolStatus(payloadString(finalEvent.payload, "status") ?? finalEvent.kind.replace("tool.", ""))],
+      tone: replayLabel === "不可回放" ? "replay" : "done",
+    });
+  });
+
+  const approvalState = approvalStateFromEvents(detail.events);
+  approvalState.pending.forEach((event) => {
+    pushUniqueIntent(intents, {
+      id: `${detail.id}-intent-approval-${event.approval_id ?? event.sequence}`,
+      label: "审批意图",
+      title: "等待确认",
+      detail: event.action || safeIntentValue(event, ["decision", "status"]) || "需要确认后继续",
+      meta: [
+        event.approval_id ? `审批 ${event.approval_id}` : "",
+        replaySafetyLabel(event.payload.replay_safe),
+        isPayloadFlagTrue(event.payload.requires_approval) ? "需要确认" : "",
+      ].filter(Boolean),
+      tone: "pending",
+    });
+  });
+  approvalState.resolved.forEach((event) => {
+    pushUniqueIntent(intents, {
+      id: `${detail.id}-intent-approval-resolved-${event.approval_id ?? event.sequence}`,
+      label: "审批意图",
+      title: "确认已处理",
+      detail: event.decision || safeIntentValue(event, ["decision", "status"]) || "已处理",
+      meta: [event.approval_id ? `审批 ${event.approval_id}` : ""].filter(Boolean),
+      tone: "done",
+    });
+  });
+
+  detail.events.forEach((event) => {
+    if (event.kind.startsWith("approval.")) return;
+    if (event.kind === "step.retrying") {
+      const attempt = safeIntentValue(event, ["attempt"]);
+      pushUniqueIntent(intents, {
+        id: `${detail.id}-intent-retry-${event.step_id ?? event.sequence}`,
+        label: "重试意图",
+        title: "准备重试",
+        detail: event.action || safeIntentValue(event, ["failure_kind", "status"]) || "失败后重试",
+        meta: [
+          attempt ? `第 ${attempt} 次` : "",
+          safeIntentValue(event, ["failure_kind", "status"]),
+          replaySafetyLabel(event.payload.replay_safe),
+        ].filter(Boolean),
+        tone: "retry",
+      });
+      return;
+    }
+    if (isRepairIntentEvent(event)) {
+      const repairAction = safeIntentValue(event, ["repair_action", "repair_kind", "remediation_action"]) || event.action || "修复方案";
+      pushUniqueIntent(intents, {
+        id: `${detail.id}-intent-repair-${event.step_id ?? event.sequence}`,
+        label: "修复意图",
+        title: repairAction,
+        detail: event.action && event.action !== repairAction ? event.action : safeIntentValue(event, ["failure_kind", "status"]) || "等待执行",
+        meta: [
+          isPayloadFlagTrue(event.payload.requires_approval) ? "需要确认" : "",
+          safeIntentValue(event, ["failure_kind"]),
+          replaySafetyLabel(event.payload.replay_safe),
+        ].filter(Boolean),
+        tone: "repair",
+      });
+    }
+  });
+  return intents;
 }
 
 function explicitDetailRows(details: Record<string, string>) {
@@ -388,9 +581,10 @@ export function RunDetailPage() {
   const isWaitingForMode = run.data.status === "waiting_user_mode" && Boolean(run.data.decision_token);
   const observerNotices = collectObserverNotices(run.data.events);
   const timelineItems = detailTimelineItems(run.data.events);
-  const toolLifecycles = collectToolLifecycles(run.data.events);
+  const toolLifecycles = toolLifecycleFromApi(run.data);
   const posture = detailPosture(run.data);
   const explicitRows = explicitDetailRows(run.data.explicit_details);
+  const executionIntents = executionIntentsForDetail(run.data);
 
   return (
     <section>
@@ -524,6 +718,32 @@ export function RunDetailPage() {
         </section>
       ) : null}
 
+      {executionIntents.length > 0 ? (
+        <section className="run-execution-intents" aria-label="执行意图">
+          <div className="run-execution-intents-header">
+            <span>Execution intent</span>
+            <strong>执行意图</strong>
+            <small>{executionIntents.length} 条</small>
+          </div>
+          <div className="run-execution-intent-list">
+            {executionIntents.map((intent) => (
+              <article key={intent.id} className={`run-execution-intent intent-${intent.tone}`}>
+                <small>{intent.label}</small>
+                <strong>{intent.title}</strong>
+                <span>{intent.detail}</span>
+                {intent.meta.length > 0 ? (
+                  <div aria-label={`${intent.label}元数据`}>
+                    {intent.meta.map((meta) => (
+                      <em key={meta}>{meta}</em>
+                    ))}
+                  </div>
+                ) : null}
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
       {toolLifecycles.length > 0 ? (
         <section aria-label="工具链路">
           <h3>工具链路</h3>
@@ -539,6 +759,9 @@ export function RunDetailPage() {
                 {item.outputBytes !== null ? <small>输出 {item.outputBytes} bytes</small> : null}
                 {item.exitCode !== null ? <small>退出码 {item.exitCode}</small> : null}
                 {item.failureKind ? <small>{item.failureKind}</small> : null}
+                {item.approvalId ? <small>审批 {item.approvalId}</small> : null}
+                {item.replaySafe !== null ? <small>{replaySafetyLabel(item.replaySafe)}</small> : null}
+                {item.artifactId ? <small>产物 {item.artifactId}</small> : null}
                 <small>事件 #{item.sequences.join(", #")}</small>
               </li>
             ))}

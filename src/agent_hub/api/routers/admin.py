@@ -321,12 +321,34 @@ class FailureDiagnosticResponse(BaseModel):
     wrapped_by: int | None = Field(default=None, ge=1)
 
 
+class ToolLifecycleResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tool_call_id: str
+    tool_name: str
+    status: str
+    operation_kind: str
+    actor: str | None = None
+    step_id: str | None = None
+    started_sequence: int | None = Field(default=None, ge=1)
+    terminal_sequence: int | None = Field(default=None, ge=1)
+    sequences: list[int] = Field(default_factory=list)
+    approval_id: str | None = None
+    replay_safe: bool | None = None
+    argument_bytes: int | None = Field(default=None, ge=0)
+    output_bytes: int | None = Field(default=None, ge=0)
+    exit_code: int | None = None
+    artifact_id: str | None = None
+    failure_kind: str | None = None
+
+
 class RunDetailResponse(RunListItem):
     request: str
     events: list[RunEventResponse]
     artifacts: list[RunArtifactResponse]
     explicit_details: dict[str, str]
     failure_diagnostics: list[FailureDiagnosticResponse] = Field(default_factory=list)
+    tool_lifecycle: list[ToolLifecycleResponse] = Field(default_factory=list)
     decision_token: str | None = None
     temporary_agent_proposal: dict[str, JsonValue] | None = None
     schedule_proposal: dict[str, JsonValue] | None = None
@@ -337,6 +359,8 @@ class RunDetailResponse(RunListItem):
     def populate_failure_diagnostics(self) -> RunDetailResponse:
         if not self.failure_diagnostics:
             self.failure_diagnostics = _failure_diagnostics_from_run_events(self.events)
+        if not self.tool_lifecycle:
+            self.tool_lifecycle = _tool_lifecycle_from_run_events(self.events)
         return self
 
 
@@ -6057,6 +6081,107 @@ def _safe_diagnostic_payload_value(event: RunEventResponse, key: str) -> str | N
         safe = _safe_model_check_detail(str(value))
         return None if safe == "redacted" else safe
     return None
+
+
+def _tool_lifecycle_from_run_events(events: Iterable[RunEventResponse]) -> list[ToolLifecycleResponse]:
+    sorted_events = sorted(events, key=lambda item: item.sequence)
+    grouped: dict[str, dict[str, object]] = {}
+    for event in sorted_events:
+        if event.kind.startswith("tool."):
+            key = _tool_lifecycle_key(event)
+            item = grouped.setdefault(
+                key,
+                {
+                    "tool_call_id": key,
+                    "tool_name": event.tool_name or _safe_diagnostic_payload_value(event, "name") or "tool",
+                    "status": "started",
+                    "operation_kind": "generic",
+                    "actor": None,
+                    "step_id": None,
+                    "started_sequence": None,
+                    "terminal_sequence": None,
+                    "sequences": [],
+                    "approval_id": None,
+                    "replay_safe": None,
+                    "argument_bytes": None,
+                    "output_bytes": None,
+                    "exit_code": None,
+                    "artifact_id": None,
+                    "failure_kind": None,
+                },
+            )
+            _merge_tool_lifecycle_event(item, event)
+            continue
+        if event.kind.startswith("approval."):
+            _merge_tool_lifecycle_approval(grouped, event)
+    return [ToolLifecycleResponse.model_validate(item) for item in grouped.values()]
+
+
+def _tool_lifecycle_key(event: RunEventResponse) -> str:
+    return (
+        event.tool_call_id
+        or _safe_diagnostic_payload_value(event, "tool_call_id")
+        or _safe_diagnostic_payload_value(event, "id")
+        or f"{event.tool_name or 'tool'}-{event.sequence}"
+    )
+
+
+def _merge_tool_lifecycle_event(item: dict[str, object], event: RunEventResponse) -> None:
+    sequences = cast(list[int], item["sequences"])
+    sequences.append(event.sequence)
+    status = _safe_diagnostic_payload_value(event, "status") or event.kind.replace("tool.", "")
+    item["status"] = status
+    if event.kind == "tool.started" and item["started_sequence"] is None:
+        item["started_sequence"] = event.sequence
+    if event.kind in {"tool.completed", "tool.failed"}:
+        item["terminal_sequence"] = event.sequence
+    if event.tool_name:
+        item["tool_name"] = event.tool_name
+    if event.actor:
+        item["actor"] = event.actor
+    if event.step_id:
+        item["step_id"] = event.step_id
+    for source_key, target_key in (
+        ("operation_kind", "operation_kind"),
+        ("approval_id", "approval_id"),
+        ("artifact_id", "artifact_id"),
+        ("failure_kind", "failure_kind"),
+    ):
+        value = _safe_diagnostic_payload_value(event, source_key)
+        if value:
+            item[target_key] = value
+    for source_key, target_key in (
+        ("argument_bytes", "argument_bytes"),
+        ("result_bytes", "output_bytes"),
+        ("output_bytes", "output_bytes"),
+        ("stdout_bytes", "output_bytes"),
+        ("exit_code", "exit_code"),
+    ):
+        numeric_value = event.payload.get(source_key)
+        if type(numeric_value) is int and numeric_value >= 0:
+            item[target_key] = numeric_value
+    replay_safe = event.payload.get("replay_safe")
+    if type(replay_safe) is bool:
+        item["replay_safe"] = replay_safe
+
+
+def _merge_tool_lifecycle_approval(
+    grouped: dict[str, dict[str, object]],
+    event: RunEventResponse,
+) -> None:
+    approval_id = event.approval_id
+    if approval_id is None:
+        return
+    if event.step_id is None:
+        return
+    for item in grouped.values():
+        if item.get("step_id") != event.step_id:
+            continue
+        cast(list[int], item["sequences"]).append(event.sequence)
+        item["approval_id"] = approval_id
+        replay_safe = event.payload.get("replay_safe")
+        if type(replay_safe) is bool:
+            item["replay_safe"] = replay_safe
 
 
 _SAFE_DIAGNOSTIC_IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
