@@ -432,6 +432,61 @@ class RunRepository:
             await session.flush()
             return self._record(row)
 
+    async def accept_self_repair_and_enqueue(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        decision_token: str,
+        version: int,
+    ) -> RunRecord:
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if row is None:
+                raise RunNotFound("run was not found")
+            if RunStatus(row.status) is not RunStatus.FAILED:
+                raise RunConflict("run is not waiting for self repair")
+            routing_decision = {} if row.routing_decision is None else dict(row.routing_decision)
+            if routing_decision.get("approval_kind") != "self_repair":
+                raise RunConflict("run is waiting for a different approval")
+            if routing_decision.get("decision_token") != decision_token:
+                raise RunConflict("self repair approval token is invalid")
+            if row.version != version:
+                raise RunConflict("run version is stale")
+            proposal = routing_decision.get("repair_proposal")
+            if not isinstance(proposal, dict) or proposal.get("kind") != "self_repair":
+                raise RunConflict("self repair proposal is invalid")
+            next_decision = {
+                key: value
+                for key, value in routing_decision.items()
+                if key not in {"approval_kind", "decision_token"}
+            }
+            next_decision.update(
+                {
+                    "source": "self_repair",
+                    "self_repair_accepted": True,
+                    "self_repair_source_run_id": str(run_id),
+                    "self_repair_source_event_sequence": proposal.get("source_event_sequence"),
+                    "self_repair_fingerprint": proposal.get("fingerprint"),
+                }
+            )
+            row.routing_decision = next_decision
+            row.status = RunStatus.QUEUED.value
+            row.version += 1
+            await session.flush()
+            session.add(
+                RunOutboxRow(
+                    id=uuid4(),
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    task_name="agent_hub.runs.execute",
+                    idempotency_key=f"{tenant_id}:{run_id}:self-repair:{version}",
+                    payload={"run_id": str(run_id)},
+                )
+            )
+            await session.flush()
+            return self._record(row)
+
     async def enqueue_existing_run(
         self,
         *,
@@ -847,6 +902,35 @@ class RunRepository:
             await self._persist_approval(session, tenant_id, run_id, event)
         if event.kind is EventKind.COST_RECORDED:
             await self._persist_usage(session, tenant_id, run_id, event)
+
+    async def record_self_repair_decision(
+        self,
+        session: AsyncSession,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        event: RunEvent,
+        proposal: dict[str, object] | None,
+        decision_token: str | None,
+    ) -> None:
+        row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+        if row is None:
+            raise RunNotFound("run was not found")
+        await self.persist_event(session, tenant_id=tenant_id, run_id=run_id, event=event)
+        if proposal is None:
+            return
+        if RunStatus(row.status) is not RunStatus.FAILED:
+            return
+        if decision_token is None:
+            raise ValueError("self repair decision token is required")
+        routing_decision = {} if row.routing_decision is None else dict(row.routing_decision)
+        row.routing_decision = {
+            **routing_decision,
+            "approval_kind": "self_repair",
+            "decision_token": decision_token,
+            "repair_proposal": proposal,
+        }
+        row.version += 1
 
     async def run_transaction(self) -> AsyncSession:
         return self._session_factory()

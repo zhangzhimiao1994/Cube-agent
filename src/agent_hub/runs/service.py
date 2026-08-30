@@ -28,6 +28,11 @@ from agent_hub.harness.types import (
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteAssessment, RouteDecision
 from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
 from agent_hub.runs.repository import RunAlreadyActive, RunRecord, RunRepository
+from agent_hub.runs.self_repair import (
+    SelfRepairDecision,
+    SelfRepairPolicy,
+    classify_terminal_run,
+)
 from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, RunEvent, TaskContext
 from agent_hub.runtime.failure_reason import safe_runtime_failure_reason
 from agent_hub.runtime.registry import RuntimeRegistry
@@ -56,6 +61,7 @@ class SubmittedRun:
     schedule_proposal: dict[str, object] | None = None
     evolution_proposal: dict[str, object] | None = None
     openclaw_proposal: dict[str, object] | None = None
+    repair_proposal: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,6 +318,7 @@ class RunService:
         terminal_run_hooks: tuple[TerminalRunHook, ...] = (),
         observer_policy: ObserverPolicy | None = None,
         harness_scheduler: HarnessSchedulerProtocol | None = None,
+        self_repair_policy: SelfRepairPolicy | None = None,
     ) -> None:
         self._repository = repository
         self._runtime_registry = runtime_registry
@@ -329,6 +336,7 @@ class RunService:
         self._terminal_run_hooks = terminal_run_hooks
         self._observer_policy = observer_policy or ObserverPolicy()
         self._harness_scheduler = harness_scheduler
+        self._self_repair_policy = self_repair_policy or SelfRepairPolicy()
 
     async def submit(
         self,
@@ -949,6 +957,24 @@ class RunService:
         )
         return _submitted(record)
 
+    async def accept_self_repair(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        decision_token: str,
+        version: int,
+    ) -> SubmittedRun:
+        del actor_id
+        record = await self._repository.accept_self_repair_and_enqueue(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            decision_token=decision_token,
+            version=version,
+        )
+        return _submitted(record)
+
     async def choose_mode(
         self,
         *,
@@ -1108,6 +1134,7 @@ class RunService:
         crash_after_event_kind: EventKind | None = None,
         allow_running_recovery: bool = False,
     ) -> SubmittedRun:
+        claimed_record: RunRecord | None = None
         async with await self._repository.run_transaction() as session, session.begin():
             try:
                 claimed = await self._repository.claim_for_execution(
@@ -1119,19 +1146,26 @@ class RunService:
                 active = await self._repository.get_for_update(session, run_id)
                 return _submitted(RunRepository._record(active))
             if isinstance(claimed, RunRecord):
-                return _submitted(claimed)
-            row, checkpoint = claimed
-            tenant_id = row.tenant_id
-            actor_id = row.actor_id
-            actor_role = _actor_role_from_row(row)
-            assert row.mode is not None
-            mode = TaskMode(row.mode)
-            request = row.request
-            routing_decision = {} if row.routing_decision is None else dict(row.routing_decision)
+                claimed_record = claimed
+            else:
+                row, checkpoint = claimed
+                tenant_id = row.tenant_id
+                actor_id = row.actor_id
+                actor_role = _actor_role_from_row(row)
+                assert row.mode is not None
+                mode = TaskMode(row.mode)
+                request = row.request
+                routing_decision = {} if row.routing_decision is None else dict(row.routing_decision)
+        if claimed_record is not None:
+            if claimed_record.status is RunStatus.FAILED:
+                await self._safe_record_self_repair_decision_for_record(claimed_record)
+                return await self._submitted_by_run_id(claimed_record.tenant_id, claimed_record.id)
+            return _submitted(claimed_record)
 
         terminal = RunStatus.RUNNING
         monitor = RunMonitor(self._observer_policy)
         observer_decisions: list[ObserverDecision] = []
+        observed_events: list[RunEvent] = []
         scheduler_notice_payloads: list[dict[str, object]] = []
         try:
             runtime = self._runtime_registry.get(mode)
@@ -1195,6 +1229,7 @@ class RunService:
                         run_id=run_id,
                         event=event,
                     )
+                    observed_events.append(event)
                     observer_decision = monitor.observe(event)
                     if observer_decision is not None:
                         observer_decisions.append(observer_decision)
@@ -1221,6 +1256,26 @@ class RunService:
             )
             if failed.status is RunStatus.WAITING_APPROVAL:
                 return _submitted(failed)
+            failure_event = RunEvent(
+                kind=EventKind.RUNTIME_FAILED,
+                sequence=1,
+                run_id=run_id,
+                reason=_runtime_failure_reason(error),
+            )
+            repair_decision = classify_terminal_run(
+                status=failed.status,
+                mode=failed.mode,
+                routing_decision=failed.routing_decision,
+                events=(*observed_events, failure_event),
+                policy=self._self_repair_policy,
+            )
+            if repair_decision is not None:
+                await self._safe_record_self_repair_decision(
+                    tenant_id=failed.tenant_id,
+                    run_id=run_id,
+                    decision=repair_decision,
+                    source_sequence_from_latest=True,
+                )
             await self._safe_record_hermes_outcome(
                 tenant_id=failed.tenant_id,
                 actor_id=failed.actor_id,
@@ -1237,7 +1292,7 @@ class RunService:
                 mode=failed.mode,
                 routing_decision=failed.routing_decision,
             )
-            return _submitted(failed)
+            return await self._submitted_by_run_id(failed.tenant_id, run_id)
         if terminal is RunStatus.RUNNING:
             terminal = RunStatus.COMPLETED
             await self._repository.update_status(tenant_id, run_id, terminal)
@@ -1254,6 +1309,19 @@ class RunService:
                     )
                     scheduler_notice_payloads.append(dict(observer_event.payload))
                     sequence += 1
+        repair_decision = classify_terminal_run(
+            status=terminal,
+            mode=mode,
+            routing_decision=routing_decision,
+            events=tuple(observed_events),
+            policy=self._self_repair_policy,
+        )
+        if repair_decision is not None:
+            await self._safe_record_self_repair_decision(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                decision=repair_decision,
+            )
         if terminal in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
             await self._safe_record_hermes_outcome(
                 tenant_id=tenant_id,
@@ -1273,6 +1341,71 @@ class RunService:
                 routing_decision=routing_decision,
             )
         return await self._submitted_by_run_id(tenant_id, run_id)
+
+    async def _safe_record_self_repair_decision_for_record(self, record: RunRecord) -> None:
+        try:
+            events_source = getattr(self._repository, "events", None)
+            if callable(events_source):
+                raw_events = await events_source(record.tenant_id, record.id)
+                events = tuple(
+                    RunEvent.from_payload(event)
+                    for event in raw_events
+                    if isinstance(event, Mapping)
+                )
+            elif isinstance(events_source, list):
+                events = tuple(event for event in events_source if isinstance(event, RunEvent))
+            else:
+                events = ()
+        except Exception as error:
+            _LOGGER.exception(
+                "run_self_repair_event_load_failed run_id=%s error_type=%s",
+                record.id,
+                type(error).__name__,
+            )
+            events = ()
+        repair_decision = classify_terminal_run(
+            status=record.status,
+            mode=record.mode,
+            routing_decision=record.routing_decision,
+            events=events,
+            policy=self._self_repair_policy,
+        )
+        if repair_decision is not None:
+            await self._safe_record_self_repair_decision(
+                tenant_id=record.tenant_id,
+                run_id=record.id,
+                decision=repair_decision,
+            )
+
+    async def _safe_record_self_repair_decision(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        decision: SelfRepairDecision,
+        source_sequence_from_latest: bool = False,
+    ) -> None:
+        try:
+            async with await self._repository.run_transaction() as session, session.begin():
+                sequence = await self._repository.next_event_sequence(session, run_id)
+                if source_sequence_from_latest:
+                    decision = decision.with_source_sequence(max(0, sequence - 1))
+                event = decision.to_event(run_id=run_id, sequence=sequence)
+                proposal = decision.to_proposal(run_id=run_id)
+                await self._repository.record_self_repair_decision(
+                    session,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    event=event,
+                    proposal=proposal,
+                    decision_token=_decision_token() if proposal is not None else None,
+                )
+        except Exception as error:
+            _LOGGER.exception(
+                "run_self_repair_decision_failed run_id=%s error_type=%s",
+                run_id,
+                type(error).__name__,
+            )
 
     async def recover(self, run_id: UUID) -> SubmittedRun:
         return await self.execute(run_id, allow_running_recovery=True)
@@ -1621,14 +1754,22 @@ def _submitted(record: RunRecord) -> SubmittedRun:
     schedule_proposal = decision.get("schedule_proposal")
     evolution_proposal = decision.get("evolution_proposal")
     openclaw_proposal = decision.get("openclaw_proposal")
+    repair_proposal = decision.get("repair_proposal")
+    waiting_for_decision = record.status in {
+        RunStatus.WAITING_USER_MODE,
+        RunStatus.WAITING_APPROVAL,
+    } or (
+        record.status is RunStatus.FAILED
+        and decision.get("approval_kind") == "self_repair"
+        and isinstance(repair_proposal, dict)
+    )
     return SubmittedRun(
         id=record.id,
         tenant_id=record.tenant_id,
         status=record.status,
         mode=record.mode,
         decision_token=str(decision.get("decision_token", ""))
-        if record.status in {RunStatus.WAITING_USER_MODE, RunStatus.WAITING_APPROVAL}
-        and decision.get("decision_token") is not None
+        if waiting_for_decision and decision.get("decision_token") is not None
         else None,
         version=record.version,
         clarification_reason=None
@@ -1647,6 +1788,9 @@ def _submitted(record: RunRecord) -> SubmittedRun:
         else None,
         openclaw_proposal=cast(dict[str, object], openclaw_proposal)
         if isinstance(openclaw_proposal, dict)
+        else None,
+        repair_proposal=cast(dict[str, object], repair_proposal)
+        if isinstance(repair_proposal, dict)
         else None,
     )
 

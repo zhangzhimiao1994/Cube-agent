@@ -438,6 +438,61 @@ def test_event_contract_supports_bounded_framework_neutral_evolution() -> None:
         )
 
 
+def test_event_contract_supports_repair_extension_events() -> None:
+    classified = RunEvent(
+        kind="repair.classified",
+        sequence=1,
+        run_id=RUN_ID,
+        payload={
+            "schema_version": 1,
+            "status": "failed",
+            "trigger": "runtime_failure",
+            "action": "draft_repair_proposal",
+            "source_kind": "runtime.failed",
+            "source_sequence": 2,
+            "fingerprint": "a" * 64,
+            "requires_approval": True,
+            "automatic_execution": False,
+        },
+    )
+    skipped = RunEvent(
+        kind="repair.skipped",
+        sequence=2,
+        run_id=RUN_ID,
+        payload={
+            "schema_version": 1,
+            "status": "failed",
+            "trigger": "runtime_failure",
+            "action": "manual_review",
+            "source_kind": "runtime.failed",
+            "source_sequence": 2,
+            "fingerprint": "b" * 64,
+            "requires_approval": True,
+            "automatic_execution": False,
+            "skip_reason": "recursive_self_repair",
+        },
+    )
+
+    assert classified.kind == "repair.classified"
+    assert skipped.kind == "repair.skipped"
+    with pytest.raises(ValidationError):
+        RunEvent(
+            kind="repair.classified",
+            sequence=3,
+            run_id=RUN_ID,
+            reason="bad",
+            payload={"schema_version": 1},
+        )
+    with pytest.raises(ValidationError):
+        RunEvent(
+            kind="repair.skipped",
+            sequence=4,
+            run_id=RUN_ID,
+            actor="repairer",
+            payload={"schema_version": 1},
+        )
+
+
 def test_known_future_events_enforce_kind_specific_semantics() -> None:
     artifact = Artifact(id=uuid4(), type="text", producer="tool", content={"text": "result"})
     events = (

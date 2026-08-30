@@ -37,6 +37,7 @@ type TemporaryAgentProposal = NonNullable<SubmittedRun["temporary_agent_proposal
 type ScheduleProposal = NonNullable<SubmittedRun["schedule_proposal"]>;
 type EvolutionProposal = NonNullable<SubmittedRun["evolution_proposal"]>;
 type OpenClawProposal = NonNullable<SubmittedRun["openclaw_proposal"]>;
+type RepairProposal = NonNullable<SubmittedRun["repair_proposal"]>;
 type RunSubmissionOverride = {
   message?: string;
   directModel?: string;
@@ -1355,6 +1356,38 @@ function openClawApprovalFromRunDetail(run: RunDetail | undefined) {
   };
 }
 
+function repairApprovalFromSubmittedRun(run: SubmittedRun) {
+  if (run.status !== "failed" || !run.decision_token || !run.repair_proposal) return null;
+  return {
+    runId: run.id,
+    decisionToken: run.decision_token,
+    version: run.version,
+    proposal: run.repair_proposal,
+  };
+}
+
+function repairApprovalFromRunDetail(run: RunDetail | undefined) {
+  if (!run || run.status !== "failed" || !run.decision_token || !run.repair_proposal) return null;
+  const parsedVersion = Number(run.explicit_details.version ?? "0");
+  return {
+    runId: run.id,
+    decisionToken: run.decision_token,
+    version: Number.isInteger(parsedVersion) && parsedVersion > 0 ? parsedVersion : 0,
+    proposal: run.repair_proposal,
+  };
+}
+
+function repairProposalBody(proposal: RepairProposal) {
+  return [
+    proposal.summary,
+    `失败类型：${proposal.failure_kind}`,
+    `修复动作：${proposal.repair_action}`,
+    proposal.automatic_execution
+      ? "该修复提案标记为自动执行。"
+      : "不会自动执行；只有确认后才会重新排队一次。",
+  ].join("\n\n");
+}
+
 function openClawProposalBody(proposal: OpenClawProposal) {
   return [
     proposal.summary,
@@ -1532,7 +1565,18 @@ function detailMessages(detail: RunDetail | undefined) {
             body: openClawProposalBody(detail.openclaw_proposal),
           },
         ]
-      : []),    ...(internalNotice ? [internalNotice] : []),
+      : []),
+    ...(detail.status === "failed" && detail.repair_proposal
+      ? [
+          {
+            id: `${detail.id}-repair-approval`,
+            role: "assistant",
+            title: detail.repair_proposal.title,
+            body: repairProposalBody(detail.repair_proposal),
+          },
+        ]
+      : []),
+    ...(internalNotice ? [internalNotice] : []),
     ...artifactMessages,
     ...failureMessages,
   ];
@@ -2699,6 +2743,12 @@ export function RunsPage() {
     proposal: OpenClawProposal;
     createdOperationId: string | null;
   } | null>(null);
+  const [repairApproval, setRepairApproval] = useState<{
+    runId: string;
+    decisionToken: string;
+    version: number;
+    proposal: RepairProposal;
+  } | null>(null);
   const userSelectedMode = useRef(false);
   const trimmedReferenceConversationId = referenceConversationId.trim();
   const handoffActive = Boolean(trimmedReferenceConversationId);
@@ -2792,6 +2842,7 @@ export function RunsPage() {
       setScheduleApproval(null);
       setEvolutionApproval(null);
       setOpenClawApproval(null);
+      setRepairApproval(null);
       setTemporaryApproval((current) =>
         current &&
         current.runId === approval.runId &&
@@ -2807,6 +2858,7 @@ export function RunsPage() {
       setTemporaryApproval(null);
       setEvolutionApproval(null);
       setOpenClawApproval(null);
+      setRepairApproval(null);
       setScheduleApproval((current) =>
         current && current.runId === proposedSchedule.runId ? current : proposedSchedule,
       );
@@ -2817,6 +2869,7 @@ export function RunsPage() {
       setTemporaryApproval(null);
       setScheduleApproval(null);
       setOpenClawApproval(null);
+      setRepairApproval(null);
       setEvolutionApproval((current) =>
         current && current.runId === proposedEvolution.runId ? current : proposedEvolution,
       );
@@ -2827,8 +2880,25 @@ export function RunsPage() {
       setTemporaryApproval(null);
       setScheduleApproval(null);
       setEvolutionApproval(null);
+      setRepairApproval(null);
       setOpenClawApproval((current) =>
         current && current.runId === proposedOpenClaw.runId ? current : proposedOpenClaw,
+      );
+    }
+    const proposedRepair = repairApprovalFromRunDetail(selectedRun.data);
+    if (proposedRepair) {
+      setModeSelection(null);
+      setTemporaryApproval(null);
+      setScheduleApproval(null);
+      setEvolutionApproval(null);
+      setOpenClawApproval(null);
+      setRepairApproval((current) =>
+        current &&
+        current.runId === proposedRepair.runId &&
+        current.version === proposedRepair.version &&
+        current.decisionToken === proposedRepair.decisionToken
+          ? current
+          : proposedRepair,
       );
     }
   }, [dismissedEvolutionApprovalRunIds, dismissedScheduleApprovalRunIds, modeSelection, selectedRun.data, temporaryApproval]);
@@ -2913,11 +2983,21 @@ export function RunsPage() {
         setArchiveInstallFile(null);
         return;
       }
-      if (run.openclaw_proposal) {
+      const repair = repairApprovalFromSubmittedRun(run);
+      if (repair) {
         setModeSelection(null);
         setTemporaryApproval(null);
         setScheduleApproval(null);
         setEvolutionApproval(null);
+        setOpenClawApproval(null);
+        setRepairApproval(repair);
+        setSubmitNotice("运行失败已生成受控自修复建议，需要确认后才会重新排队。");
+      } else if (run.openclaw_proposal) {
+        setModeSelection(null);
+        setTemporaryApproval(null);
+        setScheduleApproval(null);
+        setEvolutionApproval(null);
+        setRepairApproval(null);
         setOpenClawApproval({ runId: run.id, proposal: run.openclaw_proposal, createdOperationId: null });
         setSubmitNotice("主 Agent 已识别为 OpenClaw 操作请求，请到 OpenClaw 管理页确认权限和执行边界。");
       } else if (run.schedule_proposal) {
@@ -2925,6 +3005,7 @@ export function RunsPage() {
         setTemporaryApproval(null);
         setEvolutionApproval(null);
         setOpenClawApproval(null);
+        setRepairApproval(null);
         setDismissedScheduleApprovalRunIds((current) => current.filter((id) => id !== run.id));
         setScheduleApproval({ runId: run.id, proposal: run.schedule_proposal, createdScheduleId: null });
         setSubmitNotice("主 Agent 已识别为计划任务，确认后会加入计划任务列表。");
@@ -2933,6 +3014,7 @@ export function RunsPage() {
         setTemporaryApproval(null);
         setScheduleApproval(null);
         setOpenClawApproval(null);
+        setRepairApproval(null);
         setDismissedEvolutionApprovalRunIds((current) => current.filter((id) => id !== run.id));
         setEvolutionApproval({ runId: run.id, proposal: run.evolution_proposal, createdEvolutionId: null });
         setSubmitNotice("主 Agent 已识别为进化任务，确认后会加入进化记录。");
@@ -2941,6 +3023,7 @@ export function RunsPage() {
         setScheduleApproval(null);
         setEvolutionApproval(null);
         setOpenClawApproval(null);
+        setRepairApproval(null);
         setTemporaryApproval({
           runId: run.id,
           decisionToken: run.decision_token,
@@ -2955,6 +3038,7 @@ export function RunsPage() {
         setScheduleApproval(null);
         setEvolutionApproval(null);
         setOpenClawApproval(null);
+        setRepairApproval(null);
         setModeSelection(selection);
         setSubmitNotice("主 Agent 对这轮回复的模式判断不够确定，请直接在输入框回复编号或关键词继续。");
       } else {
@@ -2962,6 +3046,7 @@ export function RunsPage() {
         setScheduleApproval(null);
         setEvolutionApproval(null);
         setOpenClawApproval(null);
+        setRepairApproval(null);
         setModeSelection(null);
         setSubmitNotice(override?.successNotice ?? explainActualMode(run));
       }
@@ -3008,6 +3093,25 @@ export function RunsPage() {
       setSubmitNotice("已确认临时子 Agent，这轮对话已继续推进。完成后你可以决定是否永久保存该 Agent。");
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
       await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
+    },
+  });
+
+  const acceptSelfRepair = useMutation({
+    mutationFn: () => {
+      if (!repairApproval) throw new Error("repair approval is unavailable");
+      return api.acceptSelfRepair(repairApproval.runId, {
+        decision_token: repairApproval.decisionToken,
+        version: repairApproval.version,
+      });
+    },
+    onSuccess: async (run) => {
+      setRepairApproval(null);
+      setSubmitNotice("已接受受控自修复，这次运行已重新排队。");
+      await queryClient.invalidateQueries({ queryKey: ["runs"] });
+      await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
+      if (run.conversation_id) {
+        await queryClient.invalidateQueries({ queryKey: ["conversation", run.conversation_id] });
+      }
     },
   });
 
@@ -3297,6 +3401,19 @@ export function RunsPage() {
       reviseTemporaryAgent.mutate(feedback);
       return;
     }
+    if (repairApproval) {
+      const choice = parseChoiceText(trimmed, [
+        { value: "accept", label: "接受修复", aliases: ["接受", "修复", "重试", "approve", "yes", "fix"] },
+      ]);
+      if (!choice) {
+        setSubmitNotice("请回复 1/接受/修复，或点击自修复确认卡里的按钮。");
+        return;
+      }
+      setMessage("");
+      setSubmitNotice("已选择接受受控自修复，正在重新排队。");
+      acceptSelfRepair.mutate();
+      return;
+    }
     if (modeSelection) {
       const choice = parseChoiceText(
         trimmed,
@@ -3450,6 +3567,8 @@ export function RunsPage() {
     !!scheduleApproval && messages.some((item) => item.id === `${scheduleApproval.runId}-schedule-approval`);
   const openClawApprovalVisibleInMessages =
     !!openClawApproval && messages.some((item) => item.id === `${openClawApproval.runId}-openclaw-approval`);
+  const repairApprovalVisibleInMessages =
+    !!repairApproval && messages.some((item) => item.id === `${repairApproval.runId}-repair-approval`);
   const latestVisibleRun = visibleRuns.at(-1) ?? selectedRun.data;
   const canStopLatestRun = Boolean(latestVisibleRun && !TERMINAL_STATUSES.has(latestVisibleRun.status));
   const registeredModelIds = new Set(savedModels.map((model) => model.logical_model));
@@ -3897,6 +4016,13 @@ export function RunsPage() {
                 <p>{openClawProposalBody(openClawApproval.proposal)}</p>
               </article>
             ) : null}
+            {repairApproval && !repairApprovalVisibleInMessages ? (
+              <article className="chat-message assistant" aria-label="自修复文字确认">
+                <span className="eyebrow">{APP_BRAND_NAME}</span>
+                <h3>{repairApproval.proposal.title}</h3>
+                <p>{repairProposalBody(repairApproval.proposal)}</p>
+              </article>
+            ) : null}
             {messages.map((item, index) => (
               <Fragment key={item.id}>
                 <article className={`chat-message ${item.role}`}>
@@ -3997,6 +4123,22 @@ export function RunsPage() {
             ) : null}
             {createOpenClawFromProposal.isError ? (
               <p role="alert">{formatApiError(createOpenClawFromProposal.error, "OpenClaw 操作创建失败")}</p>
+            ) : null}
+            {acceptSelfRepair.isError ? (
+              <p role="alert">{formatApiError(acceptSelfRepair.error, "自修复确认失败")}</p>
+            ) : null}
+            {repairApproval ? (
+              <aside className="composer-attachment-card" role="status" aria-label="自修复确认">
+                <div>
+                  <span className="eyebrow">自修复待确认</span>
+                  <strong>{repairApproval.proposal.title}</strong>
+                  <small>{repairApproval.proposal.summary}</small>
+                </div>
+                <p>{repairProposalBody(repairApproval.proposal)}</p>
+                <button type="button" disabled={acceptSelfRepair.isPending} onClick={() => acceptSelfRepair.mutate()}>
+                  {acceptSelfRepair.isPending ? "排队中..." : "接受修复"}
+                </button>
+              </aside>
             ) : null}
             {scheduleApproval ? (
               <aside className="composer-attachment-card" role="status" aria-label="计划任务确认">

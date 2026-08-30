@@ -571,6 +571,19 @@ const OpenClawProposalSchema = z.object({
   summary: z.string(),
   metadata: z.record(z.string(), z.string()),
 });
+const RepairProposalSchema = z.object({
+  kind: z.literal("self_repair"),
+  title: z.string(),
+  summary: z.string(),
+  repair_action: z.string(),
+  failure_kind: z.string(),
+  source_run_id: z.string(),
+  source_event_sequence: z.number(),
+  requires_approval: z.boolean(),
+  replay_safe: z.boolean(),
+  automatic_execution: z.boolean(),
+  fingerprint: z.string(),
+});
 const SubmittedRunSchema = z.object({
   id: z.string(),
   tenant_id: z.string(),
@@ -585,6 +598,7 @@ const SubmittedRunSchema = z.object({
   schedule_proposal: ScheduleProposalSchema.nullable().optional(),
   evolution_proposal: EvolutionProposalSchema.nullable().optional(),
   openclaw_proposal: OpenClawProposalSchema.nullable().optional(),
+  repair_proposal: RepairProposalSchema.nullable().optional(),
 });
 
 export type SubmittedRun = z.infer<typeof SubmittedRunSchema>;
@@ -671,6 +685,7 @@ const RunDetailSchema = RunListItemSchema.extend({
   schedule_proposal: ScheduleProposalSchema.nullable().optional(),
   evolution_proposal: EvolutionProposalSchema.nullable().optional(),
   openclaw_proposal: OpenClawProposalSchema.nullable().optional(),
+  repair_proposal: RepairProposalSchema.nullable().optional(),
 });
 
 const RunDeleteSchema = z.object({
@@ -1527,6 +1542,16 @@ export const api = {
   ): Promise<SubmittedRun> {
     return request(
       `/api/v1/runs/${encodeURIComponent(id)}/revise-temporary-agent`,
+      { method: "POST", body: JSON.stringify(payload) },
+      SubmittedRunSchema,
+    );
+  },
+  acceptSelfRepair(
+    id: string,
+    payload: { decision_token: string; version: number },
+  ): Promise<SubmittedRun> {
+    return request(
+      `/api/v1/runs/${encodeURIComponent(id)}/accept-repair`,
       { method: "POST", body: JSON.stringify(payload) },
       SubmittedRunSchema,
     );

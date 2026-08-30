@@ -36,6 +36,7 @@ from agent_hub.api.routers.admin import (
     _mode_error_log_from_run,
     _model_check_failure_details,
     _openclaw_proposal,
+    _repair_proposal,
     _routing_details,
     _run_debug_from_detail,
 )
@@ -1266,6 +1267,47 @@ def test_run_detail_response_exposes_structured_failure_diagnostics_without_raw_
     assert diagnostics[2].approval_id == "approval_retry_terminal"
     assert "private-token" not in serialized
     assert "private output" not in serialized
+
+
+def test_repair_proposal_projects_allowlisted_safe_metadata_only() -> None:
+    proposal = _repair_proposal(
+        {
+            "repair_proposal": {
+                "kind": "self_repair",
+                "title": "controlled repair",
+                "summary": "failed run was classified",
+                "repair_action": "draft_repair_proposal",
+                "failure_kind": "runtime_failure",
+                "source_run_id": "run_1",
+                "source_event_sequence": 2,
+                "requires_approval": True,
+                "replay_safe": False,
+                "automatic_execution": False,
+                "fingerprint": "a" * 64,
+                "command": "cat private-token.txt",
+                "stdout": "private output",
+                "prompt": "hidden prompt",
+            }
+        }
+    )
+
+    serialized = json.dumps(proposal, ensure_ascii=False)
+    assert proposal == {
+        "kind": "self_repair",
+        "title": "controlled repair",
+        "summary": "failed run was classified",
+        "repair_action": "draft_repair_proposal",
+        "failure_kind": "runtime_failure",
+        "source_run_id": "run_1",
+        "source_event_sequence": 2,
+        "requires_approval": True,
+        "replay_safe": False,
+        "automatic_execution": False,
+        "fingerprint": "a" * 64,
+    }
+    assert "private-token" not in serialized
+    assert "private output" not in serialized
+    assert "hidden prompt" not in serialized
 
 
 def test_run_detail_response_exposes_tool_lifecycle_without_raw_payloads() -> None:

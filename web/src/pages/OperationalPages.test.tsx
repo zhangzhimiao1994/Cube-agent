@@ -499,6 +499,31 @@ describe("operational management pages", () => {
               clarification_reason: "routing_requires_user_choice",
             });
           }
+          if (message.includes("self repair")) {
+            return jsonResponse({
+              id: runId,
+              tenant_id: "33333333-3333-4333-8333-333333333333",
+              status: "failed",
+              mode: "dispatch",
+              decision_token: "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+              version: 4,
+              clarification_reason: null,
+              conversation_id: typeof body.conversation_id === "string" ? body.conversation_id : null,
+              repair_proposal: {
+                kind: "self_repair",
+                title: "受控自修复建议",
+                summary: "运行失败已分类，可在审批后创建一次受控修复重试。",
+                repair_action: "draft_repair_proposal",
+                failure_kind: "runtime_failure",
+                source_run_id: runId,
+                source_event_sequence: 2,
+                requires_approval: true,
+                replay_safe: false,
+                automatic_execution: false,
+                fingerprint: "a".repeat(64),
+              },
+            });
+          }
           if (message.includes("进化 darwin-skill")) {
             return jsonResponse({
               id: runId,
@@ -655,6 +680,30 @@ describe("operational management pages", () => {
             decision_token: null,
             version: 2,
             clarification_reason: null,
+          });
+        }
+        if (path === `/api/v1/runs/${runId}/accept-repair` && method === "POST") {
+          return jsonResponse({
+            id: runId,
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            status: "queued",
+            mode: "dispatch",
+            decision_token: null,
+            version: 5,
+            clarification_reason: null,
+            repair_proposal: {
+              kind: "self_repair",
+              title: "受控自修复建议",
+              summary: "运行失败已分类，可在审批后创建一次受控修复重试。",
+              repair_action: "draft_repair_proposal",
+              failure_kind: "runtime_failure",
+              source_run_id: runId,
+              source_event_sequence: 2,
+              requires_approval: true,
+              replay_safe: false,
+              automatic_execution: false,
+              fingerprint: "a".repeat(64),
+            },
           });
         }
         if (path === "/api/v1/admin/settings") {
@@ -2098,6 +2147,41 @@ describe("operational management pages", () => {
     );
     expect(await screen.findByText(/已创建 OpenClaw 待审批操作/)).not.toBeNull();
     expect(screen.getByRole("link", { name: "打开 OpenClaw" }).getAttribute("href")).toBe("/openclaw");
+  });
+  it("shows a self-repair confirmation card for failed repair proposals", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "trigger self repair");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    const card = await screen.findByRole("status", { name: "自修复确认" });
+    expect(within(card).getByText("受控自修复建议")).not.toBeNull();
+    expect(within(card).getByText(/runtime_failure/)).not.toBeNull();
+    expect(within(card).getByText(/不会自动执行/)).not.toBeNull();
+  });
+  it("accepts a self-repair proposal with the run decision token", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "trigger self repair");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(await screen.findByRole("status", { name: "自修复确认" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "接受修复" }));
+
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === `/api/v1/runs/${runId}/accept-repair`)).toMatchObject({
+        method: "POST",
+        body: {
+          decision_token: "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+          version: 4,
+        },
+      }),
+    );
+    expect(await screen.findByText("已接受受控自修复，这次运行已重新排队。")).not.toBeNull();
   });
   it("clears failed attachment upload state and allows retrying the same file", async () => {
     failNextAttachmentUpload = true;

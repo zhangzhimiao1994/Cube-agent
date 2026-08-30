@@ -114,6 +114,16 @@ class RunServiceProtocol(Protocol):
         feedback: str,
     ) -> SubmittedRun: ...
 
+    async def accept_self_repair(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        decision_token: str,
+        version: int,
+    ) -> SubmittedRun: ...
+
     async def get(self, tenant_id: UUID, run_id: UUID) -> RunSummary: ...
 
     async def events(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]: ...
@@ -178,6 +188,11 @@ class ReviseTemporaryAgentRequest(BaseModel):
     feedback: str = Field(min_length=1, max_length=2000)
 
 
+class AcceptSelfRepairRequest(BaseModel):
+    decision_token: str = Field(min_length=32, max_length=160)
+    version: int = Field(ge=1)
+
+
 class SubmittedRunResponse(BaseModel):
     id: UUID
     tenant_id: UUID
@@ -192,6 +207,7 @@ class SubmittedRunResponse(BaseModel):
     schedule_proposal: dict[str, object] | None = None
     evolution_proposal: dict[str, object] | None = None
     openclaw_proposal: dict[str, object] | None = None
+    repair_proposal: dict[str, object] | None = None
 
     @classmethod
     def from_submitted(cls, run: SubmittedRun) -> SubmittedRunResponse:
@@ -209,6 +225,7 @@ class SubmittedRunResponse(BaseModel):
             schedule_proposal=run.schedule_proposal,
             evolution_proposal=run.evolution_proposal,
             openclaw_proposal=run.openclaw_proposal,
+            repair_proposal=_repair_proposal_response(run.repair_proposal),
         )
 
 
@@ -238,6 +255,25 @@ class RunSummaryResponse(BaseModel):
 
 class RunEventsResponse(BaseModel):
     items: tuple[dict[str, object], ...]
+
+
+def _repair_proposal_response(proposal: dict[str, object] | None) -> dict[str, object] | None:
+    if not proposal:
+        return None
+    allowed = {
+        "kind",
+        "title",
+        "summary",
+        "repair_action",
+        "failure_kind",
+        "source_run_id",
+        "source_event_sequence",
+        "requires_approval",
+        "replay_safe",
+        "automatic_execution",
+        "fingerprint",
+    }
+    return {key: value for key, value in proposal.items() if key in allowed}
 
 
 class AttachmentUploadResponse(BaseModel):
@@ -868,6 +904,39 @@ async def revise_temporary_agent(
             decision_token=body.decision_token,
             version=body.version,
             feedback=body.feedback,
+        )
+    except RunNotFound as error:
+        raise _run_not_found() from error
+    except RunConflict as error:
+        raise _run_conflict(error) from error
+    except ValueError as error:
+        raise PublicAPIError(
+            422,
+            "request_validation",
+            str(error),
+            details={"reason": str(error)},
+        ) from error
+    return SubmittedRunResponse.from_submitted(submitted)
+
+
+@router.post(
+    "/{run_id}/accept-repair",
+    response_model=SubmittedRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def accept_self_repair(
+    run_id: UUID,
+    body: AcceptSelfRepairRequest,
+    service: Annotated[RunServiceProtocol, Depends(_run_service)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:create"))],
+) -> SubmittedRunResponse:
+    try:
+        submitted = await service.accept_self_repair(
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+            run_id=run_id,
+            decision_token=body.decision_token,
+            version=body.version,
         )
     except RunNotFound as error:
         raise _run_not_found() from error

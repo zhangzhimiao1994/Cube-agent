@@ -354,6 +354,7 @@ class RunDetailResponse(RunListItem):
     schedule_proposal: dict[str, JsonValue] | None = None
     evolution_proposal: dict[str, JsonValue] | None = None
     openclaw_proposal: dict[str, JsonValue] | None = None
+    repair_proposal: dict[str, JsonValue] | None = None
 
     @model_validator(mode="after")
     def populate_failure_diagnostics(self) -> RunDetailResponse:
@@ -3620,6 +3621,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             schedule_proposal=_schedule_proposal(record.routing_decision),
             evolution_proposal=_evolution_proposal(record.routing_decision),
             openclaw_proposal=_openclaw_proposal(record.routing_decision),
+            repair_proposal=_repair_proposal(record.routing_decision),
         )
 
     async def list_models(self) -> tuple[ModelDeploymentResponse, ...]:
@@ -7231,6 +7233,11 @@ def _safe_harness_detail_list(value: object) -> str | None:
 def _waiting_mode_decision_token(record: RunRecord) -> str | None:
     if (
         record.status not in {RunStatus.WAITING_USER_MODE, RunStatus.WAITING_APPROVAL}
+        and not (
+            record.status is RunStatus.FAILED
+            and record.routing_decision
+            and record.routing_decision.get("approval_kind") == "self_repair"
+        )
         or not record.routing_decision
     ):
         return None
@@ -7277,6 +7284,33 @@ def _openclaw_proposal(
     if not isinstance(proposal, dict):
         return None
     safe = _safe_proposal_json_mapping(proposal)
+    return safe or None
+
+
+def _repair_proposal(
+    routing_decision: Mapping[str, object] | None,
+) -> dict[str, JsonValue] | None:
+    if routing_decision is None:
+        return None
+    proposal = routing_decision.get("repair_proposal")
+    if not isinstance(proposal, dict):
+        return None
+    allowed = {
+        "kind",
+        "title",
+        "summary",
+        "repair_action",
+        "failure_kind",
+        "source_run_id",
+        "source_event_sequence",
+        "requires_approval",
+        "replay_safe",
+        "automatic_execution",
+        "fingerprint",
+    }
+    safe = _safe_proposal_json_mapping(
+        {key: value for key, value in proposal.items() if key in allowed}
+    )
     return safe or None
 
 

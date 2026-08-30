@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
 
+from agent_hub.api.routers.runs import SubmittedRunResponse
 from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
 from agent_hub.domain.runs import RunStatus, TaskMode
@@ -285,6 +286,32 @@ class StubRunService:
             version=2,
             clarification_reason=None,
             temporary_agent_proposal=None,
+        )
+
+    async def accept_self_repair(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        decision_token: str,
+        version: int,
+    ) -> SubmittedRun:
+        del actor_id, decision_token, version
+        return SubmittedRun(
+            id=run_id,
+            tenant_id=tenant_id,
+            status=RunStatus.QUEUED,
+            mode=TaskMode.DISPATCH,
+            decision_token=None,
+            version=2,
+            clarification_reason=None,
+            repair_proposal={
+                "kind": "self_repair",
+                "repair_action": "draft_repair_proposal",
+                "failure_kind": "runtime_failure",
+                "automatic_execution": False,
+            },
         )
 
     async def get(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
@@ -941,6 +968,65 @@ def test_revise_temporary_agent_accepts_user_feedback_and_queues_run() -> None:
     assert response.status_code == 202
     assert response.json()["status"] == "queued"
     assert response.json()["mode"] == "dispatch"
+
+
+def test_accept_self_repair_queues_failed_run_safely() -> None:
+    client, _, _ = _client()
+    run_id = uuid4()
+
+    response = client.post(
+        f"/api/v1/runs/{run_id}/accept-repair",
+        headers=bearer(),
+        json={
+            "decision_token": "safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+            "version": 4,
+        },
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "queued"
+    assert body["mode"] == "dispatch"
+    assert body["repair_proposal"]["kind"] == "self_repair"
+    assert body["repair_proposal"]["automatic_execution"] is False
+
+
+def test_submitted_run_response_includes_safe_self_repair_proposal() -> None:
+    run_id = uuid4()
+    tenant_id = uuid4()
+
+    response = SubmittedRunResponse.from_submitted(
+        SubmittedRun(
+            id=run_id,
+            tenant_id=tenant_id,
+            status=RunStatus.FAILED,
+            mode=TaskMode.DISPATCH,
+            decision_token="safe-decision-token-abcdefghijklmnopqrstuvwxyz1234",
+            version=5,
+            repair_proposal={
+                "kind": "self_repair",
+                "title": "受控自修复建议",
+                "summary": "运行失败已分类，可在审批后创建一次受控修复重试。",
+                "repair_action": "draft_repair_proposal",
+                "failure_kind": "runtime_failure",
+                "source_run_id": str(run_id),
+                "source_event_sequence": 2,
+                "requires_approval": True,
+                "replay_safe": False,
+                "automatic_execution": False,
+                "fingerprint": "a" * 64,
+                "command": "cat private-token.txt",
+                "stdout": "private output",
+            },
+        )
+    )
+
+    payload = response.model_dump(mode="json")
+    assert payload["repair_proposal"]["fingerprint"] == "a" * 64
+    assert "command" not in payload["repair_proposal"]
+    assert "stdout" not in payload["repair_proposal"]
+    assert "private-token" not in json.dumps(payload, ensure_ascii=False)
+    assert "private output" not in json.dumps(payload, ensure_ascii=False)
 
 
 def test_viewer_can_read_but_cannot_create_or_control_runs() -> None:
