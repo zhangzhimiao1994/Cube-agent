@@ -1641,25 +1641,39 @@ def _harness_task_requirements(
     routing_decision: Mapping[str, object],
 ) -> HarnessTaskRequirements:
     capabilities = {"text"}
+    vibe_coding = _routing_requests_vibe_coding(routing_decision)
     needs_tool_calls = _message_suggests_tool_use(message) or mode in {
         TaskMode.DISPATCH,
         TaskMode.HYBRID,
-    }
+    } or vibe_coding
     if needs_tool_calls:
         capabilities.add("tool_calling")
     token_estimate = estimate_tokens(message)
     return HarnessTaskRequirements(
         required_capabilities=frozenset(capabilities),
         required_logical_model=_string_or_none(routing_decision.get("direct_model")),
-        needs_reasoning=mode in {TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID},
+        needs_reasoning=vibe_coding
+        or mode in {TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID},
         needs_streamed_tool_calls=needs_tool_calls,
-        needs_parallel_tool_calls=mode in {TaskMode.DISPATCH, TaskMode.HYBRID},
-        needs_long_running=mode in {TaskMode.DISPATCH, TaskMode.HYBRID}
-        and _message_suggests_long_running(message),
-        requires_sandbox=_message_suggests_sandbox(message),
+        needs_parallel_tool_calls=vibe_coding or mode in {TaskMode.DISPATCH, TaskMode.HYBRID},
+        needs_long_running=vibe_coding
+        or (
+            mode in {TaskMode.DISPATCH, TaskMode.HYBRID}
+            and _message_suggests_long_running(message)
+        ),
+        requires_sandbox=vibe_coding or _message_suggests_sandbox(message),
         privacy_sensitive=_message_suggests_sensitive_context(message),
         estimated_input_tokens=token_estimate,
-        prefers_prefix_cache=token_estimate >= 32_000 or _message_suggests_large_context(message),
+        prefers_prefix_cache=vibe_coding
+        or token_estimate >= 32_000
+        or _message_suggests_large_context(message),
+    )
+
+
+def _routing_requests_vibe_coding(routing_decision: Mapping[str, object]) -> bool:
+    return (
+        routing_decision.get("vibe_coding") is True
+        or routing_decision.get("capability") == "vibe_coding"
     )
 
 

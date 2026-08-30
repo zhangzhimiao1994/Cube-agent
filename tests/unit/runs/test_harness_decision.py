@@ -224,6 +224,38 @@ async def test_harness_scheduler_failure_degrades_to_plain_routing_payload() -> 
     assert routing["harness_unavailable"] == "scheduling_failed"
 
 
+async def test_plain_direct_submit_does_not_request_vibe_engineering_requirements() -> None:
+    repository = RecordingRepository()
+    scheduler = RecordingHarnessScheduler()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=RecordingQueue(),
+        harness_scheduler=scheduler,
+    )
+
+    await service.submit(
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        message="普通问题",
+        mode=TaskMode.DIRECT,
+        conversation_id="conv-plain",
+        idempotency_key="idem-harness-plain",
+    )
+
+    assert len(scheduler.calls) == 1
+    requirements = scheduler.calls[0]["requirements"]
+    assert isinstance(requirements, HarnessTaskRequirements)
+    assert requirements.required_capabilities == frozenset({"text"})
+    assert requirements.needs_reasoning is False
+    assert requirements.needs_streamed_tool_calls is False
+    assert requirements.needs_parallel_tool_calls is False
+    assert requirements.needs_long_running is False
+    assert requirements.requires_sandbox is False
+    assert requirements.prefers_prefix_cache is False
+
+
 async def test_auto_local_resolution_stamps_harness_decision_after_mode_selection() -> None:
     repository = RecordingRepository()
     scheduler = RecordingHarnessScheduler()
@@ -308,6 +340,44 @@ async def test_auto_direct_fallback_after_hermes_check_stamps_harness_decision()
         "context_reasons": ["hermes_context_match"],
         "fallbacks_considered": ["openai"],
     }
+
+
+async def test_vibe_coding_submit_requests_engineering_harness_capabilities() -> None:
+    repository = RecordingRepository()
+    scheduler = RecordingHarnessScheduler()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=RecordingQueue(),
+        harness_scheduler=scheduler,
+    )
+
+    submitted = await service.submit(
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        message="修复这个前端交互问题",
+        mode=TaskMode.DIRECT,
+        conversation_id="conv-vibe",
+        vibe_coding=True,
+        idempotency_key="idem-harness-vibe",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert len(scheduler.calls) == 1
+    requirements = scheduler.calls[0]["requirements"]
+    assert isinstance(requirements, HarnessTaskRequirements)
+    assert requirements.required_capabilities == frozenset({"text", "tool_calling"})
+    assert requirements.needs_reasoning is True
+    assert requirements.needs_streamed_tool_calls is True
+    assert requirements.needs_parallel_tool_calls is True
+    assert requirements.needs_long_running is True
+    assert requirements.requires_sandbox is True
+    assert requirements.prefers_prefix_cache is True
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["vibe_coding"] is True
+    assert routing["capability"] == "vibe_coding"
 
 
 async def test_submit_without_harness_scheduler_preserves_existing_payload_shape() -> None:
