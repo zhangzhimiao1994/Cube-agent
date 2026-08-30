@@ -1743,6 +1743,7 @@ class CrewDispatchRuntime:
                 if step.reviewer is not None:
                     reviewer = agents[step.reviewer]
                     review_failure_retry = 0
+                    retry_requested = False
                     while True:
                         try:
                             verdict, feedback, review_evidence = await self._review(
@@ -1860,9 +1861,10 @@ class CrewDispatchRuntime:
                                     reason="review requested revision",
                                     payload={"attempt": retries + 1, "feedback": feedback},
                                 )
+                                retry_requested = True
                                 break
                             break
-                    if feedback_artifact is not None:
+                    if retry_requested:
                         continue
                 await event(
                     kind=EventKind.STEP_COMPLETED,

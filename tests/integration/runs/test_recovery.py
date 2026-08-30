@@ -1130,10 +1130,12 @@ async def test_runtime_exception_is_persisted_as_terminal_failure(
     failed = await service.execute(submitted.id)
     duplicate_retry = await service.execute(submitted.id)
     events = await service.events(tenant_id, submitted.id)
+    event_kinds = [event["kind"] for event in events]
 
     assert failed.status is RunStatus.FAILED
     assert duplicate_retry.status is RunStatus.FAILED
-    assert [event["kind"] for event in events] == ["runtime.failed"]
+    assert event_kinds.count("runtime.failed") == 1
+    assert "repair.classified" in event_kinds
 
 
 async def test_restore_exception_is_persisted_as_terminal_failure(
@@ -1159,10 +1161,12 @@ async def test_restore_exception_is_persisted_as_terminal_failure(
     failed = await service.recover(submitted.id)
     duplicate_retry = await service.execute(submitted.id)
     events = await service.events(tenant_id, submitted.id)
+    event_kinds = [event["kind"] for event in events]
 
     assert failed.status is RunStatus.FAILED
     assert duplicate_retry.status is RunStatus.FAILED
-    assert events[-1]["kind"] == "runtime.failed"
+    assert event_kinds.count("runtime.failed") == 1
+    assert "repair.classified" in event_kinds
 
 
 async def test_celery_run_queue_uses_outbox_key_as_task_id() -> None:
