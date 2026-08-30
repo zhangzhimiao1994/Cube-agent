@@ -12,6 +12,7 @@ It combines a Web console, Feishu/channel entry points, model pools, workflow an
 - Configure normal chat/tool models separately from multimedia AI models.
 - Route image/video/audio generation only to models marked with the matching generation capability.
 - Use MiniMax/Hailuo text-to-video through the multimedia executor when a valid deployment and key are configured.
+- Generate Word and PowerPoint files through runtime tools: `document.generate_docx` and `presentation.generate_pptx`.
 - Upload single-skill or multi-skill `.zip`, `.tar`, `.tar.gz`, and `.tgz` archives for scan, review, approval, use, and deletion.
 - Run OpenClaw operations through a system switch, approval mode, allowlisted commands, sessions, and local or remote adapters.
 - Create one-time or cron schedules. Chat-detected dated tasks, reminders, and recurring requests become proposals that require user confirmation before creation.
@@ -96,6 +97,8 @@ litellm_settings:
 
 For model calls in an offline environment, configure a local model service, an internal OpenAI-compatible relay, or another reachable provider from the Web console. A disconnected machine does not automatically have external model access.
 
+DOCX/PPTX generation itself uses deterministic standard-library OOXML builders, so the offline Docker image does not need extra public package downloads for Office file creation. A fresh offline install still needs a local, intranet, or otherwise reachable model configured before the main agent can plan and call those tools. Generated Office files are written under `generated_artifact_dir`, which defaults to `/var/lib/agent-hub/generated-artifacts` and is persisted by the `agent_hub_data` Docker volume.
+
 ### 2. Build and pull all required images
 
 ```bash
@@ -167,6 +170,13 @@ Models are split into two categories.
 **Multimedia AI** is used for generation jobs, not ordinary chat. Presets include Sora, OpenAI Audio, MiniMax Hailuo, MiniMax Audio, Google Veo, Kling, Alibaba Wan, Seedance, Seedream, and relay/custom providers. Capability tags such as `image_generation`, `video_generation`, and `audio_generation` control routing. A video request is rejected before submission if the selected deployment is not recognized as a video-capable model.
 
 MiniMax/Hailuo video generation is implemented by the current multimedia executor. Other preset providers are stored and routed by capability, and can be extended by adding provider clients behind the common multimedia provider interface.
+
+Office file generation is a runtime tool capability, not a `ModelCapability` value. Keep models marked with ordinary capabilities such as `text`, `tool_calling`, and `structured_output`; document and presentation tasks should route to writing or design roles that can call:
+
+- `document.generate_docx`: creates a real DOCX artifact from a structured document blueprint.
+- `presentation.generate_pptx`: creates a real PPTX artifact from a structured slide blueprint.
+
+Built-in PPTX templates are `consulting-clean`, `technical-blueprint`, and `dark-launch`. Generated files include file metadata and an authenticated `download_url`; the Web console renders them as file cards in run details, conversation output, and child-agent work seats.
 
 ## Chat, Evolution, And Modes
 

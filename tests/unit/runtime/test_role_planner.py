@@ -1,6 +1,10 @@
+import pytest
+
 from agent_hub.domain.runs import TaskMode
+from agent_hub.models.types import ModelCapability
 from agent_hub.runtime.role_catalog import RoleDefinition, default_role_catalog
 from agent_hub.runtime.role_planner import (
+    RoleAssignment,
     RolePlanner,
     RolePlanningRequest,
     RolePurpose,
@@ -221,6 +225,173 @@ def test_multimedia_generator_is_not_selected_for_non_generation_tasks() -> None
     role_ids = {role.id for role in plan.roles}
 
     assert "multimedia_generator" not in role_ids
+
+
+def test_docx_generation_dispatch_selects_document_writer_tool_role() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="请生成一份 Word 项目复盘文档，包含摘要、风险和下一步。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    writer = plan.role("document_writer")
+
+    assert writer.purpose is RolePurpose.EXECUTE
+    assert "document.generate_docx" in writer.allowed_tools
+    assert "tool_calling" in " ".join((*writer.must_answer, writer.mission))
+
+
+def test_pptx_generation_dispatch_selects_presentation_designer_tool_role() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="Build a PowerPoint deck using the technical-blueprint template.",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    designer = plan.role("presentation_designer")
+
+    assert designer.purpose is RolePurpose.EXECUTE
+    assert "presentation.generate_pptx" in designer.allowed_tools
+    assert "consulting-clean" in designer.mission
+    assert "technical-blueprint" in designer.mission
+    assert "dark-launch" in designer.mission
+
+
+def test_office_generation_allows_local_exclusions_without_disabling_file_generation() -> None:
+    docx_plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="Generate a DOCX report without appendix.",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+    pptx_plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="Create a PPTX deck without speaker notes.",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    assert docx_plan.role("document_writer")
+    assert pptx_plan.role("presentation_designer")
+
+
+@pytest.mark.parametrize(
+    ("task", "absent_role_id"),
+    (
+        ("Please review this Word document for clarity.", "document_writer"),
+        ("Discuss the slide deck outline.", "presentation_designer"),
+        ("Please review this PowerPoint deck for clarity.", "presentation_designer"),
+        ("请审查这个 Word 文档的逻辑。", "document_writer"),
+        ("请讨论这个 docx 文档的结构。", "document_writer"),
+        ("Please review this Word file for clarity.", "document_writer"),
+        ("Please review this DOCX file for clarity.", "document_writer"),
+        ("Please review this PPT file for clarity.", "presentation_designer"),
+        ("Draft a document in Markdown, no DOCX file.", "document_writer"),
+        ("Write a report about market trends.", "document_writer"),
+        ("Draft a presentation outline, no PPTX file.", "presentation_designer"),
+    ),
+)
+def test_existing_office_content_review_does_not_select_generation_roles(
+    task: str,
+    absent_role_id: str,
+) -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=task,
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    assert absent_role_id not in {role.id for role in plan.roles}
+
+
+@pytest.mark.parametrize(
+    ("task", "expected_role_id", "absent_role_id"),
+    (
+        ("Create a PPTX deck, no DOCX file needed.", "presentation_designer", "document_writer"),
+        ("Generate a DOCX report, no PPTX file needed.", "document_writer", "presentation_designer"),
+        ("Create a PowerPoint file, no Word document.", "presentation_designer", "document_writer"),
+    ),
+)
+def test_office_generation_negations_are_scoped_to_the_requested_file_type(
+    task: str,
+    expected_role_id: str,
+    absent_role_id: str,
+) -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=task,
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+    role_ids = {role.id for role in plan.roles}
+
+    assert expected_role_id in role_ids
+    assert absent_role_id not in role_ids
+
+
+def test_office_generation_does_not_add_model_capabilities() -> None:
+    assert "docx_generation" not in {capability.value for capability in ModelCapability}
+    assert "pptx_generation" not in {capability.value for capability in ModelCapability}
+
+
+def test_dotted_tool_names_are_limited_to_known_built_ins() -> None:
+    RoleDefinition(
+        id="custom_document_writer",
+        role="Custom Document Writer",
+        purpose="execute",
+        mission="Generate a document artifact.",
+        must_answer=("What file was generated?",),
+        allowed_tools=("read_context", "document.generate_docx"),
+        forbidden_actions=("do not claim success without an artifact",),
+        skills=("writing",),
+        output_schema={"summary": "string"},
+        modes=frozenset({"dispatch"}),
+        profiles=frozenset({"general"}),
+    )
+
+    with pytest.raises(ValueError, match="safe tool names"):
+        RoleDefinition(
+            id="custom_web_role",
+            role="Custom Web Role",
+            purpose="execute",
+            mission="Use an unknown dotted tool.",
+            must_answer=("What happened?",),
+            allowed_tools=("read_context", "web.search"),
+            forbidden_actions=("do not bypass review",),
+            skills=("research",),
+            output_schema={"summary": "string"},
+            modes=frozenset({"dispatch"}),
+            profiles=frozenset({"general"}),
+        )
+
+    with pytest.raises(ValueError, match="safe tool names"):
+        RoleAssignment(
+            id="unsafe_tool_role",
+            role="Unsafe Tool Role",
+            purpose=RolePurpose.EXECUTE,
+            mission="Use an unknown dotted tool.",
+            must_answer=("What happened?",),
+            allowed_tools=("read_context", "web.search"),
+            forbidden_actions=("do not bypass review",),
+            skills=("research",),
+            output_schema={"summary": "string"},
+            model="general",
+        )
 
 
 def test_general_generation_plan_does_not_select_quality_reviewer_by_default() -> None:

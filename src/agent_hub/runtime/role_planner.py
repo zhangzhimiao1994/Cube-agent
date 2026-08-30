@@ -38,6 +38,7 @@ class RolePurpose(StrEnum):
 
 
 _SAFE_IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
+_DOTTED_BUILT_IN_TOOL_NAMES = frozenset({"document.generate_docx", "presentation.generate_pptx"})
 _MAX_TEXT = 2_000
 _DISCUSSION_SCHEMA = MappingProxyType(
     {
@@ -86,7 +87,7 @@ class RoleAssignment:
             raise ValueError("role purpose is invalid")
         _require_text("mission", self.mission)
         must_answer = _normalize_tuple("must_answer", self.must_answer, min_length=1)
-        allowed_tools = _normalize_identifier_tuple("allowed_tools", self.allowed_tools)
+        allowed_tools = _normalize_tool_tuple("allowed_tools", self.allowed_tools)
         forbidden_actions = _normalize_tuple(
             "forbidden_actions",
             self.forbidden_actions,
@@ -891,6 +892,35 @@ _ROLE_TRIGGER_KEYWORDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
             "edit",
             "caption",
         ),
+        "document_writer": (
+            "word",
+            "docx",
+            "document",
+            "documents",
+            "write-up",
+            "memo",
+            "文档",
+            "word文档",
+            "docx文档",
+            "生成文档",
+            "汇报材料",
+            "复盘文档",
+        ),
+        "presentation_designer": (
+            "powerpoint",
+            "ppt",
+            "pptx",
+            "presentation",
+            "presentations",
+            "slide",
+            "slides",
+            "deck",
+            "演示稿",
+            "演示文稿",
+            "幻灯片",
+            "汇报ppt",
+            "汇报材料",
+        ),
         "multimedia_generator": (
             "generate",
             "generation",
@@ -931,6 +961,10 @@ def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
     requested = set(request.requested_skills)
     if role_id == "multimedia_generator":
         return _is_multimedia_generation_request(request.task)
+    if role_id == "document_writer":
+        return _is_document_generation_request(request.task)
+    if role_id == "presentation_designer":
+        return _is_presentation_generation_request(request.task)
     if requested and requested.intersection(skills):
         return True
     task = request.task.casefold()
@@ -1069,12 +1103,366 @@ _MULTIMEDIA_GENERATION_NEGATIONS = (
     "no need",
 )
 
+_DOCUMENT_GENERATION_TERMS = (
+    "generate a word",
+    "generate word",
+    "create a word",
+    "create word",
+    "make a word",
+    "build a word",
+    "produce a word",
+    "export a word",
+    "generate a docx",
+    "generate docx",
+    "create a docx",
+    "create docx",
+    "make a docx",
+    "build a docx",
+    "produce a docx",
+    "export a docx",
+    "export a document",
+    "export document",
+    "generate a document file",
+    "create a document file",
+    "make a document file",
+    "build a document file",
+    "produce a document file",
+    "export a document file",
+    "download a document file",
+    "generate a word file",
+    "create a word file",
+    "make a word file",
+    "build a word file",
+    "produce a word file",
+    "export a word file",
+    "download a word file",
+    "generate a docx file",
+    "create a docx file",
+    "make a docx file",
+    "build a docx file",
+    "produce a docx file",
+    "export a docx file",
+    "download a docx file",
+    "生成word",
+    "生成 word",
+    "生成docx",
+    "生成 docx",
+    "创建word",
+    "创建 word",
+    "创建docx",
+    "创建 docx",
+    "制作word",
+    "制作 word",
+    "制作docx",
+    "制作 docx",
+    "生成文档文件",
+    "创建文档文件",
+    "制作文档文件",
+    "输出文档文件",
+    "导出文档文件",
+    "下载文档文件",
+    "生成word文件",
+    "生成 word 文件",
+    "创建word文件",
+    "创建 word 文件",
+    "制作word文件",
+    "制作 word 文件",
+    "输出word文件",
+    "输出 word 文件",
+    "导出word文件",
+    "导出 word 文件",
+    "下载word文件",
+    "下载 word 文件",
+    "生成docx文件",
+    "生成 docx 文件",
+    "创建docx文件",
+    "创建 docx 文件",
+    "制作docx文件",
+    "制作 docx 文件",
+    "输出docx文件",
+    "输出 docx 文件",
+    "导出docx文件",
+    "导出 docx 文件",
+    "下载docx文件",
+    "下载 docx 文件",
+    "输出文档",
+    "输出word",
+    "输出 word",
+    "输出docx",
+    "输出 docx",
+    "导出文档",
+    "导出word",
+    "导出 word",
+    "导出docx",
+    "导出 docx",
+    "下载文档",
+    "下载word",
+    "下载 word",
+    "下载docx",
+    "下载 docx",
+)
+
+_PRESENTATION_GENERATION_TERMS = (
+    "generate a powerpoint",
+    "generate powerpoint",
+    "create a powerpoint",
+    "create powerpoint",
+    "make a powerpoint",
+    "build a powerpoint",
+    "generate a ppt",
+    "generate ppt",
+    "create a ppt",
+    "create ppt",
+    "make a ppt",
+    "build a ppt",
+    "generate a pptx",
+    "generate pptx",
+    "create a pptx",
+    "create pptx",
+    "make a pptx",
+    "build a pptx",
+    "generate a presentation",
+    "generate presentation",
+    "create a presentation",
+    "create presentation",
+    "make a presentation",
+    "build a presentation",
+    "export a presentation",
+    "export presentation",
+    "generate a slide deck",
+    "create a slide deck",
+    "make a slide deck",
+    "build a slide deck",
+    "produce a slide deck",
+    "draft a slide deck",
+    "export a slide deck",
+    "generate slides",
+    "create slides",
+    "make slides",
+    "build slides",
+    "export slides",
+    "generate a presentation file",
+    "create a presentation file",
+    "make a presentation file",
+    "build a presentation file",
+    "produce a presentation file",
+    "export a presentation file",
+    "download a presentation file",
+    "generate a powerpoint file",
+    "create a powerpoint file",
+    "make a powerpoint file",
+    "build a powerpoint file",
+    "produce a powerpoint file",
+    "export a powerpoint file",
+    "download a powerpoint file",
+    "generate a ppt file",
+    "create a ppt file",
+    "make a ppt file",
+    "build a ppt file",
+    "produce a ppt file",
+    "export a ppt file",
+    "download a ppt file",
+    "generate a pptx file",
+    "create a pptx file",
+    "make a pptx file",
+    "build a pptx file",
+    "produce a pptx file",
+    "export a pptx file",
+    "download a pptx file",
+    "生成ppt",
+    "生成 ppt",
+    "生成pptx",
+    "生成 pptx",
+    "生成演示稿",
+    "生成演示文稿",
+    "创建演示文稿",
+    "创建幻灯片",
+    "制作演示文稿",
+    "制作幻灯片",
+    "做ppt",
+    "做 ppt",
+    "做一份ppt",
+    "做一份 ppt",
+    "输出ppt",
+    "输出 ppt",
+    "导出ppt",
+    "导出 ppt",
+    "汇报ppt",
+    "汇报 ppt",
+)
+
+_OFFICE_GLOBAL_GENERATION_NEGATIONS = (
+    "do not generate",
+    "don't generate",
+    "dont generate",
+    "not generate",
+    "no need to generate",
+    "do not create",
+    "don't create",
+    "dont create",
+    "not create",
+    "no need to create",
+    "do not make",
+    "don't make",
+    "dont make",
+    "not make",
+    "no need to make",
+    "do not build",
+    "don't build",
+    "dont build",
+    "not build",
+    "no need to build",
+    "do not export",
+    "don't export",
+    "dont export",
+    "not export",
+    "no need to export",
+    "不要生成",
+    "不用生成",
+    "无需生成",
+    "不需要生成",
+    "暂不生成",
+    "不要创建",
+    "不用创建",
+    "无需创建",
+    "不需要创建",
+    "暂不创建",
+    "不要制作",
+    "不用制作",
+    "无需制作",
+    "不需要制作",
+    "暂不制作",
+    "不要输出",
+    "不用输出",
+    "无需输出",
+    "不需要输出",
+    "暂不输出",
+    "不要导出",
+    "不用导出",
+    "无需导出",
+    "不需要导出",
+    "暂不导出",
+    "no office file",
+    "without office file",
+    "no generated file",
+    "without generated file",
+    "不要文件",
+    "不用文件",
+    "无需文件",
+    "不需要文件",
+)
+
+_DOCUMENT_GENERATION_NEGATIONS = (
+    *_OFFICE_GLOBAL_GENERATION_NEGATIONS,
+    "no docx",
+    "no docx file",
+    "without docx",
+    "without docx file",
+    "no word file",
+    "without word file",
+    "no word document",
+    "without word document",
+    "no document file",
+    "without document file",
+    "不用docx",
+    "不用 docx",
+    "不要docx",
+    "不要 docx",
+    "无需docx",
+    "无需 docx",
+    "不需要docx",
+    "不需要 docx",
+    "不用word",
+    "不用 word",
+    "不要word",
+    "不要 word",
+    "无需word",
+    "无需 word",
+    "不需要word",
+    "不需要 word",
+    "不用word文档",
+    "不用 word 文档",
+    "不要word文档",
+    "不要 word 文档",
+    "无需word文档",
+    "无需 word 文档",
+    "不需要word文档",
+    "不需要 word 文档",
+)
+
+_PRESENTATION_GENERATION_NEGATIONS = (
+    *_OFFICE_GLOBAL_GENERATION_NEGATIONS,
+    "no ppt",
+    "no ppt file",
+    "without ppt",
+    "without ppt file",
+    "no pptx",
+    "no pptx file",
+    "without pptx",
+    "without pptx file",
+    "no powerpoint",
+    "no powerpoint file",
+    "without powerpoint",
+    "without powerpoint file",
+    "no presentation file",
+    "without presentation file",
+    "不用ppt",
+    "不用 ppt",
+    "不要ppt",
+    "不要 ppt",
+    "无需ppt",
+    "无需 ppt",
+    "不需要ppt",
+    "不需要 ppt",
+)
+
 
 def _is_multimedia_generation_request(task: str) -> bool:
     normalized = task.casefold()
     return any(term in normalized for term in _MULTIMEDIA_GENERATION_TERMS) and not any(
         negation in normalized for negation in _MULTIMEDIA_GENERATION_NEGATIONS
     )
+
+
+def _is_document_generation_request(task: str) -> bool:
+    normalized = task.casefold()
+    office_document_pair = (
+        any(term in normalized for term in ("word", "docx"))
+        and any(term in normalized for term in ("document", "文档", "文件", "材料"))
+    )
+    return _has_generation_terms(task, _DOCUMENT_GENERATION_TERMS, _DOCUMENT_GENERATION_NEGATIONS) or (
+        office_document_pair
+        and any(term in normalized for term in ("generate", "create", "make", "build", "生成", "创建", "制作"))
+        and not _has_office_generation_negation(normalized, _DOCUMENT_GENERATION_NEGATIONS)
+    )
+
+
+def _is_presentation_generation_request(task: str) -> bool:
+    return _has_generation_terms(
+        task,
+        _PRESENTATION_GENERATION_TERMS,
+        _PRESENTATION_GENERATION_NEGATIONS,
+    )
+
+
+def _has_generation_terms(
+    task: str,
+    terms: tuple[str, ...],
+    negations: tuple[str, ...],
+) -> bool:
+    normalized = task.casefold()
+    return any(term in normalized for term in terms) and not _has_office_generation_negation(
+        normalized,
+        negations,
+    )
+
+
+def _has_generation_negation(normalized: str) -> bool:
+    return any(negation in normalized for negation in _MULTIMEDIA_GENERATION_NEGATIONS)
+
+
+def _has_office_generation_negation(normalized: str, negations: tuple[str, ...]) -> bool:
+    return any(negation in normalized for negation in negations)
 
 
 def _normalize_profiles(
@@ -1126,6 +1514,20 @@ def _normalize_identifier_tuple(name: str, values: tuple[str, ...]) -> tuple[str
     if len(normalized) != len(set(normalized)):
         raise ValueError(f"{name} must be unique")
     return normalized
+
+
+def _normalize_tool_tuple(name: str, values: tuple[str, ...]) -> tuple[str, ...]:
+    normalized = tuple(values)
+    for value in normalized:
+        if type(value) is not str or not _is_safe_tool_name(value):
+            raise ValueError(f"{name} must contain safe tool names")
+    if len(normalized) != len(set(normalized)):
+        raise ValueError(f"{name} must be unique")
+    return normalized
+
+
+def _is_safe_tool_name(value: str) -> bool:
+    return _SAFE_IDENTIFIER.fullmatch(value) is not None or value in _DOTTED_BUILT_IN_TOOL_NAMES
 
 
 def _require_schema_key(value: str) -> str:

@@ -1672,9 +1672,18 @@ def test_schedule_api_persists_restores_and_deletes_tasks() -> None:
 
 
 def skill_archive() -> bytes:
+    return skill_archive_variant()
+
+
+def skill_archive_variant(
+    *,
+    name: str = "safe_skill",
+    version: str = "1.0.0",
+    entry_body: str = "print('ok')\n",
+) -> bytes:
     manifest = (
-        "name: safe_skill\n"
-        "version: 1.0.0\n"
+        f"name: {name}\n"
+        f"version: {version}\n"
         "entry_point: main.py\n"
         "compatible_runtime: python3.12\n"
         "declared_tools:\n"
@@ -1685,7 +1694,26 @@ def skill_archive() -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("skill.yaml", manifest)
-        archive.writestr("main.py", "print('ok')\n")
+        archive.writestr("main.py", entry_body)
+    return buffer.getvalue()
+
+
+def duplicate_skill_bundle_archive() -> bytes:
+    manifest = (
+        "name: duplicate_skill\n"
+        "version: 1.0.0\n"
+        "entry_point: main.py\n"
+        "compatible_runtime: python3.12\n"
+        "declared_tools: []\n"
+        "dependency_lock_hash: "
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("first/skill.yaml", manifest)
+        archive.writestr("first/main.py", "print('one')\n")
+        archive.writestr("second/skill.yaml", manifest)
+        archive.writestr("second/main.py", "print('two')\n")
     return buffer.getvalue()
 
 
@@ -3339,6 +3367,127 @@ def test_skill_archive_upload_scans_real_zip_package() -> None:
     assert item["requested_permissions"] == ["tool:filesystem.read"]
     assert any("content sha256" in entry for entry in item["scan_diff"])
     assert skills.json()[0]["id"] == item["id"]
+
+
+def test_skill_archive_upload_is_idempotent_for_same_package() -> None:
+    api = client()
+    archive = skill_archive()
+
+    first = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=archive,
+    )
+    second = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill-copy.zip"},
+        content=archive,
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["items"][0]["id"] == second.json()["items"][0]["id"]
+    assert [item["id"] for item in skills.json()] == [first.json()["items"][0]["id"]]
+
+
+def test_skill_archive_upload_replaces_same_identity_without_duplicating() -> None:
+    api = client()
+    first_archive = skill_archive_variant(entry_body="print('one')\n")
+    second_archive = skill_archive_variant(entry_body="print('two')\n")
+
+    first = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=first_archive,
+    )
+    second = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=second_archive,
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    first_item = first.json()["items"][0]
+    second_item = second.json()["items"][0]
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first_item["id"] == second_item["id"]
+    assert first_item["scan_diff"] != second_item["scan_diff"]
+    assert [item["id"] for item in skills.json()] == [second_item["id"]]
+    assert skills.json()[0]["scan_diff"] == second_item["scan_diff"]
+
+
+def test_skill_archive_upload_skips_duplicate_identity_inside_bundle() -> None:
+    api = client()
+
+    uploaded = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "duplicates.zip"},
+        content=duplicate_skill_bundle_archive(),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert uploaded.status_code == 200
+    body = uploaded.json()
+    assert body["bundle"] is True
+    assert [item["name"] for item in body["items"]] == ["duplicate_skill"]
+    assert body["skipped"] == [
+        {
+            "path": "duplicates-second.zip",
+            "reason": "duplicate skill identity skipped",
+        }
+    ]
+    assert [item["name"] for item in skills.json()] == ["duplicate_skill"]
+
+
+@pytest.mark.asyncio
+async def test_persistent_skill_archive_upload_upserts_stable_identity(tmp_path: Path) -> None:
+    class StoredPersistentSkillService(PersistentAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__(
+                config_service=FakeConfigService(),  # type: ignore[arg-type]
+                secret_service=FakeSecretService(),  # type: ignore[arg-type]
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+                skill_store_dir=tmp_path,
+            )
+            self.payloads: dict[tuple[str, str], dict[str, object]] = {}
+
+        async def _list_admin_payloads(self, kind: str) -> list[dict[str, object]] | None:
+            return [
+                payload
+                for (stored_kind, _resource_id), payload in self.payloads.items()
+                if stored_kind == kind
+            ]
+
+        async def _get_admin_payload(self, kind: str, resource_id: str) -> dict[str, object] | None:
+            return self.payloads.get((kind, resource_id), {})
+
+        async def _upsert_admin_payload(
+            self, kind: str, resource_id: str, payload: dict[str, object]
+        ) -> bool:
+            self.payloads[(kind, resource_id)] = payload
+            return True
+
+    service = StoredPersistentSkillService()
+
+    first = await service.upload_skill_archive(
+        "safe-skill.zip",
+        skill_archive_variant(entry_body="print('one')\n"),
+    )
+    second = await service.upload_skill_archive(
+        "safe-skill.zip",
+        skill_archive_variant(entry_body="print('two')\n"),
+    )
+    listed = await service.list_skills()
+
+    skill_id = first.items[0].id
+    assert second.items[0].id == skill_id
+    assert [item.id for item in listed] == [skill_id]
+    assert listed[0].scan_diff == second.items[0].scan_diff
+    assert (tmp_path / str(TENANT_ID) / f"{skill_id}.zip").is_file()
+    assert len([key for key in service.payloads if key[0] == "skill"]) == 1
 
 
 def test_skill_archive_upload_accepts_percent_encoded_filename_header() -> None:

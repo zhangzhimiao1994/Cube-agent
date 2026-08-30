@@ -12,6 +12,7 @@
 - 把普通模型和多媒体 AI 分开配置，避免把视频生成任务提交给不支持视频的模型。
 - 通过能力标签控制图片、视频、音频生成路由。
 - 配置 MiniMax/Hailuo 后，使用当前多媒体执行器提交文生视频任务并保存生成文件。
+- 通过运行时工具生成 Word 和 PowerPoint 文件：`document.generate_docx`、`presentation.generate_pptx`。
 - 上传单个 Skill 或多个 Skill 打包的 `.zip`、`.tar`、`.tar.gz`、`.tgz`，扫描后再审批启用。
 - 通过 OpenClaw 功能开关、权限模式、命令白名单和适配器，受控执行服务器或电脑操作。
 - 创建一次性计划任务或 cron 周期任务；对话里识别到带明确日期/时间/周期和可执行动作的计划需求时，先给出计划方案，再由用户确认创建。
@@ -96,6 +97,8 @@ litellm_settings:
 
 离线环境如果要调用模型，需要在 Web 控制台配置本地模型、内网中转站或可访问的供应商 API。断网环境不会自动拥有外部模型能力。
 
+DOCX/PPTX 生成本身使用确定性的 Python 标准库 OOXML 构建器，离线 Docker 镜像不需要为了 Office 文件生成再下载额外公网包。但全新离线安装仍然需要配置本地、内网或其他可访问模型，主 Agent 才能规划并调用这些工具。生成文件会写入 `generated_artifact_dir`，默认是 `/var/lib/agent-hub/generated-artifacts`，在 Docker 部署中由 `agent_hub_data` volume 持久化。
+
 ### 2. 构建和拉取所有镜像
 
 ```bash
@@ -176,6 +179,13 @@ docker compose --env-file .env ps
 系统会根据能力标签和已知模型名单判断是否允许提交视频生成。没有视频生成能力的模型不会收到视频生成任务。
 
 当前真实接入的多媒体执行客户端是 MiniMax/Hailuo 文生视频。其他多媒体预设可以保存配置并参与能力门控，后续通过通用多媒体 provider 接口继续扩展执行客户端。
+
+Office 文件生成是运行时工具能力，不是新的 `ModelCapability`。模型仍只需要标注 `text`、`tool_calling`、`structured_output` 等普通能力；文档和演示稿任务应路由给可工具调用的写作/设计角色，再调用：
+
+- `document.generate_docx`：根据结构化文档蓝图生成真实 DOCX 文件。
+- `presentation.generate_pptx`：根据结构化幻灯片蓝图生成真实 PPTX 文件。
+
+内置 PPT 模板包括 `consulting-clean`、`technical-blueprint`、`dark-launch`。生成文件会带文件 metadata 和受认证保护的 `download_url`；Web 控制台会在运行详情、对话输出和子 Agent 工作席里以文件卡片显示并提供下载。
 
 ## 对话、进化和模式
 

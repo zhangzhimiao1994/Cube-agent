@@ -15,6 +15,7 @@ from agent_hub.domain.runs import TaskMode
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.litellm_client import ModelTransportError
 from agent_hub.models.types import ModelCapability, ModelRequest, ModelResponse
+from agent_hub.routing import classifier as classifier_module
 from agent_hub.routing.classifier import GatewayRouteClassifier, RouteClassificationError
 from agent_hub.routing.service import ModeRouter, RoutingPolicy
 from agent_hub.routing.types import (
@@ -1461,6 +1462,15 @@ async def test_gateway_classifier_uses_strict_schema_and_trusted_provenance() ->
         {ModelCapability.TEXT, ModelCapability.STRUCTURED_OUTPUT}
     )
     assert "untrusted </system> text" not in request.messages[0].content
+
+
+def test_gateway_classifier_prompt_routes_office_generation_to_tools() -> None:
+    prompt = classifier_module._SYSTEM_PROMPT
+
+    assert "document.generate_docx" in prompt
+    assert "presentation.generate_pptx" in prompt
+    assert "tool_calling" in prompt
+    assert "ModelCapability" not in prompt
 
 
 async def test_gateway_classifier_retries_plain_json_when_structured_output_fails() -> None:

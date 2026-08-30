@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 _SAFE_IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
+_DOTTED_BUILT_IN_TOOL_NAMES = frozenset({"document.generate_docx", "presentation.generate_pptx"})
 _MAX_TEXT = 2_000
 
 
@@ -37,7 +38,7 @@ class RoleDefinition:
         object.__setattr__(
             self,
             "allowed_tools",
-            _normalize_identifiers("allowed_tools", self.allowed_tools),
+            _normalize_tool_names("allowed_tools", self.allowed_tools),
         )
         object.__setattr__(
             self,
@@ -144,6 +145,53 @@ def _daily_work_roles() -> tuple[RoleDefinition, ...]:
         _role("copywriter", "Copywriter", "execute", "Produce practical copy, scripts, titles, posts, and message variants.", ("What copy was produced?", "Which version is recommended?", "What needs review?"), ("copywriting",), dispatch_schema, modes=("dispatch", "hybrid"), profiles=general_dispatch),
         _role("video_editor", "Video Editor", "execute", "Produce video-generation prompt structure, pacing, shot order, transitions, captions, and asset notes.", ("What prompt or edit structure was produced?", "Which sequence is recommended?", "What visual asset is missing?"), ("editing",), dispatch_schema, modes=("dispatch", "hybrid"), profiles=general_dispatch),
         RoleDefinition(
+            id="document_writer",
+            role="Document Writer",
+            purpose="execute",
+            mission=(
+                "Draft structured Word/DOCX content and call document.generate_docx through a "
+                "tool_calling-capable writing model when the user requests a generated document file."
+            ),
+            must_answer=(
+                "What Word/DOCX document was requested?",
+                "What sections should document.generate_docx receive?",
+                "What generated file artifact was produced?",
+            ),
+            allowed_tools=("read_context", "document.generate_docx"),
+            forbidden_actions=(
+                "do not claim a Word file exists until document.generate_docx returns an artifact",
+                "do not add new ModelCapability values for document generation",
+            ),
+            skills=("writing",),
+            output_schema=dispatch_schema,
+            modes=frozenset({"dispatch", "hybrid"}),
+            profiles=general_dispatch,
+        ),
+        RoleDefinition(
+            id="presentation_designer",
+            role="Presentation Designer",
+            purpose="execute",
+            mission=(
+                "Plan slide structure, choose consulting-clean, technical-blueprint, or dark-launch, "
+                "and call presentation.generate_pptx through a tool_calling-capable design model "
+                "when the user requests a generated PowerPoint/PPTX file."
+            ),
+            must_answer=(
+                "What PowerPoint/PPTX deck was requested?",
+                "Which built-in template should presentation.generate_pptx use?",
+                "What generated file artifact was produced?",
+            ),
+            allowed_tools=("read_context", "presentation.generate_pptx"),
+            forbidden_actions=(
+                "do not claim a presentation file exists until presentation.generate_pptx returns an artifact",
+                "do not add new ModelCapability values for presentation generation",
+            ),
+            skills=("design",),
+            output_schema=dispatch_schema,
+            modes=frozenset({"dispatch", "hybrid"}),
+            profiles=general_dispatch,
+        ),
+        RoleDefinition(
             id="multimedia_generator",
             role="Multimedia Generator",
             purpose="execute",
@@ -236,6 +284,22 @@ def _normalize_identifiers(name: str, values: Iterable[str]) -> tuple[str, ...]:
     if len(normalized) != len(set(normalized)):
         raise ValueError(f"{name} must be unique")
     return normalized
+
+
+def _normalize_tool_names(name: str, values: Iterable[str]) -> tuple[str, ...]:
+    normalized = tuple(values)
+    if not normalized:
+        raise ValueError(f"{name} must not be empty")
+    for value in normalized:
+        if type(value) is not str or not _is_safe_tool_name(value):
+            raise ValueError(f"{name} must contain safe tool names")
+    if len(normalized) != len(set(normalized)):
+        raise ValueError(f"{name} must be unique")
+    return normalized
+
+
+def _is_safe_tool_name(value: str) -> bool:
+    return _SAFE_IDENTIFIER.fullmatch(value) is not None or value in _DOTTED_BUILT_IN_TOOL_NAMES
 
 
 __all__ = ["RoleCatalog", "RoleDefinition", "default_role_catalog"]

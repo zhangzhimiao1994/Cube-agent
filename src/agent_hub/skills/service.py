@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from uuid import uuid4
 
 from agent_hub.skills.manifest import SkillManifest
 from agent_hub.skills.scanner import SkillScanner, SkillScanReport
@@ -67,13 +66,16 @@ class InMemorySkillService:
     async def upload(self, archive_bytes: bytes) -> SkillRecord:
         content_sha256 = hashlib.sha256(archive_bytes).hexdigest()
         record = SkillRecord(
-            id=f"skill_{uuid4().hex}",
+            id=f"skill_{content_sha256[:24]}",
             package_version_id=f"pkg_{content_sha256}",
             content_sha256=content_sha256,
             package_size=len(archive_bytes),
             status=SkillStatus.QUARANTINED,
         )
         async with self._lock:
+            existing = self._record_by_content_sha256(content_sha256)
+            if existing is not None:
+                return existing
             self._records[record.id] = record
             self._archives[record.id] = bytes(archive_bytes)
         return record
@@ -166,6 +168,12 @@ class InMemorySkillService:
             return self._records[skill_id]
         except KeyError as exc:
             raise SkillNotFound(skill_id) from exc
+
+    def _record_by_content_sha256(self, content_sha256: str) -> SkillRecord | None:
+        for record in self._records.values():
+            if record.content_sha256 == content_sha256:
+                return record
+        return None
 
 
 def _assert_current_content(record: SkillRecord, archive_bytes: bytes) -> None:

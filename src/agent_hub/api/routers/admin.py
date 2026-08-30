@@ -2215,6 +2215,26 @@ def _skill_response_from_scanned_archive(
     )
 
 
+def _skill_id_from_scanned_archive(scanned: _ScannedSkillArchive) -> str:
+    if scanned.scan_report is not None:
+        manifest = scanned.scan_report.inspection.manifest
+        return _stable_skill_id("package", manifest.name, manifest.version)
+    name = scanned.instruction_name or _skill_name_slug(PurePosixPath(scanned.filename).stem)
+    return _stable_skill_id("instruction", name, "instruction-only")
+
+
+def _manual_skill_upload_id(filename: str) -> str:
+    name = _skill_name_slug(PurePosixPath(filename).stem)
+    return _stable_skill_id("manual", name, "metadata-only")
+
+
+def _stable_skill_id(kind: str, name: str, version: str) -> str:
+    slug = _skill_name_slug(name)[:64]
+    version_slug = _skill_name_slug(version)
+    digest = hashlib.sha256(f"{kind}:{slug}:{version_slug}".encode()).hexdigest()[:16]
+    return f"skill_{slug}_{digest}"
+
+
 def _skipped_skill_responses(
     skipped: tuple[_SkippedSkillArchive, ...],
 ) -> list[SkillArchiveSkippedResponse]:
@@ -2968,10 +2988,10 @@ class InMemoryAdminResourceService:
         return tuple(self.skills.values())
 
     async def upload_skill(self, request: SkillUploadRequest) -> SkillResponse:
-        skill_id = request.filename.rsplit(".", 1)[0].lower().replace("_", "-")
+        skill_id = _manual_skill_upload_id(request.filename)
         response = SkillResponse(
             id=skill_id,
-            name=skill_id,
+            name=_skill_name_slug(PurePosixPath(request.filename).stem),
             status="quarantined",
             scan_diff=["added SKILL.md", "no dangerous operations detected"],
             requested_permissions=["filesystem:read"],
@@ -2998,15 +3018,27 @@ class InMemoryAdminResourceService:
             )
             raise
         items: list[SkillResponse] = []
+        seen_skill_ids: set[str] = set()
+        skipped = list(skipped_archives)
         for scanned in scanned_archives:
-            response = _skill_response_from_scanned_archive(scanned, f"skill_{uuid4().hex}")
+            skill_id = _skill_id_from_scanned_archive(scanned)
+            if skill_id in seen_skill_ids:
+                skipped.append(
+                    _SkippedSkillArchive(
+                        path=scanned.filename,
+                        reason="duplicate skill identity skipped",
+                    )
+                )
+                continue
+            seen_skill_ids.add(skill_id)
+            response = _skill_response_from_scanned_archive(scanned, skill_id)
             self.skills[response.id] = response
             items.append(response)
         return SkillArchiveUploadResponse(
             filename=filename,
             bundle=bundle,
             items=items,
-            skipped=_skipped_skill_responses(skipped_archives),
+            skipped=_skipped_skill_responses(tuple(skipped)),
         )
 
     async def approve_skill(self, skill_id: str) -> SkillResponse:
@@ -4554,10 +4586,10 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         return tuple(SkillResponse.model_validate(payload) for payload in resources)
 
     async def upload_skill(self, request: SkillUploadRequest) -> SkillResponse:
-        skill_id = f"skill_{uuid4().hex}"
+        skill_id = _manual_skill_upload_id(request.filename)
         response = SkillResponse(
             id=skill_id,
-            name=request.filename,
+            name=_skill_name_slug(PurePosixPath(request.filename).stem),
             status="quarantined",
             scan_diff=["metadata recorded; package scan requires ZIP upload endpoint"],
             requested_permissions=["filesystem:read"],
@@ -4599,9 +4631,20 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 details={"reason": reason},
             ) from None
         items: list[SkillResponse] = []
+        seen_skill_ids: set[str] = set()
+        skipped = list(skipped_archives)
         try:
             for scanned in scanned_archives:
-                skill_id = f"skill_{uuid4().hex}"
+                skill_id = _skill_id_from_scanned_archive(scanned)
+                if skill_id in seen_skill_ids:
+                    skipped.append(
+                        _SkippedSkillArchive(
+                            path=scanned.filename,
+                            reason="duplicate skill identity skipped",
+                        )
+                    )
+                    continue
+                seen_skill_ids.add(skill_id)
                 archive_path = self._skill_archive_path(skill_id)
                 archive_path.parent.mkdir(parents=True, exist_ok=True)
                 archive_path.write_bytes(scanned.archive_bytes)
@@ -4628,7 +4671,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             filename=filename,
             bundle=bundle,
             items=items,
-            skipped=_skipped_skill_responses(skipped_archives),
+            skipped=_skipped_skill_responses(tuple(skipped)),
         )
 
     async def approve_skill(self, skill_id: str) -> SkillResponse:
