@@ -443,6 +443,27 @@ def _artifact_text_preview(artifact: Artifact, *, max_bytes: int = 2_000) -> str
     return _truncate_prompt_text(stripped, max_bytes=max_bytes)
 
 
+def _final_attachment_summary(results: list[dict[str, object]]) -> str | None:
+    for item in reversed(results):
+        result = item.get("result")
+        if not isinstance(result, Mapping) or result.get("presentation") != "final_attachment":
+            continue
+        file_metadata = result.get("file")
+        if not isinstance(file_metadata, Mapping):
+            file_metadata = result.get("metadata")
+        if not isinstance(file_metadata, Mapping):
+            continue
+        filename = file_metadata.get("filename")
+        mime_type = file_metadata.get("mime_type")
+        if type(filename) is not str or type(mime_type) is not str:
+            continue
+        summary = result.get("summary")
+        if type(summary) is str and summary.strip():
+            return summary.strip()
+        return f"Generated downloadable artifact {filename} ({mime_type})."
+    return None
+
+
 class RuntimeExecutionError(RuntimeError):
     """Stable dispatch failure that never includes model, tool, or plan input."""
 
@@ -2422,6 +2443,16 @@ class CrewDispatchRuntime:
                 await tool_boundary(idempotency_key, succeeded, artifact)
                 evidence.append(artifact)
                 results.append({"name": tool_call.name, "result": result})
+            final_attachment_summary = _final_attachment_summary(results)
+            if final_attachment_summary is not None:
+                return GatewayCompletion(
+                    response=ModelResponse(text=final_attachment_summary),
+                    deployment_id=completion.deployment_id,
+                    logical_model=completion.logical_model,
+                    provider_id=completion.provider_id,
+                    provider_model=completion.provider_model,
+                    cost_usd=None,
+                )
             messages.append(
                 ModelMessage(
                     role="user",

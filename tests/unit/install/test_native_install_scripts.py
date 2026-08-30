@@ -137,6 +137,7 @@ def test_install_verification_uses_public_url_for_docker_mode() -> None:
 
 def test_native_installer_creates_runtime_dirs_and_migrates_before_services() -> None:
     script = read("scripts/lib/install_native.sh")
+    tmpfiles_config = read("deploy/native/agent-hub.tmpfiles")
 
     tmpfiles = script.index("systemd-tmpfiles --create")
     database = script.index("configure_native_database")
@@ -146,6 +147,7 @@ def test_native_installer_creates_runtime_dirs_and_migrates_before_services() ->
     assert tmpfiles < start
     assert database < migrations
     assert migrations < start
+    assert "d /var/lib/agent-hub/generated-artifacts 0750 agent-hub agent-hub -" in tmpfiles_config
 
 
 def test_native_installer_fails_fast_when_core_services_do_not_become_active() -> None:

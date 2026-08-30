@@ -63,12 +63,63 @@ class BadProjectZipGateway:
         )
 
 
+class RepeatingProjectZipGateway(BadProjectZipGateway):
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        return GatewayCompletion(
+            response=ModelResponse(
+                text=None,
+                tool_calls=(
+                    ToolCall(
+                        id=f"provider-call-{len(self.requests)}",
+                        name="project_generate_zip",
+                        arguments={
+                            "title": "Hello World",
+                            "filename": "hello-world.zip",
+                            "presentation": "final_attachment",
+                            "files": {"main.py": "print('hello world')\n"},
+                        },
+                    ),
+                ),
+                usage=TokenUsage(1, 1, 2),
+            ),
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/chat",
+            cost_usd=Decimal(0),
+        )
+
+
 class FailingProjectZipCapabilities:
     async def execute(  # type: ignore[no-untyped-def]
         self, *, tenant_id, run_id, actor, name, arguments, idempotency_key
     ):
         del tenant_id, run_id, actor, name, arguments, idempotency_key
         raise RuntimeError("file contents must be strings")
+
+    def is_replay_safe(self, name: str) -> bool:
+        return name == "project.generate_zip"
+
+
+class SuccessfulProjectZipCapabilities:
+    async def execute(  # type: ignore[no-untyped-def]
+        self, *, tenant_id, run_id, actor, name, arguments, idempotency_key
+    ):
+        del tenant_id, run_id, actor, name, arguments, idempotency_key
+        return {
+            "artifact_id": "00000000-0000-4000-8000-000000000123",
+            "file": {
+                "artifact_id": "00000000-0000-4000-8000-000000000123",
+                "filename": "hello-world.zip",
+                "mime_type": "application/zip",
+                "size_bytes": 128,
+                "sha256": "a" * 64,
+                "storage_key": "tenant/run/artifact/hello-world.zip",
+            },
+            "summary": "Generated project ZIP artifact hello-world.zip.",
+            "presentation": "final_attachment",
+        }
 
     def is_replay_safe(self, name: str) -> bool:
         return name == "project.generate_zip"
@@ -184,3 +235,22 @@ async def test_capability_failure_event_keeps_safe_tool_error_summary() -> None:
     assert failed.payload["error_summary"] == reason
     assert failed.payload["error_stage"] == "capability"
     assert failed.payload["error_code"] == "capability.execution_failed"
+
+
+async def test_final_attachment_tool_result_completes_without_extra_tool_rounds() -> None:
+    gateway = RepeatingProjectZipGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _one_step_plan(tools=("project.generate_zip",)),
+        capability_gateway=SuccessfulProjectZipCapabilities(),
+        crew_factory=FastFactory(),
+    )
+
+    events = [event async for event in runtime.run(_context())]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert [event.kind for event in events if str(event.kind).startswith("tool.")] == [
+        EventKind.TOOL_STARTED,
+        EventKind.TOOL_COMPLETED,
+    ]
+    assert len(gateway.requests) == 1
