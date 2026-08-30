@@ -1461,6 +1461,26 @@ def test_admin_run_event_projects_safe_timeline_summary_without_raw_payload_text
     assert "private output" not in serialized
 
 
+def test_admin_run_event_preserves_repository_created_at() -> None:
+    created_at = datetime(2026, 8, 7, 0, 0, 3, tzinfo=UTC)
+
+    event = _admin_run_event(
+        {
+            "sequence": 1,
+            "kind": "tool.completed",
+            "message": "tool.completed",
+            "summary": "terminal check completed",
+            "created_at": created_at,
+            "actor": "engineer",
+            "tool_name": "run_safe_command",
+            "payload": {"status": "completed", "operation_kind": "terminal"},
+        }
+    )
+
+    assert event.created_at == created_at
+    assert event.summary == "terminal check completed"
+
+
 @pytest.mark.parametrize(
     ("mode", "reason"),
     [

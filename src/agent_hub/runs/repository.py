@@ -669,7 +669,12 @@ class RunRepository:
                     .order_by(RunEventRow.sequence)
                 )
             ).all()
-            return tuple(_public_event_payload(dict(row.payload)) for row in rows)
+            events: list[dict[str, object]] = []
+            for row in rows:
+                payload = _public_event_payload(dict(row.payload))
+                payload["created_at"] = row.created_at
+                events.append(payload)
+            return tuple(events)
 
     async def completed_step_ids(self, tenant_id: UUID, run_id: UUID) -> tuple[str, ...]:
         async with self._session_factory() as session:

@@ -674,6 +674,15 @@ type AgentDispatchCard = {
   status: "异常" | "已完成" | "工作中" | "已安排";
 };
 
+type TaskChainStep = {
+  id: string;
+  agentId: string;
+  agentName: string;
+  status: "等待确认" | "异常" | "已完成" | "进行中" | "已安排" | "等待上游";
+  summary: string;
+  dependsOn: string[];
+};
+
 type RunProcessPosture = {
   status: "等待确认" | "执行异常" | "任务已结束" | "运行中" | "已排队";
   metrics: Array<{ label: string; value: number }>;
@@ -774,6 +783,66 @@ function dispatchAgentCards(detail: RunDetail, agentNames: Map<string, string>):
       };
     })
     .filter((card): card is AgentDispatchCard => card !== null);
+}
+
+function plannedTaskChain(detail: RunDetail, agentNames: Map<string, string>): TaskChainStep[] {
+  const plan = mainAgentPlanEvent(detail);
+  if (!plan) return [];
+  const roles = Array.isArray(plan.payload.roles) ? plan.payload.roles.filter(isObjectRecord) : [];
+  const steps = Array.isArray(plan.payload.steps) ? plan.payload.steps.filter(isObjectRecord) : [];
+  const roleNames = new Map<string, string>();
+  roles.forEach((role) => {
+    const id = stringValue(role.id);
+    const label = stringValue(role.role) || stringValue(role.name);
+    if (id && label) roleNames.set(id, label);
+  });
+  const completedSteps = new Set(
+    detail.events.filter((event) => event.kind === "step.completed" && event.step_id).map((event) => event.step_id as string),
+  );
+  const approvalState = approvalStateFromEvents(detail.events);
+
+  return steps.flatMap((step) => {
+    const stepId = stringValue(step.id);
+    const agentId = stringValue(step.agent);
+    if (!stepId || !agentId) return [];
+    const dependsOn = stringArrayValue(step.depends_on);
+    const stepEvents = detail.events
+      .filter((event) => event.step_id === stepId)
+      .sort((left, right) => left.sequence - right.sequence);
+    const pendingApproval = approvalState.pending.some((event) => event.step_id === stepId);
+    const hasFailure = stepEvents.some((event) => event.kind.endsWith(".failed") || event.kind === "runtime.failed");
+    const hasCompletion = stepEvents.some((event) => event.kind === "step.completed");
+    const hasStarted = stepEvents.some((event) =>
+      ["step.started", "model.started", "model.reasoning_delta", "model.text_delta", "tool.requested", "tool.started", "tool.completed"].includes(event.kind),
+    );
+    const dependenciesComplete = dependsOn.every((dependency) => completedSteps.has(dependency));
+    const status = pendingApproval
+      ? "等待确认"
+      : hasFailure
+        ? "异常"
+        : hasCompletion
+          ? "已完成"
+          : hasStarted
+            ? "进行中"
+            : dependenciesComplete
+              ? "已安排"
+              : "等待上游";
+    const latestProgressEvent = [...stepEvents]
+      .reverse()
+      .find((event) => !event.kind.startsWith("approval.") && !isWrappedToolFailureEvent(event, detail.events));
+    const fallbackSummary = stringValue(step.task) || stringValue(step.summary) || stringValue(step.description) || "等待执行";
+    const summary = latestProgressEvent ? eventSummaryText(latestProgressEvent, agentNames) : fallbackSummary;
+    return [
+      {
+        id: stepId,
+        agentId,
+        agentName: roleNames.get(agentId) ?? agentNames.get(agentId) ?? humanizeEventIdentifier(agentId),
+        status,
+        summary,
+        dependsOn,
+      },
+    ];
+  });
 }
 
 function uniqueToolCallCount(events: RunDetail["events"]) {
@@ -2137,12 +2206,14 @@ function RunProcessSummary({
 }) {
   const items = runProcessItems(detail, agentNames, mainAgentModelName);
   const dispatchCards = dispatchAgentCards(detail, agentNames);
+  const taskChain = plannedTaskChain(detail, agentNames);
   const failureDiagnostics = failureDiagnosticsForRun(detail, agentNames);
   const executionIntents = executionIntentsForRun(detail, agentNames);
   const posture = runProcessPosture(detail, items.length, dispatchCards.length);
   const shouldShowSummary =
     items.length > 0 ||
     dispatchCards.length > 0 ||
+    taskChain.length > 0 ||
     failureDiagnostics.length > 0 ||
     executionIntents.length > 0 ||
     ["queued", "running", "waiting_approval", "failed"].includes(detail.status);
@@ -2170,6 +2241,30 @@ function RunProcessSummary({
           ))}
         </ul>
       </div>
+      {taskChain.length > 0 ? (
+        <section className="run-task-chain" aria-label="任务链路">
+          <div className="run-task-chain-header">
+            <span aria-hidden="true">⌁</span>
+            <strong>任务链路</strong>
+            <small>{taskChain.length} 个步骤</small>
+          </div>
+          <div className="run-task-chain-list">
+            {taskChain.map((step, index) => (
+              <article key={`${step.id}-${step.agentId}-${index}`} className={`run-task-chain-step step-${step.status}`}>
+                <small>
+                  {index + 1}. {step.id}
+                </small>
+                <div>
+                  <strong>{step.agentName}</strong>
+                  <span>{step.status}</span>
+                </div>
+                <p>{step.summary || "等待执行"}</p>
+                {step.dependsOn.length > 0 ? <em>依赖 {step.dependsOn.join("、")}</em> : null}
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
       {failureDiagnostics.length > 0 ? (
         <section className="run-failure-diagnostics" aria-label="故障诊断">
           <div className="run-failure-diagnostics-header">

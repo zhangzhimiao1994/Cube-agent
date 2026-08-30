@@ -1135,6 +1135,66 @@ describe("operational management pages", () => {
     expect(screen.getByText(/来源：step\.failed #4/)).not.toBeNull();
     expect(screen.queryByText("null")).toBeNull();
   });
+
+  it("shows safe timestamped run detail timeline summaries", async () => {
+    visibleRunDetail = {
+      ...runDetail,
+      events: [
+        {
+          sequence: 1,
+          kind: "model.text_delta",
+          message: "partial answer with private context",
+          summary: "model output progress",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: null,
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: {
+            delta_kind: "text",
+            text_bytes: 64,
+            text: "private context",
+          },
+        },
+        {
+          sequence: 2,
+          kind: "tool.completed",
+          message: "cat private-token.txt printed private output",
+          summary: "terminal check completed",
+          created_at: "2026-08-07T00:00:03Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: "run_safe_command",
+          tool_call_id: "call_terminal",
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: {
+            status: "completed",
+            operation_kind: "terminal",
+            stdout: "private output",
+          },
+        },
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    expect(await screen.findByRole("heading", { name: "事件日志" })).not.toBeNull();
+    expect(screen.getByText("#1")).not.toBeNull();
+    expect(screen.getByText("2026-08-07T00:00:01Z")).not.toBeNull();
+    expect(screen.getByText("model.text_delta")).not.toBeNull();
+    expect(screen.getByText("model output progress")).not.toBeNull();
+    expect(screen.getByText("#2")).not.toBeNull();
+    expect(screen.getByText("terminal check completed")).not.toBeNull();
+    expect(screen.queryByText(/partial answer with private context/)).toBeNull();
+    expect(screen.queryByText(/private-token/)).toBeNull();
+    expect(screen.queryByText(/private output/)).toBeNull();
+  });
+
   it("stops the current running chat from the conversation composer", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
@@ -2649,6 +2709,172 @@ describe("operational management pages", () => {
     expect(drawer.textContent).toContain("safe review summary");
     expect(drawer.textContent).not.toContain("private-token");
     expect(drawer.textContent).not.toContain("private output");
+  });
+
+  it("shows planned task chain status from safe run events", async () => {
+    const user = userEvent.setup();
+    const taskChainRunDetail = {
+      ...runDetail,
+      status: "waiting_approval",
+      mode: "hybrid",
+      events: [
+        {
+          sequence: 1,
+          kind: "step.started",
+          message: "step.started",
+          created_at: conversationCreatedAt,
+          actor: "main_agent",
+          participants: [],
+          tool_name: null,
+          step_id: "main_agent_plan",
+          action: null,
+          decision: null,
+          payload: {
+            roles: [
+              { id: "engineer", role: "工程师", purpose: "execute", logical_model: "deepseek-chat", tools: ["run_safe_command"] },
+              { id: "reviewer", role: "审查员", purpose: "review", logical_model: "qwen-max", tools: [] },
+              { id: "final_synthesizer", role: "汇总", purpose: "synthesize", logical_model: "main", tools: [] },
+            ],
+            steps: [
+              { id: "engineer_step", agent: "engineer", depends_on: [], final_synthesizer: false, tools: ["run_safe_command"] },
+              { id: "review_step", agent: "reviewer", depends_on: ["engineer_step"], final_synthesizer: false, tools: [] },
+              { id: "final_step", agent: "final_synthesizer", depends_on: ["review_step"], final_synthesizer: true, tools: [] },
+            ],
+          },
+        },
+        {
+          sequence: 2,
+          kind: "step.started",
+          summary: "engineer started terminal check",
+          message: "step.started",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: null,
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: {
+            task: "运行自测，不要显示 cat private-token.txt",
+          },
+        },
+        {
+          sequence: 3,
+          kind: "tool.completed",
+          summary: "engineer completed compile check",
+          message: "tool.completed",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: "run_safe_command",
+          tool_call_id: "call_compile",
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: {
+            status: "completed",
+            operation_kind: "terminal",
+            command: "cat private-token.txt",
+            stdout: "private output",
+          },
+        },
+        {
+          sequence: 4,
+          kind: "step.completed",
+          summary: "engineer finished implementation pass",
+          message: "step.completed",
+          created_at: "2026-08-07T00:00:03Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: null,
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: {
+            summary: "implementation pass complete",
+          },
+        },
+        {
+          sequence: 5,
+          kind: "step.started",
+          summary: "reviewer started acceptance review",
+          message: "step.started",
+          created_at: "2026-08-07T00:00:04Z",
+          actor: "reviewer",
+          participants: [],
+          tool_name: null,
+          step_id: "review_step",
+          action: null,
+          decision: null,
+          payload: {
+            task: "验收实现结果",
+          },
+        },
+        {
+          sequence: 6,
+          kind: "tool.failed",
+          summary: "reviewer found failing browser probe",
+          message: "tool.failed",
+          created_at: "2026-08-07T00:00:05Z",
+          actor: "reviewer",
+          participants: [],
+          tool_name: "browser_probe",
+          tool_call_id: "call_probe",
+          step_id: "review_step",
+          action: null,
+          decision: null,
+          payload: {
+            status: "failed",
+            operation_kind: "browser",
+            failure_kind: "selector_missing",
+            output: "private output",
+          },
+        },
+        {
+          sequence: 7,
+          kind: "approval.requested",
+          summary: "approval requested: rerun_browser_probe",
+          message: "approval.requested",
+          created_at: "2026-08-07T00:00:06Z",
+          actor: "main_agent",
+          participants: [],
+          tool_name: null,
+          approval_id: "approval_probe",
+          step_id: "review_step",
+          action: "rerun_browser_probe",
+          decision: null,
+          payload: {
+            requires_approval: true,
+            task: "rerun probe with private-token",
+          },
+        },
+      ],
+      artifacts: [],
+    };
+    visibleRunDetail = taskChainRunDetail;
+    visibleConversationRuns = [taskChainRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const chain = within(stream).getByRole("region", { name: "任务链路" });
+
+    expect(within(chain).getByText("任务链路")).not.toBeNull();
+    expect(within(chain).getByText("3 个步骤")).not.toBeNull();
+    expect(within(chain).getByText("工程师")).not.toBeNull();
+    expect(within(chain).getByText("已完成")).not.toBeNull();
+    expect(within(chain).getByText("engineer finished implementation pass")).not.toBeNull();
+    expect(within(chain).getByText("审查员")).not.toBeNull();
+    expect(within(chain).getByText("等待确认")).not.toBeNull();
+    expect(within(chain).getByText("依赖 engineer_step")).not.toBeNull();
+    expect(within(chain).getByText("reviewer found failing browser probe")).not.toBeNull();
+    expect(within(chain).getByText("汇总")).not.toBeNull();
+    expect(within(chain).getByText("等待上游")).not.toBeNull();
+    expect(within(chain).getByText("依赖 review_step")).not.toBeNull();
+    expect(chain.textContent).not.toContain("private-token");
+    expect(chain.textContent).not.toContain("private output");
   });
 
   it("summarizes Vibe engineer run posture from real process events", async () => {

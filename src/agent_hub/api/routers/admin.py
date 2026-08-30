@@ -6575,12 +6575,19 @@ def _admin_run_event(event: dict[str, object]) -> RunEventResponse:
     decision = _optional_event_string(event.get("decision"))
     safe_payload = _tool_event_payload(payload) if kind_text.startswith("tool.") else _event_payload(payload)
     safe_artifact = _admin_run_artifact(artifact) if isinstance(artifact, dict) else None
+    summary = _event_source_summary(event.get("summary")) or _event_summary(
+        kind_text,
+        actor=actor,
+        action=action,
+        decision=decision,
+        payload=safe_payload,
+    )
     return RunEventResponse(
         sequence=sequence if type(sequence) is int else 1,
         kind=kind_text,
         message=_event_message(kind_text, message),
-        created_at=datetime.now(UTC),
-        summary=_event_summary(kind_text, actor=actor, action=action, decision=decision, payload=safe_payload),
+        created_at=_event_created_at(event.get("created_at")),
+        summary=summary,
         actor=actor,
         participants=_event_string_list(event.get("participants")),
         tool_call_id=_optional_event_string(event.get("tool_call_id")),
@@ -6592,6 +6599,27 @@ def _admin_run_event(event: dict[str, object]) -> RunEventResponse:
         payload=safe_payload,
         artifact=safe_artifact,
     )
+
+
+def _event_created_at(value: object) -> datetime:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    if type(value) is str:
+        normalized = value.strip()
+        if normalized:
+            try:
+                parsed = datetime.fromisoformat(normalized)
+            except ValueError:
+                return datetime.now(UTC)
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    return datetime.now(UTC)
+
+
+def _event_source_summary(value: object) -> str | None:
+    if type(value) is not str:
+        return None
+    summary = _safe_model_check_detail(value)
+    return summary or None
 
 
 def _event_message(kind: str, value: object) -> str:

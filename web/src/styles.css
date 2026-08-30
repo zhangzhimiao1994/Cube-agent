@@ -1542,6 +1542,111 @@ article:hover {
   white-space: nowrap;
 }
 
+.run-task-chain {
+  border: 1px solid rgba(123, 225, 255, 0.14);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.44rem;
+  padding: 0.52rem;
+}
+
+.run-task-chain-header {
+  align-items: center;
+  color: var(--muted);
+  display: flex;
+  gap: 0.48rem;
+  min-width: 0;
+}
+
+.run-task-chain-header span {
+  color: var(--accent);
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-weight: 950;
+}
+
+.run-task-chain-header strong {
+  color: var(--text);
+  font-weight: 900;
+}
+
+.run-task-chain-header small {
+  color: var(--muted);
+  font-weight: 800;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-task-chain-list {
+  display: grid;
+  gap: 0.36rem;
+  grid-template-columns: repeat(auto-fit, minmax(12.5rem, 1fr));
+}
+
+.run-task-chain-step {
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(123, 225, 255, 0.1);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.22rem;
+  min-width: 0;
+  padding: 0.5rem 0.56rem;
+}
+
+.run-task-chain-step > div {
+  align-items: center;
+  display: flex;
+  gap: 0.45rem;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.run-task-chain-step small,
+.run-task-chain-step p,
+.run-task-chain-step em {
+  color: var(--muted);
+  font-style: normal;
+  font-weight: 800;
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-task-chain-step strong {
+  color: var(--text);
+  font-weight: 900;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-task-chain-step span {
+  color: var(--accent);
+  flex: 0 0 auto;
+  font-size: 0.76rem;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.run-task-chain-step.step-等待确认 {
+  border-color: rgba(255, 206, 86, 0.28);
+}
+
+.run-task-chain-step.step-异常 {
+  border-color: rgba(255, 101, 118, 0.28);
+}
+
+.run-task-chain-step.step-已完成 {
+  border-color: rgba(125, 255, 189, 0.22);
+}
+
+.run-task-chain-step.step-等待上游 {
+  border-color: rgba(178, 194, 216, 0.18);
+}
+
 .run-failure-diagnostics {
   border: 1px solid rgba(255, 101, 118, 0.18);
   border-radius: 8px;
@@ -2678,6 +2783,54 @@ article:hover {
   display: grid;
   gap: 1rem;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.event-log-list {
+  display: grid;
+  gap: 0.46rem;
+  list-style: none;
+  margin: 0.75rem 0 0;
+  padding: 0;
+}
+
+.event-log-list li {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(123, 225, 255, 0.12);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.35rem;
+  grid-template-columns: auto auto minmax(8rem, 0.45fr) minmax(0, 1fr);
+  min-width: 0;
+  padding: 0.54rem 0.62rem;
+}
+
+.event-log-list time,
+.event-log-list strong,
+.event-log-list span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.event-log-sequence,
+.event-log-list time {
+  color: var(--muted);
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.76rem;
+  font-weight: 850;
+}
+
+.event-log-list strong {
+  color: var(--accent);
+  font-size: 0.8rem;
+  font-weight: 900;
+}
+
+.event-log-list li > span:last-child {
+  color: var(--text);
+  font-weight: 800;
 }
 
 .channel-runtime-status {

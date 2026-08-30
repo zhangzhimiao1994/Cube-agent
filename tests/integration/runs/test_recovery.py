@@ -1334,6 +1334,44 @@ async def test_public_events_sanitize_sensitive_persisted_payload_keys(
     assert "sk-should-not-leak" not in serialized
 
 
+async def test_public_events_include_persisted_row_created_at(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    repository = RunRepository(run_session_factory)
+    submitted = await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=uuid4(),
+        request="inspect event timing",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.RUNNING,
+        idempotency_key="client-request-event-time",
+        enqueue=False,
+    )
+    created_at = datetime(2026, 8, 7, 0, 0, 3, tzinfo=UTC)
+    async with run_session_factory() as session, session.begin():
+        session.add(
+            RunEventRow(
+                id=uuid4(),
+                tenant_id=tenant_id,
+                run_id=submitted.id,
+                sequence=1,
+                kind="tool.completed",
+                created_at=created_at,
+                payload={
+                    "kind": "tool.completed",
+                    "sequence": 1,
+                    "run_id": str(submitted.id),
+                    "payload": {"status": "completed", "operation_kind": "terminal"},
+                },
+            )
+        )
+
+    events = await repository.events(tenant_id, submitted.id)
+
+    assert events[0]["created_at"] == created_at
+
+
 async def test_delete_run_removes_terminal_run_and_persisted_children(
     run_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

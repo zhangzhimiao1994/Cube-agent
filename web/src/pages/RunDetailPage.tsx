@@ -98,6 +98,27 @@ function observerSeverityLabel(severity: string) {
   return OBSERVER_SEVERITY_LABELS[severity] ?? severity;
 }
 
+function runEventTimestamp(value: string) {
+  if (!value.trim()) return "unknown time";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toISOString().replace(".000Z", "Z");
+}
+
+function isGenericEventMessage(event: RunEvent) {
+  return event.message === event.kind || /^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(event.message);
+}
+
+function safeDetailEventSummary(event: RunEvent) {
+  if (event.summary?.trim()) return event.summary.trim();
+  if (event.kind === "model.reasoning_delta") return "模型正在分析";
+  if (event.kind === "model.text_delta") return "模型正在生成";
+  if (event.kind.startsWith("tool.")) return `${event.tool_name ?? "工具"} ${event.kind.replace("tool.", "")}`;
+  if (event.kind.startsWith("approval.")) return event.action ?? event.decision ?? "等待确认";
+  if (isGenericEventMessage(event)) return "事件已记录";
+  return event.message;
+}
+
 export function RunDetailPage() {
   const { runId = "" } = useParams();
   const queryClient = useQueryClient();
@@ -246,10 +267,13 @@ export function RunDetailPage() {
         {run.data.events.length === 0 ? (
           <p>暂无事件。</p>
         ) : (
-          <ol>
+          <ol className="event-log-list">
             {run.data.events.map((event) => (
               <li key={event.sequence}>
-                <strong>{event.kind}</strong>：{event.message}
+                <span className="event-log-sequence">#{event.sequence}</span>
+                <time dateTime={event.created_at}>{runEventTimestamp(event.created_at)}</time>
+                <strong>{event.kind}</strong>
+                <span>{safeDetailEventSummary(event)}</span>
               </li>
             ))}
           </ol>
