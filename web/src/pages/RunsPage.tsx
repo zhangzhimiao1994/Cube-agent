@@ -653,6 +653,21 @@ const SUMMARY_BACKED_RAW_PAYLOAD_KEYS = new Set([
   "traceback",
 ]);
 
+const DISCUSSION_MINUTES_PAYLOAD_KEYS = new Set([
+  "conclusion",
+  "result",
+  "discussion",
+  "opinions",
+  "summary",
+  "disagreement",
+  "conflict",
+  "risks",
+  "concerns",
+  "main_agent_judgement",
+  "main_agent_judgment",
+  "final_decision",
+]);
+
 function isIntentEventWithRestrictedPayload(event: RunDetail["events"][number]) {
   return event.kind === "step.retrying" || event.kind.startsWith("approval.") || isRepairIntentEvent(event);
 }
@@ -732,6 +747,7 @@ function eventDetailRows(event: RunDetail["events"][number], agentNames: Map<str
   if (readableMessage) rows.push({ label: "事件内容", value: readableMessage });
   orderedEventPayloadEntries(event.payload).forEach(([key, value]) => {
     if (key === "participants" || key === "participant_models") return;
+    if (event.kind === "discussion.completed" && (DISCUSSION_MINUTES_PAYLOAD_KEYS.has(key) || key.endsWith("_opinion"))) return;
     if (safeSummary && key === "summary") {
       const formatted = formatEventPayloadValue(value);
       if (formatted && formatted !== safeSummary) rows.push({ label: eventPayloadLabel(key), value: formatted });
@@ -920,7 +936,7 @@ function plannedTaskChain(detail: RunDetail, agentNames: Map<string, string>): T
       .reverse()
       .find((event) => !event.kind.startsWith("approval.") && !isWrappedToolFailureEvent(event, detail.events));
     const fallbackSummary = stringValue(step.task) || stringValue(step.summary) || stringValue(step.description) || "等待执行";
-    const summary = latestProgressEvent ? eventSummaryText(latestProgressEvent, agentNames) : fallbackSummary;
+    const summary = conciseProcessText(latestProgressEvent ? eventSummaryText(latestProgressEvent, agentNames) : fallbackSummary, "等待执行");
     return [
       {
         id: stepId,
@@ -1908,13 +1924,66 @@ function eventOpinionEntries(event: RunEvent, agentNames: Map<string, string>) {
     });
 }
 
+function discussionConsensusSignal(event: RunEvent) {
+  return (
+    formatEventPayloadValue(event.payload.conclusion) ||
+    formatEventPayloadValue(event.payload.result) ||
+    formatEventPayloadValue(event.payload.discussion) ||
+    formatEventPayloadValue(event.payload.opinions) ||
+    formatEventPayloadValue(event.payload.summary) ||
+    ""
+  );
+}
+
+function discussionDisagreementSignal(event: RunEvent) {
+  return (
+    formatEventPayloadValue(event.payload.disagreement) ||
+    formatEventPayloadValue(event.payload.conflict) ||
+    formatEventPayloadValue(event.payload.risks) ||
+    formatEventPayloadValue(event.payload.concerns)
+  );
+}
+
+function discussionMinutesSummary(event: RunEvent, agentNames: Map<string, string>) {
+  const consensus = discussionConsensusSignal(event);
+  const disagreement = discussionDisagreementSignal(event);
+  const judgement = eventDecisionSignal(event);
+  const participants = displayEventParticipants(event.participants, agentNames) ?? displayPayloadParticipants(event.payload, agentNames);
+  const conciseDiscussionText = (value: string, fallback: string) => conciseProcessText(value, fallback).replace(/[。.!?！？]+$/u, "");
+  const parts = [
+    consensus ? `共识 ${conciseDiscussionText(consensus, "已形成阶段共识")}` : "",
+    disagreement ? `分歧 ${conciseDiscussionText(disagreement, "存在待裁决分歧")}` : "",
+    !consensus && judgement ? `结论 ${conciseDiscussionText(judgement, "已完成裁决")}` : "",
+  ].filter(Boolean);
+  if (parts.length > 0) return `讨论纪要：${parts.join("；")}`;
+  return `讨论纪要：${participants || "多角色"}已完成讨论`;
+}
+
+function discussionMinutesRows(event: RunEvent, agentNames: Map<string, string>) {
+  const rows: Array<{ label: string; value: string }> = [];
+  const consensus = discussionConsensusSignal(event);
+  const disagreement = discussionDisagreementSignal(event);
+  const judgement = eventDecisionSignal(event);
+  const minutes = [
+    consensus ? `共识：${consensus}` : "",
+    disagreement ? `分歧：${disagreement}` : "",
+    judgement ? `结论：${judgement}` : "",
+  ].filter(Boolean);
+  if (minutes.length > 0) rows.push({ label: "会议纪要", value: minutes.join("；") });
+  eventOpinionEntries(event, agentNames).forEach((opinion) => {
+    rows.push({ label: `${opinion.actor}意见`, value: opinion.value });
+  });
+  if (judgement) rows.push({ label: "主 Agent 裁决", value: judgement });
+  return rows;
+}
+
 function eventSummaryText(
   event: RunDetail["events"][number],
   agentNames: Map<string, string>,
   artifact?: RunArtifact | NonNullable<RunEvent["artifact"]> | null,
 ) {
   const safeSummary = eventSafeSummary(event);
-  if (safeSummary) return safeSummary;
+  if (safeSummary) return conciseProcessText(safeSummary, "记录了一步过程");
   const actor = displayEventActor(event.actor, agentNames);
   const participants = displayEventParticipants(event.participants, agentNames) ?? displayPayloadParticipants(event.payload, agentNames);
   const readableMessage =
@@ -1923,13 +1992,7 @@ function eventSummaryText(
       : "";
   const instructionSignal = eventInstructionSignal(event);
   const outputSignal = eventOutputSignal(event, artifact);
-  const discussionSignal =
-    formatEventPayloadValue(event.payload.conclusion) ||
-    formatEventPayloadValue(event.payload.result) ||
-    formatEventPayloadValue(event.payload.discussion) ||
-    formatEventPayloadValue(event.payload.opinions) ||
-    formatEventPayloadValue(event.payload.summary) ||
-    readableMessage;
+  const discussionSignal = discussionConsensusSignal(event) || readableMessage;
   const decisionSignal = eventDecisionSignal(event);
   const modelSignal =
     formatEventPayloadValue(event.payload.model) ||
@@ -1987,7 +2050,7 @@ function eventSummaryText(
     return `${participants || "多角色"} 开始讨论`;
   }
   if (event.kind === "discussion.completed") {
-    return `讨论结论：${conciseProcessText(discussionSignal, "完成讨论")}`;
+    return discussionMinutesSummary(event, agentNames);
   }
   if (event.kind === "decision.started") {
     return `主 Agent 开始决策${instructionSignal ? `：${conciseProcessText(instructionSignal, "开始裁决")}` : ""}`;
@@ -2100,12 +2163,7 @@ function modelDeltaActivityLabel(event: RunEvent) {
 function modelDeltaSummaryText(events: RunEvent[]) {
   const lastEvent = events.at(-1);
   if (!lastEvent) return "模型流式进度已记录";
-  const totalBytes = events.reduce((total, event) => total + numericPayloadValue(event, "text_bytes"), 0);
-  const duration = durationBetween(events[0]?.created_at, lastEvent.created_at);
-  const parts = [`${events.length} 个分片`];
-  if (totalBytes > 0) parts.push(`${totalBytes} bytes`);
-  if (duration) parts.push(duration);
-  return `${modelDeltaActivityLabel(lastEvent)}，${parts.join("，")}`;
+  return modelDeltaActivityLabel(lastEvent);
 }
 
 function modelDeltaPhaseLabel(events: RunEvent[]) {
@@ -2235,6 +2293,7 @@ function processItemsForEvent(
 ): ProcessDetailTarget[] {
   const baseRows = [
     ...modelRowsForEvent(event, detail.events, agentNames),
+    ...(event.kind === "discussion.completed" ? discussionMinutesRows(event, agentNames) : []),
     ...eventDetailRows(event, agentNames),
     ...eventArtifactRows(artifact),
   ];
@@ -2248,35 +2307,7 @@ function processItemsForEvent(
     createdAt: event.created_at,
     artifact: isDownloadableArtifact(artifact) ? artifact : undefined,
   };
-  if (event.kind !== "discussion.completed") return [baseItem];
-
-  const opinionItems = eventOpinionEntries(event, agentNames).map((opinion, opinionIndex) => ({
-    id: `${detail.id}-event-${event.sequence}-${index}-opinion-${opinionIndex}`,
-    title: `${opinion.actor} 给出讨论意见`,
-    message: `${opinion.actor} 意见：${conciseProcessText(opinion.value, "给出意见")}`,
-    badge: "讨论意见",
-    rows: [
-      ...modelRowsForEvent(event, detail.events, agentNames),
-      { label: "发言角色", value: opinion.actor },
-      { label: opinion.label, value: opinion.value },
-    ],
-    createdAt: event.created_at,
-  }));
-
-  const judgement = eventDecisionSignal(event);
-  if (!judgement) return [baseItem, ...opinionItems];
-  return [
-    baseItem,
-    ...opinionItems,
-    {
-      id: `${detail.id}-event-${event.sequence}-${index}-decision`,
-      title: "主 Agent 完成裁决",
-      message: `主 Agent 裁决：${conciseProcessText(judgement, "完成裁决")}`,
-      badge: "裁决过程",
-      rows: baseRows,
-      createdAt: event.created_at,
-    },
-  ];
+  return [baseItem];
 }
 
 function runProcessItems(
@@ -2404,15 +2435,12 @@ function RunProcessSummary({
           <div className="run-task-chain-list">
             {taskChain.map((step, index) => (
               <article key={`${step.id}-${step.agentId}-${index}`} className={`run-task-chain-step step-${step.status}`}>
-                <small>
-                  {index + 1}. {step.id}
-                </small>
+                <small>第 {index + 1} 步</small>
                 <div>
                   <strong>{step.agentName}</strong>
                   <span>{step.status}</span>
                 </div>
                 <p>{step.summary || "等待执行"}</p>
-                {step.dependsOn.length > 0 ? <em>依赖 {step.dependsOn.join("、")}</em> : null}
               </article>
             ))}
           </div>
@@ -2487,7 +2515,6 @@ function RunProcessSummary({
                   <small>
                     {card.role} · {card.model}
                   </small>
-                  {card.tools ? <small>{card.tools}</small> : null}
                 </div>
                 <span>{card.status}</span>
               </article>
