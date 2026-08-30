@@ -114,6 +114,7 @@ const runDetail: RunDetail = {
     routing_reason: "workflow selected explicitly",
     conversation_id: "conv-previous",
   },
+  failure_diagnostics: [],
 };
 
 const settings = {
@@ -3263,6 +3264,229 @@ describe("operational management pages", () => {
     expect(within(stream).getByRole("button", { name: /reviewer 失败：model gateway failed/ })).not.toBeNull();
     const posture = within(stream).getByRole("status", { name: /任务态势，执行异常/ });
     expect(within(posture).getByText("异常 2")).not.toBeNull();
+  });
+
+  it("separates mixed failure causes into actionable diagnostics", async () => {
+    const user = userEvent.setup();
+    const diagnosticRunDetail = {
+      ...runDetail,
+      status: "failed",
+      events: [
+        {
+          sequence: 1,
+          kind: "model.started",
+          message: "model.started",
+          created_at: "2026-08-07T00:00:00Z",
+          actor: "reviewer",
+          participants: [],
+          tool_name: null,
+          step_id: "review_step",
+          action: null,
+          decision: null,
+          payload: { logical_model: "qwen-max", provider: "litellm" },
+        },
+        {
+          sequence: 2,
+          kind: "tool.failed",
+          message: "cat private-token.txt failed with private output",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: "run_safe_command",
+          tool_call_id: "call_terminal",
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: {
+            operation_kind: "terminal",
+            failure_kind: "capability_failed",
+            exit_code: 127,
+            output_bytes: 256,
+            command: "cat private-token.txt",
+            stdout: "private output",
+          },
+        },
+        {
+          sequence: 3,
+          kind: "step.failed",
+          message: "terminal command failed with private-token details",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: null,
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: {},
+        },
+        {
+          sequence: 4,
+          kind: "runtime.failed",
+          message: "model gateway failed: model transport failed (status=401)",
+          created_at: "2026-08-07T00:00:03Z",
+          actor: "reviewer",
+          participants: [],
+          tool_name: null,
+          step_id: "review_step",
+          action: null,
+          decision: null,
+          payload: { logical_model: "qwen-max", provider: "litellm" },
+        },
+        {
+          sequence: 5,
+          kind: "approval.requested",
+          message: "approval.requested",
+          created_at: "2026-08-07T00:00:04Z",
+          actor: "main_agent",
+          participants: [],
+          tool_name: null,
+          step_id: null,
+          approval_id: "approval_retry_terminal",
+          action: "retry_terminal",
+          decision: null,
+          payload: { requires_approval: true, replay_safe: false },
+        },
+      ],
+      artifacts: [],
+      failure_diagnostics: [
+        {
+          category: "tool",
+          stage: "tool.failed",
+          reason: "backend structured tool failure",
+          recommendation: "backend tool hint",
+          sequence: 2,
+          actor: "engineer",
+          step_id: "engineer_step",
+          tool_name: "run_safe_command",
+          tool_call_id: "call_terminal",
+          failure_kind: "network_timeout",
+          status_code: null,
+          logical_model: null,
+          approval_id: null,
+          action: null,
+          wrapped_by: 3,
+        },
+        {
+          category: "model",
+          stage: "runtime.failed",
+          reason: "backend structured model failure",
+          recommendation: "backend model hint",
+          sequence: 4,
+          actor: "reviewer",
+          step_id: "review_step",
+          tool_name: null,
+          tool_call_id: null,
+          failure_kind: null,
+          status_code: "401",
+          logical_model: "qwen-max",
+          approval_id: null,
+          action: null,
+          wrapped_by: null,
+        },
+        {
+          category: "approval",
+          stage: "approval.requested",
+          reason: "retry_terminal",
+          recommendation: "backend approval hint",
+          sequence: 5,
+          actor: "main_agent",
+          step_id: null,
+          tool_name: null,
+          tool_call_id: null,
+          failure_kind: null,
+          status_code: null,
+          logical_model: null,
+          approval_id: "approval_retry_terminal",
+          action: "retry_terminal",
+          wrapped_by: null,
+        },
+      ],
+    };
+    visibleRunDetail = diagnosticRunDetail;
+    visibleConversationRuns = [diagnosticRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const diagnostics = within(stream).getByRole("region", { name: "故障诊断" });
+
+    expect(within(diagnostics).getByText("工具执行失败")).not.toBeNull();
+    expect(within(diagnostics).getByText("模型链路失败")).not.toBeNull();
+    expect(within(diagnostics).getByText("等待人工确认")).not.toBeNull();
+    expect(within(diagnostics).getByText(/network_timeout/)).not.toBeNull();
+    expect(within(diagnostics).getByText(/status=401/)).not.toBeNull();
+    expect(within(diagnostics).getByText(/检查工具权限、参数和运行环境/)).not.toBeNull();
+    expect(within(diagnostics).getByText(/检查模型配置、API Key、上游状态码和限流/)).not.toBeNull();
+    expect(stream.textContent).not.toContain("private-token");
+    expect(stream.textContent).not.toContain("private output");
+  });
+
+  it("keeps later pending approval requests when fallback events reuse an approval id", async () => {
+    const user = userEvent.setup();
+    const fallbackApprovalRunDetail = {
+      ...runDetail,
+      status: "waiting_approval",
+      events: [
+        {
+          sequence: 1,
+          kind: "approval.requested",
+          message: "approval.requested",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "main_agent",
+          participants: [],
+          tool_name: null,
+          step_id: null,
+          approval_id: "approval_retry",
+          action: "retry_terminal",
+          decision: null,
+          payload: { replay_safe: false },
+        },
+        {
+          sequence: 2,
+          kind: "approval.resolved",
+          message: "approval.resolved",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "main_agent",
+          participants: [],
+          tool_name: null,
+          step_id: null,
+          approval_id: "approval_retry",
+          action: null,
+          decision: "approved",
+          payload: {},
+        },
+        {
+          sequence: 3,
+          kind: "approval.requested",
+          message: "approval.requested",
+          created_at: "2026-08-07T00:00:03Z",
+          actor: "main_agent",
+          participants: [],
+          tool_name: null,
+          step_id: null,
+          approval_id: "approval_retry",
+          action: "retry_terminal",
+          decision: null,
+          payload: { replay_safe: false },
+        },
+      ],
+      artifacts: [],
+      failure_diagnostics: [],
+    };
+    visibleRunDetail = fallbackApprovalRunDetail;
+    visibleConversationRuns = [fallbackApprovalRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const diagnostics = within(stream).getByRole("region", { name: "故障诊断" });
+
+    expect(within(diagnostics).getByText("等待人工确认")).not.toBeNull();
+    expect(within(diagnostics).getByText(/审批 approval_retry/)).not.toBeNull();
   });
 
   it("uses ordered artifacts for process rows instead of vague generated-result summaries", async () => {

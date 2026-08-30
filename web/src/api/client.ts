@@ -621,11 +621,30 @@ const RunArtifactSchema = z.object({
   text: z.string().nullable().optional(),
 });
 
+const FailureDiagnosticSchema = z.object({
+  category: z.string(),
+  stage: z.string(),
+  reason: z.string(),
+  recommendation: z.string(),
+  sequence: z.number(),
+  actor: z.string().nullable().optional(),
+  step_id: z.string().nullable().optional(),
+  tool_name: z.string().nullable().optional(),
+  tool_call_id: z.string().nullable().optional(),
+  failure_kind: z.string().nullable().optional(),
+  status_code: z.string().nullable().optional(),
+  logical_model: z.string().nullable().optional(),
+  approval_id: z.string().nullable().optional(),
+  action: z.string().nullable().optional(),
+  wrapped_by: z.number().nullable().optional(),
+});
+
 const RunDetailSchema = RunListItemSchema.extend({
   request: z.string(),
   events: z.array(RunEventSchema),
   artifacts: z.array(RunArtifactSchema),
   explicit_details: z.record(z.string(), z.string()),
+  failure_diagnostics: z.array(FailureDiagnosticSchema).default([]),
   decision_token: z.string().nullable().optional(),
   temporary_agent_proposal: TemporaryAgentProposalSchema.nullable().optional(),
   schedule_proposal: ScheduleProposalSchema.nullable().optional(),

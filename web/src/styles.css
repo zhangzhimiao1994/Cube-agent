@@ -1542,6 +1542,116 @@ article:hover {
   white-space: nowrap;
 }
 
+.run-failure-diagnostics {
+  border: 1px solid rgba(255, 101, 118, 0.18);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.42rem;
+  padding: 0.52rem;
+}
+
+.run-failure-diagnostics-header {
+  align-items: center;
+  color: var(--muted);
+  display: flex;
+  gap: 0.48rem;
+  min-width: 0;
+}
+
+.run-failure-diagnostics-header span {
+  color: var(--danger);
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-weight: 950;
+}
+
+.run-failure-diagnostics-header strong {
+  color: var(--text);
+  font-weight: 900;
+}
+
+.run-failure-diagnostics-header small {
+  color: var(--muted);
+  font-weight: 800;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-failure-diagnostic-list {
+  display: grid;
+  gap: 0.36rem;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+}
+
+.run-failure-diagnostic {
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(255, 101, 118, 0.14);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.22rem;
+  min-width: 0;
+  padding: 0.5rem 0.56rem;
+}
+
+.run-failure-diagnostic small,
+.run-failure-diagnostic span,
+.run-failure-diagnostic em,
+.run-failure-diagnostic p {
+  color: var(--muted);
+  font-style: normal;
+  font-weight: 800;
+  min-width: 0;
+}
+
+.run-failure-diagnostic small,
+.run-failure-diagnostic span,
+.run-failure-diagnostic em {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-failure-diagnostic strong {
+  color: var(--text);
+  font-weight: 900;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-failure-diagnostic p {
+  margin: 0;
+}
+
+.run-failure-diagnostic > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.run-failure-diagnostic em {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  font-size: 0.72rem;
+  line-height: 1;
+  padding: 0.22rem 0.36rem;
+}
+
+.run-failure-diagnostic.diagnostic-model {
+  border-color: rgba(255, 206, 86, 0.24);
+}
+
+.run-failure-diagnostic.diagnostic-approval {
+  border-color: rgba(85, 215, 255, 0.24);
+}
+
+.run-failure-diagnostic.diagnostic-runtime {
+  border-color: rgba(178, 194, 216, 0.18);
+}
+
 .run-execution-intents {
   border: 1px solid rgba(255, 206, 86, 0.16);
   border-radius: 8px;

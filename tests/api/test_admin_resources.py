@@ -1191,6 +1191,248 @@ def test_admin_run_event_preserves_tool_payload_approval_id_without_raw_details(
     assert "private output" not in serialized
 
 
+def test_run_detail_response_exposes_structured_failure_diagnostics_without_raw_details() -> None:
+    response = RunDetailResponse(
+        id=uuid4(),
+        status="failed",
+        mode="dispatch",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="hello",
+        events=[
+            _admin_run_event(
+                {
+                    "sequence": 1,
+                    "kind": "tool.failed",
+                    "message": "cat private-token.txt failed with private output",
+                    "created_at": datetime.now(UTC),
+                    "actor": "engineer",
+                    "tool_name": "run_safe_command",
+                    "tool_call_id": "call_terminal",
+                    "step_id": "engineer_step",
+                    "payload": {
+                        "operation_kind": "terminal",
+                        "failure_kind": "capability_failed",
+                        "exit_code": 127,
+                        "output_bytes": 256,
+                        "command": "cat private-token.txt",
+                        "stdout": "private output",
+                    },
+                },
+            ),
+            RunEventResponse(
+                sequence=2,
+                kind="step.failed",
+                message="terminal command failed",
+                created_at=datetime.now(UTC),
+                actor="engineer",
+                step_id="engineer_step",
+            ),
+            RunEventResponse(
+                sequence=3,
+                kind="runtime.failed",
+                message="model gateway failed: model transport failed (status=401)",
+                created_at=datetime.now(UTC),
+                actor="reviewer",
+                step_id="review_step",
+                payload={"logical_model": "qwen-max", "provider": "litellm"},
+            ),
+            RunEventResponse(
+                sequence=4,
+                kind="approval.requested",
+                message="approval.requested",
+                created_at=datetime.now(UTC),
+                actor="main_agent",
+                approval_id="approval_retry_terminal",
+                action="retry_terminal",
+                payload={"requires_approval": True, "replay_safe": False},
+            ),
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    serialized = json.dumps(response.model_dump(mode="json"), ensure_ascii=False)
+    diagnostics = response.failure_diagnostics
+
+    assert [item.category for item in diagnostics] == ["tool", "model", "approval"]
+    assert diagnostics[0].stage == "tool.failed"
+    assert diagnostics[0].tool_name == "run_safe_command"
+    assert diagnostics[0].failure_kind == "capability_failed"
+    assert diagnostics[0].wrapped_by == 2
+    assert diagnostics[1].status_code == "401"
+    assert diagnostics[1].logical_model == "qwen-max"
+    assert diagnostics[2].approval_id == "approval_retry_terminal"
+    assert "private-token" not in serialized
+    assert "private output" not in serialized
+
+
+def test_failure_diagnostics_redact_sensitive_approval_action() -> None:
+    response = RunDetailResponse(
+        id=uuid4(),
+        status="waiting_approval",
+        mode="dispatch",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="hello",
+        events=[
+            _admin_run_event(
+                {
+                    "sequence": 1,
+                    "kind": "approval.requested",
+                    "message": "approval.requested",
+                    "created_at": datetime.now(UTC),
+                    "actor": "main_agent",
+                    "approval_id": "approval_secret_action",
+                    "action": "cat private-token.txt",
+                }
+            ),
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    serialized = json.dumps(response.model_dump(mode="json"), ensure_ascii=False)
+
+    assert response.failure_diagnostics[0].action is None
+    assert response.failure_diagnostics[0].reason == "approval_required"
+    assert "private-token" not in serialized
+
+
+def test_failure_diagnostics_redact_sensitive_runtime_message() -> None:
+    response = RunDetailResponse(
+        id=uuid4(),
+        status="failed",
+        mode="dispatch",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="hello",
+        events=[
+            _admin_run_event(
+                {
+                    "sequence": 1,
+                    "kind": "runtime.failed",
+                    "message": "retry failed: cat private-token.txt printed private output",
+                    "created_at": datetime.now(UTC),
+                    "actor": "main_agent",
+                    "payload": {"failure_kind": "runtime_error"},
+                }
+            ),
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    serialized = json.dumps(response.model_dump(mode="json"), ensure_ascii=False)
+
+    assert response.events[0].message == "redacted"
+    assert response.failure_diagnostics[0].reason == "runtime failure was redacted"
+    assert "private-token" not in serialized
+    assert "private output" not in serialized
+
+
+def test_failure_diagnostics_keep_later_independent_failures_after_tool_failure() -> None:
+    response = RunDetailResponse(
+        id=uuid4(),
+        status="failed",
+        mode="dispatch",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="hello",
+        events=[
+            RunEventResponse(
+                sequence=1,
+                kind="tool.failed",
+                message="tool.failed",
+                created_at=datetime.now(UTC),
+                actor="engineer",
+                tool_name="run_safe_command",
+                tool_call_id="call_terminal",
+                step_id="engineer_step",
+                payload={"failure_kind": "capability_failed"},
+            ),
+            RunEventResponse(
+                sequence=2,
+                kind="runtime.failed",
+                message="model gateway failed: independent reviewer failed (status=503)",
+                created_at=datetime.now(UTC),
+                actor="reviewer",
+                step_id="review_step",
+                payload={"logical_model": "qwen-max"},
+            ),
+            RunEventResponse(
+                sequence=3,
+                kind="runtime.failed",
+                message="scheduler cleanup failed",
+                created_at=datetime.now(UTC),
+                actor="scheduler",
+                step_id="cleanup_step",
+            ),
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    assert [item.category for item in response.failure_diagnostics] == [
+        "tool",
+        "model",
+        "runtime",
+    ]
+    assert response.failure_diagnostics[2].stage == "runtime.failed"
+    assert response.failure_diagnostics[2].actor == "scheduler"
+
+
+def test_failure_diagnostics_respect_approval_resolution_order() -> None:
+    response = RunDetailResponse(
+        id=uuid4(),
+        status="waiting_approval",
+        mode="dispatch",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="hello",
+        events=[
+            RunEventResponse(
+                sequence=1,
+                kind="approval.requested",
+                message="approval.requested",
+                created_at=datetime.now(UTC),
+                actor="main_agent",
+                approval_id="approval_retry",
+                action="retry_terminal",
+            ),
+            RunEventResponse(
+                sequence=2,
+                kind="approval.resolved",
+                message="approval.resolved",
+                created_at=datetime.now(UTC),
+                actor="main_agent",
+                approval_id="approval_retry",
+                decision="approved",
+            ),
+            RunEventResponse(
+                sequence=3,
+                kind="approval.requested",
+                message="approval.requested",
+                created_at=datetime.now(UTC),
+                actor="main_agent",
+                approval_id="approval_retry",
+                action="retry_terminal",
+            ),
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    assert len(response.failure_diagnostics) == 1
+    assert response.failure_diagnostics[0].sequence == 3
+    assert response.failure_diagnostics[0].approval_id == "approval_retry"
+
+
 @pytest.mark.parametrize(
     ("mode", "reason"),
     [

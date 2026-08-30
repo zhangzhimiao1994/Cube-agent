@@ -21,7 +21,15 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import yaml
 from fastapi import APIRouter, Depends, Request
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -292,16 +300,43 @@ class RunEventResponse(BaseModel):
     artifact: RunArtifactResponse | None = None
 
 
+class FailureDiagnosticResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    category: str
+    stage: str
+    reason: str
+    recommendation: str
+    sequence: int = Field(ge=1)
+    actor: str | None = None
+    step_id: str | None = None
+    tool_name: str | None = None
+    tool_call_id: str | None = None
+    failure_kind: str | None = None
+    status_code: str | None = None
+    logical_model: str | None = None
+    approval_id: str | None = None
+    action: str | None = None
+    wrapped_by: int | None = Field(default=None, ge=1)
+
+
 class RunDetailResponse(RunListItem):
     request: str
     events: list[RunEventResponse]
     artifacts: list[RunArtifactResponse]
     explicit_details: dict[str, str]
+    failure_diagnostics: list[FailureDiagnosticResponse] = Field(default_factory=list)
     decision_token: str | None = None
     temporary_agent_proposal: dict[str, JsonValue] | None = None
     schedule_proposal: dict[str, JsonValue] | None = None
     evolution_proposal: dict[str, JsonValue] | None = None
     openclaw_proposal: dict[str, JsonValue] | None = None
+
+    @model_validator(mode="after")
+    def populate_failure_diagnostics(self) -> RunDetailResponse:
+        if not self.failure_diagnostics:
+            self.failure_diagnostics = _failure_diagnostics_from_run_events(self.events)
+        return self
 
 
 class RunDebugArtifactResponse(BaseModel):
@@ -5472,7 +5507,16 @@ def _contains_sensitive_marker(value: str) -> bool:
     lowered = value.lower()
     return any(
         marker in lowered
-        for marker in ("api_key", "authorization:", "bearer ", "password", "secret", "sk-")
+        for marker in (
+            "api_key",
+            "authorization:",
+            "bearer ",
+            "password",
+            "private output",
+            "private-token",
+            "secret",
+            "sk-",
+        )
     )
 
 
@@ -5813,6 +5857,250 @@ def _failure_event_from_run_events(events: Iterable[RunEventResponse]) -> RunEve
         if not is_legacy_generic_failure_reason(safe_event.message):
             return safe_event
     return fallback
+
+
+def _failure_diagnostics_from_run_events(
+    events: Iterable[RunEventResponse],
+) -> list[FailureDiagnosticResponse]:
+    sorted_events = sorted(events, key=lambda item: item.sequence)
+    diagnostics: list[FailureDiagnosticResponse] = []
+    seen: set[tuple[object, ...]] = set()
+    for event in sorted_events:
+        if event.kind == "tool.failed":
+            _append_failure_diagnostic(
+                diagnostics,
+                seen,
+                _tool_failure_diagnostic(event, sorted_events),
+            )
+            continue
+        if event.kind not in {"runtime.failed", "step.failed"}:
+            continue
+        if _wrapped_tool_failure_event(event, sorted_events) is not None:
+            continue
+        _append_failure_diagnostic(
+            diagnostics,
+            seen,
+            _runtime_or_step_failure_diagnostic(event),
+        )
+    for diagnostic in _pending_approval_diagnostics(sorted_events):
+        _append_failure_diagnostic(diagnostics, seen, diagnostic)
+    return diagnostics
+
+
+def _append_failure_diagnostic(
+    diagnostics: list[FailureDiagnosticResponse],
+    seen: set[tuple[object, ...]],
+    diagnostic: FailureDiagnosticResponse,
+) -> None:
+    key = (
+        diagnostic.category,
+        diagnostic.stage,
+        diagnostic.sequence,
+        diagnostic.actor,
+        diagnostic.step_id,
+        diagnostic.tool_name,
+        diagnostic.approval_id,
+    )
+    if key in seen:
+        return
+    seen.add(key)
+    diagnostics.append(diagnostic)
+
+
+def _tool_failure_diagnostic(
+    event: RunEventResponse,
+    events: list[RunEventResponse],
+) -> FailureDiagnosticResponse:
+    failure_kind = _safe_diagnostic_payload_value(event, "failure_kind")
+    exit_code = _safe_diagnostic_payload_value(event, "exit_code")
+    output_bytes = _safe_diagnostic_payload_value(event, "output_bytes")
+    reason_parts = [
+        f"failure_kind={failure_kind}" if failure_kind else "tool_failed",
+        f"exit_code={exit_code}" if exit_code else "",
+        f"output_bytes={output_bytes}" if output_bytes else "",
+    ]
+    wrapper = _tool_failure_wrapper(event, events)
+    return FailureDiagnosticResponse(
+        category="tool",
+        stage=event.kind,
+        reason="; ".join(part for part in reason_parts if part),
+        recommendation="Check tool permission, arguments, runtime environment, then retry or reassign.",
+        sequence=event.sequence,
+        actor=event.actor,
+        step_id=event.step_id,
+        tool_name=event.tool_name,
+        tool_call_id=event.tool_call_id,
+        failure_kind=failure_kind,
+        wrapped_by=wrapper.sequence if wrapper is not None else None,
+    )
+
+
+def _runtime_or_step_failure_diagnostic(event: RunEventResponse) -> FailureDiagnosticResponse:
+    category = "model" if _is_model_failure_event(event) else "runtime"
+    status_code = _failure_status_code(event)
+    failure_kind = _safe_diagnostic_payload_value(event, "failure_kind")
+    logical_model = _event_logical_model(event)
+    reason = _safe_model_check_detail(event.message)
+    if reason == "redacted":
+        reason = "runtime failure was redacted"
+    return FailureDiagnosticResponse(
+        category=category,
+        stage=event.kind,
+        reason=reason,
+        recommendation=(
+            "Check model config, API key, upstream status code, and rate limits; retry or switch model."
+            if category == "model"
+            else "Inspect the failed stage, keep existing artifacts, and retry the smallest safe scope."
+        ),
+        sequence=event.sequence,
+        actor=event.actor,
+        step_id=event.step_id,
+        failure_kind=failure_kind,
+        status_code=status_code,
+        logical_model=logical_model,
+    )
+
+
+def _pending_approval_diagnostics(
+    events: list[RunEventResponse],
+) -> list[FailureDiagnosticResponse]:
+    pending: list[RunEventResponse] = []
+    diagnostics: list[FailureDiagnosticResponse] = []
+    for event in events:
+        if event.kind == "approval.resolved" and event.approval_id is not None:
+            for index in range(len(pending) - 1, -1, -1):
+                if pending[index].approval_id == event.approval_id:
+                    pending.pop(index)
+                    break
+            continue
+        if event.kind == "approval.requested":
+            pending.append(event)
+    for event in pending:
+        action = _safe_diagnostic_identifier(event.action)
+        diagnostics.append(
+            FailureDiagnosticResponse(
+                category="approval",
+                stage=event.kind,
+                reason=action or "approval_required",
+                recommendation="Approve or reject the pending action before the run can continue.",
+                sequence=event.sequence,
+                actor=event.actor,
+                approval_id=event.approval_id,
+                action=action,
+            )
+        )
+    return diagnostics
+
+
+def _wrapped_tool_failure_event(
+    event: RunEventResponse,
+    events: list[RunEventResponse],
+) -> RunEventResponse | None:
+    if event.kind not in {"runtime.failed", "step.failed"}:
+        return None
+    for candidate in reversed([item for item in events if item.sequence < event.sequence]):
+        if candidate.kind == "tool.failed" and _tool_failure_wraps_event(candidate, event, events):
+            return candidate
+    return None
+
+
+def _tool_failure_wrapper(
+    tool_event: RunEventResponse,
+    events: list[RunEventResponse],
+) -> RunEventResponse | None:
+    for event in events:
+        if event.sequence <= tool_event.sequence or event.kind not in {"runtime.failed", "step.failed"}:
+            continue
+        if _tool_failure_wraps_event(tool_event, event, events):
+            return event
+    return None
+
+
+def _tool_failure_wraps_event(
+    tool_event: RunEventResponse,
+    wrapper_event: RunEventResponse,
+    events: list[RunEventResponse],
+) -> bool:
+    if tool_event.step_id and wrapper_event.step_id and tool_event.step_id == wrapper_event.step_id:
+        return True
+    between = [
+        event
+        for event in events
+        if tool_event.sequence < event.sequence < wrapper_event.sequence
+    ]
+    return not any(_is_failure_boundary_event(event) for event in between)
+
+
+def _is_failure_boundary_event(event: RunEventResponse) -> bool:
+    if event.kind.endswith(".failed") or event.kind == "runtime.failed":
+        return True
+    return event.kind in {
+        "approval.requested",
+        "approval.resolved",
+        "model.started",
+        "step.started",
+        "tool.started",
+        "tool.completed",
+        "artifact.created",
+        "message.created",
+    }
+
+
+def _safe_diagnostic_payload_value(event: RunEventResponse, key: str) -> str | None:
+    value = event.payload.get(key)
+    if value is None:
+        return None
+    if type(value) in {str, int, float, bool}:
+        safe = _safe_model_check_detail(str(value))
+        return None if safe == "redacted" else safe
+    return None
+
+
+_SAFE_DIAGNOSTIC_IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def _safe_diagnostic_identifier(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if _SAFE_DIAGNOSTIC_IDENTIFIER_RE.fullmatch(stripped) is None:
+        return None
+    safe = _safe_model_check_detail(stripped)
+    return None if safe == "redacted" else safe
+
+
+def _failure_status_code(event: RunEventResponse) -> str | None:
+    for key in ("status_code", "http_status"):
+        value = _safe_diagnostic_payload_value(event, key)
+        if value and re.fullmatch(r"\d{3}", value):
+            return value
+    match = re.search(r"\bstatus=(?P<status>\d{3})\b", event.message, flags=re.IGNORECASE)
+    return match.group("status") if match is not None else None
+
+
+def _event_logical_model(event: RunEventResponse) -> str | None:
+    for key in ("logical_model", "model", "upstream_model"):
+        value = _safe_diagnostic_payload_value(event, key)
+        if value:
+            return value
+    return None
+
+
+def _is_model_failure_event(event: RunEventResponse) -> bool:
+    text = " ".join(
+        item
+        for item in (
+            event.message,
+            _safe_diagnostic_payload_value(event, "failure_kind") or "",
+            _safe_diagnostic_payload_value(event, "provider") or "",
+            _event_logical_model(event) or "",
+        )
+        if item
+    ).lower()
+    return any(
+        token in text
+        for token in ("model", "gateway", "transport", "provider", "litellm")
+    ) or (_failure_status_code(event) is not None and _event_logical_model(event) is not None)
 
 
 def _safe_debug_event(event: RunEventResponse) -> RunEventResponse:
@@ -6290,7 +6578,7 @@ def _admin_run_event(event: dict[str, object]) -> RunEventResponse:
         tool_name=_optional_event_string(event.get("tool_name")),
         step_id=_optional_event_string(event.get("step_id")),
         approval_id=_optional_event_string(event.get("approval_id")),
-        action=_optional_event_string(event.get("action")),
+        action=_optional_event_action(event.get("action")),
         decision=_optional_event_string(event.get("decision")),
         payload=_tool_event_payload(payload) if kind_text.startswith("tool.") else _event_payload(payload),
         artifact=_admin_run_artifact(artifact) if isinstance(artifact, dict) else None,
@@ -6300,7 +6588,9 @@ def _admin_run_event(event: dict[str, object]) -> RunEventResponse:
 def _event_message(kind: str, value: object) -> str:
     if kind.startswith("tool."):
         return kind
-    return value if type(value) is str else "event recorded"
+    if type(value) is not str:
+        return "event recorded"
+    return _safe_model_check_detail(value)
 
 
 _SENSITIVE_EVENT_DETAIL_KEYS = frozenset(
@@ -6321,6 +6611,10 @@ _SENSITIVE_EVENT_DETAIL_KEYS = frozenset(
 
 def _optional_event_string(value: object) -> str | None:
     return value if type(value) is str and value else None
+
+
+def _optional_event_action(value: object) -> str | None:
+    return _safe_diagnostic_identifier(value if type(value) is str else None)
 
 
 def _event_string_list(value: object) -> list[str]:
