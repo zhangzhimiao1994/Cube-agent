@@ -1742,103 +1742,128 @@ class CrewDispatchRuntime:
                 )
                 if step.reviewer is not None:
                     reviewer = agents[step.reviewer]
-                    try:
-                        verdict, feedback, review_evidence = await self._review(
-                            context,
-                            step,
-                            reviewer,
-                            artifact,
-                            event,
-                            checkpoint_boundary,
-                            model_state_boundary,
-                            usage_boundary,
-                            model_ledger,
-                            retries,
-                            run_state,
-                            step_deadline,
-                        )
-                    except RuntimeExecutionError as error:
-                        review_failure = safe_runtime_failure_reason(
-                            error, fallback="reviewer model failed"
-                        )
-                        review_diagnostic = runtime_failure_diagnostic_from_reason(review_failure)
-                        review_status = (
-                            "timeout_skipped"
-                            if review_diagnostic.get("error_code") == "crew.step_timeout"
-                            else "skipped"
-                        )
-                        await event(
-                            kind=EventKind.REVIEW_COMPLETED,
-                            actor=step.reviewer,
-                            inputs=(artifact,),
-                            payload={
-                                "verdict": "approve",
-                                "review_status": review_status,
-                                "warning": review_failure,
-                                "role": reviewer.role,
-                                "logical_model": reviewer.logical_model,
-                                "candidate_artifact_id": str(artifact.id),
-                                "candidate_output": _artifact_text_preview(artifact)
-                                or "角色已完成本步骤输出。",
-                                **review_diagnostic,
-                            },
-                        )
-                        await checkpoint_boundary(step.id, retries)
-                    else:
-                        await event(
-                            kind=EventKind.REVIEW_COMPLETED,
-                            actor=step.reviewer,
-                            inputs=(artifact,),
-                            payload={
-                                "verdict": verdict,
-                                "role": reviewer.role,
-                                "logical_model": reviewer.logical_model,
-                                "candidate_artifact_id": str(artifact.id),
-                                **({"feedback": feedback} if feedback is not None else {}),
-                            },
-                        )
-                        await checkpoint_boundary(step.id, retries)
-                        if verdict == "reject":
-                            _fail("dispatch review rejected a step")
-                        if verdict == "revise":
-                            if retries >= step.reviewer_retries:
-                                _fail("dispatch review retry budget exhausted")
-                            if feedback is None:
-                                _fail("dispatch review feedback is unavailable")
-                            feedback_artifact = Artifact(
-                                id=uuid4(),
-                                type="review_feedback",
-                                producer=step.reviewer,
-                                content={"feedback": feedback},
-                                source_ids=tuple(
-                                    str(item.id)
-                                    for item in self._ordered_artifacts(
-                                        (artifact, *review_evidence)
-                                    )
-                                ),
+                    review_failure_retry = 0
+                    while True:
+                        try:
+                            verdict, feedback, review_evidence = await self._review(
+                                context,
+                                step,
+                                reviewer,
+                                artifact,
+                                event,
+                                checkpoint_boundary,
+                                model_state_boundary,
+                                usage_boundary,
+                                model_ledger,
+                                retries,
+                                run_state,
+                                step_deadline,
+                            )
+                        except RuntimeExecutionError as error:
+                            review_failure = safe_runtime_failure_reason(
+                                error, fallback="reviewer model failed"
+                            )
+                            review_diagnostic = runtime_failure_diagnostic_from_reason(
+                                review_failure
+                            )
+                            if review_failure_retry < step.reviewer_retries:
+                                review_failure_retry += 1
+                                await event(
+                                    kind=EventKind.STEP_RETRYING,
+                                    step_id=step.id,
+                                    actor=step.reviewer,
+                                    reason=review_failure,
+                                    payload={
+                                        "attempt": review_failure_retry + 1,
+                                        "review_status": "retrying",
+                                        "role": reviewer.role,
+                                        "logical_model": reviewer.logical_model,
+                                        "candidate_artifact_id": str(artifact.id),
+                                        **review_diagnostic,
+                                    },
+                                )
+                                continue
+                            review_status = (
+                                "timeout_skipped"
+                                if review_diagnostic.get("error_code") == "crew.step_timeout"
+                                else "skipped"
                             )
                             await event(
-                                kind=EventKind.ARTIFACT_CREATED,
-                                artifact=feedback_artifact,
+                                kind=EventKind.REVIEW_COMPLETED,
                                 actor=step.reviewer,
-                                message=f"{reviewer.role} 要求修订。",
+                                inputs=(artifact,),
                                 payload={
+                                    "verdict": "approve",
+                                    "review_status": review_status,
+                                    "warning": review_failure,
                                     "role": reviewer.role,
                                     "logical_model": reviewer.logical_model,
-                                    "feedback": feedback,
-                                    "artifact_id": str(feedback_artifact.id),
+                                    "candidate_artifact_id": str(artifact.id),
+                                    "candidate_output": _artifact_text_preview(artifact)
+                                    or "角色已完成本步骤输出。",
+                                    **review_diagnostic,
                                 },
                             )
-                            retries += 1
-                            await checkpoint_boundary(step.id, retries, feedback_artifact)
+                            await checkpoint_boundary(step.id, retries)
+                            break
+                        else:
                             await event(
-                                kind=EventKind.STEP_RETRYING,
-                                step_id=step.id,
-                                actor=step.agent,
-                                reason="review requested revision",
-                                payload={"attempt": retries + 1, "feedback": feedback},
+                                kind=EventKind.REVIEW_COMPLETED,
+                                actor=step.reviewer,
+                                inputs=(artifact,),
+                                payload={
+                                    "verdict": verdict,
+                                    "role": reviewer.role,
+                                    "logical_model": reviewer.logical_model,
+                                    "candidate_artifact_id": str(artifact.id),
+                                    **({"feedback": feedback} if feedback is not None else {}),
+                                },
                             )
-                            continue
+                            await checkpoint_boundary(step.id, retries)
+                            if verdict == "reject":
+                                _fail("dispatch review rejected a step")
+                            if verdict == "revise":
+                                if retries >= step.reviewer_retries:
+                                    _fail("dispatch review retry budget exhausted")
+                                if feedback is None:
+                                    _fail("dispatch review feedback is unavailable")
+                                feedback_artifact = Artifact(
+                                    id=uuid4(),
+                                    type="review_feedback",
+                                    producer=step.reviewer,
+                                    content={"feedback": feedback},
+                                    source_ids=tuple(
+                                        str(item.id)
+                                        for item in self._ordered_artifacts(
+                                            (artifact, *review_evidence)
+                                        )
+                                    ),
+                                )
+                                await event(
+                                    kind=EventKind.ARTIFACT_CREATED,
+                                    artifact=feedback_artifact,
+                                    actor=step.reviewer,
+                                    message=f"{reviewer.role} 要求修订。",
+                                    payload={
+                                        "role": reviewer.role,
+                                        "logical_model": reviewer.logical_model,
+                                        "feedback": feedback,
+                                        "artifact_id": str(feedback_artifact.id),
+                                    },
+                                )
+                                retries += 1
+                                await checkpoint_boundary(step.id, retries, feedback_artifact)
+                                await event(
+                                    kind=EventKind.STEP_RETRYING,
+                                    step_id=step.id,
+                                    actor=step.agent,
+                                    reason="review requested revision",
+                                    payload={"attempt": retries + 1, "feedback": feedback},
+                                )
+                                break
+                            break
+                    if feedback_artifact is not None:
+                        continue
                 await event(
                     kind=EventKind.STEP_COMPLETED,
                     step_id=step.id,

@@ -234,8 +234,8 @@ class TimeoutFactory(CrewObjectFactory):
 
 
 class RecordingGeneration:
-    def __init__(self, *, timeout_reviewer: bool = False) -> None:
-        self.timeout_reviewer = timeout_reviewer
+    def __init__(self, *, reviewer_timeouts: int = 0) -> None:
+        self.reviewer_timeouts = reviewer_timeouts
         self.prompts: list[tuple[str, str | None, str]] = []
 
     async def execute(
@@ -249,7 +249,8 @@ class RecordingGeneration:
     ) -> str:
         del storage_scope
         self.prompts.append((step_id, agent_id, prompt))
-        if self.timeout_reviewer and agent_id == "reviewer":
+        if self.reviewer_timeouts > 0 and agent_id == "reviewer":
+            self.reviewer_timeouts -= 1
             raise TimeoutError
         return await bridge.complete([{"role": "system", "content": prompt}])
 
@@ -362,7 +363,7 @@ def _tool_plan() -> DispatchPlan:
     )
 
 
-def _reviewed_step_plan() -> DispatchPlan:
+def _reviewed_step_plan(*, reviewer_retries: int = 0) -> DispatchPlan:
     return DispatchPlan(
         agents=(
             AgentSpec(id="writer", role="writer", goal="Write", logical_model="general"),
@@ -380,6 +381,7 @@ def _reviewed_step_plan() -> DispatchPlan:
                 agent="writer",
                 task="Draft",
                 reviewer="reviewer",
+                reviewer_retries=reviewer_retries,
                 token_budget=1000,
             ),
             DispatchStep(
@@ -702,7 +704,7 @@ async def test_dispatch_framework_timeout_names_the_step_and_actor() -> None:
 
 
 async def test_reviewer_timeout_soft_fails_with_structured_warning() -> None:
-    generation = RecordingGeneration(timeout_reviewer=True)
+    generation = RecordingGeneration(reviewer_timeouts=1)
     runtime = CrewDispatchRuntime(
         RoleAwareGateway(),
         _reviewed_step_plan(),
@@ -717,6 +719,42 @@ async def test_reviewer_timeout_soft_fails_with_structured_warning() -> None:
     assert review_completed.payload["error_code"] == "crew.step_timeout"
     assert review_completed.payload["step_id"] == "draft.review"
     assert review_completed.payload["actor"] == "reviewer"
+    assert any(event.kind is EventKind.STEP_COMPLETED for event in events)
+
+
+async def test_reviewer_timeout_retries_before_soft_skip() -> None:
+    generation = RecordingGeneration(reviewer_timeouts=1)
+    runtime = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        _reviewed_step_plan(reviewer_retries=1),
+        crew_factory=RecordingFactory(generation),
+    )
+
+    events = await _collect(runtime)
+
+    reviewer_prompts = [item for item in generation.prompts if item[1] == "reviewer"]
+    assert len(reviewer_prompts) == 2
+    review_completed = next(event for event in events if event.kind is EventKind.REVIEW_COMPLETED)
+    assert review_completed.payload["verdict"] == "approve"
+    assert "review_status" not in review_completed.payload
+    assert "error_code" not in review_completed.payload
+
+
+async def test_reviewer_timeout_skips_after_retry_budget_is_exhausted() -> None:
+    generation = RecordingGeneration(reviewer_timeouts=2)
+    runtime = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        _reviewed_step_plan(reviewer_retries=1),
+        crew_factory=RecordingFactory(generation),
+    )
+
+    events = await _collect(runtime)
+
+    reviewer_prompts = [item for item in generation.prompts if item[1] == "reviewer"]
+    assert len(reviewer_prompts) == 2
+    review_completed = next(event for event in events if event.kind is EventKind.REVIEW_COMPLETED)
+    assert review_completed.payload["review_status"] == "timeout_skipped"
+    assert review_completed.payload["error_code"] == "crew.step_timeout"
     assert any(event.kind is EventKind.STEP_COMPLETED for event in events)
 
 
