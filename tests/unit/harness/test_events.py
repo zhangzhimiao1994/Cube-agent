@@ -37,7 +37,11 @@ def test_provider_events_project_to_runtime_extension_events_with_sequences() ->
     assert [event.sequence for event in events] == [5, 6]
     assert [event.kind for event in events] == ["model.text_delta", "tool.requested"]
     assert events[0].run_id == RUN_ID
-    assert events[0].payload == {"text": "hello"}
+    assert events[0].payload == {
+        "schema_version": 1,
+        "delta_kind": "visible_text",
+        "text_bytes": len(b"hello"),
+    }
     assert events[1].payload == {
         "id": "call_1",
         "name": "workspace_read",
@@ -48,6 +52,93 @@ def test_provider_events_project_to_runtime_extension_events_with_sequences() ->
     }
     assert events[0].actor is None
     assert events[0].message is None
+
+
+def test_provider_text_delta_projection_does_not_expose_stream_text() -> None:
+    (event,) = tuple(
+        provider_events_to_run_events(
+            (
+                NormalizedProviderEvent(
+                    kind="model.text_delta",
+                    payload={"text": "partial answer with private context", "chunk_index": 4, "phase": "draft"},
+                ),
+            ),
+            run_id=RUN_ID,
+            start_sequence=1,
+        )
+    )
+
+    serialized = json.dumps(event.to_payload(), ensure_ascii=False, sort_keys=True)
+    assert "partial answer with private context" not in serialized
+    assert event.payload == {
+        "schema_version": 1,
+        "delta_kind": "visible_text",
+        "text_bytes": len(b"partial answer with private context"),
+        "chunk_index": 4,
+        "phase": "draft",
+    }
+
+
+def test_provider_reasoning_delta_projection_does_not_expose_hidden_reasoning() -> None:
+    (event,) = tuple(
+        provider_events_to_run_events(
+            (
+                NormalizedProviderEvent(
+                    kind="model.reasoning_delta",
+                    payload={"text": "hidden chain of thought", "chunk_index": 2, "phase": "analysis"},
+                ),
+            ),
+            run_id=RUN_ID,
+            start_sequence=1,
+        )
+    )
+
+    serialized = json.dumps(event.to_payload(), ensure_ascii=False, sort_keys=True)
+    assert "hidden chain of thought" not in serialized
+    assert event.payload == {
+        "schema_version": 1,
+        "delta_kind": "reasoning",
+        "text_bytes": len(b"hidden chain of thought"),
+        "chunk_index": 2,
+        "phase": "analysis",
+    }
+
+
+def test_provider_delta_projection_ignores_unknown_phase_text() -> None:
+    (event,) = tuple(
+        provider_events_to_run_events(
+            (
+                NormalizedProviderEvent(
+                    kind="model.reasoning_delta",
+                    payload={"text": "hidden chain of thought", "phase": "user asked about private roadmap"},
+                ),
+            ),
+            run_id=RUN_ID,
+            start_sequence=1,
+        )
+    )
+
+    serialized = json.dumps(event.to_payload(), ensure_ascii=False, sort_keys=True)
+    assert "user asked about private roadmap" not in serialized
+    assert "phase" not in event.payload
+
+
+@pytest.mark.parametrize("chunk_index", [True, False, -1, "2"])
+def test_provider_delta_projection_ignores_invalid_chunk_indexes(chunk_index: bool | int | str) -> None:
+    (event,) = tuple(
+        provider_events_to_run_events(
+            (
+                NormalizedProviderEvent(
+                    kind="model.reasoning_delta",
+                    payload={"text": "hidden chain of thought", "chunk_index": chunk_index},
+                ),
+            ),
+            run_id=RUN_ID,
+            start_sequence=1,
+        )
+    )
+
+    assert "chunk_index" not in event.payload
 
 
 def test_provider_tool_event_projection_does_not_expose_argument_values() -> None:

@@ -2195,6 +2195,81 @@ describe("operational management pages", () => {
     expect(within(drawer).queryByText("b".repeat(64))).toBeNull();
   });
 
+  it("renders model stream progress without exposing legacy raw delta text", async () => {
+    const user = userEvent.setup();
+    visibleRunDetail = {
+      ...runDetail,
+      events: [
+        {
+          sequence: 1,
+          kind: "model.reasoning_delta",
+          message: "hidden chain of thought",
+          created_at: conversationCreatedAt,
+          actor: "main_agent",
+          participants: [],
+          payload: {
+            schema_version: 1,
+            delta_kind: "reasoning",
+            text_bytes: 23,
+            chunk_index: 2,
+            phase: "analysis",
+            text: "hidden chain of thought",
+          },
+        },
+        {
+          sequence: 2,
+          kind: "model.text_delta",
+          message: "partial answer with private context",
+          created_at: conversationCreatedAt,
+          actor: "main_agent",
+          participants: [],
+          payload: {
+            schema_version: 1,
+            delta_kind: "visible_text",
+            text_bytes: 35,
+            chunk_index: 4,
+            phase: "draft",
+            text: "partial answer with private context",
+          },
+        },
+        ...runDetail.events.map((event) => ({ ...event, sequence: event.sequence + 2 })),
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const reasoningCard = within(stream).getByRole("button", {
+      name: /思考过程：模型正在分析/,
+    });
+    const textCard = within(stream).getByRole("button", {
+      name: /输出进度：模型正在生成/,
+    });
+    expect(within(stream).queryByText("hidden chain of thought")).toBeNull();
+    expect(within(stream).queryByText("partial answer with private context")).toBeNull();
+
+    await user.click(reasoningCard);
+    const reasoningDrawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(reasoningDrawer).getByRole("heading", { name: "思考过程" })).not.toBeNull();
+    expect(within(reasoningDrawer).getByText("Delta 类型")).not.toBeNull();
+    expect(within(reasoningDrawer).getByText("reasoning")).not.toBeNull();
+    expect(within(reasoningDrawer).getByText("内容字节数")).not.toBeNull();
+    expect(within(reasoningDrawer).getByText("23")).not.toBeNull();
+    expect(within(reasoningDrawer).queryByText("hidden chain of thought")).toBeNull();
+    await user.click(within(reasoningDrawer).getByRole("button", { name: "关闭" }));
+
+    await user.click(textCard);
+    const textDrawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(textDrawer).getByRole("heading", { name: "输出进度" })).not.toBeNull();
+    expect(within(textDrawer).getByText("visible_text")).not.toBeNull();
+    expect(within(textDrawer).getByText("35")).not.toBeNull();
+    expect(within(textDrawer).queryByText("partial answer with private context")).toBeNull();
+  });
+
   it("marks intermediate process outputs in labeled boxes while keeping the final reply merged", async () => {
     const user = userEvent.setup();
     const view = render(<TestApp initialPath="/" />);

@@ -198,6 +198,8 @@ function displayEventTitle(event: RunDetail["events"][number], agentNames: Map<s
     queued: "任务已入队",
     "run.queued": "任务已入队",
     "model.started": actor ? `${actor} 开始调用模型` : "开始调用模型",
+    "model.reasoning_delta": "思考过程",
+    "model.text_delta": "输出进度",
     "runtime.started": "开始执行本次对话",
     "runtime.completed": "完成本次对话",
     "runtime.failed": "本次对话中断",
@@ -236,6 +238,8 @@ function displayEventMessage(event: RunDetail["events"][number]) {
     queued: "任务已进入队列，等待 Worker 调度执行。",
     "run.queued": "任务已进入队列，等待 Worker 调度执行。",
     "model.started": "模型请求已开始。",
+    "model.reasoning_delta": "模型正在分析，公开日志只记录进度元数据。",
+    "model.text_delta": "模型正在生成回复，公开日志只记录进度元数据。",
     "runtime.started": "运行时已启动，正在按模式执行。",
     "runtime.completed": "运行完成，已汇总结果。",
     "runtime.failed": readableMessage ?? "运行失败，请查看日志中心的模式运行错误。",
@@ -406,6 +410,9 @@ function eventPayloadLabel(key: string) {
     redacted_argument_key_count: "已隐藏字段数",
     argument_bytes: "参数字节数",
     arguments_sha256: "参数摘要",
+    delta_kind: "Delta 类型",
+    text_bytes: "内容字节数",
+    chunk_index: "分片序号",
     phase: "阶段",
     capabilities: "工程能力",
     policy: "策略原因",
@@ -443,6 +450,10 @@ function orderedEventPayloadEntries(payload: Record<string, unknown>) {
     "redacted_argument_key_count",
     "argument_bytes",
     "arguments_sha256",
+    "delta_kind",
+    "text_bytes",
+    "chunk_index",
+    "phase",
     "role",
     "agent",
     "task",
@@ -474,12 +485,20 @@ function orderedEventPayloadEntries(payload: Record<string, unknown>) {
   });
 }
 
+function isModelDeltaEvent(event: RunDetail["events"][number]) {
+  return event.kind === "model.reasoning_delta" || event.kind === "model.text_delta";
+}
+
 function eventDetailRows(event: RunDetail["events"][number], agentNames: Map<string, string>) {
   const rows: Array<{ label: string; value: string }> = [];
   const actor = displayEventActor(event.actor, agentNames);
   const participants = displayEventParticipants(event.participants, agentNames);
+  const isModelDelta = isModelDeltaEvent(event);
   const readableMessage =
-    event.message && event.message !== event.kind && !/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(event.message)
+    !isModelDelta &&
+    event.message &&
+    event.message !== event.kind &&
+    !/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(event.message)
       ? event.message
       : "";
   if (actor) rows.push({ label: "执行者", value: actor });
@@ -495,6 +514,7 @@ function eventDetailRows(event: RunDetail["events"][number], agentNames: Map<str
   orderedEventPayloadEntries(event.payload).forEach(([key, value]) => {
     if (key === "participants" || key === "participant_models") return;
     if (event.kind === "tool.requested" && (key === "arguments" || key === "arguments_sha256")) return;
+    if (isModelDelta && key === "text") return;
     const formatted = formatEventPayloadValue(value);
     if (formatted) {
       rows.push({ label: eventPayloadLabel(key), value: formatted });
@@ -1159,6 +1179,12 @@ function eventSummaryText(
   if (event.kind === "model.started") {
     return `${subject} 调用模型${modelSignal ? `：${conciseProcessText(modelSignal, "模型")}` : ""}`;
   }
+  if (event.kind === "model.reasoning_delta") {
+    return "思考过程：模型正在分析";
+  }
+  if (event.kind === "model.text_delta") {
+    return "输出进度：模型正在生成";
+  }
   if (event.kind === "harness.started") {
     const logicalModel = formatEventPayloadValue(event.payload.logical_model) || "harness";
     const provider = formatEventPayloadValue(event.payload.provider);
@@ -1248,9 +1274,11 @@ function processBadgeForEvent(event: RunEvent) {
   }
   if (event.kind === "review.completed" || event.kind.startsWith("decision.")) return "裁决过程";
   if (event.kind.startsWith("discussion.")) return "讨论过程";
+  if (event.kind === "model.reasoning_delta") return "思考过程";
+  if (event.kind === "model.text_delta") return "输出进度";
+  if (event.kind.startsWith("model.")) return "模型调用";
   if (event.kind.startsWith("tool.")) return "工具过程";
   if (event.kind.startsWith("harness.")) return "Harness";
-  if (event.kind.startsWith("model.")) return "模型调用";
   if (event.kind.startsWith("dispatch.")) return "调度过程";
   if (event.kind === "step.started") return "任务分解";
   return "过程记录";

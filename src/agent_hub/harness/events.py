@@ -17,6 +17,7 @@ _SENSITIVE_TEXT = re.compile(
 )
 _MAX_PROFILE_ITEMS = 6
 _MAX_PROFILE_TEXT = 160
+_PUBLIC_DELTA_PHASES = frozenset({"analysis", "draft", "final"})
 
 
 def provider_events_to_run_events(
@@ -129,6 +130,8 @@ def _safe_text_tuple(value: object) -> tuple[str, ...]:
 
 
 def _provider_event_payload(event: NormalizedProviderEvent) -> Mapping[str, JsonValue]:
+    if event.kind in {"model.text_delta", "model.reasoning_delta"}:
+        return _provider_delta_payload(event)
     if event.kind != "tool.requested":
         return event.payload
     identifier = _safe_text(event.payload.get("id"))
@@ -153,6 +156,23 @@ def _provider_event_payload(event: NormalizedProviderEvent) -> Mapping[str, Json
         "redacted_argument_key_count": len(argument_keys) - len(safe_argument_keys),
         "argument_bytes": len(canonical_arguments),
     }
+
+
+def _provider_delta_payload(event: NormalizedProviderEvent) -> Mapping[str, JsonValue]:
+    text = event.payload.get("text")
+    text_bytes = len(text.encode("utf-8")) if isinstance(text, str) else 0
+    payload: dict[str, JsonValue] = {
+        "schema_version": 1,
+        "delta_kind": "reasoning" if event.kind == "model.reasoning_delta" else "visible_text",
+        "text_bytes": text_bytes,
+    }
+    chunk_index = event.payload.get("chunk_index")
+    if type(chunk_index) is int and chunk_index >= 0:
+        payload["chunk_index"] = chunk_index
+    phase = _safe_text(event.payload.get("phase"))
+    if phase in _PUBLIC_DELTA_PHASES:
+        payload["phase"] = phase
+    return payload
 
 
 def _mutable_json(value: object) -> object:
