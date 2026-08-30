@@ -113,8 +113,14 @@ class ExecutableFakeRepository:
         self.row.version += 1
         return self._record()
 
-    async def fail_run(self, run_id: UUID, *, reason: str) -> RunRecord:
-        del reason
+    async def fail_run(
+        self,
+        run_id: UUID,
+        *,
+        reason: str,
+        diagnostics: object | None = None,
+    ) -> RunRecord:
+        del reason, diagnostics
         assert run_id == self.run_id
         self.row.status = RunStatus.FAILED.value
         self.row.version += 1

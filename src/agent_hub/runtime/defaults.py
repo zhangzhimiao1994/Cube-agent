@@ -38,6 +38,7 @@ from agent_hub.runtime.contracts import (
 from agent_hub.runtime.crew.adapter import CrewDispatchRuntime
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 from agent_hub.runtime.direct import DirectRuntime
+from agent_hub.runtime.failure_reason import runtime_failure_diagnostic_from_reason
 from agent_hub.runtime.hybrid import HybridRuntime
 from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.runtime.role_planner import (
@@ -108,6 +109,7 @@ class UnavailableRuntime:
             sequence=1,
             run_id=context.run_id,
             reason="runtime_not_configured",
+            payload=runtime_failure_diagnostic_from_reason("runtime_not_configured"),
         )
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
@@ -705,7 +707,7 @@ def _dispatch_plan(
                 ),
                 allowed_tools=(),
             )
-    )
+        )
     request_text = str(context.request)
     step_token_budget = min(context.token_budget, 1_000_000)
     role_token_budget = step_token_budget
@@ -774,10 +776,10 @@ def _is_post_product_role(role: RoleAssignment) -> bool:
         RolePurpose.RELEASE,
     }
 
+
 def _dispatch_role_payload(plan: DispatchPlan) -> tuple[Mapping[str, JsonValue], ...]:
     step_purposes = {
-        step.agent: ("synthesize" if step.final_synthesizer else "execute")
-        for step in plan.steps
+        step.agent: ("synthesize" if step.final_synthesizer else "execute") for step in plan.steps
     }
     return tuple(
         {
@@ -947,6 +949,7 @@ def _selected_config_agent_purpose(
         return RolePurpose.RECORD_DECISION
     return default
 
+
 def _temporary_role_assignments(
     context: TaskContext,
     logical_model: str,
@@ -964,11 +967,21 @@ def _temporary_role_assignments(
         role = raw.get("role") or raw.get("name")
         mission = raw.get("prompt") or raw.get("reason")
         selected_model = raw.get("model")
-        if not isinstance(identifier, str) or not isinstance(role, str) or not isinstance(mission, str):
+        if (
+            not isinstance(identifier, str)
+            or not isinstance(role, str)
+            or not isinstance(mission, str)
+        ):
             continue
-        logical_model_for_agent = selected_model if isinstance(selected_model, str) and selected_model else identifier
+        logical_model_for_agent = (
+            selected_model if isinstance(selected_model, str) and selected_model else identifier
+        )
         skills = raw.get("suggested_skills")
-        skill_tuple = tuple(item for item in skills if isinstance(item, str)) if isinstance(skills, (list, tuple)) else ()
+        skill_tuple = (
+            tuple(item for item in skills if isinstance(item, str))
+            if isinstance(skills, (list, tuple))
+            else ()
+        )
         try:
             assignments.append(
                 RoleAssignment(
@@ -1121,33 +1134,98 @@ def _rank_logical_models_for_role(
             score += 12
         if logical_model == default_model:
             score += 1
-        score += min(8, sum(deployment.max_concurrency for deployment in definition.deployments) // 2)
+        score += min(
+            8, sum(deployment.max_concurrency for deployment in definition.deployments) // 2
+        )
         if role.allowed_tools and not _logical_model_supports_tool_roles(definition):
             score -= 1000
         characteristics = _model_characteristics(logical_model, definition)
         score += _task_characteristic_score(text, characteristics)
-        if any(keyword in text for keyword in ("code", "代码", "网页", "web", "前端", "后端", "api", "github", "测试", "部署")):
+        if any(
+            keyword in text
+            for keyword in (
+                "code",
+                "代码",
+                "网页",
+                "web",
+                "前端",
+                "后端",
+                "api",
+                "github",
+                "测试",
+                "部署",
+            )
+        ):
             if any(keyword in haystack for keyword in ("coder", "code", "qwen", "program")):
                 score += 30
             if "tool_calling" in haystack:
                 score += 4
-        if any(keyword in text for keyword in ("文案", "脚本", "短剧", "视频", "导演", "剪辑", "prompt", "提示词", "creative", "story")):
-            if any(keyword in haystack for keyword in ("creative", "kimi", "qwen", "deepseek", "chat", "text")):
+        if any(
+            keyword in text
+            for keyword in (
+                "文案",
+                "脚本",
+                "短剧",
+                "视频",
+                "导演",
+                "剪辑",
+                "prompt",
+                "提示词",
+                "creative",
+                "story",
+            )
+        ):
+            if any(
+                keyword in haystack
+                for keyword in ("creative", "kimi", "qwen", "deepseek", "chat", "text")
+            ):
                 score += 24
             if any(keyword in haystack for keyword in ("creative", "kimi", "story")):
                 score += 10
             if any(keyword in haystack for keyword in ("coder", "code")):
                 score -= 4
-        if any(keyword in text for keyword in ("分析", "调研", "研究", "经济", "金融", "市场", "竞品", "风险", "review", "audit")):
-            if any(keyword in haystack for keyword in ("analyst", "analysis", "reason", "max", "sonnet", "claude", "deepseek", "qwen", "glm")):
+        if any(
+            keyword in text
+            for keyword in (
+                "分析",
+                "调研",
+                "研究",
+                "经济",
+                "金融",
+                "市场",
+                "竞品",
+                "风险",
+                "review",
+                "audit",
+            )
+        ):
+            if any(
+                keyword in haystack
+                for keyword in (
+                    "analyst",
+                    "analysis",
+                    "reason",
+                    "max",
+                    "sonnet",
+                    "claude",
+                    "deepseek",
+                    "qwen",
+                    "glm",
+                )
+            ):
                 score += 22
             if "structured_output" in haystack:
                 score += 6
-        if any(keyword in text for keyword in ("图片", "识图", "视觉", "image", "vision")) and "vision" in haystack:
+        if (
+            any(keyword in text for keyword in ("图片", "识图", "视觉", "image", "vision"))
+            and "vision" in haystack
+        ):
             score += 28
         if any(
             keyword in text for keyword in ("合规", "法律", "隐私", "版权", "资质", "compliance")
-        ) and any(keyword in haystack for keyword in ("analyst", "review", "sonnet", "claude", "max")):
+        ) and any(
+            keyword in haystack for keyword in ("analyst", "review", "sonnet", "claude", "max")
+        ):
             score += 18
         scored.append((score, -len(logical_model), logical_model))
     scored.sort(reverse=True)
@@ -1167,6 +1245,7 @@ def _is_messages_endpoint_api_base(api_base: str | None) -> bool:
         return False
     return urlsplit(api_base).path.rstrip("/").endswith("/messages")
 
+
 def _model_characteristics(
     logical_model: str,
     definition: LogicalModelDefinition,
@@ -1182,17 +1261,55 @@ def _model_characteristics(
 
 def _task_characteristics(text: str) -> frozenset[str]:
     characteristics: set[str] = set()
-    if any(keyword in text for keyword in ("语音", "录音", "音频", "听写", "转写", "speech", "audio", "voice")):
+    if any(
+        keyword in text
+        for keyword in ("语音", "录音", "音频", "听写", "转写", "speech", "audio", "voice")
+    ):
         characteristics.add("audio")
-    if any(keyword in text for keyword in ("图片", "识图", "视觉", "图像", "截图", "image", "vision")):
+    if any(
+        keyword in text for keyword in ("图片", "识图", "视觉", "图像", "截图", "image", "vision")
+    ):
         characteristics.add("vision")
-    if any(keyword in text for keyword in ("code", "代码", "网页", "web", "前端", "后端", "api", "github", "测试", "部署")):
+    if any(
+        keyword in text
+        for keyword in (
+            "code",
+            "代码",
+            "网页",
+            "web",
+            "前端",
+            "后端",
+            "api",
+            "github",
+            "测试",
+            "部署",
+        )
+    ):
         characteristics.add("code")
-    if any(keyword in text for keyword in ("质量", "审查", "复核", "验收", "评审", "review", "audit")):
+    if any(
+        keyword in text for keyword in ("质量", "审查", "复核", "验收", "评审", "review", "audit")
+    ):
         characteristics.add("review")
-    if any(keyword in text for keyword in ("分析", "调研", "研究", "经济", "金融", "市场", "竞品", "风险")):
+    if any(
+        keyword in text
+        for keyword in ("分析", "调研", "研究", "经济", "金融", "市场", "竞品", "风险")
+    ):
         characteristics.add("analysis")
-    if any(keyword in text for keyword in ("文案", "脚本", "短剧", "视频", "导演", "剪辑", "prompt", "提示词", "creative", "story")):
+    if any(
+        keyword in text
+        for keyword in (
+            "文案",
+            "脚本",
+            "短剧",
+            "视频",
+            "导演",
+            "剪辑",
+            "prompt",
+            "提示词",
+            "creative",
+            "story",
+        )
+    ):
         characteristics.add("creative")
     if any("\u4e00" <= char <= "\u9fff" for char in text):
         characteristics.add("chinese")
@@ -1235,9 +1352,12 @@ def _task_characteristic_score(text: str, characteristics: frozenset[str]) -> in
         score += 18
     if "chinese" in task_characteristics and "chinese" in characteristics:
         score += 5
-    if "general" in task_characteristics and ("general" in characteristics or "text" in characteristics):
+    if "general" in task_characteristics and (
+        "general" in characteristics or "text" in characteristics
+    ):
         score += 4
     return score
+
 
 def _requested_skills(context: TaskContext) -> tuple[str, ...]:
     value = context.routing_decision.get("requested_skills")
@@ -1346,11 +1466,13 @@ def _task_profiles(task: object) -> tuple[TaskProfile, ...]:
     profiles: list[TaskProfile] = []
     if any(keyword in text for keyword in ("deploy", "部署", "install", "安装", "server")):
         profiles.append(TaskProfile.DEPLOYMENT)
-    if any(keyword in text for keyword in ("code", "代码", "bug", "api", "github", "test", "网页", "web")):
-        profiles.append(TaskProfile.SOFTWARE)
     if any(
         keyword in text
-        for keyword in ("research", "调研", "分析", "报告", "市场", "竞品", "机会")
+        for keyword in ("code", "代码", "bug", "api", "github", "test", "网页", "web")
+    ):
+        profiles.append(TaskProfile.SOFTWARE)
+    if any(
+        keyword in text for keyword in ("research", "调研", "分析", "报告", "市场", "竞品", "机会")
     ):
         profiles.append(TaskProfile.RESEARCH)
     if any(keyword in text for keyword in ("incident", "故障", "日志", "告警", "监控")):

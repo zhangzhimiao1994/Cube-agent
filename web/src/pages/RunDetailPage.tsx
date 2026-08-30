@@ -62,6 +62,44 @@ function payloadNumber(payload: Record<string, unknown>, key: string) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function payloadBoolean(payload: Record<string, unknown>, key: string) {
+  const value = payload[key];
+  return typeof value === "boolean" ? value : null;
+}
+
+type FailureDiagnostic = {
+  sequence: number;
+  kind: string;
+  summary: string;
+  stage: string | null;
+  category: string | null;
+  code: string | null;
+  retryable: boolean | null;
+  statusCode: number | null;
+  suggestedAction: string | null;
+};
+
+function collectFailureDiagnostics(events: RunEvent[]): FailureDiagnostic[] {
+  return events.flatMap((event) => {
+    if (!["runtime.failed", "step.failed", "tool.failed"].includes(event.kind)) return [];
+    const summary = payloadString(event.payload, "error_summary") ?? event.message;
+    if (!summary) return [];
+    return [
+      {
+        sequence: event.sequence,
+        kind: event.kind,
+        summary,
+        stage: payloadString(event.payload, "error_stage"),
+        category: payloadString(event.payload, "error_category"),
+        code: payloadString(event.payload, "error_code"),
+        retryable: payloadBoolean(event.payload, "retryable"),
+        statusCode: payloadNumber(event.payload, "status_code"),
+        suggestedAction: payloadString(event.payload, "suggested_action"),
+      },
+    ];
+  });
+}
+
 function collectObserverNotices(events: RunEvent[]): ObserverNotice[] {
   return events.flatMap((event) => {
     if (event.kind !== "observer.notice") return [];
@@ -149,6 +187,7 @@ export function RunDetailPage() {
   const canCancel = !TERMINAL_STATUSES.has(run.data.status);
   const isWaitingForMode = run.data.status === "waiting_user_mode" && Boolean(run.data.decision_token);
   const observerNotices = collectObserverNotices(run.data.events);
+  const failureDiagnostics = collectFailureDiagnostics(run.data.events);
 
   return (
     <section>
@@ -235,6 +274,30 @@ export function RunDetailPage() {
                 {notice.actor ? <small>角色：{notice.actor}</small> : null}
                 <small>
                   运行信号：失败 {notice.failureEvents ?? 0} / 重试 {notice.retryEvents ?? 0} / 消息 {notice.messageEvents ?? 0} / 产物 {notice.artifactEvents ?? 0}
+                </small>
+              </li>
+            ))}
+          </ul>
+        </article>
+      ) : null}
+
+      {failureDiagnostics.length > 0 ? (
+        <article>
+          <h3>失败诊断</h3>
+          <p className="field-help">系统按失败事件提取了可公开诊断字段，用于判断是模型、容量、工具、运行时还是配置问题。</p>
+          <ul className="compact-list">
+            {failureDiagnostics.map((diagnostic) => (
+              <li key={diagnostic.sequence}>
+                <strong>{diagnostic.summary}</strong>
+                {diagnostic.code ? <span>错误码：{diagnostic.code}</span> : null}
+                {diagnostic.stage || diagnostic.category ? (
+                  <span>位置：{[diagnostic.stage, diagnostic.category].filter(Boolean).join(" / ")}</span>
+                ) : null}
+                {diagnostic.statusCode !== null ? <span>状态码：{diagnostic.statusCode}</span> : null}
+                {diagnostic.retryable !== null ? <span>可重试：{diagnostic.retryable ? "是" : "否"}</span> : null}
+                {diagnostic.suggestedAction ? <small>建议：{diagnostic.suggestedAction}</small> : null}
+                <small>
+                  来源：{diagnostic.kind} #{diagnostic.sequence}
                 </small>
               </li>
             ))}

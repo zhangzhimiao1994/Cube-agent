@@ -1208,6 +1208,47 @@ def test_mode_error_log_includes_runtime_failed_reason_from_events(
     assert log.details["reason"] == reason
 
 
+def test_mode_error_log_includes_structured_failure_diagnostic() -> None:
+    response = RunDetailResponse(
+        id=uuid4(),
+        status="failed",
+        mode="direct",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="hello",
+        events=[
+            RunEventResponse(
+                sequence=1,
+                kind="runtime.failed",
+                message="model gateway failed: model transport failed (status=401)",
+                created_at=datetime.now(UTC),
+                payload={
+                    "error_summary": "model gateway failed: model transport failed (status=401)",
+                    "error_stage": "model_provider",
+                    "error_category": "authentication",
+                    "error_code": "model.provider_auth_failed",
+                    "retryable": False,
+                    "status_code": 401,
+                    "suggested_action": "检查模型 API Key、Base URL、模型权限和账号额度后重试。",
+                },
+            )
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    log = _mode_error_log_from_run(response)
+
+    assert log.details["error_code"] == "model.provider_auth_failed"
+    assert log.details["error_stage"] == "model_provider"
+    assert log.details["error_category"] == "authentication"
+    assert log.details["retryable"] == "False"
+    assert log.details["status_code"] == "401"
+    assert "模型 API Key" in log.details["suggested_action"]
+    assert "diagnosis" not in log.details
+
+
 def test_mode_error_log_explains_missing_legacy_failure_reason() -> None:
     response = RunDetailResponse(
         id=uuid4(),

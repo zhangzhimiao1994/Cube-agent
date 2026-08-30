@@ -1,8 +1,36 @@
 # Agent Hub 重构交接文档
 
-更新时间：2026-08-12
+更新时间：2026-08-30
 
 用途：这份文档单独记录后续重构方向。当前项目仍以“先稳定已有功能”为优先；如果后续新开会话或新项目做重构，应从这里接手。
+
+## 2026-08-30 当前实现记录：运行报错细化
+
+本轮在现有系统上继续增强运行失败诊断，目标是让运行中断不再只显示一条泛化 `reason`。
+
+已完成：
+
+- 后端新增结构化失败诊断：`error_summary`、`error_stage`、`error_category`、`error_code`、`retryable`、`status_code`、`suggested_action`。
+- `runtime.failed` 合约已允许携带安全 `payload`。
+- `RunRepository.persist_event()` 会为 `runtime.failed`、`step.failed`、`tool.failed` 自动补齐诊断 payload，覆盖运行时主动上报失败和 service 捕获异常两类路径。
+- AutoGen / Crew / Hybrid / UnavailableRuntime 的失败事件已接入诊断 payload。
+- admin 日志中心的 mode error 会展示错误码、阶段、分类、是否可重试、状态码和建议动作。
+- Web 对话失败气泡、运行过程详情、运行详情页新增结构化失败诊断展示。
+- 同步修复一个 Skill 上传版本问题：包式 Skill 的管理层内容哈希改为按归一化文件内容计算，避免 ZIP/TAR 容器元数据变化导致“同内容重复上传”误判成新版本；运行沙箱执行仍使用真实包字节哈希校验。
+
+已验证：
+
+- `pytest tests/unit/runtime/test_failure_reason.py tests/unit/runs/test_failure_reason.py tests/unit/runs/test_repository_public_payload.py tests/contracts/test_runtime_contract.py tests/api/test_admin_resources.py -q`：226 passed。
+- `pytest tests/unit/runtime/test_hybrid.py tests/unit/runtime/crew/test_adapter_failure_reason.py tests/unit/runs/test_observer.py tests/unit/runs/test_terminal_hooks.py -q`：20 passed。
+- `ruff check` 覆盖本轮改动后端文件：passed。
+- `mypy` 覆盖本轮核心后端文件：passed。
+- `npm run lint`：passed。
+- `npm test -- --run src/pages/OperationalPages.test.tsx`：72 passed。
+
+未完成/注意：
+
+- `tests/integration/runtime/test_hybrid_runtime.py` 在本机因测试 PostgreSQL 端口未就绪超时，9 个 setup errors；不是业务断言失败。需要有本地集成测试数据库或 Docker 测试环境后再跑。
+- 本轮还未提交/推送/部署；后续如继续交付，需要提交后推送并检查 GitHub checks。
 
 ## 当前目标口径
 

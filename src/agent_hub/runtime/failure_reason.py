@@ -16,10 +16,12 @@ from agent_hub.models.litellm_client import ModelResponseError, ModelTransportEr
 from agent_hub.models.registry import NoCapableDeployment
 
 MAX_FAILURE_REASON_LENGTH = 240
+RuntimeFailureDiagnostic = dict[str, str | int | bool]
 SENSITIVE_FAILURE_REASON = re.compile(
     r"(api[_-]?key|authorization|bearer|credential|password|secret|(?:access|refresh|session)[_-]?token|sk-[A-Za-z0-9])",
     re.IGNORECASE,
 )
+_STATUS_CODE = re.compile(r"\(status=(?P<status>[1-5][0-9]{2})\)")
 GENERIC_MODEL_GATEWAY_FAILURE = "model gateway failed"
 LEGACY_GENERIC_FAILURES = frozenset(
     {
@@ -84,6 +86,243 @@ def safe_runtime_failure_reason(error: Exception, *, fallback: str = "runtime_fa
     return reason[:MAX_FAILURE_REASON_LENGTH]
 
 
+def safe_runtime_failure_diagnostic(
+    error: Exception,
+    *,
+    fallback: str = "runtime_failed",
+) -> RuntimeFailureDiagnostic:
+    """Return a redacted, structured diagnostic payload for failed runs."""
+
+    reason = safe_runtime_failure_reason(error, fallback=fallback)
+    status_code = error.status_code if isinstance(error, ModelTransportError) else None
+    return runtime_failure_diagnostic_from_reason(reason, status_code=status_code)
+
+
+def runtime_failure_diagnostic_from_reason(
+    reason: str | None,
+    *,
+    status_code: int | None = None,
+) -> RuntimeFailureDiagnostic:
+    """Classify an already-redacted failure reason into UI/operator hints."""
+
+    normalized = normalize_failure_reason(reason or "") or "runtime_failed"
+    if not is_safe_failure_reason(normalized):
+        normalized = "runtime_failed"
+    if status_code is None:
+        status_code = _status_code_from_reason(normalized)
+    lowered = normalized.lower()
+
+    diagnostic = _base_diagnostic(
+        normalized,
+        error_stage="runtime",
+        error_category="internal",
+        error_code="runtime.failed",
+        retryable=False,
+        suggested_action="查看运行详情中的上一条失败事件；如果失败重复出现，检查对应模式、工具或模型配置。",
+    )
+
+    if "model gateway failed" in lowered:
+        diagnostic = _model_gateway_diagnostic(normalized, status_code=status_code)
+    elif lowered in {"unaccounted_usage", "model_outcome_uncertain", "tool_outcome_uncertain"}:
+        diagnostic = _base_diagnostic(
+            normalized,
+            error_stage="runtime_accounting",
+            error_category="accounting_guardrail",
+            error_code=f"runtime.{lowered}",
+            retryable=False,
+            suggested_action="运行结果账本不完整，系统已阻止继续交付；请检查模型/工具结果记录链路后重试。",
+        )
+    elif "timeout" in lowered or "timed out" in lowered:
+        diagnostic = _base_diagnostic(
+            normalized,
+            error_stage="runtime",
+            error_category="timeout",
+            error_code="runtime.timeout",
+            retryable=True,
+            suggested_action="任务运行超时；可缩小任务范围、降低并发或稍后重试。",
+        )
+    return diagnostic
+
+
+def _model_gateway_diagnostic(
+    reason: str,
+    *,
+    status_code: int | None,
+) -> RuntimeFailureDiagnostic:
+    lowered = reason.lower()
+    if "no capable deployment" in lowered:
+        return _base_diagnostic(
+            reason,
+            error_stage="model_routing",
+            error_category="no_capable_model",
+            error_code="model.no_capable_deployment",
+            retryable=False,
+            suggested_action="在模型配置中为当前能力补齐可用部署，或调整 Agent/工作流使用的逻辑模型。",
+        )
+    if "capacity queue is full" in lowered:
+        return _base_diagnostic(
+            reason,
+            error_stage="model_capacity",
+            error_category="queue_full",
+            error_code="model.capacity_queue_full",
+            retryable=True,
+            suggested_action="模型并发队列已满；稍后重试，或降低并发/切换备用模型。",
+        )
+    if "capacity queue timeout" in lowered:
+        return _base_diagnostic(
+            reason,
+            error_stage="model_capacity",
+            error_category="queue_timeout",
+            error_code="model.capacity_timeout",
+            retryable=True,
+            suggested_action="模型容量等待超时；稍后重试，或增加可用席位/切换备用模型。",
+        )
+    if "capacity configuration failed" in lowered:
+        return _base_diagnostic(
+            reason,
+            error_stage="model_capacity",
+            error_category="configuration",
+            error_code="model.capacity_configuration_failed",
+            retryable=False,
+            suggested_action="检查模型容量配置、配额作用域和并发参数，修复后重新发布配置。",
+        )
+    if "capacity backend failed" in lowered:
+        return _base_diagnostic(
+            reason,
+            error_stage="model_capacity",
+            error_category="backend",
+            error_code="model.capacity_backend_failed",
+            retryable=True,
+            suggested_action="检查容量后端服务状态；恢复后可重试本次任务。",
+        )
+    if "capacity unavailable" in lowered:
+        return _base_diagnostic(
+            reason,
+            error_stage="model_capacity",
+            error_category="unavailable",
+            error_code="model.capacity_unavailable",
+            retryable=True,
+            suggested_action="当前模型容量不可用；稍后重试，或切换到可用模型。",
+        )
+    if "configuration failed" in lowered:
+        return _base_diagnostic(
+            reason,
+            error_stage="model_configuration",
+            error_category="configuration",
+            error_code="model.configuration_failed",
+            retryable=False,
+            suggested_action="检查模型 API Key、API Base、模型名和供应商权限后重试。",
+            status_code=status_code,
+        )
+    if "response failed" in lowered:
+        return _provider_diagnostic(reason, status_code=status_code, response=True)
+    if "transport failed" in lowered:
+        return _provider_diagnostic(reason, status_code=status_code, response=False)
+    return _base_diagnostic(
+        reason,
+        error_stage="model_gateway",
+        error_category="gateway",
+        error_code="model.gateway_failed",
+        retryable=True,
+        suggested_action="模型网关调用失败；查看模型配置与调用错误日志，必要时切换备用模型后重试。",
+        status_code=status_code,
+    )
+
+
+def _provider_diagnostic(
+    reason: str,
+    *,
+    status_code: int | None,
+    response: bool,
+) -> RuntimeFailureDiagnostic:
+    if status_code in {401, 403}:
+        return _base_diagnostic(
+            reason,
+            error_stage="model_provider",
+            error_category="authentication",
+            error_code="model.provider_auth_failed",
+            retryable=False,
+            suggested_action="模型供应商拒绝请求；检查 API Key、Base URL、模型权限和账号额度后重试。",
+            status_code=status_code,
+        )
+    if status_code == 429:
+        return _base_diagnostic(
+            reason,
+            error_stage="model_provider",
+            error_category="rate_limited",
+            error_code="model.provider_rate_limited",
+            retryable=True,
+            suggested_action="模型供应商限流；稍后重试，或降低并发/切换备用模型。",
+            status_code=status_code,
+        )
+    if status_code is not None and status_code >= 500:
+        return _base_diagnostic(
+            reason,
+            error_stage="model_provider",
+            error_category="upstream_unavailable",
+            error_code="model.provider_unavailable",
+            retryable=True,
+            suggested_action="上游模型服务异常；稍后重试，或临时切换备用模型。",
+            status_code=status_code,
+        )
+    if status_code in {408, 409, 425}:
+        return _base_diagnostic(
+            reason,
+            error_stage="model_provider",
+            error_category="transient",
+            error_code="model.provider_transient_failed",
+            retryable=True,
+            suggested_action="上游模型请求临时失败；可直接重试或切换备用模型。",
+            status_code=status_code,
+        )
+    category = "invalid_response" if response else "transport"
+    code = "model.provider_response_failed" if response else "model.provider_transport_failed"
+    action = (
+        "模型返回结构不符合系统契约；检查模型适配器、返回格式和供应商兼容性。"
+        if response
+        else "模型网络或上游连接失败；检查 API Base、网络连通性和供应商状态。"
+    )
+    return _base_diagnostic(
+        reason,
+        error_stage="model_provider",
+        error_category=category,
+        error_code=code,
+        retryable=response is False,
+        suggested_action=action,
+        status_code=status_code,
+    )
+
+
+def _base_diagnostic(
+    reason: str,
+    *,
+    error_stage: str,
+    error_category: str,
+    error_code: str,
+    retryable: bool,
+    suggested_action: str,
+    status_code: int | None = None,
+) -> RuntimeFailureDiagnostic:
+    diagnostic: RuntimeFailureDiagnostic = {
+        "error_summary": reason[:MAX_FAILURE_REASON_LENGTH],
+        "error_stage": error_stage,
+        "error_category": error_category,
+        "error_code": error_code,
+        "retryable": retryable,
+        "suggested_action": suggested_action,
+    }
+    if status_code is not None:
+        diagnostic["status_code"] = status_code
+    return diagnostic
+
+
+def _status_code_from_reason(reason: str) -> int | None:
+    match = _STATUS_CODE.search(reason)
+    if match is None:
+        return None
+    return int(match.group("status"))
+
+
 def normalize_failure_reason(reason: str) -> str:
     return " ".join(reason.strip().split())
 
@@ -105,6 +344,8 @@ __all__ = [
     "is_legacy_generic_failure_reason",
     "is_safe_failure_reason",
     "normalize_failure_reason",
+    "runtime_failure_diagnostic_from_reason",
     "safe_model_gateway_failure_reason",
+    "safe_runtime_failure_diagnostic",
     "safe_runtime_failure_reason",
 ]

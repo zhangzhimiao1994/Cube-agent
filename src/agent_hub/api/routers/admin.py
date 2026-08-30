@@ -2154,6 +2154,43 @@ def _instruction_skill_content_sha256(files: Iterable[tuple[str, bytes]]) -> str
     return digest.hexdigest()
 
 
+def _package_archive_content_sha256(archive_bytes: bytes) -> str | None:
+    """Hash package file contents without ZIP/TAR container metadata."""
+
+    if zipfile.is_zipfile(io.BytesIO(archive_bytes)):
+        try:
+            with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+                files: list[tuple[str, bytes]] = []
+                for info in archive.infolist():
+                    if info.is_dir() or info.filename.replace("\\", "/").endswith("/"):
+                        continue
+                    path = _safe_skill_bundle_path(info.filename)
+                    if _skill_bundle_path_is_ignored(path):
+                        continue
+                    files.append((path, archive.read(info.filename)))
+                return _instruction_skill_content_sha256(files) if files else None
+        except (InvalidSkillPackage, KeyError, OSError, zipfile.BadZipFile):
+            return None
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
+            files = []
+            for member in archive.getmembers():
+                if _tar_member_is_metadata(member) or member.isdir():
+                    continue
+                if not member.isfile():
+                    continue
+                path = _safe_skill_bundle_path(member.name)
+                if _skill_bundle_path_is_ignored(path):
+                    continue
+                source = archive.extractfile(member)
+                if source is None:
+                    continue
+                files.append((path, source.read()))
+            return _instruction_skill_content_sha256(files) if files else None
+    except (InvalidSkillPackage, OSError, tarfile.TarError):
+        return None
+
+
 def _select_instruction_skill_path(candidates: Iterable[str]) -> str | None:
     ordered = tuple(candidates)
     if not ordered:
@@ -2218,9 +2255,14 @@ def _validate_instruction_skill_file(path: str) -> None:
 
 
 def _skill_response_from_scan(
-    filename: str, skill_id: str, scan_report: SkillScanReport
+    filename: str,
+    skill_id: str,
+    scan_report: SkillScanReport,
+    *,
+    content_sha256: str | None = None,
 ) -> SkillResponse:
     inspection = scan_report.inspection
+    content_sha256 = content_sha256 or inspection.content_sha256
     return SkillResponse(
         id=skill_id,
         name=inspection.manifest.name,
@@ -2228,12 +2270,12 @@ def _skill_response_from_scan(
         scan_diff=[
             f"package {filename} scanned",
             f"entry point: {inspection.manifest.entry_point}",
-            f"content sha256: {inspection.content_sha256}",
+            f"content sha256: {content_sha256}",
         ],
         requested_permissions=list(inspection.requested_capabilities),
         source_filename=filename,
-        package_version_id=f"pkg_{inspection.content_sha256}",
-        content_sha256=inspection.content_sha256,
+        package_version_id=f"pkg_{content_sha256}",
+        content_sha256=content_sha256,
     )
 
 
@@ -2241,7 +2283,12 @@ def _skill_response_from_scanned_archive(
     scanned: _ScannedSkillArchive, skill_id: str
 ) -> SkillResponse:
     if scanned.scan_report is not None:
-        return _skill_response_from_scan(scanned.filename, skill_id, scanned.scan_report)
+        return _skill_response_from_scan(
+            scanned.filename,
+            skill_id,
+            scanned.scan_report,
+            content_sha256=_package_archive_content_sha256(scanned.archive_bytes),
+        )
     return SkillResponse(
         id=skill_id,
         name=scanned.instruction_name or _skill_name_slug(PurePosixPath(scanned.filename).stem),
@@ -6252,6 +6299,7 @@ def _audit_log_entry(event: AuditEventResponse) -> LogEntryResponse:
 
 def _mode_error_log_from_run(run: RunDetailResponse) -> LogEntryResponse:
     reason = _failure_reason_from_run_events(run.events)
+    diagnostic = _failure_diagnostic_from_run_events(run.events)
     display_reason = _mode_error_display_reason(reason)
     details = {
         "run_id": str(run.id),
@@ -6259,9 +6307,20 @@ def _mode_error_log_from_run(run: RunDetailResponse) -> LogEntryResponse:
         "status": run.status,
         "reason": display_reason,
     }
+    for key in (
+        "error_code",
+        "error_stage",
+        "error_category",
+        "retryable",
+        "status_code",
+        "suggested_action",
+    ):
+        value = diagnostic.get(key)
+        if value is not None:
+            details[key] = str(value)
     if reason is None:
         details["diagnosis"] = _MODE_ERROR_REASON_NOT_RECORDED_DIAGNOSIS
-    elif is_legacy_generic_failure_reason(reason):
+    elif not diagnostic and is_legacy_generic_failure_reason(reason):
         details["diagnosis"] = _MODE_ERROR_LEGACY_GENERIC_DIAGNOSIS
     return LogEntryResponse(
         id=f"log_run_{run.id}",
@@ -6304,6 +6363,28 @@ def _failure_reason_from_run_events(events: Iterable[RunEventResponse]) -> str |
             if not is_legacy_generic_failure_reason(reason):
                 return reason
     return fallback
+
+
+def _failure_diagnostic_from_run_events(
+    events: Iterable[RunEventResponse],
+) -> dict[str, JsonValue]:
+    event = _failure_event_from_run_events(events)
+    if event is None:
+        return {}
+    return {
+        key: value
+        for key, value in event.payload.items()
+        if key
+        in {
+            "error_summary",
+            "error_stage",
+            "error_category",
+            "error_code",
+            "retryable",
+            "status_code",
+            "suggested_action",
+        }
+    }
 
 
 _RUN_DEBUG_MAX_EVENTS = 50

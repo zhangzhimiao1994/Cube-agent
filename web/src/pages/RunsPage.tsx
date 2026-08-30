@@ -259,13 +259,14 @@ function displayEventMessage(event: RunDetail["events"][number]) {
     event.message && event.message !== event.kind && !/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(event.message)
       ? event.message
       : null;
+  const failureSummary = failedEventSummary(event);
   const messages: Record<string, string> = {
     queued: "任务已进入队列，等待 Worker 调度执行。",
     "run.queued": "任务已进入队列，等待 Worker 调度执行。",
     "model.started": "模型请求已开始。",
     "runtime.started": "运行时已启动，正在按模式执行。",
     "runtime.completed": "运行完成，已汇总结果。",
-    "runtime.failed": readableMessage ?? "运行失败，请查看日志中心的模式运行错误。",
+    "runtime.failed": failureSummary ?? readableMessage ?? "运行失败，请查看日志中心的模式运行错误。",
     "message.created": readableMessage ?? "运行过程中产生了一条可公开消息。",
     "artifact.created": "已生成一个可查看的结果或中间产物。",
     "dispatch.started": "主 Agent 正在拆解任务，并准备派给合适角色。",
@@ -276,12 +277,12 @@ function displayEventMessage(event: RunDetail["events"][number]) {
     "decision.completed": readableMessage ?? "主 Agent 已完成裁决并整理最终结论。",
     "step.started": readableMessage ?? "一个执行步骤已开始。",
     "step.completed": readableMessage ?? "一个执行步骤已完成。",
-    "step.failed": readableMessage ?? "一个执行步骤失败，已保留失败前的输出。",
+    "step.failed": failureSummary ?? readableMessage ?? "一个执行步骤失败，已保留失败前的输出。",
     "step.retrying": readableMessage ?? "步骤执行失败后正在重试。",
     "review.completed": readableMessage ?? "审查完成，已记录风险、证据或结论。",
     "tool.started": readableMessage ?? "工具调用已开始。",
     "tool.completed": readableMessage ?? "工具调用已完成。",
-    "tool.failed": readableMessage ?? "工具调用失败，已记录错误上下文。",
+    "tool.failed": failureSummary ?? readableMessage ?? "工具调用失败，已记录错误上下文。",
     "approval.requested": "主 Agent 需要你确认后再继续。",
     "approval.resolved": "你的确认已处理，任务会继续推进。",
     "temporary_agent.proposed": "主 Agent 建议临时加入一个子 Agent。",
@@ -437,6 +438,13 @@ function eventPayloadLabel(key: string) {
     attempt: "第几次尝试",
     missing_capability: "缺少能力",
     reason: "原因",
+    error_summary: "失败摘要",
+    error_stage: "失败位置",
+    error_category: "失败分类",
+    error_code: "错误码",
+    retryable: "是否可重试",
+    status_code: "上游状态码",
+    suggested_action: "建议处理",
     upstream_model: "上游模型",
   };
   if (labels[key]) return labels[key];
@@ -453,6 +461,13 @@ function orderedEventPayloadEntries(payload: Record<string, unknown>) {
     "upstream_model",
     "provider",
     "deployment",
+    "error_summary",
+    "error_code",
+    "error_stage",
+    "error_category",
+    "status_code",
+    "retryable",
+    "suggested_action",
     "role",
     "agent",
     "task",
@@ -837,8 +852,8 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
 function failureReasonFromEvents(events: RunDetail["events"]) {
   const event = [...events]
     .sort((left, right) => right.sequence - left.sequence)
-    .find((item) => ["runtime.failed", "step.failed", "tool.failed"].includes(item.kind) && item.message);
-  return event?.message ?? null;
+    .find((item) => isFailedEvent(item) && (item.message || payloadText(item.payload, "error_summary")));
+  return event ? (failedEventSummary(event) ?? event.message) : null;
 }
 
 function dedupeTextArtifacts(artifacts: RunDetail["artifacts"]) {
@@ -863,6 +878,43 @@ function preferredReplyArtifact(artifacts: RunDetail["artifacts"]) {
 
 function runConversationId(detail: RunDetail | undefined) {
   return detail?.explicit_details.conversation_id?.trim() || null;
+}
+
+function payloadText(payload: Record<string, unknown>, key: string) {
+  const value = payload[key];
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function payloadNumberValue(payload: Record<string, unknown>, key: string) {
+  const value = payload[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function payloadBooleanValue(payload: Record<string, unknown>, key: string) {
+  const value = payload[key];
+  return typeof value === "boolean" ? value : null;
+}
+
+function isFailedEvent(event: RunDetail["events"][number]) {
+  return event.kind === "runtime.failed" || event.kind === "step.failed" || event.kind === "tool.failed";
+}
+
+function failedEventSummary(event: RunDetail["events"][number]) {
+  if (!isFailedEvent(event)) return null;
+  const summary = payloadText(event.payload, "error_summary") ?? event.message;
+  const code = payloadText(event.payload, "error_code");
+  const stage = payloadText(event.payload, "error_stage");
+  const category = payloadText(event.payload, "error_category");
+  const statusCode = payloadNumberValue(event.payload, "status_code");
+  const retryable = payloadBooleanValue(event.payload, "retryable");
+  const suggestedAction = payloadText(event.payload, "suggested_action");
+  const parts = [`原因：${summary || "未记录具体原因"}`];
+  if (code) parts.push(`错误码：${code}`);
+  if (stage || category) parts.push(`位置：${[stage, category].filter(Boolean).join(" / ")}`);
+  if (statusCode !== null) parts.push(`状态码：${statusCode}`);
+  if (retryable !== null) parts.push(`可重试：${retryable ? "是" : "否"}`);
+  if (suggestedAction) parts.push(`建议：${suggestedAction}`);
+  return parts.join("\n");
 }
 
 function runSeatScope(detail: RunDetail) {

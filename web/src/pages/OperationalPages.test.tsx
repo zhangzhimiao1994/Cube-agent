@@ -1153,6 +1153,44 @@ describe("operational management pages", () => {
     expect(screen.queryByText("null")).toBeNull();
   });
 
+  it("shows structured runtime failure diagnostics on the detail page", async () => {
+    visibleRunDetail = {
+      ...runDetail,
+      status: "failed",
+      mode: "direct",
+      events: [
+        ...runDetail.events,
+        {
+          sequence: 5,
+          kind: "runtime.failed",
+          message: "model gateway failed: model transport failed (status=401)",
+          created_at: "2026-08-07T00:00:03Z",
+          participants: [],
+          payload: {
+            error_summary: "model gateway failed: model transport failed (status=401)",
+            error_stage: "model_provider",
+            error_category: "authentication",
+            error_code: "model.provider_auth_failed",
+            retryable: false,
+            status_code: 401,
+            suggested_action: "检查模型 API Key、Base URL、模型权限和账号额度后重试。",
+          },
+        },
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    expect(await screen.findByRole("heading", { name: "失败诊断" })).not.toBeNull();
+    expect(screen.getByText("model gateway failed: model transport failed (status=401)")).not.toBeNull();
+    expect(screen.getByText("错误码：model.provider_auth_failed")).not.toBeNull();
+    expect(screen.getByText("位置：model_provider / authentication")).not.toBeNull();
+    expect(screen.getByText("状态码：401")).not.toBeNull();
+    expect(screen.getByText("可重试：否")).not.toBeNull();
+    expect(screen.getByText(/检查模型 API Key/)).not.toBeNull();
+  });
+
   it("offers artifact downloads on the run detail page", async () => {
     visibleRunDetail = {
       ...runDetail,
@@ -1912,7 +1950,14 @@ describe("operational management pages", () => {
           message: "hybrid discuss failed: model gateway failed: model transport failed",
           created_at: "2026-08-07T00:00:03Z",
           participants: [],
-          payload: {},
+          payload: {
+            error_summary: "hybrid discuss failed: model gateway failed: model transport failed",
+            error_stage: "model_provider",
+            error_category: "transport",
+            error_code: "model.provider_transport_failed",
+            retryable: true,
+            suggested_action: "检查 API Base、网络连通性和供应商状态。",
+          },
         },
       ],
     };
@@ -1928,6 +1973,8 @@ describe("operational management pages", () => {
     expect(within(stream).getByText("运行中断")).not.toBeNull();
     expect(within(stream).getByText(/中断前输出已保留/)).not.toBeNull();
     expect(within(stream).getByText(/model transport failed/)).not.toBeNull();
+    expect(within(stream).getByText(/错误码：model\.provider_transport_failed/)).not.toBeNull();
+    expect(within(stream).getByText(/建议：检查 API Base/)).not.toBeNull();
   });
 
   it("shows Codex-style chat replies with Kimi-style inline cluster actions", async () => {

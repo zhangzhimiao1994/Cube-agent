@@ -54,7 +54,10 @@ from agent_hub.runtime.contracts import (
     TaskContext,
 )
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
-from agent_hub.runtime.failure_reason import safe_runtime_failure_reason
+from agent_hub.runtime.failure_reason import (
+    runtime_failure_diagnostic_from_reason,
+    safe_runtime_failure_reason,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -316,9 +319,7 @@ def _bounded_prompt_json(value: object, *, max_text_bytes: int) -> object:
             for key, item in value.items()
         }
     if isinstance(value, tuple | list):
-        return [
-            _bounded_prompt_json(item, max_text_bytes=max_text_bytes) for item in value
-        ]
+        return [_bounded_prompt_json(item, max_text_bytes=max_text_bytes) for item in value]
     if type(value) is str:
         return _truncate_prompt_text(value, max_bytes=max_text_bytes)
     return value
@@ -330,9 +331,7 @@ def _artifact_prompt_payload(
     max_text_bytes: int = _MAX_SOURCE_ARTIFACT_TEXT_BYTES,
 ) -> dict[str, object]:
     payload = artifact.to_payload()
-    payload["content"] = _bounded_prompt_json(
-        artifact.content, max_text_bytes=max_text_bytes
-    )
+    payload["content"] = _bounded_prompt_json(artifact.content, max_text_bytes=max_text_bytes)
     return payload
 
 
@@ -634,7 +633,9 @@ class CrewAIObjectFactory:
             original_storage_path = core_paths.__dict__["db_storage_path"]
             if original_storage_path is not _contextual_crewai_storage_path:
                 _CREWAI_DEFAULT_STORAGE_PATH = original_storage_path
-            original_secure_storage_path = token_manager_module.TokenManager._get_secure_storage_path
+            original_secure_storage_path = (
+                token_manager_module.TokenManager._get_secure_storage_path
+            )
             if original_secure_storage_path is not _contextual_crewai_secure_storage_path:
                 _CREWAI_DEFAULT_SECURE_STORAGE_PATH = original_secure_storage_path
             import_storage = self._storage_dir / ".imports"
@@ -1018,6 +1019,9 @@ class CrewDispatchRuntime:
                     await emit(
                         kind=EventKind.RUNTIME_FAILED,
                         reason="dispatch accounting exhausted",
+                        payload=runtime_failure_diagnostic_from_reason(
+                            "dispatch accounting exhausted"
+                        ),
                     )
                     terminal_item = _Terminal(
                         RuntimeExecutionError("dispatch accounting exhausted")
@@ -1132,7 +1136,9 @@ class CrewDispatchRuntime:
                     if not run_open or not self._is_current_run(state):
                         return
                     response_tokens = 0 if response_usage is None else response_usage.total_tokens
-                    response_cost = completion.cost_usd if completion.cost_usd is not None else Decimal(0)
+                    response_cost = (
+                        completion.cost_usd if completion.cost_usd is not None else Decimal(0)
+                    )
                     raw_new_tokens = usage_ledger.tokens + response_tokens
                     raw_step_tokens = usage_ledger.step_tokens.get(step_id, 0) + response_tokens
                     raw_new_cost = usage_ledger.cost_usd + (response_cost or Decimal(0))
@@ -1489,6 +1495,7 @@ class CrewDispatchRuntime:
                 await emit(
                     kind=EventKind.RUNTIME_FAILED,
                     reason="dispatch accounting exhausted",
+                    payload=runtime_failure_diagnostic_from_reason("dispatch accounting exhausted"),
                 )
             except Exception as emit_error:  # noqa: BLE001
                 emit_error.__traceback__ = None
@@ -1496,7 +1503,9 @@ class CrewDispatchRuntime:
                 emit_error.__cause__ = None
                 del emit_error
         except RuntimeExecutionError as error:
-            failure_reason = safe_runtime_failure_reason(error, fallback="dispatch execution failed")
+            failure_reason = safe_runtime_failure_reason(
+                error, fallback="dispatch execution failed"
+            )
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None
@@ -1504,14 +1513,20 @@ class CrewDispatchRuntime:
             if hydrating_restored and protected_checkpoint is not None:
                 self._publish_checkpoint(state, protected_checkpoint)
             try:
-                await emit(kind=EventKind.RUNTIME_FAILED, reason=failure_reason)
+                await emit(
+                    kind=EventKind.RUNTIME_FAILED,
+                    reason=failure_reason,
+                    payload=runtime_failure_diagnostic_from_reason(failure_reason),
+                )
             except Exception as emit_error:  # noqa: BLE001
                 emit_error.__traceback__ = None
                 emit_error.__context__ = None
                 emit_error.__cause__ = None
                 del emit_error
         except Exception as error:  # noqa: BLE001 - redact all plugin/gateway failures
-            failure_reason = safe_runtime_failure_reason(error, fallback="dispatch execution failed")
+            failure_reason = safe_runtime_failure_reason(
+                error, fallback="dispatch execution failed"
+            )
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None
@@ -1520,7 +1535,11 @@ class CrewDispatchRuntime:
             if hydrating_restored and protected_checkpoint is not None:
                 self._publish_checkpoint(state, protected_checkpoint)
             try:
-                await emit(kind=EventKind.RUNTIME_FAILED, reason=failure_reason)
+                await emit(
+                    kind=EventKind.RUNTIME_FAILED,
+                    reason=failure_reason,
+                    payload=runtime_failure_diagnostic_from_reason(failure_reason),
+                )
             except Exception as emit_error:  # noqa: BLE001
                 emit_error.__traceback__ = None
                 emit_error.__context__ = None
@@ -1558,6 +1577,9 @@ class CrewDispatchRuntime:
                                 run_id=context.run_id,
                                 kind=EventKind.RUNTIME_FAILED,
                                 reason="artifact rollback failed",
+                                payload=runtime_failure_diagnostic_from_reason(
+                                    "artifact rollback failed"
+                                ),
                             )
                         )
                     except asyncio.QueueFull as queue_full:
@@ -1765,7 +1787,9 @@ class CrewDispatchRuntime:
             except asyncio.CancelledError:
                 raise
             except RuntimeExecutionError as error:
-                failure_reason = safe_runtime_failure_reason(error, fallback="step execution failed")
+                failure_reason = safe_runtime_failure_reason(
+                    error, fallback="step execution failed"
+                )
                 await event(
                     kind=EventKind.STEP_FAILED,
                     step_id=step.id,
@@ -1774,7 +1798,9 @@ class CrewDispatchRuntime:
                 )
                 raise
             except Exception as error:  # noqa: BLE001
-                failure_reason = safe_runtime_failure_reason(error, fallback="step execution failed")
+                failure_reason = safe_runtime_failure_reason(
+                    error, fallback="step execution failed"
+                )
                 error.__traceback__ = None
                 del error
                 await event(

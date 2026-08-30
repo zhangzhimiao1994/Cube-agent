@@ -64,9 +64,7 @@ def exception_graph_text(error: BaseException) -> str:
 
 class FakeGateway:
     def __init__(self, response: ModelResponse | BaseException | None = None) -> None:
-        self.response = response or ModelResponse(
-            text="A safe answer", usage=TokenUsage(10, 5, 15)
-        )
+        self.response = response or ModelResponse(text="A safe answer", usage=TokenUsage(10, 5, 15))
         self.requests: list[ModelRequest] = []
         self.started = asyncio.Event()
         self.release = asyncio.Event()
@@ -207,9 +205,7 @@ def test_artifact_hash_binds_metadata_sources_and_provenance() -> None:
     )
     assert first.content_sha256 != second.content_sha256
     with pytest.raises(ValidationError):
-        Artifact(
-            id=uuid4(), version=True, type="text", producer="main", content={"text": "x"}
-        )
+        Artifact(id=uuid4(), version=True, type="text", producer="main", content={"text": "x"})
 
 
 @pytest.mark.parametrize(
@@ -224,12 +220,12 @@ def test_artifact_hash_binds_metadata_sources_and_provenance() -> None:
 )
 def test_artifact_rejects_unsafe_json(bad: object) -> None:
     with pytest.raises((TypeError, ValueError, ValidationError)):
-            Artifact(
-                id=uuid4(),
-                type="data",
-                producer="main",
-                content=cast(Mapping[str, JsonValue], bad),
-            )
+        Artifact(
+            id=uuid4(),
+            type="data",
+            producer="main",
+            content=cast(Mapping[str, JsonValue], bad),
+        )
 
 
 def test_artifact_rejects_untrusted_hash() -> None:
@@ -347,14 +343,26 @@ def test_direct_runtime_events_allow_safe_observability_fields() -> None:
         payload={"summary": "ok"},
         inputs=(artifact,),
     )
+    failed_event = RunEvent(
+        kind=EventKind.RUNTIME_FAILED,
+        sequence=4,
+        run_id=RUN_ID,
+        reason="model gateway failed: model transport failed (status=502)",
+        payload={
+            "error_code": "model.provider_unavailable",
+            "error_stage": "model_provider",
+            "retryable": True,
+        },
+    )
 
     assert model_event.payload["logical_model"] == "main"
     assert artifact_event.artifact == artifact
     assert completed_event.inputs == (artifact,)
+    assert failed_event.payload["error_code"] == "model.provider_unavailable"
     with pytest.raises(ValidationError, match="unrelated"):
         RunEvent(
             kind=EventKind.MODEL_STARTED,
-            sequence=4,
+            sequence=5,
             run_id=RUN_ID,
             actor="main_agent",
             tool_name="http_read",
@@ -417,9 +425,7 @@ def test_event_contract_supports_bounded_framework_neutral_evolution() -> None:
             kind="custom.progress",
             sequence=3,
             run_id=RUN_ID,
-            artifact=Artifact(
-                id=uuid4(), type="text", producer="main", content={"text": "bad"}
-            ),
+            artifact=Artifact(id=uuid4(), type="text", producer="main", content={"text": "bad"}),
             payload={"x": 1},
         )
 
@@ -559,9 +565,7 @@ def test_cost_event_accepts_zero_and_rejects_unbounded_decimal_inputs_quickly() 
             run_id=RUN_ID,
             step_id="research",
             actor="researcher",
-            artifact=Artifact(
-                id=uuid4(), type="text", producer="main", content={"text": "bad"}
-            ),
+            artifact=Artifact(id=uuid4(), type="text", producer="main", content={"text": "bad"}),
         )
 
 
@@ -728,7 +732,9 @@ async def test_stream_rejects_second_consumer_without_consuming_event() -> None:
     await stream.aclose()  # type: ignore[attr-defined]
 
 
-async def test_direct_request_marks_prior_artifacts_untrusted_and_excludes_checkpoint_state() -> None:
+async def test_direct_request_marks_prior_artifacts_untrusted_and_excludes_checkpoint_state() -> (
+    None
+):
     gateway = FakeGateway()
     previous = Artifact(
         id=uuid4(),
@@ -747,12 +753,8 @@ async def test_direct_request_marks_prior_artifacts_untrusted_and_excludes_check
 
 async def test_direct_claims_only_sources_actually_included_in_prompt() -> None:
     gateway = FakeGateway()
-    text = Artifact(
-        id=uuid4(), type="text", producer="researcher", content={"text": "included"}
-    )
-    image = Artifact(
-        id=uuid4(), type="image", producer="vision", content={"object_key": "safe"}
-    )
+    text = Artifact(id=uuid4(), type="text", producer="researcher", content={"text": "included"})
+    image = Artifact(id=uuid4(), type="image", producer="vision", content={"object_key": "safe"})
     events = await collect(
         DirectRuntime(gateway, logical_model="general"), context(artifacts=(text, image))
     )

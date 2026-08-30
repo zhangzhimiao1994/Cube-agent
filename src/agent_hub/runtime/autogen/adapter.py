@@ -76,6 +76,7 @@ from agent_hub.runtime.contracts import (
     TaskContext,
 )
 from agent_hub.runtime.failure_reason import (
+    runtime_failure_diagnostic_from_reason,
     safe_model_gateway_failure_reason,
     safe_runtime_failure_reason,
 )
@@ -120,18 +121,14 @@ def _bounded_prompt_json(value: object, *, max_text_bytes: int) -> object:
             for key, item in value.items()
         }
     if isinstance(value, tuple | list):
-        return [
-            _bounded_prompt_json(item, max_text_bytes=max_text_bytes) for item in value
-        ]
+        return [_bounded_prompt_json(item, max_text_bytes=max_text_bytes) for item in value]
     if type(value) is str:
         return _truncate_prompt_text(value, max_bytes=max_text_bytes)
     return value
 
 
 def _artifact_prompt_content(artifact: Artifact) -> object:
-    return _bounded_prompt_json(
-        artifact.content, max_text_bytes=_MAX_SOURCE_ARTIFACT_TEXT_BYTES
-    )
+    return _bounded_prompt_json(artifact.content, max_text_bytes=_MAX_SOURCE_ARTIFACT_TEXT_BYTES)
 
 
 def _artifact_text_preview(artifact: Artifact, *, max_bytes: int = 2_000) -> str | None:
@@ -1135,8 +1132,7 @@ class AutoGenDiscussionRuntime:
                 for participant in self._plan.participants
             }
             participant_models = {
-                participant.id: participant.logical_model
-                for participant in self._plan.participants
+                participant.id: participant.logical_model for participant in self._plan.participants
             }
             selector = GatewayChatCompletionClient(
                 self._gateway,
@@ -1359,8 +1355,7 @@ class AutoGenDiscussionRuntime:
                 (
                     preview
                     for preview in (
-                        _artifact_text_preview(artifact)
-                        for artifact in reversed(message_artifacts)
+                        _artifact_text_preview(artifact) for artifact in reversed(message_artifacts)
                     )
                     if preview
                 ),
@@ -1371,7 +1366,9 @@ class AutoGenDiscussionRuntime:
                 sequence=sequence,
                 run_id=context.run_id,
                 payload={
-                    "participants": tuple(participant.id for participant in self._plan.participants),
+                    "participants": tuple(
+                        participant.id for participant in self._plan.participants
+                    ),
                     "participant_models": participant_models,
                     "summary": last_discussion,
                     "reason": reason,
@@ -1408,6 +1405,7 @@ class AutoGenDiscussionRuntime:
                 sequence=sequence,
                 run_id=context.run_id,
                 reason="unaccounted_usage",
+                payload=runtime_failure_diagnostic_from_reason("unaccounted_usage"),
             )
         except ModelOutcomeUncertain:
             yield RunEvent(
@@ -1415,6 +1413,7 @@ class AutoGenDiscussionRuntime:
                 sequence=sequence,
                 run_id=context.run_id,
                 reason="model_outcome_uncertain",
+                payload=runtime_failure_diagnostic_from_reason("model_outcome_uncertain"),
             )
         except ToolOutcomeUncertain:
             yield RunEvent(
@@ -1422,6 +1421,7 @@ class AutoGenDiscussionRuntime:
                 sequence=sequence,
                 run_id=context.run_id,
                 reason="tool_outcome_uncertain",
+                payload=runtime_failure_diagnostic_from_reason("tool_outcome_uncertain"),
             )
         except asyncio.CancelledError:
             if wall_expired.is_set():
@@ -1528,6 +1528,7 @@ class AutoGenDiscussionRuntime:
                 sequence=sequence,
                 run_id=context.run_id,
                 reason=failure_reason,
+                payload=runtime_failure_diagnostic_from_reason(failure_reason),
             )
         finally:
             if wall_handle is not None:

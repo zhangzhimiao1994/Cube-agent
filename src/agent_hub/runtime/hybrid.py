@@ -25,7 +25,10 @@ from agent_hub.runtime.contracts import (
     RuntimeCheckpoint,
     TaskContext,
 )
-from agent_hub.runtime.failure_reason import safe_runtime_failure_reason
+from agent_hub.runtime.failure_reason import (
+    runtime_failure_diagnostic_from_reason,
+    safe_runtime_failure_reason,
+)
 
 _RUNTIME_TYPE = "hybrid"
 _RUNTIME_VERSION = "1"
@@ -247,6 +250,7 @@ class HybridRuntime:
                 sequence=sequence,
                 run_id=context.run_id,
                 reason=failure_reason,
+                payload=runtime_failure_diagnostic_from_reason(failure_reason),
             )
         finally:
             self._active_child = None
@@ -509,9 +513,7 @@ def _discussion_handoff_artifacts(artifacts: tuple[Artifact, ...]) -> tuple[Arti
     model_response.
     """
 
-    wrapped_source_ids = {
-        source_id for artifact in artifacts for source_id in artifact.source_ids
-    }
+    wrapped_source_ids = {source_id for artifact in artifacts for source_id in artifact.source_ids}
     return tuple(
         artifact
         for artifact in artifacts
