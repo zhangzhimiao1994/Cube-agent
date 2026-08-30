@@ -8,7 +8,9 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 _SAFE_IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
-_DOTTED_BUILT_IN_TOOL_NAMES = frozenset({"document.generate_docx", "presentation.generate_pptx"})
+_DOTTED_BUILT_IN_TOOL_NAMES = frozenset(
+    {"document.generate_docx", "presentation.generate_pptx", "project.generate_zip"}
+)
 _MAX_TEXT = 2_000
 
 

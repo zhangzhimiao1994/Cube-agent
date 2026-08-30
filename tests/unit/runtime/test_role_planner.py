@@ -363,6 +363,18 @@ def test_dotted_tool_names_are_limited_to_known_built_ins() -> None:
         modes=frozenset({"dispatch"}),
         profiles=frozenset({"general"}),
     )
+    RoleAssignment(
+        id="project_builder",
+        role="Project Builder",
+        purpose=RolePurpose.EXECUTE,
+        mission="Generate a downloadable project archive.",
+        must_answer=("What archive was generated?",),
+        allowed_tools=("read_context", "project.generate_zip"),
+        forbidden_actions=("do not claim success without an artifact",),
+        skills=("test",),
+        output_schema={"summary": "string"},
+        model="general",
+    )
 
     with pytest.raises(ValueError, match="safe tool names"):
         RoleDefinition(
