@@ -1208,6 +1208,47 @@ def test_mode_error_log_includes_runtime_failed_reason_from_events(
     assert log.details["reason"] == reason
 
 
+def test_mode_error_log_includes_structured_failure_diagnostic() -> None:
+    response = RunDetailResponse(
+        id=uuid4(),
+        status="failed",
+        mode="direct",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="hello",
+        events=[
+            RunEventResponse(
+                sequence=1,
+                kind="runtime.failed",
+                message="model gateway failed: model transport failed (status=401)",
+                created_at=datetime.now(UTC),
+                payload={
+                    "error_summary": "model gateway failed: model transport failed (status=401)",
+                    "error_stage": "model_provider",
+                    "error_category": "authentication",
+                    "error_code": "model.provider_auth_failed",
+                    "retryable": False,
+                    "status_code": 401,
+                    "suggested_action": "检查模型 API Key、Base URL、模型权限和账号额度后重试。",
+                },
+            )
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    log = _mode_error_log_from_run(response)
+
+    assert log.details["error_code"] == "model.provider_auth_failed"
+    assert log.details["error_stage"] == "model_provider"
+    assert log.details["error_category"] == "authentication"
+    assert log.details["retryable"] == "False"
+    assert log.details["status_code"] == "401"
+    assert "模型 API Key" in log.details["suggested_action"]
+    assert "diagnosis" not in log.details
+
+
 def test_mode_error_log_explains_missing_legacy_failure_reason() -> None:
     response = RunDetailResponse(
         id=uuid4(),
@@ -2896,6 +2937,23 @@ def test_admin_run_artifact_does_not_expose_sensitive_text() -> None:
                 }
             }
         },
+        {
+            "result": {
+                "file": {
+                    "filename": "project.zip",
+                    "mime_type": "application/zip",
+                    "size_bytes": 12,
+                    "sha256": "d" * 64,
+                    "artifact_id": "33333333-3333-4333-8333-333333333333",
+                    "storage_key": (
+                        "00000000-0000-4000-8000-000000000001/"
+                        "22222222-2222-4222-8222-222222222222/"
+                        "33333333-3333-4333-8333-333333333333/project.zip"
+                    ),
+                    "download_url": "https://attacker.example/download",
+                }
+            }
+        },
     ],
 )
 def test_admin_run_artifact_exposes_public_file_metadata_without_storage_key(
@@ -3020,6 +3078,34 @@ def test_admin_run_artifact_download_returns_stored_file(tmp_path: Path) -> None
     assert response.content == data
     assert response.headers["content-type"].startswith(metadata.mime_type)
     assert "report.docx" in response.headers["content-disposition"]
+
+
+def test_admin_run_artifact_download_returns_stored_zip_file(tmp_path: Path) -> None:
+    run_id = UUID("22222222-2222-4222-8222-222222222222")
+    artifact_id = UUID("33333333-3333-4333-8333-333333333333")
+    outer_artifact_id = UUID("55555555-5555-4555-8555-555555555555")
+    data = b"zip-bytes"
+    metadata = GeneratedFileStore(tmp_path).store_bytes(
+        tenant_id=TENANT_ID,
+        run_id=run_id,
+        artifact_id=artifact_id,
+        filename="project.zip",
+        mime_type="application/zip",
+        data=data,
+    )
+    file_metadata = metadata.to_content_file()
+    file_metadata["artifact_id"] = str(artifact_id)
+    api = _client_with_file_artifact(tmp_path, run_id, outer_artifact_id, file_metadata)
+
+    response = api.get(
+        f"/api/v1/admin/runs/{run_id}/artifacts/{artifact_id}/download",
+        headers=headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.content == data
+    assert response.headers["content-type"].startswith("application/zip")
+    assert "project.zip" in response.headers["content-disposition"]
 
 
 def test_admin_run_detail_hydrates_embedded_event_file_artifact_from_raw_events(
@@ -3524,6 +3610,15 @@ def test_skill_archive_upload_strategy_requires_approve_permission(monkeypatch: 
     assert first.status_code == 200
     assert denied.status_code == 403
     assert denied.json()["error"]["code"] == "permission_denied"
+
+
+def test_skill_archive_upload_openapi_exposes_strategy_query_parameter() -> None:
+    api = client()
+
+    schema = api.get("/openapi.json").json()
+    parameters = schema["paths"]["/api/v1/admin/skills/upload"]["post"]["parameters"]
+
+    assert any(parameter["name"] == "strategy" and parameter["in"] == "query" for parameter in parameters)
 
 
 def test_skill_version_activation_selects_requested_version() -> None:

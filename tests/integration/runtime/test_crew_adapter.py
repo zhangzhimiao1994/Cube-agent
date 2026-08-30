@@ -512,11 +512,16 @@ async def test_invalid_reviewer_response_is_recorded_without_failing_dispatch() 
     events = await collect(make_runtime(gateway, plan(review=True)), context())
 
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    retry = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retry.actor == "critic"
+    assert retry.reason == "reviewer execution failed; retrying review"
+    assert retry.payload["strategy"] == "optimized_retry"
+    assert retry.payload["warning"] == "model response text is empty"
     review = next(event for event in events if event.kind is EventKind.REVIEW_COMPLETED)
     assert review.actor == "critic"
     assert review.payload["verdict"] == "approve"
-    assert review.payload["review_status"] == "skipped"
-    assert review.payload["warning"] == "model response text is empty"
+    assert "review_status" not in review.payload
+    assert "warning" not in review.payload
 
 
 async def test_reviewer_feedback_artifact_survives_crash_resume() -> None:

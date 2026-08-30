@@ -38,6 +38,7 @@ from agent_hub.runtime.contracts import (
 from agent_hub.runtime.crew.adapter import CrewDispatchRuntime
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 from agent_hub.runtime.direct import DirectRuntime
+from agent_hub.runtime.failure_reason import runtime_failure_diagnostic_from_reason
 from agent_hub.runtime.hybrid import HybridRuntime
 from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.runtime.role_planner import (
@@ -81,6 +82,30 @@ _DISPATCH_OUTPUT_SCHEMA: Mapping[str, str] = {
     "artifacts": "string[]",
     "verification": "string[]",
 }
+_SOFTWARE_TASK_KEYWORDS = (
+    "code",
+    "代码",
+    "源码",
+    "项目源码",
+    "python",
+    "javascript",
+    "typescript",
+    "node",
+    "react",
+    "vue",
+    "main.py",
+    ".py",
+    ".js",
+    ".ts",
+    "网页",
+    "web",
+    "前端",
+    "后端",
+    "api",
+    "github",
+    "test",
+    "测试",
+)
 _DISCUSSION_OUTPUT_SCHEMA: Mapping[str, str] = {
     "position": "approve | reject | needs_user",
     "recommended_option": "string | null",
@@ -108,6 +133,7 @@ class UnavailableRuntime:
             sequence=1,
             run_id=context.run_id,
             reason="runtime_not_configured",
+            payload=runtime_failure_diagnostic_from_reason("runtime_not_configured"),
         )
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
@@ -311,20 +337,21 @@ class ConfigBackedDispatchRuntime:
             purpose=RolePurpose.EXECUTE,
             output_schema=_DISPATCH_OUTPUT_SCHEMA,
         )
+        planner_roles = self._role_planner.plan(
+            RolePlanningRequest(
+                task=str(context.request),
+                mode=TaskMode.DISPATCH,
+                profile=_task_profile(context.request),
+                profiles=_task_profiles(context.request),
+                high_risk=_high_risk_task(context.request),
+                requested_skills=_requested_skills(context),
+                default_model=logical_model,
+            )
+        ).roles
         if selected_roles:
-            planned_roles = selected_roles
+            planned_roles = _merge_selected_with_delivery_roles(selected_roles, planner_roles)
         else:
-            planned_roles = self._role_planner.plan(
-                RolePlanningRequest(
-                    task=str(context.request),
-                    mode=TaskMode.DISPATCH,
-                    profile=_task_profile(context.request),
-                    profiles=_task_profiles(context.request),
-                    high_risk=_high_risk_task(context.request),
-                    requested_skills=_requested_skills(context),
-                    default_model=logical_model,
-                )
-            ).roles
+            planned_roles = planner_roles
         roles = _assign_models_to_roles(
             (*planned_roles, *_temporary_role_assignments(context, logical_model)),
             config,
@@ -525,7 +552,21 @@ class ConfigBackedHybridRuntime:
             output_schema=_DISCUSSION_OUTPUT_SCHEMA,
         )
         if selected_dispatch_roles:
-            dispatch_roles = selected_dispatch_roles
+            planner_dispatch_roles = self._role_planner.plan(
+                RolePlanningRequest(
+                    task=str(context.request),
+                    mode=TaskMode.DISPATCH,
+                    profile=profile,
+                    profiles=profiles,
+                    high_risk=high_risk,
+                    requested_skills=_requested_skills(context),
+                    default_model=logical_model,
+                )
+            ).roles
+            dispatch_roles = _merge_selected_with_delivery_roles(
+                selected_dispatch_roles,
+                planner_dispatch_roles,
+            )
         else:
             dispatch_roles = self._role_planner.plan(
                 RolePlanningRequest(
@@ -705,16 +746,18 @@ def _dispatch_plan(
                 ),
                 allowed_tools=(),
             )
-    )
+        )
     request_text = str(context.request)
     step_token_budget = min(context.token_budget, 1_000_000)
     role_token_budget = step_token_budget
     final_token_budget = step_token_budget
-    role_step_timeout = min(
-        max(context.timeout_seconds / max(2, len(selected_roles)), 120.0),
-        300.0,
+    producer_step_timeout = _producer_step_timeout(context, selected_roles)
+    post_product_step_timeout = _post_product_step_timeout(context, selected_roles)
+    final_step_timeout = _final_step_timeout(
+        context,
+        selected_roles,
+        post_product_step_timeout=post_product_step_timeout,
     )
-    final_step_timeout = min(max(context.timeout_seconds * 0.45, 90.0), 300.0)
     producer_step_ids = tuple(
         f"{role.id}_step" for role in selected_roles if not _is_post_product_role(role)
     )
@@ -734,7 +777,9 @@ def _dispatch_plan(
                 capability_gateway=capability_gateway,
             ),
             token_budget=role_token_budget,
-            timeout_seconds=role_step_timeout,
+            timeout_seconds=(
+                post_product_step_timeout if _is_post_product_role(role) else producer_step_timeout
+            ),
             cost_budget_usd=Decimal(0),
         )
         for role in selected_roles
@@ -774,10 +819,58 @@ def _is_post_product_role(role: RoleAssignment) -> bool:
         RolePurpose.RELEASE,
     }
 
+
+def _producer_step_timeout(
+    context: TaskContext,
+    selected_roles: tuple[RoleAssignment, ...],
+) -> float:
+    return min(
+        max(context.timeout_seconds / max(2, len(selected_roles)), 120.0),
+        300.0,
+    )
+
+
+def _post_product_step_timeout(
+    context: TaskContext,
+    selected_roles: tuple[RoleAssignment, ...],
+) -> float:
+    producer_timeout = _producer_step_timeout(context, selected_roles)
+    request_size_bonus = min(len(str(context.request).encode("utf-8")) / 2048 * 30.0, 120.0)
+    role_count_bonus = max(0, len(selected_roles) - 2) * 30.0
+    return min(
+        max(
+            producer_timeout * 1.5,
+            context.timeout_seconds * 0.45,
+            240.0,
+        )
+        + request_size_bonus
+        + role_count_bonus,
+        600.0,
+    )
+
+
+def _final_step_timeout(
+    context: TaskContext,
+    selected_roles: tuple[RoleAssignment, ...],
+    *,
+    post_product_step_timeout: float,
+) -> float:
+    request_size_bonus = min(len(str(context.request).encode("utf-8")) / 2048 * 30.0, 120.0)
+    return min(
+        max(
+            context.timeout_seconds * 0.45,
+            post_product_step_timeout * 0.75,
+            240.0,
+        )
+        + request_size_bonus
+        + max(0, len(selected_roles) - 3) * 20.0,
+        600.0,
+    )
+
+
 def _dispatch_role_payload(plan: DispatchPlan) -> tuple[Mapping[str, JsonValue], ...]:
     step_purposes = {
-        step.agent: ("synthesize" if step.final_synthesizer else "execute")
-        for step in plan.steps
+        step.agent: ("synthesize" if step.final_synthesizer else "execute") for step in plan.steps
     }
     return tuple(
         {
@@ -947,6 +1040,31 @@ def _selected_config_agent_purpose(
         return RolePurpose.RECORD_DECISION
     return default
 
+
+_DELIVERY_TOOL_NAMES = frozenset(
+    {"document.generate_docx", "presentation.generate_pptx", "project.generate_zip"}
+)
+
+
+def _merge_selected_with_delivery_roles(
+    selected_roles: tuple[RoleAssignment, ...],
+    planner_roles: tuple[RoleAssignment, ...],
+) -> tuple[RoleAssignment, ...]:
+    merged = list(selected_roles)
+    selected_tools = {tool for role in selected_roles for tool in role.allowed_tools}
+    selected_ids = {role.id for role in selected_roles}
+    for role in planner_roles:
+        delivery_tools = _DELIVERY_TOOL_NAMES.intersection(role.allowed_tools)
+        if not delivery_tools or delivery_tools.issubset(selected_tools):
+            continue
+        if role.id in selected_ids:
+            continue
+        merged.append(role)
+        selected_ids.add(role.id)
+        selected_tools.update(delivery_tools)
+    return tuple(merged)
+
+
 def _temporary_role_assignments(
     context: TaskContext,
     logical_model: str,
@@ -964,11 +1082,21 @@ def _temporary_role_assignments(
         role = raw.get("role") or raw.get("name")
         mission = raw.get("prompt") or raw.get("reason")
         selected_model = raw.get("model")
-        if not isinstance(identifier, str) or not isinstance(role, str) or not isinstance(mission, str):
+        if (
+            not isinstance(identifier, str)
+            or not isinstance(role, str)
+            or not isinstance(mission, str)
+        ):
             continue
-        logical_model_for_agent = selected_model if isinstance(selected_model, str) and selected_model else identifier
+        logical_model_for_agent = (
+            selected_model if isinstance(selected_model, str) and selected_model else identifier
+        )
         skills = raw.get("suggested_skills")
-        skill_tuple = tuple(item for item in skills if isinstance(item, str)) if isinstance(skills, (list, tuple)) else ()
+        skill_tuple = (
+            tuple(item for item in skills if isinstance(item, str))
+            if isinstance(skills, (list, tuple))
+            else ()
+        )
         try:
             assignments.append(
                 RoleAssignment(
@@ -1121,33 +1249,84 @@ def _rank_logical_models_for_role(
             score += 12
         if logical_model == default_model:
             score += 1
-        score += min(8, sum(deployment.max_concurrency for deployment in definition.deployments) // 2)
+        score += min(
+            8, sum(deployment.max_concurrency for deployment in definition.deployments) // 2
+        )
         if role.allowed_tools and not _logical_model_supports_tool_roles(definition):
             score -= 1000
         characteristics = _model_characteristics(logical_model, definition)
         score += _task_characteristic_score(text, characteristics)
-        if any(keyword in text for keyword in ("code", "代码", "网页", "web", "前端", "后端", "api", "github", "测试", "部署")):
+        if any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS):
             if any(keyword in haystack for keyword in ("coder", "code", "qwen", "program")):
                 score += 30
             if "tool_calling" in haystack:
                 score += 4
-        if any(keyword in text for keyword in ("文案", "脚本", "短剧", "视频", "导演", "剪辑", "prompt", "提示词", "creative", "story")):
-            if any(keyword in haystack for keyword in ("creative", "kimi", "qwen", "deepseek", "chat", "text")):
+        if any(
+            keyword in text
+            for keyword in (
+                "文案",
+                "脚本",
+                "短剧",
+                "视频",
+                "导演",
+                "剪辑",
+                "prompt",
+                "提示词",
+                "creative",
+                "story",
+            )
+        ):
+            if any(
+                keyword in haystack
+                for keyword in ("creative", "kimi", "qwen", "deepseek", "chat", "text")
+            ):
                 score += 24
             if any(keyword in haystack for keyword in ("creative", "kimi", "story")):
                 score += 10
             if any(keyword in haystack for keyword in ("coder", "code")):
                 score -= 4
-        if any(keyword in text for keyword in ("分析", "调研", "研究", "经济", "金融", "市场", "竞品", "风险", "review", "audit")):
-            if any(keyword in haystack for keyword in ("analyst", "analysis", "reason", "max", "sonnet", "claude", "deepseek", "qwen", "glm")):
+        if any(
+            keyword in text
+            for keyword in (
+                "分析",
+                "调研",
+                "研究",
+                "经济",
+                "金融",
+                "市场",
+                "竞品",
+                "风险",
+                "review",
+                "audit",
+            )
+        ):
+            if any(
+                keyword in haystack
+                for keyword in (
+                    "analyst",
+                    "analysis",
+                    "reason",
+                    "max",
+                    "sonnet",
+                    "claude",
+                    "deepseek",
+                    "qwen",
+                    "glm",
+                )
+            ):
                 score += 22
             if "structured_output" in haystack:
                 score += 6
-        if any(keyword in text for keyword in ("图片", "识图", "视觉", "image", "vision")) and "vision" in haystack:
+        if (
+            any(keyword in text for keyword in ("图片", "识图", "视觉", "image", "vision"))
+            and "vision" in haystack
+        ):
             score += 28
         if any(
             keyword in text for keyword in ("合规", "法律", "隐私", "版权", "资质", "compliance")
-        ) and any(keyword in haystack for keyword in ("analyst", "review", "sonnet", "claude", "max")):
+        ) and any(
+            keyword in haystack for keyword in ("analyst", "review", "sonnet", "claude", "max")
+        ):
             score += 18
         scored.append((score, -len(logical_model), logical_model))
     scored.sort(reverse=True)
@@ -1167,6 +1346,7 @@ def _is_messages_endpoint_api_base(api_base: str | None) -> bool:
         return False
     return urlsplit(api_base).path.rstrip("/").endswith("/messages")
 
+
 def _model_characteristics(
     logical_model: str,
     definition: LogicalModelDefinition,
@@ -1182,17 +1362,41 @@ def _model_characteristics(
 
 def _task_characteristics(text: str) -> frozenset[str]:
     characteristics: set[str] = set()
-    if any(keyword in text for keyword in ("语音", "录音", "音频", "听写", "转写", "speech", "audio", "voice")):
+    if any(
+        keyword in text
+        for keyword in ("语音", "录音", "音频", "听写", "转写", "speech", "audio", "voice")
+    ):
         characteristics.add("audio")
-    if any(keyword in text for keyword in ("图片", "识图", "视觉", "图像", "截图", "image", "vision")):
+    if any(
+        keyword in text for keyword in ("图片", "识图", "视觉", "图像", "截图", "image", "vision")
+    ):
         characteristics.add("vision")
-    if any(keyword in text for keyword in ("code", "代码", "网页", "web", "前端", "后端", "api", "github", "测试", "部署")):
+    if any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS):
         characteristics.add("code")
-    if any(keyword in text for keyword in ("质量", "审查", "复核", "验收", "评审", "review", "audit")):
+    if any(
+        keyword in text for keyword in ("质量", "审查", "复核", "验收", "评审", "review", "audit")
+    ):
         characteristics.add("review")
-    if any(keyword in text for keyword in ("分析", "调研", "研究", "经济", "金融", "市场", "竞品", "风险")):
+    if any(
+        keyword in text
+        for keyword in ("分析", "调研", "研究", "经济", "金融", "市场", "竞品", "风险")
+    ):
         characteristics.add("analysis")
-    if any(keyword in text for keyword in ("文案", "脚本", "短剧", "视频", "导演", "剪辑", "prompt", "提示词", "creative", "story")):
+    if any(
+        keyword in text
+        for keyword in (
+            "文案",
+            "脚本",
+            "短剧",
+            "视频",
+            "导演",
+            "剪辑",
+            "prompt",
+            "提示词",
+            "creative",
+            "story",
+        )
+    ):
         characteristics.add("creative")
     if any("\u4e00" <= char <= "\u9fff" for char in text):
         characteristics.add("chinese")
@@ -1235,9 +1439,12 @@ def _task_characteristic_score(text: str, characteristics: frozenset[str]) -> in
         score += 18
     if "chinese" in task_characteristics and "chinese" in characteristics:
         score += 5
-    if "general" in task_characteristics and ("general" in characteristics or "text" in characteristics):
+    if "general" in task_characteristics and (
+        "general" in characteristics or "text" in characteristics
+    ):
         score += 4
     return score
+
 
 def _requested_skills(context: TaskContext) -> tuple[str, ...]:
     value = context.routing_decision.get("requested_skills")
@@ -1332,7 +1539,7 @@ def _task_profile(task: object) -> TaskProfile:
     text = str(task).lower()
     if any(keyword in text for keyword in ("deploy", "部署", "install", "安装", "server")):
         return TaskProfile.DEPLOYMENT
-    if any(keyword in text for keyword in ("code", "代码", "bug", "api", "github", "test")):
+    if any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS):
         return TaskProfile.SOFTWARE
     if any(keyword in text for keyword in ("research", "调研", "分析", "报告", "市场")):
         return TaskProfile.RESEARCH
@@ -1346,11 +1553,10 @@ def _task_profiles(task: object) -> tuple[TaskProfile, ...]:
     profiles: list[TaskProfile] = []
     if any(keyword in text for keyword in ("deploy", "部署", "install", "安装", "server")):
         profiles.append(TaskProfile.DEPLOYMENT)
-    if any(keyword in text for keyword in ("code", "代码", "bug", "api", "github", "test", "网页", "web")):
+    if any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS):
         profiles.append(TaskProfile.SOFTWARE)
     if any(
-        keyword in text
-        for keyword in ("research", "调研", "分析", "报告", "市场", "竞品", "机会")
+        keyword in text for keyword in ("research", "调研", "分析", "报告", "市场", "竞品", "机会")
     ):
         profiles.append(TaskProfile.RESEARCH)
     if any(keyword in text for keyword in ("incident", "故障", "日志", "告警", "监控")):

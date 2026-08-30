@@ -1,10 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Fragment, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, FormEvent, KeyboardEvent, MouseEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { ApiError, api, formatApiError, type AttachmentUpload, type ModelDeployment, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
-import { ArtifactFileCard, hasArtifactDownload } from "../components/ArtifactFileCard";
+import { ArtifactFileCard, artifactFileName, hasArtifactDownload } from "../components/ArtifactFileCard";
 
 const RUN_MODES = [
   { value: "auto", label: "自动", description: "主 Agent 判断应使用直连、派单、讨论或混合；不确定时向你确认。" },
@@ -33,6 +33,16 @@ type ChatAttachmentDraft = {
   size: number;
   kind: "archive" | "image" | "context";
   attachment?: AttachmentUpload;
+};
+type SkillUploadStrategy = "overwrite" | "new_version";
+type SkillUploadRequest = {
+  file: File;
+  strategy?: SkillUploadStrategy;
+};
+type SkillUploadConflict = {
+  file: File;
+  skillName: string;
+  newContentSha256?: string;
 };
 type TemporaryAgentProposal = NonNullable<SubmittedRun["temporary_agent_proposal"]>;
 type ScheduleProposal = NonNullable<SubmittedRun["schedule_proposal"]>;
@@ -85,6 +95,24 @@ const ATTACHMENT_ACCEPT = [
   ".xlsx",
   "image/*",
 ].join(",");
+
+function shortHash(value?: string | null) {
+  if (!value) return "未记录";
+  return value.length > 16 ? `${value.slice(0, 12)}…` : value;
+}
+
+function skillUploadConflictFromError(error: unknown, file: File): SkillUploadConflict | null {
+  if (!(error instanceof ApiError) || error.code !== "skill_version_choice_required") return null;
+  const details = error.details ?? {};
+  const skillName = typeof details.skill_name === "string" ? details.skill_name : "同名 Skill";
+  const newContentSha256 =
+    typeof details.new_content_sha256 === "string" ? details.new_content_sha256 : undefined;
+  return {
+    file,
+    skillName,
+    newContentSha256,
+  };
+}
 
 function isArchiveFileName(fileName: string) {
   const lower = fileName.toLowerCase();
@@ -231,13 +259,14 @@ function displayEventMessage(event: RunDetail["events"][number]) {
     event.message && event.message !== event.kind && !/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(event.message)
       ? event.message
       : null;
+  const failureSummary = failedEventSummary(event);
   const messages: Record<string, string> = {
     queued: "任务已进入队列，等待 Worker 调度执行。",
     "run.queued": "任务已进入队列，等待 Worker 调度执行。",
     "model.started": "模型请求已开始。",
     "runtime.started": "运行时已启动，正在按模式执行。",
     "runtime.completed": "运行完成，已汇总结果。",
-    "runtime.failed": readableMessage ?? "运行失败，请查看日志中心的模式运行错误。",
+    "runtime.failed": failureSummary ?? readableMessage ?? "运行失败，请查看日志中心的模式运行错误。",
     "message.created": readableMessage ?? "运行过程中产生了一条可公开消息。",
     "artifact.created": "已生成一个可查看的结果或中间产物。",
     "dispatch.started": "主 Agent 正在拆解任务，并准备派给合适角色。",
@@ -248,12 +277,12 @@ function displayEventMessage(event: RunDetail["events"][number]) {
     "decision.completed": readableMessage ?? "主 Agent 已完成裁决并整理最终结论。",
     "step.started": readableMessage ?? "一个执行步骤已开始。",
     "step.completed": readableMessage ?? "一个执行步骤已完成。",
-    "step.failed": readableMessage ?? "一个执行步骤失败，已保留失败前的输出。",
+    "step.failed": failureSummary ?? readableMessage ?? "一个执行步骤失败，已保留失败前的输出。",
     "step.retrying": readableMessage ?? "步骤执行失败后正在重试。",
     "review.completed": readableMessage ?? "审查完成，已记录风险、证据或结论。",
     "tool.started": readableMessage ?? "工具调用已开始。",
     "tool.completed": readableMessage ?? "工具调用已完成。",
-    "tool.failed": readableMessage ?? "工具调用失败，已记录错误上下文。",
+    "tool.failed": failureSummary ?? readableMessage ?? "工具调用失败，已记录错误上下文。",
     "approval.requested": "主 Agent 需要你确认后再继续。",
     "approval.resolved": "你的确认已处理，任务会继续推进。",
     "temporary_agent.proposed": "主 Agent 建议临时加入一个子 Agent。",
@@ -310,6 +339,7 @@ type ChatMessage = {
   title: string;
   body: string;
   artifact?: RunArtifact | NonNullable<RunEvent["artifact"]>;
+  temporaryAgentProposal?: TemporaryAgentProposal;
 };
 
 function isGenericArtifactText(value: string | null | undefined) {
@@ -409,6 +439,13 @@ function eventPayloadLabel(key: string) {
     attempt: "第几次尝试",
     missing_capability: "缺少能力",
     reason: "原因",
+    error_summary: "失败摘要",
+    error_stage: "失败位置",
+    error_category: "失败分类",
+    error_code: "错误码",
+    retryable: "是否可重试",
+    status_code: "上游状态码",
+    suggested_action: "建议处理",
     upstream_model: "上游模型",
   };
   if (labels[key]) return labels[key];
@@ -425,6 +462,13 @@ function orderedEventPayloadEntries(payload: Record<string, unknown>) {
     "upstream_model",
     "provider",
     "deployment",
+    "error_summary",
+    "error_code",
+    "error_stage",
+    "error_category",
+    "status_code",
+    "retryable",
+    "suggested_action",
     "role",
     "agent",
     "task",
@@ -498,14 +542,17 @@ type ProcessDetailTarget = {
 
 type AgentWorkStatus = "working" | "waiting" | "done" | "failed";
 type AgentWorkView = "activity" | "computer";
+type AgentWorkCategory = "结论" | "产物" | "阻塞" | "决策" | "证据";
 
 type AgentWorkActivity = {
   id: string;
   title: string;
   kind: string;
+  category: AgentWorkCategory;
   summary: string;
   rows: Array<{ label: string; value: string }>;
   createdAt: string | null;
+  sequence: number | null;
   event?: RunEvent;
   artifact?: RunArtifact | NonNullable<RunEvent["artifact"]>;
 };
@@ -523,6 +570,30 @@ type AgentWorkItem = {
   activity: AgentWorkActivity[];
   availableViews: AgentWorkView[];
 };
+
+const AGENT_WORK_CATEGORIES: AgentWorkCategory[] = ["结论", "产物", "阻塞", "决策", "证据"];
+
+function compareAgentActivities(left: AgentWorkActivity, right: AgentWorkActivity) {
+  if (left.sequence !== null && right.sequence !== null && left.sequence !== right.sequence) {
+    return left.sequence - right.sequence;
+  }
+  if (left.sequence !== null && right.sequence === null) return -1;
+  if (left.sequence === null && right.sequence !== null) return 1;
+  if (left.createdAt && right.createdAt && left.createdAt !== right.createdAt) return left.createdAt.localeCompare(right.createdAt);
+  if (left.createdAt && !right.createdAt) return -1;
+  if (!left.createdAt && right.createdAt) return 1;
+  return `${left.kind}:${left.title}`.localeCompare(`${right.kind}:${right.title}`, "zh-CN");
+}
+
+function dedupeAgentActivities(agent: AgentWorkItem) {
+  const seen = new Set<string>();
+  return [...agent.activity, ...agent.outputs].sort(compareAgentActivities).filter((activity) => {
+    const key = `${activity.category}:${activity.kind}:${activity.title}:${activity.summary}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return Boolean(activity.summary.trim() || activity.title.trim());
+  });
+}
 
 type ProcessDrawerTarget = {
   runId: string;
@@ -681,17 +752,12 @@ function scheduleProposalCreatePayload(proposal: ScheduleProposal) {
     metadata: proposal.metadata,
   };
 }
-function temporaryAgentApprovalBody(proposal: TemporaryAgentProposal) {
-  const skills =
-    proposal.suggested_skills.length > 0 ? `\n建议 Skill：${proposal.suggested_skills.join("、")}` : "";
-  return [
-    "主 Agent 判断当前角色池缺少一个临时子 Agent。主 Agent 已生成角色和提示词；模型/API 不需要你选，主 Agent 会按角色能力、任务要求和模型并发情况自动选择模型/API。",
-    `拟加入：${proposal.name}（${proposal.id}）`,
-    `缺少能力：${proposal.missing_capability}`,
-    `加入原因：${proposal.reason}`,
-    `角色边界：${proposal.prompt}${skills}`,
-    "请直接回复：\n1 同意临时加入\n2 不加入，按现有角色继续\n3 你的修改意见\n4 保存为永久 Agent（需先同意并运行过）",
-  ].join("\n\n");
+function temporaryAgentModel(proposal: TemporaryAgentProposal) {
+  return proposal.model?.trim() || proposal.recommended_model?.trim() || "主 Agent 自动选择";
+}
+
+function temporaryAgentSummary(proposal: TemporaryAgentProposal) {
+  return `主 Agent 判断缺少 ${proposal.missing_capability} 能力，建议招募 ${proposal.name} 负责 ${proposal.role}。`;
 }
 
 function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
@@ -710,7 +776,7 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
             textArtifacts.length > 1
               ? `${replyArtifact.text?.trim() ?? ""}\n\n（另有 ${
                   textArtifacts.length - 1
-                } 条角色产物，可点“查看运行详情”查看。）`
+                } 条角色产物，可在子 Agent 工作席查看。）`
               : replyArtifact.text?.trim() ?? "",
           artifact: hasArtifactDownload(replyArtifact) ? replyArtifact : undefined,
         },
@@ -766,7 +832,8 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
             id: `${detail.id}-temporary-agent-approval`,
             role: "assistant" as const,
             title: detail.temporary_agent_proposal.name,
-            body: temporaryAgentApprovalBody(detail.temporary_agent_proposal),
+            body: temporaryAgentSummary(detail.temporary_agent_proposal),
+            temporaryAgentProposal: detail.temporary_agent_proposal,
           },
         ]
       : []),
@@ -809,8 +876,8 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
 function failureReasonFromEvents(events: RunDetail["events"]) {
   const event = [...events]
     .sort((left, right) => right.sequence - left.sequence)
-    .find((item) => ["runtime.failed", "step.failed", "tool.failed"].includes(item.kind) && item.message);
-  return event?.message ?? null;
+    .find((item) => isFailedEvent(item) && (item.message || payloadText(item.payload, "error_summary")));
+  return event ? (failedEventSummary(event) ?? event.message) : null;
 }
 
 function dedupeTextArtifacts(artifacts: RunDetail["artifacts"]) {
@@ -835,6 +902,90 @@ function preferredReplyArtifact(artifacts: RunDetail["artifacts"]) {
 
 function runConversationId(detail: RunDetail | undefined) {
   return detail?.explicit_details.conversation_id?.trim() || null;
+}
+
+function payloadText(payload: Record<string, unknown>, key: string) {
+  const value = payload[key];
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function payloadNumberValue(payload: Record<string, unknown>, key: string) {
+  const value = payload[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function payloadBooleanValue(payload: Record<string, unknown>, key: string) {
+  const value = payload[key];
+  return typeof value === "boolean" ? value : null;
+}
+
+const ERROR_STAGE_LABELS: Record<string, string> = {
+  artifact_storage: "产物存储",
+  model_capacity: "模型容量",
+  model_configuration: "模型配置",
+  model_gateway: "模型网关",
+  model_provider: "模型供应商",
+  model_routing: "模型路由",
+  runtime: "运行时",
+  runtime_accounting: "运行账本",
+  runtime_configuration: "运行时配置",
+};
+
+const ERROR_CATEGORY_LABELS: Record<string, string> = {
+  accounting_guardrail: "账本保护",
+  authentication: "认证或权限",
+  backend: "后端服务",
+  bad_request: "请求参数",
+  configuration: "配置错误",
+  gateway: "网关错误",
+  internal: "内部错误",
+  invalid_response: "响应格式",
+  missing_runtime: "运行时缺失",
+  model_not_found: "模型不存在",
+  no_capable_model: "无可用模型",
+  payload_too_large: "请求过大",
+  queue_full: "队列已满",
+  queue_timeout: "排队超时",
+  quota_or_billing: "额度或账单",
+  rate_limited: "供应商限流",
+  rollback_failed: "回滚失败",
+  timeout: "超时",
+  transient: "临时失败",
+  transport: "网络连接",
+  unavailable: "不可用",
+  upstream_unavailable: "上游不可用",
+};
+
+function errorStageLabel(value: string | null) {
+  return value ? (ERROR_STAGE_LABELS[value] ?? value) : null;
+}
+
+function errorCategoryLabel(value: string | null) {
+  return value ? (ERROR_CATEGORY_LABELS[value] ?? value) : null;
+}
+
+function isFailedEvent(event: RunDetail["events"][number]) {
+  return event.kind === "runtime.failed" || event.kind === "step.failed" || event.kind === "tool.failed";
+}
+
+function failedEventSummary(event: RunDetail["events"][number]) {
+  if (!isFailedEvent(event)) return null;
+  const summary = payloadText(event.payload, "error_summary") ?? event.message;
+  const code = payloadText(event.payload, "error_code");
+  const stage = payloadText(event.payload, "error_stage");
+  const category = payloadText(event.payload, "error_category");
+  const statusCode = payloadNumberValue(event.payload, "status_code");
+  const retryable = payloadBooleanValue(event.payload, "retryable");
+  const suggestedAction = payloadText(event.payload, "suggested_action");
+  const parts = [`原因：${summary || "未记录具体原因"}`];
+  if (code) parts.push(`错误码：${code}`);
+  const stageLabel = errorStageLabel(stage);
+  const categoryLabel = errorCategoryLabel(category);
+  if (stageLabel || categoryLabel) parts.push(`位置：${[stageLabel, categoryLabel].filter(Boolean).join(" / ")}`);
+  if (statusCode !== null) parts.push(`状态码：${statusCode}`);
+  if (retryable !== null) parts.push(`可重试：${retryable ? "是" : "否"}`);
+  if (suggestedAction) parts.push(`建议：${suggestedAction}`);
+  return parts.join("\n");
 }
 
 function runSeatScope(detail: RunDetail) {
@@ -1063,6 +1214,18 @@ function eventOpinionEntries(event: RunEvent, agentNames: Map<string, string>) {
     });
 }
 
+function discussionCompactSummary(event: RunEvent, agentNames: Map<string, string>) {
+  const conclusionCount = formatEventPayloadValue(event.payload.result) || formatEventPayloadValue(event.payload.conclusion) ? 1 : 0;
+  const decisionCount = eventDecisionSignal(event) ? 1 : 0;
+  const opinionCount = eventOpinionEntries(event, agentNames).length;
+  const parts = [
+    conclusionCount > 0 ? `${conclusionCount} 个结论` : "",
+    decisionCount > 0 ? `${decisionCount} 个决策` : "",
+    opinionCount > 0 ? `${opinionCount} 条意见` : "",
+  ].filter(Boolean);
+  return `讨论完成：形成 ${parts.length > 0 ? parts.join("、") : "关键摘要"}`;
+}
+
 function eventSummaryText(
   event: RunDetail["events"][number],
   agentNames: Map<string, string>,
@@ -1113,7 +1276,7 @@ function eventSummaryText(
     return `${participants || "多角色"} 开始讨论`;
   }
   if (event.kind === "discussion.completed") {
-    return `讨论结论：${conciseProcessText(discussionSignal, "完成讨论")}`;
+    return discussionCompactSummary(event, agentNames);
   }
   if (event.kind === "decision.started") {
     return `主 Agent 开始决策${instructionSignal ? `：${conciseProcessText(instructionSignal, "开始裁决")}` : ""}`;
@@ -1349,12 +1512,32 @@ function activityFromTarget(target: ProcessDetailTarget): AgentWorkActivity {
     id: target.id,
     title: target.title,
     kind: target.badge,
+    category: categoryForTarget(target),
     summary: target.message,
     rows: target.rows,
     createdAt: target.createdAt,
+    sequence: target.event?.sequence ?? null,
     event: target.event,
     artifact: target.artifact,
   };
+}
+
+function categoryForTarget(target: ProcessDetailTarget): AgentWorkCategory {
+  const eventKind = target.event?.kind ?? "";
+  const text = `${target.badge} ${target.title} ${target.message}`.toLowerCase();
+  if (eventKind.includes("failed") || eventKind.includes("error") || text.includes("失败") || text.includes("阻塞")) {
+    return "阻塞";
+  }
+  if (target.artifact || target.badge.includes("产物") || target.badge === "输出" || text.includes("输出") || text.includes("产出")) {
+    return "产物";
+  }
+  if (eventKind.startsWith("decision.") || target.badge.includes("裁决") || text.includes("决策") || text.includes("裁决")) {
+    return "决策";
+  }
+  if (eventKind === "discussion.completed" || text.includes("结论")) {
+    return "结论";
+  }
+  return "证据";
 }
 
 function outputActivityFromArtifact(
@@ -1370,9 +1553,11 @@ function outputActivityFromArtifact(
     id: `${detail.id}-agent-${agent.key}-artifact-${artifact.id || index}`,
     title: `${agent.label} 输出`,
     kind: "输出",
+    category: "产物",
     summary,
     rows: eventArtifactRows(artifact),
     createdAt: null,
+    sequence: null,
     artifact,
   };
 }
@@ -1511,6 +1696,80 @@ function selectedAgentForActivity(workItems: AgentWorkItem[], activityId: string
   return workItems.find((item) => item.outputs.some((output) => output.id === activityId) || item.activity.some((activity) => activity.id === activityId))?.id;
 }
 
+function categorizedAgentHighlights(agent: AgentWorkItem) {
+  const activities = dedupeAgentActivities(agent);
+  return AGENT_WORK_CATEGORIES
+    .map((category) => ({
+      category,
+      items: activities.filter((activity) => activity.category === category).slice(0, 2),
+    }))
+    .filter((bucket) => bucket.items.length > 0);
+}
+
+function AgentSummaryBuckets({ agent }: { agent: AgentWorkItem }) {
+  const buckets = categorizedAgentHighlights(agent);
+  if (buckets.length === 0) return null;
+  return (
+    <section className="agent-workforce-section agent-workforce-summary" aria-label={`${agent.label} 重点摘要`}>
+      <h5>重点摘要</h5>
+      <div className="agent-summary-grid">
+        {buckets.map((bucket) => (
+          <article key={bucket.category} className={`agent-summary-bucket bucket-${bucket.category}`}>
+            <strong>{bucket.category}</strong>
+            <ul>
+              {bucket.items.map((item) => (
+                <li key={item.id}>{conciseProcessText(item.summary, item.title)}</li>
+              ))}
+            </ul>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function categorizedRunHighlights(workItems: AgentWorkItem[]) {
+  const seen = new Set<string>();
+  const activities = workItems
+    .flatMap((agent) => dedupeAgentActivities(agent).map((activity) => ({ ...activity, agentLabel: agent.label })))
+    .filter((activity) => {
+      const key = `${activity.category}:${activity.agentLabel}:${activity.summary}:${activity.title}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return Boolean(activity.summary.trim());
+    });
+  return AGENT_WORK_CATEGORIES
+    .map((category) => ({
+      category,
+      items: activities.filter((activity) => activity.category === category).slice(0, 2),
+    }))
+    .filter((bucket) => bucket.items.length > 0);
+}
+
+function RunSummaryBuckets({ workItems }: { workItems: AgentWorkItem[] }) {
+  const buckets = categorizedRunHighlights(workItems);
+  if (buckets.length === 0) return null;
+  return (
+    <section className="agent-workforce-section agent-workforce-summary run-workforce-summary" aria-label="运行重点摘要">
+      <h5>重点摘要</h5>
+      <div className="agent-summary-grid">
+        {buckets.map((bucket) => (
+          <article key={bucket.category} className={`agent-summary-bucket bucket-${bucket.category}`}>
+            <strong>{bucket.category}</strong>
+            <ul>
+              {bucket.items.map((item) => (
+                <li key={`${item.agentLabel}-${item.id}`}>
+                  <span>{item.agentLabel}</span>：{conciseProcessText(item.summary, item.title)}
+                </li>
+              ))}
+            </ul>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function RunProcessSummary({
   detail,
   onOpen,
@@ -1618,10 +1877,12 @@ function RunProcessDrawer({
     "";
   const [selectedAgentId, setSelectedAgentId] = useState(initialAgentId);
   const [selectedView, setSelectedView] = useState<AgentWorkView>("activity");
+  const [activityDetail, setActivityDetail] = useState<AgentWorkActivity | null>(null);
 
   useEffect(() => {
     setSelectedAgentId(initialAgentId);
     setSelectedView("activity");
+    setActivityDetail(null);
   }, [initialAgentId, target.runId, target.conversationId, target.selectedActivityId]);
 
   const selectedAgent = target.workItems.find((item) => item.id === selectedAgentId) ?? target.workItems[0];
@@ -1632,12 +1893,22 @@ function RunProcessDrawer({
   const activeView = canShowComputerView ? selectedView : "activity";
 
   return (
-    <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
+    <div
+      className="process-drawer-backdrop"
+      role="presentation"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
       <section
         className="process-drawer"
         role="dialog"
         aria-label="运行过程详情"
         aria-modal="true"
+        onPointerDown={(event) => event.stopPropagation()}
         onClick={(event) => event.stopPropagation()}
       >
         <div className="process-drawer-handle" aria-hidden="true" />
@@ -1651,6 +1922,7 @@ function RunProcessDrawer({
             关闭
           </button>
         </div>
+        <RunSummaryBuckets workItems={target.workItems} />
         <div className="agent-workforce-layout">
           <aside className="agent-workforce-roster" aria-label="子 Agent 列表">
             {target.workItems.map((agent) => (
@@ -1707,6 +1979,8 @@ function RunProcessDrawer({
                 </div>
               </div>
 
+              <AgentSummaryBuckets agent={selectedAgent} />
+
               {activeView === "computer" ? (
                 <section className="agent-workforce-section">
                   <h5>电脑视图</h5>
@@ -1714,68 +1988,361 @@ function RunProcessDrawer({
                   <AgentActivityList
                     activities={selectedAgent.activity.filter((activity) => activity.event && hasComputerEvidence(activity.event))}
                     selectedActivityId={selectedActivity?.id}
+                    onOpen={setActivityDetail}
                   />
                 </section>
               ) : (
-                <>
-                  <section className="agent-workforce-section">
-                    <h5>输出</h5>
-                    {selectedAgent.outputs.length > 0 ? (
-                      <AgentActivityList activities={selectedAgent.outputs} selectedActivityId={selectedActivity?.id} />
-                    ) : (
-                      <p className="agent-workforce-empty">暂无独立输出，查看活动轨迹里的阶段记录。</p>
-                    )}
-                  </section>
-                  <section className="agent-workforce-section">
-                    <h5>活动轨迹</h5>
-                    <AgentActivityList activities={selectedAgent.activity} selectedActivityId={selectedActivity?.id} />
-                  </section>
-                </>
+                <AgentActivityBuckets agent={selectedAgent} selectedActivityId={selectedActivity?.id} onOpen={setActivityDetail} />
               )}
             </div>
           ) : (
             <p className="agent-workforce-empty">这次运行还没有可展示的子 Agent 记录。</p>
           )}
         </div>
+        {activityDetail ? <AgentActivityDetailDrawer activity={activityDetail} onClose={() => setActivityDetail(null)} /> : null}
       </section>
     </div>
+  );
+}
+
+function AgentActivityBuckets({
+  agent,
+  selectedActivityId,
+  onOpen,
+}: {
+  agent: AgentWorkItem;
+  selectedActivityId?: string;
+  onOpen: (activity: AgentWorkActivity) => void;
+}) {
+  const activities = dedupeAgentActivities(agent);
+  const buckets = AGENT_WORK_CATEGORIES.map((category) => ({
+    category,
+    items: activities.filter((activity) => activity.category === category),
+  })).filter((bucket) => bucket.items.length > 0);
+  if (buckets.length === 0) return <p className="agent-workforce-empty">暂无可展示记录。</p>;
+  return (
+    <section className="agent-workforce-section agent-workforce-cards" aria-label={`${agent.label} 分类摘要`}>
+      <h5>分类摘要</h5>
+      <div className="agent-activity-buckets">
+        {buckets.map((bucket) => (
+          <article key={bucket.category} className={`agent-activity-bucket bucket-${bucket.category}`}>
+            <div className="agent-activity-bucket-head">
+              <strong>{bucket.category}</strong>
+              <span>{bucket.items.length} 条</span>
+            </div>
+            <AgentActivityList activities={bucket.items} selectedActivityId={selectedActivityId} onOpen={onOpen} />
+          </article>
+        ))}
+      </div>
+    </section>
   );
 }
 
 function AgentActivityList({
   activities,
   selectedActivityId,
+  onOpen,
 }: {
   activities: AgentWorkActivity[];
   selectedActivityId?: string;
+  onOpen: (activity: AgentWorkActivity) => void;
 }) {
   if (activities.length === 0) return <p className="agent-workforce-empty">暂无可展示记录。</p>;
   return (
     <div className="agent-workforce-activity-list">
       {activities.map((activity, index) => (
-        <article
+        <button
+          type="button"
           key={`${activity.id}-${index}`}
-          className={`agent-workforce-activity${activity.id === selectedActivityId ? " is-selected" : ""}`}
+          className={`agent-workforce-activity-card${activity.id === selectedActivityId ? " is-selected" : ""}`}
+          aria-label={`打开活动详情：${activity.title}`}
+          onClick={() => onOpen(activity)}
         >
           <div>
             <small>{activity.kind}</small>
             <strong>{activity.title}</strong>
           </div>
           <p>{activity.summary}</p>
-          {activity.rows.length > 0 ? (
-            <dl>
-              {activity.rows.map((row, rowIndex) => (
-                <Fragment key={`${activity.id}-${row.label}-${rowIndex}`}>
-                  <dt>{row.label}</dt>
-                  <dd>{row.value}</dd>
-                </Fragment>
-              ))}
-            </dl>
-          ) : null}
-          {hasArtifactDownload(activity.artifact) ? <ArtifactFileCard artifact={activity.artifact} compact /> : null}
-          {activity.createdAt ? <time dateTime={activity.createdAt}>{activity.createdAt}</time> : null}
-        </article>
+          <span className="agent-workforce-activity-meta">
+            <span>{activity.category}</span>
+            {activity.createdAt ? <time dateTime={activity.createdAt}>{activity.createdAt}</time> : null}
+          </span>
+        </button>
       ))}
+    </div>
+  );
+}
+
+function AgentActivityDetailDrawer({
+  activity,
+  onClose,
+}: {
+  activity: AgentWorkActivity;
+  onClose: () => void;
+}) {
+  const [showFullFields, setShowFullFields] = useState(false);
+  const summaryRows = [
+    { label: "分类", value: activity.category },
+    { label: "来源", value: activity.kind },
+    activity.createdAt ? { label: "时间", value: activity.createdAt } : null,
+    hasArtifactDownload(activity.artifact) ? { label: "下载", value: artifactFileName(activity.artifact) } : null,
+  ].filter((row): row is { label: string; value: string } => Boolean(row));
+
+  return (
+    <div
+      className="activity-detail-backdrop"
+      role="presentation"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <section
+        className="activity-detail-drawer"
+        role="dialog"
+        aria-label="活动详情"
+        aria-modal="true"
+        onPointerDown={(event) => event.stopPropagation()}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="process-drawer-header">
+          <div>
+            <span className="eyebrow">{activity.kind}</span>
+            <h3>{activity.title}</h3>
+            <p className="agent-workforce-scope">{activity.summary}</p>
+          </div>
+          <button type="button" className="secondary-action" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+        <section className="activity-detail-summary" aria-label="分类摘要">
+          <h4>分类摘要</h4>
+          <dl className="activity-summary-cards" aria-label="活动摘要">
+            {summaryRows.map((row) => (
+              <div key={`${activity.id}-summary-${row.label}`}>
+                <dt>{row.label}</dt>
+                <dd>{row.value}</dd>
+              </div>
+            ))}
+            <div>
+              <dt>摘要</dt>
+              <dd>{activity.summary}</dd>
+            </div>
+          </dl>
+        </section>
+        {hasArtifactDownload(activity.artifact) ? <ArtifactFileCard artifact={activity.artifact} compact /> : null}
+        {activity.rows.length > 0 ? (
+          <button
+            type="button"
+            className="secondary-action activity-detail-fields-toggle"
+            onClick={() => setShowFullFields((current) => !current)}
+            aria-expanded={showFullFields}
+          >
+            {showFullFields ? "收起完整字段" : `查看完整字段（${activity.rows.length}）`}
+          </button>
+        ) : null}
+        {showFullFields ? (
+          <dl className="activity-detail-list">
+            {activity.rows.map((row, rowIndex) => (
+              <div key={`${activity.id}-${row.label}-${rowIndex}`}>
+                <dt>{row.label}</dt>
+                <dd>{row.value}</dd>
+              </div>
+            ))}
+          </dl>
+        ) : null}
+      </section>
+    </div>
+  );
+}
+
+function TemporaryAgentRecruitmentCard({
+  proposal,
+  approved,
+  onOpen,
+  onApprove,
+  onReject,
+  onRevise,
+  onPersist,
+  disabled = false,
+}: {
+  proposal: TemporaryAgentProposal;
+  approved: boolean;
+  onOpen: () => void;
+  onApprove: () => void;
+  onReject: () => void;
+  onRevise: () => void;
+  onPersist: () => void;
+  disabled?: boolean;
+}) {
+  const status = approved ? "已招募" : "待确认";
+  const stopAction = (event: MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+  };
+  const handleKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      onOpen();
+    }
+  };
+  return (
+    <article
+      className="temporary-agent-recruitment-card"
+      role="button"
+      tabIndex={0}
+      aria-label={`打开 ${proposal.name} 招募详情`}
+      onClick={onOpen}
+      onKeyDown={handleKeyDown}
+    >
+      <span className="eyebrow">子 Agent 招募</span>
+      <div className="temporary-agent-recruitment-head">
+        <h3>{proposal.name}</h3>
+        <em className={`agent-workforce-status ${approved ? "status-done" : "status-working"}`}>{status}</em>
+      </div>
+      <dl className="temporary-agent-recruitment-meta">
+        <div>
+          <dt>名称</dt>
+          <dd>{proposal.name}</dd>
+        </div>
+        <div>
+          <dt>职责</dt>
+          <dd>{proposal.role}</dd>
+        </div>
+        <div>
+          <dt>模型</dt>
+          <dd>{temporaryAgentModel(proposal)}</dd>
+        </div>
+        <div>
+          <dt>状态</dt>
+          <dd>{status}</dd>
+        </div>
+      </dl>
+      <p>{temporaryAgentSummary(proposal)}</p>
+      <div className="temporary-agent-choice-grid" aria-label="临时 Agent 选择">
+        <button
+          type="button"
+          onClick={(event) => {
+            stopAction(event);
+            onApprove();
+          }}
+          disabled={disabled || approved}
+        >
+          同意加入
+        </button>
+        <button
+          type="button"
+          className="secondary-action"
+          onClick={(event) => {
+            stopAction(event);
+            onReject();
+          }}
+          disabled={disabled}
+        >
+          不加入
+        </button>
+        <button
+          type="button"
+          className="secondary-action"
+          onClick={(event) => {
+            stopAction(event);
+            onRevise();
+          }}
+          disabled={disabled}
+        >
+          提修改
+        </button>
+        {proposal.permanentizable ? (
+          <button
+            type="button"
+            className="secondary-action"
+            onClick={(event) => {
+              stopAction(event);
+              onPersist();
+            }}
+            disabled={disabled || !approved}
+          >
+            保存永久
+          </button>
+        ) : null}
+      </div>
+    </article>
+  );
+}
+
+function TemporaryAgentDetailDialog({
+  proposal,
+  onClose,
+}: {
+  proposal: TemporaryAgentProposal;
+  onClose: () => void;
+}) {
+  return (
+    <div
+      className="process-drawer-backdrop"
+      role="presentation"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <section
+        className="temporary-agent-detail-dialog"
+        role="dialog"
+        aria-label="临时 Agent 招募详情"
+        aria-modal="true"
+        onPointerDown={(event) => event.stopPropagation()}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="process-drawer-header">
+          <div>
+            <span className="eyebrow">子 Agent 招募详情</span>
+            <h3>{proposal.name}</h3>
+          </div>
+          <button type="button" className="secondary-action" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+        <dl className="temporary-agent-detail-list">
+          <div>
+            <dt>名称</dt>
+            <dd>{proposal.name}</dd>
+          </div>
+          <div>
+            <dt>职责</dt>
+            <dd>{proposal.role}</dd>
+          </div>
+          <div>
+            <dt>模型</dt>
+            <dd>{temporaryAgentModel(proposal)}</dd>
+          </div>
+          <div>
+            <dt>缺少能力</dt>
+            <dd>{proposal.missing_capability}</dd>
+          </div>
+          <div>
+            <dt>招募原因</dt>
+            <dd>{proposal.reason}</dd>
+          </div>
+          <div>
+            <dt>角色边界</dt>
+            <dd>{proposal.prompt}</dd>
+          </div>
+          {proposal.suggested_skills.length > 0 ? (
+            <div>
+              <dt>建议 Skill</dt>
+              <dd>{proposal.suggested_skills.join("、")}</dd>
+            </div>
+          ) : null}
+          <div>
+            <dt>选择方式</dt>
+            <dd>可在招募卡片中直接选择同意加入、不加入、提修改，或在同意并运行后保存为永久 Agent。</dd>
+          </div>
+        </dl>
+      </section>
     </div>
   );
 }
@@ -1937,8 +2504,10 @@ export function RunsPage() {
   const [showModeEntry, setShowModeEntry] = useState(true);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [processDetailTarget, setProcessDetailTarget] = useState<ProcessDrawerTarget | null>(null);
+  const [temporaryAgentDetail, setTemporaryAgentDetail] = useState<TemporaryAgentProposal | null>(null);
   const [modeSelection, setModeSelection] = useState<ModeSelection | null>(null);
   const [skillInstallCandidate, setSkillInstallCandidate] = useState<SkillInstallCandidate | null>(null);
+  const [skillUploadConflict, setSkillUploadConflict] = useState<SkillUploadConflict | null>(null);
   const [attachmentDraft, setAttachmentDraft] = useState<ChatAttachmentDraft | null>(null);
   const [archiveInstallFile, setArchiveInstallFile] = useState<File | null>(null);
   const [conversationRunCache, setConversationRunCache] = useState<Record<string, RunDetail[]>>({});
@@ -2016,6 +2585,20 @@ export function RunsPage() {
   useEffect(() => {
     setProcessDetailTarget(null);
   }, [activeConversationId]);
+  useEffect(() => {
+    if (!processDetailTarget && !temporaryAgentDetail) return;
+    const previousBodyOverflow = document.body.style.overflow;
+    const previousBodyTouchAction = document.body.style.touchAction;
+    const previousDocumentOverflow = document.documentElement.style.overflow;
+    document.body.style.overflow = "hidden";
+    document.body.style.touchAction = "none";
+    document.documentElement.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previousBodyOverflow;
+      document.body.style.touchAction = previousBodyTouchAction;
+      document.documentElement.style.overflow = previousDocumentOverflow;
+    };
+  }, [processDetailTarget, temporaryAgentDetail]);
   useEffect(() => {
     if (!settings.data) return;
     if (!userSelectedMode.current) {
@@ -2106,6 +2689,7 @@ export function RunsPage() {
 
   useEffect(() => {
     setProcessDetailTarget(null);
+    setTemporaryAgentDetail(null);
   }, [selectedRunId]);
 
   useEffect(() => {
@@ -2366,7 +2950,12 @@ export function RunsPage() {
         enabled: true,
         role: temporaryApproval.proposal.role,
         prompt: temporaryApproval.proposal.prompt,
-        model: temporaryApproval.proposal.model ?? (savedModels.find((model) => model.logical_model === "main")?.logical_model ?? savedModels[0]?.logical_model ?? "main"),
+        model:
+          temporaryApproval.proposal.model ??
+          temporaryApproval.proposal.recommended_model ??
+          (savedModels.find((model) => model.logical_model === "main")?.logical_model ??
+            savedModels[0]?.logical_model ??
+            "main"),
         skills: temporaryApproval.proposal.suggested_skills,
       });
     },
@@ -2393,6 +2982,37 @@ export function RunsPage() {
       await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
     },
   });
+
+  const approveTemporaryAgentFromCard = () => {
+    if (!temporaryApproval) return;
+    if (temporaryApproval.approved) {
+      setSubmitNotice("这个临时 Agent 已经加入。本轮完成后可保存为永久 Agent。");
+      return;
+    }
+    setSubmitNotice("已选择同意临时加入，正在继续这轮对话。");
+    approveTemporaryAgent.mutate();
+  };
+
+  const rejectTemporaryAgentFromCard = () => {
+    if (!temporaryApproval) return;
+    setSubmitNotice("已选择不加入临时 Agent，正在按现有角色继续。");
+    reviseTemporaryAgent.mutate("不加入，按现有角色继续");
+  };
+
+  const requestTemporaryAgentRevisionFromCard = () => {
+    setMessage((current) => (current.trim() ? current : "3 "));
+    setSubmitNotice("请在输入框补充修改意见后发送。");
+  };
+
+  const persistTemporaryAgentFromCard = () => {
+    if (!temporaryApproval) return;
+    if (!temporaryApproval.approved) {
+      setSubmitNotice("保存为永久 Agent 前，需要先同意临时加入并完成本轮运行。");
+      return;
+    }
+    setSubmitNotice("正在把这个临时 Agent 保存为永久 Agent。");
+    promoteTemporaryAgent.mutate();
+  };
 
   const deleteRun = useMutation({
     mutationFn: (runId: string) => api.deleteRun(runId),
@@ -2450,14 +3070,23 @@ export function RunsPage() {
   });
 
   const uploadSkillArchive = useMutation({
-    mutationFn: (file: File) => api.uploadSkillArchive(file),
-    onSuccess: (result, file) => {
+    mutationFn: ({ file, strategy }: SkillUploadRequest) => api.uploadSkillArchive(file, strategy),
+    onSuccess: (result, { file }) => {
       setArchiveInstallFile(null);
+      setSkillUploadConflict(null);
       setSkillInstallCandidate({ fileName: file.name, skills: result.items, skipped: result.skipped, status: "scanned" });
       setSubmitNotice("Skill 压缩包已完成安全扫描，请确认权限后再安装。");
       void queryClient.invalidateQueries({ queryKey: ["skills"] });
     },
-    onError: (error, file) => {
+    onError: (error, { file }) => {
+      const conflict = skillUploadConflictFromError(error, file);
+      if (conflict) {
+        setSkillInstallCandidate(null);
+        setSkillUploadConflict(conflict);
+        setSubmitNotice("检测到同名 Skill 已存在，请选择覆盖当前版本或保存为新版本。");
+        return;
+      }
+      setSkillUploadConflict(null);
       setSkillInstallCandidate(null);
       setAttachmentDraft((current) =>
         current ?? {
@@ -2516,6 +3145,7 @@ export function RunsPage() {
     setSubmitNotice(null);
     setAttachmentDraft(null);
     setSkillInstallCandidate(null);
+    setSkillUploadConflict(null);
     setArchiveInstallFile(isArchiveFileName(file.name) ? file : null);
     uploadAttachment.mutate(file);
   }
@@ -2737,6 +3367,20 @@ export function RunsPage() {
         : directModel && !registeredModelIds.has(directModel)
             ? "所选直连模型/API 未注册或未通过配置，请先到模型页面修正。"
           : null;
+  const refreshedRunForProcessDetail = processDetailTarget
+    ? visibleRuns.find((run) => run.id === processDetailTarget.runId) ??
+      (selectedRun.data?.id === processDetailTarget.runId ? selectedRun.data : null)
+    : null;
+  const refreshedProcessDetailTarget =
+    processDetailTarget && refreshedRunForProcessDetail
+      ? {
+          ...processDetailTarget,
+          conversationId: runConversationId(refreshedRunForProcessDetail),
+          scopeLabel: runSeatScope(refreshedRunForProcessDetail),
+          workItems: buildAgentWorkItems(refreshedRunForProcessDetail, agentNameMap, mainAgentModelName),
+        }
+      : processDetailTarget;
+
   const deletableConversationIds = items
     .filter((run) => TERMINAL_STATUSES.has(run.status))
     .map((run) => run.id);
@@ -2896,7 +3540,6 @@ export function RunsPage() {
                   >
                     <span className="conversation-mode-chip">{displayMode(run.mode)}</span>
                     <strong className="conversation-title-text">{title}</strong>
-                    <small className="conversation-meta-line">{run.status}</small>
                   </button>
                   <button
                     type="button"
@@ -3148,11 +3791,16 @@ export function RunsPage() {
               </article>
             ) : null}
             {temporaryApproval && !temporaryApprovalVisibleInMessages ? (
-              <article className="chat-message assistant" aria-label="临时 Agent 文字确认">
-                <span className="eyebrow">{APP_BRAND_NAME}</span>
-                <h3>{temporaryApproval.proposal.name}</h3>
-                <p>{temporaryAgentApprovalBody(temporaryApproval.proposal)}</p>
-              </article>
+              <TemporaryAgentRecruitmentCard
+                proposal={temporaryApproval.proposal}
+                approved={temporaryApproval.approved}
+                onOpen={() => setTemporaryAgentDetail(temporaryApproval.proposal)}
+                onApprove={approveTemporaryAgentFromCard}
+                onReject={rejectTemporaryAgentFromCard}
+                onRevise={requestTemporaryAgentRevisionFromCard}
+                onPersist={persistTemporaryAgentFromCard}
+                disabled={approveTemporaryAgent.isPending || reviseTemporaryAgent.isPending || promoteTemporaryAgent.isPending}
+              />
             ) : null}
             {scheduleApproval && !scheduleApprovalVisibleInMessages ? (
               <article className="chat-message assistant" aria-label="计划任务文字确认">
@@ -3170,12 +3818,25 @@ export function RunsPage() {
             ) : null}
             {messages.map((item, index) => (
               <Fragment key={item.id}>
-                <article className={`chat-message ${item.role}`}>
-                  <span className="eyebrow">{item.role === "user" ? "你" : APP_BRAND_NAME}</span>
-                  <h3>{item.title}</h3>
-                  <MessageBody text={item.body} title={item.title} />
-                  {hasArtifactDownload(item.artifact) ? <ArtifactFileCard artifact={item.artifact} /> : null}
-                </article>
+                {item.temporaryAgentProposal ? (
+                  <TemporaryAgentRecruitmentCard
+                    proposal={item.temporaryAgentProposal}
+                    approved={temporaryApproval?.runId === item.run?.id ? temporaryApproval.approved : false}
+                    onOpen={() => setTemporaryAgentDetail(item.temporaryAgentProposal ?? null)}
+                    onApprove={approveTemporaryAgentFromCard}
+                    onReject={rejectTemporaryAgentFromCard}
+                    onRevise={requestTemporaryAgentRevisionFromCard}
+                    onPersist={persistTemporaryAgentFromCard}
+                    disabled={approveTemporaryAgent.isPending || reviseTemporaryAgent.isPending || promoteTemporaryAgent.isPending}
+                  />
+                ) : (
+                  <article className={`chat-message ${item.role}`}>
+                    <span className="eyebrow">{item.role === "user" ? "你" : APP_BRAND_NAME}</span>
+                    <h3>{item.title}</h3>
+                    <MessageBody text={item.body} title={item.title} />
+                    {hasArtifactDownload(item.artifact) ? <ArtifactFileCard artifact={item.artifact} /> : null}
+                  </article>
+                )}
                 {item.id.endsWith("-request") && item.run ? (
                   <RunProcessSummary
                     detail={item.run}
@@ -3186,19 +3847,17 @@ export function RunsPage() {
                 ) : null}
               </Fragment>
             ))}
-            {latestVisibleRun ? (
-              <div className="chat-detail-action">
-                <Link to={`/runs/${latestVisibleRun.id}`} className="secondary-action">
-                  查看运行详情
-                </Link>
-                <span>打开完整事件、产物、错误和运行控制。</span>
-              </div>
-            ) : null}
           </div>
-          {processDetailTarget ? (
+          {refreshedProcessDetailTarget ? (
             <RunProcessDrawer
-              target={processDetailTarget}
+              target={refreshedProcessDetailTarget}
               onClose={() => setProcessDetailTarget(null)}
+            />
+          ) : null}
+          {temporaryAgentDetail ? (
+            <TemporaryAgentDetailDialog
+              proposal={temporaryAgentDetail}
+              onClose={() => setTemporaryAgentDetail(null)}
             />
           ) : null}
 
@@ -3357,10 +4016,50 @@ export function RunsPage() {
                       : "附件已选中。当前先记录附件名称，完整内容读取会走后端附件存储。"}
                 </p>
                 {attachmentDraft.kind === "archive" && archiveInstallFile ? (
-                  <button type="button" disabled={uploadSkillArchive.isPending} onClick={() => uploadSkillArchive.mutate(archiveInstallFile)}>
+                  <button
+                    type="button"
+                    disabled={uploadSkillArchive.isPending}
+                    onClick={() => uploadSkillArchive.mutate({ file: archiveInstallFile })}
+                  >
                     {uploadSkillArchive.isPending ? "扫描中..." : "作为 Skill 安装"}
                   </button>
                 ) : null}
+              </aside>
+            ) : null}
+            {skillUploadConflict ? (
+              <aside className="composer-attachment-card" role="alert" aria-label="Skill 版本选择">
+                <div>
+                  <span className="eyebrow">Skill 已存在</span>
+                  <strong>{skillUploadConflict.skillName}</strong>
+                  <small>新包 SHA256：{shortHash(skillUploadConflict.newContentSha256)}</small>
+                </div>
+                <p>检测到同名 Skill 内容不同。请选择覆盖当前版本，或保存为一个可切换的新版本。</p>
+                <div className="composer-card-actions">
+                  <button
+                    type="button"
+                    disabled={uploadSkillArchive.isPending}
+                    onClick={() =>
+                      uploadSkillArchive.mutate({
+                        file: skillUploadConflict.file,
+                        strategy: "overwrite",
+                      })
+                    }
+                  >
+                    覆盖当前版本
+                  </button>
+                  <button
+                    type="button"
+                    disabled={uploadSkillArchive.isPending}
+                    onClick={() =>
+                      uploadSkillArchive.mutate({
+                        file: skillUploadConflict.file,
+                        strategy: "new_version",
+                      })
+                    }
+                  >
+                    保存为新版本
+                  </button>
+                </div>
               </aside>
             ) : null}
             <textarea
@@ -3442,7 +4141,7 @@ export function RunsPage() {
             {submitNotice ? <p role="status">{submitNotice}</p> : null}
             {uploadSkillArchive.isPending ? <p role="status">正在扫描 Skill 压缩包...</p> : null}
             {uploadAttachment.isPending ? <p role="status">正在上传附件...</p> : null}
-            {uploadSkillArchive.isError ? (
+            {uploadSkillArchive.isError && !skillUploadConflict ? (
               <p className="field-help" role="status">
                 {formatApiError(uploadSkillArchive.error, "Skill 扫描失败")}
               </p>

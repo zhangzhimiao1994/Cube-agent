@@ -9,8 +9,10 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from agent_hub.api.dependencies import current_principal
 from agent_hub.api.errors import BASE_ERROR_RESPONSES, PublicAPIError, error_responses
 from agent_hub.auth.feishu_oauth import (
+    FeishuOAuthProfile,
     LastSuperAdminError,
     ManagedUser,
+    OAuthBindingError,
     ProtectedUserError,
     UserAlreadyExistsError,
 )
@@ -76,6 +78,19 @@ class UserAdminServiceProtocol(Protocol):
         user_id: UUID,
     ) -> ManagedUser: ...
 
+    async def bind_feishu_open_id(
+        self,
+        actor: AuthenticatedPrincipal,
+        user_id: UUID,
+        profile: FeishuOAuthProfile,
+    ) -> ManagedUser: ...
+
+    async def unbind_feishu_open_id(
+        self,
+        actor: AuthenticatedPrincipal,
+        user_id: UUID,
+    ) -> ManagedUser: ...
+
 
 class UserResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -133,6 +148,12 @@ class ResetPasswordRequest(BaseModel):
     password: SecretStr = Field(min_length=12, max_length=1024, repr=False)
 
 
+class BindFeishuRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    open_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_]+$")
+
+
 def _user_service(request: Request) -> UserAdminServiceProtocol:
     service = getattr(request.app.state, "user_admin_service", None)
     if service is None:
@@ -153,7 +174,9 @@ async def list_users(
     return [UserResponse.from_user(user) for user in users]
 
 
-@router.post("", response_model=UserResponse, responses=error_responses(400, 401, 403, 409, 422, 503))
+@router.post(
+    "", response_model=UserResponse, responses=error_responses(400, 401, 403, 409, 422, 503)
+)
 async def create_user(
     body: CreateUserRequest,
     request: Request,
@@ -299,6 +322,73 @@ async def set_disabled(
         action="user.disable" if user.disabled else "user.enable",
         resource=f"user:{user.id}",
         details={"username": user.username, "disabled": str(user.disabled).lower()},
+    )
+    return UserResponse.from_user(user)
+
+
+@router.patch(
+    "/{user_id}/feishu",
+    response_model=UserResponse,
+    responses=error_responses(400, 401, 403, 404, 409, 422, 503),
+)
+async def bind_feishu_open_id(
+    user_id: UUID,
+    body: BindFeishuRequest,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[UserAdminServiceProtocol, Depends(_user_service)],
+) -> UserResponse:
+    _require(principal, "user:write")
+    try:
+        user = await service.bind_feishu_open_id(
+            principal,
+            user_id,
+            FeishuOAuthProfile(open_id=body.open_id, tenant_key="manual"),
+        )
+    except PermissionError:
+        raise PublicAPIError(403, "permission_denied", "permission denied") from None
+    except KeyError:
+        raise PublicAPIError(404, "user_not_found", "user not found") from None
+    except OAuthBindingError:
+        raise PublicAPIError(
+            409,
+            "feishu_already_bound",
+            "feishu account is already bound",
+        ) from None
+    await _record_user_audit(
+        request,
+        principal,
+        action="user.feishu.bind",
+        resource=f"user:{user.id}",
+        details={"username": user.username, "feishu_open_id": body.open_id},
+    )
+    return UserResponse.from_user(user)
+
+
+@router.delete(
+    "/{user_id}/feishu",
+    response_model=UserResponse,
+    responses=error_responses(400, 401, 403, 404, 409, 422, 503),
+)
+async def unbind_feishu_open_id(
+    user_id: UUID,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[UserAdminServiceProtocol, Depends(_user_service)],
+) -> UserResponse:
+    _require(principal, "user:write")
+    try:
+        user = await service.unbind_feishu_open_id(principal, user_id)
+    except PermissionError:
+        raise PublicAPIError(403, "permission_denied", "permission denied") from None
+    except KeyError:
+        raise PublicAPIError(404, "user_not_found", "user not found") from None
+    await _record_user_audit(
+        request,
+        principal,
+        action="user.feishu.unbind",
+        resource=f"user:{user.id}",
+        details={"username": user.username},
     )
     return UserResponse.from_user(user)
 

@@ -106,6 +106,8 @@ export function UsersPage() {
   const [editDisabled, setEditDisabled] = useState(false);
   const [resetTarget, setResetTarget] = useState<ManagedUser | null>(null);
   const [resetPassword, setResetPassword] = useState("");
+  const [feishuTarget, setFeishuTarget] = useState<ManagedUser | null>(null);
+  const [feishuOpenId, setFeishuOpenId] = useState("");
   const [userSearchTerm, setUserSearchTerm] = useState("");
   const [userColumnFilters, setUserColumnFilters] = useState<UserColumnFilters>(EMPTY_USER_FILTERS);
   const [userSort, setUserSort] = useState<SortState<UserSortKey>>({ key: "username", direction: "asc" });
@@ -176,6 +178,25 @@ export function UsersPage() {
       refreshUsers();
     },
   });
+  const bindFeishu = useMutation({
+    mutationFn: () => {
+      if (!feishuTarget) throw new Error("未选择要绑定飞书的用户");
+      return api.bindUserFeishu(feishuTarget.id, feishuOpenId.trim());
+    },
+    onSuccess: (user) => {
+      setFeishuTarget(null);
+      setFeishuOpenId("");
+      setMessage(`已绑定 ${user.username} 的飞书账号`);
+      refreshUsers();
+    },
+  });
+  const unbindFeishu = useMutation({
+    mutationFn: (user: ManagedUser) => api.unbindUserFeishu(user.id),
+    onSuccess: (user) => {
+      setMessage(`已解绑 ${user.username} 的飞书账号`);
+      refreshUsers();
+    },
+  });
 
   const operationError =
     createUser.error ??
@@ -183,6 +204,8 @@ export function UsersPage() {
     changeRole.error ??
     setDisabled.error ??
     resetUserPassword.error ??
+    bindFeishu.error ??
+    unbindFeishu.error ??
     deleteUser.error;
 
   if (users.isLoading) return <p>正在加载用户...</p>;
@@ -394,6 +417,55 @@ export function UsersPage() {
         </div>
       ) : null}
 
+      {feishuTarget ? (
+        <div className="modal-backdrop" role="presentation">
+          <section className="modal-card" role="dialog" aria-modal="true" aria-labelledby="bind-feishu-title">
+            <h3 id="bind-feishu-title">绑定飞书账号</h3>
+            <p>
+              正在为 <strong>{feishuTarget.username}</strong> 绑定飞书 open_id。绑定后飞书消息会归属到这个管理台用户。
+            </p>
+            <form
+              className="form-grid"
+              onSubmit={(event) => {
+                event.preventDefault();
+                setMessage(null);
+                bindFeishu.mutate();
+              }}
+            >
+              <label htmlFor="feishu-open-id">
+                飞书 open_id
+                <input
+                  id="feishu-open-id"
+                  aria-label="飞书 open_id"
+                  value={feishuOpenId}
+                  onChange={(event) => setFeishuOpenId(event.target.value)}
+                  placeholder="ou_xxx"
+                  autoComplete="off"
+                  required
+                  autoFocus
+                />
+                <small>可从最近飞书任务的 channel_sender_external_id 中确认。</small>
+              </label>
+              <div className="table-actions">
+                <button type="submit" disabled={bindFeishu.isPending}>
+                  {bindFeishu.isPending ? "保存中..." : "保存飞书绑定"}
+                </button>
+                <button
+                  type="button"
+                  className="secondary-action"
+                  onClick={() => {
+                    setFeishuTarget(null);
+                    setFeishuOpenId("");
+                  }}
+                >
+                  取消
+                </button>
+              </div>
+            </form>
+          </section>
+        </div>
+      ) : null}
+
       <article>
         <h3>用户列表</h3>
         <div className="list-toolbar">
@@ -449,6 +521,7 @@ export function UsersPage() {
               {visibleUsers.map((user) => {
               const isSelf = user.id === currentUserId;
               const locked = user.protected || isSelf || !canWriteUsers;
+              const feishuLocked = !canWriteUsers;
               return (
                 <tr key={user.id}>
                   <td>
@@ -475,6 +548,33 @@ export function UsersPage() {
                   <td>{user.disabled ? "已禁用" : "正常"}</td>
                   <td>{user.feishu_open_id ?? "未绑定"}</td>
                   <td className="table-actions">
+                    {user.feishu_open_id ? (
+                      <button
+                        type="button"
+                        disabled={feishuLocked || unbindFeishu.isPending}
+                        onClick={() => {
+                          setMessage(null);
+                          setFeishuTarget(null);
+                          setFeishuOpenId("");
+                          unbindFeishu.mutate(user);
+                        }}
+                      >
+                        解绑飞书
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={feishuLocked}
+                        onClick={() => {
+                          setMessage(null);
+                          setResetTarget(null);
+                          setFeishuTarget(user);
+                          setFeishuOpenId(user.feishu_open_id ?? "");
+                        }}
+                      >
+                        绑定飞书
+                      </button>
+                    )}
                     <button
                       type="button"
                       disabled={locked}

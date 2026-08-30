@@ -1,5 +1,6 @@
 d /run/agent-hub 0750 agent-hub agent-hub -
 d /var/lib/agent-hub 0750 agent-hub agent-hub -
 d /var/lib/agent-hub/attachments 0750 agent-hub agent-hub -
+d /var/lib/agent-hub/generated-artifacts 0750 agent-hub agent-hub -
 d /var/lib/agent-hub/skills 0750 agent-hub agent-hub -
 d /var/log/agent-hub 0750 agent-hub agent-hub -

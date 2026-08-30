@@ -9,7 +9,8 @@ from uuid import UUID
 
 DOCX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 PPTX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-ALLOWED_GENERATED_FILE_MIME_TYPES = frozenset({DOCX_MIME_TYPE, PPTX_MIME_TYPE})
+ZIP_MIME_TYPE = "application/zip"
+ALLOWED_GENERATED_FILE_MIME_TYPES = frozenset({DOCX_MIME_TYPE, PPTX_MIME_TYPE, ZIP_MIME_TYPE})
 _WINDOWS_RESERVED_DEVICE_NAMES = frozenset(
     {
         "CON",

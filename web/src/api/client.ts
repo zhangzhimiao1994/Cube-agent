@@ -519,6 +519,7 @@ const TemporaryAgentProposalSchema = z.object({
   reason: z.string(),
   missing_capability: z.string(),
   model: z.string().optional(),
+  recommended_model: z.string().optional(),
   suggested_skills: z.array(z.string()),
   permanentizable: z.boolean(),
 });
@@ -1123,6 +1124,20 @@ export const api = {
     return request(
       `/api/v1/users/${userId}/password`,
       { method: "PATCH", body: JSON.stringify({ password }) },
+      UserSchema,
+    );
+  },
+  bindUserFeishu(userId: string, openId: string): Promise<ManagedUser> {
+    return request(
+      `/api/v1/users/${userId}/feishu`,
+      { method: "PATCH", body: JSON.stringify({ open_id: openId }) },
+      UserSchema,
+    );
+  },
+  unbindUserFeishu(userId: string): Promise<ManagedUser> {
+    return request(
+      `/api/v1/users/${userId}/feishu`,
+      { method: "DELETE" },
       UserSchema,
     );
   },

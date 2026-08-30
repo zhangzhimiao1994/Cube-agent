@@ -80,6 +80,28 @@ class RecordingRunService:
         return SubmittedRun(self.choice_run_id)
 
 
+class StubIdentityResolver:
+    def __init__(self, actor_id: UUID | None) -> None:
+        self.actor_id = actor_id
+        self.calls: list[dict[str, object]] = []
+
+    async def resolve_actor_id(
+        self,
+        *,
+        tenant_id: UUID,
+        channel: Channel,
+        sender_external_id: str,
+    ) -> UUID | None:
+        self.calls.append(
+            {
+                "tenant_id": tenant_id,
+                "channel": channel,
+                "sender_external_id": sender_external_id,
+            }
+        )
+        return self.actor_id
+
+
 @dataclass(frozen=True, slots=True)
 class StubSystemSettings:
     vibe_coding_enabled: bool = False
@@ -158,6 +180,31 @@ async def test_submitter_uses_same_internal_conversation_for_same_channel_thread
     await submitter.submit(_message("第二轮"), idempotency_key="idem_2")
 
     assert run_service.calls[0]["conversation_id"] == run_service.calls[1]["conversation_id"]
+
+
+async def test_submitter_uses_bound_channel_identity_before_derived_actor() -> None:
+    bound_user_id = UUID("33333333-3333-4333-8333-333333333333")
+    run_service = RecordingRunService()
+    resolver = StubIdentityResolver(bound_user_id)
+    submitter = RunServiceInboundSubmitter(
+        run_service=run_service,
+        tenant_id=TENANT_ID,
+        identity_resolver=resolver,
+    )
+
+    await submitter.submit(_message("绑定用户提交"), idempotency_key="idem_bound_user")
+
+    assert resolver.calls == [
+        {
+            "tenant_id": TENANT_ID,
+            "channel": Channel.FEISHU,
+            "sender_external_id": "user_1",
+        }
+    ]
+    assert run_service.calls[0]["actor_id"] == bound_user_id
+    context = run_service.calls[0]["channel_context"]
+    assert isinstance(context, dict)
+    assert context["channel_identity_resolution"] == "bound_user"
 
 
 async def test_submitter_consumes_numeric_choice_when_waiting_run_exists() -> None:

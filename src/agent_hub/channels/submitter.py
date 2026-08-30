@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from agent_hub.channels.base import InboundMessage
+from agent_hub.channels.base import Channel, InboundMessage
 from agent_hub.channels.directives import (
     ChannelDirectiveError,
     ChannelResourceHints,
@@ -51,6 +51,16 @@ class ChannelSettingsService(Protocol):
     async def get_settings(self) -> object: ...
 
 
+class ChannelIdentityResolver(Protocol):
+    async def resolve_actor_id(
+        self,
+        *,
+        tenant_id: UUID,
+        channel: Channel,
+        sender_external_id: str,
+    ) -> UUID | None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class RunServiceInboundSubmitter:
     """Adapt normalized channel messages to the durable run submission boundary."""
@@ -58,13 +68,26 @@ class RunServiceInboundSubmitter:
     run_service: RunSubmissionService
     tenant_id: UUID
     settings_service: ChannelSettingsService | None = None
+    identity_resolver: ChannelIdentityResolver | None = None
 
     async def submit(self, message: InboundMessage, *, idempotency_key: str) -> UUID:
         task_text = message.text.strip()
         if not task_text:
             raise ChannelDirectiveError("empty_message")
         conversation_id = _channel_conversation_id(message)
-        actor_id = _channel_actor_id(message)
+        resolved_actor_id = (
+            await self.identity_resolver.resolve_actor_id(
+                tenant_id=self.tenant_id,
+                channel=message.channel,
+                sender_external_id=message.sender_external_id,
+            )
+            if self.identity_resolver is not None
+            else None
+        )
+        actor_id = resolved_actor_id or _channel_actor_id(message)
+        identity_resolution = (
+            "bound_user" if resolved_actor_id is not None else "derived_channel_actor"
+        )
         choice_key = _numeric_choice_key(task_text)
         if choice_key is not None and isinstance(self.run_service, ConversationChoiceService):
             chosen = await self.run_service.choose_latest_choice_for_conversation(
@@ -86,7 +109,11 @@ class RunServiceInboundSubmitter:
             mode=TaskMode.AUTO,
             attachment_ids=attachment_ids,
             conversation_id=conversation_id,
-            channel_context=_channel_context(message, hints=hints),
+            channel_context=_channel_context(
+                message,
+                hints=hints,
+                identity_resolution=identity_resolution,
+            ),
             vibe_coding=False,
             idempotency_key=idempotency_key,
         )
@@ -151,7 +178,12 @@ def _message_with_attachment_manifest(task_text: str, message: InboundMessage) -
     return task_text + "\n" + "\n".join(lines)
 
 
-def _channel_context(message: InboundMessage, *, hints: ChannelResourceHints) -> dict[str, str]:
+def _channel_context(
+    message: InboundMessage,
+    *,
+    hints: ChannelResourceHints,
+    identity_resolution: str,
+) -> dict[str, str]:
     context = {
         "source_channel": message.channel.value,
         "channel_tenant_external_id": message.tenant_external_id,
@@ -161,6 +193,7 @@ def _channel_context(message: InboundMessage, *, hints: ChannelResourceHints) ->
         "channel_event_id": message.event_id,
         "channel_conversation_type": message.conversation_type.value,
         "channel_entry_policy": "main_agent_decides",
+        "channel_identity_resolution": identity_resolution,
     }
     if hints.skills:
         context["requested_skills"] = ",".join(hints.skills)
@@ -171,4 +204,9 @@ def _channel_context(message: InboundMessage, *, hints: ChannelResourceHints) ->
     return context
 
 
-__all__ = ["ChannelSettingsService", "RunServiceInboundSubmitter", "RunSubmissionService"]
+__all__ = [
+    "ChannelIdentityResolver",
+    "ChannelSettingsService",
+    "RunServiceInboundSubmitter",
+    "RunSubmissionService",
+]

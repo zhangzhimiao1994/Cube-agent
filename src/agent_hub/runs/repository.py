@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -24,7 +24,8 @@ from agent_hub.db.models import (
     RunUsageRow,
 )
 from agent_hub.domain.runs import RunStatus, TaskMode
-from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent, RuntimeCheckpoint
+from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, RunEvent, RuntimeCheckpoint
+from agent_hub.runtime.failure_reason import runtime_failure_diagnostic_from_reason
 
 
 @dataclass(frozen=True, slots=True)
@@ -580,7 +581,13 @@ class RunRepository:
             await session.flush()
             return self._record(row)
 
-    async def fail_run(self, run_id: UUID, *, reason: str) -> RunRecord:
+    async def fail_run(
+        self,
+        run_id: UUID,
+        *,
+        reason: str,
+        diagnostics: Mapping[str, JsonValue] | None = None,
+    ) -> RunRecord:
         async with self._session_factory() as session, session.begin():
             row = await self.get_for_update(session, run_id)
             current = RunStatus(row.status)
@@ -601,6 +608,7 @@ class RunRepository:
                     sequence=sequence,
                     run_id=run_id,
                     reason=reason,
+                    payload={} if diagnostics is None else diagnostics,
                 ),
             )
             row.status = RunStatus.FAILED.value
@@ -826,6 +834,7 @@ class RunRepository:
         run_id: UUID,
         event: RunEvent,
     ) -> None:
+        event = _event_with_failure_diagnostic(event)
         payload = event.to_payload()
         await session.execute(
             insert(RunEventRow)
@@ -1006,6 +1015,20 @@ def _public_event_payload(payload: dict[str, object]) -> dict[str, object]:
     return {
         key: _sanitize_public_json(value) for key, value in payload.items() if _is_public_key(key)
     }
+
+
+def _event_with_failure_diagnostic(event: RunEvent) -> RunEvent:
+    if event.kind not in {EventKind.RUNTIME_FAILED, EventKind.STEP_FAILED, EventKind.TOOL_FAILED}:
+        return event
+    if not event.reason:
+        return event
+    payload = dict(event.payload)
+    if "error_code" not in payload:
+        payload = {
+            **runtime_failure_diagnostic_from_reason(event.reason),
+            **payload,
+        }
+    return event.model_copy(update={"payload": payload})
 
 
 def _public_artifact_payload(payload: dict[str, object]) -> dict[str, object]:

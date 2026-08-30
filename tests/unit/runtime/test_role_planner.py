@@ -263,6 +263,29 @@ def test_pptx_generation_dispatch_selects_presentation_designer_tool_role() -> N
     assert "dark-launch" in designer.mission
 
 
+@pytest.mark.parametrize(
+    "task",
+    (
+        "请生成一个可下载的 PPTX 演示文稿，标题为《验收演示》，包含两页：目标、结果。只需要输出文件。",
+        "请调用 presentation.generate_pptx 生成最终附件。title=验收演示，slides 包含两页：目标、结果。",
+    ),
+)
+def test_pptx_generation_dispatch_handles_chinese_delivery_requests(task: str) -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=task,
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    designer = plan.role("presentation_designer")
+
+    assert designer.purpose is RolePurpose.EXECUTE
+    assert "presentation.generate_pptx" in designer.allowed_tools
+
+
 def test_office_generation_allows_local_exclusions_without_disabling_file_generation() -> None:
     docx_plan = RolePlanner().plan(
         RolePlanningRequest(
@@ -363,6 +386,18 @@ def test_dotted_tool_names_are_limited_to_known_built_ins() -> None:
         modes=frozenset({"dispatch"}),
         profiles=frozenset({"general"}),
     )
+    RoleAssignment(
+        id="project_builder",
+        role="Project Builder",
+        purpose=RolePurpose.EXECUTE,
+        mission="Generate a downloadable project archive.",
+        must_answer=("What archive was generated?",),
+        allowed_tools=("read_context", "project.generate_zip"),
+        forbidden_actions=("do not claim success without an artifact",),
+        skills=("test",),
+        output_schema={"summary": "string"},
+        model="general",
+    )
 
     with pytest.raises(ValueError, match="safe tool names"):
         RoleDefinition(
@@ -409,6 +444,42 @@ def test_general_generation_plan_does_not_select_quality_reviewer_by_default() -
     assert "product_manager" in role_ids
     assert "project_manager" in role_ids
     assert "quality_reviewer" not in role_ids
+
+
+def test_project_zip_delivery_uses_packager_not_software_implementer_tool() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=(
+                "生成一个最简单的 hello world Python 项目，"
+                "必须产出可下载 zip，zip 内包含 main.py。"
+            ),
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.SOFTWARE,
+            default_model="main-agent",
+        )
+    )
+
+    assert "project.generate_zip" not in plan.role("implementer").allowed_tools
+    packager = plan.role("project_packager")
+    assert packager.purpose is RolePurpose.EXECUTE
+    assert packager.allowed_tools == ("read_context", "project.generate_zip")
+    assert "without an agent harness" in packager.mission
+    assert any("do not claim tests or debugging ran" in action for action in packager.forbidden_actions)
+
+
+def test_project_packager_is_not_selected_when_zip_generation_is_negated() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="设计一个 Python 项目结构，但不需要 zip 压缩包。",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.SOFTWARE,
+            default_model="main-agent",
+        )
+    )
+
+    role_ids = {role.id for role in plan.roles}
+
+    assert "project_packager" not in role_ids
 
 
 def test_explicit_quality_check_still_selects_quality_reviewer() -> None:

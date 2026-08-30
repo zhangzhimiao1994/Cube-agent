@@ -9,7 +9,7 @@ import pytest
 
 import agent_hub.capabilities.runtime as runtime_module
 from agent_hub.capabilities.runtime import RuntimeCapabilityError, RuntimeCapabilityGateway
-from agent_hub.files.generated import DOCX_MIME_TYPE, PPTX_MIME_TYPE
+from agent_hub.files.generated import DOCX_MIME_TYPE, PPTX_MIME_TYPE, ZIP_MIME_TYPE
 from agent_hub.runtime.contracts import JsonValue
 from agent_hub.skills.sandbox.base import SkillInvocation, SkillResult
 from tests.unit.skills.test_package import skill_zip
@@ -185,6 +185,7 @@ async def test_runtime_gateway_generates_docx_artifact(tmp_path: Path) -> None:
 
     file_metadata = _assert_file_result(result, expected_mime_type=DOCX_MIME_TYPE)
     assert file_metadata["filename"] == "launch-memo.docx"
+    assert result["presentation"] == "final_attachment"
     storage_key = file_metadata["storage_key"]
     assert isinstance(storage_key, str)
     output = generated_artifact_dir / storage_key
@@ -226,6 +227,7 @@ async def test_runtime_gateway_generates_pptx_artifact(tmp_path: Path) -> None:
 
     file_metadata = _assert_file_result(result, expected_mime_type=PPTX_MIME_TYPE)
     assert file_metadata["filename"] == "technical-blueprint.pptx"
+    assert result["presentation"] == "final_attachment"
     storage_key = file_metadata["storage_key"]
     assert isinstance(storage_key, str)
     output = generated_artifact_dir / storage_key
@@ -234,6 +236,116 @@ async def test_runtime_gateway_generates_pptx_artifact(tmp_path: Path) -> None:
         assert "[Content_Types].xml" in package.namelist()
         assert "ppt/presentation.xml" in package.namelist()
         assert "ppt/slides/slide1.xml" in package.namelist()
+
+
+async def test_runtime_gateway_generates_project_zip_final_artifact(tmp_path: Path) -> None:
+    generated_artifact_dir = tmp_path / "generated"
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=generated_artifact_dir,
+    )
+
+    assert gateway.is_available(TENANT_ID, "project.generate_zip") is True
+    assert gateway.is_replay_safe("project.generate_zip") is True
+
+    result = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="engineer",
+        name="project.generate_zip",
+        arguments={
+            "title": "Hello World",
+            "files": {
+                "main.py": "print('hello world')\n",
+                "README.md": "# Hello World\n\nRun `python main.py`.\n",
+            },
+        },
+        idempotency_key="project_zip_1",
+    )
+
+    file_metadata = _assert_file_result(result, expected_mime_type=ZIP_MIME_TYPE)
+    assert file_metadata["filename"] == "hello-world.zip"
+    assert result["presentation"] == "final_attachment"
+    storage_key = file_metadata["storage_key"]
+    assert isinstance(storage_key, str)
+    output = generated_artifact_dir / storage_key
+    assert output.is_file()
+    with ZipFile(output) as archive:
+        assert archive.namelist() == ["README.md", "main.py"]
+        assert archive.read("main.py") == b"print('hello world')\n"
+
+
+async def test_runtime_gateway_rejects_unsafe_project_zip_paths(tmp_path: Path) -> None:
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=tmp_path / "generated",
+    )
+
+    for index, path in enumerate(("../main.py", "/tmp/main.py", "src/../../main.py", "NUL.txt")):
+        with pytest.raises(RuntimeCapabilityError, match="file path|reserved"):
+            await gateway.execute(
+                tenant_id=TENANT_ID,
+                run_id=RUN_ID,
+                actor="engineer",
+                name="project.generate_zip",
+                arguments={"title": "Unsafe", "files": {path: "content"}},
+                idempotency_key=f"unsafe_{index}",
+            )
+
+
+@pytest.mark.parametrize(
+    ("files", "message"),
+    [
+        ({}, "files must contain 1 to 64 entries"),
+        ({f"file-{index}.txt": "x" for index in range(65)}, "files must contain 1 to 64 entries"),
+        ({"large.txt": "x" * 256_001}, "file content is too large"),
+        (
+            {f"chunk-{index}.txt": "x" * 250_000 for index in range(9)},
+            "project content is too large",
+        ),
+    ],
+)
+async def test_runtime_gateway_rejects_oversized_project_zip_payloads(
+    tmp_path: Path, files: dict[str, str], message: str
+) -> None:
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=tmp_path / "generated",
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match=message):
+        await gateway.execute(
+            tenant_id=TENANT_ID,
+            run_id=RUN_ID,
+            actor="engineer",
+            name="project.generate_zip",
+            arguments={"title": "Oversized", "files": files},
+            idempotency_key="project_zip_limits",
+        )
+
+
+async def test_runtime_gateway_rejects_invalid_project_zip_presentation(tmp_path: Path) -> None:
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=tmp_path / "generated",
+    )
+
+    with pytest.raises(
+        RuntimeCapabilityError,
+        match="presentation must be step_detail or final_attachment",
+    ):
+        await gateway.execute(
+            tenant_id=TENANT_ID,
+            run_id=RUN_ID,
+            actor="engineer",
+            name="project.generate_zip",
+            arguments={
+                "title": "Invalid Presentation",
+                "files": {"main.py": "print('hello')\n"},
+                "presentation": "chat_inline",
+            },
+            idempotency_key="project_zip_bad_presentation",
+        )
 
 
 async def test_runtime_gateway_office_tools_require_configured_artifact_store(

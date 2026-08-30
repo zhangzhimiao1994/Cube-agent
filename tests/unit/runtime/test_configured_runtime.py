@@ -37,9 +37,24 @@ from agent_hub.runtime.defaults import (
     _selected_config_role_assignments,
     configured_runtime_registry,
 )
-from agent_hub.runtime.role_planner import RoleAssignment, RolePurpose
+from agent_hub.runtime.role_planner import RoleAssignment, RolePurpose, TaskProfile
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
+
+
+def test_python_project_zip_request_is_profiled_as_software() -> None:
+    profiles = defaults_module._task_profiles(
+        "生成一个最简单的 hello world Python 项目。必须产出可下载 zip，"
+        "zip 内至少包含 main.py，main.py 运行后输出 hello world。"
+    )
+
+    assert TaskProfile.SOFTWARE in profiles
+
+
+def test_plain_zip_delivery_request_is_not_profiled_as_software_engineering() -> None:
+    profiles = defaults_module._task_profiles("把这份材料整理成一个可下载 zip 压缩包。")
+
+    assert TaskProfile.SOFTWARE not in profiles
 
 
 class FakeConfigService:
@@ -278,9 +293,7 @@ async def test_config_backed_direct_runtime_uses_published_model_and_secret() ->
     assert request.logical_model == "main"
     assert api_key == "sk-live"
     assert capacities[0].wait_timeouts == [60.0]
-    assert secrets.resolved == [
-        (TENANT_ID, "secret://22222222-2222-4222-8222-222222222222")
-    ]
+    assert secrets.resolved == [(TENANT_ID, "secret://22222222-2222-4222-8222-222222222222")]
     assert capacities[0].recorded == [True]
 
 
@@ -337,9 +350,7 @@ async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
             }
         ),  # type: ignore[arg-type]
         secret_service=FakeSecretService(),  # type: ignore[arg-type]
-        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
-            tenant_id, deployments
-        ),
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
         transport=FakeTransport(),
     )
 
@@ -398,6 +409,96 @@ async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
     )
     assert events[1].kind is EventKind.RUNTIME_COMPLETED
     assert events[1].sequence == 2
+
+
+@pytest.mark.asyncio
+async def test_selected_dispatch_agents_do_not_hide_required_pptx_delivery_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text", "tool_calling"],
+                            }
+                        ]
+                    },
+                    "creative": {
+                        "deployments": [
+                            {
+                                "provider": "kimi",
+                                "model": "kimi-k2-latest",
+                                "api_base": "https://api.moonshot.cn/v1",
+                                "credential_ref": "secret://creative",
+                                "quota_scope_id": "kimi_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [
+                    {
+                        "id": "copywriter",
+                        "role": "Copywriter",
+                        "prompt": "Draft campaign copy.",
+                        "model": "creative",
+                        "skills": [],
+                    }
+                ],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
+        transport=FakeTransport(),
+        capability_gateway=FakeCapabilityAvailability({"presentation.generate_pptx"}),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request="请生成一个可下载的 PPTX 演示文稿，标题为《验收演示》。只需要输出文件。",
+                routing_decision={
+                    "selected_agent_ids": ("copywriter",),
+                    "main_agent_model": "main",
+                },
+            )
+        )
+    ]
+
+    roles = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["roles"])
+    steps = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["steps"])
+
+    assert {role["id"] for role in roles} >= {"copywriter", "presentation_designer"}
+    assert any(
+        role["id"] == "presentation_designer"
+        and role["tools"] == ("read_context", "presentation.generate_pptx")
+        for role in roles
+    )
+    assert any(
+        step["agent"] == "presentation_designer"
+        and step["tools"] == ("read_context", "presentation.generate_pptx")
+        for step in steps
+    )
 
 
 @pytest.mark.asyncio
@@ -460,9 +561,7 @@ async def test_config_backed_hybrid_runtime_emits_main_agent_role_plan(
             }
         ),  # type: ignore[arg-type]
         secret_service=FakeSecretService(),  # type: ignore[arg-type]
-        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
-            tenant_id, deployments
-        ),
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
         transport=FakeTransport(),
     )
 
@@ -568,9 +667,7 @@ async def test_config_backed_discussion_runtime_emits_main_agent_role_plan(
             }
         ),  # type: ignore[arg-type]
         secret_service=FakeSecretService(),  # type: ignore[arg-type]
-        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
-            tenant_id, deployments
-        ),
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
         transport=FakeTransport(),
     )
 
@@ -672,9 +769,7 @@ async def test_config_backed_direct_runtime_uses_per_run_direct_model_override()
             }
         ),  # type: ignore[arg-type]
         secret_service=FakeSecretService(),  # type: ignore[arg-type]
-        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
-            tenant_id, deployments
-        ),
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
         transport=transport,
     )
 
@@ -701,9 +796,7 @@ async def test_config_backed_direct_runtime_fails_explicitly_without_published_c
     runtime = ConfigBackedDirectRuntime(
         config_service=FakeConfigService(None),  # type: ignore[arg-type]
         secret_service=FakeSecretService(),  # type: ignore[arg-type]
-        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
-            tenant_id, deployments
-        ),
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
         transport=FakeTransport(),
     )
 
@@ -764,9 +857,7 @@ async def test_configured_runtime_registry_supplies_secret_fingerprints_to_capac
 
         async def initialize(self) -> None:
             assert secrets.fingerprinted == []
-            initialized_scope_ids.append(
-                tuple(deployment.id for deployment in self.deployments)
-            )
+            initialized_scope_ids.append(tuple(deployment.id for deployment in self.deployments))
             for reference in dict.fromkeys(
                 deployment.secret_ref for deployment in self.deployments
             ):
@@ -794,9 +885,7 @@ async def test_configured_runtime_registry_supplies_secret_fingerprints_to_capac
         def scoped(self, deployments: Sequence[Deployment]) -> ScopedCapacityPool:
             assert secrets.fingerprinted == []
             configured = tuple(deployments)
-            scoped_deployment_ids.append(
-                tuple(deployment.id for deployment in configured)
-            )
+            scoped_deployment_ids.append(tuple(deployment.id for deployment in configured))
             return ScopedCapacityPool(configured, self.fingerprint_resolver)
 
     monkeypatch.setattr(defaults_module, "CapacityPool", SpyCapacityPool)
@@ -834,7 +923,7 @@ async def test_configured_runtime_registry_supplies_secret_fingerprints_to_capac
                                 "capabilities": ["text"],
                             }
                         ]
-                    }
+                    },
                 },
                 "agents": [],
             }
@@ -976,6 +1065,73 @@ def test_dispatch_plan_runs_review_roles_after_producer_roles() -> None:
         "quality_reviewer_step",
     )
 
+
+def test_dispatch_plan_reserves_more_time_for_post_product_review_roles() -> None:
+    roles = (
+        RoleAssignment(
+            id="product_manager",
+            role="Product Manager",
+            purpose=RolePurpose.EXECUTE,
+            mission="Produce the product plan.",
+            must_answer=("What is the plan?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="writer",
+            role="Writer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Write the proposal.",
+            must_answer=("What was written?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="quality_reviewer",
+            role="Quality Reviewer",
+            purpose=RolePurpose.VERIFY,
+            mission="Review the completed proposal.",
+            must_answer=("Does the proposal pass review?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="生成一个完整项目方案，包含前端、后端、测试、部署和质量审查。",
+            timeout_seconds=600,
+        ),
+        max_parallelism=3,
+    )
+
+    steps = {step.id: step for step in plan.steps}
+    producer_timeout = max(
+        steps["product_manager_step"].timeout_seconds,
+        steps["writer_step"].timeout_seconds,
+    )
+    reviewer_timeout = steps["quality_reviewer_step"].timeout_seconds
+    final_timeout = steps["final_response_step"].timeout_seconds
+
+    assert reviewer_timeout > producer_timeout
+    assert final_timeout >= reviewer_timeout * 0.75
+    assert reviewer_timeout <= 600
+    assert final_timeout <= 600
+
+
 def test_dispatch_plan_preserves_selected_roles_and_controls_concurrency() -> None:
     roles = tuple(
         RoleAssignment(
@@ -1085,6 +1241,40 @@ def test_dispatch_plan_filters_unavailable_skills_from_executable_steps() -> Non
     assert plan.allowed_tools == ("read_context",)
 
 
+def test_dispatch_plan_keeps_available_project_zip_tool() -> None:
+    roles = (
+        RoleAssignment(
+            id="implementer",
+            role="Implementer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Create a downloadable project.",
+            must_answer=("What archive was generated?",),
+            allowed_tools=("read_context", "project.generate_zip"),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="生成一个最简单的 hello world Python 项目并提供 zip。",
+        ),
+        capability_gateway=FakeCapabilityAvailability({"project.generate_zip"}),
+    )
+
+    implementer = next(agent for agent in plan.agents if agent.id == "implementer")
+    implementer_step = next(step for step in plan.steps if step.agent == "implementer")
+    assert "project.generate_zip" in implementer.allowed_tools
+    assert "project.generate_zip" in implementer_step.tools
+    assert "project.generate_zip" in plan.allowed_tools
+
+
 def test_dispatch_plan_reserves_more_time_for_final_synthesis() -> None:
     roles = tuple(
         RoleAssignment(
@@ -1113,9 +1303,7 @@ def test_dispatch_plan_reserves_more_time_for_final_synthesis() -> None:
         ),
     )
 
-    role_timeouts = [
-        step.timeout_seconds for step in plan.steps if not step.final_synthesizer
-    ]
+    role_timeouts = [step.timeout_seconds for step in plan.steps if not step.final_synthesizer]
     final_step = next(step for step in plan.steps if step.final_synthesizer)
     assert min(role_timeouts) >= 45
     assert final_step.timeout_seconds >= 120
@@ -1409,7 +1597,6 @@ def test_role_model_assignment_rewards_matching_model_capabilities() -> None:
     assert assigned[0].model == "qwen_audio"
 
 
-
 def test_role_model_assignment_rewards_ordinary_model_characteristics() -> None:
     config = PlatformConfig.model_validate(
         {
@@ -1469,6 +1656,8 @@ def test_role_model_assignment_rewards_ordinary_model_characteristics() -> None:
     )
 
     assert assigned[0].model == "sonnet5"
+
+
 def test_general_role_model_assignment_uses_more_configured_text_models() -> None:
     config = PlatformConfig.model_validate(
         {
@@ -1624,7 +1813,6 @@ def test_role_model_assignment_uses_inferred_mainstream_model_traits() -> None:
     assert assigned[0].model == "gemini_pro"
 
 
-
 def test_role_model_assignment_avoids_messages_endpoint_for_tool_roles() -> None:
     config = PlatformConfig.model_validate(
         {
@@ -1684,6 +1872,7 @@ def test_role_model_assignment_avoids_messages_endpoint_for_tool_roles() -> None
     )
 
     assert assigned[0].model == "qwen"
+
 
 def test_dispatch_parallelism_uses_model_capacity_without_unbounded_fanout() -> None:
     config = PlatformConfig.model_validate(
@@ -1925,7 +2114,6 @@ def test_selected_agent_ids_are_resolved_from_config_without_extra_roles() -> No
     ]
 
 
-
 def test_selected_dispatch_reviewer_runs_after_selected_producers() -> None:
     config = PlatformConfig.model_validate(
         {
@@ -2002,6 +2190,8 @@ def test_selected_dispatch_reviewer_runs_after_selected_producers() -> None:
         "copywriter_step",
         "quality_reviewer_step",
     )
+
+
 def test_configured_runtime_registry_registers_all_production_modes() -> None:
     registry = configured_runtime_registry(
         config_service=FakeConfigService(None),  # type: ignore[arg-type]

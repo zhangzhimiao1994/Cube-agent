@@ -124,7 +124,10 @@ class FeishuOAuthService:
             redirect_uri=redirect_uri,
             code_verifier=code_verifier,
         )
-        if profile.tenant_key != record.tenant_key or profile.tenant_key not in self._allowed_tenant_keys:
+        if (
+            profile.tenant_key != record.tenant_key
+            or profile.tenant_key not in self._allowed_tenant_keys
+        ):
             raise OAuthStateError("invalid oauth tenant")
         if not _safe_open_id(profile.open_id):
             raise OAuthStateError("invalid oauth profile")
@@ -251,7 +254,11 @@ class InMemoryUserAdminService:
             raise ProtectedUserError("current user cannot be disabled")
         if user.protected and disabled:
             raise ProtectedUserError("protected user cannot be disabled")
-        if user.role is Role.SUPER_ADMIN and disabled and self._super_admin_count(excluding=user_id) == 0:
+        if (
+            user.role is Role.SUPER_ADMIN
+            and disabled
+            and self._super_admin_count(excluding=user_id) == 0
+        ):
             raise LastSuperAdminError("cannot disable last super admin")
         updated = ManagedUser(
             id=user.id,
@@ -308,6 +315,24 @@ class InMemoryUserAdminService:
             role=user.role,
             disabled=user.disabled,
             feishu_open_id=profile.open_id,
+            protected=user.protected,
+        )
+        self._users[user_id] = updated
+        return updated
+
+    async def unbind_feishu_open_id(
+        self,
+        actor: AuthenticatedPrincipal,
+        user_id: UUID,
+    ) -> ManagedUser:
+        _require_admin(actor)
+        user = self._users[user_id]
+        updated = ManagedUser(
+            id=user.id,
+            username=user.username,
+            role=user.role,
+            disabled=user.disabled,
+            feishu_open_id=None,
             protected=user.protected,
         )
         self._users[user_id] = updated

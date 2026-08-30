@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from agent_hub.runs.repository import _public_artifact_payload, _public_event_payload
+from uuid import uuid4
+
+from agent_hub.runs.repository import (
+    _event_with_failure_diagnostic,
+    _public_artifact_payload,
+    _public_event_payload,
+)
+from agent_hub.runtime.contracts import EventKind, RunEvent
 
 
 def test_public_artifact_payload_filters_generated_file_storage_key_recursively() -> None:
@@ -51,3 +58,36 @@ def test_public_event_payload_filters_generated_file_storage_key_recursively() -
         "type": "artifact.created",
         "artifact": {"content": {"file": {"filename": "deck.pptx"}}},
     }
+
+
+def test_failed_run_event_is_enriched_with_public_diagnostics() -> None:
+    event = RunEvent(
+        kind=EventKind.RUNTIME_FAILED,
+        sequence=1,
+        run_id=uuid4(),
+        reason="model gateway failed: model response failed (status=502)",
+    )
+
+    enriched = _event_with_failure_diagnostic(event)
+
+    assert enriched.payload["error_summary"] == "model gateway failed: model response failed (status=502)"
+    assert enriched.payload["error_code"] == "model.provider_unavailable"
+    assert enriched.payload["error_stage"] == "model_provider"
+    assert enriched.payload["retryable"] is True
+    assert _public_event_payload(enriched.to_payload())["payload"] == enriched.payload
+
+
+def test_failed_event_keeps_existing_diagnostic_payload() -> None:
+    event = RunEvent(
+        kind=EventKind.STEP_FAILED,
+        sequence=1,
+        run_id=uuid4(),
+        actor="planner",
+        step_id="plan",
+        reason="step execution failed",
+        payload={"error_code": "custom.error", "summary": "custom"},
+    )
+
+    enriched = _event_with_failure_diagnostic(event)
+
+    assert enriched.payload == {"error_code": "custom.error", "summary": "custom"}

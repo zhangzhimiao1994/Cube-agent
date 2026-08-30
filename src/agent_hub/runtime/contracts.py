@@ -548,9 +548,10 @@ class RunEvent(_RuntimeContractModel):
     def safe_kind(cls, value: object) -> EventKind | str:
         if isinstance(value, EventKind):
             return value
-        if type(value) is not str or re.fullmatch(
-            r"[a-z][a-z0-9_]{0,31}\.[a-z][a-z0-9_]{0,31}", value
-        ) is None:
+        if (
+            type(value) is not str
+            or re.fullmatch(r"[a-z][a-z0-9_]{0,31}\.[a-z][a-z0-9_]{0,31}", value) is None
+        ):
             raise ValueError("event kind must be a safe namespaced identifier")
         try:
             return EventKind(value)
@@ -669,11 +670,15 @@ class RunEvent(_RuntimeContractModel):
             self.artifact is not None or self.checkpoint is not None
         ):
             raise ValueError("runtime.completed forbids artifact and checkpoint")
-        if self.kind in {
-            EventKind.ARTIFACT_CREATED,
-            EventKind.CHECKPOINT_SAVED,
-            EventKind.RUNTIME_FAILED,
-        } and self.inputs:
+        if (
+            self.kind
+            in {
+                EventKind.ARTIFACT_CREATED,
+                EventKind.CHECKPOINT_SAVED,
+                EventKind.RUNTIME_FAILED,
+            }
+            and self.inputs
+        ):
             raise ValueError("event kind forbids inputs")
         step_kinds = {
             EventKind.STEP_STARTED,
@@ -685,9 +690,7 @@ class RunEvent(_RuntimeContractModel):
             raise ValueError("step events require step_id and actor")
         if self.kind in {EventKind.STEP_FAILED, EventKind.TOOL_FAILED} and self.reason is None:
             raise ValueError("failed events require a reason")
-        if self.kind is EventKind.MESSAGE_CREATED and (
-            self.actor is None or self.message is None
-        ):
+        if self.kind is EventKind.MESSAGE_CREATED and (self.actor is None or self.message is None):
             raise ValueError("message.created requires actor and message")
         if self.kind is EventKind.REVIEW_COMPLETED and (
             self.actor is None
@@ -786,9 +789,7 @@ class RunEvent(_RuntimeContractModel):
             EventKind.MESSAGE_CREATED: frozenset(
                 {"actor", "session_id", "message", "inputs", "payload"}
             ),
-            EventKind.TOOL_STARTED: frozenset(
-                {"actor", "tool_call_id", "tool_name", "payload"}
-            ),
+            EventKind.TOOL_STARTED: frozenset({"actor", "tool_call_id", "tool_name", "payload"}),
             EventKind.TOOL_COMPLETED: frozenset(
                 {"actor", "tool_call_id", "tool_name", "artifact", "payload"}
             ),
@@ -798,9 +799,7 @@ class RunEvent(_RuntimeContractModel):
             EventKind.APPROVAL_REQUESTED: frozenset(
                 {"actor", "approval_id", "action", "reason", "payload"}
             ),
-            EventKind.APPROVAL_RESOLVED: frozenset(
-                {"actor", "approval_id", "decision", "payload"}
-            ),
+            EventKind.APPROVAL_RESOLVED: frozenset({"actor", "approval_id", "decision", "payload"}),
             EventKind.COST_RECORDED: frozenset(
                 {"actor", "provider_id", "cost_usd", "currency", "payload"}
             ),
@@ -815,8 +814,10 @@ class RunEvent(_RuntimeContractModel):
             EventKind.MODEL_STARTED: frozenset({"actor", "message", "payload"}),
             EventKind.ARTIFACT_CREATED: frozenset({"artifact", "actor", "message", "payload"}),
             EventKind.CHECKPOINT_SAVED: frozenset({"checkpoint"}),
-            EventKind.RUNTIME_COMPLETED: frozenset({"actor", "message", "payload", "inputs", "reason"}),
-            EventKind.RUNTIME_FAILED: frozenset({"reason"}),
+            EventKind.RUNTIME_COMPLETED: frozenset(
+                {"actor", "message", "payload", "inputs", "reason"}
+            ),
+            EventKind.RUNTIME_FAILED: frozenset({"reason", "payload"}),
             EventKind.RUNTIME_CANCELLED: frozenset(),
         }
         if (
@@ -927,7 +928,11 @@ class TaskContext(_RuntimeContractModel):
     @field_validator("timeout_seconds")
     @classmethod
     def strict_timeout(cls, value: float) -> float:
-        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(value)
+        ):
             raise TypeError("timeout must be a finite number")
         return float(value)
 

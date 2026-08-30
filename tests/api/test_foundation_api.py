@@ -217,9 +217,7 @@ class StubAuthService:
         self.seen_tokens: list[str] = []
         self.login_tenant_ids: list[UUID] = []
 
-    async def consume_bootstrap_code(
-        self, code: str, username: str, password: str
-    ) -> AuthResult:
+    async def consume_bootstrap_code(self, code: str, username: str, password: str) -> AuthResult:
         return AuthResult(self.principal, "setup-access-token")
 
     async def login(self, tenant_id: UUID, username: str, password: str) -> AuthResult:
@@ -372,6 +370,54 @@ def test_user_management_reset_password_endpoint_is_wired_and_audited() -> None:
         event.action for event in audit.audit_events if event.action.startswith("user.")
     ]
     assert user_audit_actions == ["user.create", "user.password"]
+
+
+def test_user_management_can_bind_and_unbind_feishu_open_id() -> None:
+    owner_id = uuid4()
+    tenant_id = uuid4()
+    auth = StubAuthService(AuthenticatedPrincipal(owner_id, tenant_id, Role.SUPER_ADMIN))
+    service = InMemoryUserAdminService(
+        (
+            ManagedUser(
+                id=owner_id,
+                username="owner",
+                role=Role.SUPER_ADMIN,
+                protected=True,
+            ),
+        )
+    )
+    audit = InMemoryAdminResourceService()
+    client = auth_client(auth, user_admin_service=service, admin_resource_service=audit)
+
+    created = client.post(
+        "/api/v1/users",
+        headers={"Authorization": "Bearer valid-token"},
+        json={"username": "ops-user", "password": "valid password 456", "role": "operator"},
+    )
+    user_id = created.json()["id"]
+
+    bound = client.patch(
+        f"/api/v1/users/{user_id}/feishu",
+        headers={"Authorization": "Bearer valid-token"},
+        json={"open_id": "ou_user"},
+    )
+    unbound = client.delete(
+        f"/api/v1/users/{user_id}/feishu",
+        headers={"Authorization": "Bearer valid-token"},
+    )
+
+    assert bound.status_code == 200
+    assert bound.json()["feishu_open_id"] == "ou_user"
+    assert unbound.status_code == 200
+    assert unbound.json()["feishu_open_id"] is None
+    user_audit_actions = [
+        event.action for event in audit.audit_events if event.action.startswith("user.")
+    ]
+    assert user_audit_actions == [
+        "user.create",
+        "user.feishu.bind",
+        "user.feishu.unbind",
+    ]
 
 
 def test_user_management_protects_initial_super_admin() -> None:
@@ -788,8 +834,7 @@ class StubConfigService:
             (
                 revision
                 for revision in reversed(self.revisions)
-                if revision.tenant_id == tenant_id
-                and revision.status is ConfigStatus.PUBLISHED
+                if revision.tenant_id == tenant_id and revision.status is ConfigStatus.PUBLISHED
             ),
             None,
         )
@@ -833,14 +878,10 @@ def test_config_create_publish_current_history_and_rollback() -> None:
     client, service, _ = config_client()
 
     draft = client.post("/api/v1/config/drafts", headers=bearer(), json=config_document())
-    published = client.post(
-        f"/api/v1/config/drafts/{draft.json()['id']}/publish", headers=bearer()
-    )
+    published = client.post(f"/api/v1/config/drafts/{draft.json()['id']}/publish", headers=bearer())
     current = client.get("/api/v1/config/current", headers=bearer())
     history = client.get("/api/v1/config/history?limit=20&offset=0", headers=bearer())
-    rollback = client.post(
-        "/api/v1/config/history/1/rollback", headers=bearer()
-    )
+    rollback = client.post("/api/v1/config/history/1/rollback", headers=bearer())
 
     assert draft.status_code == 201
     assert published.status_code == 200
@@ -871,14 +912,10 @@ def test_config_validate_does_not_persist_and_invalid_is_422() -> None:
 @pytest.mark.parametrize("role", [Role.OPERATOR, Role.VIEWER])
 def test_read_roles_cannot_create_or_publish(role: Role) -> None:
     client, service, _ = config_client(role)
-    draft = asyncio.run(
-        service.create_draft(uuid4(), uuid4(), config_document())
-    )
+    draft = asyncio.run(service.create_draft(uuid4(), uuid4(), config_document()))
 
     create = client.post("/api/v1/config/drafts", headers=bearer(), json=config_document())
-    publish = client.post(
-        f"/api/v1/config/drafts/{draft.id}/publish", headers=bearer()
-    )
+    publish = client.post(f"/api/v1/config/drafts/{draft.id}/publish", headers=bearer())
     read = client.get("/api/v1/config/history", headers=bearer())
 
     assert create.status_code == 403
@@ -888,9 +925,7 @@ def test_read_roles_cannot_create_or_publish(role: Role) -> None:
 
 def test_publish_revision_is_tenant_scoped_and_missing_is_generic_404() -> None:
     service = StubConfigService()
-    other_tenant_draft = asyncio.run(
-        service.create_draft(uuid4(), uuid4(), config_document())
-    )
+    other_tenant_draft = asyncio.run(service.create_draft(uuid4(), uuid4(), config_document()))
     client, _, _ = config_client(service=service)
 
     response = client.post(
@@ -961,9 +996,7 @@ def test_post_commit_notification_failure_returns_committed_revision() -> None:
     draft = client.post("/api/v1/config/drafts", headers=bearer(), json=config_document())
     service.publish_notification_failure = True
 
-    response = client.post(
-        f"/api/v1/config/drafts/{draft.json()['id']}/publish", headers=bearer()
-    )
+    response = client.post(f"/api/v1/config/drafts/{draft.json()['id']}/publish", headers=bearer())
 
     assert response.status_code == 200
     assert response.json()["status"] == "published"
@@ -1035,9 +1068,7 @@ class FakeRedis:
 
 def valid_settings() -> Settings:
     key = base64.urlsafe_b64encode(b"x" * 32).decode("ascii").rstrip("=")
-    return Settings.model_validate(
-        {"jwt_signing_key": "base64url:" + key}
-    )
+    return Settings.model_validate({"jwt_signing_key": "base64url:" + key})
 
 
 def test_injected_database_and_redis_are_not_closed() -> None:
@@ -1183,9 +1214,7 @@ async def test_cleanup_cancellation_wins_over_ordinary_cleanup_failure(
 
 def test_primary_startup_error_is_preserved_over_cleanup_cancellation() -> None:
     events: list[str] = []
-    database = FakeDatabase(
-        execute_error=RuntimeError("PRIMARY_TENANT_FAILURE"), events=events
-    )
+    database = FakeDatabase(execute_error=RuntimeError("PRIMARY_TENANT_FAILURE"), events=events)
     redis = FakeRedis(cleanup_error=asyncio.CancelledError(), events=events)
     app = create_app(
         settings=valid_settings(),
@@ -1206,9 +1235,7 @@ def test_fatal_base_exceptions_from_cleanup_are_not_swallowed(
     async def fatal_cleanup() -> None:
         raise fatal_error
 
-    cleanup = _cleanup_owned_resources(
-        [("database", fatal_cleanup)], primary_error=None
-    )
+    cleanup = _cleanup_owned_resources([("database", fatal_cleanup)], primary_error=None)
 
     with pytest.raises(type(fatal_error)):
         cleanup.send(None)
@@ -1264,9 +1291,7 @@ def test_invalid_jwt_key_is_rejected_before_resource_factories_run() -> None:
         return FakeRedis()
 
     app = create_app(
-        settings=Settings.model_validate(
-            {"jwt_signing_key": "development-only-change-me"}
-        ),
+        settings=Settings.model_validate({"jwt_signing_key": "development-only-change-me"}),
         database_factory=database_factory,
         redis_factory=redis_factory,
     )
@@ -1314,9 +1339,7 @@ def test_framework_404_uses_safe_error_envelope() -> None:
     response = auth_client().get("/missing/private-resource")
 
     assert response.status_code == 404
-    assert response.json() == {
-        "error": {"code": "not_found", "message": "resource not found"}
-    }
+    assert response.json() == {"error": {"code": "not_found", "message": "resource not found"}}
     assert "detail" not in response.text
 
 
@@ -1431,12 +1454,8 @@ def test_openapi_describes_security_health_and_route_specific_errors() -> None:
     assert "security" not in schema["paths"]["/health/live"]["get"]
     assert "security" not in schema["paths"]["/api/v1/setup"]["post"]
     assert "security" not in schema["paths"]["/api/v1/auth/login"]["post"]
-    assert schema["paths"]["/api/v1/auth/me"]["get"]["security"] == [
-        {"BearerAuth": []}
-    ]
-    assert schema["paths"]["/api/v1/config/current"]["get"]["security"] == [
-        {"BearerAuth": []}
-    ]
+    assert schema["paths"]["/api/v1/auth/me"]["get"]["security"] == [{"BearerAuth": []}]
+    assert schema["paths"]["/api/v1/config/current"]["get"]["security"] == [{"BearerAuth": []}]
 
     config_403_matrix = {
         ("/api/v1/config/validate", "post"): True,
@@ -1452,9 +1471,9 @@ def test_openapi_describes_security_health_and_route_specific_errors() -> None:
         assert ("403" in schema["paths"][path][method]["responses"]) is expects_forbidden
 
     for path in ("/health/live", "/health/ready"):
-        assert schema["paths"][path]["get"]["responses"]["200"]["content"][
-            "application/json"
-        ]["schema"] == {"$ref": "#/components/schemas/HealthResponse"}
+        assert schema["paths"][path]["get"]["responses"]["200"]["content"]["application/json"][
+            "schema"
+        ] == {"$ref": "#/components/schemas/HealthResponse"}
 
     assert set(schema["paths"]["/health/live"]["get"]["responses"]) == {
         "200",
@@ -1479,14 +1498,10 @@ def test_openapi_describes_security_health_and_route_specific_errors() -> None:
             assert "405" in responses, (path, method, responses)
             for status_code in set(responses) - {"200", "201", "202", "204"}:
                 content = responses[status_code]["content"]["application/json"]
-                assert content["schema"] == {
-                    "$ref": "#/components/schemas/ErrorResponse"
-                }
+                assert content["schema"] == {"$ref": "#/components/schemas/ErrorResponse"}
 
 
-def proxy_auth_client(
-    peer: str, trusted: list[str]
-) -> tuple[TestClient, StubRateLimiter]:
+def proxy_auth_client(peer: str, trusted: list[str]) -> tuple[TestClient, StubRateLimiter]:
     limiter = StubRateLimiter()
     app = create_app(
         settings=Settings.model_validate({"trusted_proxy_ips": trusted}),
@@ -1496,9 +1511,7 @@ def proxy_auth_client(
     return TestClient(app, client=(peer, 12345)), limiter
 
 
-def proxy_login(
-    client: TestClient, headers: dict[str, str] | list[tuple[str, str]]
-) -> None:
+def proxy_login(client: TestClient, headers: dict[str, str] | list[tuple[str, str]]) -> None:
     response = client.post(
         "/api/v1/auth/login",
         headers=headers,
@@ -1526,9 +1539,7 @@ def test_ipv4_mapped_socket_matches_ipv4_trusted_proxy_configuration() -> None:
 
 
 def test_proxy_chain_strips_trusted_hops_from_the_right() -> None:
-    client, limiter = proxy_auth_client(
-        "192.0.2.10", ["192.0.2.10", "192.0.2.20"]
-    )
+    client, limiter = proxy_auth_client("192.0.2.10", ["192.0.2.10", "192.0.2.20"])
     proxy_login(
         client,
         {"X-Forwarded-For": "198.51.100.7, 192.0.2.20"},
@@ -1538,9 +1549,7 @@ def test_proxy_chain_strips_trusted_hops_from_the_right() -> None:
 
 
 def test_proxy_chain_ignores_attacker_prepended_spoof() -> None:
-    client, limiter = proxy_auth_client(
-        "192.0.2.10", ["192.0.2.10", "192.0.2.20"]
-    )
+    client, limiter = proxy_auth_client("192.0.2.10", ["192.0.2.10", "192.0.2.20"])
     proxy_login(
         client,
         {"X-Forwarded-For": "203.0.113.99, 198.51.100.7, 192.0.2.20"},
@@ -1580,9 +1589,7 @@ def test_multiple_forwarded_headers_fall_back_to_socket_peer() -> None:
 
 
 def test_all_trusted_proxy_chain_uses_leftmost_canonical_hop() -> None:
-    client, limiter = proxy_auth_client(
-        "192.0.2.10", ["192.0.2.10", "192.0.2.20", "2001:db8::1"]
-    )
+    client, limiter = proxy_auth_client("192.0.2.10", ["192.0.2.10", "192.0.2.20", "2001:db8::1"])
     proxy_login(
         client,
         {"X-Forwarded-For": "2001:0db8:0:0:0:0:0:1, 192.0.2.20"},

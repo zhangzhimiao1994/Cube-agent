@@ -75,6 +75,12 @@ describe("UsersPage", () => {
         if (path.endsWith("/password") && init?.method === "PATCH") {
           return jsonResponse(operator);
         }
+        if (path.endsWith("/feishu") && init?.method === "PATCH") {
+          return jsonResponse({ ...operator, feishu_open_id: "ou_user" });
+        }
+        if (path.endsWith("/feishu") && init?.method === "DELETE") {
+          return jsonResponse({ ...owner, feishu_open_id: null });
+        }
         if (path.includes(operator.id) && init?.method === "DELETE") {
           return new Response(null, { status: 204 });
         }
@@ -183,6 +189,29 @@ describe("UsersPage", () => {
         method: "PATCH",
         body: JSON.stringify({ username: "ops-renamed", role: "admin", disabled: true }),
       }),
+    );
+  });
+
+  it("can bind and unbind Feishu open IDs from user management", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<TestApp initialPath="/users" />);
+
+    await screen.findByRole("heading", { name: "用户管理" });
+    await userEvent.click(within(screen.getByRole("row", { name: /ops-user/ })).getByRole("button", { name: "绑定飞书" }));
+    await userEvent.type(screen.getByLabelText("飞书 open_id"), "ou_user");
+    await userEvent.click(screen.getByRole("button", { name: "保存飞书绑定" }));
+    await userEvent.click(within(screen.getByRole("row", { name: /owner/ })).getByRole("button", { name: "解绑飞书" }));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/users/22222222-2222-4222-8222-222222222222/feishu",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ open_id: "ou_user" }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/users/11111111-1111-4111-8111-111111111111/feishu",
+      expect.objectContaining({ method: "DELETE" }),
     );
   });
 });

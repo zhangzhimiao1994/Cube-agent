@@ -61,6 +61,7 @@ from agent_hub.channels.feishu.websocket import (
 )
 from agent_hub.channels.gateway import ChannelGateway
 from agent_hub.channels.generic_webhook import create_generic_channel_webhook_router
+from agent_hub.channels.identity import PersistentChannelIdentityResolver
 from agent_hub.channels.submitter import (
     ChannelSettingsService,
     RunServiceInboundSubmitter,
@@ -763,6 +764,7 @@ def create_app(
                     runtime_capabilities = RuntimeCapabilityGateway(
                         skill_store_dir=configured.skill_store_dir,
                         workspace_root=configured.attachment_store_dir,
+                        generated_artifact_dir=configured.generated_artifact_dir,
                     )
                     active_runtime_registry = configured_runtime_registry(
                         config_service=ConfigService(active_sessions),
@@ -830,6 +832,9 @@ def create_app(
                             admin_resource_service
                             if admin_resource_service is not None
                             else application.state.admin_resource_service,
+                        ),
+                        identity_resolver=PersistentChannelIdentityResolver(
+                            active_sessions
                         ),
                     ),
                     deduplicator=InboundDedupRepository(active_sessions),

@@ -20,7 +20,10 @@ from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteAssessment
 from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
 from agent_hub.runs.repository import RunAlreadyActive, RunRecord, RunRepository
 from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext
-from agent_hub.runtime.failure_reason import safe_runtime_failure_reason
+from agent_hub.runtime.failure_reason import (
+    safe_runtime_failure_diagnostic,
+    safe_runtime_failure_reason,
+)
 from agent_hub.runtime.registry import RuntimeRegistry
 
 _LOGGER = logging.getLogger(__name__)
@@ -620,7 +623,7 @@ class RunService:
                         idempotency_key=idempotency_key,
                         routing_decision=routing_payload,
                         enqueue=True,
-                )
+                    )
                 return _submitted(record)
 
             if _auto_resolvable_route_decision(decision):
@@ -1074,6 +1077,7 @@ class RunService:
             failed = await self._repository.fail_run(
                 run_id,
                 reason=_runtime_failure_reason(error),
+                diagnostics=safe_runtime_failure_diagnostic(error),
             )
             await self._safe_record_hermes_outcome(
                 tenant_id=failed.tenant_id,
@@ -1514,7 +1518,9 @@ _SKILL_CREATION_RE = re.compile(
     r"(skill|技能).{0,24}(生成|创建|新建|制作|构建|开发|沉淀|打包|create|build|generate|make))",
     re.IGNORECASE,
 )
-_EVOLUTION_NEGATION_RE = re.compile(r"(不要|别|不需要|无需|先不|暂不|not|do not|don't)", re.IGNORECASE)
+_EVOLUTION_NEGATION_RE = re.compile(
+    r"(不要|别|不需要|无需|先不|暂不|not|do not|don't)", re.IGNORECASE
+)
 _SKILL_ID_RE = re.compile(r"\b([a-z0-9][a-z0-9_-]{1,80}-skill)\b", re.IGNORECASE)
 
 
@@ -1850,7 +1856,11 @@ def _schedule_date(message: str) -> datetime | None:
         candidate = datetime(year, month, day, tzinfo=UTC)
     except ValueError:
         return None
-    if match.group("year") is None and match.group("iso_year") is None and candidate.date() < now.date():
+    if (
+        match.group("year") is None
+        and match.group("iso_year") is None
+        and candidate.date() < now.date()
+    ):
         candidate = datetime(year + 1, month, day, tzinfo=UTC)
     return candidate
 
@@ -1876,6 +1886,7 @@ def _schedule_weekday(message: str) -> int:
 
 def _weekday_label(weekday: int) -> str:
     return ["日", "一", "二", "三", "四", "五", "六"][weekday]
+
 
 def _explicit_new_conversation_request(message: str) -> bool:
     normalized = re.sub(r"\s+", " ", message).strip().casefold()

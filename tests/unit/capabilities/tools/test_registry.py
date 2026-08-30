@@ -11,6 +11,7 @@ def test_registry_registers_builtin_tool_names() -> None:
         "document.generate_docx",
         "http.read",
         "presentation.generate_pptx",
+        "project.generate_zip",
         "workspace.read",
     )
 

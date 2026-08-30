@@ -6,8 +6,9 @@ import math
 import re
 import shutil
 import tempfile
+import zipfile
 from collections.abc import Mapping
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import cast
 from uuid import UUID, uuid4
 
@@ -18,6 +19,7 @@ from agent_hub.documents.pptx import PptxBlueprint, build_pptx
 from agent_hub.files.generated import (
     DOCX_MIME_TYPE,
     PPTX_MIME_TYPE,
+    ZIP_MIME_TYPE,
     GeneratedFileStore,
     safe_generated_filename,
 )
@@ -28,7 +30,11 @@ from agent_hub.skills.sandbox.systemd import SystemdSkillSandbox
 _SAFE_CAPABILITY_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _DOCX_TOOL = "document.generate_docx"
 _PPTX_TOOL = "presentation.generate_pptx"
-_DOTTED_BUILT_INS = frozenset({_DOCX_TOOL, _PPTX_TOOL})
+_PROJECT_ZIP_TOOL = "project.generate_zip"
+_MAX_PROJECT_FILES = 64
+_MAX_PROJECT_FILE_BYTES = 256_000
+_MAX_PROJECT_ZIP_SOURCE_BYTES = 2_000_000
+_DOTTED_BUILT_INS = frozenset({_DOCX_TOOL, _PPTX_TOOL, _PROJECT_ZIP_TOOL})
 _REPLAY_SAFE = frozenset({
     "calculator",
     "calculator_evaluate",
@@ -36,6 +42,7 @@ _REPLAY_SAFE = frozenset({
     "workspace_read",
     _DOCX_TOOL,
     _PPTX_TOOL,
+    _PROJECT_ZIP_TOOL,
 })
 
 
@@ -96,6 +103,8 @@ class RuntimeCapabilityGateway:
             return self._execute_generate_docx(tenant_id, run_id, arguments)
         if name == _PPTX_TOOL:
             return self._execute_generate_pptx(tenant_id, run_id, arguments)
+        if name == _PROJECT_ZIP_TOOL:
+            return self._execute_generate_project_zip(tenant_id, run_id, arguments)
         return await self._execute_skill(
             tenant_id=tenant_id,
             run_id=run_id,
@@ -171,11 +180,18 @@ class RuntimeCapabilityGateway:
                 mime_type=DOCX_MIME_TYPE,
                 data=output.read_bytes(),
             )
-        return _file_result(
-            artifact_id=artifact_id,
-            metadata=metadata.to_public_dict(),
-            summary=f"Generated DOCX artifact {metadata.filename}.",
+        result = dict(
+            _file_result(
+                artifact_id=artifact_id,
+                metadata=metadata.to_public_dict(),
+                summary=f"Generated DOCX artifact {metadata.filename}.",
+            )
         )
+        result["presentation"] = _generated_file_presentation(
+            arguments,
+            default="final_attachment",
+        )
+        return result
 
     def _execute_generate_pptx(
         self,
@@ -210,11 +226,55 @@ class RuntimeCapabilityGateway:
                 mime_type=PPTX_MIME_TYPE,
                 data=output.read_bytes(),
             )
-        return _file_result(
-            artifact_id=artifact_id,
-            metadata=metadata.to_public_dict(),
-            summary=f"Generated PPTX artifact {metadata.filename}.",
+        result = dict(
+            _file_result(
+                artifact_id=artifact_id,
+                metadata=metadata.to_public_dict(),
+                summary=f"Generated PPTX artifact {metadata.filename}.",
+            )
         )
+        result["presentation"] = _generated_file_presentation(
+            arguments,
+            default="final_attachment",
+        )
+        return result
+
+    def _execute_generate_project_zip(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        arguments: Mapping[str, JsonValue],
+    ) -> Mapping[str, JsonValue]:
+        store = self._require_generated_file_store()
+        title = _required_string(arguments, "title")
+        files = _project_files(arguments)
+        filename = _filename(arguments, title=title, extension=".zip")
+        artifact_id = uuid4()
+        with tempfile.TemporaryDirectory(prefix="agent-hub-project-") as temporary_dir:
+            output = Path(temporary_dir) / filename
+            with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for path, data in sorted(files.items()):
+                    archive.writestr(path, data)
+            metadata = store.store_bytes(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                artifact_id=artifact_id,
+                filename=filename,
+                mime_type=ZIP_MIME_TYPE,
+                data=output.read_bytes(),
+            )
+        result = dict(
+            _file_result(
+                artifact_id=artifact_id,
+                metadata=metadata.to_public_dict(),
+                summary=f"Generated project ZIP artifact {metadata.filename}.",
+            )
+        )
+        result["presentation"] = _generated_file_presentation(
+            arguments,
+            default="final_attachment",
+        )
+        return result
 
     def _require_generated_file_store(self) -> GeneratedFileStore:
         if self._generated_file_store is None:
@@ -343,6 +403,63 @@ def _filename(arguments: Mapping[str, JsonValue], *, title: str, extension: str)
         return safe_generated_filename(f"{basename[:80]}{extension}")
     except ValueError as error:
         raise RuntimeCapabilityError(str(error)) from None
+
+
+def _generated_file_presentation(
+    arguments: Mapping[str, JsonValue], *, default: str = "step_detail"
+) -> str:
+    value = arguments.get("presentation")
+    if value is None:
+        return default
+    if value in {"step_detail", "final_attachment"}:
+        return str(value)
+    raise RuntimeCapabilityError("presentation must be step_detail or final_attachment")
+
+
+def _project_files(arguments: Mapping[str, JsonValue]) -> dict[str, bytes]:
+    raw_files = arguments.get("files")
+    if not isinstance(raw_files, Mapping):
+        raise RuntimeCapabilityError("files must be an object")
+    if not raw_files or len(raw_files) > _MAX_PROJECT_FILES:
+        raise RuntimeCapabilityError("files must contain 1 to 64 entries")
+    files: dict[str, bytes] = {}
+    total_bytes = 0
+    for raw_path, raw_content in raw_files.items():
+        if not isinstance(raw_path, str):
+            raise RuntimeCapabilityError("file paths must be strings")
+        path = _project_archive_path(raw_path)
+        if isinstance(raw_content, str):
+            data = raw_content.encode("utf-8")
+        else:
+            raise RuntimeCapabilityError("file contents must be strings")
+        if len(data) > _MAX_PROJECT_FILE_BYTES:
+            raise RuntimeCapabilityError("file content is too large")
+        total_bytes += len(data)
+        if total_bytes > _MAX_PROJECT_ZIP_SOURCE_BYTES:
+            raise RuntimeCapabilityError("project content is too large")
+        files[path] = data
+    return files
+
+
+def _project_archive_path(path: str) -> str:
+    normalized = path.strip().replace("\\", "/")
+    if not normalized or normalized != path.strip():
+        raise RuntimeCapabilityError("file path is invalid")
+    posix = PurePosixPath(normalized)
+    windows = PureWindowsPath(path)
+    if (
+        posix.is_absolute()
+        or windows.is_absolute()
+        or any(part in {"", ".", ".."} for part in posix.parts)
+        or len(posix.parts) > 8
+    ):
+        raise RuntimeCapabilityError("file path is invalid")
+    for part in posix.parts:
+        try:
+            safe_generated_filename(part)
+        except ValueError as error:
+            raise RuntimeCapabilityError(str(error)) from None
+    return posix.as_posix()
 
 
 def _file_result(
