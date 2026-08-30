@@ -468,6 +468,7 @@ function eventDetailRows(event: RunDetail["events"][number], agentNames: Map<str
   if (readableMessage) rows.push({ label: "事件内容", value: readableMessage });
   orderedEventPayloadEntries(event.payload).forEach(([key, value]) => {
     if (key === "participants" || key === "participant_models") return;
+    if (["model", "logical_model", "model_used", "upstream_model", "provider", "deployment"].includes(key)) return;
     const formatted = formatEventPayloadValue(value);
     if (formatted) {
       rows.push({ label: eventPayloadLabel(key), value: formatted });
@@ -483,6 +484,40 @@ type ProcessDetailTarget = {
   badge: string;
   rows: Array<{ label: string; value: string }>;
   createdAt: string | null;
+  event?: RunEvent;
+  artifact?: RunArtifact | NonNullable<RunEvent["artifact"]>;
+};
+
+type AgentWorkStatus = "working" | "waiting" | "done" | "failed";
+type AgentWorkView = "activity" | "computer";
+
+type AgentWorkActivity = {
+  id: string;
+  title: string;
+  kind: string;
+  summary: string;
+  rows: Array<{ label: string; value: string }>;
+  createdAt: string | null;
+  event?: RunEvent;
+  artifact?: RunArtifact | NonNullable<RunEvent["artifact"]>;
+};
+
+type AgentWorkItem = {
+  id: string;
+  label: string;
+  role: string;
+  status: AgentWorkStatus;
+  statusLabel: string;
+  summary: string;
+  outputs: AgentWorkActivity[];
+  activity: AgentWorkActivity[];
+  availableViews: AgentWorkView[];
+};
+
+type ProcessDrawerTarget = {
+  workItems: AgentWorkItem[];
+  selectedAgentId?: string;
+  selectedActivityId?: string;
 };
 
 function toggle(list: string[], value: string) {
@@ -912,7 +947,10 @@ function fallbackArtifactForEvent(
     ? artifacts.find((artifact) => artifact.title === event.actor && !consumedArtifactIds.has(artifact.id))
     : null;
   const canUseOrderedFallback = Boolean(event.actor || event.step_id || event.tool_name);
-  const byOrder = canUseOrderedFallback ? artifacts.find((artifact) => !consumedArtifactIds.has(artifact.id)) : null;
+  const hasPayloadOutput = ["result", "output", "text", "content", "summary"]
+    .map((key) => formatEventPayloadValue(event.payload[key]))
+    .some(Boolean);
+  const byOrder = canUseOrderedFallback && !hasPayloadOutput ? artifacts.find((artifact) => !consumedArtifactIds.has(artifact.id)) : null;
   const matched = byActor ?? byOrder ?? null;
   if (matched) consumedArtifactIds.add(matched.id);
   return matched;
@@ -1130,6 +1168,8 @@ function processItemsForEvent(
     badge: processBadgeForEvent(event),
     rows: baseRows,
     createdAt: event.created_at,
+    event,
+    artifact: artifact ?? undefined,
   };
   if (event.kind !== "discussion.completed") return [baseItem];
 
@@ -1144,6 +1184,7 @@ function processItemsForEvent(
       { label: opinion.label, value: opinion.value },
     ],
     createdAt: event.created_at,
+    event,
   }));
 
   const judgement = eventDecisionSignal(event);
@@ -1158,6 +1199,8 @@ function processItemsForEvent(
       badge: "裁决过程",
       rows: baseRows,
       createdAt: event.created_at,
+      event,
+      artifact: artifact ?? undefined,
     },
   ];
 }
@@ -1193,6 +1236,240 @@ function runProcessItems(
   return [...routingItem, ...eventItems];
 }
 
+function safeString(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function payloadString(payload: Record<string, unknown>, keys: string[]) {
+  return keys.map((key) => safeString(payload[key])).find(Boolean) ?? "";
+}
+
+function normalizeAgentKey(key: string) {
+  return key === "main" || key === "main_agent" ? "main-agent" : key;
+}
+
+function agentKeyFromEvent(event: RunEvent) {
+  return normalizeAgentKey(
+    safeString(event.actor) ||
+      payloadString(event.payload, ["actor", "agent", "agent_id", "assignee", "role_id"]) ||
+      safeString(event.step_id) ||
+      "main-agent",
+  );
+}
+
+function normalizedAgentLabel(agentId: string, agentNames: Map<string, string>) {
+  if (agentId === "main-agent" || agentId === "main_agent" || agentId === "main") return "主 Agent";
+  return agentNames.get(agentId) ?? agentId;
+}
+
+function agentRoleFromEvent(event: RunEvent, agentKey: string, agentNames: Map<string, string>) {
+  return (
+    payloadString(event.payload, ["role", "name", "agent_name", "label"]) ||
+    displayEventActor(event.actor, agentNames) ||
+    normalizedAgentLabel(agentKey, agentNames)
+  );
+}
+
+function statusLabel(status: AgentWorkStatus) {
+  const labels: Record<AgentWorkStatus, string> = {
+    working: "工作中",
+    waiting: "等待中",
+    done: "已下班",
+    failed: "失败",
+  };
+  return labels[status];
+}
+
+function artifactIdFromEvent(event: RunEvent) {
+  return (
+    event.artifact?.id ||
+    formatEventPayloadValue(event.payload.artifact_id) ||
+    formatEventPayloadValue(event.payload.artifactId) ||
+    formatEventPayloadValue(event.payload.id)
+  );
+}
+
+function hasComputerEvidence(event: RunEvent) {
+  const targetType = payloadString(event.payload, ["target_type", "targetType"]);
+  if (["computer", "desktop", "screen"].includes(targetType)) return true;
+  if (event.kind.startsWith("openclaw.")) return true;
+  return Boolean(
+    payloadString(event.payload, [
+      "screenshot",
+      "screenshot_url",
+      "screen_url",
+      "screen_path",
+      "code_path",
+      "workspace_path",
+      "terminal_output",
+    ]),
+  );
+}
+
+function activityFromTarget(target: ProcessDetailTarget): AgentWorkActivity {
+  return {
+    id: target.id,
+    title: target.title,
+    kind: target.badge,
+    summary: target.message,
+    rows: target.rows,
+    createdAt: target.createdAt,
+    event: target.event,
+    artifact: target.artifact,
+  };
+}
+
+function outputActivityFromArtifact(
+  detail: RunDetail,
+  artifact: RunArtifact | NonNullable<RunEvent["artifact"]>,
+  agent: { key: string; label: string },
+  index: number,
+): AgentWorkActivity | null {
+  const text = eventArtifactText(artifact);
+  const summary = text || artifact.title;
+  if (!summary) return null;
+  return {
+    id: `${detail.id}-agent-${agent.key}-artifact-${artifact.id || index}`,
+    title: `${agent.label} 输出`,
+    kind: "输出",
+    summary,
+    rows: eventArtifactRows(artifact),
+    createdAt: null,
+    artifact,
+  };
+}
+
+function buildAgentWorkItems(
+  detail: RunDetail,
+  agentNames: Map<string, string>,
+  mainAgentModelName?: string,
+): AgentWorkItem[] {
+  const groups = new Map<
+    string,
+    {
+      key: string;
+      label: string;
+      role: string;
+      events: RunEvent[];
+      artifacts: Array<RunArtifact | NonNullable<RunEvent["artifact"]>>;
+    }
+  >();
+  const eventAgentKeys = new Map<number, string>();
+
+  const ensureGroup = (key: string, event?: RunEvent) => {
+    const normalizedKey = normalizeAgentKey(key || "main-agent");
+    const existing = groups.get(normalizedKey);
+    if (existing) {
+      if (event) {
+        const role = agentRoleFromEvent(event, normalizedKey, agentNames);
+        if (role && existing.role === existing.label) existing.role = role;
+        if (role && existing.label === normalizedKey) existing.label = role;
+      }
+      return existing;
+    }
+    const role = event ? agentRoleFromEvent(event, normalizedKey, agentNames) : normalizedAgentLabel(normalizedKey, agentNames);
+    const group = {
+      key: normalizedKey,
+      label: role || normalizedAgentLabel(normalizedKey, agentNames),
+      role: role || normalizedAgentLabel(normalizedKey, agentNames),
+      events: [] as RunEvent[],
+      artifacts: [] as Array<RunArtifact | NonNullable<RunEvent["artifact"]>>,
+    };
+    groups.set(normalizedKey, group);
+    return group;
+  };
+
+  detail.explicit_details.selected_agent_ids
+    ?.split(",")
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .forEach((agentId) => ensureGroup(agentId));
+
+  detail.events.forEach((event) => {
+    const key = agentKeyFromEvent(event);
+    eventAgentKeys.set(event.sequence, key);
+    ensureGroup(key, event).events.push(event);
+  });
+
+  const artifactAgentKeys = new Map<string, string>();
+  detail.events.forEach((event) => {
+    const artifactId = artifactIdFromEvent(event);
+    const key = eventAgentKeys.get(event.sequence) ?? agentKeyFromEvent(event);
+    if (artifactId) artifactAgentKeys.set(artifactId, key);
+    if (event.artifact) {
+      const group = ensureGroup(key, event);
+      if (!group.artifacts.some((artifact) => artifact.id === event.artifact?.id)) group.artifacts.push(event.artifact);
+    }
+  });
+
+  const singleEventGroup = groups.size === 1 ? [...groups.values()][0] : null;
+  detail.artifacts.forEach((artifact) => {
+    const key = artifactAgentKeys.get(artifact.id) ?? singleEventGroup?.key;
+    if (!key) return;
+    const group = ensureGroup(key);
+    if (!group.artifacts.some((candidate) => candidate.id === artifact.id)) group.artifacts.push(artifact);
+  });
+
+  if (groups.size === 0) ensureGroup("main-agent");
+
+  const consumedArtifactIds = new Set<string>();
+  const eventTargets = new Map<number, ProcessDetailTarget[]>();
+  detail.events
+    .filter(isActionEvent)
+    .forEach((event, index) => {
+      const artifact = fallbackArtifactForEvent(event, detail.artifacts, consumedArtifactIds);
+      if (event.kind === "artifact.created" && !artifact && !hasUsefulPayload(event)) return;
+      eventTargets.set(event.sequence, processItemsForEvent(detail, event, index, agentNames, artifact));
+    });
+
+  const runDone = TERMINAL_STATUSES.has(detail.status) && detail.status !== "failed";
+  return [...groups.values()]
+    .map((group) => {
+      const failed = group.events.some((event) => event.kind.includes("failed") || event.kind.includes("error"));
+      const completed = group.events.some((event) => event.kind === "step.completed" || event.kind.endsWith(".completed"));
+      const started = group.events.some((event) => event.kind === "step.started" || event.kind.endsWith(".started"));
+      const status: AgentWorkStatus = failed ? "failed" : completed || (runDone && group.events.length > 0) ? "done" : started ? "working" : "waiting";
+      const artifactOutputs = group.artifacts
+        .map((artifact, index) => outputActivityFromArtifact(detail, artifact, group, index))
+        .filter((item): item is AgentWorkActivity => Boolean(item));
+      const activity = group.events
+        .filter((event) => !isNoiseEvent(event))
+        .flatMap((event) => eventTargets.get(event.sequence)?.map(activityFromTarget) ?? []);
+      const outputIds = new Set(artifactOutputs.map((item) => item.id));
+      const outputs = [
+        ...artifactOutputs,
+        ...activity.filter((item) => !outputIds.has(item.id) && (item.kind === "中间产物" || /输出|产出/.test(`${item.title} ${item.summary}`))),
+      ];
+      const firstSummary =
+        outputs[0]?.summary ||
+        activity.find((item) => item.summary)?.summary ||
+        (status === "waiting" ? "等待主 Agent 分配可展示任务。" : "已记录关键活动。");
+      const availableViews: AgentWorkView[] = ["activity"];
+      if (group.events.some(hasComputerEvidence)) availableViews.push("computer");
+      return {
+        id: group.key,
+        label: group.label,
+        role: group.role,
+        status,
+        statusLabel: statusLabel(status),
+        summary: conciseProcessText(firstSummary, "已记录关键活动"),
+        outputs,
+        activity,
+        availableViews,
+      };
+    })
+    .sort((left, right) => {
+      if (left.id === "main-agent" || left.id === "main" || left.id === "main_agent") return -1;
+      if (right.id === "main-agent" || right.id === "main" || right.id === "main_agent") return 1;
+      return left.label.localeCompare(right.label, "zh-CN");
+    });
+}
+
+function selectedAgentForActivity(workItems: AgentWorkItem[], activityId: string | undefined) {
+  if (!activityId) return undefined;
+  return workItems.find((item) => item.outputs.some((output) => output.id === activityId) || item.activity.some((activity) => activity.id === activityId))?.id;
+}
+
 function RunProcessSummary({
   detail,
   onOpen,
@@ -1200,27 +1477,67 @@ function RunProcessSummary({
   mainAgentModelName,
 }: {
   detail: RunDetail;
-  onOpen: (target: ProcessDetailTarget) => void;
+  onOpen: (target: ProcessDrawerTarget) => void;
   agentNames: Map<string, string>;
   mainAgentModelName?: string;
 }) {
-  const items = runProcessItems(detail, agentNames, mainAgentModelName);
-  if (items.length === 0) return null;
+  const workItems = buildAgentWorkItems(detail, agentNames, mainAgentModelName);
+  const highlightedIds = new Set<string>();
+  const outputHighlights = [
+    ...workItems.flatMap((item) => item.outputs.map((output) => ({ ...output, agentId: item.id }))),
+    ...workItems.flatMap((item) =>
+      item.activity
+        .filter((activity) => activity.kind === "中间产物" || /输出|产出/.test(`${activity.title} ${activity.summary}`))
+        .map((activity) => ({ ...activity, agentId: item.id })),
+    ),
+  ].filter((item) => {
+    const key = `${item.agentId}-${item.id}`;
+    if (highlightedIds.has(key)) return false;
+    highlightedIds.add(key);
+    return true;
+  });
+  const activityHighlights = workItems
+    .flatMap((item) => item.activity.map((activity) => ({ ...activity, agentId: item.id })))
+    .filter((item) => {
+      const key = `${item.agentId}-${item.id}`;
+      if (highlightedIds.has(key)) return false;
+      highlightedIds.add(key);
+      return true;
+    });
+  const compareActivityTime = (left: AgentWorkActivity, right: AgentWorkActivity) => {
+    if (left.createdAt && right.createdAt) return left.createdAt.localeCompare(right.createdAt);
+    if (left.createdAt) return -1;
+    if (right.createdAt) return 1;
+    return 0;
+  };
+  const highlights = [...outputHighlights.sort(compareActivityTime), ...activityHighlights.sort(compareActivityTime)].slice(0, 3);
+  if (workItems.length === 0 && highlights.length === 0) return null;
+  const doneCount = workItems.filter((item) => item.status === "done").length;
   return (
     <section className="run-process-summary" aria-label="Agent 集群动作">
-      <div className="agent-cluster-status" role="status" aria-label={`Agent 集群，${items.length} 个关键动作`}>
+      <div className="agent-cluster-status" role="status" aria-label={`Agent 工作席，${workItems.length} 个子 Agent`}>
         <span aria-hidden="true">⌘</span>
-        <strong>Agent 集群</strong>
-        <small>{items.length} 个关键动作</small>
+        <strong>Agent 工作席</strong>
+        <small>
+          {workItems.length} 个子 Agent{doneCount > 0 ? ` · ${doneCount} 已下班` : ""}
+        </small>
       </div>
       <div className="agent-cluster-actions">
-        {items.map((item) => (
-          <button key={item.id} type="button" className="run-process-toggle process-intermediate-card" onClick={() => onOpen(item)}>
+        {highlights.map((item, index) => (
+          <button
+            key={`${item.agentId}-${item.kind}-${item.id}-${index}`}
+            type="button"
+            className="run-process-toggle process-intermediate-card"
+            onClick={() => onOpen({ workItems, selectedAgentId: item.agentId, selectedActivityId: item.id })}
+          >
             <span aria-hidden="true">›</span>
-            <small className="process-card-badge">{item.badge}</small>
-            <strong>{item.message}</strong>
+            <small className="process-card-badge">{item.kind}</small>
+            <strong>{item.summary}</strong>
           </button>
         ))}
+        <button type="button" className="run-process-toggle process-open-workforce" onClick={() => onOpen({ workItems })}>
+          查看子 Agent 工作席
+        </button>
       </div>
     </section>
   );
@@ -1230,9 +1547,29 @@ function RunProcessDrawer({
   target,
   onClose,
 }: {
-  target: ProcessDetailTarget;
+  target: ProcessDrawerTarget;
   onClose: () => void;
 }) {
+  const initialAgentId =
+    target.selectedAgentId ??
+    selectedAgentForActivity(target.workItems, target.selectedActivityId) ??
+    target.workItems[0]?.id ??
+    "";
+  const [selectedAgentId, setSelectedAgentId] = useState(initialAgentId);
+  const [selectedView, setSelectedView] = useState<AgentWorkView>("activity");
+
+  useEffect(() => {
+    setSelectedAgentId(initialAgentId);
+    setSelectedView("activity");
+  }, [initialAgentId, target.selectedActivityId]);
+
+  const selectedAgent = target.workItems.find((item) => item.id === selectedAgentId) ?? target.workItems[0];
+  const selectedActivity = selectedAgent
+    ? [...selectedAgent.outputs, ...selectedAgent.activity].find((activity) => activity.id === target.selectedActivityId)
+    : undefined;
+  const canShowComputerView = Boolean(selectedAgent?.availableViews.includes("computer"));
+  const activeView = canShowComputerView ? selectedView : "activity";
+
   return (
     <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
       <section
@@ -1245,30 +1582,137 @@ function RunProcessDrawer({
         <div className="process-drawer-handle" aria-hidden="true" />
         <div className="process-drawer-header">
           <div>
-            <span className="eyebrow">{target.badge}</span>
-            <h3>{target.title}</h3>
+            <span className="eyebrow">活动轨迹</span>
+            <h3>子 Agent 工作席</h3>
           </div>
           <button type="button" className="secondary-action" onClick={onClose}>
             关闭
           </button>
         </div>
-        <div className="run-process-detail">
-          <article>
-            <p>{target.message}</p>
-            {target.rows.length > 0 ? (
-              <dl>
-                {target.rows.map((row, index) => (
-                  <Fragment key={`${target.id}-${row.label}-${index}`}>
-                    <dt>{row.label}</dt>
-                    <dd>{row.value}</dd>
-                  </Fragment>
-                ))}
-              </dl>
-            ) : null}
-            {target.createdAt ? <small>{target.createdAt}</small> : null}
-          </article>
+        <div className="agent-workforce-layout">
+          <aside className="agent-workforce-roster" aria-label="子 Agent 列表">
+            {target.workItems.map((agent) => (
+              <button
+                key={agent.id}
+                type="button"
+                className={`agent-workforce-card${agent.id === selectedAgent?.id ? " is-active" : ""}`}
+                aria-pressed={agent.id === selectedAgent?.id}
+                onClick={() => setSelectedAgentId(agent.id)}
+              >
+                <span className="agent-workforce-avatar" aria-hidden="true">
+                  {agent.label.slice(0, 1)}
+                </span>
+                <span>
+                  <strong>{agent.label}</strong>
+                  <small>{agent.role}</small>
+                </span>
+                <em className={`agent-workforce-status status-${agent.status}`}>{agent.statusLabel}</em>
+              </button>
+            ))}
+          </aside>
+
+          {selectedAgent ? (
+            <div className="agent-workforce-main">
+              <div className="agent-workforce-title">
+                <div>
+                  <span className={`agent-workforce-status status-${selectedAgent.status}`}>{selectedAgent.statusLabel}</span>
+                  <h4>{selectedAgent.label}</h4>
+                  <p>{selectedAgent.summary}</p>
+                </div>
+                <div className="agent-workforce-view-switch" aria-label="子 Agent 详情视图">
+                  {canShowComputerView ? (
+                    <>
+                      <button
+                        type="button"
+                        className={activeView === "computer" ? "is-active" : ""}
+                        aria-pressed={activeView === "computer"}
+                        onClick={() => setSelectedView("computer")}
+                      >
+                        电脑视图
+                      </button>
+                      <button
+                        type="button"
+                        className={activeView === "activity" ? "is-active" : ""}
+                        aria-pressed={activeView === "activity"}
+                        onClick={() => setSelectedView("activity")}
+                      >
+                        活动轨迹
+                      </button>
+                    </>
+                  ) : (
+                    <span>活动轨迹</span>
+                  )}
+                </div>
+              </div>
+
+              {activeView === "computer" ? (
+                <section className="agent-workforce-section">
+                  <h5>电脑视图</h5>
+                  <p>该 Agent 有屏幕、终端或工作区证据，可在这里集中查看相关记录。</p>
+                  <AgentActivityList
+                    activities={selectedAgent.activity.filter((activity) => activity.event && hasComputerEvidence(activity.event))}
+                    selectedActivityId={selectedActivity?.id}
+                  />
+                </section>
+              ) : (
+                <>
+                  <section className="agent-workforce-section">
+                    <h5>输出</h5>
+                    {selectedAgent.outputs.length > 0 ? (
+                      <AgentActivityList activities={selectedAgent.outputs} selectedActivityId={selectedActivity?.id} />
+                    ) : (
+                      <p className="agent-workforce-empty">暂无独立输出，查看活动轨迹里的阶段记录。</p>
+                    )}
+                  </section>
+                  <section className="agent-workforce-section">
+                    <h5>活动轨迹</h5>
+                    <AgentActivityList activities={selectedAgent.activity} selectedActivityId={selectedActivity?.id} />
+                  </section>
+                </>
+              )}
+            </div>
+          ) : (
+            <p className="agent-workforce-empty">这次运行还没有可展示的子 Agent 记录。</p>
+          )}
         </div>
       </section>
+    </div>
+  );
+}
+
+function AgentActivityList({
+  activities,
+  selectedActivityId,
+}: {
+  activities: AgentWorkActivity[];
+  selectedActivityId?: string;
+}) {
+  if (activities.length === 0) return <p className="agent-workforce-empty">暂无可展示记录。</p>;
+  return (
+    <div className="agent-workforce-activity-list">
+      {activities.map((activity, index) => (
+        <article
+          key={`${activity.id}-${index}`}
+          className={`agent-workforce-activity${activity.id === selectedActivityId ? " is-selected" : ""}`}
+        >
+          <div>
+            <small>{activity.kind}</small>
+            <strong>{activity.title}</strong>
+          </div>
+          <p>{activity.summary}</p>
+          {activity.rows.length > 0 ? (
+            <dl>
+              {activity.rows.map((row, rowIndex) => (
+                <Fragment key={`${activity.id}-${row.label}-${rowIndex}`}>
+                  <dt>{row.label}</dt>
+                  <dd>{row.value}</dd>
+                </Fragment>
+              ))}
+            </dl>
+          ) : null}
+          {activity.createdAt ? <time dateTime={activity.createdAt}>{activity.createdAt}</time> : null}
+        </article>
+      ))}
     </div>
   );
 }
@@ -1429,7 +1873,7 @@ export function RunsPage() {
   const [directModel, setDirectModel] = useState("");
   const [showModeEntry, setShowModeEntry] = useState(true);
   const [historyOpen, setHistoryOpen] = useState(false);
-  const [processDetailTarget, setProcessDetailTarget] = useState<ProcessDetailTarget | null>(null);
+  const [processDetailTarget, setProcessDetailTarget] = useState<ProcessDrawerTarget | null>(null);
   const [modeSelection, setModeSelection] = useState<ModeSelection | null>(null);
   const [skillInstallCandidate, setSkillInstallCandidate] = useState<SkillInstallCandidate | null>(null);
   const [attachmentDraft, setAttachmentDraft] = useState<ChatAttachmentDraft | null>(null);

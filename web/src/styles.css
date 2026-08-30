@@ -1643,6 +1643,238 @@ article:hover {
   margin: 0.1rem 0 0;
 }
 
+.agent-workforce-layout {
+  display: grid;
+  gap: 0.85rem;
+  grid-template-columns: minmax(14rem, 0.72fr) minmax(0, 1.7fr);
+}
+
+.agent-workforce-roster {
+  background: rgba(3, 10, 20, 0.32);
+  border: 1px solid rgba(123, 225, 255, 0.13);
+  border-radius: 1rem;
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.55rem;
+}
+
+.agent-workforce-card {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(123, 225, 255, 0.11);
+  border-radius: 0.9rem;
+  color: var(--text);
+  display: grid;
+  gap: 0.55rem;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  min-height: 4.1rem;
+  padding: 0.55rem;
+  text-align: left;
+}
+
+.agent-workforce-card:hover,
+.agent-workforce-card:focus-visible,
+.agent-workforce-card.is-active {
+  background: rgba(85, 215, 255, 0.08);
+  border-color: rgba(85, 215, 255, 0.34);
+  box-shadow: none;
+  transform: none;
+}
+
+.agent-workforce-avatar {
+  align-items: center;
+  background: rgba(85, 215, 255, 0.12);
+  border: 1px solid rgba(85, 215, 255, 0.24);
+  border-radius: 999px;
+  color: var(--accent);
+  display: inline-flex;
+  font-weight: 950;
+  height: 2rem;
+  justify-content: center;
+  width: 2rem;
+}
+
+.agent-workforce-card span:not(.agent-workforce-avatar) {
+  display: grid;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.agent-workforce-card strong,
+.agent-workforce-card small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-workforce-card small {
+  color: var(--muted);
+}
+
+.agent-workforce-status {
+  border: 1px solid rgba(123, 225, 255, 0.18);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-style: normal;
+  font-weight: 900;
+  padding: 0.18rem 0.42rem;
+  white-space: nowrap;
+}
+
+.agent-workforce-status.status-done {
+  background: rgba(66, 211, 146, 0.12);
+  border-color: rgba(66, 211, 146, 0.32);
+  color: #7ee3b2;
+}
+
+.agent-workforce-status.status-working {
+  background: rgba(85, 215, 255, 0.12);
+  color: var(--accent);
+}
+
+.agent-workforce-status.status-failed {
+  background: rgba(255, 107, 107, 0.12);
+  border-color: rgba(255, 107, 107, 0.32);
+  color: var(--danger);
+}
+
+.agent-workforce-main {
+  background: rgba(3, 10, 20, 0.42);
+  border: 1px solid rgba(123, 225, 255, 0.15);
+  border-radius: 1rem;
+  display: grid;
+  gap: 0.75rem;
+  padding: 0.75rem;
+}
+
+.agent-workforce-title {
+  align-items: flex-start;
+  display: flex;
+  gap: 0.8rem;
+  justify-content: space-between;
+}
+
+.agent-workforce-title h4,
+.agent-workforce-section h5 {
+  margin: 0.24rem 0;
+}
+
+.agent-workforce-title p,
+.agent-workforce-section p {
+  color: var(--muted);
+  margin: 0;
+}
+
+.agent-workforce-view-switch {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(123, 225, 255, 0.12);
+  border-radius: 999px;
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 0.25rem;
+  padding: 0.22rem;
+}
+
+.agent-workforce-view-switch button,
+.agent-workforce-view-switch span {
+  background: transparent;
+  border: 0;
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 900;
+  min-height: 2rem;
+  padding: 0.4rem 0.62rem;
+}
+
+.agent-workforce-view-switch button.is-active {
+  background: rgba(85, 215, 255, 0.14);
+  color: var(--accent);
+}
+
+.agent-workforce-section {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.agent-workforce-activity-list {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.agent-workforce-activity {
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(123, 225, 255, 0.1);
+  border-radius: 0.85rem;
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.65rem;
+}
+
+.agent-workforce-activity.is-selected {
+  border-color: rgba(85, 215, 255, 0.36);
+  box-shadow: inset 3px 0 0 rgba(85, 215, 255, 0.72);
+}
+
+.agent-workforce-activity div {
+  align-items: center;
+  display: flex;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.agent-workforce-activity small {
+  background: rgba(85, 215, 255, 0.1);
+  border: 1px solid rgba(85, 215, 255, 0.18);
+  border-radius: 999px;
+  color: var(--accent);
+  font-weight: 900;
+  padding: 0.18rem 0.42rem;
+  white-space: nowrap;
+}
+
+.agent-workforce-activity strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-workforce-activity p {
+  color: var(--text);
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.agent-workforce-activity dl {
+  display: grid;
+  gap: 0.32rem 0.6rem;
+  grid-template-columns: max-content minmax(0, 1fr);
+  margin: 0.1rem 0 0;
+}
+
+.agent-workforce-activity dt {
+  color: var(--danger);
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.76rem;
+  font-weight: 850;
+}
+
+.agent-workforce-activity dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.agent-workforce-activity time,
+.agent-workforce-empty {
+  color: rgba(178, 194, 216, 0.72);
+  font-size: 0.82rem;
+}
+
 .streaming-status {
   border-color: rgba(85, 215, 255, 0.38);
   box-shadow: 0 0 26px rgba(85, 215, 255, 0.1);
@@ -3469,6 +3701,28 @@ article:hover {
   .process-drawer {
     max-height: 72dvh;
     width: 100%;
+  }
+
+  .agent-workforce-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .agent-workforce-roster {
+    display: flex;
+    overflow-x: auto;
+    padding-bottom: 0.65rem;
+  }
+
+  .agent-workforce-card {
+    flex: 0 0 13rem;
+  }
+
+  .agent-workforce-title {
+    flex-direction: column;
+  }
+
+  .agent-workforce-view-switch {
+    align-self: flex-start;
   }
 
   .chat-detail-action {
