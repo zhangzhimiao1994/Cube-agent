@@ -1126,6 +1126,20 @@ export const api = {
       UserSchema,
     );
   },
+  bindUserFeishu(userId: string, openId: string): Promise<ManagedUser> {
+    return request(
+      `/api/v1/users/${userId}/feishu`,
+      { method: "PATCH", body: JSON.stringify({ open_id: openId }) },
+      UserSchema,
+    );
+  },
+  unbindUserFeishu(userId: string): Promise<ManagedUser> {
+    return request(
+      `/api/v1/users/${userId}/feishu`,
+      { method: "DELETE" },
+      UserSchema,
+    );
+  },
   async deleteUser(userId: string): Promise<void> {
     await requestNoContent(`/api/v1/users/${userId}`, { method: "DELETE" });
   },

@@ -339,3 +339,19 @@ Git 状态：
 - Verification: `git diff --check` passed with only the existing Git CRLF-to-LF warning for `src/agent_hub/runtime/crew/adapter.py`.
 - Feishu identity note: WS submissions are currently isolated by derived actor UUID from `channel + tenant_external_id + sender_external_id`, but this does not resolve through `agent_hub_users.feishu_open_id`; user management therefore will not show a Feishu-bound user unless a persistent bind/unbind and channel identity resolver are added.
 - Remaining TODO: implement Feishu identity binding as a follow-up: persistent lookup by Feishu `open_id`, explicit unbound-user fallback policy, user-management bind/unbind API, and Web UI display/edit controls.
+
+## 2026-08-30 Phase21 Feishu User Binding
+
+- Scope: make Feishu WS/Webhook submissions resolve to a bound Web user when `sender_external_id` matches `agent_hub_users.feishu_open_id`, and expose Feishu bind/unbind in user management.
+- Production data action: prod-web-01 had recent Feishu runs from `ou_6409212c78893c199c61e32deb60c347` using derived actor `b483df93-38fa-548c-b0dd-4416da84bd19`; that open_id was manually bound to username `admin` / user id `6e197aa7-3423-4def-b8aa-7c84df0ea41a` in the production database.
+- Changed: added `PersistentChannelIdentityResolver` in `src/agent_hub/channels/identity.py`; Feishu channel submissions now use a bound enabled Web user id when present and otherwise retain the existing derived channel actor fallback.
+- Changed: `/api/v1/users/{user_id}/feishu` now supports `PATCH` with `{open_id}` and `DELETE` to bind/unbind Feishu IDs, with audit actions `user.feishu.bind` and `user.feishu.unbind`.
+- Changed: persistent and in-memory user admin services support Feishu bind/unbind. Duplicate open_id binding is rejected.
+- Changed: `web/src/pages/UsersPage.tsx` shows explicit `绑定飞书` / `解绑飞书` controls and a dedicated bind dialog.
+- Verification: `.venv\Scripts\python.exe -m pytest tests\unit\channels\test_submitter.py tests\api\test_foundation_api.py::test_user_management_can_bind_and_unbind_feishu_open_id -q` passed with 11 tests.
+- Verification: `.venv\Scripts\python.exe -m pytest tests\unit\runtime\test_failure_reason.py tests\unit\runtime\test_configured_runtime.py tests\unit\runtime\crew\test_adapter_failure_reason.py tests\unit\channels\test_submitter.py tests\api\test_foundation_api.py::test_user_management_can_bind_and_unbind_feishu_open_id -q` passed with 81 tests.
+- Verification: `.venv\Scripts\python.exe -m ruff check src tests` passed.
+- Verification: `.venv\Scripts\python.exe -m mypy --strict src tests` passed with 286 source files.
+- Verification: `npm test -- UsersPage.test.tsx --run` passed with 6 tests.
+- Verification: `npm run lint` passed.
+- Remaining TODO: commit/push, wait for GitHub Actions, then deploy to prod-web-01 so future Feishu messages use the new bound admin user id instead of the previous derived channel actor id.

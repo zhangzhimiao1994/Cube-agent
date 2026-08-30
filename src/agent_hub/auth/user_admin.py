@@ -8,8 +8,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.auth.feishu_oauth import (
+    FeishuOAuthProfile,
     LastSuperAdminError,
     ManagedUser,
+    OAuthBindingError,
     ProtectedUserError,
     UserAlreadyExistsError,
 )
@@ -268,6 +270,54 @@ class PersistentUserAdminService:
             deleted = _managed_user_from_row(row)
             await session.delete(row)
             return deleted
+
+    async def bind_feishu_open_id(
+        self,
+        actor: AuthenticatedPrincipal,
+        user_id: UUID,
+        profile: FeishuOAuthProfile,
+    ) -> ManagedUser:
+        _require_admin(actor)
+        async with self._session_factory() as session, session.begin():
+            existing = await session.scalar(
+                select(UserRow)
+                .where(
+                    UserRow.tenant_id == actor.tenant_id,
+                    UserRow.feishu_open_id == profile.open_id,
+                    UserRow.id != user_id,
+                )
+                .with_for_update()
+            )
+            if existing is not None:
+                raise OAuthBindingError("feishu account is already bound")
+            row = await session.scalar(
+                select(UserRow)
+                .where(UserRow.tenant_id == actor.tenant_id, UserRow.id == user_id)
+                .with_for_update()
+            )
+            if row is None:
+                raise KeyError("user not found")
+            row.feishu_open_id = profile.open_id
+            await session.flush()
+            return _managed_user_from_row(row)
+
+    async def unbind_feishu_open_id(
+        self,
+        actor: AuthenticatedPrincipal,
+        user_id: UUID,
+    ) -> ManagedUser:
+        _require_admin(actor)
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(
+                select(UserRow)
+                .where(UserRow.tenant_id == actor.tenant_id, UserRow.id == user_id)
+                .with_for_update()
+            )
+            if row is None:
+                raise KeyError("user not found")
+            row.feishu_open_id = None
+            await session.flush()
+            return _managed_user_from_row(row)
 
 
 def _managed_user_from_row(row: UserRow) -> ManagedUser:
