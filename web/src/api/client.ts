@@ -946,10 +946,36 @@ export class ApiError extends Error {
   }
 }
 
+const ERROR_DETAIL_DISPLAY_KEYS = [
+  "logical_model",
+  "provider",
+  "upstream_model",
+  "status_code",
+  "http_status",
+  "failure_kind",
+  "stage",
+  "step_id",
+  "tool_name",
+  "tool_call_id",
+  "approval_id",
+  "hint",
+];
+
+function formatApiErrorDetails(details: ApiErrorDetails | null): string {
+  if (!details) return "";
+  return ERROR_DETAIL_DISPLAY_KEYS.flatMap((key) => {
+    const value = details[key];
+    if (value === null || typeof value === "undefined" || value === "") return [];
+    return [`${key}=${String(value)}`];
+  }).join(", ");
+}
+
 export function formatApiError(error: unknown, fallback: string): string {
   if (!(error instanceof ApiError)) return fallback;
   const parts = [error.code, `HTTP ${error.status}`];
   if (error.errorId) parts.push(`error ${error.errorId}`);
+  const details = formatApiErrorDetails(error.details);
+  if (details) parts.push(`details ${details}`);
   return `${fallback}: ${error.message} (${parts.join(", ")})`;
 }
 
