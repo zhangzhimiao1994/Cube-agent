@@ -47,9 +47,66 @@ async function mockRunApi(page: Page) {
               message: "Run accepted and queued.",
               created_at: "2026-08-07T00:00:00Z",
             },
+            {
+              sequence: 2,
+              kind: "tool.started",
+              message: "tool.started",
+              summary: "terminal check started",
+              created_at: "2026-08-07T00:00:01Z",
+              actor: "engineer",
+              tool_name: "run_safe_command",
+              tool_call_id: "call_terminal",
+              step_id: "verify",
+              payload: {
+                status: "started",
+                operation_kind: "terminal",
+                argument_bytes: 36,
+              },
+            },
+            {
+              sequence: 3,
+              kind: "tool.failed",
+              message: "tool.failed",
+              summary: "terminal check failed",
+              created_at: "2026-08-07T00:00:02Z",
+              actor: "engineer",
+              tool_name: "run_safe_command",
+              tool_call_id: "call_terminal",
+              step_id: "verify",
+              payload: {
+                status: "failed",
+                operation_kind: "terminal",
+                output_bytes: 96,
+                exit_code: 1,
+                failure_kind: "nonzero_exit",
+              },
+            },
           ],
           artifacts: [{ id: "artifact-1", kind: "markdown", title: "Readiness report" }],
-          explicit_details: { routing: "dispatch mode selected explicitly" },
+          explicit_details: {
+            routing_reason: "dispatch mode selected explicitly",
+            harness_provider: "openai",
+            harness_logical_model: "vibe_engineer",
+          },
+          failure_diagnostics: [
+            {
+              category: "tool",
+              stage: "tool.failed",
+              reason: "terminal command failed",
+              recommendation: "Review the tool lifecycle before retrying.",
+              sequence: 3,
+              actor: "engineer",
+              step_id: "verify",
+              tool_name: "run_safe_command",
+              tool_call_id: "call_terminal",
+              failure_kind: "nonzero_exit",
+              status_code: null,
+              logical_model: null,
+              approval_id: null,
+              action: null,
+              wrapped_by: null,
+            },
+          ],
         },
       });
       return;
@@ -67,6 +124,7 @@ async function mockRunApi(page: Page) {
           events: [],
           artifacts: [],
           explicit_details: {},
+          failure_diagnostics: [],
         },
       });
       return;
@@ -80,7 +138,11 @@ test("operator inspects run detail and cancels safely", async ({ page }) => {
   await page.goto(`/runs/${runId}`);
   await expect(page.getByText("排队等待")).toBeVisible();
   await expect(page.getByRole("heading", { name: "120 ms" })).toBeVisible();
+  await expect(page.getByRole("status", { name: /任务态势，执行异常/ })).toBeVisible();
+  await expect(page.getByRole("region", { name: "工具链路" })).toBeVisible();
+  await expect(page.getByText("run_safe_command").first()).toBeVisible();
+  await expect(page.getByRole("region", { name: "故障诊断" })).toBeVisible();
   await expect(page.getByText("Readiness report")).toBeVisible();
   await page.getByRole("button", { name: "取消" }).click();
-  await expect(page.getByRole("heading", { name: "cancelled" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "已取消" })).toBeVisible();
 });

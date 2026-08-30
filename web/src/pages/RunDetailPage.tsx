@@ -32,6 +32,20 @@ type DetailTimelineItem =
   | { type: "event"; event: RunEvent }
   | { type: "model_delta_group"; events: RunEvent[] };
 
+type ToolLifecycle = {
+  key: string;
+  toolName: string;
+  status: string;
+  operationKind: string;
+  actor: string | null;
+  stepId: string | null;
+  sequences: number[];
+  argumentBytes: number | null;
+  outputBytes: number | null;
+  exitCode: number | null;
+  failureKind: string | null;
+};
+
 const OBSERVER_TRIGGER_LABELS: Record<string, string> = {
   model_capacity_pressure: "模型容量拥堵",
   empty_model_response: "模型空响应",
@@ -55,6 +69,59 @@ const OBSERVER_SEVERITY_LABELS: Record<string, string> = {
   error: "错误",
 };
 
+const RUN_STATUS_LABELS: Record<string, string> = {
+  queued: "已排队",
+  running: "运行中",
+  paused: "已暂停",
+  completed: "已完成",
+  failed: "执行异常",
+  cancelled: "已取消",
+  waiting_approval: "等待确认",
+  waiting_user_mode: "等待模式确认",
+};
+
+const RUN_MODE_LABELS: Record<string, string> = {
+  direct: "直接执行",
+  dispatch: "派单式",
+  discuss: "讨论式",
+  hybrid: "混合式",
+  auto: "自动路由",
+};
+
+const TOOL_STATUS_LABELS: Record<string, string> = {
+  started: "进行中",
+  completed: "已完成",
+  succeeded: "已完成",
+  failed: "异常",
+};
+
+const TOOL_OPERATION_LABELS: Record<string, string> = {
+  terminal: "终端",
+  file_edit: "文件编辑",
+  file_read: "文件读取",
+  browser: "浏览器",
+  generic: "工具",
+};
+
+const EXPLICIT_DETAIL_LABELS: Record<string, string> = {
+  workflow_id: "工作流",
+  workflow_adjustment_policy: "工作流调整",
+  selected_agent_ids: "角色池",
+  routing_reason: "路由原因",
+  conversation_id: "会话",
+  direct_model: "直连模型",
+  harness_provider: "Harness 服务商",
+  harness_model: "Harness 模型",
+  harness_logical_model: "逻辑模型",
+  harness_requires_approval: "审批策略",
+  harness_capabilities: "工程能力",
+  harness_policy: "策略原因",
+  harness_context: "上下文信号",
+  harness_fallbacks: "备选路径",
+};
+
+const EXPLICIT_DETAIL_KEYS = Object.keys(EXPLICIT_DETAIL_LABELS);
+
 function payloadString(payload: Record<string, unknown>, key: string) {
   const value = payload[key];
   return typeof value === "string" && value.trim().length > 0 ? value : null;
@@ -63,6 +130,22 @@ function payloadString(payload: Record<string, unknown>, key: string) {
 function payloadNumber(payload: Record<string, unknown>, key: string) {
   const value = payload[key];
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function displayRunStatus(status: string) {
+  return RUN_STATUS_LABELS[status] ?? status;
+}
+
+function displayRunMode(mode: string) {
+  return RUN_MODE_LABELS[mode] ?? mode;
+}
+
+function displayToolStatus(status: string) {
+  return TOOL_STATUS_LABELS[status] ?? status;
+}
+
+function displayToolOperation(kind: string) {
+  return TOOL_OPERATION_LABELS[kind] ?? kind;
 }
 
 function collectObserverNotices(events: RunEvent[]): ObserverNotice[] {
@@ -195,6 +278,65 @@ function safeDetailEventSummary(event: RunEvent) {
   return event.message;
 }
 
+function toolLifecycleKey(event: RunEvent) {
+  return (
+    event.tool_call_id ??
+    payloadString(event.payload, "tool_call_id") ??
+    payloadString(event.payload, "id") ??
+    `${event.tool_name ?? "tool"}-${event.sequence}`
+  );
+}
+
+function collectToolLifecycles(events: RunEvent[]): ToolLifecycle[] {
+  const lifecycles = new Map<string, ToolLifecycle>();
+  for (const event of events) {
+    if (!event.kind.startsWith("tool.")) continue;
+    const key = toolLifecycleKey(event);
+    const existing = lifecycles.get(key);
+    const status = payloadString(event.payload, "status") ?? event.kind.replace("tool.", "");
+    const operationKind = payloadString(event.payload, "operation_kind") ?? "generic";
+    const next: ToolLifecycle = existing ?? {
+      key,
+      toolName: event.tool_name ?? payloadString(event.payload, "name") ?? "tool",
+      status,
+      operationKind,
+      actor: event.actor ?? null,
+      stepId: event.step_id ?? null,
+      sequences: [],
+      argumentBytes: null,
+      outputBytes: null,
+      exitCode: null,
+      failureKind: null,
+    };
+    next.status = status;
+    next.operationKind = operationKind;
+    next.actor = event.actor ?? next.actor;
+    next.stepId = event.step_id ?? next.stepId;
+    next.sequences = [...next.sequences, event.sequence];
+    next.argumentBytes = payloadNumber(event.payload, "argument_bytes") ?? next.argumentBytes;
+    next.outputBytes = payloadNumber(event.payload, "output_bytes") ?? next.outputBytes;
+    next.exitCode = payloadNumber(event.payload, "exit_code") ?? next.exitCode;
+    next.failureKind = payloadString(event.payload, "failure_kind") ?? next.failureKind;
+    lifecycles.set(key, next);
+  }
+  return Array.from(lifecycles.values());
+}
+
+function detailPosture(detail: RunDetail) {
+  if (detail.failure_diagnostics.length > 0 || detail.events.some((event) => event.kind.endsWith(".failed"))) {
+    return "执行异常";
+  }
+  return displayRunStatus(detail.status);
+}
+
+function explicitDetailRows(details: Record<string, string>) {
+  return EXPLICIT_DETAIL_KEYS.flatMap((key) => {
+    const value = details[key];
+    if (!value?.trim()) return [];
+    return [{ key, label: EXPLICIT_DETAIL_LABELS[key], value }];
+  });
+}
+
 export function RunDetailPage() {
   const { runId = "" } = useParams();
   const queryClient = useQueryClient();
@@ -246,6 +388,9 @@ export function RunDetailPage() {
   const isWaitingForMode = run.data.status === "waiting_user_mode" && Boolean(run.data.decision_token);
   const observerNotices = collectObserverNotices(run.data.events);
   const timelineItems = detailTimelineItems(run.data.events);
+  const toolLifecycles = collectToolLifecycles(run.data.events);
+  const posture = detailPosture(run.data);
+  const explicitRows = explicitDetailRows(run.data.explicit_details);
 
   return (
     <section>
@@ -258,11 +403,11 @@ export function RunDetailPage() {
       <div className="detail-grid">
         <article>
           <span className="eyebrow">状态</span>
-          <h3>{run.data.status}</h3>
+          <h3>{displayRunStatus(run.data.status)}</h3>
         </article>
         <article>
           <span className="eyebrow">模式</span>
-          <h3>{run.data.mode}</h3>
+          <h3>{displayRunMode(run.data.mode)}</h3>
         </article>
         <article>
           <span className="eyebrow">排队等待</span>
@@ -272,6 +417,20 @@ export function RunDetailPage() {
           <span className="eyebrow">成本</span>
           <h3>${run.data.cost_usd}</h3>
         </article>
+      </div>
+
+      <div className="run-process-posture" role="status" aria-label={`任务态势，${posture}`}>
+        <div>
+          <span>运行排障摘要</span>
+          <strong>任务态势</strong>
+          <small>{posture}</small>
+        </div>
+        <ul aria-label="运行详情指标">
+          <li>事件 <strong>{run.data.events.length}</strong></li>
+          <li>工具 <strong>{toolLifecycles.length}</strong></li>
+          <li>故障 <strong>{run.data.failure_diagnostics.length}</strong></li>
+          <li>产物 <strong>{run.data.artifacts.length}</strong></li>
+        </ul>
       </div>
 
       <article>
@@ -339,6 +498,54 @@ export function RunDetailPage() {
         </article>
       ) : null}
 
+      {run.data.failure_diagnostics.length > 0 ? (
+        <section className="run-failure-diagnostics" aria-label="故障诊断">
+          <div className="run-failure-diagnostics-header">
+            <span>Failure diagnostics</span>
+            <strong>故障诊断</strong>
+            <small>{run.data.failure_diagnostics.length} 条</small>
+          </div>
+          <div className="run-failure-diagnostic-list">
+            {run.data.failure_diagnostics.map((diagnostic) => (
+              <article key={`${diagnostic.sequence}-${diagnostic.category}`} className="run-failure-diagnostic diagnostic-tool">
+                <small>{diagnostic.category}</small>
+                <strong>{diagnostic.tool_name ?? diagnostic.logical_model ?? diagnostic.stage}</strong>
+                <span>{diagnostic.reason}</span>
+                <p>{diagnostic.recommendation}</p>
+                <div aria-label="故障元数据">
+                  <em>#{diagnostic.sequence}</em>
+                  {diagnostic.step_id ? <em>步骤 {diagnostic.step_id}</em> : null}
+                  {diagnostic.failure_kind ? <em>{diagnostic.failure_kind}</em> : null}
+                  {diagnostic.status_code ? <em>status {diagnostic.status_code}</em> : null}
+                </div>
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      {toolLifecycles.length > 0 ? (
+        <section aria-label="工具链路">
+          <h3>工具链路</h3>
+          <ul className="compact-list">
+            {toolLifecycles.map((item) => (
+              <li key={item.key}>
+                <strong>{item.toolName}</strong>
+                <span>{displayToolStatus(item.status)}</span>
+                <span>{displayToolOperation(item.operationKind)}</span>
+                {item.stepId ? <small>步骤 {item.stepId}</small> : null}
+                {item.actor ? <small>角色 {item.actor}</small> : null}
+                {item.argumentBytes !== null ? <small>参数 {item.argumentBytes} bytes</small> : null}
+                {item.outputBytes !== null ? <small>输出 {item.outputBytes} bytes</small> : null}
+                {item.exitCode !== null ? <small>退出码 {item.exitCode}</small> : null}
+                {item.failureKind ? <small>{item.failureKind}</small> : null}
+                <small>事件 #{item.sequences.join(", #")}</small>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+
       <article>
         <h3>事件日志</h3>
         {timelineItems.length === 0 ? (
@@ -390,14 +597,14 @@ export function RunDetailPage() {
 
       <article>
         <h3>模式、工作流与角色</h3>
-        {Object.keys(run.data.explicit_details).length === 0 ? (
+        {explicitRows.length === 0 ? (
           <p>暂无显式详情。</p>
         ) : (
           <dl>
-            {Object.entries(run.data.explicit_details).map(([key, value]) => (
-              <div key={key}>
-                <dt>{key}</dt>
-                <dd>{value}</dd>
+            {explicitRows.map((row) => (
+              <div key={row.key}>
+                <dt>{row.label}</dt>
+                <dd>{row.value}</dd>
               </div>
             ))}
           </dl>

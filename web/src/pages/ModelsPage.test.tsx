@@ -89,6 +89,8 @@ describe("ModelsPage", () => {
                     upstream_model: "deepseek-v4-flash",
                     status_code: "401",
                     reason: "provider returned status=401",
+                    credential_ref: "secret://private-model",
+                    traceback: "private-token stack",
                     hint: "检查 API Key 是否有效、API Base 是否可从服务器访问、模型名是否属于该服务商账号。",
                   },
                 },
@@ -329,8 +331,11 @@ describe("ModelsPage", () => {
     expect(alert.textContent).toContain("模型配置错误日志");
     expect(alert.textContent).toContain("HTTP 状态");
     expect(alert.textContent).toContain("401");
-    expect(alert.textContent).toContain("provider returned status=401");
     expect(alert.textContent).toContain("检查 API Key 是否有效");
+    expect(alert.textContent).not.toContain("https://api.deepseek.com/v1");
+    expect(alert.textContent).not.toContain("provider returned status=401");
+    expect(alert.textContent).not.toContain("secret://private-model");
+    expect(alert.textContent).not.toContain("private-token stack");
     expect(alert.textContent).not.toContain("sk-bad-1234");
   });
 

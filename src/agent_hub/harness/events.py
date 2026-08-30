@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable, Mapping
+from typing import cast
 from uuid import UUID
 
 from agent_hub.harness.provider import NormalizedProviderEvent
@@ -297,10 +298,7 @@ def _completion_payload(
         "cost_usd": None if completion.cost_usd is None else str(completion.cost_usd),
         "text_bytes": 0 if response.text is None else len(response.text.encode("utf-8")),
         "tool_calls": tuple(_tool_call_payload(call) for call in response.tool_calls),
-        "metadata": {
-            key: value
-            for key, value in response.provider_metadata.items()
-        },
+        "metadata": _safe_provider_metadata(response.provider_metadata),
     }
     if response.usage is not None:
         payload.update(
@@ -324,11 +322,34 @@ def _tool_call_payload(call: ToolCall) -> Mapping[str, JsonValue]:
         idempotency_key=call.id,
         call_id=call.id,
     )
-    return {
+    argument_bytes = _encoded_json_bytes(request.arguments)
+    argument_keys = tuple(sorted(key for key in request.arguments if isinstance(key, str)))
+    safe_argument_keys = tuple(key for key in argument_keys if _safe_text(key) is not None)
+    payload: dict[str, JsonValue] = {
         "id": request.call_id,
         "name": request.tool_name,
-        "arguments": request.arguments,
+        "argument_keys": safe_argument_keys,
+        "argument_key_count": len(argument_keys),
+        "redacted_argument_key_count": len(argument_keys) - len(safe_argument_keys),
     }
+    if argument_bytes is not None:
+        payload["argument_bytes"] = argument_bytes
+    return payload
+
+
+def _safe_provider_metadata(metadata: Mapping[str, object]) -> Mapping[str, JsonValue]:
+    payload: dict[str, JsonValue] = {}
+    for key, value in metadata.items():
+        if type(key) is not str:
+            continue
+        if type(value) is str:
+            if _safe_text(value) is None:
+                continue
+            payload[key] = value
+            continue
+        if type(value) in {int, float, bool}:
+            payload[key] = cast(JsonValue, value)
+    return payload
 
 
 __all__ = [

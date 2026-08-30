@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
-import { ApiError, api, formatApiError, type MainAgentConfig } from "../api/client";
+import { API_ERROR_DETAIL_DISPLAY_KEYS, ApiError, api, formatApiError, type MainAgentConfig } from "../api/client";
 import { useNavSection } from "../app/navSections";
 
 type ApiProtocol = "openai_compatible" | "anthropic_messages";
@@ -194,11 +194,15 @@ const API_PROTOCOL_LABELS: Record<ApiProtocol, string> = {
 const MODEL_ERROR_LABELS: Record<string, string> = {
   stage: "阶段",
   provider: "服务商",
-  api_base: "API Base",
   logical_model: "逻辑模型",
   upstream_model: "上游模型",
+  http_status: "HTTP 状态",
   status_code: "HTTP 状态",
-  reason: "失败原因",
+  failure_kind: "失败类型",
+  step_id: "步骤",
+  tool_name: "工具",
+  tool_call_id: "工具调用",
+  approval_id: "审批",
   hint: "处理建议",
 };
 
@@ -249,13 +253,15 @@ function concurrencyNeededForSlots(slots: number, targetUtilization = 0.8, reser
 
 function modelErrorDiagnostics(error: unknown) {
   if (!(error instanceof ApiError) || !error.details) return [];
-  return Object.entries(error.details)
-    .filter(([, value]) => value !== null && value !== "")
-    .map(([key, value]) => ({
+  return API_ERROR_DETAIL_DISPLAY_KEYS.flatMap((key) => {
+    const value = error.details?.[key];
+    if (value === null || typeof value === "undefined" || value === "") return [];
+    return [{
       key,
       label: MODEL_ERROR_LABELS[key] ?? key,
       value: String(value),
-    }));
+    }];
+  });
 }
 
 export function MainAgentPage() {

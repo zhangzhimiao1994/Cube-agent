@@ -12,6 +12,7 @@ from agent_hub.harness.events import (
 from agent_hub.harness.provider import NormalizedProviderEvent
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelResponse, TokenUsage, ToolCall
+from agent_hub.runtime.contracts import EventKind
 
 RUN_ID = UUID("33333333-3333-4333-8333-333333333333")
 
@@ -242,6 +243,7 @@ def test_gateway_completion_projects_safe_model_completed_event() -> None:
     )
 
     assert event.kind == "model.completed"
+    assert event.kind == EventKind.MODEL_COMPLETED
     assert event.sequence == 9
     assert event.payload == {
         "actor": "main_agent",
@@ -279,3 +281,53 @@ def test_gateway_completion_projection_rejects_sensitive_tool_arguments() -> Non
 
     with pytest.raises(ValueError, match="sensitive"):
         tuple(gateway_completion_events(completion, run_id=RUN_ID, start_sequence=1))
+
+
+def test_gateway_completion_summarizes_tool_calls_and_metadata_without_raw_values() -> None:
+    completion = GatewayCompletion(
+        response=ModelResponse(
+            text=None,
+            tool_calls=(
+                ToolCall(
+                    id="call_1",
+                    name="workspace_read",
+                    arguments={
+                        "path": "HANDOFF.md",
+                        "query": "Bearer sk-private-token",
+                    },
+                ),
+            ),
+            provider_metadata={
+                "request_id": "sk-private-token",
+                "finish_reason": "tool_calls",
+                "system_fingerprint": "fp_safe",
+            },
+        ),
+        deployment_id="deepseek-main",
+        logical_model="main",
+        provider_id="deepseek",
+        provider_model="deepseek/deepseek-chat",
+    )
+
+    (event,) = gateway_completion_events(completion, run_id=RUN_ID, start_sequence=1)
+
+    public_payload = event.to_payload()["payload"]
+    assert isinstance(public_payload, dict)
+    serialized = json.dumps(public_payload, ensure_ascii=False, sort_keys=True)
+    assert event.payload["tool_calls"] == (
+        {
+            "id": "call_1",
+            "name": "workspace_read",
+            "argument_keys": ("path", "query"),
+            "argument_key_count": 2,
+            "redacted_argument_key_count": 0,
+            "argument_bytes": len(b'{"path":"HANDOFF.md","query":"Bearer sk-private-token"}'),
+        },
+    )
+    assert event.payload["metadata"] == {
+        "finish_reason": "tool_calls",
+        "system_fingerprint": "fp_safe",
+    }
+    assert "HANDOFF.md" not in serialized
+    assert "Bearer sk-private-token" not in serialized
+    assert "sk-private-token" not in serialized

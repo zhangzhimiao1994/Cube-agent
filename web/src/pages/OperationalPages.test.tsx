@@ -1088,11 +1088,126 @@ describe("operational management pages", () => {
     render(<TestApp initialPath={`/runs/${runId}`} />);
 
     expect(await screen.findByRole("heading", { name: "运行详情" })).not.toBeNull();
-    expect(screen.getByText("running")).not.toBeNull();
+    expect(screen.getByRole("heading", { name: "运行中" })).not.toBeNull();
     expect(screen.getByText("markdown：短视频脚本")).not.toBeNull();
     await userEvent.click(screen.getByRole("button", { name: "暂停" }));
 
-    await waitFor(() => expect(screen.getByText("paused")).not.toBeNull());
+    await waitFor(() => expect(screen.getByRole("heading", { name: "已暂停" })).not.toBeNull());
+  });
+
+  it("renders run detail as a Vibe Engineer debugging summary", async () => {
+    visibleRunDetail = {
+      ...runDetail,
+      explicit_details: {
+        ...runDetail.explicit_details,
+        harness_provider: "openai",
+        harness_logical_model: "vibe_engineer",
+        harness_capabilities: "reasoning, tools, sandbox",
+        credential_ref: "secret://private",
+      },
+      failure_diagnostics: [
+        {
+          category: "tool",
+          stage: "tool.failed",
+          reason: "terminal command failed",
+          recommendation: "查看工具链路中的失败步骤，然后重试或改派。",
+          sequence: 4,
+          actor: "engineer",
+          step_id: "implementation",
+          tool_name: "run_safe_command",
+          tool_call_id: "call_terminal",
+          failure_kind: "nonzero_exit",
+          status_code: null,
+          logical_model: null,
+          approval_id: null,
+          action: null,
+          wrapped_by: null,
+        },
+      ],
+      events: [
+        {
+          sequence: 1,
+          kind: "harness.started",
+          message: "harness.started",
+          summary: "Vibe Engineer harness started",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: null,
+          participants: [],
+          payload: { logical_model: "vibe_engineer", provider: "openai" },
+        },
+        {
+          sequence: 2,
+          kind: "tool.started",
+          message: "tool.started",
+          summary: "terminal command started",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: "run_safe_command",
+          tool_call_id: "call_terminal",
+          step_id: "implementation",
+          payload: {
+            status: "started",
+            operation_kind: "terminal",
+            argument_bytes: 42,
+          },
+        },
+        {
+          sequence: 3,
+          kind: "model.text_delta",
+          message: "private output chunk",
+          summary: "text chunk",
+          created_at: "2026-08-07T00:00:03Z",
+          actor: "engineer",
+          participants: [],
+          step_id: "implementation",
+          payload: {
+            delta_kind: "visible_text",
+            text_bytes: 96,
+            text: "private-token output",
+          },
+        },
+        {
+          sequence: 4,
+          kind: "tool.failed",
+          message: "tool.failed",
+          summary: "terminal command failed",
+          created_at: "2026-08-07T00:00:04Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: "run_safe_command",
+          tool_call_id: "call_terminal",
+          step_id: "implementation",
+          payload: {
+            status: "failed",
+            operation_kind: "terminal",
+            output_bytes: 128,
+            exit_code: 1,
+            failure_kind: "nonzero_exit",
+            stdout: "private-token output",
+          },
+        },
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    expect(await screen.findByRole("status", { name: /任务态势，执行异常/ })).not.toBeNull();
+    expect(screen.getByRole("heading", { name: "运行中" })).not.toBeNull();
+    expect(screen.getByRole("heading", { name: "派单式" })).not.toBeNull();
+    const toolSection = screen.getByRole("region", { name: "工具链路" });
+    expect(toolSection).not.toBeNull();
+    expect(within(toolSection).getByText("run_safe_command")).not.toBeNull();
+    expect(within(toolSection).getByText("终端")).not.toBeNull();
+    expect(within(toolSection).getByText("退出码 1")).not.toBeNull();
+    expect(screen.getByRole("region", { name: "故障诊断" })).not.toBeNull();
+    expect(screen.getByText("查看工具链路中的失败步骤，然后重试或改派。")).not.toBeNull();
+    expect(screen.getByText("Harness 服务商")).not.toBeNull();
+    expect(screen.getByText("openai")).not.toBeNull();
+    expect(screen.queryByText("credential_ref")).toBeNull();
+    expect(screen.queryByText("secret://private")).toBeNull();
+    expect(screen.queryByText("private-token output")).toBeNull();
   });
 
   it("shows observer notices as scheduler guidance on the detail page", async () => {

@@ -81,6 +81,10 @@ _SENSITIVE_PUBLIC_KEYS = frozenset(
         "chain_of_thought",
     }
 )
+_SENSITIVE_PUBLIC_TEXT = re.compile(
+    r"(?:api[_ -]?key|sk-[a-z0-9_-]{8,}|bearer\s+|authorization|password|secret|token)",
+    re.IGNORECASE,
+)
 _SAFE_MODEL_ID = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 
@@ -1022,6 +1026,8 @@ def _sanitize_public_json(value: object) -> object:
         }
     if isinstance(value, list):
         return [_sanitize_public_json(item) for item in value]
+    if type(value) is str and _SENSITIVE_PUBLIC_TEXT.search(value):
+        return "[redacted]"
     return value
 
 

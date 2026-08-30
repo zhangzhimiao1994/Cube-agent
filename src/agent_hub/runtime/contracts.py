@@ -513,6 +513,7 @@ class RuntimeCheckpoint(_RuntimeContractModel):
 
 class EventKind(StrEnum):
     MODEL_STARTED = "model.started"
+    MODEL_COMPLETED = "model.completed"
     ARTIFACT_CREATED = "artifact.created"
     CHECKPOINT_SAVED = "checkpoint.saved"
     RUNTIME_COMPLETED = "runtime.completed"

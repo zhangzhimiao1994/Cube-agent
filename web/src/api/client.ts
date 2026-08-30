@@ -946,7 +946,7 @@ export class ApiError extends Error {
   }
 }
 
-const ERROR_DETAIL_DISPLAY_KEYS = [
+export const API_ERROR_DETAIL_DISPLAY_KEYS = [
   "logical_model",
   "provider",
   "upstream_model",
@@ -959,11 +959,11 @@ const ERROR_DETAIL_DISPLAY_KEYS = [
   "tool_call_id",
   "approval_id",
   "hint",
-];
+] as const;
 
 function formatApiErrorDetails(details: ApiErrorDetails | null): string {
   if (!details) return "";
-  return ERROR_DETAIL_DISPLAY_KEYS.flatMap((key) => {
+  return API_ERROR_DETAIL_DISPLAY_KEYS.flatMap((key) => {
     const value = details[key];
     if (value === null || typeof value === "undefined" || value === "") return [];
     return [`${key}=${String(value)}`];

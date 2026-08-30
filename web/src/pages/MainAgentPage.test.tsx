@@ -62,6 +62,8 @@ describe("MainAgentPage", () => {
                       upstream_model: "claude-sonnet-4-6",
                       status_code: "401",
                       reason: "provider returned status=401",
+                      credential_ref: "secret://private-main-agent",
+                      traceback: "private-token stack",
                       hint: "检查 API Key、API Base、模型名和中转站协议。",
                     },
                   },
@@ -240,8 +242,11 @@ describe("MainAgentPage", () => {
 
     expect(await screen.findByRole("heading", { name: "主 Agent 模型配置错误日志" })).not.toBeNull();
     expect(screen.getByText("claude-code-relay")).not.toBeNull();
-    expect(screen.getByText("https://bad-relay.example/v1/messages")).not.toBeNull();
-    expect(screen.getByText("provider returned status=401")).not.toBeNull();
+    expect(screen.queryByText("https://bad-relay.example/v1/messages")).toBeNull();
+    expect(screen.queryByText("provider returned status=401")).toBeNull();
+    expect(screen.queryByText("secret://private-main-agent")).toBeNull();
+    expect(screen.queryByText("private-token stack")).toBeNull();
+    expect(screen.getByText("检查 API Key、API Base、模型名和中转站协议。")).not.toBeNull();
     expect(screen.getByRole("link", { name: "查看模型日志" })).not.toBeNull();
   });
 
