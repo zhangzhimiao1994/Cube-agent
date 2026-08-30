@@ -384,6 +384,7 @@ describe("operational management pages", () => {
   let visibleChannels = baseChannels;
   let createdEvolutionRun: typeof evolutionRun | null = null;
   let failNextAttachmentUpload = false;
+  let skillUploadConflict = false;
   let holdActiveConversationRequest = false;
 
   beforeEach(() => {
@@ -400,6 +401,7 @@ describe("operational management pages", () => {
     visibleChannels = baseChannels;
     createdEvolutionRun = null;
     failNextAttachmentUpload = false;
+    skillUploadConflict = false;
     holdActiveConversationRequest = false;
     vi.stubGlobal("confirm", vi.fn(() => true));
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
@@ -707,7 +709,23 @@ describe("operational management pages", () => {
         if (path === "/api/v1/admin/models") {
           return jsonResponse(visibleModels);
         }
-        if (path === "/api/v1/admin/skills/upload" && method === "POST") {
+        if (path.startsWith("/api/v1/admin/skills/upload") && method === "POST") {
+          if (skillUploadConflict && !path.includes("strategy=")) {
+            return jsonResponse(
+              {
+                error: {
+                  code: "skill_version_choice_required",
+                  message: "skill version choice required",
+                  details: {
+                    skill_name: "uploaded_skill",
+                    current_version_id: "skill-uploaded-from-chat",
+                    new_content_sha256: "abcdef0123456789",
+                  },
+                },
+              },
+              { status: 409 },
+            );
+          }
           return jsonResponse({
             filename: "uploaded-skill.zip",
             bundle: false,
@@ -2781,6 +2799,27 @@ describe("operational management pages", () => {
     expect(requests.find((request) => request.path === "/api/v1/admin/skills/skill-uploaded-from-chat/approve")).toMatchObject({
       method: "POST",
     });
+  });
+
+  it("prompts for overwrite or new version when chat skill upload conflicts", async () => {
+    skillUploadConflict = true;
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    const file = new File(["PK\x03\x04"], "uploaded-skill.zip", { type: "application/zip" });
+    await user.upload(screen.getByLabelText("上传文件或 Skill 压缩包"), file);
+    await user.click(await screen.findByRole("button", { name: "作为 Skill 安装" }));
+
+    expect(await screen.findByRole("alert", { name: "Skill 版本选择" })).not.toBeNull();
+    expect(screen.getByText("uploaded_skill")).not.toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "保存为新版本" }));
+
+    expect(await screen.findByText("Skill 压缩包已扫描，等待确认")).not.toBeNull();
+    expect(
+      requests.find((request) => request.path === "/api/v1/admin/skills/upload?strategy=new_version"),
+    ).toMatchObject({ method: "POST" });
   });
 
   it("uploads an image attachment from chat and submits its attachment id with the run", async () => {

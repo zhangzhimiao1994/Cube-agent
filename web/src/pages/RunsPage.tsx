@@ -34,6 +34,16 @@ type ChatAttachmentDraft = {
   kind: "archive" | "image" | "context";
   attachment?: AttachmentUpload;
 };
+type SkillUploadStrategy = "overwrite" | "new_version";
+type SkillUploadRequest = {
+  file: File;
+  strategy?: SkillUploadStrategy;
+};
+type SkillUploadConflict = {
+  file: File;
+  skillName: string;
+  newContentSha256?: string;
+};
 type TemporaryAgentProposal = NonNullable<SubmittedRun["temporary_agent_proposal"]>;
 type ScheduleProposal = NonNullable<SubmittedRun["schedule_proposal"]>;
 type EvolutionProposal = NonNullable<SubmittedRun["evolution_proposal"]>;
@@ -85,6 +95,24 @@ const ATTACHMENT_ACCEPT = [
   ".xlsx",
   "image/*",
 ].join(",");
+
+function shortHash(value?: string | null) {
+  if (!value) return "未记录";
+  return value.length > 16 ? `${value.slice(0, 12)}…` : value;
+}
+
+function skillUploadConflictFromError(error: unknown, file: File): SkillUploadConflict | null {
+  if (!(error instanceof ApiError) || error.code !== "skill_version_choice_required") return null;
+  const details = error.details ?? {};
+  const skillName = typeof details.skill_name === "string" ? details.skill_name : "同名 Skill";
+  const newContentSha256 =
+    typeof details.new_content_sha256 === "string" ? details.new_content_sha256 : undefined;
+  return {
+    file,
+    skillName,
+    newContentSha256,
+  };
+}
 
 function isArchiveFileName(fileName: string) {
   const lower = fileName.toLowerCase();
@@ -1939,6 +1967,7 @@ export function RunsPage() {
   const [processDetailTarget, setProcessDetailTarget] = useState<ProcessDrawerTarget | null>(null);
   const [modeSelection, setModeSelection] = useState<ModeSelection | null>(null);
   const [skillInstallCandidate, setSkillInstallCandidate] = useState<SkillInstallCandidate | null>(null);
+  const [skillUploadConflict, setSkillUploadConflict] = useState<SkillUploadConflict | null>(null);
   const [attachmentDraft, setAttachmentDraft] = useState<ChatAttachmentDraft | null>(null);
   const [archiveInstallFile, setArchiveInstallFile] = useState<File | null>(null);
   const [conversationRunCache, setConversationRunCache] = useState<Record<string, RunDetail[]>>({});
@@ -2450,14 +2479,23 @@ export function RunsPage() {
   });
 
   const uploadSkillArchive = useMutation({
-    mutationFn: (file: File) => api.uploadSkillArchive(file),
-    onSuccess: (result, file) => {
+    mutationFn: ({ file, strategy }: SkillUploadRequest) => api.uploadSkillArchive(file, strategy),
+    onSuccess: (result, { file }) => {
       setArchiveInstallFile(null);
+      setSkillUploadConflict(null);
       setSkillInstallCandidate({ fileName: file.name, skills: result.items, skipped: result.skipped, status: "scanned" });
       setSubmitNotice("Skill 压缩包已完成安全扫描，请确认权限后再安装。");
       void queryClient.invalidateQueries({ queryKey: ["skills"] });
     },
-    onError: (error, file) => {
+    onError: (error, { file }) => {
+      const conflict = skillUploadConflictFromError(error, file);
+      if (conflict) {
+        setSkillInstallCandidate(null);
+        setSkillUploadConflict(conflict);
+        setSubmitNotice("检测到同名 Skill 已存在，请选择覆盖当前版本或保存为新版本。");
+        return;
+      }
+      setSkillUploadConflict(null);
       setSkillInstallCandidate(null);
       setAttachmentDraft((current) =>
         current ?? {
@@ -2516,6 +2554,7 @@ export function RunsPage() {
     setSubmitNotice(null);
     setAttachmentDraft(null);
     setSkillInstallCandidate(null);
+    setSkillUploadConflict(null);
     setArchiveInstallFile(isArchiveFileName(file.name) ? file : null);
     uploadAttachment.mutate(file);
   }
@@ -3357,10 +3396,50 @@ export function RunsPage() {
                       : "附件已选中。当前先记录附件名称，完整内容读取会走后端附件存储。"}
                 </p>
                 {attachmentDraft.kind === "archive" && archiveInstallFile ? (
-                  <button type="button" disabled={uploadSkillArchive.isPending} onClick={() => uploadSkillArchive.mutate(archiveInstallFile)}>
+                  <button
+                    type="button"
+                    disabled={uploadSkillArchive.isPending}
+                    onClick={() => uploadSkillArchive.mutate({ file: archiveInstallFile })}
+                  >
                     {uploadSkillArchive.isPending ? "扫描中..." : "作为 Skill 安装"}
                   </button>
                 ) : null}
+              </aside>
+            ) : null}
+            {skillUploadConflict ? (
+              <aside className="composer-attachment-card" role="alert" aria-label="Skill 版本选择">
+                <div>
+                  <span className="eyebrow">Skill 已存在</span>
+                  <strong>{skillUploadConflict.skillName}</strong>
+                  <small>新包 SHA256：{shortHash(skillUploadConflict.newContentSha256)}</small>
+                </div>
+                <p>检测到同名 Skill 内容不同。请选择覆盖当前版本，或保存为一个可切换的新版本。</p>
+                <div className="composer-card-actions">
+                  <button
+                    type="button"
+                    disabled={uploadSkillArchive.isPending}
+                    onClick={() =>
+                      uploadSkillArchive.mutate({
+                        file: skillUploadConflict.file,
+                        strategy: "overwrite",
+                      })
+                    }
+                  >
+                    覆盖当前版本
+                  </button>
+                  <button
+                    type="button"
+                    disabled={uploadSkillArchive.isPending}
+                    onClick={() =>
+                      uploadSkillArchive.mutate({
+                        file: skillUploadConflict.file,
+                        strategy: "new_version",
+                      })
+                    }
+                  >
+                    保存为新版本
+                  </button>
+                </div>
               </aside>
             ) : null}
             <textarea
@@ -3442,7 +3521,7 @@ export function RunsPage() {
             {submitNotice ? <p role="status">{submitNotice}</p> : null}
             {uploadSkillArchive.isPending ? <p role="status">正在扫描 Skill 压缩包...</p> : null}
             {uploadAttachment.isPending ? <p role="status">正在上传附件...</p> : null}
-            {uploadSkillArchive.isError ? (
+            {uploadSkillArchive.isError && !skillUploadConflict ? (
               <p className="field-help" role="status">
                 {formatApiError(uploadSkillArchive.error, "Skill 扫描失败")}
               </p>

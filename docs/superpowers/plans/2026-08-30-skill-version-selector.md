@@ -115,8 +115,10 @@ Run targeted Vitest; expected pass.
 - Modify: `src/agent_hub/api/routers/admin.py`
 - Modify: `web/src/api/client.ts`
 - Modify: `web/src/pages/SkillsPage.tsx`
+- Modify: `web/src/pages/RunsPage.tsx`
 - Test: `tests/api/test_admin_resources.py`
 - Test: `web/src/pages/SkillsPage.test.tsx`
+- Test: `web/src/pages/OperationalPages.test.tsx`
 
 - [x] **Step 1: Write failing tests**
 
@@ -153,6 +155,10 @@ Add an upload strategy parameter via query string or form field. The frontend sh
 - [x] **Step 4: Verify GREEN**
 
 Run targeted pytest/Vitest; expected pass.
+
+- [x] **Step 5: Cover secondary upload entry points**
+
+Chat composer Skill install now handles the same `409 skill_version_choice_required` response with an in-app overwrite/new-version choice. Feishu `/skill install` reports the conflict and sends the user to Web management for the explicit choice.
 
 ### Task 5: Verification, deploy, and production audit
 
