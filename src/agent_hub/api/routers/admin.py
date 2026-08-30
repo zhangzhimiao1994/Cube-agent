@@ -6021,6 +6021,8 @@ def _tool_failure_wraps_event(
     wrapper_event: RunEventResponse,
     events: list[RunEventResponse],
 ) -> bool:
+    if _is_model_failure_event(wrapper_event):
+        return False
     if tool_event.step_id and wrapper_event.step_id and tool_event.step_id == wrapper_event.step_id:
         return True
     between = [

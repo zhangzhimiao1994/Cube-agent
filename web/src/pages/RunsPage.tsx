@@ -1432,6 +1432,7 @@ function latestToolFailureEvent(events: RunDetail["events"]) {
 
 function isWrappedToolFailureEvent(event: RunDetail["events"][number], events: RunDetail["events"]) {
   if (event.kind !== "runtime.failed" && event.kind !== "step.failed") return false;
+  if (isModelFailureEvent(event)) return false;
   return events.some((candidate) => {
     if (candidate.kind !== "tool.failed" || candidate.sequence > event.sequence) return false;
     if (candidate.step_id && event.step_id && candidate.step_id === event.step_id) return true;
