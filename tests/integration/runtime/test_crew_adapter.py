@@ -1569,7 +1569,9 @@ async def test_tool_calls_only_cross_the_capability_gateway() -> None:
 async def test_tool_calls_cross_the_harness_tool_gateway_envelope() -> None:
     class RecordingHarnessToolGateway:
         def __init__(self) -> None:
-            self.calls: list[tuple[UUID, HarnessToolCallRequest]] = []
+            self.calls: list[
+                tuple[UUID, HarnessToolCallRequest, UUID | None, Role | None]
+            ] = []
 
         async def invoke(
             self,
@@ -1579,9 +1581,7 @@ async def test_tool_calls_cross_the_harness_tool_gateway_envelope() -> None:
             user_id: UUID | None = None,
             role: Role | None = None,
         ) -> HarnessToolCallResult:
-            assert user_id is None
-            assert role is None
-            self.calls.append((tenant_id, request))
+            self.calls.append((tenant_id, request, user_id, role))
             return HarnessToolCallResult(
                 call_id=request.call_id,
                 tool_name=request.tool_name,
@@ -1626,8 +1626,10 @@ async def test_tool_calls_cross_the_harness_tool_gateway_envelope() -> None:
 
     assert capabilities.calls == []
     assert len(harness.calls) == 1
-    tenant_id, request = harness.calls[0]
+    tenant_id, request, user_id, role = harness.calls[0]
     assert tenant_id == TENANT_ID
+    assert user_id == UUID("00000000-0000-4000-8000-000000000003")
+    assert role is Role.OPERATOR
     assert request.run_id == RUN_ID
     assert request.actor == "writer"
     assert request.tool_name == "web.search"
