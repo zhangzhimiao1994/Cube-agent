@@ -23,6 +23,7 @@ from agent_hub.runtime.crew.adapter import (
     RuntimeExecutionError,
     _artifact_final_synthesis_payload,
     _artifact_prompt_payload,
+    _artifact_review_packet_payload,
     _tool_sandbox,
 )
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
@@ -232,6 +233,64 @@ class TimeoutFactory(CrewObjectFactory):
         return TimeoutGeneration()
 
 
+class RecordingGeneration:
+    def __init__(self, *, timeout_reviewer: bool = False) -> None:
+        self.timeout_reviewer = timeout_reviewer
+        self.prompts: list[tuple[str, str | None, str]] = []
+
+    async def execute(
+        self,
+        step_id: str,
+        prompt: str,
+        bridge: CrewLLMBridge,
+        *,
+        agent_id: str | None = None,
+        storage_scope: tuple[UUID, UUID],
+    ) -> str:
+        del storage_scope
+        self.prompts.append((step_id, agent_id, prompt))
+        if self.timeout_reviewer and agent_id == "reviewer":
+            raise TimeoutError
+        return await bridge.complete([{"role": "system", "content": prompt}])
+
+
+class RecordingFactory(CrewObjectFactory):
+    def __init__(self, generation: RecordingGeneration) -> None:
+        self.generation = generation
+
+    def build(
+        self,
+        agents: tuple[CrewAgentDefinition, ...],
+        tasks: tuple[CrewTaskDefinition, ...],
+        *,
+        share_crew: bool,
+        telemetry_disabled: bool,
+    ) -> RecordingGeneration:
+        del agents, tasks, share_crew, telemetry_disabled
+        return self.generation
+
+
+class RoleAwareGateway:
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        text = (
+            '{"verdict":"approve"}'
+            if request.logical_model == "review"
+            else "role output " + ("内容" * 600)
+        )
+        return GatewayCompletion(
+            response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
 class FastGeneration:
     async def execute(
         self,
@@ -300,6 +359,65 @@ def _tool_plan() -> DispatchPlan:
         ),
         allowed_tools=("web.search",),
         total_token_budget=100,
+    )
+
+
+def _reviewed_step_plan() -> DispatchPlan:
+    return DispatchPlan(
+        agents=(
+            AgentSpec(id="writer", role="writer", goal="Write", logical_model="general"),
+            AgentSpec(id="reviewer", role="reviewer", goal="Review", logical_model="review"),
+            AgentSpec(
+                id="final_synthesizer",
+                role="Final Synthesizer",
+                goal="Synthesize",
+                logical_model="general",
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="draft",
+                agent="writer",
+                task="Draft",
+                reviewer="reviewer",
+                token_budget=1000,
+            ),
+            DispatchStep(
+                id="final_response",
+                agent="final_synthesizer",
+                task="Synthesize",
+                depends_on=("draft",),
+                final_synthesizer=True,
+                token_budget=1000,
+            ),
+        ),
+        total_token_budget=1000,
+    )
+
+
+def _dependent_final_plan() -> DispatchPlan:
+    return DispatchPlan(
+        agents=(
+            AgentSpec(id="writer", role="writer", goal="Write", logical_model="general"),
+            AgentSpec(
+                id="final_synthesizer",
+                role="Final Synthesizer",
+                goal="Synthesize",
+                logical_model="general",
+            ),
+        ),
+        steps=(
+            DispatchStep(id="draft", agent="writer", task="Draft", token_budget=1000),
+            DispatchStep(
+                id="final_response",
+                agent="final_synthesizer",
+                task="Synthesize",
+                depends_on=("draft",),
+                final_synthesizer=True,
+                token_budget=1000,
+            ),
+        ),
+        total_token_budget=1000,
     )
 
 
@@ -577,6 +695,71 @@ async def test_dispatch_framework_timeout_names_the_step_and_actor() -> None:
     assert any(
         event.kind is EventKind.STEP_FAILED and event.reason == expected for event in events
     )
+    step_failed = next(event for event in events if event.kind is EventKind.STEP_FAILED)
+    assert step_failed.payload["error_code"] == "crew.step_timeout"
+    assert step_failed.payload["step_id"] == "final"
+    assert step_failed.payload["actor"] == "writer"
+
+
+async def test_reviewer_timeout_soft_fails_with_structured_warning() -> None:
+    generation = RecordingGeneration(timeout_reviewer=True)
+    runtime = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        _reviewed_step_plan(),
+        crew_factory=RecordingFactory(generation),
+    )
+
+    events = await _collect(runtime)
+
+    review_completed = next(event for event in events if event.kind is EventKind.REVIEW_COMPLETED)
+    assert review_completed.payload["verdict"] == "approve"
+    assert review_completed.payload["review_status"] == "timeout_skipped"
+    assert review_completed.payload["error_code"] == "crew.step_timeout"
+    assert review_completed.payload["step_id"] == "draft.review"
+    assert review_completed.payload["actor"] == "reviewer"
+    assert any(event.kind is EventKind.STEP_COMPLETED for event in events)
+
+
+async def test_dependent_final_step_receives_bounded_review_packets() -> None:
+    generation = RecordingGeneration()
+    runtime = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        _dependent_final_plan(),
+        crew_factory=RecordingFactory(generation),
+    )
+
+    await _collect(runtime)
+
+    final_prompt = next(prompt for step_id, _, prompt in generation.prompts if step_id == "final_response")
+    assert '"artifact_review_packet"' in final_prompt
+    assert '"content_keys"' in final_prompt
+    assert '"content":{"text"' not in final_prompt
+
+
+def test_artifact_review_packet_payload_exposes_bounded_preview_without_full_content() -> None:
+    artifact = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="writer",
+        content={"text": "long text " * 1_000, "metadata": {"unsafe": "kept out of prompt"}},
+        source_ids=(str(uuid4()),),
+    )
+
+    payload = _artifact_review_packet_payload(artifact)
+
+    packet = payload["artifact_review_packet"]
+    assert isinstance(packet, Mapping)
+    assert packet["id"] == str(artifact.id)
+    assert packet["type"] == "text"
+    assert packet["producer"] == "writer"
+    assert isinstance(packet["source_ids"], tuple)
+    assert len(packet["source_ids"]) == 1
+    assert packet["content_sha256"] == artifact.content_sha256
+    assert packet["content_keys"] == ("metadata", "text")
+    preview = packet["preview"]
+    assert isinstance(preview, str)
+    assert len(preview.encode("utf-8")) <= 1200
+    assert "metadata" not in packet
 
 
 def test_artifact_prompt_payload_truncates_large_text_without_mutating_artifact() -> None:

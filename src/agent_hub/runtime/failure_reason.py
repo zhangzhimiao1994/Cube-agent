@@ -22,6 +22,9 @@ SENSITIVE_FAILURE_REASON = re.compile(
     re.IGNORECASE,
 )
 _STATUS_CODE = re.compile(r"\(status=(?P<status>[1-5][0-9]{2})\)")
+_CREWAI_STEP_TIMEOUT = re.compile(
+    r"^CrewAI step timed out: step=(?P<step>[A-Za-z0-9_.-]{1,128}) actor=(?P<actor>[A-Za-z0-9_.-]{1,128})$"
+)
 GENERIC_MODEL_GATEWAY_FAILURE = "model gateway failed"
 LEGACY_GENERIC_FAILURES = frozenset(
     {
@@ -121,7 +124,19 @@ def runtime_failure_diagnostic_from_reason(
         suggested_action="查看运行详情中的上一条失败事件；如果失败重复出现，检查对应模式、工具或模型配置。",
     )
 
-    if "model gateway failed" in lowered:
+    crew_timeout = _CREWAI_STEP_TIMEOUT.fullmatch(normalized)
+    if crew_timeout is not None:
+        diagnostic = _base_diagnostic(
+            normalized,
+            error_stage="crew_step",
+            error_category="step_timeout",
+            error_code="crew.step_timeout",
+            retryable=True,
+            suggested_action="CrewAI 子 Agent 步骤执行超时；可压缩该步骤输入、切换更快模型、提高审查/汇总步骤超时或降低并发等待。",
+        )
+        diagnostic["step_id"] = crew_timeout.group("step")
+        diagnostic["actor"] = crew_timeout.group("actor")
+    elif "model gateway failed" in lowered:
         diagnostic = _model_gateway_diagnostic(normalized, status_code=status_code)
     elif normalized == "runtime_not_configured":
         diagnostic = _base_diagnostic(

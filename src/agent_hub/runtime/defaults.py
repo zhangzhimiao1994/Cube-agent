@@ -733,11 +733,13 @@ def _dispatch_plan(
     step_token_budget = min(context.token_budget, 1_000_000)
     role_token_budget = step_token_budget
     final_token_budget = step_token_budget
-    role_step_timeout = min(
-        max(context.timeout_seconds / max(2, len(selected_roles)), 120.0),
-        300.0,
+    producer_step_timeout = _producer_step_timeout(context, selected_roles)
+    post_product_step_timeout = _post_product_step_timeout(context, selected_roles)
+    final_step_timeout = _final_step_timeout(
+        context,
+        selected_roles,
+        post_product_step_timeout=post_product_step_timeout,
     )
-    final_step_timeout = min(max(context.timeout_seconds * 0.45, 90.0), 300.0)
     producer_step_ids = tuple(
         f"{role.id}_step" for role in selected_roles if not _is_post_product_role(role)
     )
@@ -757,7 +759,9 @@ def _dispatch_plan(
                 capability_gateway=capability_gateway,
             ),
             token_budget=role_token_budget,
-            timeout_seconds=role_step_timeout,
+            timeout_seconds=(
+                post_product_step_timeout if _is_post_product_role(role) else producer_step_timeout
+            ),
             cost_budget_usd=Decimal(0),
         )
         for role in selected_roles
@@ -796,6 +800,55 @@ def _is_post_product_role(role: RoleAssignment) -> bool:
         RolePurpose.VERIFY,
         RolePurpose.RELEASE,
     }
+
+
+def _producer_step_timeout(
+    context: TaskContext,
+    selected_roles: tuple[RoleAssignment, ...],
+) -> float:
+    return min(
+        max(context.timeout_seconds / max(2, len(selected_roles)), 120.0),
+        300.0,
+    )
+
+
+def _post_product_step_timeout(
+    context: TaskContext,
+    selected_roles: tuple[RoleAssignment, ...],
+) -> float:
+    producer_timeout = _producer_step_timeout(context, selected_roles)
+    request_size_bonus = min(len(str(context.request).encode("utf-8")) / 2048 * 30.0, 120.0)
+    role_count_bonus = max(0, len(selected_roles) - 2) * 30.0
+    return min(
+        max(
+            producer_timeout * 1.5,
+            context.timeout_seconds * 0.45,
+            240.0,
+        )
+        + request_size_bonus
+        + role_count_bonus,
+        600.0,
+    )
+
+
+def _final_step_timeout(
+    context: TaskContext,
+    selected_roles: tuple[RoleAssignment, ...],
+    *,
+    post_product_step_timeout: float,
+) -> float:
+    request_size_bonus = min(len(str(context.request).encode("utf-8")) / 2048 * 30.0, 120.0)
+    return min(
+        max(
+            context.timeout_seconds * 0.45,
+            post_product_step_timeout * 0.75,
+            240.0,
+        )
+        + request_size_bonus
+        + max(0, len(selected_roles) - 3) * 20.0,
+        600.0,
+    )
+
 
 def _dispatch_role_payload(plan: DispatchPlan) -> tuple[Mapping[str, JsonValue], ...]:
     step_purposes = {

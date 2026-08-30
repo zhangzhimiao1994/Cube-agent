@@ -127,6 +127,20 @@ def test_runtime_failure_diagnostic_from_reason_extracts_status_code() -> None:
     assert diagnostic["status_code"] == 502
 
 
+def test_runtime_failure_diagnostic_classifies_crewai_step_timeout() -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason(
+        "CrewAI step timed out: step=writer_step actor=writer"
+    )
+
+    assert diagnostic["error_summary"] == "CrewAI step timed out: step=writer_step actor=writer"
+    assert diagnostic["error_stage"] == "crew_step"
+    assert diagnostic["error_category"] == "step_timeout"
+    assert diagnostic["error_code"] == "crew.step_timeout"
+    assert diagnostic["retryable"] is True
+    assert diagnostic["step_id"] == "writer_step"
+    assert diagnostic["actor"] == "writer"
+
+
 @pytest.mark.parametrize(
     ("status_code", "error_category", "error_code"),
     [

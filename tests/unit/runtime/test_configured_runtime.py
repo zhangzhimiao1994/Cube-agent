@@ -1147,6 +1147,55 @@ def test_dispatch_plan_runs_review_roles_after_producer_roles() -> None:
         "quality_reviewer_step",
     )
 
+
+def test_dispatch_plan_reserves_more_time_for_post_product_review_roles() -> None:
+    roles = (
+        RoleAssignment(
+            id="writer",
+            role="Writer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Write the proposal.",
+            must_answer=("What was written?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+        RoleAssignment(
+            id="quality_reviewer",
+            role="Quality Reviewer",
+            purpose=RolePurpose.VERIFY,
+            mission="Review the completed proposal.",
+            must_answer=("Does the proposal pass review?",),
+            allowed_tools=(),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Review this campaign proposal.",
+            timeout_seconds=1200,
+        ),
+        max_parallelism=2,
+    )
+
+    steps = {step.id: step for step in plan.steps}
+    assert steps["writer_step"].timeout_seconds == 300
+    assert steps["quality_reviewer_step"].timeout_seconds > steps["writer_step"].timeout_seconds
+    assert 540 <= steps["quality_reviewer_step"].timeout_seconds <= 600
+    assert steps["final_response_step"].timeout_seconds >= 540
+    assert steps["final_response_step"].timeout_seconds <= 600
+
+
 def test_dispatch_plan_preserves_selected_roles_and_controls_concurrency() -> None:
     roles = tuple(
         RoleAssignment(
