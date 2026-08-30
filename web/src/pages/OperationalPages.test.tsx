@@ -3489,6 +3489,61 @@ describe("operational management pages", () => {
     expect(within(diagnostics).getByText(/审批 approval_retry/)).not.toBeNull();
   });
 
+  it("does not keep resolved approvals in the pending intent state", async () => {
+    const user = userEvent.setup();
+    const resolvedApprovalRunDetail = {
+      ...runDetail,
+      status: "running",
+      events: [
+        {
+          sequence: 1,
+          kind: "approval.requested",
+          message: "approval.requested",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "main_agent",
+          participants: [],
+          tool_name: null,
+          step_id: null,
+          approval_id: "approval_retry",
+          action: "retry_terminal",
+          decision: null,
+          payload: { replay_safe: false, requires_approval: true },
+        },
+        {
+          sequence: 2,
+          kind: "approval.resolved",
+          message: "approval.resolved",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "main_agent",
+          participants: [],
+          tool_name: null,
+          step_id: null,
+          approval_id: "approval_retry",
+          action: null,
+          decision: "approved",
+          payload: {},
+        },
+      ],
+      artifacts: [],
+      failure_diagnostics: [],
+    };
+    visibleRunDetail = resolvedApprovalRunDetail;
+    visibleConversationRuns = [resolvedApprovalRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const posture = within(stream).getByRole("status", { name: /任务态势，运行中/ });
+    const intentRegion = within(stream).getByRole("region", { name: "执行意图" });
+
+    expect(within(posture).queryByText(/确认 1/)).toBeNull();
+    expect(within(intentRegion).queryByText("等待确认")).toBeNull();
+    expect(within(intentRegion).getByText("确认已处理")).not.toBeNull();
+    expect(within(stream).queryByRole("region", { name: "故障诊断" })).toBeNull();
+  });
+
   it("uses ordered artifacts for process rows instead of vague generated-result summaries", async () => {
     const user = userEvent.setup();
     const processRunDetail = {

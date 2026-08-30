@@ -669,6 +669,11 @@ type RunFailureDiagnostic = {
   tone: "tool" | "model" | "runtime" | "approval";
 };
 
+type ApprovalState = {
+  pending: RunEvent[];
+  resolved: RunEvent[];
+};
+
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -768,10 +773,29 @@ function artifactProgressCount(detail: RunDetail) {
   return artifacts.size;
 }
 
+function approvalStateFromEvents(events: RunDetail["events"]): ApprovalState {
+  const pending: RunEvent[] = [];
+  const resolved: RunEvent[] = [];
+  events.forEach((event) => {
+    if (event.kind === "approval.resolved" && event.approval_id) {
+      let resolvedIndex = -1;
+      for (let index = pending.length - 1; index >= 0; index -= 1) {
+        if (pending[index].approval_id === event.approval_id) {
+          resolvedIndex = index;
+          break;
+        }
+      }
+      if (resolvedIndex >= 0) pending.splice(resolvedIndex, 1);
+      resolved.push(event);
+      return;
+    }
+    if (event.kind === "approval.requested") pending.push(event);
+  });
+  return { pending, resolved };
+}
+
 function pendingApprovalCount(events: RunDetail["events"]) {
-  const requested = events.filter((event) => event.kind === "approval.requested").length;
-  const resolved = events.filter((event) => event.kind === "approval.resolved").length;
-  return Math.max(0, requested - resolved);
+  return approvalStateFromEvents(events).pending.length;
 }
 
 function failureCount(events: RunDetail["events"]) {
@@ -904,23 +928,7 @@ function pendingApprovalDiagnostics(
   detail: RunDetail,
   agentNames: Map<string, string>,
 ): RunFailureDiagnostic[] {
-  const pending: RunEvent[] = [];
-  detail.events.forEach((event) => {
-    if (event.kind === "approval.resolved" && event.approval_id) {
-      let resolvedIndex = -1;
-      for (let index = pending.length - 1; index >= 0; index -= 1) {
-        if (pending[index].approval_id === event.approval_id) {
-          resolvedIndex = index;
-          break;
-        }
-      }
-      if (resolvedIndex >= 0) pending.splice(resolvedIndex, 1);
-      return;
-    }
-    if (event.kind === "approval.requested") pending.push(event);
-  });
-
-  return pending.map((event) => ({
+  return approvalStateFromEvents(detail.events).pending.map((event) => ({
       id: `${detail.id}-diagnostic-approval-${event.approval_id ?? event.sequence}`,
       label: "等待人工确认" as const,
       title: event.action || "需要确认",
@@ -1091,8 +1099,8 @@ function executionIntentsForRun(detail: RunDetail, agentNames: Map<string, strin
     });
   });
 
-  detail.events.forEach((event) => {
-    if (event.kind === "approval.requested") {
+  const approvalState = approvalStateFromEvents(detail.events);
+  approvalState.pending.forEach((event) => {
       pushUniqueIntent(intents, {
         id: `${detail.id}-intent-approval-${event.approval_id ?? event.sequence}`,
         label: "审批意图",
@@ -1105,9 +1113,8 @@ function executionIntentsForRun(detail: RunDetail, agentNames: Map<string, strin
         ].filter(Boolean),
         tone: "pending",
       });
-      return;
-    }
-    if (event.kind === "approval.resolved") {
+  });
+  approvalState.resolved.forEach((event) => {
       pushUniqueIntent(intents, {
         id: `${detail.id}-intent-approval-resolved-${event.approval_id ?? event.sequence}`,
         label: "审批意图",
@@ -1116,6 +1123,10 @@ function executionIntentsForRun(detail: RunDetail, agentNames: Map<string, strin
         meta: [event.approval_id ? `审批 ${event.approval_id}` : ""].filter(Boolean),
         tone: "done",
       });
+  });
+
+  detail.events.forEach((event) => {
+    if (event.kind.startsWith("approval.")) {
       return;
     }
     if (event.kind === "step.retrying") {
