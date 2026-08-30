@@ -20,17 +20,36 @@
 
 已验证：
 
-- `pytest tests/unit/runtime/test_failure_reason.py tests/unit/runs/test_failure_reason.py tests/unit/runs/test_repository_public_payload.py tests/contracts/test_runtime_contract.py tests/api/test_admin_resources.py -q`：226 passed。
+- `pytest tests/unit/runtime/test_failure_reason.py tests/unit/runs/test_repository_public_payload.py tests/contracts/test_runtime_contract.py tests/api/test_admin_resources.py -q`：238 passed。
+- `pytest tests/unit/runtime/test_failure_reason.py tests/unit/runs/test_failure_reason.py tests/unit/runs/test_repository_public_payload.py tests/contracts/test_runtime_contract.py tests/api/test_admin_resources.py -q`：226 passed（追加细分分类前的首轮覆盖）。
 - `pytest tests/unit/runtime/test_hybrid.py tests/unit/runtime/crew/test_adapter_failure_reason.py tests/unit/runs/test_observer.py tests/unit/runs/test_terminal_hooks.py -q`：20 passed。
 - `ruff check` 覆盖本轮改动后端文件：passed。
 - `mypy` 覆盖本轮核心后端文件：passed。
 - `npm run lint`：passed。
 - `npm test -- --run src/pages/OperationalPages.test.tsx`：72 passed。
+- `npm run build`：passed，生成 `web/dist/assets/index-EjK5oq9c.js`。
+
+生产状态：
+
+- 已清理 `prod-web-01` 旧 release：保留 current 和最新 3 个，磁盘从 98% 降到 58%，部署后为 64%。
+- 已部署到 `prod-web-01`：`/opt/agent-hub/releases/20260830-204000-runtime-failure-diagnostics`，`/opt/agent-hub/current` 已指向该 release。
+- 服务状态：`agent-hub-api`、`agent-hub-worker`、`caddy` 均为 active。
+- 生产健康检查：`curl http://127.0.0.1:8000/health` 返回 `{"status":"ok"}`。
+- 生产专项探针：在服务器导入 `runtime_failure_diagnostic_from_reason("model gateway failed: model transport failed (status=401)")`，返回 `error_code=model.provider_auth_failed`、`error_category=authentication`、`retryable=False`。
+- 前端生产 bundle 探针：`web/dist/assets/index-EjK5oq9c.js` 包含“失败诊断”。
+
+Git 状态：
+
+- 已提交并推送到 `zhangzhimiao1994/CubeAgent.git` 的 `codex/mofang-continuation` 分支，最新 HEAD 为 `9f759193b2f7e507bc2d06baceb7c7f51562a64c`。
+- 相关提交：
+  - `18fb1b4 Add structured runtime failure diagnostics`
+  - `127f1fe Expand runtime failure categories`
+  - `9f75919 Localize runtime failure diagnostics`
+- GitHub combined status 和 commit workflow runs 对 `9f75919` 均返回空列表，表示该仓库/分支当前没有可读取的触发检查。
 
 未完成/注意：
 
 - `tests/integration/runtime/test_hybrid_runtime.py` 在本机因测试 PostgreSQL 端口未就绪超时，9 个 setup errors；不是业务断言失败。需要有本地集成测试数据库或 Docker 测试环境后再跑。
-- 本轮还未提交/推送/部署；后续如继续交付，需要提交后推送并检查 GitHub checks。
 
 ## 当前目标口径
 
