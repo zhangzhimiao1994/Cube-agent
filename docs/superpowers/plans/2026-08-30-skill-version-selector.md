@@ -169,14 +169,32 @@ Chat composer Skill install now handles the same `409 skill_version_choice_requi
 
 Run targeted backend/frontend tests, ruff, mypy, frontend lint/build, and `git diff --check`.
 
-- [ ] **Step 2: Commit and push**
+- [x] **Step 2: Commit and push**
 
 Commit with repository identity, push to GitHub, then check GitHub Actions until green.
 
-- [ ] **Step 3: Deploy to `prod-web-01`**
+- Completed commits:
+  - `a2cf1b3 Prompt chat skill upload version choice`
+  - `799e722 Expose skill upload strategy in OpenAPI`
+- GitHub Actions:
+  - `33309084699` for `a2cf1b3` -> success.
+  - `33309489572` for `799e722` -> success.
+
+- [x] **Step 3: Deploy to `prod-web-01`**
 
 Deploy release, verify `/health`, services, and the Skills API response shape.
 
-- [ ] **Step 4: Production validation**
+- Current production release:
+  - `/opt/agent-hub/releases/20260830-194500-skill-upload-strategy-schema`
+  - `agent-hub-api`, `agent-hub-worker`, and `caddy` active.
+  - `/health` returned `{"status":"ok"}`.
+
+- [x] **Step 4: Production validation**
 
 Confirm production skill main list count equals unique names, duplicate historical rows appear only inside `versions`, and no destructive deletion is needed for this pass.
+
+- OpenAPI probe confirmed `SkillResponse` exposes `current_version_id`, `versions`, `source_filename`, `package_version_id`, and `content_sha256`; upload exposes the `strategy` query parameter; activation endpoint returns `SkillResponse`.
+- Runtime model probe confirmed the deployed `SkillResponse` has the version fields.
+- Frontend bundle probe confirmed the chat upload choice markers are present.
+- Production DB read-only summary confirmed 446 raw skill rows, 104 unique skill names, 94 duplicate name groups, and 342 historical version rows. These historical rows are retained for secondary version selection; no destructive DB cleanup was performed.
+- Deployment temporary files and release dist backups created by this pass were removed after verification.
