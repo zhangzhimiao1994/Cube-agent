@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 
 import { api, formatApiError, type RunDetail } from "../api/client";
+import { ArtifactFileCard, hasArtifactDownload } from "../components/ArtifactFileCard";
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
 const MANUAL_RUN_MODES = [
@@ -264,7 +265,13 @@ export function RunDetailPage() {
           <ul>
             {run.data.artifacts.map((artifact) => (
               <li key={artifact.id}>
-                {artifact.kind}：{artifact.title}
+                {hasArtifactDownload(artifact) ? (
+                  <ArtifactFileCard artifact={artifact} compact />
+                ) : (
+                  <>
+                    {artifact.kind}：{artifact.title}
+                  </>
+                )}
               </li>
             ))}
           </ul>

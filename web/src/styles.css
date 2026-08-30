@@ -1876,6 +1876,107 @@ article:hover {
   white-space: pre-wrap;
 }
 
+.artifact-file-card,
+.agent-workforce-activity .artifact-file-card {
+  align-items: center;
+  background: rgba(3, 10, 20, 0.38);
+  border: 1px solid rgba(123, 225, 255, 0.16);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.55rem;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  margin-top: 0.65rem;
+  max-width: min(34rem, 100%);
+  padding: 0.55rem 0.65rem;
+}
+
+.artifact-file-card-compact,
+.agent-workforce-activity .artifact-file-card-compact {
+  margin-top: 0.35rem;
+  max-width: 100%;
+  padding: 0.48rem 0.55rem;
+}
+
+.artifact-file-icon {
+  align-items: center;
+  background: rgba(85, 215, 255, 0.1);
+  border: 1px solid rgba(85, 215, 255, 0.2);
+  border-radius: 6px;
+  color: var(--accent);
+  display: inline-flex;
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.64rem;
+  font-weight: 950;
+  height: 2rem;
+  justify-content: center;
+  letter-spacing: 0;
+  width: 2.45rem;
+}
+
+.artifact-file-main {
+  display: grid;
+  gap: 0.12rem;
+  min-width: 0;
+}
+
+.artifact-file-main strong {
+  color: var(--text);
+  font-size: 0.92rem;
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.artifact-file-main small,
+.agent-workforce-activity .artifact-file-main small {
+  background: transparent;
+  border: 0;
+  color: rgba(178, 194, 216, 0.74);
+  font-size: 0.72rem;
+  font-weight: 800;
+  overflow: hidden;
+  padding: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.artifact-file-meta {
+  display: flex;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.artifact-file-meta span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.artifact-file-meta span:not(:last-child)::after {
+  color: rgba(178, 194, 216, 0.44);
+  content: "/";
+  margin-left: 0.35rem;
+}
+
+.artifact-file-card a {
+  background: rgba(85, 215, 255, 0.12);
+  border: 1px solid rgba(85, 215, 255, 0.26);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 0.82rem;
+  font-weight: 900;
+  padding: 0.42rem 0.68rem;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.artifact-file-card a:hover,
+.artifact-file-card a:focus-visible {
+  background: rgba(85, 215, 255, 0.2);
+  border-color: rgba(85, 215, 255, 0.42);
+}
+
 .agent-workforce-activity time,
 .agent-workforce-empty {
   color: rgba(178, 194, 216, 0.72);

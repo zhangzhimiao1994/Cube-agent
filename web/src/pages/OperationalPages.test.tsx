@@ -1134,6 +1134,42 @@ describe("operational management pages", () => {
     expect(screen.getByText(/来源：step\.failed #4/)).not.toBeNull();
     expect(screen.queryByText("null")).toBeNull();
   });
+
+  it("offers artifact downloads on the run detail page", async () => {
+    visibleRunDetail = {
+      ...runDetail,
+      artifacts: [
+        {
+          id: "33333333-3333-4333-8333-333333333333",
+          kind: "docx",
+          title: "执行报告",
+          text: null,
+          filename: "run-report.docx",
+          mime_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          size_bytes: 2048,
+          sha256: "0f4d0c8d0e4d9d3a0a6a8e2e4b7a6c1d8e9f0a1b2c3d4e5f67890123456789cd",
+          download_url:
+            "/api/v1/admin/runs/22222222-2222-4222-8222-222222222222/artifacts/33333333-3333-4333-8333-333333333333/download",
+        } as RunDetail["artifacts"][number] & {
+          filename: string;
+          mime_type: string;
+          size_bytes: number;
+          sha256: string;
+          download_url: string;
+        },
+      ],
+    };
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    expect(await screen.findByRole("heading", { name: "运行详情" })).not.toBeNull();
+    const download = screen.getByRole("link", { name: /下载 run-report\.docx/ });
+    expect(download.getAttribute("href")).toBe(
+      "/api/v1/admin/runs/22222222-2222-4222-8222-222222222222/artifacts/33333333-3333-4333-8333-333333333333/download",
+    );
+    expect(screen.getByText("2 KB")).not.toBeNull();
+  });
+
   it("stops the current running chat from the conversation composer", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
@@ -1339,6 +1375,70 @@ describe("operational management pages", () => {
     const stream = screen.getByRole("region", { name: "主对话内容" });
     expect(within(stream).getAllByText(/这是最终回复正文/).length).toBeGreaterThan(0);
     expect(within(stream).queryByText("产物：短视频脚本")).toBeNull();
+  });
+
+  it("shows downloadable run artifacts as compact file cards in the main chat and process drawer", async () => {
+    const user = userEvent.setup();
+    const fileArtifact = {
+      id: "33333333-3333-4333-8333-333333333333",
+      kind: "docx",
+      title: "短视频脚本成稿",
+      text: null,
+      filename: "short-video-script.docx",
+      mime_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      size_bytes: 18432,
+      sha256: "8f4d0c8d0e4d9d3a0a6a8e2e4b7a6c1d8e9f0a1b2c3d4e5f67890123456789ab",
+      download_url:
+        "/api/v1/admin/runs/22222222-2222-4222-8222-222222222222/artifacts/33333333-3333-4333-8333-333333333333/download",
+    } as RunDetail["artifacts"][number] & {
+      filename: string;
+      mime_type: string;
+      size_bytes: number;
+      sha256: string;
+      download_url: string;
+    };
+    visibleRunDetail = {
+      ...runDetail,
+      status: "completed",
+      events: [
+        {
+          ...runDetail.events[2],
+          payload: { artifact_id: fileArtifact.id },
+          artifact: fileArtifact,
+        },
+      ],
+      artifacts: [
+        {
+          id: "artifact-final-reply",
+          kind: "markdown",
+          title: "回复",
+          text: "脚本已经生成，文件见附件。",
+        },
+        fileArtifact,
+      ],
+      explicit_details: {
+        ...runDetail.explicit_details,
+        selected_agent_ids: "copywriter",
+      },
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const chatDownload = within(stream).getByRole("link", { name: /下载 short-video-script\.docx/ });
+    expect(chatDownload.getAttribute("href")).toBe(fileArtifact.download_url);
+    expect(within(stream).getByText("docx")).not.toBeNull();
+    expect(within(stream).getAllByText("18 KB").length).toBeGreaterThan(0);
+
+    await user.click(within(stream).getByRole("button", { name: /文案生成 输出：短视频脚本成稿/ }));
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    const drawerDownloads = within(drawer).getAllByRole("link", { name: /下载 short-video-script\.docx/ });
+    expect(drawerDownloads.length).toBeGreaterThan(0);
+    expect(drawerDownloads.every((link) => link.getAttribute("href") === fileArtifact.download_url)).toBe(true);
   });
 
   it("renders markdown tables inside assistant chat replies as real tables", async () => {

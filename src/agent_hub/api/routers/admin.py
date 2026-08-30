@@ -3622,11 +3622,11 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
     async def _run_detail(self, record: RunRecord) -> RunDetailResponse:
         assert self._run_repository is not None
         list_item = await self._run_list_item(record)
-        events = await self._run_repository.events(self._tenant_id, record.id)
+        events = await self._admin_run_events(record.id)
         artifacts = await self._admin_run_artifacts(record.id)
         return RunDetailResponse(
             **list_item.model_dump(),
-            events=[_admin_run_event(event) for event in events],
+            events=[_admin_run_event(event, run_id=record.id) for event in events],
             artifacts=[_admin_run_artifact(artifact, run_id=record.id) for artifact in artifacts],
             explicit_details={
                 "source": "database",
@@ -3646,6 +3646,13 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         if callable(raw_artifacts):
             return cast(tuple[dict[str, object], ...], await raw_artifacts(self._tenant_id, run_id))
         return await self._run_repository.artifacts(self._tenant_id, run_id)
+
+    async def _admin_run_events(self, run_id: UUID) -> tuple[dict[str, object], ...]:
+        assert self._run_repository is not None
+        raw_events = getattr(self._run_repository, "raw_events", None)
+        if callable(raw_events):
+            return cast(tuple[dict[str, object], ...], await raw_events(self._tenant_id, run_id))
+        return await self._run_repository.events(self._tenant_id, run_id)
 
     async def list_models(self) -> tuple[ModelDeploymentResponse, ...]:
         revision = await self._config_service.get_current(self._tenant_id)
@@ -6351,7 +6358,11 @@ def _channel_error_logs_from_environment() -> tuple[LogEntryResponse, ...]:
     return _channel_error_logs_from_configuration({})
 
 
-def _admin_run_event(event: dict[str, object]) -> RunEventResponse:
+def _admin_run_event(
+    event: dict[str, object],
+    *,
+    run_id: UUID | None = None,
+) -> RunEventResponse:
     sequence = event.get("sequence")
     kind = event.get("kind")
     message = event.get("reason") or event.get("message") or kind
@@ -6369,7 +6380,7 @@ def _admin_run_event(event: dict[str, object]) -> RunEventResponse:
         action=_optional_event_string(event.get("action")),
         decision=_optional_event_string(event.get("decision")),
         payload=_event_payload(payload),
-        artifact=_admin_run_artifact(artifact) if isinstance(artifact, dict) else None,
+        artifact=_admin_run_artifact(artifact, run_id=run_id) if isinstance(artifact, dict) else None,
     )
 
 
@@ -6384,6 +6395,7 @@ _SENSITIVE_EVENT_DETAIL_KEYS = frozenset(
         "password",
         "secret",
         "secret_ref",
+        "storage_key",
         "token",
     }
 )

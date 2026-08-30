@@ -269,3 +269,13 @@
 - OpenClaw 后续应作为系统级功能开关管理，默认关闭，由管理员显式开启。
 - OpenClaw 开启项至少要包含：允许操作范围、会话超时、人工确认策略、审计级别、紧急停止行为。
 - OpenClaw 底层应是受控长会话/session provider，具备 start/pause/resume/stop/audit/permission/timeout/emergency-stop；对 Agent 暴露时可以是 tool-call 风格能力，但生命周期和电脑控制状态不能塞进 main Agent 核心。
+
+## 2026-08-30 Phase18 Task5 Frontend File Delivery Handoff
+
+- Scope: frontend display for generated run artifacts with download metadata.
+- Changed: `web/src/api/client.ts` now preserves artifact `filename`, `mime_type`, `size_bytes`, `sha256`, and `download_url` on both run artifact lists and event-embedded artifacts.
+- Changed: added shared `web/src/components/ArtifactFileCard.tsx`; `RunsPage` renders downloadable artifact cards in the main chat and process drawer, and `RunDetailPage` renders the same download entry in the artifact list.
+- Changed: `web/src/styles.css` contains compact file-card styling with desktop-first layout and natural mobile wrapping.
+- Tests: added Vitest coverage in `web/src/pages/OperationalPages.test.tsx` for main chat download href, process drawer download href, and run detail download href/size display.
+- Verification: `npm test -- OperationalPages.test.tsx --run` passed with 70 tests; `npm run lint` passed via `tsc -p tsconfig.json --noEmit`.
+- Notes: no Docker/WSL work was used for this task. Other agents had concurrent backend/admin changes in the worktree; this task did not modify or revert them.

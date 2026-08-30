@@ -658,6 +658,18 @@ class RunRepository:
             ).all()
             return tuple(_public_event_payload(dict(row.payload)) for row in rows)
 
+    async def raw_events(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
+        async with self._session_factory() as session:
+            await self._assert_run(session, tenant_id, run_id)
+            rows = (
+                await session.scalars(
+                    select(RunEventRow)
+                    .where(RunEventRow.tenant_id == tenant_id, RunEventRow.run_id == run_id)
+                    .order_by(RunEventRow.sequence)
+                )
+            ).all()
+            return tuple(dict(row.payload) for row in rows)
+
     async def completed_step_ids(self, tenant_id: UUID, run_id: UUID) -> tuple[str, ...]:
         async with self._session_factory() as session:
             rows = (

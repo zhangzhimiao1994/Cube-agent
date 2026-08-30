@@ -4,6 +4,7 @@ import { Link } from "react-router-dom";
 
 import { ApiError, api, formatApiError, type AttachmentUpload, type ModelDeployment, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
+import { ArtifactFileCard, hasArtifactDownload } from "../components/ArtifactFileCard";
 
 const RUN_MODES = [
   { value: "auto", label: "自动", description: "主 Agent 判断应使用直连、派单、讨论或混合；不确定时向你确认。" },
@@ -303,6 +304,13 @@ function formatEventPayloadValue(value: unknown): string {
 
 type RunEvent = RunDetail["events"][number];
 type RunArtifact = RunDetail["artifacts"][number];
+type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  title: string;
+  body: string;
+  artifact?: RunArtifact | NonNullable<RunEvent["artifact"]>;
+};
 
 function isGenericArtifactText(value: string | null | undefined) {
   const normalized = value?.replace(/\s+/g, " ").trim();
@@ -686,17 +694,17 @@ function temporaryAgentApprovalBody(proposal: TemporaryAgentProposal) {
   ].join("\n\n");
 }
 
-function detailMessages(detail: RunDetail | undefined) {
+function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
   if (!detail) return [];
   const textArtifacts = dedupeTextArtifacts(detail.artifacts);
   const replyArtifact = preferredReplyArtifact(textArtifacts);
   const internalNotice = internalArtifactNotice(detail);
   const failureReason = failureReasonFromEvents(detail.events);
-  const artifactMessages = replyArtifact
+  const replyMessages = replyArtifact
     ? [
         {
           id: `artifact-${replyArtifact.id}`,
-          role: "assistant",
+          role: "assistant" as const,
           title: "回复",
           body:
             textArtifacts.length > 1
@@ -704,22 +712,37 @@ function detailMessages(detail: RunDetail | undefined) {
                   textArtifacts.length - 1
                 } 条角色产物，可点“查看运行详情”查看。）`
               : replyArtifact.text?.trim() ?? "",
+          artifact: hasArtifactDownload(replyArtifact) ? replyArtifact : undefined,
         },
       ]
+    : [];
+  const downloadableMessages = detail.artifacts
+    .filter((artifact) => hasArtifactDownload(artifact) && artifact.id !== replyArtifact?.id)
+    .map((artifact) => ({
+      id: `artifact-${artifact.id}`,
+      role: "assistant" as const,
+      title: `附件：${artifact.title}`,
+      body: "",
+      artifact,
+    }));
+  const fallbackArtifactMessages = replyArtifact
+    ? []
     : detail.artifacts
         .filter((artifact) => !artifact.text?.trim())
         .map((artifact) => ({
           id: `artifact-${artifact.id}`,
-          role: "assistant",
+          role: "assistant" as const,
           title: `附件：${artifact.title}`,
-          body: artifact.kind,
+          body: hasArtifactDownload(artifact) ? "" : artifact.kind,
+          artifact: hasArtifactDownload(artifact) ? artifact : undefined,
         }));
+  const artifactMessages = [...replyMessages, ...downloadableMessages, ...fallbackArtifactMessages];
   const failureMessages =
     detail.status === "failed"
       ? [
           {
             id: "failed",
-            role: "assistant",
+            role: "assistant" as const,
             title: artifactMessages.length > 0 ? "运行中断" : "运行失败",
             body:
               artifactMessages.length > 0
@@ -733,7 +756,7 @@ function detailMessages(detail: RunDetail | undefined) {
   return [
     {
       id: "request",
-      role: "user",
+      role: "user" as const,
       title: "你",
       body: detail.request,
     },
@@ -741,7 +764,7 @@ function detailMessages(detail: RunDetail | undefined) {
       ? [
           {
             id: `${detail.id}-temporary-agent-approval`,
-            role: "assistant",
+            role: "assistant" as const,
             title: detail.temporary_agent_proposal.name,
             body: temporaryAgentApprovalBody(detail.temporary_agent_proposal),
           },
@@ -751,7 +774,7 @@ function detailMessages(detail: RunDetail | undefined) {
       ? [
           {
             id: `${detail.id}-schedule-approval`,
-            role: "assistant",
+            role: "assistant" as const,
             title: "计划任务确认",
             body: scheduleProposalBody(detail.schedule_proposal),
           },
@@ -761,7 +784,7 @@ function detailMessages(detail: RunDetail | undefined) {
       ? [
           {
             id: `${detail.id}-evolution-approval`,
-            role: "assistant",
+            role: "assistant" as const,
             title: "进化任务确认",
             body: evolutionProposalBody(detail.evolution_proposal),
           },
@@ -771,12 +794,13 @@ function detailMessages(detail: RunDetail | undefined) {
       ? [
           {
             id: `${detail.id}-openclaw-approval`,
-            role: "assistant",
+            role: "assistant" as const,
             title: "OpenClaw 操作确认",
             body: openClawProposalBody(detail.openclaw_proposal),
           },
         ]
-      : []),    ...(internalNotice ? [internalNotice] : []),
+      : []),
+    ...(internalNotice ? [internalNotice] : []),
     ...artifactMessages,
     ...failureMessages,
   ];
@@ -885,7 +909,7 @@ function mergeConversationRuns(previous: RunDetail[] | undefined, incoming: RunD
   return merged;
 }
 
-function internalArtifactNotice(detail: RunDetail) {
+function internalArtifactNotice(detail: RunDetail): ChatMessage | null {
   const textArtifacts = dedupeTextArtifacts(detail.artifacts);
   if (textArtifacts.length === 0) return null;
   if (preferredReplyArtifact(textArtifacts)) return null;
@@ -1748,6 +1772,7 @@ function AgentActivityList({
               ))}
             </dl>
           ) : null}
+          {hasArtifactDownload(activity.artifact) ? <ArtifactFileCard artifact={activity.artifact} compact /> : null}
           {activity.createdAt ? <time dateTime={activity.createdAt}>{activity.createdAt}</time> : null}
         </article>
       ))}
@@ -3149,6 +3174,7 @@ export function RunsPage() {
                   <span className="eyebrow">{item.role === "user" ? "你" : APP_BRAND_NAME}</span>
                   <h3>{item.title}</h3>
                   <MessageBody text={item.body} title={item.title} />
+                  {hasArtifactDownload(item.artifact) ? <ArtifactFileCard artifact={item.artifact} /> : null}
                 </article>
                 {item.id.endsWith("-request") && item.run ? (
                   <RunProcessSummary

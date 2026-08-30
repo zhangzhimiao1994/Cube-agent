@@ -1444,9 +1444,27 @@ def _client_with_file_artifact(
         async def events(
             self, tenant_id: UUID, requested_run_id: UUID
         ) -> tuple[dict[str, object], ...]:
+            return ()
+
+        async def raw_events(
+            self, tenant_id: UUID, requested_run_id: UUID
+        ) -> tuple[dict[str, object], ...]:
             assert tenant_id == TENANT_ID
             assert requested_run_id == run_id
-            return ()
+            return (
+                {
+                    "sequence": 1,
+                    "kind": "artifact.created",
+                    "message": "file generated",
+                    "payload": {"file": {"storage_key": file_metadata["storage_key"]}},
+                    "artifact": {
+                        "id": str(outer_artifact_id),
+                        "type": "tool_result",
+                        "producer": "document.generate_docx",
+                        "content": {"result": {"file": file_metadata}},
+                    },
+                },
+            )
 
         async def artifacts(
             self, tenant_id: UUID, requested_run_id: UUID
@@ -2892,6 +2910,50 @@ def test_admin_run_artifact_ignores_invalid_file_metadata() -> None:
     assert artifact.download_url is None
 
 
+def test_admin_run_event_exposes_download_url_for_embedded_file_artifact() -> None:
+    event = _admin_run_event(
+        {
+            "sequence": 2,
+            "kind": "artifact.created",
+            "message": "file generated",
+            "artifact": {
+                "id": "55555555-5555-4555-8555-555555555555",
+                "type": "tool_result",
+                "producer": "presentation.generate_pptx",
+                "content": {
+                    "result": {
+                        "file": {
+                            "artifact_id": "33333333-3333-4333-8333-333333333333",
+                            "filename": "launch-deck.pptx",
+                            "mime_type": (
+                                "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                            ),
+                            "size_bytes": 4096,
+                            "sha256": "d" * 64,
+                            "storage_key": (
+                                "00000000-0000-4000-8000-000000000001/"
+                                "22222222-2222-4222-8222-222222222222/"
+                                "33333333-3333-4333-8333-333333333333/launch-deck.pptx"
+                            ),
+                            "download_url": "https://attacker.example/download",
+                        }
+                    }
+                },
+            },
+        },
+        run_id=UUID("22222222-2222-4222-8222-222222222222"),
+    )
+
+    assert event.artifact is not None
+    assert event.artifact.filename == "launch-deck.pptx"
+    assert (
+        event.artifact.download_url
+        == "/api/v1/admin/runs/22222222-2222-4222-8222-222222222222/"
+        "artifacts/33333333-3333-4333-8333-333333333333/download"
+    )
+    assert "storage_key" not in event.artifact.model_dump(exclude_none=True)
+
+
 def test_admin_run_artifact_download_returns_stored_file(tmp_path: Path) -> None:
     run_id = UUID("22222222-2222-4222-8222-222222222222")
     artifact_id = UUID("33333333-3333-4333-8333-333333333333")
@@ -2918,6 +2980,40 @@ def test_admin_run_artifact_download_returns_stored_file(tmp_path: Path) -> None
     assert response.content == data
     assert response.headers["content-type"].startswith(metadata.mime_type)
     assert "report.docx" in response.headers["content-disposition"]
+
+
+def test_admin_run_detail_hydrates_embedded_event_file_artifact_from_raw_events(
+    tmp_path: Path,
+) -> None:
+    run_id = UUID("22222222-2222-4222-8222-222222222222")
+    artifact_id = UUID("33333333-3333-4333-8333-333333333333")
+    outer_artifact_id = UUID("55555555-5555-4555-8555-555555555555")
+    metadata = GeneratedFileStore(tmp_path).store_bytes(
+        tenant_id=TENANT_ID,
+        run_id=run_id,
+        artifact_id=artifact_id,
+        filename="report.docx",
+        mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        data=b"docx-bytes",
+    )
+    file_metadata = metadata.to_content_file()
+    file_metadata["artifact_id"] = str(artifact_id)
+    api = _client_with_file_artifact(tmp_path, run_id, outer_artifact_id, file_metadata)
+
+    response = api.get(f"/api/v1/admin/runs/{run_id}", headers=headers())
+
+    assert response.status_code == 200
+    payload = response.json()
+    embedded_artifact = payload["events"][0]["artifact"]
+    assert embedded_artifact["id"] == str(outer_artifact_id)
+    assert embedded_artifact["filename"] == "report.docx"
+    assert (
+        embedded_artifact["download_url"]
+        == "/api/v1/admin/runs/22222222-2222-4222-8222-222222222222/"
+        "artifacts/33333333-3333-4333-8333-333333333333/download"
+    )
+    assert "storage_key" not in embedded_artifact
+    assert metadata.storage_key not in response.text
 
 
 def test_admin_run_artifact_download_rejects_storage_key_from_other_artifact(

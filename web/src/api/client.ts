@@ -589,6 +589,18 @@ const SubmittedRunSchema = z.object({
 
 export type SubmittedRun = z.infer<typeof SubmittedRunSchema>;
 
+const RunArtifactSchema = z.object({
+  id: z.string(),
+  kind: z.string(),
+  title: z.string(),
+  text: z.string().nullable().optional(),
+  filename: z.string().nullable().optional(),
+  mime_type: z.string().nullable().optional(),
+  size_bytes: z.number().nullable().optional(),
+  sha256: z.string().nullable().optional(),
+  download_url: z.string().nullable().optional(),
+});
+
 const RunEventSchema = z.object({
   sequence: z.number(),
   kind: z.string(),
@@ -601,22 +613,7 @@ const RunEventSchema = z.object({
   action: z.string().nullable().optional(),
   decision: z.string().nullable().optional(),
   payload: z.record(z.string(), z.unknown()).default({}),
-  artifact: z
-    .object({
-      id: z.string(),
-      kind: z.string(),
-      title: z.string(),
-      text: z.string().nullable().optional(),
-    })
-    .nullable()
-    .optional(),
-});
-
-const RunArtifactSchema = z.object({
-  id: z.string(),
-  kind: z.string(),
-  title: z.string(),
-  text: z.string().nullable().optional(),
+  artifact: RunArtifactSchema.nullable().optional(),
 });
 
 const RunDetailSchema = RunListItemSchema.extend({
