@@ -1731,7 +1731,7 @@ describe("operational management pages", () => {
     });
   });
 
-  it("places generated downloads on artifacts without repeating run status in chat", async () => {
+  it("keeps step generated downloads inside the producing agent drawer", async () => {
     const user = userEvent.setup();
     visibleRunDetail = {
       ...runDetail,
@@ -1746,6 +1746,7 @@ describe("operational management pages", () => {
           size_bytes: 4096,
           sha256: "a".repeat(64),
           download_url: `/api/v1/admin/runs/${runId}/artifacts/artifact-final-docx/download`,
+          presentation: "step_detail",
         },
       ],
       events: [
@@ -1769,6 +1770,7 @@ describe("operational management pages", () => {
             size_bytes: 4096,
             sha256: "a".repeat(64),
             download_url: `/api/v1/admin/runs/${runId}/artifacts/artifact-final-docx/download`,
+            presentation: "step_detail",
           },
           payload: {
             artifact_id: "artifact-final-docx",
@@ -1786,13 +1788,44 @@ describe("operational management pages", () => {
     const stream = screen.getByRole("region", { name: "主对话内容" });
 
     expect(within(stream).queryByRole("status", { name: /任务态势/ })).toBeNull();
-    const chatDownload = within(stream).getByRole("link", { name: /下载 delivery-plan\.docx/ });
-    expect(chatDownload.getAttribute("href")).toBe(`/api/v1/admin/runs/${runId}/artifacts/artifact-final-docx/download`);
+    expect(within(stream).queryByRole("link", { name: /下载 delivery-plan\.docx/ })).toBeNull();
     expect(within(stream).queryByRole("link", { name: "查看运行详情" })).toBeNull();
 
     await user.click(within(stream).getByRole("button", { name: /文案生成 输出：生成交付文档/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     expect(within(drawer).getByRole("link", { name: /下载 delivery-plan\.docx/ })).not.toBeNull();
+  });
+
+  it("shows final generated downloads as chat attachments", async () => {
+    const user = userEvent.setup();
+    visibleRunDetail = {
+      ...runDetail,
+      artifacts: [
+        {
+          id: "artifact-final-docx",
+          kind: "tool_result",
+          title: "交付文档",
+          text: null,
+          filename: "delivery-plan.docx",
+          mime_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          size_bytes: 4096,
+          sha256: "a".repeat(64),
+          download_url: `/api/v1/admin/runs/${runId}/artifacts/artifact-final-docx/download`,
+          presentation: "final_attachment",
+        },
+      ],
+      events: runDetail.events,
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+
+    const chatDownload = within(stream).getByRole("link", { name: /下载 delivery-plan\.docx/ });
+    expect(chatDownload.getAttribute("href")).toBe(`/api/v1/admin/runs/${runId}/artifacts/artifact-final-docx/download`);
   });
 
   it("keeps live adjustment and temporary-agent switches out of workflow configuration", async () => {

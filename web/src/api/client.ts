@@ -629,6 +629,7 @@ const RunEventSchema = z.object({
       size_bytes: z.number().nullable().optional(),
       sha256: z.string().nullable().optional(),
       download_url: z.string().nullable().optional(),
+      presentation: z.string().nullable().optional(),
     })
     .nullable()
     .optional(),
@@ -644,6 +645,7 @@ const RunArtifactSchema = z.object({
   size_bytes: z.number().nullable().optional(),
   sha256: z.string().nullable().optional(),
   download_url: z.string().nullable().optional(),
+  presentation: z.string().nullable().optional(),
 });
 
 const FailureDiagnosticSchema = z.object({

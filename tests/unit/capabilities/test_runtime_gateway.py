@@ -117,6 +117,7 @@ async def test_runtime_gateway_generates_docx_file_artifact(tmp_path: Path) -> N
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
     assert file_payload["size_bytes"] > 0
+    assert result["presentation"] == "step_detail"
     assert gateway.is_available(TENANT_ID, "document.generate_docx") is True
     stored_path = (
         generated_dir
@@ -154,6 +155,7 @@ async def test_runtime_gateway_generates_pptx_file_artifact(tmp_path: Path) -> N
         "application/vnd.openxmlformats-officedocument.presentationml.presentation"
     )
     assert file_payload["size_bytes"] > 0
+    assert result["presentation"] == "step_detail"
     assert gateway.is_available(TENANT_ID, "presentation.generate_pptx") is True
     stored_path = (
         generated_dir
@@ -163,6 +165,27 @@ async def test_runtime_gateway_generates_pptx_file_artifact(tmp_path: Path) -> N
         / "launch-review.pptx"
     )
     assert stored_path.is_file()
+
+
+async def test_runtime_gateway_keeps_explicit_final_file_presentation(tmp_path: Path) -> None:
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=tmp_path / "generated",
+    )
+
+    result = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="final_synthesizer",
+        name="document.generate_docx",
+        arguments={
+            "title": "Delivery Plan",
+            "presentation": "final_attachment",
+        },
+        idempotency_key="docx_final",
+    )
+
+    assert result["presentation"] == "final_attachment"
 
 
 async def test_runtime_gateway_read_context_accepts_query_without_workspace(tmp_path: Path) -> None:

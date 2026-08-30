@@ -3425,6 +3425,56 @@ def test_admin_run_artifact_exposes_safe_generated_file_metadata() -> None:
     assert "storage_key" not in artifact.model_dump_json()
 
 
+def test_admin_run_artifact_defaults_step_generated_file_to_step_detail() -> None:
+    run_id = UUID("33333333-3333-4333-8333-333333333333")
+    artifact_id = UUID("44444444-4444-4444-8444-444444444444")
+    artifact = _admin_run_artifact(
+        {
+            "id": str(artifact_id),
+            "type": "tool_result",
+            "producer": "document_writer",
+            "content": {
+                "result": {
+                    "file": {
+                        "artifact_id": str(artifact_id),
+                        "filename": "draft-plan.docx",
+                        "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    }
+                },
+                "step_id": "draft-doc",
+            },
+        },
+        run_id=run_id,
+    )
+
+    assert artifact.presentation == "step_detail"
+
+
+def test_admin_run_artifact_keeps_explicit_final_attachment_presentation() -> None:
+    run_id = UUID("33333333-3333-4333-8333-333333333333")
+    artifact_id = UUID("44444444-4444-4444-8444-444444444444")
+    artifact = _admin_run_artifact(
+        {
+            "id": str(artifact_id),
+            "type": "tool_result",
+            "producer": "final_synthesizer",
+            "content": {
+                "result": {
+                    "file": {
+                        "artifact_id": str(artifact_id),
+                        "filename": "delivery-plan.docx",
+                        "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    }
+                },
+                "presentation": "final_attachment",
+            },
+        },
+        run_id=run_id,
+    )
+
+    assert artifact.presentation == "final_attachment"
+
+
 @pytest.mark.parametrize(
     ("filename", "mime_type", "data"),
     [
@@ -3432,6 +3482,11 @@ def test_admin_run_artifact_exposes_safe_generated_file_metadata() -> None:
             "delivery-plan.docx",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             b"docx-bytes",
+        ),
+        (
+            "launch-review.pptx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            b"pptx-bytes",
         ),
         ("chart.png", "image/png", b"\x89PNG\r\n\x1a\n"),
         ("bundle.zip", "application/zip", b"PK\x03\x04"),
@@ -3481,6 +3536,208 @@ def test_download_run_artifact_rejects_mime_extension_mismatch(tmp_path: Path) -
     )
 
     assert response.status_code == 404
+
+
+def _completed_run_record(run_id: UUID) -> RunRecord:
+    return RunRecord(
+        id=run_id,
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        request="Generate a file.",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.COMPLETED,
+        version=1,
+        created_at=datetime.now(UTC),
+        routing_decision={},
+    )
+
+
+class GeneratedArtifactRunRepository:
+    def __init__(self, run_id: UUID, artifacts: tuple[dict[str, object], ...]) -> None:
+        self.run_id = run_id
+        self.artifacts_payload = artifacts
+
+    async def get(self, tenant_id: UUID, run_id: UUID) -> RunRecord:
+        assert tenant_id == TENANT_ID
+        if run_id != self.run_id:
+            raise KeyError(run_id)
+        return _completed_run_record(run_id)
+
+    async def raw_artifacts(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
+        assert tenant_id == TENANT_ID
+        assert run_id == self.run_id
+        return self.artifacts_payload
+
+
+@pytest.mark.asyncio
+async def test_persistent_download_matches_nested_generated_file_artifact_id(tmp_path: Path) -> None:
+    from agent_hub.files.generated import DOCX_MIME_TYPE, GeneratedFileStore
+
+    run_id = UUID("33333333-3333-4333-8333-333333333333")
+    wrapper_artifact_id = UUID("44444444-4444-4444-8444-444444444441")
+    file_artifact_id = UUID("44444444-4444-4444-8444-444444444442")
+    metadata = GeneratedFileStore(tmp_path).store_bytes(
+        TENANT_ID,
+        run_id,
+        file_artifact_id,
+        "delivery-plan.docx",
+        DOCX_MIME_TYPE,
+        b"docx-bytes",
+    )
+    service = PersistentAdminResourceService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        run_repository=GeneratedArtifactRunRepository(
+            run_id,
+            (
+                {
+                    "id": str(wrapper_artifact_id),
+                    "type": "tool_result",
+                    "producer": "writer",
+                    "content": {
+                        "result": {
+                            "file": {
+                                **metadata.to_public_dict(),
+                                "artifact_id": str(file_artifact_id),
+                            },
+                            "metadata": {
+                                **metadata.to_content_file(),
+                                "artifact_id": str(file_artifact_id),
+                            },
+                        }
+                    },
+                },
+            ),
+        ),  # type: ignore[arg-type]
+        generated_artifact_dir=tmp_path,
+    )
+
+    download = await service.download_run_artifact(run_id, file_artifact_id)
+
+    assert download.filename == "delivery-plan.docx"
+    assert download.mime_type == DOCX_MIME_TYPE
+    assert download.path.read_bytes() == b"docx-bytes"
+
+
+@pytest.mark.asyncio
+async def test_persistent_download_rejects_non_generated_artifacts(tmp_path: Path) -> None:
+    run_id = UUID("33333333-3333-4333-8333-333333333333")
+    artifact_id = UUID("44444444-4444-4444-8444-444444444442")
+    service = PersistentAdminResourceService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        run_repository=GeneratedArtifactRunRepository(
+            run_id,
+            (
+                {
+                    "id": str(artifact_id),
+                    "type": "text",
+                    "producer": "writer",
+                    "content": {"text": "not a generated file"},
+                },
+            ),
+        ),  # type: ignore[arg-type]
+        generated_artifact_dir=tmp_path,
+    )
+
+    with pytest.raises(KeyError):
+        await service.download_run_artifact(run_id, artifact_id)
+
+
+@pytest.mark.asyncio
+async def test_persistent_download_rejects_generated_files_without_storage_key(
+    tmp_path: Path,
+) -> None:
+    from agent_hub.files.generated import DOCX_MIME_TYPE
+
+    run_id = UUID("33333333-3333-4333-8333-333333333333")
+    artifact_id = UUID("44444444-4444-4444-8444-444444444442")
+    service = PersistentAdminResourceService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        run_repository=GeneratedArtifactRunRepository(
+            run_id,
+            (
+                {
+                    "id": str(artifact_id),
+                    "type": "tool_result",
+                    "producer": "writer",
+                    "content": {
+                        "result": {
+                            "file": {
+                                "artifact_id": str(artifact_id),
+                                "filename": "delivery-plan.docx",
+                                "mime_type": DOCX_MIME_TYPE,
+                            },
+                            "metadata": {
+                                "artifact_id": str(artifact_id),
+                                "filename": "delivery-plan.docx",
+                            },
+                        }
+                    },
+                },
+            ),
+        ),  # type: ignore[arg-type]
+        generated_artifact_dir=tmp_path,
+    )
+
+    with pytest.raises(KeyError):
+        await service.download_run_artifact(run_id, artifact_id)
+
+
+@pytest.mark.asyncio
+async def test_persistent_download_rejects_cross_context_storage_key(tmp_path: Path) -> None:
+    from agent_hub.files.generated import DOCX_MIME_TYPE, GeneratedFileStore
+
+    run_id = UUID("33333333-3333-4333-8333-333333333333")
+    requested_artifact_id = UUID("44444444-4444-4444-8444-444444444442")
+    stored_artifact_id = UUID("44444444-4444-4444-8444-444444444443")
+    metadata = GeneratedFileStore(tmp_path).store_bytes(
+        TENANT_ID,
+        run_id,
+        stored_artifact_id,
+        "delivery-plan.docx",
+        DOCX_MIME_TYPE,
+        b"docx-bytes",
+    )
+    service = PersistentAdminResourceService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        run_repository=GeneratedArtifactRunRepository(
+            run_id,
+            (
+                {
+                    "id": str(requested_artifact_id),
+                    "type": "tool_result",
+                    "producer": "writer",
+                    "content": {
+                        "result": {
+                            "file": {
+                                **metadata.to_public_dict(),
+                                "artifact_id": str(requested_artifact_id),
+                            },
+                            "metadata": {
+                                **metadata.to_content_file(),
+                                "artifact_id": str(requested_artifact_id),
+                            },
+                        }
+                    },
+                },
+            ),
+        ),  # type: ignore[arg-type]
+        generated_artifact_dir=tmp_path,
+    )
+
+    with pytest.raises(KeyError):
+        await service.download_run_artifact(run_id, requested_artifact_id)
 
 
 def test_conversation_can_be_loaded_by_session_id() -> None:

@@ -286,6 +286,7 @@ class RunArtifactResponse(BaseModel):
     size_bytes: int | None = Field(default=None, ge=0)
     sha256: str | None = None
     download_url: str | None = None
+    presentation: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3541,12 +3542,15 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         except RunNotFound:
             raise KeyError(run_id) from None
         metadata = _find_generated_file_metadata(artifacts, artifact_id)
-        path = self._generated_file_store.resolve_for(
-            self._tenant_id,
-            run_id,
-            artifact_id,
-            metadata["storage_key"],
-        )
+        try:
+            path = self._generated_file_store.resolve_for(
+                self._tenant_id,
+                run_id,
+                artifact_id,
+                metadata["storage_key"],
+            )
+        except (FileNotFoundError, ValueError):
+            raise KeyError(artifact_id) from None
         return GeneratedArtifactDownload(
             path=path,
             filename=metadata["filename"],
@@ -6973,6 +6977,7 @@ def _admin_run_artifact(
     size_bytes = file_metadata.get("size_bytes")
     sha256 = file_metadata.get("sha256")
     download_url = file_metadata.get("download_url")
+    presentation = _artifact_presentation(artifact, file_metadata=file_metadata)
     return RunArtifactResponse(
         id=artifact_id if type(artifact_id) is str and artifact_id else "artifact",
         kind=artifact_type if type(artifact_type) is str and artifact_type else "artifact",
@@ -6983,7 +6988,33 @@ def _admin_run_artifact(
         size_bytes=size_bytes if type(size_bytes) is int else None,
         sha256=sha256 if type(sha256) is str else None,
         download_url=download_url if type(download_url) is str else None,
+        presentation=presentation,
     )
+
+
+def _artifact_presentation(
+    artifact: Mapping[str, object], *, file_metadata: Mapping[str, str | int]
+) -> str | None:
+    content = artifact.get("content")
+    containers: list[Mapping[str, object]] = []
+    if isinstance(content, Mapping):
+        containers.append(content)
+        result = content.get("result")
+        if isinstance(result, Mapping):
+            containers.append(result)
+            file_payload = result.get("file")
+            if isinstance(file_payload, Mapping):
+                containers.append(file_payload)
+            metadata_payload = result.get("metadata")
+            if isinstance(metadata_payload, Mapping):
+                containers.append(metadata_payload)
+    for container in containers:
+        presentation = container.get("presentation")
+        if presentation in {"final_attachment", "step_detail", "diagnostic", "internal"}:
+            return presentation
+    if file_metadata:
+        return "step_detail"
+    return None
 
 
 def _artifact_file_metadata(
@@ -7021,26 +7052,44 @@ def _find_generated_file_metadata(
     artifacts: Iterable[Mapping[str, object]], artifact_id: UUID
 ) -> dict[str, str]:
     for artifact in artifacts:
-        if artifact.get("id") != str(artifact_id):
-            continue
         result = _artifact_result_content(artifact.get("content"))
         if result is None:
-            break
+            continue
         file_payload = result.get("file")
         metadata_payload = result.get("metadata")
         if not isinstance(file_payload, Mapping) or not isinstance(metadata_payload, Mapping):
-            break
+            continue
+        if str(artifact_id) not in _generated_file_artifact_ids(artifact, file_payload, metadata_payload):
+            continue
         filename = metadata_payload.get("filename", file_payload.get("filename"))
         mime_type = metadata_payload.get("mime_type", file_payload.get("mime_type"))
         storage_key = metadata_payload.get("storage_key")
         if type(filename) is not str or type(mime_type) is not str or type(storage_key) is not str:
-            break
+            continue
         return {
             "filename": validate_generated_filename(filename, mime_type),
             "mime_type": mime_type,
             "storage_key": storage_key,
         }
     raise KeyError(artifact_id)
+
+
+def _generated_file_artifact_ids(
+    artifact: Mapping[str, object],
+    file_payload: Mapping[str, object],
+    metadata_payload: Mapping[str, object],
+) -> set[str]:
+    ids: set[str] = set()
+    for value in (
+        artifact.get("id"),
+        file_payload.get("artifact_id"),
+        file_payload.get("id"),
+        metadata_payload.get("artifact_id"),
+        metadata_payload.get("id"),
+    ):
+        if type(value) is str and value:
+            ids.add(value)
+    return ids
 
 
 def _artifact_result_content(content: object) -> Mapping[str, object] | None:

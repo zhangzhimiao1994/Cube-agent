@@ -341,6 +341,12 @@ function isDownloadableArtifact(
   return Boolean(artifact?.download_url && artifact.filename);
 }
 
+function isFinalDownloadableArtifact(
+  artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null | undefined,
+): artifact is DownloadableArtifact {
+  return isDownloadableArtifact(artifact) && artifact.presentation === "final_attachment";
+}
+
 function formatArtifactSize(size: number | null | undefined) {
   if (typeof size !== "number" || !Number.isFinite(size) || size < 0) return "";
   if (size < 1024) return `${size} B`;
@@ -373,7 +379,7 @@ function downloadArtifactMessage(artifact: DownloadableArtifact): ChatMessage {
 }
 
 function artifactMessage(artifact: RunArtifact): ChatMessage {
-  if (isDownloadableArtifact(artifact)) {
+  if (isFinalDownloadableArtifact(artifact)) {
     return {
       id: `artifact-${artifact.id}`,
       role: "assistant",
@@ -1485,7 +1491,7 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
   const replyArtifact = preferredReplyArtifact(textArtifacts);
   const internalNotice = internalArtifactNotice(detail);
   const failureReason = failureReasonFromEvents(detail.events);
-  const downloadableArtifacts = detail.artifacts.filter(isDownloadableArtifact);
+  const downloadableArtifacts = detail.artifacts.filter(isFinalDownloadableArtifact);
   const artifactMessages = replyArtifact
     ? [
         {
@@ -1498,7 +1504,7 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
                   textArtifacts.length - 1
                 } 条角色产物，可在对应 Agent 动作卡片中展开查看。）`
               : replyArtifact.text?.trim() ?? "",
-          artifact: isDownloadableArtifact(replyArtifact) ? replyArtifact : undefined,
+          artifact: isFinalDownloadableArtifact(replyArtifact) ? replyArtifact : undefined,
         },
         ...downloadableArtifacts
           .filter((artifact) => artifact.id !== replyArtifact.id)
@@ -1516,7 +1522,7 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
             title: artifactMessages.length > 0 ? "运行中断" : "运行失败",
             body:
               artifactMessages.length > 0
-                ? `中断前输出已保留。错误原因：${failureReason ?? "后端没有记录具体失败原因，请打开运行详情或调试接口排查。"}`
+                ? `中断前输出已保留。错误原因：${failureReason ?? "后端没有记录具体失败原因，请展开对应 Agent 动作或到日志中心排查。"}`
                 : `本次运行没有生成最终回复。错误原因：${
                     failureReason ?? "后端没有记录具体失败原因，请展开执行摘要或到日志中心查看。"
                   }`,
@@ -3745,7 +3751,7 @@ export function RunsPage() {
                   >
                     <span className="conversation-mode-chip">{displayMode(run.mode)}</span>
                     <strong className="conversation-title-text">{title}</strong>
-                    <small className="conversation-meta-line">{run.status}</small>
+                    <small className="conversation-meta-line">{conversationTimestamp(run.created_at) || "最近会话"}</small>
                   </button>
                   <button
                     type="button"

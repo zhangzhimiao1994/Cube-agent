@@ -188,6 +188,7 @@ class RuntimeCapabilityGateway:
             artifact_id=artifact_id,
             public_metadata=metadata.to_public_dict(),
             internal_metadata=metadata.to_content_file(),
+            presentation=_generated_file_presentation(arguments),
             summary=f"Generated DOCX artifact {metadata.filename}.",
         )
 
@@ -227,6 +228,7 @@ class RuntimeCapabilityGateway:
             artifact_id=artifact_id,
             public_metadata=metadata.to_public_dict(),
             internal_metadata=metadata.to_content_file(),
+            presentation=_generated_file_presentation(arguments),
             summary=f"Generated PPTX artifact {metadata.filename}.",
         )
 
@@ -363,11 +365,21 @@ def _filename(arguments: Mapping[str, JsonValue], *, title: str, extension: str)
         raise RuntimeCapabilityError(str(error)) from None
 
 
+def _generated_file_presentation(arguments: Mapping[str, JsonValue]) -> str:
+    value = arguments.get("presentation")
+    if value is None:
+        return "step_detail"
+    if value in {"step_detail", "final_attachment"}:
+        return str(value)
+    raise RuntimeCapabilityError("presentation must be step_detail or final_attachment")
+
+
 def _file_result(
     *,
     artifact_id: UUID,
     public_metadata: dict[str, str | int],
     internal_metadata: dict[str, str | int],
+    presentation: str,
     summary: str,
 ) -> Mapping[str, JsonValue]:
     public_payload: dict[str, JsonValue] = {
@@ -382,6 +394,7 @@ def _file_result(
         "artifact_id": str(artifact_id),
         "file": public_payload,
         "metadata": internal_payload,
+        "presentation": presentation,
         "summary": summary,
     }
 
