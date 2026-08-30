@@ -1814,6 +1814,17 @@ def instruction_skill_archive() -> bytes:
     return buffer.getvalue()
 
 
+def instruction_skill_archive_with_reference(reference_body: str) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "SKILL.md",
+            "---\nname: codex-writer\ndescription: Draft structured research notes.\n---\n\nWrite concise notes.\n",
+        )
+        archive.writestr("references/guide.md", reference_body)
+    return buffer.getvalue()
+
+
 def instruction_skill_bundle_archive() -> bytes:
     skill_docs = {
         "research": "---\nname: research-writer\ndescription: Research writing.\n---\n\nWrite research notes.\n",
@@ -3593,6 +3604,35 @@ def test_skill_archive_upload_accepts_instruction_only_skill_package() -> None:
     assert body["items"][0]["requested_permissions"] == []
     assert "SKILL.md detected" in body["items"][0]["scan_diff"]
     assert any(item["name"] == "codex-writer" for item in skills.json())
+
+
+def test_instruction_skill_hash_changes_when_reference_file_changes() -> None:
+    api = client()
+
+    first = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "codex-writer-skill.zip"},
+        content=instruction_skill_archive_with_reference("Original reference.\n"),
+    )
+    second = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "codex-writer-skill.zip"},
+        content=instruction_skill_archive_with_reference("Updated reference.\n"),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_item = first.json()["items"][0]
+    second_item = second.json()["items"][0]
+    assert first_item["id"] == second_item["id"]
+    assert first_item["content_sha256"] != second_item["content_sha256"]
+    assert first_item["package_version_id"] != second_item["package_version_id"]
+    assert second_item["source_filename"] == "codex-writer-skill.zip"
+    listed = skills.json()
+    assert len(listed) == 1
+    assert listed[0]["content_sha256"] == second_item["content_sha256"]
+    assert listed[0]["package_version_id"] == second_item["package_version_id"]
 
 
 def test_skill_archive_upload_accepts_instruction_skill_tar_gz_bundle() -> None:

@@ -2036,7 +2036,7 @@ def _scan_instruction_skill_archive(
     members = _instruction_skill_members(archive_bytes)
     if members is None:
         return None
-    skill_md_path, skill_md_bytes = members
+    skill_md_path, skill_md_bytes, content_sha256 = members
     name = _instruction_skill_name(
         skill_md_bytes,
         fallback=_instruction_skill_fallback_name(filename, skill_md_path),
@@ -2046,15 +2046,15 @@ def _scan_instruction_skill_archive(
         archive_bytes=archive_bytes,
         scan_report=None,
         instruction_name=name,
-        instruction_sha256=hashlib.sha256(skill_md_bytes).hexdigest(),
+        instruction_sha256=content_sha256,
     )
 
 
-def _instruction_skill_members(archive_bytes: bytes) -> tuple[str, bytes] | None:
+def _instruction_skill_members(archive_bytes: bytes) -> tuple[str, bytes, str] | None:
     if zipfile.is_zipfile(io.BytesIO(archive_bytes)):
         try:
             with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
-                normalized_to_original: dict[str, str] = {}
+                normalized_files: dict[str, bytes] = {}
                 for info in archive.infolist():
                     if info.is_dir() or info.filename.replace("\\", "/").endswith("/"):
                         continue
@@ -2067,24 +2067,29 @@ def _instruction_skill_members(archive_bytes: bytes) -> tuple[str, bytes] | None
                     if _skill_bundle_path_is_ignored(path):
                         continue
                     _validate_instruction_skill_file(path)
-                    normalized_to_original[path] = info.filename
+                    normalized_files[path] = archive.read(info.filename)
                 candidates = [
                     name
-                    for name in normalized_to_original
+                    for name in normalized_files
                     if PurePosixPath(name).name.lower() in _SKILL_INSTRUCTION_NAMES
                 ]
                 candidate = _select_instruction_skill_path(candidates)
                 if candidate is None:
                     return None
-                if len(normalized_to_original) > _MAX_SKILL_BUNDLE_ITEMS:
+                if len(normalized_files) > _MAX_SKILL_BUNDLE_ITEMS:
                     raise InvalidSkillPackage("instruction skill contains too many files")
-                return candidate, archive.read(normalized_to_original[candidate])
+                return (
+                    candidate,
+                    normalized_files[candidate],
+                    _instruction_skill_content_sha256(normalized_files.items()),
+                )
         except zipfile.BadZipFile as exc:
             raise InvalidSkillPackage("skill archive must be a valid zip file") from exc
     try:
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
-            files = []
-            for member in archive.getmembers():
+            members = archive.getmembers()
+            files: list[tuple[str, bytes]] = []
+            for member in members:
                 if _tar_member_is_metadata(member):
                     continue
                 if member.isdir():
@@ -2103,20 +2108,33 @@ def _instruction_skill_members(archive_bytes: bytes) -> tuple[str, bytes] | None
                 if _skill_bundle_path_is_ignored(path):
                     continue
                 _validate_instruction_skill_file(path)
-                if PurePosixPath(path).name.lower() in _SKILL_INSTRUCTION_NAMES:
-                    files.append((path, member))
-            candidate = _select_instruction_skill_path(path for path, _member in files)
+                source = archive.extractfile(member)
+                if source is None:
+                    raise InvalidSkillPackage("skill instruction file cannot be read")
+                files.append((path, source.read()))
+            candidate = _select_instruction_skill_path(
+                path
+                for path, _content in files
+                if PurePosixPath(path).name.lower() in _SKILL_INSTRUCTION_NAMES
+            )
             if candidate is None:
                 return None
-            if len(archive.getmembers()) > _MAX_SKILL_BUNDLE_ITEMS:
+            if len(members) > _MAX_SKILL_BUNDLE_ITEMS:
                 raise InvalidSkillPackage("instruction skill contains too many files")
-            path, member = next((path, member) for path, member in files if path == candidate)
-            source = archive.extractfile(member)
-            if source is None:
-                raise InvalidSkillPackage("skill instruction file cannot be read")
-            return path, source.read()
+            path, content = next((path, content) for path, content in files if path == candidate)
+            return path, content, _instruction_skill_content_sha256(files)
     except tarfile.TarError as exc:
         raise InvalidSkillPackage("skill archive must be a valid zip or tar archive") from exc
+
+
+def _instruction_skill_content_sha256(files: Iterable[tuple[str, bytes]]) -> str:
+    digest = hashlib.sha256()
+    for path, content in sorted(files, key=lambda item: item[0]):
+        encoded_path = path.encode("utf-8")
+        digest.update(len(encoded_path).to_bytes(8, "big"))
+        digest.update(encoded_path)
+        digest.update(hashlib.sha256(content).digest())
+    return digest.hexdigest()
 
 
 def _select_instruction_skill_path(candidates: Iterable[str]) -> str | None:
