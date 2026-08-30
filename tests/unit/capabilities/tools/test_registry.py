@@ -6,7 +6,13 @@ from agent_hub.capabilities.tools.registry import ToolRegistry, create_builtin_t
 def test_registry_registers_builtin_tool_names() -> None:
     registry = create_builtin_tool_registry()
 
-    assert registry.names() == ("calculator.evaluate", "http.read", "workspace.read")
+    assert registry.names() == (
+        "calculator.evaluate",
+        "document.generate_docx",
+        "http.read",
+        "presentation.generate_pptx",
+        "workspace.read",
+    )
 
 
 def test_registry_exposes_schemas_without_executor_callables() -> None:

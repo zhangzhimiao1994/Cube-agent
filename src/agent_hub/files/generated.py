@@ -61,7 +61,7 @@ class GeneratedFileStore:
     ) -> GeneratedFileMetadata:
         """Persist a generated file and return safe download metadata."""
 
-        safe_filename = _safe_filename(filename)
+        safe_filename = safe_generated_filename(filename)
         if mime_type not in ALLOWED_GENERATED_FILE_MIME_TYPES:
             raise ValueError("unsupported generated file MIME type")
 
@@ -128,11 +128,13 @@ class GeneratedFileStore:
         except ValueError:
             raise ValueError("storage_key contains invalid UUID segments") from None
 
-        safe_filename = _safe_filename(filename)
+        safe_filename = safe_generated_filename(filename)
         return parsed_tenant_id, parsed_run_id, parsed_artifact_id, safe_filename
 
 
-def _safe_filename(filename: str) -> str:
+def safe_generated_filename(filename: str) -> str:
+    """Return a filename that is safe to write under generated artifact storage."""
+
     normalized = filename.strip()
     if not normalized:
         raise ValueError("filename must not be blank")

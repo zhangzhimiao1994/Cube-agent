@@ -121,6 +121,7 @@ def build_worker_service(
             capability_gateway=RuntimeCapabilityGateway(
                 skill_store_dir=settings.skill_store_dir,
                 workspace_root=settings.attachment_store_dir,
+                generated_artifact_dir=settings.generated_artifact_dir,
             ),
         ),
         router=None,
