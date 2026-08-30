@@ -1490,6 +1490,90 @@ article:hover {
   padding-left: 0.55rem;
 }
 
+.agent-recruitment {
+  border: 1px solid rgba(123, 225, 255, 0.12);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.52rem;
+}
+
+.agent-recruitment-header {
+  align-items: center;
+  color: var(--muted);
+  display: flex;
+  gap: 0.48rem;
+}
+
+.agent-recruitment-header span {
+  color: var(--accent);
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-weight: 950;
+}
+
+.agent-recruitment-header strong,
+.agent-recruitment-card strong {
+  color: var(--text);
+  font-weight: 900;
+}
+
+.agent-recruitment-header small,
+.agent-recruitment-card small {
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.agent-recruitment-list {
+  display: grid;
+  gap: 0.38rem;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+}
+
+.agent-recruitment-card {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(123, 225, 255, 0.1);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  min-width: 0;
+  padding: 0.5rem;
+}
+
+.agent-recruitment-card div:nth-child(2) {
+  display: grid;
+  gap: 0.14rem;
+  min-width: 0;
+}
+
+.agent-recruitment-card strong,
+.agent-recruitment-card small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-recruitment-card > span {
+  color: var(--accent);
+  font-size: 0.76rem;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.agent-recruitment-avatar {
+  align-items: center;
+  background: rgba(85, 215, 255, 0.12);
+  border: 1px solid rgba(85, 215, 255, 0.22);
+  border-radius: 999px;
+  color: var(--accent);
+  display: inline-flex;
+  font-weight: 900;
+  height: 2rem;
+  justify-content: center;
+  width: 2rem;
+}
+
 .run-process-toggle {
   align-items: center;
   background: transparent;

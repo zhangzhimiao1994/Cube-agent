@@ -1844,6 +1844,177 @@ describe("operational management pages", () => {
     expect(within(drawer).getByText("qwen-max")).not.toBeNull();
   });
 
+  it("shows recruited subagents from the main agent plan", async () => {
+    const user = userEvent.setup();
+    visibleRunDetail = {
+      ...runDetail,
+      events: [
+        {
+          sequence: 1,
+          kind: "step.started",
+          message: "step.started",
+          created_at: conversationCreatedAt,
+          actor: "main_agent",
+          participants: [],
+          step_id: "main_agent_plan",
+          payload: {
+            mode: "dispatch",
+            roles: [
+              {
+                id: "copywriter",
+                role: "Copywriter",
+                purpose: "execute",
+                logical_model: "qwen-max",
+                tools: ["workspace.read"],
+              },
+              {
+                id: "reviewer",
+                role: "Reviewer",
+                purpose: "review",
+                logical_model: "deepseek-chat",
+                tools: [],
+              },
+              {
+                id: "final_synthesizer",
+                role: "Final Synthesizer",
+                purpose: "synthesize",
+                logical_model: "main",
+                tools: [],
+              },
+            ],
+            steps: [
+              {
+                id: "copywriter_step",
+                agent: "copywriter",
+                depends_on: [],
+                final_synthesizer: false,
+                tools: ["workspace.read"],
+              },
+              {
+                id: "reviewer_step",
+                agent: "reviewer",
+                depends_on: ["copywriter_step"],
+                final_synthesizer: false,
+                tools: [],
+              },
+            ],
+          },
+        },
+        {
+          sequence: 2,
+          kind: "step.started",
+          message: "step.started",
+          created_at: conversationCreatedAt,
+          actor: "copywriter",
+          participants: [],
+          step_id: "copywriter_step",
+          payload: { task: "撰写脚本" },
+        },
+        {
+          sequence: 3,
+          kind: "step.completed",
+          message: "step.completed",
+          created_at: conversationCreatedAt,
+          actor: "reviewer",
+          participants: [],
+          step_id: "reviewer_step",
+          payload: { result: "审查通过" },
+        },
+        ...runDetail.events.map((event) => ({ ...event, sequence: event.sequence + 3 })),
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const panel = within(stream).getByRole("region", { name: "助手派单状态" });
+    expect(within(panel).getByText("助手招募")).not.toBeNull();
+    expect(within(panel).getByText("已招募 2 个助手")).not.toBeNull();
+    expect(within(panel).getByText("文案生成")).not.toBeNull();
+    expect(within(panel).getByText("Copywriter · qwen-max")).not.toBeNull();
+    expect(within(panel).getByText("workspace.read")).not.toBeNull();
+    expect(within(panel).getByText("工作中")).not.toBeNull();
+    expect(within(panel).getByText("reviewer")).not.toBeNull();
+    expect(within(panel).getByText("Reviewer · deepseek-chat")).not.toBeNull();
+    expect(within(panel).getByText("已完成")).not.toBeNull();
+    expect(within(panel).queryByText("Final Synthesizer")).toBeNull();
+  });
+
+  it("keeps recruited subagent statuses isolated when planned steps are shared", async () => {
+    const user = userEvent.setup();
+    visibleRunDetail = {
+      ...runDetail,
+      events: [
+        {
+          sequence: 1,
+          kind: "step.started",
+          message: "step.started",
+          created_at: conversationCreatedAt,
+          actor: "main_agent",
+          participants: [],
+          step_id: "main_agent_plan",
+          payload: {
+            mode: "discuss",
+            roles: [
+              { id: "alpha", role: "Architect", purpose: "discuss", logical_model: "qwen-plus", tools: [] },
+              { id: "beta", role: "Verifier", purpose: "discuss", logical_model: "deepseek-chat", tools: [] },
+              { id: "gamma", role: "Repair", purpose: "discuss", logical_model: "kimi-k2", tools: [] },
+              { id: "summary_writer", role: "Summary Writer", purpose: "synthesize", logical_model: "main", tools: [] },
+            ],
+            steps: [
+              { id: "discussion", agent: "alpha", depends_on: [], final_synthesizer: false, tools: [] },
+              { id: "discussion", agent: "beta", depends_on: [], final_synthesizer: false, tools: [] },
+              { id: "discussion", agent: "gamma", depends_on: [], final_synthesizer: false, tools: [] },
+            ],
+          },
+        },
+        {
+          sequence: 2,
+          kind: "step.started",
+          message: "step.started",
+          created_at: conversationCreatedAt,
+          actor: "alpha",
+          participants: [],
+          step_id: "discussion",
+          payload: { task: "设计方案" },
+        },
+        {
+          sequence: 3,
+          kind: "step.failed",
+          message: "step.failed",
+          created_at: conversationCreatedAt,
+          actor: "gamma",
+          participants: [],
+          step_id: "discussion",
+          payload: { error: "测试失败" },
+        },
+        ...runDetail.events.map((event) => ({ ...event, sequence: event.sequence + 3 })),
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const panel = within(stream).getByRole("region", { name: "助手派单状态" });
+    expect(within(panel).getByText("已招募 3 个助手")).not.toBeNull();
+
+    const alphaCard = within(panel).getByText("alpha").closest(".agent-recruitment-card") as HTMLElement;
+    const betaCard = within(panel).getByText("beta").closest(".agent-recruitment-card") as HTMLElement;
+    const gammaCard = within(panel).getByText("gamma").closest(".agent-recruitment-card") as HTMLElement;
+    expect(within(alphaCard).getByText("工作中")).not.toBeNull();
+    expect(within(betaCard).getByText("已安排")).not.toBeNull();
+    expect(within(gammaCard).getByText("异常")).not.toBeNull();
+    expect(within(panel).queryByText("Summary Writer")).toBeNull();
+  });
+
   it("surfaces harness execution profile in the routing process details", async () => {
     const user = userEvent.setup();
     visibleRunDetail = {

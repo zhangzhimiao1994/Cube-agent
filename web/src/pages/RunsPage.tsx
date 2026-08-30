@@ -512,6 +512,88 @@ type ProcessDetailTarget = {
   createdAt: string | null;
 };
 
+type AgentDispatchCard = {
+  id: string;
+  name: string;
+  role: string;
+  model: string;
+  tools: string;
+  status: "异常" | "已完成" | "工作中" | "已安排";
+};
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function stringArrayValue(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+}
+
+function mainAgentPlanEvent(detail: RunDetail): RunEvent | null {
+  return (
+    detail.events.find((event) => {
+      if (event.kind !== "step.started" || event.actor !== "main_agent" || event.step_id !== "main_agent_plan") return false;
+      return Array.isArray(event.payload.roles);
+    }) ?? null
+  );
+}
+
+function agentStatusForPlan(detail: RunDetail, agentId: string, stepIds: Set<string>): AgentDispatchCard["status"] {
+  const events = detail.events.filter((event) => event.actor === agentId || (event.step_id ? stepIds.has(event.step_id) : false));
+  if (events.some((event) => event.kind.endsWith(".failed") || event.kind === "runtime.failed")) return "异常";
+  if (events.some((event) => event.kind === "step.completed")) return "已完成";
+  if (events.some((event) => ["step.started", "model.started", "tool.requested", "tool.started"].includes(event.kind))) {
+    return "工作中";
+  }
+  return "已安排";
+}
+
+function dispatchAgentCards(detail: RunDetail, agentNames: Map<string, string>): AgentDispatchCard[] {
+  const plan = mainAgentPlanEvent(detail);
+  if (!plan) return [];
+  const roles = Array.isArray(plan.payload.roles) ? plan.payload.roles.filter(isObjectRecord) : [];
+  const steps = Array.isArray(plan.payload.steps) ? plan.payload.steps.filter(isObjectRecord) : [];
+  const stepOwners = new Map<string, Set<string>>();
+  steps.forEach((step) => {
+    const stepId = stringValue(step.id);
+    const agentId = stringValue(step.agent);
+    if (!stepId || !agentId) return;
+    const owners = stepOwners.get(stepId) ?? new Set<string>();
+    owners.add(agentId);
+    stepOwners.set(stepId, owners);
+  });
+  return roles
+    .map((role) => {
+      const id = stringValue(role.id);
+      const purpose = stringValue(role.purpose);
+      if (!id || id === "final_synthesizer" || purpose === "synthesize") return null;
+      const stepIds = new Set(
+        steps.flatMap((step) => {
+          const stepId = stringValue(step.id);
+          if (!stepId || stringValue(step.agent) !== id || (stepOwners.get(stepId)?.size ?? 0) !== 1) return [];
+          return [stepId];
+        }),
+      );
+      const roleLabel = stringValue(role.role) ?? id;
+      const model = stringValue(role.logical_model) ?? "默认模型";
+      const tools = stringArrayValue(role.tools).join("、");
+      return {
+        id,
+        name: agentNames.get(id) ?? id,
+        role: roleLabel,
+        model,
+        tools,
+        status: agentStatusForPlan(detail, id, stepIds),
+      };
+    })
+    .filter((card): card is AgentDispatchCard => card !== null);
+}
+
 function toggle(list: string[], value: string) {
   return list.includes(value) ? list.filter((item) => item !== value) : [...list, value];
 }
@@ -1269,6 +1351,7 @@ function RunProcessSummary({
   mainAgentModelName?: string;
 }) {
   const items = runProcessItems(detail, agentNames, mainAgentModelName);
+  const dispatchCards = dispatchAgentCards(detail, agentNames);
   if (items.length === 0) return null;
   return (
     <section className="run-process-summary" aria-label="Agent 集群动作">
@@ -1277,6 +1360,32 @@ function RunProcessSummary({
         <strong>Agent 集群</strong>
         <small>{items.length} 个关键动作</small>
       </div>
+      {dispatchCards.length > 0 ? (
+        <section className="agent-recruitment" aria-label="助手派单状态">
+          <div className="agent-recruitment-header" role="status" aria-label={`已招募 ${dispatchCards.length} 个助手`}>
+            <span aria-hidden="true">⌁</span>
+            <strong>助手招募</strong>
+            <small>已招募 {dispatchCards.length} 个助手</small>
+          </div>
+          <div className="agent-recruitment-list">
+            {dispatchCards.map((card) => (
+              <article key={card.id} className="agent-recruitment-card">
+                <div className="agent-recruitment-avatar" aria-hidden="true">
+                  {card.name.slice(0, 1)}
+                </div>
+                <div>
+                  <strong>{card.name}</strong>
+                  <small>
+                    {card.role} · {card.model}
+                  </small>
+                  {card.tools ? <small>{card.tools}</small> : null}
+                </div>
+                <span>{card.status}</span>
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
       <div className="agent-cluster-actions">
         {items.map((item) => (
           <button key={item.id} type="button" className="run-process-toggle process-intermediate-card" onClick={() => onOpen(item)}>
