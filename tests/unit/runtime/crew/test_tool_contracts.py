@@ -91,6 +91,58 @@ class RepeatingProjectZipGateway(BadProjectZipGateway):
         )
 
 
+class TextOnlyGateway(BadProjectZipGateway):
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        return GatewayCompletion(
+            response=ModelResponse(
+                text="I prepared the requested file.",
+                usage=TokenUsage(1, 1, 2),
+            ),
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/chat",
+            cost_usd=Decimal(0),
+        )
+
+
+class TextThenToolGateway(BadProjectZipGateway):
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            response = ModelResponse(
+                text="I prepared the requested file.",
+                usage=TokenUsage(1, 1, 2),
+            )
+        else:
+            assert request.tools
+            response = ModelResponse(
+                text=None,
+                tool_calls=(
+                    ToolCall(
+                        id="provider-call",
+                        name=request.tools[0].name,
+                        arguments={
+                            "title": "Acceptance File",
+                            "filename": "acceptance-file.zip",
+                            "presentation": "final_attachment",
+                            "files": {"main.py": "print('hello world')\n"},
+                        },
+                    ),
+                ),
+                usage=TokenUsage(1, 1, 2),
+            )
+        return GatewayCompletion(
+            response=response,
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/chat",
+            cost_usd=Decimal(0),
+        )
+
+
 class FailingProjectZipCapabilities:
     async def execute(  # type: ignore[no-untyped-def]
         self, *, tenant_id, run_id, actor, name, arguments, idempotency_key
@@ -215,6 +267,65 @@ def test_project_zip_tool_definition_exposes_strict_file_contract() -> None:
     assert tool.parameters["additionalProperties"] is False
 
 
+def test_document_tool_definition_exposes_strict_downloadable_contract() -> None:
+    tool = _tool_definitions(("document.generate_docx",))[0]
+
+    assert tool.name == "document_generate_docx"
+    assert "document.generate_docx" in tool.description
+    assert "downloadable DOCX" in tool.description
+    assert tool.parameters["type"] == "object"
+    assert tool.parameters["additionalProperties"] is False
+    required = tool.parameters["required"]
+    assert isinstance(required, tuple)
+    assert required == ("title",)
+    properties = tool.parameters["properties"]
+    assert isinstance(properties, Mapping)
+    assert set(properties) == {"title", "subtitle", "filename", "presentation", "sections"}
+    assert properties["presentation"] == {
+        "type": "string",
+        "enum": ("step_detail", "final_attachment"),
+        "description": "Use final_attachment when the DOCX is the final downloadable file.",
+    }
+    assert properties["sections"] == {
+        "type": "array",
+        "description": "Optional ordered document sections.",
+        "items": {"type": "object", "additionalProperties": True},
+    }
+
+
+def test_presentation_tool_definition_exposes_strict_downloadable_contract() -> None:
+    tool = _tool_definitions(("presentation.generate_pptx",))[0]
+
+    assert tool.name == "presentation_generate_pptx"
+    assert "presentation.generate_pptx" in tool.description
+    assert "downloadable PPTX" in tool.description
+    assert tool.parameters["type"] == "object"
+    assert tool.parameters["additionalProperties"] is False
+    required = tool.parameters["required"]
+    assert isinstance(required, tuple)
+    assert required == ("title",)
+    properties = tool.parameters["properties"]
+    assert isinstance(properties, Mapping)
+    assert set(properties) == {
+        "title",
+        "subtitle",
+        "filename",
+        "template_id",
+        "presentation",
+        "slides",
+    }
+    assert properties["presentation"] == {
+        "type": "string",
+        "enum": ("step_detail", "final_attachment"),
+        "description": "Use final_attachment when the PPTX is the final downloadable file.",
+    }
+    assert properties["slides"] == {
+        "type": "array",
+        "description": "Optional ordered slide definitions.",
+        "items": {"type": "object", "additionalProperties": True},
+    }
+
+
 async def test_capability_failure_event_keeps_safe_tool_error_summary() -> None:
     runtime = CrewDispatchRuntime(
         BadProjectZipGateway(),
@@ -254,3 +365,39 @@ async def test_final_attachment_tool_result_completes_without_extra_tool_rounds(
         EventKind.TOOL_COMPLETED,
     ]
     assert len(gateway.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    ("document.generate_docx", "presentation.generate_pptx", "project.generate_zip"),
+)
+async def test_delivery_tool_step_rejects_text_only_model_response(tool_name: str) -> None:
+    gateway = TextOnlyGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _one_step_plan(tools=(tool_name,)),
+        capability_gateway=SuccessfulProjectZipCapabilities(),
+        crew_factory=FastFactory(),
+    )
+
+    with pytest.raises(CapabilityOutcomeUncertain, match="required final attachment"):
+        async for _event in runtime.run(_context()):
+            pass
+
+    assert len(gateway.requests) > 1
+
+
+async def test_delivery_tool_step_recovers_after_text_only_response() -> None:
+    gateway = TextThenToolGateway()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _one_step_plan(tools=("presentation.generate_pptx",)),
+        capability_gateway=SuccessfulProjectZipCapabilities(),
+        crew_factory=FastFactory(),
+    )
+
+    events = [event async for event in runtime.run(_context())]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(gateway.requests) == 2
+    assert any(event.kind is EventKind.TOOL_COMPLETED for event in events)

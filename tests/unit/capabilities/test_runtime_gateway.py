@@ -185,6 +185,7 @@ async def test_runtime_gateway_generates_docx_artifact(tmp_path: Path) -> None:
 
     file_metadata = _assert_file_result(result, expected_mime_type=DOCX_MIME_TYPE)
     assert file_metadata["filename"] == "launch-memo.docx"
+    assert result["presentation"] == "final_attachment"
     storage_key = file_metadata["storage_key"]
     assert isinstance(storage_key, str)
     output = generated_artifact_dir / storage_key
@@ -226,6 +227,7 @@ async def test_runtime_gateway_generates_pptx_artifact(tmp_path: Path) -> None:
 
     file_metadata = _assert_file_result(result, expected_mime_type=PPTX_MIME_TYPE)
     assert file_metadata["filename"] == "technical-blueprint.pptx"
+    assert result["presentation"] == "final_attachment"
     storage_key = file_metadata["storage_key"]
     assert isinstance(storage_key, str)
     output = generated_artifact_dir / storage_key

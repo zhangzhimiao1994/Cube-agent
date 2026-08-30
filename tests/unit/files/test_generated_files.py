@@ -10,6 +10,7 @@ from agent_hub.files.generated import GeneratedFileStore
 
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+ZIP_MIME = "application/zip"
 
 
 def test_store_bytes_writes_file_under_tenant_run_artifact_scope(tmp_path: Path) -> None:
@@ -64,14 +65,16 @@ def test_store_bytes_rejects_filenames_that_could_escape_or_are_not_safe(
     assert not any(tmp_path.rglob("*"))
 
 
-def test_store_bytes_allows_docx_and_pptx_mime_types(tmp_path: Path) -> None:
+def test_store_bytes_allows_docx_pptx_and_zip_mime_types(tmp_path: Path) -> None:
     store = GeneratedFileStore(tmp_path)
 
     docx = store.store_bytes(uuid4(), uuid4(), uuid4(), "report.docx", DOCX_MIME, b"docx")
     pptx = store.store_bytes(uuid4(), uuid4(), uuid4(), "deck.pptx", PPTX_MIME, b"pptx")
+    zip_file = store.store_bytes(uuid4(), uuid4(), uuid4(), "project.zip", ZIP_MIME, b"zip")
 
     assert docx.mime_type == DOCX_MIME
     assert pptx.mime_type == PPTX_MIME
+    assert zip_file.mime_type == ZIP_MIME
 
 
 def test_store_bytes_rejects_unknown_mime_type_with_stable_error(tmp_path: Path) -> None:

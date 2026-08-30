@@ -30,6 +30,7 @@ from agent_hub.channels.feishu.media import FeishuMediaService
 from agent_hub.channels.feishu.media_factory import build_feishu_media_service_factory
 from agent_hub.channels.feishu.settings import FeishuSettings
 from agent_hub.channels.feishu.websocket import FeishuWebSocketClient
+from agent_hub.domain.runs import TaskMode
 from agent_hub.models.capacity import CapacityLease
 from agent_hub.models.gateway import CapacityController
 from agent_hub.models.registry import NoCapableDeployment
@@ -187,6 +188,27 @@ def test_create_app_wires_admin_generated_artifact_store(tmp_path: Path) -> None
         service = application.state.admin_resource_service
 
     assert service._generated_file_store._root == generated_artifact_dir.resolve()
+
+
+def test_create_app_wires_runtime_generated_artifact_store(tmp_path: Path) -> None:
+    generated_artifact_dir = tmp_path / "generated"
+    application = create_app(
+        settings=valid_settings(tmp_path / "attachments", generated_artifact_dir),
+        database=FakeDatabase(),
+        redis_client=FakeRedis(),
+        auth_service=StubAuthService(),
+        rate_limiter=StubRateLimiter(),
+        config_service=StubConfigService(),
+        admin_resource_service=InMemoryAdminResourceService(),
+        user_admin_service=object(),
+    )
+
+    with TestClient(application):
+        runtime = application.state.run_service._runtime_registry.get(TaskMode.DISPATCH)
+
+    store = runtime._capability_gateway._generated_file_store
+    assert store is not None
+    assert store._root == generated_artifact_dir.resolve()
 
 
 

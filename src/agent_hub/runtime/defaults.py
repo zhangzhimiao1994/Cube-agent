@@ -337,20 +337,21 @@ class ConfigBackedDispatchRuntime:
             purpose=RolePurpose.EXECUTE,
             output_schema=_DISPATCH_OUTPUT_SCHEMA,
         )
+        planner_roles = self._role_planner.plan(
+            RolePlanningRequest(
+                task=str(context.request),
+                mode=TaskMode.DISPATCH,
+                profile=_task_profile(context.request),
+                profiles=_task_profiles(context.request),
+                high_risk=_high_risk_task(context.request),
+                requested_skills=_requested_skills(context),
+                default_model=logical_model,
+            )
+        ).roles
         if selected_roles:
-            planned_roles = selected_roles
+            planned_roles = _merge_selected_with_delivery_roles(selected_roles, planner_roles)
         else:
-            planned_roles = self._role_planner.plan(
-                RolePlanningRequest(
-                    task=str(context.request),
-                    mode=TaskMode.DISPATCH,
-                    profile=_task_profile(context.request),
-                    profiles=_task_profiles(context.request),
-                    high_risk=_high_risk_task(context.request),
-                    requested_skills=_requested_skills(context),
-                    default_model=logical_model,
-                )
-            ).roles
+            planned_roles = planner_roles
         roles = _assign_models_to_roles(
             (*planned_roles, *_temporary_role_assignments(context, logical_model)),
             config,
@@ -551,7 +552,21 @@ class ConfigBackedHybridRuntime:
             output_schema=_DISCUSSION_OUTPUT_SCHEMA,
         )
         if selected_dispatch_roles:
-            dispatch_roles = selected_dispatch_roles
+            planner_dispatch_roles = self._role_planner.plan(
+                RolePlanningRequest(
+                    task=str(context.request),
+                    mode=TaskMode.DISPATCH,
+                    profile=profile,
+                    profiles=profiles,
+                    high_risk=high_risk,
+                    requested_skills=_requested_skills(context),
+                    default_model=logical_model,
+                )
+            ).roles
+            dispatch_roles = _merge_selected_with_delivery_roles(
+                selected_dispatch_roles,
+                planner_dispatch_roles,
+            )
         else:
             dispatch_roles = self._role_planner.plan(
                 RolePlanningRequest(
@@ -1024,6 +1039,30 @@ def _selected_config_agent_purpose(
     if any(keyword in text for keyword in ("裁决", "决策", "decision", "record")):
         return RolePurpose.RECORD_DECISION
     return default
+
+
+_DELIVERY_TOOL_NAMES = frozenset(
+    {"document.generate_docx", "presentation.generate_pptx", "project.generate_zip"}
+)
+
+
+def _merge_selected_with_delivery_roles(
+    selected_roles: tuple[RoleAssignment, ...],
+    planner_roles: tuple[RoleAssignment, ...],
+) -> tuple[RoleAssignment, ...]:
+    merged = list(selected_roles)
+    selected_tools = {tool for role in selected_roles for tool in role.allowed_tools}
+    selected_ids = {role.id for role in selected_roles}
+    for role in planner_roles:
+        delivery_tools = _DELIVERY_TOOL_NAMES.intersection(role.allowed_tools)
+        if not delivery_tools or delivery_tools.issubset(selected_tools):
+            continue
+        if role.id in selected_ids:
+            continue
+        merged.append(role)
+        selected_ids.add(role.id)
+        selected_tools.update(delivery_tools)
+    return tuple(merged)
 
 
 def _temporary_role_assignments(

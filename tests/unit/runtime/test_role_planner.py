@@ -263,6 +263,29 @@ def test_pptx_generation_dispatch_selects_presentation_designer_tool_role() -> N
     assert "dark-launch" in designer.mission
 
 
+@pytest.mark.parametrize(
+    "task",
+    (
+        "请生成一个可下载的 PPTX 演示文稿，标题为《验收演示》，包含两页：目标、结果。只需要输出文件。",
+        "请调用 presentation.generate_pptx 生成最终附件。title=验收演示，slides 包含两页：目标、结果。",
+    ),
+)
+def test_pptx_generation_dispatch_handles_chinese_delivery_requests(task: str) -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task=task,
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.GENERAL,
+            default_model="general-model",
+        )
+    )
+
+    designer = plan.role("presentation_designer")
+
+    assert designer.purpose is RolePurpose.EXECUTE
+    assert "presentation.generate_pptx" in designer.allowed_tools
+
+
 def test_office_generation_allows_local_exclusions_without_disabling_file_generation() -> None:
     docx_plan = RolePlanner().plan(
         RolePlanningRequest(

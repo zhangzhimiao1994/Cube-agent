@@ -412,6 +412,96 @@ async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
 
 
 @pytest.mark.asyncio
+async def test_selected_dispatch_agents_do_not_hide_required_pptx_delivery_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text", "tool_calling"],
+                            }
+                        ]
+                    },
+                    "creative": {
+                        "deployments": [
+                            {
+                                "provider": "kimi",
+                                "model": "kimi-k2-latest",
+                                "api_base": "https://api.moonshot.cn/v1",
+                                "credential_ref": "secret://creative",
+                                "quota_scope_id": "kimi_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [
+                    {
+                        "id": "copywriter",
+                        "role": "Copywriter",
+                        "prompt": "Draft campaign copy.",
+                        "model": "creative",
+                        "skills": [],
+                    }
+                ],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
+        transport=FakeTransport(),
+        capability_gateway=FakeCapabilityAvailability({"presentation.generate_pptx"}),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request="请生成一个可下载的 PPTX 演示文稿，标题为《验收演示》。只需要输出文件。",
+                routing_decision={
+                    "selected_agent_ids": ("copywriter",),
+                    "main_agent_model": "main",
+                },
+            )
+        )
+    ]
+
+    roles = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["roles"])
+    steps = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["steps"])
+
+    assert {role["id"] for role in roles} >= {"copywriter", "presentation_designer"}
+    assert any(
+        role["id"] == "presentation_designer"
+        and role["tools"] == ("read_context", "presentation.generate_pptx")
+        for role in roles
+    )
+    assert any(
+        step["agent"] == "presentation_designer"
+        and step["tools"] == ("read_context", "presentation.generate_pptx")
+        for step in steps
+    )
+
+
+@pytest.mark.asyncio
 async def test_config_backed_hybrid_runtime_emits_main_agent_role_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

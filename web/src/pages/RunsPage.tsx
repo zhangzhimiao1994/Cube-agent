@@ -751,7 +751,7 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
             textArtifacts.length > 1
               ? `${replyArtifact.text?.trim() ?? ""}\n\n（另有 ${
                   textArtifacts.length - 1
-                } 条角色产物，可点“查看运行详情”查看。）`
+                } 条角色产物，可在子 Agent 工作席查看。）`
               : replyArtifact.text?.trim() ?? "",
           artifact: hasArtifactDownload(replyArtifact) ? replyArtifact : undefined,
         },
@@ -3729,14 +3729,6 @@ export function RunsPage() {
                 ) : null}
               </Fragment>
             ))}
-            {latestVisibleRun ? (
-              <div className="chat-detail-action">
-                <Link to={`/runs/${latestVisibleRun.id}`} className="secondary-action">
-                  查看运行详情
-                </Link>
-                <span>打开完整事件、产物、错误和运行控制。</span>
-              </div>
-            ) : null}
           </div>
           {processDetailTarget ? (
             <RunProcessDrawer

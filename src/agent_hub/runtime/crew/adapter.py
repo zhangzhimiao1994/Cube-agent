@@ -269,6 +269,18 @@ def _tool_definitions(internal_names: tuple[str, ...]) -> tuple[ToolDefinition, 
 
 
 def _tool_description(internal_name: str, external_name: str) -> str:
+    if internal_name == "document.generate_docx":
+        return (
+            "Approved Agent Hub capability: document.generate_docx. Use the model "
+            f"function name {external_name} to create a downloadable DOCX document. "
+            "Required field is title. Optional sections must be an array of objects."
+        )
+    if internal_name == "presentation.generate_pptx":
+        return (
+            "Approved Agent Hub capability: presentation.generate_pptx. Use the model "
+            f"function name {external_name} to create a downloadable PPTX deck. "
+            "Required field is title. Optional slides must be an array of objects."
+        )
     if internal_name == "project.generate_zip":
         return (
             "Approved Agent Hub capability: project.generate_zip. Use the model "
@@ -280,6 +292,76 @@ def _tool_description(internal_name: str, external_name: str) -> str:
 
 
 def _tool_parameters(internal_name: str) -> Mapping[str, JsonValue]:
+    if internal_name == "document.generate_docx":
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ("title",),
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Document title.",
+                    "minLength": 1,
+                },
+                "subtitle": {
+                    "type": "string",
+                    "description": "Optional document subtitle.",
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Optional safe DOCX filename ending in .docx.",
+                },
+                "presentation": {
+                    "type": "string",
+                    "enum": ("step_detail", "final_attachment"),
+                    "description": (
+                        "Use final_attachment when the DOCX is the final downloadable file."
+                    ),
+                },
+                "sections": {
+                    "type": "array",
+                    "description": "Optional ordered document sections.",
+                    "items": {"type": "object", "additionalProperties": True},
+                },
+            },
+        }
+    if internal_name == "presentation.generate_pptx":
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ("title",),
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Presentation title.",
+                    "minLength": 1,
+                },
+                "subtitle": {
+                    "type": "string",
+                    "description": "Optional presentation subtitle.",
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Optional safe PPTX filename ending in .pptx.",
+                },
+                "template_id": {
+                    "type": "string",
+                    "description": "Optional built-in template id.",
+                },
+                "presentation": {
+                    "type": "string",
+                    "enum": ("step_detail", "final_attachment"),
+                    "description": (
+                        "Use final_attachment when the PPTX is the final downloadable file."
+                    ),
+                },
+                "slides": {
+                    "type": "array",
+                    "description": "Optional ordered slide definitions.",
+                    "items": {"type": "object", "additionalProperties": True},
+                },
+            },
+        }
     if internal_name == "project.generate_zip":
         return {
             "type": "object",
@@ -462,6 +544,28 @@ def _final_attachment_summary(results: list[dict[str, object]]) -> str | None:
             return summary.strip()
         return f"Generated downloadable artifact {filename} ({mime_type})."
     return None
+
+
+def _requires_final_attachment_tool(tools: tuple[str, ...]) -> bool:
+    return any(
+        tool in {"document.generate_docx", "presentation.generate_pptx", "project.generate_zip"}
+        for tool in tools
+    )
+
+
+def _required_final_attachment_tool_message(tools: tuple[str, ...]) -> str:
+    delivery_tools = [
+        tool
+        for tool in tools
+        if tool in {"document.generate_docx", "presentation.generate_pptx", "project.generate_zip"}
+    ]
+    exposed_tools = ", ".join(tool.replace(".", "_") for tool in delivery_tools)
+    return (
+        "The user requested a downloadable final attachment. "
+        f"Call the provided final attachment tool now: {exposed_tools}. "
+        "Set presentation to final_attachment when the tool schema supports it. "
+        "Do not answer with text only."
+    )
 
 
 class RuntimeExecutionError(RuntimeError):
@@ -2292,6 +2396,18 @@ class CrewDispatchRuntime:
                 evidence.append(model_artifact)
             assert response is not None
             if not response.tool_calls:
+                if _requires_final_attachment_tool(step.tools):
+                    if _round == _MAX_TOOL_ROUNDS:
+                        raise CapabilityOutcomeUncertain(
+                            "required final attachment tool call was not produced"
+                        ) from None
+                    messages.append(
+                        ModelMessage(
+                            role="user",
+                            content=_required_final_attachment_tool_message(step.tools),
+                        )
+                    )
+                    continue
                 return completion
             if self._capabilities is None or not step.tools:
                 _fail("step requested an unavailable capability")

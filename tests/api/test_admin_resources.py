@@ -2937,6 +2937,23 @@ def test_admin_run_artifact_does_not_expose_sensitive_text() -> None:
                 }
             }
         },
+        {
+            "result": {
+                "file": {
+                    "filename": "project.zip",
+                    "mime_type": "application/zip",
+                    "size_bytes": 12,
+                    "sha256": "d" * 64,
+                    "artifact_id": "33333333-3333-4333-8333-333333333333",
+                    "storage_key": (
+                        "00000000-0000-4000-8000-000000000001/"
+                        "22222222-2222-4222-8222-222222222222/"
+                        "33333333-3333-4333-8333-333333333333/project.zip"
+                    ),
+                    "download_url": "https://attacker.example/download",
+                }
+            }
+        },
     ],
 )
 def test_admin_run_artifact_exposes_public_file_metadata_without_storage_key(
@@ -3061,6 +3078,34 @@ def test_admin_run_artifact_download_returns_stored_file(tmp_path: Path) -> None
     assert response.content == data
     assert response.headers["content-type"].startswith(metadata.mime_type)
     assert "report.docx" in response.headers["content-disposition"]
+
+
+def test_admin_run_artifact_download_returns_stored_zip_file(tmp_path: Path) -> None:
+    run_id = UUID("22222222-2222-4222-8222-222222222222")
+    artifact_id = UUID("33333333-3333-4333-8333-333333333333")
+    outer_artifact_id = UUID("55555555-5555-4555-8555-555555555555")
+    data = b"zip-bytes"
+    metadata = GeneratedFileStore(tmp_path).store_bytes(
+        tenant_id=TENANT_ID,
+        run_id=run_id,
+        artifact_id=artifact_id,
+        filename="project.zip",
+        mime_type="application/zip",
+        data=data,
+    )
+    file_metadata = metadata.to_content_file()
+    file_metadata["artifact_id"] = str(artifact_id)
+    api = _client_with_file_artifact(tmp_path, run_id, outer_artifact_id, file_metadata)
+
+    response = api.get(
+        f"/api/v1/admin/runs/{run_id}/artifacts/{artifact_id}/download",
+        headers=headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.content == data
+    assert response.headers["content-type"].startswith("application/zip")
+    assert "project.zip" in response.headers["content-disposition"]
 
 
 def test_admin_run_detail_hydrates_embedded_event_file_artifact_from_raw_events(

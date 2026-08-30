@@ -1242,7 +1242,7 @@ describe("operational management pages", () => {
     );
     expect(await screen.findByText("已停止当前运行。你可以继续发送新消息。")).not.toBeNull();
   });
-  it("keeps run detail access inside the center chat stream and sends selected workflow roles", async () => {
+  it("keeps agent process access inside the center chat stream and sends selected workflow roles", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
 
@@ -1255,9 +1255,8 @@ describe("operational management pages", () => {
     await user.type(screen.getByPlaceholderText(/输入消息/), "给我做一个短视频脚本方案。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
-    const link = await screen.findByRole("link", { name: "查看运行详情" });
-    expect(link.getAttribute("href")).toBe(`/runs/${runId}`);
-    expect(link.closest(".chat-stream")).not.toBeNull();
+    expect(await screen.findByRole("status", { name: /Agent 工作席/ })).not.toBeNull();
+    expect(screen.queryByRole("link", { name: "查看运行详情" })).toBeNull();
     expect(screen.getByText(/这轮回复使用/)).not.toBeNull();
     expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
       method: "POST",
@@ -1368,7 +1367,9 @@ describe("operational management pages", () => {
     await user.type(screen.getByPlaceholderText(/输入消息/), "1 帮我写一段口播。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
-    await screen.findByRole("link", { name: "查看运行详情" });
+    await waitFor(() =>
+      expect(requests.some((request) => request.path === "/api/v1/runs" && request.method === "POST")).toBe(true),
+    );
     expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
       method: "POST",
       body: {
@@ -1434,15 +1435,15 @@ describe("operational management pages", () => {
     expect(within(stream).queryByText("产物：短视频脚本")).toBeNull();
   });
 
-  it("shows downloadable run artifacts as compact file cards in the main chat and process drawer", async () => {
+  it("shows downloadable archive artifacts as compact file cards in the main chat and process drawer", async () => {
     const user = userEvent.setup();
     const fileArtifact = {
       id: "33333333-3333-4333-8333-333333333333",
-      kind: "docx",
-      title: "短视频脚本成稿",
+      kind: "zip",
+      title: "示例项目源码包",
       text: null,
-      filename: "short-video-script.docx",
-      mime_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      filename: "hello-world-python.zip",
+      mime_type: "application/zip",
       size_bytes: 18432,
       sha256: "8f4d0c8d0e4d9d3a0a6a8e2e4b7a6c1d8e9f0a1b2c3d4e5f67890123456789ab",
       download_url:
@@ -1486,17 +1487,17 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    const chatDownload = within(stream).getByRole("link", { name: /下载 short-video-script\.docx/ });
+    const chatDownload = within(stream).getByRole("link", { name: /下载 hello-world-python\.zip/ });
     expect(chatDownload.getAttribute("href")).toBe(fileArtifact.download_url);
-    expect(within(stream).getByText("docx")).not.toBeNull();
+    expect(within(stream).getByText("zip")).not.toBeNull();
     expect(within(stream).getAllByText("18 KB").length).toBeGreaterThan(0);
 
-    await user.click(within(stream).getByRole("button", { name: /文案生成 输出：短视频脚本成稿/ }));
+    await user.click(within(stream).getByRole("button", { name: /文案生成 输出：示例项目源码包/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     expect(within(drawer).queryByRole("link", { name: /下载 short-video-script\.docx/ })).toBeNull();
     await user.click(within(drawer).getAllByRole("button", { name: /打开活动详情：文案生成 输出/ })[0]);
     const artifactDetail = await screen.findByRole("dialog", { name: "活动详情" });
-    const drawerDownload = within(artifactDetail).getByRole("link", { name: /下载 short-video-script\.docx/ });
+    const drawerDownload = within(artifactDetail).getByRole("link", { name: /下载 hello-world-python\.zip/ });
     expect(drawerDownload.getAttribute("href")).toBe(fileArtifact.download_url);
   });
 
@@ -2788,7 +2789,9 @@ describe("operational management pages", () => {
     await user.type(screen.getByPlaceholderText(/输入消息/), "请让多个角色评审这个方案。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
-    await screen.findByRole("link", { name: "查看运行详情" });
+    await waitFor(() =>
+      expect(requests.some((request) => request.path === "/api/v1/runs" && request.method === "POST")).toBe(true),
+    );
     expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
       method: "POST",
       body: {
@@ -2812,7 +2815,9 @@ describe("operational management pages", () => {
     await user.type(screen.getByPlaceholderText(/输入消息/), "讨论 请让多个角色评审这个方案。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
-    await screen.findByRole("link", { name: "查看运行详情" });
+    await waitFor(() =>
+      expect(requests.some((request) => request.path === "/api/v1/runs" && request.method === "POST")).toBe(true),
+    );
     expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
       method: "POST",
       body: {
@@ -2912,7 +2917,9 @@ describe("operational management pages", () => {
     await user.type(screen.getByPlaceholderText(/输入消息/), "请根据图片说明问题");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
-    await screen.findByRole("link", { name: "查看运行详情" });
+    await waitFor(() =>
+      expect(requests.some((request) => request.path === "/api/v1/runs" && request.method === "POST")).toBe(true),
+    );
     expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
       method: "POST",
       body: {

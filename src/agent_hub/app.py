@@ -764,6 +764,7 @@ def create_app(
                     runtime_capabilities = RuntimeCapabilityGateway(
                         skill_store_dir=configured.skill_store_dir,
                         workspace_root=configured.attachment_store_dir,
+                        generated_artifact_dir=configured.generated_artifact_dir,
                     )
                     active_runtime_registry = configured_runtime_registry(
                         config_service=ConfigService(active_sessions),

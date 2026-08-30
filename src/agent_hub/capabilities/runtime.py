@@ -180,11 +180,18 @@ class RuntimeCapabilityGateway:
                 mime_type=DOCX_MIME_TYPE,
                 data=output.read_bytes(),
             )
-        return _file_result(
-            artifact_id=artifact_id,
-            metadata=metadata.to_public_dict(),
-            summary=f"Generated DOCX artifact {metadata.filename}.",
+        result = dict(
+            _file_result(
+                artifact_id=artifact_id,
+                metadata=metadata.to_public_dict(),
+                summary=f"Generated DOCX artifact {metadata.filename}.",
+            )
         )
+        result["presentation"] = _generated_file_presentation(
+            arguments,
+            default="final_attachment",
+        )
+        return result
 
     def _execute_generate_pptx(
         self,
@@ -219,11 +226,18 @@ class RuntimeCapabilityGateway:
                 mime_type=PPTX_MIME_TYPE,
                 data=output.read_bytes(),
             )
-        return _file_result(
-            artifact_id=artifact_id,
-            metadata=metadata.to_public_dict(),
-            summary=f"Generated PPTX artifact {metadata.filename}.",
+        result = dict(
+            _file_result(
+                artifact_id=artifact_id,
+                metadata=metadata.to_public_dict(),
+                summary=f"Generated PPTX artifact {metadata.filename}.",
+            )
         )
+        result["presentation"] = _generated_file_presentation(
+            arguments,
+            default="final_attachment",
+        )
+        return result
 
     def _execute_generate_project_zip(
         self,

@@ -1512,26 +1512,63 @@ def _is_multimedia_generation_request(task: str) -> bool:
 
 def _is_document_generation_request(task: str) -> bool:
     normalized = task.casefold()
+    if _explicit_tool_request(normalized, "document.generate_docx", "document_generate_docx"):
+        return not _has_office_generation_negation(normalized, _DOCUMENT_GENERATION_NEGATIONS)
     office_document_pair = (
         any(term in normalized for term in ("word", "docx"))
         and any(term in normalized for term in ("document", "文档", "文件", "材料"))
     )
-    return _has_generation_terms(task, _DOCUMENT_GENERATION_TERMS, _DOCUMENT_GENERATION_NEGATIONS) or (
+    office_document_delivery = _has_delivery_action(normalized) and any(
+        term in normalized for term in ("word", "docx", "word文档", "docx文档")
+    )
+    return (
+        _has_generation_terms(task, _DOCUMENT_GENERATION_TERMS, _DOCUMENT_GENERATION_NEGATIONS)
+        or (
         office_document_pair
         and any(term in normalized for term in ("generate", "create", "make", "build", "生成", "创建", "制作"))
         and not _has_office_generation_negation(normalized, _DOCUMENT_GENERATION_NEGATIONS)
     )
+        or (
+            office_document_delivery
+            and not _has_office_generation_negation(normalized, _DOCUMENT_GENERATION_NEGATIONS)
+        )
+    )
 
 
 def _is_presentation_generation_request(task: str) -> bool:
+    normalized = task.casefold()
+    if _explicit_tool_request(
+        normalized,
+        "presentation.generate_pptx",
+        "presentation_generate_pptx",
+    ):
+        return not _has_office_generation_negation(normalized, _PRESENTATION_GENERATION_NEGATIONS)
+    presentation_delivery = _has_delivery_action(normalized) and any(
+        term in normalized
+        for term in (
+            "powerpoint",
+            "ppt",
+            "pptx",
+            "presentation",
+            "演示稿",
+            "演示文稿",
+            "幻灯片",
+        )
+    )
     return _has_generation_terms(
         task,
         _PRESENTATION_GENERATION_TERMS,
         _PRESENTATION_GENERATION_NEGATIONS,
+    ) or (
+        presentation_delivery
+        and not _has_office_generation_negation(normalized, _PRESENTATION_GENERATION_NEGATIONS)
     )
 
 
 def _is_project_package_generation_request(task: str) -> bool:
+    normalized = task.casefold()
+    if _explicit_tool_request(normalized, "project.generate_zip", "project_generate_zip"):
+        return not _has_office_generation_negation(normalized, _PROJECT_PACKAGE_GENERATION_NEGATIONS)
     return _has_generation_terms(
         task,
         _PROJECT_PACKAGE_GENERATION_TERMS,
@@ -1557,6 +1594,33 @@ def _has_generation_negation(normalized: str) -> bool:
 
 def _has_office_generation_negation(normalized: str, negations: tuple[str, ...]) -> bool:
     return any(negation in normalized for negation in negations)
+
+
+def _explicit_tool_request(normalized: str, *tool_names: str) -> bool:
+    return any(tool_name in normalized for tool_name in tool_names)
+
+
+def _has_delivery_action(normalized: str) -> bool:
+    return any(
+        term in normalized
+        for term in (
+            "generate",
+            "create",
+            "make",
+            "build",
+            "produce",
+            "export",
+            "download",
+            "call",
+            "生成",
+            "创建",
+            "制作",
+            "输出",
+            "导出",
+            "下载",
+            "调用",
+        )
+    )
 
 
 def _normalize_profiles(
