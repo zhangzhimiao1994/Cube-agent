@@ -215,6 +215,7 @@ function displayEventTitle(event: RunDetail["events"][number], agentNames: Map<s
     "step.failed": actor ? `${actor} 执行失败` : "一个步骤执行失败",
     "step.retrying": actor ? `${actor} 重试执行` : "重试一个步骤",
     "review.completed": actor ? `${actor} 完成审查` : "完成审查",
+    "tool.requested": "工具请求已记录",
     "tool.started": event.tool_name ? `开始使用工具：${event.tool_name}` : "开始使用工具",
     "tool.completed": event.tool_name ? `工具执行完成：${event.tool_name}` : "工具执行完成",
     "tool.failed": event.tool_name ? `工具执行失败：${event.tool_name}` : "工具执行失败",
@@ -296,6 +297,9 @@ function formatEventPayloadValue(value: unknown): string {
   if (value === null || typeof value === "undefined") return "";
   if (typeof value === "string") return value;
   if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value) && value.every((item) => ["string", "number", "boolean"].includes(typeof item))) {
+    return value.map((item) => String(item)).join("、");
+  }
   try {
     return JSON.stringify(value, null, 2);
   } catch {
@@ -395,6 +399,13 @@ function eventPayloadLabel(key: string) {
     model_deployment: "模型部署",
     deployment: "模型部署",
     provider: "服务商",
+    id: "调用 ID",
+    name: "工具",
+    argument_keys: "参数字段",
+    argument_key_count: "参数字段数",
+    redacted_argument_key_count: "已隐藏字段数",
+    argument_bytes: "参数字节数",
+    arguments_sha256: "参数摘要",
     phase: "阶段",
     capabilities: "工程能力",
     policy: "策略原因",
@@ -425,6 +436,13 @@ function orderedEventPayloadEntries(payload: Record<string, unknown>) {
     "upstream_model",
     "provider",
     "deployment",
+    "name",
+    "id",
+    "argument_keys",
+    "argument_key_count",
+    "redacted_argument_key_count",
+    "argument_bytes",
+    "arguments_sha256",
     "role",
     "agent",
     "task",
@@ -476,6 +494,7 @@ function eventDetailRows(event: RunDetail["events"][number], agentNames: Map<str
   if (readableMessage) rows.push({ label: "事件内容", value: readableMessage });
   orderedEventPayloadEntries(event.payload).forEach(([key, value]) => {
     if (key === "participants" || key === "participant_models") return;
+    if (event.kind === "tool.requested" && (key === "arguments" || key === "arguments_sha256")) return;
     const formatted = formatEventPayloadValue(value);
     if (formatted) {
       rows.push({ label: eventPayloadLabel(key), value: formatted });
@@ -1062,6 +1081,10 @@ function eventSummaryText(
     const logicalModel = formatEventPayloadValue(event.payload.logical_model) || "harness";
     const provider = formatEventPayloadValue(event.payload.provider);
     return `Harness 启动：${conciseProcessText(logicalModel, "模型")}${provider ? ` / ${provider}` : ""}`;
+  }
+  if (event.kind === "tool.requested") {
+    const requestedTool = formatEventPayloadValue(event.payload.name) || event.tool_name || "工具";
+    return `工具请求：${conciseProcessText(requestedTool, "工具")}`;
   }
   if (event.kind === "step.started") {
     return `${subject} 接收任务：${conciseProcessText(instructionSignal, "开始执行")}`;

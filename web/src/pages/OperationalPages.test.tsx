@@ -1927,6 +1927,103 @@ describe("operational management pages", () => {
     expect(within(drawer).getByText(/supports_parallel_tool_calls/)).not.toBeNull();
   });
 
+  it("renders tool requested events from argument summaries without argument values", async () => {
+    const user = userEvent.setup();
+    visibleRunDetail = {
+      ...runDetail,
+      events: [
+        {
+          sequence: 1,
+          kind: "tool.requested",
+          message: "tool.requested",
+          created_at: conversationCreatedAt,
+          participants: [],
+          payload: {
+            id: "call_1",
+            name: "workspace_read",
+            argument_keys: ["path"],
+            argument_key_count: 1,
+            redacted_argument_key_count: 0,
+            argument_bytes: 20,
+          },
+        },
+        ...runDetail.events.map((event) => ({ ...event, sequence: event.sequence + 1 })),
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const toolCard = within(stream).getByRole("button", {
+      name: /工具请求：workspace_read/,
+    });
+    expect(toolCard).not.toBeNull();
+    expect(within(stream).queryByText("README.md")).toBeNull();
+    await user.click(toolCard);
+
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).getByText("参数字段")).not.toBeNull();
+    expect(within(drawer).getByText("path")).not.toBeNull();
+    expect(within(drawer).getByText("参数字节数")).not.toBeNull();
+    expect(within(drawer).getByText("20")).not.toBeNull();
+    expect(within(drawer).queryByText("README.md")).toBeNull();
+  });
+
+  it("does not render legacy raw arguments for tool requested events", async () => {
+    const user = userEvent.setup();
+    visibleRunDetail = {
+      ...runDetail,
+      events: [
+        {
+          sequence: 1,
+          kind: "tool.requested",
+          message: "tool.requested",
+          created_at: conversationCreatedAt,
+          participants: [],
+          payload: {
+            id: "call_1",
+            name: "workspace_read",
+            arguments: {
+              path: "README.md",
+              api_key: "sk-secret123",
+            },
+            argument_keys: ["path"],
+            argument_key_count: 2,
+            redacted_argument_key_count: 1,
+            argument_bytes: 43,
+            arguments_sha256: "b".repeat(64),
+          },
+        },
+        ...runDetail.events.map((event) => ({ ...event, sequence: event.sequence + 1 })),
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const toolCard = within(stream).getByRole("button", {
+      name: /工具请求：workspace_read/,
+    });
+    await user.click(toolCard);
+
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).getByText("工具请求已记录")).not.toBeNull();
+    expect(within(drawer).getByText("已隐藏字段数")).not.toBeNull();
+    expect(within(drawer).getByText("1")).not.toBeNull();
+    expect(within(drawer).queryByText("README.md")).toBeNull();
+    expect(within(drawer).queryByText("sk-secret123")).toBeNull();
+    expect(within(drawer).queryByText("api_key")).toBeNull();
+    expect(within(drawer).queryByText("b".repeat(64))).toBeNull();
+  });
+
   it("marks intermediate process outputs in labeled boxes while keeping the final reply merged", async () => {
     const user = userEvent.setup();
     const view = render(<TestApp initialPath="/" />);

@@ -1,3 +1,4 @@
+import json
 from decimal import Decimal
 from uuid import UUID
 
@@ -37,9 +38,67 @@ def test_provider_events_project_to_runtime_extension_events_with_sequences() ->
     assert [event.kind for event in events] == ["model.text_delta", "tool.requested"]
     assert events[0].run_id == RUN_ID
     assert events[0].payload == {"text": "hello"}
-    assert events[1].payload["arguments"] == {"path": "README.md"}
+    assert events[1].payload == {
+        "id": "call_1",
+        "name": "workspace_read",
+        "argument_keys": ("path",),
+        "argument_key_count": 1,
+        "redacted_argument_key_count": 0,
+        "argument_bytes": len(b'{"path":"README.md"}'),
+    }
     assert events[0].actor is None
     assert events[0].message is None
+
+
+def test_provider_tool_event_projection_does_not_expose_argument_values() -> None:
+    (event,) = tuple(
+        provider_events_to_run_events(
+            (
+                NormalizedProviderEvent(
+                    kind="tool.requested",
+                    payload={
+                        "id": "call_1",
+                        "name": "external_message",
+                        "arguments": {"body": "secret user content"},
+                    },
+                ),
+            ),
+            run_id=RUN_ID,
+            start_sequence=1,
+        )
+    )
+
+    serialized = json.dumps(event.to_payload(), ensure_ascii=False, sort_keys=True)
+    assert "secret user content" not in serialized
+    assert "arguments_sha256" not in event.payload
+    assert event.payload["argument_keys"] == ("body",)
+
+
+def test_provider_tool_event_projection_redacts_sensitive_argument_keys() -> None:
+    (event,) = tuple(
+        provider_events_to_run_events(
+            (
+                NormalizedProviderEvent(
+                    kind="tool.requested",
+                    payload={
+                        "id": "call_1",
+                        "name": "external_message",
+                        "arguments": {"api_key": "sk-secret123", "path": "README.md"},
+                    },
+                ),
+            ),
+            run_id=RUN_ID,
+            start_sequence=1,
+        )
+    )
+
+    serialized = json.dumps(event.to_payload(), ensure_ascii=False, sort_keys=True)
+    assert "sk-secret123" not in serialized
+    assert "api_key" not in serialized
+    assert "README.md" not in serialized
+    assert event.payload["argument_keys"] == ("path",)
+    assert event.payload["argument_key_count"] == 2
+    assert event.payload["redacted_argument_key_count"] == 1
 
 
 def test_gateway_completion_projects_safe_model_completed_event() -> None:

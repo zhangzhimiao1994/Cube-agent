@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterable, Mapping
 from uuid import UUID
@@ -11,7 +12,7 @@ from agent_hub.models.types import ToolCall
 from agent_hub.runtime.contracts import RunEvent
 
 _SENSITIVE_TEXT = re.compile(
-    r"(?:sk-[a-z0-9_-]{8,}|bearer\s+|authorization|password|secret|token)",
+    r"(?:api[_ -]?key|sk-[a-z0-9_-]{8,}|bearer\s+|authorization|password|secret|token)",
     re.IGNORECASE,
 )
 _MAX_PROFILE_ITEMS = 6
@@ -34,7 +35,7 @@ def provider_events_to_run_events(
             kind=event.kind,
             sequence=sequence,
             run_id=run_id,
-            payload=event.payload,
+            payload=_provider_event_payload(event),
         )
         sequence += 1
 
@@ -125,6 +126,41 @@ def _safe_text_tuple(value: object) -> tuple[str, ...]:
         if len(result) >= _MAX_PROFILE_ITEMS:
             break
     return tuple(result)
+
+
+def _provider_event_payload(event: NormalizedProviderEvent) -> Mapping[str, JsonValue]:
+    if event.kind != "tool.requested":
+        return event.payload
+    identifier = _safe_text(event.payload.get("id"))
+    name = _safe_text(event.payload.get("name"))
+    arguments = event.payload.get("arguments")
+    if identifier is None or name is None or not isinstance(arguments, Mapping):
+        return {}
+    canonical_arguments = json.dumps(
+        _mutable_json(arguments),
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    argument_keys = tuple(sorted(key for key in arguments if isinstance(key, str)))
+    safe_argument_keys = tuple(key for key in argument_keys if _safe_text(key) is not None)
+    return {
+        "id": identifier,
+        "name": name,
+        "argument_keys": safe_argument_keys,
+        "argument_key_count": len(argument_keys),
+        "redacted_argument_key_count": len(argument_keys) - len(safe_argument_keys),
+        "argument_bytes": len(canonical_arguments),
+    }
+
+
+def _mutable_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _mutable_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_mutable_json(item) for item in value]
+    return value
 
 
 def _completion_payload(
