@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Any, cast
 from uuid import UUID, uuid4
 
+from agent_hub.auth.models import Role
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelCapability, ModelRequest, ModelResponse, TokenUsage
@@ -51,6 +52,8 @@ def discussion_context() -> TaskContext:
     return TaskContext(
         run_id=uuid4(),
         tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=Role.OPERATOR,
         mode=TaskMode.DISCUSS,
         request="Analyze the evidence.",
     )
@@ -60,6 +63,8 @@ def resumed_context(context: TaskContext, checkpoint: Any) -> TaskContext:
     return TaskContext(
         run_id=context.run_id,
         tenant_id=context.tenant_id,
+        actor_id=context.actor_id,
+        actor_role=context.actor_role,
         mode=context.mode,
         request=context.request,
         checkpoint=checkpoint,
@@ -112,7 +117,7 @@ async def test_model_running_resume_fails_uncertain_without_gateway_replay() -> 
     stream = runtime.run(context)
     assert (await anext(stream)).kind is EventKind.DISCUSSION_STARTED
     pending: asyncio.Future[RunEvent] = asyncio.ensure_future(anext(stream))
-    await gateway.started.wait()
+    await asyncio.wait_for(gateway.started.wait(), timeout=5)
     checkpoint = await runtime.save_checkpoint()
     model_ledger = cast(tuple[Mapping[str, JsonValue], ...], checkpoint.state["model_ledger"])
     assert model_ledger[0]["status"] == "running"
@@ -201,7 +206,7 @@ async def test_model_succeeded_artifact_resumes_without_gateway_and_hash_tamper_
     stream = runtime.run(context)
     await anext(stream)
     pending: asyncio.Future[RunEvent] = asyncio.ensure_future(anext(stream))
-    await repository.text_started.wait()
+    await asyncio.wait_for(repository.text_started.wait(), timeout=5)
     checkpoint = await runtime.save_checkpoint()
     ledger = cast(tuple[Mapping[str, JsonValue], ...], checkpoint.state["model_ledger"])
     assert [entry["status"] for entry in ledger] == ["succeeded", "succeeded"]
@@ -347,7 +352,7 @@ async def running_tool_checkpoint(
     stream: AsyncIterator[RunEvent] = runtime.run(context)
     await anext(stream)
     pending: asyncio.Future[RunEvent] = asyncio.ensure_future(anext(stream))
-    await capability.started.wait()
+    await asyncio.wait_for(capability.started.wait(), timeout=5)
     checkpoint = await runtime.save_checkpoint()
     await runtime.cancel()
     await pending
