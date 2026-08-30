@@ -418,6 +418,10 @@ function eventPayloadLabel(key: string) {
     stderr_bytes: "标准错误字节数",
     result_bytes: "结果字节数",
     content_bytes: "内容字节数",
+    operation_kind: "操作类别",
+    sandbox: "沙箱",
+    replay_safe: "可重放",
+    failure_kind: "失败类型",
     delta_kind: "Delta 类型",
     text_bytes: "内容字节数",
     chunk_index: "分片序号",
@@ -612,6 +616,11 @@ type AgentDispatchCard = {
   status: "异常" | "已完成" | "工作中" | "已安排";
 };
 
+type RunProcessPosture = {
+  status: "等待确认" | "执行异常" | "任务已结束" | "运行中" | "已排队";
+  metrics: Array<{ label: string; value: number }>;
+};
+
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -683,6 +692,67 @@ function dispatchAgentCards(detail: RunDetail, agentNames: Map<string, string>):
       };
     })
     .filter((card): card is AgentDispatchCard => card !== null);
+}
+
+function uniqueToolCallCount(events: RunDetail["events"]) {
+  const calls = new Set<string>();
+  events
+    .filter(isToolEvent)
+    .forEach((event) => {
+      calls.add(toolLifecycleKey(event));
+    });
+  return calls.size;
+}
+
+function artifactProgressCount(detail: RunDetail) {
+  const artifacts = new Set<string>();
+  detail.artifacts.forEach((artifact) => artifacts.add(artifact.id));
+  detail.events
+    .filter((event) => event.kind === "artifact.created" || event.kind === "message.created")
+    .forEach((event) => {
+      const artifactId = event.artifact?.id || formatEventPayloadValue(event.payload.artifact_id);
+      if (artifactId) {
+        artifacts.add(artifactId);
+      } else if (detail.artifacts.length === 0) {
+        artifacts.add(`event:${event.sequence}`);
+      }
+    });
+  return artifacts.size;
+}
+
+function pendingApprovalCount(events: RunDetail["events"]) {
+  const requested = events.filter((event) => event.kind === "approval.requested").length;
+  const resolved = events.filter((event) => event.kind === "approval.resolved").length;
+  return Math.max(0, requested - resolved);
+}
+
+function failureCount(events: RunDetail["events"]) {
+  return events.filter((event) => (event.kind.endsWith(".failed") || event.kind === "runtime.failed") && !isWrappedToolFailureEvent(event, events)).length;
+}
+
+function runProcessPosture(detail: RunDetail, itemCount: number, assistantCount: number): RunProcessPosture {
+  const pendingApprovals = detail.status === "waiting_approval" ? Math.max(1, pendingApprovalCount(detail.events)) : pendingApprovalCount(detail.events);
+  const failures = failureCount(detail.events);
+  const status =
+    pendingApprovals > 0
+      ? "等待确认"
+      : detail.status === "failed" || failures > 0
+        ? "执行异常"
+        : TERMINAL_STATUSES.has(detail.status)
+          ? "任务已结束"
+          : detail.status === "queued"
+            ? "已排队"
+            : "运行中";
+  const metrics = [
+    { label: "动作", value: itemCount },
+    { label: "助手", value: assistantCount },
+    { label: "工具", value: uniqueToolCallCount(detail.events) },
+    { label: "产物", value: artifactProgressCount(detail) },
+    { label: "异常", value: failures },
+    { label: "确认", value: pendingApprovals },
+    { label: "思考", value: detail.events.filter((event) => event.kind === "model.reasoning_delta").length },
+  ].filter((metric) => metric.value > 0);
+  return { status, metrics };
 }
 
 function toggle(list: string[], value: string) {
@@ -946,7 +1016,45 @@ function failureReasonFromEvents(events: RunDetail["events"]) {
   const event = [...events]
     .sort((left, right) => right.sequence - left.sequence)
     .find((item) => ["runtime.failed", "step.failed", "tool.failed"].includes(item.kind) && item.message);
-  return event?.message ?? null;
+  if (!event) return null;
+  const toolFailure = latestToolFailureEvent(events);
+  if (event.kind !== "tool.failed" && toolFailure && isWrappedToolFailureEvent(event, events)) {
+    return toolFailureSummary(toolFailure);
+  }
+  if (event.kind !== "tool.failed") return event.message ?? null;
+  return toolFailureSummary(event);
+}
+
+function latestToolFailureEvent(events: RunDetail["events"]) {
+  return [...events]
+    .filter((event) => event.kind === "tool.failed")
+    .sort((left, right) => right.sequence - left.sequence)
+    .at(0);
+}
+
+function isWrappedToolFailureEvent(event: RunDetail["events"][number], events: RunDetail["events"]) {
+  if (event.kind !== "runtime.failed" && event.kind !== "step.failed") return false;
+  return events.some((candidate) => {
+    if (candidate.kind !== "tool.failed" || candidate.sequence > event.sequence) return false;
+    if (candidate.step_id && event.step_id && candidate.step_id === event.step_id) return true;
+    return !events.some((between) => between.sequence > candidate.sequence && between.sequence < event.sequence && isActionEvent(between));
+  });
+}
+
+function toolFailureSummary(event: RunDetail["events"][number]) {
+  const toolName = toolEventName(event);
+  const failureKind = formatEventPayloadValue(event.payload.failure_kind);
+  const exitCode = formatEventPayloadValue(event.payload.exit_code);
+  const outputBytes = formatEventPayloadValue(event.payload.output_bytes);
+  return [
+    `${toolOperationLabel(toolName)}失败：${toolName}`,
+    failureKind ? `失败类型 ${failureKind}` : "",
+    exitCode ? `退出码 ${exitCode}` : "",
+    outputBytes ? `输出 ${outputBytes} 字节` : "",
+    "原始命令和输出已隐藏，可在运行过程查看安全摘要。",
+  ]
+    .filter(Boolean)
+    .join("；");
 }
 
 function dedupeTextArtifacts(artifacts: RunDetail["artifacts"]) {
@@ -1364,6 +1472,98 @@ function processBadgeForEvent(event: RunEvent) {
   return "过程记录";
 }
 
+function toolLifecycleKey(event: RunEvent) {
+  return event.tool_call_id || formatEventPayloadValue(event.payload.id) || `${event.kind}:${toolEventName(event)}:${event.sequence}`;
+}
+
+function toolLifecycleStatusText(event: RunEvent) {
+  if (event.kind === "tool.requested") return "请求";
+  if (event.kind === "tool.started") return "开始";
+  if (event.kind === "tool.completed") return "完成";
+  if (event.kind === "tool.failed") return "失败";
+  return "记录";
+}
+
+function durationBetween(first: string | null | undefined, last: string | null | undefined) {
+  if (!first || !last) return "";
+  const start = Date.parse(first);
+  const end = Date.parse(last);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return "";
+  const milliseconds = end - start;
+  if (milliseconds < 1000) return `${milliseconds}ms`;
+  return `${(milliseconds / 1000).toFixed(milliseconds < 10_000 ? 1 : 0)}s`;
+}
+
+function safeLifecyclePayloadRows(events: RunEvent[], existingLabels: Set<string>) {
+  const rows: Array<{ label: string; value: string }> = [];
+  const safeKeys = [
+    "argument_keys",
+    "argument_key_count",
+    "redacted_argument_key_count",
+    "argument_bytes",
+    "command_bytes",
+    "operation_kind",
+    "sandbox",
+    "replay_safe",
+    "status",
+    "exit_code",
+    "stdout_bytes",
+    "stderr_bytes",
+    "output_bytes",
+    "result_bytes",
+    "failure_kind",
+    "artifact_id",
+  ];
+  events.forEach((event) => {
+    safeKeys.forEach((key) => {
+      if (RAW_TOOL_PAYLOAD_KEYS.has(key)) return;
+      const value = event.payload[key];
+      const formatted = formatEventPayloadValue(value);
+      const label = eventPayloadLabel(key);
+      if (!formatted || existingLabels.has(label)) return;
+      existingLabels.add(label);
+      rows.push({ label, value: formatted });
+    });
+  });
+  return rows;
+}
+
+function processItemsForToolLifecycle(
+  detail: RunDetail,
+  events: RunEvent[],
+  index: number,
+  agentNames: Map<string, string>,
+  artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null,
+): ProcessDetailTarget[] {
+  const lastEvent = events.at(-1);
+  if (!lastEvent) return [];
+  const firstEvent = events[0];
+  const statusFlow = events.map(toolLifecycleStatusText).filter((value, position, list) => position === 0 || value !== list[position - 1]);
+  const lifecycleRows = [
+    { label: "状态流", value: statusFlow.join("，") },
+    durationBetween(firstEvent.created_at, lastEvent.created_at)
+      ? { label: "耗时", value: durationBetween(firstEvent.created_at, lastEvent.created_at) }
+      : null,
+  ].filter((row): row is { label: string; value: string } => Boolean(row));
+  const baseRows = [
+    ...modelRowsForEvent(lastEvent, detail.events, agentNames),
+    ...eventDetailRows(lastEvent, agentNames),
+    ...eventArtifactRows(artifact),
+  ];
+  const labels = new Set([...lifecycleRows, ...baseRows].map((row) => row.label));
+  const rows = [...lifecycleRows, ...baseRows, ...safeLifecyclePayloadRows(events, labels)];
+  return [
+    {
+      id: `${detail.id}-tool-${toolLifecycleKey(lastEvent)}-${index}`,
+      title: displayEventTitle(lastEvent, agentNames),
+      message: eventSummaryText(lastEvent, agentNames, artifact),
+      badge: processBadgeForEvent(lastEvent),
+      rows,
+      createdAt: lastEvent.created_at,
+    },
+  ];
+}
+
 function processItemsForEvent(
   detail: RunDetail,
   event: RunEvent,
@@ -1437,9 +1637,34 @@ function runProcessItems(
         ]
       : [];
   const consumedArtifactIds = new Set<string>();
+  const toolGroups = new Map<string, Array<{ event: RunEvent; index: number }>>();
+  detail.events.forEach((event, index) => {
+    if (!isToolEvent(event)) return;
+    const key = toolLifecycleKey(event);
+    toolGroups.set(key, [...(toolGroups.get(key) ?? []), { event, index }]);
+  });
+  const finalToolEvents = new Map<RunEvent, Array<{ event: RunEvent; index: number }>>();
+  toolGroups.forEach((group) => {
+    const finalEvent = group.at(-1)?.event;
+    if (finalEvent) finalToolEvents.set(finalEvent, group);
+  });
   const eventItems = detail.events
     .filter(isActionEvent)
     .flatMap((event, index) => {
+      if (isToolEvent(event)) {
+        const group = finalToolEvents.get(event);
+        if (!group) return [];
+        const finalEvent = group.at(-1)?.event ?? event;
+        const artifact = fallbackArtifactForEvent(finalEvent, detail.artifacts, consumedArtifactIds);
+        return processItemsForToolLifecycle(
+          detail,
+          group.map((item) => item.event),
+          group[0]?.index ?? index,
+          agentNames,
+          artifact,
+        );
+      }
+      if (isWrappedToolFailureEvent(event, detail.events)) return [];
       const artifact = fallbackArtifactForEvent(event, detail.artifacts, consumedArtifactIds);
       if (event.kind === "artifact.created" && !artifact && !hasUsefulPayload(event)) return [];
       return processItemsForEvent(detail, event, index, agentNames, artifact);
@@ -1460,13 +1685,32 @@ function RunProcessSummary({
 }) {
   const items = runProcessItems(detail, agentNames, mainAgentModelName);
   const dispatchCards = dispatchAgentCards(detail, agentNames);
-  if (items.length === 0) return null;
+  const posture = runProcessPosture(detail, items.length, dispatchCards.length);
+  const shouldShowSummary =
+    items.length > 0 || dispatchCards.length > 0 || ["queued", "running", "waiting_approval", "failed"].includes(detail.status);
+  if (!shouldShowSummary) return null;
   return (
     <section className="run-process-summary" aria-label="Agent 集群动作">
-      <div className="agent-cluster-status" role="status" aria-label={`Agent 集群，${items.length} 个关键动作`}>
-        <span aria-hidden="true">⌘</span>
-        <strong>Agent 集群</strong>
-        <small>{items.length} 个关键动作</small>
+      {items.length > 0 ? (
+        <div className="agent-cluster-status" role="status" aria-label={`Agent 集群，${items.length} 个关键动作`}>
+          <span aria-hidden="true">⌘</span>
+          <strong>Agent 集群</strong>
+          <small>{items.length} 个关键动作</small>
+        </div>
+      ) : null}
+      <div className="run-process-posture" role="status" aria-label={`任务态势，${posture.status}`}>
+        <div>
+          <span aria-hidden="true">◎</span>
+          <strong>任务态势</strong>
+          <small>{posture.status}</small>
+        </div>
+        <ul aria-label="任务态势指标">
+          {posture.metrics.map((metric) => (
+            <li key={metric.label}>
+              {metric.label} {metric.value}
+            </li>
+          ))}
+        </ul>
       </div>
       {dispatchCards.length > 0 ? (
         <section className="agent-recruitment" aria-label="助手派单状态">
@@ -1494,15 +1738,17 @@ function RunProcessSummary({
           </div>
         </section>
       ) : null}
-      <div className="agent-cluster-actions">
-        {items.map((item) => (
-          <button key={item.id} type="button" className="run-process-toggle process-intermediate-card" onClick={() => onOpen(item)}>
-            <span aria-hidden="true">›</span>
-            <small className="process-card-badge">{item.badge}</small>
-            <strong>{item.message}</strong>
-          </button>
-        ))}
-      </div>
+      {items.length > 0 ? (
+        <div className="agent-cluster-actions">
+          {items.map((item) => (
+            <button key={item.id} type="button" className="run-process-toggle process-intermediate-card" onClick={() => onOpen(item)}>
+              <span aria-hidden="true">›</span>
+              <small className="process-card-badge">{item.badge}</small>
+              <strong>{item.message}</strong>
+            </button>
+          ))}
+        </div>
+      ) : null}
     </section>
   );
 }

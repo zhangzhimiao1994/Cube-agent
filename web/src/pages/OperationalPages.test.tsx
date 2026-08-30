@@ -2345,9 +2345,6 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    const startedCard = within(stream).getByRole("button", {
-      name: /文案生成 运行终端：run_safe_command/,
-    });
     const completedCard = within(stream).getByRole("button", {
       name: /文案生成 运行终端完成：run_safe_command/,
     });
@@ -2359,31 +2356,25 @@ describe("operational management pages", () => {
     expect(within(stream).queryByText("private terminal output")).toBeNull();
     expect(within(stream).queryByText("secret file content should stay hidden")).toBeNull();
 
-    await user.click(startedCard);
-    const startedDrawer = await screen.findByRole("dialog", { name: "运行过程详情" });
-    expect(within(startedDrawer).getByText("操作类型")).not.toBeNull();
-    expect(within(startedDrawer).getAllByText("运行终端").length).toBeGreaterThan(0);
-    expect(within(startedDrawer).getByText("工具状态")).not.toBeNull();
-    expect(within(startedDrawer).getByText("开始")).not.toBeNull();
-    expect(within(startedDrawer).getByText("命令字节数")).not.toBeNull();
-    expect(within(startedDrawer).getByText("20")).not.toBeNull();
-    expect(within(startedDrawer).queryByText("cat secret-token.txt")).toBeNull();
-    await user.click(within(startedDrawer).getByRole("button", { name: "关闭" }));
-
     await user.click(completedCard);
     const completedDrawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(completedDrawer).getByText("状态流")).not.toBeNull();
+    expect(within(completedDrawer).getByText("开始，完成")).not.toBeNull();
     expect(within(completedDrawer).getByText("完成")).not.toBeNull();
     expect(within(completedDrawer).getByText("退出码")).not.toBeNull();
     expect(within(completedDrawer).getByText("0")).not.toBeNull();
+    expect(within(completedDrawer).getByText("命令字节数")).not.toBeNull();
+    expect(within(completedDrawer).getByText("20")).not.toBeNull();
     expect(within(completedDrawer).getByText("输出字节数")).not.toBeNull();
     expect(within(completedDrawer).getByText("41")).not.toBeNull();
+    expect(within(completedDrawer).queryByText("cat secret-token.txt")).toBeNull();
     expect(within(completedDrawer).queryByText("terminal output contained sk-secret123")).toBeNull();
     expect(within(completedDrawer).queryByText("private terminal output")).toBeNull();
     await user.click(within(completedDrawer).getByRole("button", { name: "关闭" }));
 
     await user.click(failedCard);
     const failedDrawer = await screen.findByRole("dialog", { name: "运行过程详情" });
-    expect(within(failedDrawer).getByText("失败")).not.toBeNull();
+    expect(within(failedDrawer).getAllByText("失败").length).toBeGreaterThan(0);
     expect(within(failedDrawer).getByText("内容字节数")).not.toBeNull();
     expect(within(failedDrawer).getByText("38")).not.toBeNull();
     expect(within(failedDrawer).queryByText("secret file content should stay hidden")).toBeNull();
@@ -2607,6 +2598,442 @@ describe("operational management pages", () => {
     expect(within(opinionDrawer).getAllByText("导演").length).toBeGreaterThan(0);
     expect(within(opinionDrawer).getByText("导演意见")).not.toBeNull();
     expect(within(opinionDrawer).getByText("导演建议压缩签到环节，避免排队。")).not.toBeNull();
+  });
+
+  it("summarizes Vibe engineer run posture from real process events", async () => {
+    const user = userEvent.setup();
+    const postureRunDetail = {
+      ...runDetail,
+      status: "waiting_approval",
+      events: [
+        {
+          sequence: 1,
+          kind: "step.started",
+          message: "step.started",
+          created_at: conversationCreatedAt,
+          actor: "main_agent",
+          participants: [],
+          tool_name: null,
+          step_id: "main_agent_plan",
+          action: null,
+          decision: null,
+          payload: {
+            roles: [
+              { id: "engineer", role: "工程师", purpose: "execute", logical_model: "deepseek-chat", tools: ["run_safe_command"] },
+              { id: "reviewer", role: "审查员", purpose: "review", logical_model: "qwen-max", tools: [] },
+            ],
+            steps: [
+              { id: "engineer_step", agent: "engineer", depends_on: [], final_synthesizer: false, tools: ["run_safe_command"] },
+              { id: "reviewer_step", agent: "reviewer", depends_on: ["engineer_step"], final_synthesizer: false, tools: [] },
+            ],
+          },
+        },
+        {
+          sequence: 2,
+          kind: "model.reasoning_delta",
+          message: "model.reasoning_delta",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: null,
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: { delta_kind: "reasoning", text_bytes: 128, chunk_index: 1 },
+        },
+        {
+          sequence: 3,
+          kind: "tool.started",
+          message: "tool.started",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: "run_safe_command",
+          tool_call_id: "call_terminal",
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: { schema_version: 1, status: "running", operation_kind: "terminal", argument_key_count: 1 },
+        },
+        {
+          sequence: 4,
+          kind: "tool.failed",
+          message: "tool.failed",
+          created_at: "2026-08-07T00:00:03Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: "run_safe_command",
+          tool_call_id: "call_terminal",
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: { schema_version: 1, status: "failed", operation_kind: "terminal", failure_kind: "capability_failed" },
+        },
+        {
+          sequence: 5,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: "2026-08-07T00:00:04Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: null,
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: {},
+          artifact: {
+            id: "artifact-engineer-log",
+            kind: "markdown",
+            title: "工程执行日志",
+            text: "已记录失败命令的安全摘要。",
+          },
+        },
+        {
+          sequence: 6,
+          kind: "approval.requested",
+          message: "approval.requested",
+          created_at: "2026-08-07T00:00:05Z",
+          actor: "main_agent",
+          participants: [],
+          tool_name: null,
+          step_id: null,
+          action: "retry_terminal",
+          decision: null,
+          payload: { task: "是否允许重试终端命令" },
+        },
+      ],
+      artifacts: [],
+    };
+    visibleRunDetail = postureRunDetail;
+    visibleConversationRuns = [postureRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const posture = within(stream).getByRole("status", { name: /任务态势，等待确认/ });
+
+    expect(within(posture).getByText("任务态势")).not.toBeNull();
+    expect(within(posture).getByText("等待确认")).not.toBeNull();
+    expect(within(posture).getByText("助手 2")).not.toBeNull();
+    expect(within(posture).getByText("工具 1")).not.toBeNull();
+    expect(within(posture).getByText("产物 1")).not.toBeNull();
+    expect(within(posture).getByText("异常 1")).not.toBeNull();
+    expect(within(posture).getByText("确认 1")).not.toBeNull();
+    expect(within(posture).getByText("思考 1")).not.toBeNull();
+  });
+
+  it("groups tool lifecycle events by call id with clear failure details", async () => {
+    const user = userEvent.setup();
+    const lifecycleRunDetail = {
+      ...runDetail,
+      status: "failed",
+      events: [
+        {
+          sequence: 1,
+          kind: "tool.started",
+          message: "tool.started",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: "run_safe_command",
+          tool_call_id: "call_terminal",
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: {
+            schema_version: 1,
+            status: "running",
+            operation_kind: "terminal",
+            argument_key_count: 1,
+            argument_bytes: 32,
+            command: "cat private-token.txt",
+          },
+        },
+        {
+          sequence: 2,
+          kind: "tool.failed",
+          message: "cat private-token.txt failed with private output",
+          created_at: "2026-08-07T00:00:04Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: "run_safe_command",
+          tool_call_id: "call_terminal",
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: {
+            schema_version: 1,
+            status: "failed",
+            operation_kind: "terminal",
+            failure_kind: "capability_failed",
+            exit_code: 1,
+            output_bytes: 128,
+            stdout: "private output",
+          },
+        },
+      ],
+      artifacts: [],
+    };
+    visibleRunDetail = lifecycleRunDetail;
+    visibleConversationRuns = [lifecycleRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const toolCards = within(stream).getAllByRole("button", { name: /run_safe_command/ });
+
+    expect(toolCards).toHaveLength(1);
+    expect(toolCards[0].textContent).toContain("运行终端失败");
+    expect(stream.textContent).not.toContain("private-token");
+    expect(stream.textContent).not.toContain("private output");
+
+    await user.click(toolCards[0]);
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).getByText("状态流")).not.toBeNull();
+    expect(within(drawer).getByText("开始，失败")).not.toBeNull();
+    expect(within(drawer).getByText("失败类型")).not.toBeNull();
+    expect(within(drawer).getByText("capability_failed")).not.toBeNull();
+    expect(within(drawer).getByText("退出码")).not.toBeNull();
+    expect(within(drawer).getAllByText("1").length).toBeGreaterThan(0);
+    expect(drawer.textContent).not.toContain("private-token");
+    expect(drawer.textContent).not.toContain("private output");
+  });
+
+  it("keeps wrapped runtime tool failures out of the chat failure summary", async () => {
+    const user = userEvent.setup();
+    const wrappedFailureRunDetail = {
+      ...runDetail,
+      status: "failed",
+      events: [
+        {
+          sequence: 1,
+          kind: "tool.failed",
+          message: "tool.failed",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: "run_safe_command",
+          tool_call_id: "call_terminal",
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: {
+            status: "failed",
+            operation_kind: "terminal",
+            failure_kind: "capability_failed",
+            exit_code: 1,
+            output_bytes: 128,
+            stdout: "private output",
+          },
+        },
+        {
+          sequence: 2,
+          kind: "runtime.failed",
+          message: "runtime wrapped: cat private-token.txt failed with private output",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "main_agent",
+          participants: [],
+          tool_name: null,
+          step_id: null,
+          action: null,
+          decision: null,
+          payload: {},
+        },
+      ],
+      artifacts: [],
+    };
+    visibleRunDetail = wrappedFailureRunDetail;
+    visibleConversationRuns = [wrappedFailureRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+
+    expect(within(stream).getAllByText(/运行终端失败：run_safe_command/).length).toBeGreaterThan(0);
+    expect(within(stream).getAllByText(/原始命令和输出已隐藏/).length).toBeGreaterThan(0);
+    expect(stream.textContent).not.toContain("private-token");
+    expect(stream.textContent).not.toContain("private output");
+  });
+
+  it("keeps tool posture counts aligned with payload id lifecycle grouping", async () => {
+    const user = userEvent.setup();
+    const payloadIdRunDetail = {
+      ...runDetail,
+      status: "running",
+      events: [
+        {
+          sequence: 1,
+          kind: "tool.started",
+          message: "tool.started",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: "run_safe_command",
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: { id: "call_payload_only", status: "running", argument_key_count: 1 },
+        },
+        {
+          sequence: 2,
+          kind: "tool.completed",
+          message: "tool.completed",
+          created_at: "2026-08-07T00:00:03Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: "run_safe_command",
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: { id: "call_payload_only", status: "succeeded", exit_code: 0, output_bytes: 64 },
+        },
+      ],
+      artifacts: [],
+    };
+    visibleRunDetail = payloadIdRunDetail;
+    visibleConversationRuns = [payloadIdRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+
+    expect(within(stream).getAllByRole("button", { name: /run_safe_command/ })).toHaveLength(1);
+    const posture = within(stream).getByRole("status", { name: /任务态势，运行中/ });
+    expect(within(posture).getByText("工具 1")).not.toBeNull();
+  });
+
+  it("does not double-count artifacts already attached to process events", async () => {
+    const user = userEvent.setup();
+    const artifactCountRunDetail = {
+      ...runDetail,
+      status: "completed",
+      events: [
+        {
+          sequence: 1,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: null,
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: {},
+        },
+      ],
+      artifacts: [
+        {
+          id: "artifact-engineer-log",
+          kind: "markdown",
+          title: "工程执行日志",
+          text: "工程执行日志正文",
+        },
+      ],
+    };
+    visibleRunDetail = artifactCountRunDetail;
+    visibleConversationRuns = [artifactCountRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const posture = within(stream).getByRole("status", { name: /任务态势，任务已结束/ });
+
+    expect(within(posture).getByText("产物 1")).not.toBeNull();
+  });
+
+  it("shows queued run posture even before process actions arrive", async () => {
+    const user = userEvent.setup();
+    const queuedRunDetail = {
+      ...runDetail,
+      status: "queued",
+      events: [],
+      artifacts: [],
+    };
+    visibleRunDetail = queuedRunDetail;
+    visibleConversationRuns = [queuedRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+
+    expect(within(stream).getByRole("status", { name: /任务态势，已排队/ })).not.toBeNull();
+  });
+
+  it("keeps later independent runtime failures separate from tool failure wrappers", async () => {
+    const user = userEvent.setup();
+    const independentFailureRunDetail = {
+      ...runDetail,
+      status: "failed",
+      events: [
+        {
+          sequence: 1,
+          kind: "tool.failed",
+          message: "tool.failed",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: "run_safe_command",
+          tool_call_id: "call_terminal",
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: { status: "failed", failure_kind: "capability_failed", exit_code: 1, output_bytes: 128 },
+        },
+        {
+          sequence: 2,
+          kind: "step.started",
+          message: "step.started",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "reviewer",
+          participants: [],
+          tool_name: null,
+          step_id: "review_step",
+          action: null,
+          decision: null,
+          payload: { task: "复查上一轮结果" },
+        },
+        {
+          sequence: 3,
+          kind: "runtime.failed",
+          message: "model gateway failed: independent review model transport failed",
+          created_at: "2026-08-07T00:00:04Z",
+          actor: "reviewer",
+          participants: [],
+          tool_name: null,
+          step_id: "review_step",
+          action: null,
+          decision: null,
+          payload: {},
+        },
+      ],
+      artifacts: [],
+    };
+    visibleRunDetail = independentFailureRunDetail;
+    visibleConversationRuns = [independentFailureRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+
+    expect(within(stream).getByText(/independent review model transport failed/)).not.toBeNull();
+    expect(within(stream).getByRole("button", { name: /reviewer 失败：model gateway failed/ })).not.toBeNull();
+    const posture = within(stream).getByRole("status", { name: /任务态势，执行异常/ });
+    expect(within(posture).getByText("异常 2")).not.toBeNull();
   });
 
   it("uses ordered artifacts for process rows instead of vague generated-result summaries", async () => {
