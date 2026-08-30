@@ -691,13 +691,13 @@ async def test_autogen_tool_calls_forward_trusted_identity_to_harness_gateway() 
     assert tool_started.payload["argument_keys"] == ("query",)
     assert tool_started.payload["argument_key_count"] == 1
     assert tool_started.payload["argument_bytes"] > 0
-    assert "evidence" not in json.dumps(tool_started.payload)
+    assert "evidence" not in json.dumps(dict(tool_started.payload))
     tool_completed = next(event for event in events if event.kind is EventKind.TOOL_COMPLETED)
     assert tool_completed.payload["schema_version"] == 1
     assert tool_completed.payload["status"] == "succeeded"
     assert tool_completed.payload["result_bytes"] > 0
     assert tool_completed.payload["artifact_id"] == str(tool_completed.artifact.id)
-    assert "source-a" not in json.dumps(tool_completed.payload)
+    assert "source-a" not in json.dumps(dict(tool_completed.payload))
     assert events[-1].reason == "explicit_completion"
 
 

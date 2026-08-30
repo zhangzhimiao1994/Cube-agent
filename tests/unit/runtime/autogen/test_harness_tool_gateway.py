@@ -139,13 +139,13 @@ async def test_gateway_capability_tool_routes_through_harness_with_actor_identit
     assert started.payload["argument_keys"] == ("query",)
     assert started.payload["argument_key_count"] == 1
     assert started.payload["argument_bytes"] > 0
-    assert "evidence" not in json.dumps(started.payload)
+    assert "evidence" not in json.dumps(dict(started.payload))
     completed = records[1]
     assert completed.payload["schema_version"] == 1
     assert completed.payload["status"] == "succeeded"
     assert completed.payload["result_bytes"] > 0
     assert completed.payload["artifact_id"] == str(completed.artifact.id)
-    assert "source-a" not in json.dumps(completed.payload)
+    assert "source-a" not in json.dumps(dict(completed.payload))
 
 
 async def test_gateway_capability_tool_preserves_deterministic_harness_failure() -> None:
