@@ -1386,6 +1386,65 @@ def test_routing_details_exposes_channel_directive_context() -> None:
     assert details["source"] == "evolution"
 
 
+def test_routing_details_exposes_harness_execution_profile() -> None:
+    details = _routing_details(
+        {
+            "vibe_coding": True,
+            "capability": "vibe_coding",
+            "harness_decision": {
+                "selected_provider": "deepseek",
+                "selected_model": "deepseek-chat",
+                "selected_logical_model": "main",
+                "requires_approval": True,
+                "capability_reasons": [
+                    "supports_reasoning_delta",
+                    "supports_streamed_tool_call_delta",
+                    "supports_parallel_tool_calls",
+                ],
+                "policy_reasons": ["provider_allowed:deepseek"],
+                "context_reasons": ["hermes_context_match"],
+                "fallbacks_considered": ["openai"],
+            },
+        }
+    )
+
+    assert details["vibe_coding"] == "enabled"
+    assert details["capability"] == "vibe_coding"
+    assert details["harness_provider"] == "deepseek"
+    assert details["harness_model"] == "deepseek-chat"
+    assert details["harness_logical_model"] == "main"
+    assert details["harness_requires_approval"] == "true"
+    assert (
+        details["harness_capabilities"]
+        == "supports_reasoning_delta, supports_streamed_tool_call_delta, supports_parallel_tool_calls"
+    )
+    assert details["harness_policy"] == "provider_allowed:deepseek"
+    assert details["harness_context"] == "hermes_context_match"
+    assert details["harness_fallbacks"] == "openai"
+
+
+def test_routing_details_redacts_sensitive_harness_profile_values() -> None:
+    details = _routing_details(
+        {
+            "harness_decision": {
+                "selected_provider": "sk-secret-provider",
+                "selected_model": "deepseek-chat",
+                "selected_logical_model": "main",
+                "capability_reasons": ["supports_reasoning_delta", "bearer leaked-token"],
+                "policy_reasons": ["provider_allowed:deepseek", "secret_ref:abc"],
+            },
+        }
+    )
+
+    assert "harness_provider" not in details
+    assert details["harness_model"] == "deepseek-chat"
+    assert details["harness_capabilities"] == "supports_reasoning_delta"
+    assert details["harness_policy"] == "provider_allowed:deepseek"
+    assert "secret" not in repr(details).lower()
+    assert "bearer" not in repr(details).lower()
+    assert "sk-" not in repr(details).lower()
+
+
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
 ACTOR_ID = UUID("11111111-1111-4111-8111-111111111111")
 SECRET_ID = UUID("22222222-2222-4222-8222-222222222222")

@@ -872,6 +872,33 @@ function processRoutingRows(
     detail.explicit_details.routing_reason
       ? { label: "路由原因", value: displayRoutingReason(detail.explicit_details.routing_reason) }
       : null,
+    detail.explicit_details.harness_provider
+      ? { label: "Harness 服务商", value: detail.explicit_details.harness_provider }
+      : null,
+    detail.explicit_details.harness_model
+      ? { label: "Harness 模型", value: detail.explicit_details.harness_model }
+      : null,
+    detail.explicit_details.harness_logical_model
+      ? { label: "逻辑模型", value: detail.explicit_details.harness_logical_model }
+      : null,
+    detail.explicit_details.harness_requires_approval
+      ? {
+          label: "审批要求",
+          value: detail.explicit_details.harness_requires_approval === "true" ? "需要审批" : "无需审批",
+        }
+      : null,
+    detail.explicit_details.harness_capabilities
+      ? { label: "工程能力", value: detail.explicit_details.harness_capabilities }
+      : null,
+    detail.explicit_details.harness_policy
+      ? { label: "策略原因", value: detail.explicit_details.harness_policy }
+      : null,
+    detail.explicit_details.harness_context
+      ? { label: "上下文信号", value: detail.explicit_details.harness_context }
+      : null,
+    detail.explicit_details.harness_fallbacks
+      ? { label: "备选路径", value: detail.explicit_details.harness_fallbacks }
+      : null,
   ].filter((item): item is { label: string; value: string } => Boolean(item));
 }
 

@@ -1844,6 +1844,41 @@ describe("operational management pages", () => {
     expect(within(drawer).getByText("qwen-max")).not.toBeNull();
   });
 
+  it("surfaces harness execution profile in the routing process details", async () => {
+    const user = userEvent.setup();
+    visibleRunDetail = {
+      ...runDetail,
+      explicit_details: {
+        ...runDetail.explicit_details,
+        vibe_coding: "enabled",
+        capability: "vibe_coding",
+        harness_provider: "deepseek",
+        harness_model: "deepseek-chat",
+        harness_logical_model: "main",
+        harness_requires_approval: "false",
+        harness_capabilities:
+          "supports_reasoning_delta, supports_streamed_tool_call_delta, supports_parallel_tool_calls",
+      },
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await user.click(within(stream).getByRole("button", { name: /主 Agent 选择派单/ }));
+
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).getByText("Harness 服务商")).not.toBeNull();
+    expect(within(drawer).getByText("deepseek")).not.toBeNull();
+    expect(within(drawer).getByText("Harness 模型")).not.toBeNull();
+    expect(within(drawer).getByText("deepseek-chat")).not.toBeNull();
+    expect(within(drawer).getByText("工程能力")).not.toBeNull();
+    expect(within(drawer).getByText(/supports_streamed_tool_call_delta/)).not.toBeNull();
+  });
+
   it("marks intermediate process outputs in labeled boxes while keeping the final reply merged", async () => {
     const user = userEvent.setup();
     const view = render(<TestApp initialPath="/" />);

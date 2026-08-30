@@ -6580,6 +6580,7 @@ def _routing_details(routing_decision: dict[str, object] | None) -> dict[str, st
     capability = routing_decision.get("capability")
     if isinstance(capability, str) and capability:
         details["capability"] = capability
+    details.update(_harness_routing_details(routing_decision.get("harness_decision")))
     for key in (
         "requested_channel_features",
         "requested_skills",
@@ -6630,6 +6631,53 @@ def _routing_details(routing_decision: dict[str, object] | None) -> dict[str, st
             if safe_reasons:
                 details["hermes_reasons"] = " | ".join(safe_reasons)
     return details
+
+
+def _harness_routing_details(value: object) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        return {}
+    details: dict[str, str] = {}
+    for source_key, target_key in (
+        ("selected_provider", "harness_provider"),
+        ("selected_model", "harness_model"),
+        ("selected_logical_model", "harness_logical_model"),
+    ):
+        text = _safe_harness_detail_text(value.get(source_key))
+        if text:
+            details[target_key] = text
+    approval = value.get("requires_approval")
+    if type(approval) is bool:
+        details["harness_requires_approval"] = "true" if approval else "false"
+    for source_key, target_key in (
+        ("capability_reasons", "harness_capabilities"),
+        ("policy_reasons", "harness_policy"),
+        ("context_reasons", "harness_context"),
+        ("fallbacks_considered", "harness_fallbacks"),
+    ):
+        text = _safe_harness_detail_list(value.get(source_key))
+        if text:
+            details[target_key] = text
+    return details
+
+
+def _safe_harness_detail_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if not stripped or _contains_sensitive_marker(stripped):
+        return None
+    return stripped[:160]
+
+
+def _safe_harness_detail_list(value: object) -> str | None:
+    if not isinstance(value, list | tuple):
+        return None
+    items: list[str] = []
+    for item in value[:6]:
+        text = _safe_harness_detail_text(item)
+        if text:
+            items.append(text)
+    return ", ".join(items) if items else None
 
 
 def _waiting_mode_decision_token(record: RunRecord) -> str | None:
