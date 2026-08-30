@@ -261,11 +261,60 @@ def _tool_definitions(internal_names: tuple[str, ...]) -> tuple[ToolDefinition, 
     return tuple(
         ToolDefinition(
             name=external_name,
-            description=f"Approved Agent Hub capability: {internal_name}",
-            parameters={"type": "object", "additionalProperties": True},
+            description=_tool_description(internal_name, external_name),
+            parameters=_tool_parameters(internal_name),
         )
         for external_name, internal_name in sorted(mapping.items())
     )
+
+
+def _tool_description(internal_name: str, external_name: str) -> str:
+    if internal_name == "project.generate_zip":
+        return (
+            "Approved Agent Hub capability: project.generate_zip. Use the model "
+            f"function name {external_name} to create a downloadable ZIP archive. "
+            "Required fields are title and files. files must be an object keyed by "
+            "safe relative file path, and every value must be UTF-8 text content."
+        )
+    return f"Approved Agent Hub capability: {internal_name}"
+
+
+def _tool_parameters(internal_name: str) -> Mapping[str, JsonValue]:
+    if internal_name == "project.generate_zip":
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ("title", "files"),
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Short human-readable title for the generated project.",
+                    "minLength": 1,
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Optional safe ZIP filename ending in .zip.",
+                },
+                "presentation": {
+                    "type": "string",
+                    "enum": ("step_detail", "final_attachment"),
+                    "description": (
+                        "Use final_attachment when the user asked for a downloadable file."
+                    ),
+                },
+                "files": {
+                    "type": "object",
+                    "description": (
+                        "Project files keyed by safe relative path. Each value is UTF-8 text "
+                        "content for that file."
+                    ),
+                    "additionalProperties": {"type": "string"},
+                    "minProperties": 1,
+                    "maxProperties": 64,
+                },
+            },
+        }
+    return {"type": "object", "additionalProperties": True}
 
 
 def _map_completion_tool_names(
@@ -2330,6 +2379,12 @@ class CrewDispatchRuntime:
                         await asyncio.shield(tool_boundary(idempotency_key, uncertain, None))
                     raise
                 except Exception as error:  # noqa: BLE001
+                    failure_reason = safe_runtime_failure_reason(
+                        error,
+                        fallback="capability execution failed",
+                    )
+                    if not failure_reason.startswith("capability failed:"):
+                        failure_reason = f"capability failed: {failure_reason}"
                     error.__traceback__ = None
                     del error
                     await emit(
@@ -2337,14 +2392,13 @@ class CrewDispatchRuntime:
                         actor=step.agent,
                         tool_call_id=call_id,
                         tool_name=tool_call.name,
-                        reason="capability execution failed",
+                        reason=failure_reason,
+                        payload=runtime_failure_diagnostic_from_reason(failure_reason),
                     )
                     uncertain = dict(tool_running)
                     uncertain["status"] = "uncertain"
                     await tool_boundary(idempotency_key, uncertain, None)
-                    raise CapabilityOutcomeUncertain(
-                        "capability outcome requires confirmation"
-                    ) from None
+                    raise CapabilityOutcomeUncertain(failure_reason) from None
                 artifact = Artifact(
                     id=uuid4(),
                     type="tool_result",

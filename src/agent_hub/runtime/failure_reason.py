@@ -138,6 +138,15 @@ def runtime_failure_diagnostic_from_reason(
         diagnostic["actor"] = crew_timeout.group("actor")
     elif "model gateway failed" in lowered:
         diagnostic = _model_gateway_diagnostic(normalized, status_code=status_code)
+    elif lowered.startswith("capability failed:"):
+        diagnostic = _base_diagnostic(
+            normalized,
+            error_stage="capability",
+            error_category="execution_failed",
+            error_code="capability.execution_failed",
+            retryable=False,
+            suggested_action="工具执行被拒绝或失败；查看工具失败事件中的字段校验摘要，修正参数后重试。",
+        )
     elif normalized == "runtime_not_configured":
         diagnostic = _base_diagnostic(
             normalized,
