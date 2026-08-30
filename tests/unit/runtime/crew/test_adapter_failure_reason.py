@@ -383,7 +383,9 @@ async def test_tool_calls_cross_the_harness_tool_gateway_envelope() -> None:
     assert tool_started.payload["sandbox"] == "restricted"
     assert tool_started.payload["argument_keys"] == ("q",)
     assert tool_started.payload["argument_key_count"] == 1
-    assert tool_started.payload["argument_bytes"] > 0
+    argument_bytes = tool_started.payload["argument_bytes"]
+    assert isinstance(argument_bytes, int)
+    assert argument_bytes > 0
     assert "arguments" not in tool_started.payload
     assert '"safe"' not in json.dumps(dict(tool_started.payload))
     tool_artifact = next(
@@ -392,7 +394,9 @@ async def test_tool_calls_cross_the_harness_tool_gateway_envelope() -> None:
     tool_completed = next(event for event in events if event.kind is EventKind.TOOL_COMPLETED)
     assert tool_completed.payload["schema_version"] == 1
     assert tool_completed.payload["status"] == "succeeded"
-    assert tool_completed.payload["result_bytes"] > 0
+    result_bytes = tool_completed.payload["result_bytes"]
+    assert isinstance(result_bytes, int)
+    assert result_bytes > 0
     assert tool_completed.payload["artifact_id"] == str(tool_artifact.id)
     assert "result" not in tool_completed.payload
     assert "harness result" not in json.dumps(dict(tool_completed.payload))

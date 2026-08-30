@@ -212,7 +212,9 @@ def test_safe_tool_event_payload_projects_terminal_result_metadata_only() -> Non
     assert payload["stdout_bytes"] == len(b"private terminal output")
     assert payload["stderr_bytes"] == len(b"secret warning")
     assert payload["output_bytes"] == len(b"private terminal outputsecret warning")
-    assert payload["result_bytes"] > 0
+    result_bytes = payload["result_bytes"]
+    assert isinstance(result_bytes, int)
+    assert result_bytes > 0
     assert "private terminal output" not in serialized
     assert "secret warning" not in serialized
     assert '"result"' not in serialized
