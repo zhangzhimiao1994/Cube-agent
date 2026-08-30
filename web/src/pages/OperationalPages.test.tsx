@@ -2724,6 +2724,235 @@ describe("operational management pages", () => {
     expect(within(posture).getByText("思考 1")).not.toBeNull();
   });
 
+  it("surfaces execution intent rows for approvals, retries, and replay safety", async () => {
+    const user = userEvent.setup();
+    const intentRunDetail = {
+      ...runDetail,
+      status: "waiting_approval",
+      events: [
+        {
+          sequence: 1,
+          kind: "tool.started",
+          message: "tool.started",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: "run_safe_command",
+          tool_call_id: "call_terminal",
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: {
+            status: "running",
+            operation_kind: "terminal",
+            replay_safe: false,
+            command: "cat private-token.txt",
+          },
+        },
+        {
+          sequence: 2,
+          kind: "tool.failed",
+          message: "cat private-token.txt failed with private output",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "engineer",
+          participants: [],
+          tool_name: "run_safe_command",
+          tool_call_id: "call_terminal",
+          step_id: "engineer_step",
+          action: null,
+          decision: null,
+          payload: {
+            status: "failed",
+            operation_kind: "terminal",
+            replay_safe: false,
+            failure_kind: "capability_failed",
+            stdout: "private output",
+          },
+        },
+        {
+          sequence: 3,
+          kind: "step.retrying",
+          message: "step.retrying",
+          created_at: "2026-08-07T00:00:03Z",
+          actor: "main_agent",
+          participants: ["engineer"],
+          tool_name: null,
+          step_id: "engineer_step",
+          action: "retry_terminal",
+          decision: null,
+          payload: {
+            attempt: 2,
+            reason: "fallback_model",
+            replay_safe: false,
+            feedback: "private output should stay hidden",
+          },
+        },
+        {
+          sequence: 4,
+          kind: "approval.requested",
+          message: "approval.requested",
+          created_at: "2026-08-07T00:00:04Z",
+          actor: "main_agent",
+          participants: [],
+          tool_name: null,
+          step_id: null,
+          approval_id: "approval_retry_terminal",
+          action: "retry_terminal",
+          decision: null,
+          payload: {
+            requires_approval: true,
+            replay_safe: false,
+            task: "是否允许重试终端命令",
+          },
+        },
+      ],
+      artifacts: [],
+    };
+    visibleRunDetail = intentRunDetail;
+    visibleConversationRuns = [intentRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const intentRegion = within(stream).getByRole("region", { name: "执行意图" });
+
+    expect(within(intentRegion).getByText("审批意图")).not.toBeNull();
+    expect(within(intentRegion).getByText("重试意图")).not.toBeNull();
+    expect(within(intentRegion).getByText("回放意图")).not.toBeNull();
+    expect(within(intentRegion).getAllByText("retry_terminal").length).toBeGreaterThan(0);
+    expect(within(intentRegion).getAllByText("不可回放").length).toBeGreaterThan(0);
+    expect(stream.textContent).not.toContain("private-token");
+    expect(stream.textContent).not.toContain("private output");
+
+    const approvalCard = within(stream).getByRole("button", { name: /等待确认/ });
+    await user.click(approvalCard);
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).getByText("审批 ID")).not.toBeNull();
+    expect(within(drawer).getByText("approval_retry_terminal")).not.toBeNull();
+    expect(drawer.textContent).not.toContain("private-token");
+    expect(drawer.textContent).not.toContain("private output");
+  });
+
+  it("keeps future repair proposals in intent rows without raw payload leakage", async () => {
+    const user = userEvent.setup();
+    const repairRunDetail = {
+      ...runDetail,
+      status: "running",
+      events: [
+        {
+          sequence: 1,
+          kind: "self_repair.proposed",
+          message: "self_repair.proposed",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "main_agent",
+          participants: ["engineer"],
+          tool_name: null,
+          step_id: "engineer_step",
+          action: "retry_with_fallback",
+          decision: null,
+          payload: {
+            repair_action: "switch_model",
+            failure_kind: "model_timeout",
+            requires_approval: true,
+            command: "cat private-token.txt",
+            output: "private output",
+          },
+        },
+      ],
+      artifacts: [],
+    };
+    visibleRunDetail = repairRunDetail;
+    visibleConversationRuns = [repairRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const intentRegion = within(stream).getByRole("region", { name: "执行意图" });
+
+    expect(within(intentRegion).getByText("修复意图")).not.toBeNull();
+    expect(within(intentRegion).getByText("switch_model")).not.toBeNull();
+    expect(within(intentRegion).getByText("需要确认")).not.toBeNull();
+    expect(stream.textContent).not.toContain("private-token");
+    expect(stream.textContent).not.toContain("private output");
+
+    await user.click(within(stream).getByRole("button", { name: /修复意图/ }));
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).getByText("修复动作")).not.toBeNull();
+    expect(within(drawer).getByText("switch_model")).not.toBeNull();
+    expect(drawer.textContent).not.toContain("private-token");
+    expect(drawer.textContent).not.toContain("private output");
+  });
+
+  it("redacts free-text intent reasons and honors false approval flags", async () => {
+    const user = userEvent.setup();
+    const reasonRunDetail = {
+      ...runDetail,
+      status: "running",
+      events: [
+        {
+          sequence: 1,
+          kind: "step.retrying",
+          message: "retry failed: cat private-token.txt printed private output",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "main_agent",
+          participants: ["engineer"],
+          tool_name: null,
+          step_id: "engineer_step",
+          action: "retry_terminal",
+          decision: null,
+          payload: {
+            attempt: 2,
+            reason: "cat private-token.txt printed private output",
+            replay_safe: false,
+            requires_approval: false,
+          },
+        },
+        {
+          sequence: 2,
+          kind: "review.completed",
+          message: "review.completed",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "reviewer",
+          participants: [],
+          tool_name: null,
+          step_id: "review_step",
+          action: null,
+          decision: null,
+          payload: {
+            self_repair: false,
+            summary: "正常审查完成，不应被归为修复意图。",
+          },
+        },
+      ],
+      artifacts: [],
+    };
+    visibleRunDetail = reasonRunDetail;
+    visibleConversationRuns = [reasonRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const intentRegion = within(stream).getByRole("region", { name: "执行意图" });
+
+    expect(within(intentRegion).getByText("重试意图")).not.toBeNull();
+    expect(within(intentRegion).getByText("retry_terminal")).not.toBeNull();
+    expect(within(intentRegion).queryByText("需要确认")).toBeNull();
+    expect(within(intentRegion).queryByText("修复意图")).toBeNull();
+    expect(stream.textContent).not.toContain("private-token");
+    expect(stream.textContent).not.toContain("private output");
+
+    await user.click(within(stream).getByRole("button", { name: /重试意图/ }));
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(drawer.textContent).not.toContain("private-token");
+    expect(drawer.textContent).not.toContain("private output");
+  });
+
   it("groups tool lifecycle events by call id with clear failure details", async () => {
     const user = userEvent.setup();
     const lifecycleRunDetail = {

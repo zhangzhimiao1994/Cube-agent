@@ -1166,6 +1166,31 @@ def test_admin_run_event_exposes_safe_process_details_without_secrets() -> None:
     assert "result" not in serialized
 
 
+def test_admin_run_event_preserves_tool_payload_approval_id_without_raw_details() -> None:
+    response = _admin_run_event(
+        {
+            "sequence": 8,
+            "kind": "tool.failed",
+            "message": "tool.failed",
+            "tool_name": "run_safe_command",
+            "payload": {
+                "approval_id": "approval_terminal_1",
+                "failure_kind": "waiting_approval",
+                "command": "cat private-token.txt",
+                "stdout": "private output",
+            },
+        }
+    )
+
+    serialized = json.dumps(response.model_dump(mode="json"), ensure_ascii=False)
+    assert response.payload == {
+        "approval_id": "approval_terminal_1",
+        "failure_kind": "waiting_approval",
+    }
+    assert "private-token" not in serialized
+    assert "private output" not in serialized
+
+
 @pytest.mark.parametrize(
     ("mode", "reason"),
     [

@@ -285,6 +285,7 @@ class RunEventResponse(BaseModel):
     tool_call_id: str | None = None
     tool_name: str | None = None
     step_id: str | None = None
+    approval_id: str | None = None
     action: str | None = None
     decision: str | None = None
     payload: dict[str, JsonValue] = Field(default_factory=dict)
@@ -6288,6 +6289,7 @@ def _admin_run_event(event: dict[str, object]) -> RunEventResponse:
         tool_call_id=_optional_event_string(event.get("tool_call_id")),
         tool_name=_optional_event_string(event.get("tool_name")),
         step_id=_optional_event_string(event.get("step_id")),
+        approval_id=_optional_event_string(event.get("approval_id")),
         action=_optional_event_string(event.get("action")),
         decision=_optional_event_string(event.get("decision")),
         payload=_tool_event_payload(payload) if kind_text.startswith("tool.") else _event_payload(payload),
@@ -6342,6 +6344,7 @@ _SAFE_TOOL_EVENT_PAYLOAD_KEYS = frozenset(
         "id",
         "name",
         "schema_version",
+        "approval_id",
         "status",
         "operation_kind",
         "sandbox",

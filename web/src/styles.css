@@ -1542,6 +1542,107 @@ article:hover {
   white-space: nowrap;
 }
 
+.run-execution-intents {
+  border: 1px solid rgba(255, 206, 86, 0.16);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.42rem;
+  padding: 0.52rem;
+}
+
+.run-execution-intents-header {
+  align-items: center;
+  color: var(--muted);
+  display: flex;
+  gap: 0.48rem;
+  min-width: 0;
+}
+
+.run-execution-intents-header span {
+  color: #ffd166;
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-weight: 950;
+}
+
+.run-execution-intents-header strong {
+  color: var(--text);
+  font-weight: 900;
+}
+
+.run-execution-intents-header small {
+  color: var(--muted);
+  font-weight: 800;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-execution-intent-list {
+  display: grid;
+  gap: 0.36rem;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+}
+
+.run-execution-intent {
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(255, 206, 86, 0.14);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.18rem;
+  min-width: 0;
+  padding: 0.48rem 0.55rem;
+}
+
+.run-execution-intent small,
+.run-execution-intent span,
+.run-execution-intent em {
+  color: var(--muted);
+  font-style: normal;
+  font-weight: 800;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-execution-intent strong {
+  color: var(--text);
+  font-weight: 900;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-execution-intent > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.run-execution-intent em {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  font-size: 0.72rem;
+  line-height: 1;
+  padding: 0.22rem 0.36rem;
+}
+
+.run-execution-intent.intent-pending {
+  border-color: rgba(255, 206, 86, 0.3);
+}
+
+.run-execution-intent.intent-retry,
+.run-execution-intent.intent-replay {
+  border-color: rgba(255, 166, 94, 0.28);
+}
+
+.run-execution-intent.intent-repair {
+  border-color: rgba(125, 255, 189, 0.26);
+}
+
 .agent-cluster-actions {
   display: grid;
   gap: 0.12rem;

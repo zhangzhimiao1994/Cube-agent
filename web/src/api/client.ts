@@ -599,6 +599,7 @@ const RunEventSchema = z.object({
   tool_call_id: z.string().nullable().optional(),
   tool_name: z.string().nullable().optional(),
   step_id: z.string().nullable().optional(),
+  approval_id: z.string().nullable().optional(),
   action: z.string().nullable().optional(),
   decision: z.string().nullable().optional(),
   payload: z.record(z.string(), z.unknown()).default({}),
