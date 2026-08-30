@@ -123,6 +123,33 @@ def runtime_failure_diagnostic_from_reason(
 
     if "model gateway failed" in lowered:
         diagnostic = _model_gateway_diagnostic(normalized, status_code=status_code)
+    elif normalized == "runtime_not_configured":
+        diagnostic = _base_diagnostic(
+            normalized,
+            error_stage="runtime_configuration",
+            error_category="missing_runtime",
+            error_code="runtime.not_configured",
+            retryable=False,
+            suggested_action="当前运行模式没有可用运行时；请检查服务启动参数和模式注册配置后重试。",
+        )
+    elif normalized == "dispatch accounting exhausted":
+        diagnostic = _base_diagnostic(
+            normalized,
+            error_stage="runtime_accounting",
+            error_category="accounting_guardrail",
+            error_code="runtime.dispatch_accounting_exhausted",
+            retryable=False,
+            suggested_action="派单运行的账本或预算记录已耗尽，系统已停止交付；请检查任务预算、模型用量记录和产物提交记录。",
+        )
+    elif normalized == "artifact rollback failed":
+        diagnostic = _base_diagnostic(
+            normalized,
+            error_stage="artifact_storage",
+            error_category="rollback_failed",
+            error_code="artifact.rollback_failed",
+            retryable=False,
+            suggested_action="产物写入回滚失败；请检查文件存储/对象存储状态，确认残留产物后再重试。",
+        )
     elif lowered in {"unaccounted_usage", "model_outcome_uncertain", "tool_outcome_uncertain"}:
         diagnostic = _base_diagnostic(
             normalized,
@@ -235,6 +262,16 @@ def _provider_diagnostic(
     status_code: int | None,
     response: bool,
 ) -> RuntimeFailureDiagnostic:
+    if status_code == 400:
+        return _base_diagnostic(
+            reason,
+            error_stage="model_provider",
+            error_category="bad_request",
+            error_code="model.provider_bad_request",
+            retryable=False,
+            suggested_action="模型请求参数被供应商拒绝；检查模型名、上下文长度、工具参数和供应商兼容性。",
+            status_code=status_code,
+        )
     if status_code in {401, 403}:
         return _base_diagnostic(
             reason,
@@ -243,6 +280,36 @@ def _provider_diagnostic(
             error_code="model.provider_auth_failed",
             retryable=False,
             suggested_action="模型供应商拒绝请求；检查 API Key、Base URL、模型权限和账号额度后重试。",
+            status_code=status_code,
+        )
+    if status_code == 402:
+        return _base_diagnostic(
+            reason,
+            error_stage="model_provider",
+            error_category="quota_or_billing",
+            error_code="model.provider_quota_or_billing_failed",
+            retryable=False,
+            suggested_action="模型账号额度或计费状态不可用；检查供应商余额、额度、账单或组织权限后重试。",
+            status_code=status_code,
+        )
+    if status_code == 404:
+        return _base_diagnostic(
+            reason,
+            error_stage="model_provider",
+            error_category="model_not_found",
+            error_code="model.provider_model_not_found",
+            retryable=False,
+            suggested_action="供应商找不到该模型或端点；检查模型名、API Base 路径和部署配置。",
+            status_code=status_code,
+        )
+    if status_code == 413:
+        return _base_diagnostic(
+            reason,
+            error_stage="model_provider",
+            error_category="payload_too_large",
+            error_code="model.provider_payload_too_large",
+            retryable=False,
+            suggested_action="模型请求体或上下文过大；压缩上下文、减少附件/历史消息或降低输出长度后重试。",
             status_code=status_code,
         )
     if status_code == 429:
