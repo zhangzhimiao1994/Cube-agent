@@ -5815,7 +5815,12 @@ def _failure_event_from_run_events(events: Iterable[RunEventResponse]) -> RunEve
 
 
 def _safe_debug_event(event: RunEventResponse) -> RunEventResponse:
-    return event.model_copy(update={"payload": _event_payload(event.payload)})
+    payload = (
+        _tool_event_payload(event.payload)
+        if event.kind.startswith("tool.")
+        else _event_payload(event.payload)
+    )
+    return event.model_copy(update={"payload": payload})
 
 
 def _run_debug_artifact(artifact: RunArtifactResponse) -> RunDebugArtifactResponse:

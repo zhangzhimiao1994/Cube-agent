@@ -1359,6 +1359,46 @@ def test_run_debug_snapshot_preserves_partial_output_and_failure_context() -> No
     assert "模型服务" in debug.recommendation
 
 
+def test_run_debug_snapshot_filters_tool_event_payloads() -> None:
+    run_id = uuid4()
+    response = RunDetailResponse(
+        id=run_id,
+        status="completed",
+        mode="dispatch",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="Run a private command",
+        events=[
+            RunEventResponse(
+                sequence=1,
+                kind="tool.completed",
+                message="tool.completed",
+                created_at=datetime.now(UTC),
+                actor="executor",
+                tool_call_id="call_1",
+                tool_name="run_safe_command",
+                payload={
+                    "command": "echo private-token",
+                    "stdout": "private terminal output",
+                    "result": {"private": "secret"},
+                    "exit_code": 0,
+                    "output_bytes": 23,
+                },
+            ),
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    debug = _run_debug_from_detail(response)
+    serialized = debug.model_dump_json()
+
+    assert debug.events[0].payload == {"exit_code": 0, "output_bytes": 23}
+    assert "private-token" not in serialized
+    assert "private terminal output" not in serialized
+
+
 def test_run_debug_endpoint_exposes_safe_failure_snapshot() -> None:
     api = client()
     run_id = "22222222-2222-4222-8222-222222222222"
