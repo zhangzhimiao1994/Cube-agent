@@ -3974,7 +3974,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 "version": str(record.version),
                 **_routing_details(record.routing_decision),
             },
-            routing_decision=cast(dict[str, JsonValue], record.routing_decision or {}),
+            routing_decision=_public_routing_decision(record.routing_decision),
             decision_token=_waiting_mode_decision_token(record),
             temporary_agent_proposal=_temporary_agent_proposal(record.routing_decision),
             schedule_proposal=_schedule_proposal(record.routing_decision),
@@ -6981,6 +6981,41 @@ _SENSITIVE_EVENT_DETAIL_KEYS = frozenset(
         "token",
     }
 )
+
+
+_PUBLIC_ROUTING_DECISION_OMIT_KEYS = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "approval_token",
+        "authorization",
+        "bearer",
+        "credential",
+        "credential_ref",
+        "decision_token",
+        "evolution_proposal",
+        "openclaw_proposal",
+        "password",
+        "schedule_proposal",
+        "secret",
+        "secret_ref",
+        "storage_key",
+        "temporary_agent_proposal",
+        "token",
+    }
+)
+
+
+def _public_routing_decision(routing_decision: Mapping[str, object] | None) -> dict[str, JsonValue]:
+    if not routing_decision:
+        return {}
+    payload: dict[str, JsonValue] = {}
+    for key, value in routing_decision.items():
+        key_text = str(key)
+        if key_text.lower() in _PUBLIC_ROUTING_DECISION_OMIT_KEYS:
+            continue
+        payload[key_text] = _safe_event_detail(value, key=key_text)
+    return payload
 
 
 def _optional_event_string(value: object) -> str | None:

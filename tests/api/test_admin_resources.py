@@ -2796,6 +2796,9 @@ def test_operational_run_detail_exposes_hermes_routing_decision() -> None:
     routing_decision = {
         "conversation_id": "conv-hermes-runtime",
         "reason": "main_agent_local_resolution",
+        "decision_token": "secret-decision-token",
+        "temporary_agent_proposal": {"id": "proposal-temp"},
+        "api_key": "sk-test-secret",
         "hermes": {
             "injected_memories": [
                 {
@@ -2878,6 +2881,9 @@ def test_operational_run_detail_exposes_hermes_routing_decision() -> None:
     conversation = api.get("/api/v1/admin/conversations/conv-hermes-runtime", headers=headers())
 
     assert detail.status_code == 200
+    assert "decision_token" not in detail.json()["routing_decision"]
+    assert "temporary_agent_proposal" not in detail.json()["routing_decision"]
+    assert "api_key" not in detail.json()["routing_decision"]
     assert detail.json()["routing_decision"]["hermes"]["injected_memories"][0]["id"] == (
         "hermes_review_timeout"
     )
@@ -2885,6 +2891,10 @@ def test_operational_run_detail_exposes_hermes_routing_decision() -> None:
         "当前用户要求直连，未注入。"
     )
     assert conversation.status_code == 200
+    conversation_routing = conversation.json()["runs"][0]["routing_decision"]
+    assert "decision_token" not in conversation_routing
+    assert "temporary_agent_proposal" not in conversation_routing
+    assert "api_key" not in conversation_routing
     assert conversation.json()["runs"][0]["routing_decision"]["hermes"]["injected_memories"][0][
         "summary"
     ] == "reviewer 超时时先压缩上下文再分块审查。"
