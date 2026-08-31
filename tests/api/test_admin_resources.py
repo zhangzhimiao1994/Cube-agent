@@ -2793,7 +2793,7 @@ def test_operational_run_listing_details_and_controls() -> None:
 
 def test_operational_run_detail_exposes_hermes_routing_decision() -> None:
     run_id = uuid4()
-    routing_decision = {
+    routing_decision: dict[str, object] = {
         "conversation_id": "conv-hermes-runtime",
         "reason": "main_agent_local_resolution",
         "decision_token": "secret-decision-token",

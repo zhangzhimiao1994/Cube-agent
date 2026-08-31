@@ -1079,6 +1079,18 @@ def test_dispatch_plan_includes_hermes_memory_context_in_steps() -> None:
         output_schema={"summary": "string"},
         model="main",
     )
+    routing_decision: dict[str, JsonValue] = {
+        "hermes": {
+            "injected_memories": (
+                {
+                    "summary": "reviewer 超时时先压缩上下文再分块审查。",
+                    "memory_type": "error_handling",
+                    "target": "reviewer",
+                    "reason": "命中 reviewer 超时经验",
+                },
+            )
+        }
+    }
     context = TaskContext(
         run_id=uuid4(),
         tenant_id=TENANT_ID,
@@ -1087,18 +1099,7 @@ def test_dispatch_plan_includes_hermes_memory_context_in_steps() -> None:
         artifacts=(),
         timeout_seconds=60,
         token_budget=10_000,
-        routing_decision={
-            "hermes": {
-                "injected_memories": [
-                    {
-                        "summary": "reviewer 超时时先压缩上下文再分块审查。",
-                        "memory_type": "error_handling",
-                        "target": "reviewer",
-                        "reason": "命中 reviewer 超时经验",
-                    }
-                ]
-            }
-        },
+        routing_decision=routing_decision,
     )
 
     plan = _dispatch_plan((role,), context, max_parallelism=1)

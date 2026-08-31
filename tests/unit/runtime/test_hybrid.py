@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -9,6 +10,7 @@ from agent_hub.domain.runs import TaskMode
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
+    JsonValue,
     RunEvent,
     RuntimeCheckpoint,
     TaskContext,
@@ -232,19 +234,23 @@ async def test_hybrid_child_context_preserves_routing_decision() -> None:
     discussion = RecordingArtifactRuntime(TaskMode.DISCUSS, discussion_output)
     synthesis = RecordingArtifactRuntime(TaskMode.DIRECT, final_output)
     runtime = HybridRuntime(dispatch, discussion, synthesis)
+    routing_decision: dict[str, JsonValue] = {
+        "hermes": {"injected_memories": ({"summary": "保留记忆"},)}
+    }
     context = TaskContext(
         run_id=uuid4(),
         tenant_id=uuid4(),
         mode=TaskMode.HYBRID,
         request="审查脚本",
-        routing_decision={"hermes": {"injected_memories": [{"summary": "保留记忆"}]}},
+        routing_decision=routing_decision,
     )
 
     _ = [event async for event in runtime.run(context)]
 
-    assert dispatch.contexts[0].routing_decision["hermes"]["injected_memories"][0]["summary"] == "保留记忆"
-    assert discussion.contexts[0].routing_decision["hermes"]["injected_memories"][0]["summary"] == "保留记忆"
-    assert synthesis.contexts[0].routing_decision["hermes"]["injected_memories"][0]["summary"] == "保留记忆"
+    for child_context in (dispatch.contexts[0], discussion.contexts[0], synthesis.contexts[0]):
+        hermes = cast(Mapping[str, JsonValue], child_context.routing_decision["hermes"])
+        memories = cast(tuple[Mapping[str, JsonValue], ...], hermes["injected_memories"])
+        assert memories[0]["summary"] == "保留记忆"
 
 
 @pytest.mark.asyncio
