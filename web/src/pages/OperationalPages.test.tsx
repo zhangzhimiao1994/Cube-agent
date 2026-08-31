@@ -3067,6 +3067,31 @@ describe("operational management pages", () => {
     expect(screen.getByRole("dialog", { name: "运行过程详情" })).not.toBeNull();
   });
 
+  it("hides the Hermes memory row when no memories were injected or skipped", async () => {
+    const user = userEvent.setup();
+    const hermesRunDetail: RunDetail = {
+      ...runDetail,
+      routing_decision: {
+        hermes: {
+          injected_memories: [],
+          skipped_memories: [],
+        },
+      },
+    };
+    visibleRunDetail = hermesRunDetail;
+    visibleConversationRuns = [hermesRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await user.click(within(stream).getByRole("button", { name: /讨论完成：形成 1 个结论、1 个决策、3 条意见/ }));
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+
+    expect(within(drawer).queryByRole("button", { name: /Hermes\+ 记忆/ })).toBeNull();
+  });
+
   it("falls back to concrete artifact titles when upstream artifact text is generic", async () => {
     const user = userEvent.setup();
     const processRunDetail = {

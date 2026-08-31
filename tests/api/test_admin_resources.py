@@ -2791,6 +2791,105 @@ def test_operational_run_listing_details_and_controls() -> None:
     assert cancel.json()["status"] == "cancelled"
 
 
+def test_operational_run_detail_exposes_hermes_routing_decision() -> None:
+    run_id = uuid4()
+    routing_decision = {
+        "conversation_id": "conv-hermes-runtime",
+        "reason": "main_agent_local_resolution",
+        "hermes": {
+            "injected_memories": [
+                {
+                    "id": "hermes_review_timeout",
+                    "summary": "reviewer 超时时先压缩上下文再分块审查。",
+                    "memory_type": "error_handling",
+                    "target": "reviewer",
+                    "score": 0.91,
+                    "reason": "命中 reviewer 超时经验",
+                }
+            ],
+            "skipped_memories": [
+                {
+                    "id": "hermes_hybrid",
+                    "summary": "大任务优先混合模式。",
+                    "reason": "当前用户要求直连，未注入。",
+                    "score": 0.5,
+                }
+            ],
+        },
+    }
+
+    class FakeRunRepository:
+        async def get(self, tenant_id: UUID, requested_run_id: UUID) -> RunRecord:
+            assert tenant_id == TENANT_ID
+            assert requested_run_id == run_id
+            return RunRecord(
+                id=run_id,
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+                request="审查脚本",
+                mode=TaskMode.DISPATCH,
+                status=RunStatus.COMPLETED,
+                version=1,
+                created_at=datetime.now(UTC),
+                routing_decision=routing_decision,
+            )
+
+        async def list_recent(
+            self, tenant_id: UUID, *, limit: int | None = None
+        ) -> tuple[RunRecord, ...]:
+            del limit
+            assert tenant_id == TENANT_ID
+            return (await self.get(tenant_id, run_id),)
+
+        async def usage_cost(self, tenant_id: UUID, requested_run_id: UUID) -> str:
+            assert tenant_id == TENANT_ID
+            assert requested_run_id == run_id
+            return "0"
+
+        async def events(
+            self, tenant_id: UUID, requested_run_id: UUID
+        ) -> tuple[dict[str, object], ...]:
+            assert tenant_id == TENANT_ID
+            assert requested_run_id == run_id
+            return ()
+
+        async def artifacts(
+            self, tenant_id: UUID, requested_run_id: UUID
+        ) -> tuple[dict[str, object], ...]:
+            assert tenant_id == TENANT_ID
+            assert requested_run_id == run_id
+            return ()
+
+    service = PersistentAdminResourceService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        run_repository=FakeRunRepository(),  # type: ignore[arg-type]
+    )
+    app = create_app(
+        auth_service=StubAuthService(),
+        rate_limiter=object(),
+        admin_resource_service=service,
+    )
+    api = TestClient(app)
+
+    detail = api.get(f"/api/v1/admin/runs/{run_id}", headers=headers())
+    conversation = api.get("/api/v1/admin/conversations/conv-hermes-runtime", headers=headers())
+
+    assert detail.status_code == 200
+    assert detail.json()["routing_decision"]["hermes"]["injected_memories"][0]["id"] == (
+        "hermes_review_timeout"
+    )
+    assert detail.json()["routing_decision"]["hermes"]["skipped_memories"][0]["reason"] == (
+        "当前用户要求直连，未注入。"
+    )
+    assert conversation.status_code == 200
+    assert conversation.json()["runs"][0]["routing_decision"]["hermes"]["injected_memories"][0][
+        "summary"
+    ] == "reviewer 超时时先压缩上下文再分块审查。"
+
+
 def test_operational_run_delete_removes_cancelled_conversation() -> None:
     api = client()
     run_id = api.get("/api/v1/admin/runs", headers=headers()).json()[0]["id"]

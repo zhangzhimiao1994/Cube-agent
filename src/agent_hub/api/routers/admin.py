@@ -326,6 +326,7 @@ class RunDetailResponse(RunListItem):
     events: list[RunEventResponse]
     artifacts: list[RunArtifactResponse]
     explicit_details: dict[str, str]
+    routing_decision: dict[str, JsonValue] = Field(default_factory=dict)
     decision_token: str | None = None
     temporary_agent_proposal: dict[str, JsonValue] | None = None
     schedule_proposal: dict[str, JsonValue] | None = None
@@ -3973,6 +3974,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 "version": str(record.version),
                 **_routing_details(record.routing_decision),
             },
+            routing_decision=cast(dict[str, JsonValue], record.routing_decision or {}),
             decision_token=_waiting_mode_decision_token(record),
             temporary_agent_proposal=_temporary_agent_proposal(record.routing_decision),
             schedule_proposal=_schedule_proposal(record.routing_decision),
