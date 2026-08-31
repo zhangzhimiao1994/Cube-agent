@@ -28,6 +28,7 @@ from agent_hub.runtime.contracts import (
     TaskContext,
 )
 from agent_hub.runtime.failure_reason import safe_model_gateway_failure_reason
+from agent_hub.runtime.hermes_context import hermes_memory_context_text
 
 _RUNTIME_TYPE = "direct"
 _RUNTIME_VERSION = "1"
@@ -466,8 +467,10 @@ class DirectRuntime:
                 sort_keys=True,
                 separators=(",", ":"),
             ).replace("<", "\\u003c").replace(">", "\\u003e")
+            hermes_context = hermes_memory_context_text(context.routing_decision)
             payload = (
                 f"<USER_REQUEST_JSON>{task_payload}</USER_REQUEST_JSON>\n"
+                f"{hermes_context}\n"
                 f"<UNTRUSTED_ARTIFACTS_JSON>{prior_payload}</UNTRUSTED_ARTIFACTS_JSON>"
             )
             if len(payload.encode("utf-8")) > _MAX_CONTEXT_BYTES:

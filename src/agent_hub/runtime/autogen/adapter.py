@@ -48,6 +48,8 @@ from autogen_core.models import (
 )
 from autogen_core.tools import BaseTool, Tool, ToolSchema
 from opentelemetry.trace import NoOpTracerProvider
+
+from agent_hub.runtime.hermes_context import hermes_memory_context_text
 from pydantic import BaseModel, ConfigDict
 
 from agent_hub.domain.runs import TaskMode
@@ -1543,11 +1545,14 @@ class AutoGenDiscussionRuntime:
             f"Artifact {item.id} ({item.type}, {item.producer}): {json.dumps(_artifact_prompt_content(item), ensure_ascii=False, sort_keys=True)}"
             for item in context.artifacts
         )
+        hermes_context = hermes_memory_context_text(context.routing_decision)
         task = (
             context.request
             if not artifacts
             else f"{context.request}\n\nValidated artifacts:\n{artifacts}"
         )
+        if hermes_context:
+            task = f"{task}\n\n{hermes_context}"
         prior = "\n".join(
             f"{item.producer}: {cast(str, item.content['text'])}" for item in transcript
         )

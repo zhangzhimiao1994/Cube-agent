@@ -1066,6 +1066,47 @@ def test_dispatch_plan_runs_review_roles_after_producer_roles() -> None:
     )
 
 
+def test_dispatch_plan_includes_hermes_memory_context_in_steps() -> None:
+    role = RoleAssignment(
+        id="reviewer",
+        role="Reviewer",
+        purpose=RolePurpose.VERIFY,
+        mission="Review output quality.",
+        must_answer=("What risks remain?",),
+        allowed_tools=(),
+        forbidden_actions=("Do not perform dangerous operations.",),
+        skills=(),
+        output_schema={"summary": "string"},
+        model="main",
+    )
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        request="审查脚本",
+        artifacts=(),
+        timeout_seconds=60,
+        token_budget=10_000,
+        routing_decision={
+            "hermes": {
+                "injected_memories": [
+                    {
+                        "summary": "reviewer 超时时先压缩上下文再分块审查。",
+                        "memory_type": "error_handling",
+                        "target": "reviewer",
+                        "reason": "命中 reviewer 超时经验",
+                    }
+                ]
+            }
+        },
+    )
+
+    plan = _dispatch_plan((role,), context, max_parallelism=1)
+
+    assert any("HERMES_MEMORY_CONTEXT" in step.task for step in plan.steps)
+    assert any("reviewer 超时时先压缩上下文再分块审查" in step.task for step in plan.steps)
+
+
 def test_dispatch_plan_reserves_more_time_for_post_product_review_roles() -> None:
     roles = (
         RoleAssignment(
