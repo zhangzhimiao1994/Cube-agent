@@ -35,6 +35,13 @@ _CAPACITY_MARKERS = frozenset(
         "http 429",
     }
 )
+_EMPTY_RESPONSE_MARKERS = frozenset(
+    {
+        "model response text is empty",
+        "model response is empty",
+        "empty model response",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,6 +279,11 @@ def repair_context_from_proposal(proposal: Mapping[str, object]) -> dict[str, ob
 def _repair_instruction(failure_category: str) -> str:
     if failure_category == "capacity_pressure":
         return "用更小的输入和更低负载重试，必要时标记模型 fallback，但不要绕过审批或隐藏失败。"
+    if failure_category == "empty_model_response":
+        return (
+            "先压缩输入和历史上下文，再拆分提示或降负载重试；必要时标记模型 "
+            "fallback/切换备用模型，重试后仍为空则保留中断前输出并闭环失败。"
+        )
     if failure_category == "tool_failure":
         return "先检查工具权限、参数和产物状态，只执行可审计的最小修复步骤。"
     if failure_category == "step_failure":
@@ -327,6 +339,8 @@ def _failure_category(event: RunEvent) -> str:
     text = _failure_text(event)
     if _contains_marker(text, _UNCERTAIN_MARKERS):
         return "outcome_uncertain"
+    if _contains_marker(text, _EMPTY_RESPONSE_MARKERS):
+        return "empty_model_response"
     if _contains_marker(text, _CAPACITY_MARKERS):
         return "capacity_pressure"
     if event.kind is EventKind.TOOL_FAILED:

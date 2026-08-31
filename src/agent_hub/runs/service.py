@@ -1179,7 +1179,10 @@ class RunService:
         if claimed_record is not None:
             if claimed_record.status is RunStatus.FAILED:
                 await self._safe_record_self_repair_decision_for_record(claimed_record)
+                await self._safe_record_hermes_outcome_for_record(claimed_record)
                 return await self._submitted_by_run_id(claimed_record.tenant_id, claimed_record.id)
+            if claimed_record.status in {RunStatus.COMPLETED, RunStatus.CANCELLED}:
+                await self._safe_record_hermes_outcome_for_record(claimed_record)
             return _submitted(claimed_record)
 
         terminal = RunStatus.RUNNING
@@ -1457,6 +1460,18 @@ class RunService:
                 run_id=record.id,
                 decision=repair_decision,
             )
+
+    async def _safe_record_hermes_outcome_for_record(self, record: RunRecord) -> None:
+        if record.status not in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
+            return
+        await self._safe_record_hermes_outcome(
+            tenant_id=record.tenant_id,
+            actor_id=record.actor_id,
+            run_id=record.id,
+            status=record.status,
+            mode=record.mode,
+            routing_decision=record.routing_decision,
+        )
 
     async def _safe_record_self_repair_decision(
         self,

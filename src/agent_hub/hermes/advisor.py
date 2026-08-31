@@ -157,7 +157,7 @@ class PersistentHermesRunAdvisor:
         workflow = outcome.workflow_id or "no-workflow"
         conversation_id = outcome.conversation_id or "unknown-conversation"
         status = outcome.status.value
-        lesson_id = f"hermes_run_{uuid4().hex}"
+        lesson_id = f"hermes_run_{outcome.run_id.hex}"
         scheduler_notices = _safe_scheduler_notices(outcome.scheduler_notices)
         if scheduler_notices:
             lesson = _scheduler_notice_lesson(

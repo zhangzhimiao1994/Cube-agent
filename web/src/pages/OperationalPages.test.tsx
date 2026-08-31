@@ -3930,6 +3930,51 @@ describe("operational management pages", () => {
             output: "private output",
           },
         },
+        {
+          sequence: 2,
+          kind: "repair.started",
+          message: "repair.started",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: null,
+          participants: [],
+          tool_name: null,
+          step_id: null,
+          action: null,
+          decision: null,
+          payload: {
+            repair_action: "draft_repair_proposal",
+            failure_kind: "runtime_failure",
+            status: "running",
+            attempt: 1,
+            max_attempts: 1,
+            requires_approval: true,
+            automatic_execution: false,
+            command: "cat private-token.txt",
+            stdout: "private output",
+          },
+        },
+        {
+          sequence: 3,
+          kind: "repair.completed",
+          message: "repair.completed",
+          created_at: "2026-08-07T00:00:03Z",
+          actor: null,
+          participants: [],
+          tool_name: null,
+          step_id: null,
+          action: null,
+          decision: null,
+          payload: {
+            repair_action: "draft_repair_proposal",
+            failure_kind: "runtime_failure",
+            status: "completed",
+            attempt: 1,
+            max_attempts: 1,
+            requires_approval: true,
+            automatic_execution: false,
+            output: "private output",
+          },
+        },
       ],
       artifacts: [],
     };
@@ -3943,13 +3988,16 @@ describe("operational management pages", () => {
     const stream = screen.getByRole("region", { name: "主对话内容" });
     const intentRegion = within(stream).getByRole("region", { name: "执行意图" });
 
-    expect(within(intentRegion).getByText("修复意图")).not.toBeNull();
+    expect(within(intentRegion).getAllByText("修复意图").length).toBeGreaterThanOrEqual(3);
     expect(within(intentRegion).getByText("switch_model")).not.toBeNull();
-    expect(within(intentRegion).getByText("需要确认")).not.toBeNull();
+    expect(within(intentRegion).getAllByText("需要确认").length).toBeGreaterThan(0);
+    expect(within(intentRegion).getAllByText("第 1/1 次").length).toBeGreaterThan(0);
+    expect(within(intentRegion).getByText("修复已开始")).not.toBeNull();
+    expect(within(intentRegion).getByText("修复已完成")).not.toBeNull();
     expect(stream.textContent).not.toContain("private-token");
     expect(stream.textContent).not.toContain("private output");
 
-    await user.click(within(stream).getByRole("button", { name: /修复意图/ }));
+    await user.click(within(stream).getByRole("button", { name: /修复意图：switch_model/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     const decisionDetail = await openProcessDetailGroup(user, drawer, "决策");
     expect(within(decisionDetail).getByText("修复动作")).not.toBeNull();
@@ -4807,6 +4855,26 @@ describe("operational management pages", () => {
     expect(document.documentElement.style.overflow).toBe("");
   });
 
+  it("locks page scrolling while the conversation history drawer is open", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "打开历史对话" }));
+
+    expect(document.body.style.overflow).toBe("hidden");
+    expect(document.body.style.touchAction).toBe("none");
+    expect(document.documentElement.style.overflow).toBe("hidden");
+
+    const backdrop = document.querySelector(".conversation-drawer-backdrop");
+    expect(backdrop).not.toBeNull();
+    await user.click(backdrop as HTMLElement);
+
+    await waitFor(() => expect(document.body.style.overflow).toBe(""));
+    expect(document.body.style.touchAction).toBe("");
+    expect(document.documentElement.style.overflow).toBe("");
+  });
+
   it("refreshes process drawer content while viewing a terminal run", async () => {
     const user = userEvent.setup();
     const completedRunDetail: RunDetail = {
@@ -4936,11 +5004,19 @@ describe("operational management pages", () => {
     await waitFor(() => expect(screen.getAllByText("文案生成").length).toBeGreaterThan(0));
     expect(screen.queryByText("导演")).toBeNull();
 
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await user.click(within(stream).getByRole("button", { name: /主 Agent 接收任务：main_agent_plan/ }));
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).queryByText("导演")).toBeNull();
+
     const refreshedRunDetail: RunDetail = {
       ...initialRunDetail,
       events: [
+        ...initialRunDetail.events,
         {
           ...initialRunDetail.events[0],
+          sequence: 2,
+          created_at: "2026-08-07T00:00:02Z",
           payload: {
             roles: [
               ...(initialRunDetail.events[0].payload.roles as Array<Record<string, string>>),
@@ -4967,6 +5043,12 @@ describe("operational management pages", () => {
     visibleConversationRuns = [refreshedRunDetail];
 
     await waitFor(() => expect(screen.getAllByText("导演").length).toBeGreaterThan(0), { timeout: 2500 });
+    await waitFor(() => expect(within(drawer).getByText("2026-08-07T00:00:02Z")).not.toBeNull(), {
+      timeout: 2500,
+    });
+    const activityDetail = await openProcessDetailGroup(user, drawer, "活动");
+    expect(within(activityDetail).getByText(/负责审查活动动线与现场节奏/)).not.toBeNull();
+    await user.click(within(activityDetail).getByRole("button", { name: "关闭" }));
     const directorCard = Array.from(document.querySelectorAll(".agent-recruitment-card")).find((card) =>
       card.textContent?.includes("负责审查活动动线"),
     );
@@ -5630,6 +5712,18 @@ describe("operational management pages", () => {
       }),
     );
   });
+
+  it("explains when Hermes filters hide scheduler learning records", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/hermes?category=conversation" />);
+
+    expect(await screen.findByRole("table", { name: /Hermes/ })).not.toBeNull();
+    await user.type(screen.getByRole("searchbox", { name: "快速搜索 Hermes 学习" }), "conv-workflow-2");
+
+    expect(await screen.findByText("当前筛选隐藏了调度观察记录")).not.toBeNull();
+    expect(screen.getByText(/自动运行学习通常归类在“调度观察”/)).not.toBeNull();
+  });
+
   it("bulk selects Hermes learning records and confirms them through one batch API call", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/hermes" />);

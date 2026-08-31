@@ -42,7 +42,13 @@ SAFE_MODEL_GATEWAY_FAILURES = frozenset(
         "model outcome recording failed",
         "model capacity release failed",
         "model gateway completed without a response",
+        "model response text is empty",
+        "model response is empty",
     }
+)
+EMPTY_MODEL_RESPONSE_ACTION = (
+    "模型返回了空内容；先压缩输入和历史上下文，必要时拆分提示、标记模型 fallback "
+    "或切换备用模型后重试，重试后仍失败则保留中断前输出并闭环失败原因。"
 )
 
 
@@ -124,6 +130,18 @@ def runtime_failure_diagnostic_from_reason(
         status_code = _status_code_from_reason(normalized)
     lowered = normalized.lower()
 
+    if "model response text is empty" in lowered or "model response is empty" in lowered:
+        diagnostic = _base_diagnostic(
+            normalized,
+            error_stage="model_response",
+            error_category="empty_response",
+            error_code="model.empty_response",
+            retryable=True,
+            suggested_action=EMPTY_MODEL_RESPONSE_ACTION,
+            status_code=status_code,
+        )
+        return diagnostic
+
     diagnostic = _base_diagnostic(
         normalized,
         error_stage="runtime",
@@ -201,6 +219,16 @@ def _model_gateway_diagnostic(
     status_code: int | None,
 ) -> RuntimeFailureDiagnostic:
     lowered = reason.lower()
+    if "model response text is empty" in lowered or "model response is empty" in lowered:
+        return _base_diagnostic(
+            reason,
+            error_stage="model_response",
+            error_category="empty_response",
+            error_code="model.empty_response",
+            retryable=True,
+            suggested_action=EMPTY_MODEL_RESPONSE_ACTION,
+            status_code=status_code,
+        )
     if "no capable deployment" in lowered:
         return _base_diagnostic(
             reason,

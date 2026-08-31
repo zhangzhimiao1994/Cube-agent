@@ -751,6 +751,9 @@ type ProcessDetailTarget = {
   rows: Array<{ label: string; value: string }>;
   createdAt: string | null;
   artifact?: DownloadableArtifact;
+  sourceKind?: string;
+  sourceStepId?: string | null;
+  sourceActor?: string | null;
 };
 
 type AgentDispatchCard = {
@@ -816,7 +819,7 @@ function stringArrayValue(value: unknown): string[] {
 
 function mainAgentPlanEvent(detail: RunDetail): RunEvent | null {
   return (
-    detail.events.find((event) => {
+    [...detail.events].reverse().find((event) => {
       if (event.kind !== "step.started" || event.actor !== "main_agent" || event.step_id !== "main_agent_plan") return false;
       return Array.isArray(event.payload.roles);
     }) ?? null
@@ -983,6 +986,20 @@ function replaySafetyLabel(value: unknown) {
   if (value === false || value === "false") return "不可回放";
   if (value === true || value === "true") return "可回放";
   return "";
+}
+
+function repairAttemptLabel(event: RunEvent) {
+  const attempt = safeIntentValue(event, ["attempt"]);
+  const maxAttempts = safeIntentValue(event, ["max_attempts"]);
+  if (attempt && maxAttempts) return `第 ${attempt}/${maxAttempts} 次`;
+  return attempt ? `第 ${attempt} 次` : "";
+}
+
+function repairStatusLabel(event: RunEvent) {
+  if (event.kind === "repair.started") return "修复已开始";
+  if (event.kind === "repair.completed") return "修复已完成";
+  if (event.kind === "repair.failed") return "修复未完成";
+  return safeIntentValue(event, ["status"]) || "等待执行";
 }
 
 function isPayloadFlagTrue(value: unknown) {
@@ -1283,8 +1300,9 @@ function executionIntentsForRun(detail: RunDetail, agentNames: Map<string, strin
         id: `${detail.id}-intent-repair-${event.step_id ?? event.sequence}`,
         label: "修复意图",
         title: repairAction,
-        detail: event.action && event.action !== repairAction ? event.action : safeIntentValue(event, ["failure_kind", "status"]) || "等待执行",
+        detail: event.action && event.action !== repairAction ? event.action : repairStatusLabel(event),
         meta: [
+          repairAttemptLabel(event),
           isPayloadFlagTrue(event.payload.requires_approval) ? "需要确认" : "",
           safeIntentValue(event, ["failure_kind"]),
           replaySafetyLabel(event.payload.replay_safe),
@@ -2116,7 +2134,8 @@ function eventSummaryText(
   }
   if (isRepairIntentEvent(event)) {
     const repairSignal = safeIntentValue(event, ["repair_action", "repair_kind", "failure_kind", "status"]) || event.action || "准备修复";
-    return `修复意图：${conciseProcessText(repairSignal, "准备修复")}`;
+    const status = repairStatusLabel(event);
+    return `修复意图：${conciseProcessText(`${repairSignal} ${status}`, "准备修复")}`;
   }
   if (event.kind === "temporary_agent.proposed") {
     return `主 Agent 建议临时加入子 Agent：${conciseProcessText(instructionSignal, "补齐缺失能力")}`;
@@ -2250,6 +2269,9 @@ function processItemsForModelDeltaGroup(
       badge: processBadgeForEvent(lastEvent),
       rows,
       createdAt: lastEvent.created_at,
+      sourceKind: lastEvent.kind,
+      sourceStepId: lastEvent.step_id,
+      sourceActor: lastEvent.actor,
     },
   ];
 }
@@ -2323,6 +2345,9 @@ function processItemsForToolLifecycle(
       rows,
       createdAt: lastEvent.created_at,
       artifact: artifactDetailDownload(artifact),
+      sourceKind: lastEvent.kind,
+      sourceStepId: lastEvent.step_id,
+      sourceActor: lastEvent.actor,
     },
   ];
 }
@@ -2351,8 +2376,28 @@ function processItemsForEvent(
     rows: baseRows,
     createdAt: event.created_at,
     artifact: artifactDetailDownload(artifact),
+    sourceKind: event.kind,
+    sourceStepId: event.step_id,
+    sourceActor: event.actor,
   };
   return [baseItem];
+}
+
+function refreshedProcessTarget(
+  currentTarget: ProcessDetailTarget,
+  candidates: ProcessDetailTarget[],
+): ProcessDetailTarget {
+  const matchedByStableSource =
+    currentTarget.sourceKind || currentTarget.sourceStepId || currentTarget.sourceActor
+      ? candidates.filter(
+          (item) =>
+            item.runId === currentTarget.runId &&
+            item.sourceKind === currentTarget.sourceKind &&
+            item.sourceStepId === currentTarget.sourceStepId &&
+            item.sourceActor === currentTarget.sourceActor,
+        )
+      : [];
+  return matchedByStableSource.at(-1) ?? candidates.find((item) => item.id === currentTarget.id) ?? currentTarget;
 }
 
 function runProcessItems(
@@ -3111,8 +3156,9 @@ export function RunsPage() {
     setProcessDetailTarget(null);
   }, [selectedRunId]);
 
+  const pageOverlayOpen = Boolean(processDetailTarget) || historyOpen;
   useEffect(() => {
-    if (!processDetailTarget) return undefined;
+    if (!pageOverlayOpen) return undefined;
     const previousBodyOverflow = document.body.style.overflow;
     const previousBodyTouchAction = document.body.style.touchAction;
     const previousDocumentOverflow = document.documentElement.style.overflow;
@@ -3124,7 +3170,7 @@ export function RunsPage() {
       document.body.style.touchAction = previousBodyTouchAction || "";
       document.documentElement.style.overflow = previousDocumentOverflow || "";
     };
-  }, [processDetailTarget]);
+  }, [pageOverlayOpen]);
 
   useEffect(() => {
     if (!activeConversation.data) return;
@@ -3782,9 +3828,10 @@ export function RunsPage() {
     : null;
   const refreshedProcessDetailTarget =
     processDetailTarget && refreshedRunForProcessDetail
-      ? runProcessItems(refreshedRunForProcessDetail, agentNameMap, mainAgentModelName).find(
-          (item) => item.id === processDetailTarget.id,
-        ) ?? processDetailTarget
+      ? refreshedProcessTarget(
+          processDetailTarget,
+          runProcessItems(refreshedRunForProcessDetail, agentNameMap, mainAgentModelName),
+        )
       : processDetailTarget;
   const directSendBlockedReason =
     mode !== "direct"

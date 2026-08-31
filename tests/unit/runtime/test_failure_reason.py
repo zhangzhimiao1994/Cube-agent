@@ -58,6 +58,10 @@ from agent_hub.runtime.failure_reason import (
             CapacityBackendError("redis password leaked"),
             "model gateway failed: model capacity backend failed",
         ),
+        (
+            ModelGatewayError("model response text is empty"),
+            "model gateway failed: model response text is empty",
+        ),
     ],
 )
 def test_safe_runtime_failure_reason_preserves_diagnostic_without_secrets(
@@ -125,6 +129,27 @@ def test_runtime_failure_diagnostic_from_reason_extracts_status_code() -> None:
     assert diagnostic["error_code"] == "model.provider_unavailable"
     assert diagnostic["retryable"] is True
     assert diagnostic["status_code"] == 502
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "model response text is empty",
+        "model gateway failed: model response text is empty",
+        "hybrid dispatch failed: model gateway failed: model response text is empty",
+    ],
+)
+def test_runtime_failure_diagnostic_classifies_empty_model_response_as_retryable(
+    reason: str,
+) -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason(reason)
+
+    assert diagnostic["error_stage"] == "model_response"
+    assert diagnostic["error_category"] == "empty_response"
+    assert diagnostic["error_code"] == "model.empty_response"
+    assert diagnostic["retryable"] is True
+    assert "压缩输入" in diagnostic["suggested_action"]
+    assert "fallback" in diagnostic["suggested_action"]
 
 
 def test_runtime_failure_diagnostic_classifies_crewai_step_timeout() -> None:

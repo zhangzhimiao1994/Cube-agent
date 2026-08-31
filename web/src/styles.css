@@ -4673,6 +4673,174 @@ article:hover {
   white-space: nowrap;
 }
 
+.run-process-summary {
+  color: #475569;
+}
+
+.agent-cluster-status,
+.agent-recruitment,
+.run-task-chain,
+.run-failure-diagnostics,
+.run-execution-intents {
+  background: #ffffff;
+  border: 1px solid rgba(148, 163, 184, 0.26);
+  box-shadow: 0 16px 38px rgba(15, 23, 42, 0.1);
+}
+
+.agent-cluster-status strong,
+.agent-recruitment-header strong,
+.agent-recruitment-card strong,
+.run-task-chain-header strong,
+.run-task-chain-step strong,
+.run-failure-diagnostics-header strong,
+.run-failure-diagnostic strong,
+.run-execution-intents-header strong,
+.run-execution-intent strong,
+.process-detail-card span,
+.process-drawer-header h3,
+.process-detail-modal-header h4 {
+  color: #111827;
+}
+
+.agent-cluster-status small,
+.agent-recruitment-header small,
+.agent-recruitment-card small,
+.run-task-chain-header small,
+.run-task-chain-step small,
+.run-task-chain-step p,
+.run-failure-diagnostics-header small,
+.run-failure-diagnostic small,
+.run-failure-diagnostic span,
+.run-failure-diagnostic p,
+.run-execution-intents-header small,
+.run-execution-intent small,
+.run-execution-intent span,
+.process-detail-card strong,
+.process-detail-modal dt,
+.run-process-detail small {
+  color: #64748b;
+}
+
+.agent-cluster-status span,
+.agent-recruitment-header span,
+.run-task-chain-header span,
+.run-process-toggle span {
+  color: #2563eb;
+}
+
+.agent-recruitment-card,
+.run-task-chain-step,
+.run-failure-diagnostic,
+.run-execution-intent,
+.process-detail-card,
+.artifact-file-card {
+  background: #f8fafc;
+  border-color: rgba(148, 163, 184, 0.24);
+}
+
+.agent-recruitment-card p,
+.run-process-toggle strong,
+.run-process-toggle small,
+.process-detail-card small,
+.artifact-file-link small {
+  color: #64748b;
+}
+
+.agent-recruitment-card > span,
+.process-card-badge {
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+  color: #047857;
+}
+
+.agent-recruitment-avatar {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+  color: #2563eb;
+}
+
+.process-intermediate-card {
+  background: #ffffff;
+  border-color: rgba(148, 163, 184, 0.28);
+  box-shadow: 0 10px 26px rgba(15, 23, 42, 0.08);
+}
+
+.process-intermediate-card:hover,
+.process-intermediate-card:focus-visible {
+  background: #f8fafc;
+  border-color: rgba(37, 99, 235, 0.34);
+}
+
+.run-process-detail {
+  background: #f8fafc;
+  border-color: rgba(148, 163, 184, 0.24);
+}
+
+.run-process-detail article,
+.process-detail-modal {
+  background: #ffffff;
+  border-color: rgba(148, 163, 184, 0.28);
+}
+
+.run-process-detail p,
+.run-process-detail dd,
+.process-detail-modal dd {
+  color: #1f2937;
+}
+
+.run-process-detail dt {
+  color: #0f766e;
+}
+
+.process-detail-modal-backdrop {
+  background: rgba(15, 23, 42, 0.38);
+  z-index: 70;
+}
+
+.process-detail-modal {
+  box-shadow: 0 28px 90px rgba(15, 23, 42, 0.24);
+}
+
+.process-drawer-backdrop {
+  background: rgba(15, 23, 42, 0.32);
+  z-index: 60;
+}
+
+.process-drawer {
+  background: #f8fafc;
+  border-color: rgba(148, 163, 184, 0.28);
+  box-shadow: 0 -24px 80px rgba(15, 23, 42, 0.24);
+  z-index: 61;
+}
+
+.process-drawer-handle {
+  background: #cbd5e1;
+}
+
+.artifact-file-card button,
+.process-drawer .secondary-action,
+.process-detail-modal .secondary-action {
+  background: #ffffff;
+  border-color: rgba(148, 163, 184, 0.34);
+  color: #334155;
+  box-shadow: none;
+}
+
+.artifact-file-card button:hover,
+.artifact-file-card button:focus-visible,
+.process-drawer .secondary-action:hover,
+.process-detail-modal .secondary-action:hover {
+  background: #eff6ff;
+  border-color: rgba(37, 99, 235, 0.4);
+  color: #1d4ed8;
+}
+
+.artifact-file-link {
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+  color: #065f46;
+}
+
 @media (max-width: 640px) {
   .conversation-list {
     border-radius: 8px 0 0 8px;

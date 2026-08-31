@@ -232,6 +232,10 @@ function HermesLearningTable() {
     visibleConfirmableIds.length > 0 && visibleConfirmableIds.every((id) => selectedIds.includes(id));
   const busy = bulkConfirm.isPending || bulkDelete.isPending || confirmInsight.isPending || deleteInsight.isPending;
   const ledgerNavSection = activeSection ?? "ledger";
+  const filtersHideSchedulerLearning =
+    visibleInsights.length === 0 &&
+    items.some((insight) => insight.category === "scheduler") &&
+    columnFilters.category !== "scheduler";
 
   return (
     <section>
@@ -322,8 +326,12 @@ function HermesLearningTable() {
             ) : null}
             {visibleInsights.length === 0 ? (
               <article>
-                <h4>没有匹配的学习记录</h4>
-                <p>调整列筛选或清空筛选查看全部 Hermes 学习记录。</p>
+                <h4>{filtersHideSchedulerLearning ? "当前筛选隐藏了调度观察记录" : "没有匹配的学习记录"}</h4>
+                <p>
+                  {filtersHideSchedulerLearning
+                    ? "自动运行学习通常归类在“调度观察”。清空筛选或切到调度观察后，可以查看运行完成、失败或取消后写入的台账。"
+                    : "调整列筛选或清空筛选查看全部 Hermes 学习记录。"}
+                </p>
               </article>
             ) : (
               <div className="table-shell">

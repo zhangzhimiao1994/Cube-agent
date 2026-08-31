@@ -75,6 +75,12 @@ class ExecutableFakeRepository:
     ) -> tuple[FakeRunRow, RuntimeCheckpoint | None] | RunRecord:
         del session, allow_running_recovery
         assert run_id == self.run_id
+        if self.row.status in {
+            RunStatus.COMPLETED.value,
+            RunStatus.FAILED.value,
+            RunStatus.CANCELLED.value,
+        }:
+            return self._record()
         self.row.status = RunStatus.RUNNING.value
         self.row.version += 1
         return self.row, None
@@ -203,6 +209,18 @@ class ExecutableFakeRepository:
         assert run_id == self.run_id
         return self._record()
 
+    async def conversation_context(
+        self,
+        tenant_id: UUID,
+        conversation_id: str,
+        *,
+        before_run_id: UUID,
+    ) -> list[object]:
+        assert tenant_id == TENANT_ID
+        assert before_run_id == self.run_id
+        assert conversation_id
+        return []
+
     def _record(self) -> RunRecord:
         return RunRecord(
             id=self.row.id,
@@ -308,6 +326,27 @@ class RuntimeReportsCapacityPressure:
             sequence=2,
             run_id=context.run_id,
             reason="model gateway failed: model capacity unavailable",
+        )
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        del checkpoint
+
+    async def cancel(self) -> None:
+        raise AssertionError("not used")
+
+
+class RuntimeReportsEmptyModelResponse:
+    mode = TaskMode.DISPATCH
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        yield RunEvent(
+            kind=EventKind.RUNTIME_FAILED,
+            sequence=1,
+            run_id=context.run_id,
+            reason="hybrid dispatch failed: model gateway failed: model response text is empty",
         )
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
@@ -819,6 +858,31 @@ async def test_execute_persists_repair_classification_for_failed_run() -> None:
 
 
 @pytest.mark.asyncio
+async def test_execute_classifies_empty_model_response_for_controlled_retry() -> None:
+    repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeReportsEmptyModelResponse(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.FAILED
+    notice = next(event for event in repository.events if event.kind == "observer.notice")
+    assert notice.payload["trigger"] == "empty_model_response"
+    assert notice.payload["action"] == "retry_fallback_or_reassign_model"
+    repair = next(event for event in repository.events if event.kind == "repair.classified")
+    assert repair.payload["failure_category"] == "empty_model_response"
+    assert repair.payload["automatic_execution"] is False
+    assert submitted.repair_proposal is not None
+    assert submitted.repair_proposal["failure_kind"] == "empty_model_response"
+    assert "压缩输入" in str(submitted.repair_proposal["instruction"])
+    assert "fallback" in str(submitted.repair_proposal["instruction"])
+
+
+@pytest.mark.asyncio
 async def test_execute_skips_self_repair_source_without_recursive_repair() -> None:
     repository = ExecutableFakeRepository(routing_decision={"source": "self_repair"})
     service = RunService(
@@ -1098,3 +1162,38 @@ async def test_execute_records_observer_notices_in_hermes_scheduler_outcome() ->
     )
     assert "正文" not in repr(outcome.scheduler_notices)
     assert "prompt" not in repr(outcome.scheduler_notices)
+
+
+@pytest.mark.asyncio
+async def test_execute_backfills_hermes_outcome_for_terminal_run_after_crash() -> None:
+    repository = ExecutableFakeRepository(
+        routing_decision={
+            "source": "manual",
+            "conversation_id": "conv-crash-after-terminal",
+            "workflow_id": "workflow-alpha",
+            "selected_agent_ids": ["writer"],
+        }
+    )
+    hermes = RecordingHermesAdvisor()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeCompletes(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+        hermes_advisor=hermes,
+    )
+
+    interrupted = await service.execute(
+        repository.run_id,
+        crash_after_event_kind=EventKind.RUNTIME_COMPLETED,
+    )
+    recovered = await service.execute(repository.run_id)
+
+    assert interrupted.status is RunStatus.COMPLETED
+    assert recovered.status is RunStatus.COMPLETED
+    assert len(hermes.outcomes) == 1
+    outcome = hermes.outcomes[0]
+    assert outcome.status is RunStatus.COMPLETED
+    assert outcome.conversation_id == "conv-crash-after-terminal"
+    assert outcome.workflow_id == "workflow-alpha"
+    assert outcome.agent_ids == ("writer",)

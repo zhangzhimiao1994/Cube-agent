@@ -440,6 +440,20 @@ function safeIntentIdentifier(event: RunEvent, keys: string[], fallback = "") {
   return fallback;
 }
 
+function repairAttemptLabel(event: RunEvent) {
+  const attempt = safeIntentValue(event, ["attempt"]);
+  const maxAttempts = safeIntentValue(event, ["max_attempts"]);
+  if (attempt && maxAttempts) return `第 ${attempt}/${maxAttempts} 次`;
+  return attempt ? `第 ${attempt} 次` : "";
+}
+
+function repairStatusLabel(event: RunEvent) {
+  if (event.kind === "repair.started") return "修复已开始";
+  if (event.kind === "repair.completed") return "修复已完成";
+  if (event.kind === "repair.failed") return "修复未完成";
+  return safeIntentIdentifier(event, ["status"], "等待执行");
+}
+
 function isRepairIntentEvent(event: RunEvent) {
   const kind = event.kind.toLowerCase();
   if (kind.includes("repair") || kind.includes("remediation")) return true;
@@ -760,8 +774,9 @@ function executionIntentsForDetail(detail: RunDetail): RunExecutionIntent[] {
         id: `${detail.id}-intent-repair-${event.step_id ?? event.sequence}`,
         label: "修复意图",
         title: repairAction,
-        detail: eventAction && eventAction !== repairAction ? eventAction : safeIntentIdentifier(event, ["failure_kind", "status"]) || "等待执行",
+        detail: eventAction && eventAction !== repairAction ? eventAction : repairStatusLabel(event),
         meta: [
+          repairAttemptLabel(event),
           isPayloadFlagTrue(event.payload.requires_approval) ? "需要确认" : "",
           safeIntentIdentifier(event, ["failure_kind"]),
           replaySafetyLabel(event.payload.replay_safe),
