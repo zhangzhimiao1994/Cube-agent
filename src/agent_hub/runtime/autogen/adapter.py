@@ -48,8 +48,6 @@ from autogen_core.models import (
 )
 from autogen_core.tools import BaseTool, Tool, ToolSchema
 from opentelemetry.trace import NoOpTracerProvider
-
-from agent_hub.runtime.hermes_context import hermes_memory_context_text
 from pydantic import BaseModel, ConfigDict
 
 from agent_hub.domain.runs import TaskMode
@@ -82,6 +80,7 @@ from agent_hub.runtime.failure_reason import (
     safe_model_gateway_failure_reason,
     safe_runtime_failure_reason,
 )
+from agent_hub.runtime.hermes_context import hermes_memory_context_text
 
 _ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _RUNTIME_TYPE = "autogen"

@@ -62,7 +62,7 @@ def test_direct_prompt_includes_bounded_hermes_memory_context() -> None:
     )
     runtime = DirectRuntime(UnusedGateway(), logical_model="main")  # type: ignore[arg-type]
 
-    prompt = runtime._build_prompt(context)  # noqa: SLF001
+    prompt = runtime._build_prompt(context)
 
     assert prompt.messages is not None
     serialized = "\n".join(message.content for message in prompt.messages)

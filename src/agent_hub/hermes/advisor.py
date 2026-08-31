@@ -18,7 +18,6 @@ from agent_hub.runs.service import (
     HermesSkippedMemory,
 )
 
-
 _INJECTABLE_MEMORY_TYPES = {
     "user_preference",
     "project_fact",
@@ -141,7 +140,6 @@ class PersistentHermesRunAdvisor:
         if not selected_injections and not conflict_skipped:
             return None
         best = injected[0][3] if injected else confirmed[0]
-        weight = injected[0][1] if injected else _lesson_weight(best)
         recommended_mode = _recommended_mode(best, lowered)
         confidence = injected[0][0] if injected else 0.5
         return HermesRunAdvice(
