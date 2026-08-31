@@ -37,8 +37,7 @@ from agent_hub.runtime.defaults import (
     _selected_config_role_assignments,
     configured_runtime_registry,
 )
-from agent_hub.runtime.role_planner import RoleAssignment, RolePurpose
-from agent_hub.runtime.role_planner import TaskProfile
+from agent_hub.runtime.role_planner import RoleAssignment, RolePurpose, TaskProfile
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
 

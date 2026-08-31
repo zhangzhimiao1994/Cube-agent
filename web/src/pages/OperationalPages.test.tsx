@@ -5715,9 +5715,10 @@ describe("operational management pages", () => {
 
   it("explains when Hermes filters hide scheduler learning records", async () => {
     const user = userEvent.setup();
-    render(<TestApp initialPath="/hermes?category=conversation" />);
+    render(<TestApp initialPath="/hermes" />);
 
     expect(await screen.findByRole("table", { name: /Hermes/ })).not.toBeNull();
+    await user.selectOptions(screen.getByRole("combobox", { name: "按 Hermes 分类筛选" }), "conversation");
     await user.type(screen.getByRole("searchbox", { name: "快速搜索 Hermes 学习" }), "conv-workflow-2");
 
     expect(await screen.findByText("当前筛选隐藏了调度观察记录")).not.toBeNull();

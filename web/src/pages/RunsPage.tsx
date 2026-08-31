@@ -729,7 +729,7 @@ function eventDetailRows(event: RunDetail["events"][number], agentNames: Map<str
       if (formatted && formatted !== safeSummary) rows.push({ label: eventPayloadLabel(key), value: formatted });
       return;
     }
-    if (safeSummary && SUMMARY_BACKED_RAW_PAYLOAD_KEYS.has(key)) return;
+    if (safeSummary && SUMMARY_BACKED_RAW_PAYLOAD_KEYS.has(key) && key !== "output") return;
     if (isTool && RAW_TOOL_PAYLOAD_KEYS.has(key)) return;
     if (isIntentEventWithRestrictedPayload(event) && INTENT_RAW_PAYLOAD_KEYS.has(key)) return;
     if (isModelDelta && key === "text") return;

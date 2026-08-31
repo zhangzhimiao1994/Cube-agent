@@ -149,11 +149,15 @@ test("operator inspects run detail and cancels safely", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "已取消" })).toBeVisible();
 });
 
-async function mockCodingRunApi(page: Page) {
+async function mockCodingRunApi(
+  page: Page,
+  options: { liveRefresh?: boolean; fullOutputSentinel?: string } = {},
+) {
   const finalArtifactId = "55555555-5555-4555-8555-555555555555";
   const intermediateArtifactId = "66666666-6666-4666-8666-666666666666";
   const finalDownloadPath = `/api/v1/admin/runs/${codingRunId}/artifacts/${finalArtifactId}/download`;
   const intermediateDownloadPath = `/api/v1/admin/runs/${codingRunId}/artifacts/${intermediateArtifactId}/download`;
+  let detailRequests = 0;
   const runDetail = {
     id: codingRunId,
     status: "completed",
@@ -216,7 +220,10 @@ async function mockCodingRunApi(page: Page) {
         created_at: "2026-08-31T00:00:02Z",
         actor: "engineer",
         step_id: "create_project",
-        payload: { artifact_id: intermediateArtifactId },
+        payload: {
+          artifact_id: intermediateArtifactId,
+          ...(options.fullOutputSentinel ? { output: options.fullOutputSentinel } : {}),
+        },
         artifact: {
           id: intermediateArtifactId,
           kind: "zip",
@@ -284,6 +291,26 @@ async function mockCodingRunApi(page: Page) {
     },
     failure_diagnostics: [],
     tool_lifecycle: [],
+  };
+  const refreshedRunDetail = {
+    ...runDetail,
+    events: [
+      ...runDetail.events,
+      {
+        sequence: 6,
+        kind: "step.started",
+        message: "step.started",
+        summary: "工程师刷新后继续执行验收。",
+        created_at: "2026-08-31T00:00:04Z",
+        actor: "engineer",
+        step_id: "create_project",
+        payload: {
+          role: "工程师",
+          logical_model: "vibe-engineer",
+          task: "刷新后继续验收 hello world 项目",
+        },
+      },
+    ],
   };
 
   await page.route("**/api/v1/**", async (route) => {
@@ -375,7 +402,10 @@ async function mockCodingRunApi(page: Page) {
       return;
     }
     if (path === `/api/v1/admin/runs/${codingRunId}`) {
-      await route.fulfill({ json: runDetail });
+      detailRequests += 1;
+      await route.fulfill({
+        json: options.liveRefresh && detailRequests > 1 ? refreshedRunDetail : runDetail,
+      });
       return;
     }
     if (path === `/api/v1/admin/conversations/${codingConversationId}`) {
@@ -423,4 +453,44 @@ test("operator validates a simple coding run and downloads final and intermediat
   expect((await intermediateDownload).suggestedFilename()).toBe("hello-world-source.zip");
   await page.locator(".process-drawer-backdrop").click({ position: { x: 5, y: 5 } });
   await expect(page.getByRole("dialog", { name: "运行过程详情" })).toHaveCount(0);
+});
+
+test("opened agent process drawer refreshes when new step events arrive", async ({ page }) => {
+  await mockCodingRunApi(page, { liveRefresh: true });
+
+  await page.goto("/");
+  await page.getByLabel("发送消息").getByPlaceholder(/输入消息，继续当前对话/).fill("生成一个最简单的 hello world 项目。");
+  await page.getByRole("button", { name: "发送" }).click();
+
+  await page.getByRole("button", { name: /工程师开始创建最小项目。/ }).click();
+  const drawer = page.getByRole("dialog", { name: "运行过程详情" });
+  await expect(drawer).toBeVisible();
+  await expect(drawer).toContainText("工程师开始创建最小项目。");
+
+  await expect(drawer).toContainText("工程师刷新后继续执行验收。", { timeout: 5000 });
+  await expect(drawer).toBeVisible();
+});
+
+test("process drawer keeps long fields behind summary detail cards", async ({ page }) => {
+  const fullOutputSentinel =
+    "完整输出字段应该只在二级详情中出现，不能直接铺在抽屉正文里。alpha beta gamma delta epsilon.";
+  await mockCodingRunApi(page, { fullOutputSentinel });
+
+  await page.goto("/");
+  await page.getByLabel("发送消息").getByPlaceholder(/输入消息，继续当前对话/).fill("生成一个最简单的 hello world 项目。");
+  await page.getByRole("button", { name: "发送" }).click();
+
+  await page.getByRole("button", { name: /生成中间项目文件。/ }).click();
+  const drawer = page.getByRole("dialog", { name: "运行过程详情" });
+  await expect(drawer).toBeVisible();
+  await expect.poll(() => page.evaluate(() => document.body.style.overflow)).toBe("hidden");
+  await expect(drawer).not.toContainText(fullOutputSentinel);
+
+  await drawer.getByRole("button", { name: /产物：/ }).click();
+  const modal = page.getByRole("dialog", { name: "产物详情" });
+  await expect(modal).toContainText(fullOutputSentinel);
+
+  await page.locator(".process-detail-modal-backdrop").click({ position: { x: 5, y: 5 } });
+  await expect(page.getByRole("dialog", { name: "产物详情" })).toHaveCount(0);
+  await expect(drawer).toBeVisible();
 });

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 
 from agent_hub.models.capacity import (
@@ -148,8 +150,9 @@ def test_runtime_failure_diagnostic_classifies_empty_model_response_as_retryable
     assert diagnostic["error_category"] == "empty_response"
     assert diagnostic["error_code"] == "model.empty_response"
     assert diagnostic["retryable"] is True
-    assert "压缩输入" in diagnostic["suggested_action"]
-    assert "fallback" in diagnostic["suggested_action"]
+    suggested_action = cast(str, diagnostic["suggested_action"])
+    assert "压缩输入" in suggested_action
+    assert "fallback" in suggested_action
 
 
 def test_runtime_failure_diagnostic_classifies_crewai_step_timeout() -> None:
