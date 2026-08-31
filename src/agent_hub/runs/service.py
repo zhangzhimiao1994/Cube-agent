@@ -240,12 +240,32 @@ class TemporaryAgentPolicyProtocol(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class HermesMemoryInjection:
+    id: str
+    summary: str
+    memory_type: str
+    target: str
+    score: float
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class HermesSkippedMemory:
+    id: str
+    summary: str
+    reason: str
+    score: float
+
+
+@dataclass(frozen=True, slots=True)
 class HermesRunAdvice:
     recommended_mode: TaskMode
     confidence: float
     reasons: tuple[str, ...]
     recommended_skills: tuple[str, ...] = ()
     requires_approval: bool = True
+    injected_memories: tuple[HermesMemoryInjection, ...] = ()
+    skipped_memories: tuple[HermesSkippedMemory, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -2319,6 +2339,26 @@ def _hermes_advice_payload(advice: HermesRunAdvice) -> dict[str, object]:
         "reasons": list(advice.reasons),
         "recommended_skills": list(advice.recommended_skills),
         "requires_approval": advice.requires_approval,
+        "injected_memories": [
+            {
+                "id": item.id,
+                "summary": item.summary,
+                "memory_type": item.memory_type,
+                "target": item.target,
+                "score": item.score,
+                "reason": item.reason,
+            }
+            for item in advice.injected_memories[:3]
+        ],
+        "skipped_memories": [
+            {
+                "id": item.id,
+                "summary": item.summary,
+                "reason": item.reason,
+                "score": item.score,
+            }
+            for item in advice.skipped_memories[:5]
+        ],
     }
 
 
@@ -2431,8 +2471,10 @@ def _runtime_failure_reason(error: Exception) -> str:
 
 __all__ = [
     "HermesAdvisorProtocol",
+    "HermesMemoryInjection",
     "HermesRunAdvice",
     "HermesRunOutcome",
+    "HermesSkippedMemory",
     "RunService",
     "RunSummary",
     "SubmittedRun",

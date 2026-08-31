@@ -6,7 +6,13 @@ from uuid import UUID, uuid4
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteDecision
 from agent_hub.runs.repository import RunRecord
-from agent_hub.runs.service import HermesRunAdvice, HermesRunOutcome, RunService
+from agent_hub.runs.service import (
+    HermesMemoryInjection,
+    HermesRunAdvice,
+    HermesRunOutcome,
+    HermesSkippedMemory,
+    RunService,
+)
 from agent_hub.runtime.defaults import UnavailableRuntime
 from agent_hub.runtime.registry import RuntimeRegistry
 
@@ -383,6 +389,70 @@ async def test_auto_submission_uses_hermes_before_local_direct_router_fallback()
     routing = repository.created[0]["routing_decision"]
     assert isinstance(routing, dict)
     assert routing["reason"] == "hermes_recommendation"
+
+
+async def test_auto_submission_records_hermes_injected_memory_payload() -> None:
+    repository = ConversationModeRepository(None)
+    advisor = RecordingHermesAdvisor(
+        HermesRunAdvice(
+            recommended_mode=TaskMode.DISPATCH,
+            confidence=0.86,
+            reasons=("matched previous execution pattern",),
+            recommended_skills=("script-review",),
+            requires_approval=False,
+            injected_memories=(
+                HermesMemoryInjection(
+                    id="hermes_confirmed_review",
+                    summary="reviewer 超时时先压缩上下文再分块审查。",
+                    memory_type="error_handling",
+                    target="reviewer",
+                    score=0.91,
+                    reason="命中 reviewer 超时处理经验",
+                ),
+            ),
+            skipped_memories=(
+                HermesSkippedMemory(
+                    id="hermes_old_direct",
+                    summary="旧 direct 模式观察。",
+                    reason="当前任务相关性不足",
+                    score=0.42,
+                ),
+            ),
+        )
+    )
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DISPATCH),)),
+        router=None,
+        task_queue=RecordingQueue(),
+        hermes_advisor=advisor,
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="short video script",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-1",
+        idempotency_key="idem-hermes-memory-payload",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    hermes = routing["hermes"]
+    assert isinstance(hermes, dict)
+    assert hermes["injected_memories"] == [
+        {
+            "id": "hermes_confirmed_review",
+            "summary": "reviewer 超时时先压缩上下文再分块审查。",
+            "memory_type": "error_handling",
+            "target": "reviewer",
+            "score": 0.91,
+            "reason": "命中 reviewer 超时处理经验",
+        }
+    ]
+    assert hermes["skipped_memories"][0]["reason"] == "当前任务相关性不足"
 
 
 async def test_declined_evolution_proposal_can_continue_through_auto_mode() -> None:
