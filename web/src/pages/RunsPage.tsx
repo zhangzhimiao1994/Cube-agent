@@ -601,9 +601,27 @@ type ProcessDrawerTarget = {
   conversationId: string | null;
   scopeLabel: string;
   workItems: AgentWorkItem[];
+  hermesMemoryDetail?: HermesMemoryDetail;
   selectedAgentId?: string;
   selectedActivityId?: string;
 };
+
+type HermesMemoryDetail = {
+  injected: NonNullable<NonNullable<RunDetail["routing_decision"]>["hermes"]>["injected_memories"];
+  skipped: NonNullable<NonNullable<RunDetail["routing_decision"]>["hermes"]>["skipped_memories"];
+};
+
+function hermesMemoryItemsFromRunDetail(run: RunDetail | undefined): HermesMemoryDetail {
+  const hermes = run?.routing_decision?.hermes;
+  return {
+    injected: hermes?.injected_memories ?? [],
+    skipped: hermes?.skipped_memories ?? [],
+  };
+}
+
+function hermesMemoryCountLabel(detail: HermesMemoryDetail) {
+  return `Hermes+ 记忆：已注入 ${detail.injected.length} 条，未注入 ${detail.skipped.length} 条`;
+}
 
 function toggle(list: string[], value: string) {
   return list.includes(value) ? list.filter((item) => item !== value) : [...list, value];
@@ -1882,6 +1900,7 @@ function RunProcessSummary({
                 conversationId: runConversationId(detail),
                 scopeLabel: runSeatScope(detail),
                 workItems,
+                hermesMemoryDetail: hermesMemoryItemsFromRunDetail(detail),
                 selectedAgentId: item.agentId,
                 selectedActivityId: item.id,
               })
@@ -1901,6 +1920,7 @@ function RunProcessSummary({
               conversationId: runConversationId(detail),
               scopeLabel: runSeatScope(detail),
               workItems,
+              hermesMemoryDetail: hermesMemoryItemsFromRunDetail(detail),
             })
           }
         >
@@ -1908,6 +1928,100 @@ function RunProcessSummary({
         </button>
       </div>
     </section>
+  );
+}
+
+function HermesMemorySummaryRow({
+  detail,
+  onOpen,
+}: {
+  detail: HermesMemoryDetail;
+  onOpen: () => void;
+}) {
+  const total = detail.injected.length + detail.skipped.length;
+  if (total === 0) return null;
+  return (
+    <button
+      type="button"
+      className="hermes-memory-summary-row"
+      aria-label={hermesMemoryCountLabel(detail)}
+      onClick={onOpen}
+    >
+      <span aria-hidden="true">H+</span>
+      <strong>{hermesMemoryCountLabel(detail)}</strong>
+      <small>已按本轮路由结果整理注入与跳过原因</small>
+    </button>
+  );
+}
+
+function HermesMemoryDetailDrawer({
+  detail,
+  onClose,
+}: {
+  detail: HermesMemoryDetail;
+  onClose: () => void;
+}) {
+  return (
+    <div
+      className="activity-detail-backdrop hermes-memory-detail-backdrop"
+      role="presentation"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <section
+        className="activity-detail-drawer hermes-memory-detail-drawer"
+        role="dialog"
+        aria-label="Hermes+ 记忆详情"
+        aria-modal="true"
+        onPointerDown={(event) => event.stopPropagation()}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="process-drawer-header">
+          <div>
+            <span className="eyebrow">Hermes+</span>
+            <h3>Hermes+ 记忆详情</h3>
+            <p className="agent-workforce-scope">{hermesMemoryCountLabel(detail)}</p>
+          </div>
+          <button type="button" className="secondary-action" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+        {detail.injected.length > 0 ? (
+          <section className="hermes-memory-section" aria-label="已注入记忆">
+            <h4>已注入</h4>
+            <div className="hermes-memory-card-list">
+              {detail.injected.map((memory) => (
+                <article key={memory.id} className="hermes-memory-card">
+                  <strong>{memory.summary}</strong>
+                  <p>{memory.reason}</p>
+                  <small>
+                    {memory.memory_type} · {memory.target} · {memory.score.toFixed(2)}
+                  </small>
+                </article>
+              ))}
+            </div>
+          </section>
+        ) : null}
+        {detail.skipped.length > 0 ? (
+          <section className="hermes-memory-section" aria-label="未注入记忆">
+            <h4>未注入</h4>
+            <div className="hermes-memory-card-list">
+              {detail.skipped.map((memory) => (
+                <article key={memory.id} className="hermes-memory-card is-skipped">
+                  <strong>{memory.summary}</strong>
+                  <p>{memory.reason}</p>
+                  <small>{memory.score.toFixed(2)}</small>
+                </article>
+              ))}
+            </div>
+          </section>
+        ) : null}
+      </section>
+    </div>
   );
 }
 
@@ -1926,11 +2040,13 @@ function RunProcessDrawer({
   const [selectedAgentId, setSelectedAgentId] = useState(initialAgentId);
   const [selectedView, setSelectedView] = useState<AgentWorkView>("activity");
   const [activityDetail, setActivityDetail] = useState<AgentWorkActivity | null>(null);
+  const [hermesDetailOpen, setHermesDetailOpen] = useState(false);
 
   useEffect(() => {
     setSelectedAgentId(initialAgentId);
     setSelectedView("activity");
     setActivityDetail(null);
+    setHermesDetailOpen(false);
   }, [initialAgentId, target.runId, target.conversationId, target.selectedActivityId]);
 
   const selectedAgent = target.workItems.find((item) => item.id === selectedAgentId) ?? target.workItems[0];
@@ -1942,6 +2058,7 @@ function RunProcessDrawer({
     : null;
   const canShowComputerView = Boolean(selectedAgent?.availableViews.includes("computer"));
   const activeView = canShowComputerView ? selectedView : "activity";
+  const hermesMemoryDetail = target.hermesMemoryDetail ?? { injected: [], skipped: [] };
 
   return (
     <div
@@ -1973,6 +2090,7 @@ function RunProcessDrawer({
             关闭
           </button>
         </div>
+        <HermesMemorySummaryRow detail={hermesMemoryDetail} onOpen={() => setHermesDetailOpen(true)} />
         <RunSummaryBuckets workItems={target.workItems} />
         <div className="agent-workforce-layout">
           <aside className="agent-workforce-roster" aria-label="子 Agent 列表">
@@ -2052,6 +2170,9 @@ function RunProcessDrawer({
         </div>
         {refreshedActivityDetail ? (
           <AgentActivityDetailDrawer activity={refreshedActivityDetail} onClose={() => setActivityDetail(null)} />
+        ) : null}
+        {hermesDetailOpen ? (
+          <HermesMemoryDetailDrawer detail={hermesMemoryDetail} onClose={() => setHermesDetailOpen(false)} />
         ) : null}
       </section>
     </div>
@@ -3434,6 +3555,7 @@ export function RunsPage() {
           conversationId: runConversationId(refreshedRunForProcessDetail),
           scopeLabel: runSeatScope(refreshedRunForProcessDetail),
           workItems: buildAgentWorkItems(refreshedRunForProcessDetail, agentNameMap, mainAgentModelName),
+          hermesMemoryDetail: hermesMemoryItemsFromRunDetail(refreshedRunForProcessDetail),
         }
       : processDetailTarget;
 

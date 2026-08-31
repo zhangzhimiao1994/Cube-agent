@@ -617,11 +617,40 @@ const RunEventSchema = z.object({
   artifact: RunArtifactSchema.nullable().optional(),
 });
 
+const HermesInjectedMemorySchema = z.object({
+  id: z.string(),
+  summary: z.string(),
+  memory_type: z.string(),
+  target: z.string(),
+  score: z.number(),
+  reason: z.string(),
+});
+
+const HermesSkippedMemorySchema = z.object({
+  id: z.string(),
+  summary: z.string(),
+  reason: z.string(),
+  score: z.number(),
+});
+
+const RoutingDecisionSchema = z
+  .object({
+    hermes: z
+      .object({
+        injected_memories: z.array(HermesInjectedMemorySchema).default([]),
+        skipped_memories: z.array(HermesSkippedMemorySchema).default([]),
+      })
+      .nullable()
+      .optional(),
+  })
+  .passthrough();
+
 const RunDetailSchema = RunListItemSchema.extend({
   request: z.string(),
   events: z.array(RunEventSchema),
   artifacts: z.array(RunArtifactSchema),
   explicit_details: z.record(z.string(), z.string()),
+  routing_decision: RoutingDecisionSchema.nullable().optional(),
   decision_token: z.string().nullable().optional(),
   temporary_agent_proposal: TemporaryAgentProposalSchema.nullable().optional(),
   schedule_proposal: ScheduleProposalSchema.nullable().optional(),

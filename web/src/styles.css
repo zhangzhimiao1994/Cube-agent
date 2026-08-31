@@ -1649,6 +1649,55 @@ article:hover {
   margin: 0.1rem 0 0;
 }
 
+.hermes-memory-summary-row {
+  align-items: center;
+  background: rgba(85, 215, 255, 0.07);
+  border: 1px solid rgba(123, 225, 255, 0.18);
+  border-radius: 8px;
+  color: var(--text);
+  display: grid;
+  gap: 0.3rem 0.55rem;
+  grid-template-columns: auto minmax(0, 1fr);
+  justify-items: start;
+  margin-bottom: 0.75rem;
+  padding: 0.55rem 0.65rem;
+  text-align: left;
+  width: 100%;
+}
+
+.hermes-memory-summary-row:hover,
+.hermes-memory-summary-row:focus-visible {
+  background: rgba(85, 215, 255, 0.12);
+  border-color: rgba(85, 215, 255, 0.34);
+  box-shadow: none;
+  transform: none;
+}
+
+.hermes-memory-summary-row span {
+  background: rgba(85, 215, 255, 0.14);
+  border: 1px solid rgba(85, 215, 255, 0.22);
+  border-radius: 999px;
+  color: var(--accent);
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.74rem;
+  font-weight: 950;
+  grid-row: span 2;
+  padding: 0.22rem 0.4rem;
+}
+
+.hermes-memory-summary-row strong {
+  font-weight: 900;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hermes-memory-summary-row small {
+  color: var(--muted);
+  font-weight: 800;
+}
+
 .agent-workforce-scope {
   color: var(--muted);
   font-size: 0.78rem;
@@ -2040,6 +2089,52 @@ article:hover {
 
 .activity-detail-summary h4 {
   margin: 0;
+}
+
+.hermes-memory-detail-drawer {
+  gap: 0.75rem;
+}
+
+.hermes-memory-section {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.hermes-memory-section h4 {
+  margin: 0;
+}
+
+.hermes-memory-card-list {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.hermes-memory-card {
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(123, 225, 255, 0.12);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.65rem;
+}
+
+.hermes-memory-card.is-skipped {
+  border-color: rgba(255, 196, 87, 0.18);
+}
+
+.hermes-memory-card strong {
+  color: var(--text);
+}
+
+.hermes-memory-card p {
+  color: var(--muted);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.hermes-memory-card small {
+  color: rgba(178, 194, 216, 0.72);
+  font-weight: 850;
 }
 
 .activity-summary-cards {

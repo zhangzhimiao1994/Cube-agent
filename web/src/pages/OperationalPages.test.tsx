@@ -3013,6 +3013,60 @@ describe("operational management pages", () => {
     expect(document.body.style.overflow).toBe("");
   });
 
+  it("shows Hermes memory injection details from the process drawer row", async () => {
+    const user = userEvent.setup();
+    const hermesRunDetail: RunDetail = {
+      ...runDetail,
+      routing_decision: {
+        hermes: {
+          injected_memories: [
+            {
+              id: "memory-injected-1",
+              summary: "用户偏好先给短视频脚本，再补镜头表。",
+              memory_type: "conversation",
+              target: "copywriter",
+              score: 0.91,
+              reason: "与当前短视频脚本任务高度相关。",
+            },
+          ],
+          skipped_memories: [
+            {
+              id: "memory-skipped-1",
+              summary: "历史任务要求输出英文广告词。",
+              reason: "当前任务是中文脚本，语言和目标不匹配。",
+              score: 0.27,
+            },
+          ],
+        },
+      },
+    };
+    visibleRunDetail = hermesRunDetail;
+    visibleConversationRuns = [hermesRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await user.click(within(stream).getByRole("button", { name: /讨论完成：形成 1 个结论、1 个决策、3 条意见/ }));
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    const hermesRow = within(drawer).getByRole("button", { name: /Hermes\+ 记忆：已注入 1 条，未注入 1 条/ });
+    expect(within(drawer).queryByRole("button", { name: /查看详情/ })).toBeNull();
+
+    await user.click(hermesRow);
+
+    const hermesDrawer = await screen.findByRole("dialog", { name: "Hermes+ 记忆详情" });
+    expect(within(hermesDrawer).getByText("用户偏好先给短视频脚本，再补镜头表。")).not.toBeNull();
+    expect(within(hermesDrawer).getByText("与当前短视频脚本任务高度相关。")).not.toBeNull();
+    expect(within(hermesDrawer).getByText("历史任务要求输出英文广告词。")).not.toBeNull();
+    expect(within(hermesDrawer).getByText("当前任务是中文脚本，语言和目标不匹配。")).not.toBeNull();
+
+    await user.click(hermesDrawer.parentElement as HTMLElement);
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Hermes+ 记忆详情" })).toBeNull());
+    expect(screen.getByRole("dialog", { name: "运行过程详情" })).not.toBeNull();
+  });
+
   it("falls back to concrete artifact titles when upstream artifact text is generic", async () => {
     const user = userEvent.setup();
     const processRunDetail = {
