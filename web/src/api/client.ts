@@ -728,15 +728,31 @@ const ConversationSchema = z.object({
 
 export type Conversation = z.infer<typeof ConversationSchema>;
 
+const SkillVersionSchema = z.object({
+  id: z.string(),
+  source_filename: z.string().nullable().optional(),
+  package_version_id: z.string().nullable().optional(),
+  content_sha256: z.string().nullable().optional(),
+  created_at: z.string().nullable().optional(),
+  updated_at: z.string().nullable().optional(),
+  is_current: z.boolean(),
+});
+
 const SkillSchema = z.object({
   id: z.string(),
   name: z.string(),
   status: z.string(),
   scan_diff: z.array(z.string()),
   requested_permissions: z.array(z.string()),
+  source_filename: z.string().nullable().optional(),
+  package_version_id: z.string().nullable().optional(),
+  content_sha256: z.string().nullable().optional(),
+  current_version_id: z.string().nullable().optional(),
+  versions: z.array(SkillVersionSchema).optional().default([]),
 });
 
 export type Skill = z.infer<typeof SkillSchema>;
+export type SkillVersion = z.infer<typeof SkillVersionSchema>;
 
 const SkillBulkDeleteSchema = z.object({
   deleted: z.array(z.string()),
@@ -925,6 +941,7 @@ const HermesInsightSchema = z.object({
   outcome: z.string(),
   lesson: z.string(),
   summary: z.string(),
+  user_summary: z.string().nullable().optional(),
   run_id: z.string().nullable(),
   conversation_id: z.string().nullable(),
   confirmed_at: z.string().nullable(),
@@ -1133,6 +1150,31 @@ async function requestBinary<T>(
     );
   }
   return parsed.data;
+}
+
+const GENERATED_ARTIFACT_DOWNLOAD_PATH =
+  /^\/api\/v1\/admin\/runs\/[^/]+\/artifacts\/[^/]+\/download$/;
+
+async function requestDownload(path: string): Promise<Blob> {
+  if (!GENERATED_ARTIFACT_DOWNLOAD_PATH.test(path)) {
+    throw new ApiError("unsupported download URL", 0, "invalid_download_url");
+  }
+  let response: Response;
+  const token = currentAccessToken();
+  try {
+    response = await fetch(path, {
+      credentials: "include",
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+    });
+  } catch {
+    throw new ApiError("network request failed", 0, "network_error");
+  }
+  if (!response.ok) {
+    throw await errorFromResponse(response);
+  }
+  return response.blob();
 }
 
 export const api = {
@@ -1610,10 +1652,11 @@ export const api = {
       SkillSchema,
     );
   },
-  uploadSkillArchive(file: File): Promise<SkillArchiveUpload> {
+  uploadSkillArchive(file: File, strategy?: "overwrite" | "new_version"): Promise<SkillArchiveUpload> {
     const filename = encodedFilenameHeader(file.name);
+    const query = strategy ? `?strategy=${strategy}` : "";
     return requestBinary(
-      "/api/v1/admin/skills/upload",
+      `/api/v1/admin/skills/upload${query}`,
       {
         method: "POST",
         body: file,
@@ -1625,6 +1668,16 @@ export const api = {
       },
       SkillArchiveUploadSchema,
     );
+  },
+  activateSkillVersion(skillId: string, versionId: string): Promise<Skill> {
+    return request(
+      `/api/v1/admin/skills/${encodeURIComponent(skillId)}/versions/${encodeURIComponent(versionId)}/activate`,
+      { method: "POST" },
+      SkillSchema,
+    );
+  },
+  downloadGeneratedArtifact(path: string): Promise<Blob> {
+    return requestDownload(path);
   },
   approveSkill(id: string): Promise<Skill> {
     return request(`/api/v1/admin/skills/${id}/approve`, { method: "POST" }, SkillSchema);

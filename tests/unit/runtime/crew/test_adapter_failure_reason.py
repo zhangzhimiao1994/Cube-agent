@@ -234,8 +234,9 @@ class TimeoutFactory(CrewObjectFactory):
 
 
 class RecordingGeneration:
-    def __init__(self, *, reviewer_timeouts: int = 0) -> None:
+    def __init__(self, *, reviewer_timeouts: int = 0, agent_timeouts: int = 0) -> None:
         self.reviewer_timeouts = reviewer_timeouts
+        self.agent_timeouts = agent_timeouts
         self.prompts: list[tuple[str, str | None, str]] = []
 
     async def execute(
@@ -251,6 +252,9 @@ class RecordingGeneration:
         self.prompts.append((step_id, agent_id, prompt))
         if self.reviewer_timeouts > 0 and agent_id == "reviewer":
             self.reviewer_timeouts -= 1
+            raise TimeoutError
+        if self.agent_timeouts > 0 and agent_id != "reviewer":
+            self.agent_timeouts -= 1
             raise TimeoutError
         return await bridge.complete([{"role": "system", "content": prompt}])
 
@@ -703,23 +707,108 @@ async def test_dispatch_framework_timeout_names_the_step_and_actor() -> None:
     assert step_failed.payload["actor"] == "writer"
 
 
-async def test_reviewer_timeout_soft_fails_with_structured_warning() -> None:
-    generation = RecordingGeneration(reviewer_timeouts=1)
+async def test_agent_timeout_compact_retries_before_failing_step() -> None:
+    generation = RecordingGeneration(agent_timeouts=1)
+    plan = _one_step_plan()
     runtime = CrewDispatchRuntime(
         RoleAwareGateway(),
-        _reviewed_step_plan(),
+        plan,
         crew_factory=RecordingFactory(generation),
     )
 
     events = await _collect(runtime)
 
+    writer_prompts = [prompt for step_id, agent_id, prompt in generation.prompts if step_id == "final"]
+    assert len(writer_prompts) == 2
+    retrying = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retrying.actor == "writer"
+    assert retrying.payload["recovery_strategy"] == "compact_retry"
+    assert retrying.payload["recovery_attempt"] == 1
+    assert retrying.payload["recovery_layers"] == (
+        "input_compression",
+        "prompt_decomposition",
+        "model_fallback_marked",
+        "failure_closure",
+    )
+    assert retrying.payload["model_fallback"] == "not_available_in_crewai_bridge"
+    assert "Keep the retry concise" in writer_prompts[1]
+    assert any(event.kind is EventKind.STEP_COMPLETED for event in events)
+    checkpoint = await runtime.save_checkpoint()
+    restored = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        plan,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+    await restored.restore_checkpoint(checkpoint)
+
+
+async def test_agent_timeout_reports_recovery_closure_after_retry_exhausted() -> None:
+    generation = RecordingGeneration(agent_timeouts=2)
+    runtime = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        _one_step_plan(),
+        crew_factory=RecordingFactory(generation),
+    )
+    events: list[RunEvent] = []
+
+    with pytest.raises(RuntimeExecutionError) as caught:
+        async for event in runtime.run(_context()):
+            events.append(event)
+
+    assert str(caught.value) == "CrewAI step timed out: step=final actor=writer"
+    writer_prompts = [prompt for step_id, agent_id, prompt in generation.prompts if step_id == "final"]
+    assert len(writer_prompts) == 2
+    retry_events = [event for event in events if event.kind is EventKind.STEP_RETRYING]
+    assert len(retry_events) == 1
+    step_failed = next(event for event in events if event.kind is EventKind.STEP_FAILED)
+    assert step_failed.payload["error_code"] == "crew.step_timeout"
+    assert step_failed.payload["recovery_status"] == "failed_after_compact_retry"
+    assert step_failed.payload["recovery_attempts"] == 1
+    assert step_failed.payload["recovery_layers"] == (
+        "input_compression",
+        "prompt_decomposition",
+        "model_fallback_marked",
+        "failure_closure",
+    )
+
+
+async def test_reviewer_timeout_uses_generic_recovery_before_soft_skip() -> None:
+    generation = RecordingGeneration(reviewer_timeouts=1)
+    plan = _reviewed_step_plan()
+    runtime = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        plan,
+        crew_factory=RecordingFactory(generation),
+    )
+
+    events = await _collect(runtime)
+
+    reviewer_prompts = [item for item in generation.prompts if item[1] == "reviewer"]
+    assert len(reviewer_prompts) == 2
+    retrying = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retrying.actor == "reviewer"
+    assert retrying.payload["recovery_strategy"] == "compact_retry"
+    assert retrying.payload["recovery_attempt"] == 1
+    assert retrying.payload["recovery_layers"] == (
+        "input_compression",
+        "prompt_decomposition",
+        "model_fallback_marked",
+        "failure_closure",
+    )
+    assert retrying.payload["model_fallback"] == "not_available_in_crewai_bridge"
+    assert "Keep the retry concise" in reviewer_prompts[1][2]
     review_completed = next(event for event in events if event.kind is EventKind.REVIEW_COMPLETED)
     assert review_completed.payload["verdict"] == "approve"
-    assert review_completed.payload["review_status"] == "timeout_skipped"
-    assert review_completed.payload["error_code"] == "crew.step_timeout"
-    assert review_completed.payload["step_id"] == "draft.review"
-    assert review_completed.payload["actor"] == "reviewer"
+    assert "review_status" not in review_completed.payload
+    assert "error_code" not in review_completed.payload
     assert any(event.kind is EventKind.STEP_COMPLETED for event in events)
+    checkpoint = await runtime.save_checkpoint()
+    restored = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        plan,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+    await restored.restore_checkpoint(checkpoint)
 
 
 async def test_reviewer_timeout_retries_before_soft_skip() -> None:
@@ -744,7 +833,7 @@ async def test_reviewer_timeout_skips_after_retry_budget_is_exhausted() -> None:
     generation = RecordingGeneration(reviewer_timeouts=2)
     runtime = CrewDispatchRuntime(
         RoleAwareGateway(),
-        _reviewed_step_plan(reviewer_retries=1),
+        _reviewed_step_plan(),
         crew_factory=RecordingFactory(generation),
     )
 
@@ -755,6 +844,15 @@ async def test_reviewer_timeout_skips_after_retry_budget_is_exhausted() -> None:
     review_completed = next(event for event in events if event.kind is EventKind.REVIEW_COMPLETED)
     assert review_completed.payload["review_status"] == "timeout_skipped"
     assert review_completed.payload["error_code"] == "crew.step_timeout"
+    assert review_completed.payload["recovery_status"] == "failed_after_compact_retry"
+    assert review_completed.payload["recovery_attempts"] == 1
+    assert review_completed.payload["recovery_layers"] == (
+        "input_compression",
+        "prompt_decomposition",
+        "model_fallback_marked",
+        "failure_closure",
+    )
+    assert review_completed.payload["model_fallback"] == "not_available_in_crewai_bridge"
     assert any(event.kind is EventKind.STEP_COMPLETED for event in events)
 
 

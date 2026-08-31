@@ -4,6 +4,7 @@ import { Link } from "react-router-dom";
 
 import { ApiError, api, formatApiError, type AttachmentUpload, type ModelDeployment, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
+import { ArtifactFileCard, artifactFileName, formatFileSize, hasArtifactDownload } from "../components/ArtifactFileCard";
 
 const RUN_MODES = [
   { value: "auto", label: "自动", description: "主 Agent 判断应使用直连、派单、讨论或混合；不确定时向你确认。" },
@@ -320,7 +321,6 @@ type RunEvent = RunDetail["events"][number];
 type RunArtifact = RunDetail["artifacts"][number];
 type DownloadableArtifact = (RunArtifact | NonNullable<RunEvent["artifact"]>) & {
   download_url: string;
-  filename: string;
 };
 type ChatMessage = {
   id: string;
@@ -335,58 +335,26 @@ type EventGroupItem = {
   index: number;
 };
 
-function isDownloadableArtifact(
-  artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null | undefined,
-): artifact is DownloadableArtifact {
-  return Boolean(artifact?.download_url && artifact.filename);
-}
-
 function isFinalDownloadableArtifact(
   artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null | undefined,
 ): artifact is DownloadableArtifact {
-  return isDownloadableArtifact(artifact) && artifact.presentation === "final_attachment";
-}
-
-function formatArtifactSize(size: number | null | undefined) {
-  if (typeof size !== "number" || !Number.isFinite(size) || size < 0) return "";
-  if (size < 1024) return `${size} B`;
-  if (size < 1024 * 1024) return `${(size / 1024).toFixed(size < 10 * 1024 ? 1 : 0)} KB`;
-  return `${(size / 1024 / 1024).toFixed(size < 10 * 1024 * 1024 ? 1 : 0)} MB`;
-}
-
-function artifactFileSummary(artifact: DownloadableArtifact) {
-  return [artifact.mime_type, formatArtifactSize(artifact.size_bytes)].filter(Boolean).join(" · ");
-}
-
-function ArtifactDownloadLink({ artifact }: { artifact: DownloadableArtifact }) {
-  const summary = artifactFileSummary(artifact);
-  return (
-    <a className="artifact-file-link" href={artifact.download_url ?? "#"} download={artifact.filename ?? undefined}>
-      <span>下载 {artifact.filename}</span>
-      {summary ? <small>{summary}</small> : null}
-    </a>
-  );
+  return hasArtifactDownload(artifact) && artifact.presentation === "final_attachment";
 }
 
 function downloadArtifactMessage(artifact: DownloadableArtifact): ChatMessage {
+  const filename = artifactFileName(artifact);
   return {
     id: `download-${artifact.id}`,
     role: "assistant",
-    title: `附件：${artifact.filename}`,
-    body: artifactFileSummary(artifact) || artifact.kind,
+    title: `附件：${filename}`,
+    body: [artifact.kind, artifact.mime_type].filter(Boolean).join(" · ") || artifact.kind,
     artifact,
   };
 }
 
 function artifactMessage(artifact: RunArtifact): ChatMessage {
   if (isFinalDownloadableArtifact(artifact)) {
-    return {
-      id: `artifact-${artifact.id}`,
-      role: "assistant",
-      title: `附件：${artifact.filename}`,
-      body: artifactFileSummary(artifact) || artifact.kind,
-      artifact,
-    };
+    return downloadArtifactMessage(artifact);
   }
   return {
     id: `artifact-${artifact.id}`,
@@ -394,6 +362,14 @@ function artifactMessage(artifact: RunArtifact): ChatMessage {
     title: `附件：${artifact.title}`,
     body: artifact.kind,
   };
+}
+
+function artifactDisplayName(artifact: RunArtifact | NonNullable<RunEvent["artifact"]>) {
+  return artifactFileName(artifact);
+}
+
+function artifactDetailDownload(artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null | undefined) {
+  return hasArtifactDownload(artifact) ? artifact : undefined;
 }
 
 function isGenericArtifactText(value: string | null | undefined) {
@@ -767,6 +743,8 @@ function eventDetailRows(event: RunDetail["events"][number], agentNames: Map<str
 
 type ProcessDetailTarget = {
   id: string;
+  runId: string;
+  conversationId: string | null;
   title: string;
   message: string;
   badge: string;
@@ -780,8 +758,14 @@ type AgentDispatchCard = {
   name: string;
   role: string;
   model: string;
-  tools: string;
+  summary: string;
   status: "异常" | "已完成" | "工作中" | "已安排";
+};
+
+type ProcessDetailGroup = {
+  key: string;
+  label: string;
+  rows: Array<{ label: string; value: string }>;
 };
 
 type TaskChainStep = {
@@ -877,13 +861,18 @@ function dispatchAgentCards(detail: RunDetail, agentNames: Map<string, string>):
       );
       const roleLabel = stringValue(role.role) ?? id;
       const model = stringValue(role.logical_model) ?? "默认模型";
-      const tools = stringArrayValue(role.tools).join("、");
+      const roleSummary =
+        stringValue(role.summary) ??
+        stringValue(role.goal) ??
+        stringValue(role.description) ??
+        stringValue(role.backstory) ??
+        "等待执行分配任务";
       return {
         id,
         name: agentNames.get(id) ?? id,
         role: roleLabel,
         model,
-        tools,
+        summary: conciseProcessText(roleSummary, "等待执行分配任务"),
         status: agentStatusForPlan(detail, id, stepIds),
       };
     })
@@ -1713,14 +1702,62 @@ function conversationMessages(runs: RunDetail[]): ChatMessage[] {
 }
 
 function sameRunSnapshot(left: RunDetail, right: RunDetail) {
-  return (
-    left.id === right.id &&
-    left.status === right.status &&
-    left.mode === right.mode &&
-    left.request === right.request &&
-    left.events.length === right.events.length &&
-    left.artifacts.length === right.artifacts.length
-  );
+  return runSnapshotSignature(left) === runSnapshotSignature(right);
+}
+
+function runSnapshotSignature(run: RunDetail) {
+  const lastArtifact = run.artifacts.at(-1);
+  return JSON.stringify({
+    id: run.id,
+    status: run.status,
+    mode: run.mode,
+    request: run.request,
+    decision_token: run.decision_token,
+    explicit_details: {
+      conversation_id: run.explicit_details.conversation_id,
+      version: run.explicit_details.version,
+      harness_provider: run.explicit_details.harness_provider,
+      harness_logical_model: run.explicit_details.harness_logical_model,
+      harness_capabilities: run.explicit_details.harness_capabilities,
+    },
+    temporary_agent_proposal: run.temporary_agent_proposal,
+    schedule_proposal: run.schedule_proposal,
+    evolution_proposal: run.evolution_proposal,
+    openclaw_proposal: run.openclaw_proposal,
+    repair_proposal: run.repair_proposal,
+    failure_diagnostics: run.failure_diagnostics,
+    tool_lifecycle: run.tool_lifecycle,
+    events: run.events.map((event) => ({
+      sequence: event.sequence,
+      kind: event.kind,
+      message: event.message,
+      summary: event.summary,
+      created_at: event.created_at,
+      actor: event.actor,
+      participants: event.participants,
+      step_id: event.step_id,
+      tool_name: event.tool_name,
+      tool_call_id: event.tool_call_id,
+      action: event.action,
+      decision: event.decision,
+      payload: event.payload,
+      artifact: event.artifact,
+    })),
+    artifacts: run.artifacts.length,
+    last_artifact: lastArtifact
+      ? {
+          id: lastArtifact.id,
+          kind: lastArtifact.kind,
+          title: lastArtifact.title,
+          filename: lastArtifact.filename,
+          mime_type: lastArtifact.mime_type,
+          size_bytes: lastArtifact.size_bytes,
+          sha256: lastArtifact.sha256,
+          download_url: lastArtifact.download_url,
+          text: lastArtifact.text,
+        }
+      : null,
+  });
 }
 
 function mergeConversationRuns(previous: RunDetail[] | undefined, incoming: RunDetail[]) {
@@ -1819,7 +1856,7 @@ function eventArtifactRows(artifact: RunArtifact | NonNullable<RunEvent["artifac
   if (artifact.kind) rows.push({ label: "产物类型", value: artifact.kind });
   if (artifact.filename) rows.push({ label: "文件名", value: artifact.filename });
   if (artifact.mime_type) rows.push({ label: "文件类型", value: artifact.mime_type });
-  const size = formatArtifactSize(artifact.size_bytes);
+  const size = formatFileSize(artifact.size_bytes);
   if (size) rows.push({ label: "文件大小", value: size });
   if (artifact.sha256) rows.push({ label: "SHA-256", value: artifact.sha256 });
   const text = eventArtifactText(artifact);
@@ -2204,6 +2241,8 @@ function processItemsForModelDeltaGroup(
   return [
     {
       id: `${detail.id}-model-delta-${modelDeltaGroupKey(lastEvent)}-${index}`,
+      runId: detail.id,
+      conversationId: runConversationId(detail),
       title: displayEventTitle(lastEvent, agentNames),
       message: `${displayEventTitle(lastEvent, agentNames)}：${modelDeltaSummaryText(events)}`,
       badge: processBadgeForEvent(lastEvent),
@@ -2274,12 +2313,14 @@ function processItemsForToolLifecycle(
   return [
     {
       id: `${detail.id}-tool-${toolLifecycleKey(lastEvent)}-${index}`,
+      runId: detail.id,
+      conversationId: runConversationId(detail),
       title: displayEventTitle(lastEvent, agentNames),
       message: eventSummaryText(lastEvent, agentNames, artifact),
       badge: processBadgeForEvent(lastEvent),
       rows,
       createdAt: lastEvent.created_at,
-      artifact: isDownloadableArtifact(artifact) ? artifact : undefined,
+      artifact: artifactDetailDownload(artifact),
     },
   ];
 }
@@ -2300,12 +2341,14 @@ function processItemsForEvent(
   if (baseRows.length === 0 && !event.message) return [];
   const baseItem: ProcessDetailTarget = {
     id: `${detail.id}-event-${event.sequence}-${index}`,
+    runId: detail.id,
+    conversationId: runConversationId(detail),
     title: displayEventTitle(event, agentNames),
     message: eventSummaryText(event, agentNames, artifact),
     badge: processBadgeForEvent(event),
     rows: baseRows,
     createdAt: event.created_at,
-    artifact: isDownloadableArtifact(artifact) ? artifact : undefined,
+    artifact: artifactDetailDownload(artifact),
   };
   return [baseItem];
 }
@@ -2322,6 +2365,8 @@ function runProcessItems(
       ? [
           {
             id: `${detail.id}-routing`,
+            runId: detail.id,
+            conversationId: runConversationId(detail),
             title: "主 Agent 调度判断",
             message: `主 Agent 选择${displayMode(detail.mode)}${routingAgentPool ? `：${routingAgentPool}` : ""}`,
             badge: "调度判断",
@@ -2515,6 +2560,7 @@ function RunProcessSummary({
                   <small>
                     {card.role} · {card.model}
                   </small>
+                  <p>{card.summary}</p>
                 </div>
                 <span>{card.status}</span>
               </article>
@@ -2529,12 +2575,117 @@ function RunProcessSummary({
               <span aria-hidden="true">›</span>
               <small className="process-card-badge">{item.badge}</small>
               <strong>{item.message}</strong>
-              {item.artifact ? <small>{item.artifact.filename}</small> : null}
+              {item.artifact ? <small>{artifactDisplayName(item.artifact)}</small> : null}
             </button>
           ))}
         </div>
       ) : null}
     </section>
+  );
+}
+
+const PROCESS_DETAIL_GROUPS: Array<{
+  key: string;
+  label: string;
+  match: (row: { label: string; value: string }) => boolean;
+}> = [
+  {
+    key: "conclusion",
+    label: "结论",
+    match: (row) => /结论|纪要|共识|得到结果|执行摘要|审查完成/.test(row.label),
+  },
+  {
+    key: "artifact",
+    label: "产物",
+    match: (row) => /产物|文件|SHA|输出内容/.test(row.label),
+  },
+  {
+    key: "blocker",
+    label: "阻塞",
+    match: (row) => /错误|失败|异常|超时|阻塞|退出|stderr|故障/.test(`${row.label} ${row.value}`),
+  },
+  {
+    key: "decision",
+    label: "决策",
+    match: (row) => /决策|裁决|判断|审批|策略|模式|工作流|路由|修复/.test(row.label),
+  },
+  {
+    key: "evidence",
+    label: "证据",
+    match: (row) => /执行者|参与者|模型|服务商|能力|步骤|工具|事件|耗时|字节|字段|分片|状态流|参数|类型/.test(row.label),
+  },
+];
+
+function processDetailGroups(rows: Array<{ label: string; value: string }>): ProcessDetailGroup[] {
+  const groups = new Map<string, ProcessDetailGroup>();
+  PROCESS_DETAIL_GROUPS.forEach((group) => groups.set(group.key, { key: group.key, label: group.label, rows: [] }));
+  groups.set("activity", { key: "activity", label: "活动", rows: [] });
+
+  rows.forEach((row) => {
+    const group = PROCESS_DETAIL_GROUPS.find((candidate) => candidate.match(row));
+    groups.get(group?.key ?? "activity")?.rows.push(row);
+  });
+
+  return [...groups.values()].filter((group) => group.rows.length > 0);
+}
+
+function processDetailGroupSummary(group: ProcessDetailGroup) {
+  const first = group.rows.find((row) => row.value.trim().length > 0);
+  return conciseProcessText(first?.value ?? "", `${group.rows.length} 项摘要`);
+}
+
+function ProcessDetailCards({ target }: { target: ProcessDetailTarget }) {
+  const [openGroupKey, setOpenGroupKey] = useState<string | null>(null);
+  const groups = processDetailGroups(target.rows);
+  if (groups.length === 0) return null;
+  const openGroup = groups.find((group) => group.key === openGroupKey) ?? null;
+  return (
+    <>
+      <div className="process-detail-card-grid" role="group" aria-label="运行详情摘要">
+        {groups.map((group) => (
+          <button
+            key={`${target.id}-${group.key}`}
+            type="button"
+            className={`process-detail-card process-detail-card-${group.key}`}
+            onClick={() => setOpenGroupKey(group.key)}
+            aria-label={`${group.label}：${processDetailGroupSummary(group)}`}
+          >
+            <span>{group.label}</span>
+            <small>{group.rows.length} 项</small>
+            <strong>{processDetailGroupSummary(group)}</strong>
+          </button>
+        ))}
+      </div>
+      {openGroup ? (
+        <div className="process-detail-modal-backdrop" role="presentation" onClick={() => setOpenGroupKey(null)}>
+          <section
+            className="process-detail-modal"
+            role="dialog"
+            aria-label={`${openGroup.label}详情`}
+            aria-modal="true"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="process-detail-modal-header">
+              <div>
+                <span className="eyebrow">{target.badge}</span>
+                <h4>{openGroup.label}</h4>
+              </div>
+              <button type="button" className="secondary-action" onClick={() => setOpenGroupKey(null)}>
+                关闭
+              </button>
+            </div>
+            <dl>
+              {openGroup.rows.map((row, index) => (
+                <Fragment key={`${target.id}-${openGroup.key}-${row.label}-${index}`}>
+                  <dt>{row.label}</dt>
+                  <dd>{row.value}</dd>
+                </Fragment>
+              ))}
+            </dl>
+          </section>
+        </div>
+      ) : null}
+    </>
   );
 }
 
@@ -2569,19 +2720,10 @@ function RunProcessDrawer({
             <p>{target.message}</p>
             {target.artifact ? (
               <div className="artifact-download-list" aria-label="中间产物">
-                <ArtifactDownloadLink artifact={target.artifact} />
+                <ArtifactFileCard artifact={target.artifact} compact />
               </div>
             ) : null}
-            {target.rows.length > 0 ? (
-              <dl>
-                {target.rows.map((row, index) => (
-                  <Fragment key={`${target.id}-${row.label}-${index}`}>
-                    <dt>{row.label}</dt>
-                    <dd>{row.value}</dd>
-                  </Fragment>
-                ))}
-              </dl>
-            ) : null}
+            <ProcessDetailCards target={target} />
             {target.createdAt ? <small>{target.createdAt}</small> : null}
           </article>
         </div>
@@ -2726,9 +2868,20 @@ function MessageBody({ text, title }: { text: string; title: string }) {
 }
 export function RunsPage() {
   const queryClient = useQueryClient();
-  const runs = useQuery({ queryKey: ["runs"], queryFn: () => api.runs() });
+  const runs = useQuery({
+    queryKey: ["runs"],
+    queryFn: () => api.runs(),
+    refetchInterval: (query) =>
+      query.state.data?.some((run) => !TERMINAL_STATUSES.has(run.status)) ? 1000 : 5000,
+    refetchIntervalInBackground: true,
+  });
   const runListItems = runs.data ?? [];
-  const agents = useQuery({ queryKey: ["agents"], queryFn: () => api.agents() });
+  const agents = useQuery({
+    queryKey: ["agents"],
+    queryFn: () => api.agents(),
+    refetchInterval: 5000,
+    refetchIntervalInBackground: true,
+  });
   const models = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
   const workflows = useQuery({ queryKey: ["workflows"], queryFn: () => api.workflows() });
   const settings = useQuery({ queryKey: ["settings"], queryFn: () => api.settings() });
@@ -2798,8 +2951,11 @@ export function RunsPage() {
     enabled: Boolean(selectedRunId),
     refetchInterval: (query) => {
       const data = query.state.data;
-      return data && !TERMINAL_STATUSES.has(data.status) ? 1000 : false;
+      if (!data) return false;
+      if (processDetailTarget?.runId === data.id) return 1000;
+      return !TERMINAL_STATUSES.has(data.status) ? 1000 : false;
     },
+    refetchIntervalInBackground: true,
   });
 
   const referenceConversation = useQuery({
@@ -2820,9 +2976,21 @@ export function RunsPage() {
     enabled: Boolean(activeConversationId && activeConversationKnown),
     refetchInterval: (query) => {
       const data = query.state.data;
+      if (data && processDetailTarget?.conversationId === data.conversation_id) return 1000;
+      if (data && activeConversationId === data.conversation_id) return 1000;
       return data?.runs.some((run) => !TERMINAL_STATUSES.has(run.status)) ? 1000 : false;
     },
+    refetchIntervalInBackground: true,
   });
+
+  async function refreshRunSurfaces(run: { id: string; conversation_id?: string | null }) {
+    await queryClient.invalidateQueries({ queryKey: ["runs"] });
+    await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
+    const surfaceConversationId = run.conversation_id?.trim() || activeConversationId;
+    if (surfaceConversationId) {
+      await queryClient.invalidateQueries({ queryKey: ["conversation", surfaceConversationId] });
+    }
+  }
 
   useEffect(() => {
     const closeHistoryDrawer = () => setHistoryOpen(false);
@@ -2942,6 +3110,21 @@ export function RunsPage() {
   }, [selectedRunId]);
 
   useEffect(() => {
+    if (!processDetailTarget) return undefined;
+    const previousBodyOverflow = document.body.style.overflow;
+    const previousBodyTouchAction = document.body.style.touchAction;
+    const previousDocumentOverflow = document.documentElement.style.overflow;
+    document.body.style.overflow = "hidden";
+    document.body.style.touchAction = "none";
+    document.documentElement.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previousBodyOverflow || "";
+      document.body.style.touchAction = previousBodyTouchAction || "";
+      document.documentElement.style.overflow = previousDocumentOverflow || "";
+    };
+  }, [processDetailTarget]);
+
+  useEffect(() => {
     if (!activeConversation.data) return;
     setConversationRunCache((current) => {
       const conversationRuns = mergeConversationRuns(
@@ -3007,11 +3190,7 @@ export function RunsPage() {
           operator_note: "用户已在新对话入口明确选择该模式。",
         });
         if (continued.conversation_id) setConversationId(continued.conversation_id);
-        await queryClient.invalidateQueries({ queryKey: ["runs"] });
-        await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
-        if (continued.conversation_id) {
-          await queryClient.invalidateQueries({ queryKey: ["conversation", continued.conversation_id] });
-        }
+        await refreshRunSurfaces({ id: run.id, conversation_id: continued.conversation_id ?? run.conversation_id });
         setMessage("");
         setAttachmentDraft(null);
         setArchiveInstallFile(null);
@@ -3087,11 +3266,7 @@ export function RunsPage() {
       setMessage("");
       setAttachmentDraft(null);
       setArchiveInstallFile(null);
-      await queryClient.invalidateQueries({ queryKey: ["runs"] });
-      await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
-      if (run.conversation_id) {
-        await queryClient.invalidateQueries({ queryKey: ["conversation", run.conversation_id] });
-      }
+      await refreshRunSurfaces(run);
     },
   });
 
@@ -3109,8 +3284,7 @@ export function RunsPage() {
       setModeSelection(null);
       if (run.mode) setMode(run.mode as RunMode);
       setSubmitNotice(explainActualMode(run));
-      await queryClient.invalidateQueries({ queryKey: ["runs"] });
-      await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
+      await refreshRunSurfaces(run);
     },
   });
 
@@ -3125,8 +3299,7 @@ export function RunsPage() {
     onSuccess: async (run) => {
       setTemporaryApproval((current) => (current ? { ...current, approved: true } : current));
       setSubmitNotice("已确认临时子 Agent，这轮对话已继续推进。完成后你可以决定是否永久保存该 Agent。");
-      await queryClient.invalidateQueries({ queryKey: ["runs"] });
-      await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
+      await refreshRunSurfaces(run);
     },
   });
 
@@ -3141,11 +3314,7 @@ export function RunsPage() {
     onSuccess: async (run) => {
       setRepairApproval(null);
       setSubmitNotice("已接受受控自修复，这次运行已重新排队。");
-      await queryClient.invalidateQueries({ queryKey: ["runs"] });
-      await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
-      if (run.conversation_id) {
-        await queryClient.invalidateQueries({ queryKey: ["conversation", run.conversation_id] });
-      }
+      await refreshRunSurfaces(run);
     },
   });
 
@@ -3216,12 +3385,7 @@ export function RunsPage() {
     mutationFn: (runId: string) => api.cancelRun(runId),
     onSuccess: async (run) => {
       setSubmitNotice("已停止当前运行。你可以继续发送新消息。");
-      await queryClient.invalidateQueries({ queryKey: ["runs"] });
-      await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
-      const stoppedConversationId = runConversationId(run) ?? activeConversationId;
-      if (stoppedConversationId) {
-        await queryClient.invalidateQueries({ queryKey: ["conversation", stoppedConversationId] });
-      }
+      await refreshRunSurfaces({ id: run.id, conversation_id: runConversationId(run) ?? run.conversation_id });
     },
   });
   const promoteTemporaryAgent = useMutation({
@@ -3256,8 +3420,7 @@ export function RunsPage() {
       setTemporaryApproval(null);
       setTemporaryFeedback("");
       setSubmitNotice("已收到你的新意见，主 Agent 会按反馈重新规划本次任务。");
-      await queryClient.invalidateQueries({ queryKey: ["runs"] });
-      await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
+      await refreshRunSurfaces(run);
     },
   });
 
@@ -3611,6 +3774,16 @@ export function RunsPage() {
   const mainAgentModelName = mainAgent.data?.model
     ? `${mainAgent.data.model.provider}/${mainAgent.data.model.upstream_model}`
     : "未配置";
+  const refreshedRunForProcessDetail = processDetailTarget
+    ? visibleRuns.find((run) => run.id === processDetailTarget.runId) ??
+      (selectedRun.data?.id === processDetailTarget.runId ? selectedRun.data : null)
+    : null;
+  const refreshedProcessDetailTarget =
+    processDetailTarget && refreshedRunForProcessDetail
+      ? runProcessItems(refreshedRunForProcessDetail, agentNameMap, mainAgentModelName).find(
+          (item) => item.id === processDetailTarget.id,
+        ) ?? processDetailTarget
+      : processDetailTarget;
   const directSendBlockedReason =
     mode !== "direct"
       ? null
@@ -4065,7 +4238,7 @@ export function RunsPage() {
                   <MessageBody text={item.body} title={item.title} />
                   {item.artifact ? (
                     <div className="artifact-download-list" aria-label="附件">
-                      <ArtifactDownloadLink artifact={item.artifact} />
+                      <ArtifactFileCard artifact={item.artifact} />
                     </div>
                   ) : null}
                 </article>
@@ -4080,9 +4253,9 @@ export function RunsPage() {
               </Fragment>
             ))}
           </div>
-          {processDetailTarget ? (
+          {refreshedProcessDetailTarget ? (
             <RunProcessDrawer
-              target={processDetailTarget}
+              target={refreshedProcessDetailTarget}
               onClose={() => setProcessDetailTarget(null)}
             />
           ) : null}

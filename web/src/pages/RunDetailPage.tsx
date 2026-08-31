@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 
 import { api, formatApiError, type RunDetail } from "../api/client";
+import { ArtifactFileCard, hasArtifactDownload } from "../components/ArtifactFileCard";
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
 const MANUAL_RUN_MODES = [
@@ -188,28 +189,6 @@ function displayToolStatus(status: string) {
 
 function displayToolOperation(kind: string) {
   return TOOL_OPERATION_LABELS[kind] ?? kind;
-}
-
-function formatArtifactSize(size: number | null | undefined) {
-  if (typeof size !== "number" || !Number.isFinite(size) || size < 0) return "";
-  if (size < 1024) return `${size} B`;
-  if (size < 1024 * 1024) return `${(size / 1024).toFixed(size < 10 * 1024 ? 1 : 0)} KB`;
-  return `${(size / 1024 / 1024).toFixed(size < 10 * 1024 * 1024 ? 1 : 0)} MB`;
-}
-
-function artifactFileSummary(artifact: RunArtifact) {
-  return [artifact.mime_type, formatArtifactSize(artifact.size_bytes)].filter(Boolean).join(" · ");
-}
-
-function ArtifactDownloadLink({ artifact }: { artifact: RunArtifact }) {
-  if (!artifact.download_url || !artifact.filename) return null;
-  const summary = artifactFileSummary(artifact);
-  return (
-    <a className="artifact-file-link" href={artifact.download_url} download={artifact.filename}>
-      <span>下载 {artifact.filename}</span>
-      {summary ? <small>{summary}</small> : null}
-    </a>
-  );
 }
 
 function displayDetailActor(actor: string | null | undefined) {
@@ -811,8 +790,10 @@ export function RunDetailPage() {
     enabled: runId.length > 0,
     refetchInterval: (query) => {
       const data = query.state.data;
-      return data && !TERMINAL_STATUSES.has(data.status) ? 1000 : false;
+      if (!data) return false;
+      return !TERMINAL_STATUSES.has(data.status) ? 1000 : 5000;
     },
+    refetchIntervalInBackground: true,
   });
   const control = useMutation({
     mutationFn: (action: "pause" | "resume" | "cancel") => {
@@ -1087,7 +1068,7 @@ export function RunDetailPage() {
               <li key={artifact.id}>
                 <strong>{artifact.kind}：{artifact.title}</strong>
                 {artifact.filename ? <small>{artifact.filename}</small> : null}
-                <ArtifactDownloadLink artifact={artifact} />
+                {hasArtifactDownload(artifact) ? <ArtifactFileCard artifact={artifact} compact /> : null}
               </li>
             ))}
           </ul>

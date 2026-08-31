@@ -25,6 +25,28 @@ const skills = [
     status: "quarantined",
     scan_diff: ["manifest loaded"],
     requested_permissions: ["network:http"],
+    source_filename: "deep-research.zip",
+    package_version_id: "pkg-v2",
+    content_sha256: "sha256-current",
+    current_version_id: "version-2",
+    versions: [
+      {
+        id: "version-1",
+        source_filename: "deep-research-v1.zip",
+        package_version_id: "pkg-v1",
+        content_sha256: "sha256-old",
+        created_at: "2026-08-14T01:00:00Z",
+        is_current: false,
+      },
+      {
+        id: "version-2",
+        source_filename: "deep-research.zip",
+        package_version_id: "pkg-v2",
+        content_sha256: "sha256-current",
+        created_at: "2026-08-15T01:00:00Z",
+        is_current: true,
+      },
+    ],
   },
   {
     id: "docx",
@@ -43,7 +65,10 @@ const skills = [
 ];
 
 describe("SkillsPage", () => {
+  let duplicateUploadAttempts = 0;
+
   beforeEach(() => {
+    duplicateUploadAttempts = 0;
     window.sessionStorage.setItem("agent_hub_access_token", "owner-token");
     vi.stubGlobal(
       "fetch",
@@ -61,6 +86,20 @@ describe("SkillsPage", () => {
           return jsonResponse(skills);
         }
         if (path === "/api/v1/admin/skills/upload" && init?.method === "POST") {
+          const filename = (init.headers as Record<string, string>)["X-Agent-Hub-Skill-Filename"];
+          if (filename === "duplicate-skill.zip") {
+            duplicateUploadAttempts += 1;
+            return jsonResponse(
+              {
+                error: {
+                  code: "skill_version_choice_required",
+                  message: "Skill already exists with different content",
+                  details: { skill_id: "deep-research", name: "deep-research" },
+                },
+              },
+              { status: 409 },
+            );
+          }
           return jsonResponse({
             filename: "all-skills.tar.gz",
             bundle: true,
@@ -74,6 +113,87 @@ describe("SkillsPage", () => {
               },
             ],
             skipped: [{ path: "invalid-skill", reason: "instruction skill contains nested archives" }],
+          });
+        }
+        if (path === "/api/v1/admin/skills/upload?strategy=overwrite" && init?.method === "POST") {
+          duplicateUploadAttempts += 1;
+          return jsonResponse({
+            filename: "duplicate-skill.zip",
+            bundle: false,
+            items: [
+              {
+                id: "deep-research",
+                name: "deep-research",
+                status: "scanned",
+                scan_diff: ["overwrote current version"],
+                requested_permissions: ["network:http"],
+                source_filename: "duplicate-skill.zip",
+                package_version_id: "pkg-v3",
+                content_sha256: "sha256-overwrite",
+                current_version_id: "version-3",
+                versions: [
+                  {
+                    id: "version-3",
+                    source_filename: "duplicate-skill.zip",
+                    package_version_id: "pkg-v3",
+                    content_sha256: "sha256-overwrite",
+                    created_at: "2026-08-16T01:00:00Z",
+                    is_current: true,
+                  },
+                ],
+              },
+            ],
+            skipped: [],
+          });
+        }
+        if (path === "/api/v1/admin/skills/upload?strategy=new_version" && init?.method === "POST") {
+          duplicateUploadAttempts += 1;
+          return jsonResponse({
+            filename: "duplicate-skill.zip",
+            bundle: false,
+            items: [
+              {
+                id: "deep-research",
+                name: "deep-research",
+                status: "scanned",
+                scan_diff: ["saved as new version"],
+                requested_permissions: ["network:http"],
+                source_filename: "duplicate-skill.zip",
+                package_version_id: "pkg-v3",
+                content_sha256: "sha256-new",
+                current_version_id: "version-3",
+                versions: [
+                  {
+                    id: "version-2",
+                    source_filename: "deep-research.zip",
+                    package_version_id: "pkg-v2",
+                    content_sha256: "sha256-current",
+                    created_at: "2026-08-15T01:00:00Z",
+                    is_current: false,
+                  },
+                  {
+                    id: "version-3",
+                    source_filename: "duplicate-skill.zip",
+                    package_version_id: "pkg-v3",
+                    content_sha256: "sha256-new",
+                    created_at: "2026-08-16T01:00:00Z",
+                    is_current: true,
+                  },
+                ],
+              },
+            ],
+            skipped: [],
+          });
+        }
+        if (path === "/api/v1/admin/skills/deep-research/versions/version-1/activate" && init?.method === "POST") {
+          const versionedSkill = skills[0];
+          return jsonResponse({
+            ...versionedSkill,
+            current_version_id: "version-1",
+            versions: (versionedSkill.versions ?? []).map((version) => ({
+              ...version,
+              is_current: version.id === "version-1",
+            })),
           });
         }
         if (path === "/api/v1/admin/evolution-runs" && init?.method === "POST") {
@@ -291,5 +411,55 @@ describe("SkillsPage", () => {
     });
     expect(await screen.findByText(/跳过 1 项/)).not.toBeNull();
     expect(screen.getByText(/invalid-skill/)).not.toBeNull();
+  });
+
+  it("asks how to handle same-name skill uploads before retrying with a version strategy", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/skills" />);
+
+    await screen.findByRole("heading", { name: "技能管理" });
+    const file = new File(["new bytes"], "duplicate-skill.zip", { type: "application/zip" });
+    await user.upload(screen.getByLabelText("Skill 压缩包"), file);
+    await user.click(screen.getByRole("button", { name: "上传并扫描" }));
+
+    expect(await screen.findByText(/deep-research 已存在且内容不同/)).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "保存为新版本" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/admin/skills/upload?strategy=new_version",
+        expect.objectContaining({
+          method: "POST",
+          headers: expect.objectContaining({
+            "X-Agent-Hub-Skill-Filename": "duplicate-skill.zip",
+          }),
+        }),
+      );
+    });
+    expect(duplicateUploadAttempts).toBe(2);
+    expect(await screen.findByText(/已扫描 1 个 Skill/)).not.toBeNull();
+  });
+
+  it("shows skill version metadata and can activate a previous version", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/skills" />);
+
+    const table = await screen.findByRole("table", { name: "已上传 Skill" });
+    const deepResearchRow = within(table).getByText("deep-research").closest("tr");
+    expect(deepResearchRow).not.toBeNull();
+    expect(within(deepResearchRow as HTMLTableRowElement).getByText(/当前版本：version-2/)).not.toBeNull();
+    expect(within(deepResearchRow as HTMLTableRowElement).getByText(/版本数：2/)).not.toBeNull();
+    expect(within(deepResearchRow as HTMLTableRowElement).getByText(/deep-research.zip/)).not.toBeNull();
+
+    await user.click(within(deepResearchRow as HTMLTableRowElement).getByRole("button", { name: "激活 version-1" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/admin/skills/deep-research/versions/version-1/activate",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
   });
 });

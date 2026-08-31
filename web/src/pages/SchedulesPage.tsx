@@ -76,9 +76,10 @@ export function SchedulesPage() {
 
   const tickSchedules = useMutation({
     mutationFn: () => api.tickSchedules(localDateTimeWithShanghaiOffset(date, time)),
-    onSuccess: (result) => {
+    onSuccess: async (result) => {
       setTickStatus(`已触发 ${result.fired.length} 个计划任务`);
-      void queryClient.invalidateQueries({ queryKey: ["schedules"] });
+      await queryClient.invalidateQueries({ queryKey: ["schedules"] });
+      await queryClient.invalidateQueries({ queryKey: ["runs"] });
     },
   });
 

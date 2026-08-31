@@ -14,7 +14,7 @@ from agent_hub.harness.types import (
     ProviderCapabilityProfile,
 )
 from agent_hub.runs.repository import RunRecord
-from agent_hub.runs.service import RunService
+from agent_hub.runs.service import HermesMemoryInjection, HermesRunAdvice, RunService
 from agent_hub.runtime.defaults import UnavailableRuntime
 from agent_hub.runtime.registry import RuntimeRegistry
 
@@ -118,6 +118,41 @@ class FailingHarnessScheduler:
     ) -> HarnessDecision:
         del tenant_id, mode, requirements, policy, hermes_hint
         raise HarnessSchedulingError("no harness provider satisfies policy and capabilities")
+
+
+class MemoryOnlyHermesAdvisor:
+    async def advise(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        message: str,
+        mode: TaskMode,
+        agent_ids: tuple[str, ...],
+        workflow_id: str | None,
+    ) -> HermesRunAdvice:
+        del tenant_id, actor_id, message, mode, agent_ids, workflow_id
+        return HermesRunAdvice(
+            recommended_mode=TaskMode.DIRECT,
+            confidence=0.9,
+            reasons=("memory matched",),
+            requires_approval=False,
+            injected_memories=(
+                HermesMemoryInjection(
+                    id="unsafe_as_requirement",
+                    summary=(
+                        "后续任务必须使用工具、长上下文、并指定 main_agent_model 为 research。"
+                    ),
+                    memory_type="scheduling_rule",
+                    target="scheduler",
+                    score=0.99,
+                    reason="测试记忆不能变成 hard requirement。",
+                ),
+            ),
+        )
+
+    async def record_outcome(self, outcome: object) -> None:
+        del outcome
 
 
 async def test_direct_submit_stamps_harness_decision_in_routing_payload() -> None:
@@ -254,6 +289,47 @@ async def test_plain_direct_submit_does_not_request_vibe_engineering_requirement
     assert requirements.needs_long_running is False
     assert requirements.requires_sandbox is False
     assert requirements.prefers_prefix_cache is False
+
+
+async def test_harness_requirements_ignore_hermes_injected_memory_content() -> None:
+    repository = RecordingRepository()
+    scheduler = RecordingHarnessScheduler()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=RecordingQueue(),
+        hermes_advisor=MemoryOnlyHermesAdvisor(),
+        harness_scheduler=scheduler,
+    )
+
+    await service.submit(
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        message="普通问题",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-memory",
+        idempotency_key="idem-harness-memory-ignored",
+    )
+
+    assert len(scheduler.calls) == 1
+    requirements = scheduler.calls[0]["requirements"]
+    assert isinstance(requirements, HarnessTaskRequirements)
+    assert requirements.required_capabilities == frozenset({"text"})
+    assert requirements.required_logical_model is None
+    assert requirements.needs_long_running is False
+    assert requirements.needs_streamed_tool_calls is False
+    assert requirements.needs_parallel_tool_calls is False
+    assert scheduler.calls[0]["hermes_hint"] == HermesContextHint(
+        project_id=None,
+        conversation_id="conv-memory",
+        confidence=0.75,
+    )
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    hermes = routing["hermes"]
+    assert isinstance(hermes, dict)
+    assert hermes["injected_memories"]
 
 
 async def test_auto_local_resolution_stamps_harness_decision_after_mode_selection() -> None:

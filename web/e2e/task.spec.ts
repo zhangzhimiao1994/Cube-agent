@@ -406,20 +406,20 @@ test("operator validates a simple coding run and downloads final and intermediat
   await page.getByRole("button", { name: "发送" }).click();
 
   await expect(page.getByText("已生成一个最小 hello world 项目，并附上可下载压缩包。")).toBeVisible();
-  await expect(page.getByRole("link", { name: /下载 hello-world\.zip/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /下载 hello-world\.zip/ })).toBeVisible();
   await expect(page.getByText("hello-world-source.zip")).toHaveCount(1);
   await expect(page.getByRole("region", { name: "助手派单状态" })).toContainText("陆微");
   await expect(page.getByRole("region", { name: "Agent 集群动作" })).toContainText("生成中间项目文件。");
   await expect(page.getByRole("region", { name: "Agent 集群动作" })).not.toContainText("create_project");
 
   const finalDownload = page.waitForEvent("download");
-  await page.getByRole("link", { name: /下载 hello-world\.zip/ }).click();
+  await page.getByRole("button", { name: /下载 hello-world\.zip/ }).click();
   expect((await finalDownload).suggestedFilename()).toBe("hello-world.zip");
 
   await page.getByRole("button", { name: /生成中间项目文件。/ }).click();
   await expect(page.getByRole("dialog", { name: "运行过程详情" })).toBeVisible();
   const intermediateDownload = page.waitForEvent("download");
-  await page.getByRole("link", { name: /下载 hello-world-source\.zip/ }).click();
+  await page.getByRole("button", { name: /下载 hello-world-source\.zip/ }).click();
   expect((await intermediateDownload).suggestedFilename()).toBe("hello-world-source.zip");
   await page.locator(".process-drawer-backdrop").click({ position: { x: 5, y: 5 } });
   await expect(page.getByRole("dialog", { name: "运行过程详情" })).toHaveCount(0);

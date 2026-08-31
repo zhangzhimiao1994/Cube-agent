@@ -20,7 +20,7 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import yaml
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import (
     BaseModel,
@@ -448,6 +448,19 @@ class SkillUploadRequest(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
 
 
+class SkillVersionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    status: str
+    source_filename: str | None = None
+    package_version_id: str | None = None
+    content_sha256: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    is_current: bool = False
+
+
 class SkillResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -456,6 +469,11 @@ class SkillResponse(BaseModel):
     status: str
     scan_diff: list[str]
     requested_permissions: list[str]
+    source_filename: str | None = None
+    package_version_id: str | None = None
+    content_sha256: str | None = None
+    current_version_id: str | None = None
+    versions: list[SkillVersionResponse] = Field(default_factory=list)
 
 
 class SkillBulkDeleteRequest(BaseModel):
@@ -1675,6 +1693,7 @@ class HermesInsightResponse(BaseModel):
     outcome: str
     lesson: str
     summary: str
+    user_summary: str | None = None
     run_id: UUID | None = None
     conversation_id: str | None = None
     confirmed_at: datetime | None = None
@@ -1865,8 +1884,10 @@ class AdminResourceService(Protocol):
     async def upload_skill(self, request: SkillUploadRequest) -> SkillResponse: ...
 
     async def upload_skill_archive(
-        self, filename: str, archive_bytes: bytes
+        self, filename: str, archive_bytes: bytes, *, strategy: str | None = None
     ) -> SkillArchiveUploadResponse: ...
+
+    async def activate_skill_version(self, skill_id: str, version_id: str) -> SkillResponse: ...
 
     async def approve_skill(self, skill_id: str) -> SkillResponse: ...
 
@@ -2080,7 +2101,7 @@ def _scan_instruction_skill_archive(
     members = _instruction_skill_members(archive_bytes)
     if members is None:
         return None
-    skill_md_path, skill_md_bytes = members
+    skill_md_path, skill_md_bytes, content_sha256 = members
     name = _instruction_skill_name(
         skill_md_bytes,
         fallback=_instruction_skill_fallback_name(filename, skill_md_path),
@@ -2090,15 +2111,15 @@ def _scan_instruction_skill_archive(
         archive_bytes=archive_bytes,
         scan_report=None,
         instruction_name=name,
-        instruction_sha256=hashlib.sha256(skill_md_bytes).hexdigest(),
+        instruction_sha256=content_sha256,
     )
 
 
-def _instruction_skill_members(archive_bytes: bytes) -> tuple[str, bytes] | None:
+def _instruction_skill_members(archive_bytes: bytes) -> tuple[str, bytes, str] | None:
     if zipfile.is_zipfile(io.BytesIO(archive_bytes)):
         try:
             with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
-                normalized_to_original: dict[str, str] = {}
+                normalized_files: dict[str, bytes] = {}
                 for info in archive.infolist():
                     if info.is_dir() or info.filename.replace("\\", "/").endswith("/"):
                         continue
@@ -2111,24 +2132,29 @@ def _instruction_skill_members(archive_bytes: bytes) -> tuple[str, bytes] | None
                     if _skill_bundle_path_is_ignored(path):
                         continue
                     _validate_instruction_skill_file(path)
-                    normalized_to_original[path] = info.filename
+                    normalized_files[path] = archive.read(info.filename)
                 candidates = [
                     name
-                    for name in normalized_to_original
+                    for name in normalized_files
                     if PurePosixPath(name).name.lower() in _SKILL_INSTRUCTION_NAMES
                 ]
                 candidate = _select_instruction_skill_path(candidates)
                 if candidate is None:
                     return None
-                if len(normalized_to_original) > _MAX_SKILL_BUNDLE_ITEMS:
+                if len(normalized_files) > _MAX_SKILL_BUNDLE_ITEMS:
                     raise InvalidSkillPackage("instruction skill contains too many files")
-                return candidate, archive.read(normalized_to_original[candidate])
+                return (
+                    candidate,
+                    normalized_files[candidate],
+                    _instruction_skill_content_sha256(normalized_files.items()),
+                )
         except zipfile.BadZipFile as exc:
             raise InvalidSkillPackage("skill archive must be a valid zip file") from exc
     try:
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
-            files = []
-            for member in archive.getmembers():
+            members = archive.getmembers()
+            files: list[tuple[str, bytes]] = []
+            for member in members:
                 if _tar_member_is_metadata(member):
                     continue
                 if member.isdir():
@@ -2147,20 +2173,67 @@ def _instruction_skill_members(archive_bytes: bytes) -> tuple[str, bytes] | None
                 if _skill_bundle_path_is_ignored(path):
                     continue
                 _validate_instruction_skill_file(path)
-                if PurePosixPath(path).name.lower() in _SKILL_INSTRUCTION_NAMES:
-                    files.append((path, member))
-            candidate = _select_instruction_skill_path(path for path, _member in files)
+                source = archive.extractfile(member)
+                if source is None:
+                    raise InvalidSkillPackage("skill instruction file cannot be read")
+                files.append((path, source.read()))
+            candidate = _select_instruction_skill_path(
+                path
+                for path, _content in files
+                if PurePosixPath(path).name.lower() in _SKILL_INSTRUCTION_NAMES
+            )
             if candidate is None:
                 return None
-            if len(archive.getmembers()) > _MAX_SKILL_BUNDLE_ITEMS:
+            if len(members) > _MAX_SKILL_BUNDLE_ITEMS:
                 raise InvalidSkillPackage("instruction skill contains too many files")
-            path, member = next((path, member) for path, member in files if path == candidate)
-            source = archive.extractfile(member)
-            if source is None:
-                raise InvalidSkillPackage("skill instruction file cannot be read")
-            return path, source.read()
+            path, content = next((path, content) for path, content in files if path == candidate)
+            return path, content, _instruction_skill_content_sha256(files)
     except tarfile.TarError as exc:
         raise InvalidSkillPackage("skill archive must be a valid zip or tar archive") from exc
+
+
+def _instruction_skill_content_sha256(files: Iterable[tuple[str, bytes]]) -> str:
+    digest = hashlib.sha256()
+    for path, content in sorted(files, key=lambda item: item[0]):
+        encoded_path = path.encode("utf-8")
+        digest.update(len(encoded_path).to_bytes(8, "big"))
+        digest.update(encoded_path)
+        digest.update(hashlib.sha256(content).digest())
+    return digest.hexdigest()
+
+
+def _package_archive_content_sha256(archive_bytes: bytes) -> str | None:
+    """Hash skill package contents without ZIP/TAR container metadata."""
+
+    if zipfile.is_zipfile(io.BytesIO(archive_bytes)):
+        try:
+            with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+                files: list[tuple[str, bytes]] = []
+                for info in archive.infolist():
+                    if info.is_dir() or info.filename.replace("\\", "/").endswith("/"):
+                        continue
+                    path = _safe_skill_bundle_path(info.filename)
+                    if _skill_bundle_path_is_ignored(path):
+                        continue
+                    files.append((path, archive.read(info.filename)))
+                return _instruction_skill_content_sha256(files) if files else None
+        except (InvalidSkillPackage, zipfile.BadZipFile):
+            return None
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
+            files = []
+            for member in archive.getmembers():
+                if _tar_member_is_metadata(member) or member.isdir():
+                    continue
+                path = _safe_skill_bundle_path(member.name)
+                if _skill_bundle_path_is_ignored(path):
+                    continue
+                source = archive.extractfile(member)
+                if source is not None:
+                    files.append((path, source.read()))
+            return _instruction_skill_content_sha256(files) if files else None
+    except (InvalidSkillPackage, tarfile.TarError):
+        return None
 
 
 def _select_instruction_skill_path(candidates: Iterable[str]) -> str | None:
@@ -2227,9 +2300,14 @@ def _validate_instruction_skill_file(path: str) -> None:
 
 
 def _skill_response_from_scan(
-    filename: str, skill_id: str, scan_report: SkillScanReport
+    filename: str,
+    skill_id: str,
+    scan_report: SkillScanReport,
+    *,
+    content_sha256: str | None = None,
 ) -> SkillResponse:
     inspection = scan_report.inspection
+    content_sha256 = content_sha256 or inspection.content_sha256
     return SkillResponse(
         id=skill_id,
         name=inspection.manifest.name,
@@ -2237,9 +2315,12 @@ def _skill_response_from_scan(
         scan_diff=[
             f"package {filename} scanned",
             f"entry point: {inspection.manifest.entry_point}",
-            f"content sha256: {inspection.content_sha256}",
+            f"content sha256: {content_sha256}",
         ],
         requested_permissions=list(inspection.requested_capabilities),
+        source_filename=filename,
+        package_version_id=f"pkg_{content_sha256}",
+        content_sha256=content_sha256,
     )
 
 
@@ -2247,7 +2328,12 @@ def _skill_response_from_scanned_archive(
     scanned: _ScannedSkillArchive, skill_id: str
 ) -> SkillResponse:
     if scanned.scan_report is not None:
-        return _skill_response_from_scan(scanned.filename, skill_id, scanned.scan_report)
+        return _skill_response_from_scan(
+            scanned.filename,
+            skill_id,
+            scanned.scan_report,
+            content_sha256=_package_archive_content_sha256(scanned.archive_bytes),
+        )
     return SkillResponse(
         id=skill_id,
         name=scanned.instruction_name or _skill_name_slug(PurePosixPath(scanned.filename).stem),
@@ -2259,6 +2345,172 @@ def _skill_response_from_scanned_archive(
             f"content sha256: {scanned.instruction_sha256}",
         ],
         requested_permissions=[],
+        source_filename=scanned.filename,
+        package_version_id=f"pkg_{scanned.instruction_sha256}",
+        content_sha256=scanned.instruction_sha256,
+    )
+
+
+def _skill_id_from_scanned_archive(scanned: _ScannedSkillArchive) -> str:
+    if scanned.scan_report is not None:
+        manifest = scanned.scan_report.inspection.manifest
+        return _stable_skill_id("package", manifest.name, manifest.version)
+    name = scanned.instruction_name or _skill_name_slug(PurePosixPath(scanned.filename).stem)
+    return _stable_skill_id("instruction", name, "instruction-only")
+
+
+def _skill_version_id_from_scanned_archive(scanned: _ScannedSkillArchive) -> str:
+    response = _skill_response_from_scanned_archive(scanned, "skill_pending")
+    return _stable_skill_id("version", response.name, response.content_sha256 or response.id)
+
+
+def _manual_skill_upload_id(filename: str) -> str:
+    name = _skill_name_slug(PurePosixPath(filename).stem)
+    return _stable_skill_id("manual", name, "metadata-only")
+
+
+def _stable_skill_id(kind: str, name: str, version: str) -> str:
+    slug = _skill_name_slug(name)[:64]
+    version_slug = _skill_name_slug(version)
+    digest = hashlib.sha256(f"{kind}:{slug}:{version_slug}".encode()).hexdigest()[:16]
+    return f"skill_{slug}_{digest}"
+
+
+@dataclass(frozen=True, slots=True)
+class _SkillVersionRecord:
+    response: SkillResponse
+    created_at: datetime | None
+    updated_at: datetime | None
+    ordinal: int
+
+
+def _skill_response_from_payload(
+    payload: Mapping[str, object], *, resource_id: str | None = None
+) -> SkillResponse:
+    data = dict(payload)
+    if resource_id is not None and not isinstance(data.get("id"), str):
+        data["id"] = resource_id
+    return SkillResponse.model_validate(data)
+
+
+def _group_skill_records(
+    records: Iterable[_SkillVersionRecord],
+    active_versions: Mapping[str, str],
+) -> tuple[SkillResponse, ...]:
+    groups: dict[str, list[_SkillVersionRecord]] = {}
+    group_order: list[str] = []
+    for record in records:
+        name = record.response.name
+        if name not in groups:
+            groups[name] = []
+            group_order.append(name)
+        groups[name].append(record)
+
+    grouped: list[SkillResponse] = []
+    for name in group_order:
+        versions = sorted(groups[name], key=_skill_version_sort_key, reverse=True)
+        active_id = active_versions.get(name)
+        current = next((record for record in versions if record.response.id == active_id), versions[0])
+        current_id = current.response.id
+        version_responses = [
+            SkillVersionResponse(
+                id=record.response.id,
+                status=record.response.status,
+                source_filename=record.response.source_filename,
+                package_version_id=record.response.package_version_id,
+                content_sha256=record.response.content_sha256,
+                created_at=record.created_at,
+                updated_at=record.updated_at,
+                is_current=record.response.id == current_id,
+            )
+            for record in versions
+        ]
+        grouped.append(
+            current.response.model_copy(
+                update={"current_version_id": current_id, "versions": version_responses}
+            )
+        )
+    return tuple(grouped)
+
+
+def _skill_version_sort_key(record: _SkillVersionRecord) -> tuple[datetime, int]:
+    timestamp = record.updated_at or record.created_at or datetime.min.replace(tzinfo=UTC)
+    return timestamp, record.ordinal
+
+
+_SKILL_ACTIVE_VERSIONS_SETTING_ID = "skill-active-versions"
+
+
+def _skill_upload_strategy_or_error(strategy: str | None) -> str | None:
+    if strategy in {None, "", "overwrite", "new_version"}:
+        return strategy or None
+    raise PublicAPIError(
+        422,
+        "request_validation",
+        "skill upload strategy must be overwrite or new_version",
+    )
+
+
+def _matching_skill_content(
+    versions: Iterable[SkillResponse], content_sha256: str | None
+) -> SkillResponse | None:
+    if not content_sha256:
+        return None
+    return next((skill for skill in versions if skill.content_sha256 == content_sha256), None)
+
+
+def _current_skill_for_name(
+    versions: Iterable[SkillResponse],
+    active_versions: Mapping[str, str],
+    name: str,
+) -> SkillResponse:
+    version_list = list(versions)
+    active_id = active_versions.get(name)
+    if active_id:
+        active = next((skill for skill in version_list if skill.id == active_id), None)
+        if active is not None:
+            return active
+    return version_list[-1]
+
+
+def _skill_version_choice_error(candidate: SkillResponse, current: SkillResponse) -> PublicAPIError:
+    return PublicAPIError(
+        409,
+        "skill_version_choice_required",
+        "same-name skill already exists; choose overwrite or new_version",
+        details={
+            "skill_name": candidate.name,
+            "current_version_id": current.id,
+            "new_content_sha256": candidate.content_sha256 or "",
+        },
+    )
+
+
+def _active_skill_versions_from_payload(payload: Mapping[str, object]) -> dict[str, str]:
+    value = payload.get("active_versions")
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(name): str(version_id)
+        for name, version_id in value.items()
+        if isinstance(name, str) and isinstance(version_id, str)
+    }
+
+
+def _skill_response_with_archive_identity(
+    response: SkillResponse, archive_path: Path
+) -> SkillResponse:
+    if response.content_sha256 and response.package_version_id and response.source_filename:
+        return response
+    if not archive_path.is_file():
+        return response
+    content_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+    return response.model_copy(
+        update={
+            "source_filename": response.source_filename or archive_path.name,
+            "package_version_id": response.package_version_id or f"pkg_{content_sha256}",
+            "content_sha256": response.content_sha256 or content_sha256,
+        }
     )
 
 
@@ -2480,6 +2732,7 @@ class InMemoryAdminResourceService:
     main_agent_config: MainAgentConfigResponse = field(default_factory=MainAgentConfigResponse)
     runs: dict[UUID, RunDetailResponse] = field(default_factory=dict)
     skills: dict[str, SkillResponse] = field(default_factory=dict)
+    skill_active_versions: dict[str, str] = field(default_factory=dict)
     mcp_servers: dict[str, McpServerResponse] = field(default_factory=dict)
     channel_config: dict[str, dict[str, str]] = field(default_factory=dict)
     memory: dict[str, MemoryRecordResponse] = field(default_factory=dict)
@@ -2566,6 +2819,11 @@ class InMemoryAdminResourceService:
                     lesson="Use dispatch mode when the request has clear deliverables and separable steps.",
                     tags=["dispatch", "planning", "clear-task"],
                     weight=3,
+                ),
+                user_summary=_hermes_user_summary(
+                    outcome="success",
+                    lesson="Use dispatch mode when the request has clear deliverables and separable steps.",
+                    category="conversation",
                 ),
                 run_id=None,
                 conversation_id="conv-readiness",
@@ -3017,13 +3275,17 @@ class InMemoryAdminResourceService:
         return updated
 
     async def list_skills(self) -> tuple[SkillResponse, ...]:
-        return tuple(self.skills.values())
+        records = [
+            _SkillVersionRecord(response=skill, created_at=None, updated_at=None, ordinal=index)
+            for index, skill in enumerate(self.skills.values())
+        ]
+        return _group_skill_records(records, self.skill_active_versions)
 
     async def upload_skill(self, request: SkillUploadRequest) -> SkillResponse:
-        skill_id = request.filename.rsplit(".", 1)[0].lower().replace("_", "-")
+        skill_id = _manual_skill_upload_id(request.filename)
         response = SkillResponse(
             id=skill_id,
-            name=skill_id,
+            name=_skill_name_slug(PurePosixPath(request.filename).stem),
             status="quarantined",
             scan_diff=["added SKILL.md", "no dangerous operations detected"],
             requested_permissions=["filesystem:read"],
@@ -3032,8 +3294,9 @@ class InMemoryAdminResourceService:
         return response
 
     async def upload_skill_archive(
-        self, filename: str, archive_bytes: bytes
+        self, filename: str, archive_bytes: bytes, *, strategy: str | None = None
     ) -> SkillArchiveUploadResponse:
+        strategy = _skill_upload_strategy_or_error(strategy)
         try:
             bundle, scanned_archives, skipped_archives = _scan_skill_archive_upload(
                 filename, archive_bytes
@@ -3050,15 +3313,46 @@ class InMemoryAdminResourceService:
             )
             raise
         items: list[SkillResponse] = []
+        seen_skill_ids: set[str] = set()
+        skipped = list(skipped_archives)
         for scanned in scanned_archives:
-            response = _skill_response_from_scanned_archive(scanned, f"skill_{uuid4().hex}")
+            skill_id = _skill_id_from_scanned_archive(scanned)
+            if skill_id in seen_skill_ids:
+                skipped.append(
+                    _SkippedSkillArchive(
+                        path=scanned.filename,
+                        reason="duplicate skill identity skipped",
+                    )
+                )
+                continue
+            seen_skill_ids.add(skill_id)
+            response = _skill_response_from_scanned_archive(scanned, skill_id)
+            existing_versions = [
+                skill for skill in self.skills.values() if skill.name == response.name
+            ]
+            matching_content = _matching_skill_content(existing_versions, response.content_sha256)
+            if matching_content is not None:
+                items.append(matching_content)
+                continue
+            if existing_versions:
+                current = _current_skill_for_name(
+                    existing_versions, self.skill_active_versions, response.name
+                )
+                if strategy is None:
+                    raise _skill_version_choice_error(response, current)
+                skill_id = (
+                    current.id if strategy == "overwrite" else _skill_version_id_from_scanned_archive(scanned)
+                )
+                response = _skill_response_from_scanned_archive(scanned, skill_id)
             self.skills[response.id] = response
+            if existing_versions:
+                self.skill_active_versions[response.name] = response.id
             items.append(response)
         return SkillArchiveUploadResponse(
             filename=filename,
             bundle=bundle,
             items=items,
-            skipped=_skipped_skill_responses(skipped_archives),
+            skipped=_skipped_skill_responses(tuple(skipped)),
         )
 
     async def approve_skill(self, skill_id: str) -> SkillResponse:
@@ -3066,6 +3360,22 @@ class InMemoryAdminResourceService:
         updated = current.model_copy(update={"status": "enabled"})
         self.skills[skill_id] = updated
         return updated
+
+    async def activate_skill_version(self, skill_id: str, version_id: str) -> SkillResponse:
+        try:
+            skill = self.skills[skill_id]
+            version = self.skills[version_id]
+        except KeyError as exc:
+            raise KeyError(str(exc)) from None
+        if skill.name != version.name:
+            raise PublicAPIError(
+                409,
+                "skill_version_mismatch",
+                "skill version does not belong to this skill",
+            )
+        self.skill_active_versions[skill.name] = version.id
+        grouped = await self.list_skills()
+        return next(item for item in grouped if item.name == skill.name)
 
     async def delete_skill(self, skill_id: str) -> None:
         del self.skills[skill_id]
@@ -3426,6 +3736,11 @@ class InMemoryAdminResourceService:
                 lesson=request.lesson,
                 tags=request.tags,
                 weight=request.weight,
+            ),
+            user_summary=_hermes_user_summary(
+                outcome=request.outcome,
+                lesson=request.lesson,
+                category=request.category,
             ),
             run_id=request.run_id,
             conversation_id=request.conversation_id,
@@ -4581,16 +4896,40 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         return updated
 
     async def list_skills(self) -> tuple[SkillResponse, ...]:
-        resources = await self._list_admin_payloads("skill")
-        if resources is None:
-            return await super().list_skills()
-        return tuple(SkillResponse.model_validate(payload) for payload in resources)
+        rows = await self._list_admin_payloads_with_metadata("skill")
+        if rows is None:
+            resources = await self._list_admin_payloads("skill")
+            if resources is None:
+                return await super().list_skills()
+            records = [
+                _SkillVersionRecord(
+                    response=_skill_response_from_payload(payload),
+                    created_at=None,
+                    updated_at=None,
+                    ordinal=index,
+                )
+                for index, payload in enumerate(resources)
+            ]
+        else:
+            records = [
+                _SkillVersionRecord(
+                    response=_skill_response_with_archive_identity(
+                        _skill_response_from_payload(payload, resource_id=resource_id),
+                        self._skill_archive_path(resource_id),
+                    ),
+                    created_at=created_at,
+                    updated_at=updated_at,
+                    ordinal=index,
+                )
+                for index, (resource_id, payload, created_at, updated_at) in enumerate(rows)
+            ]
+        return _group_skill_records(records, await self._active_skill_versions())
 
     async def upload_skill(self, request: SkillUploadRequest) -> SkillResponse:
-        skill_id = f"skill_{uuid4().hex}"
+        skill_id = _manual_skill_upload_id(request.filename)
         response = SkillResponse(
             id=skill_id,
-            name=request.filename,
+            name=_skill_name_slug(PurePosixPath(request.filename).stem),
             status="quarantined",
             scan_diff=["metadata recorded; package scan requires ZIP upload endpoint"],
             requested_permissions=["filesystem:read"],
@@ -4605,8 +4944,9 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         return response
 
     async def upload_skill_archive(
-        self, filename: str, archive_bytes: bytes
+        self, filename: str, archive_bytes: bytes, *, strategy: str | None = None
     ) -> SkillArchiveUploadResponse:
+        strategy = _skill_upload_strategy_or_error(strategy)
         try:
             bundle, scanned_archives, skipped_archives = _scan_skill_archive_upload(
                 filename, archive_bytes
@@ -4632,13 +4972,49 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 details={"reason": reason},
             ) from None
         items: list[SkillResponse] = []
+        active_upload_ids: set[str] = set()
+        seen_skill_ids: set[str] = set()
+        skipped = list(skipped_archives)
         try:
             for scanned in scanned_archives:
-                skill_id = f"skill_{uuid4().hex}"
-                archive_path = self._skill_archive_path(skill_id)
+                skill_id = _skill_id_from_scanned_archive(scanned)
+                if skill_id in seen_skill_ids:
+                    skipped.append(
+                        _SkippedSkillArchive(
+                            path=scanned.filename,
+                            reason="duplicate skill identity skipped",
+                        )
+                    )
+                    continue
+                seen_skill_ids.add(skill_id)
+                response = _skill_response_from_scanned_archive(scanned, skill_id)
+                existing_versions = await self._skill_versions_by_name(response.name)
+                matching_content = _matching_skill_content(
+                    (record.response for record in existing_versions),
+                    response.content_sha256,
+                )
+                if matching_content is not None:
+                    items.append(matching_content)
+                    continue
+                if existing_versions:
+                    current = _current_skill_for_name(
+                        (record.response for record in existing_versions),
+                        await self._active_skill_versions(),
+                        response.name,
+                    )
+                    if strategy is None:
+                        raise _skill_version_choice_error(response, current)
+                    skill_id = (
+                        current.id
+                        if strategy == "overwrite"
+                        else _skill_version_id_from_scanned_archive(scanned)
+                    )
+                    response = _skill_response_from_scanned_archive(scanned, skill_id)
+                archive_path = self._skill_archive_path(response.id)
                 archive_path.parent.mkdir(parents=True, exist_ok=True)
                 archive_path.write_bytes(scanned.archive_bytes)
-                items.append(_skill_response_from_scanned_archive(scanned, skill_id))
+                active_upload_ids.add(response.id)
+                items.append(response)
         except OSError:
             await self.record_log(
                 category="feature_error",
@@ -4652,17 +5028,46 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 503, "skill_store_unavailable", "skill store is unavailable"
             ) from None
         for response in items:
+            if response.id not in active_upload_ids:
+                continue
             if not await self._upsert_admin_payload(
                 "skill", response.id, response.model_dump(mode="json")
             ):
-                return await super().upload_skill_archive(filename, archive_bytes)
+                return await super().upload_skill_archive(
+                    filename, archive_bytes, strategy=strategy
+                )
+            await self._set_active_skill_version(response.name, response.id)
             await self._record_audit("skill.upload", f"skill:{response.id}", {"filename": filename})
         return SkillArchiveUploadResponse(
             filename=filename,
             bundle=bundle,
             items=items,
-            skipped=_skipped_skill_responses(skipped_archives),
+            skipped=_skipped_skill_responses(tuple(skipped)),
         )
+
+    async def activate_skill_version(self, skill_id: str, version_id: str) -> SkillResponse:
+        skill_payload = await self._get_admin_payload("skill", skill_id)
+        version_payload = await self._get_admin_payload("skill", version_id)
+        if skill_payload is None or version_payload is None:
+            return await super().activate_skill_version(skill_id, version_id)
+        if not skill_payload or not version_payload:
+            raise KeyError(skill_id if not skill_payload else version_id)
+        skill = _skill_response_from_payload(skill_payload, resource_id=skill_id)
+        version = _skill_response_from_payload(version_payload, resource_id=version_id)
+        if skill.name != version.name:
+            raise PublicAPIError(
+                409,
+                "skill_version_mismatch",
+                "skill version does not belong to this skill",
+            )
+        await self._set_active_skill_version(skill.name, version.id)
+        await self._record_audit(
+            "skill.version.activate",
+            f"skill:{skill.id}",
+            {"version_id": version.id, "skill_name": skill.name},
+        )
+        grouped = await self.list_skills()
+        return next(item for item in grouped if item.name == skill.name)
 
     async def approve_skill(self, skill_id: str) -> SkillResponse:
         payload = await self._get_admin_payload("skill", skill_id)
@@ -4956,6 +5361,11 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 tags=request.tags,
                 weight=request.weight,
             ),
+            user_summary=_hermes_user_summary(
+                outcome=request.outcome,
+                lesson=request.lesson,
+                category=request.category,
+            ),
             run_id=request.run_id,
             conversation_id=request.conversation_id,
             confirmed_at=None,
@@ -5057,6 +5467,64 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 )
             ).scalars()
             return [dict(row.payload) for row in rows]
+
+    async def _list_admin_payloads_with_metadata(
+        self, kind: str
+    ) -> list[tuple[str, dict[str, object], datetime | None, datetime | None]] | None:
+        if self._session_factory is None:
+            return None
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(AdminResourceRow)
+                    .where(AdminResourceRow.tenant_id == self._tenant_id)
+                    .where(AdminResourceRow.kind == kind)
+                    .order_by(AdminResourceRow.created_at)
+                )
+            ).scalars()
+            return [
+                (row.resource_id, dict(row.payload), row.created_at, row.updated_at)
+                for row in rows
+            ]
+
+    async def _active_skill_versions(self) -> dict[str, str]:
+        payload = await self._get_admin_payload("setting", _SKILL_ACTIVE_VERSIONS_SETTING_ID)
+        if payload is None:
+            return dict(self.skill_active_versions)
+        if not payload:
+            return {}
+        return _active_skill_versions_from_payload(payload)
+
+    async def _set_active_skill_version(self, name: str, version_id: str) -> None:
+        payload = await self._get_admin_payload("setting", _SKILL_ACTIVE_VERSIONS_SETTING_ID)
+        if payload is None:
+            self.skill_active_versions[name] = version_id
+            return
+        active_versions = _active_skill_versions_from_payload(payload)
+        active_versions[name] = version_id
+        await self._upsert_admin_payload(
+            "setting",
+            _SKILL_ACTIVE_VERSIONS_SETTING_ID,
+            {"active_versions": active_versions},
+        )
+
+    async def _skill_versions_by_name(self, name: str) -> tuple[_SkillVersionRecord, ...]:
+        rows = await self._list_admin_payloads_with_metadata("skill")
+        if rows is None:
+            return tuple(
+                _SkillVersionRecord(skill, None, None, index)
+                for index, skill in enumerate(self.skills.values())
+                if skill.name == name
+            )
+        records: list[_SkillVersionRecord] = []
+        for index, (resource_id, payload, created_at, updated_at) in enumerate(rows):
+            response = _skill_response_with_archive_identity(
+                _skill_response_from_payload(payload, resource_id=resource_id),
+                self._skill_archive_path(resource_id),
+            )
+            if response.name == name:
+                records.append(_SkillVersionRecord(response, created_at, updated_at, index))
+        return tuple(records)
 
     async def _channel_config_values(self) -> dict[str, dict[str, str]] | None:
         resources = await self._list_admin_payloads("channel")
@@ -6418,6 +6886,7 @@ def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightRe
     category = str(raw_category) if raw_category in {"conversation", "scheduler"} else "conversation"
     lesson = str(payload.get("lesson", ""))
     raw_summary = payload.get("summary")
+    raw_user_summary = payload.get("user_summary")
     run_id = _uuid_from_json(payload.get("run_id"))
     raw_conversation_id = payload.get("conversation_id")
     raw_confirmed_at = payload.get("confirmed_at")
@@ -6434,6 +6903,9 @@ def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightRe
             tags=normalized_tags,
             weight=weight,
         ),
+        user_summary=raw_user_summary
+        if isinstance(raw_user_summary, str) and raw_user_summary.strip()
+        else _hermes_user_summary(outcome=outcome, lesson=lesson, category=category),
         run_id=run_id,
         conversation_id=raw_conversation_id if isinstance(raw_conversation_id, str) else None,
         confirmed_at=_datetime_from_json(raw_confirmed_at) if raw_confirmed_at else None,
@@ -6458,6 +6930,19 @@ def _hermes_feedback_summary(
     normalized_tags = ", ".join(tag for tag in tags if tag)
     tags_part = normalized_tags or "none"
     return f"{label}: {lesson.strip()} Tags: {tags_part}. Weight: {weight}."
+
+
+def _hermes_user_summary(*, outcome: str, lesson: str, category: str) -> str:
+    normalized = " ".join(lesson.split()).strip()
+    if len(normalized) > 72:
+        normalized = f"{normalized[:71]}..."
+    category_label = "调度观察" if category == "scheduler" else "对话记忆"
+    outcome_label = {
+        "success": "有效经验",
+        "failure": "风险提醒",
+        "neutral": "中性观察",
+    }.get(outcome, "学习记录")
+    return f"{category_label}记录了一条{outcome_label}：{normalized or '暂无具体内容'}"
 
 
 def _datetime_from_json(value: object) -> datetime:
@@ -8657,12 +9142,16 @@ async def upload_skill(
 @router.post(
     "/skills/upload",
     response_model=SkillArchiveUploadResponse,
-    responses=error_responses(401, 403, 413, 422, 503),
+    responses=error_responses(401, 403, 409, 413, 422, 503),
 )
 async def upload_skill_archive(
     request: Request,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
+    strategy: Annotated[
+        str | None,
+        Query(description="Same-name upload strategy: overwrite or new_version."),
+    ] = None,
 ) -> SkillArchiveUploadResponse:
     _require(principal, "skill:write")
     filename = _safe_skill_upload_filename(
@@ -8674,8 +9163,13 @@ async def upload_skill_archive(
     archive_bytes = await request.body()
     if not archive_bytes:
         raise PublicAPIError(422, "request_validation", "skill archive is empty")
+    upload_strategy = _skill_upload_strategy_or_error(strategy)
+    if upload_strategy is not None:
+        _require(principal, "skill:approve")
     try:
-        return await service.upload_skill_archive(filename, archive_bytes)
+        return await service.upload_skill_archive(
+            filename, archive_bytes, strategy=upload_strategy
+        )
     except InvalidSkillPackage as error:
         raise PublicAPIError(
             422,
@@ -8683,6 +9177,24 @@ async def upload_skill_archive(
             "skill package is invalid",
             details={"reason": _safe_model_check_detail(str(error))},
         ) from None
+
+
+@router.post(
+    "/skills/{skill_id}/versions/{version_id}/activate",
+    response_model=SkillResponse,
+    responses=error_responses(401, 403, 404, 409, 422),
+)
+async def activate_skill_version(
+    skill_id: str,
+    version_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> SkillResponse:
+    _require(principal, "skill:approve")
+    try:
+        return await service.activate_skill_version(skill_id, version_id)
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
 
 
 @router.post(

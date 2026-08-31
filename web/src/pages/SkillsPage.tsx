@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
-import { api, formatApiError, type Skill } from "../api/client";
+import { ApiError, api, formatApiError, type Skill } from "../api/client";
 import { useNavSection } from "../app/navSections";
 import { compareText, nextSortState, SortHeader, textContains, type SortState } from "../components/TableTools";
 
@@ -12,6 +12,13 @@ type SkillColumnFilters = {
   permissions: string;
   scan: string;
   status: string;
+};
+
+type UploadStrategy = "overwrite" | "new_version";
+
+type SkillUploadConflict = {
+  file: File;
+  name: string;
 };
 
 const EMPTY_SKILL_FILTERS: SkillColumnFilters = {
@@ -61,6 +68,24 @@ function skillCreatorObjective(goal: string, materials: string, checks: string) 
   ].join("\n");
 }
 
+function versionCount(skill: Skill) {
+  return skill.versions.length || (skill.current_version_id ? 1 : 0);
+}
+
+function currentVersionLabel(skill: Skill) {
+  return skill.current_version_id ?? skill.package_version_id ?? skill.content_sha256?.slice(0, 12) ?? "旧数据未提供";
+}
+
+function conflictName(error: ApiError, file: File) {
+  const detailSkillName = error.details?.skill_name;
+  const detailName = error.details?.name;
+  const detailSkillId = error.details?.skill_id;
+  if (typeof detailSkillName === "string" && detailSkillName) return detailSkillName;
+  if (typeof detailName === "string" && detailName) return detailName;
+  if (typeof detailSkillId === "string" && detailSkillId) return detailSkillId;
+  return file.name;
+}
+
 export function SkillsPage() {
   const { navTargetProps } = useNavSection(["view"]);
   const [file, setFile] = useState<File | null>(null);
@@ -72,17 +97,35 @@ export function SkillsPage() {
   const [creatorGoal, setCreatorGoal] = useState("围绕 AI 方向完成资料检索、研究问题拆解、创新点发现和论文计划输出。");
   const [creatorMaterials, setCreatorMaterials] = useState("由主 Agent 先制定检索计划，再拉取真实论文、项目和基准资料；用户可补充本地文献或链接。");
   const [creatorChecks, setCreatorChecks] = useState("用 3 个真实研究任务验收：资料综述、创新点候选、论文实验计划。未通过则继续迭代。");
+  const [uploadConflict, setUploadConflict] = useState<SkillUploadConflict | null>(null);
   const queryClient = useQueryClient();
   const skills = useQuery({ queryKey: ["skills"], queryFn: () => api.skills() });
   const upload = useMutation({
-    mutationFn: () => {
-      if (!file) throw new Error("请选择 Skill 压缩包");
-      return api.uploadSkillArchive(file);
+    mutationFn: (strategy?: UploadStrategy) => {
+      const uploadFile = strategy ? uploadConflict?.file : file;
+      if (!uploadFile) throw new Error("请选择 Skill 压缩包");
+      return api.uploadSkillArchive(uploadFile, strategy);
     },
     onSuccess: () => {
       setFile(null);
+      setUploadConflict(null);
       void queryClient.invalidateQueries({ queryKey: ["skills"] });
     },
+    onError: (error) => {
+      if (
+        error instanceof ApiError &&
+        error.status === 409 &&
+        error.code === "skill_version_choice_required" &&
+        file
+      ) {
+        setUploadConflict({ file, name: conflictName(error, file) });
+      }
+    },
+  });
+  const activateVersion = useMutation({
+    mutationFn: ({ skillId, versionId }: { skillId: string; versionId: string }) =>
+      api.activateSkillVersion(skillId, versionId),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["skills"] }),
   });
   const approve = useMutation({
     mutationFn: (id: string) => api.approveSkill(id),
@@ -168,8 +211,15 @@ export function SkillsPage() {
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.includes(id));
   const allVisibleApprovalSelected =
     visibleApprovalIds.length > 0 && visibleApprovalIds.every((id) => selectedIds.includes(id));
-  const busy = approve.isPending || deleteSkill.isPending || bulkApprove.isPending || bulkDelete.isPending || createSkillTask.isPending;
+  const busy =
+    approve.isPending ||
+    deleteSkill.isPending ||
+    bulkApprove.isPending ||
+    bulkDelete.isPending ||
+    createSkillTask.isPending ||
+    activateVersion.isPending;
   const skippedUploadItems = upload.data?.skipped ?? [];
+  const showUploadError = upload.isError && !uploadConflict;
 
   return (
     <section>
@@ -226,16 +276,32 @@ export function SkillsPage() {
               aria-label="Skill 压缩包"
               type="file"
               accept=".zip,.tar,.tar.gz,.tgz"
-              onChange={(event) => setFile(event.currentTarget.files?.[0] ?? null)}
+              onChange={(event) => {
+                setFile(event.currentTarget.files?.[0] ?? null);
+                setUploadConflict(null);
+              }}
             />
           </label>
           <p className="field-help">
             支持 `.zip`、`.tar`、`.tar.gz`、`.tgz`。可以上传单个 Skill，也可以上传包含多个 Skill 目录的归档；多层外层文件夹会自动识别，每个指令型 Skill 目录需包含 `SKILL.md`。
           </p>
-          <button type="button" disabled={!file || upload.isPending} onClick={() => upload.mutate()}>
+          <button type="button" disabled={!file || upload.isPending} onClick={() => upload.mutate(undefined)}>
             {upload.isPending ? "正在扫描..." : "上传并扫描"}
           </button>
-          {upload.isError ? <p role="alert">{formatApiError(upload.error, "Skill 上传失败")}</p> : null}
+          {uploadConflict ? (
+            <div role="alert">
+              <p>{uploadConflict.name} 已存在且内容不同。请选择覆盖当前版本，或保存为新版本。</p>
+              <div className="channel-config-actions" role="group" aria-label="同名 Skill 上传策略">
+                <button type="button" disabled={upload.isPending} onClick={() => upload.mutate("overwrite")}>
+                  覆盖当前版本
+                </button>
+                <button type="button" disabled={upload.isPending} onClick={() => upload.mutate("new_version")}>
+                  保存为新版本
+                </button>
+              </div>
+            </div>
+          ) : null}
+          {showUploadError ? <p role="alert">{formatApiError(upload.error, "Skill 上传失败")}</p> : null}
           {upload.isSuccess ? (
             <p role="status">
               已扫描 {upload.data.items.length} 个 Skill
@@ -246,6 +312,7 @@ export function SkillsPage() {
           {deleteSkill.isError ? <p role="alert">{formatApiError(deleteSkill.error, "Skill 删除失败")}</p> : null}
           {bulkApprove.isError ? <p role="alert">{formatApiError(bulkApprove.error, "Skill 批量审批失败")}</p> : null}
           {bulkDelete.isError ? <p role="alert">{formatApiError(bulkDelete.error, "Skill 批量删除失败")}</p> : null}
+          {activateVersion.isError ? <p role="alert">{formatApiError(activateVersion.error, "Skill 版本激活失败")}</p> : null}
           {bulkDelete.isSuccess && bulkDelete.data.failed.length > 0 ? (
             <p role="status">已删除 {bulkDelete.data.deleted.length} 个 Skill，{bulkDelete.data.failed.length} 个未删除。</p>
           ) : null}
@@ -389,6 +456,9 @@ export function SkillsPage() {
                         <td>
                           <strong>{skill.name}</strong>
                           <p className="field-help">ID：{skill.id}</p>
+                          <p className="field-help">当前版本：{currentVersionLabel(skill)}；版本数：{versionCount(skill)}</p>
+                          {skill.source_filename ? <p className="field-help">来源：{skill.source_filename}</p> : null}
+                          {skill.content_sha256 ? <p className="field-help">SHA256：{skill.content_sha256.slice(0, 12)}</p> : null}
                         </td>
                         <td>{skill.status}</td>
                         <td>{skill.scan_diff.join("; ") || "无"}</td>
@@ -409,6 +479,21 @@ export function SkillsPage() {
                           >
                             删除
                           </button>
+                          {skill.versions.length > 1
+                            ? skill.versions
+                                .filter((version) => !version.is_current)
+                                .map((version) => (
+                                  <button
+                                    key={version.id}
+                                    type="button"
+                                    className="secondary-action"
+                                    disabled={busy}
+                                    onClick={() => activateVersion.mutate({ skillId: skill.id, versionId: version.id })}
+                                  >
+                                    激活 {version.id}
+                                  </button>
+                                ))
+                            : null}
                         </td>
                       </tr>
                     ))}

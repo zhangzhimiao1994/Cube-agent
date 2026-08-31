@@ -141,6 +141,20 @@ def test_runtime_failure_diagnostic_classifies_crewai_step_timeout() -> None:
     assert diagnostic["actor"] == "writer"
 
 
+def test_runtime_failure_diagnostic_classifies_capability_failure_without_raw_details() -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason(
+        "capability failed: terminal command exited with private path C:/Users/me/token.txt"
+    )
+
+    assert diagnostic["error_summary"] == "capability failed"
+    assert diagnostic["error_stage"] == "capability"
+    assert diagnostic["error_category"] == "execution_failed"
+    assert diagnostic["error_code"] == "capability.execution_failed"
+    assert diagnostic["retryable"] is False
+    assert "private path" not in str(diagnostic)
+    assert "token.txt" not in str(diagnostic)
+
+
 @pytest.mark.parametrize(
     ("status_code", "error_category", "error_code"),
     [

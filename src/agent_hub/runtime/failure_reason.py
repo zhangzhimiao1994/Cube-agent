@@ -109,6 +109,15 @@ def runtime_failure_diagnostic_from_reason(
     """Classify an already-redacted failure reason into UI/operator hints."""
 
     normalized = normalize_failure_reason(reason or "") or "runtime_failed"
+    if normalized.lower().startswith("capability failed:"):
+        return _base_diagnostic(
+            "capability failed",
+            error_stage="capability",
+            error_category="execution_failed",
+            error_code="capability.execution_failed",
+            retryable=False,
+            suggested_action="工具执行被拒绝或失败；查看工具失败事件中的字段校验摘要，修正参数后重试。",
+        )
     if not is_safe_failure_reason(normalized):
         normalized = "runtime_failed"
     if status_code is None:

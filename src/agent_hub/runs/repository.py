@@ -26,6 +26,7 @@ from agent_hub.db.models import (
 )
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent, RuntimeCheckpoint
+from agent_hub.runtime.failure_reason import runtime_failure_diagnostic_from_reason
 
 _RECOVERY_REPLAYABLE_EVENT_KINDS = frozenset({"harness.started"})
 
@@ -891,6 +892,7 @@ class RunRepository:
         run_id: UUID,
         event: RunEvent,
     ) -> None:
+        event = _event_with_failure_diagnostic(event)
         payload = event.to_payload()
         await session.execute(
             insert(RunEventRow)
@@ -1105,6 +1107,21 @@ def _public_event_payload(payload: dict[str, object]) -> dict[str, object]:
     return {
         key: _sanitize_public_json(value) for key, value in payload.items() if _is_public_key(key)
     }
+
+
+def _event_with_failure_diagnostic(event: RunEvent) -> RunEvent:
+    if event.kind not in {EventKind.RUNTIME_FAILED, EventKind.STEP_FAILED, EventKind.TOOL_FAILED}:
+        return event
+    if not event.reason:
+        return event
+    payload = dict(event.payload)
+    if "error_code" in payload:
+        return event
+    payload = {
+        **runtime_failure_diagnostic_from_reason(event.reason),
+        **payload,
+    }
+    return event.model_copy(update={"payload": payload})
 
 
 def _public_artifact_payload(payload: dict[str, object]) -> dict[str, object]:

@@ -60,7 +60,8 @@ from agent_hub.multimodal.generation import (
     MultimediaGenerationExecutor,
 )
 from agent_hub.multimodal.video_providers import VideoProviderGenerationError
-from agent_hub.runs.repository import RunRecord
+from agent_hub.runs.repository import RunRecord, _event_with_failure_diagnostic
+from agent_hub.runtime.contracts import EventKind, RunEvent
 from agent_hub.scheduler.service import SchedulerService
 from agent_hub.scheduler.types import TaskRequest
 from agent_hub.security.secrets import SecretReference
@@ -1270,6 +1271,57 @@ def test_run_detail_response_exposes_structured_failure_diagnostics_without_raw_
     assert "private output" not in serialized
 
 
+def test_repository_backfills_public_diagnostic_for_failed_event_reason() -> None:
+    run_id = uuid4()
+    event = RunEvent(
+        kind=EventKind.RUNTIME_FAILED,
+        sequence=1,
+        run_id=run_id,
+        reason="capability failed: raw terminal output with private path",
+    )
+
+    updated = _event_with_failure_diagnostic(event)
+
+    payload = dict(updated.payload)
+    assert payload["error_summary"] == "capability failed"
+    assert payload["error_stage"] == "capability"
+    assert payload["error_category"] == "execution_failed"
+    assert payload["error_code"] == "capability.execution_failed"
+    assert "raw terminal output" not in str(payload)
+    assert "private path" not in str(payload)
+
+
+def test_repository_preserves_existing_failed_event_diagnostic_payload() -> None:
+    run_id = uuid4()
+    event = RunEvent(
+        kind=EventKind.STEP_FAILED,
+        sequence=1,
+        run_id=run_id,
+        step_id="review_step",
+        actor="reviewer",
+        reason="capability failed: raw terminal output",
+        payload={
+            "error_summary": "existing public summary",
+            "error_stage": "custom_stage",
+            "error_category": "custom_category",
+            "error_code": "custom.failure",
+            "retryable": True,
+            "suggested_action": "existing action",
+        },
+    )
+
+    updated = _event_with_failure_diagnostic(event)
+
+    assert dict(updated.payload) == {
+        "error_summary": "existing public summary",
+        "error_stage": "custom_stage",
+        "error_category": "custom_category",
+        "error_code": "custom.failure",
+        "retryable": True,
+        "suggested_action": "existing action",
+    }
+
+
 def test_repair_proposal_projects_allowlisted_safe_metadata_only() -> None:
     proposal = _repair_proposal(
         {
@@ -2275,6 +2327,24 @@ def skill_archive() -> bytes:
     return buffer.getvalue()
 
 
+def skill_archive_variant(*, entry_body: str) -> bytes:
+    manifest = (
+        "name: safe_skill\n"
+        "version: 1.0.0\n"
+        "entry_point: main.py\n"
+        "compatible_runtime: python3.12\n"
+        "declared_tools:\n"
+        "  - filesystem.read\n"
+        "dependency_lock_hash: "
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("skill.yaml", manifest)
+        archive.writestr("main.py", entry_body)
+    return buffer.getvalue()
+
+
 def skill_tar_archive() -> bytes:
     manifest = (
         "name: safe_tar_skill\n"
@@ -2369,6 +2439,17 @@ def instruction_skill_archive() -> bytes:
             "SKILL.md",
             "---\nname: codex-writer\ndescription: Draft structured research notes.\n---\n\nWrite concise notes.\n",
         )
+    return buffer.getvalue()
+
+
+def instruction_skill_archive_with_reference(reference_body: str) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "SKILL.md",
+            "---\nname: codex-writer\ndescription: Draft structured research notes.\n---\n\nWrite concise notes.\n",
+        )
+        archive.writestr("references/guide.md", reference_body)
     return buffer.getvalue()
 
 
@@ -4037,6 +4118,158 @@ def test_skill_archive_upload_scans_real_zip_package() -> None:
     assert skills.json()[0]["id"] == item["id"]
 
 
+def test_skill_archive_upload_requires_choice_for_same_name_new_content() -> None:
+    api = client()
+
+    first = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=skill_archive_variant(entry_body="print('one')\n"),
+    )
+    conflict = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=skill_archive_variant(entry_body="print('two')\n"),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert first.status_code == 200
+    assert conflict.status_code == 409
+    body = conflict.json()
+    assert body["error"]["code"] == "skill_version_choice_required"
+    assert body["error"]["details"]["skill_name"] == "safe_skill"
+    assert body["error"]["details"]["current_version_id"] == first.json()["items"][0]["id"]
+    assert body["error"]["details"]["new_content_sha256"]
+    assert len(skills.json()) == 1
+
+
+def test_skill_archive_upload_overwrites_same_name_when_requested() -> None:
+    api = client()
+
+    first = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=skill_archive_variant(entry_body="print('one')\n"),
+    )
+    overwritten = api.post(
+        "/api/v1/admin/skills/upload?strategy=overwrite",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=skill_archive_variant(entry_body="print('two')\n"),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert first.status_code == 200
+    assert overwritten.status_code == 200
+    first_item = first.json()["items"][0]
+    overwritten_item = overwritten.json()["items"][0]
+    assert overwritten_item["id"] == first_item["id"]
+    assert overwritten_item["content_sha256"] != first_item["content_sha256"]
+    listed = skills.json()
+    assert len(listed) == 1
+    assert listed[0]["id"] == first_item["id"]
+    assert listed[0]["current_version_id"] == first_item["id"]
+    assert len(listed[0]["versions"]) == 1
+
+
+def test_skill_archive_upload_saves_same_name_as_new_version_when_requested() -> None:
+    api = client()
+
+    first = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=skill_archive_variant(entry_body="print('one')\n"),
+    )
+    second = api.post(
+        "/api/v1/admin/skills/upload?strategy=new_version",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=skill_archive_variant(entry_body="print('two')\n"),
+    )
+    repeated = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill-copy.zip"},
+        content=skill_archive_variant(entry_body="print('two')\n"),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert repeated.status_code == 200
+    first_item = first.json()["items"][0]
+    second_item = second.json()["items"][0]
+    assert second_item["id"] != first_item["id"]
+    assert repeated.json()["items"][0]["id"] == second_item["id"]
+    listed = skills.json()
+    assert len(listed) == 1
+    assert listed[0]["id"] == second_item["id"]
+    assert listed[0]["current_version_id"] == second_item["id"]
+    assert [version["id"] for version in listed[0]["versions"]] == [
+        second_item["id"],
+        first_item["id"],
+    ]
+
+
+def test_skill_version_activation_switches_current_version() -> None:
+    api = client()
+
+    first = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=skill_archive_variant(entry_body="print('one')\n"),
+    ).json()["items"][0]
+    second = api.post(
+        "/api/v1/admin/skills/upload?strategy=new_version",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=skill_archive_variant(entry_body="print('two')\n"),
+    ).json()["items"][0]
+
+    activated = api.post(
+        f"/api/v1/admin/skills/{second['id']}/versions/{first['id']}/activate",
+        headers=headers(),
+    )
+
+    assert activated.status_code == 200
+    body = activated.json()
+    assert body["id"] == first["id"]
+    assert body["current_version_id"] == first["id"]
+    assert [version["is_current"] for version in body["versions"]] == [False, True]
+
+
+def test_skill_strategy_upload_and_activation_require_approval_permission() -> None:
+    class OperatorAuthService:
+        def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
+            if token != "operator-token":
+                raise InvalidCredentials("bad token")
+            return AuthenticatedPrincipal(USER_ID, TENANT_ID, Role.OPERATOR)
+
+    resource_service = InMemoryAdminResourceService()
+    admin_app = create_app(auth_service=StubAuthService(), rate_limiter=object())
+    admin_app.state.admin_resource_service = resource_service
+    admin_api = TestClient(admin_app)
+    app = create_app(auth_service=OperatorAuthService(), rate_limiter=object())
+    app.state.admin_resource_service = resource_service
+    api = TestClient(app)
+    limited_headers = {"Authorization": "Bearer operator-token"}
+
+    first = admin_api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=skill_archive_variant(entry_body="print('one')\n"),
+    )
+    overwrite = api.post(
+        "/api/v1/admin/skills/upload?strategy=overwrite",
+        headers={**limited_headers, "X-Agent-Hub-Skill-Filename": "safe-skill.zip"},
+        content=skill_archive_variant(entry_body="print('two')\n"),
+    )
+    activate = api.post(
+        f"/api/v1/admin/skills/{first.json()['items'][0]['id']}/versions/{first.json()['items'][0]['id']}/activate",
+        headers=limited_headers,
+    )
+
+    assert first.status_code == 200
+    assert overwrite.status_code == 403
+    assert activate.status_code == 403
+
+
 def test_skill_archive_upload_accepts_percent_encoded_filename_header() -> None:
     api = client()
     filename = "技能包.zip"
@@ -4132,6 +4365,35 @@ def test_skill_archive_upload_accepts_instruction_only_skill_package() -> None:
     assert body["items"][0]["requested_permissions"] == []
     assert "SKILL.md detected" in body["items"][0]["scan_diff"]
     assert any(item["name"] == "codex-writer" for item in skills.json())
+
+
+def test_instruction_skill_hash_changes_when_reference_file_changes() -> None:
+    api = client()
+
+    first = api.post(
+        "/api/v1/admin/skills/upload",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "codex-writer-skill.zip"},
+        content=instruction_skill_archive_with_reference("Original reference.\n"),
+    )
+    second = api.post(
+        "/api/v1/admin/skills/upload?strategy=overwrite",
+        headers={**headers(), "X-Agent-Hub-Skill-Filename": "codex-writer-skill.zip"},
+        content=instruction_skill_archive_with_reference("Updated reference.\n"),
+    )
+    skills = api.get("/api/v1/admin/skills", headers=headers())
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_item = first.json()["items"][0]
+    second_item = second.json()["items"][0]
+    assert first_item["id"] == second_item["id"]
+    assert first_item["content_sha256"] != second_item["content_sha256"]
+    assert first_item["package_version_id"] != second_item["package_version_id"]
+    assert second_item["source_filename"] == "codex-writer-skill.zip"
+    listed = skills.json()
+    assert len(listed) == 1
+    assert listed[0]["content_sha256"] == second_item["content_sha256"]
+    assert listed[0]["package_version_id"] == second_item["package_version_id"]
 
 
 def test_skill_archive_upload_accepts_instruction_skill_tar_gz_bundle() -> None:

@@ -186,6 +186,7 @@ const hermesInsight = {
   category: "conversation",
   lesson: "Use group chat when debate review is required.",
   summary: "Learned success pattern: Use group chat when debate review is required. Tags: debate, review. Weight: 5.",
+  user_summary: "对话记忆记录了一条有效经验：需要争议评审时优先使用群聊讨论。",
   run_id: runId,
   conversation_id: "conv-architecture-1",
   confirmed_at: null,
@@ -201,6 +202,7 @@ const secondHermesInsight = {
   category: "scheduler",
   lesson: "Ask for confirmation before changing the workflow role pool.",
   summary: "Learned failure pattern: Ask for confirmation before changing the workflow role pool. Tags: workflow, approval. Weight: 4.",
+  user_summary: "调度观察记录了一条风险提醒：修改工作流角色池前需要先确认。",
   conversation_id: "conv-workflow-2",
   confirmed_at: null,
   tags: ["workflow", "approval"],
@@ -370,6 +372,11 @@ function jsonResponse(payload: unknown, init: ResponseInit = {}) {
     headers: { "Content-Type": "application/json" },
     ...init,
   });
+}
+
+async function openProcessDetailGroup(user: ReturnType<typeof userEvent.setup>, drawer: HTMLElement, label: string) {
+  await user.click(within(drawer).getByRole("button", { name: new RegExp(`^${label}`) }));
+  return screen.findByRole("dialog", { name: `${label}详情` });
 }
 
 describe("operational management pages", () => {
@@ -1169,8 +1176,8 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "运行详情" })).not.toBeNull();
     const archive = screen.getByRole("heading", { name: "产物" }).closest("article");
     expect(archive).not.toBeNull();
-    const download = within(archive as HTMLElement).getByRole("link", { name: /下载 delivery-plan\.docx/ });
-    expect(download.getAttribute("href")).toBe(`/api/v1/admin/runs/${runId}/artifacts/artifact-final-docx/download`);
+    const download = within(archive as HTMLElement).getByRole("button", { name: /下载 delivery-plan\.docx/ });
+    expect(download).not.toBeNull();
     expect(within(archive as HTMLElement).getByText(/4\.0 KB/)).not.toBeNull();
   });
 
@@ -1788,13 +1795,13 @@ describe("operational management pages", () => {
     const stream = screen.getByRole("region", { name: "主对话内容" });
 
     expect(within(stream).queryByRole("status", { name: /任务态势/ })).toBeNull();
-    expect(within(stream).queryByRole("link", { name: /下载 delivery-plan\.docx/ })).toBeNull();
+    expect(within(stream).queryByRole("button", { name: /下载 delivery-plan\.docx/ })).toBeNull();
     expect(within(stream).queryByText("附件：delivery-plan.docx")).toBeNull();
     expect(within(stream).queryByRole("link", { name: "查看运行详情" })).toBeNull();
 
     await user.click(within(stream).getByRole("button", { name: /文案生成 输出：生成交付文档/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
-    expect(within(drawer).getByRole("link", { name: /下载 delivery-plan\.docx/ })).not.toBeNull();
+    expect(within(drawer).getByRole("button", { name: /下载 delivery-plan\.docx/ })).not.toBeNull();
   });
 
   it("shows final generated downloads as chat attachments", async () => {
@@ -1825,8 +1832,8 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     const stream = screen.getByRole("region", { name: "主对话内容" });
 
-    const chatDownload = within(stream).getByRole("link", { name: /下载 delivery-plan\.docx/ });
-    expect(chatDownload.getAttribute("href")).toBe(`/api/v1/admin/runs/${runId}/artifacts/artifact-final-docx/download`);
+    const chatDownload = within(stream).getByRole("button", { name: /下载 delivery-plan\.docx/ });
+    expect(chatDownload).not.toBeNull();
   });
 
   it("keeps live adjustment and temporary-agent switches out of workflow configuration", async () => {
@@ -2525,9 +2532,18 @@ describe("operational management pages", () => {
     expect(within(drawer).queryByText("任务已进入队列，等待 Worker 调度执行。")).toBeNull();
     expect(within(drawer).queryByText("model.started")).toBeNull();
     expect(within(drawer).queryByText("模型请求已开始。")).toBeNull();
-    expect(within(drawer).getByText("得到一版可拍摄脚本文案")).not.toBeNull();
-    expect(within(drawer).getByText("调用模型")).not.toBeNull();
-    expect(within(drawer).getByText("qwen-max")).not.toBeNull();
+    expect(within(drawer).getByRole("button", { name: /产物/ })).not.toBeNull();
+    expect(within(drawer).getByRole("button", { name: /证据/ })).not.toBeNull();
+    expect(within(drawer).queryByText("调用模型")).toBeNull();
+    const conclusionDetail = await openProcessDetailGroup(user, drawer, "结论");
+    expect(within(conclusionDetail).getByText("得到一版可拍摄脚本文案")).not.toBeNull();
+    await user.click(within(conclusionDetail).getByRole("button", { name: "关闭" }));
+    const productDetail = await openProcessDetailGroup(user, drawer, "产物");
+    expect(within(productDetail).getByText("短视频脚本")).not.toBeNull();
+    await user.click(within(productDetail).getByRole("button", { name: "关闭" }));
+    const evidenceDetail = await openProcessDetailGroup(user, drawer, "证据");
+    expect(within(evidenceDetail).getByText("调用模型")).not.toBeNull();
+    expect(within(evidenceDetail).getByText("qwen-max")).not.toBeNull();
   });
 
   it("shows recruited subagents from the main agent plan", async () => {
@@ -2551,6 +2567,7 @@ describe("operational management pages", () => {
                 role: "Copywriter",
                 purpose: "execute",
                 logical_model: "qwen-max",
+                summary: "负责输出可拍摄脚本文案。",
                 tools: ["workspace.read"],
               },
               {
@@ -2558,6 +2575,7 @@ describe("operational management pages", () => {
                 role: "Reviewer",
                 purpose: "review",
                 logical_model: "deepseek-chat",
+                summary: "负责审查产物是否符合请求。",
                 tools: [],
               },
               {
@@ -2622,10 +2640,12 @@ describe("operational management pages", () => {
     expect(within(panel).getByText("已招募 2 个助手")).not.toBeNull();
     expect(within(panel).getByText("文案生成")).not.toBeNull();
     expect(within(panel).getByText("Copywriter · qwen-max")).not.toBeNull();
+    expect(within(panel).getByText("负责输出可拍摄脚本文案。")).not.toBeNull();
     expect(within(panel).queryByText("workspace.read")).toBeNull();
     expect(within(panel).getByText("工作中")).not.toBeNull();
     expect(within(panel).getByText("reviewer")).not.toBeNull();
     expect(within(panel).getByText("Reviewer · deepseek-chat")).not.toBeNull();
+    expect(within(panel).getByText("负责审查产物是否符合请求。")).not.toBeNull();
     expect(within(panel).getByText("已完成")).not.toBeNull();
     expect(within(panel).queryByText("Final Synthesizer")).toBeNull();
   });
@@ -2728,12 +2748,15 @@ describe("operational management pages", () => {
     await user.click(within(stream).getByRole("button", { name: /主 Agent 选择派单/ }));
 
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
-    expect(within(drawer).getByText("Harness 服务商")).not.toBeNull();
-    expect(within(drawer).getByText("deepseek")).not.toBeNull();
-    expect(within(drawer).getByText("Harness 模型")).not.toBeNull();
-    expect(within(drawer).getByText("deepseek-chat")).not.toBeNull();
-    expect(within(drawer).getByText("工程能力")).not.toBeNull();
-    expect(within(drawer).getByText(/supports_streamed_tool_call_delta/)).not.toBeNull();
+    expect(within(drawer).getByRole("button", { name: /证据/ })).not.toBeNull();
+    expect(within(drawer).queryByText("Harness 服务商")).toBeNull();
+    const evidenceDetail = await openProcessDetailGroup(user, drawer, "证据");
+    expect(within(evidenceDetail).getByText("Harness 服务商")).not.toBeNull();
+    expect(within(evidenceDetail).getAllByText("deepseek").length).toBeGreaterThan(0);
+    expect(within(evidenceDetail).getByText("Harness 模型")).not.toBeNull();
+    expect(within(evidenceDetail).getAllByText("deepseek-chat").length).toBeGreaterThan(0);
+    expect(within(evidenceDetail).getByText("工程能力")).not.toBeNull();
+    expect(within(evidenceDetail).getByText(/supports_streamed_tool_call_delta/)).not.toBeNull();
   });
 
   it("renders harness lifecycle events as explicit process cards", async () => {
@@ -2780,8 +2803,10 @@ describe("operational management pages", () => {
 
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     expect(within(drawer).getByText("Harness 已启动")).not.toBeNull();
-    expect(within(drawer).getByText("工程能力")).not.toBeNull();
-    expect(within(drawer).getByText(/supports_parallel_tool_calls/)).not.toBeNull();
+    expect(within(drawer).getByRole("button", { name: /证据/ })).not.toBeNull();
+    const evidenceDetail = await openProcessDetailGroup(user, drawer, "证据");
+    expect(within(evidenceDetail).getByText("工程能力")).not.toBeNull();
+    expect(within(evidenceDetail).getByText(/supports_parallel_tool_calls/)).not.toBeNull();
   });
 
   it("renders tool requested events from argument summaries without argument values", async () => {
@@ -2823,10 +2848,11 @@ describe("operational management pages", () => {
     await user.click(toolCard);
 
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
-    expect(within(drawer).getByText("参数字段")).not.toBeNull();
-    expect(within(drawer).getByText("path")).not.toBeNull();
-    expect(within(drawer).getByText("参数字节数")).not.toBeNull();
-    expect(within(drawer).getByText("20")).not.toBeNull();
+    const evidenceDetail = await openProcessDetailGroup(user, drawer, "证据");
+    expect(within(evidenceDetail).getByText("参数字段")).not.toBeNull();
+    expect(within(evidenceDetail).getByText("path")).not.toBeNull();
+    expect(within(evidenceDetail).getByText("参数字节数")).not.toBeNull();
+    expect(within(evidenceDetail).getByText("20")).not.toBeNull();
     expect(within(drawer).queryByText("README.md")).toBeNull();
   });
 
@@ -2873,12 +2899,17 @@ describe("operational management pages", () => {
 
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     expect(within(drawer).getByText("工具请求已记录")).not.toBeNull();
-    expect(within(drawer).getByText("已隐藏字段数")).not.toBeNull();
-    expect(within(drawer).getByText("1")).not.toBeNull();
+    const evidenceDetail = await openProcessDetailGroup(user, drawer, "证据");
+    expect(within(evidenceDetail).getByText("已隐藏字段数")).not.toBeNull();
+    expect(within(evidenceDetail).getByText("1")).not.toBeNull();
     expect(within(drawer).queryByText("README.md")).toBeNull();
     expect(within(drawer).queryByText("sk-secret123")).toBeNull();
     expect(within(drawer).queryByText("api_key")).toBeNull();
     expect(within(drawer).queryByText("b".repeat(64))).toBeNull();
+    expect(evidenceDetail.textContent).not.toContain("README.md");
+    expect(evidenceDetail.textContent).not.toContain("sk-secret123");
+    expect(evidenceDetail.textContent).not.toContain("api_key");
+    expect(evidenceDetail.textContent).not.toContain("b".repeat(64));
   });
 
   it("renders model stream progress without exposing legacy raw delta text", async () => {
@@ -2941,19 +2972,25 @@ describe("operational management pages", () => {
     await user.click(reasoningCard);
     const reasoningDrawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     expect(within(reasoningDrawer).getByRole("heading", { name: "思考过程" })).not.toBeNull();
-    expect(within(reasoningDrawer).getByText("Delta 类型")).not.toBeNull();
-    expect(within(reasoningDrawer).getByText("reasoning")).not.toBeNull();
-    expect(within(reasoningDrawer).getByText("内容字节数")).not.toBeNull();
-    expect(within(reasoningDrawer).getByText("23")).not.toBeNull();
+    expect(within(reasoningDrawer).getByRole("button", { name: /证据/ })).not.toBeNull();
     expect(within(reasoningDrawer).queryByText("hidden chain of thought")).toBeNull();
+    const reasoningEvidence = await openProcessDetailGroup(user, reasoningDrawer, "证据");
+    expect(within(reasoningEvidence).getByText("Delta 类型")).not.toBeNull();
+    expect(within(reasoningEvidence).getByText("reasoning")).not.toBeNull();
+    expect(within(reasoningEvidence).getByText("内容字节数")).not.toBeNull();
+    expect(within(reasoningEvidence).getByText("23")).not.toBeNull();
+    expect(reasoningEvidence.textContent).not.toContain("hidden chain of thought");
+    await user.click(within(reasoningEvidence).getByRole("button", { name: "关闭" }));
     await user.click(within(reasoningDrawer).getByRole("button", { name: "关闭" }));
 
     await user.click(textCard);
     const textDrawer = await screen.findByRole("dialog", { name: "运行过程详情" });
     expect(within(textDrawer).getByRole("heading", { name: "输出进度" })).not.toBeNull();
-    expect(within(textDrawer).getByText("visible_text")).not.toBeNull();
-    expect(within(textDrawer).getByText("35")).not.toBeNull();
+    const textEvidence = await openProcessDetailGroup(user, textDrawer, "证据");
+    expect(within(textEvidence).getByText("visible_text")).not.toBeNull();
+    expect(within(textEvidence).getByText("35")).not.toBeNull();
     expect(within(textDrawer).queryByText("partial answer with private context")).toBeNull();
+    expect(textEvidence.textContent).not.toContain("partial answer with private context");
   });
 
   it("renders tool progress rows from safe metadata without raw command or output text", async () => {
@@ -3044,26 +3081,34 @@ describe("operational management pages", () => {
 
     await user.click(completedCard);
     const completedDrawer = await screen.findByRole("dialog", { name: "运行过程详情" });
-    expect(within(completedDrawer).getByText("状态流")).not.toBeNull();
-    expect(within(completedDrawer).getByText("开始，完成")).not.toBeNull();
-    expect(within(completedDrawer).getByText("完成")).not.toBeNull();
-    expect(within(completedDrawer).getByText("退出码")).not.toBeNull();
-    expect(within(completedDrawer).getByText("0")).not.toBeNull();
-    expect(within(completedDrawer).getByText("命令字节数")).not.toBeNull();
-    expect(within(completedDrawer).getByText("20")).not.toBeNull();
-    expect(within(completedDrawer).getByText("输出字节数")).not.toBeNull();
-    expect(within(completedDrawer).getByText("41")).not.toBeNull();
+    const completedEvidence = await openProcessDetailGroup(user, completedDrawer, "证据");
+    expect(within(completedEvidence).getByText("状态流")).not.toBeNull();
+    expect(within(completedEvidence).getAllByText("开始，完成").length).toBeGreaterThan(0);
+    expect(within(completedEvidence).getByText("完成")).not.toBeNull();
+    expect(within(completedEvidence).getByText("命令字节数")).not.toBeNull();
+    expect(within(completedEvidence).getAllByText("20").length).toBeGreaterThan(0);
+    expect(within(completedEvidence).getByText("输出字节数")).not.toBeNull();
+    expect(within(completedEvidence).getByText("41")).not.toBeNull();
     expect(within(completedDrawer).queryByText("cat secret-token.txt")).toBeNull();
     expect(within(completedDrawer).queryByText("terminal output contained sk-secret123")).toBeNull();
     expect(within(completedDrawer).queryByText("private terminal output")).toBeNull();
+    expect(completedEvidence.textContent).not.toContain("cat secret-token.txt");
+    expect(completedEvidence.textContent).not.toContain("terminal output contained sk-secret123");
+    expect(completedEvidence.textContent).not.toContain("private terminal output");
+    await user.click(within(completedEvidence).getByRole("button", { name: "关闭" }));
     await user.click(within(completedDrawer).getByRole("button", { name: "关闭" }));
 
     await user.click(failedCard);
     const failedDrawer = await screen.findByRole("dialog", { name: "运行过程详情" });
-    expect(within(failedDrawer).getAllByText("失败").length).toBeGreaterThan(0);
-    expect(within(failedDrawer).getByText("内容字节数")).not.toBeNull();
-    expect(within(failedDrawer).getByText("38")).not.toBeNull();
+    const failedBlocker = await openProcessDetailGroup(user, failedDrawer, "阻塞");
+    expect(within(failedBlocker).getAllByText("失败").length).toBeGreaterThan(0);
+    await user.click(within(failedBlocker).getByRole("button", { name: "关闭" }));
+    const failedEvidence = await openProcessDetailGroup(user, failedDrawer, "证据");
+    expect(within(failedEvidence).getByText("内容字节数")).not.toBeNull();
+    expect(within(failedEvidence).getByText("38")).not.toBeNull();
     expect(within(failedDrawer).queryByText("secret file content should stay hidden")).toBeNull();
+    expect(failedBlocker.textContent).not.toContain("secret file content should stay hidden");
+    expect(failedEvidence.textContent).not.toContain("secret file content should stay hidden");
   });
 
   it("marks intermediate process outputs in labeled boxes while keeping the final reply merged", async () => {
@@ -3261,33 +3306,49 @@ describe("operational management pages", () => {
 
     await user.click(mainPlan);
     const planDrawer = await screen.findByRole("dialog", { name: "运行过程详情" });
-    expect(within(planDrawer).getByText("执行者")).not.toBeNull();
-    expect(within(planDrawer).getAllByText("主 Agent").length).toBeGreaterThan(0);
-    expect(within(planDrawer).getByText("逻辑模型")).not.toBeNull();
-    expect(within(planDrawer).getAllByText("main").length).toBeGreaterThan(0);
+    const planEvidence = await openProcessDetailGroup(user, planDrawer, "证据");
+    expect(within(planEvidence).getByText("执行者")).not.toBeNull();
+    expect(within(planEvidence).getAllByText("主 Agent").length).toBeGreaterThan(0);
+    expect(within(planEvidence).getByText("逻辑模型")).not.toBeNull();
+    expect(within(planEvidence).getAllByText("main").length).toBeGreaterThan(0);
+    await user.click(within(planEvidence).getByRole("button", { name: "关闭" }));
     await user.click(within(planDrawer).getByRole("button", { name: "关闭" }));
 
     await user.click(copywriterOutput);
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
-    expect(within(drawer).getByText("执行者")).not.toBeNull();
-    expect(within(drawer).getAllByText("文案生成").length).toBeGreaterThan(0);
-    expect(within(drawer).getByText("调用模型")).not.toBeNull();
-    expect(within(drawer).getByText("qwen-max")).not.toBeNull();
-    expect(within(drawer).getByText("输出内容")).not.toBeNull();
-    expect(within(drawer).getAllByText(/中秋灯谜游园会/).length).toBeGreaterThan(0);
+    expect(within(drawer).getByRole("group", { name: "运行详情摘要" })).not.toBeNull();
+    expect(within(drawer).getByRole("button", { name: /产物/ })).not.toBeNull();
+    expect(within(drawer).getByRole("button", { name: /证据/ })).not.toBeNull();
+    expect(within(drawer).queryByText("执行者")).toBeNull();
+    const outputEvidence = await openProcessDetailGroup(user, drawer, "证据");
+    expect(within(outputEvidence).getByText("执行者")).not.toBeNull();
+    expect(within(outputEvidence).getAllByText("文案生成").length).toBeGreaterThan(0);
+    expect(within(outputEvidence).getByText("调用模型")).not.toBeNull();
+    expect(within(outputEvidence).getByText("qwen-max")).not.toBeNull();
+    await user.click(within(outputEvidence).getByRole("button", { name: "关闭" }));
+    const outputProduct = await openProcessDetailGroup(user, drawer, "产物");
+    expect(within(outputProduct).getByText("输出内容")).not.toBeNull();
+    expect(within(outputProduct).getAllByText(/中秋灯谜游园会/).length).toBeGreaterThan(0);
+    await user.click(within(outputProduct).getByRole("button", { name: "关闭" }));
 
     await user.click(within(drawer).getByRole("button", { name: "关闭" }));
     await user.click(minutes);
     const minutesDrawer = await screen.findByRole("dialog", { name: "运行过程详情" });
-    expect(within(minutesDrawer).getByText("会议纪要")).not.toBeNull();
-    expect(within(minutesDrawer).getByText(/共识：采用灯谜游园会，压缩签到流程。/)).not.toBeNull();
-    expect(within(minutesDrawer).getByText(/分歧：是否保留嘉宾签到环节存在分歧。/)).not.toBeNull();
-    expect(within(minutesDrawer).getByText("文案生成意见")).not.toBeNull();
-    expect(within(minutesDrawer).getByText("文案建议主打灯谜游园会。")).not.toBeNull();
-    expect(within(minutesDrawer).getByText("导演意见")).not.toBeNull();
-    expect(within(minutesDrawer).getByText("导演建议压缩签到环节，避免排队。")).not.toBeNull();
-    expect(within(minutesDrawer).getByText("主 Agent 裁决")).not.toBeNull();
-    expect(within(minutesDrawer).getByText("主 Agent 采纳灯谜游园会方案，并保留导演对动线的调整。")).not.toBeNull();
+    const minutesConclusion = await openProcessDetailGroup(user, minutesDrawer, "结论");
+    expect(within(minutesConclusion).getByText("会议纪要")).not.toBeNull();
+    expect(within(minutesConclusion).getAllByText(/共识：采用灯谜游园会，压缩签到流程。/).length).toBeGreaterThan(0);
+    expect(within(minutesConclusion).getAllByText(/分歧：是否保留嘉宾签到环节存在分歧。/).length).toBeGreaterThan(0);
+    await user.click(within(minutesConclusion).getByRole("button", { name: "关闭" }));
+    const minutesActivity = await openProcessDetailGroup(user, minutesDrawer, "活动");
+    expect(within(minutesActivity).getByText("文案生成意见")).not.toBeNull();
+    expect(within(minutesActivity).getAllByText("文案建议主打灯谜游园会。").length).toBeGreaterThan(0);
+    expect(within(minutesActivity).getByText("导演意见")).not.toBeNull();
+    expect(within(minutesActivity).getAllByText("导演建议压缩签到环节，避免排队。").length).toBeGreaterThan(0);
+    await user.click(within(minutesActivity).getByRole("button", { name: "关闭" }));
+    const minutesDecision = await openProcessDetailGroup(user, minutesDrawer, "决策");
+    expect(within(minutesDecision).getByText("主 Agent 裁决")).not.toBeNull();
+    expect(within(minutesDecision).getAllByText("主 Agent 采纳灯谜游园会方案，并保留导演对动线的调整。").length).toBeGreaterThan(0);
+    await user.click(within(minutesDecision).getByRole("button", { name: "关闭" }));
 
     await user.click(minutesDrawer.parentElement as HTMLElement);
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "运行过程详情" })).toBeNull());
@@ -3336,11 +3397,14 @@ describe("operational management pages", () => {
 
     await user.click(reviewCard);
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
-    expect(within(drawer).getByText("安全摘要")).not.toBeNull();
     expect(within(drawer).getAllByText("reviewer completed review").length).toBeGreaterThan(0);
-    expect(drawer.textContent).toContain("safe review summary");
     expect(drawer.textContent).not.toContain("private-token");
     expect(drawer.textContent).not.toContain("private output");
+    const conclusionDetail = await openProcessDetailGroup(user, drawer, "结论");
+    expect(within(conclusionDetail).getByText("执行摘要")).not.toBeNull();
+    expect(conclusionDetail.textContent).toContain("safe review summary");
+    expect(conclusionDetail.textContent).not.toContain("private-token");
+    expect(conclusionDetail.textContent).not.toContain("private output");
   });
 
   it("aggregates model delta chunks in the conversation process summary", async () => {
@@ -3426,10 +3490,11 @@ describe("operational management pages", () => {
 
     await user.click(reasoningCard);
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
-    expect(within(drawer).getByText("分片数")).not.toBeNull();
-    expect(within(drawer).getByText("2")).not.toBeNull();
-    expect(within(drawer).getByText("内容字节数")).not.toBeNull();
-    expect(within(drawer).getByText("160")).not.toBeNull();
+    const evidenceDetail = await openProcessDetailGroup(user, drawer, "证据");
+    expect(within(evidenceDetail).getByText("分片数")).not.toBeNull();
+    expect(within(evidenceDetail).getAllByText("2").length).toBeGreaterThan(0);
+    expect(within(evidenceDetail).getByText("内容字节数")).not.toBeNull();
+    expect(within(evidenceDetail).getAllByText("160").length).toBeGreaterThan(0);
   });
 
   it("shows planned task chain status from safe run events", async () => {
@@ -3823,10 +3888,13 @@ describe("operational management pages", () => {
     const approvalCard = within(stream).getByRole("button", { name: /等待确认/ });
     await user.click(approvalCard);
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
-    expect(within(drawer).getByText("审批 ID")).not.toBeNull();
-    expect(within(drawer).getByText("approval_retry_terminal")).not.toBeNull();
+    const decisionDetail = await openProcessDetailGroup(user, drawer, "决策");
+    expect(within(decisionDetail).getByText("审批 ID")).not.toBeNull();
+    expect(within(decisionDetail).getAllByText("approval_retry_terminal").length).toBeGreaterThan(0);
     expect(drawer.textContent).not.toContain("private-token");
     expect(drawer.textContent).not.toContain("private output");
+    expect(decisionDetail.textContent).not.toContain("private-token");
+    expect(decisionDetail.textContent).not.toContain("private output");
   });
 
   it("keeps future repair proposals in intent rows without raw payload leakage", async () => {
@@ -3875,10 +3943,13 @@ describe("operational management pages", () => {
 
     await user.click(within(stream).getByRole("button", { name: /修复意图/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
-    expect(within(drawer).getByText("修复动作")).not.toBeNull();
-    expect(within(drawer).getByText("switch_model")).not.toBeNull();
+    const decisionDetail = await openProcessDetailGroup(user, drawer, "决策");
+    expect(within(decisionDetail).getByText("修复动作")).not.toBeNull();
+    expect(within(decisionDetail).getByText("switch_model")).not.toBeNull();
     expect(drawer.textContent).not.toContain("private-token");
     expect(drawer.textContent).not.toContain("private output");
+    expect(decisionDetail.textContent).not.toContain("private-token");
+    expect(decisionDetail.textContent).not.toContain("private output");
   });
 
   it("redacts free-text intent reasons and honors false approval flags", async () => {
@@ -4016,14 +4087,17 @@ describe("operational management pages", () => {
 
     await user.click(toolCards[0]);
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
-    expect(within(drawer).getByText("状态流")).not.toBeNull();
-    expect(within(drawer).getByText("开始，失败")).not.toBeNull();
-    expect(within(drawer).getByText("失败类型")).not.toBeNull();
-    expect(within(drawer).getByText("capability_failed")).not.toBeNull();
-    expect(within(drawer).getByText("退出码")).not.toBeNull();
-    expect(within(drawer).getAllByText("1").length).toBeGreaterThan(0);
+    const blockerDetail = await openProcessDetailGroup(user, drawer, "阻塞");
+    expect(within(blockerDetail).getByText("状态流")).not.toBeNull();
+    expect(within(blockerDetail).getAllByText("开始，失败").length).toBeGreaterThan(0);
+    expect(within(blockerDetail).getByText("失败类型")).not.toBeNull();
+    expect(within(blockerDetail).getAllByText("capability_failed").length).toBeGreaterThan(0);
+    expect(within(blockerDetail).getByText("退出码")).not.toBeNull();
+    expect(within(blockerDetail).getAllByText("1").length).toBeGreaterThan(0);
     expect(drawer.textContent).not.toContain("private-token");
     expect(drawer.textContent).not.toContain("private output");
+    expect(blockerDetail.textContent).not.toContain("private-token");
+    expect(blockerDetail.textContent).not.toContain("private output");
   });
 
   it("keeps wrapped runtime tool failures out of the chat failure summary", async () => {
@@ -4627,12 +4701,17 @@ describe("operational management pages", () => {
 
     await user.click(directorOutput);
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
-    expect(within(drawer).getByText("执行者")).not.toBeNull();
-    expect(within(drawer).getAllByText("导演").length).toBeGreaterThan(0);
-    expect(within(drawer).getByText("调用模型")).not.toBeNull();
-    expect(within(drawer).getByText("deepseek-v4-flash")).not.toBeNull();
-    expect(within(drawer).getByText("输出内容")).not.toBeNull();
-    expect(within(drawer).getByText("导演输出：压缩主持人串场，保留抽奖互动。")).not.toBeNull();
+    expect(within(drawer).getByRole("button", { name: /证据/ })).not.toBeNull();
+    expect(within(drawer).getByRole("button", { name: /产物/ })).not.toBeNull();
+    const evidenceDetail = await openProcessDetailGroup(user, drawer, "证据");
+    expect(within(evidenceDetail).getByText("执行者")).not.toBeNull();
+    expect(within(evidenceDetail).getAllByText("导演").length).toBeGreaterThan(0);
+    expect(within(evidenceDetail).getByText("调用模型")).not.toBeNull();
+    expect(within(evidenceDetail).getByText("deepseek-v4-flash")).not.toBeNull();
+    await user.click(within(evidenceDetail).getByRole("button", { name: "关闭" }));
+    const productDetail = await openProcessDetailGroup(user, drawer, "产物");
+    expect(within(productDetail).getByText("输出内容")).not.toBeNull();
+    expect(within(productDetail).getByText("导演输出：压缩主持人串场，保留抽奖互动。")).not.toBeNull();
   });
 
   it("falls back to concrete artifact titles when upstream artifact text is generic", async () => {
@@ -4682,9 +4761,209 @@ describe("operational management pages", () => {
 
     await user.click(outputRow);
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
-    expect(within(drawer).getByText("产物标题")).not.toBeNull();
-    expect(within(drawer).getAllByText("中秋活动文案初稿").length).toBeGreaterThan(0);
+    expect(within(drawer).getByRole("button", { name: /产物/ })).not.toBeNull();
+    expect(within(drawer).queryByText("产物标题")).toBeNull();
     expect(within(drawer).queryByText(/已生成一个可查看的结果或中间产物/)).toBeNull();
+    await user.click(within(drawer).getByRole("button", { name: /产物/ }));
+    expect(await screen.findByRole("dialog", { name: "产物详情" })).not.toBeNull();
+    expect(screen.getByText("产物标题")).not.toBeNull();
+    expect(screen.getAllByText("中秋活动文案初稿").length).toBeGreaterThan(0);
+  });
+
+  it("locks page scrolling while the process drawer is open and closes from the backdrop", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await user.click(
+      within(stream).getByRole("button", {
+        name: /文案生成 输出：得到一版可拍摄脚本文案/,
+      }),
+    );
+
+    expect(await screen.findByRole("dialog", { name: "运行过程详情" })).not.toBeNull();
+    expect(document.body.style.overflow).toBe("hidden");
+    expect(document.body.style.touchAction).toBe("none");
+    expect(document.documentElement.style.overflow).toBe("hidden");
+
+    const backdrop = document.querySelector(".process-drawer-backdrop");
+    expect(backdrop).not.toBeNull();
+    await user.click(backdrop as HTMLElement);
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "运行过程详情" })).toBeNull());
+    expect(document.body.style.overflow).toBe("");
+    expect(document.body.style.touchAction).toBe("");
+    expect(document.documentElement.style.overflow).toBe("");
+  });
+
+  it("refreshes process drawer content while viewing a terminal run", async () => {
+    const user = userEvent.setup();
+    const completedRunDetail: RunDetail = {
+      ...runDetail,
+      status: "completed",
+      events: [
+        {
+          sequence: 1,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "copywriter",
+          participants: [],
+          tool_name: null,
+          step_id: "copywriting_step",
+          action: null,
+          decision: null,
+          payload: { result: "第一版摘要" },
+          artifact: {
+            id: "artifact-refresh-copy",
+            kind: "markdown",
+            title: "刷新测试文案",
+            text: "第一版摘要。",
+          },
+        },
+      ],
+      artifacts: [
+        {
+          id: "artifact-refresh-copy",
+          kind: "markdown",
+          title: "刷新测试文案",
+          text: "第一版摘要。",
+        },
+      ],
+    };
+    visibleRunDetail = completedRunDetail;
+    visibleConversationRuns = [completedRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await user.click(within(stream).getByRole("button", { name: /文案生成 输出：第一版摘要/ }));
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).getByRole("button", { name: /产物/ })).not.toBeNull();
+    expect(within(drawer).queryByText("第一版摘要。")).toBeNull();
+
+    const refreshedRunDetail: RunDetail = {
+      ...completedRunDetail,
+      events: [
+        {
+          ...completedRunDetail.events[0],
+          payload: { result: "第二版摘要，后台已刷新" },
+          artifact: {
+            id: "artifact-refresh-copy",
+            kind: "markdown",
+            title: "刷新测试文案",
+            text: "第二版摘要，后台已刷新。",
+          },
+        },
+      ],
+      artifacts: [
+        {
+          id: "artifact-refresh-copy",
+          kind: "markdown",
+          title: "刷新测试文案",
+          text: "第二版摘要，后台已刷新。",
+        },
+      ],
+    };
+    visibleRunDetail = refreshedRunDetail;
+    visibleConversationRuns = [refreshedRunDetail];
+
+    await waitFor(
+      () => expect(within(drawer).getByRole("button", { name: /第二版摘要，后台已刷新/ })).not.toBeNull(),
+      { timeout: 2500 },
+    );
+  });
+
+  it("refreshes newly recruited agents without a manual page reload", async () => {
+    const user = userEvent.setup();
+    const initialRunDetail: RunDetail = {
+      ...runDetail,
+      status: "running",
+      events: [
+        {
+          sequence: 1,
+          kind: "step.started",
+          message: "main_agent_plan",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "main_agent",
+          participants: [],
+          tool_name: null,
+          step_id: "main_agent_plan",
+          action: null,
+          decision: null,
+          payload: {
+            roles: [
+              {
+                id: "copywriter",
+                role: "文案生成",
+                logical_model: "qwen-max",
+                summary: "负责活动主题与宣传文案。",
+              },
+            ],
+            steps: [
+              {
+                id: "copywriting_step",
+                agent: "copywriter",
+                task: "输出活动文案。",
+              },
+            ],
+          },
+        },
+      ],
+      artifacts: [],
+    };
+    visibleRunDetail = initialRunDetail;
+    visibleConversationRuns = [initialRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    await waitFor(() => expect(screen.getAllByText("文案生成").length).toBeGreaterThan(0));
+    expect(screen.queryByText("导演")).toBeNull();
+
+    const refreshedRunDetail: RunDetail = {
+      ...initialRunDetail,
+      events: [
+        {
+          ...initialRunDetail.events[0],
+          payload: {
+            roles: [
+              ...(initialRunDetail.events[0].payload.roles as Array<Record<string, string>>),
+              {
+                id: "director",
+                role: "导演",
+                logical_model: "deepseek-v4-flash",
+                summary: "负责审查活动动线与现场节奏。",
+              },
+            ],
+            steps: [
+              ...(initialRunDetail.events[0].payload.steps as Array<Record<string, string>>),
+              {
+                id: "director_review",
+                agent: "director",
+                task: "审查活动动线。",
+              },
+            ],
+          },
+        },
+      ],
+    };
+    visibleRunDetail = refreshedRunDetail;
+    visibleConversationRuns = [refreshedRunDetail];
+
+    await waitFor(() => expect(screen.getAllByText("导演").length).toBeGreaterThan(0), { timeout: 2500 });
+    const directorCard = Array.from(document.querySelectorAll(".agent-recruitment-card")).find((card) =>
+      card.textContent?.includes("负责审查活动动线"),
+    );
+    expect(directorCard?.textContent).toContain("deepseek-v4-flash");
+    expect(directorCard?.textContent).toContain("负责审查活动动线");
   });
 
   it("shows localized process summaries with participating roles instead of raw event codes", async () => {
@@ -4698,18 +4977,26 @@ describe("operational management pages", () => {
     await user.click(within(stream).getByRole("button", { name: /讨论纪要：共识 采用可拍摄性最高的方案/ }));
     const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
 
-    expect(within(drawer).getByText("参与者")).not.toBeNull();
-    expect(within(drawer).getByText("导演、文案生成、剪辑师")).not.toBeNull();
+    expect(within(drawer).getByRole("button", { name: /结论/ })).not.toBeNull();
+    expect(within(drawer).getByRole("button", { name: /证据/ })).not.toBeNull();
+    expect(within(drawer).getByRole("button", { name: /活动/ })).not.toBeNull();
     expect(within(drawer).queryByText(/生成了结果/)).toBeNull();
     expect(within(drawer).getAllByText(/多角色完成讨论/).length).toBeGreaterThan(0);
-    expect(within(drawer).getAllByText(/采用可拍摄性最高的方案/).length).toBeGreaterThan(0);
-    expect(within(drawer).getByText("导演认为要优先可拍摄性。")).not.toBeNull();
-    expect(within(drawer).getByText("文案建议强化开头钩子。")).not.toBeNull();
-    expect(within(drawer).getByText("剪辑师建议三段式节奏。")).not.toBeNull();
-    expect(within(drawer).getByText("主 Agent 选择可拍摄性最高且风险最低的方案。")).not.toBeNull();
-    expect(within(drawer).getAllByText("执行者").length).toBeGreaterThan(0);
-    expect(within(drawer).getByText("参与者")).not.toBeNull();
-    expect(within(drawer).getByText("导演、文案生成、剪辑师")).not.toBeNull();
+    const conclusionDetail = await openProcessDetailGroup(user, drawer, "结论");
+    expect(within(conclusionDetail).getAllByText(/采用可拍摄性最高的方案/).length).toBeGreaterThan(0);
+    await user.click(within(conclusionDetail).getByRole("button", { name: "关闭" }));
+    const activityDetail = await openProcessDetailGroup(user, drawer, "活动");
+    expect(within(activityDetail).getAllByText("导演认为要优先可拍摄性。").length).toBeGreaterThan(0);
+    expect(within(activityDetail).getAllByText("文案建议强化开头钩子。").length).toBeGreaterThan(0);
+    expect(within(activityDetail).getAllByText("剪辑师建议三段式节奏。").length).toBeGreaterThan(0);
+    await user.click(within(activityDetail).getByRole("button", { name: "关闭" }));
+    const decisionDetail = await openProcessDetailGroup(user, drawer, "决策");
+    expect(within(decisionDetail).getAllByText("主 Agent 选择可拍摄性最高且风险最低的方案。").length).toBeGreaterThan(0);
+    await user.click(within(decisionDetail).getByRole("button", { name: "关闭" }));
+    const evidenceDetail = await openProcessDetailGroup(user, drawer, "证据");
+    expect(within(evidenceDetail).getAllByText("执行者").length).toBeGreaterThan(0);
+    expect(within(evidenceDetail).getByText("参与者")).not.toBeNull();
+    expect(within(evidenceDetail).getByText("导演、文案生成、剪辑师")).not.toBeNull();
     expect(within(drawer).queryByText("artifact.created")).toBeNull();
   });
 
@@ -5308,8 +5595,9 @@ describe("operational management pages", () => {
     expect(screen.getByText("2026-08-07T00:04:00Z")).not.toBeNull();
     await user.click(screen.getByRole("link", { name: /conv-architecture-1/ }));
 
-    expect(await screen.findByText(hermesInsight.summary)).not.toBeNull();
+    expect(await screen.findByText(hermesInsight.user_summary)).not.toBeNull();
     expect(screen.getByText(hermesInsight.lesson)).not.toBeNull();
+    expect(screen.getByText(hermesInsight.summary)).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /确认/ }));
 
     await waitFor(() => expect(screen.getByText("2026-08-07T00:05:00Z")).not.toBeNull());

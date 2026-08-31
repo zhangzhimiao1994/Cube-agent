@@ -62,6 +62,7 @@ from agent_hub.runtime.failure_reason import (
     runtime_failure_diagnostic_from_reason,
     safe_runtime_failure_reason,
 )
+from agent_hub.runtime.hermes_context import hermes_memory_context_text
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -77,6 +78,16 @@ _MAX_TOOL_CALLS_PER_RESPONSE = 16
 _MAX_TOOL_ARGUMENT_BYTES = 32_768
 _MAX_AUDITED_TOKENS = 100_000_000
 _MAX_AUDITED_COST_USD = Decimal(64000000)
+_STEP_TIMEOUT_RECOVERY_RETRIES = 1
+_STEP_TIMEOUT_RETRY_MIN_REMAINING_SECONDS = 1.0
+_STEP_TIMEOUT_RECOVERY_LAYERS = (
+    "input_compression",
+    "prompt_decomposition",
+    "model_fallback_marked",
+    "failure_closure",
+)
+_MODEL_FALLBACK_UNAVAILABLE = "not_available_in_crewai_bridge"
+_COMPACT_RETRY_SOURCE_PREVIEW_BYTES = 512
 _TASK_CANCELLATION_GRACE_SECONDS = 0.25
 _ARTIFACT_CLEANUP_DEADLINE_SECONDS = 5.0
 _ARTIFACT_CLEANUP_HARD_GRACE_SECONDS = 0.25
@@ -374,8 +385,12 @@ def _artifact_final_synthesis_payload(artifact: Artifact) -> dict[str, object]:
     return payload
 
 
-def _artifact_review_packet_payload(artifact: Artifact) -> dict[str, object]:
-    preview = _artifact_text_preview(artifact, max_bytes=1_200)
+def _artifact_review_packet_payload(
+    artifact: Artifact,
+    *,
+    max_preview_bytes: int = 1_200,
+) -> dict[str, object]:
+    preview = _artifact_text_preview(artifact, max_bytes=max_preview_bytes)
     packet: dict[str, object] = {
         "id": str(artifact.id),
         "version": artifact.version,
@@ -419,6 +434,30 @@ class RuntimeBusy(RuntimeExecutionError):
 
 def _fail(message: str) -> Never:
     raise RuntimeExecutionError(message) from None
+
+
+def _subagent_model_attempt(retries: int, recovery_attempt: int) -> int:
+    return retries * (_STEP_TIMEOUT_RECOVERY_RETRIES + 1) + recovery_attempt
+
+
+def _subagent_recovery_payload(
+    *,
+    status: str,
+    recovery_attempt: int | None = None,
+    recovery_attempts: int | None = None,
+    strategy: str = "compact_retry",
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "recovery_strategy": strategy,
+        "recovery_layers": _STEP_TIMEOUT_RECOVERY_LAYERS,
+        "recovery_status": status,
+        "model_fallback": _MODEL_FALLBACK_UNAVAILABLE,
+    }
+    if recovery_attempt is not None:
+        payload["recovery_attempt"] = recovery_attempt
+    if recovery_attempts is not None:
+        payload["recovery_attempts"] = recovery_attempts
+    return payload
 
 
 def _framework_failure_reason(prefix: str, error: Exception) -> str:
@@ -1686,6 +1725,7 @@ class CrewDispatchRuntime:
         step_deadline = asyncio.get_running_loop().time() + min(
             step.timeout_seconds, self._remaining_timeout(run_state)
         )
+        recovery_attempt = 0
         while True:
             attempt_sources = self._ordered_artifacts(
                 (*sources, *((feedback_artifact,) if feedback_artifact is not None else ()))
@@ -1718,6 +1758,7 @@ class CrewDispatchRuntime:
                     tool_ledger,
                     model_ledger,
                     retries,
+                    recovery_attempt,
                     run_state,
                     step_deadline,
                 )
@@ -1743,6 +1784,7 @@ class CrewDispatchRuntime:
                 if step.reviewer is not None:
                     reviewer = agents[step.reviewer]
                     review_failure_retry = 0
+                    review_recovery_attempt = 0
                     retry_requested = False
                     while True:
                         try:
@@ -1757,6 +1799,7 @@ class CrewDispatchRuntime:
                                 usage_boundary,
                                 model_ledger,
                                 retries,
+                                review_recovery_attempt,
                                 run_state,
                                 step_deadline,
                             )
@@ -1764,9 +1807,57 @@ class CrewDispatchRuntime:
                             review_failure = safe_runtime_failure_reason(
                                 error, fallback="reviewer model failed"
                             )
-                            review_diagnostic = runtime_failure_diagnostic_from_reason(
-                                review_failure
+                            review_diagnostic: dict[str, object] = dict(
+                                runtime_failure_diagnostic_from_reason(review_failure)
                             )
+                            if (
+                                review_diagnostic.get("error_code") == "crew.step_timeout"
+                                and review_recovery_attempt < _STEP_TIMEOUT_RECOVERY_RETRIES
+                                and self._remaining_timeout(run_state, step_deadline)
+                                > _STEP_TIMEOUT_RETRY_MIN_REMAINING_SECONDS
+                            ):
+                                review_recovery_attempt += 1
+                                await event(
+                                    kind=EventKind.STEP_RETRYING,
+                                    step_id=step.id,
+                                    actor=step.reviewer,
+                                    reason=review_failure,
+                                    payload={
+                                        "attempt": review_failure_retry
+                                        + review_recovery_attempt
+                                        + 1,
+                                        "review_status": "retrying",
+                                        "role": reviewer.role,
+                                        "logical_model": reviewer.logical_model,
+                                        "candidate_artifact_id": str(artifact.id),
+                                        **_subagent_recovery_payload(
+                                            status="retrying_after_timeout",
+                                            recovery_attempt=review_recovery_attempt,
+                                        ),
+                                        **review_diagnostic,
+                                    },
+                                )
+                                continue
+                            if (
+                                review_diagnostic.get("error_code") == "crew.step_timeout"
+                                and review_recovery_attempt >= _STEP_TIMEOUT_RECOVERY_RETRIES
+                            ):
+                                review_diagnostic = {
+                                    **review_diagnostic,
+                                    **_subagent_recovery_payload(
+                                        status="failed_after_compact_retry",
+                                        recovery_attempts=review_recovery_attempt,
+                                    ),
+                                }
+                            else:
+                                review_diagnostic = {
+                                    **review_diagnostic,
+                                    **_subagent_recovery_payload(
+                                        status="failed_without_compact_retry",
+                                        recovery_attempts=review_recovery_attempt,
+                                        strategy="failure_closure",
+                                    ),
+                                }
                             if review_failure_retry < step.reviewer_retries:
                                 review_failure_retry += 1
                                 await event(
@@ -1775,7 +1866,9 @@ class CrewDispatchRuntime:
                                     actor=step.reviewer,
                                     reason=review_failure,
                                     payload={
-                                        "attempt": review_failure_retry + 1,
+                                        "attempt": review_failure_retry
+                                        + review_recovery_attempt
+                                        + 1,
                                         "review_status": "retrying",
                                         "role": reviewer.role,
                                         "logical_model": reviewer.logical_model,
@@ -1885,12 +1978,59 @@ class CrewDispatchRuntime:
                 raise
             except RuntimeExecutionError as error:
                 failure_reason = safe_runtime_failure_reason(error, fallback="step execution failed")
+                diagnostic: dict[str, object] = dict(
+                    runtime_failure_diagnostic_from_reason(failure_reason)
+                )
+                if (
+                    diagnostic.get("error_code") == "crew.step_timeout"
+                    and recovery_attempt < _STEP_TIMEOUT_RECOVERY_RETRIES
+                    and self._remaining_timeout(run_state, step_deadline)
+                    > _STEP_TIMEOUT_RETRY_MIN_REMAINING_SECONDS
+                ):
+                    recovery_attempt += 1
+                    await event(
+                        kind=EventKind.STEP_RETRYING,
+                        step_id=step.id,
+                        actor=step.agent,
+                        reason=failure_reason,
+                        payload={
+                            "attempt": retries + recovery_attempt + 1,
+                            "role": agent.role,
+                            "logical_model": agent.logical_model,
+                            **_subagent_recovery_payload(
+                                status="retrying_after_timeout",
+                                recovery_attempt=recovery_attempt,
+                            ),
+                            **diagnostic,
+                        },
+                    )
+                    continue
+                if (
+                    diagnostic.get("error_code") == "crew.step_timeout"
+                    and recovery_attempt >= _STEP_TIMEOUT_RECOVERY_RETRIES
+                ):
+                    diagnostic = {
+                        **diagnostic,
+                        **_subagent_recovery_payload(
+                            status="failed_after_compact_retry",
+                            recovery_attempts=recovery_attempt,
+                        ),
+                    }
+                else:
+                    diagnostic = {
+                        **diagnostic,
+                        **_subagent_recovery_payload(
+                            status="failed_without_compact_retry",
+                            recovery_attempts=recovery_attempt,
+                            strategy="failure_closure",
+                        ),
+                    }
                 await event(
                     kind=EventKind.STEP_FAILED,
                     step_id=step.id,
                     actor=step.agent,
                     reason=failure_reason,
-                    payload=runtime_failure_diagnostic_from_reason(failure_reason),
+                    payload=diagnostic,
                 )
                 raise
             except Exception as error:  # noqa: BLE001
@@ -1902,7 +2042,14 @@ class CrewDispatchRuntime:
                     step_id=step.id,
                     actor=step.agent,
                     reason=failure_reason,
-                    payload=runtime_failure_diagnostic_from_reason(failure_reason),
+                    payload={
+                        **runtime_failure_diagnostic_from_reason(failure_reason),
+                        **_subagent_recovery_payload(
+                            status="failed_without_compact_retry",
+                            recovery_attempts=recovery_attempt,
+                            strategy="failure_closure",
+                        ),
+                    },
                 )
                 _fail(failure_reason)
 
@@ -1921,23 +2068,42 @@ class CrewDispatchRuntime:
         tool_ledger: _ToolLedger,
         model_ledger: _ModelLedger,
         retries: int,
+        recovery_attempt: int,
         run_state: _RunState,
         step_deadline: float,
     ) -> tuple[GatewayCompletion, tuple[Artifact, ...]]:
         use_review_packets = step.final_synthesizer or bool(step.depends_on)
         source_payload = [
             (
-                _artifact_review_packet_payload(artifact)
-                if use_review_packets
+                _artifact_review_packet_payload(
+                    artifact,
+                    max_preview_bytes=_COMPACT_RETRY_SOURCE_PREVIEW_BYTES,
+                )
+                if recovery_attempt > 0 or use_review_packets
                 else _artifact_prompt_payload(artifact)
             )
             for artifact in sources
         ]
-        user = {
+        user: dict[str, object] = {
             "request": context.request,
             "task": step.task,
             "untrusted_source_artifacts": source_payload,
         }
+        hermes_context = hermes_memory_context_text(context.routing_decision)
+        if hermes_context:
+            user["hermes_memory_context"] = hermes_context
+        if recovery_attempt > 0:
+            user["recovery"] = {
+                "strategy": "compact_retry",
+                "attempt": recovery_attempt,
+                "layers": _STEP_TIMEOUT_RECOVERY_LAYERS,
+                "instruction": (
+                    "Keep the retry concise. Split the task into the smallest complete answer, "
+                    "preserve required deliverables, avoid verbose reasoning, and explicitly name "
+                    "any blocker with evidence."
+                ),
+                "model_fallback": _MODEL_FALLBACK_UNAVAILABLE,
+            }
         if feedback is not None:
             user["untrusted_reviewer_feedback"] = feedback
         user_text = json.dumps(user, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -1970,6 +2136,7 @@ class CrewDispatchRuntime:
                     evidence,
                     sources,
                     retries,
+                    _subagent_model_attempt(retries, recovery_attempt),
                     run_state,
                     step_deadline,
                 )
@@ -1984,6 +2151,7 @@ class CrewDispatchRuntime:
                     step.id,
                     user_text,
                     StepBridge(),
+                    agent_id=agent.id,
                     storage_scope=(context.tenant_id, context.run_id),
                 )
         except asyncio.CancelledError:
@@ -2055,6 +2223,7 @@ class CrewDispatchRuntime:
         evidence: list[Artifact],
         input_sources: tuple[Artifact, ...],
         retries: int,
+        model_attempt: int,
         run_state: _RunState,
         step_deadline: float,
     ) -> GatewayCompletion:
@@ -2093,7 +2262,7 @@ class CrewDispatchRuntime:
             key = self._model_call_key(
                 context.run_id,
                 step.id,
-                retries,
+                model_attempt,
                 "step",
                 agent.id,
                 call_index,
@@ -2122,7 +2291,7 @@ class CrewDispatchRuntime:
                 prepared: Mapping[str, JsonValue] = {
                     "status": "prepared",
                     "step_id": step.id,
-                    "attempt": retries,
+                    "attempt": model_attempt,
                     "purpose": "step",
                     "actor": agent.id,
                     "call_index": call_index,
@@ -2212,7 +2381,7 @@ class CrewDispatchRuntime:
                 idempotency_key = self._tool_call_key(
                     context.run_id,
                     step.id,
-                    retries,
+                    model_attempt,
                     _round,
                     tool_index,
                     tool_call.name,
@@ -2262,7 +2431,7 @@ class CrewDispatchRuntime:
                 tool_prepared: Mapping[str, JsonValue] = {
                     "status": "prepared",
                     "step_id": step.id,
-                    "attempt": retries,
+                    "attempt": model_attempt,
                     "round": _round,
                     "tool_index": tool_index,
                     "name": tool_call.name,
@@ -2686,11 +2855,30 @@ class CrewDispatchRuntime:
         usage_boundary: UsageBoundary,
         model_ledger: _ModelLedger,
         retries: int,
+        recovery_attempt: int,
         run_state: _RunState,
         step_deadline: float,
     ) -> tuple[str, str | None, tuple[Artifact, ...]]:
+        review_payload = _artifact_review_packet_payload(
+            artifact,
+            max_preview_bytes=(
+                _COMPACT_RETRY_SOURCE_PREVIEW_BYTES if recovery_attempt > 0 else 1_200
+            ),
+        )
+        if recovery_attempt > 0:
+            review_payload["recovery"] = {
+                "strategy": "compact_retry",
+                "attempt": recovery_attempt,
+                "layers": _STEP_TIMEOUT_RECOVERY_LAYERS,
+                "instruction": (
+                    "Keep the retry concise. Split the review into the smallest complete "
+                    "verdict, avoid verbose reasoning, and explicitly name any blocker with "
+                    "evidence in feedback."
+                ),
+                "model_fallback": _MODEL_FALLBACK_UNAVAILABLE,
+            }
         payload = json.dumps(
-            _artifact_review_packet_payload(artifact),
+            review_payload,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -2729,10 +2917,11 @@ class CrewDispatchRuntime:
                 call_index = call_cursor.value
                 call_cursor.value += 1
                 request_sha256 = runtime._model_request_sha256(request)
+                review_model_attempt = _subagent_model_attempt(retries, recovery_attempt)
                 key = runtime._model_call_key(
                     context.run_id,
                     step.id,
-                    retries,
+                    review_model_attempt,
                     "review",
                     reviewer.id,
                     call_index,
@@ -2757,7 +2946,7 @@ class CrewDispatchRuntime:
                         prepared = {
                             "status": "prepared",
                             "step_id": step.id,
-                            "attempt": retries,
+                            "attempt": review_model_attempt,
                             "purpose": "review",
                             "actor": reviewer.id,
                             "call_index": call_index,
@@ -3441,7 +3630,13 @@ class CrewDispatchRuntime:
                 or type(tool_step_id) is not str
                 or tool_step_id not in steps
                 or type(attempt) is not int
-                or not 0 <= attempt <= steps[tool_step_id].reviewer_retries
+                or not 0
+                <= attempt
+                <= (
+                    steps[tool_step_id].reviewer_retries
+                    * (_STEP_TIMEOUT_RECOVERY_RETRIES + 1)
+                    + _STEP_TIMEOUT_RECOVERY_RETRIES
+                )
                 or type(round_index) is not int
                 or not 0 <= round_index <= _MAX_TOOL_ROUNDS
                 or type(tool_index) is not int
@@ -3519,7 +3714,12 @@ class CrewDispatchRuntime:
                 or type(model_step_id) is not str
                 or model_step_id not in steps
                 or type(attempt) is not int
-                or not 0 <= attempt <= steps[model_step_id].reviewer_retries
+                or not 0
+                <= attempt
+                <= _subagent_model_attempt(
+                    steps[model_step_id].reviewer_retries,
+                    _STEP_TIMEOUT_RECOVERY_RETRIES,
+                )
                 or purpose not in {"step", "review"}
                 or type(actor) is not str
                 or type(call_index) is not int

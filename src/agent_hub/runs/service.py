@@ -264,12 +264,32 @@ class TemporaryAgentPolicyProtocol(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class HermesMemoryInjection:
+    id: str
+    summary: str
+    memory_type: str
+    target: str
+    score: float
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class HermesSkippedMemory:
+    id: str
+    summary: str
+    reason: str
+    score: float
+
+
+@dataclass(frozen=True, slots=True)
 class HermesRunAdvice:
     recommended_mode: TaskMode
     confidence: float
     reasons: tuple[str, ...]
     recommended_skills: tuple[str, ...] = ()
     requires_approval: bool = True
+    injected_memories: tuple[HermesMemoryInjection, ...] = ()
+    skipped_memories: tuple[HermesSkippedMemory, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1531,14 +1551,18 @@ class RunService:
         if self._hermes_advisor is None:
             return None
         try:
-            return await self._hermes_advisor.advise(
-                tenant_id=tenant_id,
-                actor_id=actor_id,
-                message=message,
-                mode=mode,
-                agent_ids=agent_ids,
-                workflow_id=workflow_id,
-            )
+            async with asyncio.timeout(0.8):
+                return await self._hermes_advisor.advise(
+                    tenant_id=tenant_id,
+                    actor_id=actor_id,
+                    message=message,
+                    mode=mode,
+                    agent_ids=agent_ids,
+                    workflow_id=workflow_id,
+                )
+        except TimeoutError:
+            _LOGGER.warning("hermes_advice_timeout tenant_id=%s", tenant_id)
+            return None
         except Exception:
             _LOGGER.exception("hermes_advice_failed tenant_id=%s", tenant_id)
             return None
@@ -2739,6 +2763,26 @@ def _hermes_advice_payload(advice: HermesRunAdvice) -> dict[str, object]:
         "reasons": list(advice.reasons),
         "recommended_skills": list(advice.recommended_skills),
         "requires_approval": advice.requires_approval,
+        "injected_memories": [
+            {
+                "id": item.id,
+                "summary": item.summary,
+                "memory_type": item.memory_type,
+                "target": item.target,
+                "score": item.score,
+                "reason": item.reason,
+            }
+            for item in advice.injected_memories[:3]
+        ],
+        "skipped_memories": [
+            {
+                "id": item.id,
+                "summary": item.summary,
+                "reason": item.reason,
+                "score": item.score,
+            }
+            for item in advice.skipped_memories[:5]
+        ],
     }
 
 
@@ -2857,8 +2901,10 @@ def _event_at_sequence(event: RunEvent, *, run_id: UUID, sequence: int) -> RunEv
 
 __all__ = [
     "HermesAdvisorProtocol",
+    "HermesMemoryInjection",
     "HermesRunAdvice",
     "HermesRunOutcome",
+    "HermesSkippedMemory",
     "RunService",
     "RunSummary",
     "SubmittedRun",
