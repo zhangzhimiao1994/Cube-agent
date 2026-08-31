@@ -438,6 +438,8 @@ def _fail(message: str) -> Never:
 
 
 def _subagent_model_attempt(retries: int, recovery_attempt: int) -> int:
+    if recovery_attempt == 0:
+        return retries
     return retries * (_STEP_TIMEOUT_RECOVERY_RETRIES + 1) + recovery_attempt
 
 
