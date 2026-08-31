@@ -94,6 +94,34 @@ _DISPATCH_OUTPUT_SCHEMA: Mapping[str, str] = {
     "artifacts": "string[]",
     "verification": "string[]",
 }
+_SOFTWARE_TASK_KEYWORDS = (
+    "code",
+    "代码",
+    "源码",
+    "项目源码",
+    "python",
+    "javascript",
+    "typescript",
+    "node",
+    "react",
+    "vue",
+    "main.py",
+    ".py",
+    ".js",
+    ".ts",
+    "zip",
+    "压缩包",
+    "可下载",
+    "download",
+    "网页",
+    "web",
+    "前端",
+    "后端",
+    "api",
+    "github",
+    "test",
+    "测试",
+)
 _DISCUSSION_OUTPUT_SCHEMA: Mapping[str, str] = {
     "position": "approve | reject | needs_user",
     "recommended_option": "string | null",
@@ -1202,7 +1230,7 @@ def _rank_logical_models_for_role(
             score -= 1000
         characteristics = _model_characteristics(logical_model, definition)
         score += _task_characteristic_score(text, characteristics)
-        if any(keyword in text for keyword in ("code", "代码", "网页", "web", "前端", "后端", "api", "github", "测试", "部署")):
+        if any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS):
             if any(keyword in haystack for keyword in ("coder", "code", "qwen", "program")):
                 score += 30
             if "tool_calling" in haystack:
@@ -1262,7 +1290,7 @@ def _task_characteristics(text: str) -> frozenset[str]:
         characteristics.add("audio")
     if any(keyword in text for keyword in ("图片", "识图", "视觉", "图像", "截图", "image", "vision")):
         characteristics.add("vision")
-    if any(keyword in text for keyword in ("code", "代码", "网页", "web", "前端", "后端", "api", "github", "测试", "部署")):
+    if any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS):
         characteristics.add("code")
     if any(keyword in text for keyword in ("质量", "审查", "复核", "验收", "评审", "review", "audit")):
         characteristics.add("review")
@@ -1408,7 +1436,7 @@ def _task_profile(task: object) -> TaskProfile:
     text = str(task).lower()
     if any(keyword in text for keyword in ("deploy", "部署", "install", "安装", "server")):
         return TaskProfile.DEPLOYMENT
-    if any(keyword in text for keyword in ("code", "代码", "bug", "api", "github", "test")):
+    if any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS):
         return TaskProfile.SOFTWARE
     if any(keyword in text for keyword in ("research", "调研", "分析", "报告", "市场")):
         return TaskProfile.RESEARCH
@@ -1422,7 +1450,7 @@ def _task_profiles(task: object) -> tuple[TaskProfile, ...]:
     profiles: list[TaskProfile] = []
     if any(keyword in text for keyword in ("deploy", "部署", "install", "安装", "server")):
         profiles.append(TaskProfile.DEPLOYMENT)
-    if any(keyword in text for keyword in ("code", "代码", "bug", "api", "github", "test", "网页", "web")):
+    if any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS):
         profiles.append(TaskProfile.SOFTWARE)
     if any(
         keyword in text

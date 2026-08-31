@@ -38,8 +38,18 @@ from agent_hub.runtime.defaults import (
     configured_runtime_registry,
 )
 from agent_hub.runtime.role_planner import RoleAssignment, RolePurpose
+from agent_hub.runtime.role_planner import TaskProfile
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
+
+
+def test_python_project_zip_request_is_profiled_as_software() -> None:
+    profiles = defaults_module._task_profiles(
+        "生成一个最简单的 hello world Python 项目。必须产出可下载 zip，"
+        "zip 内至少包含 main.py，main.py 运行后输出 hello world。"
+    )
+
+    assert TaskProfile.SOFTWARE in profiles
 
 
 class FakeConfigService:
