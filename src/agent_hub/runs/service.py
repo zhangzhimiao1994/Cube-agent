@@ -1276,14 +1276,18 @@ class RunService:
         if self._hermes_advisor is None:
             return None
         try:
-            return await self._hermes_advisor.advise(
-                tenant_id=tenant_id,
-                actor_id=actor_id,
-                message=message,
-                mode=mode,
-                agent_ids=agent_ids,
-                workflow_id=workflow_id,
-            )
+            async with asyncio.timeout(0.8):
+                return await self._hermes_advisor.advise(
+                    tenant_id=tenant_id,
+                    actor_id=actor_id,
+                    message=message,
+                    mode=mode,
+                    agent_ids=agent_ids,
+                    workflow_id=workflow_id,
+                )
+        except TimeoutError:
+            _LOGGER.warning("hermes_advice_timeout tenant_id=%s", tenant_id)
+            return None
         except Exception:
             _LOGGER.exception("hermes_advice_failed tenant_id=%s", tenant_id)
             return None

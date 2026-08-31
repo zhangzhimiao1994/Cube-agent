@@ -315,6 +315,7 @@ class HybridRuntime:
             artifacts=artifacts,
             timeout_seconds=parent.timeout_seconds,
             token_budget=parent.token_budget,
+            routing_decision=parent.routing_decision,
         )
         self._active_child = child
         terminal_seen = False

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -144,6 +146,12 @@ class RecordingHermesAdvisor:
 
     async def record_outcome(self, outcome: HermesRunOutcome) -> None:
         del outcome
+
+
+class SlowHermesAdvisor(RecordingHermesAdvisor):
+    async def advise(self, **kwargs: object) -> HermesRunAdvice | None:
+        await asyncio.sleep(2)
+        return None
 
 
 async def test_auto_submission_reuses_previous_mode_for_same_conversation_without_reasking() -> None:
@@ -453,6 +461,32 @@ async def test_auto_submission_records_hermes_injected_memory_payload() -> None:
         }
     ]
     assert hermes["skipped_memories"][0]["reason"] == "当前任务相关性不足"
+
+
+async def test_hermes_advice_timeout_does_not_block_auto_submission() -> None:
+    repository = ConversationModeRepository(None)
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=RecordingQueue(),
+        hermes_advisor=SlowHermesAdvisor(None),
+    )
+
+    started = time.monotonic()
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="hello",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-1",
+        idempotency_key="idem-hermes-timeout",
+    )
+    elapsed = time.monotonic() - started
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DIRECT
+    assert elapsed < 1.5
 
 
 async def test_declined_evolution_proposal_can_continue_through_auto_mode() -> None:

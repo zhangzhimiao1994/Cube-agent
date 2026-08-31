@@ -224,6 +224,30 @@ async def test_hybrid_runtime_preserves_child_process_events() -> None:
 
 
 @pytest.mark.asyncio
+async def test_hybrid_child_context_preserves_routing_decision() -> None:
+    dispatch_output = artifact("planner", "dispatch result")
+    discussion_output = artifact("critic", "review")
+    final_output = artifact("main", "answer")
+    dispatch = RecordingArtifactRuntime(TaskMode.DISPATCH, dispatch_output)
+    discussion = RecordingArtifactRuntime(TaskMode.DISCUSS, discussion_output)
+    synthesis = RecordingArtifactRuntime(TaskMode.DIRECT, final_output)
+    runtime = HybridRuntime(dispatch, discussion, synthesis)
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.HYBRID,
+        request="审查脚本",
+        routing_decision={"hermes": {"injected_memories": [{"summary": "保留记忆"}]}},
+    )
+
+    _ = [event async for event in runtime.run(context)]
+
+    assert dispatch.contexts[0].routing_decision["hermes"]["injected_memories"][0]["summary"] == "保留记忆"
+    assert discussion.contexts[0].routing_decision["hermes"]["injected_memories"][0]["summary"] == "保留记忆"
+    assert synthesis.contexts[0].routing_decision["hermes"]["injected_memories"][0]["summary"] == "保留记忆"
+
+
+@pytest.mark.asyncio
 async def test_hybrid_runtime_preserves_dispatch_child_failure_reason() -> None:
     run_id = uuid4()
     runtime = HybridRuntime(
