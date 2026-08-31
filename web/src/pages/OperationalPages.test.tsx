@@ -3768,7 +3768,7 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("table", { name: /Hermes/ })).not.toBeNull();
     expect(screen.queryByText("请求 Hermes 推荐")).toBeNull();
     expect(screen.queryByText("推荐结果")).toBeNull();
-    expect(screen.getByRole("columnheader", { name: /一句话总结/ })).not.toBeNull();
+    expect(screen.getByRole("columnheader", { name: /中文学习摘要/ })).not.toBeNull();
     expect(screen.getByText(hermesInsight.user_summary)).not.toBeNull();
     expect(screen.getByText("conv-architecture-1")).not.toBeNull();
     expect(screen.getByText("2026-08-07T00:04:00Z")).not.toBeNull();

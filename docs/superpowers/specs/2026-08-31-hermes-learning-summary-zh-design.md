@@ -17,13 +17,13 @@ Hermes+ 已经能把运行结果、对话经验和调度观察写入 Hermes lear
 
 ## 推荐方案
 
-新增 `learning_summary_zh` 字段。
+复用现有 `user_summary` 字段，并把前端展示统一为用户能理解的“中文学习摘要”。
 
-- 后端 Hermes learning 响应模型增加 `learning_summary_zh: str`。
-- Hermes 自动记录运行结果时同步写入中文摘要。
-- 手动记录 Hermes 经验时也生成中文摘要。
-- 旧数据没有该字段时，在读取 payload 时根据 `category/outcome/lesson/tags/weight` 生成 fallback。
-- 前端 Hermes 学习台账增加“学习摘要”列，显示 `learning_summary_zh`。
+- 后端 Hermes learning 响应模型已经包含 `user_summary: str`。
+- Hermes 自动记录运行结果时已经同步写入中文摘要。
+- 手动记录 Hermes 经验时已经生成中文摘要。
+- 旧数据没有该字段时，读取 payload 时根据 `category/outcome/lesson` 生成 fallback。
+- 前端 Hermes 学习台账将现有“一句话总结”列更名为“中文学习摘要”，显示 `user_summary`。
 - 详情页保留原始 summary、lesson、tags、weight，避免丢失机器可用信息。
 
 ## 中文摘要规则
@@ -47,18 +47,18 @@ Hermes+ 已经能把运行结果、对话经验和调度观察写入 Hermes lear
 ## 数据流
 
 1. Hermes+ 产生学习记录。
-2. 后端生成并存储 `learning_summary_zh`。
+2. 后端生成并存储 `user_summary`。
 3. 管理 API 返回 Hermes learning 列表和详情。
 4. 前端列表展示中文摘要栏。
 5. 用户可在详情页查看完整 lesson 和系统 summary。
 
 ## 兼容性
 
-旧 Hermes payload 不包含 `learning_summary_zh` 时，后端读取层必须补齐中文摘要，避免前端解析失败或显示空值。
+旧 Hermes payload 不包含 `user_summary` 时，后端读取层必须补齐中文摘要，避免前端解析失败或显示空值。
 
 ## 测试计划
 
-- 后端单元/集成测试：自动记录 Hermes outcome 时 payload 包含 `learning_summary_zh`。
+- 后端单元/集成测试：自动记录 Hermes outcome 时 payload 包含 `user_summary`。
 - 后端 API 兼容测试：旧 payload 被读取时会生成中文摘要。
 - 前端测试：Hermes 页面显示“学习摘要”列和中文摘要内容。
 

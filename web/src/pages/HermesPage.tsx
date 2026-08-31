@@ -332,7 +332,7 @@ function HermesLearningTable() {
                       <th><SortHeader column="category" label="分类" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>分类</SortHeader></th>
                       <th><SortHeader column="created" label="时间" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>时间</SortHeader></th>
                       <th><SortHeader column="conversation" label="对话 ID" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>对话 ID</SortHeader></th>
-                      <th><SortHeader column="user_summary" label="一句话总结" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>一句话总结</SortHeader></th>
+                      <th><SortHeader column="user_summary" label="中文学习摘要" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>中文学习摘要</SortHeader></th>
                       <th><SortHeader column="outcome" label="结果" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>结果</SortHeader></th>
                       <th><SortHeader column="status" label="确认状态" sort={sort} onSort={(column) => setSort((current) => nextSortState(current, column))}>确认状态</SortHeader></th>
                       <th>操作</th>
@@ -348,7 +348,7 @@ function HermesLearningTable() {
                       </th>
                       <th><input aria-label="按 Hermes 时间筛选" value={columnFilters.created} onChange={(event) => updateColumnFilter("created", event.currentTarget.value)} placeholder="时间" /></th>
                       <th><input aria-label="按 Hermes 对话 ID 筛选" value={columnFilters.conversation} onChange={(event) => updateColumnFilter("conversation", event.currentTarget.value)} placeholder="对话 ID" /></th>
-                      <th><input aria-label="按 Hermes 一句话总结筛选" value={columnFilters.user_summary} onChange={(event) => updateColumnFilter("user_summary", event.currentTarget.value)} placeholder="总结关键词" /></th>
+                      <th><input aria-label="按 Hermes 中文学习摘要筛选" value={columnFilters.user_summary} onChange={(event) => updateColumnFilter("user_summary", event.currentTarget.value)} placeholder="摘要关键词" /></th>
                       <th>
                         <select aria-label="按 Hermes 结果筛选" value={columnFilters.outcome} onChange={(event) => updateColumnFilter("outcome", event.currentTarget.value)}>
                           <option value="all">全部</option>
