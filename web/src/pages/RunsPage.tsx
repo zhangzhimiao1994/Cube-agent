@@ -1397,10 +1397,12 @@ function repairProposalBody(proposal: RepairProposal) {
     proposal.summary,
     `失败类型：${proposal.failure_kind}`,
     `修复动作：${proposal.repair_action}`,
+    `修复次数：第 ${proposal.attempt}/${proposal.max_attempts} 次`,
+    proposal.instruction ? `受控指令：${proposal.instruction}` : "",
     proposal.automatic_execution
       ? "该修复提案标记为自动执行。"
       : "不会自动执行；只有确认后才会重新排队一次。",
-  ].join("\n\n");
+  ].filter(Boolean).join("\n\n");
 }
 
 function openClawProposalBody(proposal: OpenClawProposal) {

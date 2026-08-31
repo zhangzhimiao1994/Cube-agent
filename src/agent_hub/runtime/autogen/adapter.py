@@ -84,6 +84,7 @@ from agent_hub.runtime.failure_reason import (
     safe_runtime_failure_reason,
 )
 from agent_hub.runtime.hermes_context import hermes_memory_context_text
+from agent_hub.runtime.self_repair_context import self_repair_context_text
 
 _ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _RUNTIME_TYPE = "autogen"
@@ -1716,6 +1717,7 @@ class AutoGenDiscussionRuntime:
             for item in context.artifacts
         )
         hermes_context = hermes_memory_context_text(context.routing_decision)
+        repair_context = self_repair_context_text(context.routing_decision)
         task = (
             context.request
             if not artifacts
@@ -1723,6 +1725,8 @@ class AutoGenDiscussionRuntime:
         )
         if hermes_context:
             task = f"{task}\n\n{hermes_context}"
+        if repair_context:
+            task = f"{task}\n\n{repair_context}"
         prior = "\n".join(
             f"{item.producer}: {cast(str, item.content['text'])}" for item in transcript
         )

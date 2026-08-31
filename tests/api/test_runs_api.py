@@ -1011,6 +1011,9 @@ def test_submitted_run_response_includes_safe_self_repair_proposal() -> None:
                 "failure_kind": "runtime_failure",
                 "source_run_id": str(run_id),
                 "source_event_sequence": 2,
+                "attempt": 1,
+                "max_attempts": 1,
+                "instruction": "只执行一次受控修复。",
                 "requires_approval": True,
                 "replay_safe": False,
                 "automatic_execution": False,
@@ -1023,6 +1026,9 @@ def test_submitted_run_response_includes_safe_self_repair_proposal() -> None:
 
     payload = response.model_dump(mode="json")
     assert payload["repair_proposal"]["fingerprint"] == "a" * 64
+    assert payload["repair_proposal"]["attempt"] == 1
+    assert payload["repair_proposal"]["max_attempts"] == 1
+    assert payload["repair_proposal"]["instruction"] == "只执行一次受控修复。"
     assert "command" not in payload["repair_proposal"]
     assert "stdout" not in payload["repair_proposal"]
     assert "private-token" not in json.dumps(payload, ensure_ascii=False)

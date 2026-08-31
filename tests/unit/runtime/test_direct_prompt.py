@@ -1,8 +1,7 @@
+from typing import cast
 from uuid import uuid4
 
 from agent_hub.domain.runs import TaskMode
-from typing import cast
-
 from agent_hub.runtime.contracts import Artifact, JsonValue, TaskContext
 from agent_hub.runtime.direct import DirectRuntime
 
@@ -72,3 +71,41 @@ def test_direct_prompt_includes_bounded_hermes_memory_context() -> None:
     assert "HERMES_MEMORY_CONTEXT" in serialized
     assert "reviewer 超时时先压缩上下文再分块审查" in serialized
     assert "Current user instructions override them" in serialized
+
+
+def test_direct_prompt_includes_bounded_self_repair_context() -> None:
+    routing_decision: dict[str, JsonValue] = {
+        "source": "self_repair",
+        "self_repair_context": {
+            "schema_version": 1,
+            "source": "self_repair",
+            "source_run_id": "run_1",
+            "source_event_sequence": 2,
+            "failure_kind": "runtime_failure",
+            "repair_action": "draft_repair_proposal",
+            "attempt": 1,
+            "max_attempts": 1,
+            "instruction": "只执行一次受控修复。",
+            "automatic_execution": False,
+            "requires_approval": True,
+        },
+    }
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        mode=TaskMode.DIRECT,
+        request="修复失败运行",
+        artifacts=(),
+        timeout_seconds=60,
+        token_budget=10_000,
+        routing_decision=routing_decision,
+    )
+    runtime = DirectRuntime(UnusedGateway(), logical_model="main")  # type: ignore[arg-type]
+
+    prompt = runtime._build_prompt(context)
+
+    assert prompt.messages is not None
+    serialized = "\n".join(cast(str, message.content) for message in prompt.messages)
+    assert "SELF_REPAIR_CONTEXT" in serialized
+    assert "只执行一次受控修复" in serialized
+    assert "do not bypass approvals" in serialized

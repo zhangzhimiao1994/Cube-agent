@@ -524,6 +524,9 @@ describe("operational management pages", () => {
                 failure_kind: "runtime_failure",
                 source_run_id: runId,
                 source_event_sequence: 2,
+                attempt: 1,
+                max_attempts: 1,
+                instruction: "只执行一次受控修复。",
                 requires_approval: true,
                 replay_safe: false,
                 automatic_execution: false,
@@ -706,6 +709,9 @@ describe("operational management pages", () => {
               failure_kind: "runtime_failure",
               source_run_id: runId,
               source_event_sequence: 2,
+              attempt: 1,
+              max_attempts: 1,
+              instruction: "只执行一次受控修复。",
               requires_approval: true,
               replay_safe: false,
               automatic_execution: false,
@@ -2293,6 +2299,8 @@ describe("operational management pages", () => {
     const card = await screen.findByRole("status", { name: "自修复确认" });
     expect(within(card).getByText("受控自修复建议")).not.toBeNull();
     expect(within(card).getByText(/runtime_failure/)).not.toBeNull();
+    expect(within(card).getByText(/第 1\/1 次/)).not.toBeNull();
+    expect(within(card).getByText(/只执行一次受控修复/)).not.toBeNull();
     expect(within(card).getByText(/不会自动执行/)).not.toBeNull();
   });
   it("accepts a self-repair proposal with the run decision token", async () => {

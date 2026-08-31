@@ -41,11 +41,14 @@ _CAPACITY_MARKERS = frozenset(
 class SelfRepairPolicy:
     enabled: bool = True
     requires_approval: bool = True
+    max_attempts: int = 1
 
     def __post_init__(self) -> None:
         for name in ("enabled", "requires_approval"):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"{name} must be a boolean")
+        if type(self.max_attempts) is not int or not 1 <= self.max_attempts <= 3:
+            raise ValueError("max_attempts must be between 1 and 3")
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +65,8 @@ class SelfRepairDecision:
     failure_category: str
     requires_approval: bool
     automatic_execution: bool
+    attempt: int
+    max_attempts: int
     skip_reason: str | None = None
 
     def with_source_sequence(self, source_sequence: int) -> SelfRepairDecision:
@@ -78,6 +83,8 @@ class SelfRepairDecision:
             failure_category=self.failure_category,
             requires_approval=self.requires_approval,
             automatic_execution=self.automatic_execution,
+            attempt=self.attempt,
+            max_attempts=self.max_attempts,
             skip_reason=self.skip_reason,
         )
 
@@ -94,6 +101,8 @@ class SelfRepairDecision:
             "failure_category": self.failure_category,
             "requires_approval": self.requires_approval,
             "automatic_execution": self.automatic_execution,
+            "attempt": self.attempt,
+            "max_attempts": self.max_attempts,
         }
         if self.mode is not None:
             payload["mode"] = self.mode.value
@@ -112,6 +121,9 @@ class SelfRepairDecision:
             "failure_kind": self.failure_category,
             "source_run_id": str(run_id),
             "source_event_sequence": self.source_sequence,
+            "attempt": self.attempt,
+            "max_attempts": self.max_attempts,
+            "instruction": _repair_instruction(self.failure_category),
             "requires_approval": self.requires_approval,
             "replay_safe": False,
             "automatic_execution": False,
@@ -149,6 +161,8 @@ def classify_terminal_run(
             fingerprint=fingerprint,
             failure_category=failure_category,
             requires_approval=policy.requires_approval,
+            attempt=1,
+            max_attempts=policy.max_attempts,
             skip_reason="recursive_self_repair",
         )
     if failure_category == "outcome_uncertain":
@@ -160,6 +174,8 @@ def classify_terminal_run(
             fingerprint=fingerprint,
             failure_category=failure_category,
             requires_approval=policy.requires_approval,
+            attempt=1,
+            max_attempts=policy.max_attempts,
             skip_reason="side_effect_outcome_uncertain",
             severity="warning",
         )
@@ -176,6 +192,8 @@ def classify_terminal_run(
         failure_category=failure_category,
         requires_approval=policy.requires_approval,
         automatic_execution=False,
+        attempt=1,
+        max_attempts=policy.max_attempts,
     )
 
 
@@ -188,6 +206,8 @@ def _skipped_decision(
     fingerprint: str,
     failure_category: str,
     requires_approval: bool,
+    attempt: int,
+    max_attempts: int,
     skip_reason: str,
     severity: str = "info",
 ) -> SelfRepairDecision:
@@ -204,8 +224,78 @@ def _skipped_decision(
         failure_category=failure_category,
         requires_approval=requires_approval,
         automatic_execution=False,
+        attempt=attempt,
+        max_attempts=max_attempts,
         skip_reason=skip_reason,
     )
+
+
+def repair_context_from_proposal(proposal: Mapping[str, object]) -> dict[str, object]:
+    """Build a bounded repair context from an approved safe proposal."""
+
+    failure_kind = _safe_text(proposal.get("failure_kind"), default="runtime_failure")
+    attempt = _safe_int(proposal.get("attempt"), default=1, minimum=1, maximum=3)
+    max_attempts = _safe_int(
+        proposal.get("max_attempts"),
+        default=1,
+        minimum=attempt,
+        maximum=3,
+    )
+    return {
+        "schema_version": 1,
+        "source": "self_repair",
+        "source_run_id": _safe_text(proposal.get("source_run_id"), default="unknown"),
+        "source_event_sequence": _safe_int(
+            proposal.get("source_event_sequence"),
+            default=0,
+            minimum=0,
+            maximum=2**63 - 1,
+        ),
+        "fingerprint": _safe_text(proposal.get("fingerprint"), default=""),
+        "failure_kind": failure_kind,
+        "repair_action": _safe_text(
+            proposal.get("repair_action"),
+            default="draft_repair_proposal",
+        ),
+        "attempt": attempt,
+        "max_attempts": max_attempts,
+        "instruction": _safe_text(
+            proposal.get("instruction"),
+            default=_repair_instruction(failure_kind),
+            max_chars=240,
+        ),
+        "requires_approval": True,
+        "automatic_execution": False,
+    }
+
+
+def _repair_instruction(failure_category: str) -> str:
+    if failure_category == "capacity_pressure":
+        return "用更小的输入和更低负载重试，必要时标记模型 fallback，但不要绕过审批或隐藏失败。"
+    if failure_category == "tool_failure":
+        return "先检查工具权限、参数和产物状态，只执行可审计的最小修复步骤。"
+    if failure_category == "step_failure":
+        return "定位失败步骤，压缩上下文后只重做必要步骤，并保留原始交付目标。"
+    return "定位失败原因，提出并执行一次受控的最小修复重试，失败后关闭循环交由人工处理。"
+
+
+def _safe_text(value: object, *, default: str, max_chars: int = 128) -> str:
+    if not isinstance(value, str):
+        return default
+    text = " ".join(value.split())[:max_chars]
+    return text or default
+
+
+def _safe_int(
+    value: object,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if type(value) is int:
+        return min(max(value, minimum), maximum)
+    return default
 
 
 def _already_classified(events: Sequence[RunEvent]) -> bool:
@@ -299,4 +389,5 @@ __all__ = [
     "SelfRepairDecision",
     "SelfRepairPolicy",
     "classify_terminal_run",
+    "repair_context_from_proposal",
 ]

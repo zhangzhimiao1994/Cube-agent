@@ -1213,6 +1213,14 @@ class RunService:
                 ),
                 token_budget=token_budget,
             )
+            if _routing_source(routing_decision) == "self_repair":
+                await self._safe_record_self_repair_execution_event(
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    routing_decision=routing_decision,
+                    status=RunStatus.RUNNING,
+                    kind="repair.started",
+                )
             started_event = harness_started_event(
                 routing_decision=routing_decision,
                 run_id=run_id,
@@ -1276,6 +1284,14 @@ class RunService:
             )
             if failed.status is RunStatus.WAITING_APPROVAL:
                 return _submitted(failed)
+            if _routing_source(failed.routing_decision) == "self_repair":
+                await self._safe_record_self_repair_execution_event(
+                    tenant_id=failed.tenant_id,
+                    run_id=run_id,
+                    routing_decision=failed.routing_decision,
+                    status=RunStatus.FAILED,
+                    kind="repair.failed",
+                )
             failure_event = RunEvent(
                 kind=EventKind.RUNTIME_FAILED,
                 sequence=1,
@@ -1329,6 +1345,17 @@ class RunService:
                     )
                     scheduler_notice_payloads.append(dict(observer_event.payload))
                     sequence += 1
+        if (
+            terminal in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}
+            and _routing_source(routing_decision) == "self_repair"
+        ):
+            await self._safe_record_self_repair_execution_event(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                routing_decision=routing_decision,
+                status=terminal,
+                kind="repair.completed" if terminal is RunStatus.COMPLETED else "repair.failed",
+            )
         repair_decision = classify_terminal_run(
             status=terminal,
             mode=mode,
@@ -1361,6 +1388,40 @@ class RunService:
                 routing_decision=routing_decision,
             )
         return await self._submitted_by_run_id(tenant_id, run_id)
+
+    async def _safe_record_self_repair_execution_event(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        routing_decision: Mapping[str, object] | None,
+        status: RunStatus,
+        kind: str,
+    ) -> None:
+        try:
+            async with await self._repository.run_transaction() as session, session.begin():
+                sequence = await self._repository.next_event_sequence(session, run_id)
+                await self._repository.persist_event(
+                    session,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    event=RunEvent(
+                        kind=kind,
+                        sequence=sequence,
+                        run_id=run_id,
+                        payload=_self_repair_execution_payload(
+                            routing_decision,
+                            status=status,
+                        ),
+                    ),
+                )
+        except Exception as error:
+            _LOGGER.exception(
+                "run_self_repair_execution_event_failed run_id=%s kind=%s error_type=%s",
+                run_id,
+                kind,
+                type(error).__name__,
+            )
 
     async def _safe_record_self_repair_decision_for_record(self, record: RunRecord) -> None:
         try:
@@ -1769,6 +1830,70 @@ def _actor_role_from_row(row: object) -> Role | None:
     if isinstance(raw_role, str):
         return Role(raw_role)
     raise TypeError("run actor_role must be a role value")
+
+
+def _routing_source(routing_decision: Mapping[str, object] | None) -> str | None:
+    if routing_decision is None:
+        return None
+    source = routing_decision.get("source")
+    return source if isinstance(source, str) else None
+
+
+def _self_repair_execution_payload(
+    routing_decision: Mapping[str, object] | None,
+    *,
+    status: RunStatus,
+) -> dict[str, JsonValue]:
+    decision = routing_decision or {}
+    context = decision.get("self_repair_context")
+    repair = context if isinstance(context, Mapping) else decision
+    attempt = _bounded_int(repair.get("attempt") or decision.get("self_repair_attempt"), 1, 1, 3)
+    max_attempts = _bounded_int(
+        repair.get("max_attempts") or decision.get("self_repair_max_attempts"),
+        1,
+        attempt,
+        3,
+    )
+    return {
+        "schema_version": 1,
+        "source": "self_repair",
+        "status": status.value,
+        "repair_action": _bounded_text(repair.get("repair_action"), "draft_repair_proposal", 96),
+        "failure_kind": _bounded_text(repair.get("failure_kind"), "runtime_failure", 64),
+        "source_run_id": _bounded_text(
+            repair.get("source_run_id") or decision.get("self_repair_source_run_id"),
+            "unknown",
+            96,
+        ),
+        "source_event_sequence": _bounded_int(
+            repair.get("source_event_sequence") or decision.get("self_repair_source_event_sequence"),
+            0,
+            0,
+            2**63 - 1,
+        ),
+        "fingerprint": _bounded_text(
+            repair.get("fingerprint") or decision.get("self_repair_fingerprint"),
+            "",
+            64,
+        ),
+        "attempt": attempt,
+        "max_attempts": max_attempts,
+        "requires_approval": True,
+        "automatic_execution": False,
+    }
+
+
+def _bounded_text(value: object, default: str, max_chars: int) -> str:
+    if not isinstance(value, str):
+        return default
+    text = " ".join(value.split())[:max_chars]
+    return text or default
+
+
+def _bounded_int(value: object, default: int, minimum: int, maximum: int) -> int:
+    if type(value) is not int:
+        return default
+    return min(max(value, minimum), maximum)
 
 
 def _submitted(record: RunRecord) -> SubmittedRun:

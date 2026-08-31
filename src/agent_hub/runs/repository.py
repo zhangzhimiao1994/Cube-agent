@@ -25,6 +25,7 @@ from agent_hub.db.models import (
     RunUsageRow,
 )
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.runs.self_repair import repair_context_from_proposal
 from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent, RuntimeCheckpoint
 from agent_hub.runtime.failure_reason import runtime_failure_diagnostic_from_reason
 
@@ -458,6 +459,10 @@ class RunRepository:
             proposal = routing_decision.get("repair_proposal")
             if not isinstance(proposal, dict) or proposal.get("kind") != "self_repair":
                 raise RunConflict("self repair proposal is invalid")
+            attempt = proposal.get("attempt", 1)
+            max_attempts = proposal.get("max_attempts", 1)
+            if type(attempt) is not int or type(max_attempts) is not int or attempt > max_attempts:
+                raise RunConflict("self repair proposal exceeds retry budget")
             next_decision = {
                 key: value
                 for key, value in routing_decision.items()
@@ -467,9 +472,12 @@ class RunRepository:
                 {
                     "source": "self_repair",
                     "self_repair_accepted": True,
+                    "self_repair_attempt": attempt,
+                    "self_repair_max_attempts": max_attempts,
                     "self_repair_source_run_id": str(run_id),
                     "self_repair_source_event_sequence": proposal.get("source_event_sequence"),
                     "self_repair_fingerprint": proposal.get("fingerprint"),
+                    "self_repair_context": repair_context_from_proposal(proposal),
                 }
             )
             row.routing_decision = next_decision

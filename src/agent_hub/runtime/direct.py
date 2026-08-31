@@ -29,6 +29,7 @@ from agent_hub.runtime.contracts import (
 )
 from agent_hub.runtime.failure_reason import safe_model_gateway_failure_reason
 from agent_hub.runtime.hermes_context import hermes_memory_context_text
+from agent_hub.runtime.self_repair_context import self_repair_context_text
 
 _RUNTIME_TYPE = "direct"
 _RUNTIME_VERSION = "1"
@@ -430,6 +431,7 @@ class DirectRuntime:
         text: object = None
         task_payload: str | None = None
         prior_payload: str | None = None
+        repair_context: str | None = None
         payload: str | None = None
         serialized_messages: str | None = None
         messages: tuple[ModelMessage, ...] | None = None
@@ -468,9 +470,11 @@ class DirectRuntime:
                 separators=(",", ":"),
             ).replace("<", "\\u003c").replace(">", "\\u003e")
             hermes_context = hermes_memory_context_text(context.routing_decision)
+            repair_context = self_repair_context_text(context.routing_decision)
             payload = (
                 f"<USER_REQUEST_JSON>{task_payload}</USER_REQUEST_JSON>\n"
                 f"{hermes_context}\n"
+                f"{repair_context}\n"
                 f"<UNTRUSTED_ARTIFACTS_JSON>{prior_payload}</UNTRUSTED_ARTIFACTS_JSON>"
             )
             if len(payload.encode("utf-8")) > _MAX_CONTEXT_BYTES:
@@ -516,6 +520,7 @@ class DirectRuntime:
             text,
             task_payload,
             prior_payload,
+            repair_context,
             payload,
             serialized_messages,
             messages,

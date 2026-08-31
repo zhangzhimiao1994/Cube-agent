@@ -11,7 +11,7 @@ import pytest
 from agent_hub.auth.models import Role
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import RunRecord
-from agent_hub.runs.self_repair import SelfRepairPolicy
+from agent_hub.runs.self_repair import SelfRepairPolicy, repair_context_from_proposal
 from agent_hub.runs.service import HermesRunOutcome, RunService
 from agent_hub.runtime.contracts import EventKind, RunEvent, RuntimeCheckpoint, TaskContext
 from agent_hub.runtime.registry import RuntimeRegistry
@@ -176,10 +176,23 @@ class ExecutableFakeRepository:
             raise AssertionError("token mismatch")
         if self.row.version != version:
             raise AssertionError("version mismatch")
+        proposal = routing_decision.get("repair_proposal")
+        assert isinstance(proposal, dict)
+        attempt = proposal.get("attempt")
+        max_attempts = proposal.get("max_attempts")
+        assert type(attempt) is int
+        assert type(max_attempts) is int
         self.row.routing_decision = {
-            **routing_decision,
+            **{
+                key: value
+                for key, value in routing_decision.items()
+                if key not in {"approval_kind", "decision_token"}
+            },
             "source": "self_repair",
             "self_repair_accepted": True,
+            "self_repair_attempt": attempt,
+            "self_repair_max_attempts": max_attempts,
+            "self_repair_context": repair_context_from_proposal(proposal),
         }
         self.row.status = RunStatus.QUEUED.value
         self.row.version += 1
@@ -246,6 +259,26 @@ class RuntimeCompletes:
     mode = TaskMode.DISPATCH
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        yield RunEvent(kind=EventKind.RUNTIME_COMPLETED, sequence=1, run_id=context.run_id)
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        del checkpoint
+
+    async def cancel(self) -> None:
+        raise AssertionError("not used")
+
+
+class RuntimeRecordsRepairContextCompletes:
+    mode = TaskMode.DISPATCH
+
+    def __init__(self) -> None:
+        self.contexts: list[TaskContext] = []
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        self.contexts.append(context)
         yield RunEvent(kind=EventKind.RUNTIME_COMPLETED, sequence=1, run_id=context.run_id)
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
@@ -774,6 +807,9 @@ async def test_execute_persists_repair_classification_for_failed_run() -> None:
         "failure_kind": "capacity_pressure",
         "source_run_id": str(repository.run_id),
         "source_event_sequence": 2,
+        "attempt": 1,
+        "max_attempts": 1,
+        "instruction": "用更小的输入和更低负载重试，必要时标记模型 fallback，但不要绕过审批或隐藏失败。",
         "requires_approval": True,
         "replay_safe": False,
         "automatic_execution": False,
@@ -956,6 +992,55 @@ async def test_accept_self_repair_requeues_failed_run_with_recursion_guard() -> 
     assert repository.row.routing_decision is not None
     assert repository.row.routing_decision["source"] == "self_repair"
     assert repository.row.routing_decision["self_repair_accepted"] is True
+    assert repository.row.routing_decision["self_repair_attempt"] == 1
+    assert repository.row.routing_decision["self_repair_max_attempts"] == 1
+    assert isinstance(repository.row.routing_decision["self_repair_context"], dict)
+    assert repository.row.routing_decision["self_repair_context"]["source"] == "self_repair"
+
+
+@pytest.mark.asyncio
+async def test_accepted_self_repair_run_records_bounded_execution_audit() -> None:
+    repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
+    failure_service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeReportsCapacityPressure(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+    failed = await failure_service.execute(repository.run_id)
+    assert failed.decision_token is not None
+    await failure_service.accept_self_repair(
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        run_id=repository.run_id,
+        decision_token=failed.decision_token,
+        version=failed.version,
+    )
+    repair_runtime = RuntimeRecordsRepairContextCompletes()
+    repair_service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((repair_runtime,)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    repaired = await repair_service.execute(repository.run_id)
+
+    assert repaired.status is RunStatus.COMPLETED
+    repair_events = [event for event in repository.events if str(event.kind).startswith("repair.")]
+    assert [event.kind for event in repair_events] == [
+        "repair.classified",
+        "repair.started",
+        "repair.completed",
+    ]
+    assert repair_events[-2].payload["attempt"] == 1
+    assert repair_events[-2].payload["max_attempts"] == 1
+    assert repair_events[-1].payload["status"] == RunStatus.COMPLETED.value
+    assert repair_runtime.contexts
+    repair_context = repair_runtime.contexts[0].routing_decision["self_repair_context"]
+    assert isinstance(repair_context, dict)
+    assert repair_context["source"] == "self_repair"
+    assert repair_context["automatic_execution"] is False
 
 
 @pytest.mark.asyncio

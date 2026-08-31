@@ -63,6 +63,7 @@ from agent_hub.runtime.failure_reason import (
     safe_runtime_failure_reason,
 )
 from agent_hub.runtime.hermes_context import hermes_memory_context_text
+from agent_hub.runtime.self_repair_context import self_repair_context_text
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -2092,6 +2093,9 @@ class CrewDispatchRuntime:
         hermes_context = hermes_memory_context_text(context.routing_decision)
         if hermes_context:
             user["hermes_memory_context"] = hermes_context
+        repair_context = self_repair_context_text(context.routing_decision)
+        if repair_context:
+            user["self_repair_context"] = repair_context
         if recovery_attempt > 0:
             user["recovery"] = {
                 "strategy": "compact_retry",
