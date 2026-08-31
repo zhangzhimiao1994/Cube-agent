@@ -3145,7 +3145,8 @@ describe("operational management pages", () => {
     expect(recruitmentCard).not.toBeNull();
     expect(within(recruitmentCard).getAllByText("Temporary Web Engineer").length).toBeGreaterThan(0);
     expect(within(recruitmentCard).getByText("职责")).not.toBeNull();
-    expect(within(recruitmentCard).getByText(/software_engineering/)).not.toBeNull();
+    expect(within(recruitmentCard).getByText("Web Engineer")).not.toBeNull();
+    expect(within(recruitmentCard).queryByText(/software_engineering/)).toBeNull();
     expect(within(recruitmentCard).getByText("模型")).not.toBeNull();
     expect(within(recruitmentCard).getByText("coder")).not.toBeNull();
     expect(within(recruitmentCard).getByText("状态")).not.toBeNull();
@@ -3153,7 +3154,7 @@ describe("operational management pages", () => {
     expect(within(recruitmentCard).getByRole("button", { name: "同意加入" })).not.toBeNull();
     expect(within(recruitmentCard).getByRole("button", { name: "不加入" })).not.toBeNull();
     expect(within(recruitmentCard).getByRole("button", { name: "提修改" })).not.toBeNull();
-    expect(within(stream).getByText(/主 Agent 判断缺少 software_engineering 能力/)).not.toBeNull();
+    expect(within(stream).getByText(/Temporary Web Engineer 将负责 Web Engineer/)).not.toBeNull();
     expect(within(stream).queryByText("把方案落成网页并说明验证步骤。")).toBeNull();
     expect(within(stream).queryByText("当前角色池缺少 software_engineering 能力。")).toBeNull();
     expect(within(stream).queryByRole("button", { name: /查看详情/ })).toBeNull();

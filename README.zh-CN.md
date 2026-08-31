@@ -8,12 +8,13 @@
 
 ## 能做什么
 
-- 在 Web 或已接入通道里和主 Agent 对话，继续历史会话，从历史上下文新建分支并上传附件。项目级 Vibe Coding 能力留给后续 harness/runtime 改造；当前 UI 不暴露 Vibe Coding 按钮，后端 metadata 字段保留作未来接入。
+- 在 Web 或已接入通道里和主 Agent 对话，继续历史会话，从历史上下文新建分支并上传附件。项目级 Vibe Coding 能力留给后续 harness/runtime 改造；当前 UI 不暴露 Vibe Coding 按钮，后端 metadata 字段保留作未来接入。在没有 harness 的当前版本里，系统可以分析代码、给出修改方案或补丁建议，但不能直接接管仓库完成代码修改、测试、审查和调试闭环。
+- 查看派单和讨论运行的子 Agent 工作席。每个席位显示名称、职责、模型、状态、分类摘要和紧凑卡片；点击卡片后再打开详情抽屉。已打开的抽屉会跟随运行数据实时刷新，支持点击遮罩关闭，并在打开时锁住底层页面滚动。
 - 把普通模型和多媒体 AI 分开配置，避免把视频生成任务提交给不支持视频的模型。
 - 通过能力标签控制图片、视频、音频生成路由。
 - 配置 MiniMax/Hailuo 后，使用当前多媒体执行器提交文生视频任务并保存生成文件。
 - 通过运行时工具生成 Word 和 PowerPoint 文件：`document.generate_docx`、`presentation.generate_pptx`。
-- 上传单个 Skill 或多个 Skill 打包的 `.zip`、`.tar`、`.tar.gz`、`.tgz`，扫描后再审批启用。
+- 上传单个 Skill 或多个 Skill 打包的 `.zip`、`.tar`、`.tar.gz`、`.tgz`，扫描后再审批启用。同名 Skill 默认只保留最新可用版本；上传冲突时提示选择覆盖，或保留为可控的不同版本。
 - 通过 OpenClaw 功能开关、权限模式、命令白名单和适配器，受控执行服务器或电脑操作。
 - 创建一次性计划任务或 cron 周期任务；对话里识别到带明确日期/时间/周期和可执行动作的计划需求时，先给出计划方案，再由用户确认创建。
 - 在日志中心查看模型、模式、功能、Agent、通道和审计日志。用户触发对话会记录 `run.submit` 审计事件，能查到哪个用户提交了哪个对话。
@@ -23,8 +24,8 @@
 在干净的 Linux 服务器上执行：
 
 ```bash
-git clone https://github.com/zhangzhimiao1994/mutilagent.git
-cd mutilagent
+git clone https://github.com/zhangzhimiao1994/CubeAgent.git
+cd CubeAgent
 sudo bash install.sh --mode auto --yes
 ```
 
@@ -34,7 +35,7 @@ sudo bash install.sh --mode auto --yes
 
 ```bash
 tmp="$(mktemp -d /tmp/agent-hub-install.XXXXXX)"
-curl -fL https://github.com/zhangzhimiao1994/mutilagent/archive/refs/heads/main.tar.gz -o "$tmp/source.tar.gz"
+curl -fL https://github.com/zhangzhimiao1994/CubeAgent/archive/refs/heads/main.tar.gz -o "$tmp/source.tar.gz"
 mkdir -p "$tmp/source"
 tar -xzf "$tmp/source.tar.gz" --strip-components=1 -C "$tmp/source"
 cd "$tmp/source"
@@ -199,7 +200,9 @@ Office 文件生成是运行时工具能力，不是新的 `ModelCapability`。�
 - `discuss`：走讨论式流程。
 - `hybrid`：结合派单和讨论。
 
-历史会话行提供按原思路新建分支的入口；分支引用激活后，输入区只显示明确的取消引用控件，不再要求每条消息手动打开 Handoff。完整的项目级 Vibe Coding（生成项目、读写代码、运行测试、审查、调试并再次验证）留给后续 harness/runtime 改造：当前 UI 不暴露 Vibe Coding 按钮，后端 metadata 字段保留作未来接入。正在运行的对话可以在输入区停止生成；对话里检测出的计划任务或进化任务提案，也可以在创建持久记录前取消。
+历史会话行提供按原思路新建分支的入口；分支引用激活后，输入区只显示明确的取消引用控件，不再要求每条消息手动打开 Handoff。完整的项目级 Vibe Coding（生成项目、读写代码、运行测试、审查、调试并再次验证）留给后续 harness/runtime 改造：当前 UI 不暴露 Vibe Coding 按钮，后端 metadata 字段保留作未来接入。在 harness 接入前，代码类请求属于建议型能力：系统可以读取用户提供的代码上下文、说明问题、制定实现计划、生成补丁建议或文件产物，但不会直接修改用户源码树。正在运行的对话可以在输入区停止生成；对话里检测出的计划任务或进化任务提案，也可以在创建持久记录前取消。
+
+派单和讨论运行会在对话流里显示紧凑的运行过程卡片。点击后进入子 Agent 工作席：每个 Agent 独立显示工作中、等待中、失败、已下班等状态。抽屉默认展示分类摘要和重点卡片，详细事件字段、工具 payload、模型元数据和产物元数据不会直接铺开；需要点开对应卡片并展开完整字段后查看。这样既能减少长流程的 UI 噪音，也保留排查和审计所需的信息。
 
 长对话由对话框架处理，不归进化模块处理。当历史内容接近主 Agent 模型上下文窗口时，系统会自动压缩旧轮次，保留初始目标、长期约束和最新结论，再把压缩上下文传入下一轮。
 
@@ -249,6 +252,8 @@ Skill 必须先上传、扫描、审批，再进入可用列表。
 一个压缩包可以是单个 Skill，也可以包含多个 Skill 目录。多 Skill 压缩包允许存在多层目录；扫描器会寻找有效的 Skill manifest，并把不能识别的项目列为 skipped。
 
 每个 Skill 仍然会进行安全检查：路径穿越、压缩包大小、解压大小、文件数量、依赖锁定、禁止扩展名、可执行文件声明、权限 diff。审批通过后才会启用。
+
+Skill 名称默认去重：同名 Skill 的最新审批版本作为当前可用版本。上传时如果与已有名称冲突，系统会提示选择覆盖当前版本，或保留为一个可选择的不同版本。只有确实需要运维回退或灰度时才建议保留多版本；普通场景保持最新版本，避免路由时出现重复能力。
 
 MCP 独立配置，包括 transport、命令或 URL、允许工具、可执行文件白名单、域名白名单和超时。
 

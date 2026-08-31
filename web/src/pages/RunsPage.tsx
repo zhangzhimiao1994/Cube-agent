@@ -760,6 +760,10 @@ function temporaryAgentSummary(proposal: TemporaryAgentProposal) {
   return `主 Agent 判断缺少 ${proposal.missing_capability} 能力，建议招募 ${proposal.name} 负责 ${proposal.role}。`;
 }
 
+function temporaryAgentCardSummary(proposal: TemporaryAgentProposal) {
+  return `${proposal.name} 将负责 ${proposal.role}，确认后加入当前任务。`;
+}
+
 function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
   if (!detail) return [];
   const textArtifacts = dedupeTextArtifacts(detail.artifacts);
@@ -2219,7 +2223,7 @@ function TemporaryAgentRecruitmentCard({
           <dd>{status}</dd>
         </div>
       </dl>
-      <p>{temporaryAgentSummary(proposal)}</p>
+      <p>{temporaryAgentCardSummary(proposal)}</p>
       <div className="temporary-agent-choice-grid" aria-label="临时 Agent 选择">
         <button
           type="button"

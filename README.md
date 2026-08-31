@@ -8,12 +8,13 @@ It combines a Web console, Feishu/channel entry points, model pools, workflow an
 
 ## What You Can Do
 
-- Chat with the main agent in Web or supported channels, continue historical conversations, branch from prior context, and attach files. Project-level Vibe Coding is reserved for a future harness/runtime; the current UI does not expose a Vibe Coding button, while backend metadata remains available for future integration.
+- Chat with the main agent in Web or supported channels, continue historical conversations, branch from prior context, and attach files. Project-level Vibe Coding is reserved for a future harness/runtime; the current UI does not expose a Vibe Coding button, while backend metadata remains available for future integration. Without that harness, Cube Agent can analyze code and provide modification plans or patch suggestions, but it cannot directly edit a repository, run the resulting tests, review the changes, and debug them end to end.
+- Inspect dispatch and discussion runs from the child-agent work seats. Each seat shows name, role, model, status, categorized summaries, and compact cards; click a card to open the detailed drawer. Open drawers stay synced with live run updates, close from the backdrop, and lock background scrolling while active.
 - Configure normal chat/tool models separately from multimedia AI models.
 - Route image/video/audio generation only to models marked with the matching generation capability.
 - Use MiniMax/Hailuo text-to-video through the multimedia executor when a valid deployment and key are configured.
 - Generate Word and PowerPoint files through runtime tools: `document.generate_docx` and `presentation.generate_pptx`.
-- Upload single-skill or multi-skill `.zip`, `.tar`, `.tar.gz`, and `.tgz` archives for scan, review, approval, use, and deletion.
+- Upload single-skill or multi-skill `.zip`, `.tar`, `.tar.gz`, and `.tgz` archives for scan, review, approval, use, and deletion. A Skill name keeps one active latest version by default; upload conflicts ask whether to overwrite or keep a separate version for controlled selection.
 - Run OpenClaw operations through a system switch, approval mode, allowlisted commands, sessions, and local or remote adapters.
 - Create one-time or cron schedules. Chat-detected dated tasks, reminders, and recurring requests become proposals that require user confirmation before creation.
 - Review Hermes learning, logs, and audit records. `run.submit` audit records include the user, role, run, conversation, mode, attachments, and a message hash.
@@ -23,8 +24,8 @@ It combines a Web console, Feishu/channel entry points, model pools, workflow an
 On a clean supported Linux server:
 
 ```bash
-git clone https://github.com/zhangzhimiao1994/mutilagent.git
-cd mutilagent
+git clone https://github.com/zhangzhimiao1994/CubeAgent.git
+cd CubeAgent
 sudo bash install.sh --mode auto --yes
 ```
 
@@ -34,7 +35,7 @@ If the server does not have `git`:
 
 ```bash
 tmp="$(mktemp -d /tmp/agent-hub-install.XXXXXX)"
-curl -fL https://github.com/zhangzhimiao1994/mutilagent/archive/refs/heads/main.tar.gz -o "$tmp/source.tar.gz"
+curl -fL https://github.com/zhangzhimiao1994/CubeAgent/archive/refs/heads/main.tar.gz -o "$tmp/source.tar.gz"
 mkdir -p "$tmp/source"
 tar -xzf "$tmp/source.tar.gz" --strip-components=1 -C "$tmp/source"
 cd "$tmp/source"
@@ -190,7 +191,9 @@ The chat page supports:
 - `discuss`: run a discussion-style workflow.
 - `hybrid`: combine dispatch and discussion.
 
-Historical conversations expose a branch action for continuing with prior context; once a branch reference is active, the composer shows an explicit cancel control instead of requiring a per-message Handoff toggle. Project-level Vibe Coding (generate a project, read/write code, run tests, review, debug, and verify again) is reserved for a future harness/runtime integration: the current UI does not expose a Vibe Coding button, while the backend metadata field remains for future compatibility. A running chat can be stopped from the composer, and detected schedule or Evolution proposals can be cancelled before they create durable records.
+Historical conversations expose a branch action for continuing with prior context; once a branch reference is active, the composer shows an explicit cancel control instead of requiring a per-message Handoff toggle. Project-level Vibe Coding (generate a project, read/write code, run tests, review, debug, and verify again) is reserved for a future harness/runtime integration: the current UI does not expose a Vibe Coding button, while the backend metadata field remains for future compatibility. Until that harness exists, coding-related requests are treated as advisory work: the agent may inspect supplied code context, explain issues, draft implementation plans, and produce patch-style suggestions or file artifacts, but it does not directly mutate the user's source tree. A running chat can be stopped from the composer, and detected schedule or Evolution proposals can be cancelled before they create durable records.
+
+Dispatch and discussion runs render a compact process card in the conversation stream. The card opens the child-agent work-seat drawer, where each agent has its own seat with status such as working, waiting, failed, or done. The drawer favors short categorized summaries; detailed event fields, tool payloads, model metadata, and artifact metadata are hidden until the user opens the relevant card and expands full fields. This keeps long task traces readable while preserving auditability.
 
 Long conversations are handled by the conversation framework, not by the Evolution module. When the history approaches the main agent model context window, Cube Agent compacts older turns, keeps the origin goal and latest decisions, and passes the compacted context into the next run.
 
@@ -231,6 +234,8 @@ scripts/agent-hub openclaw-adapter
 Skills are uploaded as archives, scanned, and approved before use. Accepted outer archive names are `.zip`, `.tar`, `.tar.gz`, and `.tgz`.
 
 A package may contain a single Skill or multiple Skill directories. Multi-skill bundles can include extra directory layers; the scanner looks for valid skill manifests and reports skipped entries. Each individual Skill still goes through path traversal checks, size limits, file count limits, dependency pinning checks, forbidden extension checks, permission diffing, and approval.
+
+Skill names are de-duplicated by default: the newest approved upload is the active version for that name. When an upload conflicts with an existing Skill name, the review flow asks whether to overwrite the active version or keep a separate selectable version. Use separate versions only when operators intentionally need a controlled fallback; otherwise keep the latest version to avoid duplicated routing choices.
 
 MCP servers are configured separately with transport, command or URL, allowed tools, executable allowlists, domain allowlists, and timeouts.
 
