@@ -490,6 +490,17 @@ def _recovery_status_after_attempts(
     )
 
 
+def _failed_model_state_can_compact_retry(model_state: Mapping[str, JsonValue]) -> bool:
+    failure_reason = model_state.get("failure_reason")
+    if type(failure_reason) is not str or not failure_reason.strip():
+        return False
+    return _can_compact_retry_subagent(
+        runtime_failure_diagnostic_from_reason(failure_reason),
+        recovery_attempt=0,
+        remaining_seconds=float("inf"),
+    )
+
+
 def _framework_failure_reason(prefix: str, error: Exception) -> str:
     reason = safe_runtime_failure_reason(error, fallback=prefix)
     return prefix if reason == prefix else f"{prefix}: {reason}"
@@ -2319,6 +2330,8 @@ class CrewDispatchRuntime:
                     completion = None
                     response = None
                 elif existing.get("status") == "failed":
+                    if not _failed_model_state_can_compact_retry(existing):
+                        raise ModelOutcomeUncertain("model outcome requires confirmation")
                     failure_reason = existing.get("failure_reason")
                     if type(failure_reason) is str and failure_reason.strip():
                         _fail(failure_reason)
@@ -2984,6 +2997,8 @@ class CrewDispatchRuntime:
                     elif existing.get("status") == "running":
                         raise ModelOutcomeUncertain("model outcome requires confirmation")
                     elif existing.get("status") == "failed":
+                        if not _failed_model_state_can_compact_retry(existing):
+                            raise ModelOutcomeUncertain("model outcome requires confirmation")
                         failure_reason = existing.get("failure_reason")
                         if type(failure_reason) is str and failure_reason.strip():
                             _fail(failure_reason)
@@ -4376,7 +4391,10 @@ class CrewDispatchRuntime:
                     _fail("runtime checkpoint model artifacts are unavailable")
                 self._completion_from_model_artifact(artifact)
                 model_ledger.artifacts[key] = artifact
-            elif model_state["status"] == "running":
+            elif model_state["status"] == "running" or (
+                model_state["status"] == "failed"
+                and not _failed_model_state_can_compact_retry(model_state)
+            ):
                 outcome_error = ModelOutcomeUncertain("model outcome requires confirmation")
         tool_ledger = _ToolLedger()
         tool_states = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["tools"])

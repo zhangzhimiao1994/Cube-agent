@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from decimal import Decimal
+from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -21,6 +22,7 @@ from agent_hub.runtime.crew.adapter import (
     CrewLLMBridge,
     CrewObjectFactory,
     CrewTaskDefinition,
+    ModelOutcomeUncertain,
     RuntimeExecutionError,
     _artifact_final_synthesis_payload,
     _artifact_prompt_payload,
@@ -340,6 +342,33 @@ class EmptyThenReviewingGateway(EmptyThenRoleAwareGateway):
             text = self.reviews.pop(0) if self.reviews else '{"verdict":"approve"}'
         return GatewayCompletion(
             response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
+class FailingModelGateway(RoleAwareGateway):
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        raise RuntimeError("provider detail must be redacted")
+
+
+class FailingAfterToolGateway(ToolGateway):
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        if self.requests:
+            raise RuntimeError("provider detail must be redacted")
+        self.requests.append(request)
+        return GatewayCompletion(
+            response=ModelResponse(
+                text=None,
+                tool_calls=(
+                    ToolCall(id="provider-call", name="web.search", arguments={"q": "safe"}),
+                ),
+                usage=TokenUsage(1, 1, 2),
+            ),
             deployment_id="primary",
             logical_model=request.logical_model,
             provider_id="deepseek",
@@ -913,6 +942,97 @@ async def test_failed_model_checkpoint_resumes_through_generic_compact_retry() -
     assert len(restored_generation.prompts) == 2
     assert "Keep the retry concise" in restored_generation.prompts[1][2]
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_non_retryable_failed_model_checkpoint_requires_confirmation() -> None:
+    repository = InMemoryArtifactRepository()
+    runtime = CrewDispatchRuntime(
+        FailingModelGateway(),
+        _one_step_plan(),
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+    events: list[RunEvent] = []
+
+    with pytest.raises(RuntimeExecutionError):
+        async for event in runtime.run(_context(actor_id=uuid4(), actor_role=Role.OPERATOR)):
+            events.append(event)
+
+    def has_failed_model(event: RunEvent) -> bool:
+        checkpoint = event.checkpoint
+        if checkpoint is None:
+            return False
+        model_states = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["models"])
+        return any(state["status"] == "failed" for state in model_states.values())
+
+    failed_checkpoint = next(
+        event.checkpoint
+        for event in reversed(events)
+        if event.kind is EventKind.CHECKPOINT_SAVED
+        and has_failed_model(event)
+    )
+    assert failed_checkpoint is not None
+    restored_gateway = RoleAwareGateway()
+    restored = CrewDispatchRuntime(
+        restored_gateway,
+        _one_step_plan(),
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+    await restored.restore_checkpoint(failed_checkpoint)
+
+    with pytest.raises(ModelOutcomeUncertain, match="model outcome requires confirmation"):
+        [event async for event in restored.run(_context(checkpoint=failed_checkpoint))]
+
+    assert restored_gateway.requests == []
+
+
+async def test_succeeded_tool_survives_non_retryable_followup_model_failure() -> None:
+    repository = InMemoryArtifactRepository()
+    tool_plan = _tool_plan()
+    first_capabilities = FakeCapabilities()
+    runtime = CrewDispatchRuntime(
+        FailingAfterToolGateway(),
+        tool_plan,
+        capability_gateway=first_capabilities,
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+    events: list[RunEvent] = []
+
+    with pytest.raises(RuntimeExecutionError):
+        async for event in runtime.run(_context(actor_id=uuid4(), actor_role=Role.OPERATOR)):
+            events.append(event)
+
+    checkpoint = await runtime.save_checkpoint()
+    persisted_artifacts = tuple(event.artifact for event in events if event.artifact is not None)
+    tool_artifacts = tuple(
+        artifact for artifact in persisted_artifacts if artifact.type == "tool_result"
+    )
+    assert len(tool_artifacts) == 1
+    assert first_capabilities.calls == [("writer", "web.search")]
+
+    second_capabilities = FakeCapabilities()
+    restored_gateway = ToolGateway()
+    restored = CrewDispatchRuntime(
+        restored_gateway,
+        tool_plan,
+        capability_gateway=second_capabilities,
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+    await restored.restore_checkpoint(checkpoint)
+
+    with pytest.raises(ModelOutcomeUncertain, match="model outcome requires confirmation"):
+        [
+            event
+            async for event in restored.run(
+                _context(checkpoint=checkpoint, artifacts=persisted_artifacts)
+            )
+        ]
+
+    assert restored_gateway.requests == []
+    assert second_capabilities.calls == []
 
 
 async def test_reviewer_timeout_uses_generic_recovery_before_soft_skip() -> None:
