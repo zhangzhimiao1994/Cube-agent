@@ -125,6 +125,129 @@ async def test_runtime_advice_can_use_confirmed_conversation_lessons() -> None:
     assert advice.recommended_mode is TaskMode.DISCUSS
 
 
+@pytest.mark.asyncio
+async def test_runtime_advice_injects_cross_mode_project_rule_when_relevant() -> None:
+    lesson = {
+        "id": "hermes_ui_drawer_rule",
+        "category": "conversation",
+        "outcome": "success",
+        "lesson": "调度卡片应默认显示摘要，详情放抽屉，点击遮罩关闭。",
+        "user_summary": "调度卡片默认只显示摘要，详情放抽屉。",
+        "tags": ["调度卡片", "抽屉", "ui"],
+        "weight": 9,
+        "source_mode": "discuss",
+        "applies_to_modes": ["dispatch", "direct", "hybrid"],
+        "memory_type": "ui_rule",
+        "target": "frontend",
+        "confidence": 0.88,
+        "noise_risk": 0.1,
+        "created_at": datetime.now(UTC).isoformat(),
+        "confirmed_at": datetime.now(UTC).isoformat(),
+    }
+    session_factory = FakeSessionFactory(
+        [
+            [],
+            [FakeRow({"hermes_policy": "suggest"})],
+            [FakeRow(lesson)],
+        ]
+    )
+    advisor = PersistentHermesRunAdvisor(session_factory)  # type: ignore[arg-type]
+
+    advice = await advisor.advise(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="修改调度卡片 UI，详情用抽屉展示",
+        mode=TaskMode.DISPATCH,
+        agent_ids=("frontend",),
+        workflow_id=None,
+    )
+
+    assert advice is not None
+    assert advice.injected_memories[0].id == "hermes_ui_drawer_rule"
+    assert advice.injected_memories[0].target == "frontend"
+
+
+@pytest.mark.asyncio
+async def test_runtime_advice_skips_same_mode_low_quality_noise() -> None:
+    lesson = {
+        "id": "hermes_noise",
+        "category": "conversation",
+        "outcome": "neutral",
+        "lesson": "这个任务成功了。",
+        "user_summary": "这个任务成功了。",
+        "tags": ["direct"],
+        "weight": 10,
+        "source_mode": "direct",
+        "memory_type": "temporary_state",
+        "target": "main_agent",
+        "confidence": 0.3,
+        "noise_risk": 0.9,
+        "created_at": datetime.now(UTC).isoformat(),
+        "confirmed_at": datetime.now(UTC).isoformat(),
+    }
+    session_factory = FakeSessionFactory(
+        [
+            [],
+            [FakeRow({"hermes_policy": "suggest"})],
+            [FakeRow(lesson)],
+        ]
+    )
+    advisor = PersistentHermesRunAdvisor(session_factory)  # type: ignore[arg-type]
+
+    advice = await advisor.advise(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="direct 模式继续处理这个任务",
+        mode=TaskMode.DIRECT,
+        agent_ids=(),
+        workflow_id=None,
+    )
+
+    assert advice is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_advice_records_conflicting_memory_as_skipped() -> None:
+    lesson = {
+        "id": "hermes_hybrid_preference",
+        "category": "conversation",
+        "outcome": "success",
+        "lesson": "大任务优先使用混合模式。",
+        "user_summary": "大任务优先使用混合模式。",
+        "tags": ["大任务", "hybrid"],
+        "weight": 8,
+        "source_mode": "hybrid",
+        "memory_type": "scheduling_rule",
+        "target": "scheduler",
+        "confidence": 0.8,
+        "noise_risk": 0.1,
+        "created_at": datetime.now(UTC).isoformat(),
+        "confirmed_at": datetime.now(UTC).isoformat(),
+    }
+    session_factory = FakeSessionFactory(
+        [
+            [],
+            [FakeRow({"hermes_policy": "suggest"})],
+            [FakeRow(lesson)],
+        ]
+    )
+    advisor = PersistentHermesRunAdvisor(session_factory)  # type: ignore[arg-type]
+
+    advice = await advisor.advise(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="先跑直连模式，不要混合，处理这个大任务",
+        mode=TaskMode.DIRECT,
+        agent_ids=(),
+        workflow_id=None,
+    )
+
+    assert advice is not None
+    assert advice.injected_memories == ()
+    assert advice.skipped_memories[0].id == "hermes_hybrid_preference"
+    assert advice.skipped_memories[0].reason == "当前用户指令覆盖这条记忆"
+
+
 def test_runtime_lesson_summary_localizes_scheduler_outcomes_for_users() -> None:
     assert (
         _runtime_lesson_summary("Run failed with mode=hybrid, workflow=quality-review.")

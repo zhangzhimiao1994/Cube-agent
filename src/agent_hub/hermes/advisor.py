@@ -11,7 +11,29 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.db.models import AdminResourceRow
 from agent_hub.domain.runs import RunStatus, TaskMode
-from agent_hub.runs.service import HermesRunAdvice, HermesRunOutcome
+from agent_hub.runs.service import (
+    HermesMemoryInjection,
+    HermesRunAdvice,
+    HermesRunOutcome,
+    HermesSkippedMemory,
+)
+
+
+_INJECTABLE_MEMORY_TYPES = {
+    "user_preference",
+    "project_fact",
+    "ui_rule",
+    "error_handling",
+    "scheduling_rule",
+}
+_LOW_QUALITY_PHRASES = (
+    "这个任务成功了",
+    "任务成功了",
+    "出错了",
+    "失败了",
+    "worked",
+    "failed",
+)
 
 
 class PersistentHermesRunAdvisor:
@@ -35,7 +57,7 @@ class PersistentHermesRunAdvisor:
         agent_ids: tuple[str, ...],
         workflow_id: str | None,
     ) -> HermesRunAdvice | None:
-        del actor_id, mode, agent_ids
+        del actor_id
         if not await self._enabled(tenant_id):
             return None
         policy = await self._main_agent_hermes_policy(tenant_id)
@@ -45,24 +67,91 @@ class PersistentHermesRunAdvisor:
         if not lessons:
             return None
 
-        lowered = message.lower()
-        matched = [
-            lesson
-            for lesson in lessons
-            if _lesson_is_confirmed(lesson) and _lesson_matches(lowered, lesson, workflow_id)
-        ]
-        if not matched:
+        lowered = message.casefold()
+        confirmed = [lesson for lesson in lessons if _lesson_is_confirmed(lesson)]
+        if not confirmed:
             return None
-        best = max(matched, key=_lesson_weight)
-        weight = _lesson_weight(best)
+
+        injected: list[tuple[float, int, HermesMemoryInjection, dict[str, object]]] = []
+        skipped: list[HermesSkippedMemory] = []
+        conflict_skipped = False
+        for lesson in confirmed:
+            if not _lesson_matches(lowered, lesson, workflow_id):
+                continue
+            score = _lesson_relevance_score(
+                lowered,
+                lesson,
+                mode=mode,
+                agent_ids=agent_ids,
+                workflow_id=workflow_id,
+            )
+            summary = _lesson_user_summary(lesson)
+            lesson_id = _lesson_id(lesson)
+            noise_reason = _lesson_noise_reason(lesson)
+            if noise_reason is not None:
+                skipped.append(
+                    HermesSkippedMemory(
+                        id=lesson_id,
+                        summary=summary,
+                        reason=noise_reason,
+                        score=score,
+                    )
+                )
+                continue
+            if _lesson_conflicts_with_request(lowered, lesson):
+                conflict_skipped = True
+                skipped.append(
+                    HermesSkippedMemory(
+                        id=lesson_id,
+                        summary=summary,
+                        reason="当前用户指令覆盖这条记忆",
+                        score=score,
+                    )
+                )
+                continue
+            if score >= 0.65:
+                injected.append(
+                    (
+                        score,
+                        _lesson_weight(lesson),
+                        HermesMemoryInjection(
+                            id=lesson_id,
+                            summary=summary,
+                            memory_type=_lesson_memory_type(lesson),
+                            target=_lesson_target(lesson),
+                            score=round(score, 2),
+                            reason=_lesson_injection_reason(lesson, score),
+                        ),
+                        lesson,
+                    )
+                )
+            elif score >= 0.45:
+                skipped.append(
+                    HermesSkippedMemory(
+                        id=lesson_id,
+                        summary=summary,
+                        reason="当前任务相关性不足",
+                        score=round(score, 2),
+                    )
+                )
+
+        injected.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        selected_injections = tuple(item[2] for item in injected[:3])
+        selected_skipped = tuple(skipped[:5])
+        if not selected_injections and not conflict_skipped:
+            return None
+        best = injected[0][3] if injected else confirmed[0]
+        weight = injected[0][1] if injected else _lesson_weight(best)
         recommended_mode = _recommended_mode(best, lowered)
-        confidence = min(0.95, 0.55 + weight / 20)
+        confidence = injected[0][0] if injected else 0.5
         return HermesRunAdvice(
             recommended_mode=recommended_mode,
             confidence=confidence,
-            reasons=(f"Hermes matched stored lesson {best.get('id', 'unknown')}",),
+            reasons=(f"Hermes matched stored lesson {_lesson_id(best)}",),
             recommended_skills=(),
             requires_approval=policy in {"suggest", "confirm_before_apply"} or confidence < 0.75,
+            injected_memories=selected_injections,
+            skipped_memories=selected_skipped,
         )
 
     async def record_outcome(self, outcome: HermesRunOutcome) -> None:
@@ -209,6 +298,108 @@ def _lesson_matches(lowered_message: str, lesson: dict[str, object], workflow_id
     if not isinstance(text, str):
         return False
     return any(word and len(word) >= 4 and word in lowered_message for word in text.lower().split())
+
+
+def _lesson_id(lesson: dict[str, object]) -> str:
+    value = lesson.get("id")
+    return value if isinstance(value, str) and value else "unknown"
+
+
+def _lesson_user_summary(lesson: dict[str, object]) -> str:
+    for key in ("user_summary", "summary", "lesson"):
+        value = lesson.get(key)
+        if isinstance(value, str) and value.strip():
+            return _compact_sentence(value, limit=220)
+    return "Hermes+ 记忆"
+
+
+def _lesson_memory_type(lesson: dict[str, object]) -> str:
+    value = lesson.get("memory_type")
+    return value if isinstance(value, str) and value else "conversation_advice"
+
+
+def _lesson_target(lesson: dict[str, object]) -> str:
+    value = lesson.get("target")
+    return value if isinstance(value, str) and value else "main_agent"
+
+
+def _float_or_default(value: object, default: float) -> float:
+    if isinstance(value, int | float):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return default
+    return default
+
+
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, list | tuple):
+        return []
+    return [item for item in value if isinstance(item, str) and item]
+
+
+def _lesson_noise_reason(lesson: dict[str, object]) -> str | None:
+    confidence = _float_or_default(lesson.get("confidence"), 0.7)
+    noise = _float_or_default(lesson.get("noise_risk"), 0.0)
+    text = f"{lesson.get('lesson', '')} {lesson.get('user_summary', '')}"
+    if confidence < 0.45:
+        return "置信度不足"
+    if noise >= 0.7:
+        return "噪音风险过高"
+    if any(phrase in text.casefold() for phrase in _LOW_QUALITY_PHRASES):
+        return "记忆过于泛化"
+    if _lesson_memory_type(lesson) in {"temporary_state", "single_run_state"}:
+        return "临时运行状态不参与注入"
+    return None
+
+
+def _lesson_relevance_score(
+    lowered_message: str,
+    lesson: dict[str, object],
+    *,
+    mode: TaskMode,
+    agent_ids: tuple[str, ...],
+    workflow_id: str | None,
+) -> float:
+    score = 0.0
+    tags = _string_list(lesson.get("tags"))
+    if _lesson_matches(lowered_message, lesson, workflow_id):
+        score += 0.35
+    if any(tag.casefold() in lowered_message for tag in tags):
+        score += 0.2
+    if workflow_id and workflow_id in tags:
+        score += 0.1
+    agent_id_set = set(agent_ids)
+    if any(tag in agent_id_set for tag in tags):
+        score += 0.1
+    if _lesson_target(lesson) in agent_id_set:
+        score += 0.1
+    applies = _string_list(lesson.get("applies_to_modes"))
+    if mode.value in applies:
+        score += 0.12
+    elif _lesson_memory_type(lesson) in _INJECTABLE_MEMORY_TYPES:
+        score += 0.08
+    score += min(0.12, _lesson_weight(lesson) / 100)
+    score += min(0.08, _float_or_default(lesson.get("confidence"), 0.7) / 10)
+    score -= min(0.2, _float_or_default(lesson.get("noise_risk"), 0.0) / 2)
+    return max(0.0, min(1.0, score))
+
+
+def _lesson_conflicts_with_request(lowered_message: str, lesson: dict[str, object]) -> bool:
+    tags = " ".join(_string_list(lesson.get("tags")))
+    text = f"{lesson.get('lesson', '')} {tags}".casefold()
+    direct_requested = any(token in lowered_message for token in ("直连", "direct", "不要混合", "不混合"))
+    hybrid_suggested = any(token in text for token in ("hybrid", "混合"))
+    return direct_requested and hybrid_suggested
+
+
+def _lesson_injection_reason(lesson: dict[str, object], score: float) -> str:
+    raw = lesson.get("injection_reason")
+    if isinstance(raw, str) and raw.strip():
+        return _compact_sentence(raw, limit=160)
+    return f"相关性评分 {score:.2f}，命中 Hermes+ 已确认记忆"
 
 
 def _lesson_is_confirmed(lesson: dict[str, object]) -> bool:
