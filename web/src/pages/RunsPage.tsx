@@ -2926,7 +2926,7 @@ export function RunsPage() {
   const agents = useQuery({
     queryKey: ["agents"],
     queryFn: () => api.agents(),
-    refetchInterval: 5000,
+    refetchInterval: 1000,
     refetchIntervalInBackground: true,
   });
   const models = useQuery({ queryKey: ["models"], queryFn: () => api.models() });

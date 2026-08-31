@@ -211,6 +211,34 @@ class PersistentHermesRunAdvisor:
             "confirmed_at": None,
         }
         await self._upsert(outcome.tenant_id, lesson_id, payload)
+        if outcome.status is RunStatus.COMPLETED:
+            conversation_lesson_id = f"hermes_conversation_{outcome.run_id.hex}"
+            conversation_lesson = f"Run {status} with mode={mode}, workflow={workflow}."
+            conversation_tags = _unique_tags([status, mode, workflow, *outcome.agent_ids[:8]])
+            conversation_summary = (
+                f"Hermes recorded reusable conversation memory from {conversation_id}: "
+                f"{conversation_lesson} Tags: {', '.join(conversation_tags) or 'none'}. Weight: 4."
+            )
+            conversation_payload: dict[str, object] = {
+                "id": conversation_lesson_id,
+                "category": "conversation",
+                "outcome": "success",
+                "lesson": conversation_lesson,
+                "summary": conversation_summary,
+                "user_summary": f"对话记忆记录了一条可复用经验：{_runtime_lesson_summary(conversation_lesson)}",
+                "tags": conversation_tags,
+                "weight": 4,
+                "memory_type": "conversation_outcome_summary",
+                "target": "learning_ledger",
+                "applies_to_modes": [mode] if mode != "unknown" else [],
+                "confidence": 0.62,
+                "noise_risk": 0.2,
+                "created_at": datetime.now(UTC).isoformat(),
+                "run_id": str(outcome.run_id),
+                "conversation_id": outcome.conversation_id,
+                "confirmed_at": None,
+            }
+            await self._upsert(outcome.tenant_id, conversation_lesson_id, conversation_payload)
 
     async def _enabled(self, tenant_id: UUID) -> bool:
         async with self._session_factory() as session:
@@ -342,14 +370,17 @@ def _lesson_noise_reason(lesson: dict[str, object]) -> str | None:
     confidence = _float_or_default(lesson.get("confidence"), 0.7)
     noise = _float_or_default(lesson.get("noise_risk"), 0.0)
     text = f"{lesson.get('lesson', '')} {lesson.get('user_summary', '')}"
+    memory_type = _lesson_memory_type(lesson)
     if confidence < 0.45:
         return "置信度不足"
     if noise >= 0.7:
         return "噪音风险过高"
     if any(phrase in text.casefold() for phrase in _LOW_QUALITY_PHRASES):
         return "记忆过于泛化"
-    if _lesson_memory_type(lesson) in {"temporary_state", "single_run_state"}:
+    if memory_type in {"temporary_state", "single_run_state"}:
         return "临时运行状态不参与注入"
+    if memory_type not in _INJECTABLE_MEMORY_TYPES and memory_type != "conversation_advice":
+        return "记忆类型仅用于台账展示"
     return None
 
 

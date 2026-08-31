@@ -694,6 +694,48 @@ async def test_persistent_hermes_runtime_outcome_is_scheduler_observation(
     assert payload["conversation_id"] == "conv-scheduler-observe"
     assert payload["run_id"] == str(run_id)
 
+
+async def test_persistent_hermes_completed_run_also_records_conversation_memory(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    actor_id = uuid4()
+    run_id = uuid4()
+    advisor = PersistentHermesRunAdvisor(run_session_factory)
+
+    await advisor.record_outcome(
+        HermesRunOutcome(
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            run_id=run_id,
+            status=RunStatus.COMPLETED,
+            mode=TaskMode.HYBRID,
+            workflow_id="quality-review",
+            conversation_id="conv-learns-after-clear",
+            agent_ids=("planner", "reviewer"),
+        )
+    )
+
+    async with run_session_factory() as session:
+        rows = (
+            await session.execute(
+                select(AdminResourceRow)
+                .where(AdminResourceRow.tenant_id == tenant_id)
+                .where(AdminResourceRow.kind == "hermes")
+            )
+        ).scalars().all()
+
+    payloads = [dict(row.payload) for row in rows]
+    categories = {payload["category"] for payload in payloads}
+    assert categories == {"scheduler", "conversation"}
+    conversation_payload = next(payload for payload in payloads if payload["category"] == "conversation")
+    assert conversation_payload["id"] == f"hermes_conversation_{run_id.hex}"
+    assert conversation_payload["conversation_id"] == "conv-learns-after-clear"
+    assert conversation_payload["run_id"] == str(run_id)
+    assert conversation_payload["memory_type"] == "conversation_outcome_summary"
+    assert conversation_payload["target"] == "learning_ledger"
+    assert conversation_payload["user_summary"] == "对话记忆记录了一条可复用经验：quality-review 工作流以 hybrid 模式成功完成。"
+
 async def test_persistent_hermes_records_scheduler_notice_details(
     run_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

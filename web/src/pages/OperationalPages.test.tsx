@@ -385,6 +385,7 @@ describe("operational management pages", () => {
   let visibleRunDetail = runDetail;
   let visibleConversationRuns = [runDetail];
   let visibleRunListItems = [runListItem];
+  let visibleAgents = agents;
   let visibleModels = models;
   let visibleWorkflows = workflows;
   let deletedRunIds = new Set<string>();
@@ -401,6 +402,7 @@ describe("operational management pages", () => {
     visibleRunDetail = runDetail;
     visibleConversationRuns = [visibleRunDetail];
     visibleRunListItems = [visibleRunListItem];
+    visibleAgents = agents;
     visibleModels = models;
     visibleWorkflows = workflows;
     deletedRunIds = new Set<string>();
@@ -763,10 +765,22 @@ describe("operational management pages", () => {
         }
         if (path === "/api/v1/admin/agents" && method === "POST") {
           const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
+          visibleAgents = [
+            ...visibleAgents.filter((agent) => agent.id !== body.id),
+            {
+              id: String(body.id),
+              name: String(body.name),
+              enabled: Boolean(body.enabled ?? true),
+              role: String(body.role),
+              prompt: String(body.prompt),
+              model: String(body.model),
+              skills: Array.isArray(body.skills) ? body.skills : [],
+            },
+          ];
           return jsonResponse(body);
         }
         if (path === "/api/v1/admin/agents") {
-          return jsonResponse(agents);
+          return jsonResponse(visibleAgents);
         }
         if (path === "/api/v1/admin/models") {
           return jsonResponse(visibleModels);
@@ -5084,6 +5098,109 @@ describe("operational management pages", () => {
     );
     expect(directorCard?.textContent).toContain("deepseek-v4-flash");
     expect(directorCard?.textContent).toContain("负责审查活动动线");
+  });
+
+  it("refreshes newly saved agents in the run configuration without a manual page reload", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await openRunConfig(user);
+    expect(screen.queryByText("测试工程师（qa-engineer）")).toBeNull();
+
+    visibleAgents = [
+      ...visibleAgents,
+      {
+        id: "qa-engineer",
+        name: "测试工程师",
+        enabled: true,
+        role: "测试工程师",
+        prompt: "负责从用户视角验证交付能力。",
+        model: "main",
+        skills: [],
+      },
+    ];
+
+    await waitFor(() => expect(screen.getByText("测试工程师（qa-engineer）")).not.toBeNull(), {
+      timeout: 2500,
+    });
+  });
+
+  it("refreshes new process cards while a different process detail drawer stays open", async () => {
+    const user = userEvent.setup();
+    const initialRunDetail: RunDetail = {
+      ...runDetail,
+      status: "running",
+      events: [
+        {
+          sequence: 1,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "copywriter",
+          participants: [],
+          tool_name: "artifact_writer",
+          step_id: "write-script",
+          action: null,
+          decision: null,
+          payload: { result: "第一张过程卡" },
+          artifact: {
+            id: "artifact-card-one",
+            kind: "markdown",
+            title: "第一张过程卡",
+            text: "第一张过程卡正文。",
+          },
+        },
+      ],
+      artifacts: [],
+    };
+    visibleRunDetail = initialRunDetail;
+    visibleConversationRuns = [initialRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await user.click(within(stream).getByRole("button", { name: /文案生成 输出：第一张过程卡/ }));
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).getAllByText("第一张过程卡").length).toBeGreaterThan(0);
+    expect(within(stream).queryByRole("button", { name: /导演 输出：第二张过程卡/ })).toBeNull();
+
+    const refreshedRunDetail: RunDetail = {
+      ...initialRunDetail,
+      events: [
+        ...initialRunDetail.events,
+        {
+          sequence: 2,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "director",
+          participants: [],
+          tool_name: "artifact_writer",
+          step_id: "director-review",
+          action: null,
+          decision: null,
+          payload: { result: "第二张过程卡" },
+          artifact: {
+            id: "artifact-card-two",
+            kind: "markdown",
+            title: "第二张过程卡",
+            text: "第二张过程卡正文。",
+          },
+        },
+      ],
+    };
+    visibleRunDetail = refreshedRunDetail;
+    visibleConversationRuns = [refreshedRunDetail];
+
+    await waitFor(() => expect(within(stream).getByRole("button", { name: /导演 输出：第二张过程卡/ })).not.toBeNull(), {
+      timeout: 2500,
+    });
+    expect(within(drawer).getByText("文案生成 输出：第一张过程卡")).not.toBeNull();
+    expect(within(drawer).queryByText("导演 输出：第二张过程卡")).toBeNull();
   });
 
   it("shows localized process summaries with participating roles instead of raw event codes", async () => {

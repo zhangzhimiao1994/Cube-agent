@@ -123,3 +123,45 @@ async def test_runtime_advice_can_use_confirmed_conversation_lessons() -> None:
 
     assert advice is not None
     assert advice.recommended_mode is TaskMode.DISCUSS
+
+
+@pytest.mark.asyncio
+async def test_runtime_advice_ignores_confirmed_conversation_outcome_summaries() -> None:
+    conversation_summary = {
+        "id": "hermes_conversation_outcome",
+        "category": "conversation",
+        "outcome": "success",
+        "lesson": "Run completed with mode=hybrid, workflow=quality-review.",
+        "summary": "Hermes recorded a reusable conversation outcome summary.",
+        "user_summary": "对话记忆记录了一条可复用经验：quality-review 工作流以 hybrid 模式成功完成。",
+        "tags": ["completed", "hybrid", "quality-review"],
+        "weight": 10,
+        "memory_type": "conversation_outcome_summary",
+        "target": "learning_ledger",
+        "applies_to_modes": ["hybrid"],
+        "confidence": 0.9,
+        "noise_risk": 0.0,
+        "created_at": datetime.now(UTC).isoformat(),
+        "run_id": str(uuid4()),
+        "conversation_id": "conv-ledger-only",
+        "confirmed_at": datetime.now(UTC).isoformat(),
+    }
+    session_factory = FakeSessionFactory(
+        [
+            [],
+            [FakeRow({"hermes_policy": "suggest"})],
+            [FakeRow(conversation_summary)],
+        ]
+    )
+    advisor = PersistentHermesRunAdvisor(session_factory)  # type: ignore[arg-type]
+
+    advice = await advisor.advise(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="please run a quality-review hybrid task",
+        mode=TaskMode.HYBRID,
+        agent_ids=(),
+        workflow_id="quality-review",
+    )
+
+    assert advice is None
