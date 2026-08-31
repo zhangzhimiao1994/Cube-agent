@@ -640,6 +640,9 @@ async def test_persistent_hermes_runtime_outcome_is_scheduler_observation(
     assert payload["category"] == "scheduler"
     assert payload["conversation_id"] == "conv-scheduler-observe"
     assert payload["run_id"] == str(run_id)
+    assert payload["user_summary"] == (
+        "本次调度学习记录了一个失败教训：quality-review 工作流以 hybrid 模式运行失败。"
+    )
 
 async def test_persistent_hermes_records_scheduler_notice_details(
     run_session_factory: async_sessionmaker[AsyncSession],
@@ -684,6 +687,7 @@ async def test_persistent_hermes_records_scheduler_notice_details(
     assert payload["category"] == "scheduler"
     assert payload["outcome"] == "failure"
     assert "调度观察" in str(payload["summary"])
+    assert str(payload["user_summary"]).startswith("本次调度观察提醒：short-video-dispatch 工作流以 dispatch 模式运行失败")
     assert "model_capacity_pressure" in str(payload["lesson"])
     tags = payload["tags"]
     assert isinstance(tags, list)

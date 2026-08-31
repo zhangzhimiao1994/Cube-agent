@@ -871,6 +871,7 @@ const HermesInsightSchema = z.object({
   outcome: z.string(),
   lesson: z.string(),
   summary: z.string(),
+  user_summary: z.string().default(""),
   run_id: z.string().nullable(),
   conversation_id: z.string().nullable(),
   confirmed_at: z.string().nullable(),

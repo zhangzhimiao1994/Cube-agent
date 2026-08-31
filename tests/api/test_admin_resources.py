@@ -4426,12 +4426,18 @@ def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
         "Learned success pattern: Use group chat when debate review is required. "
         "Tags: debate, review. Weight: 5."
     )
+    assert feedback.json()["user_summary"] == (
+        "本次对话记住了一个成功经验：需要争议评审时优先使用讨论模式。"
+    )
     detail = api.get(f"/api/v1/admin/hermes/{insight_id}", headers=headers())
     confirmed = api.post(f"/api/v1/admin/hermes/{insight_id}/confirm", headers=headers())
     assert recommendation.status_code == 200
     assert detail.status_code == 200
     assert detail.json()["id"] == insight_id
     assert detail.json()["conversation_id"] == "conv-architecture-1"
+    assert detail.json()["user_summary"] == (
+        "本次对话记住了一个成功经验：需要争议评审时优先使用讨论模式。"
+    )
     assert confirmed.status_code == 200
     assert confirmed.json()["confirmed_at"] is not None
     assert recommendation.json()["recommended_mode"] == "group_chat"
@@ -4441,6 +4447,7 @@ def test_hermes_records_feedback_and_recommends_from_prior_lessons() -> None:
     assert any(
         insight["lesson"] == "Use group chat when debate review is required."
         and insight["summary"].startswith("Learned success pattern:")
+        and insight["user_summary"] == "本次对话记住了一个成功经验：需要争议评审时优先使用讨论模式。"
         and insight["category"] == "conversation"
         for insight in insights.json()
     )

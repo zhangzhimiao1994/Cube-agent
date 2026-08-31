@@ -97,6 +97,7 @@ class PersistentHermesRunAdvisor:
                 f"调度观察：Hermes learned from conversation {conversation_id}: "
                 f"{lesson} Tags: {', '.join(tags) or 'none'}. Weight: {weight}."
             )
+            user_summary = f"本次调度观察提醒：{_runtime_lesson_summary(lesson)}"
         else:
             lesson = f"Run {status} with mode={mode}, workflow={workflow}."
             tags = _unique_tags([status, mode, workflow, *outcome.agent_ids[:8]])
@@ -106,12 +107,15 @@ class PersistentHermesRunAdvisor:
                 f"{lesson} Tags: {status}, {mode}, {workflow}. "
                 f"Weight: {weight}."
             )
+            label = "成功经验" if outcome.status is RunStatus.COMPLETED else "失败教训"
+            user_summary = f"本次调度学习记录了一个{label}：{_runtime_lesson_summary(lesson)}"
         payload: dict[str, object] = {
             "id": lesson_id,
             "category": "scheduler",
             "outcome": "success" if outcome.status is RunStatus.COMPLETED else "failure",
             "lesson": lesson,
             "summary": summary,
+            "user_summary": user_summary,
             "tags": tags,
             "weight": weight,
             "created_at": datetime.now(UTC).isoformat(),
@@ -286,3 +290,33 @@ def _unique_tags(tags: list[str]) -> list[str]:
         if len(result) >= 16:
             break
     return result
+
+
+def _compact_sentence(value: str, *, limit: int = 96) -> str:
+    cleaned = " ".join(value.strip().split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return f"{cleaned[: limit - 1].rstrip()}..."
+
+
+def _runtime_lesson_summary(value: str) -> str:
+    cleaned = " ".join(value.strip().split())
+    prefix = "Run "
+    if not cleaned.startswith(prefix):
+        return _compact_sentence(cleaned)
+    head = cleaned.split(". Scheduler notices:", 1)[0]
+    parts = head.removeprefix(prefix).split(" with mode=", 1)
+    if len(parts) != 2:
+        return _compact_sentence(cleaned)
+    status, rest = parts
+    mode, _, workflow = rest.partition(", workflow=")
+    workflow = workflow.removesuffix(".")
+    status_label = {
+        "completed": "成功完成",
+        "failed": "运行失败",
+        "cancelled": "被取消",
+    }.get(status, status)
+    summary = f"{workflow} 工作流以 {mode} 模式{status_label}。"
+    if ". Scheduler notices:" in cleaned:
+        summary = f"{summary} 已记录调度告警。"
+    return summary

@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 
 from agent_hub.domain.runs import TaskMode
-from agent_hub.hermes.advisor import PersistentHermesRunAdvisor
+from agent_hub.hermes.advisor import PersistentHermesRunAdvisor, _runtime_lesson_summary
 
 
 @dataclass(slots=True)
@@ -123,3 +123,17 @@ async def test_runtime_advice_can_use_confirmed_conversation_lessons() -> None:
 
     assert advice is not None
     assert advice.recommended_mode is TaskMode.DISCUSS
+
+
+def test_runtime_lesson_summary_localizes_scheduler_outcomes_for_users() -> None:
+    assert (
+        _runtime_lesson_summary("Run failed with mode=hybrid, workflow=quality-review.")
+        == "quality-review 工作流以 hybrid 模式运行失败。"
+    )
+    assert (
+        _runtime_lesson_summary(
+            "Run completed with mode=dispatch, workflow=short-video-dispatch. "
+            "Scheduler notices: trigger=model_capacity_pressure."
+        )
+        == "short-video-dispatch 工作流以 dispatch 模式成功完成。 已记录调度告警。"
+    )

@@ -184,6 +184,7 @@ const hermesInsight = {
   category: "conversation",
   lesson: "Use group chat when debate review is required.",
   summary: "Learned success pattern: Use group chat when debate review is required. Tags: debate, review. Weight: 5.",
+  user_summary: "本次对话记住了一个成功经验：需要争议评审时使用讨论模式。",
   run_id: runId,
   conversation_id: "conv-architecture-1",
   confirmed_at: null,
@@ -199,6 +200,7 @@ const secondHermesInsight = {
   category: "scheduler",
   lesson: "Ask for confirmation before changing the workflow role pool.",
   summary: "Learned failure pattern: Ask for confirmation before changing the workflow role pool. Tags: workflow, approval. Weight: 4.",
+  user_summary: "本次调度观察提醒：调整工作流角色池前需要先确认。",
   conversation_id: "conv-workflow-2",
   confirmed_at: null,
   tags: ["workflow", "approval"],
@@ -3766,10 +3768,13 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("table", { name: /Hermes/ })).not.toBeNull();
     expect(screen.queryByText("请求 Hermes 推荐")).toBeNull();
     expect(screen.queryByText("推荐结果")).toBeNull();
+    expect(screen.getByRole("columnheader", { name: /一句话总结/ })).not.toBeNull();
+    expect(screen.getByText(hermesInsight.user_summary)).not.toBeNull();
     expect(screen.getByText("conv-architecture-1")).not.toBeNull();
     expect(screen.getByText("2026-08-07T00:04:00Z")).not.toBeNull();
     await user.click(screen.getByRole("link", { name: /conv-architecture-1/ }));
 
+    expect(await screen.findByText(hermesInsight.user_summary)).not.toBeNull();
     expect(await screen.findByText(hermesInsight.summary)).not.toBeNull();
     expect(screen.getByText(hermesInsight.lesson)).not.toBeNull();
     await user.click(screen.getByRole("button", { name: /确认/ }));

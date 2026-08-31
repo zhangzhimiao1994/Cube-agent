@@ -1646,6 +1646,7 @@ class HermesInsightResponse(BaseModel):
     outcome: str
     lesson: str
     summary: str
+    user_summary: str
     run_id: UUID | None = None
     conversation_id: str | None = None
     confirmed_at: datetime | None = None
@@ -2780,6 +2781,11 @@ class InMemoryAdminResourceService:
                     tags=["dispatch", "planning", "clear-task"],
                     weight=3,
                 ),
+                user_summary=_hermes_user_summary(
+                    category="conversation",
+                    outcome="success",
+                    lesson="Use dispatch mode when the request has clear deliverables and separable steps.",
+                ),
                 run_id=None,
                 conversation_id="conv-readiness",
                 confirmed_at=None,
@@ -3695,6 +3701,7 @@ class InMemoryAdminResourceService:
             raise ValueError("sensitive content")
         insight = HermesInsightResponse(
             id=f"hermes-{uuid4().hex}",
+            category=request.category,
             outcome=request.outcome,
             lesson=request.lesson,
             summary=_hermes_feedback_summary(
@@ -3702,6 +3709,11 @@ class InMemoryAdminResourceService:
                 lesson=request.lesson,
                 tags=request.tags,
                 weight=request.weight,
+            ),
+            user_summary=_hermes_user_summary(
+                category=request.category,
+                outcome=request.outcome,
+                lesson=request.lesson,
             ),
             run_id=request.run_id,
             conversation_id=request.conversation_id,
@@ -5349,6 +5361,11 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 tags=request.tags,
                 weight=request.weight,
             ),
+            user_summary=_hermes_user_summary(
+                category=request.category,
+                outcome=request.outcome,
+                lesson=request.lesson,
+            ),
             run_id=request.run_id,
             conversation_id=request.conversation_id,
             confirmed_at=None,
@@ -6547,6 +6564,7 @@ def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightRe
     category = str(raw_category) if raw_category in {"conversation", "scheduler"} else "conversation"
     lesson = str(payload.get("lesson", ""))
     raw_summary = payload.get("summary")
+    raw_user_summary = payload.get("user_summary")
     run_id = _uuid_from_json(payload.get("run_id"))
     raw_conversation_id = payload.get("conversation_id")
     raw_confirmed_at = payload.get("confirmed_at")
@@ -6563,6 +6581,9 @@ def _hermes_response_from_payload(payload: dict[str, object]) -> HermesInsightRe
             tags=normalized_tags,
             weight=weight,
         ),
+        user_summary=raw_user_summary
+        if isinstance(raw_user_summary, str) and raw_user_summary.strip()
+        else _hermes_user_summary(category=category, outcome=outcome, lesson=lesson),
         run_id=run_id,
         conversation_id=raw_conversation_id if isinstance(raw_conversation_id, str) else None,
         confirmed_at=_datetime_from_json(raw_confirmed_at) if raw_confirmed_at else None,
@@ -6587,6 +6608,42 @@ def _hermes_feedback_summary(
     normalized_tags = ", ".join(tag for tag in tags if tag)
     tags_part = normalized_tags or "none"
     return f"{label}: {lesson.strip()} Tags: {tags_part}. Weight: {weight}."
+
+
+def _hermes_user_summary(*, category: str, outcome: str, lesson: str) -> str:
+    cleaned = _localized_hermes_lesson(lesson)
+    if category == "scheduler":
+        prefix = "本次调度观察提醒"
+    else:
+        prefix = {
+            "success": "本次对话记住了一个成功经验",
+            "failure": "本次对话记住了一个失败教训",
+            "neutral": "本次对话记录了一条中性观察",
+        }.get(outcome, "本次对话记录了一条学习")
+    return f"{prefix}：{cleaned}"
+
+
+def _localized_hermes_lesson(lesson: str) -> str:
+    cleaned = " ".join(lesson.strip().split())
+    if not cleaned:
+        return "记录了一条新的 Hermes 学习。"
+    lowered = cleaned.lower()
+    if lowered == "use group chat when debate review is required.":
+        return "需要争议评审时优先使用讨论模式。"
+    if lowered == "use dispatch mode when the request has clear deliverables and separable steps.":
+        return "需求交付物清晰且步骤可拆分时优先使用派单模式。"
+    runtime = re.fullmatch(r"Run ([a-z_]+) with mode=([^,]+), workflow=([^.\s]+)\.", cleaned)
+    if runtime:
+        status, mode, workflow = runtime.groups()
+        status_label = {
+            "completed": "成功完成",
+            "failed": "运行失败",
+            "cancelled": "被取消",
+        }.get(status, status)
+        return f"{workflow} 工作流以 {mode} 模式{status_label}。"
+    if len(cleaned) > 96:
+        cleaned = f"{cleaned[:95].rstrip()}..."
+    return cleaned
 
 
 def _datetime_from_json(value: object) -> datetime:
