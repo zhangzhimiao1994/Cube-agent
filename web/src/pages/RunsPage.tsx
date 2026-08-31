@@ -588,7 +588,8 @@ function compareAgentActivities(left: AgentWorkActivity, right: AgentWorkActivit
 function dedupeAgentActivities(agent: AgentWorkItem) {
   const seen = new Set<string>();
   return [...agent.activity, ...agent.outputs].sort(compareAgentActivities).filter((activity) => {
-    const key = `${activity.category}:${activity.kind}:${activity.title}:${activity.summary}`;
+    const artifactKey = activity.artifact?.id || activity.artifact?.download_url || activity.artifact?.filename || "";
+    const key = `${activity.category}:${activity.kind}:${activity.title}:${activity.summary}:${artifactKey}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return Boolean(activity.summary.trim() || activity.title.trim());
@@ -1042,8 +1043,51 @@ function sameRunSnapshot(left: RunDetail, right: RunDetail) {
     left.mode === right.mode &&
     left.request === right.request &&
     left.events.length === right.events.length &&
-    left.artifacts.length === right.artifacts.length
+    left.artifacts.length === right.artifacts.length &&
+    left.events.every((event, index) => eventFingerprint(event) === eventFingerprint(right.events[index])) &&
+    left.artifacts.every((artifact, index) => artifactFingerprint(artifact) === artifactFingerprint(right.artifacts[index]))
   );
+}
+
+function stablePayloadFingerprint(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stablePayloadFingerprint).join(",")}]`;
+  return `{${Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, item]) => `${JSON.stringify(key)}:${stablePayloadFingerprint(item)}`)
+    .join(",")}}`;
+}
+
+function artifactFingerprint(artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null | undefined) {
+  if (!artifact) return "";
+  return [
+    artifact.id,
+    artifact.kind,
+    artifact.title,
+    artifact.text ?? "",
+    artifact.filename ?? "",
+    artifact.mime_type ?? "",
+    artifact.size_bytes ?? "",
+    artifact.sha256 ?? "",
+    artifact.download_url ?? "",
+  ].join("\u001f");
+}
+
+function eventFingerprint(event: RunEvent) {
+  return [
+    event.sequence,
+    event.kind,
+    event.message,
+    event.created_at,
+    event.actor ?? "",
+    event.participants.join(","),
+    event.tool_name ?? "",
+    event.step_id ?? "",
+    event.action ?? "",
+    event.decision ?? "",
+    stablePayloadFingerprint(event.payload),
+    artifactFingerprint(event.artifact),
+  ].join("\u001f");
 }
 
 function mergeConversationRuns(previous: RunDetail[] | undefined, incoming: RunDetail[]) {
@@ -1893,6 +1937,9 @@ function RunProcessDrawer({
   const selectedActivity = selectedAgent
     ? [...selectedAgent.outputs, ...selectedAgent.activity].find((activity) => activity.id === target.selectedActivityId)
     : undefined;
+  const refreshedActivityDetail = activityDetail
+    ? target.workItems.flatMap(dedupeAgentActivities).find((activity) => activity.id === activityDetail.id) ?? activityDetail
+    : null;
   const canShowComputerView = Boolean(selectedAgent?.availableViews.includes("computer"));
   const activeView = canShowComputerView ? selectedView : "activity";
 
@@ -2003,7 +2050,9 @@ function RunProcessDrawer({
             <p className="agent-workforce-empty">这次运行还没有可展示的子 Agent 记录。</p>
           )}
         </div>
-        {activityDetail ? <AgentActivityDetailDrawer activity={activityDetail} onClose={() => setActivityDetail(null)} /> : null}
+        {refreshedActivityDetail ? (
+          <AgentActivityDetailDrawer activity={refreshedActivityDetail} onClose={() => setActivityDetail(null)} />
+        ) : null}
       </section>
     </div>
   );
@@ -2186,6 +2235,7 @@ function TemporaryAgentRecruitmentCard({
     event.stopPropagation();
   };
   const handleKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (event.target !== event.currentTarget) return;
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
       onOpen();
@@ -2555,6 +2605,7 @@ export function RunsPage() {
     enabled: Boolean(selectedRunId),
     refetchInterval: (query) => {
       const data = query.state.data;
+      if (data && processDetailTarget?.runId === data.id) return 1000;
       return data && !TERMINAL_STATUSES.has(data.status) ? 1000 : false;
     },
   });
@@ -2577,6 +2628,7 @@ export function RunsPage() {
     enabled: Boolean(activeConversationId && activeConversationKnown),
     refetchInterval: (query) => {
       const data = query.state.data;
+      if (data && processDetailTarget?.conversationId === data.conversation_id) return 1000;
       return data?.runs.some((run) => !TERMINAL_STATUSES.has(run.status)) ? 1000 : false;
     },
   });

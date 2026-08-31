@@ -2748,6 +2748,252 @@ describe("operational management pages", () => {
     await waitFor(() => expect(within(drawer).getAllByText(/第二版输出/).length).toBeGreaterThan(0), { timeout: 2500 });
   });
 
+  it("keeps an open subagent work drawer polling when a terminal run receives late artifacts", async () => {
+    const user = userEvent.setup();
+    const firstSnapshot = {
+      ...runDetail,
+      status: "completed",
+      events: [
+        {
+          sequence: 1,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "copywriter",
+          participants: [],
+          tool_name: null,
+          step_id: "copywriting_step",
+          action: null,
+          decision: null,
+          payload: {},
+          artifact: {
+            id: "artifact-terminal-first",
+            kind: "markdown",
+            title: "终态第一版",
+            text: "终态第一版：已完成。",
+          },
+        },
+      ],
+      artifacts: [
+        {
+          id: "artifact-terminal-first",
+          kind: "markdown",
+          title: "终态第一版",
+          text: "终态第一版：已完成。",
+        },
+      ],
+    };
+    const secondSnapshot = {
+      ...firstSnapshot,
+      events: [
+        ...firstSnapshot.events,
+        {
+          sequence: 2,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: "2026-08-07T00:00:04Z",
+          actor: "copywriter",
+          participants: [],
+          tool_name: null,
+          step_id: "copywriting_step",
+          action: null,
+          decision: null,
+          payload: {},
+          artifact: {
+            id: "artifact-terminal-late",
+            kind: "markdown",
+            title: "终态补写产物",
+            text: "终态补写产物：补充下载信息。",
+          },
+        },
+      ],
+      artifacts: [
+        ...firstSnapshot.artifacts,
+        {
+          id: "artifact-terminal-late",
+          kind: "markdown",
+          title: "终态补写产物",
+          text: "终态补写产物：补充下载信息。",
+        },
+      ],
+    };
+    visibleRunDetail = firstSnapshot;
+    visibleConversationRuns = [firstSnapshot];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await user.click(within(stream).getByRole("button", { name: /文案生成 输出：终态第一版/ }));
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).queryByText(/终态补写产物/)).toBeNull();
+
+    visibleRunDetail = secondSnapshot;
+    visibleConversationRuns = [secondSnapshot];
+
+    await waitFor(() => expect(within(drawer).getAllByText(/终态补写产物/).length).toBeGreaterThan(0), { timeout: 2500 });
+  });
+
+  it("keeps an open activity detail synced with refreshed event content", async () => {
+    const user = userEvent.setup();
+    const firstSnapshot = {
+      ...runDetail,
+      events: [
+        {
+          sequence: 1,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "copywriter",
+          participants: [],
+          tool_name: null,
+          step_id: "copywriting_step",
+          action: null,
+          decision: null,
+          payload: {},
+          artifact: {
+            id: "artifact-live-detail",
+            kind: "markdown",
+            title: "第一版输出",
+            text: "第一版输出：先完成主题。",
+          },
+        },
+      ],
+      artifacts: [
+        {
+          id: "artifact-live-detail",
+          kind: "markdown",
+          title: "第一版输出",
+          text: "第一版输出：先完成主题。",
+        },
+      ],
+    };
+    const refreshedSnapshot = {
+      ...firstSnapshot,
+      events: [
+        {
+          ...firstSnapshot.events[0],
+          artifact: {
+            id: "artifact-live-detail",
+            kind: "markdown",
+            title: "第一版输出",
+            text: "第一版输出：补充验收标准。",
+          },
+        },
+      ],
+      artifacts: [
+        {
+          id: "artifact-live-detail",
+          kind: "markdown",
+          title: "第一版输出",
+          text: "第一版输出：补充验收标准。",
+        },
+      ],
+    };
+    visibleRunDetail = firstSnapshot;
+    visibleConversationRuns = [firstSnapshot];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await user.click(within(stream).getByRole("button", { name: /文案生成 输出：第一版输出/ }));
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    await user.click(within(drawer).getByRole("button", { name: /打开活动详情：文案生成 输出/ }));
+    const activityDetail = await screen.findByRole("dialog", { name: "活动详情" });
+    expect(within(activityDetail).getAllByText(/先完成主题/).length).toBeGreaterThan(0);
+    expect(within(activityDetail).queryByText(/补充验收标准/)).toBeNull();
+
+    visibleRunDetail = refreshedSnapshot;
+    visibleConversationRuns = [refreshedSnapshot];
+
+    await waitFor(() => expect(within(activityDetail).getAllByText(/补充验收标准/).length).toBeGreaterThan(0), {
+      timeout: 2500,
+    });
+  });
+
+  it("keeps duplicate-looking artifacts separate when their downloadable files differ", async () => {
+    const user = userEvent.setup();
+    const duplicateArtifactRun = {
+      ...runDetail,
+      events: [
+        {
+          sequence: 1,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: "2026-08-07T00:00:02Z",
+          actor: "copywriter",
+          participants: [],
+          tool_name: null,
+          step_id: "copywriting_step",
+          action: null,
+          decision: null,
+          payload: {},
+          artifact: {
+            id: "artifact-duplicate-a",
+            kind: "markdown",
+            title: "交付文件",
+            text: "同一份摘要。",
+            filename: "plan-a.md",
+            download_url: "/api/v1/admin/runs/22222222/artifacts/artifact-duplicate-a/download",
+          },
+        },
+        {
+          sequence: 2,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: "2026-08-07T00:00:03Z",
+          actor: "copywriter",
+          participants: [],
+          tool_name: null,
+          step_id: "copywriting_step",
+          action: null,
+          decision: null,
+          payload: {},
+          artifact: {
+            id: "artifact-duplicate-b",
+            kind: "markdown",
+            title: "交付文件",
+            text: "同一份摘要。",
+            filename: "plan-b.md",
+            download_url: "/api/v1/admin/runs/22222222/artifacts/artifact-duplicate-b/download",
+          },
+        },
+      ],
+      artifacts: [
+        {
+          id: "artifact-duplicate-a",
+          kind: "markdown",
+          title: "交付文件",
+          text: "同一份摘要。",
+          filename: "plan-a.md",
+          download_url: "/api/v1/admin/runs/22222222/artifacts/artifact-duplicate-a/download",
+        },
+        {
+          id: "artifact-duplicate-b",
+          kind: "markdown",
+          title: "交付文件",
+          text: "同一份摘要。",
+          filename: "plan-b.md",
+          download_url: "/api/v1/admin/runs/22222222/artifacts/artifact-duplicate-b/download",
+        },
+      ],
+    };
+    visibleRunDetail = duplicateArtifactRun;
+    visibleConversationRuns = [duplicateArtifactRun];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await user.click(within(stream).getAllByRole("button", { name: /文案生成 输出：同一份摘要/ })[0]);
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).getAllByRole("button", { name: /打开活动详情：文案生成 输出/ }).length).toBeGreaterThanOrEqual(2);
+  });
+
   it("closes the subagent work drawer from the backdrop and locks background scrolling", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);
@@ -3179,6 +3425,31 @@ describe("operational management pages", () => {
           version: 1,
           feedback: "do not add an engineer yet",
         },
+      }),
+    );
+  });
+
+  it("does not open the temporary-agent detail when keyboard-activating card actions", async () => {
+    const user = userEvent.setup();
+    const view = render(<TestApp initialPath="/" />);
+
+    await waitFor(() => expect(view.container.querySelector(".chat-composer")).not.toBeNull());
+    await openRunConfig(user);
+    await user.selectOptions(screen.getAllByRole("combobox")[1], "short-video-dispatch");
+    const composer = view.container.querySelector(".chat-composer") as HTMLFormElement;
+    await user.type(composer.querySelector("textarea") as HTMLTextAreaElement, "make this into a web page");
+    await user.click(composer.querySelector('button[type="submit"]') as HTMLButtonElement);
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const recruitmentCard = within(stream).getByRole("button", { name: /打开 Temporary Web Engineer 招募详情/ });
+    const approveButton = within(recruitmentCard).getByRole("button", { name: "同意加入" });
+    approveButton.focus();
+    await user.keyboard("{Enter}");
+
+    expect(screen.queryByRole("dialog", { name: "临时 Agent 招募详情" })).toBeNull();
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === `/api/v1/runs/${runId}/approve-temporary-agent`)).toMatchObject({
+        method: "POST",
       }),
     );
   });
