@@ -62,6 +62,7 @@ class ExecutableFakeRepository:
             routing_decision=routing_decision,
         )
         self.events: list[RunEvent] = []
+        self.conversation_context_calls: list[dict[str, object]] = []
 
     async def run_transaction(self) -> FakeTransaction:
         return FakeTransaction()
@@ -219,6 +220,13 @@ class ExecutableFakeRepository:
         assert tenant_id == TENANT_ID
         assert before_run_id == self.run_id
         assert conversation_id
+        self.conversation_context_calls.append(
+            {
+                "tenant_id": tenant_id,
+                "conversation_id": conversation_id,
+                "before_run_id": before_run_id,
+            }
+        )
         return []
 
     def _record(self) -> RunRecord:
@@ -1196,4 +1204,40 @@ async def test_execute_backfills_hermes_outcome_for_terminal_run_after_crash() -
     assert outcome.status is RunStatus.COMPLETED
     assert outcome.conversation_id == "conv-crash-after-terminal"
     assert outcome.workflow_id == "workflow-alpha"
+    assert outcome.agent_ids == ("writer",)
+
+
+@pytest.mark.asyncio
+async def test_execute_records_hermes_outcome_when_cleared_conversation_has_no_context() -> None:
+    repository = ExecutableFakeRepository(
+        routing_decision={
+            "source": "manual",
+            "conversation_id": "conv-cleared-then-continued",
+            "workflow_id": None,
+            "selected_agent_ids": ["writer"],
+        }
+    )
+    hermes = RecordingHermesAdvisor()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeCompletes(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+        hermes_advisor=hermes,
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.COMPLETED
+    assert repository.conversation_context_calls == [
+        {
+            "tenant_id": TENANT_ID,
+            "conversation_id": "conv-cleared-then-continued",
+            "before_run_id": repository.run_id,
+        }
+    ]
+    assert len(hermes.outcomes) == 1
+    outcome = hermes.outcomes[0]
+    assert outcome.status is RunStatus.COMPLETED
+    assert outcome.conversation_id == "conv-cleared-then-continued"
     assert outcome.agent_ids == ("writer",)

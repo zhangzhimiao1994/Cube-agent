@@ -12,6 +12,7 @@ from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
+from agent_hub.runtime.artifacts import InMemoryArtifactRepository
 from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, RunEvent, TaskContext
 from agent_hub.runtime.crew.adapter import (
     CapabilityOutcomeUncertain,
@@ -286,6 +287,57 @@ class RoleAwareGateway:
             if request.logical_model == "review"
             else "role output " + ("内容" * 600)
         )
+        return GatewayCompletion(
+            response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
+class EmptyThenRoleAwareGateway(RoleAwareGateway):
+    def __init__(self, *, empty_logical_model: str) -> None:
+        super().__init__()
+        self.empty_logical_model = empty_logical_model
+        self._empty_returned = False
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        if request.logical_model == self.empty_logical_model and not self._empty_returned:
+            self._empty_returned = True
+            text = ""
+        else:
+            text = (
+                '{"verdict":"approve"}'
+                if request.logical_model == "review"
+                else "role output " + ("内容" * 600)
+            )
+        return GatewayCompletion(
+            response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
+class EmptyThenReviewingGateway(EmptyThenRoleAwareGateway):
+    def __init__(self, *, empty_logical_model: str, reviews: tuple[str, ...]) -> None:
+        super().__init__(empty_logical_model=empty_logical_model)
+        self.reviews = list(reviews)
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        if request.logical_model != "review":
+            return await super().complete_with_context(request)
+        self.requests.append(request)
+        if request.logical_model == self.empty_logical_model and not self._empty_returned:
+            self._empty_returned = True
+            text = ""
+        else:
+            text = self.reviews.pop(0) if self.reviews else '{"verdict":"approve"}'
         return GatewayCompletion(
             response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
             deployment_id="primary",
@@ -772,6 +824,97 @@ async def test_agent_timeout_reports_recovery_closure_after_retry_exhausted() ->
     )
 
 
+async def test_agent_empty_model_response_compact_retries_before_completing() -> None:
+    gateway = EmptyThenRoleAwareGateway(empty_logical_model="general")
+    generation = RecordingGeneration()
+    repository = InMemoryArtifactRepository()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _one_step_plan(),
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(generation),
+    )
+
+    events = await _collect(runtime)
+
+    assert len(gateway.requests) == 2
+    writer_prompts = [prompt for step_id, agent_id, prompt in generation.prompts if step_id == "final"]
+    assert len(writer_prompts) == 2
+    retrying = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retrying.actor == "writer"
+    assert retrying.payload["error_code"] == "model.empty_response"
+    assert retrying.payload["recovery_strategy"] == "compact_retry"
+    assert retrying.payload["recovery_attempt"] == 1
+    assert retrying.payload["recovery_layers"] == (
+        "input_compression",
+        "prompt_decomposition",
+        "model_fallback_marked",
+        "failure_closure",
+    )
+    assert "Keep the retry concise" in writer_prompts[1]
+    assert any(event.kind is EventKind.STEP_COMPLETED for event in events)
+    checkpoint = await runtime.save_checkpoint()
+    model_states = checkpoint.state["models"]
+    assert isinstance(model_states, Mapping)
+    assert {state["status"] for state in model_states.values() if isinstance(state, Mapping)} == {
+        "failed",
+        "succeeded",
+    }
+    restored = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        _one_step_plan(),
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+    await restored.restore_checkpoint(checkpoint)
+    resumed_events = [event async for event in restored.run(_context(checkpoint=checkpoint))]
+    assert [event.kind for event in resumed_events] == [EventKind.RUNTIME_COMPLETED]
+
+
+async def test_failed_model_checkpoint_resumes_through_generic_compact_retry() -> None:
+    repository = InMemoryArtifactRepository()
+    runtime = CrewDispatchRuntime(
+        EmptyThenRoleAwareGateway(empty_logical_model="general"),
+        _one_step_plan(),
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+
+    checkpoints = [
+        event.checkpoint
+        async for event in runtime.run(_context())
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    ]
+    failed_checkpoint = None
+    for checkpoint in checkpoints:
+        model_states = checkpoint.state["models"]
+        assert isinstance(model_states, Mapping)
+        if {
+            state["status"] for state in model_states.values() if isinstance(state, Mapping)
+        } == {"failed"}:
+            failed_checkpoint = checkpoint
+            break
+    assert failed_checkpoint is not None
+    restored_generation = RecordingGeneration()
+    restored = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        _one_step_plan(),
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(restored_generation),
+    )
+    await restored.restore_checkpoint(failed_checkpoint)
+
+    events = [event async for event in restored.run(_context(checkpoint=failed_checkpoint))]
+
+    retrying = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retrying.actor == "writer"
+    assert retrying.payload["error_code"] == "model.empty_response"
+    assert retrying.payload["recovery_strategy"] == "compact_retry"
+    assert len(restored_generation.prompts) == 2
+    assert "Keep the retry concise" in restored_generation.prompts[1][2]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
 async def test_reviewer_timeout_uses_generic_recovery_before_soft_skip() -> None:
     generation = RecordingGeneration(reviewer_timeouts=1)
     plan = _reviewed_step_plan()
@@ -809,6 +952,126 @@ async def test_reviewer_timeout_uses_generic_recovery_before_soft_skip() -> None
         crew_factory=RecordingFactory(RecordingGeneration()),
     )
     await restored.restore_checkpoint(checkpoint)
+
+
+async def test_reviewer_empty_model_response_uses_generic_recovery_before_soft_skip() -> None:
+    gateway = EmptyThenRoleAwareGateway(empty_logical_model="review")
+    generation = RecordingGeneration()
+    repository = InMemoryArtifactRepository()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _reviewed_step_plan(),
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(generation),
+    )
+
+    events = await _collect(runtime)
+
+    reviewer_prompts = [item for item in generation.prompts if item[1] == "reviewer"]
+    assert len(reviewer_prompts) == 2
+    retrying = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retrying.actor == "reviewer"
+    assert retrying.payload["error_code"] == "model.empty_response"
+    assert retrying.payload["recovery_strategy"] == "compact_retry"
+    assert retrying.payload["recovery_attempt"] == 1
+    assert "Keep the retry concise" in reviewer_prompts[1][2]
+    review_completed = next(event for event in events if event.kind is EventKind.REVIEW_COMPLETED)
+    assert review_completed.payload["verdict"] == "approve"
+    assert any(event.kind is EventKind.STEP_COMPLETED for event in events)
+    checkpoint = await runtime.save_checkpoint()
+    model_states = checkpoint.state["models"]
+    assert isinstance(model_states, Mapping)
+    assert {state["status"] for state in model_states.values() if isinstance(state, Mapping)} == {
+        "failed",
+        "succeeded",
+    }
+    restored = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        _reviewed_step_plan(),
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+    await restored.restore_checkpoint(checkpoint)
+    resumed_events = [event async for event in restored.run(_context(checkpoint=checkpoint))]
+    assert [event.kind for event in resumed_events] == [EventKind.RUNTIME_COMPLETED]
+
+
+async def test_reviewer_revise_checkpoint_after_compact_recovery_resumes() -> None:
+    gateway = EmptyThenReviewingGateway(
+        empty_logical_model="review",
+        reviews=('{"verdict":"revise","feedback":"tighten"}', '{"verdict":"approve"}'),
+    )
+    generation = RecordingGeneration()
+    repository = InMemoryArtifactRepository()
+    plan = _reviewed_step_plan(reviewer_retries=1)
+    runtime = CrewDispatchRuntime(
+        gateway,
+        plan,
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(generation),
+    )
+
+    checkpoints = [
+        event.checkpoint
+        async for event in runtime.run(_context())
+        if event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None
+    ]
+    revise_checkpoint = next(
+        checkpoint for checkpoint in checkpoints if checkpoint.state["review_refs"]
+    )
+    restored_generation = RecordingGeneration()
+    restored = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        plan,
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(restored_generation),
+    )
+    await restored.restore_checkpoint(revise_checkpoint)
+
+    events = [event async for event in restored.run(_context(checkpoint=revise_checkpoint))]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert any(item[0] == "draft" and item[1] == "writer" for item in restored_generation.prompts)
+
+
+async def test_recovered_agent_attempt_can_still_survive_reviewer_revision_resume() -> None:
+    gateway = EmptyThenReviewingGateway(
+        empty_logical_model="general",
+        reviews=('{"verdict":"revise","feedback":"tighten"}', '{"verdict":"approve"}'),
+    )
+    generation = RecordingGeneration()
+    repository = InMemoryArtifactRepository()
+    plan = _reviewed_step_plan(reviewer_retries=1)
+    runtime = CrewDispatchRuntime(
+        gateway,
+        plan,
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(generation),
+    )
+
+    events = await _collect(runtime)
+
+    assert len([event for event in events if event.kind is EventKind.STEP_RETRYING]) == 2
+    checkpoint = await runtime.save_checkpoint()
+    model_states = checkpoint.state["models"]
+    assert isinstance(model_states, Mapping)
+    draft_step_attempts = {
+        state["attempt"]
+        for state in model_states.values()
+        if isinstance(state, Mapping)
+        and state["step_id"] == "draft"
+        and state["purpose"] == "step"
+    }
+    assert draft_step_attempts == {0, 1, 3}
+    restored = CrewDispatchRuntime(
+        RoleAwareGateway(),
+        plan,
+        artifact_repository=repository,
+        crew_factory=RecordingFactory(RecordingGeneration()),
+    )
+    await restored.restore_checkpoint(checkpoint)
+    resumed_events = [event async for event in restored.run(_context(checkpoint=checkpoint))]
+    assert [event.kind for event in resumed_events] == [EventKind.RUNTIME_COMPLETED]
 
 
 async def test_reviewer_timeout_retries_before_soft_skip() -> None:

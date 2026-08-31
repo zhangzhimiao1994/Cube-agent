@@ -463,6 +463,33 @@ def _subagent_recovery_payload(
     return payload
 
 
+def _can_compact_retry_subagent(
+    diagnostic: Mapping[str, object],
+    *,
+    recovery_attempt: int,
+    remaining_seconds: float,
+) -> bool:
+    return (
+        diagnostic.get("retryable") is True
+        and diagnostic.get("error_code") in {"crew.step_timeout", "model.empty_response"}
+        and recovery_attempt < _STEP_TIMEOUT_RECOVERY_RETRIES
+        and remaining_seconds > _STEP_TIMEOUT_RETRY_MIN_REMAINING_SECONDS
+    )
+
+
+def _recovery_status_after_attempts(
+    diagnostic: Mapping[str, object],
+    *,
+    recovery_attempts: int,
+) -> str:
+    return (
+        "failed_after_compact_retry"
+        if diagnostic.get("error_code") in {"crew.step_timeout", "model.empty_response"}
+        and recovery_attempts >= _STEP_TIMEOUT_RECOVERY_RETRIES
+        else "failed_without_compact_retry"
+    )
+
+
 def _framework_failure_reason(prefix: str, error: Exception) -> str:
     reason = safe_runtime_failure_reason(error, fallback=prefix)
     return prefix if reason == prefix else f"{prefix}: {reason}"
@@ -1813,11 +1840,12 @@ class CrewDispatchRuntime:
                             review_diagnostic: dict[str, object] = dict(
                                 runtime_failure_diagnostic_from_reason(review_failure)
                             )
-                            if (
-                                review_diagnostic.get("error_code") == "crew.step_timeout"
-                                and review_recovery_attempt < _STEP_TIMEOUT_RECOVERY_RETRIES
-                                and self._remaining_timeout(run_state, step_deadline)
-                                > _STEP_TIMEOUT_RETRY_MIN_REMAINING_SECONDS
+                            if _can_compact_retry_subagent(
+                                review_diagnostic,
+                                recovery_attempt=review_recovery_attempt,
+                                remaining_seconds=self._remaining_timeout(
+                                    run_state, step_deadline
+                                ),
                             ):
                                 review_recovery_attempt += 1
                                 await event(
@@ -1834,21 +1862,22 @@ class CrewDispatchRuntime:
                                         "logical_model": reviewer.logical_model,
                                         "candidate_artifact_id": str(artifact.id),
                                         **_subagent_recovery_payload(
-                                            status="retrying_after_timeout",
+                                            status="retrying_after_compact_trigger",
                                             recovery_attempt=review_recovery_attempt,
                                         ),
                                         **review_diagnostic,
                                     },
                                 )
                                 continue
-                            if (
-                                review_diagnostic.get("error_code") == "crew.step_timeout"
-                                and review_recovery_attempt >= _STEP_TIMEOUT_RECOVERY_RETRIES
-                            ):
+                            recovery_status = _recovery_status_after_attempts(
+                                review_diagnostic,
+                                recovery_attempts=review_recovery_attempt,
+                            )
+                            if recovery_status == "failed_after_compact_retry":
                                 review_diagnostic = {
                                     **review_diagnostic,
                                     **_subagent_recovery_payload(
-                                        status="failed_after_compact_retry",
+                                        status=recovery_status,
                                         recovery_attempts=review_recovery_attempt,
                                     ),
                                 }
@@ -1984,11 +2013,10 @@ class CrewDispatchRuntime:
                 diagnostic: dict[str, object] = dict(
                     runtime_failure_diagnostic_from_reason(failure_reason)
                 )
-                if (
-                    diagnostic.get("error_code") == "crew.step_timeout"
-                    and recovery_attempt < _STEP_TIMEOUT_RECOVERY_RETRIES
-                    and self._remaining_timeout(run_state, step_deadline)
-                    > _STEP_TIMEOUT_RETRY_MIN_REMAINING_SECONDS
+                if _can_compact_retry_subagent(
+                    diagnostic,
+                    recovery_attempt=recovery_attempt,
+                    remaining_seconds=self._remaining_timeout(run_state, step_deadline),
                 ):
                     recovery_attempt += 1
                     await event(
@@ -2001,21 +2029,22 @@ class CrewDispatchRuntime:
                             "role": agent.role,
                             "logical_model": agent.logical_model,
                             **_subagent_recovery_payload(
-                                status="retrying_after_timeout",
+                                status="retrying_after_compact_trigger",
                                 recovery_attempt=recovery_attempt,
                             ),
                             **diagnostic,
                         },
                     )
                     continue
-                if (
-                    diagnostic.get("error_code") == "crew.step_timeout"
-                    and recovery_attempt >= _STEP_TIMEOUT_RECOVERY_RETRIES
-                ):
+                recovery_status = _recovery_status_after_attempts(
+                    diagnostic,
+                    recovery_attempts=recovery_attempt,
+                )
+                if recovery_status == "failed_after_compact_retry":
                     diagnostic = {
                         **diagnostic,
                         **_subagent_recovery_payload(
-                            status="failed_after_compact_retry",
+                            status=recovery_status,
                             recovery_attempts=recovery_attempt,
                         ),
                     }
@@ -2289,6 +2318,11 @@ class CrewDispatchRuntime:
                 elif existing.get("status") == "prepared":
                     completion = None
                     response = None
+                elif existing.get("status") == "failed":
+                    failure_reason = existing.get("failure_reason")
+                    if type(failure_reason) is str and failure_reason.strip():
+                        _fail(failure_reason)
+                    _fail("model gateway failed")
                 else:
                     _fail("model ledger state is invalid")
             else:
@@ -2305,6 +2339,7 @@ class CrewDispatchRuntime:
                     "artifact_id": None,
                     "sha256": None,
                     "provenance": None,
+                    "failure_reason": None,
                 }
                 await model_state_boundary(key, prepared)
                 existing = prepared
@@ -2323,6 +2358,10 @@ class CrewDispatchRuntime:
                     failure_reason = safe_runtime_failure_reason(
                         error, fallback="model gateway failed"
                     )
+                    failed = dict(running)
+                    failed["status"] = "failed"
+                    failed["failure_reason"] = failure_reason
+                    await model_state_boundary(key, failed)
                     error.__traceback__ = None
                     error.__context__ = None
                     error.__cause__ = None
@@ -2944,6 +2983,11 @@ class CrewDispatchRuntime:
                         evidence.append(model_artifact)
                     elif existing.get("status") == "running":
                         raise ModelOutcomeUncertain("model outcome requires confirmation")
+                    elif existing.get("status") == "failed":
+                        failure_reason = existing.get("failure_reason")
+                        if type(failure_reason) is str and failure_reason.strip():
+                            _fail(failure_reason)
+                        _fail("model gateway failed")
                     elif existing.get("status") != "prepared":
                         _fail("model ledger state is invalid")
                 if completion is None:
@@ -2960,6 +3004,7 @@ class CrewDispatchRuntime:
                             "artifact_id": None,
                             "sha256": None,
                             "provenance": None,
+                            "failure_reason": None,
                         }
                         await model_state_boundary(key, prepared)
                     else:
@@ -2967,10 +3012,27 @@ class CrewDispatchRuntime:
                     running = dict(prepared)
                     running["status"] = "running"
                     await model_state_boundary(key, running)
-                    async with asyncio.timeout(
-                        runtime._remaining_timeout(run_state, step_deadline)
-                    ):
-                        completion = await runtime._gateway.complete_with_context(request)
+                    try:
+                        async with asyncio.timeout(
+                            runtime._remaining_timeout(run_state, step_deadline)
+                        ):
+                            completion = await runtime._gateway.complete_with_context(request)
+                        runtime._valid_response(completion)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:  # noqa: BLE001 - normalize model boundary
+                        failure_reason = safe_runtime_failure_reason(
+                            error, fallback="model gateway failed"
+                        )
+                        failed = dict(running)
+                        failed["status"] = "failed"
+                        failed["failure_reason"] = failure_reason
+                        await model_state_boundary(key, failed)
+                        error.__traceback__ = None
+                        error.__context__ = None
+                        error.__cause__ = None
+                        del error
+                        _fail(failure_reason)
                     model_artifact = runtime._model_artifact(
                         completion,
                         reviewer.id,
@@ -3000,7 +3062,6 @@ class CrewDispatchRuntime:
                         run_state,
                     )
                     evidence.append(model_artifact)
-                    runtime._valid_response(completion)
                 response = runtime._valid_response(completion)
                 if response.text is None and response.tool_calls:
                     _fail("reviewer returned tool calls instead of JSON")
@@ -3689,24 +3750,27 @@ class CrewDispatchRuntime:
         if len(models) > 4096:
             _fail("runtime checkpoint is incompatible")
         model_entries = cast(Mapping[str, Mapping[str, JsonValue]], models)
+        model_state_keys = {
+            "status",
+            "step_id",
+            "attempt",
+            "purpose",
+            "actor",
+            "call_index",
+            "request_sha256",
+            "artifact_id",
+            "sha256",
+            "provenance",
+        }
         for key, value in model_entries.items():
             if (
                 type(key) is not str
                 or _SHA256.fullmatch(key) is None
                 or not isinstance(value, Mapping)
-                or set(value)
-                != {
-                    "status",
-                    "step_id",
-                    "attempt",
-                    "purpose",
-                    "actor",
-                    "call_index",
-                    "request_sha256",
-                    "artifact_id",
-                    "sha256",
-                    "provenance",
-                }
+                or (
+                    set(value) != model_state_keys
+                    and set(value) != model_state_keys | {"failure_reason"}
+                )
             ):
                 _fail("runtime checkpoint is incompatible")
             status = value["status"]
@@ -3715,8 +3779,9 @@ class CrewDispatchRuntime:
             purpose = value["purpose"]
             actor = value["actor"]
             call_index = value["call_index"]
+            failure_reason = value.get("failure_reason")
             if (
-                status not in {"prepared", "running", "succeeded"}
+                status not in {"prepared", "running", "succeeded", "failed"}
                 or type(model_step_id) is not str
                 or model_step_id not in steps
                 or type(attempt) is not int
@@ -3770,10 +3835,23 @@ class CrewDispatchRuntime:
                     GatewayProvenance.model_validate(dict(provenance), strict=True)
                 except (TypeError, ValueError):
                     _fail("runtime checkpoint is incompatible")
+                if failure_reason is not None:
+                    _fail("runtime checkpoint is incompatible")
+            elif status == "failed":
+                if (
+                    value["artifact_id"] is not None
+                    or value["sha256"] is not None
+                    or value["provenance"] is not None
+                    or type(failure_reason) is not str
+                    or not failure_reason.strip()
+                    or len(failure_reason.encode("utf-8")) > 512
+                ):
+                    _fail("runtime checkpoint is incompatible")
             elif (
                 value["artifact_id"] is not None
                 or value["sha256"] is not None
                 or value["provenance"] is not None
+                or failure_reason is not None
             ):
                 _fail("runtime checkpoint is incompatible")
         if any(indices != set(range(max(indices) + 1)) for indices in model_indices.values()):
@@ -3920,6 +3998,8 @@ class CrewDispatchRuntime:
         model_ids: set[str] = set()
         candidate_ids: set[str] = set()
         for key, state in model_ledger.states.items():
+            if state["status"] == "failed":
+                continue
             artifact = model_ledger.artifacts.get(key)
             model_group = (
                 cast(str, state["step_id"]),
@@ -3986,6 +4066,56 @@ class CrewDispatchRuntime:
         model_step_ids = {group[0] for group in models}
         tool_step_ids = {group[0] for group in tools}
 
+        def model_attempt_candidates(business_attempt: int) -> tuple[int, ...]:
+            candidates = [business_attempt]
+            for recovery_attempt in range(1, _STEP_TIMEOUT_RECOVERY_RETRIES + 1):
+                model_attempt = _subagent_model_attempt(business_attempt, recovery_attempt)
+                if model_attempt not in candidates:
+                    candidates.append(model_attempt)
+            return tuple(candidates)
+
+        def step_model_calls(
+            step: DispatchStep,
+            business_attempt: int,
+            input_ids: tuple[str, ...],
+        ) -> dict[int, tuple[Mapping[str, JsonValue], Artifact | None]]:
+            for model_attempt in model_attempt_candidates(business_attempt):
+                calls = models.get((step.id, model_attempt, "step"), {})
+                if not calls:
+                    continue
+                first = calls.get(0)
+                if first is None or first[1] is None or first[1].source_ids == input_ids:
+                    return calls
+            return {}
+
+        def review_model_calls(
+            step: DispatchStep,
+            business_attempt: int,
+            output_sources: tuple[str, ...],
+            last_model: Artifact | None,
+        ) -> dict[int, tuple[Mapping[str, JsonValue], Artifact | None]]:
+            for model_attempt in model_attempt_candidates(business_attempt):
+                calls = models.get((step.id, model_attempt, "review"), {})
+                if not calls:
+                    continue
+                first = calls.get(0)
+                first_artifact = None if first is None else first[1]
+                if first is None or first_artifact is None:
+                    return calls
+                if not first_artifact.source_ids or last_model is None:
+                    continue
+                candidate = by_id.get(first_artifact.source_ids[0])
+                if (
+                    candidate is not None
+                    and candidate.type == "text"
+                    and candidate.producer == step.agent
+                    and candidate.version == business_attempt + 1
+                    and candidate.source_ids == output_sources
+                    and candidate.provenance == last_model.provenance
+                ):
+                    return calls
+            return {}
+
         for step in plan.steps:
             if step.depends_on and any(
                 dependency not in completed for dependency in step.depends_on
@@ -4002,7 +4132,7 @@ class CrewDispatchRuntime:
             feedback_id: str | None = None
             for attempt in range(retry_count + 1):
                 input_ids = (*base_ids, *((feedback_id,) if feedback_id is not None else ()))
-                step_calls = models.get((step.id, attempt, "step"), {})
+                step_calls = step_model_calls(step, attempt, input_ids)
                 evidence_ids: list[str] = []
                 last_model: Artifact | None = None
                 incomplete = False
@@ -4061,7 +4191,7 @@ class CrewDispatchRuntime:
                     if call_index < len(step_calls) - 1 and len(round_tools) != len(calls):
                         _fail("runtime checkpoint artifact graph is invalid")
                 output_sources = (*input_ids, *evidence_ids)
-                review_calls = models.get((step.id, attempt, "review"), {})
+                review_calls = review_model_calls(step, attempt, output_sources, last_model)
                 candidate: Artifact | None = None
                 if review_calls:
                     first_review_artifact = review_calls[0][1]
@@ -4310,17 +4440,10 @@ class CrewDispatchRuntime:
                 if artifact is not None and artifact.source_ids
                 else None
             )
-            reviewed_attempt = retries[step_id] - 1
-            review_model_ids = tuple(
-                cast(str, model_state["artifact_id"])
-                for _, model_state in sorted(
-                    model_states.items(),
-                    key=lambda item: cast(int, item[1]["call_index"]),
-                )
-                if model_state["status"] == "succeeded"
-                and model_state["step_id"] == step_id
-                and model_state["purpose"] == "review"
-                and model_state["attempt"] == reviewed_attempt
+            review_model_ids = (
+                artifact.source_ids[1:]
+                if artifact is not None and len(artifact.source_ids) > 1
+                else ()
             )
             if (
                 artifact is None
@@ -4337,7 +4460,10 @@ class CrewDispatchRuntime:
                 or not review_model_ids
                 or artifact.source_ids != (str(candidate.id), *review_model_ids)
                 or any(
-                    not by_id[model_id].source_ids
+                    model_id not in by_id
+                    or by_id[model_id].type != "model_response"
+                    or by_id[model_id].producer != agents[reviewer].id
+                    or not by_id[model_id].source_ids
                     or by_id[model_id].source_ids[0] != str(candidate.id)
                     for model_id in review_model_ids
                 )

@@ -1541,6 +1541,36 @@ describe("operational management pages", () => {
     expect(diagnostics.textContent).not.toContain("private output");
   });
 
+  it("keeps empty model response diagnostics actionable on the detail page", async () => {
+    visibleRunDetail = {
+      ...runDetail,
+      status: "failed",
+      failure_diagnostics: [
+        {
+          category: "model",
+          stage: "model_response",
+          reason: "hybrid dispatch failed: model gateway failed: model response text is empty",
+          recommendation:
+            "模型返回了空内容；先压缩输入和历史上下文，必要时拆分提示、标记模型 fallback 或切换备用模型后重试。",
+          sequence: 7,
+          actor: "writer",
+          step_id: "draft",
+          logical_model: "deepseek-chat",
+          failure_kind: "empty_response",
+        },
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const diagnostics = await screen.findByRole("region", { name: "故障诊断" });
+    expect(within(diagnostics).getByText("模型链路失败")).not.toBeNull();
+    expect(within(diagnostics).getByText(/模型返回了空内容/)).not.toBeNull();
+    expect(within(diagnostics).getByText(/压缩输入和历史上下文/)).not.toBeNull();
+    expect(within(diagnostics).getByText(/fallback/)).not.toBeNull();
+  });
+
   it("shows observer notices as scheduler guidance on the detail page", async () => {
     visibleRunDetail = {
       ...runDetail,
