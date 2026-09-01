@@ -174,6 +174,42 @@ def test_resolve_rejects_missing_file_with_valid_storage_key(tmp_path: Path) -> 
         store.resolve(storage_key)
 
 
+def test_delete_run_removes_only_that_runs_generated_files(tmp_path: Path) -> None:
+    tenant_id = uuid4()
+    run_id = uuid4()
+    sibling_run_id = uuid4()
+    artifact_id = uuid4()
+    sibling_artifact_id = uuid4()
+    store = GeneratedFileStore(tmp_path)
+
+    metadata = store.store_bytes(
+        tenant_id,
+        run_id,
+        artifact_id,
+        "report.docx",
+        DOCX_MIME,
+        b"docx",
+    )
+    sibling_metadata = store.store_bytes(
+        tenant_id,
+        sibling_run_id,
+        sibling_artifact_id,
+        "deck.pptx",
+        PPTX_MIME,
+        b"pptx",
+    )
+
+    store.delete_run(tenant_id, run_id)
+
+    with pytest.raises(FileNotFoundError):
+        store.resolve(metadata.storage_key)
+    assert store.resolve(sibling_metadata.storage_key).read_bytes() == b"pptx"
+
+
+def test_delete_run_ignores_missing_generated_directory(tmp_path: Path) -> None:
+    GeneratedFileStore(tmp_path).delete_run(uuid4(), uuid4())
+
+
 def test_resolve_for_returns_existing_file_when_context_matches(tmp_path: Path) -> None:
     tenant_id = uuid4()
     run_id = uuid4()

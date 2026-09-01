@@ -3675,6 +3675,7 @@ class GeneratedArtifactRunRepository:
     def __init__(self, run_id: UUID, artifacts: tuple[dict[str, object], ...]) -> None:
         self.run_id = run_id
         self.artifacts_payload = artifacts
+        self.deleted_run_id: UUID | None = None
 
     async def get(self, tenant_id: UUID, run_id: UUID) -> RunRecord:
         assert tenant_id == TENANT_ID
@@ -3686,6 +3687,12 @@ class GeneratedArtifactRunRepository:
         assert tenant_id == TENANT_ID
         assert run_id == self.run_id
         return self.artifacts_payload
+
+    async def delete_run(self, tenant_id: UUID, run_id: UUID) -> None:
+        assert tenant_id == TENANT_ID
+        if run_id != self.run_id:
+            raise KeyError(run_id)
+        self.deleted_run_id = run_id
 
 
 @pytest.mark.asyncio
@@ -3738,6 +3745,51 @@ async def test_persistent_download_matches_nested_generated_file_artifact_id(tmp
     assert download.filename == "delivery-plan.docx"
     assert download.mime_type == DOCX_MIME_TYPE
     assert download.path.read_bytes() == b"docx-bytes"
+
+
+@pytest.mark.asyncio
+async def test_persistent_delete_run_cleans_generated_artifact_files(tmp_path: Path) -> None:
+    from agent_hub.files.generated import DOCX_MIME_TYPE, PPTX_MIME_TYPE, GeneratedFileStore
+
+    run_id = UUID("33333333-3333-4333-8333-333333333333")
+    artifact_id = UUID("44444444-4444-4444-8444-444444444442")
+    sibling_run_id = UUID("33333333-3333-4333-8333-333333333334")
+    sibling_artifact_id = UUID("44444444-4444-4444-8444-444444444443")
+    store = GeneratedFileStore(tmp_path)
+    metadata = store.store_bytes(
+        TENANT_ID,
+        run_id,
+        artifact_id,
+        "delivery-plan.docx",
+        DOCX_MIME_TYPE,
+        b"docx-bytes",
+    )
+    sibling_metadata = store.store_bytes(
+        TENANT_ID,
+        sibling_run_id,
+        sibling_artifact_id,
+        "launch-review.pptx",
+        PPTX_MIME_TYPE,
+        b"pptx-bytes",
+    )
+    repository = GeneratedArtifactRunRepository(run_id, ())
+    service = PersistentAdminResourceService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        run_repository=repository,  # type: ignore[arg-type]
+        generated_artifact_dir=tmp_path,
+    )
+
+    deleted = await service.delete_run(run_id)
+
+    assert deleted.id == run_id
+    assert deleted.deleted is True
+    assert repository.deleted_run_id == run_id
+    with pytest.raises(FileNotFoundError):
+        store.resolve(metadata.storage_key)
+    assert store.resolve(sibling_metadata.storage_key).read_bytes() == b"pptx-bytes"
 
 
 @pytest.mark.asyncio

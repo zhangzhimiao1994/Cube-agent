@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -151,6 +152,18 @@ class GeneratedFileStore:
         ):
             raise ValueError("storage_key context does not match requested artifact")
         return self.resolve(storage_key)
+
+    def delete_run(self, tenant_id: UUID, run_id: UUID) -> None:
+        """Remove all generated files for a run without touching sibling runs."""
+
+        run_path = (self._root / str(tenant_id) / str(run_id)).resolve()
+        if not run_path.is_relative_to(self._root):
+            raise ValueError("run path escapes generated artifact root")
+        if not run_path.exists():
+            return
+        if not run_path.is_dir():
+            raise ValueError("run path is not a directory")
+        shutil.rmtree(run_path)
 
     def _path_for_storage_key(self, storage_key: str) -> Path:
         tenant_id, run_id, artifact_id, safe_filename = self._parse_storage_key(storage_key)

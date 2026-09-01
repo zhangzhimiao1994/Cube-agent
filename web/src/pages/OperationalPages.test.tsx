@@ -1153,6 +1153,9 @@ describe("operational management pages", () => {
 
   afterEach(() => {
     cleanup();
+    document.body.style.overflow = "";
+    document.body.style.touchAction = "";
+    document.documentElement.style.overflow = "";
     window.sessionStorage.clear();
     vi.unstubAllGlobals();
   });
@@ -5014,6 +5017,67 @@ describe("operational management pages", () => {
     expect(document.body.style.overflow).toBe("");
     expect(document.body.style.touchAction).toBe("");
     expect(document.documentElement.style.overflow).toBe("");
+  });
+
+  it("restores existing page scroll styles after closing the process drawer", async () => {
+    const user = userEvent.setup();
+    document.body.style.overflow = "auto";
+    document.body.style.touchAction = "pan-y";
+    document.documentElement.style.overflow = "scroll";
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await user.click(
+      within(stream).getByRole("button", {
+        name: /文案生成 输出：得到一版可拍摄脚本文案/,
+      }),
+    );
+
+    expect(await screen.findByRole("dialog", { name: "运行过程详情" })).not.toBeNull();
+    expect(document.body.style.overflow).toBe("hidden");
+    expect(document.body.style.touchAction).toBe("none");
+    expect(document.documentElement.style.overflow).toBe("hidden");
+
+    const backdrop = document.querySelector(".process-drawer-backdrop");
+    expect(backdrop).not.toBeNull();
+    await user.click(backdrop as HTMLElement);
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "运行过程详情" })).toBeNull());
+    expect(document.body.style.overflow).toBe("auto");
+    expect(document.body.style.touchAction).toBe("pan-y");
+    expect(document.documentElement.style.overflow).toBe("scroll");
+  });
+
+  it("closes process detail group dialogs from the backdrop", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await user.click(
+      within(stream).getByRole("button", {
+        name: /文案生成 输出：得到一版可拍摄脚本文案/,
+      }),
+    );
+
+    const drawer = await screen.findByRole("dialog", { name: "运行过程详情" });
+    expect(within(drawer).queryByText("产物标题")).toBeNull();
+
+    const productDetail = await openProcessDetailGroup(user, drawer, "产物");
+    expect(within(productDetail).getByText("产物标题")).not.toBeNull();
+
+    const groupBackdrop = document.querySelector(".process-detail-modal-backdrop");
+    expect(groupBackdrop).not.toBeNull();
+    await user.click(groupBackdrop as HTMLElement);
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "产物详情" })).toBeNull());
+    expect(await screen.findByRole("dialog", { name: "运行过程详情" })).not.toBeNull();
+    expect(within(drawer).queryByText("产物标题")).toBeNull();
   });
 
   it("locks page scrolling while the conversation history drawer is open", async () => {

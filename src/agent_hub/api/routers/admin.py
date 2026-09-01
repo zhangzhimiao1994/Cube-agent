@@ -3970,6 +3970,15 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 reason,
                 details={"reason": reason, "action": "delete"},
             ) from None
+        if self._generated_file_store is not None:
+            try:
+                self._generated_file_store.delete_run(self._tenant_id, run_id)
+            except (OSError, ValueError):
+                _LOGGER.warning(
+                    "failed to clean generated artifacts for deleted run %s",
+                    run_id,
+                    exc_info=True,
+                )
         return RunDeleteResponse(id=run_id, deleted=True)
 
     async def _run_list_item(self, record: RunRecord) -> RunListItem:
