@@ -82,7 +82,10 @@ from agent_hub.openclaw.remote_adapter import (
 )
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRecord, RunRepository
 from agent_hub.runtime.contracts import JsonValue
-from agent_hub.runtime.failure_reason import is_legacy_generic_failure_reason
+from agent_hub.runtime.failure_reason import (
+    is_legacy_generic_failure_reason,
+    runtime_failure_diagnostic_from_reason,
+)
 from agent_hub.scheduler.types import (
     CronScheduleSpec,
     OneTimeScheduleSpec,
@@ -331,6 +334,10 @@ class FailureDiagnosticResponse(BaseModel):
     failure_kind: str | None = None
     status_code: str | None = None
     logical_model: str | None = None
+    error_stage: str | None = None
+    error_category: str | None = None
+    error_code: str | None = None
+    retryable: bool | None = None
     approval_id: str | None = None
     action: str | None = None
     wrapped_by: int | None = Field(default=None, ge=1)
@@ -6493,9 +6500,25 @@ def _tool_failure_diagnostic(
 
 
 def _runtime_or_step_failure_diagnostic(event: RunEventResponse) -> FailureDiagnosticResponse:
-    category = "model" if _is_model_failure_event(event) else "runtime"
+    runtime_diagnostic = runtime_failure_diagnostic_from_reason(event.message)
+    error_stage = _safe_diagnostic_payload_value(event, "error_stage") or _safe_diagnostic_text(
+        runtime_diagnostic.get("error_stage")
+    )
+    error_category = _safe_diagnostic_payload_value(event, "error_category") or _safe_diagnostic_text(
+        runtime_diagnostic.get("error_category")
+    )
+    error_code = _safe_diagnostic_payload_value(event, "error_code") or _safe_diagnostic_text(
+        runtime_diagnostic.get("error_code")
+    )
+    retryable = _bool_diagnostic_payload_value(event, "retryable")
+    if retryable is None and type(runtime_diagnostic.get("retryable")) is bool:
+        retryable = bool(runtime_diagnostic["retryable"])
+    category = "model" if _is_model_failure_event(event) or error_code == "model.empty_response" else "runtime"
+    suggested_action = _safe_diagnostic_payload_value(event, "suggested_action") or _safe_diagnostic_text(
+        runtime_diagnostic.get("suggested_action")
+    )
     status_code = _failure_status_code(event)
-    failure_kind = _safe_diagnostic_payload_value(event, "failure_kind")
+    failure_kind = _safe_diagnostic_payload_value(event, "failure_kind") or error_category
     logical_model = _event_logical_model(event)
     reason = _safe_model_check_detail(event.message)
     if reason == "redacted":
@@ -6504,7 +6527,8 @@ def _runtime_or_step_failure_diagnostic(event: RunEventResponse) -> FailureDiagn
         category=category,
         stage=event.kind,
         reason=reason,
-        recommendation=(
+        recommendation=suggested_action
+        or (
             "Check model config, API key, upstream status code, and rate limits; retry or switch model."
             if category == "model"
             else "Inspect the failed stage, keep existing artifacts, and retry the smallest safe scope."
@@ -6515,6 +6539,10 @@ def _runtime_or_step_failure_diagnostic(event: RunEventResponse) -> FailureDiagn
         failure_kind=failure_kind,
         status_code=status_code,
         logical_model=logical_model,
+        error_stage=error_stage,
+        error_category=error_category,
+        error_code=error_code,
+        retryable=retryable,
     )
 
 
@@ -6607,12 +6635,21 @@ def _is_failure_boundary_event(event: RunEventResponse) -> bool:
 
 def _safe_diagnostic_payload_value(event: RunEventResponse, key: str) -> str | None:
     value = event.payload.get(key)
+    return _safe_diagnostic_text(value)
+
+
+def _safe_diagnostic_text(value: object) -> str | None:
     if value is None:
         return None
     if type(value) in {str, int, float, bool}:
         safe = _safe_model_check_detail(str(value))
         return None if safe == "redacted" else safe
     return None
+
+
+def _bool_diagnostic_payload_value(event: RunEventResponse, key: str) -> bool | None:
+    value = event.payload.get(key)
+    return value if type(value) is bool else None
 
 
 def _tool_lifecycle_from_run_events(events: Iterable[RunEventResponse]) -> list[ToolLifecycleResponse]:

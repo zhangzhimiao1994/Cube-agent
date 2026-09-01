@@ -557,7 +557,7 @@ function detailDiagnosticFromApi(
   const label = diagnosticLabel(diagnostic.category);
   const actor = displayDetailActor(diagnostic.actor);
   const statusCode = diagnostic.status_code ? `status=${diagnostic.status_code}` : "";
-  const detail = [diagnostic.failure_kind, statusCode, diagnostic.reason]
+  const detail = [diagnostic.failure_kind, statusCode, detailDiagnosticReason(diagnostic)]
     .filter(Boolean)
     .filter((value, position, list) => list.indexOf(value) === position)
     .join("；");
@@ -569,6 +569,10 @@ function detailDiagnosticFromApi(
     recommendation: diagnosticRecommendation(diagnostic.category, diagnostic.recommendation),
     meta: [
       actor,
+      diagnostic.error_stage ? `位置 ${diagnostic.error_stage}` : "",
+      diagnostic.error_code ? `错误码 ${diagnostic.error_code}` : "",
+      typeof diagnostic.retryable === "boolean" ? `可重试 ${diagnostic.retryable ? "是" : "否"}` : "",
+      diagnostic.error_category ? `类型 ${diagnostic.error_category}` : "",
       diagnostic.step_id ? `步骤 ${diagnostic.step_id}` : "",
       diagnostic.approval_id ? `审批 ${diagnostic.approval_id}` : "",
       diagnostic.wrapped_by ? `包装于 #${diagnostic.wrapped_by}` : "",
@@ -576,6 +580,13 @@ function detailDiagnosticFromApi(
     ].filter(Boolean),
     tone: diagnosticTone(diagnostic.category),
   };
+}
+
+function detailDiagnosticReason(diagnostic: RunDetail["failure_diagnostics"][number]) {
+  if (diagnostic.error_code === "model.empty_response" || diagnostic.error_category === "empty_response") {
+    return "模型返回了空内容";
+  }
+  return diagnostic.reason;
 }
 
 function pendingApprovalDiagnostics(detail: RunDetail): DetailFailureDiagnostic[] {

@@ -1571,6 +1571,10 @@ describe("operational management pages", () => {
           step_id: "draft",
           logical_model: "deepseek-chat",
           failure_kind: "empty_response",
+          error_stage: "model_response",
+          error_category: "empty_response",
+          error_code: "model.empty_response",
+          retryable: true,
         },
       ],
     };
@@ -1580,7 +1584,10 @@ describe("operational management pages", () => {
 
     const diagnostics = await screen.findByRole("region", { name: "故障诊断" });
     expect(within(diagnostics).getByText("模型链路失败")).not.toBeNull();
-    expect(within(diagnostics).getByText(/模型返回了空内容/)).not.toBeNull();
+    expect(within(diagnostics).getAllByText(/模型返回了空内容/).length).toBeGreaterThan(0);
+    expect(within(diagnostics).getByText(/错误码 model\.empty_response/)).not.toBeNull();
+    expect(within(diagnostics).getByText(/位置 model_response/)).not.toBeNull();
+    expect(within(diagnostics).getByText(/可重试 是/)).not.toBeNull();
     expect(within(diagnostics).getByText(/压缩输入和历史上下文/)).not.toBeNull();
     expect(within(diagnostics).getByText(/fallback/)).not.toBeNull();
   });
@@ -2555,6 +2562,57 @@ describe("operational management pages", () => {
     expect(within(stream).getByText("运行中断")).not.toBeNull();
     expect(within(stream).getByText(/中断前输出已保留/)).not.toBeNull();
     expect(within(stream).getByText(/model transport failed/)).not.toBeNull();
+  });
+
+  it("summarizes empty model response failures without exposing the hybrid error chain in chat", async () => {
+    visibleRunListItem = { ...runListItem, status: "failed", mode: "hybrid" };
+    visibleRunListItems = [visibleRunListItem];
+    visibleRunDetail = {
+      ...runDetail,
+      ...visibleRunListItem,
+      events: [
+        {
+          sequence: 1,
+          kind: "runtime.failed",
+          message: "hybrid dispatch failed: model response text is empty",
+          created_at: "2026-08-07T00:00:03Z",
+          participants: [],
+          payload: {},
+        },
+      ],
+      artifacts: [],
+      failure_diagnostics: [
+        {
+          category: "model",
+          stage: "runtime.failed",
+          reason: "hybrid dispatch failed: model response text is empty",
+          recommendation:
+            "模型返回了空内容；先压缩输入和历史上下文，必要时拆分提示、标记模型 fallback 或切换备用模型后重试。",
+          sequence: 1,
+          actor: null,
+          step_id: null,
+          error_stage: "model_response",
+          error_category: "empty_response",
+          error_code: "model.empty_response",
+          retryable: true,
+        },
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    expect(within(stream).getByText("运行失败")).not.toBeNull();
+    expect(within(stream).getByText(/原因：模型返回了空内容/)).not.toBeNull();
+    expect(within(stream).getByText(/错误码：model\.empty_response/)).not.toBeNull();
+    expect(within(stream).getByText(/位置：model_response/)).not.toBeNull();
+    expect(within(stream).getByText(/可重试：是/)).not.toBeNull();
+    expect(within(stream).getByText(/压缩输入和历史上下文/)).not.toBeNull();
+    expect(within(stream).queryByText(/hybrid dispatch failed: model response text is empty/)).toBeNull();
   });
 
   it("shows Codex-style chat replies with Kimi-style inline cluster actions", async () => {

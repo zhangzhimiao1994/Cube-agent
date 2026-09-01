@@ -1172,10 +1172,11 @@ function runFailureDiagnosticFromApi(
     actor ||
     label;
   const statusCode = diagnostic.status_code ? `status=${diagnostic.status_code}` : "";
+  const reason = diagnosticDisplayReason(diagnostic);
   const detail = [
     diagnostic.failure_kind,
     statusCode,
-    diagnostic.reason,
+    reason,
   ]
     .filter(Boolean)
     .filter((value, position, list) => list.indexOf(value) === position)
@@ -1188,6 +1189,10 @@ function runFailureDiagnosticFromApi(
     recommendation: diagnosticRecommendation(diagnostic.category, diagnostic.recommendation),
     meta: [
       actor,
+      diagnostic.error_stage ? `位置 ${diagnostic.error_stage}` : "",
+      diagnostic.error_code ? `错误码 ${diagnostic.error_code}` : "",
+      typeof diagnostic.retryable === "boolean" ? `可重试 ${diagnostic.retryable ? "是" : "否"}` : "",
+      diagnostic.error_category ? `类型 ${diagnostic.error_category}` : "",
       diagnostic.step_id ? `步骤 ${diagnostic.step_id}` : "",
       diagnostic.approval_id ? `审批 ${diagnostic.approval_id}` : "",
       diagnostic.wrapped_by ? `包装于 #${diagnostic.wrapped_by}` : "",
@@ -1515,7 +1520,7 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
   const textArtifacts = dedupeTextArtifacts(detail.artifacts);
   const replyArtifact = preferredReplyArtifact(textArtifacts);
   const internalNotice = internalArtifactNotice(detail);
-  const failureReason = failureReasonFromEvents(detail.events);
+  const failureReason = failureSummaryForChat(detail);
   const downloadableArtifacts = detail.artifacts.filter(isFinalDownloadableArtifact);
   const artifactMessages = replyArtifact
     ? [
@@ -1615,6 +1620,32 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
     ...artifactMessages,
     ...failureMessages,
   ];
+}
+
+function failureSummaryForChat(detail: RunDetail) {
+  const diagnostic = detail.failure_diagnostics[0];
+  if (diagnostic) {
+    const parts = [
+      `原因：${diagnosticChatReason(diagnostic)}`,
+      diagnostic.error_code ? `错误码：${diagnostic.error_code}` : null,
+      diagnostic.error_stage ? `位置：${diagnostic.error_stage}` : null,
+      typeof diagnostic.retryable === "boolean" ? `可重试：${diagnostic.retryable ? "是" : "否"}` : null,
+      diagnostic.recommendation ? `建议：${diagnostic.recommendation}` : null,
+    ].filter(Boolean);
+    return parts.join("\n");
+  }
+  return failureReasonFromEvents(detail.events);
+}
+
+function diagnosticChatReason(diagnostic: RunDetail["failure_diagnostics"][number]) {
+  return diagnosticDisplayReason(diagnostic);
+}
+
+function diagnosticDisplayReason(diagnostic: RunDetail["failure_diagnostics"][number]) {
+  if (diagnostic.error_code === "model.empty_response" || diagnostic.error_category === "empty_response") {
+    return "模型返回了空内容";
+  }
+  return diagnostic.reason;
 }
 
 function failureReasonFromEvents(events: RunDetail["events"]) {
