@@ -79,6 +79,10 @@ class RunSummary:
     usage_cost_usd: Decimal
 
 
+class VibeCodingUnavailable(RuntimeError):
+    """Raised when an explicit Vibe Coding request cannot be scheduled safely."""
+
+
 class TaskQueue(Protocol):
     async def enqueue_run(self, run_id: UUID, *, idempotency_key: str) -> None: ...
 
@@ -916,6 +920,8 @@ class RunService:
     ) -> dict[str, object]:
         scheduler = self._harness_scheduler
         if scheduler is None:
+            if _routing_requests_vibe_coding(routing_decision):
+                raise _vibe_coding_unavailable()
             return routing_decision
         if mode is TaskMode.AUTO:
             return routing_decision
@@ -931,8 +937,10 @@ class RunService:
                 policy=HarnessPolicy(),
                 hermes_hint=_harness_context_hint(routing_decision),
             )
-        except HarnessSchedulingError:
+        except HarnessSchedulingError as error:
             _LOGGER.warning("harness_scheduler_selection_failed tenant_id=%s", tenant_id)
+            if _routing_requests_vibe_coding(routing_decision):
+                raise _vibe_coding_unavailable() from error
             return {**routing_decision, "harness_unavailable": "scheduling_failed"}
         return {
             **routing_decision,
@@ -2213,6 +2221,14 @@ def _routing_requests_vibe_coding(routing_decision: Mapping[str, object]) -> boo
     return (
         routing_decision.get("vibe_coding") is True
         or routing_decision.get("capability") == "vibe_coding"
+    )
+
+
+def _vibe_coding_unavailable() -> VibeCodingUnavailable:
+    return VibeCodingUnavailable(
+        "Vibe Coding requires a harness-capable model deployment with text, "
+        "tool calling, reasoning, parallel tool calls, sandbox, and long-running "
+        "task support."
     )
 
 

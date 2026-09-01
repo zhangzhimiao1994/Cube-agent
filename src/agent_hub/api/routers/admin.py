@@ -6450,6 +6450,8 @@ def _failure_diagnostics_from_run_events(
             continue
         if _wrapped_tool_failure_event(event, sorted_events) is not None:
             continue
+        if _secondary_generic_runtime_failure(event, diagnostics):
+            continue
         _append_failure_diagnostic(
             diagnostics,
             seen,
@@ -6493,19 +6495,63 @@ def _tool_failure_diagnostic(
         f"output_bytes={output_bytes}" if output_bytes else "",
     ]
     wrapper = _tool_failure_wrapper(event, events)
+    error_code = _tool_failure_error_code(failure_kind)
     return FailureDiagnosticResponse(
         category="tool",
         stage=event.kind,
         reason="; ".join(part for part in reason_parts if part),
-        recommendation="Check tool permission, arguments, runtime environment, then retry or reassign.",
+        recommendation=_tool_failure_recommendation(failure_kind),
         sequence=event.sequence,
         actor=event.actor,
         step_id=event.step_id,
         tool_name=event.tool_name,
         tool_call_id=event.tool_call_id,
         failure_kind=failure_kind,
+        error_stage="capability",
+        error_category=failure_kind or "tool_failed",
+        error_code=error_code,
+        retryable=error_code != "capability.outcome_uncertain",
         wrapped_by=wrapper.sequence if wrapper is not None else None,
     )
+
+
+def _secondary_generic_runtime_failure(
+    event: RunEventResponse,
+    diagnostics: list[FailureDiagnosticResponse],
+) -> bool:
+    runtime_diagnostic = runtime_failure_diagnostic_from_reason(event.message)
+    if (
+        event.kind != "runtime.failed"
+        or not diagnostics
+        or runtime_diagnostic.get("error_code") != "runtime.failed"
+    ):
+        return False
+    previous = diagnostics[-1]
+    if event.actor and previous.actor and event.actor != previous.actor:
+        return False
+    return not (event.step_id and previous.step_id and event.step_id != previous.step_id)
+
+
+def _tool_failure_error_code(failure_kind: str | None) -> str:
+    if failure_kind == "waiting_approval":
+        return "capability.waiting_approval"
+    if failure_kind == "invalid_request":
+        return "capability.invalid_request"
+    if failure_kind == "uncertain":
+        return "capability.outcome_uncertain"
+    if failure_kind == "capability_failed":
+        return "capability.execution_failed"
+    return "capability.execution_failed"
+
+
+def _tool_failure_recommendation(failure_kind: str | None) -> str:
+    if failure_kind == "waiting_approval":
+        return "等待用户审批或拒绝该工具动作，再继续运行。"
+    if failure_kind == "invalid_request":
+        return "工具请求参数不合法；修正参数、权限或文件范围后重试。"
+    if failure_kind == "uncertain":
+        return "工具结果状态不确定；先核验副作用和已有产物，再决定是否重试。"
+    return "检查工具权限、参数和运行环境；保留已有产物，只重试最小必要步骤。"
 
 
 def _runtime_or_step_failure_diagnostic(event: RunEventResponse) -> FailureDiagnosticResponse:

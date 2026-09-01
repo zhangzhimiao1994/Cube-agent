@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
+import pytest
+
 from agent_hub.auth.models import Role
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.harness.scheduler import CapabilityAwareHarnessScheduler, HarnessSchedulingError
@@ -14,7 +16,12 @@ from agent_hub.harness.types import (
     ProviderCapabilityProfile,
 )
 from agent_hub.runs.repository import RunRecord
-from agent_hub.runs.service import HermesMemoryInjection, HermesRunAdvice, RunService
+from agent_hub.runs.service import (
+    HermesMemoryInjection,
+    HermesRunAdvice,
+    RunService,
+    VibeCodingUnavailable,
+)
 from agent_hub.runtime.defaults import UnavailableRuntime
 from agent_hub.runtime.registry import RuntimeRegistry
 
@@ -454,6 +461,57 @@ async def test_vibe_coding_submit_requests_engineering_harness_capabilities() ->
     assert isinstance(routing, dict)
     assert routing["vibe_coding"] is True
     assert routing["capability"] == "vibe_coding"
+
+
+async def test_vibe_coding_submit_rejects_when_harness_cannot_schedule() -> None:
+    repository = RecordingRepository()
+    queue = RecordingQueue()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=queue,
+        harness_scheduler=FailingHarnessScheduler(),
+    )
+
+    with pytest.raises(VibeCodingUnavailable, match="Vibe Coding requires"):
+        await service.submit(
+            tenant_id=TENANT_ID,
+            actor_id=ACTOR_ID,
+            message="生成一个最小 Python CLI 项目",
+            mode=TaskMode.HYBRID,
+            conversation_id="conv-vibe-unavailable",
+            vibe_coding=True,
+            idempotency_key="idem-harness-vibe-unavailable",
+        )
+
+    assert repository.created == []
+    assert queue.enqueued == []
+
+
+async def test_vibe_coding_submit_rejects_when_harness_scheduler_is_missing() -> None:
+    repository = RecordingRepository()
+    queue = RecordingQueue()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=queue,
+    )
+
+    with pytest.raises(VibeCodingUnavailable, match="Vibe Coding requires"):
+        await service.submit(
+            tenant_id=TENANT_ID,
+            actor_id=ACTOR_ID,
+            message="生成一个最小 Python CLI 项目",
+            mode=TaskMode.HYBRID,
+            conversation_id="conv-vibe-no-scheduler",
+            vibe_coding=True,
+            idempotency_key="idem-harness-vibe-no-scheduler",
+        )
+
+    assert repository.created == []
+    assert queue.enqueued == []
 
 
 async def test_submit_without_harness_scheduler_preserves_existing_payload_shape() -> None:

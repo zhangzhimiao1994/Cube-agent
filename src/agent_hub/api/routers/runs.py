@@ -25,7 +25,7 @@ from agent_hub.api.errors import PublicAPIError, error_responses
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import RunConflict, RunNotFound
-from agent_hub.runs.service import RunSummary, SubmittedRun
+from agent_hub.runs.service import RunSummary, SubmittedRun, VibeCodingUnavailable
 
 router = APIRouter(
     prefix="/api/v1/runs",
@@ -797,23 +797,32 @@ async def create_run(
             "vibe_coding_disabled",
             "Vibe Coding is disabled in system settings",
         )
-    submitted = await service.submit(
-        tenant_id=principal.tenant_id,
-        actor_id=principal.user_id,
-        actor_role=principal.role,
-        message=body.message,
-        mode=body.mode,
-        agent_ids=body.agent_ids,
-        workflow_id=body.workflow_id,
-        allow_workflow_adjustment=body.allow_workflow_adjustment,
-        conversation_id=body.conversation_id,
-        reference_conversation_id=body.reference_conversation_id,
-        attachment_ids=body.attachment_ids,
-        direct_model=body.direct_model,
-        vibe_coding=body.vibe_coding,
-        skip_evolution_proposal=body.skip_evolution_proposal,
-        idempotency_key=idempotency_key,
-    )
+    try:
+        submitted = await service.submit(
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+            actor_role=principal.role,
+            message=body.message,
+            mode=body.mode,
+            agent_ids=body.agent_ids,
+            workflow_id=body.workflow_id,
+            allow_workflow_adjustment=body.allow_workflow_adjustment,
+            conversation_id=body.conversation_id,
+            reference_conversation_id=body.reference_conversation_id,
+            attachment_ids=body.attachment_ids,
+            direct_model=body.direct_model,
+            vibe_coding=body.vibe_coding,
+            skip_evolution_proposal=body.skip_evolution_proposal,
+            idempotency_key=idempotency_key,
+        )
+    except VibeCodingUnavailable as error:
+        reason = str(error)
+        raise PublicAPIError(
+            409,
+            "vibe_coding_unavailable",
+            reason,
+            details={"reason": reason},
+        ) from error
     await _record_run_submit_audit(request, principal, body, submitted)
     return SubmittedRunResponse.from_submitted(submitted)
 

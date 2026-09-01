@@ -8,6 +8,12 @@ import pytest
 
 from agent_hub.auth.models import Role
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.harness.types import (
+    HarnessDecision,
+    HarnessPolicy,
+    HarnessTaskRequirements,
+    HermesContextHint,
+)
 from agent_hub.routing.types import (
     EXECUTABLE_MODES,
     RiskLevel,
@@ -50,6 +56,31 @@ class UnusedRuntime:
 
     async def cancel(self) -> None:
         return None
+
+
+class VibeHarnessScheduler:
+    def select(
+        self,
+        *,
+        tenant_id: UUID,
+        mode: TaskMode,
+        requirements: HarnessTaskRequirements,
+        policy: HarnessPolicy,
+        hermes_hint: HermesContextHint | None,
+    ) -> HarnessDecision:
+        del requirements, policy, hermes_hint
+        return HarnessDecision(
+            tenant_id=tenant_id,
+            mode=mode.value,
+            selected_provider="test-provider",
+            selected_model="test-model",
+            selected_logical_model="main",
+            requires_approval=False,
+            capability_reasons=("supports_vibe_coding",),
+            policy_reasons=("provider_allowed:test-provider",),
+            context_reasons=(),
+            fallbacks_considered=(),
+        )
 
 
 class FakeRepository:
@@ -358,6 +389,7 @@ async def test_submit_persists_vibe_coding_capability_metadata() -> None:
         runtime_registry=RuntimeRegistry((UnusedRuntime(),)),
         router=None,
         task_queue=queue,
+        harness_scheduler=VibeHarnessScheduler(),
     )
 
     submitted = await service.submit(

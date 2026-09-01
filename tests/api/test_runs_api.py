@@ -17,7 +17,7 @@ from agent_hub.api.routers.runs import SubmittedRunResponse
 from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
 from agent_hub.domain.runs import RunStatus, TaskMode
-from agent_hub.runs.service import RunSummary, SubmittedRun
+from agent_hub.runs.service import RunSummary, SubmittedRun, VibeCodingUnavailable
 
 
 class StubAuthService:
@@ -92,6 +92,12 @@ class StubRunService:
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         del idempotency_key
+        if vibe_coding and "no capable harness" in message:
+            raise VibeCodingUnavailable(
+                "Vibe Coding requires a harness-capable model deployment with text, "
+                "tool calling, reasoning, parallel tool calls, sandbox, and long-running "
+                "task support."
+            )
         self.actor_roles.append(actor_role)
         if self.direct_models is not None:
             self.direct_models.append(direct_model)
@@ -568,6 +574,28 @@ def test_vibe_coding_submission_is_forwarded_when_system_switch_is_enabled() -> 
             False,
         )
     ]
+
+
+def test_vibe_coding_submission_reports_unavailable_harness_clearly() -> None:
+    client, service, _ = _client(settings_service=StubSettingsService(vibe_coding_enabled=True))
+    service.vibe_coding_flags = []
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": "no capable harness",
+            "mode": "hybrid",
+            "conversation_id": "conv-vibe-coding",
+            "vibe_coding": True,
+        },
+    )
+
+    assert response.status_code == 409
+    payload = response.json()
+    assert payload["error"]["code"] == "vibe_coding_unavailable"
+    assert "harness-capable model deployment" in payload["error"]["message"]
+    assert service.vibe_coding_flags == []
 
 
 def test_evolution_proposal_is_returned_from_run_submission() -> None:

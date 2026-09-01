@@ -153,6 +153,48 @@ def test_runtime_failure_diagnostic_classifies_empty_model_response_as_retryable
     suggested_action = cast(str, diagnostic["suggested_action"])
     assert "压缩输入" in suggested_action
     assert "fallback" in suggested_action
+    if reason.startswith("hybrid "):
+        assert diagnostic["hybrid_child_mode"] == "dispatch"
+
+
+@pytest.mark.parametrize("mode", ["direct", "dispatch", "discuss"])
+def test_runtime_failure_diagnostic_classifies_generic_hybrid_child_failure(mode: str) -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason(
+        f"hybrid {mode} failed: task execution plan is invalid"
+    )
+
+    assert diagnostic["error_stage"] == f"hybrid_{mode}"
+    assert diagnostic["error_category"] == "child_runtime_failed"
+    assert diagnostic["error_code"] == "runtime.hybrid_child_failed"
+    assert diagnostic["retryable"] is True
+    assert diagnostic["hybrid_child_mode"] == mode
+
+
+@pytest.mark.parametrize(
+    ("reason", "stage", "category", "code"),
+    [
+        (
+            "dispatch execution failed",
+            "dispatch_runtime",
+            "child_runtime_failed",
+            "runtime.dispatch_failed",
+        ),
+        ("step execution failed", "crew_step", "step_failed", "crew.step_failed"),
+        ("discussion_failed", "discussion_runtime", "discussion_failed", "runtime.discussion_failed"),
+    ],
+)
+def test_runtime_failure_diagnostic_classifies_legacy_safe_runtime_fallbacks(
+    reason: str,
+    stage: str,
+    category: str,
+    code: str,
+) -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason(reason)
+
+    assert diagnostic["error_stage"] == stage
+    assert diagnostic["error_category"] == category
+    assert diagnostic["error_code"] == code
+    assert diagnostic["retryable"] is True
 
 
 def test_runtime_failure_diagnostic_classifies_crewai_step_timeout() -> None:
@@ -181,6 +223,28 @@ def test_runtime_failure_diagnostic_classifies_capability_failure_without_raw_de
     assert diagnostic["retryable"] is False
     assert "private path" not in str(diagnostic)
     assert "token.txt" not in str(diagnostic)
+
+
+def test_runtime_failure_diagnostic_classifies_replay_safe_capability_failure_as_retryable() -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason("capability transient execution failed")
+
+    assert diagnostic["error_summary"] == "capability transient execution failed"
+    assert diagnostic["error_stage"] == "capability"
+    assert diagnostic["error_category"] == "transient_execution_failed"
+    assert diagnostic["error_code"] == "capability.transient_execution_failed"
+    assert diagnostic["retryable"] is True
+    suggested_action = cast(str, diagnostic["suggested_action"])
+    assert "replay-safe" in suggested_action
+    assert "压缩输入" in suggested_action
+
+
+def test_runtime_failure_diagnostic_classifies_uncertain_capability_outcome_as_non_retryable() -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason("capability outcome requires confirmation")
+
+    assert diagnostic["error_stage"] == "capability"
+    assert diagnostic["error_category"] == "outcome_uncertain"
+    assert diagnostic["error_code"] == "capability.outcome_uncertain"
+    assert diagnostic["retryable"] is False
 
 
 @pytest.mark.parametrize(

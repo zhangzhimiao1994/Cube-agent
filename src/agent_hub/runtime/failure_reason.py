@@ -25,6 +25,10 @@ _STATUS_CODE = re.compile(r"\(status=(?P<status>[1-5][0-9]{2})\)")
 _CREWAI_STEP_TIMEOUT = re.compile(
     r"^CrewAI step timed out: step=(?P<step>[A-Za-z0-9_.-]{1,128}) actor=(?P<actor>[A-Za-z0-9_.-]{1,128})$"
 )
+_HYBRID_CHILD_FAILURE = re.compile(
+    r"^hybrid (?P<mode>direct|dispatch|discuss) failed: (?P<reason>.+)$",
+    re.IGNORECASE,
+)
 GENERIC_MODEL_GATEWAY_FAILURE = "model gateway failed"
 LEGACY_GENERIC_FAILURES = frozenset(
     {
@@ -130,6 +134,55 @@ def runtime_failure_diagnostic_from_reason(
         status_code = _status_code_from_reason(normalized)
     lowered = normalized.lower()
 
+    if lowered == "capability transient execution failed":
+        return _base_diagnostic(
+            normalized,
+            error_stage="capability",
+            error_category="transient_execution_failed",
+            error_code="capability.transient_execution_failed",
+            retryable=True,
+            suggested_action=(
+                "replay-safe 工具执行遇到临时异常；先压缩输入和工具参数，必要时拆分提示、"
+                "标记模型 fallback 后重试，重试后仍失败则保留中断前输出并闭环失败原因。"
+            ),
+            status_code=status_code,
+        )
+    if lowered == "capability outcome requires confirmation":
+        return _base_diagnostic(
+            normalized,
+            error_stage="capability",
+            error_category="outcome_uncertain",
+            error_code="capability.outcome_uncertain",
+            retryable=False,
+            suggested_action=(
+                "工具结果可能已经产生不可确认副作用，系统已停止自动重放；"
+                "请查看上一条工具事件并人工确认状态后再继续。"
+            ),
+            status_code=status_code,
+        )
+
+    hybrid_child = _HYBRID_CHILD_FAILURE.fullmatch(normalized)
+    if hybrid_child is not None:
+        inner = normalize_failure_reason(hybrid_child.group("reason"))
+        inner_diagnostic = runtime_failure_diagnostic_from_reason(
+            inner,
+            status_code=status_code,
+        )
+        inner_diagnostic["hybrid_child_mode"] = hybrid_child.group("mode").lower()
+        if inner_diagnostic.get("error_code") != "runtime.failed":
+            return inner_diagnostic
+        return _base_diagnostic(
+            normalized,
+            error_stage=f"hybrid_{hybrid_child.group('mode').lower()}",
+            error_category="child_runtime_failed",
+            error_code="runtime.hybrid_child_failed",
+            retryable=True,
+            suggested_action=(
+                "Hybrid 子流程失败；查看该子流程上一条 step/tool 事件，若已有可下载产物先下载核验，"
+                "再压缩输入、拆分任务或切换备用模型后重试。"
+            ),
+        ) | {"hybrid_child_mode": hybrid_child.group("mode").lower()}
+
     if "model response text is empty" in lowered or "model response is empty" in lowered:
         diagnostic = _base_diagnostic(
             normalized,
@@ -191,6 +244,39 @@ def runtime_failure_diagnostic_from_reason(
             error_code="artifact.rollback_failed",
             retryable=False,
             suggested_action="产物写入回滚失败；请检查文件存储/对象存储状态，确认残留产物后再重试。",
+        )
+    elif normalized == "dispatch execution failed":
+        diagnostic = _base_diagnostic(
+            normalized,
+            error_stage="dispatch_runtime",
+            error_category="child_runtime_failed",
+            error_code="runtime.dispatch_failed",
+            retryable=True,
+            suggested_action=(
+                "派单执行失败；优先查看最近的 step/tool 失败诊断和已保存产物，"
+                "再压缩输入、拆分任务或切换备用模型后重试。"
+            ),
+        )
+    elif normalized == "step execution failed":
+        diagnostic = _base_diagnostic(
+            normalized,
+            error_stage="crew_step",
+            error_category="step_failed",
+            error_code="crew.step_failed",
+            retryable=True,
+            suggested_action=(
+                "子 Agent 步骤失败；优先重试该步骤或降低该步骤负载，"
+                "仍失败时保留已有产物并关闭失败原因。"
+            ),
+        )
+    elif normalized == "discussion_failed":
+        diagnostic = _base_diagnostic(
+            normalized,
+            error_stage="discussion_runtime",
+            error_category="discussion_failed",
+            error_code="runtime.discussion_failed",
+            retryable=True,
+            suggested_action="讨论流程失败；压缩讨论上下文或改为更小的子问题后重试，必要时切换备用模型。",
         )
     elif lowered in {"unaccounted_usage", "model_outcome_uncertain", "tool_outcome_uncertain"}:
         diagnostic = _base_diagnostic(

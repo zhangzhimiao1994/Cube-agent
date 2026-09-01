@@ -117,6 +117,12 @@ class RaisingCapabilities(FakeCapabilities):
         return False
 
 
+class ReplaySafeRaisingCapabilities(RaisingCapabilities):
+    def is_replay_safe(self, name: str) -> bool:
+        del name
+        return True
+
+
 class RecordingHarnessToolGateway:
     def __init__(self) -> None:
         self.calls: list[tuple[UUID, HarnessToolCallRequest]] = []
@@ -751,6 +757,34 @@ async def test_default_harness_wrapper_preserves_backend_uncertainty() -> None:
     state = next(iter(tool_states.values()))
     assert isinstance(state, Mapping)
     assert state["status"] == "uncertain"
+
+
+async def test_replay_safe_harness_backend_error_records_failed_not_uncertain() -> None:
+    runtime = CrewDispatchRuntime(
+        ToolGateway(),
+        _tool_plan(),
+        capability_gateway=ReplaySafeRaisingCapabilities(),
+        crew_factory=FastFactory(),
+    )
+    events: list[RunEvent] = []
+
+    async for event in runtime.run(_context(actor_id=uuid4(), actor_role=Role.OPERATOR)):
+        events.append(event)
+
+    failed_event = next(event for event in events if event.kind is EventKind.TOOL_FAILED)
+    assert failed_event.reason == "capability transient execution failed"
+    assert failed_event.payload["replay_safe"] is True
+    assert failed_event.payload["failure_kind"] == "capability_failed"
+    retrying = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retrying.payload["error_code"] == "capability.transient_execution_failed"
+    assert retrying.payload["recovery_strategy"] == "compact_retry"
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    checkpoint = await runtime.save_checkpoint()
+    tool_states = checkpoint.state["tools"]
+    assert isinstance(tool_states, Mapping)
+    state = next(iter(tool_states.values()))
+    assert isinstance(state, Mapping)
+    assert state["status"] == "failed"
 
 
 async def test_deterministic_harness_errors_record_failed_not_uncertain() -> None:

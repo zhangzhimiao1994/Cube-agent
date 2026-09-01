@@ -1271,6 +1271,57 @@ def test_run_detail_response_exposes_structured_failure_diagnostics_without_raw_
     assert "private output" not in serialized
 
 
+def test_run_detail_response_classifies_tool_failure_without_runtime_noise() -> None:
+    response = RunDetailResponse(
+        id=uuid4(),
+        status="failed",
+        mode="dispatch",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="hello",
+        events=[
+            RunEventResponse(
+                sequence=1,
+                kind="tool.failed",
+                message="capability execution failed",
+                created_at=datetime.now(UTC),
+                actor="engineer",
+                tool_name="write_project_file",
+                tool_call_id="call_write",
+                step_id="engineer_step",
+                payload={"failure_kind": "capability_failed"},
+            ),
+            RunEventResponse(
+                sequence=2,
+                kind="step.failed",
+                message="step execution failed",
+                created_at=datetime.now(UTC),
+                actor="engineer",
+                step_id="engineer_step",
+            ),
+            RunEventResponse(
+                sequence=3,
+                kind="runtime.failed",
+                message="runtime failed",
+                created_at=datetime.now(UTC),
+                actor="engineer",
+            ),
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    diagnostics = response.failure_diagnostics
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0].category == "tool"
+    assert diagnostics[0].failure_kind == "capability_failed"
+    assert diagnostics[0].error_code == "capability.execution_failed"
+    assert diagnostics[0].retryable is True
+    assert diagnostics[0].wrapped_by == 2
+
+
 def test_run_detail_response_exposes_empty_response_code_and_retryability() -> None:
     response = RunDetailResponse(
         id=uuid4(),

@@ -532,7 +532,12 @@ def _can_compact_retry_subagent(
 ) -> bool:
     return (
         diagnostic.get("retryable") is True
-        and diagnostic.get("error_code") in {"crew.step_timeout", "model.empty_response"}
+        and diagnostic.get("error_code")
+        in {
+            "crew.step_timeout",
+            "model.empty_response",
+            "capability.transient_execution_failed",
+        }
         and recovery_attempt < _STEP_TIMEOUT_RECOVERY_RETRIES
         and remaining_seconds > _STEP_TIMEOUT_RETRY_MIN_REMAINING_SECONDS
     )
@@ -545,7 +550,12 @@ def _recovery_status_after_attempts(
 ) -> str:
     return (
         "failed_after_compact_retry"
-        if diagnostic.get("error_code") in {"crew.step_timeout", "model.empty_response"}
+        if diagnostic.get("error_code")
+        in {
+            "crew.step_timeout",
+            "model.empty_response",
+            "capability.transient_execution_failed",
+        }
         and recovery_attempts >= _STEP_TIMEOUT_RECOVERY_RETRIES
         else "failed_without_compact_retry"
     )
@@ -2657,6 +2667,11 @@ class CrewDispatchRuntime:
                 except Exception as error:  # noqa: BLE001
                     error.__traceback__ = None
                     del error
+                    failed_reason = (
+                        "capability transient execution failed"
+                        if replay_safe
+                        else "capability execution failed"
+                    )
                     await emit(
                         kind=EventKind.TOOL_FAILED,
                         actor=step.agent,
@@ -2668,13 +2683,19 @@ class CrewDispatchRuntime:
                             arguments=tool_call.arguments,
                             sandbox=_tool_sandbox(tool_call.name),
                             replay_safe=replay_safe,
-                            failure_kind="uncertain",
+                            failure_kind="capability_failed"
+                            if replay_safe
+                            else "uncertain",
                         ),
-                        reason="capability execution failed",
+                        reason=failed_reason,
                     )
-                    uncertain = dict(tool_running)
-                    uncertain["status"] = "uncertain"
-                    await tool_boundary(idempotency_key, uncertain, None)
+                    failed_state = dict(tool_running)
+                    failed_state["status"] = "failed" if replay_safe else "uncertain"
+                    await tool_boundary(idempotency_key, failed_state, None)
+                    if replay_safe:
+                        raise RuntimeExecutionError(
+                            "capability transient execution failed"
+                        ) from None
                     raise CapabilityOutcomeUncertain(
                         "capability outcome requires confirmation"
                     ) from None
@@ -2707,6 +2728,11 @@ class CrewDispatchRuntime:
                 except Exception as error:  # noqa: BLE001
                     error.__traceback__ = None
                     del error
+                    failed_reason = (
+                        "capability transient execution failed"
+                        if replay_safe
+                        else "capability execution failed"
+                    )
                     await emit(
                         kind=EventKind.TOOL_FAILED,
                         actor=step.agent,
@@ -2718,13 +2744,19 @@ class CrewDispatchRuntime:
                             arguments=tool_call.arguments,
                             sandbox=_tool_sandbox(tool_call.name),
                             replay_safe=replay_safe,
-                            failure_kind="uncertain",
+                            failure_kind="capability_failed"
+                            if replay_safe
+                            else "uncertain",
                         ),
-                        reason="capability execution failed",
+                        reason=failed_reason,
                     )
-                    uncertain = dict(tool_running)
-                    uncertain["status"] = "uncertain"
-                    await tool_boundary(idempotency_key, uncertain, None)
+                    failed_state = dict(tool_running)
+                    failed_state["status"] = "failed" if replay_safe else "uncertain"
+                    await tool_boundary(idempotency_key, failed_state, None)
+                    if replay_safe:
+                        raise RuntimeExecutionError(
+                            "capability transient execution failed"
+                        ) from None
                     raise CapabilityOutcomeUncertain(
                         "capability outcome requires confirmation"
                     ) from None
