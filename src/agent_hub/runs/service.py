@@ -34,7 +34,10 @@ from agent_hub.runs.self_repair import (
     classify_terminal_run,
 )
 from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, RunEvent, TaskContext
-from agent_hub.runtime.failure_reason import safe_runtime_failure_reason
+from agent_hub.runtime.failure_reason import (
+    runtime_failure_diagnostic_from_reason,
+    safe_runtime_failure_reason,
+)
 from agent_hub.runtime.registry import RuntimeRegistry
 
 _LOGGER = logging.getLogger(__name__)
@@ -1179,6 +1182,9 @@ class RunService:
         if claimed_record is not None:
             if claimed_record.status is RunStatus.FAILED:
                 await self._safe_record_self_repair_decision_for_record(claimed_record)
+                await self._safe_record_empty_response_closure_artifact_for_record(
+                    claimed_record
+                )
                 await self._safe_record_hermes_outcome_for_record(claimed_record)
                 return await self._submitted_by_run_id(claimed_record.tenant_id, claimed_record.id)
             if claimed_record.status in {RunStatus.COMPLETED, RunStatus.CANCELLED}:
@@ -1315,6 +1321,12 @@ class RunService:
                     decision=repair_decision,
                     source_sequence_from_latest=True,
                 )
+            await self._safe_record_empty_response_closure_artifact(
+                tenant_id=failed.tenant_id,
+                run_id=run_id,
+                events=(*observed_events, failure_event),
+                repair_decision=repair_decision,
+            )
             await self._safe_record_hermes_outcome(
                 tenant_id=failed.tenant_id,
                 actor_id=failed.actor_id,
@@ -1371,6 +1383,13 @@ class RunService:
                 tenant_id=tenant_id,
                 run_id=run_id,
                 decision=repair_decision,
+            )
+        if terminal is RunStatus.FAILED:
+            await self._safe_record_empty_response_closure_artifact(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                events=tuple(observed_events),
+                repair_decision=repair_decision,
             )
         if terminal in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
             await self._safe_record_hermes_outcome(
@@ -1473,6 +1492,38 @@ class RunService:
             routing_decision=record.routing_decision,
         )
 
+    async def _safe_record_empty_response_closure_artifact_for_record(
+        self, record: RunRecord
+    ) -> None:
+        if record.status is not RunStatus.FAILED:
+            return
+        try:
+            events_source = getattr(self._repository, "events", None)
+            if not callable(events_source):
+                return
+            raw_events = await events_source(record.tenant_id, record.id)
+            events = tuple(
+                _run_event_from_public_payload(event)
+                for event in raw_events
+                if isinstance(event, Mapping)
+            )
+        except Exception as error:
+            _LOGGER.exception(
+                "run_empty_response_closure_event_load_failed run_id=%s error_type=%s",
+                record.id,
+                type(error).__name__,
+            )
+            return
+        await self._safe_record_empty_response_closure_artifact(
+            tenant_id=record.tenant_id,
+            run_id=record.id,
+            events=events,
+            repair_decision=None,
+            repair_proposal_recorded=_has_recorded_self_repair_proposal(
+                record.routing_decision
+            ),
+        )
+
     async def _safe_record_self_repair_decision(
         self,
         *,
@@ -1502,6 +1553,79 @@ class RunService:
                 run_id,
                 type(error).__name__,
             )
+
+    async def _safe_record_empty_response_closure_artifact(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        events: tuple[RunEvent, ...],
+        repair_decision: SelfRepairDecision | None,
+        repair_proposal_recorded: bool = False,
+    ) -> None:
+        if not _needs_empty_response_closure_artifact(events):
+            return
+        try:
+            async with await self._repository.run_transaction() as session, session.begin():
+                latest_events = await self._safe_load_run_events(
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    fallback=events,
+                )
+                if not _needs_empty_response_closure_artifact(latest_events):
+                    return
+                sequence = await self._repository.next_event_sequence(session, run_id)
+                await self._repository.persist_event(
+                    session,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    event=RunEvent(
+                        kind=EventKind.ARTIFACT_CREATED,
+                        sequence=sequence,
+                        run_id=run_id,
+                        actor="main_agent",
+                        artifact=_empty_response_closure_artifact(
+                            repair_decision=repair_decision,
+                            repair_proposal_recorded=repair_proposal_recorded,
+                        ),
+                        payload={
+                            "schema_version": 1,
+                            "failure_category": "empty_model_response",
+                            "recovery_stage": "failure_closure",
+                        },
+                    ),
+                )
+        except Exception as error:
+            _LOGGER.exception(
+                "run_empty_response_closure_artifact_failed run_id=%s error_type=%s",
+                run_id,
+                type(error).__name__,
+            )
+
+    async def _safe_load_run_events(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        fallback: tuple[RunEvent, ...],
+    ) -> tuple[RunEvent, ...]:
+        events_source = getattr(self._repository, "events", None)
+        if not callable(events_source):
+            return fallback
+        try:
+            raw_events = await events_source(tenant_id, run_id)
+            return tuple(
+                _run_event_from_public_payload(event)
+                for event in raw_events
+                if isinstance(event, Mapping)
+            )
+        except Exception as error:
+            _LOGGER.exception(
+                "run_event_snapshot_load_failed run_id=%s error_type=%s",
+                run_id,
+                type(error).__name__,
+            )
+            return fallback
 
     async def recover(self, run_id: UUID) -> SubmittedRun:
         return await self.execute(run_id, allow_running_recovery=True)
@@ -1909,6 +2033,91 @@ def _bounded_int(value: object, default: int, minimum: int, maximum: int) -> int
     if type(value) is not int:
         return default
     return min(max(value, minimum), maximum)
+
+
+def _needs_empty_response_closure_artifact(events: tuple[RunEvent, ...]) -> bool:
+    if _has_delivery_artifact(events) or _has_empty_response_closure_artifact(events):
+        return False
+    for event in events:
+        if event.kind not in {
+            EventKind.RUNTIME_FAILED,
+            EventKind.STEP_FAILED,
+            EventKind.TOOL_FAILED,
+        }:
+            continue
+        diagnostic = runtime_failure_diagnostic_from_reason(event.reason)
+        if diagnostic.get("error_code") == "model.empty_response":
+            return True
+    return False
+
+
+def _run_event_from_public_payload(event: Mapping[str, object]) -> RunEvent:
+    return RunEvent.from_payload(
+        {
+            key: value
+            for key, value in event.items()
+            if key in RunEvent.model_fields
+        }
+    )
+
+
+def _has_delivery_artifact(events: tuple[RunEvent, ...]) -> bool:
+    return any(
+        event.kind is EventKind.ARTIFACT_CREATED
+        and event.artifact is not None
+        and event.artifact.producer != "run_service"
+        for event in events
+    )
+
+
+def _has_empty_response_closure_artifact(events: tuple[RunEvent, ...]) -> bool:
+    return any(
+        event.kind is EventKind.ARTIFACT_CREATED
+        and event.artifact is not None
+        and event.artifact.producer == "run_service"
+        and event.artifact.content.get("failure_category") == "empty_model_response"
+        for event in events
+    )
+
+
+def _empty_response_closure_artifact(
+    *,
+    repair_decision: SelfRepairDecision | None,
+    repair_proposal_recorded: bool = False,
+) -> Artifact:
+    has_repair_proposal = (
+        repair_decision is not None and repair_decision.kind == "repair.classified"
+    ) or repair_proposal_recorded
+    approval_text = (
+        "系统已生成一次受控自修复建议，审批后可压缩上下文并重试。"
+        if has_repair_proposal
+        else "系统已保留失败现场，可压缩输入和上下文、拆分任务或切换备用模型后重试。"
+    )
+    return Artifact(
+        id=uuid4(),
+        type="text",
+        producer="run_service",
+        content={
+            "text": (
+                "模型返回了空内容，当前轮次没有生成可交付结果。"
+                f"{approval_text}"
+                "若多轮重复出现，请优先检查模型配置、fallback 标记和任务上下文长度。"
+            ),
+            "category": "failure_closure",
+            "failure_category": "empty_model_response",
+        },
+    )
+
+
+def _has_recorded_self_repair_proposal(
+    routing_decision: Mapping[str, object] | None
+) -> bool:
+    if routing_decision is None:
+        return False
+    proposal = routing_decision.get("repair_proposal")
+    return routing_decision.get("approval_kind") == "self_repair" and isinstance(
+        proposal, Mapping
+    )
 
 
 def _submitted(record: RunRecord) -> SubmittedRun:

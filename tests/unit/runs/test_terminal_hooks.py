@@ -13,7 +13,13 @@ from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import RunRecord
 from agent_hub.runs.self_repair import SelfRepairPolicy, repair_context_from_proposal
 from agent_hub.runs.service import HermesRunOutcome, RunService
-from agent_hub.runtime.contracts import EventKind, RunEvent, RuntimeCheckpoint, TaskContext
+from agent_hub.runtime.contracts import (
+    Artifact,
+    EventKind,
+    RunEvent,
+    RuntimeCheckpoint,
+    TaskContext,
+)
 from agent_hub.runtime.registry import RuntimeRegistry
 
 TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -61,7 +67,8 @@ class ExecutableFakeRepository:
             created_at=datetime.now(UTC),
             routing_decision=routing_decision,
         )
-        self.events: list[RunEvent] = []
+        self.event_log: list[RunEvent] = []
+        self.artifacts: list[Artifact] = []
         self.conversation_context_calls: list[dict[str, object]] = []
 
     async def run_transaction(self) -> FakeTransaction:
@@ -102,12 +109,14 @@ class ExecutableFakeRepository:
         del session
         assert tenant_id == TENANT_ID
         assert run_id == self.run_id
-        self.events.append(event)
+        self.event_log.append(event)
+        if event.artifact is not None:
+            self.artifacts.append(event.artifact)
 
     async def next_event_sequence(self, session: FakeTransaction, run_id: UUID) -> int:
         del session
         assert run_id == self.run_id
-        return max((event.sequence for event in self.events), default=0) + 1
+        return max((event.sequence for event in self.event_log), default=0) + 1
 
     async def update_status(
         self,
@@ -128,8 +137,8 @@ class ExecutableFakeRepository:
         assert run_id == self.run_id
         if self.row.status == RunStatus.WAITING_APPROVAL.value:
             return self._record()
-        sequence = max((event.sequence for event in self.events), default=0) + 1
-        self.events.append(
+        sequence = max((event.sequence for event in self.event_log), default=0) + 1
+        self.event_log.append(
             RunEvent(
                 kind=EventKind.RUNTIME_FAILED,
                 sequence=sequence,
@@ -229,6 +238,14 @@ class ExecutableFakeRepository:
         )
         return []
 
+    async def events(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
+        assert tenant_id == TENANT_ID
+        assert run_id == self.run_id
+        return tuple(
+            {**event.to_payload(), "created_at": datetime.now(UTC).isoformat()}
+            for event in self.event_log
+        )
+
     def _record(self) -> RunRecord:
         return RunRecord(
             id=self.row.id,
@@ -259,7 +276,7 @@ class RecoveredFailedRepository(ExecutableFakeRepository):
         assert run_id == self.run_id
         self.row.status = RunStatus.FAILED.value
         self.row.version += 1
-        self.events.append(
+        self.event_log.append(
             RunEvent(
                 kind=EventKind.STEP_FAILED,
                 sequence=1,
@@ -269,6 +286,33 @@ class RecoveredFailedRepository(ExecutableFakeRepository):
                 reason="non replayable event after checkpoint",
             )
         )
+        return self._record()
+
+
+class RecoveredEmptyResponseRepository(ExecutableFakeRepository):
+    async def claim_for_execution(
+        self,
+        session: FakeTransaction,
+        run_id: UUID,
+        *,
+        allow_running_recovery: bool,
+    ) -> tuple[FakeRunRow, RuntimeCheckpoint | None] | RunRecord:
+        del session, allow_running_recovery
+        assert run_id == self.run_id
+        self.row.status = RunStatus.FAILED.value
+        self.row.version += 1
+        if not self.event_log:
+            self.event_log.append(
+                RunEvent(
+                    kind=EventKind.RUNTIME_FAILED,
+                    sequence=1,
+                    run_id=run_id,
+                    reason=(
+                        "hybrid dispatch failed: model gateway failed: "
+                        "model response text is empty"
+                    ),
+                )
+            )
         return self._record()
 
 
@@ -642,12 +686,12 @@ async def test_execute_persists_harness_started_event_before_vibe_runtime_events
     submitted = await service.execute(repository.run_id)
 
     assert submitted.status is RunStatus.COMPLETED
-    assert [event.kind for event in repository.events] == [
+    assert [event.kind for event in repository.event_log] == [
         "harness.started",
         EventKind.RUNTIME_COMPLETED,
     ]
-    assert [event.sequence for event in repository.events] == [1, 2]
-    assert repository.events[0].payload == {
+    assert [event.sequence for event in repository.event_log] == [1, 2]
+    assert repository.event_log[0].payload == {
         "schema_version": 1,
         "phase": "started",
         "mode": "dispatch",
@@ -678,8 +722,8 @@ async def test_execute_without_harness_decision_keeps_runtime_event_sequence() -
     submitted = await service.execute(repository.run_id)
 
     assert submitted.status is RunStatus.COMPLETED
-    assert [event.kind for event in repository.events] == [EventKind.RUNTIME_COMPLETED]
-    assert [event.sequence for event in repository.events] == [1]
+    assert [event.kind for event in repository.event_log] == [EventKind.RUNTIME_COMPLETED]
+    assert [event.sequence for event in repository.event_log] == [1]
 
 
 @pytest.mark.asyncio
@@ -709,9 +753,9 @@ async def test_execute_does_not_emit_harness_started_event_with_sensitive_profil
     submitted = await service.execute(repository.run_id)
 
     assert submitted.status is RunStatus.COMPLETED
-    assert [event.kind for event in repository.events] == [EventKind.RUNTIME_COMPLETED]
-    assert "sk-secret-model-token" not in repr(repository.events)
-    assert "authorization bypass" not in repr(repository.events)
+    assert [event.kind for event in repository.event_log] == [EventKind.RUNTIME_COMPLETED]
+    assert "sk-secret-model-token" not in repr(repository.event_log)
+    assert "authorization bypass" not in repr(repository.event_log)
 
 
 @pytest.mark.asyncio
@@ -731,7 +775,7 @@ async def test_execute_preserves_waiting_approval_status_set_by_capability_polic
     submitted = await service.execute(repository.run_id)
 
     assert submitted.status is RunStatus.WAITING_APPROVAL
-    assert repository.events == []
+    assert repository.event_log == []
     assert hermes.outcomes == []
     assert hook.calls == []
 
@@ -754,7 +798,7 @@ async def test_execute_exception_does_not_overwrite_waiting_approval_status() ->
     submitted = await service.execute(repository.run_id)
 
     assert submitted.status is RunStatus.WAITING_APPROVAL
-    assert repository.events == []
+    assert repository.event_log == []
     assert hermes.outcomes == []
     assert hook.calls == []
 
@@ -792,10 +836,10 @@ async def test_execute_persists_observer_notice_for_capacity_pressure() -> None:
     submitted = await service.execute(repository.run_id)
 
     assert submitted.status is RunStatus.FAILED
-    notices = [event for event in repository.events if event.kind == "observer.notice"]
+    notices = [event for event in repository.event_log if event.kind == "observer.notice"]
     assert len(notices) == 1
     notice = notices[0]
-    assert [event.kind for event in repository.events] == [
+    assert [event.kind for event in repository.event_log] == [
         EventKind.STEP_FAILED,
         EventKind.RUNTIME_FAILED,
         "observer.notice",
@@ -822,10 +866,10 @@ async def test_execute_persists_repair_classification_for_failed_run() -> None:
     submitted = await service.execute(repository.run_id)
 
     assert submitted.status is RunStatus.FAILED
-    repair_events = [event for event in repository.events if event.kind == "repair.classified"]
+    repair_events = [event for event in repository.event_log if event.kind == "repair.classified"]
     assert len(repair_events) == 1
     repair = repair_events[0]
-    assert [event.kind for event in repository.events] == [
+    assert [event.kind for event in repository.event_log] == [
         EventKind.STEP_FAILED,
         EventKind.RUNTIME_FAILED,
         "observer.notice",
@@ -878,16 +922,85 @@ async def test_execute_classifies_empty_model_response_for_controlled_retry() ->
     submitted = await service.execute(repository.run_id)
 
     assert submitted.status is RunStatus.FAILED
-    notice = next(event for event in repository.events if event.kind == "observer.notice")
+    notice = next(event for event in repository.event_log if event.kind == "observer.notice")
     assert notice.payload["trigger"] == "empty_model_response"
     assert notice.payload["action"] == "retry_fallback_or_reassign_model"
-    repair = next(event for event in repository.events if event.kind == "repair.classified")
+    repair = next(event for event in repository.event_log if event.kind == "repair.classified")
     assert repair.payload["failure_category"] == "empty_model_response"
     assert repair.payload["automatic_execution"] is False
     assert submitted.repair_proposal is not None
     assert submitted.repair_proposal["failure_kind"] == "empty_model_response"
     assert "压缩输入" in str(submitted.repair_proposal["instruction"])
     assert "fallback" in str(submitted.repair_proposal["instruction"])
+    assert [event.kind for event in repository.event_log] == [
+        EventKind.RUNTIME_FAILED,
+        "observer.notice",
+        "repair.classified",
+        EventKind.ARTIFACT_CREATED,
+    ]
+    closure_events = [
+        event
+        for event in repository.event_log
+        if event.kind is EventKind.ARTIFACT_CREATED
+        and event.artifact is not None
+        and event.artifact.producer == "run_service"
+    ]
+    assert len(closure_events) == 1
+    closure_text = closure_events[0].artifact.content["text"]
+    assert isinstance(closure_text, str)
+    assert "模型返回了空内容" in closure_text
+    assert "压缩输入" in closure_text
+    assert "审批后" in closure_text
+    assert "hybrid dispatch failed" not in closure_text
+    assert "secret" not in closure_text
+    assert repository.artifacts == [closure_events[0].artifact]
+
+
+@pytest.mark.asyncio
+async def test_execute_records_empty_response_closure_when_runtime_raises() -> None:
+    class RuntimeRaisesEmptyResponse:
+        mode = TaskMode.DISPATCH
+
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+            del context
+            raise RuntimeError(
+                "hybrid dispatch failed: model gateway failed: model response text is empty"
+            )
+            yield RunEvent(kind=EventKind.RUNTIME_COMPLETED, sequence=1, run_id=uuid4())
+
+        async def save_checkpoint(self) -> RuntimeCheckpoint:
+            raise AssertionError("not used")
+
+        async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+            del checkpoint
+
+        async def cancel(self) -> None:
+            raise AssertionError("not used")
+
+    repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeRaisesEmptyResponse(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.FAILED
+    assert submitted.repair_proposal is not None
+    assert submitted.repair_proposal["failure_kind"] == "empty_model_response"
+    closure_events = [
+        event
+        for event in repository.event_log
+        if event.kind is EventKind.ARTIFACT_CREATED
+        and event.artifact is not None
+        and event.artifact.producer == "run_service"
+    ]
+    assert len(closure_events) == 1
+    closure_text = str(closure_events[0].artifact.content["text"])
+    assert "模型返回了空内容" in closure_text
+    assert "审批后" in closure_text
 
 
 @pytest.mark.asyncio
@@ -903,10 +1016,10 @@ async def test_execute_skips_self_repair_source_without_recursive_repair() -> No
     submitted = await service.execute(repository.run_id)
 
     assert submitted.status is RunStatus.FAILED
-    skipped = [event for event in repository.events if event.kind == "repair.skipped"]
+    skipped = [event for event in repository.event_log if event.kind == "repair.skipped"]
     assert len(skipped) == 1
     assert skipped[0].payload["skip_reason"] == "recursive_self_repair"
-    assert [event for event in repository.events if event.kind == "repair.classified"] == []
+    assert [event for event in repository.event_log if event.kind == "repair.classified"] == []
 
 
 @pytest.mark.asyncio
@@ -923,7 +1036,7 @@ async def test_execute_does_not_emit_repair_event_for_completed_run() -> None:
 
     assert submitted.status is RunStatus.COMPLETED
     assert [
-        event for event in repository.events if str(event.kind).startswith("repair.")
+        event for event in repository.event_log if str(event.kind).startswith("repair.")
     ] == []
 
 
@@ -941,7 +1054,7 @@ async def test_execute_does_not_emit_repair_event_for_cancelled_run() -> None:
 
     assert submitted.status is RunStatus.CANCELLED
     assert [
-        event for event in repository.events if str(event.kind).startswith("repair.")
+        event for event in repository.event_log if str(event.kind).startswith("repair.")
     ] == []
 
 
@@ -960,7 +1073,7 @@ async def test_execute_respects_self_repair_policy_kill_switch() -> None:
 
     assert submitted.status is RunStatus.FAILED
     assert [
-        event for event in repository.events if str(event.kind).startswith("repair.")
+        event for event in repository.event_log if str(event.kind).startswith("repair.")
     ] == []
 
 
@@ -982,7 +1095,7 @@ async def test_execute_skips_any_uncertain_failure_without_auto_repair() -> None
     submitted = await service.execute(repository.run_id)
 
     assert submitted.status is RunStatus.FAILED
-    skipped = [event for event in repository.events if event.kind == "repair.skipped"]
+    skipped = [event for event in repository.event_log if event.kind == "repair.skipped"]
     assert len(skipped) == 1
     assert skipped[0].payload["skip_reason"] == "side_effect_outcome_uncertain"
     assert skipped[0].payload["source_kind"] == "tool.failed"
@@ -1005,7 +1118,7 @@ async def test_execute_skips_uncertain_tool_failure_when_runtime_raises_later() 
     submitted = await service.execute(repository.run_id)
 
     assert submitted.status is RunStatus.FAILED
-    skipped = [event for event in repository.events if event.kind == "repair.skipped"]
+    skipped = [event for event in repository.event_log if event.kind == "repair.skipped"]
     assert len(skipped) == 1
     assert skipped[0].payload["skip_reason"] == "side_effect_outcome_uncertain"
     assert skipped[0].payload["source_kind"] == "tool.failed"
@@ -1025,11 +1138,11 @@ async def test_execute_classifies_runtime_exception_failure() -> None:
     submitted = await service.execute(repository.run_id)
 
     assert submitted.status is RunStatus.FAILED
-    assert [event.kind for event in repository.events] == [
+    assert [event.kind for event in repository.event_log] == [
         EventKind.RUNTIME_FAILED,
         "repair.classified",
     ]
-    repair = repository.events[-1]
+    repair = repository.event_log[-1]
     assert repair.sequence == 2
     assert repair.payload["source_kind"] == "runtime.failed"
     assert repair.payload["source_sequence"] == 1
@@ -1099,7 +1212,9 @@ async def test_accepted_self_repair_run_records_bounded_execution_audit() -> Non
     repaired = await repair_service.execute(repository.run_id)
 
     assert repaired.status is RunStatus.COMPLETED
-    repair_events = [event for event in repository.events if str(event.kind).startswith("repair.")]
+    repair_events = [
+        event for event in repository.event_log if str(event.kind).startswith("repair.")
+    ]
     assert [event.kind for event in repair_events] == [
         "repair.classified",
         "repair.started",
@@ -1128,10 +1243,36 @@ async def test_recover_persists_repair_classification_for_failed_running_recover
     submitted = await service.recover(repository.run_id)
 
     assert submitted.status is RunStatus.FAILED
-    repair_events = [event for event in repository.events if event.kind == "repair.classified"]
+    repair_events = [event for event in repository.event_log if event.kind == "repair.classified"]
     assert len(repair_events) == 1
     assert repair_events[0].payload["source_kind"] == "step.failed"
     assert submitted.repair_proposal is not None
+
+
+@pytest.mark.asyncio
+async def test_recover_backfills_empty_response_closure_once_for_failed_run() -> None:
+    repository = RecoveredEmptyResponseRepository(routing_decision={"source": "manual"})
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeCompletes(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    first = await service.recover(repository.run_id)
+    second = await service.recover(repository.run_id)
+
+    assert first.status is RunStatus.FAILED
+    assert second.status is RunStatus.FAILED
+    closure_events = [
+        event
+        for event in repository.event_log
+        if event.kind is EventKind.ARTIFACT_CREATED
+        and event.artifact is not None
+        and event.artifact.producer == "run_service"
+    ]
+    assert len(closure_events) == 1
+    assert "模型返回了空内容" in str(closure_events[0].artifact.content["text"])
 
 
 @pytest.mark.asyncio
