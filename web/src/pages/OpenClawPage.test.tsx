@@ -53,7 +53,7 @@ describe("OpenClawPage", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const path = String(input);
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
         const method = init?.method ?? "GET";
         if (init?.body) requests.push({ path, method, body: JSON.parse(String(init.body)) });
         if (path === "/api/v1/auth/me") return jsonResponse(principal);

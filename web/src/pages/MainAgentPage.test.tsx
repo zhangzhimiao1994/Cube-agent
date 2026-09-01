@@ -34,7 +34,7 @@ describe("MainAgentPage", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const path = String(input);
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
         const method = init?.method ?? "GET";
         if (init?.body && typeof init.body === "string") {
           requests.push({ path, method, body: JSON.parse(init.body) });

@@ -43,7 +43,7 @@ describe("LoginPage", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const path = String(input);
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
         if (path === "/api/v1/auth/me") {
           return jsonResponse({ error: "unauthenticated" }, { status: 401 });
         }
@@ -159,7 +159,8 @@ describe("LoginPage", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
-        if (String(input) === "/api/v1/auth/me") {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
           return jsonResponse({
             user_id: "44444444-4444-4444-8444-444444444444",
             tenant_id: principal.tenant_id,
@@ -175,7 +176,7 @@ describe("LoginPage", () => {
             ],
           });
         }
-        if (String(input) === "/api/v1/admin/runs") {
+        if (path === "/api/v1/admin/runs") {
           return jsonResponse(runs);
         }
         return new Response(null, { status: 204 });

@@ -19,7 +19,7 @@ describe("AppShell presentation", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
-        const path = String(input);
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
         if (path === "/api/v1/auth/me") {
           return jsonResponse({
             user_id: "11111111-1111-4111-8111-111111111111",

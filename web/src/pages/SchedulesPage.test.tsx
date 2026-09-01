@@ -38,7 +38,7 @@ describe("SchedulesPage", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const path = String(input);
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
         const method = init?.method ?? "GET";
         const body = init?.body ? JSON.parse(String(init.body)) : undefined;
         if (method !== "GET") requests.push({ path, method, body });

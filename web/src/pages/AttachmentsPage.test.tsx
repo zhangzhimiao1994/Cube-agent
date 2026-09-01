@@ -18,7 +18,7 @@ describe("AttachmentsPage", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const path = String(input);
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
         expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer owner-token");
         if (path === "/api/v1/auth/me") {
           return jsonResponse({

@@ -31,7 +31,7 @@ describe("ModelsPage", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const path = String(input);
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
         const method = init?.method ?? "GET";
         expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer owner-token");
         if (init?.body) {

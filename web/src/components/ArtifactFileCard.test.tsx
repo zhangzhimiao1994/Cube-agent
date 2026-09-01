@@ -70,8 +70,9 @@ describe("ArtifactFileCard", () => {
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
-        downloadable.download_url,
+        expect.stringMatching(/^\/api\/v1\/admin\/runs\/run-1\/artifacts\/artifact-zip\/download\?_=/),
         expect.objectContaining({
+          cache: "no-store",
           credentials: "include",
           headers: expect.objectContaining({ Authorization: "Bearer owner-token" }),
         }),

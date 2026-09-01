@@ -73,7 +73,9 @@ describe("SkillsPage", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const path = String(input);
+        const url = new URL(String(input), "https://agent-hub.test");
+        const path = url.pathname;
+        const pathWithSearch = `${url.pathname}${url.search}`;
         expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer owner-token");
         if (path === "/api/v1/auth/me") {
           return jsonResponse({
@@ -85,7 +87,7 @@ describe("SkillsPage", () => {
         if (path === "/api/v1/admin/skills" && (!init?.method || init.method === "GET")) {
           return jsonResponse(skills);
         }
-        if (path === "/api/v1/admin/skills/upload" && init?.method === "POST") {
+        if (pathWithSearch === "/api/v1/admin/skills/upload" && init?.method === "POST") {
           const filename = (init.headers as Record<string, string>)["X-Agent-Hub-Skill-Filename"];
           if (filename === "duplicate-skill.zip") {
             duplicateUploadAttempts += 1;
@@ -115,7 +117,7 @@ describe("SkillsPage", () => {
             skipped: [{ path: "invalid-skill", reason: "instruction skill contains nested archives" }],
           });
         }
-        if (path === "/api/v1/admin/skills/upload?strategy=overwrite" && init?.method === "POST") {
+        if (pathWithSearch === "/api/v1/admin/skills/upload?strategy=overwrite" && init?.method === "POST") {
           duplicateUploadAttempts += 1;
           return jsonResponse({
             filename: "duplicate-skill.zip",
@@ -146,7 +148,7 @@ describe("SkillsPage", () => {
             skipped: [],
           });
         }
-        if (path === "/api/v1/admin/skills/upload?strategy=new_version" && init?.method === "POST") {
+        if (pathWithSearch === "/api/v1/admin/skills/upload?strategy=new_version" && init?.method === "POST") {
           duplicateUploadAttempts += 1;
           return jsonResponse({
             filename: "duplicate-skill.zip",
