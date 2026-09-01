@@ -417,7 +417,8 @@ describe("operational management pages", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const path = String(input);
+        const requestPath = String(input);
+        const path = new URL(requestPath, "https://agent-hub.test").pathname;
         const method = init?.method ?? "GET";
         const requestHeaders = Object.fromEntries(new Headers(init?.headers).entries());
         if (init?.body && typeof init.body === "string") {
@@ -1142,7 +1143,7 @@ describe("operational management pages", () => {
               created_at: "2026-08-07T00:03:30Z",
             },
           ];
-          const url = new URL(path, "https://agent-hub.test");
+          const url = new URL(requestPath, "https://agent-hub.test");
           const category = url.searchParams.get("category");
           return jsonResponse(category ? logs.filter((item) => item.category === category) : logs);
         }
@@ -1334,7 +1335,8 @@ describe("operational management pages", () => {
     expect(toolCards[0].getAttribute("aria-expanded")).toBe("false");
     await user.click(toolCards[0]);
     expect(toolCards[0].getAttribute("aria-expanded")).toBe("true");
-    expect(within(processRegion).getByRole("group", { name: "Agent 动作详情" })).not.toBeNull();
+    const actionDrawer = screen.getByRole("dialog", { name: "Agent 动作详情" });
+    expect(within(actionDrawer).getByRole("group", { name: "运行详情摘要" })).not.toBeNull();
     expect(processRegion.textContent).not.toContain("tool.failed");
     expect(processRegion.textContent).not.toContain("model.text_delta");
     expect(processRegion.textContent).not.toContain("stdout");
@@ -1645,7 +1647,9 @@ describe("operational management pages", () => {
     expect(within(eventLog).queryByText("checkpoint.saved")).toBeNull();
     const checkpointCard = within(processRegion).getByRole("button", { name: /保存第一版 harness checkpoint/ });
     await user.click(checkpointCard);
-    expect(within(processRegion).getByText("事件类型 checkpoint.saved")).not.toBeNull();
+    const evidenceDetail = await openProcessDetailGroup(user, screen.getByRole("dialog", { name: "Agent 动作详情" }), "证据");
+    expect(within(evidenceDetail).getByText("原始事件类型")).not.toBeNull();
+    expect(within(evidenceDetail).getByText("checkpoint.saved")).not.toBeNull();
   });
 
   it("shows observer notices as scheduler guidance on the detail page", async () => {
@@ -5019,6 +5023,29 @@ describe("operational management pages", () => {
     expect(document.documentElement.style.overflow).toBe("");
   });
 
+  it("closes the process drawer with Escape from the chat workspace", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await user.click(
+      within(stream).getByRole("button", {
+        name: /文案生成 输出：得到一版可拍摄脚本文案/,
+      }),
+    );
+
+    expect(await screen.findByRole("dialog", { name: "运行过程详情" })).not.toBeNull();
+    await user.keyboard("{Escape}");
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "运行过程详情" })).toBeNull());
+    expect(document.body.style.overflow).toBe("");
+    expect(document.body.style.touchAction).toBe("");
+    expect(document.documentElement.style.overflow).toBe("");
+  });
+
   it("restores existing page scroll styles after closing the process drawer", async () => {
     const user = userEvent.setup();
     document.body.style.overflow = "auto";
@@ -6150,7 +6177,7 @@ describe("operational management pages", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
-        const path = String(input);
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
         if (path === "/api/v1/auth/me") {
           return jsonResponse({
             user_id: "11111111-1111-4111-8111-111111111111",

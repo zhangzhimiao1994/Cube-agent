@@ -1,6 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ApiError, formatApiError } from "./client";
+import { ApiError, api, formatApiError } from "./client";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
 describe("formatApiError", () => {
   it("includes safe structured details without dumping unrelated values", () => {
@@ -27,5 +32,22 @@ describe("formatApiError", () => {
     expect(formatted).toContain("hint=Check model config and rate limits.");
     expect(formatted).not.toContain("secret://private-key");
     expect(formatted).not.toContain("private stack");
+  });
+});
+
+describe("api client transport", () => {
+  it("disables browser caching for API reads used by live run surfaces", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.runs();
+
+    expect(fetchMock.mock.calls[0]?.[0]).toMatch(/^\/api\/v1\/admin\/runs\?_=/);
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({ cache: "no-store" }));
   });
 });

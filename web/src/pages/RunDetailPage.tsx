@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 
@@ -41,6 +41,24 @@ type DetailProcessCard = {
   title: string;
   detail: string;
   meta: string[];
+  rows: DetailProcessRow[];
+  createdAt: string | null;
+  artifact?: DownloadableArtifact;
+};
+
+type DetailProcessRow = {
+  label: string;
+  value: string;
+};
+
+type DetailProcessGroup = {
+  key: string;
+  label: string;
+  rows: DetailProcessRow[];
+};
+
+type DownloadableArtifact = RunArtifact & {
+  download_url: string;
 };
 
 type ToolLifecycle = {
@@ -357,6 +375,147 @@ function formatPayloadValue(value: unknown) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : "";
 }
 
+function formatDetailValue(value: unknown): string {
+  if (value === null || typeof value === "undefined") return "";
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value) && value.every((item) => ["string", "number", "boolean"].includes(typeof item))) {
+    return value.map((item) => String(item)).join("、");
+  }
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function conciseProcessText(value: string, fallback: string) {
+  const normalized = value
+    .replace(/```[\s\S]*?```/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return fallback;
+  const sentence = normalized.split(/(?<=[。！？.!?])\s+/)[0]?.trim() || normalized;
+  return sentence.length > 38 ? `${sentence.slice(0, 38)}...` : sentence;
+}
+
+function isGenericDetailText(value: string | null | undefined) {
+  const normalized = value?.replace(/\s+/g, " ").trim();
+  if (!normalized) return false;
+  return normalized === "artifact.created" || normalized === "message.created" || /^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(normalized);
+}
+
+function detailPayloadLabel(key: string) {
+  const labels: Record<string, string> = {
+    artifact_id: "产物 ID",
+    artifactId: "产物 ID",
+    output: "输出内容",
+    result: "得到结果",
+    summary: "执行摘要",
+    input: "输入内容",
+    prompt: "提示词/指令",
+    instruction: "下发指令",
+    instructions: "下发指令",
+    task: "下发任务",
+    final_decision: "最终裁决",
+    main_agent_judgement: "主 Agent 判断",
+    main_agent_judgment: "主 Agent 判断",
+    model: "调用模型",
+    logical_model: "逻辑模型",
+    provider: "服务商",
+    status: "状态",
+    exit_code: "退出码",
+    output_bytes: "输出字节数",
+    argument_bytes: "参数字节数",
+    operation_kind: "操作类别",
+    failure_kind: "失败类型",
+    replay_safe: "可回放",
+  };
+  return labels[key] ?? key.replace(/_/g, " ");
+}
+
+function isSensitivePayloadKey(key: string) {
+  return /api[_-]?key|secret|token|password|credential/i.test(key);
+}
+
+function hasSensitiveNestedValue(value: unknown): boolean {
+  if (value === null || typeof value === "undefined") return false;
+  if (typeof value === "string") return /api[_-]?key|secret|token|password|credential/i.test(value);
+  if (typeof value !== "object") return false;
+  if (Array.isArray(value)) return value.some((item) => hasSensitiveNestedValue(item));
+  return Object.entries(value as Record<string, unknown>).some(
+    ([key, item]) => isSensitivePayloadKey(key) || hasSensitiveNestedValue(item),
+  );
+}
+
+function artifactText(artifact: RunArtifact | null | undefined) {
+  const text = artifact?.text?.trim() ?? "";
+  return isGenericDetailText(text) ? "" : text;
+}
+
+function formatArtifactSize(sizeBytes: number | null | undefined) {
+  if (typeof sizeBytes !== "number" || !Number.isFinite(sizeBytes) || sizeBytes < 0) return "";
+  if (sizeBytes < 1024) return `${sizeBytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = sizeBytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toFixed(1)} ${units[unitIndex]}`;
+}
+
+function artifactRows(artifact: RunArtifact | null | undefined): DetailProcessRow[] {
+  if (!artifact) return [];
+  return [
+    artifact.title ? { label: "产物标题", value: artifact.title } : null,
+    artifact.kind ? { label: "产物类型", value: artifact.kind } : null,
+    artifact.filename ? { label: "文件名", value: artifact.filename } : null,
+    artifact.mime_type ? { label: "文件类型", value: artifact.mime_type } : null,
+    formatArtifactSize(artifact.size_bytes) ? { label: "文件大小", value: formatArtifactSize(artifact.size_bytes) } : null,
+    artifact.sha256 ? { label: "SHA-256", value: artifact.sha256 } : null,
+    artifactText(artifact) ? { label: "输出内容", value: artifactText(artifact) } : null,
+  ].filter((row): row is DetailProcessRow => Boolean(row));
+}
+
+function downloadableArtifact(artifact: RunArtifact | null | undefined): DownloadableArtifact | undefined {
+  return hasArtifactDownload(artifact) ? artifact : undefined;
+}
+
+function artifactForEvent(event: RunEvent, artifacts: RunArtifact[]) {
+  if (event.artifact) return event.artifact;
+  const artifactId =
+    formatDetailValue(event.payload.artifact_id) ||
+    formatDetailValue(event.payload.artifactId) ||
+    formatDetailValue(event.payload.id);
+  return artifactId ? artifacts.find((artifact) => artifact.id === artifactId) ?? null : null;
+}
+
+function eventDetailRows(event: RunEvent, artifact: RunArtifact | null | undefined): DetailProcessRow[] {
+  const rows: DetailProcessRow[] = [
+    { label: "时间", value: runEventTimestamp(event.created_at) },
+    { label: "事件类型", value: displayDetailEventKind(event.kind) },
+  ];
+  if (!isKnownDetailEventKind(event.kind)) rows.push({ label: "原始事件类型", value: event.kind });
+  if (event.actor) rows.push({ label: "执行者", value: displayDetailActor(event.actor) });
+  if (event.participants.length > 0) rows.push({ label: "参与者", value: event.participants.join("、") });
+  if (event.step_id) rows.push({ label: "步骤", value: event.step_id });
+  if (event.tool_name) rows.push({ label: "工具", value: event.tool_name });
+  if (event.tool_call_id) rows.push({ label: "调用 ID", value: event.tool_call_id });
+  if (event.approval_id) rows.push({ label: "审批 ID", value: event.approval_id });
+  if (safeDiagnosticIdentifier(event.action, "")) rows.push({ label: "动作", value: safeDiagnosticIdentifier(event.action, "") });
+  if (safeDiagnosticIdentifier(event.decision, "")) rows.push({ label: "决策", value: safeDiagnosticIdentifier(event.decision, "") });
+  if (event.summary?.trim()) rows.push({ label: "安全摘要", value: event.summary.trim() });
+  if (!isGenericDetailText(event.message)) rows.push({ label: "事件内容", value: event.message.trim() });
+  Object.entries(event.payload).forEach(([key, value]) => {
+    if (isSensitivePayloadKey(key) || hasSensitiveNestedValue(value)) return;
+    const formatted = formatDetailValue(value);
+    if (formatted) rows.push({ label: detailPayloadLabel(key), value: formatted });
+  });
+  return [...rows, ...artifactRows(artifact)];
+}
+
 function numericPayloadValue(event: RunEvent, key: string) {
   const value = event.payload[key];
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
@@ -425,30 +584,41 @@ function detailProcessLabel(event: RunEvent) {
   return displayDetailEventKind(event.kind);
 }
 
-function detailProcessCards(items: DetailTimelineItem[]): DetailProcessCard[] {
+function detailProcessCards(items: DetailTimelineItem[], artifacts: RunArtifact[]): DetailProcessCard[] {
   return items.flatMap((item) => {
     if (item.type === "model_delta_group") {
       const firstEvent = item.events[0];
       const lastEvent = item.events.at(-1) ?? firstEvent;
       const sequence = `事件 #${firstEvent.sequence}${lastEvent.sequence !== firstEvent.sequence ? `-#${lastEvent.sequence}` : ""}`;
+      const summary = modelDeltaSummary(item.events);
       return [
         {
           id: `model-delta-${firstEvent.sequence}-${lastEvent.sequence}`,
           label: "模型过程",
-          title: modelDeltaSummary(item.events),
-          detail: modelDeltaSummary(item.events),
+          title: conciseProcessText(summary, "模型流式进度已记录"),
+          detail: summary,
           meta: [sequence, displayDetailActor(lastEvent.actor), lastEvent.step_id ? `步骤 ${lastEvent.step_id}` : ""].filter(Boolean),
+          rows: [
+            { label: "时间", value: runEventTimestamp(lastEvent.created_at) },
+            { label: "事件范围", value: sequence },
+            { label: "活动", value: summary },
+            displayDetailActor(lastEvent.actor) ? { label: "执行者", value: displayDetailActor(lastEvent.actor) } : null,
+            lastEvent.step_id ? { label: "步骤", value: lastEvent.step_id } : null,
+          ].filter((row): row is DetailProcessRow => Boolean(row)),
+          createdAt: lastEvent.created_at,
         },
       ];
     }
     const { event } = item;
     const rawKindMeta = isKnownDetailEventKind(event.kind) ? "" : `事件类型 ${event.kind}`;
+    const artifact = artifactForEvent(event, artifacts);
+    const summary = safeDetailEventSummary(event);
     return [
       {
         id: `event-${event.sequence}`,
         label: detailProcessLabel(event),
-        title: safeDetailEventSummary(event),
-        detail: safeDetailEventSummary(event),
+        title: conciseProcessText(summary, displayDetailEventKind(event.kind)),
+        detail: summary,
         meta: [
           displayDetailEventKind(event.kind),
           rawKindMeta,
@@ -457,6 +627,9 @@ function detailProcessCards(items: DetailTimelineItem[]): DetailProcessCard[] {
           event.step_id ? `步骤 ${event.step_id}` : "",
           event.tool_name && event.kind.startsWith("tool.") ? `工具 ${event.tool_name}` : "",
         ].filter(Boolean),
+        rows: eventDetailRows(event, artifact),
+        createdAt: event.created_at,
+        artifact: downloadableArtifact(artifact),
       },
     ];
   });
@@ -467,13 +640,26 @@ function isGenericEventMessage(event: RunEvent) {
 }
 
 function safeDetailEventSummary(event: RunEvent) {
-  if (event.summary?.trim()) return event.summary.trim();
+  if (event.summary?.trim()) return conciseProcessText(event.summary, displayDetailEventKind(event.kind));
+  if (event.kind === "artifact.created") {
+    const artifactTitle = event.artifact?.title?.trim();
+    if (artifactTitle) return `生成了${artifactTitle}`;
+    const payloadTitle = formatDetailValue(event.payload.title);
+    if (payloadTitle) return `生成了${payloadTitle}`;
+    return "生成了一个运行产物";
+  }
+  if (event.kind === "message.created") {
+    const payloadSummary = formatDetailValue(event.payload.summary) || formatDetailValue(event.payload.title);
+    return payloadSummary ? conciseProcessText(payloadSummary, "生成了阶段消息") : "生成了阶段消息";
+  }
   if (event.kind === "model.reasoning_delta") return "模型正在分析";
   if (event.kind === "model.text_delta") return "模型正在生成";
   if (event.kind.startsWith("tool.")) return `${event.tool_name ?? "工具"} ${event.kind.replace("tool.", "")}`;
-  if (event.kind.startsWith("approval.")) return event.action ?? event.decision ?? "等待确认";
+  if (event.kind.startsWith("approval.")) {
+    return safeDiagnosticIdentifier(event.action, "") || safeDiagnosticIdentifier(event.decision, "") || "等待确认";
+  }
   if (isGenericEventMessage(event)) return "事件已记录";
-  return event.message;
+  return displayDetailEventKind(event.kind);
 }
 
 function toolLifecycleKey(event: RunEvent) {
@@ -956,11 +1142,181 @@ function explicitDetailRows(details: Record<string, string>) {
   });
 }
 
+const DETAIL_PROCESS_GROUPS: Array<{
+  key: string;
+  label: string;
+  match: (row: DetailProcessRow) => boolean;
+}> = [
+  {
+    key: "conclusion",
+    label: "结论",
+    match: (row) => /结论|纪要|共识|得到结果|执行摘要|安全摘要/.test(row.label),
+  },
+  {
+    key: "artifact",
+    label: "产物",
+    match: (row) => /产物|文件|SHA|输出内容/.test(row.label),
+  },
+  {
+    key: "blocker",
+    label: "阻塞",
+    match: (row) => /错误|失败|异常|超时|阻塞|退出|stderr|故障/.test(`${row.label} ${row.value}`),
+  },
+  {
+    key: "decision",
+    label: "决策",
+    match: (row) => /决策|裁决|判断|审批|策略|模式|工作流|路由|修复/.test(row.label),
+  },
+  {
+    key: "evidence",
+    label: "证据",
+    match: (row) => /执行者|参与者|模型|服务商|能力|步骤|工具|事件|时间|耗时|字节|字段|分片|状态流|参数|类型|ID/.test(row.label),
+  },
+];
+
+function detailProcessGroups(rows: DetailProcessRow[]): DetailProcessGroup[] {
+  const groups = new Map<string, DetailProcessGroup>();
+  DETAIL_PROCESS_GROUPS.forEach((group) => groups.set(group.key, { key: group.key, label: group.label, rows: [] }));
+  groups.set("activity", { key: "activity", label: "活动", rows: [] });
+  rows.forEach((row) => {
+    const group = DETAIL_PROCESS_GROUPS.find((candidate) => candidate.match(row));
+    groups.get(group?.key ?? "activity")?.rows.push(row);
+  });
+  return [...groups.values()].filter((group) => group.rows.length > 0);
+}
+
+function detailProcessGroupSummary(group: DetailProcessGroup) {
+  const first = group.rows.find((row) => row.value.trim().length > 0);
+  return conciseProcessText(first?.value ?? "", `${group.rows.length} 项摘要`);
+}
+
+function DetailProcessCards({ card }: { card: DetailProcessCard }) {
+  const [openGroupKey, setOpenGroupKey] = useState<string | null>(null);
+  const groups = detailProcessGroups(card.rows);
+  const openGroup = groups.find((group) => group.key === openGroupKey) ?? null;
+  useEffect(() => {
+    if (!openGroup) return undefined;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpenGroupKey(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [openGroup]);
+  if (groups.length === 0) return null;
+  return (
+    <>
+      <div className="process-detail-card-grid" role="group" aria-label="运行详情摘要">
+        {groups.map((group) => (
+          <button
+            key={`${card.id}-${group.key}`}
+            type="button"
+            className={`process-detail-card process-detail-card-${group.key}`}
+            onClick={() => setOpenGroupKey(group.key)}
+            aria-label={`${group.label}：${detailProcessGroupSummary(group)}`}
+          >
+            <span>{group.label}</span>
+            <small>{group.rows.length} 项</small>
+            <strong>{detailProcessGroupSummary(group)}</strong>
+          </button>
+        ))}
+      </div>
+      {openGroup ? (
+        <div className="process-detail-modal-backdrop" role="presentation" onClick={() => setOpenGroupKey(null)}>
+          <section
+            className="process-detail-modal"
+            role="dialog"
+            aria-label={`${openGroup.label}详情`}
+            aria-modal="true"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="process-detail-modal-header">
+              <div>
+                <span className="eyebrow">{card.label}</span>
+                <h4>{openGroup.label}</h4>
+              </div>
+              <button type="button" className="secondary-action" onClick={() => setOpenGroupKey(null)}>
+                关闭
+              </button>
+            </div>
+            <dl>
+              {openGroup.rows.map((row, index) => (
+                <Fragment key={`${card.id}-${openGroup.key}-${row.label}-${index}`}>
+                  <dt>{row.label}</dt>
+                  <dd>{row.value}</dd>
+                </Fragment>
+              ))}
+            </dl>
+          </section>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+function DetailProcessDrawer({ card, dialogId, onClose }: { card: DetailProcessCard; dialogId: string; onClose: () => void }) {
+  return (
+    <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
+      <section
+        id={dialogId}
+        className="process-drawer"
+        role="dialog"
+        aria-label="Agent 动作详情"
+        aria-modal="true"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="process-drawer-handle" aria-hidden="true" />
+        <div className="process-drawer-header">
+          <div>
+            <span className="eyebrow">{card.label}</span>
+            <h3>{card.title}</h3>
+          </div>
+          <button type="button" className="secondary-action" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+        <div className="run-process-detail">
+          <article>
+            <p>{card.detail}</p>
+            {card.artifact ? (
+              <div className="artifact-download-list" aria-label="中间产物">
+                <ArtifactFileCard artifact={card.artifact} compact />
+              </div>
+            ) : null}
+            <DetailProcessCards card={card} />
+            {card.createdAt ? <small>{runEventTimestamp(card.createdAt)}</small> : null}
+          </article>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function DetailProcessSummary({ cards }: { cards: DetailProcessCard[] }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  if (cards.length === 0) return null;
+  const previouslyFocused = useRef<HTMLElement | null>(null);
   const selected = selectedId ? cards.find((card) => card.id === selectedId) : null;
-  const detailId = selected ? `run-detail-process-${selected.id}` : undefined;
+  useEffect(() => {
+    if (!selected) return undefined;
+    previouslyFocused.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const previousBodyOverflow = document.body.style.overflow;
+    const previousBodyTouchAction = document.body.style.touchAction;
+    const previousDocumentOverflow = document.documentElement.style.overflow;
+    document.body.style.overflow = "hidden";
+    document.body.style.touchAction = "none";
+    document.documentElement.style.overflow = "hidden";
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSelectedId(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      document.body.style.overflow = previousBodyOverflow || "";
+      document.body.style.touchAction = previousBodyTouchAction || "";
+      document.documentElement.style.overflow = previousDocumentOverflow || "";
+      previouslyFocused.current?.focus();
+    };
+  }, [selectedId]);
+  if (cards.length === 0) return null;
   return (
     <section className="run-detail-process-summary" aria-label="Agent 集群动作">
       <div className="run-failure-diagnostics-header">
@@ -976,26 +1332,21 @@ function DetailProcessSummary({ cards }: { cards: DetailProcessCard[] }) {
             className="run-process-toggle process-intermediate-card"
             aria-controls={`run-detail-process-${card.id}`}
             aria-expanded={selectedId === card.id}
-            onClick={() => setSelectedId((current) => (current === card.id ? null : card.id))}
+            onClick={() => setSelectedId(card.id)}
           >
-            <span aria-hidden="true">{selectedId === card.id ? "⌄" : "›"}</span>
+            <span aria-hidden="true">›</span>
             <small className="process-card-badge">{card.label}</small>
             <strong>{card.title}</strong>
+            {card.artifact?.filename ? <small>{card.artifact.filename}</small> : null}
           </button>
         ))}
       </div>
       {selected ? (
-        <div id={detailId} className="run-detail-process-detail" role="group" aria-label="Agent 动作详情">
-          <strong>{selected.title}</strong>
-          <p>{selected.detail}</p>
-          {selected.meta.length > 0 ? (
-            <div aria-label="Agent 动作元数据">
-              {selected.meta.map((meta) => (
-                <em key={meta}>{meta}</em>
-              ))}
-            </div>
-          ) : null}
-        </div>
+        <DetailProcessDrawer
+          card={selected}
+          dialogId={`run-detail-process-${selected.id}`}
+          onClose={() => setSelectedId(null)}
+        />
       ) : null}
     </section>
   );
@@ -1054,7 +1405,7 @@ export function RunDetailPage() {
   const isWaitingForMode = run.data.status === "waiting_user_mode" && Boolean(run.data.decision_token);
   const observerNotices = collectObserverNotices(run.data.events);
   const timelineItems = detailTimelineItems(run.data.events);
-  const processCards = detailProcessCards(timelineItems);
+  const processCards = detailProcessCards(timelineItems, run.data.artifacts);
   const toolLifecycles = toolLifecycleFromApi(run.data);
   const posture = detailPosture(run.data);
   const explicitRows = explicitDetailRows(run.data.explicit_details);

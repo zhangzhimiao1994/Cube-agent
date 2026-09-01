@@ -143,6 +143,13 @@ export function rememberedTenantId(): string {
   return safeSessionGet(TENANT_STORAGE_KEY) ?? "";
 }
 
+function uncachedPath(path: string, method: string | undefined): string {
+  if ((method ?? "GET").toUpperCase() !== "GET") return path;
+  if (!path.startsWith("/api/")) return path;
+  const separator = path.includes("?") ? "&" : "?";
+  return `${path}${separator}_=${Date.now().toString(36)}`;
+}
+
 const UserSchema = z.object({
   id: z.string(),
   username: z.string(),
@@ -1077,8 +1084,9 @@ async function request<T>(
   let response: Response;
   const token = currentAccessToken();
   try {
-    response = await fetch(path, {
+    response = await fetch(uncachedPath(path, init.method), {
       ...init,
+      cache: "no-store",
       credentials: "include",
       headers: {
         "Content-Type": "application/json",
@@ -1108,8 +1116,9 @@ async function requestNoContent(path: string, init: RequestInit): Promise<void> 
   let response: Response;
   const token = currentAccessToken();
   try {
-    response = await fetch(path, {
+    response = await fetch(uncachedPath(path, init.method), {
       ...init,
+      cache: "no-store",
       credentials: "include",
       headers: {
         "Content-Type": "application/json",
@@ -1133,8 +1142,9 @@ async function requestBinary<T>(
   let response: Response;
   const token = currentAccessToken();
   try {
-    response = await fetch(path, {
+    response = await fetch(uncachedPath(path, init.method), {
       ...init,
+      cache: "no-store",
       credentials: "include",
       headers: {
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -1169,7 +1179,8 @@ async function requestDownload(path: string): Promise<Blob> {
   let response: Response;
   const token = currentAccessToken();
   try {
-    response = await fetch(path, {
+    response = await fetch(uncachedPath(path, "GET"), {
+      cache: "no-store",
       credentials: "include",
       headers: {
         ...(token ? { Authorization: `Bearer ${token}` } : {}),

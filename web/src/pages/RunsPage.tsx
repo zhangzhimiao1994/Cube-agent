@@ -3247,6 +3247,38 @@ export function RunsPage() {
   }, [pageOverlayOpen]);
 
   useEffect(() => {
+    if (!processDetailTarget) return undefined;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setProcessDetailTarget(null);
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [processDetailTarget]);
+
+  useEffect(() => {
+    if (!processDetailTarget) return undefined;
+    const refreshOpenProcess = () => {
+      if (selectedRunId === processDetailTarget.runId) {
+        void selectedRun.refetch();
+      } else {
+        void queryClient.invalidateQueries({ queryKey: ["run", processDetailTarget.runId] });
+      }
+      if (processDetailTarget.conversationId) {
+        if (activeConversationId === processDetailTarget.conversationId) {
+          void activeConversation.refetch();
+        } else {
+          void queryClient.invalidateQueries({ queryKey: ["conversation", processDetailTarget.conversationId] });
+        }
+      }
+    };
+    refreshOpenProcess();
+    const interval = window.setInterval(refreshOpenProcess, 1000);
+    return () => window.clearInterval(interval);
+  }, [activeConversation, activeConversationId, processDetailTarget, queryClient, selectedRun, selectedRunId]);
+
+  useEffect(() => {
     if (!activeConversation.data) return;
     setConversationRunCache((current) => {
       const conversationRuns = mergeConversationRuns(
@@ -3877,7 +3909,15 @@ export function RunsPage() {
   const savedWorkflows = workflows.data ?? [];
   const agentNameMap = new Map(savedAgents.map((agent) => [agent.id, agent.name]));
   const cachedConversationRuns = activeConversationId ? conversationRunCache[activeConversationId] : undefined;
-  const visibleRuns = cachedConversationRuns ?? activeConversation.data?.runs ?? (selectedRun.data ? [selectedRun.data] : []);
+  const activeConversationRuns =
+    activeConversation.data?.conversation_id === activeConversationId ? activeConversation.data.runs : undefined;
+  const conversationVisibleRuns = activeConversationRuns
+    ? mergeConversationRuns(cachedConversationRuns, activeConversationRuns)
+    : cachedConversationRuns;
+  const visibleRuns =
+    selectedRun.data && runConversationId(selectedRun.data) === activeConversationId
+      ? mergeConversationRuns(conversationVisibleRuns, [selectedRun.data])
+      : conversationVisibleRuns ?? activeConversationRuns ?? (selectedRun.data ? [selectedRun.data] : []);
   const messages = conversationMessages(visibleRuns);
   const temporaryApprovalVisibleInMessages =
     !!temporaryApproval &&
