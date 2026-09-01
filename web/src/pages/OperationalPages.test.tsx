@@ -3540,6 +3540,7 @@ describe("operational management pages", () => {
           action: null,
           decision: null,
           payload: {
+            output: "private output should not be visible either",
             result: "private output should not be visible",
             traceback: "Traceback includes private-token",
             summary: "safe review summary",

@@ -411,6 +411,41 @@ class RuntimeReportsEmptyModelResponse:
         raise AssertionError("not used")
 
 
+class RuntimeReportsHarnessEmptyModelClosure:
+    mode = TaskMode.DISPATCH
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        yield RunEvent(
+            kind=EventKind.ARTIFACT_CREATED,
+            sequence=1,
+            run_id=context.run_id,
+            artifact=Artifact(
+                id=uuid4(),
+                type="text",
+                producer="harness_failure_closure",
+                content={
+                    "text": "Harness 已保留中断前状态，但模型返回了空内容，当前没有可交付产物。",
+                    "error_code": "model.empty_response",
+                },
+            ),
+        )
+        yield RunEvent(
+            kind=EventKind.RUNTIME_FAILED,
+            sequence=2,
+            run_id=context.run_id,
+            reason="hybrid dispatch failed: model gateway failed: model response text is empty",
+        )
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        del checkpoint
+
+    async def cancel(self) -> None:
+        raise AssertionError("not used")
+
+
 class RuntimeReportsToolFailure:
     mode = TaskMode.DISPATCH
 
@@ -1005,6 +1040,37 @@ async def test_execute_records_empty_response_closure_when_runtime_raises() -> N
     closure_text = str(closure_artifact.content["text"])
     assert "模型返回了空内容" in closure_text
     assert "审批后" in closure_text
+
+
+@pytest.mark.asyncio
+async def test_execute_keeps_harness_empty_response_closure_without_duplicate() -> None:
+    repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((RuntimeReportsHarnessEmptyModelClosure(),)),
+        router=None,
+        task_queue=object(),  # type: ignore[arg-type]
+    )
+
+    submitted = await service.execute(repository.run_id)
+
+    assert submitted.status is RunStatus.FAILED
+    closure_events = [
+        event
+        for event in repository.event_log
+        if event.kind is EventKind.ARTIFACT_CREATED
+        and event.artifact is not None
+    ]
+    assert [event.artifact.producer for event in closure_events if event.artifact is not None] == [
+        "harness_failure_closure",
+    ]
+    assert [event.kind for event in repository.event_log] == [
+        EventKind.ARTIFACT_CREATED,
+        EventKind.RUNTIME_FAILED,
+        "observer.notice",
+        "repair.classified",
+    ]
+    assert repository.artifacts == [closure_events[0].artifact]
 
 
 @pytest.mark.asyncio

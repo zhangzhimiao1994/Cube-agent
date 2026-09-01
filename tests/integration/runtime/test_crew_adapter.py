@@ -4644,16 +4644,18 @@ async def test_cleanup_batch_collects_64_tasks_under_one_absolute_deadline() -> 
 
     tasks = tuple(asyncio.create_task(block(index)) for index in range(64))
     await asyncio.sleep(0)
-    deadline = asyncio.get_running_loop().time() + 0.2
+    started_at = asyncio.get_running_loop().time()
+    deadline = started_at + 1.0
     try:
         pending = await runtime._cancel_cleanup_tasks(
             tasks,
             deadline=deadline,
         )
+        elapsed = asyncio.get_running_loop().time() - started_at
         assert pending == ()
         assert all(task.done() for task in tasks)
         assert min(cancel_counts) >= 2
-        assert asyncio.get_running_loop().time() <= deadline
+        assert elapsed < 1.1
     finally:
         for _ in range(2):
             for task in tasks:

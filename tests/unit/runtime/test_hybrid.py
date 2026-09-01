@@ -311,6 +311,41 @@ async def test_hybrid_runtime_completes_partial_when_synthesis_gateway_fails() -
     )
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     assert events[-1].reason == "partial_hybrid_after_synthesis_failure"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_runtime_emits_closure_artifact_for_initial_empty_model_response() -> None:
+    run_id = uuid4()
+    runtime = HybridRuntime(
+        FailingRuntime(TaskMode.DISPATCH, "model gateway failed: model response text is empty"),
+        UnusedRuntime(TaskMode.DISCUSS, "unused"),
+        UnusedRuntime(TaskMode.DIRECT, "unused"),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=run_id,
+                tenant_id=uuid4(),
+                mode=TaskMode.HYBRID,
+                request="build a plan",
+            )
+        )
+    ]
+
+    artifact_event = events[-2]
+    failure_event = events[-1]
+    assert artifact_event.kind is EventKind.ARTIFACT_CREATED
+    assert artifact_event.artifact is not None
+    assert artifact_event.artifact.producer == "harness_failure_closure"
+    assert artifact_event.artifact.content["error_code"] == "model.empty_response"
+    assert "Harness 已保留中断前状态" in str(artifact_event.artifact.content["text"])
+    assert "hybrid dispatch failed" not in repr(artifact_event.artifact.content)
+    assert failure_event.kind is EventKind.RUNTIME_FAILED
+    assert failure_event.reason == "hybrid dispatch failed: model gateway failed: model response text is empty"
+
+
 @pytest.mark.asyncio
 async def test_hybrid_runtime_redacts_sensitive_child_failure_reason() -> None:
     run_id = uuid4()

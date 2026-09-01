@@ -25,7 +25,10 @@ from agent_hub.runtime.contracts import (
     RuntimeCheckpoint,
     TaskContext,
 )
-from agent_hub.runtime.failure_reason import safe_runtime_failure_reason
+from agent_hub.runtime.failure_reason import (
+    runtime_failure_diagnostic_from_reason,
+    safe_runtime_failure_reason,
+)
 
 _RUNTIME_TYPE = "hybrid"
 _RUNTIME_VERSION = "1"
@@ -242,6 +245,17 @@ class HybridRuntime:
                     reason=partial_reason,
                 )
                 return
+            closure_artifact = _empty_model_response_closure_artifact(context, failure_reason)
+            if closure_artifact is not None:
+                await self._repository.put(context.tenant_id, context.run_id, closure_artifact)
+                artifacts.append(closure_artifact)
+                yield RunEvent(
+                    kind=EventKind.ARTIFACT_CREATED,
+                    sequence=sequence,
+                    run_id=context.run_id,
+                    artifact=closure_artifact,
+                )
+                sequence += 1
             yield RunEvent(
                 kind=EventKind.RUNTIME_FAILED,
                 sequence=sequence,
@@ -533,6 +547,35 @@ def _partial_hybrid_completion_reason(
     if failure_reason.startswith("hybrid direct failed: model gateway failed"):
         return "partial_hybrid_after_synthesis_failure"
     return None
+
+
+def _empty_model_response_closure_artifact(
+    context: TaskContext,
+    failure_reason: str,
+) -> Artifact | None:
+    diagnostic = runtime_failure_diagnostic_from_reason(failure_reason)
+    if diagnostic.get("error_code") != "model.empty_response":
+        return None
+    text = (
+        "Harness 已保留中断前状态，但模型返回了空内容，当前没有可交付产物。\n\n"
+        "已完成的处置：识别为空响应、要求压缩输入和历史上下文、建议拆分提示并标记模型 fallback。"
+        "请在自修复流程中用更小任务重试；如果仍为空，检查对应模型配置和服务商可用性。"
+    )
+    return Artifact(
+        id=uuid4(),
+        type="text",
+        producer="harness_failure_closure",
+        content={
+            "text": text,
+            "error_code": "model.empty_response",
+            "recovery_layers": (
+                "input_compaction",
+                "prompt_split",
+                "model_fallback_marked",
+                "failed_closure",
+            ),
+        },
+    )
 
 
 __all__ = ["HybridPlan", "HybridRuntime", "HybridUpgrade", "RuntimeExecutionError"]
