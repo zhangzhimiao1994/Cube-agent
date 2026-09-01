@@ -1303,6 +1303,45 @@ def test_run_detail_response_exposes_empty_response_code_and_retryability() -> N
     assert "压缩输入" in diagnostic.recommendation
 
 
+def test_run_detail_response_prefers_specific_empty_response_over_stale_payload() -> None:
+    response = RunDetailResponse(
+        id=uuid4(),
+        status="failed",
+        mode="hybrid",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="hello",
+        events=[
+            RunEventResponse(
+                sequence=1,
+                kind="runtime.failed",
+                message="hybrid dispatch failed: model response text is empty",
+                created_at=datetime.now(UTC),
+                actor="writer",
+                step_id="draft",
+                payload={
+                    "error_stage": "runtime",
+                    "error_category": "internal",
+                    "error_code": "runtime.failed",
+                    "retryable": False,
+                    "suggested_action": "查看运行详情中的上一条失败事件。",
+                },
+            ),
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    diagnostic = response.failure_diagnostics[0]
+    assert diagnostic.category == "model"
+    assert diagnostic.error_stage == "model_response"
+    assert diagnostic.error_category == "empty_response"
+    assert diagnostic.error_code == "model.empty_response"
+    assert diagnostic.retryable is True
+    assert "压缩输入" in diagnostic.recommendation
+
+
 def test_repository_backfills_public_diagnostic_for_failed_event_reason() -> None:
     run_id = uuid4()
     event = RunEvent(

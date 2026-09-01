@@ -6510,21 +6510,34 @@ def _tool_failure_diagnostic(
 
 def _runtime_or_step_failure_diagnostic(event: RunEventResponse) -> FailureDiagnosticResponse:
     runtime_diagnostic = runtime_failure_diagnostic_from_reason(event.message)
-    error_stage = _safe_diagnostic_payload_value(event, "error_stage") or _safe_diagnostic_text(
-        runtime_diagnostic.get("error_stage")
+    runtime_error_code = _safe_diagnostic_text(runtime_diagnostic.get("error_code"))
+    prefer_reason_diagnostic = runtime_error_code == "model.empty_response"
+    error_stage = (
+        _safe_diagnostic_text(runtime_diagnostic.get("error_stage"))
+        if prefer_reason_diagnostic
+        else _safe_diagnostic_payload_value(event, "error_stage")
+        or _safe_diagnostic_text(runtime_diagnostic.get("error_stage"))
     )
-    error_category = _safe_diagnostic_payload_value(event, "error_category") or _safe_diagnostic_text(
-        runtime_diagnostic.get("error_category")
+    error_category = (
+        _safe_diagnostic_text(runtime_diagnostic.get("error_category"))
+        if prefer_reason_diagnostic
+        else _safe_diagnostic_payload_value(event, "error_category")
+        or _safe_diagnostic_text(runtime_diagnostic.get("error_category"))
     )
-    error_code = _safe_diagnostic_payload_value(event, "error_code") or _safe_diagnostic_text(
-        runtime_diagnostic.get("error_code")
+    error_code = (
+        runtime_error_code
+        if prefer_reason_diagnostic
+        else _safe_diagnostic_payload_value(event, "error_code") or runtime_error_code
     )
-    retryable = _bool_diagnostic_payload_value(event, "retryable")
+    retryable = None if prefer_reason_diagnostic else _bool_diagnostic_payload_value(event, "retryable")
     if retryable is None and type(runtime_diagnostic.get("retryable")) is bool:
         retryable = bool(runtime_diagnostic["retryable"])
     category = "model" if _is_model_failure_event(event) or error_code == "model.empty_response" else "runtime"
-    suggested_action = _safe_diagnostic_payload_value(event, "suggested_action") or _safe_diagnostic_text(
-        runtime_diagnostic.get("suggested_action")
+    suggested_action = (
+        _safe_diagnostic_text(runtime_diagnostic.get("suggested_action"))
+        if prefer_reason_diagnostic
+        else _safe_diagnostic_payload_value(event, "suggested_action")
+        or _safe_diagnostic_text(runtime_diagnostic.get("suggested_action"))
     )
     status_code = _failure_status_code(event)
     failure_kind = _safe_diagnostic_payload_value(event, "failure_kind") or error_category
