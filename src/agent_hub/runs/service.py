@@ -1521,7 +1521,8 @@ class RunService:
             repair_decision=None,
             repair_proposal_recorded=_has_recorded_self_repair_proposal(
                 record.routing_decision
-            ),
+            )
+            or _has_recorded_self_repair_event(events),
         )
 
     async def _safe_record_self_repair_decision(
@@ -2078,6 +2079,10 @@ def _has_empty_response_closure_artifact(events: tuple[RunEvent, ...]) -> bool:
         and event.artifact.content.get("failure_category") == "empty_model_response"
         for event in events
     )
+
+
+def _has_recorded_self_repair_event(events: tuple[RunEvent, ...]) -> bool:
+    return any(event.kind == "repair.classified" for event in events)
 
 
 def _empty_response_closure_artifact(
