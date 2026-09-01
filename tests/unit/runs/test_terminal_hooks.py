@@ -946,14 +946,16 @@ async def test_execute_classifies_empty_model_response_for_controlled_retry() ->
         and event.artifact.producer == "run_service"
     ]
     assert len(closure_events) == 1
-    closure_text = closure_events[0].artifact.content["text"]
+    closure_artifact = closure_events[0].artifact
+    assert closure_artifact is not None
+    closure_text = closure_artifact.content["text"]
     assert isinstance(closure_text, str)
     assert "模型返回了空内容" in closure_text
     assert "压缩输入" in closure_text
     assert "审批后" in closure_text
     assert "hybrid dispatch failed" not in closure_text
     assert "secret" not in closure_text
-    assert repository.artifacts == [closure_events[0].artifact]
+    assert repository.artifacts == [closure_artifact]
 
 
 @pytest.mark.asyncio
@@ -998,7 +1000,9 @@ async def test_execute_records_empty_response_closure_when_runtime_raises() -> N
         and event.artifact.producer == "run_service"
     ]
     assert len(closure_events) == 1
-    closure_text = str(closure_events[0].artifact.content["text"])
+    closure_artifact = closure_events[0].artifact
+    assert closure_artifact is not None
+    closure_text = str(closure_artifact.content["text"])
     assert "模型返回了空内容" in closure_text
     assert "审批后" in closure_text
 
@@ -1277,8 +1281,11 @@ async def test_recover_backfills_empty_response_closure_once_for_failed_run() ->
         and event.artifact.producer == "run_service"
     ]
     assert len(closure_events) == 1
-    assert "模型返回了空内容" in str(closure_events[0].artifact.content["text"])
-    assert "审批后" in str(closure_events[0].artifact.content["text"])
+    closure_artifact = closure_events[0].artifact
+    assert closure_artifact is not None
+    closure_text = str(closure_artifact.content["text"])
+    assert "模型返回了空内容" in closure_text
+    assert "审批后" in closure_text
 
 
 @pytest.mark.asyncio

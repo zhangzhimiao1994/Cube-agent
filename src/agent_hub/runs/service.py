@@ -2094,7 +2094,7 @@ def _empty_response_closure_artifact(
         repair_decision is not None and repair_decision.kind == "repair.classified"
     ) or repair_proposal_recorded
     approval_text = (
-        "系统已生成一次受控自修复建议，审批后可压缩上下文并重试。"
+        "系统已生成一次受控自修复建议，审批后可压缩输入和上下文并重试。"
         if has_repair_proposal
         else "系统已保留失败现场，可压缩输入和上下文、拆分任务或切换备用模型后重试。"
     )
