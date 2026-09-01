@@ -3106,6 +3106,7 @@ export function RunsPage() {
   async function refreshRunSurfaces(run: { id: string; conversation_id?: string | null }) {
     await queryClient.invalidateQueries({ queryKey: ["runs"] });
     await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
+    await queryClient.invalidateQueries({ queryKey: ["hermes"] });
     const surfaceConversationId = run.conversation_id?.trim() || activeConversationId;
     if (surfaceConversationId) {
       await queryClient.invalidateQueries({ queryKey: ["conversation", surfaceConversationId] });

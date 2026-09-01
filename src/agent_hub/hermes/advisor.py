@@ -211,34 +211,38 @@ class PersistentHermesRunAdvisor:
             "confirmed_at": None,
         }
         await self._upsert(outcome.tenant_id, lesson_id, payload)
-        if outcome.status is RunStatus.COMPLETED:
-            conversation_lesson_id = f"hermes_conversation_{outcome.run_id.hex}"
-            conversation_lesson = f"Run {status} with mode={mode}, workflow={workflow}."
-            conversation_tags = _unique_tags([status, mode, workflow, *outcome.agent_ids[:8]])
-            conversation_summary = (
-                f"Hermes recorded reusable conversation memory from {conversation_id}: "
-                f"{conversation_lesson} Tags: {', '.join(conversation_tags) or 'none'}. Weight: 4."
-            )
-            conversation_payload: dict[str, object] = {
-                "id": conversation_lesson_id,
-                "category": "conversation",
-                "outcome": "success",
-                "lesson": conversation_lesson,
-                "summary": conversation_summary,
-                "user_summary": f"对话记忆记录了一条可复用经验：{_runtime_lesson_summary(conversation_lesson)}",
-                "tags": conversation_tags,
-                "weight": 4,
-                "memory_type": "conversation_outcome_summary",
-                "target": "learning_ledger",
-                "applies_to_modes": [mode] if mode != "unknown" else [],
-                "confidence": 0.62,
-                "noise_risk": 0.2,
-                "created_at": datetime.now(UTC).isoformat(),
-                "run_id": str(outcome.run_id),
-                "conversation_id": outcome.conversation_id,
-                "confirmed_at": None,
-            }
-            await self._upsert(outcome.tenant_id, conversation_lesson_id, conversation_payload)
+        conversation_lesson_id = f"hermes_conversation_{outcome.run_id.hex}"
+        conversation_lesson = f"Run {status} with mode={mode}, workflow={workflow}."
+        conversation_tags = _unique_tags([status, mode, workflow, *outcome.agent_ids[:8]])
+        conversation_weight = 4 if outcome.status is RunStatus.COMPLETED else 2
+        conversation_summary = (
+            f"Hermes recorded reusable conversation memory from {conversation_id}: "
+            f"{conversation_lesson} Tags: {', '.join(conversation_tags) or 'none'}. "
+            f"Weight: {conversation_weight}."
+        )
+        conversation_payload: dict[str, object] = {
+            "id": conversation_lesson_id,
+            "category": "conversation",
+            "outcome": "success" if outcome.status is RunStatus.COMPLETED else "failure",
+            "lesson": conversation_lesson,
+            "summary": conversation_summary,
+            "user_summary": _conversation_outcome_user_summary(
+                status=outcome.status,
+                lesson=conversation_lesson,
+            ),
+            "tags": conversation_tags,
+            "weight": conversation_weight,
+            "memory_type": "conversation_outcome_summary",
+            "target": "learning_ledger",
+            "applies_to_modes": [mode] if mode != "unknown" else [],
+            "confidence": 0.62 if outcome.status is RunStatus.COMPLETED else 0.5,
+            "noise_risk": 0.2,
+            "created_at": datetime.now(UTC).isoformat(),
+            "run_id": str(outcome.run_id),
+            "conversation_id": outcome.conversation_id,
+            "confirmed_at": None,
+        }
+        await self._upsert(outcome.tenant_id, conversation_lesson_id, conversation_payload)
 
     async def _enabled(self, tenant_id: UUID) -> bool:
         async with self._session_factory() as session:
@@ -540,3 +544,8 @@ def _runtime_lesson_summary(value: str) -> str:
     if ". Scheduler notices:" in cleaned:
         summary = f"{summary} 已记录调度告警。"
     return summary
+
+
+def _conversation_outcome_user_summary(*, status: RunStatus, lesson: str) -> str:
+    label = "可复用经验" if status is RunStatus.COMPLETED else "风险提醒"
+    return f"对话记忆记录了一条{label}：{_runtime_lesson_summary(lesson)}"

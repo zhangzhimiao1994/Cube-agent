@@ -681,18 +681,22 @@ async def test_persistent_hermes_runtime_outcome_is_scheduler_observation(
     )
 
     async with run_session_factory() as session:
-        row = (
+        rows = (
             await session.execute(
                 select(AdminResourceRow)
                 .where(AdminResourceRow.tenant_id == tenant_id)
                 .where(AdminResourceRow.kind == "hermes")
             )
-        ).scalar_one()
+        ).scalars().all()
 
-    payload = dict(row.payload)
+    payloads = [dict(row.payload) for row in rows]
+    payload = next(payload for payload in payloads if payload["category"] == "scheduler")
     assert payload["category"] == "scheduler"
     assert payload["conversation_id"] == "conv-scheduler-observe"
     assert payload["run_id"] == str(run_id)
+    conversation_payload = next(payload for payload in payloads if payload["category"] == "conversation")
+    assert conversation_payload["outcome"] == "failure"
+    assert conversation_payload["target"] == "learning_ledger"
 
 
 async def test_persistent_hermes_completed_run_also_records_conversation_memory(
@@ -736,6 +740,7 @@ async def test_persistent_hermes_completed_run_also_records_conversation_memory(
     assert conversation_payload["target"] == "learning_ledger"
     assert conversation_payload["user_summary"] == "对话记忆记录了一条可复用经验：quality-review 工作流以 hybrid 模式成功完成。"
 
+
 async def test_persistent_hermes_records_scheduler_notice_details(
     run_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -767,15 +772,16 @@ async def test_persistent_hermes_records_scheduler_notice_details(
     )
 
     async with run_session_factory() as session:
-        row = (
+        rows = (
             await session.execute(
                 select(AdminResourceRow)
                 .where(AdminResourceRow.tenant_id == tenant_id)
                 .where(AdminResourceRow.kind == "hermes")
             )
-        ).scalar_one()
+        ).scalars().all()
 
-    payload = dict(row.payload)
+    payloads = [dict(row.payload) for row in rows]
+    payload = next(payload for payload in payloads if payload["category"] == "scheduler")
     assert payload["category"] == "scheduler"
     assert payload["outcome"] == "failure"
     assert "调度观察" in str(payload["summary"])
@@ -784,6 +790,10 @@ async def test_persistent_hermes_records_scheduler_notice_details(
     assert isinstance(tags, list)
     assert "reschedule_or_reassign_model" in tags
     assert "planner" in tags
+    conversation_payload = next(payload for payload in payloads if payload["category"] == "conversation")
+    assert conversation_payload["outcome"] == "failure"
+    assert conversation_payload["target"] == "learning_ledger"
+
 
 async def test_persistent_hermes_runtime_advice_uses_only_confirmed_lessons(
     run_session_factory: async_sessionmaker[AsyncSession],

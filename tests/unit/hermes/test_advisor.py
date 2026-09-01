@@ -7,8 +7,9 @@ from uuid import uuid4
 
 import pytest
 
-from agent_hub.domain.runs import TaskMode
+from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.hermes.advisor import PersistentHermesRunAdvisor
+from agent_hub.runs.service import HermesRunOutcome
 
 
 @dataclass(slots=True)
@@ -50,6 +51,19 @@ class FakeSessionFactory:
 
     def __call__(self) -> FakeSession:
         return FakeSession(self._result_sets)
+
+
+class CapturingHermesAdvisor(PersistentHermesRunAdvisor):
+    def __init__(self) -> None:
+        self.payloads: list[tuple[str, dict[str, object]]] = []
+
+    async def _enabled(self, tenant_id: object) -> bool:
+        del tenant_id
+        return True
+
+    async def _upsert(self, tenant_id: object, resource_id: str, payload: dict[str, object]) -> None:
+        del tenant_id
+        self.payloads.append((resource_id, payload))
 
 
 @pytest.mark.asyncio
@@ -165,3 +179,36 @@ async def test_runtime_advice_ignores_confirmed_conversation_outcome_summaries()
     )
 
     assert advice is None
+
+
+@pytest.mark.asyncio
+async def test_record_outcome_writes_conversation_ledger_for_failed_runs() -> None:
+    advisor = CapturingHermesAdvisor()
+    run_id = uuid4()
+
+    await advisor.record_outcome(
+        HermesRunOutcome(
+            tenant_id=uuid4(),
+            actor_id=uuid4(),
+            run_id=run_id,
+            status=RunStatus.FAILED,
+            mode=TaskMode.HYBRID,
+            workflow_id="quality-review",
+            conversation_id="conv-cleared-then-continued",
+            agent_ids=("reviewer",),
+        )
+    )
+
+    resource_ids = [resource_id for resource_id, _payload in advisor.payloads]
+    assert resource_ids == [
+        f"hermes_run_{run_id.hex}",
+        f"hermes_conversation_{run_id.hex}",
+    ]
+    conversation_payload = advisor.payloads[1][1]
+    assert conversation_payload["category"] == "conversation"
+    assert conversation_payload["outcome"] == "failure"
+    assert conversation_payload["memory_type"] == "conversation_outcome_summary"
+    assert conversation_payload["target"] == "learning_ledger"
+    assert conversation_payload["conversation_id"] == "conv-cleared-then-continued"
+    assert conversation_payload["weight"] == 2
+    assert "对话记忆记录了一条风险提醒" in str(conversation_payload["user_summary"])
