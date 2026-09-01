@@ -410,6 +410,9 @@ class ModelGateway:
                         break
                     yielded = True
                     yield event
+                if not yielded:
+                    last_retryable_error = ModelGatewayError("model response is empty")
+                    continue
             except (ModelTransportError, ModelGatewayError) as error:
                 if yielded or not _retryable_model_failure(error):
                     raise
@@ -492,14 +495,19 @@ class ModelGateway:
                     api_key,
                 )
                 try:
+                    yielded = False
                     while True:
                         try:
                             event = await anext(events)
                         except StopAsyncIteration:
                             break
+                        yielded = True
                         yield event
-                    succeeded = True
                     status_code = 200
+                    if yielded:
+                        succeeded = True
+                    else:
+                        primary_error = ModelGatewayError("model response is empty")
                 except GeneratorExit as error:
                     stream_primary_error = error
                     primary_error = error

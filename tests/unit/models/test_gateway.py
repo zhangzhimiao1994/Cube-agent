@@ -293,6 +293,26 @@ class StreamingTransportStub(TransportStub):
         return self.stream
 
 
+class PerCallStreamingTransportStub(TransportStub):
+    def __init__(self, events: list[object], streams: Sequence[Sequence[object]]) -> None:
+        super().__init__(events)
+        self._streams = [list(stream) for stream in streams]
+        self.streams: list[AsyncChunkStream] = []
+        self.stream_calls: list[tuple[Deployment, ModelRequest, str]] = []
+
+    def stream_openai_compatible_chunks(
+        self,
+        deployment: Deployment,
+        model_request: ModelRequest,
+        api_key: str,
+    ) -> AsyncIterator[object]:
+        self.events.append(("stream", deployment.id))
+        self.stream_calls.append((deployment, model_request, api_key))
+        stream = AsyncChunkStream(self._streams.pop(0) if self._streams else [])
+        self.streams.append(stream)
+        return stream
+
+
 class BlockingStreamingTransportStub(StreamingTransportStub):
     stream: BlockingAsyncChunkStream
 
@@ -522,6 +542,69 @@ async def test_streaming_gateway_falls_back_when_primary_fails_before_first_even
     ]
     assert [record[2] for record in capacity.records] == [pytest.approx(0.2), pytest.approx(0.3)]
     assert [item.deployment_id for item in capacity.releases] == ["primary-key", "backup-key"]
+    assert transport.stream.closed is True
+
+
+async def test_streaming_gateway_empty_stream_tries_fallback_model_when_available() -> None:
+    primary = deployment("primary-key", provider_model="deepseek/deepseek-chat")
+    backup = deployment("backup-key", "backup", provider_model="openai/gpt-5")
+    capacity = CapacityStub([lease("primary-key"), lease("backup-key")])
+    transport = PerCallStreamingTransportStub(
+        capacity.events,
+        [
+            [{"choices": [{"delta": {}}]}],
+            [{"choices": [{"delta": {"content": "backup answer"}}]}],
+        ],
+    )
+    gateway = ModelGateway(
+        ModelRegistry([primary, backup]),
+        capacity,
+        SecretStub(capacity.events),
+        transport,
+        fallbacks={"primary": "backup"},
+        monotonic=monotonic([32.0, 32.2, 33.0, 33.3]),
+    )
+
+    events = [event async for event in gateway.stream_openai_compatible_events(request())]
+
+    assert [(event.kind, dict(event.payload)) for event in events] == [
+        ("model.text_delta", {"text": "backup answer"}),
+    ]
+    assert [call[0].id for call in transport.stream_calls] == ["primary-key", "backup-key"]
+    assert [(scope, status, succeeded) for scope, status, _latency, succeeded in capacity.records] == [
+        ("scope-primary-key", 200, False),
+        ("scope-backup-key", 200, True),
+    ]
+    assert [record[2] for record in capacity.records] == [pytest.approx(0.2), pytest.approx(0.3)]
+    assert [item.deployment_id for item in capacity.releases] == ["primary-key", "backup-key"]
+    assert [stream.closed for stream in transport.streams] == [True, True]
+
+
+async def test_streaming_gateway_empty_stream_raises_when_no_fallback_available() -> None:
+    selected = deployment("selected", provider_model="deepseek/deepseek-chat")
+    selected_lease = lease("selected")
+    capacity = CapacityStub([selected_lease])
+    transport = StreamingTransportStub(
+        capacity.events,
+        [{"choices": [{"delta": {}}]}],
+    )
+    gateway = ModelGateway(
+        ModelRegistry([selected]),
+        capacity,
+        SecretStub(capacity.events),
+        transport,
+        monotonic=monotonic([34.0, 34.2]),
+    )
+
+    with pytest.raises(ModelGatewayError, match="model response is empty"):
+        _events = [event async for event in gateway.stream_openai_compatible_events(request())]
+
+    assert [call[0].id for call in transport.stream_calls] == ["selected"]
+    assert [(scope, status, succeeded) for scope, status, _latency, succeeded in capacity.records] == [
+        ("scope-selected", 200, False),
+    ]
+    assert capacity.records[0][2] == pytest.approx(0.2)
+    assert capacity.releases == [selected_lease]
     assert transport.stream.closed is True
 
 
