@@ -1202,6 +1202,7 @@ describe("operational management pages", () => {
   });
 
   it("renders run detail as a Vibe Engineer debugging summary", async () => {
+    const user = userEvent.setup();
     visibleRunDetail = {
       ...runDetail,
       explicit_details: {
@@ -1320,6 +1321,21 @@ describe("operational management pages", () => {
     render(<TestApp initialPath={`/runs/${runId}`} />);
 
     expect(await screen.findByRole("status", { name: /任务态势，执行异常/ })).not.toBeNull();
+    const processRegion = screen.getByRole("region", { name: "Agent 集群动作" });
+    const eventLogHeading = screen.getByRole("heading", { name: "事件日志" });
+    expect(processRegion.compareDocumentPosition(eventLogHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const processCards = within(processRegion).getAllByRole("button");
+    expect(processCards.length).toBeGreaterThan(0);
+    const toolCards = within(processRegion).getAllByRole("button", { name: /工具动作/ });
+    expect(toolCards.length).toBeGreaterThan(0);
+    expect(toolCards[0].getAttribute("aria-expanded")).toBe("false");
+    await user.click(toolCards[0]);
+    expect(toolCards[0].getAttribute("aria-expanded")).toBe("true");
+    expect(within(processRegion).getByRole("group", { name: "Agent 动作详情" })).not.toBeNull();
+    expect(processRegion.textContent).not.toContain("tool.failed");
+    expect(processRegion.textContent).not.toContain("model.text_delta");
+    expect(processRegion.textContent).not.toContain("stdout");
+    expect(processRegion.textContent).not.toContain("private-token output");
     expect(screen.getByRole("heading", { name: "运行中" })).not.toBeNull();
     expect(screen.getByRole("heading", { name: "派单式" })).not.toBeNull();
     const toolSection = screen.getByRole("region", { name: "工具链路" });
@@ -1334,6 +1350,8 @@ describe("operational management pages", () => {
     expect(screen.getByText("查看工具链路中的失败步骤，然后重试或改派。")).not.toBeNull();
     expect(screen.getByText("Harness 服务商")).not.toBeNull();
     expect(screen.getByText("openai")).not.toBeNull();
+    expect(screen.queryByText("tool.failed")).toBeNull();
+    expect(screen.queryByText("model.text_delta")).toBeNull();
     expect(screen.queryByText("credential_ref")).toBeNull();
     expect(screen.queryByText("secret://private")).toBeNull();
     expect(screen.queryByText("private-token output")).toBeNull();
@@ -1592,6 +1610,41 @@ describe("operational management pages", () => {
     expect(within(diagnostics).getByText(/fallback/)).not.toBeNull();
   });
 
+  it("keeps unknown run detail event kinds debuggable without showing raw codes in the summary", async () => {
+    const user = userEvent.setup();
+    visibleRunDetail = {
+      ...runDetail,
+      events: [
+        {
+          sequence: 1,
+          kind: "checkpoint.saved",
+          message: "checkpoint.saved",
+          summary: "保存第一版 harness checkpoint",
+          created_at: "2026-08-07T00:00:01Z",
+          actor: "main_agent",
+          participants: [],
+          tool_name: null,
+          step_id: "checkpoint_step",
+          action: null,
+          decision: null,
+          payload: {},
+        },
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    expect(await screen.findByRole("heading", { name: "事件日志" })).not.toBeNull();
+    const processRegion = screen.getByRole("region", { name: "Agent 集群动作" });
+    const eventLog = screen.getByRole("heading", { name: "事件日志" }).closest("article") as HTMLElement;
+    expect(within(eventLog).getByText("检查点保存")).not.toBeNull();
+    expect(within(eventLog).queryByText("checkpoint.saved")).toBeNull();
+    const checkpointCard = within(processRegion).getByRole("button", { name: /保存第一版 harness checkpoint/ });
+    await user.click(checkpointCard);
+    expect(within(processRegion).getByText("事件类型 checkpoint.saved")).not.toBeNull();
+  });
+
   it("shows observer notices as scheduler guidance on the detail page", async () => {
     visibleRunDetail = {
       ...runDetail,
@@ -1629,7 +1682,7 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("heading", { name: "调度观察" })).not.toBeNull();
     expect(screen.getByText("模型容量拥堵")).not.toBeNull();
     expect(screen.getByText("建议改派模型或重新调度")).not.toBeNull();
-    expect(screen.getByText(/来源：step\.failed #4/)).not.toBeNull();
+    expect(screen.getByText(/来源：执行步骤 #4/)).not.toBeNull();
     expect(screen.queryByText("null")).toBeNull();
   });
 
@@ -1681,15 +1734,18 @@ describe("operational management pages", () => {
     render(<TestApp initialPath={`/runs/${runId}`} />);
 
     expect(await screen.findByRole("heading", { name: "事件日志" })).not.toBeNull();
-    expect(screen.getByText("#1")).not.toBeNull();
-    expect(screen.getByText("2026-08-07T00:00:01Z")).not.toBeNull();
-    expect(screen.getByText("model.text_delta")).not.toBeNull();
-    expect(screen.getByText("model output progress")).not.toBeNull();
-    expect(screen.getByText("#2")).not.toBeNull();
-    expect(screen.getByText("terminal check completed")).not.toBeNull();
-    expect(screen.queryByText(/partial answer with private context/)).toBeNull();
-    expect(screen.queryByText(/private-token/)).toBeNull();
-    expect(screen.queryByText(/private output/)).toBeNull();
+    const eventLog = screen.getByRole("heading", { name: "事件日志" }).closest("article") as HTMLElement;
+    expect(within(eventLog).getByText("#1")).not.toBeNull();
+    expect(within(eventLog).getByText("2026-08-07T00:00:01Z")).not.toBeNull();
+    expect(within(eventLog).getByText("模型输出")).not.toBeNull();
+    expect(within(eventLog).getByText("model output progress")).not.toBeNull();
+    expect(within(eventLog).getByText("#2")).not.toBeNull();
+    expect(within(eventLog).getByText("工具完成")).not.toBeNull();
+    expect(within(eventLog).getByText("terminal check completed")).not.toBeNull();
+    expect(within(eventLog).queryByText("model.text_delta")).toBeNull();
+    expect(within(eventLog).queryByText(/partial answer with private context/)).toBeNull();
+    expect(within(eventLog).queryByText(/private-token/)).toBeNull();
+    expect(within(eventLog).queryByText(/private output/)).toBeNull();
   });
 
   it("aggregates model delta chunks in the run detail timeline", async () => {
@@ -1743,12 +1799,14 @@ describe("operational management pages", () => {
     render(<TestApp initialPath={`/runs/${runId}`} />);
 
     expect(await screen.findByRole("heading", { name: "事件日志" })).not.toBeNull();
-    expect(screen.getByText("#1-2")).not.toBeNull();
-    expect(screen.getByText("model.text_delta")).not.toBeNull();
-    expect(screen.getByText("模型正在生成，2 个分片，96 bytes，2.0s")).not.toBeNull();
-    expect(screen.queryByText("#1")).toBeNull();
-    expect(screen.queryByText("#2")).toBeNull();
-    expect(screen.queryByText(/private output/)).toBeNull();
+    const eventLog = screen.getByRole("heading", { name: "事件日志" }).closest("article") as HTMLElement;
+    expect(within(eventLog).getByText("#1-2")).not.toBeNull();
+    expect(within(eventLog).getByText("模型输出")).not.toBeNull();
+    expect(within(eventLog).getByText("模型正在生成，2 个分片，96 bytes，2.0s")).not.toBeNull();
+    expect(within(eventLog).queryByText("model.text_delta")).toBeNull();
+    expect(within(eventLog).queryByText("#1")).toBeNull();
+    expect(within(eventLog).queryByText("#2")).toBeNull();
+    expect(within(eventLog).queryByText(/private output/)).toBeNull();
   });
 
   it("stops the current running chat from the conversation composer", async () => {

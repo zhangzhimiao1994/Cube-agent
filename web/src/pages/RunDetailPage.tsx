@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 
@@ -33,6 +34,14 @@ type ObserverNotice = {
 type DetailTimelineItem =
   | { type: "event"; event: RunEvent }
   | { type: "model_delta_group"; events: RunEvent[] };
+
+type DetailProcessCard = {
+  id: string;
+  label: string;
+  title: string;
+  detail: string;
+  meta: string[];
+};
 
 type ToolLifecycle = {
   key: string;
@@ -126,6 +135,75 @@ const TOOL_OPERATION_LABELS: Record<string, string> = {
   file_read: "文件读取",
   browser: "浏览器",
   generic: "工具",
+};
+
+const DETAIL_EVENT_KIND_LABELS: Record<string, string> = {
+  "artifact.created": "产物生成",
+  "approval.requested": "等待确认",
+  "approval.resolved": "确认完成",
+  "decision.completed": "决策完成",
+  "decision.started": "开始决策",
+  "dispatch.completed": "派单完成",
+  "dispatch.started": "开始派单",
+  "discussion.completed": "讨论完成",
+  "discussion.started": "开始讨论",
+  "harness.completed": "Harness 完成",
+  "harness.failed": "Harness 失败",
+  "harness.started": "Harness 启动",
+  "message.created": "消息产出",
+  "model.completed": "模型完成",
+  "model.failed": "模型失败",
+  "model.reasoning_delta": "模型思考",
+  "model.started": "模型开始",
+  "model.text_delta": "模型输出",
+  "observer.notice": "调度观察",
+  "review.completed": "审查完成",
+  "runtime.failed": "运行失败",
+  "step.completed": "执行完成",
+  "step.failed": "执行失败",
+  "step.retrying": "执行重试",
+  "step.started": "执行步骤",
+  "temporary_agent.proposed": "临时 Agent",
+  "tool.completed": "工具完成",
+  "tool.failed": "工具失败",
+  "tool.requested": "工具请求",
+  "tool.started": "工具动作",
+};
+
+const DETAIL_EVENT_SCOPE_LABELS: Record<string, string> = {
+  artifact: "产物",
+  approval: "审批",
+  checkpoint: "检查点",
+  decision: "决策",
+  dispatch: "调度",
+  discussion: "讨论",
+  harness: "Harness",
+  memory: "记忆",
+  message: "消息",
+  model: "模型",
+  observer: "观察",
+  repair: "修复",
+  review: "审查",
+  runtime: "运行",
+  step: "步骤",
+  temporary_agent: "临时 Agent",
+  tool: "工具",
+};
+
+const DETAIL_EVENT_ACTION_LABELS: Record<string, string> = {
+  accepted: "接受",
+  cancelled: "取消",
+  completed: "完成",
+  created: "生成",
+  failed: "失败",
+  proposed: "提议",
+  requested: "请求",
+  resolved: "完成",
+  retrying: "重试",
+  saved: "保存",
+  skipped: "跳过",
+  started: "启动",
+  updated: "更新",
 };
 
 const EXPLICIT_DETAIL_LABELS: Record<string, string> = {
@@ -234,6 +312,26 @@ function observerSeverityLabel(severity: string) {
   return OBSERVER_SEVERITY_LABELS[severity] ?? severity;
 }
 
+function displayDetailEventKind(kind: string) {
+  const explicit = DETAIL_EVENT_KIND_LABELS[kind];
+  if (explicit) return explicit;
+  const [scope, action] = kind.split(".");
+  const scopeLabel = DETAIL_EVENT_SCOPE_LABELS[scope];
+  const actionLabel = DETAIL_EVENT_ACTION_LABELS[action];
+  if (scopeLabel && actionLabel) return `${scopeLabel}${actionLabel}`;
+  if (scopeLabel) return `${scopeLabel}过程`;
+  return "过程记录";
+}
+
+function isKnownDetailEventKind(kind: string) {
+  return Object.prototype.hasOwnProperty.call(DETAIL_EVENT_KIND_LABELS, kind);
+}
+
+function observerSourceLabel(kind: string) {
+  if (kind.startsWith("step.")) return "执行步骤";
+  return displayDetailEventKind(kind);
+}
+
 function runEventTimestamp(value: string) {
   if (!value.trim()) return "unknown time";
   const parsed = new Date(value);
@@ -311,6 +409,57 @@ function detailTimelineItems(events: RunEvent[]): DetailTimelineItem[] {
     items.push(group.length > 1 ? { type: "model_delta_group", events: group } : { type: "event", event });
   }
   return items;
+}
+
+function detailProcessLabel(event: RunEvent) {
+  if (event.kind.startsWith("tool.")) return "工具动作";
+  if (event.kind.startsWith("model.")) return "模型过程";
+  if (event.kind.startsWith("harness.")) return "Harness";
+  if (event.kind.startsWith("discussion.")) return "讨论过程";
+  if (event.kind.startsWith("decision.")) return "决策过程";
+  if (event.kind.startsWith("dispatch.")) return "调度过程";
+  if (event.kind.startsWith("approval.")) return "审批意图";
+  if (event.kind === "artifact.created" || event.kind === "message.created" || event.kind.startsWith("step.")) {
+    return "执行过程";
+  }
+  return displayDetailEventKind(event.kind);
+}
+
+function detailProcessCards(items: DetailTimelineItem[]): DetailProcessCard[] {
+  return items.flatMap((item) => {
+    if (item.type === "model_delta_group") {
+      const firstEvent = item.events[0];
+      const lastEvent = item.events.at(-1) ?? firstEvent;
+      const sequence = `事件 #${firstEvent.sequence}${lastEvent.sequence !== firstEvent.sequence ? `-#${lastEvent.sequence}` : ""}`;
+      return [
+        {
+          id: `model-delta-${firstEvent.sequence}-${lastEvent.sequence}`,
+          label: "模型过程",
+          title: modelDeltaSummary(item.events),
+          detail: modelDeltaSummary(item.events),
+          meta: [sequence, displayDetailActor(lastEvent.actor), lastEvent.step_id ? `步骤 ${lastEvent.step_id}` : ""].filter(Boolean),
+        },
+      ];
+    }
+    const { event } = item;
+    const rawKindMeta = isKnownDetailEventKind(event.kind) ? "" : `事件类型 ${event.kind}`;
+    return [
+      {
+        id: `event-${event.sequence}`,
+        label: detailProcessLabel(event),
+        title: safeDetailEventSummary(event),
+        detail: safeDetailEventSummary(event),
+        meta: [
+          displayDetailEventKind(event.kind),
+          rawKindMeta,
+          `事件 #${event.sequence}`,
+          displayDetailActor(event.actor),
+          event.step_id ? `步骤 ${event.step_id}` : "",
+          event.tool_name && event.kind.startsWith("tool.") ? `工具 ${event.tool_name}` : "",
+        ].filter(Boolean),
+      },
+    ];
+  });
 }
 
 function isGenericEventMessage(event: RunEvent) {
@@ -807,6 +956,51 @@ function explicitDetailRows(details: Record<string, string>) {
   });
 }
 
+function DetailProcessSummary({ cards }: { cards: DetailProcessCard[] }) {
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  if (cards.length === 0) return null;
+  const selected = selectedId ? cards.find((card) => card.id === selectedId) : null;
+  const detailId = selected ? `run-detail-process-${selected.id}` : undefined;
+  return (
+    <section className="run-detail-process-summary" aria-label="Agent 集群动作">
+      <div className="run-failure-diagnostics-header">
+        <span>Agent process</span>
+        <strong>Agent 集群动作</strong>
+        <small>{cards.length} 条</small>
+      </div>
+      <div className="agent-cluster-actions">
+        {cards.map((card) => (
+          <button
+            key={card.id}
+            type="button"
+            className="run-process-toggle process-intermediate-card"
+            aria-controls={`run-detail-process-${card.id}`}
+            aria-expanded={selectedId === card.id}
+            onClick={() => setSelectedId((current) => (current === card.id ? null : card.id))}
+          >
+            <span aria-hidden="true">{selectedId === card.id ? "⌄" : "›"}</span>
+            <small className="process-card-badge">{card.label}</small>
+            <strong>{card.title}</strong>
+          </button>
+        ))}
+      </div>
+      {selected ? (
+        <div id={detailId} className="run-detail-process-detail" role="group" aria-label="Agent 动作详情">
+          <strong>{selected.title}</strong>
+          <p>{selected.detail}</p>
+          {selected.meta.length > 0 ? (
+            <div aria-label="Agent 动作元数据">
+              {selected.meta.map((meta) => (
+                <em key={meta}>{meta}</em>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 export function RunDetailPage() {
   const { runId = "" } = useParams();
   const queryClient = useQueryClient();
@@ -860,6 +1054,7 @@ export function RunDetailPage() {
   const isWaitingForMode = run.data.status === "waiting_user_mode" && Boolean(run.data.decision_token);
   const observerNotices = collectObserverNotices(run.data.events);
   const timelineItems = detailTimelineItems(run.data.events);
+  const processCards = detailProcessCards(timelineItems);
   const toolLifecycles = toolLifecycleFromApi(run.data);
   const posture = detailPosture(run.data);
   const explicitRows = explicitDetailRows(run.data.explicit_details);
@@ -960,7 +1155,7 @@ export function RunDetailPage() {
                 <span>{observerSeverityLabel(notice.severity)}</span>
                 <strong>{observerActionLabel(notice.action)}</strong>
                 {notice.sourceKind && notice.sourceSequence !== null ? (
-                  <small>来源：{notice.sourceKind} #{notice.sourceSequence}</small>
+                  <small>来源：{observerSourceLabel(notice.sourceKind)} #{notice.sourceSequence}</small>
                 ) : null}
                 {notice.actor ? <small>角色：{notice.actor}</small> : null}
                 <small>
@@ -971,6 +1166,8 @@ export function RunDetailPage() {
           </ul>
         </article>
       ) : null}
+
+      <DetailProcessSummary cards={processCards} />
 
       {failureDiagnostics.length > 0 ? (
         <section className="run-failure-diagnostics" aria-label="故障诊断">
@@ -1066,7 +1263,7 @@ export function RunDetailPage() {
                   <li key={`model-delta-${firstEvent.sequence}-${lastEvent.sequence}`}>
                     <span className="event-log-sequence">{sequence}</span>
                     <time dateTime={lastEvent.created_at}>{runEventTimestamp(lastEvent.created_at)}</time>
-                    <strong>{lastEvent.kind}</strong>
+                    <strong>{displayDetailEventKind(lastEvent.kind)}</strong>
                     <span>{modelDeltaSummary(item.events)}</span>
                   </li>
                 );
@@ -1075,7 +1272,7 @@ export function RunDetailPage() {
                 <li key={item.event.sequence}>
                   <span className="event-log-sequence">#{item.event.sequence}</span>
                   <time dateTime={item.event.created_at}>{runEventTimestamp(item.event.created_at)}</time>
-                  <strong>{item.event.kind}</strong>
+                  <strong>{displayDetailEventKind(item.event.kind)}</strong>
                   <span>{safeDetailEventSummary(item.event)}</span>
                 </li>
               );

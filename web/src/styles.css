@@ -2052,6 +2052,56 @@ article:hover {
   color: rgba(178, 194, 216, 0.72);
 }
 
+.run-detail-process-summary {
+  border: 1px solid rgba(123, 225, 255, 0.12);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.7rem;
+  padding: 0.78rem;
+}
+
+.run-detail-process-summary .agent-cluster-actions {
+  padding-left: 0;
+}
+
+.run-detail-process-detail {
+  background: rgba(3, 10, 20, 0.42);
+  border: 1px solid rgba(123, 225, 255, 0.16);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.52rem;
+  padding: 0.72rem;
+}
+
+.run-detail-process-detail strong {
+  color: var(--text);
+  font-weight: 900;
+}
+
+.run-detail-process-detail p {
+  color: rgba(232, 240, 255, 0.86);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.run-detail-process-detail div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.36rem;
+}
+
+.run-detail-process-detail em {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  color: rgba(178, 194, 216, 0.8);
+  font-size: 0.72rem;
+  font-style: normal;
+  font-weight: 820;
+  line-height: 1;
+  padding: 0.24rem 0.4rem;
+}
+
 .run-process-detail {
   background: rgba(3, 10, 20, 0.42);
   border: 1px solid rgba(123, 225, 255, 0.15);
