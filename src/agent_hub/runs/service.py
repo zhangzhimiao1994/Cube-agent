@@ -1451,7 +1451,7 @@ class RunService:
             if callable(events_source):
                 raw_events = await events_source(record.tenant_id, record.id)
                 events = tuple(
-                    RunEvent.from_payload(event)
+                    _run_event_from_public_payload(event)
                     for event in raw_events
                     if isinstance(event, Mapping)
                 )

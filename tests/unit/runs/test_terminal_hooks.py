@@ -1264,6 +1264,11 @@ async def test_recover_backfills_empty_response_closure_once_for_failed_run() ->
 
     assert first.status is RunStatus.FAILED
     assert second.status is RunStatus.FAILED
+    repair_events = [
+        event for event in repository.event_log if event.kind == "repair.classified"
+    ]
+    assert len(repair_events) == 1
+    assert repair_events[0].payload["failure_category"] == "empty_model_response"
     closure_events = [
         event
         for event in repository.event_log
@@ -1273,6 +1278,7 @@ async def test_recover_backfills_empty_response_closure_once_for_failed_run() ->
     ]
     assert len(closure_events) == 1
     assert "模型返回了空内容" in str(closure_events[0].artifact.content["text"])
+    assert "审批后" in str(closure_events[0].artifact.content["text"])
 
 
 @pytest.mark.asyncio
