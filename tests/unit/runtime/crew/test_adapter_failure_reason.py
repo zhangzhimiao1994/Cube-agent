@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from agent_hub.auth.models import Role
+from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.gateway import GatewayCompletion
@@ -27,6 +28,7 @@ from agent_hub.runtime.crew.adapter import (
     _artifact_final_synthesis_payload,
     _artifact_prompt_payload,
     _artifact_review_packet_payload,
+    _tool_definitions,
     _tool_sandbox,
 )
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
@@ -159,6 +161,23 @@ class FailingHarnessToolGateway:
             payload={},
             failure_reason="tool unavailable",
         )
+
+
+class DeterministicErrorHarnessToolGateway:
+    def __init__(self) -> None:
+        self.calls: list[HarnessToolCallRequest] = []
+
+    async def invoke(
+        self,
+        tenant_id: UUID,
+        request: HarnessToolCallRequest,
+        *,
+        user_id: UUID | None = None,
+        role: Role | None = None,
+    ) -> HarnessToolCallResult:
+        del tenant_id, user_id, role
+        self.calls.append(request)
+        raise RuntimeCapabilityError("files must be an object")
 
 
 class IdentityRecordingHarnessToolGateway:
@@ -734,12 +753,55 @@ async def test_default_harness_wrapper_preserves_backend_uncertainty() -> None:
     assert state["status"] == "uncertain"
 
 
+async def test_deterministic_harness_errors_record_failed_not_uncertain() -> None:
+    capabilities = FakeCapabilities()
+    harness = DeterministicErrorHarnessToolGateway()
+    runtime = CrewDispatchRuntime(
+        ToolGateway(),
+        _tool_plan(),
+        capability_gateway=capabilities,
+        harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+    events: list[RunEvent] = []
+
+    with pytest.raises(RuntimeExecutionError, match="capability execution failed"):
+        async for event in runtime.run(_context()):
+            events.append(event)
+
+    assert capabilities.calls == []
+    assert len(harness.calls) == 1
+    failed_event = next(event for event in events if event.kind is EventKind.TOOL_FAILED)
+    assert failed_event.reason == "files must be an object"
+    assert failed_event.payload["failure_kind"] == "capability_failed"
+    checkpoint = await runtime.save_checkpoint()
+    tool_states = checkpoint.state["tools"]
+    assert isinstance(tool_states, Mapping)
+    state = next(iter(tool_states.values()))
+    assert isinstance(state, Mapping)
+    assert state["status"] == "failed"
+
+
 def test_tool_sandbox_accepts_dot_and_underscore_builtin_names() -> None:
     assert _tool_sandbox("workspace.read") == "read_only"
     assert _tool_sandbox("workspace_read") == "read_only"
     assert _tool_sandbox("calculator.evaluate") == "none"
     assert _tool_sandbox("calculator_evaluate") == "none"
     assert _tool_sandbox("web.search") == "restricted"
+
+
+def test_project_zip_tool_definition_exposes_required_file_schema() -> None:
+    (definition,) = _tool_definitions(("project.generate_zip",))
+
+    assert definition.name == "project_generate_zip"
+    assert definition.parameters["required"] == ("title", "files")
+    properties = definition.parameters["properties"]
+    assert isinstance(properties, Mapping)
+    files = properties["files"]
+    assert isinstance(files, Mapping)
+    assert files["type"] == "object"
+    assert files["additionalProperties"] == {"type": "string"}
+    assert definition.parameters["additionalProperties"] is False
 
 
 async def test_dispatch_framework_failure_records_safe_root_cause() -> None:

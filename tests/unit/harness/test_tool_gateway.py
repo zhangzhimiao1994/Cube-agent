@@ -3,6 +3,7 @@ from uuid import UUID
 
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.gateway import CapabilityResult, CapabilityStatus
+from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.harness.tool_gateway import HarnessToolGateway
 from agent_hub.harness.types import HarnessToolCallRequest, JsonValue
@@ -48,6 +49,21 @@ class FakeRuntimeCapabilityGateway:
         if self.fail:
             raise RuntimeError("raw provider filesystem failure")
         return {"value": "14"}
+
+
+class DeterministicFailureRuntimeCapabilityGateway(FakeRuntimeCapabilityGateway):
+    async def execute(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        del tenant_id, run_id, actor, name, arguments, idempotency_key
+        raise RuntimeCapabilityError("files must be an object")
 
 
 class FakePolicyGateway:
@@ -437,3 +453,13 @@ async def test_harness_tool_gateway_can_preserve_backend_uncertainty_for_runtime
         assert "raw provider" in str(error)
     else:
         raise AssertionError("backend uncertainty should be re-raised for runtime ledgers")
+
+
+async def test_harness_tool_gateway_reports_deterministic_capability_errors_when_runtime_reraises() -> None:
+    runtime = DeterministicFailureRuntimeCapabilityGateway()
+    gateway = HarnessToolGateway(runtime, raise_backend_errors=True)
+
+    result = await gateway.invoke(TENANT_ID, project_zip_create_request())
+
+    assert result.status == "failed"
+    assert result.failure_reason == "files must be an object"

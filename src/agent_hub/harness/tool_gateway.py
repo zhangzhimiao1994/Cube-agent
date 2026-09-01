@@ -6,6 +6,7 @@ from uuid import UUID
 
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.gateway import CapabilityResult, CapabilityStatus
+from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult, JsonValue
 
@@ -78,6 +79,8 @@ class HarnessToolGateway:
                 arguments=request.arguments,
                 idempotency_key=request.idempotency_key,
             )
+        except RuntimeCapabilityError as error:
+            return self._failure(request, _deterministic_failure_reason(error))
         except Exception as error:
             error.__traceback__ = None
             error.__context__ = None
@@ -185,6 +188,13 @@ def _capability_failure_reason(status: CapabilityStatus) -> str:
     if status is CapabilityStatus.WAITING_APPROVAL:
         return "capability requires approval"
     return "capability denied"
+
+
+def _deterministic_failure_reason(error: RuntimeCapabilityError) -> str:
+    reason = str(error).strip()
+    if not reason or len(reason) > 512 or any(ord(character) < 32 or ord(character) == 127 for character in reason):
+        return "tool input is invalid"
+    return reason
 
 
 def _mutable_json_object(value: Mapping[str, JsonValue]) -> dict[str, MutableJson]:

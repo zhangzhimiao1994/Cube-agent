@@ -28,6 +28,7 @@ from typing import Any, Never, Protocol, cast
 from uuid import UUID, uuid4
 
 from agent_hub.auth.models import Role
+from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness import HarnessToolGateway
 from agent_hub.harness.events import safe_tool_event_payload
@@ -274,11 +275,71 @@ def _tool_definitions(internal_names: tuple[str, ...]) -> tuple[ToolDefinition, 
     return tuple(
         ToolDefinition(
             name=external_name,
-            description=f"Approved Agent Hub capability: {internal_name}",
-            parameters={"type": "object", "additionalProperties": True},
+            description=_tool_description(internal_name),
+            parameters=_tool_parameters(internal_name),
         )
         for external_name, internal_name in sorted(mapping.items())
     )
+
+
+def _tool_description(internal_name: str) -> str:
+    if internal_name == "project.generate_zip":
+        return (
+            "Generate a downloadable project ZIP. Use files as an object mapping "
+            "relative file paths to UTF-8 text file contents."
+        )
+    if internal_name == "document.generate_docx":
+        return "Generate a downloadable DOCX document from title and section content."
+    if internal_name == "presentation.generate_pptx":
+        return "Generate a downloadable PPTX presentation from title and slide content."
+    if internal_name in {"read_context", "workspace.read", "workspace_read"}:
+        return "Read approved workspace or conversation context."
+    return f"Approved Agent Hub capability: {internal_name}"
+
+
+def _tool_parameters(internal_name: str) -> Mapping[str, JsonValue]:
+    if internal_name == "project.generate_zip":
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ("title", "files"),
+            "properties": {
+                "title": {"type": "string", "minLength": 1, "maxLength": 200},
+                "filename": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200,
+                    "description": "Optional .zip filename.",
+                },
+                "presentation": {
+                    "type": "string",
+                    "enum": ("step_detail", "final_attachment"),
+                    "description": "Use final_attachment for user-downloadable deliverables.",
+                },
+                "files": {
+                    "type": "object",
+                    "minProperties": 1,
+                    "maxProperties": 64,
+                    "additionalProperties": {"type": "string"},
+                    "description": "Relative paths mapped to UTF-8 text content.",
+                },
+            },
+        }
+    if internal_name in {"document.generate_docx", "presentation.generate_pptx"}:
+        return {
+            "type": "object",
+            "additionalProperties": True,
+            "required": ("title",),
+            "properties": {
+                "title": {"type": "string", "minLength": 1, "maxLength": 200},
+                "filename": {"type": "string", "minLength": 1, "maxLength": 200},
+                "presentation": {
+                    "type": "string",
+                    "enum": ("step_detail", "final_attachment"),
+                },
+            },
+        }
+    return {"type": "object", "additionalProperties": True}
 
 
 def _tool_sandbox(name: str) -> str:
@@ -504,6 +565,13 @@ def _failed_model_state_can_compact_retry(model_state: Mapping[str, JsonValue]) 
 def _framework_failure_reason(prefix: str, error: Exception) -> str:
     reason = safe_runtime_failure_reason(error, fallback=prefix)
     return prefix if reason == prefix else f"{prefix}: {reason}"
+
+
+def _deterministic_capability_failure_reason(error: RuntimeCapabilityError) -> str:
+    reason = safe_runtime_failure_reason(error, fallback="capability execution failed").strip()
+    if not reason:
+        return "capability execution failed"
+    return _truncate_prompt_text(reason, max_bytes=512)
 
 
 class ModelGateway(Protocol):
@@ -2555,6 +2623,31 @@ class CrewDispatchRuntime:
                             user_id=context.actor_id,
                             role=context.actor_role,
                         )
+                except RuntimeCapabilityError as error:
+                    failed_reason = _deterministic_capability_failure_reason(error)
+                    error.__traceback__ = None
+                    error.__context__ = None
+                    error.__cause__ = None
+                    del error
+                    await emit(
+                        kind=EventKind.TOOL_FAILED,
+                        actor=step.agent,
+                        tool_call_id=call_id,
+                        tool_name=tool_call.name,
+                        payload=safe_tool_event_payload(
+                            name=tool_call.name,
+                            status="failed",
+                            arguments=tool_call.arguments,
+                            sandbox=_tool_sandbox(tool_call.name),
+                            replay_safe=replay_safe,
+                            failure_kind="capability_failed",
+                        ),
+                        reason=failed_reason,
+                    )
+                    failed = dict(tool_running)
+                    failed["status"] = "failed"
+                    await tool_boundary(idempotency_key, failed, None)
+                    raise RuntimeExecutionError("capability execution failed") from None
                 except asyncio.CancelledError:
                     if not replay_safe:
                         uncertain = dict(tool_running)
