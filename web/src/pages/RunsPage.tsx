@@ -328,6 +328,7 @@ type ChatMessage = {
   title: string;
   body: string;
   artifact?: DownloadableArtifact;
+  temporaryAgent?: TemporaryAgentProposal;
   run?: RunDetail;
 };
 type EventGroupItem = {
@@ -1503,16 +1504,56 @@ function scheduleProposalCreatePayload(proposal: ScheduleProposal) {
   };
 }
 function temporaryAgentApprovalBody(proposal: TemporaryAgentProposal) {
-  const skills =
-    proposal.suggested_skills.length > 0 ? `\n建议 Skill：${proposal.suggested_skills.join("、")}` : "";
+  const model = proposal.model ? `模型：${proposal.model}` : "模型：主 Agent 自动选择";
   return [
-    "主 Agent 判断当前角色池缺少一个临时子 Agent。主 Agent 已生成角色和提示词；模型/API 不需要你选，主 Agent 会按角色能力、任务要求和模型并发情况自动选择模型/API。",
-    `拟加入：${proposal.name}（${proposal.id}）`,
-    `缺少能力：${proposal.missing_capability}`,
-    `加入原因：${proposal.reason}`,
-    `角色边界：${proposal.prompt}${skills}`,
-    "请直接回复：\n1 同意临时加入\n2 不加入，按现有角色继续\n3 你的修改意见\n4 保存为永久 Agent（需先同意并运行过）",
+    `主 Agent 建议临时加入子 Agent：补齐 ${proposal.missing_capability} 能力。`,
+    `职责：${proposal.role}；${model}。`,
+    "回复：1 同意临时加入；2 不加入；3 给修改意见；4 保存为永久 Agent（需先同意并运行过）。",
   ].join("\n\n");
+}
+
+function temporaryAgentDetailRows(proposal: TemporaryAgentProposal) {
+  const skills =
+    proposal.suggested_skills.length > 0 ? proposal.suggested_skills.join("、") : "无";
+  return [
+    { label: "Agent ID", value: proposal.id },
+    { label: "名称", value: proposal.name },
+    { label: "职责", value: proposal.role },
+    { label: "缺少能力", value: proposal.missing_capability },
+    { label: "加入原因", value: proposal.reason },
+    { label: "角色边界", value: proposal.prompt },
+    { label: "建议 Skill", value: skills },
+    { label: "可保存为永久 Agent", value: proposal.permanentizable ? "是" : "否" },
+  ];
+}
+
+function TemporaryAgentApprovalMessage({ proposal }: { proposal: TemporaryAgentProposal }) {
+  const [detailOpen, setDetailOpen] = useState(false);
+  return (
+    <>
+      <MessageBody text={temporaryAgentApprovalBody(proposal)} title={proposal.name} />
+      <div className="temporary-agent-summary-card">
+        <button
+          type="button"
+          className="secondary-action"
+          aria-expanded={detailOpen}
+          onClick={() => setDetailOpen((open) => !open)}
+        >
+          {detailOpen ? "收起临时 Agent 详情" : "展开临时 Agent 详情"}
+        </button>
+        {detailOpen ? (
+          <dl className="temporary-agent-detail-list" aria-label="临时 Agent 详情">
+            {temporaryAgentDetailRows(proposal).map((row) => (
+              <div key={row.label}>
+                <dt>{row.label}</dt>
+                <dd>{row.value}</dd>
+              </div>
+            ))}
+          </dl>
+        ) : null}
+      </div>
+    </>
+  );
 }
 
 function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
@@ -1573,6 +1614,7 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
             role: "assistant" as const,
             title: detail.temporary_agent_proposal.name,
             body: temporaryAgentApprovalBody(detail.temporary_agent_proposal),
+            temporaryAgent: detail.temporary_agent_proposal,
           },
         ]
       : []),
@@ -4286,7 +4328,7 @@ export function RunsPage() {
               <article className="chat-message assistant" aria-label="临时 Agent 文字确认">
                 <span className="eyebrow">{APP_BRAND_NAME}</span>
                 <h3>{temporaryApproval.proposal.name}</h3>
-                <p>{temporaryAgentApprovalBody(temporaryApproval.proposal)}</p>
+                <TemporaryAgentApprovalMessage proposal={temporaryApproval.proposal} />
               </article>
             ) : null}
             {scheduleApproval && !scheduleApprovalVisibleInMessages ? (
@@ -4315,7 +4357,11 @@ export function RunsPage() {
                 <article className={`chat-message ${item.role}`}>
                   <span className="eyebrow">{item.role === "user" ? "你" : APP_BRAND_NAME}</span>
                   <h3>{item.title}</h3>
-                  <MessageBody text={item.body} title={item.title} />
+                  {item.temporaryAgent ? (
+                    <TemporaryAgentApprovalMessage proposal={item.temporaryAgent} />
+                  ) : (
+                    <MessageBody text={item.body} title={item.title} />
+                  )}
                   {item.artifact ? (
                     <div className="artifact-download-list" aria-label="附件">
                       <ArtifactFileCard artifact={item.artifact} />

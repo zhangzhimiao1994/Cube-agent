@@ -1386,6 +1386,37 @@ article:hover {
   white-space: pre-wrap;
 }
 
+.temporary-agent-summary-card {
+  display: grid;
+  gap: 0.65rem;
+  margin-top: 0.7rem;
+}
+
+.temporary-agent-detail-list {
+  border: 1px solid rgba(125, 255, 189, 0.16);
+  border-radius: 0.75rem;
+  display: grid;
+  gap: 0.55rem;
+  margin: 0;
+  padding: 0.8rem;
+}
+
+.temporary-agent-detail-list div {
+  display: grid;
+  gap: 0.18rem;
+}
+
+.temporary-agent-detail-list dt {
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.temporary-agent-detail-list dd {
+  line-height: 1.55;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
 .mode-entry-panel {
   align-self: center;
   background: transparent;

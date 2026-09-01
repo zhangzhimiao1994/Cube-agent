@@ -5557,6 +5557,14 @@ describe("operational management pages", () => {
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
     expect(within(stream).getByText("Temporary Web Engineer")).not.toBeNull();
+    expect(within(stream).getByText(/补齐 software_engineering 能力/)).not.toBeNull();
+    expect(within(stream).queryByText(/temp-web-engineer/)).toBeNull();
+    expect(within(stream).queryByText(/把方案落成网页并说明验证步骤/)).toBeNull();
+    expect(within(stream).queryByText(/当前角色池缺少 software_engineering 能力/)).toBeNull();
+    await user.click(within(stream).getByRole("button", { name: "展开临时 Agent 详情" }));
+    expect(within(stream).getByText(/temp-web-engineer/)).not.toBeNull();
+    expect(within(stream).getByText(/把方案落成网页并说明验证步骤/)).not.toBeNull();
+    expect(within(stream).getByText(/当前角色池缺少 software_engineering 能力/)).not.toBeNull();
     expect(screen.queryByRole("dialog", { name: "临时 Agent 确认提醒" })).toBeNull();
     await user.clear(composer.querySelector("textarea") as HTMLTextAreaElement);
     await user.type(composer.querySelector("textarea") as HTMLTextAreaElement, "3 do not add an engineer yet");
@@ -5586,8 +5594,8 @@ describe("operational management pages", () => {
     await user.click(composer.querySelector('button[type="submit"]') as HTMLButtonElement);
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
-    expect(within(stream).getByText(/主 Agent 已生成角色和提示词/)).not.toBeNull();
-    expect(within(stream).getByText(/主 Agent 会按角色能力、任务要求和模型并发情况自动选择模型/)).not.toBeNull();
+    expect(within(stream).getByText(/补齐 software_engineering 能力/)).not.toBeNull();
+    expect(within(stream).getByText(/模型：主 Agent 自动选择/)).not.toBeNull();
     expect(within(stream).queryByLabelText("运行模型")).toBeNull();
     expect(within(stream).queryByText(/建议模型\/API：coder/)).toBeNull();
     await user.clear(composer.querySelector("textarea") as HTMLTextAreaElement);
