@@ -29,6 +29,11 @@ from agent_hub.runtime.failure_reason import (
     runtime_failure_diagnostic_from_reason,
     safe_runtime_failure_reason,
 )
+from agent_hub.runtime.generated_file_recovery import (
+    final_attachment_ready_text,
+    final_attachment_result,
+    final_attachment_text_conflicts,
+)
 
 _RUNTIME_TYPE = "hybrid"
 _RUNTIME_VERSION = "1"
@@ -346,6 +351,8 @@ class HybridRuntime:
                     continue
                 if item.kind is EventKind.CHECKPOINT_SAVED:
                     continue
+                if mode is TaskMode.DIRECT:
+                    item = _reconcile_synthesis_event(item, artifacts)
                 if (
                     item.kind is EventKind.ARTIFACT_CREATED
                     and item.artifact is not None
@@ -513,6 +520,41 @@ def _renumber_child_event(
         updates["session_id"] = str(run_id)
         if not event.inputs:
             updates["inputs"] = inputs
+    return event.model_copy(update=updates)
+
+
+def _reconcile_synthesis_event(
+    event: RunEvent,
+    prior_artifacts: tuple[Artifact, ...],
+) -> RunEvent:
+    artifact = event.artifact
+    if event.kind is not EventKind.ARTIFACT_CREATED or artifact is None:
+        return event
+    if artifact.type != "text":
+        return event
+    text = artifact.content.get("text")
+    if type(text) is not str or not final_attachment_text_conflicts(text):
+        return event
+    result = final_attachment_result(prior_artifacts)
+    if result is None:
+        return event
+    content = dict(artifact.content)
+    content["text"] = final_attachment_ready_text(result)
+    reconciled = Artifact(
+        id=artifact.id,
+        version=artifact.version,
+        type=artifact.type,
+        producer=artifact.producer,
+        content=content,
+        source_ids=artifact.source_ids,
+        provenance=artifact.provenance,
+    )
+    updates: dict[str, object] = {"artifact": reconciled}
+    payload = event.payload
+    if "output" in payload:
+        next_payload = dict(payload)
+        next_payload["output"] = reconciled.content["text"]
+        updates["payload"] = next_payload
     return event.model_copy(update=updates)
 
 

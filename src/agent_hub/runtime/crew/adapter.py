@@ -63,7 +63,12 @@ from agent_hub.runtime.failure_reason import (
     runtime_failure_diagnostic_from_reason,
     safe_runtime_failure_reason,
 )
-from agent_hub.runtime.generated_file_recovery import reusable_generated_file_result
+from agent_hub.runtime.generated_file_recovery import (
+    final_attachment_ready_text,
+    final_attachment_result,
+    final_attachment_text_conflicts,
+    reusable_generated_file_result,
+)
 from agent_hub.runtime.hermes_context import hermes_memory_context_text
 from agent_hub.runtime.self_repair_context import self_repair_context_text
 
@@ -502,77 +507,20 @@ def _artifact_text_preview(artifact: Artifact, *, max_bytes: int = 2_000) -> str
     return _truncate_prompt_text(stripped, max_bytes=max_bytes)
 
 
-def _final_attachment_result(artifacts: Sequence[Artifact]) -> Mapping[str, JsonValue] | None:
-    for artifact in reversed(artifacts):
-        if artifact.type != "tool_result":
-            continue
-        result = artifact.content.get("result")
-        if not isinstance(result, Mapping):
-            continue
-        if result.get("presentation") != "final_attachment":
-            continue
-        file_payload = result.get("file")
-        if not isinstance(file_payload, Mapping):
-            continue
-        filename = file_payload.get("filename")
-        download_url = file_payload.get("download_url")
-        if type(filename) is str and filename.strip() and type(download_url) is str:
-            return result
-    return None
-
-
-def _final_attachment_filename(result: Mapping[str, JsonValue]) -> str | None:
-    file_payload = result.get("file")
-    if not isinstance(file_payload, Mapping):
-        return None
-    filename = file_payload.get("filename")
-    if type(filename) is not str:
-        return None
-    stripped = filename.strip()
-    return stripped or None
-
-
-def _final_attachment_text_conflicts(text: str) -> bool:
-    normalized = text.lower()
-    denial_markers = (
-        "无法",
-        "不能",
-        "没法",
-        "没有暴露",
-        "没有可用",
-        "cannot",
-        "can't",
-        "unable",
-        "not available",
-        "no harness tool",
-        "no tool",
-    )
-    return any(marker in normalized for marker in denial_markers)
-
-
-def _final_attachment_ready_text(result: Mapping[str, JsonValue]) -> str:
-    filename = _final_attachment_filename(result) or "生成文件"
-    file_payload = result.get("file")
-    mime_type = file_payload.get("mime_type") if isinstance(file_payload, Mapping) else None
-    if filename.lower().endswith(".zip") or mime_type == "application/zip":
-        return f"已生成可下载项目 ZIP：{filename}。"
-    return f"已生成可下载文件：{filename}。"
-
-
 def _reconcile_final_attachment_completion(
     completion: GatewayCompletion,
     artifacts: Sequence[Artifact],
 ) -> GatewayCompletion:
     text = completion.response.text
-    if type(text) is not str or not _final_attachment_text_conflicts(text):
+    if type(text) is not str or not final_attachment_text_conflicts(text):
         return completion
-    result = _final_attachment_result(artifacts)
+    result = final_attachment_result(artifacts)
     if result is None:
         return completion
     response = completion.response
     return GatewayCompletion(
         response=ModelResponse(
-            text=_final_attachment_ready_text(result),
+            text=final_attachment_ready_text(result),
             tool_calls=response.tool_calls,
             usage=response.usage,
             provider_metadata=response.provider_metadata,

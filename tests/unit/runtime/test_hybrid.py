@@ -154,6 +154,27 @@ def artifact(
     )
 
 
+def final_zip_artifact() -> Artifact:
+    artifact_id = str(uuid4())
+    return Artifact(
+        id=uuid4(),
+        type="tool_result",
+        producer="implementer",
+        content={
+            "result": {
+                "artifact_id": artifact_id,
+                "file": {
+                    "artifact_id": artifact_id,
+                    "filename": "main.py.zip",
+                    "mime_type": "application/zip",
+                    "download_url": f"/api/v1/runs/{uuid4()}/artifacts/{artifact_id}/download",
+                },
+                "presentation": "final_attachment",
+            }
+        },
+    )
+
+
 @pytest.mark.asyncio
 async def test_hybrid_discussion_handoff_drops_wrapped_model_response_duplicates() -> None:
     model_output = artifact("writer", "draft", artifact_type="model_response")
@@ -180,6 +201,40 @@ async def test_hybrid_discussion_handoff_drops_wrapped_model_response_duplicates
     assert discussion.contexts[0].artifacts == (text_output,)
     started = next(event for event in events if event.kind is EventKind.DISCUSSION_STARTED)
     assert started.inputs == (text_output,)
+
+
+@pytest.mark.asyncio
+async def test_hybrid_synthesis_cannot_deny_existing_final_attachment() -> None:
+    zip_result = final_zip_artifact()
+    discussion_output = artifact("critic", "zip result verified", sources=(str(zip_result.id),))
+    denial_output = artifact("main", "无法生成 zip，因为没有可用 harness 工具。")
+    runtime = HybridRuntime(
+        MultiArtifactRuntime(TaskMode.DISPATCH, (zip_result,)),
+        MultiArtifactRuntime(TaskMode.DISCUSS, (discussion_output,)),
+        MultiArtifactRuntime(TaskMode.DIRECT, (denial_output,)),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=uuid4(),
+                mode=TaskMode.HYBRID,
+                request="build a zip",
+            )
+        )
+    ]
+
+    final_event = next(
+        event
+        for event in reversed(events)
+        if event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
+    )
+    final_artifact = final_event.artifact
+    assert final_artifact is not None
+    assert final_artifact.producer == "main"
+    assert final_artifact.content["text"] == "已生成可下载项目 ZIP：main.py.zip。"
 
 
 @pytest.mark.asyncio
