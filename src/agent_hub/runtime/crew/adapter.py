@@ -537,6 +537,7 @@ def _can_compact_retry_subagent(
         in {
             "crew.step_timeout",
             "model.empty_response",
+            "model.capacity_unavailable",
             "capability.transient_execution_failed",
         }
         and recovery_attempt < _STEP_TIMEOUT_RECOVERY_RETRIES
@@ -555,6 +556,7 @@ def _recovery_status_after_attempts(
         in {
             "crew.step_timeout",
             "model.empty_response",
+            "model.capacity_unavailable",
             "capability.transient_execution_failed",
         }
         and recovery_attempts >= _STEP_TIMEOUT_RECOVERY_RETRIES

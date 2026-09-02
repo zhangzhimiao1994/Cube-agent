@@ -12,6 +12,7 @@ from agent_hub.auth.models import Role
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
+from agent_hub.models.capacity import CapacityUnavailable
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
@@ -341,6 +342,50 @@ class EmptyThenRoleAwareGateway(RoleAwareGateway):
                 if request.logical_model == "review"
                 else "role output " + ("内容" * 600)
             )
+        return GatewayCompletion(
+            response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
+class CapacityUnavailableThenRoleAwareGateway(RoleAwareGateway):
+    def __init__(self, *, unavailable_logical_model: str) -> None:
+        super().__init__()
+        self.unavailable_logical_model = unavailable_logical_model
+        self._unavailable_returned = False
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        if request.logical_model == self.unavailable_logical_model and not self._unavailable_returned:
+            self._unavailable_returned = True
+            raise CapacityUnavailable("model capacity unavailable")
+        text = '{"verdict":"approve"}' if request.logical_model == "review" else "role output"
+        return GatewayCompletion(
+            response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
+class RepeatedCapacityUnavailableGateway(RoleAwareGateway):
+    def __init__(self, *, unavailable_logical_model: str, failures: int) -> None:
+        super().__init__()
+        self.unavailable_logical_model = unavailable_logical_model
+        self.failures = failures
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        if request.logical_model == self.unavailable_logical_model and self.failures > 0:
+            self.failures -= 1
+            raise CapacityUnavailable("model capacity unavailable")
+        text = '{"verdict":"approve"}' if request.logical_model == "review" else "role output"
         return GatewayCompletion(
             response=ModelResponse(text=text, usage=TokenUsage(1, 1, 2)),
             deployment_id="primary",
@@ -1140,6 +1185,36 @@ async def test_agent_empty_model_response_compact_retries_before_completing() ->
     assert [event.kind for event in resumed_events] == [EventKind.RUNTIME_COMPLETED]
 
 
+async def test_agent_capacity_unavailable_compact_retries_before_completing() -> None:
+    gateway = CapacityUnavailableThenRoleAwareGateway(unavailable_logical_model="general")
+    generation = RecordingGeneration()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _one_step_plan(),
+        crew_factory=RecordingFactory(generation),
+    )
+
+    events = await _collect(runtime)
+
+    writer_prompts = [prompt for step_id, agent_id, prompt in generation.prompts if step_id == "final"]
+    assert len(gateway.requests) == 2
+    assert len(writer_prompts) == 2
+    retrying = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retrying.actor == "writer"
+    assert retrying.payload["error_code"] == "model.capacity_unavailable"
+    assert retrying.payload["recovery_strategy"] == "compact_retry"
+    assert retrying.payload["recovery_attempt"] == 1
+    assert retrying.payload["recovery_layers"] == (
+        "input_compression",
+        "prompt_decomposition",
+        "model_fallback_marked",
+        "failure_closure",
+    )
+    assert retrying.payload["model_fallback"] == "not_available_in_crewai_bridge"
+    assert "Keep the retry concise" in writer_prompts[1]
+    assert any(event.kind is EventKind.STEP_COMPLETED for event in events)
+
+
 async def test_failed_model_checkpoint_resumes_through_generic_compact_retry() -> None:
     repository = InMemoryArtifactRepository()
     runtime = CrewDispatchRuntime(
@@ -1354,6 +1429,54 @@ async def test_reviewer_empty_model_response_uses_generic_recovery_before_soft_s
     await restored.restore_checkpoint(checkpoint)
     resumed_events = [event async for event in restored.run(_context(checkpoint=checkpoint))]
     assert [event.kind for event in resumed_events] == [EventKind.RUNTIME_COMPLETED]
+
+
+async def test_reviewer_capacity_unavailable_uses_generic_recovery_before_completing() -> None:
+    gateway = CapacityUnavailableThenRoleAwareGateway(unavailable_logical_model="review")
+    generation = RecordingGeneration()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _reviewed_step_plan(),
+        crew_factory=RecordingFactory(generation),
+    )
+
+    events = await _collect(runtime)
+
+    reviewer_prompts = [item for item in generation.prompts if item[1] == "reviewer"]
+    assert len(reviewer_prompts) == 2
+    retrying = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
+    assert retrying.actor == "reviewer"
+    assert retrying.payload["error_code"] == "model.capacity_unavailable"
+    assert retrying.payload["recovery_strategy"] == "compact_retry"
+    assert retrying.payload["recovery_attempt"] == 1
+    assert "Keep the retry concise" in reviewer_prompts[1][2]
+    review_completed = next(event for event in events if event.kind is EventKind.REVIEW_COMPLETED)
+    assert review_completed.payload["verdict"] == "approve"
+    assert "review_status" not in review_completed.payload
+    assert any(event.kind is EventKind.STEP_COMPLETED for event in events)
+
+
+async def test_reviewer_capacity_unavailable_soft_skips_after_compact_retry() -> None:
+    gateway = RepeatedCapacityUnavailableGateway(unavailable_logical_model="review", failures=2)
+    generation = RecordingGeneration()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _reviewed_step_plan(),
+        crew_factory=RecordingFactory(generation),
+    )
+
+    events = await _collect(runtime)
+
+    reviewer_prompts = [item for item in generation.prompts if item[1] == "reviewer"]
+    assert len(reviewer_prompts) == 2
+    review_completed = next(event for event in events if event.kind is EventKind.REVIEW_COMPLETED)
+    assert review_completed.actor == "reviewer"
+    assert review_completed.payload["verdict"] == "approve"
+    assert review_completed.payload["review_status"] == "skipped"
+    assert review_completed.payload["error_code"] == "model.capacity_unavailable"
+    assert review_completed.payload["recovery_status"] == "failed_after_compact_retry"
+    assert review_completed.payload["recovery_attempts"] == 1
+    assert any(event.kind is EventKind.STEP_COMPLETED for event in events)
 
 
 async def test_reviewer_revise_checkpoint_after_compact_recovery_resumes() -> None:
