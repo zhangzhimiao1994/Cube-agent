@@ -420,14 +420,12 @@ def _generated_file_presentation(
 
 def _project_files(arguments: Mapping[str, JsonValue]) -> dict[str, bytes]:
     raw_files = arguments.get("files")
-    if not isinstance(raw_files, Mapping):
-        raise RuntimeCapabilityError("files must be an object")
-    raw_files = _unwrap_project_files_item(raw_files)
-    if not raw_files or len(raw_files) > _MAX_PROJECT_FILES:
+    raw_entries = _project_file_entries(raw_files)
+    if not raw_entries or len(raw_entries) > _MAX_PROJECT_FILES:
         raise RuntimeCapabilityError("files must contain 1 to 64 entries")
     files: dict[str, bytes] = {}
     total_bytes = 0
-    for raw_path, raw_content in raw_files.items():
+    for raw_path, raw_content in raw_entries:
         if not isinstance(raw_path, str):
             raise RuntimeCapabilityError("file paths must be strings")
         path = _project_archive_path(raw_path)
@@ -442,6 +440,20 @@ def _project_files(arguments: Mapping[str, JsonValue]) -> dict[str, bytes]:
             raise RuntimeCapabilityError("project content is too large")
         files[path] = data
     return files
+
+
+def _project_file_entries(raw_files: object) -> tuple[tuple[object, object], ...]:
+    if isinstance(raw_files, Mapping):
+        unwrapped = _unwrap_project_files_item(raw_files)
+        return tuple(unwrapped.items())
+    if isinstance(raw_files, list | tuple):
+        entries: list[tuple[object, object]] = []
+        for item in raw_files:
+            if not isinstance(item, Mapping) or len(item) != 1:
+                raise RuntimeCapabilityError("file entries must map one path to content")
+            entries.append(next(iter(item.items())))
+        return tuple(entries)
+    raise RuntimeCapabilityError("files must be an object or list")
 
 
 def _unwrap_project_files_item(raw_files: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:

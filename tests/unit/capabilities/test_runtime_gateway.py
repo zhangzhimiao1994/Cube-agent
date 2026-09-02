@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
+from typing import cast
 from uuid import UUID
 from zipfile import ZipFile
 
 import pytest
 
 from agent_hub.capabilities.runtime import RuntimeCapabilityError, RuntimeCapabilityGateway
+from agent_hub.runtime.contracts import JsonValue
 from agent_hub.skills.sandbox.base import SkillInvocation, SkillResult
 from tests.unit.skills.test_package import skill_zip
 
@@ -265,6 +268,44 @@ async def test_runtime_gateway_accepts_common_project_zip_files_item_wrapper(
     with ZipFile(stored_path) as archive:
         assert archive.namelist() == ["main.py"]
         assert archive.read("main.py") == b'print("hello mofang")\n'
+
+
+async def test_runtime_gateway_accepts_common_project_zip_files_list(
+    tmp_path: Path,
+) -> None:
+    generated_dir = tmp_path / "generated"
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=generated_dir,
+    )
+
+    result = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="engineer",
+        name="project.generate_zip",
+        arguments=cast(
+            Mapping[str, JsonValue],
+            {
+                "title": "Mofang Hello",
+                "filename": "mofang-hello.zip",
+                "files": [{"main.py": "print(\"hello mofang\")"}],
+            },
+        ),
+        idempotency_key="project_zip_file_list",
+    )
+
+    stored_path = (
+        generated_dir
+        / str(TENANT_ID)
+        / str(RUN_ID)
+        / str(result["artifact_id"])
+        / "mofang-hello.zip"
+    )
+    assert stored_path.is_file()
+    with ZipFile(stored_path) as archive:
+        assert archive.namelist() == ["main.py"]
+        assert archive.read("main.py") == b'print("hello mofang")'
 
 
 async def test_runtime_gateway_rejects_unsafe_project_zip_paths(tmp_path: Path) -> None:
