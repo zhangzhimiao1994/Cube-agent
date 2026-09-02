@@ -2496,6 +2496,23 @@ class CrewDispatchRuntime:
             if self._capabilities is None or self._tool_gateway is None or not step.tools:
                 _fail("step requested an unavailable capability")
             if _round == _MAX_TOOL_ROUNDS:
+                reusable_results = tuple(
+                    reusable_generated_file_result(tool_call.name, evidence)
+                    for tool_call in response.tool_calls
+                )
+                if reusable_results and all(result is not None for result in reusable_results):
+                    return GatewayCompletion(
+                        response=ModelResponse(
+                            text="Generated downloadable project ZIP artifact is ready.",
+                            usage=response.usage,
+                            provider_metadata=response.provider_metadata,
+                        ),
+                        deployment_id=completion.deployment_id,
+                        logical_model=completion.logical_model,
+                        provider_id=completion.provider_id,
+                        provider_model=completion.provider_model,
+                        cost_usd=completion.cost_usd,
+                    )
                 _fail("step capability round limit exceeded")
             trigger_model_artifact = evidence[-1]
             if trigger_model_artifact.type != "model_response":
@@ -2556,6 +2573,47 @@ class CrewDispatchRuntime:
                         }
                     )
                     evidence.append(artifact)
+                    continue
+                reusable_result = reusable_generated_file_result(tool_call.name, evidence)
+                if reusable_result is not None:
+                    reusable_result = cast(Mapping[str, JsonValue], _mutable_json(reusable_result))
+                    artifact = Artifact(
+                        id=uuid4(),
+                        type="tool_result",
+                        producer=step.agent,
+                        content={"result": reusable_result},
+                        source_ids=(str(trigger_model_artifact.id),),
+                    )
+                    await emit(
+                        kind=EventKind.TOOL_COMPLETED,
+                        actor=step.agent,
+                        tool_call_id=call_id,
+                        tool_name=tool_call.name,
+                        payload=safe_tool_event_payload(
+                            name=tool_call.name,
+                            status="succeeded",
+                            result=reusable_result,
+                            artifact_id=str(artifact.id),
+                            replay_safe=True,
+                        ),
+                        artifact=artifact,
+                    )
+                    reused_state: Mapping[str, JsonValue] = {
+                        "status": "succeeded",
+                        "step_id": step.id,
+                        "attempt": model_attempt,
+                        "round": _round,
+                        "tool_index": tool_index,
+                        "name": tool_call.name,
+                        "arguments_sha256": arguments_sha256,
+                        "trigger_model_artifact_id": str(trigger_model_artifact.id),
+                        "replay_safe": True,
+                        "artifact_id": str(artifact.id),
+                        "sha256": artifact.content_sha256,
+                    }
+                    await tool_boundary(idempotency_key, reused_state, artifact)
+                    evidence.append(artifact)
+                    results.append({"name": tool_call.name, "result": reusable_result})
                     continue
                 replay_safe_method = getattr(self._capabilities, "is_replay_safe", None)
                 replay_safe = bool(

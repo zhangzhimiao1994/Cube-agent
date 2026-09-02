@@ -815,13 +815,99 @@ async def test_project_zip_failure_after_final_zip_reuses_existing_artifact() ->
 
     events = await _collect(runtime)
 
-    assert len(harness.calls) == 2
+    assert len(harness.calls) == 1
     assert [event.kind for event in events if event.kind is EventKind.TOOL_FAILED] == []
     assert [event.kind for event in events if event.kind is EventKind.TOOL_COMPLETED] == [
         EventKind.TOOL_COMPLETED,
         EventKind.TOOL_COMPLETED,
     ]
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+async def test_project_zip_round_limit_reuses_existing_final_artifact() -> None:
+    class EndlessZipGateway:
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            return GatewayCompletion(
+                response=ModelResponse(
+                    text=None,
+                    tool_calls=(
+                        ToolCall(
+                            id=f"provider-{len(self.requests)}",
+                            name="project_generate_zip",
+                            arguments={
+                                "title": "Hello Mofang",
+                                "files": {"main.py": "print('hello mofang')\n"},
+                                "presentation": "final_attachment",
+                            },
+                        ),
+                    ),
+                    usage=TokenUsage(1, 1, 2),
+                ),
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/deepseek-v4-flash",
+                cost_usd=Decimal(0),
+            )
+
+    class ZipCapabilities(FakeCapabilities):
+        def is_replay_safe(self, name: str) -> bool:
+            return name == "project.generate_zip"
+
+    class ZipHarnessToolGateway:
+        def __init__(self) -> None:
+            self.calls: list[HarnessToolCallRequest] = []
+            self.artifact_id = str(uuid4())
+
+        async def invoke(
+            self,
+            tenant_id: UUID,
+            request: HarnessToolCallRequest,
+            *,
+            user_id: UUID | None = None,
+            role: Role | None = None,
+        ) -> HarnessToolCallResult:
+            del tenant_id, user_id, role
+            self.calls.append(request)
+            return HarnessToolCallResult(
+                call_id=request.call_id,
+                tool_name=request.tool_name,
+                status="succeeded",
+                payload={
+                    "artifact_id": self.artifact_id,
+                    "file": {
+                        "artifact_id": self.artifact_id,
+                        "filename": "hello-mofang.zip",
+                        "mime_type": "application/zip",
+                        "size_bytes": 128,
+                        "sha256": "0" * 64,
+                        "download_url": f"/api/v1/runs/{RUN_ID}/artifacts/{self.artifact_id}/download",
+                    },
+                    "presentation": "final_attachment",
+                    "summary": "Generated project ZIP artifact hello-mofang.zip.",
+                },
+            )
+
+    harness = ZipHarnessToolGateway()
+    runtime = CrewDispatchRuntime(
+        EndlessZipGateway(),
+        _project_zip_plan(),
+        capability_gateway=ZipCapabilities(),
+        harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+
+    events = await _collect(runtime)
+
+    assert len(harness.calls) == 1
+    assert [event.kind for event in events if event.kind is EventKind.TOOL_FAILED] == []
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    completed = next(event for event in events if event.kind is EventKind.STEP_COMPLETED)
+    assert completed.payload["artifact_id"]
 
 
 async def test_tool_calls_forward_trusted_actor_identity_to_harness_gateway() -> None:
