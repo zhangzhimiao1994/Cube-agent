@@ -17,7 +17,7 @@ import re
 import sys
 import threading
 import weakref
-from collections.abc import AsyncIterator, Coroutine, Mapping
+from collections.abc import AsyncIterator, Coroutine, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -500,6 +500,89 @@ def _artifact_text_preview(artifact: Artifact, *, max_bytes: int = 2_000) -> str
     if not stripped:
         return None
     return _truncate_prompt_text(stripped, max_bytes=max_bytes)
+
+
+def _final_attachment_result(artifacts: Sequence[Artifact]) -> Mapping[str, JsonValue] | None:
+    for artifact in reversed(artifacts):
+        if artifact.type != "tool_result":
+            continue
+        result = artifact.content.get("result")
+        if not isinstance(result, Mapping):
+            continue
+        if result.get("presentation") != "final_attachment":
+            continue
+        file_payload = result.get("file")
+        if not isinstance(file_payload, Mapping):
+            continue
+        filename = file_payload.get("filename")
+        download_url = file_payload.get("download_url")
+        if type(filename) is str and filename.strip() and type(download_url) is str:
+            return result
+    return None
+
+
+def _final_attachment_filename(result: Mapping[str, JsonValue]) -> str | None:
+    file_payload = result.get("file")
+    if not isinstance(file_payload, Mapping):
+        return None
+    filename = file_payload.get("filename")
+    if type(filename) is not str:
+        return None
+    stripped = filename.strip()
+    return stripped or None
+
+
+def _final_attachment_text_conflicts(text: str) -> bool:
+    normalized = text.lower()
+    denial_markers = (
+        "无法",
+        "不能",
+        "没法",
+        "没有暴露",
+        "没有可用",
+        "cannot",
+        "can't",
+        "unable",
+        "not available",
+        "no harness tool",
+        "no tool",
+    )
+    return any(marker in normalized for marker in denial_markers)
+
+
+def _final_attachment_ready_text(result: Mapping[str, JsonValue]) -> str:
+    filename = _final_attachment_filename(result) or "生成文件"
+    file_payload = result.get("file")
+    mime_type = file_payload.get("mime_type") if isinstance(file_payload, Mapping) else None
+    if filename.lower().endswith(".zip") or mime_type == "application/zip":
+        return f"已生成可下载项目 ZIP：{filename}。"
+    return f"已生成可下载文件：{filename}。"
+
+
+def _reconcile_final_attachment_completion(
+    completion: GatewayCompletion,
+    artifacts: Sequence[Artifact],
+) -> GatewayCompletion:
+    text = completion.response.text
+    if type(text) is not str or not _final_attachment_text_conflicts(text):
+        return completion
+    result = _final_attachment_result(artifacts)
+    if result is None:
+        return completion
+    response = completion.response
+    return GatewayCompletion(
+        response=ModelResponse(
+            text=_final_attachment_ready_text(result),
+            tool_calls=response.tool_calls,
+            usage=response.usage,
+            provider_metadata=response.provider_metadata,
+        ),
+        deployment_id=completion.deployment_id,
+        logical_model=completion.logical_model,
+        provider_id=completion.provider_id,
+        provider_model=completion.provider_model,
+        cost_usd=completion.cost_usd,
+    )
 
 
 class RuntimeExecutionError(RuntimeError):
@@ -2516,6 +2599,8 @@ class CrewDispatchRuntime:
                 evidence.append(model_artifact)
             assert response is not None
             if not response.tool_calls:
+                if step.final_synthesizer:
+                    completion = _reconcile_final_attachment_completion(completion, evidence)
                 return completion
             if self._capabilities is None or self._tool_gateway is None or not step.tools:
                 _fail("step requested an unavailable capability")

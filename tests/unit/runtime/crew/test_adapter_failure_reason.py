@@ -954,6 +954,95 @@ async def test_project_zip_round_limit_reuses_existing_final_artifact() -> None:
     assert completed.payload["artifact_id"]
 
 
+async def test_final_project_zip_attachment_overrides_conflicting_denial_text() -> None:
+    class ConflictingZipGateway:
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            response = (
+                ModelResponse(
+                    text=None,
+                    tool_calls=(
+                        ToolCall(
+                            id="provider-1",
+                            name="project_generate_zip",
+                            arguments={
+                                "title": "Main Py Only",
+                                "files": {"main.py": 'print("hello sandbox button")'},
+                                "presentation": "final_attachment",
+                            },
+                        ),
+                    ),
+                    usage=TokenUsage(1, 1, 2),
+                )
+                if len(self.requests) == 1
+                else ModelResponse(
+                    text="无法直接生成 zip 文件，因为当前没有暴露 harness 工具。",
+                    usage=TokenUsage(1, 1, 2),
+                )
+            )
+            return GatewayCompletion(
+                response=response,
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/deepseek-v4-flash",
+                cost_usd=Decimal(0),
+            )
+
+    class ZipHarnessToolGateway:
+        async def invoke(
+            self,
+            tenant_id: UUID,
+            request: HarnessToolCallRequest,
+            *,
+            user_id: UUID | None = None,
+            role: Role | None = None,
+        ) -> HarnessToolCallResult:
+            del tenant_id, user_id, role
+            artifact_id = str(uuid4())
+            return HarnessToolCallResult(
+                call_id=request.call_id,
+                tool_name=request.tool_name,
+                status="succeeded",
+                payload={
+                    "artifact_id": artifact_id,
+                    "file": {
+                        "artifact_id": artifact_id,
+                        "filename": "main-py-only.zip",
+                        "mime_type": "application/zip",
+                        "size_bytes": 128,
+                        "sha256": "0" * 64,
+                        "download_url": (
+                            f"/api/v1/runs/{RUN_ID}/artifacts/{artifact_id}/download"
+                        ),
+                    },
+                    "presentation": "final_attachment",
+                    "summary": "Generated project ZIP artifact main-py-only.zip.",
+                },
+            )
+
+    class ZipCapabilities(FakeCapabilities):
+        def is_replay_safe(self, name: str) -> bool:
+            return name == "project.generate_zip"
+
+    runtime = CrewDispatchRuntime(
+        ConflictingZipGateway(),
+        _project_zip_plan(),
+        capability_gateway=ZipCapabilities(),
+        harness_tool_gateway=ZipHarnessToolGateway(),
+        crew_factory=FastFactory(),
+    )
+
+    events = await _collect(runtime)
+
+    completed = next(event for event in events if event.kind is EventKind.RUNTIME_COMPLETED)
+    final = completed.inputs[0]
+    assert final.content["text"] == "已生成可下载项目 ZIP：main-py-only.zip。"
+
+
 async def test_tool_calls_forward_trusted_actor_identity_to_harness_gateway() -> None:
     user_id = UUID("00000000-0000-4000-8000-000000000003")
     harness = IdentityRecordingHarnessToolGateway()
