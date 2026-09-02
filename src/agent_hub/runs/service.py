@@ -73,6 +73,7 @@ class RunSummary:
     tenant_id: UUID
     status: RunStatus
     mode: TaskMode | None
+    version: int
     request: str
     completed_step_ids: tuple[str, ...]
     artifact_ids: tuple[UUID, ...]
@@ -1684,6 +1685,7 @@ class RunService:
             tenant_id=record.tenant_id,
             status=record.status,
             mode=record.mode,
+            version=record.version,
             request=record.request,
             completed_step_ids=await self._repository.completed_step_ids(
                 record.tenant_id, record.id

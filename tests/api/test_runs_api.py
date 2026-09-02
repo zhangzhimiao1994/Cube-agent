@@ -383,6 +383,7 @@ class StubRunService:
             tenant_id=tenant_id,
             status=RunStatus.RUNNING,
             mode=TaskMode.DISPATCH,
+            version=7,
             request="safe request",
             completed_step_ids=("research",),
             artifact_ids=(uuid4(),),
@@ -414,6 +415,7 @@ class StubRunService:
             tenant_id=summary.tenant_id,
             status=RunStatus.CANCELLED,
             mode=summary.mode,
+            version=summary.version,
             request=summary.request,
             completed_step_ids=summary.completed_step_ids,
             artifact_ids=summary.artifact_ids,
@@ -1187,7 +1189,21 @@ def test_viewer_can_read_but_cannot_create_or_control_runs() -> None:
 
     assert create.status_code == 403
     assert read.status_code == 200
+    assert read.json()["version"] == 7
     assert cancel.status_code == 403
+
+
+def test_run_details_include_version_for_capability_approval() -> None:
+    client, _, _ = _client()
+    run_id = uuid4()
+
+    summary = client.get(f"/api/v1/runs/{run_id}", headers=bearer())
+    details = client.get(f"/api/v1/runs/{run_id}/details", headers=bearer())
+
+    assert summary.status_code == 200
+    assert details.status_code == 200
+    assert summary.json()["version"] == 7
+    assert details.json()["version"] == 7
 
 
 def test_run_events_and_details_never_expose_credentials_or_hidden_reasoning() -> None:

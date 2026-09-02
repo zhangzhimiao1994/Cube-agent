@@ -3505,6 +3505,7 @@ def test_operational_run_listing_details_and_controls() -> None:
     assert runs.json()[0]["capacity_wait_ms"] >= 0
     assert runs.json()[0]["cost_usd"] == "0.0132"
     assert runs.json()[0]["request"] == "Summarize current deployment readiness."
+    assert runs.json()[0]["version"] == 1
 
     detail = api.get(f"/api/v1/admin/runs/{run_id}", headers=headers())
     pause = api.post(f"/api/v1/admin/runs/{run_id}/pause", headers=headers())
@@ -3513,6 +3514,7 @@ def test_operational_run_listing_details_and_controls() -> None:
 
     assert detail.status_code == 200
     assert detail.json()["mode"] == "dispatch"
+    assert detail.json()["version"] == 1
     assert detail.json()["events"][0]["kind"] == "queued"
     assert detail.json()["artifacts"][0]["title"] == "Readiness report"
     assert pause.json()["status"] == "paused"

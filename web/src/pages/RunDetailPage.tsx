@@ -1405,11 +1405,17 @@ export function RunDetailPage() {
   const chooseMode = useMutation({
     mutationFn: (mode: ManualRunMode) => {
       if (!run.data?.decision_token) throw new Error("mode decision token is unavailable");
-      const parsedVersion = Number(run.data.explicit_details.version ?? "0");
+      const fallbackVersion = Number(run.data.explicit_details.version ?? "0");
+      const version =
+        typeof run.data.version === "number" && Number.isInteger(run.data.version) && run.data.version > 0
+          ? run.data.version
+          : Number.isInteger(fallbackVersion) && fallbackVersion > 0
+            ? fallbackVersion
+            : 0;
       return api.chooseMode(runId, {
         mode,
         decision_token: run.data.decision_token,
-        version: Number.isInteger(parsedVersion) && parsedVersion > 0 ? parsedVersion : 0,
+        version,
       });
     },
     onSuccess: async (updated) => {

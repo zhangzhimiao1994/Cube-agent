@@ -276,6 +276,7 @@ class RunSummaryResponse(BaseModel):
     tenant_id: UUID
     status: RunStatus
     mode: TaskMode | None
+    version: int
     request: str
     completed_step_ids: tuple[str, ...]
     artifact_ids: tuple[UUID, ...]
@@ -288,6 +289,7 @@ class RunSummaryResponse(BaseModel):
             tenant_id=run.tenant_id,
             status=run.status,
             mode=run.mode,
+            version=run.version,
             request=run.request,
             completed_step_ids=run.completed_step_ids,
             artifact_ids=run.artifact_ids,

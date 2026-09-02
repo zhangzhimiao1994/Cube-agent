@@ -269,6 +269,7 @@ class RunListItem(BaseModel):
     id: UUID
     status: str
     mode: str
+    version: int = Field(default=1, ge=1)
     conversation_id: str | None = None
     request: str = ""
     created_at: datetime | None = None
@@ -3000,6 +3001,7 @@ class InMemoryAdminResourceService:
                 id=run.id,
                 status=run.status,
                 mode=run.mode,
+                version=run.version,
                 conversation_id=run.explicit_details.get("conversation_id"),
                 request=run.request,
                 created_at=run.events[0].created_at if run.events else None,
@@ -3987,6 +3989,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             id=record.id,
             status=record.status.value,
             mode="auto" if record.mode is None else record.mode.value,
+            version=record.version,
             conversation_id=_routing_details(record.routing_decision).get("conversation_id"),
             request=record.request,
             created_at=record.created_at,

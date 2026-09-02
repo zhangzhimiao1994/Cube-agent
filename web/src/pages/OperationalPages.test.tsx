@@ -27,6 +27,7 @@ const runListItem: RunListItem = {
   id: runId,
   status: "running",
   mode: "dispatch",
+  version: 1,
   conversation_id: "conv-previous",
   request: "给我做一个短视频脚本方案。",
   created_at: conversationCreatedAt,
@@ -2465,10 +2466,11 @@ describe("operational management pages", () => {
   });
   it("allows a pending sandbox capability from the composer card", async () => {
     const user = userEvent.setup();
-    visibleRunListItem = { ...runListItem, status: "waiting_approval" };
+    visibleRunListItem = { ...runListItem, status: "waiting_approval", version: 5 };
     visibleRunDetail = {
       ...runDetail,
       status: "waiting_approval",
+      version: 5,
       explicit_details: {
         ...runDetail.explicit_details,
         approval_kind: "capability_tool",

@@ -508,6 +508,7 @@ const RunListItemSchema = z.object({
   id: z.string(),
   status: z.string(),
   mode: z.string(),
+  version: z.number().optional(),
   conversation_id: z.string().nullable().optional(),
   request: z.string().optional(),
   created_at: z.string().nullable().optional(),

@@ -1332,6 +1332,14 @@ function toggle(list: string[], value: string) {
   return list.includes(value) ? list.filter((item) => item !== value) : [...list, value];
 }
 
+export function runDetailVersion(run: RunDetail): number {
+  if (typeof run.version === "number" && Number.isInteger(run.version) && run.version > 0) {
+    return run.version;
+  }
+  const parsedVersion = Number(run.explicit_details.version ?? "0");
+  return Number.isInteger(parsedVersion) && parsedVersion > 0 ? parsedVersion : 0;
+}
+
 function explainActualMode(run: { status: string; mode: string | null }) {
   if (run.status === "waiting_user_mode") {
     return "自动检测没有足够把握，这轮回复需要你确认运行模式。";
@@ -1352,11 +1360,10 @@ function modeSelectionFromSubmittedRun(run: SubmittedRun): ModeSelection | null 
 
 function modeSelectionFromRunDetail(run: RunDetail | undefined): ModeSelection | null {
   if (!run || run.status !== "waiting_user_mode" || !run.decision_token) return null;
-  const parsedVersion = Number(run.explicit_details.version ?? "0");
   return {
     runId: run.id,
     decisionToken: run.decision_token,
-    version: Number.isInteger(parsedVersion) && parsedVersion > 0 ? parsedVersion : 0,
+    version: runDetailVersion(run),
     reason: run.explicit_details.routing_reason ?? null,
   };
 }
@@ -1365,11 +1372,10 @@ function temporaryApprovalFromRunDetail(run: RunDetail | undefined) {
   if (!run || run.status !== "waiting_approval" || !run.decision_token || !run.temporary_agent_proposal) {
     return null;
   }
-  const parsedVersion = Number(run.explicit_details.version ?? "0");
   return {
     runId: run.id,
     decisionToken: run.decision_token,
-    version: Number.isInteger(parsedVersion) && parsedVersion > 0 ? parsedVersion : 0,
+    version: runDetailVersion(run),
     proposal: run.temporary_agent_proposal,
     approved: false,
   };
@@ -1414,11 +1420,10 @@ function repairApprovalFromSubmittedRun(run: SubmittedRun) {
 
 function repairApprovalFromRunDetail(run: RunDetail | undefined) {
   if (!run || run.status !== "failed" || !run.decision_token || !run.repair_proposal) return null;
-  const parsedVersion = Number(run.explicit_details.version ?? "0");
   return {
     runId: run.id,
     decisionToken: run.decision_token,
-    version: Number.isInteger(parsedVersion) && parsedVersion > 0 ? parsedVersion : 0,
+    version: runDetailVersion(run),
     proposal: run.repair_proposal,
   };
 }
@@ -1428,7 +1433,6 @@ function capabilityApprovalFromRunDetail(run: RunDetail | undefined): Capability
   if (run.explicit_details.approval_kind !== "capability_tool") return null;
   const approvalId = run.explicit_details.approval_id?.trim();
   if (!approvalId) return null;
-  const parsedVersion = Number(run.explicit_details.version ?? "0");
   const pending = approvalStateFromEvents(run.events).pending.at(-1);
   const diagnostic = run.failure_diagnostics.find((item) => item.approval_id === approvalId);
   const summary =
@@ -1440,7 +1444,7 @@ function capabilityApprovalFromRunDetail(run: RunDetail | undefined): Capability
   return {
     runId: run.id,
     approvalId,
-    version: Number.isInteger(parsedVersion) && parsedVersion > 0 ? parsedVersion : 0,
+    version: runDetailVersion(run),
     summary,
   };
 }

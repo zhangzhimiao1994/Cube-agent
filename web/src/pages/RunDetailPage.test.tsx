@@ -18,6 +18,7 @@ const runDetail: RunDetail = {
   id: runId,
   status: "completed",
   mode: "dispatch",
+  version: 1,
   conversation_id: "conv-run-detail",
   request: "请生成独立运行详情页回归样例。",
   created_at: "2026-08-20T00:00:00Z",
