@@ -5,7 +5,11 @@ from enum import StrEnum
 from uuid import UUID
 
 from agent_hub.auth.models import Role
-from agent_hub.capabilities.approvals import ApprovalRecord, ApprovalService
+from agent_hub.capabilities.approvals import (
+    ApprovalRecord,
+    ApprovalService,
+    capability_approval_scope,
+)
 from agent_hub.capabilities.policy import CapabilityPolicy
 from agent_hub.capabilities.types import CapabilityRequest, PolicyEffect
 
@@ -53,6 +57,7 @@ class CapabilityGateway:
                 request.run_id,
                 approval_id=approval.id,
                 approval_fingerprint=approval.request_fingerprint,
+                approval_scope=capability_approval_scope(request),
             )
 
         approval = await self._approvals.start_waiting(

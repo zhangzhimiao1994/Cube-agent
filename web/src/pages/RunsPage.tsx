@@ -1785,8 +1785,8 @@ function preferredReplyArtifact(artifacts: RunDetail["artifacts"]) {
   );
 }
 
-function runConversationId(detail: RunDetail | undefined) {
-  return detail?.explicit_details.conversation_id?.trim() || null;
+export function runConversationId(detail: RunDetail | undefined) {
+  return detail?.explicit_details.conversation_id?.trim() || detail?.conversation_id?.trim() || null;
 }
 
 function normalizeConversationQuestion(value: string | undefined, fallback: string) {

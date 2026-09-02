@@ -15,6 +15,10 @@ const downloadable = {
   sha256: "8f4d0c8d0e4d9d3a0a6a8e2e4b7a6c1d8e9f0a1b2c3d4e5f67890123456789ab",
   download_url: "/api/v1/admin/runs/run-1/artifacts/artifact-zip/download",
 };
+const userDownloadable = {
+  ...downloadable,
+  download_url: "/api/v1/runs/run-1/artifacts/artifact-zip/download",
+};
 
 describe("ArtifactFileCard", () => {
   beforeEach(() => {
@@ -80,6 +84,45 @@ describe("ArtifactFileCard", () => {
       expect(anchorClick).toHaveBeenCalledTimes(1);
     });
     expect(URL.createObjectURL).toHaveBeenCalled();
+  });
+
+  it("downloads generated files from the user run download path", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(new Blob(["zip-bytes"], { type: "application/zip" }), {
+        status: 200,
+        headers: { "content-type": "application/zip" },
+      }),
+    );
+    const objectUrl = "blob:artifact-download";
+    const anchorClick = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("URL", {
+      ...URL,
+      createObjectURL: vi.fn(() => objectUrl),
+      revokeObjectURL: vi.fn(),
+    });
+    vi.spyOn(document, "createElement").mockImplementation((tagName) => {
+      const element = document.createElementNS("http://www.w3.org/1999/xhtml", tagName);
+      if (tagName.toLowerCase() === "a") {
+        Object.defineProperty(element, "click", { value: anchorClick });
+      }
+      return element as HTMLElement;
+    });
+
+    render(<ArtifactFileCard artifact={userDownloadable} />);
+    await userEvent.click(screen.getByRole("button", { name: "下载 源码包" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringMatching(/^\/api\/v1\/runs\/run-1\/artifacts\/artifact-zip\/download\?_=/),
+        expect.objectContaining({
+          cache: "no-store",
+          credentials: "include",
+          headers: expect.objectContaining({ Authorization: "Bearer owner-token" }),
+        }),
+      );
+      expect(anchorClick).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("requires only a non-empty download URL for download eligibility", () => {

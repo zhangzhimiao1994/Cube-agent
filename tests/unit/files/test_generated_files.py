@@ -132,14 +132,14 @@ def test_metadata_contains_public_file_contract(tmp_path: Path) -> None:
         f"{tenant_id}/{run_id}/{artifact_id}/launch-deck.pptx"
     )
     assert metadata.download_url == (
-        f"/api/v1/admin/runs/{run_id}/artifacts/{artifact_id}/download"
+        f"/api/v1/runs/{run_id}/artifacts/{artifact_id}/download"
     )
     assert metadata.to_public_dict() == {
         "filename": "launch-deck.pptx",
         "mime_type": PPTX_MIME,
         "size_bytes": len(data),
         "sha256": sha256(data).hexdigest(),
-        "download_url": f"/api/v1/admin/runs/{run_id}/artifacts/{artifact_id}/download",
+        "download_url": f"/api/v1/runs/{run_id}/artifacts/{artifact_id}/download",
     }
     assert metadata.to_content_file() == {
         **metadata.to_public_dict(),

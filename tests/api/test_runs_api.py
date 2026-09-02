@@ -34,6 +34,9 @@ class StubAuthService:
 class StubSettingsService:
     vibe_coding_enabled: bool = False
     audit_events: list[dict[str, object]] = field(default_factory=list)
+    download_path: Path | None = None
+    download_filename: str = "artifact.zip"
+    download_mime_type: str = "application/zip"
 
     async def get_settings(self) -> object:
         return type("Settings", (), {"vibe_coding_enabled": self.vibe_coding_enabled})()
@@ -48,6 +51,20 @@ class StubSettingsService:
     ) -> object:
         self.audit_events.append({"actor": actor, "action": action, "resource": resource, "details": details})
         return object()
+
+    async def download_run_artifact(self, run_id: UUID, artifact_id: UUID) -> object:
+        del run_id, artifact_id
+        if self.download_path is None:
+            raise KeyError("download not configured")
+        return type(
+            "Download",
+            (),
+            {
+                "path": self.download_path,
+                "filename": self.download_filename,
+                "mime_type": self.download_mime_type,
+            },
+        )()
 
 
 @dataclass(slots=True)
@@ -1093,6 +1110,25 @@ def test_reject_capability_cancels_waiting_run_safely() -> None:
     assert response.status_code == 202
     assert response.json()["status"] == "cancelled"
     assert response.json()["mode"] == "dispatch"
+
+
+def test_user_run_download_path_returns_generated_artifact(tmp_path: Path) -> None:
+    artifact_path = tmp_path / "hello-world.zip"
+    artifact_path.write_bytes(b"zip-bytes")
+    settings = StubSettingsService(download_path=artifact_path, download_filename="hello-world.zip")
+    client, _, _ = _client(settings_service=settings)
+    run_id = uuid4()
+    artifact_id = uuid4()
+
+    response = client.get(
+        f"/api/v1/runs/{run_id}/artifacts/{artifact_id}/download",
+        headers=bearer(),
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"zip-bytes"
+    assert response.headers["content-type"].startswith("application/zip")
+    assert "hello-world.zip" in response.headers["content-disposition"]
 
 
 def test_submitted_run_response_includes_safe_self_repair_proposal() -> None:

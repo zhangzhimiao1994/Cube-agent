@@ -9,6 +9,7 @@ from agent_hub.auth.models import Role
 from agent_hub.capabilities.approvals import (
     ApprovalService,
     InMemoryApprovalStore,
+    capability_approval_scope,
     fingerprint_capability_request,
 )
 from agent_hub.capabilities.gateway import CapabilityGateway, CapabilityResult, CapabilityStatus
@@ -47,6 +48,8 @@ class DefaultRuntimeCapabilityPolicyGateway:
     ) -> CapabilityResult:
         if await _has_approved_capability_request(self._run_repository, request):
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
+        if await _has_approved_capability_scope(self._run_repository, request):
+            return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
         gateway = CapabilityGateway(
             default_capability_policy(
                 request.tenant_id,
@@ -77,6 +80,16 @@ async def _has_approved_capability_request(repository: object, request: Capabili
             fingerprint_capability_request(request),
         )
     )
+
+
+async def _has_approved_capability_scope(repository: object, request: CapabilityRequest) -> bool:
+    approval_scope = capability_approval_scope(request)
+    if approval_scope is None:
+        return False
+    checker = getattr(repository, "is_capability_approval_scope_approved", None)
+    if not callable(checker):
+        return False
+    return bool(await checker(request.tenant_id, request.run_id, approval_scope))
 
 
 def default_capability_policy(

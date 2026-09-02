@@ -7633,7 +7633,7 @@ def _artifact_file_metadata(
         except ValueError:
             return metadata
         metadata["download_url"] = (
-            f"/api/v1/admin/runs/{run_id}/artifacts/{parsed_artifact_id}/download"
+            f"/api/v1/runs/{run_id}/artifacts/{parsed_artifact_id}/download"
         )
     return metadata
 

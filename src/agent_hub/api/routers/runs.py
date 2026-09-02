@@ -17,6 +17,7 @@ from urllib.parse import unquote
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, Request, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -153,6 +154,20 @@ class RunServiceProtocol(Protocol):
     async def resume(self, tenant_id: UUID, run_id: UUID) -> RunSummary: ...
 
     async def cancel(self, tenant_id: UUID, run_id: UUID) -> RunSummary: ...
+
+
+class GeneratedArtifactDownloadProtocol(Protocol):
+    path: Path
+    filename: str
+    mime_type: str
+
+
+class RunArtifactDownloadServiceProtocol(Protocol):
+    async def download_run_artifact(
+        self,
+        run_id: UUID,
+        artifact_id: UUID,
+    ) -> GeneratedArtifactDownloadProtocol: ...
 
 
 class CreateRunRequest(BaseModel):
@@ -370,6 +385,13 @@ def _run_service(request: Request) -> RunServiceProtocol:
     if service is None:
         raise PublicAPIError(503, "service_unavailable", "service unavailable")
     return cast(RunServiceProtocol, service)
+
+
+def _download_service(request: Request) -> RunArtifactDownloadServiceProtocol:
+    service = getattr(request.app.state, "admin_resource_service", None)
+    if service is None:
+        raise PublicAPIError(503, "service_unavailable", "service unavailable")
+    return cast(RunArtifactDownloadServiceProtocol, service)
 
 
 async def _vibe_coding_enabled(request: Request) -> bool:
@@ -1094,6 +1116,28 @@ async def run_details(
     except RunNotFound as error:
         raise _run_not_found() from error
     return RunSummaryResponse.from_summary(summary)
+
+
+@router.get(
+    "/{run_id}/artifacts/{artifact_id}/download",
+    response_class=FileResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def download_run_artifact(
+    run_id: UUID,
+    artifact_id: UUID,
+    service: Annotated[RunArtifactDownloadServiceProtocol, Depends(_download_service)],
+    _principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:read"))],
+) -> FileResponse:
+    try:
+        download = await service.download_run_artifact(run_id, artifact_id)
+    except (KeyError, FileNotFoundError, ValueError):
+        raise PublicAPIError(404, "not_found", "not found") from None
+    return FileResponse(
+        download.path,
+        media_type=download.mime_type,
+        filename=download.filename,
+    )
 
 
 @router.post("/{run_id}/pause", response_model=RunSummaryResponse)

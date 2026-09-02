@@ -126,7 +126,7 @@ class GeneratedFileStore:
             size_bytes=len(data),
             sha256=digest,
             storage_key=storage_key,
-            download_url=f"/api/v1/admin/runs/{run_id}/artifacts/{artifact_id}/download",
+            download_url=f"/api/v1/runs/{run_id}/artifacts/{artifact_id}/download",
         )
 
     def resolve(self, storage_key: str) -> Path:

@@ -34,6 +34,7 @@ class RunStatusRepository(Protocol):
         *,
         approval_id: str,
         approval_fingerprint: str,
+        approval_scope: str | None = None,
     ) -> object: ...
 
     async def resolve_capability_approval(
@@ -55,6 +56,7 @@ class ApprovalRecord:
     user_id: UUID
     run_id: UUID
     expires_at: datetime
+    request_scope: str | None = None
     status: str = "pending"
 
 
@@ -71,6 +73,12 @@ class InMemoryApprovalStore:
     async def get_pending_by_fingerprint(self, fingerprint: str) -> ApprovalRecord | None:
         for record in self._records.values():
             if record.status == "pending" and record.request_fingerprint == fingerprint:
+                return record
+        return None
+
+    async def get_pending_by_scope(self, scope: str) -> ApprovalRecord | None:
+        for record in self._records.values():
+            if record.status == "pending" and record.request_scope == scope:
                 return record
         return None
 
@@ -132,6 +140,7 @@ class ApprovalService:
                 user_id=record.user_id,
                 run_id=record.run_id,
                 expires_at=record.expires_at,
+                request_scope=record.request_scope,
                 status="approved",
             )
             if self._run_repository is not None:
@@ -169,6 +178,7 @@ class ApprovalService:
                         user_id=record.user_id,
                         run_id=record.run_id,
                         expires_at=record.expires_at,
+                        request_scope=record.request_scope,
                         status="expired",
                     )
                 )
@@ -180,6 +190,7 @@ class ApprovalService:
                 user_id=record.user_id,
                 run_id=record.run_id,
                 expires_at=record.expires_at,
+                request_scope=record.request_scope,
                 status="rejected",
             )
             if self._run_repository is not None:
@@ -206,6 +217,7 @@ class ApprovalService:
                     user_id=record.user_id,
                     run_id=record.run_id,
                     expires_at=record.expires_at,
+                    request_scope=record.request_scope,
                     status="expired",
                 )
                 if self._run_repository is not None:
@@ -249,6 +261,7 @@ class ApprovalService:
                     user_id=record.user_id,
                     run_id=record.run_id,
                     expires_at=record.expires_at,
+                    request_scope=record.request_scope,
                     status="expired",
                 )
             )
@@ -260,6 +273,11 @@ class ApprovalService:
         existing = await self._store.get_pending_by_fingerprint(fingerprint)
         if existing is not None:
             return existing
+        request_scope = capability_approval_scope(request)
+        if request_scope is not None:
+            existing = await self._store.get_pending_by_scope(request_scope)
+            if existing is not None:
+                return existing
         record = ApprovalRecord(
             id=f"approval_{uuid4().hex}",
             request_fingerprint=fingerprint,
@@ -267,6 +285,7 @@ class ApprovalService:
             user_id=request.user_id,
             run_id=request.run_id,
             expires_at=self._clock() + self._expires_in,
+            request_scope=request_scope,
         )
         await self._store.put(record)
         return record
@@ -298,6 +317,26 @@ def fingerprint_capability_request(request: CapabilityRequest) -> str:
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def capability_approval_scope(request: CapabilityRequest) -> str | None:
+    normalized_resource = normalize_resource(request.resource)
+    if (
+        request.capability != "file"
+        or request.operation != "create"
+        or normalized_resource is None
+        or not normalized_resource.startswith("generated/")
+    ):
+        return None
+    return (
+        "capability-scope:v1:"
+        f"tenant={request.tenant_id}:"
+        f"user={request.user_id}:"
+        f"run={request.run_id}:"
+        f"capability={request.capability}:"
+        f"operation={request.operation}:"
+        f"resource={normalized_resource}"
+    )
 
 
 def _fingerprint_request(request: CapabilityRequest) -> str:

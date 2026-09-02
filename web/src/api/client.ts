@@ -1170,7 +1170,7 @@ async function requestBinary<T>(
 }
 
 const GENERATED_ARTIFACT_DOWNLOAD_PATH =
-  /^\/api\/v1\/admin\/runs\/[^/]+\/artifacts\/[^/]+\/download$/;
+  /^\/api\/v1\/(?:admin\/)?runs\/[^/]+\/artifacts\/[^/]+\/download$/;
 
 async function requestDownload(path: string): Promise<Blob> {
   if (!GENERATED_ARTIFACT_DOWNLOAD_PATH.test(path)) {

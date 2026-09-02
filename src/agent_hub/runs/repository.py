@@ -600,6 +600,7 @@ class RunRepository:
         *,
         approval_id: str,
         approval_fingerprint: str,
+        approval_scope: str | None = None,
     ) -> RunRecord:
         async with self._session_factory() as session, session.begin():
             row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
@@ -621,6 +622,7 @@ class RunRepository:
                 "approval_id": approval_id,
                 "approval_fingerprint": approval_fingerprint,
                 "reason": "capability requires approval",
+                **({"approval_scope": approval_scope} if approval_scope else {}),
             }
             row.version += 1
             await self._upsert_capability_approval(
@@ -629,6 +631,7 @@ class RunRepository:
                 run_id,
                 approval_id=approval_id,
                 approval_fingerprint=approval_fingerprint,
+                approval_scope=approval_scope,
                 status="pending",
             )
             await session.flush()
@@ -661,7 +664,8 @@ class RunRepository:
             row.routing_decision = {
                 key: value
                 for key, value in routing_decision.items()
-                if key not in {"approval_kind", "approval_id", "approval_fingerprint"}
+                if key
+                not in {"approval_kind", "approval_id", "approval_fingerprint", "approval_scope"}
             }
             await self._upsert_capability_approval(
                 session,
@@ -669,6 +673,7 @@ class RunRepository:
                 run_id,
                 approval_id=approval_id,
                 approval_fingerprint=approval_fingerprint,
+                approval_scope=_optional_string(routing_decision.get("approval_scope")),
                 status="approved" if status is RunStatus.RUNNING else "rejected",
             )
             row.version += 1
@@ -696,6 +701,24 @@ class RunRepository:
                 for row in rows
             )
 
+    async def is_capability_approval_scope_approved(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        approval_scope: str,
+    ) -> bool:
+        async with self._session_factory() as session:
+            rows = (
+                await session.scalars(
+                    select(RunApprovalRow).where(
+                        RunApprovalRow.tenant_id == tenant_id,
+                        RunApprovalRow.run_id == run_id,
+                        RunApprovalRow.status == "approved",
+                    )
+                )
+            ).all()
+            return any(row.payload.get("approval_scope") == approval_scope for row in rows)
+
     async def approve_capability_and_enqueue(
         self,
         *,
@@ -718,12 +741,14 @@ class RunRepository:
             approval_fingerprint = routing_decision.get("approval_fingerprint")
             if type(approval_fingerprint) is not str or not approval_fingerprint:
                 raise RunConflict("capability approval fingerprint is missing")
+            approval_scope = _optional_string(routing_decision.get("approval_scope"))
             if row.version != version:
                 raise RunConflict("run version is stale")
             row.routing_decision = {
                 key: value
                 for key, value in routing_decision.items()
-                if key not in {"approval_kind", "approval_id", "approval_fingerprint"}
+                if key
+                not in {"approval_kind", "approval_id", "approval_fingerprint", "approval_scope"}
             }
             row.status = RunStatus.QUEUED.value
             row.version += 1
@@ -733,6 +758,7 @@ class RunRepository:
                 run_id,
                 approval_id=approval_id,
                 approval_fingerprint=approval_fingerprint,
+                approval_scope=approval_scope,
                 status="approved",
             )
             await session.flush()
@@ -771,12 +797,14 @@ class RunRepository:
             approval_fingerprint = routing_decision.get("approval_fingerprint")
             if type(approval_fingerprint) is not str or not approval_fingerprint:
                 raise RunConflict("capability approval fingerprint is missing")
+            approval_scope = _optional_string(routing_decision.get("approval_scope"))
             if row.version != version:
                 raise RunConflict("run version is stale")
             row.routing_decision = {
                 key: value
                 for key, value in routing_decision.items()
-                if key not in {"approval_kind", "approval_id", "approval_fingerprint"}
+                if key
+                not in {"approval_kind", "approval_id", "approval_fingerprint", "approval_scope"}
             }
             row.status = RunStatus.CANCELLED.value
             row.version += 1
@@ -786,6 +814,7 @@ class RunRepository:
                 run_id,
                 approval_id=approval_id,
                 approval_fingerprint=approval_fingerprint,
+                approval_scope=approval_scope,
                 status="rejected",
             )
             await session.flush()
@@ -1197,6 +1226,7 @@ class RunRepository:
         *,
         approval_id: str,
         approval_fingerprint: str,
+        approval_scope: str | None = None,
         status: str,
     ) -> None:
         payload: dict[str, object] = {
@@ -1204,6 +1234,7 @@ class RunRepository:
             "approval_fingerprint": approval_fingerprint,
             "approval_kind": "capability_tool",
             "status": status,
+            **({"approval_scope": approval_scope} if approval_scope else {}),
         }
         await session.execute(
             insert(RunApprovalRow)
@@ -1317,6 +1348,10 @@ def _sanitize_public_json(value: object) -> object:
     if type(value) is str and _SENSITIVE_PUBLIC_TEXT.search(value):
         return "[redacted]"
     return value
+
+
+def _optional_string(value: object) -> str | None:
+    return value if type(value) is str else None
 
 
 def _is_public_key(key: str) -> bool:

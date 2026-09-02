@@ -155,8 +155,8 @@ async function mockCodingRunApi(
 ) {
   const finalArtifactId = "55555555-5555-4555-8555-555555555555";
   const intermediateArtifactId = "66666666-6666-4666-8666-666666666666";
-  const finalDownloadPath = `/api/v1/admin/runs/${codingRunId}/artifacts/${finalArtifactId}/download`;
-  const intermediateDownloadPath = `/api/v1/admin/runs/${codingRunId}/artifacts/${intermediateArtifactId}/download`;
+  const finalDownloadPath = `/api/v1/runs/${codingRunId}/artifacts/${finalArtifactId}/download`;
+  const intermediateDownloadPath = `/api/v1/runs/${codingRunId}/artifacts/${intermediateArtifactId}/download`;
   let detailRequests = 0;
   const runDetail = {
     id: codingRunId,
