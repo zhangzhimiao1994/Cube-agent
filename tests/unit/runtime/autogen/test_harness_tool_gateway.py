@@ -239,6 +239,128 @@ async def test_gateway_capability_tool_preserves_deterministic_harness_failure()
     assert '"evidence"' not in json.dumps(dict(failed.payload))
 
 
+async def test_gateway_capability_tool_reuses_existing_final_project_zip_after_failure() -> None:
+    class ReplayGateway:
+        def is_replay_safe(self, name: str) -> bool:
+            return name == "project.generate_zip"
+
+        async def execute(
+            self,
+            *,
+            tenant_id: UUID,
+            run_id: UUID,
+            actor: str,
+            name: str,
+            arguments: Mapping[str, JsonValue],
+            idempotency_key: str,
+        ) -> Mapping[str, JsonValue]:
+            del tenant_id, run_id, actor, name, arguments, idempotency_key
+            raise AssertionError("tool execution must be routed through harness")
+
+    class FlakyZipHarnessGateway:
+        def __init__(self) -> None:
+            self.calls: list[HarnessToolCallRequest] = []
+            self.artifact_id = str(uuid4())
+
+        async def invoke(
+            self,
+            tenant_id: UUID,
+            request: HarnessToolCallRequest,
+            *,
+            user_id: UUID | None = None,
+            role: Role | None = None,
+        ) -> HarnessToolCallResult:
+            del tenant_id, user_id, role
+            self.calls.append(request)
+            if len(self.calls) == 1:
+                return HarnessToolCallResult(
+                    call_id=request.call_id,
+                    tool_name=request.tool_name,
+                    status="succeeded",
+                    payload={
+                        "artifact_id": self.artifact_id,
+                        "file": {
+                            "artifact_id": self.artifact_id,
+                            "filename": "hello-world-python.zip",
+                            "mime_type": "application/zip",
+                            "size_bytes": 128,
+                            "sha256": "0" * 64,
+                            "download_url": f"/api/v1/admin/runs/{request.run_id}/artifacts/{self.artifact_id}/download",
+                        },
+                        "presentation": "final_attachment",
+                        "summary": "Generated project ZIP artifact hello-world-python.zip.",
+                    },
+                )
+            return HarnessToolCallResult(
+                call_id=request.call_id,
+                tool_name=request.tool_name,
+                status="failed",
+                payload={},
+                failure_reason="generated artifact store rejected duplicate request",
+            )
+
+    async def publish(
+        durable_artifacts: tuple[Artifact, ...],
+        model_entries: tuple[dict[str, JsonValue], ...],
+        tool_entries: tuple[dict[str, JsonValue], ...],
+    ) -> None:
+        del durable_artifacts, model_entries, tool_entries
+
+    async def store(artifact: Artifact) -> UUID:
+        del artifact
+        return uuid4()
+
+    async def abort(write_id: UUID) -> bool:
+        del write_id
+        return True
+
+    def finalize(write_id: UUID) -> None:
+        del write_id
+
+    run_id = uuid4()
+    records: list[Any] = []
+    harness = FlakyZipHarnessGateway()
+    tool = GatewayCapabilityTool(
+        ReplayGateway(),
+        tenant_id=uuid4(),
+        run_id=run_id,
+        actor="implementer",
+        name="project.generate_zip",
+        records=records,
+        durability=_DiscussionDurability(
+            publish,
+            store,
+            abort,
+            finalize,
+            run_id=run_id,
+        ),
+        harness_tool_gateway=harness,
+        user_id=uuid4(),
+        role=Role.OPERATOR,
+    )
+
+    first = await tool.run_json(
+        {"title": "Hello", "files": {"hello.py": "print('hello')\n"}},
+        CancellationToken(),
+        call_id="call_1",
+    )
+    second = await tool.run_json(
+        {"title": "Hello", "files": {"hello.py": "print('hello')\n"}},
+        CancellationToken(),
+        call_id="call_2",
+    )
+
+    assert len(harness.calls) == 2
+    assert first.result["file"]["filename"] == "hello-world-python.zip"
+    assert second.result["file"]["filename"] == "hello-world-python.zip"
+    assert [record.kind for record in records] == [
+        EventKind.TOOL_STARTED,
+        EventKind.TOOL_COMPLETED,
+        EventKind.TOOL_STARTED,
+        EventKind.TOOL_COMPLETED,
+    ]
+
+
 async def test_autogen_runtime_yields_tool_failure_before_runtime_failure() -> None:
     class ToolCallingGateway:
         def __init__(self) -> None:

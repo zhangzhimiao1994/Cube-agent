@@ -25,6 +25,12 @@ _INJECTABLE_MEMORY_TYPES = {
     "error_handling",
     "scheduling_rule",
 }
+_NON_INJECTABLE_TARGETS = {
+    "learning_ledger",
+    "runtime_observation",
+    "scheduler",
+    "scheduler_observation",
+}
 _LOW_QUALITY_PHRASES = (
     "这个任务成功了",
     "任务成功了",
@@ -375,6 +381,9 @@ def _lesson_noise_reason(lesson: dict[str, object]) -> str | None:
     noise = _float_or_default(lesson.get("noise_risk"), 0.0)
     text = f"{lesson.get('lesson', '')} {lesson.get('user_summary', '')}"
     memory_type = _lesson_memory_type(lesson)
+    target = _lesson_target(lesson)
+    if target in _NON_INJECTABLE_TARGETS:
+        return "观察类记忆仅用于台账展示"
     if confidence < 0.45:
         return "置信度不足"
     if noise >= 0.7:

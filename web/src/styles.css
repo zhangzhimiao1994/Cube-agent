@@ -2366,9 +2366,12 @@ article:hover {
   align-items: flex-end;
   background: rgba(0, 0, 0, 0.28);
   display: flex;
+  height: 100dvh;
   inset: 0;
   justify-content: center;
+  overscroll-behavior: contain;
   position: fixed;
+  width: 100vw;
   z-index: 30;
 }
 

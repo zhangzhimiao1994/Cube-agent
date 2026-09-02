@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -85,6 +85,7 @@ describe("MainAgentPage", () => {
   });
 
   afterEach(() => {
+    cleanup();
     window.sessionStorage.clear();
     vi.unstubAllGlobals();
   });
@@ -180,7 +181,7 @@ describe("MainAgentPage", () => {
     expect(screen.getAllByText("deepseek").length).toBeGreaterThan(0);
     expect(screen.getAllByText("https://api.deepseek.com/v1").length).toBeGreaterThan(0);
     expect(screen.getByText("2 / 3")).not.toBeNull();
-    expect(screen.getByText("可沿用当前已保存 Key")).not.toBeNull();
+    expect(await screen.findByText("可沿用当前已保存 Key")).not.toBeNull();
 
     await user.selectOptions(screen.getByTestId("main-agent-model"), "deepseek-v4-pro");
     expect(screen.getByText("可沿用当前已保存 Key")).not.toBeNull();

@@ -99,6 +99,27 @@ class FakeRuntime:
         raise AssertionError("not used")
 
 
+class FailingRuntime:
+    mode = TaskMode.DISPATCH
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        yield RunEvent(
+            kind=EventKind.RUNTIME_FAILED,
+            sequence=1,
+            run_id=context.run_id,
+            reason="synthetic failure for Hermes ledger",
+        )
+
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        raise AssertionError("not used")
+
+    async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
+        raise AssertionError("not used")
+
+    async def cancel(self) -> None:
+        raise AssertionError("not used")
+
+
 class WaitingModeRouter:
     async def route(self, task_text: object) -> RouteDecision:
         del task_text
@@ -657,6 +678,133 @@ async def test_completed_run_records_bounded_hermes_outcome(
             agent_ids=("director", "copywriter"),
         )
     ]
+
+
+async def test_continued_conversation_records_visible_hermes_ledger_after_clear(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    user_id = uuid4()
+    conversation_id = "conv-cleared-ledger-visible"
+    repository = RunRepository(run_session_factory)
+    service = RunService(
+        repository,
+        runtime_registry=RuntimeRegistry((FakeRuntime(),)),
+        router=None,
+        task_queue=RecordingQueue([]),
+        hermes_advisor=PersistentHermesRunAdvisor(run_session_factory),
+    )
+    old_run = await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        request="old conversation turn to clear",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.CANCELLED,
+        idempotency_key="client-request-cleared-ledger-old",
+        routing_decision={"conversation_id": conversation_id},
+        enqueue=False,
+    )
+    await repository.delete_run(tenant_id, old_run.id)
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        message="continue after clearing the visible conversation",
+        mode=TaskMode.DISPATCH,
+        agent_ids=("writer",),
+        workflow_id="post-clear-ledger",
+        conversation_id=conversation_id,
+    )
+
+    completed = await service.execute(submitted.id)
+
+    assert completed.status is RunStatus.COMPLETED
+    async with run_session_factory() as session:
+        rows = (
+            await session.execute(
+                select(AdminResourceRow)
+                .where(AdminResourceRow.tenant_id == tenant_id)
+                .where(AdminResourceRow.kind == "hermes")
+                .order_by(AdminResourceRow.created_at.desc())
+            )
+        ).scalars().all()
+
+    payloads = [dict(row.payload) for row in rows]
+    conversation_payload = next(
+        payload
+        for payload in payloads
+        if payload["id"] == f"hermes_conversation_{submitted.id.hex}"
+    )
+    assert conversation_payload["category"] == "conversation"
+    assert conversation_payload["target"] == "learning_ledger"
+    assert conversation_payload["memory_type"] == "conversation_outcome_summary"
+    assert conversation_payload["conversation_id"] == conversation_id
+    assert conversation_payload["confirmed_at"] is None
+    assert "对话记忆记录了一条可复用经验" in str(conversation_payload["user_summary"])
+
+
+async def test_failed_run_records_visible_hermes_ledger_after_clear(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id = uuid4()
+    user_id = uuid4()
+    conversation_id = "conv-cleared-ledger-visible-failed"
+    repository = RunRepository(run_session_factory)
+    service = RunService(
+        repository,
+        runtime_registry=RuntimeRegistry((FailingRuntime(),)),
+        router=None,
+        task_queue=RecordingQueue([]),
+        hermes_advisor=PersistentHermesRunAdvisor(run_session_factory),
+    )
+    old_run = await repository.create_run(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        request="old failed conversation turn to clear",
+        mode=TaskMode.DISPATCH,
+        status=RunStatus.CANCELLED,
+        idempotency_key="client-request-cleared-ledger-failed-old",
+        routing_decision={"conversation_id": conversation_id},
+        enqueue=False,
+    )
+    await repository.delete_run(tenant_id, old_run.id)
+
+    submitted = await service.submit(
+        tenant_id=tenant_id,
+        actor_id=user_id,
+        message="continue after clearing the visible conversation and fail",
+        mode=TaskMode.DISPATCH,
+        agent_ids=("writer",),
+        workflow_id="post-clear-ledger",
+        conversation_id=conversation_id,
+    )
+
+    failed = await service.execute(submitted.id)
+
+    assert failed.status is RunStatus.FAILED
+    async with run_session_factory() as session:
+        rows = (
+            await session.execute(
+                select(AdminResourceRow)
+                .where(AdminResourceRow.tenant_id == tenant_id)
+                .where(AdminResourceRow.kind == "hermes")
+                .order_by(AdminResourceRow.created_at.desc())
+            )
+        ).scalars().all()
+
+    payloads = [dict(row.payload) for row in rows]
+    conversation_payload = next(
+        payload
+        for payload in payloads
+        if payload["id"] == f"hermes_conversation_{submitted.id.hex}"
+    )
+    assert conversation_payload["category"] == "conversation"
+    assert conversation_payload["outcome"] == "failure"
+    assert conversation_payload["target"] == "learning_ledger"
+    assert conversation_payload["memory_type"] == "conversation_outcome_summary"
+    assert conversation_payload["conversation_id"] == conversation_id
+    assert conversation_payload["confirmed_at"] is None
+    assert "对话记忆记录了一条风险提醒" in str(conversation_payload["user_summary"])
 
 
 async def test_persistent_hermes_runtime_outcome_is_scheduler_observation(

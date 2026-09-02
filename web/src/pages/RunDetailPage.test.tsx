@@ -135,6 +135,8 @@ describe("RunDetailPage", () => {
     await user.click(processCard);
 
     const drawer = await screen.findByRole("dialog", { name: "Agent 动作详情" });
+    const backdrop = document.querySelector(".process-drawer-backdrop");
+    expect(backdrop?.parentElement).toBe(document.body);
     expect(controlsId ? document.getElementById(controlsId) : null).toBe(drawer);
     expect(document.body.style.overflow).toBe("hidden");
     expect(document.body.style.touchAction).toBe("none");
@@ -173,5 +175,137 @@ describe("RunDetailPage", () => {
     expect(document.body.style.overflow).toBe("");
     expect(document.body.style.touchAction).toBe("");
     expect(document.documentElement.style.overflow).toBe("");
+  });
+
+  it("refreshes the open Agent action drawer when a newer event arrives for the same source", async () => {
+    const user = userEvent.setup();
+    const initialSummary = "初始动作摘要";
+    const refreshedSummary = "刷新后的动作摘要";
+    let currentDetail: RunDetail = {
+      ...runDetail,
+      status: "running",
+      events: [
+        {
+          ...runDetail.events[0],
+          sequence: 1,
+          summary: initialSummary,
+          created_at: "2026-08-20T00:00:01Z",
+          actor: "writer",
+          step_id: "write-final",
+        },
+      ],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(currentDetail);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const processSummary = await screen.findByLabelText("Agent 集群动作");
+    const processCard = within(processSummary).getByRole("button", { name: /初始动作摘要/ });
+    await user.click(processCard);
+
+    const drawer = await screen.findByRole("dialog", { name: "Agent 动作详情" });
+    expect(within(drawer).getAllByText(initialSummary).length).toBeGreaterThan(0);
+    expect(within(drawer).getAllByText("2026-08-20T00:00:01Z").length).toBeGreaterThan(0);
+
+    currentDetail = {
+      ...currentDetail,
+      events: [
+        ...currentDetail.events,
+        {
+          ...currentDetail.events[0],
+          sequence: 2,
+          summary: refreshedSummary,
+          created_at: "2026-08-20T00:00:05Z",
+        },
+      ],
+    };
+
+    await waitFor(
+      () => {
+        expect(within(drawer).getAllByText(refreshedSummary).length).toBeGreaterThan(0);
+        expect(within(drawer).getAllByText("2026-08-20T00:00:05Z").length).toBeGreaterThan(0);
+      },
+      { timeout: 2500 },
+    );
+  });
+
+  it("shows newly arrived Agent action cards without closing an open drawer", async () => {
+    const user = userEvent.setup();
+    let currentDetail: RunDetail = {
+      ...runDetail,
+      status: "running",
+      events: [
+        {
+          ...runDetail.events[0],
+          sequence: 1,
+          summary: "writer 初始动作",
+          created_at: "2026-08-20T00:00:01Z",
+          actor: "writer",
+          step_id: "write-final",
+        },
+      ],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(currentDetail);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const processSummary = await screen.findByLabelText("Agent 集群动作");
+    await user.click(within(processSummary).getByRole("button", { name: /writer 初始动作/ }));
+    expect(await screen.findByRole("dialog", { name: "Agent 动作详情" })).not.toBeNull();
+
+    currentDetail = {
+      ...currentDetail,
+      events: [
+        ...currentDetail.events,
+        {
+          ...currentDetail.events[0],
+          sequence: 2,
+          summary: "reviewer 新加入动作",
+          created_at: "2026-08-20T00:00:05Z",
+          actor: "reviewer",
+          step_id: "review-final",
+        },
+      ],
+    };
+
+    await waitFor(
+      () => {
+        expect(within(processSummary).getByRole("button", { name: /reviewer 新加入动作/ })).not.toBeNull();
+      },
+      { timeout: 2500 },
+    );
+    expect(screen.getByRole("dialog", { name: "Agent 动作详情" })).not.toBeNull();
   });
 });

@@ -5015,6 +5015,7 @@ describe("operational management pages", () => {
 
     const backdrop = document.querySelector(".process-drawer-backdrop");
     expect(backdrop).not.toBeNull();
+    expect(backdrop?.parentElement).toBe(document.body);
     await user.click(backdrop as HTMLElement);
 
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "运行过程详情" })).toBeNull());

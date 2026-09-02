@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { createPortal } from "react-dom";
 import { Link, useParams } from "react-router-dom";
 
 import { api, formatApiError, type RunDetail } from "../api/client";
@@ -44,6 +45,9 @@ type DetailProcessCard = {
   rows: DetailProcessRow[];
   createdAt: string | null;
   artifact?: DownloadableArtifact;
+  sourceKind?: string;
+  sourceStepId?: string | null;
+  sourceActor?: string | null;
 };
 
 type DetailProcessRow = {
@@ -606,6 +610,9 @@ function detailProcessCards(items: DetailTimelineItem[], artifacts: RunArtifact[
             lastEvent.step_id ? { label: "步骤", value: lastEvent.step_id } : null,
           ].filter((row): row is DetailProcessRow => Boolean(row)),
           createdAt: lastEvent.created_at,
+          sourceKind: lastEvent.kind,
+          sourceStepId: lastEvent.step_id,
+          sourceActor: lastEvent.actor,
         },
       ];
     }
@@ -630,9 +637,25 @@ function detailProcessCards(items: DetailTimelineItem[], artifacts: RunArtifact[
         rows: eventDetailRows(event, artifact),
         createdAt: event.created_at,
         artifact: downloadableArtifact(artifact),
+        sourceKind: event.kind,
+        sourceStepId: event.step_id,
+        sourceActor: event.actor,
       },
     ];
   });
+}
+
+function refreshedDetailProcessCard(currentCard: DetailProcessCard, candidates: DetailProcessCard[]) {
+  const matchedByStableSource =
+    currentCard.sourceKind || currentCard.sourceStepId || currentCard.sourceActor
+      ? candidates.filter(
+          (card) =>
+            card.sourceKind === currentCard.sourceKind &&
+            card.sourceStepId === currentCard.sourceStepId &&
+            card.sourceActor === currentCard.sourceActor,
+        )
+      : [];
+  return matchedByStableSource.at(-1) ?? candidates.find((card) => card.id === currentCard.id) ?? currentCard;
 }
 
 function isGenericEventMessage(event: RunEvent) {
@@ -1254,7 +1277,7 @@ function DetailProcessCards({ card }: { card: DetailProcessCard }) {
 }
 
 function DetailProcessDrawer({ card, dialogId, onClose }: { card: DetailProcessCard; dialogId: string; onClose: () => void }) {
-  return (
+  return createPortal(
     <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
       <section
         id={dialogId}
@@ -1287,16 +1310,18 @@ function DetailProcessDrawer({ card, dialogId, onClose }: { card: DetailProcessC
           </article>
         </div>
       </section>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
 function DetailProcessSummary({ cards }: { cards: DetailProcessCard[] }) {
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedCard, setSelectedCard] = useState<DetailProcessCard | null>(null);
   const previouslyFocused = useRef<HTMLElement | null>(null);
-  const selected = selectedId ? cards.find((card) => card.id === selectedId) : null;
+  const selected = selectedCard ? refreshedDetailProcessCard(selectedCard, cards) : null;
+  const drawerOpen = Boolean(selectedCard);
   useEffect(() => {
-    if (!selected) return undefined;
+    if (!drawerOpen) return undefined;
     previouslyFocused.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const previousBodyOverflow = document.body.style.overflow;
     const previousBodyTouchAction = document.body.style.touchAction;
@@ -1305,7 +1330,7 @@ function DetailProcessSummary({ cards }: { cards: DetailProcessCard[] }) {
     document.body.style.touchAction = "none";
     document.documentElement.style.overflow = "hidden";
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setSelectedId(null);
+      if (event.key === "Escape") setSelectedCard(null);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => {
@@ -1315,7 +1340,7 @@ function DetailProcessSummary({ cards }: { cards: DetailProcessCard[] }) {
       document.documentElement.style.overflow = previousDocumentOverflow || "";
       previouslyFocused.current?.focus();
     };
-  }, [selectedId]);
+  }, [drawerOpen]);
   if (cards.length === 0) return null;
   return (
     <section className="run-detail-process-summary" aria-label="Agent 集群动作">
@@ -1331,8 +1356,8 @@ function DetailProcessSummary({ cards }: { cards: DetailProcessCard[] }) {
             type="button"
             className="run-process-toggle process-intermediate-card"
             aria-controls={`run-detail-process-${card.id}`}
-            aria-expanded={selectedId === card.id}
-            onClick={() => setSelectedId(card.id)}
+            aria-expanded={selected?.id === card.id}
+            onClick={() => setSelectedCard(card)}
           >
             <span aria-hidden="true">›</span>
             <small className="process-card-badge">{card.label}</small>
@@ -1345,7 +1370,7 @@ function DetailProcessSummary({ cards }: { cards: DetailProcessCard[] }) {
         <DetailProcessDrawer
           card={selected}
           dialogId={`run-detail-process-${selected.id}`}
-          onClose={() => setSelectedId(null)}
+          onClose={() => setSelectedCard(null)}
         />
       ) : null}
     </section>

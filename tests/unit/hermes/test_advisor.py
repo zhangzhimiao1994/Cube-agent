@@ -182,6 +182,47 @@ async def test_runtime_advice_ignores_confirmed_conversation_outcome_summaries()
 
 
 @pytest.mark.asyncio
+async def test_runtime_advice_ignores_confirmed_runtime_observation_targets() -> None:
+    runtime_observation = {
+        "id": "hermes_runtime_observation",
+        "category": "conversation",
+        "outcome": "success",
+        "lesson": "Use hybrid for planning tasks.",
+        "summary": "Runtime observation from a previous run.",
+        "user_summary": "本次运行观察到 hybrid 曾经完成规划任务。",
+        "tags": ["planning", "hybrid"],
+        "weight": 10,
+        "memory_type": "user_preference",
+        "target": "scheduler",
+        "confidence": 0.95,
+        "noise_risk": 0.0,
+        "created_at": datetime.now(UTC).isoformat(),
+        "run_id": str(uuid4()),
+        "conversation_id": "conv-runtime-observation",
+        "confirmed_at": datetime.now(UTC).isoformat(),
+    }
+    session_factory = FakeSessionFactory(
+        [
+            [],
+            [FakeRow({"hermes_policy": "suggest"})],
+            [FakeRow(runtime_observation)],
+        ]
+    )
+    advisor = PersistentHermesRunAdvisor(session_factory)  # type: ignore[arg-type]
+
+    advice = await advisor.advise(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message="planning task needs a routing suggestion",
+        mode=TaskMode.AUTO,
+        agent_ids=(),
+        workflow_id=None,
+    )
+
+    assert advice is None
+
+
+@pytest.mark.asyncio
 async def test_record_outcome_writes_conversation_ledger_for_failed_runs() -> None:
     advisor = CapturingHermesAdvisor()
     run_id = uuid4()

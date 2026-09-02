@@ -63,6 +63,7 @@ from agent_hub.runtime.failure_reason import (
     runtime_failure_diagnostic_from_reason,
     safe_runtime_failure_reason,
 )
+from agent_hub.runtime.generated_file_recovery import reusable_generated_file_result
 from agent_hub.runtime.hermes_context import hermes_memory_context_text
 from agent_hub.runtime.self_repair_context import self_repair_context_text
 
@@ -2700,6 +2701,40 @@ class CrewDispatchRuntime:
                         "capability outcome requires confirmation"
                     ) from None
                 if tool_result.status != "succeeded":
+                    reusable_result = reusable_generated_file_result(tool_call.name, evidence)
+                    if reusable_result is not None:
+                        reusable_result = cast(Mapping[str, JsonValue], _mutable_json(reusable_result))
+                        artifact = Artifact(
+                            id=uuid4(),
+                            type="tool_result",
+                            producer=step.agent,
+                            content={"result": reusable_result},
+                            source_ids=(str(trigger_model_artifact.id),),
+                        )
+                        await emit(
+                            kind=EventKind.TOOL_COMPLETED,
+                            actor=step.agent,
+                            tool_call_id=call_id,
+                            tool_name=tool_call.name,
+                            payload=safe_tool_event_payload(
+                                name=tool_call.name,
+                                status="succeeded",
+                                result=reusable_result,
+                                artifact_id=str(artifact.id),
+                                replay_safe=replay_safe,
+                            ),
+                            artifact=artifact,
+                        )
+                        succeeded = dict(tool_running)
+                        succeeded.update(
+                            status="succeeded",
+                            artifact_id=str(artifact.id),
+                            sha256=artifact.content_sha256,
+                        )
+                        await tool_boundary(idempotency_key, succeeded, artifact)
+                        evidence.append(artifact)
+                        results.append({"name": tool_call.name, "result": reusable_result})
+                        continue
                     failed_reason = tool_result.failure_reason or "capability execution failed"
                     await emit(
                         kind=EventKind.TOOL_FAILED,

@@ -473,6 +473,32 @@ def _tool_plan() -> DispatchPlan:
     )
 
 
+def _project_zip_plan() -> DispatchPlan:
+    return DispatchPlan(
+        agents=(
+            AgentSpec(
+                id="writer",
+                role="writer",
+                goal="Write",
+                logical_model="general",
+                allowed_tools=("project.generate_zip",),
+            ),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                tools=("project.generate_zip",),
+                final_synthesizer=True,
+                token_budget=100,
+            ),
+        ),
+        allowed_tools=("project.generate_zip",),
+        total_token_budget=100,
+    )
+
+
 def _reviewed_step_plan(*, reviewer_retries: int = 0) -> DispatchPlan:
     return DispatchPlan(
         agents=(
@@ -633,6 +659,124 @@ async def test_tool_calls_cross_the_harness_tool_gateway_envelope() -> None:
     result = tool_artifact.content["result"]
     assert isinstance(result, Mapping)
     assert result["items"] == ("harness result",)
+
+
+async def test_project_zip_failure_after_final_zip_reuses_existing_artifact() -> None:
+    class RepeatedZipGateway:
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            self.requests.append(request)
+            response = (
+                ModelResponse(
+                    text=None,
+                    tool_calls=(
+                        ToolCall(
+                            id=f"provider-{len(self.requests)}",
+                            name="project_generate_zip",
+                            arguments={
+                                "title": "Hello World Python",
+                                "files": {"main.py": "print('hello world')\n"},
+                            },
+                        ),
+                    ),
+                    usage=TokenUsage(1, 1, 2),
+                )
+                if len(self.requests) <= 2
+                else ModelResponse(text="done", usage=TokenUsage(1, 1, 2))
+            )
+            return GatewayCompletion(
+                response=response,
+                deployment_id="primary",
+                logical_model=request.logical_model,
+                provider_id="deepseek",
+                provider_model="deepseek/deepseek-v4-flash",
+                cost_usd=Decimal(0),
+            )
+
+    class ZipCapabilities(FakeCapabilities):
+        def is_replay_safe(self, name: str) -> bool:
+            return name == "project.generate_zip"
+
+    class FlakyZipHarnessToolGateway:
+        def __init__(self) -> None:
+            self.calls: list[HarnessToolCallRequest] = []
+            self.artifact_id = str(uuid4())
+
+        async def invoke(
+            self,
+            tenant_id: UUID,
+            request: HarnessToolCallRequest,
+            *,
+            user_id: UUID | None = None,
+            role: Role | None = None,
+        ) -> HarnessToolCallResult:
+            del tenant_id, user_id, role
+            self.calls.append(request)
+            if len(self.calls) == 1:
+                return HarnessToolCallResult(
+                    call_id=request.call_id,
+                    tool_name=request.tool_name,
+                    status="succeeded",
+                    payload={
+                        "artifact_id": self.artifact_id,
+                        "file": {
+                            "artifact_id": self.artifact_id,
+                            "filename": "hello-world-python.zip",
+                            "mime_type": "application/zip",
+                            "size_bytes": 128,
+                            "sha256": "0" * 64,
+                            "download_url": (
+                                f"/api/v1/admin/runs/{RUN_ID}/artifacts/"
+                                f"{self.artifact_id}/download"
+                            ),
+                        },
+                        "metadata": {
+                            "artifact_id": self.artifact_id,
+                            "filename": "hello-world-python.zip",
+                            "mime_type": "application/zip",
+                            "size_bytes": 128,
+                            "sha256": "0" * 64,
+                            "storage_key": (
+                                f"{TENANT_ID}/{RUN_ID}/{self.artifact_id}/"
+                                "hello-world-python.zip"
+                            ),
+                            "download_url": (
+                                f"/api/v1/admin/runs/{RUN_ID}/artifacts/"
+                                f"{self.artifact_id}/download"
+                            ),
+                        },
+                        "presentation": "final_attachment",
+                        "summary": "Generated project ZIP artifact hello-world-python.zip.",
+                    },
+                )
+            return HarnessToolCallResult(
+                call_id=request.call_id,
+                tool_name=request.tool_name,
+                status="failed",
+                payload={},
+                failure_reason="generated artifact store rejected duplicate request",
+            )
+
+    harness = FlakyZipHarnessToolGateway()
+    runtime = CrewDispatchRuntime(
+        RepeatedZipGateway(),
+        _project_zip_plan(),
+        capability_gateway=ZipCapabilities(),
+        harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+
+    events = await _collect(runtime)
+
+    assert len(harness.calls) == 2
+    assert [event.kind for event in events if event.kind is EventKind.TOOL_FAILED] == []
+    assert [event.kind for event in events if event.kind is EventKind.TOOL_COMPLETED] == [
+        EventKind.TOOL_COMPLETED,
+        EventKind.TOOL_COMPLETED,
+    ]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
 async def test_tool_calls_forward_trusted_actor_identity_to_harness_gateway() -> None:

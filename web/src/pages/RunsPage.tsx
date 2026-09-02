@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
 
 import { ApiError, api, formatApiError, type AttachmentUpload, type ModelDeployment, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun } from "../api/client";
@@ -2816,7 +2817,7 @@ function RunProcessDrawer({
   target: ProcessDetailTarget;
   onClose: () => void;
 }) {
-  return (
+  return createPortal(
     <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
       <section
         className="process-drawer"
@@ -2848,7 +2849,8 @@ function RunProcessDrawer({
           </article>
         </div>
       </section>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

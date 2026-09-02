@@ -83,6 +83,7 @@ from agent_hub.runtime.failure_reason import (
     safe_model_gateway_failure_reason,
     safe_runtime_failure_reason,
 )
+from agent_hub.runtime.generated_file_recovery import reusable_generated_file_result
 from agent_hub.runtime.hermes_context import hermes_memory_context_text
 from agent_hub.runtime.self_repair_context import self_repair_context_text
 
@@ -840,6 +841,33 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
             )
             raise RuntimeExecutionError("capability outcome is uncertain") from None
         if tool_result.status != "succeeded":
+            reusable_result = reusable_generated_file_result(self.name, self._durability.artifacts)
+            if reusable_result is not None:
+                reusable_result = cast(Mapping[str, JsonValue], _mutable_json(reusable_result))
+                artifact = Artifact(
+                    id=uuid4(),
+                    type="tool_result",
+                    producer=self._actor,
+                    content={"result": reusable_result},
+                )
+                self._records.append(
+                    _ToolRecord(
+                        EventKind.TOOL_COMPLETED,
+                        self._actor,
+                        safe_call_id,
+                        self.name,
+                        payload=safe_tool_event_payload(
+                            name=self.name,
+                            status="succeeded",
+                            result=reusable_result,
+                            artifact_id=str(artifact.id),
+                            replay_safe=replay_safe,
+                        ),
+                        artifact=artifact,
+                    )
+                )
+                await self._durability.succeed_tool(artifact)
+                return _DynamicToolResult(result=dict(reusable_result))
             self._records.append(
                 _ToolRecord(
                     EventKind.TOOL_FAILED,
