@@ -4006,7 +4006,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         return RunDetailResponse(
             **list_item.model_dump(),
             events=[_admin_run_event(event) for event in events],
-            artifacts=[_admin_run_artifact(artifact, run_id=record.id) for artifact in artifacts],
+            artifacts=_admin_run_artifacts(artifacts, run_id=record.id),
             explicit_details={
                 "source": "database",
                 "version": str(record.version),
@@ -7583,6 +7583,23 @@ def _admin_run_artifact(
         download_url=download_url if type(download_url) is str else None,
         presentation=presentation,
     )
+
+
+def _admin_run_artifacts(
+    artifacts: Iterable[dict[str, object]],
+    *,
+    run_id: UUID | None = None,
+) -> list[RunArtifactResponse]:
+    responses: list[RunArtifactResponse] = []
+    seen_download_urls: set[str] = set()
+    for artifact in artifacts:
+        response = _admin_run_artifact(artifact, run_id=run_id)
+        if response.download_url is not None:
+            if response.download_url in seen_download_urls:
+                continue
+            seen_download_urls.add(response.download_url)
+        responses.append(response)
+    return responses
 
 
 def _artifact_presentation(

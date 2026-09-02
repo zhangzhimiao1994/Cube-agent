@@ -1981,6 +1981,49 @@ describe("operational management pages", () => {
     expect(chatDownload).not.toBeNull();
   });
 
+  it("deduplicates reused final generated downloads in chat attachments", async () => {
+    const downloadUrl = `/api/v1/admin/runs/${runId}/artifacts/artifact-final-docx/download`;
+    visibleRunDetail = {
+      ...runDetail,
+      artifacts: [
+        {
+          id: "artifact-final-docx",
+          kind: "tool_result",
+          title: "交付文档",
+          text: null,
+          filename: "delivery-plan.docx",
+          mime_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          size_bytes: 4096,
+          sha256: "a".repeat(64),
+          download_url: downloadUrl,
+          presentation: "final_attachment",
+        },
+        {
+          id: "artifact-final-docx-wrapper-2",
+          kind: "tool_result",
+          title: "交付文档",
+          text: null,
+          filename: "delivery-plan.docx",
+          mime_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          size_bytes: 4096,
+          sha256: "a".repeat(64),
+          download_url: downloadUrl,
+          presentation: "final_attachment",
+        },
+      ],
+      events: runDetail.events,
+    };
+    visibleConversationRuns = [visibleRunDetail];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+
+    expect(within(stream).getAllByRole("button", { name: /下载 delivery-plan\.docx/ })).toHaveLength(1);
+  });
+
   it("keeps live adjustment and temporary-agent switches out of workflow configuration", async () => {
     render(<TestApp initialPath="/workflows" />);
 

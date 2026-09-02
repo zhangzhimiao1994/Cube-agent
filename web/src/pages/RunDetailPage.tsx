@@ -65,6 +65,18 @@ type DownloadableArtifact = RunArtifact & {
   download_url: string;
 };
 
+type ApprovalState = {
+  pending: RunEvent[];
+  resolved: RunEvent[];
+};
+
+type CapabilityApproval = {
+  runId: string;
+  approvalId: string;
+  version: number;
+  summary: string;
+};
+
 type ToolLifecycle = {
   key: string;
   toolName: string;
@@ -283,6 +295,33 @@ function displayRunMode(mode: string) {
   return RUN_MODE_LABELS[mode] ?? mode;
 }
 
+function runDetailVersion(run: RunDetail) {
+  const fallbackVersion = Number(run.explicit_details.version ?? "0");
+  if (typeof run.version === "number" && Number.isInteger(run.version) && run.version > 0) return run.version;
+  return Number.isInteger(fallbackVersion) && fallbackVersion > 0 ? fallbackVersion : 0;
+}
+
+function capabilityApprovalFromRunDetail(run: RunDetail | undefined): CapabilityApproval | null {
+  if (!run || run.status !== "waiting_approval") return null;
+  if (run.explicit_details.approval_kind !== "capability_tool") return null;
+  const approvalId = run.explicit_details.approval_id?.trim();
+  if (!approvalId) return null;
+  const pending = approvalStateFromEvents(run.events).pending.at(-1);
+  const diagnostic = run.failure_diagnostics.find((item) => item.approval_id === approvalId);
+  const summary =
+    diagnostic?.reason ||
+    diagnostic?.recommendation ||
+    pending?.action ||
+    pending?.summary ||
+    "当前工具调用需要沙箱权限确认";
+  return {
+    runId: run.id,
+    approvalId,
+    version: runDetailVersion(run),
+    summary,
+  };
+}
+
 function displayToolStatus(status: string) {
   return TOOL_STATUS_LABELS[status] ?? status;
 }
@@ -485,6 +524,17 @@ function artifactRows(artifact: RunArtifact | null | undefined): DetailProcessRo
 
 function downloadableArtifact(artifact: RunArtifact | null | undefined): DownloadableArtifact | undefined {
   return hasArtifactDownload(artifact) ? artifact : undefined;
+}
+
+function dedupeArtifactDownloads(artifacts: RunArtifact[]) {
+  const seen = new Set<string>();
+  return artifacts.filter((artifact) => {
+    if (!hasArtifactDownload(artifact)) return true;
+    const key = artifact.download_url.trim();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function artifactForEvent(event: RunEvent, artifacts: RunArtifact[]) {
@@ -1025,7 +1075,7 @@ function failureDiagnosticsForDetail(detail: RunDetail): DetailFailureDiagnostic
   return diagnostics;
 }
 
-function approvalStateFromEvents(events: RunEvent[]) {
+function approvalStateFromEvents(events: RunEvent[]): ApprovalState {
   const pending: RunEvent[] = [];
   const resolved: RunEvent[] = [];
   events.forEach((event) => {
@@ -1424,6 +1474,30 @@ export function RunDetailPage() {
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
     },
   });
+  const approveCapability = useMutation({
+    mutationFn: (approval: CapabilityApproval) =>
+      api.approveCapability(approval.runId, {
+        approval_id: approval.approvalId,
+        version: approval.version,
+      }),
+    onSuccess: async (updated) => {
+      void updated;
+      await queryClient.invalidateQueries({ queryKey: ["run", runId] });
+      await queryClient.invalidateQueries({ queryKey: ["runs"] });
+    },
+  });
+  const rejectCapability = useMutation({
+    mutationFn: (approval: CapabilityApproval) =>
+      api.rejectCapability(approval.runId, {
+        approval_id: approval.approvalId,
+        version: approval.version,
+      }),
+    onSuccess: async (updated) => {
+      void updated;
+      await queryClient.invalidateQueries({ queryKey: ["run", runId] });
+      await queryClient.invalidateQueries({ queryKey: ["runs"] });
+    },
+  });
 
   if (run.isLoading) return <p>正在加载运行详情...</p>;
   if (run.isError || !run.data) {
@@ -1434,6 +1508,7 @@ export function RunDetailPage() {
   const canResume = run.data.status === "paused";
   const canCancel = !TERMINAL_STATUSES.has(run.data.status);
   const isWaitingForMode = run.data.status === "waiting_user_mode" && Boolean(run.data.decision_token);
+  const capabilityApproval = capabilityApprovalFromRunDetail(run.data);
   const observerNotices = collectObserverNotices(run.data.events);
   const timelineItems = detailTimelineItems(run.data.events);
   const processCards = detailProcessCards(timelineItems, run.data.artifacts);
@@ -1507,23 +1582,54 @@ export function RunDetailPage() {
             </div>
           </div>
         ) : (
-          <div className="toolbar">
-            <button type="button" disabled={!canPause || control.isPending} onClick={() => control.mutate("pause")}>
-              暂停
-            </button>
-            <button type="button" disabled={!canResume || control.isPending} onClick={() => control.mutate("resume")}>
-              恢复
-            </button>
-            <button type="button" disabled={!canCancel || control.isPending} onClick={() => control.mutate("cancel")}>
-              取消
-            </button>
-          </div>
+          <>
+            {capabilityApproval ? (
+              <aside className="composer-attachment-card" role="status" aria-label="沙箱权限确认">
+                <div>
+                  <span className="eyebrow">沙箱权限待确认</span>
+                  <strong>工具调用需要授权</strong>
+                  <small>审批 {capabilityApproval.approvalId}</small>
+                </div>
+                <p>{capabilityApproval.summary}</p>
+                <div className="composer-card-actions">
+                  <button
+                    type="button"
+                    disabled={approveCapability.isPending || rejectCapability.isPending}
+                    onClick={() => approveCapability.mutate(capabilityApproval)}
+                  >
+                    {approveCapability.isPending ? "允许中..." : "允许一次"}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-action"
+                    disabled={approveCapability.isPending || rejectCapability.isPending}
+                    onClick={() => rejectCapability.mutate(capabilityApproval)}
+                  >
+                    {rejectCapability.isPending ? "拒绝中..." : "拒绝"}
+                  </button>
+                </div>
+              </aside>
+            ) : null}
+            <div className="toolbar">
+              <button type="button" disabled={!canPause || control.isPending} onClick={() => control.mutate("pause")}>
+                暂停
+              </button>
+              <button type="button" disabled={!canResume || control.isPending} onClick={() => control.mutate("resume")}>
+                恢复
+              </button>
+              <button type="button" disabled={!canCancel || control.isPending} onClick={() => control.mutate("cancel")}>
+                取消
+              </button>
+            </div>
+          </>
         )}
         {!isWaitingForMode && !canPause && !canResume && canCancel ? (
           <p className="field-help">当前状态不支持暂停或恢复，只能取消。</p>
         ) : null}
         {control.isError ? <p role="alert">{formatApiError(control.error, "运行控制失败")}</p> : null}
         {chooseMode.isError ? <p role="alert">{formatApiError(chooseMode.error, "运行模式确认失败")}</p> : null}
+        {approveCapability.isError ? <p role="alert">{formatApiError(approveCapability.error, "沙箱权限确认失败")}</p> : null}
+        {rejectCapability.isError ? <p role="alert">{formatApiError(rejectCapability.error, "沙箱权限拒绝失败")}</p> : null}
       </article>
 
       {observerNotices.length > 0 ? (
@@ -1669,7 +1775,7 @@ export function RunDetailPage() {
           <p>暂无产物。</p>
         ) : (
           <ul>
-            {run.data.artifacts.map((artifact) => (
+            {dedupeArtifactDownloads(run.data.artifacts).map((artifact) => (
               <li key={artifact.id}>
                 <strong>{artifact.kind}：{artifact.title}</strong>
                 {artifact.filename ? <small>{artifact.filename}</small> : null}

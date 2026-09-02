@@ -349,6 +349,16 @@ function isFinalDownloadableArtifact(
   return hasArtifactDownload(artifact) && artifact.presentation === "final_attachment";
 }
 
+function dedupeDownloadableArtifacts<T extends { download_url: string }>(artifacts: T[]) {
+  const seen = new Set<string>();
+  return artifacts.filter((artifact) => {
+    const key = artifact.download_url.trim();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function downloadArtifactMessage(artifact: DownloadableArtifact): ChatMessage {
   const filename = artifactFileName(artifact);
   return {
@@ -378,6 +388,10 @@ function artifactDisplayName(artifact: RunArtifact | NonNullable<RunEvent["artif
 
 function artifactDetailDownload(artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null | undefined) {
   return hasArtifactDownload(artifact) ? artifact : undefined;
+}
+
+function artifactDownloadKey(artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null | undefined) {
+  return hasArtifactDownload(artifact) ? artifact.download_url.trim() : "";
 }
 
 function isGenericArtifactText(value: string | null | undefined) {
@@ -1595,7 +1609,7 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
   const replyArtifact = preferredReplyArtifact(textArtifacts);
   const internalNotice = internalArtifactNotice(detail);
   const failureReason = failureSummaryForChat(detail);
-  const downloadableArtifacts = detail.artifacts.filter(isFinalDownloadableArtifact);
+  const downloadableArtifacts = dedupeDownloadableArtifacts(detail.artifacts.filter(isFinalDownloadableArtifact));
   const artifactMessages = replyArtifact
     ? [
         {
@@ -1818,12 +1832,22 @@ function conversationTitle(run: RunListItem, items: RunListItem[]) {
 }
 
 function conversationMessages(runs: RunDetail[]): ChatMessage[] {
+  const seenDownloadMessages = new Set<string>();
   return runs.flatMap((run) =>
-    detailMessages(run).map((message) => ({
-      ...message,
-      id: `${run.id}-${message.id}`,
-      run,
-    })),
+    detailMessages(run)
+      .filter((message) => {
+        const downloadKey = artifactDownloadKey(message.artifact);
+        if (!downloadKey) return true;
+        const messageKey = `${run.id}:${downloadKey}`;
+        if (seenDownloadMessages.has(messageKey)) return false;
+        seenDownloadMessages.add(messageKey);
+        return true;
+      })
+      .map((message) => ({
+        ...message,
+        id: `${run.id}-${message.id}`,
+        run,
+      })),
   );
 }
 
@@ -1994,8 +2018,14 @@ function fallbackArtifactForEvent(
   event: RunEvent,
   artifacts: RunArtifact[],
   consumedArtifactIds: Set<string>,
+  consumedDownloadUrls: Set<string>,
 ) {
-  if (event.artifact) return event.artifact;
+  if (event.artifact) {
+    const downloadKey = artifactDownloadKey(event.artifact);
+    if (downloadKey && consumedDownloadUrls.has(downloadKey)) return null;
+    if (downloadKey) consumedDownloadUrls.add(downloadKey);
+    return event.artifact;
+  }
   const explicitArtifactId =
     formatEventPayloadValue(event.payload.artifact_id) ||
     formatEventPayloadValue(event.payload.artifactId) ||
@@ -2004,6 +2034,9 @@ function fallbackArtifactForEvent(
     const matched = artifacts.find((artifact) => artifact.id === explicitArtifactId);
     if (matched) {
       consumedArtifactIds.add(matched.id);
+      const downloadKey = artifactDownloadKey(matched);
+      if (downloadKey && consumedDownloadUrls.has(downloadKey)) return null;
+      if (downloadKey) consumedDownloadUrls.add(downloadKey);
       return matched;
     }
   }
@@ -2012,9 +2045,16 @@ function fallbackArtifactForEvent(
     ? artifacts.find((artifact) => artifact.title === event.actor && !consumedArtifactIds.has(artifact.id))
     : null;
   const canUseOrderedFallback = Boolean(event.actor || event.step_id || event.tool_name);
-  const byOrder = canUseOrderedFallback ? artifacts.find((artifact) => !consumedArtifactIds.has(artifact.id)) : null;
+  const byOrder = canUseOrderedFallback
+    ? artifacts.find((artifact) => !consumedArtifactIds.has(artifact.id) && !hasArtifactDownload(artifact))
+    : null;
   const matched = byActor ?? byOrder ?? null;
-  if (matched) consumedArtifactIds.add(matched.id);
+  if (matched) {
+    consumedArtifactIds.add(matched.id);
+    const downloadKey = artifactDownloadKey(matched);
+    if (downloadKey && consumedDownloadUrls.has(downloadKey)) return null;
+    if (downloadKey) consumedDownloadUrls.add(downloadKey);
+  }
   return matched;
 }
 
@@ -2542,6 +2582,11 @@ function runProcessItems(
   });
   const actionEvents = detail.events.flatMap((event, index) => (isActionEvent(event) ? [{ event, index }] : []));
   const eventItems: ProcessDetailTarget[] = [];
+  const consumedDownloadUrls = new Set(
+    dedupeDownloadableArtifacts(detail.artifacts.filter(isFinalDownloadableArtifact)).map((artifact) =>
+      artifact.download_url.trim(),
+    ),
+  );
   for (let index = 0; index < actionEvents.length; index += 1) {
     const { event, index: eventIndex } = actionEvents[index];
     if (isModelDeltaEvent(event)) {
@@ -2553,7 +2598,7 @@ function runProcessItems(
         index += 1;
       }
       if (group.length === 1) {
-        const artifact = fallbackArtifactForEvent(event, detail.artifacts, consumedArtifactIds);
+        const artifact = fallbackArtifactForEvent(event, detail.artifacts, consumedArtifactIds, consumedDownloadUrls);
         eventItems.push(...processItemsForEvent(detail, event, eventIndex, agentNames, artifact));
         continue;
       }
@@ -2571,7 +2616,7 @@ function runProcessItems(
       const group = finalToolEvents.get(event);
       if (!group) continue;
       const finalEvent = group.at(-1)?.event ?? event;
-      const artifact = fallbackArtifactForEvent(finalEvent, detail.artifacts, consumedArtifactIds);
+      const artifact = fallbackArtifactForEvent(finalEvent, detail.artifacts, consumedArtifactIds, consumedDownloadUrls);
       eventItems.push(
         ...processItemsForToolLifecycle(
           detail,
@@ -2584,7 +2629,7 @@ function runProcessItems(
       continue;
     }
     if (isWrappedToolFailureEvent(event, detail.events)) continue;
-    const artifact = fallbackArtifactForEvent(event, detail.artifacts, consumedArtifactIds);
+    const artifact = fallbackArtifactForEvent(event, detail.artifacts, consumedArtifactIds, consumedDownloadUrls);
     if (event.kind === "artifact.created" && !artifact && !hasUsefulPayload(event)) continue;
     eventItems.push(...processItemsForEvent(detail, event, eventIndex, agentNames, artifact));
   }

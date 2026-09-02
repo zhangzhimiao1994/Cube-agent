@@ -3701,6 +3701,55 @@ def test_admin_run_artifact_keeps_explicit_final_attachment_presentation() -> No
     assert artifact.presentation == "final_attachment"
 
 
+def test_admin_run_artifacts_deduplicate_reused_generated_downloads() -> None:
+    from agent_hub.api.routers.admin import _admin_run_artifacts
+
+    run_id = UUID("33333333-3333-4333-8333-333333333333")
+    stored_artifact_id = UUID("44444444-4444-4444-8444-444444444444")
+    download_url = f"/api/v1/runs/{run_id}/artifacts/{stored_artifact_id}/download"
+    artifacts: list[dict[str, object]] = [
+        {
+            "id": "55555555-5555-4555-8555-555555555555",
+            "type": "tool_result",
+            "producer": "implementer",
+            "content": {
+                "result": {
+                    "file": {
+                        "artifact_id": str(stored_artifact_id),
+                        "filename": "mofang-main.zip",
+                        "mime_type": "application/zip",
+                        "size_bytes": 135,
+                        "download_url": download_url,
+                    },
+                    "presentation": "final_attachment",
+                }
+            },
+        },
+        {
+            "id": "66666666-6666-4666-8666-666666666666",
+            "type": "tool_result",
+            "producer": "implementer",
+            "content": {
+                "result": {
+                    "file": {
+                        "artifact_id": str(stored_artifact_id),
+                        "filename": "mofang-main.zip",
+                        "mime_type": "application/zip",
+                        "size_bytes": 135,
+                        "download_url": download_url,
+                    },
+                    "presentation": "final_attachment",
+                }
+            },
+        },
+    ]
+
+    responses = _admin_run_artifacts(artifacts, run_id=run_id)
+
+    assert len(responses) == 1
+    assert responses[0].download_url == download_url
+
+
 @pytest.mark.parametrize(
     ("filename", "mime_type", "data"),
     [

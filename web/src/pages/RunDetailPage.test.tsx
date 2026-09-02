@@ -178,6 +178,203 @@ describe("RunDetailPage", () => {
     expect(document.documentElement.style.overflow).toBe("");
   });
 
+  it("deduplicates generated downloads that reuse the same file URL", async () => {
+    const duplicatedDownload = {
+      id: "artifact-final-wrapper-2",
+      kind: "tool_result",
+      title: "最终脚本产物",
+      text: null,
+      filename: "final-script.md",
+      mime_type: "text/markdown",
+      size_bytes: 2048,
+      sha256: "a".repeat(64),
+      download_url: "/api/v1/admin/artifacts/final-script.md",
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) {
+          return jsonResponse({
+            ...runDetail,
+            artifacts: [...runDetail.artifacts, duplicatedDownload],
+          });
+        }
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    expect(await screen.findByRole("heading", { name: "运行详情" })).not.toBeNull();
+    const archive = screen.getByRole("heading", { name: "产物" }).closest("article");
+    expect(archive).not.toBeNull();
+    expect(within(archive as HTMLElement).getAllByRole("button", { name: /下载 final-script\.md/ })).toHaveLength(1);
+  });
+
+  it("allows sandbox capability approvals from the run detail page", async () => {
+    const user = userEvent.setup();
+    const approvalRun = {
+      ...runDetail,
+      status: "waiting_approval",
+      version: 0,
+      explicit_details: {
+        ...runDetail.explicit_details,
+        approval_kind: "capability_tool",
+        approval_id: "approval-sandbox-1",
+        version: "7",
+      },
+      failure_diagnostics: [
+        {
+          category: "approval",
+          stage: "approval.requested",
+          reason: "project.generate_zip 需要沙箱权限。",
+          recommendation: "确认本次受限工具调用后继续。",
+          sequence: 2,
+          actor: "implementer",
+          step_id: "build-zip",
+          tool_name: "project.generate_zip",
+          approval_id: "approval-sandbox-1",
+        },
+      ],
+    } satisfies RunDetail;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), "https://agent-hub.test").pathname;
+      if (path === "/api/v1/auth/me") {
+        return jsonResponse({
+          user_id: "11111111-1111-4111-8111-111111111111",
+          tenant_id: "33333333-3333-4333-8333-333333333333",
+          username: "admin",
+          role: "super_admin",
+          permissions: ["*"],
+        });
+      }
+      if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(approvalRun);
+      if (path === `/api/v1/admin/runs/${runId}/approve-capability`) {
+        expect(JSON.parse(String(init?.body))).toEqual({
+          approval_id: "approval-sandbox-1",
+          version: 7,
+        });
+        return jsonResponse({ ...approvalRun, status: "queued", version: 8 });
+      }
+      return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const card = await screen.findByRole("status", { name: "沙箱权限确认" });
+    expect(within(card).getByText("project.generate_zip 需要沙箱权限。")).not.toBeNull();
+    await user.click(within(card).getByRole("button", { name: "允许一次" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/approve-capability"), expect.any(Object)));
+  });
+
+  it("rejects sandbox capability approvals from the run detail page", async () => {
+    const user = userEvent.setup();
+    const approvalRun = {
+      ...runDetail,
+      status: "waiting_approval",
+      explicit_details: {
+        ...runDetail.explicit_details,
+        approval_kind: "capability_tool",
+        approval_id: "approval-sandbox-2",
+      },
+      events: [
+        ...runDetail.events,
+        {
+          sequence: 2,
+          kind: "approval.requested",
+          message: "approval.requested",
+          summary: "当前工具调用需要授权。",
+          created_at: "2026-08-20T00:00:02Z",
+          actor: "implementer",
+          participants: [],
+          tool_name: "project.generate_zip",
+          step_id: "build-zip",
+          action: "生成可下载 zip",
+          decision: null,
+          approval_id: "approval-sandbox-2",
+          payload: {},
+        },
+      ],
+    } satisfies RunDetail;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), "https://agent-hub.test").pathname;
+      if (path === "/api/v1/auth/me") {
+        return jsonResponse({
+          user_id: "11111111-1111-4111-8111-111111111111",
+          tenant_id: "33333333-3333-4333-8333-333333333333",
+          username: "admin",
+          role: "super_admin",
+          permissions: ["*"],
+        });
+      }
+      if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(approvalRun);
+      if (path === `/api/v1/admin/runs/${runId}/reject-capability`) {
+        expect(JSON.parse(String(init?.body))).toEqual({
+          approval_id: "approval-sandbox-2",
+          version: 1,
+        });
+        return jsonResponse({ ...approvalRun, status: "cancelled", version: 2 });
+      }
+      return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const card = await screen.findByRole("status", { name: "沙箱权限确认" });
+    expect(within(card).getByText("生成可下载 zip")).not.toBeNull();
+    await user.click(within(card).getByRole("button", { name: "拒绝" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/reject-capability"), expect.any(Object)));
+  });
+
+  it("does not show sandbox controls for non-capability waiting approvals", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) {
+          return jsonResponse({
+            ...runDetail,
+            status: "waiting_approval",
+            explicit_details: {
+              ...runDetail.explicit_details,
+              approval_kind: "temporary_agent",
+              approval_id: "approval-temporary-agent",
+            },
+          });
+        }
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    expect(await screen.findByRole("heading", { name: "运行详情" })).not.toBeNull();
+    expect(screen.queryByRole("status", { name: "沙箱权限确认" })).toBeNull();
+  });
+
   it("refreshes the open Agent action drawer when a newer event arrives for the same source", async () => {
     const user = userEvent.setup();
     const initialSummary = "初始动作摘要";
