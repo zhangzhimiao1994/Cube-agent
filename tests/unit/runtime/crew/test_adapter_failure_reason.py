@@ -892,9 +892,10 @@ async def test_project_zip_round_limit_reuses_existing_final_artifact() -> None:
                 },
             )
 
+    gateway = EndlessZipGateway()
     harness = ZipHarnessToolGateway()
     runtime = CrewDispatchRuntime(
-        EndlessZipGateway(),
+        gateway,
         _project_zip_plan(),
         capability_gateway=ZipCapabilities(),
         harness_tool_gateway=harness,
@@ -904,6 +905,7 @@ async def test_project_zip_round_limit_reuses_existing_final_artifact() -> None:
     events = await _collect(runtime)
 
     assert len(harness.calls) == 1
+    assert len(gateway.requests) == 2
     assert [event.kind for event in events if event.kind is EventKind.TOOL_FAILED] == []
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     completed = next(event for event in events if event.kind is EventKind.STEP_COMPLETED)

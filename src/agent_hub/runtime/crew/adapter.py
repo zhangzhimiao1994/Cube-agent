@@ -386,6 +386,24 @@ def _map_completion_tool_names(
     )
 
 
+def _generated_file_ready_completion(
+    completion: GatewayCompletion,
+    response: ModelResponse,
+) -> GatewayCompletion:
+    return GatewayCompletion(
+        response=ModelResponse(
+            text="Generated downloadable project ZIP artifact is ready.",
+            usage=response.usage,
+            provider_metadata=response.provider_metadata,
+        ),
+        deployment_id=completion.deployment_id,
+        logical_model=completion.logical_model,
+        provider_id=completion.provider_id,
+        provider_model=completion.provider_model,
+        cost_usd=completion.cost_usd,
+    )
+
+
 def _truncate_prompt_text(value: str, *, max_bytes: int) -> str:
     encoded = value.encode("utf-8")
     if len(encoded) <= max_bytes:
@@ -2501,23 +2519,13 @@ class CrewDispatchRuntime:
                     for tool_call in response.tool_calls
                 )
                 if reusable_results and all(result is not None for result in reusable_results):
-                    return GatewayCompletion(
-                        response=ModelResponse(
-                            text="Generated downloadable project ZIP artifact is ready.",
-                            usage=response.usage,
-                            provider_metadata=response.provider_metadata,
-                        ),
-                        deployment_id=completion.deployment_id,
-                        logical_model=completion.logical_model,
-                        provider_id=completion.provider_id,
-                        provider_model=completion.provider_model,
-                        cost_usd=completion.cost_usd,
-                    )
+                    return _generated_file_ready_completion(completion, response)
                 _fail("step capability round limit exceeded")
             trigger_model_artifact = evidence[-1]
             if trigger_model_artifact.type != "model_response":
                 _fail("capability trigger evidence is invalid")
             results: list[dict[str, object]] = []
+            reused_generated_file_results = 0
             for tool_index, tool_call in enumerate(response.tool_calls):
                 if tool_call.name not in step.tools:
                     _fail("step requested a forbidden capability")
@@ -2614,6 +2622,7 @@ class CrewDispatchRuntime:
                     await tool_boundary(idempotency_key, reused_state, artifact)
                     evidence.append(artifact)
                     results.append({"name": tool_call.name, "result": reusable_result})
+                    reused_generated_file_results += 1
                     continue
                 replay_safe_method = getattr(self._capabilities, "is_replay_safe", None)
                 replay_safe = bool(
@@ -2885,6 +2894,8 @@ class CrewDispatchRuntime:
                 await tool_boundary(idempotency_key, succeeded, artifact)
                 evidence.append(artifact)
                 results.append({"name": tool_call.name, "result": result})
+            if reused_generated_file_results == len(response.tool_calls):
+                return _generated_file_ready_completion(completion, response)
             messages.append(
                 ModelMessage(
                     role="user",
