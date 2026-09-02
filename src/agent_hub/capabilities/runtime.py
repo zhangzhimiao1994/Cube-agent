@@ -422,6 +422,7 @@ def _project_files(arguments: Mapping[str, JsonValue]) -> dict[str, bytes]:
     raw_files = arguments.get("files")
     if not isinstance(raw_files, Mapping):
         raise RuntimeCapabilityError("files must be an object")
+    raw_files = _unwrap_project_files_item(raw_files)
     if not raw_files or len(raw_files) > _MAX_PROJECT_FILES:
         raise RuntimeCapabilityError("files must contain 1 to 64 entries")
     files: dict[str, bytes] = {}
@@ -441,6 +442,15 @@ def _project_files(arguments: Mapping[str, JsonValue]) -> dict[str, bytes]:
             raise RuntimeCapabilityError("project content is too large")
         files[path] = data
     return files
+
+
+def _unwrap_project_files_item(raw_files: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
+    if set(raw_files) != {"item"}:
+        return raw_files
+    item = raw_files.get("item")
+    if isinstance(item, Mapping):
+        return item
+    return raw_files
 
 
 def _project_archive_path(path: str) -> str:

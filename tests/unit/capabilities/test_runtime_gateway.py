@@ -231,6 +231,42 @@ async def test_runtime_gateway_generates_project_zip_final_artifact(tmp_path: Pa
         assert archive.read("main.py") == b"print('hello world')\n"
 
 
+async def test_runtime_gateway_accepts_common_project_zip_files_item_wrapper(
+    tmp_path: Path,
+) -> None:
+    generated_dir = tmp_path / "generated"
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=generated_dir,
+    )
+
+    result = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="engineer",
+        name="project.generate_zip",
+        arguments={
+            "title": "Mofang Hello Python",
+            "filename": "mofang-hello-python.zip",
+            "presentation": "final_attachment",
+            "files": {"item": {"main.py": "print(\"hello mofang\")\n"}},
+        },
+        idempotency_key="project_zip_wrapped_item",
+    )
+
+    stored_path = (
+        generated_dir
+        / str(TENANT_ID)
+        / str(RUN_ID)
+        / str(result["artifact_id"])
+        / "mofang-hello-python.zip"
+    )
+    assert stored_path.is_file()
+    with ZipFile(stored_path) as archive:
+        assert archive.namelist() == ["main.py"]
+        assert archive.read("main.py") == b'print("hello mofang")\n'
+
+
 async def test_runtime_gateway_rejects_unsafe_project_zip_paths(tmp_path: Path) -> None:
     gateway = RuntimeCapabilityGateway(
         skill_store_dir=tmp_path / "skills",
