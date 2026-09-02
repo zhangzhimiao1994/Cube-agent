@@ -83,6 +83,7 @@ _MAX_AUDITED_TOKENS = 100_000_000
 _MAX_AUDITED_COST_USD = Decimal(64000000)
 _STEP_TIMEOUT_RECOVERY_RETRIES = 1
 _STEP_TIMEOUT_RETRY_MIN_REMAINING_SECONDS = 1.0
+_STEP_TIMEOUT_RECOVERY_WINDOW_SECONDS = 60.0
 _STEP_TIMEOUT_RECOVERY_LAYERS = (
     "input_compression",
     "prompt_decomposition",
@@ -1958,6 +1959,10 @@ class CrewDispatchRuntime:
                                 ),
                             ):
                                 review_recovery_attempt += 1
+                                step_deadline = self._recovery_step_deadline(
+                                    run_state,
+                                    step_deadline,
+                                )
                                 await event(
                                     kind=EventKind.STEP_RETRYING,
                                     step_id=step.id,
@@ -2129,6 +2134,7 @@ class CrewDispatchRuntime:
                     remaining_seconds=self._remaining_timeout(run_state, step_deadline),
                 ):
                     recovery_attempt += 1
+                    step_deadline = self._recovery_step_deadline(run_state, step_deadline)
                     await event(
                         kind=EventKind.STEP_RETRYING,
                         step_id=step.id,
@@ -3525,6 +3531,15 @@ class CrewDispatchRuntime:
         if remaining <= 0:
             _fail("dispatch deadline exhausted")
         return remaining
+
+    @staticmethod
+    def _recovery_step_deadline(run_state: _RunState, step_deadline: float) -> float:
+        run_deadline = run_state.deadline
+        if run_deadline is None:
+            _fail("dispatch deadline is unavailable")
+        loop_time = asyncio.get_running_loop().time()
+        recovery_deadline = loop_time + _STEP_TIMEOUT_RECOVERY_WINDOW_SECONDS
+        return min(max(step_deadline, recovery_deadline), run_deadline)
 
     @staticmethod
     def _artifact(

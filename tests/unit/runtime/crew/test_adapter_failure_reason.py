@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Mapping
 from decimal import Decimal
@@ -374,6 +375,28 @@ class CapacityUnavailableThenRoleAwareGateway(RoleAwareGateway):
         )
 
 
+class SlowCapacityRecoveryGateway(RoleAwareGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self._failed_once = False
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        if not self._failed_once:
+            self._failed_once = True
+            await asyncio.sleep(0.8)
+            raise CapacityUnavailable("model capacity unavailable")
+        await asyncio.sleep(1.5)
+        return GatewayCompletion(
+            response=ModelResponse(text="role output", usage=TokenUsage(1, 1, 2)),
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/deepseek-v4-flash",
+            cost_usd=Decimal(0),
+        )
+
+
 class RepeatedCapacityUnavailableGateway(RoleAwareGateway):
     def __init__(self, *, unavailable_logical_model: str, failures: int) -> None:
         super().__init__()
@@ -486,6 +509,25 @@ def _one_step_plan() -> DispatchPlan:
                 task="Answer",
                 final_synthesizer=True,
                 token_budget=100,
+            ),
+        ),
+        total_token_budget=100,
+    )
+
+
+def _short_timeout_plan() -> DispatchPlan:
+    return DispatchPlan(
+        agents=(
+            AgentSpec(id="writer", role="writer", goal="Write", logical_model="general"),
+        ),
+        steps=(
+            DispatchStep(
+                id="final",
+                agent="writer",
+                task="Answer",
+                final_synthesizer=True,
+                token_budget=100,
+                timeout_seconds=2.1,
             ),
         ),
         total_token_budget=100,
@@ -1301,6 +1343,23 @@ async def test_agent_capacity_unavailable_compact_retries_before_completing() ->
     assert retrying.payload["model_fallback"] == "not_available_in_crewai_bridge"
     assert "Keep the retry concise" in writer_prompts[1]
     assert any(event.kind is EventKind.STEP_COMPLETED for event in events)
+
+
+async def test_agent_capacity_recovery_gets_bounded_step_deadline_window() -> None:
+    gateway = SlowCapacityRecoveryGateway()
+    generation = RecordingGeneration()
+    runtime = CrewDispatchRuntime(
+        gateway,
+        _short_timeout_plan(),
+        crew_factory=RecordingFactory(generation),
+    )
+
+    events = [event async for event in runtime.run(_context(timeout_seconds=20.0))]
+
+    assert len(gateway.requests) == 2
+    assert any(event.kind is EventKind.STEP_RETRYING for event in events)
+    assert any(event.kind is EventKind.STEP_COMPLETED for event in events)
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
 async def test_failed_model_checkpoint_resumes_through_generic_compact_retry() -> None:
