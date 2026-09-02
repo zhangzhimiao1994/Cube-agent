@@ -283,7 +283,7 @@ class ApprovalService:
         return self._now()  # type: ignore[operator,no-any-return]
 
 
-def _fingerprint_request(request: CapabilityRequest) -> str:
+def fingerprint_capability_request(request: CapabilityRequest) -> str:
     normalized_resource = normalize_resource(request.resource)
     payload = {
         "tenant_id": str(request.tenant_id),
@@ -298,3 +298,7 @@ def _fingerprint_request(request: CapabilityRequest) -> str:
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _fingerprint_request(request: CapabilityRequest) -> str:
+    return fingerprint_capability_request(request)

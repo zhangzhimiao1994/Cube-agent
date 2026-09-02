@@ -320,6 +320,46 @@ class StubRunService:
             },
         )
 
+    async def approve_capability(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+    ) -> SubmittedRun:
+        del actor_id, approval_id, version
+        return SubmittedRun(
+            id=run_id,
+            tenant_id=tenant_id,
+            status=RunStatus.QUEUED,
+            mode=TaskMode.DISPATCH,
+            decision_token=None,
+            version=2,
+            clarification_reason=None,
+        )
+
+    async def reject_capability(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+    ) -> SubmittedRun:
+        del actor_id, approval_id, version
+        return SubmittedRun(
+            id=run_id,
+            tenant_id=tenant_id,
+            status=RunStatus.CANCELLED,
+            mode=TaskMode.DISPATCH,
+            decision_token=None,
+            version=2,
+            clarification_reason=None,
+        )
+
     async def get(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
         return RunSummary(
             id=run_id,
@@ -1017,6 +1057,42 @@ def test_accept_self_repair_queues_failed_run_safely() -> None:
     assert body["mode"] == "dispatch"
     assert body["repair_proposal"]["kind"] == "self_repair"
     assert body["repair_proposal"]["automatic_execution"] is False
+
+
+def test_approve_capability_queues_waiting_run_safely() -> None:
+    client, _, _ = _client()
+    run_id = uuid4()
+
+    response = client.post(
+        f"/api/v1/runs/{run_id}/approve-capability",
+        headers=bearer(),
+        json={
+            "approval_id": "capability_approval_1",
+            "version": 3,
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "queued"
+    assert response.json()["mode"] == "dispatch"
+
+
+def test_reject_capability_cancels_waiting_run_safely() -> None:
+    client, _, _ = _client()
+    run_id = uuid4()
+
+    response = client.post(
+        f"/api/v1/runs/{run_id}/reject-capability",
+        headers=bearer(),
+        json={
+            "approval_id": "capability_approval_1",
+            "version": 3,
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "cancelled"
+    assert response.json()["mode"] == "dispatch"
 
 
 def test_submitted_run_response_includes_safe_self_repair_proposal() -> None:

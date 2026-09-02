@@ -722,6 +722,28 @@ describe("operational management pages", () => {
             },
           });
         }
+        if (path === `/api/v1/runs/${runId}/approve-capability` && method === "POST") {
+          return jsonResponse({
+            id: runId,
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            status: "queued",
+            mode: "dispatch",
+            decision_token: null,
+            version: 6,
+            clarification_reason: null,
+          });
+        }
+        if (path === `/api/v1/runs/${runId}/reject-capability` && method === "POST") {
+          return jsonResponse({
+            id: runId,
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            status: "cancelled",
+            mode: "dispatch",
+            decision_token: null,
+            version: 6,
+            clarification_reason: null,
+          });
+        }
         if (path === "/api/v1/admin/settings") {
           return jsonResponse(settings);
         }
@@ -2440,6 +2462,54 @@ describe("operational management pages", () => {
       }),
     );
     expect(await screen.findByText("已接受受控自修复，这次运行已重新排队。")).not.toBeNull();
+  });
+  it("allows a pending sandbox capability from the composer card", async () => {
+    const user = userEvent.setup();
+    visibleRunListItem = { ...runListItem, status: "waiting_approval" };
+    visibleRunDetail = {
+      ...runDetail,
+      status: "waiting_approval",
+      explicit_details: {
+        ...runDetail.explicit_details,
+        approval_kind: "capability_tool",
+        approval_id: "capability_approval_1",
+        version: "5",
+      },
+      failure_diagnostics: [
+        {
+          category: "runtime",
+          stage: "capability",
+          reason: "project.generate_zip 需要一次性沙箱写入权限。",
+          recommendation: "确认后将按同一工具调用指纹继续执行。",
+          sequence: 4,
+          approval_id: "capability_approval_1",
+          retryable: true,
+        },
+      ],
+    };
+    visibleConversationRuns = [visibleRunDetail];
+    visibleRunListItems = [visibleRunListItem];
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await user.type(screen.getByPlaceholderText(/输入消息/), "请生成一个项目压缩包");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    const card = await screen.findByRole("status", { name: "沙箱权限确认" });
+    expect(within(card).getByText("工具调用需要授权")).not.toBeNull();
+    expect(within(card).getByText("project.generate_zip 需要一次性沙箱写入权限。")).not.toBeNull();
+    await user.click(within(card).getByRole("button", { name: "允许一次" }));
+
+    await waitFor(() =>
+      expect(requests.find((request) => request.path === `/api/v1/runs/${runId}/approve-capability`)).toMatchObject({
+        method: "POST",
+        body: {
+          approval_id: "capability_approval_1",
+          version: 5,
+        },
+      }),
+    );
+    expect(await screen.findByText("已允许本次沙箱工具调用，当前任务已重新排队继续执行。")).not.toBeNull();
   });
   it("clears failed attachment upload state and allows retrying the same file", async () => {
     failNextAttachmentUpload = true;

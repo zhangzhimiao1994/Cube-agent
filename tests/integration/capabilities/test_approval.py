@@ -14,6 +14,7 @@ from agent_hub.capabilities.approvals import (
     ApprovalRejected,
     ApprovalService,
     InMemoryApprovalStore,
+    fingerprint_capability_request,
 )
 from agent_hub.capabilities.gateway import CapabilityGateway, CapabilityStatus
 from agent_hub.capabilities.policy import CapabilityPolicy, CapabilityRule
@@ -356,3 +357,62 @@ async def test_allowed_and_denied_gateway_outcomes_are_stable(
     assert denied.status is CapabilityStatus.DENIED
     assert denied.reason == "capability denied"
     assert run.status is RunStatus.RUNNING
+
+
+async def test_approved_capability_is_persisted_for_exact_replay(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repository = RunRepository(run_session_factory)
+    run_id = await create_running_run(repository)
+    gateway = CapabilityGateway(
+        approval_policy(),
+        ApprovalService(InMemoryApprovalStore()),
+        run_repository=repository,
+    )
+    pending_request = external_message_request(run_id)
+    result = await gateway.invoke(pending_request, role=Role.OPERATOR)
+    run = await repository.get(TENANT_ID, run_id)
+
+    approved = await repository.approve_capability_and_enqueue(
+        tenant_id=TENANT_ID,
+        run_id=run_id,
+        approval_id=result.approval_id or "",
+        version=run.version,
+    )
+
+    assert approved.status is RunStatus.QUEUED
+    assert await repository.is_capability_approval_approved(
+        TENANT_ID,
+        run_id,
+        fingerprint_capability_request(pending_request),
+    )
+    assert not await repository.is_capability_approval_approved(
+        TENANT_ID,
+        run_id,
+        fingerprint_capability_request(
+            external_message_request(run_id, arguments={"body": "changed"})
+        ),
+    )
+
+
+async def test_rejected_capability_cancels_waiting_run(
+    run_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repository = RunRepository(run_session_factory)
+    run_id = await create_running_run(repository)
+    gateway = CapabilityGateway(
+        approval_policy(),
+        ApprovalService(InMemoryApprovalStore()),
+        run_repository=repository,
+    )
+    result = await gateway.invoke(external_message_request(run_id), role=Role.OPERATOR)
+    run = await repository.get(TENANT_ID, run_id)
+
+    rejected = await repository.reject_capability_approval(
+        tenant_id=TENANT_ID,
+        run_id=run_id,
+        approval_id=result.approval_id or "",
+        version=run.version,
+    )
+
+    assert rejected.status is RunStatus.CANCELLED

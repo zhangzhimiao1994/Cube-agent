@@ -1006,6 +1006,42 @@ class RunService:
         )
         return _submitted(record)
 
+    async def approve_capability(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+    ) -> SubmittedRun:
+        del actor_id
+        record = await self._repository.approve_capability_and_enqueue(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            approval_id=approval_id,
+            version=version,
+        )
+        return _submitted(record)
+
+    async def reject_capability(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+    ) -> SubmittedRun:
+        del actor_id
+        record = await self._repository.reject_capability_approval(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            approval_id=approval_id,
+            version=version,
+        )
+        return _submitted(record)
+
     async def choose_mode(
         self,
         *,

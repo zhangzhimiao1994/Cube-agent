@@ -6,6 +6,7 @@ from uuid import UUID
 import pytest
 
 from agent_hub.auth.models import Role
+from agent_hub.capabilities.defaults import default_capability_policy
 from agent_hub.capabilities.policy import CapabilityPolicy, CapabilityRule
 from agent_hub.capabilities.types import CapabilityRequest, PolicyEffect
 
@@ -183,3 +184,27 @@ def test_tenant_and_rbac_role_are_isolated(policy: CapabilityPolicy) -> None:
 
     assert other_tenant.effect is PolicyEffect.DENY
     assert wrong_role.effect is PolicyEffect.DENY
+
+
+def test_default_policy_requires_approval_for_generated_files_when_configured() -> None:
+    policy = default_capability_policy(TENANT_A, require_approval_for_tools=True)
+
+    decision = policy.evaluate(
+        request("file.create", resource="generated/project.generate_zip"),
+        Role.OPERATOR,
+    )
+
+    assert decision.effect is PolicyEffect.REQUIRE_APPROVAL
+
+
+def test_default_policy_keeps_low_risk_tools_allowed_when_approval_is_required() -> None:
+    policy = default_capability_policy(TENANT_A, require_approval_for_tools=True)
+
+    calculator = policy.evaluate(
+        request("calculator.evaluate", resource="calculator"),
+        Role.OPERATOR,
+    )
+    context = policy.evaluate(request("context.read", resource="context"), Role.OPERATOR)
+
+    assert calculator.effect is PolicyEffect.ALLOW
+    assert context.effect is PolicyEffect.ALLOW

@@ -2162,6 +2162,21 @@ def test_routing_details_exposes_harness_execution_profile() -> None:
     assert details["harness_fallbacks"] == "openai"
 
 
+def test_routing_details_exposes_capability_approval_id_without_fingerprint() -> None:
+    details = _routing_details(
+        {
+            "approval_kind": "capability_tool",
+            "approval_id": "approval_123",
+            "approval_fingerprint": "f" * 64,
+        }
+    )
+
+    assert details["approval_kind"] == "capability_tool"
+    assert details["approval_id"] == "approval_123"
+    assert "approval_fingerprint" not in details
+    assert "f" * 64 not in repr(details)
+
+
 def test_routing_details_redacts_sensitive_harness_profile_values() -> None:
     details = _routing_details(
         {

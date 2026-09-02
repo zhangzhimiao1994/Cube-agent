@@ -317,6 +317,19 @@ async def _harness_scheduler_from_current_config(
         return None
 
 
+async def _require_tool_approval_from_settings(
+    get_settings: Callable[[], Awaitable[admin.SystemSettingsResponse]],
+) -> bool:
+    try:
+        return (await get_settings()).require_approval_for_tools
+    except Exception as error:  # noqa: BLE001 - tool approval must fail closed.
+        _LOGGER.warning(
+            "tool_approval_settings_unavailable error_type=%s",
+            type(error).__name__,
+        )
+        return True
+
+
 class _ConfigBackedMultimediaGenerationExecutor:
     """Build a generation gateway from the current registered model resources."""
 
@@ -792,12 +805,21 @@ def create_app(
                 if active_runtime_registry is None:
                     assert active_redis is not None
                     assert active_secret_service is not None
+                    admin_service_for_capabilities = cast(
+                        admin.AdminResourceService,
+                        admin_resource_service
+                        if admin_resource_service is not None
+                        else application.state.admin_resource_service,
+                    )
                     runtime_capability_stack = build_runtime_capability_stack(
                         tenant_id=configured.bootstrap_tenant_id,
                         run_repository=RunRepository(active_sessions),
                         skill_store_dir=configured.skill_store_dir,
                         workspace_root=configured.attachment_store_dir,
                         generated_artifact_dir=configured.generated_artifact_dir,
+                        require_approval_for_tools=lambda _tenant_id: _require_tool_approval_from_settings(
+                            admin_service_for_capabilities.get_settings
+                        ),
                     )
                     active_runtime_registry = configured_runtime_registry(
                         config_service=ConfigService(active_sessions),

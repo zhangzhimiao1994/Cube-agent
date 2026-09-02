@@ -40,6 +40,12 @@ type ScheduleProposal = NonNullable<SubmittedRun["schedule_proposal"]>;
 type EvolutionProposal = NonNullable<SubmittedRun["evolution_proposal"]>;
 type OpenClawProposal = NonNullable<SubmittedRun["openclaw_proposal"]>;
 type RepairProposal = NonNullable<SubmittedRun["repair_proposal"]>;
+type CapabilityApproval = {
+  runId: string;
+  approvalId: string;
+  version: number;
+  summary: string;
+};
 type RunSubmissionOverride = {
   message?: string;
   directModel?: string;
@@ -1414,6 +1420,28 @@ function repairApprovalFromRunDetail(run: RunDetail | undefined) {
     decisionToken: run.decision_token,
     version: Number.isInteger(parsedVersion) && parsedVersion > 0 ? parsedVersion : 0,
     proposal: run.repair_proposal,
+  };
+}
+
+function capabilityApprovalFromRunDetail(run: RunDetail | undefined): CapabilityApproval | null {
+  if (!run || run.status !== "waiting_approval") return null;
+  if (run.explicit_details.approval_kind !== "capability_tool") return null;
+  const approvalId = run.explicit_details.approval_id?.trim();
+  if (!approvalId) return null;
+  const parsedVersion = Number(run.explicit_details.version ?? "0");
+  const pending = approvalStateFromEvents(run.events).pending.at(-1);
+  const diagnostic = run.failure_diagnostics.find((item) => item.approval_id === approvalId);
+  const summary =
+    diagnostic?.reason ||
+    diagnostic?.recommendation ||
+    pending?.action ||
+    pending?.summary ||
+    "当前工具调用需要沙箱权限确认";
+  return {
+    runId: run.id,
+    approvalId,
+    version: Number.isInteger(parsedVersion) && parsedVersion > 0 ? parsedVersion : 0,
+    summary,
   };
 }
 
@@ -3058,6 +3086,7 @@ export function RunsPage() {
     version: number;
     proposal: RepairProposal;
   } | null>(null);
+  const [capabilityApproval, setCapabilityApproval] = useState<CapabilityApproval | null>(null);
   const userSelectedMode = useRef(false);
   const trimmedReferenceConversationId = referenceConversationId.trim();
   const handoffActive = Boolean(trimmedReferenceConversationId);
@@ -3168,6 +3197,7 @@ export function RunsPage() {
       setEvolutionApproval(null);
       setOpenClawApproval(null);
       setRepairApproval(null);
+      setCapabilityApproval(null);
       setTemporaryApproval((current) =>
         current &&
         current.runId === approval.runId &&
@@ -3184,6 +3214,7 @@ export function RunsPage() {
       setEvolutionApproval(null);
       setOpenClawApproval(null);
       setRepairApproval(null);
+      setCapabilityApproval(null);
       setScheduleApproval((current) =>
         current && current.runId === proposedSchedule.runId ? current : proposedSchedule,
       );
@@ -3195,6 +3226,7 @@ export function RunsPage() {
       setScheduleApproval(null);
       setOpenClawApproval(null);
       setRepairApproval(null);
+      setCapabilityApproval(null);
       setEvolutionApproval((current) =>
         current && current.runId === proposedEvolution.runId ? current : proposedEvolution,
       );
@@ -3206,6 +3238,7 @@ export function RunsPage() {
       setScheduleApproval(null);
       setEvolutionApproval(null);
       setRepairApproval(null);
+      setCapabilityApproval(null);
       setOpenClawApproval((current) =>
         current && current.runId === proposedOpenClaw.runId ? current : proposedOpenClaw,
       );
@@ -3217,6 +3250,7 @@ export function RunsPage() {
       setScheduleApproval(null);
       setEvolutionApproval(null);
       setOpenClawApproval(null);
+      setCapabilityApproval(null);
       setRepairApproval((current) =>
         current &&
         current.runId === proposedRepair.runId &&
@@ -3226,7 +3260,26 @@ export function RunsPage() {
           : proposedRepair,
       );
     }
-  }, [dismissedEvolutionApprovalRunIds, dismissedScheduleApprovalRunIds, modeSelection, selectedRun.data, temporaryApproval]);
+    const proposedCapabilityApproval = capabilityApprovalFromRunDetail(selectedRun.data);
+    if (proposedCapabilityApproval) {
+      setModeSelection(null);
+      setTemporaryApproval(null);
+      setScheduleApproval(null);
+      setEvolutionApproval(null);
+      setOpenClawApproval(null);
+      setRepairApproval(null);
+      setCapabilityApproval((current) =>
+        current &&
+        current.runId === proposedCapabilityApproval.runId &&
+        current.approvalId === proposedCapabilityApproval.approvalId &&
+        current.version === proposedCapabilityApproval.version
+          ? current
+          : proposedCapabilityApproval,
+      );
+    } else if (selectedRun.data && capabilityApproval?.runId === selectedRun.data.id) {
+      setCapabilityApproval(null);
+    }
+  }, [capabilityApproval, dismissedEvolutionApprovalRunIds, dismissedScheduleApprovalRunIds, modeSelection, selectedRun.data, temporaryApproval]);
 
   useEffect(() => {
     setProcessDetailTarget(null);
@@ -3470,6 +3523,36 @@ export function RunsPage() {
     onSuccess: async (run) => {
       setRepairApproval(null);
       setSubmitNotice("已接受受控自修复，这次运行已重新排队。");
+      await refreshRunSurfaces(run);
+    },
+  });
+
+  const approveCapability = useMutation({
+    mutationFn: () => {
+      if (!capabilityApproval) throw new Error("capability approval is unavailable");
+      return api.approveCapability(capabilityApproval.runId, {
+        approval_id: capabilityApproval.approvalId,
+        version: capabilityApproval.version,
+      });
+    },
+    onSuccess: async (run) => {
+      setCapabilityApproval(null);
+      setSubmitNotice("已允许本次沙箱工具调用，当前任务已重新排队继续执行。");
+      await refreshRunSurfaces(run);
+    },
+  });
+
+  const rejectCapability = useMutation({
+    mutationFn: () => {
+      if (!capabilityApproval) throw new Error("capability approval is unavailable");
+      return api.rejectCapability(capabilityApproval.runId, {
+        approval_id: capabilityApproval.approvalId,
+        version: capabilityApproval.version,
+      });
+    },
+    onSuccess: async (run) => {
+      setCapabilityApproval(null);
+      setSubmitNotice("已拒绝本次沙箱工具调用，当前任务已取消。");
       await refreshRunSurfaces(run);
     },
   });
@@ -3765,6 +3848,25 @@ export function RunsPage() {
       setMessage("");
       setSubmitNotice("已选择接受受控自修复，正在重新排队。");
       acceptSelfRepair.mutate();
+      return;
+    }
+    if (capabilityApproval) {
+      const choice = parseChoiceText(trimmed, [
+        { value: "approve", label: "允许一次", aliases: ["允许", "同意", "通过", "approve", "yes", "allow"] },
+        { value: "reject", label: "拒绝", aliases: ["拒绝", "取消", "reject", "no", "deny"] },
+      ]);
+      if (!choice) {
+        setSubmitNotice("请回复 1/允许一次，或 2/拒绝本次沙箱工具调用。");
+        return;
+      }
+      setMessage("");
+      if (choice.option.value === "approve") {
+        setSubmitNotice("已选择允许一次，正在重新排队继续执行。");
+        approveCapability.mutate();
+        return;
+      }
+      setSubmitNotice("已选择拒绝，本次任务会取消。");
+      rejectCapability.mutate();
       return;
     }
     if (modeSelection) {
@@ -4500,6 +4602,12 @@ export function RunsPage() {
             {acceptSelfRepair.isError ? (
               <p role="alert">{formatApiError(acceptSelfRepair.error, "自修复确认失败")}</p>
             ) : null}
+            {approveCapability.isError ? (
+              <p role="alert">{formatApiError(approveCapability.error, "沙箱权限确认失败")}</p>
+            ) : null}
+            {rejectCapability.isError ? (
+              <p role="alert">{formatApiError(rejectCapability.error, "沙箱权限拒绝失败")}</p>
+            ) : null}
             {repairApproval ? (
               <aside className="composer-attachment-card" role="status" aria-label="自修复确认">
                 <div>
@@ -4511,6 +4619,33 @@ export function RunsPage() {
                 <button type="button" disabled={acceptSelfRepair.isPending} onClick={() => acceptSelfRepair.mutate()}>
                   {acceptSelfRepair.isPending ? "排队中..." : "接受修复"}
                 </button>
+              </aside>
+            ) : null}
+            {capabilityApproval ? (
+              <aside className="composer-attachment-card" role="status" aria-label="沙箱权限确认">
+                <div>
+                  <span className="eyebrow">沙箱权限待确认</span>
+                  <strong>工具调用需要授权</strong>
+                  <small>审批 {capabilityApproval.approvalId}</small>
+                </div>
+                <p>{capabilityApproval.summary}</p>
+                <div className="composer-card-actions">
+                  <button
+                    type="button"
+                    disabled={approveCapability.isPending || rejectCapability.isPending}
+                    onClick={() => approveCapability.mutate()}
+                  >
+                    {approveCapability.isPending ? "允许中..." : "允许一次"}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-action"
+                    disabled={approveCapability.isPending || rejectCapability.isPending}
+                    onClick={() => rejectCapability.mutate()}
+                  >
+                    {rejectCapability.isPending ? "拒绝中..." : "拒绝"}
+                  </button>
+                </div>
               </aside>
             ) : null}
             {scheduleApproval ? (

@@ -1628,6 +1628,26 @@ export const api = {
       SubmittedRunSchema,
     );
   },
+  approveCapability(
+    id: string,
+    payload: { approval_id: string; version: number },
+  ): Promise<SubmittedRun> {
+    return request(
+      `/api/v1/runs/${encodeURIComponent(id)}/approve-capability`,
+      { method: "POST", body: JSON.stringify(payload) },
+      SubmittedRunSchema,
+    );
+  },
+  rejectCapability(
+    id: string,
+    payload: { approval_id: string; version: number },
+  ): Promise<SubmittedRun> {
+    return request(
+      `/api/v1/runs/${encodeURIComponent(id)}/reject-capability`,
+      { method: "POST", body: JSON.stringify(payload) },
+      SubmittedRunSchema,
+    );
+  },
   runs(): Promise<RunListItem[]> {
     return request("/api/v1/admin/runs", { method: "GET" }, z.array(RunListItemSchema));
   },

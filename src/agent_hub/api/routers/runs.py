@@ -124,6 +124,26 @@ class RunServiceProtocol(Protocol):
         version: int,
     ) -> SubmittedRun: ...
 
+    async def approve_capability(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+    ) -> SubmittedRun: ...
+
+    async def reject_capability(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        approval_id: str,
+        version: int,
+    ) -> SubmittedRun: ...
+
     async def get(self, tenant_id: UUID, run_id: UUID) -> RunSummary: ...
 
     async def events(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]: ...
@@ -190,6 +210,13 @@ class ReviseTemporaryAgentRequest(BaseModel):
 
 class AcceptSelfRepairRequest(BaseModel):
     decision_token: str = Field(min_length=32, max_length=160)
+    version: int = Field(ge=1)
+
+
+class CapabilityApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    approval_id: str = Field(min_length=1, max_length=128)
     version: int = Field(ge=1)
 
 
@@ -948,6 +975,72 @@ async def accept_self_repair(
             actor_id=principal.user_id,
             run_id=run_id,
             decision_token=body.decision_token,
+            version=body.version,
+        )
+    except RunNotFound as error:
+        raise _run_not_found() from error
+    except RunConflict as error:
+        raise _run_conflict(error) from error
+    except ValueError as error:
+        raise PublicAPIError(
+            422,
+            "request_validation",
+            str(error),
+            details={"reason": str(error)},
+        ) from error
+    return SubmittedRunResponse.from_submitted(submitted)
+
+
+@router.post(
+    "/{run_id}/approve-capability",
+    response_model=SubmittedRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def approve_capability(
+    run_id: UUID,
+    body: CapabilityApprovalRequest,
+    service: Annotated[RunServiceProtocol, Depends(_run_service)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:create"))],
+) -> SubmittedRunResponse:
+    try:
+        submitted = await service.approve_capability(
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+            run_id=run_id,
+            approval_id=body.approval_id,
+            version=body.version,
+        )
+    except RunNotFound as error:
+        raise _run_not_found() from error
+    except RunConflict as error:
+        raise _run_conflict(error) from error
+    except ValueError as error:
+        raise PublicAPIError(
+            422,
+            "request_validation",
+            str(error),
+            details={"reason": str(error)},
+        ) from error
+    return SubmittedRunResponse.from_submitted(submitted)
+
+
+@router.post(
+    "/{run_id}/reject-capability",
+    response_model=SubmittedRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def reject_capability(
+    run_id: UUID,
+    body: CapabilityApprovalRequest,
+    service: Annotated[RunServiceProtocol, Depends(_run_service)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:create"))],
+) -> SubmittedRunResponse:
+    try:
+        submitted = await service.reject_capability(
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+            run_id=run_id,
+            approval_id=body.approval_id,
             version=body.version,
         )
     except RunNotFound as error:

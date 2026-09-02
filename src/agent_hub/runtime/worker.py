@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Protocol
 from uuid import UUID
@@ -29,6 +30,19 @@ class WorkerRunService(Protocol):
     async def publish_pending(self, limit: int) -> int: ...
 
     async def execute(self, run_id: UUID) -> object: ...
+
+
+async def _require_tool_approval_from_settings(
+    get_settings: Callable[[], Awaitable[admin.SystemSettingsResponse]],
+) -> bool:
+    try:
+        return (await get_settings()).require_approval_for_tools
+    except Exception as error:  # noqa: BLE001 - tool approval must fail closed.
+        _LOGGER.warning(
+            "tool_approval_settings_unavailable error_type=%s",
+            type(error).__name__,
+        )
+        return True
 
 
 class LocalRunQueue:
@@ -108,16 +122,29 @@ def build_worker_service(
     queue = LocalRunQueue()
     config_service = ConfigService(database.session_factory)
     run_repository = RunRepository(database.session_factory)
+    secret_service = SecretService(
+        database.session_factory,
+        SecretCipher(settings.master_key_bytes()),
+    )
+    admin_service = admin.PersistentAdminResourceService(
+        config_service=config_service,
+        secret_service=secret_service,
+        tenant_id=settings.bootstrap_tenant_id,
+        actor_id=settings.bootstrap_tenant_id,
+        run_repository=run_repository,
+        session_factory=database.session_factory,
+        skill_store_dir=settings.skill_store_dir,
+        generated_artifact_dir=settings.generated_artifact_dir,
+    )
     runtime_capability_stack = build_runtime_capability_stack(
         tenant_id=settings.bootstrap_tenant_id,
         run_repository=run_repository,
         skill_store_dir=settings.skill_store_dir,
         workspace_root=settings.attachment_store_dir,
         generated_artifact_dir=settings.generated_artifact_dir,
-    )
-    secret_service = SecretService(
-        database.session_factory,
-        SecretCipher(settings.master_key_bytes()),
+        require_approval_for_tools=lambda _tenant_id: _require_tool_approval_from_settings(
+            admin_service.get_settings
+        ),
     )
     service = RunService(
         run_repository,

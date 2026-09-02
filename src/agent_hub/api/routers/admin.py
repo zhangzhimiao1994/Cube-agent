@@ -7943,6 +7943,12 @@ def _routing_details(routing_decision: dict[str, object] | None) -> dict[str, st
     reason = routing_decision.get("reason")
     if isinstance(reason, str) and reason:
         details["routing_reason"] = reason
+    approval_kind = routing_decision.get("approval_kind")
+    if approval_kind == "capability_tool":
+        details["approval_kind"] = approval_kind
+        approval_id = routing_decision.get("approval_id")
+        if isinstance(approval_id, str) and approval_id:
+            details["approval_id"] = approval_id[:128]
     hermes = routing_decision.get("hermes")
     if isinstance(hermes, dict):
         confidence = hermes.get("confidence")
