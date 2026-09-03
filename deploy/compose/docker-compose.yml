@@ -106,6 +106,8 @@ services:
       - agent_hub_data:/var/lib/agent-hub
     security_opt: ["no-new-privileges:true"]
     cap_drop: [ALL]
+    healthcheck:
+      disable: true
 
   litellm:
     image: ${LITELLM_IMAGE:-ghcr.io/berriai/litellm:main-stable}

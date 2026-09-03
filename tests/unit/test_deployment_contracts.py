@@ -159,6 +159,16 @@ def test_compose_litellm_is_health_checked_and_can_reach_provider_apis() -> None
     assert "socket.create_connection(('127.0.0.1', 4000), 3)" in compose
 
 
+def test_compose_worker_does_not_inherit_api_http_healthcheck() -> None:
+    compose = read("deploy/compose/docker-compose.yml")
+    worker_block = compose.split("  worker:\n", 1)[1].split("\n  litellm:", 1)[0]
+
+    assert "command: [\"python\", \"-m\", \"agent_hub.runtime.worker\"]" in worker_block
+    assert "healthcheck:" in worker_block
+    assert "disable: true" in worker_block
+    assert "agent-hub-healthcheck" not in worker_block
+
+
 def test_compose_caddy_requires_explicit_public_url_without_localhost_default() -> None:
     caddyfile = read("deploy/compose/Caddyfile")
 

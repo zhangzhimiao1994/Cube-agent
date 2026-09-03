@@ -22,6 +22,7 @@ class FeishuSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="FEISHU_",
         env_file=".env",
+        env_ignore_empty=True,
         hide_input_in_errors=True,
         validate_default=True,
     )
