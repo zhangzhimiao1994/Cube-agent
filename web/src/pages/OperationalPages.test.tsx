@@ -2284,6 +2284,49 @@ describe("operational management pages", () => {
     expect((await within(stream).findAllByText(/这是第二轮回复正文/)).length).toBeGreaterThan(0);
   });
 
+  it("renders conversation messages by run creation time when the API returns runs out of order", async () => {
+    visibleConversationRuns = [
+      {
+        ...runDetail,
+        id: secondRunId,
+        created_at: "2026-08-07T00:02:00Z",
+        request: "第二轮：生成压缩包。",
+        artifacts: [
+          {
+            id: "artifact-2",
+            kind: "markdown",
+            title: "第二轮产物",
+            text: "第二轮回复：压缩包已经生成。",
+          },
+        ],
+      },
+      {
+        ...runDetail,
+        created_at: "2026-08-07T00:01:00Z",
+        request: "第一轮：先生成代码。",
+        artifacts: [
+          {
+            id: "artifact-1",
+            kind: "markdown",
+            title: "第一轮产物",
+            text: "第一轮回复：代码已经生成。",
+          },
+        ],
+      },
+    ];
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await within(stream).findByText("第一轮：先生成代码。");
+    const text = stream.textContent ?? "";
+    expect(text.indexOf("第一轮：先生成代码。")).toBeLessThan(text.indexOf("第二轮：生成压缩包。"));
+    expect(text.indexOf("第一轮回复：代码已经生成。")).toBeLessThan(text.indexOf("第二轮回复：压缩包已经生成。"));
+  });
+
   it("restores historical conversation messages after starting a new chat", async () => {
     const user = userEvent.setup();
     render(<TestApp initialPath="/" />);

@@ -703,6 +703,32 @@ async def _gateway_for_config(
     return gateway, logical_model
 
 
+def _software_delivery_guidance(context: TaskContext, tools: tuple[str, ...]) -> str:
+    if TaskProfile.SOFTWARE not in _task_profiles(context.request):
+        return ""
+    lines = [
+        "Software delivery requirements:",
+        "List every file path included in the ZIP and state how each file satisfies the user request.",
+        "Do not claim the project works without verification evidence.",
+    ]
+    if "run_safe_command" in tools:
+        lines.append("Run an available safe command smoke test before final packaging.")
+    if "project.generate_zip" in tools:
+        lines.append(
+            "Use project.generate_zip only after verification; set presentation to final_attachment for the user-downloadable ZIP."
+        )
+    return "\n" + "\n".join(lines) + "\n"
+
+
+def _software_final_guidance(context: TaskContext) -> str:
+    if TaskProfile.SOFTWARE not in _task_profiles(context.request):
+        return ""
+    return (
+        "Do not claim the project works without verification evidence. "
+        "Summarize the verified file list, smoke-test result, and any remaining risk. "
+    )
+
+
 def _dispatch_plan(
     roles: tuple[RoleAssignment, ...],
     context: TaskContext,
@@ -731,17 +757,21 @@ def _dispatch_plan(
         context,
         capability_gateway=capability_gateway,
     )
+    role_tools_by_id = {
+        role.id: _role_allowed_tools(
+            role,
+            context,
+            capability_gateway=capability_gateway,
+        )
+        for role in selected_roles
+    }
     agents = [
         AgentSpec(
             id=role.id,
             role=role.role,
             goal=role.mission,
             logical_model=role.model,
-            allowed_tools=_role_allowed_tools(
-                role,
-                context,
-                capability_gateway=capability_gateway,
-            ),
+            allowed_tools=role_tools_by_id[role.id],
         )
         for role in selected_roles
     ]
@@ -786,14 +816,11 @@ def _dispatch_plan(
                 f"Role mission: {role.mission}\n"
                 f"User task: {request_text}\n"
                 f"{memory_guidance}"
+                f"{_software_delivery_guidance(context, role_tools_by_id[role.id])}"
                 "Return only the role-specific result, evidence, risks, and verification."
             ),
             depends_on=producer_step_ids if _is_post_product_role(role) else (),
-            tools=_role_allowed_tools(
-                role,
-                context,
-                capability_gateway=capability_gateway,
-            ),
+            tools=role_tools_by_id[role.id],
             token_budget=role_token_budget,
             timeout_seconds=(
                 post_product_step_timeout if _is_post_product_role(role) else producer_step_timeout
@@ -809,6 +836,7 @@ def _dispatch_plan(
         task=(
             f"Synthesize all role outputs into the final answer for this task: {request_text}. "
             f"{memory_guidance}"
+            f"{_software_final_guidance(context)}"
             "Resolve conflicts explicitly and state any user decision required."
         ),
         depends_on=final_dependencies,

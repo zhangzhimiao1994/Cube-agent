@@ -18,6 +18,21 @@ type ManualRunMode = (typeof MANUAL_RUN_MODES)[number]["value"];
 type RunEvent = RunDetail["events"][number];
 type RunArtifact = RunDetail["artifacts"][number];
 
+function detailTimestampValue(value: string | null | undefined) {
+  if (!value) return 0;
+  const timestamp = new Date(value).getTime();
+  return Number.isNaN(timestamp) ? 0 : timestamp;
+}
+
+function orderedDetailEvents(events: RunEvent[]) {
+  return [...events].sort(
+    (left, right) =>
+      left.sequence - right.sequence ||
+      detailTimestampValue(left.created_at) - detailTimestampValue(right.created_at) ||
+      left.kind.localeCompare(right.kind),
+  );
+}
+
 type ObserverNotice = {
   sequence: number;
   trigger: string;
@@ -1504,19 +1519,20 @@ export function RunDetailPage() {
     return <p role="alert">{formatApiError(run.error, "运行详情加载失败")}</p>;
   }
 
-  const canPause = ["queued", "running"].includes(run.data.status);
-  const canResume = run.data.status === "paused";
-  const canCancel = !TERMINAL_STATUSES.has(run.data.status);
-  const isWaitingForMode = run.data.status === "waiting_user_mode" && Boolean(run.data.decision_token);
-  const capabilityApproval = capabilityApprovalFromRunDetail(run.data);
-  const observerNotices = collectObserverNotices(run.data.events);
-  const timelineItems = detailTimelineItems(run.data.events);
-  const processCards = detailProcessCards(timelineItems, run.data.artifacts);
-  const toolLifecycles = toolLifecycleFromApi(run.data);
-  const posture = detailPosture(run.data);
-  const explicitRows = explicitDetailRows(run.data.explicit_details);
-  const executionIntents = executionIntentsForDetail(run.data);
-  const failureDiagnostics = failureDiagnosticsForDetail(run.data);
+  const orderedRunData: RunDetail = { ...run.data, events: orderedDetailEvents(run.data.events) };
+  const canPause = ["queued", "running"].includes(orderedRunData.status);
+  const canResume = orderedRunData.status === "paused";
+  const canCancel = !TERMINAL_STATUSES.has(orderedRunData.status);
+  const isWaitingForMode = orderedRunData.status === "waiting_user_mode" && Boolean(orderedRunData.decision_token);
+  const capabilityApproval = capabilityApprovalFromRunDetail(orderedRunData);
+  const observerNotices = collectObserverNotices(orderedRunData.events);
+  const timelineItems = detailTimelineItems(orderedRunData.events);
+  const processCards = detailProcessCards(timelineItems, orderedRunData.artifacts);
+  const toolLifecycles = toolLifecycleFromApi(orderedRunData);
+  const posture = detailPosture(orderedRunData);
+  const explicitRows = explicitDetailRows(orderedRunData.explicit_details);
+  const executionIntents = executionIntentsForDetail(orderedRunData);
+  const failureDiagnostics = failureDiagnosticsForDetail(orderedRunData);
 
   return (
     <section>

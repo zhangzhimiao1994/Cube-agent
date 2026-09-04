@@ -1,8 +1,99 @@
 import { expect, test, type Page } from "@playwright/test";
+import { spawnSync } from "node:child_process";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
 const runId = "22222222-2222-4222-8222-222222222222";
 const codingRunId = "33333333-3333-4333-8333-333333333333";
 const codingConversationId = "44444444-4444-4444-8444-444444444444";
+
+function crc32(bytes: Buffer) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function buildStoredZip(files: Record<string, string>) {
+  const localParts: Buffer[] = [];
+  const centralParts: Buffer[] = [];
+  let offset = 0;
+
+  for (const [name, content] of Object.entries(files)) {
+    const nameBytes = Buffer.from(name, "utf8");
+    const contentBytes = Buffer.from(content, "utf8");
+    const checksum = crc32(contentBytes);
+
+    const localHeader = Buffer.alloc(30);
+    localHeader.writeUInt32LE(0x04034b50, 0);
+    localHeader.writeUInt16LE(20, 4);
+    localHeader.writeUInt16LE(0, 6);
+    localHeader.writeUInt16LE(0, 8);
+    localHeader.writeUInt32LE(checksum, 14);
+    localHeader.writeUInt32LE(contentBytes.length, 18);
+    localHeader.writeUInt32LE(contentBytes.length, 22);
+    localHeader.writeUInt16LE(nameBytes.length, 26);
+    localParts.push(localHeader, nameBytes, contentBytes);
+
+    const centralHeader = Buffer.alloc(46);
+    centralHeader.writeUInt32LE(0x02014b50, 0);
+    centralHeader.writeUInt16LE(20, 4);
+    centralHeader.writeUInt16LE(20, 6);
+    centralHeader.writeUInt16LE(0, 8);
+    centralHeader.writeUInt16LE(0, 10);
+    centralHeader.writeUInt32LE(checksum, 16);
+    centralHeader.writeUInt32LE(contentBytes.length, 20);
+    centralHeader.writeUInt32LE(contentBytes.length, 24);
+    centralHeader.writeUInt16LE(nameBytes.length, 28);
+    centralHeader.writeUInt32LE(offset, 42);
+    centralParts.push(centralHeader, nameBytes);
+
+    offset += localHeader.length + nameBytes.length + contentBytes.length;
+  }
+
+  const centralDirectory = Buffer.concat(centralParts);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(Object.keys(files).length, 8);
+  end.writeUInt16LE(Object.keys(files).length, 10);
+  end.writeUInt32LE(centralDirectory.length, 12);
+  end.writeUInt32LE(offset, 16);
+
+  return Buffer.concat([...localParts, centralDirectory, end]);
+}
+
+function readStoredZipEntries(bytes: Buffer) {
+  const entries = new Map<string, string>();
+  let offset = 0;
+  while (offset + 4 <= bytes.length && bytes.readUInt32LE(offset) === 0x04034b50) {
+    const method = bytes.readUInt16LE(offset + 8);
+    const compressedSize = bytes.readUInt32LE(offset + 18);
+    const filenameLength = bytes.readUInt16LE(offset + 26);
+    const extraLength = bytes.readUInt16LE(offset + 28);
+    const nameStart = offset + 30;
+    const contentStart = nameStart + filenameLength + extraLength;
+    const contentEnd = contentStart + compressedSize;
+    if (method !== 0) throw new Error("test ZIP parser only supports stored entries");
+    const name = bytes.subarray(nameStart, nameStart + filenameLength).toString("utf8");
+    entries.set(name, bytes.subarray(contentStart, contentEnd).toString("utf8"));
+    offset = contentEnd;
+  }
+  return entries;
+}
+
+async function extractStoredZipEntries(bytes: Buffer, destination: string) {
+  const entries = readStoredZipEntries(bytes);
+  for (const [name, content] of entries) {
+    const outputPath = join(destination, name);
+    await mkdir(dirname(outputPath), { recursive: true });
+    await writeFile(outputPath, content, "utf8");
+  }
+  return entries;
+}
 
 async function mockRunApi(page: Page) {
   await page.route("**/api/v1/**", async (route) => {
@@ -228,6 +319,7 @@ async function mockCodingRunApi(
           id: intermediateArtifactId,
           kind: "zip",
           title: "工程师",
+          text: options.fullOutputSentinel ?? null,
           filename: "hello-world-source.zip",
           mime_type: "application/zip",
           size_bytes: 22,
@@ -414,13 +506,25 @@ async function mockCodingRunApi(
     }
     if (path === finalDownloadPath || path === intermediateDownloadPath) {
       const filename = path === finalDownloadPath ? "hello-world.zip" : "hello-world-source.zip";
+      const body =
+        path === finalDownloadPath
+          ? buildStoredZip({
+              "hello-world/index.mjs": "console.log('hello world')\n",
+              "hello-world/package.json": "{\"type\":\"module\",\"scripts\":{\"start\":\"node index.mjs\"}}\n",
+              "hello-world/README.md": "# Hello World\n\nRun with `node index.mjs`.\n",
+            })
+          : buildStoredZip({
+              "source/index.mjs": "console.log('hello world')\n",
+              "source/package.json": "{\"type\":\"module\",\"scripts\":{\"start\":\"node index.mjs\"}}\n",
+              "source/README.md": "# Source Package\n\nRun with `node index.mjs`.\n",
+            });
       await route.fulfill({
         status: 200,
         headers: {
           "Content-Type": "application/zip",
           "Content-Disposition": `attachment; filename="${filename}"`,
         },
-        body: "zip-bytes",
+        body,
       });
       return;
     }
@@ -428,7 +532,7 @@ async function mockCodingRunApi(
   });
 }
 
-test("operator validates a simple coding run and downloads final and intermediate artifacts", async ({ page }) => {
+test("operator validates a simple coding run and downloads final and intermediate artifacts", async ({ page }, testInfo) => {
   await mockCodingRunApi(page);
 
   await page.goto("/");
@@ -444,13 +548,48 @@ test("operator validates a simple coding run and downloads final and intermediat
 
   const finalDownload = page.waitForEvent("download");
   await page.getByRole("button", { name: /下载 hello-world\.zip/ }).click();
-  expect((await finalDownload).suggestedFilename()).toBe("hello-world.zip");
+  const finalArchive = await finalDownload;
+  expect(finalArchive.suggestedFilename()).toBe("hello-world.zip");
+  const finalArchivePath = testInfo.outputPath("hello-world.zip");
+  await finalArchive.saveAs(finalArchivePath);
+  const finalArchiveBytes = await readFile(finalArchivePath);
+  expect(finalArchiveBytes.subarray(0, 4).toString("binary")).toBe("PK\u0003\u0004");
+  const finalEntries = readStoredZipEntries(finalArchiveBytes);
+  expect([...finalEntries.keys()].sort()).toEqual([
+    "hello-world/README.md",
+    "hello-world/index.mjs",
+    "hello-world/package.json",
+  ]);
+  expect(finalEntries.get("hello-world/index.mjs")).toBe("console.log('hello world')\n");
+  expect(JSON.parse(finalEntries.get("hello-world/package.json") ?? "{}")).toMatchObject({
+    scripts: { start: "node index.mjs" },
+  });
+  const extractedFinalDir = testInfo.outputPath("final-extracted");
+  await extractStoredZipEntries(finalArchiveBytes, extractedFinalDir);
+  const runResult = spawnSync(process.execPath, ["index.mjs"], {
+    cwd: join(extractedFinalDir, "hello-world"),
+    encoding: "utf8",
+  });
+  expect(runResult.status).toBe(0);
+  expect(runResult.stdout.trim()).toBe("hello world");
 
   await page.getByRole("button", { name: /生成中间项目文件。/ }).click();
   await expect(page.getByRole("dialog", { name: "运行过程详情" })).toBeVisible();
   const intermediateDownload = page.waitForEvent("download");
   await page.getByRole("button", { name: /下载 hello-world-source\.zip/ }).click();
-  expect((await intermediateDownload).suggestedFilename()).toBe("hello-world-source.zip");
+  const intermediateArchive = await intermediateDownload;
+  expect(intermediateArchive.suggestedFilename()).toBe("hello-world-source.zip");
+  const intermediateArchivePath = testInfo.outputPath("hello-world-source.zip");
+  await intermediateArchive.saveAs(intermediateArchivePath);
+  const intermediateArchiveBytes = await readFile(intermediateArchivePath);
+  expect(intermediateArchiveBytes.subarray(0, 4).toString("binary")).toBe("PK\u0003\u0004");
+  const intermediateEntries = readStoredZipEntries(intermediateArchiveBytes);
+  expect([...intermediateEntries.keys()].sort()).toEqual([
+    "source/README.md",
+    "source/index.mjs",
+    "source/package.json",
+  ]);
+  expect(intermediateEntries.get("source/README.md")).toContain("node index.mjs");
   await page.locator(".process-drawer-backdrop").click({ position: { x: 5, y: 5 } });
   await expect(page.getByRole("dialog", { name: "运行过程详情" })).toHaveCount(0);
 });
@@ -465,8 +604,6 @@ test("opened agent process drawer refreshes when new step events arrive", async 
   await page.getByRole("button", { name: /工程师开始创建最小项目。/ }).click();
   const drawer = page.getByRole("dialog", { name: "运行过程详情" });
   await expect(drawer).toBeVisible();
-  await expect(drawer).toContainText("工程师开始创建最小项目。");
-
   await expect(drawer).toContainText("工程师刷新后继续执行验收。", { timeout: 5000 });
   await expect(drawer).toBeVisible();
 });

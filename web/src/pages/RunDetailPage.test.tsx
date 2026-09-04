@@ -178,6 +178,61 @@ describe("RunDetailPage", () => {
     expect(document.documentElement.style.overflow).toBe("");
   });
 
+  it("renders run detail events in sequence order when backend payload arrives out of order", async () => {
+    const outOfOrderDetail: RunDetail = {
+      ...runDetail,
+      events: [
+        {
+          ...runDetail.events[0],
+          sequence: 2,
+          summary: "第二步产物",
+          created_at: "2026-08-20T00:00:02Z",
+          actor: "writer",
+          step_id: "write-final",
+        },
+        {
+          ...runDetail.events[0],
+          sequence: 1,
+          kind: "step.started",
+          message: "step.started",
+          summary: "第一步规划",
+          created_at: "2026-08-20T00:00:01Z",
+          actor: "main_agent",
+          tool_name: null,
+          step_id: "plan",
+          payload: { task: "第一步规划" },
+          artifact: null,
+        },
+      ],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(outOfOrderDetail);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    expect(await screen.findByRole("heading", { name: "运行详情" })).not.toBeNull();
+    const eventRows = Array.from(document.querySelectorAll(".event-log-list li")).map((row) => row.textContent ?? "");
+    expect(eventRows).toEqual([
+      expect.stringContaining("第一步规划"),
+      expect.stringContaining("第二步产物"),
+    ]);
+  });
+
   it("deduplicates generated downloads that reuse the same file URL", async () => {
     const duplicatedDownload = {
       id: "artifact-final-wrapper-2",

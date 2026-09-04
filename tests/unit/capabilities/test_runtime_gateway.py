@@ -308,6 +308,34 @@ async def test_runtime_gateway_accepts_common_project_zip_files_list(
         assert archive.read("main.py") == b'print("hello mofang")'
 
 
+async def test_runtime_gateway_rejects_duplicate_normalized_project_zip_paths(
+    tmp_path: Path,
+) -> None:
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=tmp_path / "generated",
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="duplicate file path"):
+        await gateway.execute(
+            tenant_id=TENANT_ID,
+            run_id=RUN_ID,
+            actor="engineer",
+            name="project.generate_zip",
+            arguments=cast(
+                Mapping[str, JsonValue],
+                {
+                    "title": "Duplicate Paths",
+                    "files": [
+                        {"src/main.py": "print('first')\n"},
+                        {"src/main.py": "print('second')\n"},
+                    ],
+                },
+            ),
+            idempotency_key="project_zip_duplicate_normalized_paths",
+        )
+
+
 async def test_runtime_gateway_rejects_unsafe_project_zip_paths(tmp_path: Path) -> None:
     gateway = RuntimeCapabilityGateway(
         skill_store_dir=tmp_path / "skills",

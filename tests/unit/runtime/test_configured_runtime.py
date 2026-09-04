@@ -1356,6 +1356,42 @@ def test_dispatch_plan_filters_unavailable_skills_from_executable_steps() -> Non
     assert plan.allowed_tools == ("read_context",)
 
 
+def test_dispatch_plan_requires_verification_before_final_project_zip() -> None:
+    roles = (
+        RoleAssignment(
+            id="implementer",
+            role="Implementer",
+            purpose=RolePurpose.EXECUTE,
+            mission="Build the requested project.",
+            must_answer=("What code was produced?",),
+            allowed_tools=("run_safe_command", "project.generate_zip"),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="生成一个最简单的 hello world Node 项目，并给我可下载压缩包。",
+        ),
+        capability_gateway=FakeCapabilityAvailability({"run_safe_command", "project.generate_zip"}),
+    )
+
+    implementer_step = next(step for step in plan.steps if step.agent == "implementer")
+    final_step = next(step for step in plan.steps if step.id == "final_response_step")
+    assert "Run an available safe command smoke test before final packaging" in implementer_step.task
+    assert "List every file path included in the ZIP" in implementer_step.task
+    assert "project.generate_zip" in implementer_step.task
+    assert "final_attachment" in implementer_step.task
+    assert "Do not claim the project works without verification evidence" in final_step.task
+
+
 def test_dispatch_plan_reserves_more_time_for_final_synthesis() -> None:
     roles = tuple(
         RoleAssignment(

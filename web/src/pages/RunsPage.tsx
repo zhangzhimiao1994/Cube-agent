@@ -1354,6 +1354,26 @@ export function runDetailVersion(run: RunDetail): number {
   return Number.isInteger(parsedVersion) && parsedVersion > 0 ? parsedVersion : 0;
 }
 
+function runMaxEventSequence(run: RunDetail): number {
+  return run.events.reduce((max, event) => (event.sequence > max ? event.sequence : max), 0);
+}
+
+function runHasNewerProgress(candidate: RunDetail, current: RunDetail): boolean {
+  const candidateVersion = runDetailVersion(candidate);
+  const currentVersion = runDetailVersion(current);
+  if (candidateVersion !== currentVersion) return candidateVersion > currentVersion;
+  const candidateSequence = runMaxEventSequence(candidate);
+  const currentSequence = runMaxEventSequence(current);
+  if (candidateSequence !== currentSequence) return candidateSequence > currentSequence;
+  return candidate.artifacts.length > current.artifacts.length;
+}
+
+function preferredRunSnapshot(current: RunDetail, candidate: RunDetail): RunDetail {
+  if (runHasNewerProgress(candidate, current)) return candidate;
+  if (runHasNewerProgress(current, candidate)) return current;
+  return candidate;
+}
+
 function explainActualMode(run: { status: string; mode: string | null }) {
   if (run.status === "waiting_user_mode") {
     return "自动检测没有足够把握，这轮回复需要你确认运行模式。";
@@ -1821,6 +1841,29 @@ function conversationTimestamp(value: string | null | undefined) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+function timestampValue(value: string | null | undefined) {
+  if (!value) return Number.MAX_SAFE_INTEGER;
+  const timestamp = new Date(value).getTime();
+  return Number.isNaN(timestamp) ? Number.MAX_SAFE_INTEGER : timestamp;
+}
+
+function compareTimestamp(left: string | null | undefined, right: string | null | undefined) {
+  return timestampValue(left) - timestampValue(right);
+}
+
+function orderedConversationRuns(runs: RunDetail[]) {
+  return [...runs].sort((left, right) => compareTimestamp(left.created_at, right.created_at) || left.id.localeCompare(right.id));
+}
+
+function orderedRunEvents(events: RunDetail["events"]) {
+  return [...events].sort(
+    (left, right) =>
+      left.sequence - right.sequence ||
+      compareTimestamp(left.created_at, right.created_at) ||
+      left.kind.localeCompare(right.kind),
+  );
+}
+
 function conversationTitle(run: RunListItem, items: RunListItem[]) {
   const fallback = run.id.slice(0, 8);
   const conversationKey = run.conversation_id?.trim();
@@ -1831,9 +1874,9 @@ function conversationTitle(run: RunListItem, items: RunListItem[]) {
   return timestamp ? `${question} · ${timestamp}` : question;
 }
 
-function conversationMessages(runs: RunDetail[]): ChatMessage[] {
+export function conversationMessages(runs: RunDetail[]): ChatMessage[] {
   const seenDownloadMessages = new Set<string>();
-  return runs.flatMap((run) =>
+  return orderedConversationRuns(runs).flatMap((run) =>
     detailMessages(run)
       .filter((message) => {
         const downloadKey = artifactDownloadKey(message.artifact);
@@ -1910,22 +1953,26 @@ function runSnapshotSignature(run: RunDetail) {
   });
 }
 
-function mergeConversationRuns(previous: RunDetail[] | undefined, incoming: RunDetail[]) {
-  if (!previous || previous.length === 0) return incoming;
-  if (incoming.length === 0) return previous;
+export function mergeConversationRuns(previous: RunDetail[] | undefined, incoming: RunDetail[]) {
+  if (!previous || previous.length === 0) return orderedConversationRuns(incoming);
+  if (incoming.length === 0) return orderedConversationRuns(previous);
   const incomingById = new Map(incoming.map((run) => [run.id, run]));
   const previousIds = new Set(previous.map((run) => run.id));
-  const merged = previous.map((run) => incomingById.get(run.id) ?? run);
+  const merged = previous.map((run) => {
+    const incomingRun = incomingById.get(run.id);
+    return incomingRun ? preferredRunSnapshot(run, incomingRun) : run;
+  });
   for (const run of incoming) {
     if (!previousIds.has(run.id)) merged.push(run);
   }
+  const ordered = orderedConversationRuns(merged);
   if (
-    merged.length === previous.length &&
-    merged.every((run, index) => sameRunSnapshot(run, previous[index]))
+    ordered.length === previous.length &&
+    ordered.every((run, index) => sameRunSnapshot(run, previous[index]))
   ) {
     return previous;
   }
-  return merged;
+  return ordered;
 }
 
 function internalArtifactNotice(detail: RunDetail): ChatMessage | null {
@@ -2546,22 +2593,23 @@ function refreshedProcessTarget(
   return matchedByStableSource.at(-1) ?? candidates.find((item) => item.id === currentTarget.id) ?? currentTarget;
 }
 
-function runProcessItems(
+export function runProcessItems(
   detail: RunDetail,
   agentNames: Map<string, string>,
   mainAgentModelName?: string,
 ): ProcessDetailTarget[] {
-  const routingRows = processRoutingRows(detail, agentNames, mainAgentModelName);
-  const routingAgentPool = displayAgentPool(detail.explicit_details.selected_agent_ids, agentNames);
+  const orderedDetail: RunDetail = { ...detail, events: orderedRunEvents(detail.events) };
+  const routingRows = processRoutingRows(orderedDetail, agentNames, mainAgentModelName);
+  const routingAgentPool = displayAgentPool(orderedDetail.explicit_details.selected_agent_ids, agentNames);
   const routingItem =
     routingRows.length > 0
       ? [
           {
-            id: `${detail.id}-routing`,
-            runId: detail.id,
-            conversationId: runConversationId(detail),
+            id: `${orderedDetail.id}-routing`,
+            runId: orderedDetail.id,
+            conversationId: runConversationId(orderedDetail),
             title: "主 Agent 调度判断",
-            message: `主 Agent 选择${displayMode(detail.mode)}${routingAgentPool ? `：${routingAgentPool}` : ""}`,
+            message: `主 Agent 选择${displayMode(orderedDetail.mode)}${routingAgentPool ? `：${routingAgentPool}` : ""}`,
             badge: "调度判断",
             rows: routingRows,
             createdAt: null,
@@ -2570,7 +2618,7 @@ function runProcessItems(
       : [];
   const consumedArtifactIds = new Set<string>();
   const toolGroups = new Map<string, EventGroupItem[]>();
-  detail.events.forEach((event, index) => {
+  orderedDetail.events.forEach((event, index) => {
     if (!isToolEvent(event)) return;
     const key = toolLifecycleKey(event);
     toolGroups.set(key, [...(toolGroups.get(key) ?? []), { event, index }]);
@@ -2580,10 +2628,10 @@ function runProcessItems(
     const finalEvent = group.at(-1)?.event;
     if (finalEvent) finalToolEvents.set(finalEvent, group);
   });
-  const actionEvents = detail.events.flatMap((event, index) => (isActionEvent(event) ? [{ event, index }] : []));
+  const actionEvents = orderedDetail.events.flatMap((event, index) => (isActionEvent(event) ? [{ event, index }] : []));
   const eventItems: ProcessDetailTarget[] = [];
   const consumedDownloadUrls = new Set(
-    dedupeDownloadableArtifacts(detail.artifacts.filter(isFinalDownloadableArtifact)).map((artifact) =>
+    dedupeDownloadableArtifacts(orderedDetail.artifacts.filter(isFinalDownloadableArtifact)).map((artifact) =>
       artifact.download_url.trim(),
     ),
   );
@@ -2598,13 +2646,13 @@ function runProcessItems(
         index += 1;
       }
       if (group.length === 1) {
-        const artifact = fallbackArtifactForEvent(event, detail.artifacts, consumedArtifactIds, consumedDownloadUrls);
-        eventItems.push(...processItemsForEvent(detail, event, eventIndex, agentNames, artifact));
+        const artifact = fallbackArtifactForEvent(event, orderedDetail.artifacts, consumedArtifactIds, consumedDownloadUrls);
+        eventItems.push(...processItemsForEvent(orderedDetail, event, eventIndex, agentNames, artifact));
         continue;
       }
       eventItems.push(
         ...processItemsForModelDeltaGroup(
-          detail,
+          orderedDetail,
           group.map((item) => item.event),
           group[0]?.index ?? eventIndex,
           agentNames,
@@ -2616,10 +2664,10 @@ function runProcessItems(
       const group = finalToolEvents.get(event);
       if (!group) continue;
       const finalEvent = group.at(-1)?.event ?? event;
-      const artifact = fallbackArtifactForEvent(finalEvent, detail.artifacts, consumedArtifactIds, consumedDownloadUrls);
+      const artifact = fallbackArtifactForEvent(finalEvent, orderedDetail.artifacts, consumedArtifactIds, consumedDownloadUrls);
       eventItems.push(
         ...processItemsForToolLifecycle(
-          detail,
+          orderedDetail,
           group.map((item) => item.event),
           group[0]?.index ?? eventIndex,
           agentNames,
@@ -2628,10 +2676,10 @@ function runProcessItems(
       );
       continue;
     }
-    if (isWrappedToolFailureEvent(event, detail.events)) continue;
-    const artifact = fallbackArtifactForEvent(event, detail.artifacts, consumedArtifactIds, consumedDownloadUrls);
+    if (isWrappedToolFailureEvent(event, orderedDetail.events)) continue;
+    const artifact = fallbackArtifactForEvent(event, orderedDetail.artifacts, consumedArtifactIds, consumedDownloadUrls);
     if (event.kind === "artifact.created" && !artifact && !hasUsefulPayload(event)) continue;
-    eventItems.push(...processItemsForEvent(detail, event, eventIndex, agentNames, artifact));
+    eventItems.push(...processItemsForEvent(orderedDetail, event, eventIndex, agentNames, artifact));
   }
   return [...routingItem, ...eventItems];
 }
@@ -4067,8 +4115,16 @@ export function RunsPage() {
   const conversationVisibleRuns = activeConversationRuns
     ? mergeConversationRuns(cachedConversationRuns, activeConversationRuns)
     : cachedConversationRuns;
-  const visibleRuns =
+  const selectedRunAlreadyVisible =
     selectedRun.data && runConversationId(selectedRun.data) === activeConversationId
+      ? conversationVisibleRuns?.find((run) => run.id === selectedRun.data?.id)
+      : undefined;
+  const shouldMergeSelectedRun =
+    selectedRun.data &&
+    runConversationId(selectedRun.data) === activeConversationId &&
+    (!selectedRunAlreadyVisible || runHasNewerProgress(selectedRun.data, selectedRunAlreadyVisible));
+  const visibleRuns =
+    shouldMergeSelectedRun
       ? mergeConversationRuns(conversationVisibleRuns, [selectedRun.data])
       : conversationVisibleRuns ?? activeConversationRuns ?? (selectedRun.data ? [selectedRun.data] : []);
   const messages = conversationMessages(visibleRuns);

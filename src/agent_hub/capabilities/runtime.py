@@ -438,6 +438,8 @@ def _project_files(arguments: Mapping[str, JsonValue]) -> dict[str, bytes]:
         total_bytes += len(data)
         if total_bytes > _MAX_PROJECT_ZIP_SOURCE_BYTES:
             raise RuntimeCapabilityError("project content is too large")
+        if path in files:
+            raise RuntimeCapabilityError("duplicate file path after normalization")
         files[path] = data
     return files
 
