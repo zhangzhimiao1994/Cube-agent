@@ -357,7 +357,14 @@ function formatEventPayloadValue(value: unknown): string {
 
 type RunEvent = RunDetail["events"][number];
 type RunArtifact = RunDetail["artifacts"][number];
-type DownloadableArtifact = DownloadableFile;
+type DownloadableArtifact = (RunArtifact | NonNullable<RunEvent["artifact"]>) & {
+  download_url: string;
+};
+type ConversationWorkspaceFileBuckets = {
+  final: DownloadableFile[];
+  intermediate: DownloadableFile[];
+  total: number;
+};
 type ChatMessage = {
   id: string;
   role: "user" | "assistant";
@@ -1930,8 +1937,8 @@ export function conversationMessages(runs: RunDetail[]): ChatMessage[] {
 }
 
 export function conversationWorkspaceFiles(runs: RunDetail[]) {
-  const final: DownloadableArtifact[] = [];
-  const intermediate: DownloadableArtifact[] = [];
+  const final: DownloadableFile[] = [];
+  const intermediate: DownloadableFile[] = [];
   const seen = new Set<string>();
   const append = (artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null | undefined) => {
     if (!isWorkspaceDownloadArtifact(artifact)) return;
@@ -1952,10 +1959,54 @@ export function conversationWorkspaceFiles(runs: RunDetail[]) {
   return { final, intermediate, total: final.length + intermediate.length };
 }
 
+function mergeWorkspaceFileList(
+  current: ConversationWorkspaceFileBuckets,
+  workspace: WorkspaceFileList | undefined,
+): ConversationWorkspaceFileBuckets {
+  if (!workspace) return current;
+  const seen = new Set(
+    [...current.final, ...current.intermediate].map((artifact) => artifact.download_url.trim()),
+  );
+  const final: DownloadableFile[] = [...current.final];
+  const intermediate: DownloadableFile[] = [...current.intermediate];
+  if (workspace.bundle_download_url.trim() && workspace.items.length > 0 && !seen.has(workspace.bundle_download_url)) {
+    seen.add(workspace.bundle_download_url);
+    final.push({
+      id: "workspace-bundle",
+      kind: "workspace_bundle",
+      title: "当前会话文件夹",
+      filename: "workspace.zip",
+      mime_type: "application/zip",
+      size_bytes: workspace.items.reduce((total, item) => total + item.size_bytes, 0),
+      sha256: null,
+      download_url: workspace.bundle_download_url,
+      presentation: "final_attachment",
+    });
+  }
+  workspace.items.forEach((item) => {
+    const key = item.download_url.trim();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    intermediate.push({
+      id: `workspace-file-${item.path}`,
+      kind: "workspace_file",
+      title: item.path,
+      filename: item.filename,
+      mime_type: item.mime_type,
+      size_bytes: item.size_bytes,
+      sha256: item.sha256,
+      download_url: item.download_url,
+      presentation: "step_detail",
+      path: item.path,
+    });
+  });
+  return { final, intermediate, total: final.length + intermediate.length };
+}
+
 function ConversationWorkspaceFiles({
   files,
 }: {
-  files: ReturnType<typeof conversationWorkspaceFiles>;
+  files: ConversationWorkspaceFileBuckets;
 }) {
   if (files.total === 0) return null;
   return (
@@ -3330,6 +3381,13 @@ export function RunsPage() {
     },
     refetchIntervalInBackground: true,
   });
+  const activeWorkspaceFiles = useQuery({
+    queryKey: ["workspace-files", projectId.trim() || "default", activeConversationId],
+    queryFn: () => api.workspaceFiles(projectId.trim() || "default", activeConversationId),
+    enabled: Boolean(activeConversationId),
+    refetchInterval: 1500,
+    refetchIntervalInBackground: true,
+  });
 
   async function refreshRunSurfaces(run: { id: string; conversation_id?: string | null }) {
     await queryClient.invalidateQueries({ queryKey: ["runs"] });
@@ -3338,6 +3396,9 @@ export function RunsPage() {
     const surfaceConversationId = run.conversation_id?.trim() || activeConversationId;
     if (surfaceConversationId) {
       await queryClient.invalidateQueries({ queryKey: ["conversation", surfaceConversationId] });
+      await queryClient.invalidateQueries({
+        queryKey: ["workspace-files", projectId.trim() || "default", surfaceConversationId],
+      });
     }
   }
 
@@ -4233,7 +4294,10 @@ export function RunsPage() {
       ? mergeConversationRuns(conversationVisibleRuns, [selectedRun.data])
       : conversationVisibleRuns ?? activeConversationRuns ?? (selectedRun.data ? [selectedRun.data] : []);
   const messages = conversationMessages(visibleRuns);
-  const workspaceFiles = conversationWorkspaceFiles(visibleRuns);
+  const workspaceFiles = mergeWorkspaceFileList(
+    conversationWorkspaceFiles(visibleRuns),
+    activeWorkspaceFiles.data,
+  );
   const temporaryApprovalVisibleInMessages =
     !!temporaryApproval &&
     messages.some((item) => item.id === `${temporaryApproval.runId}-temporary-agent-approval`);

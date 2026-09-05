@@ -33,6 +33,27 @@ def test_project_workspace_store_writes_and_lists_session_files(tmp_path: Path) 
     assert store.list_files(tenant_id, "Mofang Agent", "Conv Main 01") == (metadata,)
 
 
+def test_project_workspace_store_uses_run_workspace_segment_rules(tmp_path: Path) -> None:
+    tenant_id = uuid4()
+    store = ProjectWorkspaceStore(tmp_path)
+
+    metadata = store.write_bytes(
+        tenant_id=tenant_id,
+        project_id="Foo_Bar",
+        session_id="Session_01",
+        relative_path="main.py",
+        data=b"print('ok')\n",
+        mime_type="text/x-python",
+    )
+
+    assert metadata.download_url == (
+        "/api/v1/workspaces/projects/foo_bar/sessions/session_01/files/download?path=main.py"
+    )
+    assert store.bundle_download_url("Foo_Bar", "Session_01") == (
+        "/api/v1/workspaces/projects/foo_bar/sessions/session_01/bundle/download"
+    )
+
+
 @pytest.mark.parametrize(
     "relative_path",
     [
@@ -92,6 +113,13 @@ def test_project_workspace_store_creates_bounded_zip_without_hidden_files(
     with zipfile.ZipFile(bundle.path) as archive:
         assert archive.namelist() == ["README.md", "src/app.py"]
         assert archive.read("src/app.py") == b"print('ok')\n"
+
+
+def test_project_workspace_store_rejects_empty_session_zip(tmp_path: Path) -> None:
+    store = ProjectWorkspaceStore(tmp_path)
+
+    with pytest.raises(FileNotFoundError, match="workspace has no files"):
+        store.create_session_zip(uuid4(), "project", "session")
 
 
 def test_project_workspace_store_zip_rejects_too_many_files(tmp_path: Path) -> None:

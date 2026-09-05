@@ -393,6 +393,17 @@ describe("operational management pages", () => {
   let deletedHermesIds = new Set<string>();
   let visibleEvolutionRuns = [evolutionRun];
   let visibleChannels = baseChannels;
+  let visibleWorkspaceFiles = {
+    items: [] as Array<{
+      path: string;
+      filename: string;
+      mime_type: string;
+      size_bytes: number;
+      sha256: string;
+      download_url: string;
+    }>,
+    bundle_download_url: "/api/v1/workspaces/projects/default/sessions/conv-previous/bundle/download",
+  };
   let createdEvolutionRun: typeof evolutionRun | null = null;
   let failNextAttachmentUpload = false;
   let holdActiveConversationRequest = false;
@@ -410,6 +421,10 @@ describe("operational management pages", () => {
     deletedHermesIds = new Set<string>();
     visibleEvolutionRuns = [evolutionRun];
     visibleChannels = baseChannels;
+    visibleWorkspaceFiles = {
+      items: [],
+      bundle_download_url: "/api/v1/workspaces/projects/default/sessions/conv-previous/bundle/download",
+    };
     createdEvolutionRun = null;
     failNextAttachmentUpload = false;
     holdActiveConversationRequest = false;
@@ -462,6 +477,9 @@ describe("operational management pages", () => {
         }
         if (path === "/api/v1/admin/conversations/conv-previous") {
           return jsonResponse({ conversation_id: "conv-previous", runs: visibleConversationRuns });
+        }
+        if (path === "/api/v1/workspaces/projects/default/sessions/conv-previous/files") {
+          return jsonResponse(visibleWorkspaceFiles);
         }
         if (path === `/api/v1/admin/conversations/${runDetail.explicit_details.conversation_id}`) {
           if (holdActiveConversationRequest) {
@@ -2052,6 +2070,32 @@ describe("operational management pages", () => {
     const stream = screen.getByRole("region", { name: "主对话内容" });
 
     expect(within(stream).getAllByRole("button", { name: /下载 delivery-plan\.docx/ })).toHaveLength(1);
+  });
+
+  it("shows current conversation workspace files without reopening the conversation", async () => {
+    visibleWorkspaceFiles = {
+      items: [
+        {
+          path: "src/app.py",
+          filename: "app.py",
+          mime_type: "text/x-python",
+          size_bytes: 21,
+          sha256: "2d543015627a771436b30ea79fd0ecda8df8bcd77b3d55661caf5a0d6e809886",
+          download_url: "/api/v1/workspaces/projects/default/sessions/conv-previous/files/download?path=src%2Fapp.py",
+        },
+      ],
+      bundle_download_url: "/api/v1/workspaces/projects/default/sessions/conv-previous/bundle/download",
+    };
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const files = await screen.findByRole("region", { name: "当前会话文件" });
+
+    expect(within(files).getByRole("heading", { name: "当前会话文件" })).not.toBeNull();
+    expect(within(files).getByRole("button", { name: "下载 workspace.zip" })).not.toBeNull();
+    expect(within(files).getByText("中间产物")).not.toBeNull();
   });
 
   it("keeps live adjustment and temporary-agent switches out of workflow configuration", async () => {

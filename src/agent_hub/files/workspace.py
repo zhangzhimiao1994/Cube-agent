@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import zipfile
 from dataclasses import asdict, dataclass
 from hashlib import sha256
@@ -10,6 +11,7 @@ from urllib.parse import quote
 from uuid import UUID
 
 WORKSPACE_ZIP_MIME_TYPE = "application/zip"
+_SAFE_SEGMENT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +135,8 @@ class ProjectWorkspaceStore:
         session_id: str,
     ) -> ProjectWorkspaceBundle:
         files = self.list_files(tenant_id, project_id, session_id)
+        if not files:
+            raise FileNotFoundError("workspace has no files")
         if len(files) > self._max_bundle_files:
             raise ValueError("too many workspace files to bundle")
         total_bytes = sum(item.size_bytes for item in files)
@@ -214,17 +218,18 @@ class ProjectWorkspaceStore:
 
 
 def _safe_workspace_segment(value: str) -> str:
-    normalized = value.strip().lower()
-    normalized = "-".join(part for part in normalized.replace("_", "-").split() if part)
-    normalized = "".join(
-        character
-        for character in normalized
-        if character in "abcdefghijklmnopqrstuvwxyz0123456789-"
-    )
-    normalized = normalized.strip("-")
+    raw = (value or "default").strip()
+    if not raw:
+        raw = "default"
+    if "/" in raw or "\\" in raw or ".." in raw:
+        raise ValueError("workspace segment must be a single safe path segment")
+    normalized = re.sub(r"[^a-z0-9_-]+", "-", raw.casefold())
+    normalized = re.sub(r"[-_]{2,}", "-", normalized).strip("-_")
     if not normalized:
-        return "default"
-    return normalized[:80]
+        normalized = "default"
+    if _SAFE_SEGMENT.fullmatch(normalized) is None:
+        raise ValueError("workspace segment must be a safe path segment")
+    return normalized
 
 
 def _safe_workspace_path(value: str) -> str:

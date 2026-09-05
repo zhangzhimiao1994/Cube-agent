@@ -8,7 +8,7 @@ type ArtifactFile = (
 ) & {
   path?: string;
 };
-export type DownloadableFile = {
+type FileLike = {
   id?: string;
   kind?: string | null;
   title?: string | null;
@@ -17,10 +17,11 @@ export type DownloadableFile = {
   mime_type?: string | null;
   size_bytes?: number | null;
   sha256?: string | null;
-  download_url: string;
+  download_url?: string | null;
   presentation?: string | null;
   path?: string | null;
 };
+export type DownloadableFile = FileLike & { download_url: string };
 
 export function hasArtifactDownload(
   artifact: ArtifactFile | null | undefined,
@@ -28,7 +29,7 @@ export function hasArtifactDownload(
   return typeof artifact?.download_url === "string" && artifact.download_url.trim().length > 0;
 }
 
-export function artifactFileName(artifact: DownloadableFile) {
+export function artifactFileName(artifact: FileLike) {
   return artifact.filename?.trim() || artifact.title || artifact.path || artifact.id || "download";
 }
 

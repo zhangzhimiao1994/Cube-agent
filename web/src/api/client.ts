@@ -1197,7 +1197,7 @@ async function requestBinary<T>(
 const GENERATED_ARTIFACT_DOWNLOAD_PATH =
   /^\/api\/v1\/(?:admin\/)?runs\/[^/]+\/artifacts\/[^/]+\/download$/;
 const DownloadURL = URL;
-const SAFE_WORKSPACE_SEGMENT = /^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?$/;
+const SAFE_WORKSPACE_SEGMENT = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 function isSafeWorkspaceSegment(value: string): boolean {
   return SAFE_WORKSPACE_SEGMENT.test(value);

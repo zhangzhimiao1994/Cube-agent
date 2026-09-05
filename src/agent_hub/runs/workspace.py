@@ -86,6 +86,10 @@ def workspace_selection(
     )
 
 
+def safe_workspace_segment(value: str | None, *, default: str) -> str:
+    return _normalize_segment(value, name="workspace segment", default=default)
+
+
 def _sandbox_profile(value: str | None) -> SandboxProfile:
     profile = (value or "none").strip()
     if profile not in SANDBOX_PROFILES:
