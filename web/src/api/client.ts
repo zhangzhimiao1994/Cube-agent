@@ -605,6 +605,13 @@ const SubmittedRunSchema = z.object({
   clarification_reason: z.string().nullable(),
   conversation_id: z.string().nullable().optional(),
   reference_conversation_id: z.string().nullable().optional(),
+  project_id: z.string().nullable().optional(),
+  project_label: z.string().nullable().optional(),
+  workspace_session_id: z.string().nullable().optional(),
+  workspace_session_path: z.string().nullable().optional(),
+  workspace_artifacts_path: z.string().nullable().optional(),
+  sandbox_profile: z.string().nullable().optional(),
+  requested_permissions: z.array(z.string()).default([]),
   temporary_agent_proposal: TemporaryAgentProposalSchema.nullable().optional(),
   schedule_proposal: ScheduleProposalSchema.nullable().optional(),
   evolution_proposal: EvolutionProposalSchema.nullable().optional(),
@@ -1506,6 +1513,11 @@ export const api = {
     allow_workflow_adjustment?: boolean;
     conversation_id?: string | null;
     reference_conversation_id?: string | null;
+    project_id?: string | null;
+    project_label?: string | null;
+    workspace_session_id?: string | null;
+    sandbox_profile?: "none" | "read_only" | "restricted" | "workspace_write";
+    requested_permissions?: string[];
     attachment_ids?: string[];
     vibe_coding?: boolean;
     skip_evolution_proposal?: boolean;

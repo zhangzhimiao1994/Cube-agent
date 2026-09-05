@@ -1336,6 +1336,54 @@ article:hover {
   padding: 0.75rem;
 }
 
+.sandbox-settings {
+  display: grid;
+  gap: 0.45rem;
+  grid-column: 1 / -1;
+}
+
+.field-label {
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 850;
+}
+
+.sandbox-choice-row {
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+}
+
+.sandbox-choice {
+  align-items: flex-start;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(123, 225, 255, 0.14);
+  border-radius: 0.75rem;
+  color: var(--text);
+  cursor: pointer;
+  display: grid;
+  gap: 0.2rem;
+  min-height: 4rem;
+  padding: 0.65rem;
+  text-align: left;
+}
+
+.sandbox-choice strong {
+  font-size: 0.88rem;
+}
+
+.sandbox-choice span {
+  color: var(--muted);
+  font-size: 0.75rem;
+  line-height: 1.35;
+}
+
+.sandbox-choice.selected {
+  background: rgba(33, 224, 163, 0.14);
+  border-color: rgba(33, 224, 163, 0.62);
+  box-shadow: 0 0 0 1px rgba(33, 224, 163, 0.16);
+}
+
 .chat-stream {
   display: flex;
   flex-direction: column;

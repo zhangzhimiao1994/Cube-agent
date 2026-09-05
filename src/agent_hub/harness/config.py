@@ -36,7 +36,7 @@ def provider_profiles_from_config(config: PlatformConfig) -> tuple[ProviderCapab
                     and not is_generation_only,
                     max_context_tokens=_max_context_tokens(provider, deployment.model),
                     cost_latency_tier=_cost_latency_tier(provider),
-                    sandbox_modes=_sandbox_modes(capabilities),
+                    sandbox_modes=_sandbox_modes(provider, capabilities),
                 )
             )
     return tuple(profiles)
@@ -94,9 +94,11 @@ def _cost_latency_tier(provider: str) -> str:
     return "standard"
 
 
-def _sandbox_modes(capabilities: frozenset[str]) -> tuple[str, ...]:
+def _sandbox_modes(provider: str, capabilities: frozenset[str]) -> tuple[str, ...]:
     if "tool_calling" not in capabilities:
         return ("none",)
+    if provider == "openai":
+        return ("none", "read_only", "restricted", "workspace_write")
     return ("none", "read_only", "restricted")
 
 

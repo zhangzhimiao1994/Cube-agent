@@ -240,6 +240,43 @@ async def test_direct_submit_constrains_harness_decision_to_direct_model() -> No
     assert harness["selected_logical_model"] == "main"
 
 
+async def test_explicit_workspace_write_sandbox_is_stamped_for_harness() -> None:
+    repository = RecordingRepository()
+    scheduler = RecordingHarnessScheduler()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=RecordingQueue(),
+        harness_scheduler=scheduler,
+    )
+
+    submitted = await service.submit(
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        message="生成一个简单项目并打包",
+        mode=TaskMode.DIRECT,
+        conversation_id="conv-workspace",
+        project_id="Mofang Agent",
+        project_label="魔方 Agent",
+        sandbox_profile="workspace_write",
+        requested_permissions=("workspace.read", "workspace.write"),
+        idempotency_key="idem-harness-workspace-write",
+    )
+
+    assert submitted.project_id == "mofang-agent"
+    assert submitted.workspace_session_path == "projects/mofang-agent/sessions/conv-workspace"
+    assert submitted.requested_permissions == ("workspace.read", "workspace.write")
+    requirements = scheduler.calls[0]["requirements"]
+    assert isinstance(requirements, HarnessTaskRequirements)
+    assert requirements.requires_sandbox is True
+    assert requirements.required_sandbox_mode == "workspace_write"
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["workspace_artifacts_path"] == "projects/mofang-agent/sessions/conv-workspace/artifacts"
+    assert routing["sandbox_permission_policy"] == "ask_on_escalation"
+
+
 async def test_harness_scheduler_failure_degrades_to_plain_routing_payload() -> None:
     repository = RecordingRepository()
     service = RunService(

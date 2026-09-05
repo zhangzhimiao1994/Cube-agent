@@ -1,7 +1,15 @@
 import { describe, expect, it } from "vitest";
 
 import type { RunDetail } from "../api/client";
-import { conversationMessages, mergeConversationRuns, runConversationId, runDetailVersion, runProcessItems } from "./RunsPage";
+import {
+  conversationMessages,
+  mergeConversationRuns,
+  requestedPermissionsForSandbox,
+  runConversationId,
+  runDetailVersion,
+  runProcessItems,
+  workspacePreviewPath,
+} from "./RunsPage";
 
 const baseRun: RunDetail = {
   id: "22222222-2222-4222-8222-222222222222",
@@ -207,5 +215,24 @@ describe("conversation ordering", () => {
       "2026-09-02T00:00:01Z",
       "2026-09-02T00:00:02Z",
     ]);
+  });
+});
+
+describe("workspace and sandbox submission helpers", () => {
+  it("maps sandbox profiles to bounded requested permissions", () => {
+    expect(requestedPermissionsForSandbox("none")).toEqual([]);
+    expect(requestedPermissionsForSandbox("read_only")).toEqual(["workspace.read"]);
+    expect(requestedPermissionsForSandbox("workspace_write")).toEqual([
+      "workspace.read",
+      "workspace.write",
+      "network.read",
+      "command.run",
+    ]);
+  });
+
+  it("previews the logical project session workspace path", () => {
+    expect(workspacePreviewPath("Mofang Agent", "Conv Main 01")).toBe(
+      "projects/mofang-agent/sessions/conv-main-01",
+    );
   });
 });

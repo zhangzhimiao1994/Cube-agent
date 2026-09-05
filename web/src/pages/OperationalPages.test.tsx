@@ -1883,6 +1883,36 @@ describe("operational management pages", () => {
     });
   });
 
+  it("submits project workspace and sandbox permission choices from run settings", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await openRunConfig(user);
+    await user.clear(screen.getByLabelText("项目文件夹"));
+    await user.type(screen.getByLabelText("项目文件夹"), "Mofang Agent");
+    await user.type(screen.getByLabelText("项目名称"), "魔方 Agent");
+    await user.click(screen.getByRole("button", { name: /项目写入/ }));
+    expect(screen.getByText(/^工作区：projects\/mofang-agent\/sessions\/conv-/)).not.toBeNull();
+
+    await user.type(screen.getByPlaceholderText(/输入消息/), "生成一个简单项目并打包。");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(requests.find((request) => request.path === "/api/v1/runs")).toBeTruthy());
+    expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
+      method: "POST",
+      body: {
+        message: "生成一个简单项目并打包。",
+        project_id: "Mofang Agent",
+        project_label: "魔方 Agent",
+        sandbox_profile: "workspace_write",
+        requested_permissions: ["workspace.read", "workspace.write", "network.read", "command.run"],
+      },
+    });
+    const request = requests.find((item) => item.path === "/api/v1/runs");
+    expect((request?.body as { workspace_session_id?: string }).workspace_session_id).toMatch(/^conv-/);
+  });
+
   it("keeps step generated downloads inside the producing agent drawer", async () => {
     const user = userEvent.setup();
     visibleRunDetail = {

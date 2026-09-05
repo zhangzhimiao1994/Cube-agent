@@ -12,7 +12,7 @@ import zipfile
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Protocol, cast
+from typing import Annotated, Literal, Protocol, cast
 from urllib.parse import unquote
 from uuid import UUID, uuid4
 
@@ -27,6 +27,7 @@ from agent_hub.auth.models import AuthenticatedPrincipal, Role
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import RunConflict, RunNotFound
 from agent_hub.runs.service import RunSummary, SubmittedRun, VibeCodingUnavailable
+from agent_hub.runs.workspace import REQUESTED_PERMISSIONS, SANDBOX_PROFILES
 
 router = APIRouter(
     prefix="/api/v1/runs",
@@ -79,6 +80,11 @@ class RunServiceProtocol(Protocol):
         direct_model: str | None = None,
         vibe_coding: bool = False,
         skip_evolution_proposal: bool = False,
+        project_id: str | None = None,
+        project_label: str | None = None,
+        workspace_session_id: str | None = None,
+        sandbox_profile: str | None = None,
+        requested_permissions: tuple[str, ...] = (),
         idempotency_key: str | None = None,
     ) -> SubmittedRun: ...
 
@@ -186,10 +192,22 @@ class CreateRunRequest(BaseModel):
     attachment_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
     vibe_coding: bool = False
     skip_evolution_proposal: bool = False
+    project_id: str | None = Field(default=None, max_length=128)
+    project_label: str | None = Field(default=None, max_length=80)
+    workspace_session_id: str | None = Field(default=None, max_length=128)
+    sandbox_profile: Literal["none", "read_only", "restricted", "workspace_write"] = "none"
+    requested_permissions: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
 
     @field_validator("attachment_ids", mode="before")
     @classmethod
     def coerce_attachment_ids(cls, value: object) -> object:
+        if isinstance(value, list):
+            return tuple(value)
+        return value
+
+    @field_validator("requested_permissions", mode="before")
+    @classmethod
+    def coerce_requested_permissions(cls, value: object) -> object:
         if isinstance(value, list):
             return tuple(value)
         return value
@@ -201,6 +219,32 @@ class CreateRunRequest(BaseModel):
         for item in value:
             if item in seen or not re.fullmatch(r"att_[a-f0-9]{32}", item):
                 raise ValueError("attachment_ids must be unique attachment identifiers")
+            seen.add(item)
+        return value
+
+    @field_validator("project_id", "workspace_session_id")
+    @classmethod
+    def validate_workspace_identifier(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if "/" in value or "\\" in value or ".." in value:
+            raise ValueError("workspace identifiers must be single safe path segments")
+        return value
+
+    @field_validator("sandbox_profile")
+    @classmethod
+    def validate_sandbox_profile(cls, value: str) -> str:
+        if value not in SANDBOX_PROFILES:
+            raise ValueError("invalid sandbox_profile")
+        return value
+
+    @field_validator("requested_permissions")
+    @classmethod
+    def validate_requested_permissions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        seen: set[str] = set()
+        for item in value:
+            if item in seen or item not in REQUESTED_PERMISSIONS:
+                raise ValueError("requested_permissions must be unique known permission ids")
             seen.add(item)
         return value
 
@@ -245,6 +289,13 @@ class SubmittedRunResponse(BaseModel):
     clarification_reason: str | None = None
     conversation_id: str | None = None
     reference_conversation_id: str | None = None
+    project_id: str | None = None
+    project_label: str | None = None
+    workspace_session_id: str | None = None
+    workspace_session_path: str | None = None
+    workspace_artifacts_path: str | None = None
+    sandbox_profile: str | None = None
+    requested_permissions: tuple[str, ...] = ()
     temporary_agent_proposal: dict[str, object] | None = None
     schedule_proposal: dict[str, object] | None = None
     evolution_proposal: dict[str, object] | None = None
@@ -263,6 +314,13 @@ class SubmittedRunResponse(BaseModel):
             clarification_reason=run.clarification_reason,
             conversation_id=run.conversation_id,
             reference_conversation_id=run.reference_conversation_id,
+            project_id=run.project_id,
+            project_label=run.project_label,
+            workspace_session_id=run.workspace_session_id,
+            workspace_session_path=run.workspace_session_path,
+            workspace_artifacts_path=run.workspace_artifacts_path,
+            sandbox_profile=run.sandbox_profile,
+            requested_permissions=run.requested_permissions,
             temporary_agent_proposal=run.temporary_agent_proposal,
             schedule_proposal=run.schedule_proposal,
             evolution_proposal=run.evolution_proposal,
@@ -431,6 +489,11 @@ async def _record_run_submit_audit(
         "workflow_id": body.workflow_id,
         "direct_model": body.direct_model,
         "vibe_coding": body.vibe_coding,
+        "project_id": submitted.project_id,
+        "project_label": submitted.project_label,
+        "workspace_session_id": submitted.workspace_session_id,
+        "sandbox_profile": submitted.sandbox_profile,
+        "requested_permissions": list(submitted.requested_permissions),
         "attachment_count": len(body.attachment_ids),
         "message_preview": preview,
         "message_sha256": hashlib.sha256(body.message.encode("utf-8")).hexdigest(),
@@ -864,6 +927,11 @@ async def create_run(
             direct_model=body.direct_model,
             vibe_coding=body.vibe_coding,
             skip_evolution_proposal=body.skip_evolution_proposal,
+            project_id=body.project_id,
+            project_label=body.project_label,
+            workspace_session_id=body.workspace_session_id,
+            sandbox_profile=body.sandbox_profile,
+            requested_permissions=body.requested_permissions,
             idempotency_key=idempotency_key,
         )
     except VibeCodingUnavailable as error:
@@ -871,6 +939,14 @@ async def create_run(
         raise PublicAPIError(
             409,
             "vibe_coding_unavailable",
+            reason,
+            details={"reason": reason},
+        ) from error
+    except ValueError as error:
+        reason = str(error)
+        raise PublicAPIError(
+            422,
+            "request_validation",
             reason,
             details={"reason": reason},
         ) from error

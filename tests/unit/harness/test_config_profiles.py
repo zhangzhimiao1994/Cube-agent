@@ -96,6 +96,8 @@ def test_provider_profiles_are_derived_only_from_real_configured_deployments() -
     openai = next(profile for profile in profiles if profile.provider == "openai")
     assert openai.supports_long_running_tasks is True
     assert openai.supports_parallel_tool_calls is True
+    assert "workspace_write" in openai.sandbox_modes
+    assert "workspace_write" not in deepseek.sandbox_modes
 
 
 def test_multimodal_generation_profile_does_not_gain_reasoning_strengths() -> None:

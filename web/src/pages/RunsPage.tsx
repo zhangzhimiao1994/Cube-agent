@@ -17,6 +17,31 @@ const RUN_MODES = [
 
 type RunMode = (typeof RUN_MODES)[number]["value"];
 type ManualRunMode = Exclude<RunMode, "auto">;
+const SANDBOX_OPTIONS = [
+  { value: "none", label: "无沙箱", summary: "不预授权工具工作区" },
+  { value: "read_only", label: "只读", summary: "可读取项目上下文" },
+  { value: "restricted", label: "受限", summary: "读取、联网和命令需受控" },
+  { value: "workspace_write", label: "项目写入", summary: "允许产物写入项目工作区" },
+] as const;
+type SandboxProfile = (typeof SANDBOX_OPTIONS)[number]["value"];
+export function requestedPermissionsForSandbox(profile: SandboxProfile): string[] {
+  if (profile === "none") return [];
+  if (profile === "read_only") return ["workspace.read"];
+  if (profile === "restricted") return ["workspace.read", "network.read", "command.run"];
+  return ["workspace.read", "workspace.write", "network.read", "command.run"];
+}
+export function workspacePreviewPath(projectId: string, sessionId: string): string {
+  return `projects/${safeWorkspaceSegment(projectId, "default")}/sessions/${safeWorkspaceSegment(sessionId, "session-default")}`;
+}
+function safeWorkspaceSegment(value: string, fallback: string): string {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/[-_]{2,}/g, "-")
+    .replace(/^[-_]+|[-_]+$/g, "");
+  return normalized || fallback;
+}
 type ModeSelection = {
   runId: string;
   decisionToken: string;
@@ -3138,6 +3163,9 @@ export function RunsPage() {
   const [workflowId, setWorkflowId] = useState("");
   const [agentIds, setAgentIds] = useState<string[]>([]);
   const [conversationId, setConversationId] = useState(newConversationId);
+  const [projectId, setProjectId] = useState("default");
+  const [projectLabel, setProjectLabel] = useState("");
+  const [sandboxProfile, setSandboxProfile] = useState<SandboxProfile>("none");
   const [referenceConversationId, setReferenceConversationId] = useState("");
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [selectedConversationIds, setSelectedConversationIds] = useState<string[]>([]);
@@ -3472,6 +3500,11 @@ export function RunsPage() {
         direct_model: runMode === "direct" ? selectedDirectModel : null,
         conversation_id: conversationId,
         reference_conversation_id: referenceConversationId.trim() || null,
+        project_id: projectId.trim() || null,
+        project_label: projectLabel.trim() || null,
+        workspace_session_id: conversationId.trim() || null,
+        sandbox_profile: sandboxProfile,
+        requested_permissions: requestedPermissionsForSandbox(sandboxProfile),
         attachment_ids: attachmentDraft?.attachment ? [attachmentDraft.attachment.id] : [],
         skip_evolution_proposal: override?.skipEvolutionProposal === true ? true : undefined,
       });
@@ -4393,6 +4426,24 @@ export function RunsPage() {
                 onChange={(event) => setConversationId(event.target.value)}
               />
             </label>
+            <label htmlFor="project-id">
+              项目文件夹
+              <input
+                id="project-id"
+                value={projectId}
+                onChange={(event) => setProjectId(event.target.value)}
+                placeholder="default"
+              />
+            </label>
+            <label htmlFor="project-label">
+              项目名称
+              <input
+                id="project-label"
+                value={projectLabel}
+                onChange={(event) => setProjectLabel(event.target.value)}
+                placeholder="可选"
+              />
+            </label>
             <label htmlFor="reference-conversation-id">
               参考会话 ID
               <input
@@ -4410,6 +4461,26 @@ export function RunsPage() {
             >
               {referenceConversation.isFetching ? "读取中..." : "读取参考会话"}
             </button>
+            <div className="sandbox-settings" aria-label="沙箱权限">
+              <span className="field-label">沙箱权限</span>
+              <div className="sandbox-choice-row" role="group" aria-label="选择本次运行沙箱权限">
+                {SANDBOX_OPTIONS.map((option) => (
+                  <button
+                    key={option.value}
+                    type="button"
+                    className={`sandbox-choice${sandboxProfile === option.value ? " selected" : ""}`}
+                    aria-pressed={sandboxProfile === option.value}
+                    onClick={() => setSandboxProfile(option.value)}
+                  >
+                    <strong>{option.label}</strong>
+                    <span>{option.summary}</span>
+                  </button>
+                ))}
+              </div>
+              <p className="field-help">
+                工作区：{workspacePreviewPath(projectId, conversationId)}
+              </p>
+            </div>
             <div className="mode-help">
               <span className="eyebrow">{selectedMode.label}</span>
               <p>{selectedMode.description}</p>

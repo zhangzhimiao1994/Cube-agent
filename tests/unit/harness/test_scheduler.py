@@ -96,6 +96,30 @@ def test_scheduler_requires_approval_for_sensitive_tasks_even_when_provider_matc
     assert "sandbox_required" in decision.capability_reasons
 
 
+def test_scheduler_treats_required_sandbox_mode_as_hard_capability() -> None:
+    scheduler = CapabilityAwareHarnessScheduler(
+        profiles=(
+            ProviderCapabilityProfile.deepseek("deepseek-chat", logical_model="main"),
+            ProviderCapabilityProfile.openai_codex("gpt-5", logical_model="main"),
+        )
+    )
+
+    decision = scheduler.select(
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DISPATCH,
+        requirements=HarnessTaskRequirements(
+            required_capabilities=frozenset({"text", "tool_calling"}),
+            required_sandbox_mode="workspace_write",
+        ),
+        policy=HarnessPolicy(),
+        hermes_hint=None,
+    )
+
+    assert decision.selected_provider == "openai"
+    assert "sandbox_mode:workspace_write" in decision.capability_reasons
+    assert "sandbox_mode_blocked:deepseek:workspace_write" in decision.fallbacks_considered
+
+
 def test_scheduler_rejects_profiles_that_cannot_satisfy_hard_capabilities() -> None:
     scheduler = CapabilityAwareHarnessScheduler(
         profiles=(ProviderCapabilityProfile.openai_codex("gpt-5", logical_model="main"),)

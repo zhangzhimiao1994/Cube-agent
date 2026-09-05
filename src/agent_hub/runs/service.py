@@ -33,6 +33,7 @@ from agent_hub.runs.self_repair import (
     SelfRepairPolicy,
     classify_terminal_run,
 )
+from agent_hub.runs.workspace import DEFAULT_PROJECT_ID, workspace_selection
 from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, RunEvent, TaskContext
 from agent_hub.runtime.failure_reason import (
     runtime_failure_diagnostic_from_reason,
@@ -60,6 +61,13 @@ class SubmittedRun:
     clarification_reason: str | None = None
     conversation_id: str | None = None
     reference_conversation_id: str | None = None
+    project_id: str | None = None
+    project_label: str | None = None
+    workspace_session_id: str | None = None
+    workspace_session_path: str | None = None
+    workspace_artifacts_path: str | None = None
+    sandbox_profile: str | None = None
+    requested_permissions: tuple[str, ...] = ()
     temporary_agent_proposal: dict[str, object] | None = None
     schedule_proposal: dict[str, object] | None = None
     evolution_proposal: dict[str, object] | None = None
@@ -383,10 +391,22 @@ class RunService:
         direct_model: str | None = None,
         vibe_coding: bool = False,
         skip_evolution_proposal: bool = False,
+        project_id: str | None = None,
+        project_label: str | None = None,
+        workspace_session_id: str | None = None,
+        sandbox_profile: str | None = None,
+        requested_permissions: tuple[str, ...] = (),
         channel_context: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         effective_conversation_id = conversation_id or f"conv-{uuid4().hex}"
+        workspace = workspace_selection(
+            project_id=project_id,
+            project_label=project_label,
+            session_id=workspace_session_id or effective_conversation_id,
+            sandbox_profile=sandbox_profile,
+            requested_permissions=requested_permissions,
+        )
         cleaned_direct_model = direct_model.strip() if direct_model else None
         if cleaned_direct_model and _SAFE_MODEL_ID.fullmatch(cleaned_direct_model) is None:
             raise ValueError("direct_model must be a safe logical model identifier")
@@ -400,6 +420,8 @@ class RunService:
             "conversation_id": effective_conversation_id,
             "reference_conversation_id": reference_conversation_id,
             "attachment_ids": list(attachment_ids),
+            "workspace_project_explicit": project_id is not None and bool(project_id.strip()),
+            **workspace.routing_payload(),
         }
         if cleaned_direct_model:
             operator_selection["direct_model"] = cleaned_direct_model
@@ -2179,6 +2201,12 @@ def _submitted(record: RunRecord) -> SubmittedRun:
     evolution_proposal = decision.get("evolution_proposal")
     openclaw_proposal = decision.get("openclaw_proposal")
     repair_proposal = decision.get("repair_proposal")
+    requested_permissions_value = decision.get("requested_permissions")
+    requested_permissions = (
+        tuple(item for item in requested_permissions_value if isinstance(item, str))
+        if isinstance(requested_permissions_value, list | tuple)
+        else ()
+    )
     waiting_for_decision = record.status in {
         RunStatus.WAITING_USER_MODE,
         RunStatus.WAITING_APPROVAL,
@@ -2201,6 +2229,13 @@ def _submitted(record: RunRecord) -> SubmittedRun:
         else reason,
         conversation_id=_string_or_none(decision.get("conversation_id")) or f"conv-{record.id}",
         reference_conversation_id=_string_or_none(decision.get("reference_conversation_id")),
+        project_id=_string_or_none(decision.get("project_id")),
+        project_label=_string_or_none(decision.get("project_label")),
+        workspace_session_id=_string_or_none(decision.get("workspace_session_id")),
+        workspace_session_path=_string_or_none(decision.get("workspace_session_path")),
+        workspace_artifacts_path=_string_or_none(decision.get("workspace_artifacts_path")),
+        sandbox_profile=_string_or_none(decision.get("sandbox_profile")),
+        requested_permissions=requested_permissions,
         temporary_agent_proposal=cast(dict[str, object], proposal)
         if isinstance(proposal, dict)
         else None,
@@ -2234,6 +2269,7 @@ def _harness_task_requirements(
     if needs_tool_calls:
         capabilities.add("tool_calling")
     token_estimate = estimate_tokens(message)
+    sandbox_profile = _routing_sandbox_profile(routing_decision)
     return HarnessTaskRequirements(
         required_capabilities=frozenset(capabilities),
         required_logical_model=_string_or_none(routing_decision.get("direct_model")),
@@ -2246,7 +2282,10 @@ def _harness_task_requirements(
             mode in {TaskMode.DISPATCH, TaskMode.HYBRID}
             and _message_suggests_long_running(message)
         ),
-        requires_sandbox=vibe_coding or _message_suggests_sandbox(message),
+        requires_sandbox=vibe_coding
+        or sandbox_profile != "none"
+        or _message_suggests_sandbox(message),
+        required_sandbox_mode=sandbox_profile if sandbox_profile != "none" else None,
         privacy_sensitive=_message_suggests_sensitive_context(message),
         estimated_input_tokens=token_estimate,
         prefers_prefix_cache=vibe_coding
@@ -2262,6 +2301,13 @@ def _routing_requests_vibe_coding(routing_decision: Mapping[str, object]) -> boo
     )
 
 
+def _routing_sandbox_profile(routing_decision: Mapping[str, object]) -> str:
+    profile = routing_decision.get("sandbox_profile")
+    if isinstance(profile, str) and profile in {"none", "read_only", "restricted", "workspace_write"}:
+        return profile
+    return "none"
+
+
 def _vibe_coding_unavailable() -> VibeCodingUnavailable:
     return VibeCodingUnavailable(
         "Vibe Coding requires a harness-capable model deployment with text, "
@@ -2272,7 +2318,13 @@ def _vibe_coding_unavailable() -> VibeCodingUnavailable:
 
 def _harness_context_hint(routing_decision: Mapping[str, object]) -> HermesContextHint | None:
     conversation_id = _string_or_none(routing_decision.get("conversation_id"))
-    project_id = _string_or_none(routing_decision.get("project_id"))
+    project_id = (
+        _string_or_none(routing_decision.get("project_id"))
+        if routing_decision.get("workspace_project_explicit") is True
+        else None
+    )
+    if project_id == DEFAULT_PROJECT_ID:
+        project_id = None
     if conversation_id is None and project_id is None:
         return None
     return HermesContextHint(project_id=project_id, conversation_id=conversation_id, confidence=0.75)

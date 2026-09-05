@@ -88,6 +88,7 @@ class StubRunService:
     direct_models: list[str | None] | None = None
     vibe_coding_flags: list[bool] | None = None
     actor_roles: list[Role | None] = field(default_factory=list)
+    workspace_contexts: list[dict[str, object]] = field(default_factory=list)
 
     async def submit(
         self,
@@ -106,6 +107,11 @@ class StubRunService:
         direct_model: str | None = None,
         vibe_coding: bool = False,
         skip_evolution_proposal: bool = False,
+        project_id: str | None = None,
+        project_label: str | None = None,
+        workspace_session_id: str | None = None,
+        sandbox_profile: str | None = None,
+        requested_permissions: tuple[str, ...] = (),
         idempotency_key: str | None = None,
     ) -> SubmittedRun:
         del idempotency_key
@@ -120,6 +126,15 @@ class StubRunService:
             self.direct_models.append(direct_model)
         if self.vibe_coding_flags is not None:
             self.vibe_coding_flags.append(vibe_coding)
+        self.workspace_contexts.append(
+            {
+                "project_id": project_id,
+                "project_label": project_label,
+                "workspace_session_id": workspace_session_id,
+                "sandbox_profile": sandbox_profile,
+                "requested_permissions": requested_permissions,
+            }
+        )
         self.submitted.append(
             (
                 tenant_id,
@@ -146,6 +161,11 @@ class StubRunService:
                 clarification_reason="evolution_requires_user_confirmation",
                 conversation_id=conversation_id or "conv-test",
                 reference_conversation_id=reference_conversation_id,
+                project_id=project_id,
+                project_label=project_label,
+                workspace_session_id=workspace_session_id,
+                sandbox_profile=sandbox_profile,
+                requested_permissions=requested_permissions,
                 evolution_proposal={
                     "kind": "skill_optimization",
                     "title": "Skill 进化任务",
@@ -181,6 +201,11 @@ class StubRunService:
                 clarification_reason="evolution_requires_user_confirmation",
                 conversation_id=conversation_id or "conv-test",
                 reference_conversation_id=reference_conversation_id,
+                project_id=project_id,
+                project_label=project_label,
+                workspace_session_id=workspace_session_id,
+                sandbox_profile=sandbox_profile,
+                requested_permissions=requested_permissions,
                 evolution_proposal={
                     "kind": "skill_distillation",
                     "title": "Skill 创建任务",
@@ -216,6 +241,11 @@ class StubRunService:
                 clarification_reason="openclaw_requires_user_confirmation",
                 conversation_id=conversation_id or "conv-test",
                 reference_conversation_id=reference_conversation_id,
+                project_id=project_id,
+                project_label=project_label,
+                workspace_session_id=workspace_session_id,
+                sandbox_profile=sandbox_profile,
+                requested_permissions=requested_permissions,
                 openclaw_proposal={
                     "kind": "server_command",
                     "platform": "linux",
@@ -244,6 +274,11 @@ class StubRunService:
             else None,
             conversation_id=conversation_id or "conv-test",
             reference_conversation_id=reference_conversation_id,
+            project_id=project_id,
+            project_label=project_label,
+            workspace_session_id=workspace_session_id,
+            sandbox_profile=sandbox_profile,
+            requested_permissions=requested_permissions,
         )
 
     async def choose_mode(
@@ -550,6 +585,46 @@ def test_direct_submission_forwards_selected_model_without_agent_ids() -> None:
             False,
         )
     ]
+
+
+def test_run_submission_forwards_workspace_and_sandbox_context() -> None:
+    settings = StubSettingsService()
+    client, service, _ = _client(settings_service=settings)
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": "请在项目工作区里生成一个 zip 包",
+            "mode": "dispatch",
+            "conversation_id": "conv-workspace-api",
+            "project_id": "Mofang Agent",
+            "project_label": "魔方 Agent",
+            "workspace_session_id": "Conv Workspace 01",
+            "sandbox_profile": "workspace_write",
+            "requested_permissions": ["workspace.read", "workspace.write"],
+        },
+    )
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["project_id"] == "Mofang Agent"
+    assert payload["project_label"] == "魔方 Agent"
+    assert payload["workspace_session_id"] == "Conv Workspace 01"
+    assert payload["sandbox_profile"] == "workspace_write"
+    assert payload["requested_permissions"] == ["workspace.read", "workspace.write"]
+    assert service.workspace_contexts[-1] == {
+        "project_id": "Mofang Agent",
+        "project_label": "魔方 Agent",
+        "workspace_session_id": "Conv Workspace 01",
+        "sandbox_profile": "workspace_write",
+        "requested_permissions": ("workspace.read", "workspace.write"),
+    }
+    details = cast(dict[str, object], settings.audit_events[-1]["details"])
+    assert details["project_id"] == "Mofang Agent"
+    assert details["workspace_session_id"] == "Conv Workspace 01"
+    assert details["sandbox_profile"] == "workspace_write"
+    assert details["requested_permissions"] == ["workspace.read", "workspace.write"]
 
 
 def test_run_submission_forwards_skip_evolution_proposal_flag() -> None:

@@ -232,6 +232,7 @@ class HarnessTaskRequirements:
     needs_parallel_tool_calls: bool = False
     needs_long_running: bool = False
     requires_sandbox: bool = False
+    required_sandbox_mode: str | None = None
     privacy_sensitive: bool = False
     estimated_input_tokens: int = 0
     prefers_prefix_cache: bool = False
@@ -240,6 +241,10 @@ class HarnessTaskRequirements:
         object.__setattr__(self, "required_capabilities", _capability_set(self.required_capabilities))
         if self.required_logical_model is not None:
             _require_safe_id("required_logical_model", self.required_logical_model)
+        if self.required_sandbox_mode is not None:
+            _require_safe_id("required_sandbox_mode", self.required_sandbox_mode)
+            if self.required_sandbox_mode != "none":
+                object.__setattr__(self, "requires_sandbox", True)
         for name in (
             "needs_reasoning",
             "needs_streamed_tool_calls",

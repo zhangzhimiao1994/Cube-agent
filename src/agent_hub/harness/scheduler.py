@@ -74,6 +74,14 @@ class CapabilityAwareHarnessScheduler:
             if not context_window.fits:
                 fallbacks.append(f"context_window_exceeded:{profile.provider}")
                 continue
+            if (
+                requirements.required_sandbox_mode is not None
+                and requirements.required_sandbox_mode not in profile.sandbox_modes
+            ):
+                fallbacks.append(
+                    f"sandbox_mode_blocked:{profile.provider}:{requirements.required_sandbox_mode}"
+                )
+                continue
             candidates.append(
                 self._score(
                     profile,
@@ -141,7 +149,13 @@ class CapabilityAwareHarnessScheduler:
         if requirements.needs_long_running and profile.supports_long_running_tasks:
             score += 3
             capability_reasons.append("supports_long_running_tasks")
-        if requirements.requires_sandbox and "restricted" in profile.sandbox_modes:
+        if (
+            requirements.required_sandbox_mode is not None
+            and requirements.required_sandbox_mode in profile.sandbox_modes
+        ):
+            score += 3
+            capability_reasons.append(f"sandbox_mode:{requirements.required_sandbox_mode}")
+        elif requirements.requires_sandbox and "restricted" in profile.sandbox_modes:
             score += 2
             capability_reasons.append("sandbox_required")
         if requirements.prefers_prefix_cache and profile.supports_prefix_cache:

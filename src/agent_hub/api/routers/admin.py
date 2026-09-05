@@ -7916,6 +7916,26 @@ def _routing_details(routing_decision: dict[str, object] | None) -> dict[str, st
     reference_conversation_id = routing_decision.get("reference_conversation_id")
     if isinstance(reference_conversation_id, str) and reference_conversation_id:
         details["reference_conversation_id"] = reference_conversation_id
+    for key in (
+        "project_id",
+        "project_label",
+        "workspace_session_id",
+        "workspace_project_path",
+        "workspace_session_path",
+        "workspace_artifacts_path",
+        "sandbox_profile",
+        "sandbox_permission_policy",
+    ):
+        value = routing_decision.get(key)
+        if isinstance(value, str) and value:
+            details[key] = value[:512]
+    requested_permissions = routing_decision.get("requested_permissions")
+    if isinstance(requested_permissions, list):
+        safe_permissions = [
+            item for item in requested_permissions if isinstance(item, str) and item
+        ]
+        if safe_permissions:
+            details["requested_permissions"] = ", ".join(safe_permissions)
     adjustment_policy = routing_decision.get("workflow_adjustment_policy")
     if adjustment_policy == "ask_before_apply":
         details["workflow_adjustment_policy"] = "ask_before_apply"

@@ -179,7 +179,9 @@ async def test_auto_submission_reuses_previous_mode_for_same_conversation_withou
     assert submitted.mode is TaskMode.HYBRID
     assert submitted.clarification_reason is None
     assert router.calls == 0
-    assert repository.created[0]["routing_decision"] == {
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing.items() >= {
         "reason": "conversation_mode_continuation",
         "main_agent_selected_mode": "hybrid",
         "mode_source": "previous_conversation_run",
@@ -190,7 +192,11 @@ async def test_auto_submission_reuses_previous_mode_for_same_conversation_withou
         "conversation_id": "conv-1",
         "reference_conversation_id": None,
         "attachment_ids": [],
-    }
+        "project_id": "default",
+        "workspace_session_id": "conv-1",
+        "sandbox_profile": "none",
+        "requested_permissions": [],
+    }.items()
 
 
 async def test_auto_reuses_previous_mode_when_discussion_is_context() -> None:
@@ -269,7 +275,9 @@ async def test_auto_submission_switches_mode_when_user_explicitly_requests_it() 
     assert submitted.status is RunStatus.QUEUED
     assert submitted.mode is TaskMode.DISCUSS
     assert router.calls == 0
-    assert repository.created[0]["routing_decision"] == {
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing.items() >= {
         "reason": "conversation_mode_switch",
         "main_agent_selected_mode": "discuss",
         "mode_source": "explicit_user_request",
@@ -280,7 +288,11 @@ async def test_auto_submission_switches_mode_when_user_explicitly_requests_it() 
         "conversation_id": "conv-1",
         "reference_conversation_id": None,
         "attachment_ids": [],
-    }
+        "project_id": "default",
+        "workspace_session_id": "conv-1",
+        "sandbox_profile": "none",
+        "requested_permissions": [],
+    }.items()
 
 
 async def test_auto_submission_does_not_reuse_previous_mode_when_user_requests_new_conversation() -> None:
