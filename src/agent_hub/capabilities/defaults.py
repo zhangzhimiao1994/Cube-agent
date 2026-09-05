@@ -134,12 +134,14 @@ def build_runtime_capability_stack(
     skill_store_dir: Path,
     workspace_root: Path | None,
     generated_artifact_dir: Path | None = None,
+    project_workspace_dir: Path | None = None,
     require_approval_for_tools: ToolApprovalPolicyGetter | None = None,
 ) -> RuntimeCapabilityStack:
     runtime_gateway = RuntimeCapabilityGateway(
         skill_store_dir=skill_store_dir,
         workspace_root=workspace_root,
         generated_artifact_dir=generated_artifact_dir,
+        project_workspace_dir=project_workspace_dir,
     )
     del tenant_id
     policy_gateway = DefaultRuntimeCapabilityPolicyGateway(

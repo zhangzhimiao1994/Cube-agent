@@ -37,6 +37,7 @@ def test_worker_runtime_stack_uses_configured_generated_artifact_dir(
         skill_store_dir = tmp_path / "skills"
         attachment_store_dir = tmp_path / "attachments"
         generated_artifact_dir = tmp_path / "generated"
+        project_workspace_dir = tmp_path / "workspaces"
         runtime_timeout_seconds = 10
         runtime_token_budget = 1000
 
@@ -74,6 +75,7 @@ def test_worker_runtime_stack_uses_configured_generated_artifact_dir(
     runtime_stack = captured["runtime_stack"]
     assert isinstance(runtime_stack, dict)
     assert runtime_stack["generated_artifact_dir"] == tmp_path / "generated"
+    assert runtime_stack["project_workspace_dir"] == tmp_path / "workspaces"
 
 
 def test_worker_builds_evolution_terminal_hook(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:

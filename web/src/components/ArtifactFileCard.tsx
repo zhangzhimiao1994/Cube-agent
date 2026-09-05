@@ -2,9 +2,25 @@ import { useState } from "react";
 
 import { api, formatApiError, type RunDetail } from "../api/client";
 
-type ArtifactFile =
+type ArtifactFile = (
   | RunDetail["artifacts"][number]
-  | NonNullable<RunDetail["events"][number]["artifact"]>;
+  | NonNullable<RunDetail["events"][number]["artifact"]>
+) & {
+  path?: string;
+};
+export type DownloadableFile = {
+  id?: string;
+  kind?: string | null;
+  title?: string | null;
+  text?: string | null;
+  filename?: string | null;
+  mime_type?: string | null;
+  size_bytes?: number | null;
+  sha256?: string | null;
+  download_url: string;
+  presentation?: string | null;
+  path?: string | null;
+};
 
 export function hasArtifactDownload(
   artifact: ArtifactFile | null | undefined,
@@ -12,8 +28,8 @@ export function hasArtifactDownload(
   return typeof artifact?.download_url === "string" && artifact.download_url.trim().length > 0;
 }
 
-export function artifactFileName(artifact: ArtifactFile) {
-  return artifact.filename?.trim() || artifact.title || artifact.id;
+export function artifactFileName(artifact: DownloadableFile) {
+  return artifact.filename?.trim() || artifact.title || artifact.path || artifact.id || "download";
 }
 
 export function formatFileSize(sizeBytes: number | null | undefined) {
@@ -33,7 +49,7 @@ export function ArtifactFileCard({
   artifact,
   compact = false,
 }: {
-  artifact: ArtifactFile & { download_url: string };
+  artifact: DownloadableFile;
   compact?: boolean;
 }) {
   const [downloading, setDownloading] = useState(false);

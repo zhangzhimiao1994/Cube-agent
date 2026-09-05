@@ -173,6 +173,8 @@ class RunArtifactDownloadServiceProtocol(Protocol):
         self,
         run_id: UUID,
         artifact_id: UUID,
+        *,
+        tenant_id: UUID | None = None,
     ) -> GeneratedArtifactDownloadProtocol: ...
 
 
@@ -1205,10 +1207,14 @@ async def download_run_artifact(
     run_id: UUID,
     artifact_id: UUID,
     service: Annotated[RunArtifactDownloadServiceProtocol, Depends(_download_service)],
-    _principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:read"))],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:read"))],
 ) -> FileResponse:
     try:
-        download = await service.download_run_artifact(run_id, artifact_id)
+        download = await service.download_run_artifact(
+            run_id,
+            artifact_id,
+            tenant_id=principal.tenant_id,
+        )
     except (KeyError, FileNotFoundError, ValueError):
         raise PublicAPIError(404, "not_found", "not found") from None
     return FileResponse(

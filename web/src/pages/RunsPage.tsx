@@ -3,9 +3,15 @@ import { Fragment, FormEvent, useEffect, useMemo, useRef, useState } from "react
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
 
-import { ApiError, api, formatApiError, type AttachmentUpload, type ModelDeployment, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun } from "../api/client";
+import { ApiError, api, formatApiError, type AttachmentUpload, type ModelDeployment, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WorkspaceFileList } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
-import { ArtifactFileCard, artifactFileName, formatFileSize, hasArtifactDownload } from "../components/ArtifactFileCard";
+import {
+  ArtifactFileCard,
+  artifactFileName,
+  formatFileSize,
+  hasArtifactDownload,
+  type DownloadableFile,
+} from "../components/ArtifactFileCard";
 
 const RUN_MODES = [
   { value: "auto", label: "自动", description: "主 Agent 判断应使用直连、派单、讨论或混合；不确定时向你确认。" },
@@ -351,9 +357,7 @@ function formatEventPayloadValue(value: unknown): string {
 
 type RunEvent = RunDetail["events"][number];
 type RunArtifact = RunDetail["artifacts"][number];
-type DownloadableArtifact = (RunArtifact | NonNullable<RunEvent["artifact"]>) & {
-  download_url: string;
-};
+type DownloadableArtifact = DownloadableFile;
 type ChatMessage = {
   id: string;
   role: "user" | "assistant";
@@ -417,6 +421,12 @@ function artifactDetailDownload(artifact: RunArtifact | NonNullable<RunEvent["ar
 
 function artifactDownloadKey(artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null | undefined) {
   return hasArtifactDownload(artifact) ? artifact.download_url.trim() : "";
+}
+
+function isWorkspaceDownloadArtifact(
+  artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null | undefined,
+): artifact is DownloadableArtifact {
+  return hasArtifactDownload(artifact) && artifact.download_url.trim().startsWith("/api/v1/workspaces/");
 }
 
 function isGenericArtifactText(value: string | null | undefined) {
@@ -1916,6 +1926,68 @@ export function conversationMessages(runs: RunDetail[]): ChatMessage[] {
         id: `${run.id}-${message.id}`,
         run,
       })),
+  );
+}
+
+export function conversationWorkspaceFiles(runs: RunDetail[]) {
+  const final: DownloadableArtifact[] = [];
+  const intermediate: DownloadableArtifact[] = [];
+  const seen = new Set<string>();
+  const append = (artifact: RunArtifact | NonNullable<RunEvent["artifact"]> | null | undefined) => {
+    if (!isWorkspaceDownloadArtifact(artifact)) return;
+    const key = artifact.download_url.trim();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    if (artifact.presentation === "final_attachment") {
+      final.push(artifact);
+      return;
+    }
+    intermediate.push(artifact);
+  };
+
+  orderedConversationRuns(runs).forEach((run) => {
+    run.artifacts.forEach(append);
+    orderedRunEvents(run.events).forEach((event) => append(event.artifact));
+  });
+  return { final, intermediate, total: final.length + intermediate.length };
+}
+
+function ConversationWorkspaceFiles({
+  files,
+}: {
+  files: ReturnType<typeof conversationWorkspaceFiles>;
+}) {
+  if (files.total === 0) return null;
+  return (
+    <section className="conversation-files-panel" aria-label="当前会话文件">
+      <div className="conversation-files-header">
+        <div>
+          <span className="eyebrow">Files</span>
+          <h3>当前会话文件</h3>
+        </div>
+        <small>
+          {files.final.length} 个最终产物
+          {files.intermediate.length > 0 ? ` · ${files.intermediate.length} 个中间产物` : ""}
+        </small>
+      </div>
+      {files.final.length > 0 ? (
+        <div className="conversation-files-group" aria-label="最终产物">
+          {files.final.map((artifact) => (
+            <ArtifactFileCard key={artifact.download_url} artifact={artifact} compact />
+          ))}
+        </div>
+      ) : null}
+      {files.intermediate.length > 0 ? (
+        <details className="conversation-files-details">
+          <summary>中间产物</summary>
+          <div className="conversation-files-group">
+            {files.intermediate.map((artifact) => (
+              <ArtifactFileCard key={artifact.download_url} artifact={artifact} compact />
+            ))}
+          </div>
+        </details>
+      ) : null}
+    </section>
   );
 }
 
@@ -4161,6 +4233,7 @@ export function RunsPage() {
       ? mergeConversationRuns(conversationVisibleRuns, [selectedRun.data])
       : conversationVisibleRuns ?? activeConversationRuns ?? (selectedRun.data ? [selectedRun.data] : []);
   const messages = conversationMessages(visibleRuns);
+  const workspaceFiles = conversationWorkspaceFiles(visibleRuns);
   const temporaryApprovalVisibleInMessages =
     !!temporaryApproval &&
     messages.some((item) => item.id === `${temporaryApproval.runId}-temporary-agent-approval`);
@@ -4597,6 +4670,7 @@ export function RunsPage() {
                 </button>
               </div>
             </div>
+            <ConversationWorkspaceFiles files={workspaceFiles} />
             {showModeEntry ? (
               <ModeEntryPanel selectedMode={mode} onSelect={chooseRunMode} />
             ) : null}

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { RunDetail } from "../api/client";
 import {
+  conversationWorkspaceFiles,
   conversationMessages,
   mergeConversationRuns,
   requestedPermissionsForSandbox,
@@ -219,6 +220,75 @@ describe("conversation ordering", () => {
 });
 
 describe("workspace and sandbox submission helpers", () => {
+  it("groups current conversation downloadable files by final and intermediate artifacts", () => {
+    const firstRun: RunDetail = {
+      ...baseRun,
+      id: "11111111-1111-4111-8111-111111111111",
+      created_at: "2026-09-02T00:01:00Z",
+      artifacts: [
+        {
+          id: "final-zip",
+          kind: "tool_result",
+          title: "源码包",
+          text: null,
+          filename: "demo.zip",
+          mime_type: "application/zip",
+          size_bytes: 128,
+          sha256: "a".repeat(64),
+          download_url: "/api/v1/workspaces/projects/project/sessions/session/bundle/download",
+          presentation: "final_attachment",
+        },
+      ],
+      events: [
+        {
+          sequence: 1,
+          kind: "artifact.created",
+          message: "artifact.created",
+          created_at: "2026-09-02T00:01:30Z",
+          participants: [],
+          payload: {},
+          artifact: {
+            id: "draft-md",
+            kind: "tool_result",
+            title: "草稿",
+            text: null,
+            filename: "draft.md",
+            mime_type: "text/markdown",
+            size_bytes: 16,
+            sha256: "b".repeat(64),
+            download_url:
+              "/api/v1/workspaces/projects/project/sessions/session/files/download?path=draft.md",
+            presentation: "step_detail",
+          },
+        },
+      ],
+    };
+    const secondRun: RunDetail = {
+      ...baseRun,
+      id: "22222222-2222-4222-8222-222222222223",
+      created_at: "2026-09-02T00:02:00Z",
+      artifacts: [
+        {
+          id: "final-zip-copy",
+          kind: "tool_result",
+          title: "源码包副本",
+          text: null,
+          filename: "demo.zip",
+          mime_type: "application/zip",
+          size_bytes: 128,
+          sha256: "a".repeat(64),
+          download_url: "/api/v1/workspaces/projects/project/sessions/session/bundle/download",
+          presentation: "final_attachment",
+        },
+      ],
+    };
+
+    const files = conversationWorkspaceFiles([secondRun, firstRun]);
+
+    expect(files.final.map((artifact) => artifact.filename)).toEqual(["demo.zip"]);
+    expect(files.intermediate.map((artifact) => artifact.filename)).toEqual(["draft.md"]);
+  });
+
   it("maps sandbox profiles to bounded requested permissions", () => {
     expect(requestedPermissionsForSandbox("none")).toEqual([]);
     expect(requestedPermissionsForSandbox("read_only")).toEqual(["workspace.read"]);

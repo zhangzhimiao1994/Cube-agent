@@ -234,6 +234,69 @@ async def test_runtime_gateway_generates_project_zip_final_artifact(tmp_path: Pa
         assert archive.read("main.py") == b"print('hello world')\n"
 
 
+async def test_runtime_gateway_copies_project_zip_sources_to_project_workspace(
+    tmp_path: Path,
+) -> None:
+    generated_dir = tmp_path / "generated"
+    workspace_dir = tmp_path / "workspaces"
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=generated_dir,
+        project_workspace_dir=workspace_dir,
+    )
+
+    result = await gateway.execute(
+        tenant_id=TENANT_ID,
+        run_id=RUN_ID,
+        actor="engineer",
+        name="project.generate_zip",
+        arguments={
+            "title": "Hello World",
+            "project_id": "Demo Project",
+            "workspace_session_id": "Session 01",
+            "files": {
+                "main.py": "print('hello world')\n",
+                "README.md": "# Hello World\n",
+            },
+        },
+        idempotency_key="project_zip_workspace_copy",
+    )
+
+    assert result["workspace_files"] == (
+        {
+            "path": "README.md",
+            "filename": "README.md",
+            "mime_type": "text/markdown",
+            "size_bytes": 14,
+            "sha256": "3193a37e30746364372ddb1604d91052647d835206efaaeb2f77ab5e2100bcba",
+            "download_url": (
+                "/api/v1/workspaces/projects/demo-project/sessions/session-01/files/download"
+                "?path=README.md"
+            ),
+        },
+        {
+            "path": "main.py",
+            "filename": "main.py",
+            "mime_type": "text/x-python",
+            "size_bytes": 21,
+            "sha256": "2d543015627a771436b30ea79fd0ecda8df8bcd77b3d55661caf5a0d6e809886",
+            "download_url": (
+                "/api/v1/workspaces/projects/demo-project/sessions/session-01/files/download"
+                "?path=main.py"
+            ),
+        },
+    )
+    assert (
+        workspace_dir
+        / str(TENANT_ID)
+        / "projects"
+        / "demo-project"
+        / "sessions"
+        / "session-01"
+        / "main.py"
+    ).read_text(encoding="utf-8") == "print('hello world')\n"
+
+
 async def test_runtime_gateway_accepts_common_project_zip_files_item_wrapper(
     tmp_path: Path,
 ) -> None:

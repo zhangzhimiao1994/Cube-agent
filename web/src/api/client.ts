@@ -750,6 +750,23 @@ const ConversationSchema = z.object({
 
 export type Conversation = z.infer<typeof ConversationSchema>;
 
+const WorkspaceFileSchema = z.object({
+  path: z.string(),
+  filename: z.string(),
+  mime_type: z.string(),
+  size_bytes: z.number(),
+  sha256: z.string(),
+  download_url: z.string(),
+});
+
+const WorkspaceFileListSchema = z.object({
+  items: z.array(WorkspaceFileSchema),
+  bundle_download_url: z.string(),
+});
+
+export type WorkspaceFile = z.infer<typeof WorkspaceFileSchema>;
+export type WorkspaceFileList = z.infer<typeof WorkspaceFileListSchema>;
+
 const SkillVersionSchema = z.object({
   id: z.string(),
   source_filename: z.string().nullable().optional(),
@@ -1179,9 +1196,52 @@ async function requestBinary<T>(
 
 const GENERATED_ARTIFACT_DOWNLOAD_PATH =
   /^\/api\/v1\/(?:admin\/)?runs\/[^/]+\/artifacts\/[^/]+\/download$/;
+const DownloadURL = URL;
+const SAFE_WORKSPACE_SEGMENT = /^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?$/;
+
+function isSafeWorkspaceSegment(value: string): boolean {
+  return SAFE_WORKSPACE_SEGMENT.test(value);
+}
+
+function isSafeWorkspaceRelativePath(value: string): boolean {
+  if (!value || value !== value.trim() || value.length > 512) return false;
+  if (value.includes("\\") || value.startsWith("/") || value.includes("//")) return false;
+  return value.split("/").every((part) => part.length > 0 && part !== "." && part !== ".." && !part.startsWith("."));
+}
+
+function isSupportedWorkspaceDownloadPath(path: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new DownloadURL(path, "http://agent-hub.local");
+  } catch {
+    return false;
+  }
+  if (parsed.origin !== "http://agent-hub.local") return false;
+  const bundleMatch = parsed.pathname.match(
+    /^\/api\/v1\/workspaces\/projects\/([^/]+)\/sessions\/([^/]+)\/bundle\/download$/,
+  );
+  if (bundleMatch) {
+    return (
+      parsed.search === "" &&
+      isSafeWorkspaceSegment(bundleMatch[1]) &&
+      isSafeWorkspaceSegment(bundleMatch[2])
+    );
+  }
+  const fileMatch = parsed.pathname.match(
+    /^\/api\/v1\/workspaces\/projects\/([^/]+)\/sessions\/([^/]+)\/files\/download$/,
+  );
+  if (!fileMatch || !isSafeWorkspaceSegment(fileMatch[1]) || !isSafeWorkspaceSegment(fileMatch[2])) {
+    return false;
+  }
+  const pathValues = parsed.searchParams.getAll("path");
+  return pathValues.length === 1 && isSafeWorkspaceRelativePath(pathValues[0]);
+}
 
 async function requestDownload(path: string): Promise<Blob> {
-  if (!GENERATED_ARTIFACT_DOWNLOAD_PATH.test(path)) {
+  if (
+    !GENERATED_ARTIFACT_DOWNLOAD_PATH.test(path) &&
+    !isSupportedWorkspaceDownloadPath(path)
+  ) {
     throw new ApiError("unsupported download URL", 0, "invalid_download_url");
   }
   let response: Response;
@@ -1672,6 +1732,13 @@ export const api = {
       `/api/v1/admin/conversations/${encodeURIComponent(conversationId)}`,
       { method: "GET" },
       ConversationSchema,
+    );
+  },
+  workspaceFiles(projectId: string, sessionId: string): Promise<WorkspaceFileList> {
+    return request(
+      `/api/v1/workspaces/projects/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}/files`,
+      { method: "GET" },
+      WorkspaceFileListSchema,
     );
   },
   pauseRun(id: string): Promise<RunDetail> {

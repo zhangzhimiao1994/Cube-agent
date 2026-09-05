@@ -23,6 +23,7 @@ from agent_hub.files.generated import (
     GeneratedFileStore,
     safe_generated_filename,
 )
+from agent_hub.files.workspace import ProjectWorkspaceStore
 from agent_hub.runtime.contracts import JsonValue
 from agent_hub.skills.sandbox.base import SkillInvocation, SkillSandbox
 from agent_hub.skills.sandbox.systemd import SystemdSkillSandbox
@@ -71,6 +72,7 @@ class RuntimeCapabilityGateway:
         skill_store_dir: Path,
         workspace_root: Path | None = None,
         generated_artifact_dir: Path | None = None,
+        project_workspace_dir: Path | None = None,
         skill_sandbox: SkillSandbox | None = None,
         calculator: Calculator | None = None,
     ) -> None:
@@ -78,6 +80,11 @@ class RuntimeCapabilityGateway:
         self._workspace_root = workspace_root
         self._generated_file_store = (
             GeneratedFileStore(generated_artifact_dir) if generated_artifact_dir is not None else None
+        )
+        self._project_workspace_store = (
+            ProjectWorkspaceStore(project_workspace_dir)
+            if project_workspace_dir is not None
+            else None
         )
         self._skill_sandbox = skill_sandbox or SystemdSkillSandbox()
         self._calculator = calculator or Calculator()
@@ -251,6 +258,7 @@ class RuntimeCapabilityGateway:
         store = self._require_generated_file_store()
         title = _required_string(arguments, "title")
         files = _project_files(arguments)
+        workspace_files = self._copy_project_files_to_workspace(tenant_id, arguments, files)
         filename = _filename(arguments, title=title, extension=".zip")
         artifact_id = uuid4()
         with tempfile.TemporaryDirectory(prefix="agent-hub-project-") as temporary_dir:
@@ -266,13 +274,43 @@ class RuntimeCapabilityGateway:
                 mime_type=ZIP_MIME_TYPE,
                 data=output.read_bytes(),
             )
-        return _file_result(
-            artifact_id=artifact_id,
-            public_metadata=metadata.to_public_dict(),
-            internal_metadata=metadata.to_content_file(),
-            presentation=_generated_file_presentation(arguments, default="final_attachment"),
-            summary=f"Generated project ZIP artifact {metadata.filename}.",
+        result = dict(
+            _file_result(
+                artifact_id=artifact_id,
+                public_metadata=metadata.to_public_dict(),
+                internal_metadata=metadata.to_content_file(),
+                presentation=_generated_file_presentation(arguments, default="final_attachment"),
+                summary=f"Generated project ZIP artifact {metadata.filename}.",
+            )
         )
+        if workspace_files:
+            result["workspace_files"] = workspace_files
+        return result
+
+    def _copy_project_files_to_workspace(
+        self,
+        tenant_id: UUID,
+        arguments: Mapping[str, JsonValue],
+        files: Mapping[str, bytes],
+    ) -> tuple[Mapping[str, JsonValue], ...]:
+        if self._project_workspace_store is None:
+            return ()
+        project_id = _optional_string(arguments, "project_id")
+        session_id = _optional_string(arguments, "workspace_session_id")
+        if project_id is None or session_id is None:
+            return ()
+        stored = [
+            self._project_workspace_store.write_bytes(
+                tenant_id=tenant_id,
+                project_id=project_id,
+                session_id=session_id,
+                relative_path=path,
+                data=data,
+                mime_type=_workspace_mime_type(path),
+            )
+            for path, data in sorted(files.items())
+        ]
+        return tuple(cast(Mapping[str, JsonValue], item.to_public_dict()) for item in stored)
 
     def _require_generated_file_store(self) -> GeneratedFileStore:
         if self._generated_file_store is None:
@@ -486,6 +524,27 @@ def _project_archive_path(path: str) -> str:
         except ValueError as error:
             raise RuntimeCapabilityError(str(error)) from None
     return posix.as_posix()
+
+
+def _workspace_mime_type(path: str) -> str:
+    lowered = path.lower()
+    if lowered.endswith(".md"):
+        return "text/markdown"
+    if lowered.endswith(".json"):
+        return "application/json"
+    if lowered.endswith(".csv"):
+        return "text/csv"
+    if lowered.endswith(".html"):
+        return "text/html"
+    if lowered.endswith(".css"):
+        return "text/css"
+    if lowered.endswith(".js"):
+        return "text/javascript"
+    if lowered.endswith(".ts"):
+        return "text/typescript"
+    if lowered.endswith(".py"):
+        return "text/x-python"
+    return "text/plain"
 
 
 def _file_result(

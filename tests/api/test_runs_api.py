@@ -52,8 +52,20 @@ class StubSettingsService:
         self.audit_events.append({"actor": actor, "action": action, "resource": resource, "details": details})
         return object()
 
-    async def download_run_artifact(self, run_id: UUID, artifact_id: UUID) -> object:
+    async def download_run_artifact(
+        self, run_id: UUID, artifact_id: UUID, *, tenant_id: UUID | None = None
+    ) -> object:
         del run_id, artifact_id
+        if tenant_id is None:
+            raise KeyError("tenant required")
+        self.audit_events.append(
+            {
+                "actor": "download-service",
+                "action": "download_run_artifact",
+                "resource": str(tenant_id),
+                "details": {},
+            }
+        )
         if self.download_path is None:
             raise KeyError("download not configured")
         return type(
@@ -1193,7 +1205,7 @@ def test_user_run_download_path_returns_generated_artifact(tmp_path: Path) -> No
     artifact_path = tmp_path / "hello-world.zip"
     artifact_path.write_bytes(b"zip-bytes")
     settings = StubSettingsService(download_path=artifact_path, download_filename="hello-world.zip")
-    client, _, _ = _client(settings_service=settings)
+    client, _, principal = _client(settings_service=settings)
     run_id = uuid4()
     artifact_id = uuid4()
 
@@ -1206,6 +1218,7 @@ def test_user_run_download_path_returns_generated_artifact(tmp_path: Path) -> No
     assert response.content == b"zip-bytes"
     assert response.headers["content-type"].startswith("application/zip")
     assert "hello-world.zip" in response.headers["content-disposition"]
+    assert settings.audit_events[-1]["resource"] == str(principal.tenant_id)
 
 
 def test_submitted_run_response_includes_safe_self_repair_proposal() -> None:

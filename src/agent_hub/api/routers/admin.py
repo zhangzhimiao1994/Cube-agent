@@ -1824,7 +1824,7 @@ class AdminResourceService(Protocol):
     async def get_run(self, run_id: UUID) -> RunDetailResponse: ...
 
     async def download_run_artifact(
-        self, run_id: UUID, artifact_id: UUID
+        self, run_id: UUID, artifact_id: UUID, *, tenant_id: UUID | None = None
     ) -> GeneratedArtifactDownload: ...
 
     async def get_conversation(self, conversation_id: str) -> ConversationResponse: ...
@@ -3016,8 +3016,9 @@ class InMemoryAdminResourceService:
         return self.runs[run_id]
 
     async def download_run_artifact(
-        self, run_id: UUID, artifact_id: UUID
+        self, run_id: UUID, artifact_id: UUID, *, tenant_id: UUID | None = None
     ) -> GeneratedArtifactDownload:
+        del tenant_id
         path, filename, mime_type = self.generated_artifacts[(run_id, artifact_id)]
         return GeneratedArtifactDownload(
             path=path,
@@ -3856,10 +3857,16 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         return await self._run_detail(record)
 
     async def download_run_artifact(
-        self, run_id: UUID, artifact_id: UUID
+        self, run_id: UUID, artifact_id: UUID, *, tenant_id: UUID | None = None
     ) -> GeneratedArtifactDownload:
+        if tenant_id is not None and tenant_id != self._tenant_id:
+            raise KeyError(run_id)
         if self._run_repository is None or self._generated_file_store is None:
-            return await super().download_run_artifact(run_id, artifact_id)
+            return await super().download_run_artifact(
+                run_id,
+                artifact_id,
+                tenant_id=tenant_id,
+            )
         try:
             await self._run_repository.get(self._tenant_id, run_id)
             artifacts = await self._run_repository.raw_artifacts(self._tenant_id, run_id)

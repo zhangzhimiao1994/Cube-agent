@@ -6,10 +6,18 @@ from agent_hub.files.generated import (
     safe_generated_filename,
     validate_generated_filename,
 )
+from agent_hub.files.workspace import (
+    ProjectWorkspaceBundle,
+    ProjectWorkspaceFile,
+    ProjectWorkspaceStore,
+)
 
 __all__ = [
     "GeneratedFileMetadata",
     "GeneratedFileStore",
+    "ProjectWorkspaceBundle",
+    "ProjectWorkspaceFile",
+    "ProjectWorkspaceStore",
     "safe_generated_filename",
     "validate_generated_filename",
 ]

@@ -30,7 +30,7 @@ from agent_hub.api.errors import (
     public_error_handler,
 )
 from agent_hub.api.middleware import RequestBodyLimitMiddleware, SafeExceptionMiddleware
-from agent_hub.api.routers import admin, auth, config, runs, system, users
+from agent_hub.api.routers import admin, auth, config, runs, system, users, workspaces
 from agent_hub.auth.models import Role
 from agent_hub.auth.passwords import PasswordService
 from agent_hub.auth.rate_limit import RedisAuthRateLimiter
@@ -739,6 +739,12 @@ def create_app(
             application.state.trusted_proxy_ips = configured.trusted_proxy_ips
             application.state.bootstrap_tenant_id = configured.bootstrap_tenant_id
             application.state.attachment_store_dir = configured.attachment_store_dir
+            if getattr(application.state, "project_workspace_store", None) is None:
+                from agent_hub.files.workspace import ProjectWorkspaceStore
+
+                application.state.project_workspace_store = ProjectWorkspaceStore(
+                    configured.project_workspace_dir
+                )
             needs_sessions = (
                 auth_service is None
                 or config_service is None
@@ -817,6 +823,7 @@ def create_app(
                         skill_store_dir=configured.skill_store_dir,
                         workspace_root=configured.attachment_store_dir,
                         generated_artifact_dir=configured.generated_artifact_dir,
+                        project_workspace_dir=configured.project_workspace_dir,
                         require_approval_for_tools=lambda _tenant_id: _require_tool_approval_from_settings(
                             admin_service_for_capabilities.get_settings
                         ),
@@ -1002,6 +1009,7 @@ def create_app(
     application.state.feishu_websocket_connector = None
     application.state.feishu_websocket_task = None
     application.state.multimedia_generation_executor = None
+    application.state.project_workspace_store = None
 
     async def refresh_channel_runtime_config(runtime_config: Mapping[str, str]) -> None:
         application.state.channel_runtime_config = dict(runtime_config)
@@ -1033,6 +1041,7 @@ def create_app(
     application.router.routes.extend(auth.router.routes)
     application.router.routes.extend(config.router.routes)
     application.router.routes.extend(runs.router.routes)
+    application.router.routes.extend(workspaces.router.routes)
     application.router.routes.extend(admin.router.routes)
     application.router.routes.extend(users.router.routes)
     application.router.routes.extend(

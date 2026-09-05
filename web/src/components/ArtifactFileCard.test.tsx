@@ -19,6 +19,14 @@ const userDownloadable = {
   ...downloadable,
   download_url: "/api/v1/runs/run-1/artifacts/artifact-zip/download",
 };
+const workspaceDownloadable = {
+  ...downloadable,
+  download_url: "/api/v1/workspaces/projects/project/sessions/session/files/download?path=src%2Fapp.py",
+};
+const workspaceBundleDownloadable = {
+  ...downloadable,
+  download_url: "/api/v1/workspaces/projects/project/sessions/session/bundle/download",
+};
 
 describe("ArtifactFileCard", () => {
   beforeEach(() => {
@@ -122,6 +130,109 @@ describe("ArtifactFileCard", () => {
         }),
       );
       expect(anchorClick).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("downloads workspace files from backend-issued workspace paths", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(new Blob(["source"], { type: "text/plain" }), {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+      }),
+    );
+    const anchorClick = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("URL", {
+      ...URL,
+      createObjectURL: vi.fn(() => "blob:workspace-file"),
+      revokeObjectURL: vi.fn(),
+    });
+    vi.spyOn(document, "createElement").mockImplementation((tagName) => {
+      const element = document.createElementNS("http://www.w3.org/1999/xhtml", tagName);
+      if (tagName.toLowerCase() === "a") {
+        Object.defineProperty(element, "click", { value: anchorClick });
+      }
+      return element as HTMLElement;
+    });
+
+    render(<ArtifactFileCard artifact={workspaceDownloadable} />);
+    await userEvent.click(screen.getByRole("button", { name: "下载 源码包" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringMatching(
+          /^\/api\/v1\/workspaces\/projects\/project\/sessions\/session\/files\/download\?path=src%2Fapp\.py&_=/,
+        ),
+        expect.objectContaining({
+          cache: "no-store",
+          credentials: "include",
+        }),
+      );
+      expect(anchorClick).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("downloads workspace bundles from backend-issued bundle paths", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(new Blob(["zip"], { type: "application/zip" }), {
+        status: 200,
+        headers: { "content-type": "application/zip" },
+      }),
+    );
+    const anchorClick = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("URL", {
+      ...URL,
+      createObjectURL: vi.fn(() => "blob:workspace-bundle"),
+      revokeObjectURL: vi.fn(),
+    });
+    vi.spyOn(document, "createElement").mockImplementation((tagName) => {
+      const element = document.createElementNS("http://www.w3.org/1999/xhtml", tagName);
+      if (tagName.toLowerCase() === "a") {
+        Object.defineProperty(element, "click", { value: anchorClick });
+      }
+      return element as HTMLElement;
+    });
+
+    render(<ArtifactFileCard artifact={workspaceBundleDownloadable} />);
+    await userEvent.click(screen.getByRole("button", { name: "下载 源码包" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringMatching(
+          /^\/api\/v1\/workspaces\/projects\/project\/sessions\/session\/bundle\/download\?_=/,
+        ),
+        expect.objectContaining({
+          cache: "no-store",
+          credentials: "include",
+        }),
+      );
+      expect(anchorClick).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("rejects workspace download paths with unsafe project segments before fetching", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(new Blob(["unsafe"], { type: "text/plain" }), {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <ArtifactFileCard
+        artifact={{
+          ...workspaceBundleDownloadable,
+          download_url: "/api/v1/workspaces/projects/../sessions/session/bundle/download",
+        }}
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "下载 源码包" }));
+
+    await waitFor(() => {
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(screen.getByRole("alert").textContent).toContain("unsupported download URL");
     });
   });
 

@@ -142,6 +142,7 @@ def build_worker_service(
         skill_store_dir=settings.skill_store_dir,
         workspace_root=settings.attachment_store_dir,
         generated_artifact_dir=settings.generated_artifact_dir,
+        project_workspace_dir=settings.project_workspace_dir,
         require_approval_for_tools=lambda _tenant_id: _require_tool_approval_from_settings(
             admin_service.get_settings
         ),
