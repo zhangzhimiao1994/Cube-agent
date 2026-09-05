@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
+from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
 from agent_hub.files.workspace import ProjectWorkspaceStore
 
 
@@ -98,6 +99,44 @@ def test_downloads_project_session_workspace_zip(tmp_path: Path) -> None:
     archive_path.write_bytes(response.content)
     with zipfile.ZipFile(archive_path) as archive:
         assert archive.namelist() == ["README.md", "src/app.py"]
+
+
+async def test_downloads_runtime_generated_project_as_workspace_zip(tmp_path: Path) -> None:
+    client, _, principal = client_with_workspace(tmp_path / "workspaces")
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        generated_artifact_dir=tmp_path / "generated",
+        project_workspace_dir=tmp_path / "workspaces",
+    )
+
+    await gateway.execute(
+        tenant_id=principal.tenant_id,
+        run_id=uuid4(),
+        actor="engineer",
+        name="project.generate_zip",
+        arguments={
+            "title": "Hello Python",
+            "project_id": "Mofang Agent",
+            "workspace_session_id": "Conv 01",
+            "files": {
+                "main.py": "print('hello from mofang')\n",
+                "README.md": "# Hello Python\n\nRun `python main.py`.\n",
+            },
+        },
+        idempotency_key="project_zip_user_download",
+    )
+
+    response = client.get(
+        "/api/v1/workspaces/projects/mofang-agent/sessions/conv-01/bundle/download",
+        headers=bearer(),
+    )
+
+    assert response.status_code == 200
+    archive_path = tmp_path / "downloaded-runtime-project.zip"
+    archive_path.write_bytes(response.content)
+    with zipfile.ZipFile(archive_path) as archive:
+        assert archive.namelist() == ["README.md", "main.py"]
+        assert archive.read("main.py") == b"print('hello from mofang')\n"
 
 
 def test_workspace_download_rejects_path_traversal(tmp_path: Path) -> None:
