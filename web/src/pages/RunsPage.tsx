@@ -4734,7 +4734,6 @@ export function RunsPage() {
                 </button>
               </div>
             </div>
-            <ConversationWorkspaceFiles files={workspaceFiles} />
             {showModeEntry ? (
               <ModeEntryPanel selectedMode={mode} onSelect={chooseRunMode} />
             ) : null}
@@ -4837,6 +4836,7 @@ export function RunsPage() {
                 ) : null}
               </Fragment>
             ))}
+            <ConversationWorkspaceFiles files={workspaceFiles} />
           </div>
           {refreshedProcessDetailTarget ? (
             <RunProcessDrawer

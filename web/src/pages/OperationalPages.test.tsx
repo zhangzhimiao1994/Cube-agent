@@ -2098,6 +2098,32 @@ describe("operational management pages", () => {
     expect(within(files).getByText("中间产物")).not.toBeNull();
   });
 
+  it("places current conversation workspace files after the conversation messages", async () => {
+    visibleWorkspaceFiles = {
+      items: [
+        {
+          path: "src/app.py",
+          filename: "app.py",
+          mime_type: "text/x-python",
+          size_bytes: 21,
+          sha256: "2d543015627a771436b30ea79fd0ecda8df8bcd77b3d55661caf5a0d6e809886",
+          download_url: "/api/v1/workspaces/projects/default/sessions/conv-previous/files/download?path=src%2Fapp.py",
+        },
+      ],
+      bundle_download_url: "/api/v1/workspaces/projects/default/sessions/conv-previous/bundle/download",
+    };
+
+    render(<TestApp initialPath="/" />);
+
+    expect(await screen.findByRole("heading", { name: "对话与进化" })).not.toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    const assistantReply = await within(stream).findByText(/这是最终回复正文/);
+    const files = await within(stream).findByRole("region", { name: "当前会话文件" });
+
+    expect(Boolean(assistantReply.compareDocumentPosition(files) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true);
+  });
+
   it("keeps live adjustment and temporary-agent switches out of workflow configuration", async () => {
     render(<TestApp initialPath="/workflows" />);
 
