@@ -7,6 +7,7 @@ from agent_hub.auth.models import Role
 from agent_hub.capabilities.gateway import CapabilityGateway, CapabilityStatus
 from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.mcp.client import McpClient
+from agent_hub.mcp.manifest import McpSnapshotCapabilityManifestSource
 from agent_hub.mcp.types import (
     DiscoveredMcpTool,
     McpAuditEvent,
@@ -122,6 +123,19 @@ class McpService:
 
     async def snapshot(self) -> McpGenerationSnapshot:
         return self._snapshot.model_copy(deep=True)
+
+    def capability_manifest_source(self) -> McpSnapshotCapabilityManifestSource:
+        return McpSnapshotCapabilityManifestSource(
+            snapshot_getter=lambda: self._snapshot.model_copy(deep=True),
+            servers_getter=lambda: tuple(
+                server.model_copy(deep=True) for server in self._servers.values()
+            ),
+            projected_tool_names=frozenset(
+                tool_name
+                for tool_names in self._tool_allowlist_by_agent.values()
+                for tool_name in tool_names
+            ),
+        )
 
     async def tools_for_agent(self, agent_id: str) -> tuple[DiscoveredMcpTool, ...]:
         allowed = self._tool_allowlist_by_agent.get(agent_id, frozenset())

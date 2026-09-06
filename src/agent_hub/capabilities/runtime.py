@@ -76,6 +76,13 @@ class CapabilityManifestSource(Protocol):
     def manifests(self) -> Mapping[str, JsonValue]: ...
 
 
+class TenantCapabilityManifestSource(Protocol):
+    def manifests_for_tenant(self, tenant_id: UUID) -> Mapping[str, JsonValue]: ...
+
+
+CapabilityManifestProvider = CapabilityManifestSource | TenantCapabilityManifestSource
+
+
 class RuntimeCapabilityGateway:
     """Production capability executor for non-dangerous built-ins and approved skills."""
 
@@ -88,7 +95,7 @@ class RuntimeCapabilityGateway:
         project_workspace_dir: Path | None = None,
         skill_sandbox: SkillSandbox | None = None,
         calculator: Calculator | None = None,
-        tool_registry: CapabilityManifestSource | None = None,
+        tool_registry: CapabilityManifestProvider | None = None,
     ) -> None:
         self._skill_store_dir = skill_store_dir
         self._workspace_root = workspace_root
@@ -120,7 +127,7 @@ class RuntimeCapabilityGateway:
         self,
         tenant_id: UUID,
         *,
-        extra_sources: tuple[CapabilityManifestSource, ...] = (),
+        extra_sources: tuple[CapabilityManifestProvider, ...] = (),
     ) -> Mapping[str, JsonValue]:
         builtin_items = tuple(
             self._builtin_manifest_item(name)
@@ -133,7 +140,11 @@ class RuntimeCapabilityGateway:
             "capabilities": (
                 *builtin_items,
                 *skill_items,
-                *self._registry_manifest_items(existing_items, extra_sources=extra_sources),
+                *self._registry_manifest_items(
+                    tenant_id,
+                    existing_items,
+                    extra_sources=extra_sources,
+                ),
             ),
         }
 
@@ -461,9 +472,10 @@ class RuntimeCapabilityGateway:
 
     def _registry_manifest_items(
         self,
+        tenant_id: UUID,
         existing_items: tuple[Mapping[str, JsonValue], ...],
         *,
-        extra_sources: tuple[CapabilityManifestSource, ...] = (),
+        extra_sources: tuple[CapabilityManifestProvider, ...] = (),
     ) -> tuple[Mapping[str, JsonValue], ...]:
         manifest_sources = (
             *((self._tool_registry,) if self._tool_registry is not None else ()),
@@ -484,7 +496,7 @@ class RuntimeCapabilityGateway:
         )
         projected: list[Mapping[str, JsonValue]] = []
         for source in manifest_sources:
-            for raw_item in _manifest_source_items(source):
+            for raw_item in _manifest_source_items(source, tenant_id):
                 projected_item = _project_registry_manifest_item(raw_item, seen_ids, seen_names)
                 if projected_item is None:
                     continue
@@ -497,10 +509,15 @@ class RuntimeCapabilityGateway:
 
 
 def _manifest_source_items(
-    source: CapabilityManifestSource,
+    source: CapabilityManifestProvider,
+    tenant_id: UUID,
 ) -> tuple[Mapping[str, JsonValue], ...]:
     try:
-        manifest = source.manifests()
+        tenant_manifest = getattr(source, "manifests_for_tenant", None)
+        if callable(tenant_manifest):
+            manifest = tenant_manifest(tenant_id)
+        else:
+            manifest = cast(CapabilityManifestSource, source).manifests()
     except Exception:  # noqa: BLE001 - optional manifest sources must fail closed.
         return ()
     if manifest.get("schema_version") != 1:

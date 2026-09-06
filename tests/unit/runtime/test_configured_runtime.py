@@ -1161,6 +1161,17 @@ async def test_config_backed_dispatch_runtime_exposes_capability_inventory(
         ),
         "truncated": False,
     }
+    assignments = cast(
+        tuple[Mapping[str, JsonValue], ...],
+        capability_plan["role_capability_assignments"],
+    )
+    assigned_names = {
+        capability["name"]
+        for assignment in assignments
+        for capability in cast(tuple[Mapping[str, JsonValue], ...], assignment["capabilities"])
+    }
+    assert "docx" in assigned_names
+    assert "filesystem.read_file" not in assigned_names
 
 
 @pytest.mark.asyncio

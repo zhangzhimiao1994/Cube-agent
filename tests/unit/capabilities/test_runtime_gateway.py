@@ -45,6 +45,30 @@ class FakeManifestSource:
         return self.manifest
 
 
+class TenantAwareManifestSource:
+    def __init__(self) -> None:
+        self.tenants: list[UUID] = []
+
+    def manifests_for_tenant(self, tenant_id: UUID) -> Mapping[str, JsonValue]:
+        self.tenants.append(tenant_id)
+        return {
+            "schema_version": 1,
+            "capabilities": (
+                {
+                    "id": "mcp.live_search",
+                    "kind": "mcp",
+                    "adapter": "mcp_server",
+                    "permission_class": "mcp.invoke",
+                    "sandbox_profile": "mcp_remote",
+                    "available": True,
+                    "availability_reason": None,
+                    "replay_safe": False,
+                    "aliases": (),
+                },
+            ),
+        }
+
+
 async def test_runtime_gateway_executes_calculator_without_external_side_effects(tmp_path: Path) -> None:
     gateway = RuntimeCapabilityGateway(skill_store_dir=tmp_path)
 
@@ -841,6 +865,23 @@ def test_runtime_gateway_capability_manifest_includes_extra_manifest_sources(
         "replay_safe": False,
         "aliases": (),
     }
+
+
+def test_runtime_gateway_capability_manifest_uses_tenant_aware_sources(
+    tmp_path: Path,
+) -> None:
+    source = TenantAwareManifestSource()
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        tool_registry=source,
+    )
+
+    manifest = gateway.capability_manifest(TENANT_ID)
+    manifest_items = cast(tuple[Mapping[str, JsonValue], ...], manifest["capabilities"])
+    capabilities = {item["id"]: item for item in manifest_items}
+
+    assert source.tenants == [TENANT_ID]
+    assert capabilities["mcp.live_search"]["adapter"] == "mcp_server"
 
 
 def test_runtime_gateway_capability_manifest_keeps_runtime_items_authoritative(
