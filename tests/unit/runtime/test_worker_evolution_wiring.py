@@ -54,6 +54,10 @@ def test_worker_runtime_stack_uses_configured_generated_artifact_dir(
         runtime_gateway = object()
         harness_tool_gateway = object()
 
+    class FakeMcpService:
+        def capability_manifest_source(self) -> object:
+            return "mcp-source"
+
     def fake_build_runtime_capability_stack(**kwargs: object) -> FakeRuntimeStack:
         captured["runtime_stack"] = kwargs
         return FakeRuntimeStack()
@@ -68,6 +72,11 @@ def test_worker_runtime_stack_uses_configured_generated_artifact_dir(
     monkeypatch.setattr(worker, "_evolution_terminal_hooks", lambda **kwargs: ())
     monkeypatch.setattr(worker, "configured_runtime_registry", lambda **kwargs: object())
     monkeypatch.setattr(worker, "RunService", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        worker,
+        "build_runtime_mcp_service_sync",
+        lambda **kwargs: FakeMcpService(),
+    )
     monkeypatch.setattr(worker, "build_runtime_capability_stack", fake_build_runtime_capability_stack)
 
     worker.build_worker_service(cast(Settings, FakeSettings()))
@@ -76,6 +85,7 @@ def test_worker_runtime_stack_uses_configured_generated_artifact_dir(
     assert isinstance(runtime_stack, dict)
     assert runtime_stack["generated_artifact_dir"] == tmp_path / "generated"
     assert runtime_stack["project_workspace_dir"] == tmp_path / "workspaces"
+    assert runtime_stack["tool_registry"] == "mcp-source"
 
 
 def test_worker_builds_evolution_terminal_hook(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:

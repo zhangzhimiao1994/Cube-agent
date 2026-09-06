@@ -11,6 +11,7 @@ import pytest
 from fastapi.responses import FileResponse
 from fastapi.testclient import TestClient
 
+from agent_hub import app as app_module
 from agent_hub.api.routers.admin import (
     InMemoryAdminResourceService,
     MainAgentConfigResponse,
@@ -444,6 +445,65 @@ def test_create_app_wires_harness_scheduler_from_published_config(tmp_path: Path
         policy=HarnessPolicy(),
         hermes_hint=None,
     ).selected_provider == "deepseek"
+
+
+def test_create_app_wires_runtime_mcp_manifest_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+    mcp_source = object()
+
+    class FakeMcpService:
+        async def reload(self, tenant_id: UUID | None = None) -> None:
+            captured["reload_tenant_id"] = tenant_id
+
+        def capability_manifest_source(self) -> object:
+            return mcp_source
+
+    class FakeRuntimeStack:
+        runtime_gateway = object()
+        harness_tool_gateway = object()
+
+    async def fake_build_runtime_mcp_service(**kwargs: object) -> FakeMcpService:
+        captured["mcp_service_kwargs"] = kwargs
+        return FakeMcpService()
+
+    def fake_build_runtime_capability_stack(**kwargs: object) -> FakeRuntimeStack:
+        captured["runtime_stack_kwargs"] = kwargs
+        return FakeRuntimeStack()
+
+    monkeypatch.setattr(
+        app_module,
+        "build_runtime_mcp_service",
+        fake_build_runtime_mcp_service,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "build_runtime_capability_stack",
+        fake_build_runtime_capability_stack,
+    )
+    monkeypatch.setattr(app_module, "configured_runtime_registry", lambda **kwargs: object())
+
+    application = create_app(
+        settings=valid_settings(tmp_path),
+        database=FakeDatabase(),
+        redis_client=FakeRedis(),
+        auth_service=StubAuthService(),
+        rate_limiter=StubRateLimiter(),
+        config_service=StubConfigService(),
+        admin_resource_service=InMemoryAdminResourceService(),
+        user_admin_service=object(),
+    )
+
+    with TestClient(application):
+        pass
+
+    runtime_kwargs = captured["runtime_stack_kwargs"]
+    assert isinstance(runtime_kwargs, dict)
+    assert runtime_kwargs["tool_registry"] is mcp_source
+    assert getattr(application.state, "mcp_service", None) is not None
+    assert callable(getattr(application.state, "reload_mcp_runtime_config", None))
 
 
 def test_feishu_media_factory_uses_memory_store_in_development(tmp_path: Path) -> None:

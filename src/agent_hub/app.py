@@ -74,6 +74,7 @@ from agent_hub.db.session import build_database
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.config import harness_scheduler_from_config
 from agent_hub.hermes import PersistentHermesRunAdvisor
+from agent_hub.mcp.runtime import build_runtime_mcp_service
 from agent_hub.models.capabilities import is_known_video_generation_model
 from agent_hub.models.capacity import CapacityPool, CredentialDescriptor, CredentialRegistry
 from agent_hub.models.gateway import CapacityController, ModelGateway, ModelTransport
@@ -831,9 +832,21 @@ def create_app(
                         if admin_resource_service is not None
                         else application.state.admin_resource_service,
                     )
+                    capability_run_repository = RunRepository(active_sessions)
+                    runtime_mcp_service = await build_runtime_mcp_service(
+                        tenant_id=configured.bootstrap_tenant_id,
+                        admin_service=admin_service_for_capabilities,
+                        run_repository=capability_run_repository,
+                    )
+                    application.state.mcp_service = runtime_mcp_service
+                    reload_mcp_runtime_config = getattr(runtime_mcp_service, "reload", None)
+                    if callable(reload_mcp_runtime_config):
+                        application.state.reload_mcp_runtime_config = (
+                            reload_mcp_runtime_config
+                        )
                     runtime_capability_stack = build_runtime_capability_stack(
                         tenant_id=configured.bootstrap_tenant_id,
-                        run_repository=RunRepository(active_sessions),
+                        run_repository=capability_run_repository,
                         skill_store_dir=configured.skill_store_dir,
                         workspace_root=configured.attachment_store_dir,
                         generated_artifact_dir=configured.generated_artifact_dir,
@@ -844,6 +857,7 @@ def create_app(
                         tool_approval_mode=lambda _tenant_id: _tool_approval_mode_from_settings(
                             admin_service_for_capabilities.get_settings
                         ),
+                        tool_registry=runtime_mcp_service.capability_manifest_source(),
                     )
                     application.state.runtime_capability_gateway = (
                         runtime_capability_stack.runtime_gateway

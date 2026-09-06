@@ -17,6 +17,7 @@ from agent_hub.config.service import ConfigService
 from agent_hub.db.session import Database, build_database
 from agent_hub.evolution_hooks import EvolutionExecutionIngestHook
 from agent_hub.hermes import PersistentHermesRunAdvisor
+from agent_hub.mcp.runtime import build_runtime_mcp_service_sync
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import RunService
 from agent_hub.runtime.defaults import configured_runtime_registry
@@ -150,6 +151,11 @@ def build_worker_service(
         skill_store_dir=settings.skill_store_dir,
         generated_artifact_dir=settings.generated_artifact_dir,
     )
+    runtime_mcp_service = build_runtime_mcp_service_sync(
+        tenant_id=settings.bootstrap_tenant_id,
+        admin_service=admin_service,
+        run_repository=run_repository,
+    )
     runtime_capability_stack = build_runtime_capability_stack(
         tenant_id=settings.bootstrap_tenant_id,
         run_repository=run_repository,
@@ -163,6 +169,7 @@ def build_worker_service(
         tool_approval_mode=lambda _tenant_id: _tool_approval_mode_from_settings(
             admin_service.get_settings
         ),
+        tool_registry=runtime_mcp_service.capability_manifest_source(),
     )
     service = RunService(
         run_repository,

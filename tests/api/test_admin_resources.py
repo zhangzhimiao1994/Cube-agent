@@ -2421,6 +2421,64 @@ def test_capability_manifest_endpoint_reads_mcp_config_for_principal_tenant() ->
     assert gateway.tenant_ids == [OTHER_TENANT_ID]
 
 
+def test_mcp_upsert_and_delete_trigger_runtime_reload_callback() -> None:
+    api = client()
+    reloaded: list[UUID] = []
+
+    async def reload_mcp_runtime_config(tenant_id: UUID) -> None:
+        reloaded.append(tenant_id)
+
+    cast(Any, api.app).state.reload_mcp_runtime_config = reload_mcp_runtime_config
+
+    created = api.post(
+        "/api/v1/admin/mcp",
+        headers=headers(),
+        json={
+            "id": "filesystem",
+            "name": "Filesystem MCP",
+            "allowed_tools": ["read_file"],
+            "transport": "stdio",
+            "command": "uvx",
+            "args": ["mcp-server-filesystem"],
+            "executable_allowlist": ["uvx"],
+            "timeout_seconds": 10,
+        },
+    )
+    deleted = api.delete("/api/v1/admin/mcp/filesystem", headers=headers())
+
+    assert created.status_code == 200
+    assert deleted.status_code == 200
+    assert reloaded == [TENANT_ID, TENANT_ID]
+
+
+def test_mcp_reload_callback_failure_does_not_fail_saved_config() -> None:
+    api = client()
+
+    async def reload_mcp_runtime_config(tenant_id: UUID) -> None:
+        assert tenant_id == TENANT_ID
+        raise RuntimeError("reload failed with secret token")
+
+    cast(Any, api.app).state.reload_mcp_runtime_config = reload_mcp_runtime_config
+
+    response = api.post(
+        "/api/v1/admin/mcp",
+        headers=headers(),
+        json={
+            "id": "filesystem",
+            "name": "Filesystem MCP",
+            "allowed_tools": ["read_file"],
+            "transport": "stdio",
+            "command": "uvx",
+            "args": ["mcp-server-filesystem"],
+            "executable_allowlist": ["uvx"],
+            "timeout_seconds": 10,
+        },
+    )
+
+    assert response.status_code == 200
+    assert "secret token" not in response.text
+
+
 def test_capability_manifest_endpoint_requires_plugin_and_mcp_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

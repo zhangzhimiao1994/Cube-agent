@@ -9527,11 +9527,14 @@ async def list_mcp_servers(
 @router.post("/mcp", response_model=McpServerResponse, responses=error_responses(401, 403, 422))
 async def upsert_mcp_server(
     body: McpServerRequest,
+    request: Request,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> McpServerResponse:
     _require(principal, "mcp:write")
-    return await service.upsert_mcp_server(body)
+    response = await service.upsert_mcp_server(body)
+    await _reload_mcp_runtime_config(request, principal.tenant_id)
+    return response
 
 
 @router.delete(
@@ -9541,6 +9544,7 @@ async def upsert_mcp_server(
 )
 async def delete_mcp_server(
     server_id: str,
+    request: Request,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> OperationStatusResponse:
@@ -9549,7 +9553,24 @@ async def delete_mcp_server(
         await service.delete_mcp_server(server_id)
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
+    await _reload_mcp_runtime_config(request, principal.tenant_id)
     return OperationStatusResponse(status="deleted")
+
+
+async def _reload_mcp_runtime_config(request: Request, tenant_id: UUID) -> None:
+    callback = getattr(request.app.state, "reload_mcp_runtime_config", None)
+    if not callable(callback):
+        return
+    try:
+        result = callback(tenant_id)
+        if inspect.isawaitable(result):
+            await result
+    except Exception as error:  # noqa: BLE001 - MCP reload must not break config writes.
+        _LOGGER.warning(
+            "mcp runtime reload failed tenant_id=%s error_type=%s",
+            tenant_id,
+            type(error).__name__,
+        )
 
 
 def _channels_with_runtime_status(
