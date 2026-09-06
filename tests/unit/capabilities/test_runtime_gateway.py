@@ -508,3 +508,190 @@ async def test_runtime_gateway_invokes_installed_skill_through_sandbox(tmp_path:
     assert len(sandbox.invocations) == 1
     assert sandbox.invocations[0].package_path == skill_dir / "docx.zip"
     assert sandbox.invocations[0].input["arguments"] == {"task": "draft"}
+
+
+def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    skill_dir = tmp_path / "skills" / str(TENANT_ID)
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "data_cleaner.zip").write_bytes(skill_zip())
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        workspace_root=workspace,
+        generated_artifact_dir=tmp_path / "generated",
+    )
+
+    manifest = gateway.capability_manifest(TENANT_ID)
+
+    assert manifest == {
+        "schema_version": 1,
+        "capabilities": (
+            {
+                "id": "calculator.evaluate",
+                "kind": "builtin",
+                "adapter": "runtime_builtin",
+                "permission_class": "calculator.evaluate",
+                "sandbox_profile": "in_process",
+                "available": True,
+                "availability_reason": None,
+                "replay_safe": True,
+            },
+            {
+                "id": "document.generate_docx",
+                "kind": "builtin",
+                "adapter": "runtime_builtin",
+                "permission_class": "file.create",
+                "sandbox_profile": "generated_artifact_store",
+                "available": True,
+                "availability_reason": None,
+                "replay_safe": True,
+            },
+            {
+                "id": "presentation.generate_pptx",
+                "kind": "builtin",
+                "adapter": "runtime_builtin",
+                "permission_class": "file.create",
+                "sandbox_profile": "generated_artifact_store",
+                "available": True,
+                "availability_reason": None,
+                "replay_safe": True,
+            },
+            {
+                "id": "project.generate_zip",
+                "kind": "builtin",
+                "adapter": "runtime_builtin",
+                "permission_class": "file.create",
+                "sandbox_profile": "generated_artifact_store",
+                "available": True,
+                "availability_reason": None,
+                "replay_safe": True,
+            },
+            {
+                "id": "read_context",
+                "kind": "builtin",
+                "adapter": "runtime_builtin",
+                "permission_class": "context.read",
+                "sandbox_profile": "in_process",
+                "available": True,
+                "availability_reason": None,
+                "replay_safe": True,
+            },
+            {
+                "id": "workspace.read",
+                "kind": "builtin",
+                "adapter": "runtime_builtin",
+                "permission_class": "file.read",
+                "sandbox_profile": "workspace_read",
+                "available": True,
+                "availability_reason": None,
+                "replay_safe": True,
+            },
+            {
+                "id": "data_cleaner",
+                "kind": "skill",
+                "adapter": "skill_sandbox",
+                "permission_class": "skill.use",
+                "sandbox_profile": "systemd_skill_sandbox",
+                "available": True,
+                "availability_reason": None,
+                "replay_safe": False,
+            },
+        ),
+    }
+
+
+def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
+    tmp_path: Path,
+) -> None:
+    skill_dir = tmp_path / "skills" / str(TENANT_ID)
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "private_writer.zip").write_bytes(
+        skill_zip(
+            tools=("tool:filesystem.read",),
+            writable_paths=("workspace/output.txt",),
+            env_secret_refs=("secret://openai",),
+        )
+    )
+    gateway = RuntimeCapabilityGateway(skill_store_dir=tmp_path / "skills")
+
+    manifest = gateway.capability_manifest(TENANT_ID)
+
+    assert manifest["capabilities"] == (
+        {
+            "id": "calculator.evaluate",
+            "kind": "builtin",
+            "adapter": "runtime_builtin",
+            "permission_class": "calculator.evaluate",
+            "sandbox_profile": "in_process",
+            "available": True,
+            "availability_reason": None,
+            "replay_safe": True,
+        },
+        {
+            "id": "document.generate_docx",
+            "kind": "builtin",
+            "adapter": "runtime_builtin",
+            "permission_class": "file.create",
+            "sandbox_profile": "generated_artifact_store",
+            "available": False,
+            "availability_reason": "generated_artifact_store_not_configured",
+            "replay_safe": True,
+        },
+        {
+            "id": "presentation.generate_pptx",
+            "kind": "builtin",
+            "adapter": "runtime_builtin",
+            "permission_class": "file.create",
+            "sandbox_profile": "generated_artifact_store",
+            "available": False,
+            "availability_reason": "generated_artifact_store_not_configured",
+            "replay_safe": True,
+        },
+        {
+            "id": "project.generate_zip",
+            "kind": "builtin",
+            "adapter": "runtime_builtin",
+            "permission_class": "file.create",
+            "sandbox_profile": "generated_artifact_store",
+            "available": False,
+            "availability_reason": "generated_artifact_store_not_configured",
+            "replay_safe": True,
+        },
+        {
+            "id": "read_context",
+            "kind": "builtin",
+            "adapter": "runtime_builtin",
+            "permission_class": "context.read",
+            "sandbox_profile": "in_process",
+            "available": True,
+            "availability_reason": None,
+            "replay_safe": True,
+        },
+        {
+            "id": "workspace.read",
+            "kind": "builtin",
+            "adapter": "runtime_builtin",
+            "permission_class": "file.read",
+            "sandbox_profile": "workspace_read",
+            "available": False,
+            "availability_reason": "workspace_root_not_configured",
+            "replay_safe": True,
+        },
+        {
+            "id": "private_writer",
+            "kind": "skill",
+            "adapter": "skill_sandbox",
+            "permission_class": "skill.use",
+            "sandbox_profile": "systemd_skill_sandbox",
+            "available": True,
+            "availability_reason": None,
+            "replay_safe": False,
+        },
+    )
+    assert "secret://openai" not in repr(manifest)
+    assert "workspace/output.txt" not in repr(manifest)
+    assert "tool:filesystem.read" not in repr(manifest)
+    assert str(tmp_path) not in repr(manifest)

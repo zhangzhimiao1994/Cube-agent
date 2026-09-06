@@ -57,6 +57,14 @@ _BUILTIN_ALIASES = {
     "calculator.evaluate": "calculator",
     "workspace.read": "workspace_read",
 }
+_MANIFEST_BUILTINS = (
+    "calculator.evaluate",
+    _DOCX_TOOL,
+    _PPTX_TOOL,
+    _PROJECT_ZIP_TOOL,
+    "read_context",
+    "workspace.read",
+)
 
 
 class RuntimeCapabilityError(RuntimeError):
@@ -100,6 +108,18 @@ class RuntimeCapabilityGateway:
         if _SAFE_CAPABILITY_NAME.fullmatch(normalized_name) is None:
             return False
         return self._skill_package_path(tenant_id, normalized_name).is_file()
+
+    def capability_manifest(self, tenant_id: UUID) -> Mapping[str, JsonValue]:
+        return {
+            "schema_version": 1,
+            "capabilities": (
+                *(
+                    self._builtin_manifest_item(name)
+                    for name in _MANIFEST_BUILTINS
+                ),
+                *self._skill_manifest_items(tenant_id),
+            ),
+        }
 
     async def execute(
         self,
@@ -376,6 +396,51 @@ class RuntimeCapabilityGateway:
             raise RuntimeCapabilityError("skill path is invalid") from None
         return target
 
+    def _builtin_manifest_item(self, name: str) -> Mapping[str, JsonValue]:
+        availability_reason = self._builtin_availability_reason(name)
+        return {
+            "id": name,
+            "kind": "builtin",
+            "adapter": "runtime_builtin",
+            "permission_class": _builtin_permission_class(name),
+            "sandbox_profile": _builtin_sandbox_profile(name),
+            "available": availability_reason is None,
+            "availability_reason": availability_reason,
+            "replay_safe": self.is_replay_safe(name),
+        }
+
+    def _builtin_availability_reason(self, name: str) -> str | None:
+        if name == "workspace.read" and self._workspace_root is None:
+            return "workspace_root_not_configured"
+        if name in {_DOCX_TOOL, _PPTX_TOOL, _PROJECT_ZIP_TOOL} and (
+            self._generated_file_store is None
+        ):
+            return "generated_artifact_store_not_configured"
+        return None
+
+    def _skill_manifest_items(self, tenant_id: UUID) -> tuple[Mapping[str, JsonValue], ...]:
+        tenant_dir = self._skill_store_dir / str(tenant_id)
+        if not tenant_dir.is_dir():
+            return ()
+        items: list[Mapping[str, JsonValue]] = []
+        for package_path in sorted(tenant_dir.glob("*.zip")):
+            skill_id = package_path.stem
+            if _SAFE_CAPABILITY_NAME.fullmatch(skill_id) is None:
+                continue
+            items.append(
+                {
+                    "id": skill_id,
+                    "kind": "skill",
+                    "adapter": "skill_sandbox",
+                    "permission_class": "skill.use",
+                    "sandbox_profile": "systemd_skill_sandbox",
+                    "available": True,
+                    "availability_reason": None,
+                    "replay_safe": False,
+                }
+            )
+        return tuple(items)
+
 
 def _require_safe(name: str, value: str, *, max_length: int = 128) -> None:
     if name == "capability name" and value in _DOTTED_BUILT_INS:
@@ -390,6 +455,24 @@ def _require_safe(name: str, value: str, *, max_length: int = 128) -> None:
 
 def _normalize_tool_name(name: str) -> str:
     return _BUILTIN_ALIASES.get(name, name)
+
+
+def _builtin_permission_class(name: str) -> str:
+    if name == "calculator.evaluate":
+        return "calculator.evaluate"
+    if name == "read_context":
+        return "context.read"
+    if name == "workspace.read":
+        return "file.read"
+    return "file.create"
+
+
+def _builtin_sandbox_profile(name: str) -> str:
+    if name in {"calculator.evaluate", "read_context"}:
+        return "in_process"
+    if name == "workspace.read":
+        return "workspace_read"
+    return "generated_artifact_store"
 
 
 def _required_string(arguments: Mapping[str, JsonValue], field_name: str) -> str:
