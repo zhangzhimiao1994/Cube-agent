@@ -680,6 +680,36 @@ class RunRepository:
             await session.flush()
             return self._record(row)
 
+    async def record_capability_approval_review(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        *,
+        approval_id: str,
+        approval_fingerprint: str,
+        reviewer: str,
+        reason: str,
+        status: str,
+    ) -> RunRecord:
+        if status not in {"approved", "denied"}:
+            raise RunConflict("approval review status is invalid")
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if row is None:
+                raise RunNotFound("run was not found")
+            await self._upsert_capability_approval_review(
+                session,
+                tenant_id,
+                run_id,
+                approval_id=approval_id,
+                approval_fingerprint=approval_fingerprint,
+                reviewer=reviewer,
+                reason=reason,
+                status=status,
+            )
+            await session.flush()
+            return self._record(row)
+
     async def is_capability_approval_approved(
         self,
         tenant_id: UUID,
@@ -1244,6 +1274,43 @@ class RunRepository:
                 run_id=run_id,
                 approval_id=approval_id,
                 action="capability_tool",
+                status=status,
+                payload=payload,
+            )
+            .on_conflict_do_update(
+                index_elements=[RunApprovalRow.run_id, RunApprovalRow.approval_id],
+                set_={"status": status, "payload": payload},
+            )
+        )
+
+    @staticmethod
+    async def _upsert_capability_approval_review(
+        session: AsyncSession,
+        tenant_id: UUID,
+        run_id: UUID,
+        *,
+        approval_id: str,
+        approval_fingerprint: str,
+        reviewer: str,
+        reason: str,
+        status: str,
+    ) -> None:
+        payload: dict[str, object] = {
+            "approval_id": approval_id,
+            "approval_fingerprint": approval_fingerprint,
+            "approval_kind": "capability_tool",
+            "reviewer": reviewer,
+            "reason": reason,
+            "status": status,
+        }
+        await session.execute(
+            insert(RunApprovalRow)
+            .values(
+                id=uuid4(),
+                tenant_id=tenant_id,
+                run_id=run_id,
+                approval_id=approval_id,
+                action="capability_tool.auto_review",
                 status=status,
                 payload=payload,
             )

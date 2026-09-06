@@ -183,12 +183,63 @@ def test_system_settings_default_openclaw_is_disabled() -> None:
 
     assert settings.vibe_coding_enabled is False
     assert settings.openclaw_enabled is False
+    assert settings.tool_approval_mode == "auto_review"
     assert settings.openclaw_mode == "ask"
     assert settings.openclaw_allowed_commands == []
     assert settings.model_dump()["vibe_coding_enabled"] is False
     assert settings.model_dump()["openclaw_enabled"] is False
+    assert settings.model_dump()["tool_approval_mode"] == "auto_review"
     assert settings.model_dump()["openclaw_mode"] == "ask"
     assert settings.model_dump()["openclaw_allowed_commands"] == []
+
+
+@pytest.mark.asyncio
+async def test_persistent_settings_missing_tool_approval_mode_migrates_to_ask() -> None:
+    class StoredPersistentService(PersistentAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__(
+                config_service=FakeConfigService(),  # type: ignore[arg-type]
+                secret_service=FakeSecretService(),  # type: ignore[arg-type]
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+                run_repository=object(),  # type: ignore[arg-type]
+            )
+            self.payload = SystemSettingsResponse().model_dump(mode="json")
+            self.payload.pop("tool_approval_mode")
+
+        async def _get_admin_payload(self, kind: str, resource_id: str) -> dict[str, object] | None:
+            assert (kind, resource_id) == ("setting", "system")
+            return self.payload
+
+    settings = await StoredPersistentService().get_settings()
+
+    assert settings.require_approval_for_tools is True
+    assert settings.tool_approval_mode == "ask"
+
+
+@pytest.mark.asyncio
+async def test_persistent_settings_invalid_tool_approval_mode_migrates_to_ask() -> None:
+    class StoredPersistentService(PersistentAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__(
+                config_service=FakeConfigService(),  # type: ignore[arg-type]
+                secret_service=FakeSecretService(),  # type: ignore[arg-type]
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+                run_repository=object(),  # type: ignore[arg-type]
+            )
+            self.payload = {
+                **SystemSettingsResponse().model_dump(mode="json"),
+                "tool_approval_mode": "trusted_auto",
+            }
+
+        async def _get_admin_payload(self, kind: str, resource_id: str) -> dict[str, object] | None:
+            assert (kind, resource_id) == ("setting", "system")
+            return self.payload
+
+    settings = await StoredPersistentService().get_settings()
+
+    assert settings.tool_approval_mode == "ask"
 
 
 def test_openclaw_operation_requires_feature_switch() -> None:

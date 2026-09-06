@@ -50,4 +50,32 @@ describe("api client transport", () => {
     expect(fetchMock.mock.calls[0]?.[0]).toMatch(/^\/api\/v1\/admin\/runs\?_=/);
     expect(fetchMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({ cache: "no-store" }));
   });
+
+  it("keeps legacy settings responses on manual tool approval by default", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          default_mode: "auto",
+          default_workflow_id: null,
+          default_agent_ids: [],
+          log_level: "warning",
+          hermes_enabled: true,
+          safe_tools_enabled: true,
+          require_approval_for_tools: true,
+          channel_entry: "web",
+          attachment_retention_days: 7,
+          attachment_max_mb: 25,
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const settings = await api.settings();
+
+    expect(settings.tool_approval_mode).toBe("ask");
+  });
 });

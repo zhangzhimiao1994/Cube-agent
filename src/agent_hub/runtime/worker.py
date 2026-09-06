@@ -45,6 +45,20 @@ async def _require_tool_approval_from_settings(
         return True
 
 
+async def _tool_approval_mode_from_settings(
+    get_settings: Callable[[], Awaitable[admin.SystemSettingsResponse]],
+) -> str:
+    try:
+        mode = (await get_settings()).tool_approval_mode
+    except Exception as error:  # noqa: BLE001 - approval review mode must fail closed.
+        _LOGGER.warning(
+            "tool_approval_mode_settings_unavailable error_type=%s",
+            type(error).__name__,
+        )
+        return "ask"
+    return mode if mode in {"ask", "auto_review"} else "ask"
+
+
 class LocalRunQueue:
     """Process-local execution queue fed by the durable run outbox."""
 
@@ -144,6 +158,9 @@ def build_worker_service(
         generated_artifact_dir=settings.generated_artifact_dir,
         project_workspace_dir=settings.project_workspace_dir,
         require_approval_for_tools=lambda _tenant_id: _require_tool_approval_from_settings(
+            admin_service.get_settings
+        ),
+        tool_approval_mode=lambda _tenant_id: _tool_approval_mode_from_settings(
             admin_service.get_settings
         ),
     )

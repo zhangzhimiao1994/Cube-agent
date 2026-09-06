@@ -785,6 +785,7 @@ class SystemSettingsRequest(BaseModel):
     hermes_enabled: bool = True
     safe_tools_enabled: bool = True
     require_approval_for_tools: bool = True
+    tool_approval_mode: str = Field(default="auto_review", pattern=r"^(ask|auto_review)$")
     allow_main_agent_override: bool = False
     allow_temporary_agents: bool = False
     vibe_coding_enabled: bool = False
@@ -815,6 +816,13 @@ class SystemSettingsRequest(BaseModel):
 
 class SystemSettingsResponse(SystemSettingsRequest):
     pass
+
+
+def _migrate_system_settings_payload(payload: Mapping[str, object]) -> dict[str, object]:
+    migrated = dict(payload)
+    if migrated.get("tool_approval_mode") not in {"ask", "auto_review"}:
+        migrated["tool_approval_mode"] = "ask"
+    return migrated
 
 
 class OpenClawOperationRequest(BaseModel):
@@ -4440,7 +4448,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             return await super().get_settings()
         if not payload:
             return SystemSettingsResponse()
-        return SystemSettingsResponse.model_validate(payload)
+        return SystemSettingsResponse.model_validate(_migrate_system_settings_payload(payload))
 
     async def update_settings(self, request: SystemSettingsRequest) -> SystemSettingsResponse:
         response = SystemSettingsResponse(**request.model_dump())

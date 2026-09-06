@@ -186,7 +186,7 @@ export function ConfigPage() {
           <span>工具防护</span>
           <p>
             {settings.safe_tools_enabled ? "已允许非危险工具" : "未允许非危险工具"}；
-            {settings.require_approval_for_tools ? "高风险工具必须审批" : "高风险工具未强制审批"}。
+            {settings.require_approval_for_tools ? `审批模式：${settings.tool_approval_mode}` : "高风险工具未强制审批"}。
           </p>
         </article>
         <article className="status-card">
@@ -301,6 +301,18 @@ export function ConfigPage() {
               onChange={(event) => updateSettings({ require_approval_for_tools: event.target.checked })}
             />
             高风险工具调用必须审批
+          </label>
+          <label htmlFor="tool-approval-mode">
+            工具审批模式
+            <select
+              id="tool-approval-mode"
+              value={settings.tool_approval_mode}
+              onChange={(event) => updateSettings({ tool_approval_mode: event.target.value as SystemSettings["tool_approval_mode"] })}
+              disabled={!settings.require_approval_for_tools}
+            >
+              <option value="auto_review">auto_review：Codex 自动审核安全工具</option>
+              <option value="ask">ask：全部交给人工审批</option>
+            </select>
           </label>
           <label className="inline-check">
             <input

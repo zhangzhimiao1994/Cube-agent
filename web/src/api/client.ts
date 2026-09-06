@@ -244,6 +244,7 @@ const SystemSettingsSchema = z.object({
   hermes_enabled: z.boolean(),
   safe_tools_enabled: z.boolean(),
   require_approval_for_tools: z.boolean(),
+  tool_approval_mode: z.enum(["ask", "auto_review"]).default("ask"),
   allow_main_agent_override: z.boolean().default(false),
   allow_temporary_agents: z.boolean().default(false),
   vibe_coding_enabled: z.boolean().default(false),

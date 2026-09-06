@@ -18,6 +18,7 @@ const settings = {
   hermes_enabled: true,
   safe_tools_enabled: true,
   require_approval_for_tools: true,
+  tool_approval_mode: "auto_review",
   allow_main_agent_override: false,
   allow_temporary_agents: false,
   vibe_coding_enabled: false,
@@ -289,6 +290,7 @@ describe("ConfigPage", () => {
 
     await user.selectOptions(screen.getByLabelText("默认运行模式"), "dispatch");
     await user.selectOptions(screen.getByLabelText("默认工作流"), "short-video-dispatch");
+    await user.selectOptions(screen.getByLabelText("工具审批模式"), "ask");
     await user.click(screen.getByLabelText(/导演/));
     await user.click(screen.getByLabelText("允许主 Agent 提出临场调整，执行前必须向用户核对"));
     await user.click(screen.getByLabelText("允许主 Agent 在能力不足时申请临时子 Agent"));
@@ -306,6 +308,7 @@ describe("ConfigPage", () => {
         default_mode: "dispatch",
         default_workflow_id: "short-video-dispatch",
         default_agent_ids: ["director"],
+        tool_approval_mode: "ask",
         allow_main_agent_override: true,
         allow_temporary_agents: true,
         multimedia_generation_enabled: true,

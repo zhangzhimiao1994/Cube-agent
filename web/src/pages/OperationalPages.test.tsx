@@ -127,6 +127,7 @@ const settings = {
   hermes_enabled: true,
   safe_tools_enabled: true,
   require_approval_for_tools: true,
+  tool_approval_mode: "auto_review",
   allow_main_agent_override: true,
   allow_temporary_agents: true,
   vibe_coding_enabled: true,

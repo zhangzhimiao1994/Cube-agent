@@ -4,14 +4,22 @@ from collections.abc import Mapping
 from pathlib import Path
 from uuid import UUID, uuid4
 
+import pytest
+
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.approvals import ApprovalService, InMemoryApprovalStore
 from agent_hub.capabilities.defaults import (
+    CodexAutoApprovalReviewer,
     DefaultRuntimeCapabilityPolicyGateway,
     build_runtime_capability_stack,
     default_capability_policy,
 )
-from agent_hub.capabilities.gateway import CapabilityGateway, CapabilityStatus
+from agent_hub.capabilities.gateway import (
+    ApprovalReviewDecision,
+    ApprovalReviewOutcome,
+    CapabilityGateway,
+    CapabilityStatus,
+)
 from agent_hub.capabilities.policy import CapabilityPolicy, CapabilityRule
 from agent_hub.capabilities.types import CapabilityRequest, PolicyEffect
 from agent_hub.harness.types import HarnessToolCallRequest
@@ -98,8 +106,76 @@ class ScopeApprovedRepository:
         return object()
 
 
+class RecordingApprovalRepository(ScopeApprovedRepository):
+    def __init__(self) -> None:
+        super().__init__()
+        self.approvals: list[dict[str, str | None]] = []
+        self.review_records: list[dict[str, str | None]] = []
+
+    async def begin_capability_approval(
+        self,
+        _tenant_id: UUID,
+        _run_id: UUID,
+        *,
+        approval_id: str,
+        approval_fingerprint: str,
+        approval_scope: str | None = None,
+    ) -> object:
+        self.pending_approvals += 1
+        self.approvals.append(
+            {
+                "approval_id": approval_id,
+                "approval_fingerprint": approval_fingerprint,
+                "approval_scope": approval_scope,
+            }
+        )
+        return object()
+
+    async def record_capability_approval_review(
+        self,
+        _tenant_id: UUID,
+        _run_id: UUID,
+        *,
+        approval_id: str,
+        approval_fingerprint: str,
+        reviewer: str,
+        reason: str,
+        status: str,
+    ) -> object:
+        self.review_records.append(
+            {
+                "approval_id": approval_id,
+                "approval_fingerprint": approval_fingerprint,
+                "reviewer": reviewer,
+                "reason": reason,
+                "status": status,
+            }
+        )
+        return object()
+
+
+class StaticApprovalReviewer:
+    def __init__(self, decision: ApprovalReviewDecision) -> None:
+        self.decision = decision
+        self.requests: list[CapabilityRequest] = []
+
+    async def review(self, request: CapabilityRequest) -> ApprovalReviewDecision:
+        self.requests.append(request)
+        return self.decision
+
+
+class FailingApprovalReviewer:
+    async def review(self, request: CapabilityRequest) -> ApprovalReviewDecision:
+        del request
+        raise RuntimeError("raw reviewer failure with secret token")
+
+
 async def approval_required(_tenant_id: UUID) -> bool:
     return True
+
+
+async def ask_approval_mode(_tenant_id: UUID) -> str:
+    return "ask"
 
 
 def test_default_capability_policy_allows_safe_runtime_tools_for_operators() -> None:
@@ -198,6 +274,115 @@ async def test_default_runtime_capability_stack_wires_generated_artifact_store(
     assert (generated_dir / metadata["storage_key"]).is_file()
 
 
+async def test_default_runtime_stack_auto_reviews_replay_safe_generated_artifact(
+    tmp_path: Path,
+) -> None:
+    generated_dir = tmp_path / "generated"
+    stack = build_runtime_capability_stack(
+        tenant_id=TENANT_ID,
+        run_repository=RecordingApprovalRepository(),
+        skill_store_dir=tmp_path / "skills",
+        workspace_root=tmp_path / "workspace",
+        generated_artifact_dir=generated_dir,
+        require_approval_for_tools=approval_required,
+    )
+
+    result = await stack.harness_tool_gateway.invoke(
+        TENANT_ID,
+        HarnessToolCallRequest(
+            run_id=RUN_ID,
+            actor="engineer",
+            tool_name="project.generate_zip",
+            arguments={"title": "Hello World", "files": {"main.py": "print('hello')\n"}},
+            approval_required=True,
+            sandbox="workspace_write",
+            idempotency_key="project-zip-auto-review",
+        ),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "succeeded"
+    file_payload = result.payload["file"]
+    assert isinstance(file_payload, Mapping)
+    assert file_payload["filename"] == "hello-world.zip"
+
+
+async def test_default_runtime_stack_can_use_ask_mode_for_generated_artifact_approval(
+    tmp_path: Path,
+) -> None:
+    repository = RecordingApprovalRepository()
+    stack = build_runtime_capability_stack(
+        tenant_id=TENANT_ID,
+        run_repository=repository,
+        skill_store_dir=tmp_path / "skills",
+        workspace_root=tmp_path / "workspace",
+        generated_artifact_dir=tmp_path / "generated",
+        require_approval_for_tools=approval_required,
+        tool_approval_mode=ask_approval_mode,
+    )
+
+    result = await stack.harness_tool_gateway.invoke(
+        TENANT_ID,
+        HarnessToolCallRequest(
+            run_id=RUN_ID,
+            actor="engineer",
+            tool_name="project.generate_zip",
+            arguments={"title": "Hello World", "files": {"main.py": "print('hello')\n"}},
+            approval_required=True,
+            sandbox="workspace_write",
+            idempotency_key="project-zip-ask-mode",
+        ),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    assert result.failure_reason == "capability requires approval"
+    assert repository.pending_approvals == 1
+
+
+async def test_auto_review_does_not_allow_project_zip_workspace_side_effect(
+    tmp_path: Path,
+) -> None:
+    repository = RecordingApprovalRepository()
+    workspace_dir = tmp_path / "project-workspaces"
+    stack = build_runtime_capability_stack(
+        tenant_id=TENANT_ID,
+        run_repository=repository,
+        skill_store_dir=tmp_path / "skills",
+        workspace_root=tmp_path / "workspace",
+        generated_artifact_dir=tmp_path / "generated",
+        project_workspace_dir=workspace_dir,
+        require_approval_for_tools=approval_required,
+    )
+
+    result = await stack.harness_tool_gateway.invoke(
+        TENANT_ID,
+        HarnessToolCallRequest(
+            run_id=RUN_ID,
+            actor="engineer",
+            tool_name="project.generate_zip",
+            arguments={
+                "title": "Hello World",
+                "files": {"main.py": "print('hello')\n"},
+                "project_id": "project-main",
+                "workspace_session_id": "session-main",
+            },
+            approval_required=True,
+            sandbox="workspace_write",
+            idempotency_key="project-zip-workspace-side-effect",
+        ),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    assert result.failure_reason == "capability requires approval"
+    assert repository.pending_approvals == 1
+    assert not workspace_dir.exists()
+
+
 async def test_generated_file_scope_approval_reuses_run_level_tool_consent() -> None:
     repository = ScopeApprovedRepository()
     first_request = capability_request(agent_id="engineer")
@@ -277,3 +462,252 @@ async def test_pending_generated_file_scope_reuses_one_approval_id_before_user_d
     assert first.status is CapabilityStatus.WAITING_APPROVAL
     assert second.status is CapabilityStatus.WAITING_APPROVAL
     assert second.approval_id == first.approval_id
+
+
+async def test_auto_review_can_allow_replay_safe_generated_artifact_without_pending_approval() -> None:
+    repository = RecordingApprovalRepository()
+    reviewer = StaticApprovalReviewer(
+        ApprovalReviewDecision(
+            outcome=ApprovalReviewOutcome.ALLOW,
+            reviewer="auto_review",
+            reason="reviewed bounded generated artifact",
+        )
+    )
+    gateway = CapabilityGateway(
+        CapabilityPolicy(
+            (
+                CapabilityRule(
+                    tenant_id=TENANT_ID,
+                    role=Role.OPERATOR,
+                    agent_id=None,
+                    capability="file",
+                    operation="create",
+                    resource_prefix="generated",
+                    effect=PolicyEffect.REQUIRE_APPROVAL,
+                ),
+            )
+        ),
+        ApprovalService(InMemoryApprovalStore()),
+        repository,
+        approval_reviewer=reviewer,
+    )
+
+    result = await gateway.invoke(capability_request(agent_id="engineer"), role=Role.OPERATOR)
+
+    assert result.status is CapabilityStatus.ALLOWED
+    assert result.reason == "approved by auto_review"
+    assert result.review is not None
+    assert result.review.outcome is ApprovalReviewOutcome.ALLOW
+    assert repository.pending_approvals == 0
+    assert repository.review_records == [
+        {
+            "approval_id": repository.review_records[0]["approval_id"],
+            "approval_fingerprint": repository.review_records[0]["approval_fingerprint"],
+            "reviewer": "auto_review",
+            "reason": "reviewed bounded generated artifact",
+            "status": "approved",
+        }
+    ]
+    assert len(reviewer.requests) == 1
+
+
+async def test_auto_review_defers_unknown_required_capability_to_user_approval() -> None:
+    repository = RecordingApprovalRepository()
+    reviewer = StaticApprovalReviewer(
+        ApprovalReviewDecision(
+            outcome=ApprovalReviewOutcome.REQUIRE_USER_APPROVAL,
+            reviewer="auto_review",
+            reason="not in deterministic allowlist",
+        )
+    )
+    gateway = CapabilityGateway(
+        CapabilityPolicy(
+            (
+                CapabilityRule(
+                    tenant_id=TENANT_ID,
+                    role=Role.OPERATOR,
+                    agent_id=None,
+                    capability="skill",
+                    operation="use",
+                    resource_prefix="skill",
+                    effect=PolicyEffect.REQUIRE_APPROVAL,
+                ),
+            )
+        ),
+        ApprovalService(InMemoryApprovalStore()),
+        repository,
+        approval_reviewer=reviewer,
+    )
+
+    result = await gateway.invoke(
+        CapabilityRequest(
+            tenant_id=TENANT_ID,
+            user_id=USER_ID,
+            agent_id="reviewer",
+            capability="skill",
+            operation="use",
+            resource="skill/project-packager",
+            arguments={"name": "project-packager"},
+            idempotency_key="skill:project-packager",
+            run_id=RUN_ID,
+        ),
+        role=Role.OPERATOR,
+    )
+
+    assert result.status is CapabilityStatus.WAITING_APPROVAL
+    assert result.reason == "capability requires approval"
+    assert result.review is not None
+    assert result.review.outcome is ApprovalReviewOutcome.REQUIRE_USER_APPROVAL
+    assert repository.pending_approvals == 1
+    approval_fingerprint = repository.approvals[0]["approval_fingerprint"]
+    assert approval_fingerprint is not None
+    assert approval_fingerprint not in repr(result.review)
+
+
+async def test_auto_review_can_deny_required_capability_without_pending_approval() -> None:
+    repository = RecordingApprovalRepository()
+    reviewer = StaticApprovalReviewer(
+        ApprovalReviewDecision(
+            outcome=ApprovalReviewOutcome.DENY,
+            reviewer="auto_review",
+            reason="deterministic reviewer denied request",
+        )
+    )
+    gateway = CapabilityGateway(
+        CapabilityPolicy(
+            (
+                CapabilityRule(
+                    tenant_id=TENANT_ID,
+                    role=Role.OPERATOR,
+                    agent_id=None,
+                    capability="skill",
+                    operation="use",
+                    resource_prefix="skill",
+                    effect=PolicyEffect.REQUIRE_APPROVAL,
+                ),
+            )
+        ),
+        ApprovalService(InMemoryApprovalStore()),
+        repository,
+        approval_reviewer=reviewer,
+    )
+
+    result = await gateway.invoke(
+        CapabilityRequest(
+            tenant_id=TENANT_ID,
+            user_id=USER_ID,
+            agent_id="reviewer",
+            capability="skill",
+            operation="use",
+            resource="skill/project-packager",
+            arguments={"name": "project-packager"},
+            idempotency_key="skill:deny",
+            run_id=RUN_ID,
+        ),
+        role=Role.OPERATOR,
+    )
+
+    assert result.status is CapabilityStatus.DENIED
+    assert result.reason == "deterministic reviewer denied request"
+    assert repository.pending_approvals == 0
+    assert repository.review_records == [
+        {
+            "approval_id": repository.review_records[0]["approval_id"],
+            "approval_fingerprint": repository.review_records[0]["approval_fingerprint"],
+            "reviewer": "auto_review",
+            "reason": "deterministic reviewer denied request",
+            "status": "denied",
+        }
+    ]
+
+
+async def test_auto_review_failure_fails_closed_without_raw_error_details() -> None:
+    repository = RecordingApprovalRepository()
+    gateway = CapabilityGateway(
+        CapabilityPolicy(
+            (
+                CapabilityRule(
+                    tenant_id=TENANT_ID,
+                    role=Role.OPERATOR,
+                    agent_id=None,
+                    capability="skill",
+                    operation="use",
+                    resource_prefix="skill",
+                    effect=PolicyEffect.REQUIRE_APPROVAL,
+                ),
+            )
+        ),
+        ApprovalService(InMemoryApprovalStore()),
+        repository,
+        approval_reviewer=FailingApprovalReviewer(),
+    )
+
+    result = await gateway.invoke(
+        CapabilityRequest(
+            tenant_id=TENANT_ID,
+            user_id=USER_ID,
+            agent_id="reviewer",
+            capability="skill",
+            operation="use",
+            resource="skill/project-packager",
+            arguments={"name": "project-packager"},
+            idempotency_key="skill:review-failure",
+            run_id=RUN_ID,
+        ),
+        role=Role.OPERATOR,
+    )
+
+    assert result.status is CapabilityStatus.WAITING_APPROVAL
+    assert result.review is not None
+    assert result.review.reason == "approval reviewer unavailable"
+    assert "secret token" not in repr(result)
+    assert repository.pending_approvals == 1
+
+
+def test_approval_review_decision_rejects_unbounded_or_unprintable_text() -> None:
+    with pytest.raises(ValueError, match="reviewer"):
+        ApprovalReviewDecision(
+            outcome=ApprovalReviewOutcome.DENY,
+            reviewer="auto_review\nsecret",
+            reason="blocked",
+        )
+    with pytest.raises(ValueError, match="reason"):
+        ApprovalReviewDecision(
+            outcome=ApprovalReviewOutcome.DENY,
+            reviewer="auto_review",
+            reason="x" * 257,
+        )
+
+
+def test_codex_auto_review_allows_only_bounded_builtin_generated_artifacts() -> None:
+    reviewer = CodexAutoApprovalReviewer()
+
+    generated_zip = reviewer.review_sync(capability_request(agent_id="engineer"))
+    workspace_zip = reviewer.review_sync(
+        capability_request(
+            agent_id="engineer",
+            arguments={
+                "filename": "engineer.zip",
+                "project_id": "project-main",
+                "workspace_session_id": "session-main",
+            },
+        )
+    )
+    skill = reviewer.review_sync(
+        CapabilityRequest(
+            tenant_id=TENANT_ID,
+            user_id=USER_ID,
+            agent_id="reviewer",
+            capability="skill",
+            operation="use",
+            resource="skill/project-packager",
+            arguments={"name": "project-packager"},
+            idempotency_key="skill:project-packager",
+            run_id=RUN_ID,
+        )
+    )
+
+    assert generated_zip.outcome is ApprovalReviewOutcome.ALLOW
+    assert generated_zip.reviewer == "auto_review"
+    assert workspace_zip.outcome is ApprovalReviewOutcome.REQUIRE_USER_APPROVAL
+    assert skill.outcome is ApprovalReviewOutcome.REQUIRE_USER_APPROVAL

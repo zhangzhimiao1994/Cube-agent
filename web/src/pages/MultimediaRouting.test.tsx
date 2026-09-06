@@ -37,6 +37,7 @@ describe("multimedia generation routing", () => {
             hermes_enabled: true,
             safe_tools_enabled: true,
             require_approval_for_tools: true,
+            tool_approval_mode: "auto_review",
             multimedia_generation_enabled: true,
             channel_entry: "web",
           });
