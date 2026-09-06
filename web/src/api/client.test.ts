@@ -98,6 +98,27 @@ describe("api client transport", () => {
         },
       ],
     };
+    const capabilityExecutionPlan = {
+      schema_version: 1,
+      permission_boundary: "runtime_capability_gateway",
+      role_capability_assignments: [
+        {
+          role_id: "copywriter",
+          capabilities: [
+            {
+              name: "read_context",
+              replay_safe: true,
+              approval_policy: "not_required",
+            },
+            {
+              name: "docx",
+              replay_safe: false,
+              approval_policy: "runtime_policy",
+            },
+          ],
+        },
+      ],
+    };
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -121,6 +142,7 @@ describe("api client transport", () => {
               step_id: "main_agent_plan",
               payload: {
                 model_execution_plan: modelExecutionPlan,
+                capability_execution_plan: capabilityExecutionPlan,
               },
             },
           ],
@@ -140,5 +162,8 @@ describe("api client transport", () => {
     const run = await api.run("run_1");
 
     expect(run.events[0]?.payload.model_execution_plan).toEqual(modelExecutionPlan);
+    expect(run.events[0]?.payload.capability_execution_plan).toEqual(
+      capabilityExecutionPlan,
+    );
   });
 });

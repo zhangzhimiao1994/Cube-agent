@@ -189,12 +189,14 @@ class _PlannedRuntime:
         main_agent_model: str,
         roles: tuple[Mapping[str, JsonValue], ...],
         steps: tuple[Mapping[str, JsonValue], ...],
+        capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
     ) -> None:
         self.mode = mode
         self._child = child
         self._main_agent_model = main_agent_model
         self._roles = roles
         self._steps = steps
+        self._capability_gateway = capability_gateway
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
         sequence_offset = 1
@@ -217,6 +219,10 @@ class _PlannedRuntime:
                         context,
                         main_agent_model=self._main_agent_model,
                         roles=self._roles,
+                    ),
+                    "capability_execution_plan": _capability_execution_plan_payload(
+                        self._roles,
+                        capability_gateway=self._capability_gateway,
                     ),
                 },
             )
@@ -407,6 +413,7 @@ class ConfigBackedDispatchRuntime:
             main_agent_model=logical_model,
             roles=_dispatch_role_payload(plan),
             steps=_dispatch_step_payload(plan),
+            capability_gateway=self._capability_gateway,
         )
 
 
@@ -516,6 +523,7 @@ class ConfigBackedDiscussionRuntime:
             main_agent_model=logical_model,
             roles=_discussion_role_payload(plan),
             steps=_discussion_step_payload(plan),
+            capability_gateway=self._capability_gateway,
         )
 
 
@@ -689,6 +697,7 @@ class ConfigBackedHybridRuntime:
                     "tools": (),
                 },
             ),
+            capability_gateway=self._capability_gateway,
         )
 
 
@@ -1100,7 +1109,7 @@ def _role_allowed_tools(
     is_available = getattr(capability_gateway, "is_available", None)
     filtered: list[str] = []
     for name in requested:
-        if capability_gateway.is_replay_safe(name):
+        if _is_replay_safe_capability(name, capability_gateway=capability_gateway):
             filtered.append(name)
             continue
         if callable(is_available) and is_available(context.tenant_id, name):
@@ -1352,6 +1361,60 @@ def _model_execution_plan_payload(
             if "id" in role and "purpose" in role and "logical_model" in role
         ),
     }
+
+
+def _capability_execution_plan_payload(
+    roles: tuple[Mapping[str, JsonValue], ...],
+    *,
+    capability_gateway: RuntimeCapabilityGatewayProtocol | None,
+) -> Mapping[str, JsonValue]:
+    return {
+        "schema_version": 1,
+        "permission_boundary": "runtime_capability_gateway",
+        "role_capability_assignments": tuple(
+            {
+                "role_id": str(role["id"]),
+                "capabilities": tuple(
+                    _capability_plan_item(tool, capability_gateway=capability_gateway)
+                    for tool in _tool_names(role.get("tools"))
+                ),
+            }
+            for role in roles
+            if "id" in role
+        ),
+    }
+
+
+def _tool_names(value: object) -> tuple[str, ...]:
+    if not isinstance(value, tuple | list):
+        return ()
+    return tuple(item for item in value if isinstance(item, str) and item)
+
+
+def _capability_plan_item(
+    name: str,
+    *,
+    capability_gateway: RuntimeCapabilityGatewayProtocol | None,
+) -> Mapping[str, JsonValue]:
+    replay_safe = _is_replay_safe_capability(name, capability_gateway=capability_gateway)
+    return {
+        "name": name,
+        "replay_safe": replay_safe,
+        "approval_policy": "not_required" if replay_safe else "runtime_policy",
+    }
+
+
+def _is_replay_safe_capability(
+    name: str,
+    *,
+    capability_gateway: RuntimeCapabilityGatewayProtocol | None,
+) -> bool:
+    if capability_gateway is None:
+        return False
+    try:
+        return capability_gateway.is_replay_safe(name) is True
+    except (LookupError, RuntimeError, TypeError, ValueError):
+        return False
 
 
 def _dispatch_final_synthesizer_model(context: TaskContext, fallback: str) -> str:
