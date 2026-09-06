@@ -26,15 +26,15 @@ type ManualRunMode = Exclude<RunMode, "auto">;
 const SANDBOX_OPTIONS = [
   { value: "none", label: "无沙箱", summary: "不预授权工具工作区" },
   { value: "read_only", label: "只读", summary: "可读取项目上下文" },
-  { value: "restricted", label: "受限", summary: "读取、联网和命令需受控" },
-  { value: "workspace_write", label: "项目写入", summary: "允许产物写入项目工作区" },
+  { value: "restricted", label: "受限", summary: "读取和命令需受控" },
+  { value: "workspace_write", label: "项目写入", summary: "允许在项目工作区读写和执行命令" },
 ] as const;
 type SandboxProfile = (typeof SANDBOX_OPTIONS)[number]["value"];
 export function requestedPermissionsForSandbox(profile: SandboxProfile): string[] {
   if (profile === "none") return [];
   if (profile === "read_only") return ["workspace.read"];
-  if (profile === "restricted") return ["workspace.read", "network.read", "command.run"];
-  return ["workspace.read", "workspace.write", "network.read", "command.run"];
+  if (profile === "restricted") return ["workspace.read", "command.run"];
+  return ["workspace.read", "workspace.write", "command.run"];
 }
 export function workspacePreviewPath(projectId: string, sessionId: string): string {
   return `projects/${safeWorkspaceSegment(projectId, "default")}/sessions/${safeWorkspaceSegment(sessionId, "session-default")}`;
@@ -3288,7 +3288,7 @@ export function RunsPage() {
   const [conversationId, setConversationId] = useState(newConversationId);
   const [projectId, setProjectId] = useState("default");
   const [projectLabel, setProjectLabel] = useState("");
-  const [sandboxProfile, setSandboxProfile] = useState<SandboxProfile>("none");
+  const [sandboxProfile, setSandboxProfile] = useState<SandboxProfile>("workspace_write");
   const [referenceConversationId, setReferenceConversationId] = useState("");
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [selectedConversationIds, setSelectedConversationIds] = useState<string[]>([]);

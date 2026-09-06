@@ -639,6 +639,31 @@ def test_run_submission_forwards_workspace_and_sandbox_context() -> None:
     assert details["requested_permissions"] == ["workspace.read", "workspace.write"]
 
 
+def test_run_submission_defaults_to_workspace_write_without_network() -> None:
+    settings = StubSettingsService()
+    client, service, _ = _client(settings_service=settings)
+
+    response = client.post(
+        "/api/v1/runs",
+        headers=bearer(),
+        json={
+            "message": "请在项目工作区里修改代码",
+            "mode": "dispatch",
+            "conversation_id": "conv-workspace-default",
+        },
+    )
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["sandbox_profile"] == "workspace_write"
+    assert payload["requested_permissions"] == ["workspace.read", "workspace.write", "command.run"]
+    assert service.workspace_contexts[-1]["sandbox_profile"] == "workspace_write"
+    assert service.workspace_contexts[-1]["requested_permissions"] == ("workspace.read", "workspace.write", "command.run")
+    details = cast(dict[str, object], settings.audit_events[-1]["details"])
+    assert details["sandbox_profile"] == "workspace_write"
+    assert details["requested_permissions"] == ["workspace.read", "workspace.write", "command.run"]
+
+
 def test_run_submission_forwards_skip_evolution_proposal_flag() -> None:
     client, service, principal = _client()
 

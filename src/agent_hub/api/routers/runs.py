@@ -18,7 +18,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, Request, status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy.exc import SQLAlchemyError
 
 from agent_hub.api.dependencies import require_permission
@@ -27,7 +27,7 @@ from agent_hub.auth.models import AuthenticatedPrincipal, Role
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import RunConflict, RunNotFound
 from agent_hub.runs.service import RunSummary, SubmittedRun, VibeCodingUnavailable
-from agent_hub.runs.workspace import REQUESTED_PERMISSIONS, SANDBOX_PROFILES
+from agent_hub.runs.workspace import REQUESTED_PERMISSIONS, SANDBOX_PROFILES, workspace_selection
 
 router = APIRouter(
     prefix="/api/v1/runs",
@@ -197,7 +197,7 @@ class CreateRunRequest(BaseModel):
     project_id: str | None = Field(default=None, max_length=128)
     project_label: str | None = Field(default=None, max_length=80)
     workspace_session_id: str | None = Field(default=None, max_length=128)
-    sandbox_profile: Literal["none", "read_only", "restricted", "workspace_write"] = "none"
+    sandbox_profile: Literal["none", "read_only", "restricted", "workspace_write"] = "workspace_write"
     requested_permissions: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
 
     @field_validator("attachment_ids", mode="before")
@@ -249,6 +249,16 @@ class CreateRunRequest(BaseModel):
                 raise ValueError("requested_permissions must be unique known permission ids")
             seen.add(item)
         return value
+
+    @model_validator(mode="after")
+    def default_requested_permissions_from_sandbox(self) -> CreateRunRequest:
+        if not self.requested_permissions:
+            self.requested_permissions = workspace_selection(
+                project_id=None,
+                session_id=None,
+                sandbox_profile=self.sandbox_profile,
+            ).requested_permissions
+        return self
 
 
 class ChooseModeRequest(BaseModel):

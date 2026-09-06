@@ -1924,7 +1924,7 @@ describe("operational management pages", () => {
         project_id: "Mofang Agent",
         project_label: "魔方 Agent",
         sandbox_profile: "workspace_write",
-        requested_permissions: ["workspace.read", "workspace.write", "network.read", "command.run"],
+        requested_permissions: ["workspace.read", "workspace.write", "command.run"],
       },
     });
     const request = requests.find((item) => item.path === "/api/v1/runs");

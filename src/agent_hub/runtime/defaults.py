@@ -348,6 +348,7 @@ class ConfigBackedDispatchRuntime:
             secret_service=self._secret_service,
             capacity_factory=self._capacity_factory,
             transport=self._transport,
+            routing_decision=context.routing_decision,
         )
         selected_roles = _selected_config_role_assignments(
             context,
@@ -453,6 +454,7 @@ class ConfigBackedDiscussionRuntime:
             secret_service=self._secret_service,
             capacity_factory=self._capacity_factory,
             transport=self._transport,
+            routing_decision=context.routing_decision,
         )
         selected_roles = _selected_config_role_assignments(
             context,
@@ -558,6 +560,7 @@ class ConfigBackedHybridRuntime:
             secret_service=self._secret_service,
             capacity_factory=self._capacity_factory,
             transport=self._transport,
+            routing_decision=context.routing_decision,
         )
         profile = _task_profile(context.request)
         profiles = _task_profiles(context.request)
@@ -689,8 +692,9 @@ async def _gateway_for_config(
     secret_service: SecretService,
     capacity_factory: CapacityFactory,
     transport: ModelTransport,
+    routing_decision: object | None = None,
 ) -> tuple[ModelGateway, str]:
-    logical_model = _direct_logical_model(config)
+    logical_model = _direct_logical_model(config, routing_decision)
     deployments = _deployments(config)
     gateway = ModelGateway(
         ModelRegistry(deployments),
@@ -1540,6 +1544,11 @@ def _direct_logical_model(
     routing_decision: object | None = None,
 ) -> str:
     if isinstance(routing_decision, Mapping):
+        harness_decision = routing_decision.get("harness_decision")
+        if isinstance(harness_decision, Mapping):
+            selected = harness_decision.get("selected_logical_model")
+            if isinstance(selected, str) and selected in config.models:
+                return selected
         requested = routing_decision.get("direct_model")
         if isinstance(requested, str) and requested:
             return requested

@@ -191,11 +191,11 @@ async def test_auto_submission_reuses_previous_mode_for_same_conversation_withou
         "workflow_adjustment_policy": "strict_preset",
         "conversation_id": "conv-1",
         "reference_conversation_id": None,
-        "attachment_ids": [],
-        "project_id": "default",
-        "workspace_session_id": "conv-1",
-        "sandbox_profile": "none",
-        "requested_permissions": [],
+            "attachment_ids": [],
+            "project_id": "default",
+            "workspace_session_id": "conv-1",
+            "sandbox_profile": "workspace_write",
+            "requested_permissions": ["workspace.read", "workspace.write", "command.run"],
     }.items()
 
 
@@ -287,11 +287,11 @@ async def test_auto_submission_switches_mode_when_user_explicitly_requests_it() 
         "workflow_adjustment_policy": "strict_preset",
         "conversation_id": "conv-1",
         "reference_conversation_id": None,
-        "attachment_ids": [],
-        "project_id": "default",
-        "workspace_session_id": "conv-1",
-        "sandbox_profile": "none",
-        "requested_permissions": [],
+            "attachment_ids": [],
+            "project_id": "default",
+            "workspace_session_id": "conv-1",
+            "sandbox_profile": "workspace_write",
+            "requested_permissions": ["workspace.read", "workspace.write", "command.run"],
     }.items()
 
 

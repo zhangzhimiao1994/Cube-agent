@@ -357,6 +357,10 @@ def _tool_sandbox(name: str) -> str:
     return "restricted"
 
 
+def _tool_requires_approval(name: str) -> bool:
+    return _tool_sandbox(name) == "restricted"
+
+
 def _map_completion_tool_names(
     completion: GatewayCompletion,
     external_to_internal: Mapping[str, str],
@@ -1126,6 +1130,7 @@ class CrewDispatchRuntime:
         self._gateway = gateway
         self._plan = plan
         self._capabilities = capability_gateway
+        self._uses_external_harness_tool_gateway = harness_tool_gateway is not None
         self._tool_gateway = harness_tool_gateway
         if self._tool_gateway is None and capability_gateway is not None:
             self._tool_gateway = HarnessToolGateway(
@@ -2709,7 +2714,10 @@ class CrewDispatchRuntime:
                         actor=step.agent,
                         tool_name=tool_call.name,
                         arguments=tool_call.arguments,
-                        approval_required=False,
+                        approval_required=(
+                            self._uses_external_harness_tool_gateway
+                            and _tool_requires_approval(tool_call.name)
+                        ),
                         sandbox=_tool_sandbox(tool_call.name),
                         idempotency_key=idempotency_key,
                         call_id=call_id,

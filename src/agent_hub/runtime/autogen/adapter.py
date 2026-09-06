@@ -517,6 +517,10 @@ def _tool_sandbox(name: str) -> str:
     return "restricted"
 
 
+def _tool_requires_approval(name: str) -> bool:
+    return _tool_sandbox(name) == "restricted"
+
+
 def _safe_id(value: str, name: str) -> str:
     if type(value) is not str or _ID.fullmatch(value) is None:
         raise ValueError(f"{name} must be a safe identifier")
@@ -670,6 +674,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
         harness_tool_gateway: HarnessToolInvoker,
         user_id: UUID | None = None,
         role: Role | None = None,
+        approval_envelope_required: bool = True,
     ) -> None:
         super().__init__(
             _DynamicToolArguments,
@@ -686,6 +691,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
         self._tool_gateway = harness_tool_gateway
         self._user_id = user_id
         self._role = role
+        self._approval_envelope_required = approval_envelope_required
 
     async def run(
         self, args: _DynamicToolArguments, cancellation_token: CancellationToken
@@ -782,7 +788,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                 actor=self._actor,
                 tool_name=self.name,
                 arguments=cast(Mapping[str, JsonValue], arguments),
-                approval_required=False,
+                approval_required=self._approval_envelope_required and _tool_requires_approval(self.name),
                 sandbox=_tool_sandbox(self.name),
                 idempotency_key=idempotency_key,
                 call_id=safe_call_id,
@@ -1175,6 +1181,7 @@ class AutoGenDiscussionRuntime:
         ):
             raise ValueError("configured discussion tools require CapabilityGateway")
         self._capabilities = capability_gateway
+        self._uses_external_harness_tool_gateway = harness_tool_gateway is not None
         self._tool_gateway = harness_tool_gateway
         if self._tool_gateway is None and capability_gateway is not None:
             self._tool_gateway = HarnessToolGateway(
@@ -1368,6 +1375,7 @@ class AutoGenDiscussionRuntime:
                                     ),
                                     user_id=context.actor_id,
                                     role=context.actor_role,
+                                    approval_envelope_required=self._uses_external_harness_tool_gateway,
                                 )
                                 for name in participant.allowed_tools
                             ]

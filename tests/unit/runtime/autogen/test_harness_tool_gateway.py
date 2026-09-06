@@ -123,6 +123,7 @@ async def test_gateway_capability_tool_routes_through_harness_with_actor_identit
     assert request.actor == "analyst"
     assert request.tool_name == "web.search"
     assert request.arguments == {"query": "evidence"}
+    assert request.approval_required is True
     assert request.sandbox == "restricted"
     assert request.call_id == "call_1"
     assert user_id == actor_id

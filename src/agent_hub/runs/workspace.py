@@ -91,7 +91,7 @@ def safe_workspace_segment(value: str | None, *, default: str) -> str:
 
 
 def _sandbox_profile(value: str | None) -> SandboxProfile:
-    profile = (value or "none").strip()
+    profile = (value or "workspace_write").strip()
     if profile not in SANDBOX_PROFILES:
         raise ValueError("sandbox_profile must be one of none, read_only, restricted, workspace_write")
     return profile
@@ -142,8 +142,8 @@ def _default_permissions(profile: SandboxProfile) -> tuple[str, ...]:
     if profile == "read_only":
         return ("workspace.read",)
     if profile == "restricted":
-        return ("workspace.read", "network.read", "command.run")
-    return ("workspace.read", "workspace.write", "network.read", "command.run")
+        return ("workspace.read", "command.run")
+    return ("workspace.read", "workspace.write", "command.run")
 
 
 def _allowed_permissions(profile: SandboxProfile) -> frozenset[str]:

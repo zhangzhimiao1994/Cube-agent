@@ -298,6 +298,77 @@ async def test_config_backed_direct_runtime_uses_published_model_and_secret() ->
 
 
 @pytest.mark.asyncio
+async def test_config_backed_direct_runtime_uses_harness_selected_logical_model() -> None:
+    transport = FakeTransport()
+    runtime = ConfigBackedDirectRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "openai",
+                                "model": "gpt-5.6-sol",
+                                "api_base": "https://api.openai.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "openai_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                    "research": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-chat",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://research",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
+        transport=transport,
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DIRECT,
+                request="summarize this research",
+                routing_decision={
+                    "harness_decision": {
+                        "selected_provider": "deepseek",
+                        "selected_model": "deepseek-chat",
+                        "selected_logical_model": "research",
+                    }
+                },
+            )
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    deployment, request, _api_key = transport.calls[0]
+    assert deployment.provider_model == "deepseek/deepseek-chat"
+    assert request.logical_model == "research"
+
+
+@pytest.mark.asyncio
 async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

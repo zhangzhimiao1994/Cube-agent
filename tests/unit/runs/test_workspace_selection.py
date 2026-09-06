@@ -41,11 +41,22 @@ def test_workspace_selection_defaults_permissions_from_sandbox_profile() -> None
     selection = workspace_selection(project_id=None, session_id="conv-test", sandbox_profile="restricted")
 
     assert selection.project_id == "default"
-    assert selection.requested_permissions == ("workspace.read", "network.read", "command.run")
+    assert selection.requested_permissions == ("workspace.read", "command.run")
 
 
-def test_workspace_selection_defaults_to_metadata_only_without_sandbox() -> None:
+def test_workspace_selection_defaults_to_workspace_write_without_network() -> None:
     selection = workspace_selection(project_id=None, session_id="conv-test")
 
-    assert selection.sandbox_profile == "none"
-    assert selection.requested_permissions == ()
+    assert selection.sandbox_profile == "workspace_write"
+    assert selection.requested_permissions == ("workspace.read", "workspace.write", "command.run")
+
+
+def test_workspace_selection_requires_explicit_network_permission() -> None:
+    selection = workspace_selection(
+        project_id=None,
+        session_id="conv-test",
+        sandbox_profile="workspace_write",
+        requested_permissions=("workspace.read", "workspace.write", "network.read"),
+    )
+
+    assert selection.requested_permissions == ("workspace.read", "workspace.write", "network.read")

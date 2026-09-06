@@ -292,10 +292,10 @@ describe("workspace and sandbox submission helpers", () => {
   it("maps sandbox profiles to bounded requested permissions", () => {
     expect(requestedPermissionsForSandbox("none")).toEqual([]);
     expect(requestedPermissionsForSandbox("read_only")).toEqual(["workspace.read"]);
+    expect(requestedPermissionsForSandbox("restricted")).toEqual(["workspace.read", "command.run"]);
     expect(requestedPermissionsForSandbox("workspace_write")).toEqual([
       "workspace.read",
       "workspace.write",
-      "network.read",
       "command.run",
     ]);
   });

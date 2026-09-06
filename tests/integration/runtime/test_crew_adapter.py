@@ -1660,7 +1660,7 @@ async def test_tool_calls_cross_the_harness_tool_gateway_envelope() -> None:
     assert request.actor == "writer"
     assert request.tool_name == "web.search"
     assert request.arguments == {"q": "safe"}
-    assert request.approval_required is False
+    assert request.approval_required is True
     assert request.sandbox == "restricted"
     assert request.call_id == f"call-{request.idempotency_key[:32]}"
     checkpoint = next(

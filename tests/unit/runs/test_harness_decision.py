@@ -303,7 +303,7 @@ async def test_harness_scheduler_failure_degrades_to_plain_routing_payload() -> 
     assert routing["harness_unavailable"] == "scheduling_failed"
 
 
-async def test_plain_direct_submit_does_not_request_vibe_engineering_requirements() -> None:
+async def test_plain_direct_submit_defaults_to_workspace_write_without_vibe_requirements() -> None:
     repository = RecordingRepository()
     scheduler = RecordingHarnessScheduler()
     service = RunService(
@@ -331,7 +331,8 @@ async def test_plain_direct_submit_does_not_request_vibe_engineering_requirement
     assert requirements.needs_streamed_tool_calls is False
     assert requirements.needs_parallel_tool_calls is False
     assert requirements.needs_long_running is False
-    assert requirements.requires_sandbox is False
+    assert requirements.requires_sandbox is True
+    assert requirements.required_sandbox_mode == "workspace_write"
     assert requirements.prefers_prefix_cache is False
 
 
