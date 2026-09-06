@@ -9,6 +9,7 @@ from zipfile import ZipFile
 import pytest
 
 from agent_hub.capabilities.runtime import RuntimeCapabilityError, RuntimeCapabilityGateway
+from agent_hub.capabilities.tools.registry import ToolRegistry
 from agent_hub.runtime.contracts import JsonValue
 from agent_hub.skills.sandbox.base import SkillInvocation, SkillResult
 from tests.unit.skills.test_package import skill_zip
@@ -32,6 +33,16 @@ class FakeSandbox:
 
     async def terminate(self, execution_id: str) -> None:
         del execution_id
+
+
+class FakeManifestSource:
+    def __init__(self, manifest: Mapping[str, JsonValue] | Exception) -> None:
+        self.manifest = manifest
+
+    def manifests(self) -> Mapping[str, JsonValue]:
+        if isinstance(self.manifest, Exception):
+            raise self.manifest
+        return self.manifest
 
 
 async def test_runtime_gateway_executes_calculator_without_external_side_effects(tmp_path: Path) -> None:
@@ -709,3 +720,191 @@ def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
     assert "workspace/output.txt" not in repr(manifest)
     assert "tool:filesystem.read" not in repr(manifest)
     assert str(tmp_path) not in repr(manifest)
+
+
+def test_runtime_gateway_capability_manifest_includes_registry_capabilities(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry()
+    registry.register(
+        "mcp.search",
+        object(),
+        kind="mcp",
+        adapter="mcp_server",
+        permission_class="mcp.call",
+        sandbox_profile="remote_connector",
+        replay_safe=False,
+        aliases=("search_web",),
+    )
+    registry.register(
+        "plugin.todoist.create_task",
+        object(),
+        kind="plugin",
+        adapter="plugin_registry",
+        permission_class="plugin.use",
+        sandbox_profile="remote_connector",
+        replay_safe=False,
+    )
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        tool_registry=registry,
+    )
+
+    manifest = gateway.capability_manifest(TENANT_ID)
+    manifest_items = cast(tuple[Mapping[str, JsonValue], ...], manifest["capabilities"])
+    capabilities = {item["id"]: item for item in manifest_items}
+
+    assert capabilities["mcp.search"] == {
+        "id": "mcp.search",
+        "kind": "mcp",
+        "adapter": "mcp_server",
+        "permission_class": "mcp.call",
+        "sandbox_profile": "remote_connector",
+        "available": True,
+        "availability_reason": None,
+        "replay_safe": False,
+        "aliases": ("search_web",),
+    }
+    assert capabilities["plugin.todoist.create_task"] == {
+        "id": "plugin.todoist.create_task",
+        "kind": "plugin",
+        "adapter": "plugin_registry",
+        "permission_class": "plugin.use",
+        "sandbox_profile": "remote_connector",
+        "available": True,
+        "availability_reason": None,
+        "replay_safe": False,
+        "aliases": (),
+    }
+
+
+def test_runtime_gateway_capability_manifest_keeps_runtime_items_authoritative(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry()
+    registry.register(
+        "workspace.read",
+        object(),
+        kind="mcp",
+        adapter="mcp_server",
+        permission_class="mcp.call",
+        sandbox_profile="remote_connector",
+        replay_safe=False,
+        aliases=("external_workspace",),
+    )
+    registry.register(
+        "mcp.shadow_calculator",
+        object(),
+        kind="mcp",
+        adapter="mcp_server",
+        permission_class="mcp.call",
+        sandbox_profile="remote_connector",
+        replay_safe=False,
+        aliases=("calculator",),
+    )
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        tool_registry=registry,
+    )
+
+    manifest = gateway.capability_manifest(TENANT_ID)
+    manifest_items = cast(tuple[Mapping[str, JsonValue], ...], manifest["capabilities"])
+    capabilities = {item["id"]: item for item in manifest_items}
+
+    assert capabilities["workspace.read"]["adapter"] == "runtime_builtin"
+    assert capabilities["workspace.read"]["available"] is False
+    assert capabilities["workspace.read"]["availability_reason"] == "workspace_root_not_configured"
+    assert capabilities["workspace.read"]["aliases"] == ("workspace_read",)
+    assert "mcp.shadow_calculator" not in capabilities
+
+
+def test_runtime_gateway_capability_manifest_skips_bad_registry_sources(
+    tmp_path: Path,
+) -> None:
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        tool_registry=FakeManifestSource(RuntimeError("registry unavailable")),
+    )
+
+    manifest = gateway.capability_manifest(TENANT_ID)
+    manifest_items = cast(tuple[Mapping[str, JsonValue], ...], manifest["capabilities"])
+
+    assert {item["id"] for item in manifest_items} == {
+        "calculator.evaluate",
+        "document.generate_docx",
+        "presentation.generate_pptx",
+        "project.generate_zip",
+        "read_context",
+        "workspace.read",
+    }
+
+
+def test_runtime_gateway_capability_manifest_rejects_malformed_registry_items(
+    tmp_path: Path,
+) -> None:
+    source = FakeManifestSource(
+        {
+            "schema_version": 1,
+            "capabilities": (
+                {
+                    "id": " bad.tool",
+                    "kind": "mcp",
+                    "adapter": "mcp_server",
+                    "permission_class": "mcp.call",
+                    "sandbox_profile": "remote_connector",
+                    "replay_safe": False,
+                    "aliases": (),
+                },
+                {
+                    "id": "mcp.bad_alias",
+                    "kind": "mcp",
+                    "adapter": "mcp_server",
+                    "permission_class": "mcp.call",
+                    "sandbox_profile": "remote_connector",
+                    "replay_safe": False,
+                    "aliases": ("search_web", "search_web"),
+                },
+                {
+                    "id": "mcp.accepted",
+                    "kind": "mcp",
+                    "adapter": "mcp_server",
+                    "permission_class": "mcp.call",
+                    "sandbox_profile": "remote_connector",
+                    "replay_safe": False,
+                    "aliases": ("search_web",),
+                },
+                {
+                    "id": "mcp.shadow",
+                    "kind": "mcp",
+                    "adapter": "mcp_server",
+                    "permission_class": "mcp.call",
+                    "sandbox_profile": "remote_connector",
+                    "replay_safe": False,
+                    "aliases": ("mcp.accepted",),
+                },
+                {
+                    "id": "mcp.other",
+                    "kind": "mcp",
+                    "adapter": "mcp_server",
+                    "permission_class": "mcp.call",
+                    "sandbox_profile": "remote_connector",
+                    "replay_safe": False,
+                    "aliases": ("bad alias",),
+                },
+            ),
+        }
+    )
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        tool_registry=source,
+    )
+
+    manifest = gateway.capability_manifest(TENANT_ID)
+    manifest_items = cast(tuple[Mapping[str, JsonValue], ...], manifest["capabilities"])
+    capabilities = {item["id"]: item for item in manifest_items}
+
+    assert capabilities["mcp.accepted"]["aliases"] == ("search_web",)
+    assert " bad.tool" not in capabilities
+    assert "mcp.bad_alias" not in capabilities
+    assert "mcp.shadow" not in capabilities
+    assert "mcp.other" not in capabilities

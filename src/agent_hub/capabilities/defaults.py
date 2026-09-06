@@ -21,7 +21,7 @@ from agent_hub.capabilities.gateway import (
     CapabilityStatus,
 )
 from agent_hub.capabilities.policy import CapabilityPolicy, CapabilityRule, normalize_resource
-from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
+from agent_hub.capabilities.runtime import CapabilityManifestSource, RuntimeCapabilityGateway
 from agent_hub.capabilities.types import CapabilityRequest, PolicyEffect
 from agent_hub.harness.tool_gateway import HarnessToolGateway
 
@@ -218,12 +218,14 @@ def build_runtime_capability_stack(
     require_approval_for_tools: ToolApprovalPolicyGetter | None = None,
     tool_approval_mode: ToolApprovalModeGetter | None = None,
     approval_reviewer: ApprovalReviewer | None = None,
+    tool_registry: CapabilityManifestSource | None = None,
 ) -> RuntimeCapabilityStack:
     runtime_gateway = RuntimeCapabilityGateway(
         skill_store_dir=skill_store_dir,
         workspace_root=workspace_root,
         generated_artifact_dir=generated_artifact_dir,
         project_workspace_dir=project_workspace_dir,
+        tool_registry=tool_registry,
     )
     del tenant_id
     default_reviewer = (

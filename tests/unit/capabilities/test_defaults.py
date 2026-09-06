@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
+from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -21,8 +22,10 @@ from agent_hub.capabilities.gateway import (
     CapabilityStatus,
 )
 from agent_hub.capabilities.policy import CapabilityPolicy, CapabilityRule
+from agent_hub.capabilities.tools.registry import ToolRegistry
 from agent_hub.capabilities.types import CapabilityRequest, PolicyEffect
 from agent_hub.harness.types import HarnessToolCallRequest
+from agent_hub.runtime.contracts import JsonValue
 
 TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
 USER_ID = UUID("22222222-2222-4222-8222-222222222222")
@@ -69,6 +72,37 @@ def capability_request(
         idempotency_key=f"{run_id}:{agent_id}:{resource}",
         run_id=run_id,
     )
+
+
+def test_runtime_capability_stack_passes_tool_registry_to_manifest(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry()
+    registry.register(
+        "mcp.search",
+        object(),
+        kind="mcp",
+        adapter="mcp_server",
+        permission_class="mcp.call",
+        sandbox_profile="remote_connector",
+        replay_safe=False,
+        aliases=("search_web",),
+    )
+
+    stack = build_runtime_capability_stack(
+        tenant_id=TENANT_ID,
+        run_repository=object(),
+        skill_store_dir=tmp_path / "skills",
+        workspace_root=None,
+        tool_registry=registry,
+    )
+
+    manifest = stack.runtime_gateway.capability_manifest(TENANT_ID)
+    manifest_items = cast(tuple[Mapping[str, JsonValue], ...], manifest["capabilities"])
+    capabilities = {item["id"]: item for item in manifest_items}
+    assert capabilities["mcp.search"]["adapter"] == "mcp_server"
+    assert capabilities["mcp.search"]["available"] is True
+    assert capabilities["mcp.search"]["aliases"] == ("search_web",)
 
 
 class ScopeApprovedRepository:
