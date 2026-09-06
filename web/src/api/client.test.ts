@@ -78,4 +78,67 @@ describe("api client transport", () => {
 
     expect(settings.tool_approval_mode).toBe("ask");
   });
+
+  it("preserves nested model execution plans on run detail events", async () => {
+    const modelExecutionPlan = {
+      schema_version: 1,
+      main_agent: {
+        logical_model: "main",
+        selection_source: "harness_decision",
+        harness_constrained: true,
+        selected_provider: "deepseek",
+        selected_model: "deepseek-chat",
+        fallback_policy: "disabled_for_harness_selection",
+      },
+      role_model_assignments: [
+        {
+          role_id: "copywriter",
+          purpose: "execute",
+          logical_model: "creative",
+        },
+      ],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: "run_1",
+          status: "running",
+          mode: "dispatch",
+          version: 1,
+          request: "Draft copy.",
+          created_at: "2026-09-06T13:50:00Z",
+          queue_wait_ms: 0,
+          capacity_wait_ms: 0,
+          cost_usd: "0",
+          events: [
+            {
+              sequence: 1,
+              kind: "step.started",
+              message: "main_agent_plan",
+              created_at: "2026-09-06T13:50:01Z",
+              actor: "main_agent",
+              participants: [],
+              step_id: "main_agent_plan",
+              payload: {
+                model_execution_plan: modelExecutionPlan,
+              },
+            },
+          ],
+          artifacts: [],
+          explicit_details: {},
+          failure_diagnostics: [],
+          tool_lifecycle: [],
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const run = await api.run("run_1");
+
+    expect(run.events[0]?.payload.model_execution_plan).toEqual(modelExecutionPlan);
+  });
 });

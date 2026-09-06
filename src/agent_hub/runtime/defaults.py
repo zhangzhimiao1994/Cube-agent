@@ -213,6 +213,11 @@ class _PlannedRuntime:
                     "summary": "Main Agent selected the runtime mode, roles, and models.",
                     "roles": self._roles,
                     "steps": self._steps,
+                    "model_execution_plan": _model_execution_plan_payload(
+                        context,
+                        main_agent_model=self._main_agent_model,
+                        roles=self._roles,
+                    ),
                 },
             )
         async for event in self._child.run(context):
@@ -771,6 +776,29 @@ def _harness_deployment_selection(
     return logical_model, provider.casefold(), model
 
 
+def _harness_deployment_selection_payload(
+    routing_decision: object | None,
+) -> tuple[str, str, str] | None:
+    if not isinstance(routing_decision, Mapping):
+        return None
+    harness_decision = routing_decision.get("harness_decision")
+    if not isinstance(harness_decision, Mapping):
+        return None
+    logical_model = harness_decision.get("selected_logical_model")
+    provider = harness_decision.get("selected_provider")
+    model = harness_decision.get("selected_model")
+    if not (
+        isinstance(logical_model, str)
+        and isinstance(provider, str)
+        and isinstance(model, str)
+        and logical_model
+        and provider
+        and model
+    ):
+        return None
+    return logical_model, provider, model
+
+
 def _deployment_matches_harness_selection(
     deployment: Deployment,
     *,
@@ -1281,6 +1309,49 @@ def _logical_model_capacity(config: PlatformConfig, logical_model: str) -> int:
 
 def _string_or_default(value: object, default: str) -> str:
     return value if isinstance(value, str) and value else default
+
+
+def _model_execution_plan_payload(
+    context: TaskContext,
+    *,
+    main_agent_model: str,
+    roles: tuple[Mapping[str, JsonValue], ...],
+) -> Mapping[str, JsonValue]:
+    selection = _harness_deployment_selection_payload(context.routing_decision)
+    explicit_main = context.routing_decision.get("main_agent_model")
+    selection_source = (
+        "main_agent_model"
+        if isinstance(explicit_main, str) and explicit_main
+        else "harness_decision"
+        if selection is not None
+        else "runtime_default"
+    )
+    selected_provider: str | None = None
+    selected_model: str | None = None
+    if selection is not None:
+        _, selected_provider, selected_model = selection
+    return {
+        "schema_version": 1,
+        "main_agent": {
+            "logical_model": main_agent_model,
+            "selection_source": selection_source,
+            "harness_constrained": selection is not None,
+            "selected_provider": selected_provider,
+            "selected_model": selected_model,
+            "fallback_policy": (
+                "disabled_for_harness_selection" if selection is not None else "configured"
+            ),
+        },
+        "role_model_assignments": tuple(
+            {
+                "role_id": str(role["id"]),
+                "purpose": str(role["purpose"]),
+                "logical_model": str(role["logical_model"]),
+            }
+            for role in roles
+            if "id" in role and "purpose" in role and "logical_model" in role
+        ),
+    }
 
 
 def _dispatch_final_synthesizer_model(context: TaskContext, fallback: str) -> str:

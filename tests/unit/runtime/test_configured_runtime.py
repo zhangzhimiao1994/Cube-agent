@@ -816,6 +816,29 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
         "deepseek/deepseek-chat",
         "kimi/kimi-k2-latest",
     }
+    assert events[0].payload["model_execution_plan"] == {
+        "schema_version": 1,
+        "main_agent": {
+            "logical_model": "main",
+            "selection_source": "harness_decision",
+            "harness_constrained": True,
+            "selected_provider": "deepseek",
+            "selected_model": "deepseek-chat",
+            "fallback_policy": "disabled_for_harness_selection",
+        },
+        "role_model_assignments": (
+            {
+                "role_id": "copywriter",
+                "purpose": "execute",
+                "logical_model": "creative",
+            },
+            {
+                "role_id": "final_synthesizer",
+                "purpose": "synthesize",
+                "logical_model": "main",
+            },
+        ),
+    }
 
 
 @pytest.mark.asyncio
