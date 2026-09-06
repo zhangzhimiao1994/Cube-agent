@@ -166,4 +166,59 @@ describe("api client transport", () => {
       capabilityExecutionPlan,
     );
   });
+
+  it("loads the runtime capability manifest without browser cache", async () => {
+    const manifest = {
+      schema_version: 1,
+      capabilities: [
+        {
+          id: "calculator.evaluate",
+          kind: "builtin",
+          adapter: "runtime_builtin",
+          permission_class: "calculator.evaluate",
+          sandbox_profile: "in_process",
+          available: true,
+          availability_reason: null,
+          replay_safe: true,
+          aliases: ["calculator"],
+        },
+        {
+          id: "workspace.read",
+          kind: "builtin",
+          adapter: "runtime_builtin",
+          permission_class: "file.read",
+          sandbox_profile: "workspace_read",
+          available: false,
+          availability_reason: "workspace_root_not_configured",
+          replay_safe: true,
+          aliases: ["workspace_read"],
+        },
+      ],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(manifest), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.capabilityManifest();
+
+    expect(fetchMock.mock.calls[0]?.[0]).toMatch(
+      /^\/api\/v1\/admin\/capabilities\/manifest\?_=/,
+    );
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({ cache: "no-store" }));
+    expect(result.capabilities[1]).toEqual({
+      id: "workspace.read",
+      kind: "builtin",
+      adapter: "runtime_builtin",
+      permission_class: "file.read",
+      sandbox_profile: "workspace_read",
+      available: false,
+      availability_reason: "workspace_root_not_configured",
+      replay_safe: true,
+      aliases: ["workspace_read"],
+    });
+  });
 });

@@ -538,6 +538,7 @@ def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
                 "available": True,
                 "availability_reason": None,
                 "replay_safe": True,
+                "aliases": ("calculator",),
             },
             {
                 "id": "document.generate_docx",
@@ -548,6 +549,7 @@ def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
                 "available": True,
                 "availability_reason": None,
                 "replay_safe": True,
+                "aliases": (),
             },
             {
                 "id": "presentation.generate_pptx",
@@ -558,6 +560,7 @@ def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
                 "available": True,
                 "availability_reason": None,
                 "replay_safe": True,
+                "aliases": (),
             },
             {
                 "id": "project.generate_zip",
@@ -568,6 +571,7 @@ def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
                 "available": True,
                 "availability_reason": None,
                 "replay_safe": True,
+                "aliases": (),
             },
             {
                 "id": "read_context",
@@ -578,6 +582,7 @@ def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
                 "available": True,
                 "availability_reason": None,
                 "replay_safe": True,
+                "aliases": (),
             },
             {
                 "id": "workspace.read",
@@ -588,6 +593,7 @@ def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
                 "available": True,
                 "availability_reason": None,
                 "replay_safe": True,
+                "aliases": ("workspace_read",),
             },
             {
                 "id": "data_cleaner",
@@ -598,6 +604,7 @@ def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
                 "available": True,
                 "availability_reason": None,
                 "replay_safe": False,
+                "aliases": (),
             },
         ),
     }
@@ -629,6 +636,7 @@ def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
             "available": True,
             "availability_reason": None,
             "replay_safe": True,
+            "aliases": ("calculator",),
         },
         {
             "id": "document.generate_docx",
@@ -639,6 +647,7 @@ def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
             "available": False,
             "availability_reason": "generated_artifact_store_not_configured",
             "replay_safe": True,
+            "aliases": (),
         },
         {
             "id": "presentation.generate_pptx",
@@ -649,6 +658,7 @@ def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
             "available": False,
             "availability_reason": "generated_artifact_store_not_configured",
             "replay_safe": True,
+            "aliases": (),
         },
         {
             "id": "project.generate_zip",
@@ -659,6 +669,7 @@ def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
             "available": False,
             "availability_reason": "generated_artifact_store_not_configured",
             "replay_safe": True,
+            "aliases": (),
         },
         {
             "id": "read_context",
@@ -669,6 +680,7 @@ def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
             "available": True,
             "availability_reason": None,
             "replay_safe": True,
+            "aliases": (),
         },
         {
             "id": "workspace.read",
@@ -679,6 +691,7 @@ def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
             "available": False,
             "availability_reason": "workspace_root_not_configured",
             "replay_safe": True,
+            "aliases": ("workspace_read",),
         },
         {
             "id": "private_writer",
@@ -689,6 +702,7 @@ def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
             "available": True,
             "availability_reason": None,
             "replay_safe": False,
+            "aliases": (),
         },
     )
     assert "secret://openai" not in repr(manifest)

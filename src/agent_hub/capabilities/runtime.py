@@ -407,6 +407,7 @@ class RuntimeCapabilityGateway:
             "available": availability_reason is None,
             "availability_reason": availability_reason,
             "replay_safe": self.is_replay_safe(name),
+            "aliases": _builtin_aliases(name),
         }
 
     def _builtin_availability_reason(self, name: str) -> str | None:
@@ -437,6 +438,7 @@ class RuntimeCapabilityGateway:
                     "available": True,
                     "availability_reason": None,
                     "replay_safe": False,
+                    "aliases": (),
                 }
             )
         return tuple(items)
@@ -455,6 +457,11 @@ def _require_safe(name: str, value: str, *, max_length: int = 128) -> None:
 
 def _normalize_tool_name(name: str) -> str:
     return _BUILTIN_ALIASES.get(name, name)
+
+
+def _builtin_aliases(name: str) -> tuple[str, ...]:
+    alias = _BUILTIN_ALIASES.get(name)
+    return () if alias is None else (alias,)
 
 
 def _builtin_permission_class(name: str) -> str:

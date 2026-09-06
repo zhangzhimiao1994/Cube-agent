@@ -1,9 +1,12 @@
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MemoryRouter } from "react-router-dom";
 
 import type { ChannelStatus, EvolutionRun, RunDetail, RunListItem } from "../api/client";
-import { TestApp } from "../app/router";
+import { AppRoutes, TestApp } from "../app/router";
+import { AuthProvider } from "../auth/AuthProvider";
 
 const runId = "22222222-2222-4222-8222-222222222222";
 const secondRunId = "33333333-3333-4333-8333-333333333333";
@@ -368,6 +371,45 @@ const workflows = [
   },
 ];
 
+const capabilityManifest = {
+  schema_version: 1,
+  capabilities: [
+    {
+      id: "calculator.evaluate",
+      kind: "builtin",
+      adapter: "runtime_builtin",
+      permission_class: "calculator.evaluate",
+      sandbox_profile: "in_process",
+      available: true,
+      availability_reason: null,
+      replay_safe: true,
+      aliases: ["calculator"],
+    },
+    {
+      id: "workspace.read",
+      kind: "builtin",
+      adapter: "runtime_builtin",
+      permission_class: "file.read",
+      sandbox_profile: "workspace_read",
+      available: false,
+      availability_reason: "workspace_root_not_configured",
+      replay_safe: true,
+      aliases: ["workspace_read"],
+    },
+    {
+      id: "summarizer",
+      kind: "skill",
+      adapter: "skill_sandbox",
+      permission_class: "skill.use",
+      sandbox_profile: "systemd_skill_sandbox",
+      available: true,
+      availability_reason: null,
+      replay_safe: false,
+      aliases: [],
+    },
+  ],
+};
+
 function jsonResponse(payload: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(payload), {
     status: 200,
@@ -394,6 +436,9 @@ describe("operational management pages", () => {
   let deletedHermesIds = new Set<string>();
   let visibleEvolutionRuns = [evolutionRun];
   let visibleChannels = baseChannels;
+  let visibleCapabilityManifest = capabilityManifest;
+  let failCapabilityManifest = false;
+  let currentPrincipalRole = "super_admin";
   let visibleWorkspaceFiles = {
     items: [] as Array<{
       path: string;
@@ -422,6 +467,9 @@ describe("operational management pages", () => {
     deletedHermesIds = new Set<string>();
     visibleEvolutionRuns = [evolutionRun];
     visibleChannels = baseChannels;
+    visibleCapabilityManifest = capabilityManifest;
+    failCapabilityManifest = false;
+    currentPrincipalRole = "super_admin";
     visibleWorkspaceFiles = {
       items: [],
       bundle_download_url: "/api/v1/workspaces/projects/default/sessions/conv-previous/bundle/download",
@@ -447,7 +495,7 @@ describe("operational management pages", () => {
           return jsonResponse({
             user_id: "11111111-1111-4111-8111-111111111111",
             tenant_id: "33333333-3333-4333-8333-333333333333",
-            role: "super_admin",
+            role: currentPrincipalRole,
           });
         }
         if (path === "/api/v1/admin/runs") {
@@ -1092,6 +1140,15 @@ describe("operational management pages", () => {
         }
         if (path === "/api/v1/admin/mcp") {
           return jsonResponse([{ id: "filesystem", name: "Filesystem MCP", health: "healthy", allowed_tools: ["read_file"] }]);
+        }
+        if (path === "/api/v1/admin/capabilities/manifest") {
+          if (failCapabilityManifest) {
+            return jsonResponse(
+              { error: { code: "permission_denied", message: "plugin read permission required" } },
+              { status: 403 },
+            );
+          }
+          return jsonResponse(visibleCapabilityManifest);
         }
         if (path === "/api/v1/admin/memory") {
           return jsonResponse([
@@ -6226,12 +6283,79 @@ describe("operational management pages", () => {
     expect(screen.getByText(/还缺少配置：CUSTOM_WEBHOOK_TOKEN/)).not.toBeNull();
     expect(requests.find((request) => request.path === "/api/v1/admin/channels/custom_webhook/config" && request.method === "DELETE")).toBeTruthy();
   });
+
+  it("keeps MCP configuration usable when the capability manifest cannot load", async () => {
+    failCapabilityManifest = true;
+
+    render(<TestApp initialPath="/mcp" />);
+
+    expect(await screen.findByText("Filesystem MCP")).not.toBeNull();
+    expect(screen.getByText("healthy")).not.toBeNull();
+    expect((await screen.findByRole("alert")).textContent).toContain("运行时能力加载失败");
+  });
+
+  it("does not request the capability manifest when plugin read permission is missing", async () => {
+    currentPrincipalRole = "mcp_viewer";
+
+    render(<TestApp initialPath="/mcp" />);
+
+    expect(await screen.findByText("Filesystem MCP")).not.toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(requests.some((request) => request.path === "/api/v1/admin/capabilities/manifest")).toBe(false);
+  });
+
+  it("does not reveal a cached capability manifest after plugin read permission is lost", async () => {
+    currentPrincipalRole = "mcp_viewer";
+    const testClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    testClient.setQueryData(["capability-manifest"], capabilityManifest);
+
+    render(
+      <QueryClientProvider client={testClient}>
+        <MemoryRouter initialEntries={["/mcp"]}>
+          <AuthProvider>
+            <AppRoutes />
+          </AuthProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText("Filesystem MCP")).not.toBeNull();
+    expect(screen.getByText("当前账号无权查看运行时能力。")).not.toBeNull();
+    expect(screen.queryByRole("table", { name: "运行时能力注册表" })).toBeNull();
+    expect(screen.queryByText("calculator.evaluate")).toBeNull();
+    expect(requests.some((request) => request.path === "/api/v1/admin/capabilities/manifest")).toBe(false);
+  });
+
+  it("shows an empty state when the runtime exposes no capabilities", async () => {
+    visibleCapabilityManifest = { schema_version: 1, capabilities: [] };
+
+    render(<TestApp initialPath="/mcp" />);
+
+    expect(await screen.findByText("Filesystem MCP")).not.toBeNull();
+    expect(screen.getByText("还没有运行时能力")).not.toBeNull();
+    expect(screen.queryByRole("table", { name: "运行时能力注册表" })).toBeNull();
+  });
+
   it("shows MCP, memory, and modular log pages", async () => {
     const user = userEvent.setup();
 
     render(<TestApp initialPath="/mcp" />);
     expect(await screen.findByText("Filesystem MCP")).not.toBeNull();
     expect(screen.getByText("healthy")).not.toBeNull();
+    const capabilityTable = screen.getByRole("table", { name: "运行时能力注册表" });
+    expect(within(capabilityTable).getAllByText("calculator.evaluate").length).toBeGreaterThan(0);
+    expect(within(capabilityTable).getByText("summarizer")).not.toBeNull();
+    expect(within(capabilityTable).getByText("workspace_root_not_configured")).not.toBeNull();
+    expect(within(capabilityTable).getAllByText("无需审批").length).toBeGreaterThan(0);
+    expect(within(capabilityTable).getByText("运行时策略")).not.toBeNull();
+    expect(requests.find((request) => request.path === "/api/v1/admin/capabilities/manifest")).toMatchObject({
+      method: "GET",
+    });
 
     cleanup();
     render(<TestApp initialPath="/memory" />);

@@ -899,6 +899,26 @@ const McpServerSchema = z.object({
 
 export type McpServer = z.infer<typeof McpServerSchema>;
 
+const CapabilityManifestItemSchema = z.object({
+  id: z.string(),
+  kind: z.string(),
+  adapter: z.string(),
+  permission_class: z.string(),
+  sandbox_profile: z.string(),
+  available: z.boolean(),
+  availability_reason: z.string().nullable(),
+  replay_safe: z.boolean(),
+  aliases: z.array(z.string()).default([]),
+});
+
+const CapabilityManifestSchema = z.object({
+  schema_version: z.number(),
+  capabilities: z.array(CapabilityManifestItemSchema),
+});
+
+export type CapabilityManifestItem = z.infer<typeof CapabilityManifestItemSchema>;
+export type CapabilityManifest = z.infer<typeof CapabilityManifestSchema>;
+
 const ChannelRuntimeStatusSchema = z.object({
   status: z.string(),
   ready: z.boolean(),
@@ -1817,6 +1837,13 @@ export const api = {
   },
   mcpServers(): Promise<McpServer[]> {
     return request("/api/v1/admin/mcp", { method: "GET" }, z.array(McpServerSchema));
+  },
+  capabilityManifest(): Promise<CapabilityManifest> {
+    return request(
+      "/api/v1/admin/capabilities/manifest",
+      { method: "GET" },
+      CapabilityManifestSchema,
+    );
   },
   createMcpServer(payload: {
     id: string;

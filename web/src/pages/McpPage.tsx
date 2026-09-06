@@ -1,7 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useState } from "react";
 
-import { api, formatApiError, type McpServer } from "../api/client";
+import { api, formatApiError, type CapabilityManifestItem, type McpServer } from "../api/client";
+import { useAuth } from "../auth/AuthProvider";
 
 function parseCsv(value: string) {
   return value
@@ -25,9 +26,39 @@ function fillFromServer(server: McpServer) {
   };
 }
 
+function capabilityKindLabel(kind: string) {
+  if (kind === "builtin") return "内置";
+  if (kind === "skill") return "Skill";
+  if (kind === "mcp") return "MCP";
+  if (kind === "plugin") return "插件";
+  return kind;
+}
+
+function availabilityLabel(capability: CapabilityManifestItem) {
+  return capability.available ? "可用" : "不可用";
+}
+
+function approvalLabel(capability: CapabilityManifestItem) {
+  return capability.replay_safe ? "无需审批" : "运行时策略";
+}
+
 export function McpPage() {
+  const auth = useAuth();
+  const canReadCapabilityManifest = auth.hasPermission("plugin:read");
   const queryClient = useQueryClient();
   const servers = useQuery({ queryKey: ["mcp"], queryFn: () => api.mcpServers() });
+  const capabilityManifest = useQuery({
+    queryKey: [
+      "capability-manifest",
+      auth.user?.tenant_id,
+      auth.user?.user_id,
+      auth.user?.role,
+      canReadCapabilityManifest,
+    ],
+    queryFn: () => api.capabilityManifest(),
+    enabled: canReadCapabilityManifest,
+  });
+  const visibleCapabilityManifest = canReadCapabilityManifest ? capabilityManifest.data : undefined;
   const [serverId, setServerId] = useState("filesystem");
   const [name, setName] = useState("Filesystem MCP");
   const [transport, setTransport] = useState("stdio");
@@ -110,6 +141,58 @@ export function McpPage() {
         MCP 用来接入文件、浏览器、数据库或外部系统。这里配置的是生产连接参数：本地
         stdio 需要命令和可执行白名单，远程 MCP 需要 HTTPS URL 和域名白名单。
       </p>
+
+      <section aria-label="运行时能力注册表">
+        <h3>运行时能力注册表</h3>
+        {!canReadCapabilityManifest ? <p className="field-help">当前账号无权查看运行时能力。</p> : null}
+        {capabilityManifest.isLoading ? <p>正在加载运行时能力...</p> : null}
+        {capabilityManifest.isError ? (
+          <p role="alert">{formatApiError(capabilityManifest.error, "运行时能力加载失败")}</p>
+        ) : null}
+        {visibleCapabilityManifest && visibleCapabilityManifest.capabilities.length === 0 ? (
+          <article>
+            <h4>还没有运行时能力</h4>
+            <p>当前租户暂未暴露可调用能力；确认运行时网关、Skill 存储和工具注册表配置。</p>
+          </article>
+        ) : null}
+        {visibleCapabilityManifest && visibleCapabilityManifest.capabilities.length > 0 ? (
+          <div className="table-shell">
+            <table aria-label="运行时能力注册表" className="dense-table">
+              <thead>
+                <tr>
+                  <th>能力</th>
+                  <th>类型</th>
+                  <th>适配器</th>
+                  <th>权限</th>
+                  <th>沙箱</th>
+                  <th>状态</th>
+                  <th>审批</th>
+                  <th>别名</th>
+                </tr>
+              </thead>
+              <tbody>
+                {visibleCapabilityManifest.capabilities.map((capability) => (
+                  <tr key={capability.id}>
+                    <td><strong>{capability.id}</strong></td>
+                    <td>{capabilityKindLabel(capability.kind)}</td>
+                    <td>{capability.adapter}</td>
+                    <td>{capability.permission_class}</td>
+                    <td>{capability.sandbox_profile}</td>
+                    <td>
+                      {availabilityLabel(capability)}
+                      {capability.availability_reason ? (
+                        <p className="field-help">{capability.availability_reason}</p>
+                      ) : null}
+                    </td>
+                    <td>{approvalLabel(capability)}</td>
+                    <td>{capability.aliases.join(", ") || "无"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : null}
+      </section>
 
       <div className="two-column">
         <form onSubmit={submit} aria-label="保存 MCP 工具">
