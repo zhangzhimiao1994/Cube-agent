@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import keyword
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import replace
 from decimal import Decimal
-from typing import Protocol
+from typing import Protocol, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -95,6 +96,21 @@ _DISPATCH_OUTPUT_SCHEMA: Mapping[str, str] = {
     "artifacts": "string[]",
     "verification": "string[]",
 }
+_MAX_CAPABILITY_INVENTORY_ITEMS = 96
+_MAX_CAPABILITY_INVENTORY_ALIASES = 16
+_MAX_CAPABILITY_INVENTORY_SCAN_ITEMS = 512
+_SAFE_CAPABILITY_INVENTORY_ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
+_SENSITIVE_CAPABILITY_INVENTORY_TEXT = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "authorization",
+        "bearer",
+        "password",
+        "secret",
+        "token",
+    }
+)
 _SOFTWARE_TASK_KEYWORDS = (
     "code",
     "代码",
@@ -222,6 +238,7 @@ class _PlannedRuntime:
                     ),
                     "capability_execution_plan": _capability_execution_plan_payload(
                         self._roles,
+                        tenant_id=context.tenant_id,
                         capability_gateway=self._capability_gateway,
                     ),
                 },
@@ -1366,9 +1383,10 @@ def _model_execution_plan_payload(
 def _capability_execution_plan_payload(
     roles: tuple[Mapping[str, JsonValue], ...],
     *,
+    tenant_id: UUID | None = None,
     capability_gateway: RuntimeCapabilityGatewayProtocol | None,
 ) -> Mapping[str, JsonValue]:
-    return {
+    payload: dict[str, JsonValue] = {
         "schema_version": 1,
         "permission_boundary": "runtime_capability_gateway",
         "role_capability_assignments": tuple(
@@ -1383,6 +1401,13 @@ def _capability_execution_plan_payload(
             if "id" in role
         ),
     }
+    capability_inventory = _capability_inventory_payload(
+        tenant_id,
+        capability_gateway=capability_gateway,
+    )
+    if capability_inventory is not None:
+        payload["capability_inventory"] = capability_inventory
+    return payload
 
 
 def _tool_names(value: object) -> tuple[str, ...]:
@@ -1402,6 +1427,105 @@ def _capability_plan_item(
         "replay_safe": replay_safe,
         "approval_policy": "not_required" if replay_safe else "runtime_policy",
     }
+
+
+def _capability_inventory_payload(
+    tenant_id: UUID | None,
+    *,
+    capability_gateway: RuntimeCapabilityGatewayProtocol | None,
+) -> Mapping[str, JsonValue] | None:
+    if tenant_id is None or capability_gateway is None:
+        return None
+    manifest_provider = getattr(capability_gateway, "capability_manifest", None)
+    if not callable(manifest_provider):
+        return None
+    try:
+        manifest = manifest_provider(tenant_id)
+    except Exception:  # noqa: BLE001 - capability inventory is optional planning context.
+        return None
+    if not isinstance(manifest, Mapping) or manifest.get("schema_version") != 1:
+        return None
+    raw_items = manifest.get("capabilities")
+    if not isinstance(raw_items, tuple | list):
+        return None
+    items: list[Mapping[str, JsonValue]] = []
+    truncated = False
+    for index, raw_item in enumerate(raw_items):
+        if (
+            index >= _MAX_CAPABILITY_INVENTORY_SCAN_ITEMS
+            or len(items) >= _MAX_CAPABILITY_INVENTORY_ITEMS
+        ):
+            truncated = True
+            break
+        item = _capability_inventory_item(raw_item)
+        if item is not None:
+            items.append(item)
+    return {
+        "schema_version": 1,
+        "items": tuple(items),
+        "truncated": truncated,
+    }
+
+
+def _capability_inventory_item(raw_item: object) -> Mapping[str, JsonValue] | None:
+    if not isinstance(raw_item, Mapping):
+        return None
+    item_id = raw_item.get("id")
+    if (
+        not isinstance(item_id, str)
+        or _SAFE_CAPABILITY_INVENTORY_ID.fullmatch(item_id) is None
+    ):
+        return None
+    available = raw_item.get("available")
+    availability_reason = raw_item.get("availability_reason")
+    aliases = tuple(
+        alias
+        for alias in _tool_names(raw_item.get("aliases"))
+        if _is_safe_inventory_token(alias, max_length=128)
+    )[:_MAX_CAPABILITY_INVENTORY_ALIASES]
+    return {
+        "id": item_id,
+        "kind": _inventory_token(raw_item.get("kind"), "unknown", max_length=64),
+        "adapter": _inventory_token(raw_item.get("adapter"), "unknown", max_length=128),
+        "permission_class": _inventory_token(
+            raw_item.get("permission_class"),
+            "unknown",
+            max_length=128,
+        ),
+        "sandbox_profile": _inventory_token(
+            raw_item.get("sandbox_profile"),
+            "unknown",
+            max_length=128,
+        ),
+        "available": available if isinstance(available, bool) else False,
+        "availability_reason": _optional_inventory_token(
+            availability_reason,
+            max_length=128,
+        ),
+        "replay_safe": raw_item.get("replay_safe") is True,
+        "aliases": aliases,
+    }
+
+
+def _inventory_token(value: object, default: str, *, max_length: int) -> str:
+    if not _is_safe_inventory_token(value, max_length=max_length):
+        return default
+    return cast(str, value)
+
+
+def _optional_inventory_token(value: object, *, max_length: int) -> str | None:
+    if not _is_safe_inventory_token(value, max_length=max_length):
+        return None
+    return cast(str, value)
+
+
+def _is_safe_inventory_token(value: object, *, max_length: int) -> bool:
+    if not isinstance(value, str) or not value or len(value) > max_length:
+        return False
+    normalized = value.casefold()
+    if any(part in normalized for part in _SENSITIVE_CAPABILITY_INVENTORY_TEXT):
+        return False
+    return _SAFE_CAPABILITY_INVENTORY_ID.fullmatch(value) is not None
 
 
 def _is_replay_safe_capability(

@@ -30,6 +30,7 @@ from agent_hub.runtime.defaults import (
     ConfigBackedHybridRuntime,
     UnavailableRuntime,
     _assign_models_to_roles,
+    _capability_inventory_payload,
     _discussion_plan,
     _dispatch_parallelism,
     _dispatch_plan,
@@ -110,6 +111,50 @@ class FakeCapabilityAvailability:
     ) -> Mapping[str, JsonValue]:
         del tenant_id, run_id, actor, name, arguments, idempotency_key
         return {}
+
+
+class ManifestCapabilityGateway(FakeCapabilityAvailability):
+    def capability_manifest(self, tenant_id: UUID) -> Mapping[str, JsonValue]:
+        assert tenant_id == TENANT_ID
+        return {
+            "schema_version": 1,
+            "capabilities": (
+                {
+                    "id": "docx",
+                    "kind": "skill",
+                    "adapter": "skill_sandbox",
+                    "permission_class": "skill.use",
+                    "sandbox_profile": "systemd_skill_sandbox",
+                    "available": True,
+                    "availability_reason": None,
+                    "replay_safe": False,
+                    "aliases": (),
+                },
+                {
+                    "id": "filesystem.read_file",
+                    "kind": "mcp",
+                    "adapter": "mcp_server",
+                    "permission_class": "mcp.invoke",
+                    "sandbox_profile": "mcp_stdio",
+                    "available": False,
+                    "availability_reason": "mcp_server_not_discovered",
+                    "replay_safe": False,
+                    "aliases": (),
+                },
+            ),
+        }
+
+
+class BadManifestCapabilityGateway(FakeCapabilityAvailability):
+    def __init__(self, manifest: Mapping[str, JsonValue] | Exception) -> None:
+        super().__init__(set())
+        self.manifest = manifest
+
+    def capability_manifest(self, tenant_id: UUID) -> Mapping[str, JsonValue]:
+        assert tenant_id == TENANT_ID
+        if isinstance(self.manifest, Exception):
+            raise self.manifest
+        return self.manifest
 
 
 class TruthyReplaySafeGateway(FakeCapabilityAvailability):
@@ -1023,6 +1068,399 @@ async def test_config_backed_dispatch_runtime_treats_uncertain_capabilities_as_p
         "replay_safe": False,
         "approval_policy": "runtime_policy",
     }
+
+
+@pytest.mark.asyncio
+async def test_config_backed_dispatch_runtime_exposes_capability_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-chat",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://deepseek",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [
+                    {
+                        "id": "writer",
+                        "role": "Writer",
+                        "prompt": "Draft a document.",
+                        "model": "main",
+                        "skills": ["docx"],
+                    }
+                ],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id,
+            deployments,
+        ),
+        transport=FakeTransport(),
+        capability_gateway=ManifestCapabilityGateway({"docx"}),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request="Draft a document.",
+                routing_decision={"selected_agent_ids": ("writer",)},
+            )
+        )
+    ]
+
+    capability_plan = cast(
+        Mapping[str, JsonValue],
+        events[0].payload["capability_execution_plan"],
+    )
+    assert capability_plan["capability_inventory"] == {
+        "schema_version": 1,
+        "items": (
+            {
+                "id": "docx",
+                "kind": "skill",
+                "adapter": "skill_sandbox",
+                "permission_class": "skill.use",
+                "sandbox_profile": "systemd_skill_sandbox",
+                "available": True,
+                "availability_reason": None,
+                "replay_safe": False,
+                "aliases": (),
+            },
+            {
+                "id": "filesystem.read_file",
+                "kind": "mcp",
+                "adapter": "mcp_server",
+                "permission_class": "mcp.invoke",
+                "sandbox_profile": "mcp_stdio",
+                "available": False,
+                "availability_reason": "mcp_server_not_discovered",
+                "replay_safe": False,
+                "aliases": (),
+            },
+        ),
+        "truncated": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_config_backed_dispatch_runtime_omits_invalid_capability_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-chat",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://deepseek",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [
+                    {
+                        "id": "writer",
+                        "role": "Writer",
+                        "prompt": "Draft a document.",
+                        "model": "main",
+                        "skills": ["docx"],
+                    }
+                ],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id,
+            deployments,
+        ),
+        transport=FakeTransport(),
+        capability_gateway=BadManifestCapabilityGateway(RuntimeError("manifest unavailable")),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request="Draft a document.",
+                routing_decision={"selected_agent_ids": ("writer",)},
+            )
+        )
+    ]
+
+    capability_plan = cast(
+        Mapping[str, JsonValue],
+        events[0].payload["capability_execution_plan"],
+    )
+    assert "capability_inventory" not in capability_plan
+
+
+@pytest.mark.asyncio
+async def test_config_backed_dispatch_runtime_bounds_capability_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-chat",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://deepseek",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [
+                    {
+                        "id": "writer",
+                        "role": "Writer",
+                        "prompt": "Draft a document.",
+                        "model": "main",
+                        "skills": ["docx"],
+                    }
+                ],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id,
+            deployments,
+        ),
+        transport=FakeTransport(),
+        capability_gateway=BadManifestCapabilityGateway(
+            {
+                "schema_version": 1,
+                "capabilities": (
+                    {
+                        "id": "bad tool",
+                        "kind": "mcp",
+                    },
+                    *(
+                        {
+                            "id": f"plugin.tool_{index}",
+                            "kind": "plugin" + ("x" * 100),
+                            "adapter": "plugin_registry",
+                            "permission_class": "plugin.use",
+                            "sandbox_profile": "remote_connector",
+                            "available": True,
+                            "availability_reason": "x" * 200,
+                            "replay_safe": False,
+                            "aliases": (
+                                *(f"alias_{alias_index}" for alias_index in range(40)),
+                                "bad alias",
+                            ),
+                        }
+                        for index in range(300)
+                    ),
+                ),
+            }
+        ),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request="Draft a document.",
+                routing_decision={"selected_agent_ids": ("writer",)},
+            )
+        )
+    ]
+
+    capability_plan = cast(
+        Mapping[str, JsonValue],
+        events[0].payload["capability_execution_plan"],
+    )
+    inventory = cast(Mapping[str, JsonValue], capability_plan["capability_inventory"])
+    items = cast(tuple[Mapping[str, JsonValue], ...], inventory["items"])
+    assert inventory["truncated"] is True
+    assert len(items) == 96
+    assert items[0]["id"] == "plugin.tool_0"
+    assert items[0]["kind"] == "unknown"
+    assert items[0]["availability_reason"] is None
+    assert items[0]["aliases"] == tuple(f"alias_{index}" for index in range(16))
+    assert "bad tool" not in {item["id"] for item in items}
+
+
+@pytest.mark.asyncio
+async def test_config_backed_dispatch_runtime_bounds_invalid_inventory_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-chat",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://deepseek",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [
+                    {
+                        "id": "writer",
+                        "role": "Writer",
+                        "prompt": "Draft a document.",
+                        "model": "main",
+                        "skills": ["docx"],
+                    }
+                ],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id,
+            deployments,
+        ),
+        transport=FakeTransport(),
+        capability_gateway=BadManifestCapabilityGateway(
+            {
+                "schema_version": 1,
+                "capabilities": tuple({"id": f"bad tool {index}"} for index in range(600)),
+            }
+        ),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request="Draft a document.",
+                routing_decision={"selected_agent_ids": ("writer",)},
+            )
+        )
+    ]
+
+    capability_plan = cast(
+        Mapping[str, JsonValue],
+        events[0].payload["capability_execution_plan"],
+    )
+    inventory = cast(Mapping[str, JsonValue], capability_plan["capability_inventory"])
+    assert inventory["items"] == ()
+    assert inventory["truncated"] is True
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    (
+        {"schema_version": 2, "capabilities": ()},
+        {"schema_version": 1, "capabilities": {"id": "docx"}},
+    ),
+)
+def test_capability_inventory_payload_omits_bad_manifest_shapes(
+    manifest: Mapping[str, JsonValue],
+) -> None:
+    assert (
+        _capability_inventory_payload(
+            TENANT_ID,
+            capability_gateway=BadManifestCapabilityGateway(manifest),
+        )
+        is None
+    )
+
+
+def test_capability_inventory_payload_sanitizes_manifest_tokens() -> None:
+    inventory = _capability_inventory_payload(
+        TENANT_ID,
+        capability_gateway=BadManifestCapabilityGateway(
+            {
+                "schema_version": 1,
+                "capabilities": (
+                    "not a mapping",
+                    {
+                        "id": "plugin.safe_tool",
+                        "kind": "secret_plugin",
+                        "adapter": "adapter with spaces",
+                        "permission_class": "plugin.use",
+                        "sandbox_profile": "token_sandbox",
+                        "available": True,
+                        "availability_reason": "bearer_token",
+                        "replay_safe": False,
+                        "aliases": ("safe_alias", "secret_alias"),
+                    },
+                ),
+            }
+        ),
+    )
+
+    assert inventory is not None
+    items = cast(tuple[Mapping[str, JsonValue], ...], inventory["items"])
+    assert items == (
+        {
+            "id": "plugin.safe_tool",
+            "kind": "unknown",
+            "adapter": "unknown",
+            "permission_class": "plugin.use",
+            "sandbox_profile": "unknown",
+            "available": True,
+            "availability_reason": None,
+            "replay_safe": False,
+            "aliases": ("safe_alias",),
+        },
+    )
 
 
 @pytest.mark.asyncio
