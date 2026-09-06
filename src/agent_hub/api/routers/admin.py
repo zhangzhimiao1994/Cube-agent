@@ -544,6 +544,27 @@ class McpServerRequest(BaseModel):
     timeout_seconds: float = Field(default=10, gt=0, le=120)
 
 
+class CapabilityManifestItemResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=128)
+    kind: str = Field(min_length=1, max_length=64)
+    adapter: str = Field(min_length=1, max_length=128)
+    permission_class: str = Field(min_length=1, max_length=128)
+    sandbox_profile: str = Field(min_length=1, max_length=128)
+    available: bool
+    availability_reason: str | None = None
+    replay_safe: bool
+    aliases: list[str] = Field(default_factory=list, max_length=128)
+
+
+class CapabilityManifestResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int
+    capabilities: list[CapabilityManifestItemResponse]
+
+
 class ChannelRuntimeStatusResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -2731,6 +2752,10 @@ def _tar_group_to_skill_archive(
             target_info.external_attr = (member.mode & 0o777) << 16
             output.writestr(target_info, source.read())
     return buffer.getvalue()
+
+
+class CapabilityManifestProvider(Protocol):
+    def capability_manifest(self, tenant_id: UUID) -> Mapping[str, JsonValue]: ...
 
 
 @dataclass(slots=True)
@@ -5867,6 +5892,17 @@ def _service(request: Request) -> AdminResourceService:
     if service is None:
         raise PublicAPIError(503, "service_unavailable", "service unavailable")
     return cast(AdminResourceService, service)
+
+
+def _runtime_capability_gateway(request: Request) -> CapabilityManifestProvider:
+    gateway = getattr(request.app.state, "runtime_capability_gateway", None)
+    if gateway is None or not callable(getattr(gateway, "capability_manifest", None)):
+        raise PublicAPIError(
+            503,
+            "capability_manifest_unavailable",
+            "capability manifest unavailable",
+        )
+    return cast(CapabilityManifestProvider, gateway)
 
 
 def _multimedia_generation_executor(request: Request) -> MultimediaGenerationExecutorProtocol:
@@ -9426,6 +9462,21 @@ async def delete_skill(
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
     return OperationStatusResponse(status="deleted")
+
+
+@router.get(
+    "/capabilities/manifest",
+    response_model=CapabilityManifestResponse,
+    responses=error_responses(401, 403, 503),
+)
+async def capability_manifest(
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+) -> CapabilityManifestResponse:
+    _require(principal, "plugin:read")
+    return CapabilityManifestResponse.model_validate(
+        _runtime_capability_gateway(request).capability_manifest(principal.tenant_id)
+    )
 
 
 @router.get(

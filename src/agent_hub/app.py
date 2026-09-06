@@ -845,6 +845,9 @@ def create_app(
                             admin_service_for_capabilities.get_settings
                         ),
                     )
+                    application.state.runtime_capability_gateway = (
+                        runtime_capability_stack.runtime_gateway
+                    )
                     active_runtime_registry = configured_runtime_registry(
                         config_service=ConfigService(active_sessions),
                         secret_service=active_secret_service,
@@ -1017,6 +1020,7 @@ def create_app(
     application.state.bootstrap_tenant_id = configured_settings.bootstrap_tenant_id
     application.state.run_service = run_service
     application.state.runtime_registry = active_runtime_registry
+    application.state.runtime_capability_gateway = None
     application.state.mode_router = mode_router
     application.state.run_queue = task_queue
     application.state.schedule_service = None

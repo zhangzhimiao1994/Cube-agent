@@ -2276,6 +2276,64 @@ def headers() -> dict[str, str]:
     return {"Authorization": "Bearer valid-token"}
 
 
+class FakeRuntimeCapabilityGateway:
+    def __init__(self) -> None:
+        self.tenant_ids: list[UUID] = []
+
+    def capability_manifest(self, tenant_id: UUID) -> dict[str, object]:
+        self.tenant_ids.append(tenant_id)
+        return {
+            "schema_version": 1,
+            "capabilities": (
+                {
+                    "id": "mcp.search",
+                    "kind": "mcp",
+                    "adapter": "mcp_server",
+                    "permission_class": "mcp.call",
+                    "sandbox_profile": "remote_connector",
+                    "available": True,
+                    "availability_reason": None,
+                    "replay_safe": False,
+                    "aliases": ("search_web",),
+                },
+            ),
+        }
+
+
+def test_capability_manifest_endpoint_exposes_runtime_gateway_manifest() -> None:
+    api = client()
+    gateway = FakeRuntimeCapabilityGateway()
+    cast(Any, api.app).state.runtime_capability_gateway = gateway
+
+    response = api.get("/api/v1/admin/capabilities/manifest", headers=headers())
+
+    assert response.status_code == 200
+    assert gateway.tenant_ids == [TENANT_ID]
+    assert response.json() == {
+        "schema_version": 1,
+        "capabilities": [
+            {
+                "id": "mcp.search",
+                "kind": "mcp",
+                "adapter": "mcp_server",
+                "permission_class": "mcp.call",
+                "sandbox_profile": "remote_connector",
+                "available": True,
+                "availability_reason": None,
+                "replay_safe": False,
+                "aliases": ["search_web"],
+            },
+        ],
+    }
+
+
+def test_capability_manifest_endpoint_fails_when_runtime_gateway_is_unavailable() -> None:
+    response = client().get("/api/v1/admin/capabilities/manifest", headers=headers())
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "capability_manifest_unavailable"
+
+
 @dataclass(frozen=True, slots=True)
 class SubmittedScheduleRun:
     id: UUID
