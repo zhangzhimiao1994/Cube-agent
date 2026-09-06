@@ -19,12 +19,14 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from agent_hub.api.errors import PublicAPIError
+from agent_hub.api.routers import admin as admin_router
 from agent_hub.api.routers.admin import (
     AgentResourceRequest,
     InMemoryAdminResourceService,
     MainAgentConfigRequest,
     MainAgentModelConfig,
     McpServerRequest,
+    McpServerResponse,
     ModelDeploymentRequest,
     PersistentAdminResourceService,
     RunArtifactResponse,
@@ -2251,6 +2253,7 @@ def test_routing_details_redacts_sensitive_harness_profile_values() -> None:
 
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
+OTHER_TENANT_ID = UUID("00000000-0000-4000-8000-000000000002")
 ACTOR_ID = UUID("11111111-1111-4111-8111-111111111111")
 SECRET_ID = UUID("22222222-2222-4222-8222-222222222222")
 USER_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -2280,23 +2283,35 @@ class FakeRuntimeCapabilityGateway:
     def __init__(self) -> None:
         self.tenant_ids: list[UUID] = []
 
-    def capability_manifest(self, tenant_id: UUID) -> dict[str, object]:
+    def capability_manifest(
+        self,
+        tenant_id: UUID,
+        *,
+        extra_sources: tuple[object, ...] = (),
+    ) -> dict[str, object]:
         self.tenant_ids.append(tenant_id)
+        capabilities: list[object] = []
+        for source in extra_sources:
+            source_manifest = cast(Any, source).manifests()
+            raw_capabilities = source_manifest["capabilities"]
+            assert isinstance(raw_capabilities, tuple)
+            capabilities.extend(raw_capabilities)
+        capabilities.append(
+            {
+                "id": "mcp.search",
+                "kind": "mcp",
+                "adapter": "mcp_server",
+                "permission_class": "mcp.call",
+                "sandbox_profile": "remote_connector",
+                "available": True,
+                "availability_reason": None,
+                "replay_safe": False,
+                "aliases": ("search_web",),
+            }
+        )
         return {
             "schema_version": 1,
-            "capabilities": (
-                {
-                    "id": "mcp.search",
-                    "kind": "mcp",
-                    "adapter": "mcp_server",
-                    "permission_class": "mcp.call",
-                    "sandbox_profile": "remote_connector",
-                    "available": True,
-                    "availability_reason": None,
-                    "replay_safe": False,
-                    "aliases": ("search_web",),
-                },
-            ),
+            "capabilities": tuple(capabilities),
         }
 
 
@@ -2309,22 +2324,125 @@ def test_capability_manifest_endpoint_exposes_runtime_gateway_manifest() -> None
 
     assert response.status_code == 200
     assert gateway.tenant_ids == [TENANT_ID]
-    assert response.json() == {
-        "schema_version": 1,
-        "capabilities": [
-            {
-                "id": "mcp.search",
-                "kind": "mcp",
-                "adapter": "mcp_server",
-                "permission_class": "mcp.call",
-                "sandbox_profile": "remote_connector",
-                "available": True,
-                "availability_reason": None,
-                "replay_safe": False,
-                "aliases": ["search_web"],
-            },
-        ],
+    body = response.json()
+    capabilities = {
+        item["id"]: item
+        for item in body["capabilities"]
     }
+    assert body["schema_version"] == 1
+    assert "filesystem.list_directory" in capabilities
+    assert "filesystem.read_file" in capabilities
+    assert capabilities["mcp.search"] == {
+        "id": "mcp.search",
+        "kind": "mcp",
+        "adapter": "mcp_server",
+        "permission_class": "mcp.call",
+        "sandbox_profile": "remote_connector",
+        "available": True,
+        "availability_reason": None,
+        "replay_safe": False,
+        "aliases": ["search_web"],
+    }
+
+
+def test_capability_manifest_endpoint_includes_saved_mcp_config_tools() -> None:
+    api = client()
+    gateway = FakeRuntimeCapabilityGateway()
+    cast(Any, api.app).state.runtime_capability_gateway = gateway
+    response = api.post(
+        "/api/v1/admin/mcp",
+        headers=headers(),
+        json={
+            "id": "filesystem",
+            "name": "Filesystem MCP",
+            "allowed_tools": ["read_file", "list_directory"],
+            "transport": "stdio",
+            "command": "uvx",
+            "args": ["mcp-server-filesystem"],
+            "executable_allowlist": ["uvx"],
+            "timeout_seconds": 10,
+        },
+    )
+    assert response.status_code == 200
+
+    manifest_response = api.get("/api/v1/admin/capabilities/manifest", headers=headers())
+
+    assert manifest_response.status_code == 200
+    capabilities = {
+        item["id"]: item
+        for item in manifest_response.json()["capabilities"]
+    }
+    assert capabilities["filesystem.list_directory"] == {
+        "id": "filesystem.list_directory",
+        "kind": "mcp",
+        "adapter": "mcp_server",
+        "permission_class": "mcp.invoke",
+        "sandbox_profile": "mcp_stdio",
+        "available": False,
+        "availability_reason": "mcp_server_not_discovered",
+        "replay_safe": False,
+        "aliases": [],
+    }
+    assert capabilities["filesystem.read_file"]["sandbox_profile"] == "mcp_stdio"
+
+
+def test_capability_manifest_endpoint_reads_mcp_config_for_principal_tenant() -> None:
+    class OtherTenantAuthService:
+        def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
+            if token != "valid-token":
+                raise InvalidCredentials("bad token")
+            return AuthenticatedPrincipal(USER_ID, OTHER_TENANT_ID, Role.SUPER_ADMIN)
+
+    class RecordingMcpService:
+        def __init__(self) -> None:
+            self.tenant_ids: list[UUID | None] = []
+
+        async def list_mcp_servers(
+            self,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> tuple[McpServerResponse, ...]:
+            self.tenant_ids.append(tenant_id)
+            return ()
+
+    api = create_app(auth_service=OtherTenantAuthService(), rate_limiter=object())
+    service = RecordingMcpService()
+    gateway = FakeRuntimeCapabilityGateway()
+    cast(Any, api).state.admin_resource_service = service
+    cast(Any, api).state.runtime_capability_gateway = gateway
+
+    response = TestClient(api).get(
+        "/api/v1/admin/capabilities/manifest",
+        headers=headers(),
+    )
+
+    assert response.status_code == 200
+    assert service.tenant_ids == [OTHER_TENANT_ID]
+    assert gateway.tenant_ids == [OTHER_TENANT_ID]
+
+
+def test_capability_manifest_endpoint_requires_plugin_and_mcp_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    required_permissions: list[str] = []
+
+    class RecordingAuthorizer:
+        def require(
+            self,
+            principal: AuthenticatedPrincipal,
+            permission: str,
+        ) -> AuthenticatedPrincipal:
+            required_permissions.append(permission)
+            return principal
+
+    monkeypatch.setattr(admin_router, "Authorizer", RecordingAuthorizer)
+    api = client()
+    cast(Any, api.app).state.runtime_capability_gateway = FakeRuntimeCapabilityGateway()
+
+    response = api.get("/api/v1/admin/capabilities/manifest", headers=headers())
+
+    assert response.status_code == 200
+    assert required_permissions == ["plugin:read", "mcp:read"]
 
 
 def test_capability_manifest_endpoint_fails_when_runtime_gateway_is_unavailable() -> None:

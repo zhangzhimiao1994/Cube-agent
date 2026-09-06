@@ -56,6 +56,7 @@ from agent_hub.evolution import (
     plan_evolution_next_round,
 )
 from agent_hub.files.generated import GeneratedFileStore, validate_generated_filename
+from agent_hub.mcp.manifest import McpConfigCapabilityManifestSource
 from agent_hub.models.capabilities import infer_model_capabilities
 from agent_hub.models.capacity import safe_operational_limit
 from agent_hub.models.gateway import ModelTransport
@@ -1930,7 +1931,11 @@ class AdminResourceService(Protocol):
 
     async def delete_skill(self, skill_id: str) -> None: ...
 
-    async def list_mcp_servers(self) -> tuple[McpServerResponse, ...]: ...
+    async def list_mcp_servers(
+        self,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> tuple[McpServerResponse, ...]: ...
 
     async def upsert_mcp_server(self, request: McpServerRequest) -> McpServerResponse: ...
 
@@ -2755,7 +2760,12 @@ def _tar_group_to_skill_archive(
 
 
 class CapabilityManifestProvider(Protocol):
-    def capability_manifest(self, tenant_id: UUID) -> Mapping[str, JsonValue]: ...
+    def capability_manifest(
+        self,
+        tenant_id: UUID,
+        *,
+        extra_sources: tuple[Any, ...] = (),
+    ) -> Mapping[str, JsonValue]: ...
 
 
 @dataclass(slots=True)
@@ -3423,7 +3433,11 @@ class InMemoryAdminResourceService:
     async def delete_skill(self, skill_id: str) -> None:
         del self.skills[skill_id]
 
-    async def list_mcp_servers(self) -> tuple[McpServerResponse, ...]:
+    async def list_mcp_servers(
+        self,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> tuple[McpServerResponse, ...]:
         return tuple(self.mcp_servers.values())
 
     async def upsert_mcp_server(self, request: McpServerRequest) -> McpServerResponse:
@@ -5177,9 +5191,15 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             raise PublicAPIError(422, "request_validation", "invalid skill id")
         return target
 
-    async def list_mcp_servers(self) -> tuple[McpServerResponse, ...]:
-        resources = await self._list_admin_payloads("mcp")
+    async def list_mcp_servers(
+        self,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> tuple[McpServerResponse, ...]:
+        resources = await self._list_admin_payloads("mcp", tenant_id=tenant_id)
         if resources is None:
+            if tenant_id is not None and tenant_id != self._tenant_id:
+                return ()
             return await super().list_mcp_servers()
         return tuple(McpServerResponse.model_validate(payload) for payload in resources)
 
@@ -5513,14 +5533,20 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             )
         return tuple(entries)
 
-    async def _list_admin_payloads(self, kind: str) -> list[dict[str, object]] | None:
+    async def _list_admin_payloads(
+        self,
+        kind: str,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> list[dict[str, object]] | None:
         if self._session_factory is None:
             return None
+        target_tenant_id = self._tenant_id if tenant_id is None else tenant_id
         async with self._session_factory() as session:
             rows = (
                 await session.execute(
                     select(AdminResourceRow)
-                    .where(AdminResourceRow.tenant_id == self._tenant_id)
+                    .where(AdminResourceRow.tenant_id == target_tenant_id)
                     .where(AdminResourceRow.kind == kind)
                     .order_by(AdminResourceRow.created_at)
                 )
@@ -9472,10 +9498,18 @@ async def delete_skill(
 async def capability_manifest(
     request: Request,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
 ) -> CapabilityManifestResponse:
     _require(principal, "plugin:read")
+    _require(principal, "mcp:read")
+    mcp_source = McpConfigCapabilityManifestSource(
+        await service.list_mcp_servers(tenant_id=principal.tenant_id)
+    )
     return CapabilityManifestResponse.model_validate(
-        _runtime_capability_gateway(request).capability_manifest(principal.tenant_id)
+        _runtime_capability_gateway(request).capability_manifest(
+            principal.tenant_id,
+            extra_sources=(mcp_source,),
+        )
     )
 
 
@@ -9487,7 +9521,7 @@ async def list_mcp_servers(
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> list[McpServerResponse]:
     _require(principal, "mcp:read")
-    return list(await service.list_mcp_servers())
+    return list(await service.list_mcp_servers(tenant_id=principal.tenant_id))
 
 
 @router.post("/mcp", response_model=McpServerResponse, responses=error_responses(401, 403, 422))

@@ -778,6 +778,71 @@ def test_runtime_gateway_capability_manifest_includes_registry_capabilities(
     }
 
 
+def test_runtime_gateway_capability_manifest_includes_extra_manifest_sources(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry()
+    registry.register(
+        "mcp.search",
+        object(),
+        kind="mcp",
+        adapter="registry_mcp",
+        permission_class="mcp.call",
+        sandbox_profile="remote_connector",
+        replay_safe=False,
+    )
+    extra_source = FakeManifestSource(
+        {
+            "schema_version": 1,
+            "capabilities": (
+                {
+                    "id": "mcp.search",
+                    "kind": "mcp",
+                    "adapter": "extra_mcp",
+                    "permission_class": "mcp.invoke",
+                    "sandbox_profile": "mcp_remote",
+                    "available": False,
+                    "availability_reason": "mcp_server_not_discovered",
+                    "replay_safe": False,
+                    "aliases": (),
+                },
+                {
+                    "id": "filesystem.read_file",
+                    "kind": "mcp",
+                    "adapter": "mcp_server",
+                    "permission_class": "mcp.invoke",
+                    "sandbox_profile": "mcp_stdio",
+                    "available": False,
+                    "availability_reason": "mcp_server_not_discovered",
+                    "replay_safe": False,
+                    "aliases": (),
+                },
+            ),
+        }
+    )
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        tool_registry=registry,
+    )
+
+    manifest = gateway.capability_manifest(TENANT_ID, extra_sources=(extra_source,))
+    manifest_items = cast(tuple[Mapping[str, JsonValue], ...], manifest["capabilities"])
+    capabilities = {item["id"]: item for item in manifest_items}
+
+    assert capabilities["mcp.search"]["adapter"] == "registry_mcp"
+    assert capabilities["filesystem.read_file"] == {
+        "id": "filesystem.read_file",
+        "kind": "mcp",
+        "adapter": "mcp_server",
+        "permission_class": "mcp.invoke",
+        "sandbox_profile": "mcp_stdio",
+        "available": False,
+        "availability_reason": "mcp_server_not_discovered",
+        "replay_safe": False,
+        "aliases": (),
+    }
+
+
 def test_runtime_gateway_capability_manifest_keeps_runtime_items_authoritative(
     tmp_path: Path,
 ) -> None:

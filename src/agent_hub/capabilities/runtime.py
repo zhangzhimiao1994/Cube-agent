@@ -116,18 +116,24 @@ class RuntimeCapabilityGateway:
             return False
         return self._skill_package_path(tenant_id, normalized_name).is_file()
 
-    def capability_manifest(self, tenant_id: UUID) -> Mapping[str, JsonValue]:
+    def capability_manifest(
+        self,
+        tenant_id: UUID,
+        *,
+        extra_sources: tuple[CapabilityManifestSource, ...] = (),
+    ) -> Mapping[str, JsonValue]:
         builtin_items = tuple(
             self._builtin_manifest_item(name)
             for name in _MANIFEST_BUILTINS
         )
         skill_items = self._skill_manifest_items(tenant_id)
+        existing_items = (*builtin_items, *skill_items)
         return {
             "schema_version": 1,
             "capabilities": (
                 *builtin_items,
                 *skill_items,
-                *self._registry_manifest_items((*builtin_items, *skill_items)),
+                *self._registry_manifest_items(existing_items, extra_sources=extra_sources),
             ),
         }
 
@@ -456,23 +462,20 @@ class RuntimeCapabilityGateway:
     def _registry_manifest_items(
         self,
         existing_items: tuple[Mapping[str, JsonValue], ...],
+        *,
+        extra_sources: tuple[CapabilityManifestSource, ...] = (),
     ) -> tuple[Mapping[str, JsonValue], ...]:
-        if self._tool_registry is None:
+        manifest_sources = (
+            *((self._tool_registry,) if self._tool_registry is not None else ()),
+            *extra_sources,
+        )
+        if not manifest_sources:
             return ()
-        try:
-            manifest = self._tool_registry.manifests()
-        except Exception:  # noqa: BLE001 - optional manifest sources must fail closed.
-            return ()
-        if manifest.get("schema_version") != 1:
-            return ()
-        raw_items = manifest.get("capabilities")
-        if not isinstance(raw_items, tuple | list):
-            return ()
-        seen_ids = {
-            item["id"]
-            for item in existing_items
-            if isinstance(item.get("id"), str)
-        }
+        seen_ids: set[str] = set()
+        for item in existing_items:
+            item_id = item.get("id")
+            if isinstance(item_id, str):
+                seen_ids.add(item_id)
         seen_names = set(seen_ids)
         seen_names.update(
             alias
@@ -480,41 +483,70 @@ class RuntimeCapabilityGateway:
             for alias in _tuple_strings(item.get("aliases"))
         )
         projected: list[Mapping[str, JsonValue]] = []
-        for raw_item in raw_items:
-            if not isinstance(raw_item, Mapping):
-                continue
-            item_id = raw_item.get("id")
-            aliases = _manifest_aliases(raw_item.get("aliases"))
-            if (
-                not _is_safe_manifest_name(item_id)
-                or item_id in seen_ids
-                or aliases is None
-            ):
-                continue
-            if item_id in seen_names or any(alias in seen_names for alias in aliases):
-                continue
-            item: Mapping[str, JsonValue] = {
-                "id": item_id,
-                "kind": _string_or_default(raw_item.get("kind"), "plugin"),
-                "adapter": _string_or_default(raw_item.get("adapter"), "tool_registry"),
-                "permission_class": _string_or_default(
-                    raw_item.get("permission_class"),
-                    "tool.use",
-                ),
-                "sandbox_profile": _string_or_default(
-                    raw_item.get("sandbox_profile"),
-                    "unspecified",
-                ),
-                "available": True,
-                "availability_reason": None,
-                "replay_safe": raw_item.get("replay_safe") is True,
-                "aliases": aliases,
-            }
-            projected.append(item)
-            seen_ids.add(item_id)
-            seen_names.add(item_id)
-            seen_names.update(aliases)
+        for source in manifest_sources:
+            for raw_item in _manifest_source_items(source):
+                projected_item = _project_registry_manifest_item(raw_item, seen_ids, seen_names)
+                if projected_item is None:
+                    continue
+                projected.append(projected_item)
+                item_id = cast(str, projected_item["id"])
+                seen_ids.add(item_id)
+                seen_names.add(item_id)
+                seen_names.update(_tuple_strings(projected_item.get("aliases")))
         return tuple(projected)
+
+
+def _manifest_source_items(
+    source: CapabilityManifestSource,
+) -> tuple[Mapping[str, JsonValue], ...]:
+    try:
+        manifest = source.manifests()
+    except Exception:  # noqa: BLE001 - optional manifest sources must fail closed.
+        return ()
+    if manifest.get("schema_version") != 1:
+        return ()
+    raw_items = manifest.get("capabilities")
+    if not isinstance(raw_items, tuple | list):
+        return ()
+    return tuple(item for item in raw_items if isinstance(item, Mapping))
+
+
+def _project_registry_manifest_item(
+    raw_item: Mapping[str, JsonValue],
+    seen_ids: set[str],
+    seen_names: set[str],
+) -> Mapping[str, JsonValue] | None:
+    item_id = raw_item.get("id")
+    aliases = _manifest_aliases(raw_item.get("aliases"))
+    available = raw_item.get("available")
+    availability_reason = raw_item.get("availability_reason")
+    if (
+        not _is_safe_manifest_name(item_id)
+        or item_id in seen_ids
+        or aliases is None
+        or (availability_reason is not None and not isinstance(availability_reason, str))
+    ):
+        return None
+    if item_id in seen_names or any(alias in seen_names for alias in aliases):
+        return None
+    item_id = cast(str, item_id)
+    return {
+        "id": item_id,
+        "kind": _string_or_default(raw_item.get("kind"), "plugin"),
+        "adapter": _string_or_default(raw_item.get("adapter"), "tool_registry"),
+        "permission_class": _string_or_default(
+            raw_item.get("permission_class"),
+            "tool.use",
+        ),
+        "sandbox_profile": _string_or_default(
+            raw_item.get("sandbox_profile"),
+            "unspecified",
+        ),
+        "available": available if isinstance(available, bool) else True,
+        "availability_reason": availability_reason,
+        "replay_safe": raw_item.get("replay_safe") is True,
+        "aliases": aliases,
+    }
 
 
 def _require_safe(name: str, value: str, *, max_length: int = 128) -> None:
