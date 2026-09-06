@@ -4,6 +4,7 @@ import asyncio
 import logging
 import signal
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 from uuid import UUID
@@ -17,7 +18,7 @@ from agent_hub.config.service import ConfigService
 from agent_hub.db.session import Database, build_database
 from agent_hub.evolution_hooks import EvolutionExecutionIngestHook
 from agent_hub.hermes import PersistentHermesRunAdvisor
-from agent_hub.mcp.runtime import build_runtime_mcp_service_sync
+from agent_hub.mcp.runtime import RuntimeMcpService
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import RunService
 from agent_hub.runtime.defaults import configured_runtime_registry
@@ -85,6 +86,15 @@ class LocalRunQueue:
         return self._queue.empty()
 
 
+@dataclass(frozen=True)
+class WorkerResources:
+    database: Database
+    redis_client: Redis
+    service: RunService
+    queue: LocalRunQueue
+    runtime_mcp_service: RuntimeMcpService
+
+
 async def run_worker_loop(
     service: WorkerRunService,
     queue: LocalRunQueue,
@@ -131,7 +141,7 @@ async def run_worker_loop(
 
 def build_worker_service(
     settings: Settings,
-) -> tuple[Database, Redis, RunService, LocalRunQueue]:
+) -> WorkerResources:
     database = build_database(settings.database_url_value())
     redis_client = Redis.from_url(settings.redis_url_value())
     queue = LocalRunQueue()
@@ -151,7 +161,7 @@ def build_worker_service(
         skill_store_dir=settings.skill_store_dir,
         generated_artifact_dir=settings.generated_artifact_dir,
     )
-    runtime_mcp_service = build_runtime_mcp_service_sync(
+    runtime_mcp_service = RuntimeMcpService(
         tenant_id=settings.bootstrap_tenant_id,
         admin_service=admin_service,
         run_repository=run_repository,
@@ -194,7 +204,13 @@ def build_worker_service(
             skill_store_dir=settings.skill_store_dir,
         ),
     )
-    return database, redis_client, service, queue
+    return WorkerResources(
+        database=database,
+        redis_client=redis_client,
+        service=service,
+        queue=queue,
+        runtime_mcp_service=runtime_mcp_service,
+    )
 
 
 def _evolution_terminal_hooks(
@@ -227,12 +243,13 @@ async def _run() -> None:
         except NotImplementedError:
             pass
 
-    database, redis_client, service, queue = build_worker_service(get_settings())
+    resources = build_worker_service(get_settings())
     try:
-        await run_worker_loop(service, queue, stop=stop)
+        await resources.runtime_mcp_service.start()
+        await run_worker_loop(resources.service, resources.queue, stop=stop)
     finally:
-        await redis_client.aclose()
-        await database.dispose()
+        await resources.redis_client.aclose()
+        await resources.database.dispose()
 
 
 def main() -> None:

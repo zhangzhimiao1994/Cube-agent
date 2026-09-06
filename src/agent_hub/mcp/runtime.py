@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol
 from uuid import UUID
@@ -122,23 +121,6 @@ async def build_runtime_mcp_service(
     return service
 
 
-def build_runtime_mcp_service_sync(
-    *,
-    tenant_id: UUID,
-    admin_service: McpConfigService,
-    run_repository: object,
-    client_factory: McpClientFactory | None = None,
-) -> RuntimeMcpService:
-    return asyncio.run(
-        build_runtime_mcp_service(
-            tenant_id=tenant_id,
-            admin_service=admin_service,
-            run_repository=run_repository,
-            client_factory=client_factory,
-        )
-    )
-
-
 def _server_definitions(
     tenant_id: UUID,
     servers: Sequence[Any],
@@ -203,5 +185,4 @@ __all__ = [
     "McpConfigService",
     "RuntimeMcpService",
     "build_runtime_mcp_service",
-    "build_runtime_mcp_service_sync",
 ]
