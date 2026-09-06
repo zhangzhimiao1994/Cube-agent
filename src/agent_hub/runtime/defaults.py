@@ -139,17 +139,18 @@ _DISCUSSION_OUTPUT_SCHEMA: Mapping[str, str] = {
 class UnavailableRuntime:
     """Fail queued runs deterministically instead of leaving them stuck forever."""
 
-    def __init__(self, mode: TaskMode) -> None:
+    def __init__(self, mode: TaskMode, *, reason: str = "runtime_not_configured") -> None:
         if mode is TaskMode.AUTO:
             raise ValueError("default runtime mode must be executable")
         self.mode: TaskMode = mode
+        self._reason = reason
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
         yield RunEvent(
             kind=EventKind.RUNTIME_FAILED,
             sequence=1,
             run_id=context.run_id,
-            reason="runtime_not_configured",
+            reason=self._reason,
         )
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
@@ -171,6 +172,10 @@ class TenantSecretResolver:
 
     async def resolve(self, secret_ref: str) -> str:
         return await self._secret_service.resolve(self._tenant_id, secret_ref)
+
+
+class HarnessModelSelectionError(RuntimeError):
+    """Stable failure when a recorded harness model selection no longer exists."""
 
 
 class _PlannedRuntime:
@@ -277,16 +282,17 @@ class ConfigBackedDirectRuntime:
         config = PlatformConfig.model_validate(current.document)
         if not config.models:
             return UnavailableRuntime(TaskMode.DIRECT)
-        logical_model = _direct_logical_model(config, context.routing_decision)
-        deployments = _deployments(config)
-        gateway = ModelGateway(
-            ModelRegistry(deployments),
-            await self._capacity_factory(context.tenant_id, deployments),
-            TenantSecretResolver(self._secret_service, context.tenant_id),
-            self._transport,
-            fallbacks=_fallbacks(config),
-            capacity_wait_timeout=60,
-        )
+        try:
+            gateway, logical_model = await _gateway_for_config(
+                config,
+                tenant_id=context.tenant_id,
+                secret_service=self._secret_service,
+                capacity_factory=self._capacity_factory,
+                transport=self._transport,
+                routing_decision=context.routing_decision,
+            )
+        except HarnessModelSelectionError:
+            return UnavailableRuntime(TaskMode.DIRECT, reason="harness_model_unavailable")
         return DirectRuntime(gateway, logical_model=logical_model)
 
 
@@ -342,14 +348,17 @@ class ConfigBackedDispatchRuntime:
         config = await _current_platform_config(self._config_service, context.tenant_id)
         if config is None:
             return UnavailableRuntime(TaskMode.DISPATCH)
-        gateway, logical_model = await _gateway_for_config(
-            config,
-            tenant_id=context.tenant_id,
-            secret_service=self._secret_service,
-            capacity_factory=self._capacity_factory,
-            transport=self._transport,
-            routing_decision=context.routing_decision,
-        )
+        try:
+            gateway, logical_model = await _gateway_for_config(
+                config,
+                tenant_id=context.tenant_id,
+                secret_service=self._secret_service,
+                capacity_factory=self._capacity_factory,
+                transport=self._transport,
+                routing_decision=context.routing_decision,
+            )
+        except HarnessModelSelectionError:
+            return UnavailableRuntime(TaskMode.DISPATCH, reason="harness_model_unavailable")
         selected_roles = _selected_config_role_assignments(
             context,
             config,
@@ -448,14 +457,17 @@ class ConfigBackedDiscussionRuntime:
         config = await _current_platform_config(self._config_service, context.tenant_id)
         if config is None:
             return UnavailableRuntime(TaskMode.DISCUSS)
-        gateway, logical_model = await _gateway_for_config(
-            config,
-            tenant_id=context.tenant_id,
-            secret_service=self._secret_service,
-            capacity_factory=self._capacity_factory,
-            transport=self._transport,
-            routing_decision=context.routing_decision,
-        )
+        try:
+            gateway, logical_model = await _gateway_for_config(
+                config,
+                tenant_id=context.tenant_id,
+                secret_service=self._secret_service,
+                capacity_factory=self._capacity_factory,
+                transport=self._transport,
+                routing_decision=context.routing_decision,
+            )
+        except HarnessModelSelectionError:
+            return UnavailableRuntime(TaskMode.DISCUSS, reason="harness_model_unavailable")
         selected_roles = _selected_config_role_assignments(
             context,
             config,
@@ -554,14 +566,17 @@ class ConfigBackedHybridRuntime:
         config = await _current_platform_config(self._config_service, context.tenant_id)
         if config is None:
             return UnavailableRuntime(TaskMode.HYBRID)
-        gateway, logical_model = await _gateway_for_config(
-            config,
-            tenant_id=context.tenant_id,
-            secret_service=self._secret_service,
-            capacity_factory=self._capacity_factory,
-            transport=self._transport,
-            routing_decision=context.routing_decision,
-        )
+        try:
+            gateway, logical_model = await _gateway_for_config(
+                config,
+                tenant_id=context.tenant_id,
+                secret_service=self._secret_service,
+                capacity_factory=self._capacity_factory,
+                transport=self._transport,
+                routing_decision=context.routing_decision,
+            )
+        except HarnessModelSelectionError:
+            return UnavailableRuntime(TaskMode.HYBRID, reason="harness_model_unavailable")
         profile = _task_profile(context.request)
         profiles = _task_profiles(context.request)
         high_risk = _high_risk_task(context.request)
@@ -696,15 +711,78 @@ async def _gateway_for_config(
 ) -> tuple[ModelGateway, str]:
     logical_model = _direct_logical_model(config, routing_decision)
     deployments = _deployments(config)
+    harness_selection = _harness_deployment_selection(config, routing_decision)
+    deployments = _constrained_deployments_for_harness_decision(deployments, harness_selection)
     gateway = ModelGateway(
         ModelRegistry(deployments),
         await capacity_factory(tenant_id, deployments),
         TenantSecretResolver(secret_service, tenant_id),
         transport,
-        fallbacks=_fallbacks(config),
+        fallbacks={} if harness_selection is not None else _fallbacks(config),
         capacity_wait_timeout=60,
     )
     return gateway, logical_model
+
+
+def _constrained_deployments_for_harness_decision(
+    deployments: tuple[Deployment, ...],
+    selection: tuple[str, str, str] | None,
+) -> tuple[Deployment, ...]:
+    if selection is None:
+        return deployments
+    logical_model, provider, model = selection
+    constrained: list[Deployment] = []
+    matched = False
+    for deployment in deployments:
+        if deployment.logical_model != logical_model:
+            constrained.append(deployment)
+            continue
+        if _deployment_matches_harness_selection(deployment, provider=provider, model=model):
+            constrained.append(deployment)
+            matched = True
+    if not matched:
+        raise HarnessModelSelectionError("harness model selection is unavailable")
+    return tuple(constrained)
+
+
+def _harness_deployment_selection(
+    config: PlatformConfig,
+    routing_decision: object | None,
+) -> tuple[str, str, str] | None:
+    if not isinstance(routing_decision, Mapping):
+        return None
+    harness_decision = routing_decision.get("harness_decision")
+    if not isinstance(harness_decision, Mapping):
+        return None
+    logical_model = harness_decision.get("selected_logical_model")
+    provider = harness_decision.get("selected_provider")
+    model = harness_decision.get("selected_model")
+    if not (
+        isinstance(logical_model, str)
+        and isinstance(provider, str)
+        and isinstance(model, str)
+        and logical_model
+        and provider
+        and model
+    ):
+        return None
+    if logical_model not in config.models:
+        raise HarnessModelSelectionError("harness logical model is unavailable")
+    return logical_model, provider.casefold(), model
+
+
+def _deployment_matches_harness_selection(
+    deployment: Deployment,
+    *,
+    provider: str,
+    model: str,
+) -> bool:
+    deployment_provider, _, provider_model = deployment.provider_model.partition("/")
+    return deployment_provider.casefold() == provider and model in {
+        deployment.request_model,
+        provider_model,
+        deployment.provider_model,
+    }
 
 
 def _software_delivery_guidance(context: TaskContext, tools: tuple[str, ...]) -> str:
@@ -785,10 +863,7 @@ def _dispatch_plan(
                 id="final_synthesizer",
                 role="Final Synthesizer",
                 goal="Merge role outputs into one concise, evidence-aware final answer.",
-                logical_model=_string_or_default(
-                    context.routing_decision.get("main_agent_model"),
-                    selected_roles[0].model,
-                ),
+                logical_model=_dispatch_final_synthesizer_model(context, selected_roles[0].model),
                 allowed_tools=(),
             )
     )
@@ -1206,6 +1281,23 @@ def _logical_model_capacity(config: PlatformConfig, logical_model: str) -> int:
 
 def _string_or_default(value: object, default: str) -> str:
     return value if isinstance(value, str) and value else default
+
+
+def _dispatch_final_synthesizer_model(context: TaskContext, fallback: str) -> str:
+    return _string_or_default(
+        context.routing_decision.get("main_agent_model"),
+        _string_or_default(_harness_selected_logical_model(context.routing_decision), fallback),
+    )
+
+
+def _harness_selected_logical_model(routing_decision: object | None) -> str | None:
+    if not isinstance(routing_decision, Mapping):
+        return None
+    harness_decision = routing_decision.get("harness_decision")
+    if not isinstance(harness_decision, Mapping):
+        return None
+    selected = harness_decision.get("selected_logical_model")
+    return selected if isinstance(selected, str) and selected else None
 
 
 def _select_logical_model_for_role(

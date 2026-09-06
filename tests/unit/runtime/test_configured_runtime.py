@@ -13,7 +13,7 @@ import agent_hub.runtime.defaults as defaults_module
 from agent_hub.config.repository import ConfigRevision, ConfigStatus
 from agent_hub.config.schema import PlatformConfig
 from agent_hub.domain.runs import TaskMode
-from agent_hub.models.capacity import CapacityLease
+from agent_hub.models.capacity import CapacityLease, CapacityWaitTimeout
 from agent_hub.models.gateway import CapacityController
 from agent_hub.models.types import Deployment, ModelRequest, ModelResponse, TokenUsage
 from agent_hub.runtime.contracts import (
@@ -37,6 +37,7 @@ from agent_hub.runtime.defaults import (
     _selected_config_role_assignments,
     configured_runtime_registry,
 )
+from agent_hub.runtime.direct import RuntimeExecutionError
 from agent_hub.runtime.role_planner import RoleAssignment, RolePurpose, TaskProfile
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
@@ -159,6 +160,21 @@ class ImmediateCapacity:
     ) -> None:
         del quota_scope_id, status_code, latency_seconds
         self.recorded.append(succeeded)
+
+
+class TimeoutCapacity(ImmediateCapacity):
+    async def acquire(
+        self,
+        candidates: Sequence[Deployment],
+        wait_timeout: float,
+        *,
+        estimated_tokens: int,
+    ) -> CapacityLease:
+        self.wait_timeouts.append(wait_timeout)
+        self.events = getattr(self, "events", [])
+        self.events.append(tuple(deployment.provider_model for deployment in candidates))
+        assert estimated_tokens > 0
+        raise CapacityWaitTimeout("busy")
 
 
 class FakeTransport:
@@ -369,6 +385,210 @@ async def test_config_backed_direct_runtime_uses_harness_selected_logical_model(
 
 
 @pytest.mark.asyncio
+async def test_config_backed_direct_runtime_constrains_harness_selected_deployment() -> None:
+    transport = FakeTransport()
+    runtime = ConfigBackedDirectRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "openai",
+                                "model": "gpt-5.6-sol",
+                                "api_base": "https://api.openai.com/v1",
+                                "credential_ref": "secret://openai",
+                                "quota_scope_id": "openai_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            },
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-chat",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://deepseek",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            },
+                        ]
+                    },
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
+        transport=transport,
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DIRECT,
+                request="use the harness-selected model",
+                routing_decision={
+                    "harness_decision": {
+                        "selected_provider": "deepseek",
+                        "selected_model": "deepseek-chat",
+                        "selected_logical_model": "main",
+                    }
+                },
+            )
+        )
+    ]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    deployment, request, _api_key = transport.calls[0]
+    assert deployment.provider_model == "deepseek/deepseek-chat"
+    assert request.logical_model == "main"
+
+
+@pytest.mark.asyncio
+async def test_config_backed_direct_runtime_fails_closed_when_harness_deployment_is_missing() -> None:
+    transport = FakeTransport()
+    runtime = ConfigBackedDirectRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "openai",
+                                "model": "gpt-5.6-sol",
+                                "api_base": "https://api.openai.com/v1",
+                                "credential_ref": "secret://openai",
+                                "quota_scope_id": "openai_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(tenant_id, deployments),
+        transport=transport,
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DIRECT,
+                request="use the harness-selected model",
+                routing_decision={
+                    "harness_decision": {
+                        "selected_provider": "deepseek",
+                        "selected_model": "deepseek-chat",
+                        "selected_logical_model": "main",
+                    }
+                },
+            )
+        )
+    ]
+
+    assert [event.kind for event in events] == [EventKind.RUNTIME_FAILED]
+    assert events[0].reason == "harness_model_unavailable"
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_config_backed_direct_runtime_does_not_fallback_past_harness_selection() -> None:
+    transport = FakeTransport()
+    capacities: list[TimeoutCapacity] = []
+
+    async def capacity_factory(
+        tenant_id: UUID,
+        deployments: tuple[Deployment, ...],
+    ) -> TimeoutCapacity:
+        assert tenant_id == TENANT_ID
+        capacity = TimeoutCapacity(deployments)
+        capacities.append(capacity)
+        return capacity
+
+    runtime = ConfigBackedDirectRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "fallback_model": "backup",
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-chat",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://deepseek",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ],
+                    },
+                    "backup": {
+                        "deployments": [
+                            {
+                                "provider": "openai",
+                                "model": "gpt-5.6-sol",
+                                "api_base": "https://api.openai.com/v1",
+                                "credential_ref": "secret://openai",
+                                "quota_scope_id": "openai_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=capacity_factory,
+        transport=transport,
+    )
+
+    with pytest.raises(RuntimeExecutionError, match="model capacity unavailable"):
+        _ = [
+            event
+            async for event in runtime.run(
+                TaskContext(
+                    run_id=uuid4(),
+                    tenant_id=TENANT_ID,
+                    mode=TaskMode.DIRECT,
+                    request="use the harness-selected model",
+                    routing_decision={
+                        "harness_decision": {
+                            "selected_provider": "deepseek",
+                            "selected_model": "deepseek-chat",
+                            "selected_logical_model": "main",
+                        }
+                    },
+                )
+            )
+        ]
+
+    assert capacities[0].events == [("deepseek/deepseek-chat",)]
+    assert transport.calls == []
+
+
+@pytest.mark.asyncio
 async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -482,6 +702,120 @@ async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
     )
     assert events[1].kind is EventKind.RUNTIME_COMPLETED
     assert events[1].sequence == 2
+
+
+@pytest.mark.asyncio
+async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_constraint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    capacities: list[ImmediateCapacity] = []
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "openai",
+                                "model": "gpt-5.6-sol",
+                                "api_base": "https://api.openai.com/v1",
+                                "credential_ref": "secret://openai",
+                                "quota_scope_id": "openai_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            },
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-chat",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://deepseek",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            },
+                        ]
+                    },
+                    "creative": {
+                        "deployments": [
+                            {
+                                "provider": "kimi",
+                                "model": "kimi-k2-latest",
+                                "api_base": "https://api.moonshot.cn/v1",
+                                "credential_ref": "secret://creative",
+                                "quota_scope_id": "kimi_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [
+                    {
+                        "id": "copywriter",
+                        "role": "Copywriter",
+                        "prompt": "Draft campaign copy.",
+                        "model": "creative",
+                        "skills": [],
+                    }
+                ],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _remember_capacity(
+            capacities, tenant_id, deployments
+        ),
+        transport=FakeTransport(),
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request="Draft a launch campaign.",
+                routing_decision={
+                    "selected_agent_ids": ("copywriter",),
+                    "harness_decision": {
+                        "selected_provider": "deepseek",
+                        "selected_model": "deepseek-chat",
+                        "selected_logical_model": "main",
+                    },
+                },
+            )
+        )
+    ]
+
+    assert events[0].payload["main_agent_model"] == "main"
+    assert events[0].payload["roles"] == (
+        {
+            "id": "copywriter",
+            "role": "Copywriter",
+            "purpose": "execute",
+            "logical_model": "creative",
+            "tools": (),
+        },
+        {
+            "id": "final_synthesizer",
+            "role": "Final Synthesizer",
+            "purpose": "synthesize",
+            "logical_model": "main",
+            "tools": (),
+        },
+    )
+    assert {deployment.provider_model for deployment in capacities[0].deployments} == {
+        "deepseek/deepseek-chat",
+        "kimi/kimi-k2-latest",
+    }
 
 
 @pytest.mark.asyncio
