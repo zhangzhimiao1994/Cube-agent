@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ApiError, api, formatApiError } from "./client";
+import { ApiError, api, formatApiError, type PluginResource } from "./client";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -215,6 +215,7 @@ describe("api client transport", () => {
       adapter: "runtime_builtin",
       permission_class: "file.read",
       sandbox_profile: "workspace_read",
+      policy_effect: "inherit",
       available: false,
       availability_reason: "workspace_root_not_configured",
       replay_safe: true,
@@ -225,7 +226,7 @@ describe("api client transport", () => {
   });
 
   it("loads plugin resources and preserves HTTP credential metadata", async () => {
-    const plugin = {
+    const plugin: PluginResource = {
       id: "calendar",
       name: "Calendar HTTP",
       enabled: true,
@@ -243,6 +244,7 @@ describe("api client transport", () => {
           adapter: "http_json",
           permission_class: "calendar.write",
           sandbox_profile: "remote_connector",
+          policy_effect: "require_approval",
           replay_safe: false,
           aliases: ["calendar_create"],
           input_schema: {
@@ -275,8 +277,68 @@ describe("api client transport", () => {
     expect(result[0]).toEqual(plugin);
   });
 
+  it("defaults plugin capability sandbox profiles to remote connector", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify([
+          {
+            id: "calendar",
+            name: "Calendar HTTP",
+            enabled: true,
+            status: "running",
+            health: "healthy",
+            capabilities: [
+              {
+                id: "calendar.create_event",
+              },
+            ],
+          },
+        ]),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.plugins();
+
+    expect(result[0]?.capabilities[0]?.sandbox_profile).toBe("remote_connector");
+  });
+
+  it("defaults plugin capability policy effects to inherit", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify([
+          {
+            id: "calendar",
+            name: "Calendar HTTP",
+            enabled: true,
+            status: "running",
+            health: "healthy",
+            capabilities: [
+              {
+                id: "calendar.create_event",
+              },
+            ],
+          },
+        ]),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.plugins();
+
+    expect(result[0]?.capabilities[0]?.policy_effect).toBe("inherit");
+  });
+
   it("posts plugin resources to the admin API", async () => {
-    const plugin = {
+    const plugin: PluginResource = {
       id: "calendar",
       name: "Calendar HTTP",
       enabled: true,
@@ -294,6 +356,7 @@ describe("api client transport", () => {
           adapter: "http_json",
           permission_class: "calendar.write",
           sandbox_profile: "remote_connector",
+          policy_effect: "require_approval",
           replay_safe: false,
           aliases: ["calendar_create"],
           input_schema: {
@@ -350,6 +413,7 @@ describe("api client transport", () => {
           adapter: "http_json",
           permission_class: "calendar.write",
           sandbox_profile: "remote_connector",
+          policy_effect: "require_approval",
           replay_safe: false,
           aliases: ["calendar_create"],
           input_schema: {

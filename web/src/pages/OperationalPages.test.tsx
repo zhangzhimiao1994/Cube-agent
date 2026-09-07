@@ -402,10 +402,23 @@ const capabilityManifest = {
       adapter: "skill_sandbox",
       permission_class: "skill.use",
       sandbox_profile: "systemd_skill_sandbox",
+      policy_effect: "inherit",
       available: true,
       availability_reason: null,
       replay_safe: false,
       aliases: [],
+    },
+    {
+      id: "calendar.create_event",
+      kind: "plugin",
+      adapter: "http_json",
+      permission_class: "calendar.write",
+      sandbox_profile: "remote_connector",
+      policy_effect: "require_approval",
+      available: true,
+      availability_reason: null,
+      replay_safe: false,
+      aliases: ["calendar_create"],
     },
   ],
 };
@@ -428,6 +441,7 @@ const calendarPlugin = {
       adapter: "http_json",
           permission_class: "calendar.write",
           sandbox_profile: "remote_connector",
+          policy_effect: "require_approval",
           replay_safe: false,
           aliases: ["calendar_create"],
           input_schema: {
@@ -487,6 +501,7 @@ const pluginAdapterDescriptors = [
       properties: {
         permission_class: { type: "string", default: "workflow.run" },
         sandbox_profile: { type: "string", default: "workflow_sandbox" },
+        policy_effect: { type: "string", default: "require_approval" },
         replay_safe: { type: "boolean", default: true },
         input_schema: { type: "object" },
         output_schema: { type: "object" },
@@ -6488,7 +6503,8 @@ describe("operational management pages", () => {
     expect(screen.getByText("Calendar HTTP")).not.toBeNull();
     expect(screen.getByText("https://plugins.example/invoke")).not.toBeNull();
     expect(screen.getByText("plugins.example")).not.toBeNull();
-    expect(screen.getByText("calendar.create_event")).not.toBeNull();
+    expect(screen.getAllByText("calendar.create_event").length).toBeGreaterThan(0);
+    expect(screen.getByText("calendar.create_event:需要审批")).not.toBeNull();
     expect(screen.getByText("secret://calendar")).not.toBeNull();
 
     await user.click(screen.getByRole("button", { name: "重载插件 Calendar HTTP" }));
@@ -6516,6 +6532,7 @@ describe("operational management pages", () => {
     await user.type(screen.getByLabelText("能力 ID 1"), "search.query");
     await user.clear(screen.getByLabelText("权限类 1"));
     await user.type(screen.getByLabelText("权限类 1"), "search.read");
+    await user.selectOptions(screen.getByLabelText("权限策略 1"), "require_approval");
     await user.clear(screen.getByLabelText("能力别名 1，英文逗号分隔"));
     await user.type(screen.getByLabelText("能力别名 1，英文逗号分隔"), "web_search");
     await user.click(screen.getByRole("button", { name: "保存插件" }));
@@ -6552,6 +6569,7 @@ describe("operational management pages", () => {
           adapter: "http_json",
           permission_class: "search.read",
           sandbox_profile: "remote_connector",
+          policy_effect: "require_approval",
           replay_safe: false,
           aliases: ["web_search"],
           input_schema: null,
@@ -6572,6 +6590,7 @@ describe("operational management pages", () => {
 
     expect((screen.getByLabelText("权限类 1") as HTMLInputElement).value).toBe("workflow.run");
     expect((screen.getByLabelText("沙箱 Profile 1") as HTMLInputElement).value).toBe("workflow_sandbox");
+    expect((screen.getByLabelText("权限策略 1") as HTMLSelectElement).value).toBe("require_approval");
     expect((screen.getByLabelText("可安全重放 1") as HTMLInputElement).checked).toBe(true);
 
     await user.clear(screen.getByLabelText("插件 ID"));
@@ -6606,6 +6625,7 @@ describe("operational management pages", () => {
           adapter: "workflow",
           permission_class: "workflow.run",
           sandbox_profile: "workflow_sandbox",
+          policy_effect: "require_approval",
           replay_safe: true,
         },
       ],
@@ -6624,6 +6644,7 @@ describe("operational management pages", () => {
     expect((screen.getByLabelText("能力适配器 2") as HTMLSelectElement).value).toBe("workflow");
     expect((screen.getByLabelText("权限类 2") as HTMLInputElement).value).toBe("workflow.run");
     expect((screen.getByLabelText("沙箱 Profile 2") as HTMLInputElement).value).toBe("workflow_sandbox");
+    expect((screen.getByLabelText("权限策略 2") as HTMLSelectElement).value).toBe("require_approval");
     expect((screen.getByLabelText("可安全重放 2") as HTMLInputElement).checked).toBe(true);
   });
 
@@ -6725,6 +6746,7 @@ describe("operational management pages", () => {
     expect((screen.getByLabelText("Input Schema 1") as HTMLTextAreaElement).value).toBe(
       JSON.stringify(calendarPlugin.capabilities[0].input_schema, null, 2),
     );
+    expect((screen.getByLabelText("权限策略 1") as HTMLSelectElement).value).toBe("require_approval");
     await user.clear(screen.getByLabelText("Output Schema 1"));
     fireEvent.change(screen.getByLabelText("Output Schema 1"), {
       target: {
@@ -6755,6 +6777,7 @@ describe("operational management pages", () => {
         {
           id: "calendar.create_event",
           input_schema: calendarPlugin.capabilities[0].input_schema,
+          policy_effect: "require_approval",
           output_schema: {
             type: "object",
             properties: { event_id: { type: "string" } },
@@ -6774,8 +6797,9 @@ describe("operational management pages", () => {
     expect(within(capabilityTable).getAllByText("calculator.evaluate").length).toBeGreaterThan(0);
     expect(within(capabilityTable).getByText("summarizer")).not.toBeNull();
     expect(within(capabilityTable).getByText("workspace_root_not_configured")).not.toBeNull();
+    expect(within(capabilityTable).getByText("需要审批")).not.toBeNull();
     expect(within(capabilityTable).getAllByText("无需审批").length).toBeGreaterThan(0);
-    expect(within(capabilityTable).getByText("运行时策略")).not.toBeNull();
+    expect(within(capabilityTable).getAllByText("运行时策略").length).toBeGreaterThan(0);
     expect(requests.find((request) => request.path === "/api/v1/admin/capabilities/manifest")).toMatchObject({
       method: "GET",
     });

@@ -15,7 +15,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Any, Protocol, cast
+from typing import Annotated, Any, Literal, Protocol, cast
 from urllib.parse import unquote, urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -537,6 +537,7 @@ class PluginCapabilityRequest(BaseModel):
         max_length=128,
         pattern=r"^[a-z0-9][a-z0-9_.-]*$",
     )
+    policy_effect: Literal["inherit", "allow", "require_approval", "deny"] = "inherit"
     replay_safe: bool = False
     aliases: list[str] = Field(default_factory=list, max_length=128)
     input_schema: dict[str, JsonValue] | None = None
@@ -658,6 +659,7 @@ class CapabilityManifestItemResponse(BaseModel):
     adapter: str = Field(min_length=1, max_length=128)
     permission_class: str = Field(min_length=1, max_length=128)
     sandbox_profile: str = Field(min_length=1, max_length=128)
+    policy_effect: Literal["inherit", "allow", "require_approval", "deny"] = "inherit"
     available: bool
     availability_reason: str | None = None
     replay_safe: bool
@@ -2992,6 +2994,11 @@ def _default_http_json_adapter_descriptor() -> PluginAdapterDescriptorResponse:
                 "id": {"type": "string"},
                 "permission_class": {"type": "string", "default": "plugin.use"},
                 "sandbox_profile": {"type": "string", "default": "remote_connector"},
+                "policy_effect": {
+                    "type": "string",
+                    "enum": ("inherit", "allow", "require_approval", "deny"),
+                    "default": "inherit",
+                },
                 "replay_safe": {"type": "boolean", "default": False},
                 "aliases": {"type": "array", "items": {"type": "string"}},
                 "input_schema": {"type": "object"},

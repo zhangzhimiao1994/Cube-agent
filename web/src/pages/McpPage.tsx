@@ -40,6 +40,7 @@ type PluginCapabilityForm = {
   id: string;
   inputSchema: string;
   outputSchema: string;
+  policyEffect: PluginCapability["policy_effect"];
   permissionClass: string;
   replaySafe: boolean;
   sandboxProfile: string;
@@ -53,6 +54,7 @@ function createPluginCapabilityForm(
     adapter: "http_json",
     permissionClass: "plugin.use",
     sandboxProfile: "remote_connector",
+    policyEffect: "inherit",
     replaySafe: false,
     aliases: "",
     inputSchema: "",
@@ -86,6 +88,7 @@ function pluginCapabilityFormFromCapability(capability: PluginCapability): Plugi
     adapter: capability.adapter,
     permissionClass: capability.permission_class,
     sandboxProfile: capability.sandbox_profile,
+    policyEffect: capability.policy_effect,
     replaySafe: capability.replay_safe,
     aliases: capability.aliases.join(","),
     inputSchema: formatSchemaText(capability.input_schema),
@@ -127,6 +130,13 @@ function approvalLabel(capability: CapabilityManifestItem) {
   return capability.replay_safe ? "无需审批" : "运行时策略";
 }
 
+function policyEffectLabel(effect: PluginCapability["policy_effect"]) {
+  if (effect === "allow") return "允许";
+  if (effect === "require_approval") return "需要审批";
+  if (effect === "deny") return "拒绝";
+  return "继承";
+}
+
 function schemaRequiredFields(schema: PluginAdapterDescriptor["resource_schema"]) {
   const required = schema.required;
   return Array.isArray(required) ? required.filter((field): field is string => typeof field === "string") : [];
@@ -156,13 +166,24 @@ function capabilityDefaultsForAdapter(
   if (!adapter) return {};
   const permissionClass = schemaDefault(adapter.capability_schema, "permission_class");
   const sandboxProfile = schemaDefault(adapter.capability_schema, "sandbox_profile");
+  const policyEffect = schemaDefault(adapter.capability_schema, "policy_effect");
   const replaySafe = schemaDefault(adapter.capability_schema, "replay_safe");
   return {
     adapter: adapter.id,
     ...(typeof permissionClass === "string" ? { permissionClass } : {}),
     ...(typeof sandboxProfile === "string" ? { sandboxProfile } : {}),
+    ...(isPolicyEffect(policyEffect) ? { policyEffect } : {}),
     ...(typeof replaySafe === "boolean" ? { replaySafe } : {}),
   };
+}
+
+function isPolicyEffect(value: unknown): value is PluginCapability["policy_effect"] {
+  return (
+    value === "inherit" ||
+    value === "allow" ||
+    value === "require_approval" ||
+    value === "deny"
+  );
 }
 
 export function McpPage() {
@@ -280,6 +301,7 @@ export function McpPage() {
           adapter: capability.adapter.trim() || "http_json",
           permission_class: capability.permissionClass.trim() || "plugin.use",
           sandbox_profile: capability.sandboxProfile.trim() || "remote_connector",
+          policy_effect: capability.policyEffect,
           replay_safe: capability.replaySafe,
           aliases: parseCsv(capability.aliases),
           input_schema: parseSchemaText(capability.inputSchema, `Input Schema ${index + 1}`),
@@ -445,6 +467,7 @@ export function McpPage() {
                   <th>适配器</th>
                   <th>权限</th>
                   <th>沙箱</th>
+                  <th>策略</th>
                   <th>状态</th>
                   <th>审批</th>
                   <th>别名</th>
@@ -458,6 +481,7 @@ export function McpPage() {
                     <td>{capability.adapter}</td>
                     <td>{capability.permission_class}</td>
                     <td>{capability.sandbox_profile}</td>
+                    <td>{policyEffectLabel(capability.policy_effect)}</td>
                     <td>
                       {availabilityLabel(capability)}
                       {capability.availability_reason ? (
@@ -618,6 +642,22 @@ export function McpPage() {
                     placeholder="remote_connector"
                   />
 
+                  <label htmlFor={`plugin-policy-effect-${index}`}>权限策略 {capabilityNumber}</label>
+                  <select
+                    id={`plugin-policy-effect-${index}`}
+                    value={capability.policyEffect}
+                    onChange={(event) =>
+                      updatePluginCapability(index, {
+                        policyEffect: event.target.value as PluginCapability["policy_effect"],
+                      })
+                    }
+                  >
+                    <option value="inherit">继承</option>
+                    <option value="allow">允许</option>
+                    <option value="require_approval">需要审批</option>
+                    <option value="deny">拒绝</option>
+                  </select>
+
                   <label htmlFor={`plugin-replay-safe-${index}`}>
                     <input
                       id={`plugin-replay-safe-${index}`}
@@ -740,6 +780,14 @@ export function McpPage() {
                     <p>Credential：<span>{plugin.credential_ref ?? "未配置"}</span></p>
                     <p>Header：<span>{plugin.credential_header}</span></p>
                     <p>能力：<span>{plugin.capabilities.map((capability) => capability.id).join(", ") || "未配置"}</span></p>
+                    <p>
+                      策略：
+                      <span>
+                        {plugin.capabilities
+                          .map((capability) => `${capability.id}:${policyEffectLabel(capability.policy_effect)}`)
+                          .join(", ") || "未配置"}
+                      </span>
+                    </p>
                     <button type="button" onClick={() => editPlugin(plugin)}>
                       编辑
                     </button>

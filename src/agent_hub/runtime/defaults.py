@@ -1570,6 +1570,11 @@ def _capability_inventory_item(raw_item: object) -> Mapping[str, JsonValue] | No
             "unknown",
             max_length=128,
         ),
+        "policy_effect": _inventory_token(
+            raw_item.get("policy_effect"),
+            "inherit",
+            max_length=32,
+        ),
         "available": available if isinstance(available, bool) else False,
         "availability_reason": _optional_inventory_token(
             availability_reason,

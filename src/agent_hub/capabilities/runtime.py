@@ -644,6 +644,7 @@ def _project_registry_manifest_item(
             raw_item.get("sandbox_profile"),
             "unspecified",
         ),
+        "policy_effect": _policy_effect(raw_item.get("policy_effect")),
         "available": available if isinstance(available, bool) else True,
         "availability_reason": availability_reason,
         "replay_safe": raw_item.get("replay_safe") is True,
@@ -667,6 +668,12 @@ def _require_safe(name: str, value: str, *, max_length: int = 128) -> None:
         or _SAFE_CAPABILITY_NAME.fullmatch(value) is None
     ):
         raise RuntimeCapabilityError(f"{name} is invalid")
+
+
+def _policy_effect(value: object) -> str:
+    if value in {"inherit", "allow", "require_approval", "deny"}:
+        return value
+    return "inherit"
 
 
 def _normalize_tool_name(name: str) -> str:

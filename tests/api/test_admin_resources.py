@@ -2340,6 +2340,7 @@ def test_capability_manifest_endpoint_exposes_runtime_gateway_manifest() -> None
         "adapter": "mcp_server",
         "permission_class": "mcp.call",
         "sandbox_profile": "remote_connector",
+        "policy_effect": "inherit",
         "available": True,
         "availability_reason": None,
         "replay_safe": False,
@@ -2382,6 +2383,7 @@ def test_capability_manifest_endpoint_includes_saved_mcp_config_tools() -> None:
         "adapter": "mcp_server",
         "permission_class": "mcp.invoke",
         "sandbox_profile": "mcp_stdio",
+        "policy_effect": "inherit",
         "available": False,
         "availability_reason": "mcp_server_not_discovered",
         "replay_safe": False,
@@ -2560,6 +2562,12 @@ def test_plugin_capability_request_defaults_to_remote_connector_sandbox_profile(
     assert capability.sandbox_profile == "remote_connector"
 
 
+def test_plugin_capability_request_defaults_to_inherited_policy_effect() -> None:
+    capability = PluginCapabilityRequest(id="search.web")
+
+    assert capability.policy_effect == "inherit"
+
+
 @pytest.mark.asyncio
 async def test_admin_plugin_lifecycle_updates_status_and_health() -> None:
     service = InMemoryAdminResourceService()
@@ -2625,6 +2633,7 @@ def test_plugin_admin_api_exposes_running_plugin_capabilities_in_manifest() -> N
                     "id": "search.web",
                     "permission_class": "network.read",
                     "sandbox_profile": "remote_connector",
+                    "policy_effect": "require_approval",
                     "aliases": ["search_web"],
                 }
             ],
@@ -2643,6 +2652,7 @@ def test_plugin_admin_api_exposes_running_plugin_capabilities_in_manifest() -> N
         "adapter": "plugin_runtime",
         "permission_class": "network.read",
         "sandbox_profile": "remote_connector",
+        "policy_effect": "require_approval",
         "available": True,
         "availability_reason": None,
         "replay_safe": False,

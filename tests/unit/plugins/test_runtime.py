@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import cast
+from typing import Literal, cast
 from uuid import UUID
 
 import pytest
@@ -12,7 +12,10 @@ from agent_hub.api.routers.admin import (
     PluginResourceRequest,
     PluginResourceResponse,
 )
+from agent_hub.auth.models import Role
+from agent_hub.capabilities.policy import CapabilityRule
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
+from agent_hub.capabilities.types import PolicyEffect
 from agent_hub.plugins.runtime import (
     HttpJsonPluginAdapter,
     PluginInvocationContext,
@@ -90,6 +93,7 @@ def plugin(
     credential_scheme: str = "Bearer",
     permission_class: str = "calendar.write",
     sandbox_profile: str = "remote_connector",
+    policy_effect: Literal["inherit", "allow", "require_approval", "deny"] = "inherit",
     replay_safe: bool = False,
     input_schema: Mapping[str, JsonValue] | None = None,
     output_schema: Mapping[str, JsonValue] | None = None,
@@ -111,6 +115,7 @@ def plugin(
                     adapter=adapter,
                     permission_class=permission_class,
                     sandbox_profile=sandbox_profile,
+                    policy_effect=policy_effect,
                     replay_safe=replay_safe,
                     aliases=["calendar_create"],
                     input_schema=dict(input_schema) if input_schema is not None else None,
@@ -212,6 +217,13 @@ def test_http_json_plugin_adapter_exposes_safe_descriptor() -> None:
     assert "endpoint_url" in properties
     assert "credential_ref" in properties
     assert "credential_header" in properties
+    capability_schema = cast(Mapping[str, object], descriptor["capability_schema"])
+    capability_properties = cast(Mapping[str, object], capability_schema["properties"])
+    assert capability_properties["policy_effect"] == {
+        "type": "string",
+        "enum": ("inherit", "allow", "require_approval", "deny"),
+        "default": "inherit",
+    }
 
 
 async def test_runtime_plugin_service_lists_registered_adapter_descriptors() -> None:
@@ -370,7 +382,89 @@ async def test_runtime_plugin_service_preserves_generic_plugin_policy_parts() ->
         adapters={"plugin_runtime": RecordingPluginAdapter([])},
     )
 
-    assert service.capability_policy_parts(TENANT_ID, "calendar.create_event") is None
+    assert service.capability_policy_parts(TENANT_ID, "calendar.create_event") == (
+        "plugin",
+        "use",
+        "plugin/calendar/create_event",
+    )
+
+
+async def test_runtime_plugin_service_resolves_aliases_to_canonical_plugin_policy_parts() -> None:
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(
+            (
+                plugin(
+                    "calendar",
+                    permission_class="plugin.use",
+                    policy_effect="deny",
+                ),
+            )
+        ),
+        adapters={"plugin_runtime": RecordingPluginAdapter([])},
+    )
+
+    assert service.capability_policy_parts(TENANT_ID, "calendar_create") == (
+        "plugin",
+        "use",
+        "plugin/calendar/create_event",
+    )
+
+
+async def test_runtime_plugin_service_exposes_explicit_policy_effect_rules() -> None:
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(
+            (
+                plugin(
+                    "calendar",
+                    permission_class="calendar.write",
+                    policy_effect="require_approval",
+                ),
+            )
+        ),
+        adapters={"plugin_runtime": RecordingPluginAdapter([])},
+    )
+
+    assert service.capability_policy_rules(TENANT_ID) == (
+        CapabilityRule(
+            tenant_id=TENANT_ID,
+            role=Role.SUPER_ADMIN,
+            agent_id=None,
+            capability="calendar",
+            operation="write",
+            resource_prefix="plugin/calendar/calendar/create_event",
+            effect=PolicyEffect.REQUIRE_APPROVAL,
+        ),
+        CapabilityRule(
+            tenant_id=TENANT_ID,
+            role=Role.ADMIN,
+            agent_id=None,
+            capability="calendar",
+            operation="write",
+            resource_prefix="plugin/calendar/calendar/create_event",
+            effect=PolicyEffect.REQUIRE_APPROVAL,
+        ),
+        CapabilityRule(
+            tenant_id=TENANT_ID,
+            role=Role.OPERATOR,
+            agent_id=None,
+            capability="calendar",
+            operation="write",
+            resource_prefix="plugin/calendar/calendar/create_event",
+            effect=PolicyEffect.REQUIRE_APPROVAL,
+        ),
+    )
+
+
+async def test_runtime_plugin_service_omits_inherited_policy_effect_rules() -> None:
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService((plugin("calendar", policy_effect="inherit"),)),
+        adapters={"plugin_runtime": RecordingPluginAdapter([])},
+    )
+
+    assert service.capability_policy_rules(TENANT_ID) == ()
 
 
 async def test_runtime_plugin_service_records_invocation_audit_without_payloads() -> None:

@@ -229,6 +229,84 @@ class RecordingApprovalRepository(ScopeApprovedRepository):
         return object()
 
 
+class RequestApprovedRepository(ScopeApprovedRepository):
+    async def is_capability_approval_approved(
+        self,
+        _tenant_id: UUID,
+        _run_id: UUID,
+        _approval_fingerprint: str,
+    ) -> bool:
+        return True
+
+
+class StaticPluginPolicyRuleSource:
+    def __init__(self, rules: tuple[CapabilityRule, ...]) -> None:
+        self.rules = rules
+        self.tenants: list[UUID] = []
+
+    def capability_policy_rules(self, tenant_id: UUID) -> tuple[CapabilityRule, ...]:
+        self.tenants.append(tenant_id)
+        return self.rules
+
+
+class RecordingPluginBackend:
+    def __init__(
+        self,
+        *,
+        capability: str = "plugin",
+        operation: str = "use",
+        resource: str = "plugin/calendar/create_event",
+        effect: PolicyEffect = PolicyEffect.ALLOW,
+        declared_parts: tuple[str, str, str] | None = None,
+        tool_name: str = "calendar.create_event",
+    ) -> None:
+        self.capability = capability
+        self.operation = operation
+        self.resource = resource
+        self.effect = effect
+        self.declared_parts = declared_parts
+        self.tool_name = tool_name
+        self.calls: list[str] = []
+
+    def is_available(self, tenant_id: UUID, name: str) -> bool:
+        return tenant_id == TENANT_ID and name == self.tool_name
+
+    def capability_policy_parts(self, tenant_id: UUID, name: str) -> tuple[str, str, str] | None:
+        if tenant_id != TENANT_ID or name != self.tool_name:
+            return None
+        return self.declared_parts
+
+    def capability_policy_rules(self, tenant_id: UUID) -> tuple[CapabilityRule, ...]:
+        if tenant_id != TENANT_ID:
+            return ()
+        return (
+            CapabilityRule(
+                tenant_id=tenant_id,
+                role=Role.OPERATOR,
+                agent_id=None,
+                capability=self.capability,
+                operation=self.operation,
+                resource_prefix=self.resource,
+                effect=self.effect,
+            ),
+        )
+
+    async def invoke(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        del tenant_id, user_id, run_id, actor, arguments, idempotency_key
+        self.calls.append(name)
+        return {"ok": True}
+
+
 class StaticApprovalReviewer:
     def __init__(self, decision: ApprovalReviewDecision) -> None:
         self.decision = decision
@@ -283,6 +361,307 @@ def test_default_capability_policy_denies_viewer_runtime_tools() -> None:
     decision = policy.evaluate(request("calculator", "evaluate", "calculator"), Role.VIEWER)
 
     assert decision.effect is PolicyEffect.DENY
+
+
+async def test_default_policy_gateway_allows_custom_plugin_permission_from_policy_effect() -> None:
+    source = StaticPluginPolicyRuleSource(
+        (
+            CapabilityRule(
+                tenant_id=TENANT_ID,
+                role=Role.OPERATOR,
+                agent_id=None,
+                capability="calendar",
+                operation="write",
+                resource_prefix="plugin/calendar/calendar/create_event",
+                effect=PolicyEffect.ALLOW,
+            ),
+        )
+    )
+    gateway = DefaultRuntimeCapabilityPolicyGateway(
+        ApprovalService(InMemoryApprovalStore()),
+        ScopeApprovedRepository(),
+        plugin_policy_rules=source,
+    )
+
+    result = await gateway.invoke(
+        request("calendar", "write", "plugin/calendar/calendar/create_event"),
+        role=Role.OPERATOR,
+    )
+
+    assert result.status is CapabilityStatus.ALLOWED
+    assert source.tenants == [TENANT_ID]
+
+
+async def test_default_policy_gateway_requires_approval_for_plugin_policy_effect() -> None:
+    repository = ScopeApprovedRepository()
+    source = StaticPluginPolicyRuleSource(
+        (
+            CapabilityRule(
+                tenant_id=TENANT_ID,
+                role=Role.OPERATOR,
+                agent_id=None,
+                capability="plugin",
+                operation="use",
+                resource_prefix="plugin/calendar/create_event",
+                effect=PolicyEffect.REQUIRE_APPROVAL,
+            ),
+        )
+    )
+    gateway = DefaultRuntimeCapabilityPolicyGateway(
+        ApprovalService(InMemoryApprovalStore()),
+        repository,
+        plugin_policy_rules=source,
+    )
+
+    result = await gateway.invoke(
+        request("plugin", "use", "plugin/calendar/create_event"),
+        role=Role.OPERATOR,
+    )
+
+    assert result.status is CapabilityStatus.WAITING_APPROVAL
+    assert result.reason == "capability requires approval"
+    assert repository.pending_approvals == 1
+
+
+async def test_default_policy_gateway_denies_plugin_policy_effect_over_default_allow() -> None:
+    source = StaticPluginPolicyRuleSource(
+        (
+            CapabilityRule(
+                tenant_id=TENANT_ID,
+                role=Role.OPERATOR,
+                agent_id=None,
+                capability="plugin",
+                operation="use",
+                resource_prefix="plugin/calendar/create_event",
+                effect=PolicyEffect.DENY,
+            ),
+        )
+    )
+    gateway = DefaultRuntimeCapabilityPolicyGateway(
+        ApprovalService(InMemoryApprovalStore()),
+        ScopeApprovedRepository(),
+        plugin_policy_rules=source,
+    )
+
+    result = await gateway.invoke(
+        request("plugin", "use", "plugin/calendar/create_event"),
+        role=Role.OPERATOR,
+    )
+
+    assert result.status is CapabilityStatus.DENIED
+    assert result.reason == "capability denied"
+
+
+async def test_runtime_stack_allows_plugin_with_custom_policy_effect(
+    tmp_path: Path,
+) -> None:
+    plugin_backend = RecordingPluginBackend(
+        capability="calendar",
+        operation="write",
+        resource="plugin/calendar/calendar/create_event",
+        declared_parts=("calendar", "write", "plugin/calendar/calendar/create_event"),
+    )
+    stack = build_runtime_capability_stack(
+        tenant_id=TENANT_ID,
+        run_repository=ScopeApprovedRepository(),
+        skill_store_dir=tmp_path / "skills",
+        workspace_root=tmp_path,
+        plugin_backend=plugin_backend,
+    )
+
+    result = await stack.harness_tool_gateway.invoke(
+        TENANT_ID,
+        HarnessToolCallRequest(
+            run_id=RUN_ID,
+            actor="researcher",
+            tool_name="calendar.create_event",
+            arguments={"title": "review"},
+            approval_required=False,
+            sandbox="restricted",
+            idempotency_key="calendar-custom-allow",
+        ),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "succeeded"
+    assert result.payload == {"ok": True}
+    assert plugin_backend.calls == ["calendar.create_event"]
+
+
+async def test_runtime_stack_allows_plugin_policy_effect_over_global_approval(
+    tmp_path: Path,
+) -> None:
+    plugin_backend = RecordingPluginBackend(effect=PolicyEffect.ALLOW)
+    stack = build_runtime_capability_stack(
+        tenant_id=TENANT_ID,
+        run_repository=ScopeApprovedRepository(),
+        skill_store_dir=tmp_path / "skills",
+        workspace_root=tmp_path,
+        require_approval_for_tools=approval_required,
+        plugin_backend=plugin_backend,
+    )
+
+    result = await stack.harness_tool_gateway.invoke(
+        TENANT_ID,
+        HarnessToolCallRequest(
+            run_id=RUN_ID,
+            actor="researcher",
+            tool_name="calendar.create_event",
+            arguments={"title": "review"},
+            approval_required=False,
+            sandbox="restricted",
+            idempotency_key="calendar-policy-allow-global-approval",
+        ),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "succeeded"
+    assert plugin_backend.calls == ["calendar.create_event"]
+
+
+async def test_runtime_stack_requires_approval_for_plugin_policy_effect(
+    tmp_path: Path,
+) -> None:
+    repository = ScopeApprovedRepository()
+    plugin_backend = RecordingPluginBackend(effect=PolicyEffect.REQUIRE_APPROVAL)
+    stack = build_runtime_capability_stack(
+        tenant_id=TENANT_ID,
+        run_repository=repository,
+        skill_store_dir=tmp_path / "skills",
+        workspace_root=tmp_path,
+        plugin_backend=plugin_backend,
+    )
+
+    result = await stack.harness_tool_gateway.invoke(
+        TENANT_ID,
+        HarnessToolCallRequest(
+            run_id=RUN_ID,
+            actor="researcher",
+            tool_name="calendar.create_event",
+            arguments={"title": "review"},
+            approval_required=False,
+            sandbox="restricted",
+            idempotency_key="calendar-policy-approval",
+        ),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    assert result.failure_reason == "capability requires approval"
+    assert repository.pending_approvals == 1
+    assert plugin_backend.calls == []
+
+
+async def test_runtime_stack_requires_approval_for_alias_plugin_policy_effect(
+    tmp_path: Path,
+) -> None:
+    repository = ScopeApprovedRepository()
+    plugin_backend = RecordingPluginBackend(
+        effect=PolicyEffect.REQUIRE_APPROVAL,
+        declared_parts=("plugin", "use", "plugin/calendar/create_event"),
+        tool_name="calendar_create",
+    )
+    stack = build_runtime_capability_stack(
+        tenant_id=TENANT_ID,
+        run_repository=repository,
+        skill_store_dir=tmp_path / "skills",
+        workspace_root=tmp_path,
+        plugin_backend=plugin_backend,
+    )
+
+    result = await stack.harness_tool_gateway.invoke(
+        TENANT_ID,
+        HarnessToolCallRequest(
+            run_id=RUN_ID,
+            actor="researcher",
+            tool_name="calendar_create",
+            arguments={"title": "review"},
+            approval_required=False,
+            sandbox="restricted",
+            idempotency_key="calendar-policy-alias-approval",
+        ),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    assert result.failure_reason == "capability requires approval"
+    assert repository.pending_approvals == 1
+    assert plugin_backend.calls == []
+
+
+async def test_runtime_stack_denies_plugin_policy_effect_before_adapter(
+    tmp_path: Path,
+) -> None:
+    plugin_backend = RecordingPluginBackend(effect=PolicyEffect.DENY)
+    stack = build_runtime_capability_stack(
+        tenant_id=TENANT_ID,
+        run_repository=ScopeApprovedRepository(),
+        skill_store_dir=tmp_path / "skills",
+        workspace_root=tmp_path,
+        plugin_backend=plugin_backend,
+    )
+
+    result = await stack.harness_tool_gateway.invoke(
+        TENANT_ID,
+        HarnessToolCallRequest(
+            run_id=RUN_ID,
+            actor="researcher",
+            tool_name="calendar.create_event",
+            arguments={"title": "review"},
+            approval_required=False,
+            sandbox="restricted",
+            idempotency_key="calendar-policy-deny",
+        ),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    assert result.failure_reason == "capability denied"
+    assert plugin_backend.calls == []
+
+
+async def test_default_policy_gateway_denies_plugin_effect_before_existing_approval() -> None:
+    source = StaticPluginPolicyRuleSource(
+        (
+            CapabilityRule(
+                tenant_id=TENANT_ID,
+                role=Role.OPERATOR,
+                agent_id=None,
+                capability="plugin",
+                operation="use",
+                resource_prefix="plugin/calendar/create_event",
+                effect=PolicyEffect.DENY,
+            ),
+        )
+    )
+    gateway = DefaultRuntimeCapabilityPolicyGateway(
+        ApprovalService(InMemoryApprovalStore()),
+        RequestApprovedRepository(),
+        plugin_policy_rules=source,
+    )
+
+    result = await gateway.invoke(
+        CapabilityRequest(
+            tenant_id=TENANT_ID,
+            user_id=USER_ID,
+            agent_id="researcher",
+            capability="plugin",
+            operation="use",
+            resource="plugin/calendar/create_event",
+            arguments={"title": "review"},
+            idempotency_key="calendar-deny-after-approval",
+            run_id=RUN_ID,
+        ),
+        role=Role.OPERATOR,
+    )
+
+    assert result.status is CapabilityStatus.DENIED
+    assert result.reason == "capability denied"
 
 
 async def test_default_runtime_capability_stack_authorizes_request_tenant(

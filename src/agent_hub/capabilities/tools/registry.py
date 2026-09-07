@@ -94,6 +94,7 @@ class PluginCapabilityConfig(Protocol):
     adapter: str
     permission_class: str
     sandbox_profile: str
+    policy_effect: str
     replay_safe: bool
     aliases: Sequence[str]
 
@@ -126,6 +127,7 @@ class PluginConfigCapabilityManifestSource:
                     "adapter": capability.adapter,
                     "permission_class": capability.permission_class,
                     "sandbox_profile": capability.sandbox_profile,
+                    "policy_effect": _policy_effect(getattr(capability, "policy_effect", None)),
                     "available": available,
                     "availability_reason": reason,
                     "replay_safe": capability.replay_safe is True,
@@ -204,6 +206,12 @@ def create_builtin_tool_registry() -> ToolRegistry:
         aliases=("workspace_read",),
     )
     return registry
+
+
+def _policy_effect(value: object) -> str:
+    if value in {"inherit", "allow", "require_approval", "deny"}:
+        return value
+    return "inherit"
 
 
 def _plugin_availability_reason(plugin: PluginConfig) -> str:

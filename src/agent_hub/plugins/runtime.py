@@ -12,8 +12,11 @@ from jsonschema.protocols import Validator  # type: ignore[import-untyped]
 from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 
 from agent_hub.api.routers.admin import PluginCapabilityRequest, PluginResourceResponse
+from agent_hub.auth.models import Role
+from agent_hub.capabilities.policy import CapabilityRule
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.capabilities.tools.registry import PluginConfigCapabilityManifestSource
+from agent_hub.capabilities.types import PolicyEffect
 from agent_hub.runtime.contracts import JsonValue, _mutable_json
 
 
@@ -181,17 +184,36 @@ class RuntimePluginService:
         if target is None:
             return None
         plugin, capability = target
-        if capability.permission_class == "plugin.use":
-            return None
-        permission = _permission_class_parts(capability.permission_class)
-        if permission is None:
-            return None
-        policy_capability, policy_operation = permission
-        return (
-            policy_capability,
-            policy_operation,
-            _plugin_policy_resource(plugin, capability),
-        )
+        return _plugin_capability_policy_parts(plugin, capability)
+
+    def capability_policy_rules(self, tenant_id: UUID) -> tuple[CapabilityRule, ...]:
+        if tenant_id != self._tenant_id:
+            return ()
+        rules: list[CapabilityRule] = []
+        for plugin in self._plugins:
+            if not _plugin_is_running(plugin):
+                continue
+            for capability in plugin.capabilities:
+                effect = _plugin_policy_effect(capability.policy_effect)
+                if effect is None:
+                    continue
+                parts = _plugin_capability_policy_parts(plugin, capability)
+                if parts is None:
+                    continue
+                policy_capability, policy_operation, resource_prefix = parts
+                for role in _PLUGIN_POLICY_ROLES:
+                    rules.append(
+                        CapabilityRule(
+                            tenant_id=tenant_id,
+                            role=role,
+                            agent_id=None,
+                            capability=policy_capability,
+                            operation=policy_operation,
+                            resource_prefix=resource_prefix,
+                            effect=effect,
+                        )
+                    )
+        return tuple(rules)
 
     async def invoke(
         self,
@@ -354,6 +376,32 @@ def _plugin_policy_resource(
     return f"plugin/{plugin.id}/{capability.id.replace('.', '/')}"
 
 
+def _generic_plugin_policy_resource(capability: PluginCapabilityRequest) -> str:
+    return f"plugin/{capability.id.replace('.', '/')}"
+
+
+def _plugin_capability_policy_parts(
+    plugin: PluginResourceResponse,
+    capability: PluginCapabilityRequest,
+) -> tuple[str, str, str] | None:
+    if capability.permission_class == "plugin.use":
+        return "plugin", "use", _generic_plugin_policy_resource(capability)
+    permission = _permission_class_parts(capability.permission_class)
+    if permission is None:
+        return None
+    policy_capability, policy_operation = permission
+    return policy_capability, policy_operation, _plugin_policy_resource(plugin, capability)
+
+
+def _plugin_policy_effect(value: str) -> PolicyEffect | None:
+    if value == "inherit":
+        return None
+    try:
+        return PolicyEffect(value)
+    except ValueError:
+        return PolicyEffect.DENY
+
+
 def _ensure_supported_plugin_sandbox_profile(sandbox_profile: str) -> None:
     if sandbox_profile in _SUPPORTED_PLUGIN_SANDBOX_PROFILES:
         return
@@ -361,6 +409,7 @@ def _ensure_supported_plugin_sandbox_profile(sandbox_profile: str) -> None:
 
 
 _SUPPORTED_PLUGIN_SANDBOX_PROFILES = frozenset(("remote_connector",))
+_PLUGIN_POLICY_ROLES = (Role.SUPER_ADMIN, Role.ADMIN, Role.OPERATOR)
 
 
 def _default_plugin_adapters(admin_service: object) -> dict[str, PluginAdapter]:
@@ -443,6 +492,11 @@ def _http_json_adapter_descriptor() -> Mapping[str, JsonValue]:
                 "id": {"type": "string"},
                 "permission_class": {"type": "string", "default": "plugin.use"},
                 "sandbox_profile": {"type": "string", "default": "remote_connector"},
+                "policy_effect": {
+                    "type": "string",
+                    "enum": ("inherit", "allow", "require_approval", "deny"),
+                    "default": "inherit",
+                },
                 "replay_safe": {"type": "boolean", "default": False},
                 "aliases": {"type": "array", "items": {"type": "string"}},
                 "input_schema": {"type": "object"},

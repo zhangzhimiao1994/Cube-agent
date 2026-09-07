@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol, cast
 from uuid import UUID
 
 from agent_hub.auth.models import Role
@@ -29,6 +30,10 @@ ToolApprovalPolicyGetter = Callable[[UUID], Awaitable[bool]]
 ToolApprovalModeGetter = Callable[[UUID], Awaitable[str]]
 
 
+class PluginPolicyRuleSource(Protocol):
+    def capability_policy_rules(self, tenant_id: UUID) -> tuple[CapabilityRule, ...]: ...
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeCapabilityStack:
     runtime_gateway: RuntimeCapabilityGateway
@@ -45,12 +50,14 @@ class DefaultRuntimeCapabilityPolicyGateway:
         require_approval_for_tools: ToolApprovalPolicyGetter | None = None,
         tool_approval_mode: ToolApprovalModeGetter | None = None,
         approval_reviewer: ApprovalReviewer | None = None,
+        plugin_policy_rules: PluginPolicyRuleSource | None = None,
     ) -> None:
         self._approvals = approvals
         self._run_repository = run_repository
         self._require_approval_for_tools = require_approval_for_tools
         self._tool_approval_mode = tool_approval_mode
         self._approval_reviewer = approval_reviewer
+        self._plugin_policy_rules = plugin_policy_rules
 
     async def invoke(
         self,
@@ -58,15 +65,26 @@ class DefaultRuntimeCapabilityPolicyGateway:
         *,
         role: Role,
     ) -> CapabilityResult:
+        approval_required = await self._tool_approval_required(request.tenant_id)
+        extra_rules = self._extra_policy_rules(request)
+        explicit_plugin_effect = _explicit_policy_effect(extra_rules, request, role)
+        if explicit_plugin_effect is PolicyEffect.DENY:
+            return CapabilityResult(
+                CapabilityStatus.DENIED,
+                request.run_id,
+                reason="capability denied",
+            )
         if await _has_approved_capability_request(self._run_repository, request):
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
         if await _has_approved_capability_scope(self._run_repository, request):
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
-        approval_required = await self._tool_approval_required(request.tenant_id)
+        if explicit_plugin_effect is PolicyEffect.ALLOW:
+            return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
         gateway = CapabilityGateway(
             default_capability_policy(
                 request.tenant_id,
                 require_approval_for_tools=approval_required,
+                extra_rules=extra_rules,
             ),
             self._approvals,
             self._run_repository,
@@ -99,6 +117,17 @@ class DefaultRuntimeCapabilityPolicyGateway:
         if mode in {"ask", "auto_review"}:
             return mode
         return "ask"
+
+    def _extra_policy_rules(self, request: CapabilityRequest) -> tuple[CapabilityRule, ...]:
+        if self._plugin_policy_rules is None:
+            return ()
+        try:
+            rules = self._plugin_policy_rules.capability_policy_rules(request.tenant_id)
+        except Exception:  # noqa: BLE001 - plugin policy discovery must fail closed for plugin tools.
+            return _deny_current_plugin_request_rules(request)
+        if not isinstance(rules, tuple) or not all(isinstance(rule, CapabilityRule) for rule in rules):
+            return _deny_current_plugin_request_rules(request)
+        return rules
 
 
 class CodexAutoApprovalReviewer:
@@ -176,6 +205,7 @@ def default_capability_policy(
     tenant_id: UUID,
     *,
     require_approval_for_tools: bool = False,
+    extra_rules: tuple[CapabilityRule, ...] = (),
 ) -> CapabilityPolicy:
     allowed_roles = (Role.SUPER_ADMIN, Role.ADMIN, Role.OPERATOR)
     generated_effect = (
@@ -188,29 +218,28 @@ def default_capability_policy(
     plugin_effect = (
         PolicyEffect.REQUIRE_APPROVAL if require_approval_for_tools else PolicyEffect.ALLOW
     )
-    return CapabilityPolicy(
-        tuple(
-            CapabilityRule(
-                tenant_id=tenant_id,
-                role=role,
-                agent_id=None,
-                capability=capability,
-                operation=operation,
-                resource_prefix=resource_prefix,
-                effect=effect,
-            )
-            for role in allowed_roles
-            for capability, operation, resource_prefix, effect in (
-                ("calculator", "evaluate", "calculator", PolicyEffect.ALLOW),
-                ("file", "read", "workspace", PolicyEffect.ALLOW),
-                ("file", "create", "generated", generated_effect),
-                ("context", "read", "context", PolicyEffect.ALLOW),
-                ("skill", "use", "skill", skill_effect),
-                ("mcp", "invoke", "mcp", mcp_effect),
-                ("plugin", "use", "plugin", plugin_effect),
-            )
+    default_rules = tuple(
+        CapabilityRule(
+            tenant_id=tenant_id,
+            role=role,
+            agent_id=None,
+            capability=capability,
+            operation=operation,
+            resource_prefix=resource_prefix,
+            effect=effect,
+        )
+        for role in allowed_roles
+        for capability, operation, resource_prefix, effect in (
+            ("calculator", "evaluate", "calculator", PolicyEffect.ALLOW),
+            ("file", "read", "workspace", PolicyEffect.ALLOW),
+            ("file", "create", "generated", generated_effect),
+            ("context", "read", "context", PolicyEffect.ALLOW),
+            ("skill", "use", "skill", skill_effect),
+            ("mcp", "invoke", "mcp", mcp_effect),
+            ("plugin", "use", "plugin", plugin_effect),
         )
     )
+    return CapabilityPolicy(default_rules + extra_rules)
 
 
 def build_runtime_capability_stack(
@@ -247,6 +276,7 @@ def build_runtime_capability_stack(
         require_approval_for_tools=require_approval_for_tools,
         tool_approval_mode=tool_approval_mode,
         approval_reviewer=default_reviewer,
+        plugin_policy_rules=_plugin_policy_rule_source(plugin_backend),
     )
     harness_tool_gateway = HarnessToolGateway(
         runtime_gateway,
@@ -269,3 +299,72 @@ __all__ = [
     "build_runtime_capability_stack",
     "default_capability_policy",
 ]
+
+
+def _deny_current_plugin_request_rules(request: CapabilityRequest) -> tuple[CapabilityRule, ...]:
+    if not _is_plugin_policy_request(request):
+        return ()
+    resource = normalize_resource(request.resource)
+    if resource is None:
+        return ()
+    return tuple(
+        CapabilityRule(
+            tenant_id=request.tenant_id,
+            role=role,
+            agent_id=None,
+            capability=request.capability,
+            operation=request.operation,
+            resource_prefix=resource,
+            effect=PolicyEffect.DENY,
+        )
+        for role in (Role.SUPER_ADMIN, Role.ADMIN, Role.OPERATOR)
+    )
+
+
+def _is_plugin_policy_request(request: CapabilityRequest) -> bool:
+    resource = normalize_resource(request.resource)
+    return (
+        request.capability == "plugin"
+        or resource == "plugin"
+        or (resource is not None and resource.startswith("plugin/"))
+    )
+
+
+def _plugin_policy_rule_source(source: object | None) -> PluginPolicyRuleSource | None:
+    if source is None:
+        return None
+    if not callable(getattr(source, "capability_policy_rules", None)):
+        return None
+    return cast(PluginPolicyRuleSource, source)
+
+
+def _explicit_policy_effect(
+    rules: tuple[CapabilityRule, ...],
+    request: CapabilityRequest,
+    role: Role,
+) -> PolicyEffect | None:
+    normalized_resource = normalize_resource(request.resource)
+    if normalized_resource is None:
+        return None
+    effects = [
+        rule.effect
+        for rule in rules
+        if (
+            rule.tenant_id == request.tenant_id
+            and (rule.role is None or rule.role is role)
+            and (rule.agent_id is None or rule.agent_id == request.agent_id)
+            and rule.capability == request.capability
+            and rule.operation == request.operation
+            and (
+                normalized_resource == rule.resource_prefix
+                or normalized_resource.startswith(f"{rule.resource_prefix}/")
+            )
+        )
+    ]
+    if PolicyEffect.DENY in effects:
+        return PolicyEffect.DENY
+    if PolicyEffect.REQUIRE_APPROVAL in effects:
+        return PolicyEffect.REQUIRE_APPROVAL
+    if PolicyEffect.ALLOW in effects:
+        return PolicyEffect.ALLOW
+    return None
