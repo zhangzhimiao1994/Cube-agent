@@ -105,6 +105,47 @@ def test_runtime_capability_stack_passes_tool_registry_to_manifest(
     assert capabilities["mcp.search"]["aliases"] == ("search_web",)
 
 
+class TenantAwareReplaySafePluginSource:
+    def __init__(self) -> None:
+        self.tenants: list[UUID] = []
+
+    def manifests_for_tenant(self, tenant_id: UUID) -> Mapping[str, JsonValue]:
+        self.tenants.append(tenant_id)
+        return {
+            "schema_version": 1,
+            "capabilities": (
+                {
+                    "id": "calendar.create_event",
+                    "kind": "plugin",
+                    "adapter": "plugin_runtime",
+                    "permission_class": "calendar.write",
+                    "sandbox_profile": "remote_connector",
+                    "available": True,
+                    "availability_reason": None,
+                    "replay_safe": True,
+                    "aliases": ("calendar_create",),
+                },
+            ),
+        }
+
+
+def test_runtime_capability_stack_uses_tenant_for_plugin_replay_safe(
+    tmp_path: Path,
+) -> None:
+    source = TenantAwareReplaySafePluginSource()
+    stack = build_runtime_capability_stack(
+        tenant_id=TENANT_ID,
+        run_repository=object(),
+        skill_store_dir=tmp_path / "skills",
+        workspace_root=None,
+        tool_registry=source,
+    )
+
+    assert stack.runtime_gateway.is_replay_safe("calendar.create_event") is True
+    assert stack.runtime_gateway.is_replay_safe("calendar_create") is True
+    assert source.tenants == [TENANT_ID, TENANT_ID]
+
+
 class ScopeApprovedRepository:
     def __init__(self) -> None:
         self.pending_approvals = 0

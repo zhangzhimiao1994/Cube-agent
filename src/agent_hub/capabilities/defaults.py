@@ -230,12 +230,12 @@ def build_runtime_capability_stack(
 ) -> RuntimeCapabilityStack:
     runtime_gateway = RuntimeCapabilityGateway(
         skill_store_dir=skill_store_dir,
+        tenant_id=tenant_id,
         workspace_root=workspace_root,
         generated_artifact_dir=generated_artifact_dir,
         project_workspace_dir=project_workspace_dir,
         tool_registry=tool_registry,
     )
-    del tenant_id
     default_reviewer = (
         CodexAutoApprovalReviewer()
         if approval_reviewer is None and tool_approval_mode is None

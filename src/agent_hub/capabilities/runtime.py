@@ -13,6 +13,7 @@ from typing import Protocol, cast
 from uuid import UUID, uuid4
 
 from agent_hub.capabilities.tools.calculator import Calculator
+from agent_hub.capabilities.tools.registry import ToolRegistry
 from agent_hub.capabilities.tools.workspace_read import WorkspaceReader
 from agent_hub.documents.docx import DocxBlueprint, build_docx
 from agent_hub.documents.pptx import PptxBlueprint, build_pptx
@@ -90,6 +91,7 @@ class RuntimeCapabilityGateway:
         self,
         *,
         skill_store_dir: Path,
+        tenant_id: UUID | None = None,
         workspace_root: Path | None = None,
         generated_artifact_dir: Path | None = None,
         project_workspace_dir: Path | None = None,
@@ -110,10 +112,19 @@ class RuntimeCapabilityGateway:
         self._skill_sandbox = skill_sandbox or SystemdSkillSandbox()
         self._calculator = calculator or Calculator()
         self._tool_registry = tool_registry
+        self._tenant_id = tenant_id
 
     def is_replay_safe(self, name: str) -> bool:
         normalized_name = _normalize_tool_name(name)
-        return normalized_name in _REPLAY_SAFE
+        if normalized_name in _REPLAY_SAFE:
+            return True
+        if self._tool_registry is None:
+            return False
+        return _manifest_replay_safe(
+            self._tool_registry,
+            self._tenant_id,
+            normalized_name,
+        )
 
     def is_available(self, tenant_id: UUID, name: str) -> bool:
         normalized_name = _normalize_tool_name(name)
@@ -520,12 +531,86 @@ def _manifest_source_items(
             manifest = cast(CapabilityManifestSource, source).manifests()
     except Exception:  # noqa: BLE001 - optional manifest sources must fail closed.
         return ()
+    if not isinstance(manifest, Mapping):
+        return ()
     if manifest.get("schema_version") != 1:
         return ()
     raw_items = manifest.get("capabilities")
     if not isinstance(raw_items, tuple | list):
         return ()
     return tuple(item for item in raw_items if isinstance(item, Mapping))
+
+
+def _manifest_replay_safe(
+    source: CapabilityManifestProvider,
+    tenant_id: UUID | None,
+    name: str,
+) -> bool:
+    allow_missing_available = isinstance(source, ToolRegistry)
+    items = _replay_safe_manifest_source_items(source, tenant_id)
+    ambiguous_names = _ambiguous_manifest_names(items)
+    for item in items:
+        available = item.get("available")
+        if (
+            available is not True
+            and not (allow_missing_available and available is None)
+        ) or item.get("replay_safe") is not True:
+            continue
+        item_names = _manifest_item_names(item)
+        if not item_names or any(item_name in ambiguous_names for item_name in item_names):
+            continue
+        if _RESERVED_REPLAY_SAFE_NAMES.intersection(item_names):
+            continue
+        item_id = item.get("id")
+        aliases = _tuple_strings(item.get("aliases"))
+        if item_id == name or name in aliases:
+            return True
+    return False
+
+
+def _replay_safe_manifest_source_items(
+    source: CapabilityManifestProvider,
+    tenant_id: UUID | None,
+) -> tuple[Mapping[str, JsonValue], ...]:
+    if tenant_id is not None:
+        return _manifest_source_items(source, tenant_id)
+    try:
+        plain_manifest = getattr(source, "manifests", None)
+        if not callable(plain_manifest):
+            return ()
+        manifest = plain_manifest()
+    except Exception:  # noqa: BLE001 - optional replay metadata must fail closed.
+        return ()
+    if not isinstance(manifest, Mapping) or manifest.get("schema_version") != 1:
+        return ()
+    raw_items = manifest.get("capabilities")
+    if not isinstance(raw_items, tuple | list):
+        return ()
+    return tuple(item for item in raw_items if isinstance(item, Mapping))
+
+
+def _ambiguous_manifest_names(items: tuple[Mapping[str, JsonValue], ...]) -> frozenset[str]:
+    counts: dict[str, int] = {}
+    for item in items:
+        for name in _manifest_item_names(item):
+            counts[name] = counts.get(name, 0) + 1
+    return frozenset(name for name, count in counts.items() if count > 1)
+
+
+def _manifest_item_names(item: Mapping[str, JsonValue]) -> tuple[str, ...]:
+    item_id = item.get("id")
+    names = [item_id] if isinstance(item_id, str) else []
+    names.extend(_tuple_strings(item.get("aliases")))
+    return tuple(names)
+
+
+_RESERVED_REPLAY_SAFE_NAMES = frozenset(
+    {
+        *_REPLAY_SAFE,
+        *_BUILTIN_ALIASES,
+        *_BUILTIN_ALIASES.values(),
+    }
+)
 
 
 def _project_registry_manifest_item(

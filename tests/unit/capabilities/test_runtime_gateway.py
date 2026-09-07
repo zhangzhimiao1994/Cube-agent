@@ -69,6 +69,35 @@ class TenantAwareManifestSource:
         }
 
 
+class TenantAwareReplaySafeManifestSource:
+    def __init__(self) -> None:
+        self.tenants: list[UUID] = []
+
+    def manifests_for_tenant(self, tenant_id: UUID) -> Mapping[str, JsonValue]:
+        self.tenants.append(tenant_id)
+        return {
+            "schema_version": 1,
+            "capabilities": (
+                {
+                    "id": "calendar.create_event",
+                    "kind": "plugin",
+                    "adapter": "plugin_runtime",
+                    "permission_class": "calendar.write",
+                    "sandbox_profile": "remote_connector",
+                    "available": True,
+                    "availability_reason": None,
+                    "replay_safe": True,
+                    "aliases": ("calendar_create",),
+                },
+            ),
+        }
+
+
+class InvalidTenantManifestSource:
+    def manifests_for_tenant(self, tenant_id: UUID) -> Mapping[str, JsonValue]:
+        return cast(Mapping[str, JsonValue], None)
+
+
 async def test_runtime_gateway_executes_calculator_without_external_side_effects(tmp_path: Path) -> None:
     gateway = RuntimeCapabilityGateway(skill_store_dir=tmp_path)
 
@@ -800,6 +829,247 @@ def test_runtime_gateway_capability_manifest_includes_registry_capabilities(
         "replay_safe": False,
         "aliases": (),
     }
+
+
+def test_runtime_gateway_replay_safe_uses_registry_manifest_capabilities(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    registry.register(
+        "calendar.create_event",
+        object(),
+        kind="plugin",
+        adapter="plugin_runtime",
+        permission_class="calendar.write",
+        sandbox_profile="remote_connector",
+        replay_safe=True,
+        aliases=("calendar_create",),
+    )
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        tool_registry=registry,
+    )
+
+    assert gateway.is_replay_safe("calendar.create_event") is True
+    assert gateway.is_replay_safe("calendar_create") is True
+
+
+def test_runtime_gateway_replay_safe_uses_tenant_aware_manifest_capabilities(
+    tmp_path: Path,
+) -> None:
+    source = TenantAwareReplaySafeManifestSource()
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        tenant_id=TENANT_ID,
+        tool_registry=source,
+    )
+
+    assert gateway.is_replay_safe("calendar.create_event") is True
+    assert gateway.is_replay_safe("calendar_create") is True
+    assert source.tenants == [TENANT_ID, TENANT_ID]
+
+
+def test_runtime_gateway_replay_safe_ignores_unavailable_registry_capabilities(
+    tmp_path: Path,
+) -> None:
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        tool_registry=FakeManifestSource(
+            {
+                "schema_version": 1,
+                "capabilities": (
+                    {
+                        "id": "calendar.create_event",
+                        "kind": "plugin",
+                        "adapter": "plugin_runtime",
+                        "permission_class": "calendar.write",
+                        "sandbox_profile": "remote_connector",
+                        "available": False,
+                        "availability_reason": "plugin_disabled",
+                        "replay_safe": True,
+                        "aliases": ("calendar_create",),
+                    },
+                ),
+            }
+        ),
+    )
+
+    assert gateway.is_replay_safe("calendar.create_event") is False
+    assert gateway.is_replay_safe("calendar_create") is False
+
+
+def test_runtime_gateway_replay_safe_requires_manifest_capability_to_be_available(
+    tmp_path: Path,
+) -> None:
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        tool_registry=FakeManifestSource(
+            {
+                "schema_version": 1,
+                "capabilities": (
+                    {
+                        "id": "calendar.create_event",
+                        "kind": "plugin",
+                        "adapter": "plugin_runtime",
+                        "permission_class": "calendar.write",
+                        "sandbox_profile": "remote_connector",
+                        "replay_safe": True,
+                        "aliases": ("calendar_create",),
+                    },
+                ),
+            }
+        ),
+    )
+
+    assert gateway.is_replay_safe("calendar.create_event") is False
+    assert gateway.is_replay_safe("calendar_create") is False
+
+
+def test_runtime_gateway_replay_safe_fails_closed_on_invalid_tenant_manifest(
+    tmp_path: Path,
+) -> None:
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        tenant_id=TENANT_ID,
+        tool_registry=InvalidTenantManifestSource(),
+    )
+
+    assert gateway.is_replay_safe("calendar.create_event") is False
+
+
+def test_runtime_gateway_replay_safe_fails_closed_on_duplicate_aliases(
+    tmp_path: Path,
+) -> None:
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        tool_registry=FakeManifestSource(
+            {
+                "schema_version": 1,
+                "capabilities": (
+                    {
+                        "id": "calendar.create_event",
+                        "kind": "plugin",
+                        "adapter": "plugin_runtime",
+                        "permission_class": "calendar.write",
+                        "sandbox_profile": "remote_connector",
+                        "available": True,
+                        "availability_reason": None,
+                        "replay_safe": False,
+                        "aliases": ("calendar_action",),
+                    },
+                    {
+                        "id": "calendar.delete_event",
+                        "kind": "plugin",
+                        "adapter": "plugin_runtime",
+                        "permission_class": "calendar.write",
+                        "sandbox_profile": "remote_connector",
+                        "available": True,
+                        "availability_reason": None,
+                        "replay_safe": True,
+                        "aliases": ("calendar_action",),
+                    },
+                ),
+            }
+        ),
+    )
+
+    assert gateway.is_replay_safe("calendar_action") is False
+
+
+def test_runtime_gateway_replay_safe_fails_closed_on_duplicate_ids(
+    tmp_path: Path,
+) -> None:
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        tool_registry=FakeManifestSource(
+            {
+                "schema_version": 1,
+                "capabilities": (
+                    {
+                        "id": "calendar.create_event",
+                        "kind": "plugin",
+                        "adapter": "plugin_runtime",
+                        "permission_class": "calendar.write",
+                        "sandbox_profile": "remote_connector",
+                        "available": True,
+                        "availability_reason": None,
+                        "replay_safe": False,
+                        "aliases": ("calendar_create",),
+                    },
+                    {
+                        "id": "calendar.create_event",
+                        "kind": "plugin",
+                        "adapter": "plugin_runtime",
+                        "permission_class": "calendar.write",
+                        "sandbox_profile": "remote_connector",
+                        "available": True,
+                        "availability_reason": None,
+                        "replay_safe": True,
+                        "aliases": ("calendar_duplicate",),
+                    },
+                ),
+            }
+        ),
+    )
+
+    assert gateway.is_replay_safe("calendar.create_event") is False
+    assert gateway.is_replay_safe("calendar_duplicate") is False
+
+
+def test_runtime_gateway_replay_safe_fails_closed_on_builtin_alias_conflict(
+    tmp_path: Path,
+) -> None:
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        tool_registry=FakeManifestSource(
+            {
+                "schema_version": 1,
+                "capabilities": (
+                    {
+                        "id": "calendar.create_event",
+                        "kind": "plugin",
+                        "adapter": "plugin_runtime",
+                        "permission_class": "calendar.write",
+                        "sandbox_profile": "remote_connector",
+                        "available": True,
+                        "availability_reason": None,
+                        "replay_safe": True,
+                        "aliases": ("calculator",),
+                    },
+                ),
+            }
+        ),
+    )
+
+    assert gateway.is_replay_safe("calendar.create_event") is False
+    assert gateway.is_replay_safe("calculator") is True
+
+
+def test_runtime_gateway_replay_safe_fails_closed_on_builtin_id_conflict(
+    tmp_path: Path,
+) -> None:
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        tool_registry=FakeManifestSource(
+            {
+                "schema_version": 1,
+                "capabilities": (
+                    {
+                        "id": "calculator",
+                        "kind": "plugin",
+                        "adapter": "plugin_runtime",
+                        "permission_class": "calculator.remote",
+                        "sandbox_profile": "remote_connector",
+                        "available": True,
+                        "availability_reason": None,
+                        "replay_safe": True,
+                        "aliases": ("remote_calculator",),
+                    },
+                ),
+            }
+        ),
+    )
+
+    assert gateway.is_replay_safe("remote_calculator") is False
+    assert gateway.is_replay_safe("calculator") is True
 
 
 def test_runtime_gateway_capability_manifest_includes_extra_manifest_sources(
