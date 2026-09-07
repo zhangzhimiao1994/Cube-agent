@@ -899,6 +899,50 @@ const McpServerSchema = z.object({
 
 export type McpServer = z.infer<typeof McpServerSchema>;
 
+const PluginCapabilitySchema = z.object({
+  id: z.string(),
+  adapter: z.string().default("plugin_runtime"),
+  permission_class: z.string().default("plugin.use"),
+  sandbox_profile: z.string().default("plugin"),
+  replay_safe: z.boolean().default(false),
+  aliases: z.array(z.string()).default([]),
+});
+
+const PluginResourceSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  enabled: z.boolean().default(true),
+  description: z.string().nullable().default(null),
+  version: z.string().default("local"),
+  endpoint_url: z.string().nullable().default(null),
+  domain_allowlist: z.array(z.string()).default([]),
+  timeout_seconds: z.number().default(10),
+  credential_ref: z.string().nullable().default(null),
+  credential_header: z.string().default("X-Plugin-Credential"),
+  credential_scheme: z.string().default("Bearer"),
+  capabilities: z.array(PluginCapabilitySchema).default([]),
+  status: z.string(),
+  health: z.string(),
+  last_error_type: z.string().nullable().default(null),
+});
+
+export type PluginCapability = z.infer<typeof PluginCapabilitySchema>;
+export type PluginResource = z.infer<typeof PluginResourceSchema>;
+export type PluginResourcePayload = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  description?: string | null;
+  version?: string;
+  endpoint_url?: string | null;
+  domain_allowlist?: string[];
+  timeout_seconds?: number;
+  credential_ref?: string | null;
+  credential_header?: string;
+  credential_scheme?: string;
+  capabilities?: PluginCapability[];
+};
+
 const CapabilityManifestItemSchema = z.object({
   id: z.string(),
   kind: z.string(),
@@ -1866,6 +1910,44 @@ export const api = {
   deleteMcpServer(id: string): Promise<{ status: string }> {
     return request(
       `/api/v1/admin/mcp/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+      z.object({ status: z.string() }),
+    );
+  },
+  plugins(): Promise<PluginResource[]> {
+    return request("/api/v1/admin/plugins", { method: "GET" }, z.array(PluginResourceSchema));
+  },
+  createPlugin(payload: PluginResourcePayload): Promise<PluginResource> {
+    return request(
+      "/api/v1/admin/plugins",
+      { method: "POST", body: JSON.stringify(payload) },
+      PluginResourceSchema,
+    );
+  },
+  startPlugin(id: string): Promise<PluginResource> {
+    return request(
+      `/api/v1/admin/plugins/${encodeURIComponent(id)}/start`,
+      { method: "POST" },
+      PluginResourceSchema,
+    );
+  },
+  stopPlugin(id: string): Promise<PluginResource> {
+    return request(
+      `/api/v1/admin/plugins/${encodeURIComponent(id)}/stop`,
+      { method: "POST" },
+      PluginResourceSchema,
+    );
+  },
+  reloadPlugin(id: string): Promise<PluginResource> {
+    return request(
+      `/api/v1/admin/plugins/${encodeURIComponent(id)}/reload`,
+      { method: "POST" },
+      PluginResourceSchema,
+    );
+  },
+  deletePlugin(id: string): Promise<{ status: string }> {
+    return request(
+      `/api/v1/admin/plugins/${encodeURIComponent(id)}`,
       { method: "DELETE" },
       z.object({ status: z.string() }),
     );

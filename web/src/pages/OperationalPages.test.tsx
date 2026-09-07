@@ -410,6 +410,33 @@ const capabilityManifest = {
   ],
 };
 
+const calendarPlugin = {
+  id: "calendar",
+  name: "Calendar HTTP",
+  enabled: true,
+  description: "Calendar connector",
+  version: "local",
+  endpoint_url: "https://plugins.example/invoke",
+  domain_allowlist: ["plugins.example"],
+  timeout_seconds: 4,
+  credential_ref: "secret://calendar",
+  credential_header: "X-Plugin-Key",
+  credential_scheme: "",
+  capabilities: [
+    {
+      id: "calendar.create_event",
+      adapter: "http_json",
+      permission_class: "calendar.write",
+      sandbox_profile: "remote_connector",
+      replay_safe: false,
+      aliases: ["calendar_create"],
+    },
+  ],
+  status: "running",
+  health: "healthy",
+  last_error_type: null,
+};
+
 function jsonResponse(payload: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(payload), {
     status: 200,
@@ -437,6 +464,7 @@ describe("operational management pages", () => {
   let visibleEvolutionRuns = [evolutionRun];
   let visibleChannels = baseChannels;
   let visibleCapabilityManifest = capabilityManifest;
+  let visiblePlugins = [calendarPlugin];
   let failCapabilityManifest = false;
   let currentPrincipalRole = "super_admin";
   let visibleWorkspaceFiles = {
@@ -468,6 +496,7 @@ describe("operational management pages", () => {
     visibleEvolutionRuns = [evolutionRun];
     visibleChannels = baseChannels;
     visibleCapabilityManifest = capabilityManifest;
+    visiblePlugins = [calendarPlugin];
     failCapabilityManifest = false;
     currentPrincipalRole = "super_admin";
     visibleWorkspaceFiles = {
@@ -1140,6 +1169,42 @@ describe("operational management pages", () => {
         }
         if (path === "/api/v1/admin/mcp") {
           return jsonResponse([{ id: "filesystem", name: "Filesystem MCP", health: "healthy", allowed_tools: ["read_file"] }]);
+        }
+        if (path === "/api/v1/admin/plugins" && method === "GET") {
+          return jsonResponse(visiblePlugins);
+        }
+        if (path === "/api/v1/admin/plugins" && method === "POST") {
+          const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
+          const saved = {
+            ...body,
+            description: body.description ?? null,
+            version: body.version ?? "local",
+            endpoint_url: body.endpoint_url ?? null,
+            domain_allowlist: body.domain_allowlist ?? [],
+            timeout_seconds: body.timeout_seconds ?? 10,
+            credential_ref: body.credential_ref ?? null,
+            credential_header: body.credential_header ?? "X-Plugin-Credential",
+            credential_scheme: body.credential_scheme ?? "Bearer",
+            capabilities: body.capabilities ?? [],
+            status: body.enabled === false ? "disabled" : "stopped",
+            health: body.enabled === false ? "disabled" : "stopped",
+            last_error_type: null,
+          };
+          visiblePlugins = [saved];
+          return jsonResponse(saved);
+        }
+        if (path === "/api/v1/admin/plugins/calendar/reload" && method === "POST") {
+          return jsonResponse(calendarPlugin);
+        }
+        if (path === "/api/v1/admin/plugins/calendar/start" && method === "POST") {
+          return jsonResponse(calendarPlugin);
+        }
+        if (path === "/api/v1/admin/plugins/calendar/stop" && method === "POST") {
+          return jsonResponse({ ...calendarPlugin, status: "stopped", health: "stopped" });
+        }
+        if (path === "/api/v1/admin/plugins/calendar" && method === "DELETE") {
+          visiblePlugins = [];
+          return jsonResponse({ status: "deleted" });
         }
         if (path === "/api/v1/admin/capabilities/manifest") {
           if (failCapabilityManifest) {
@@ -6339,6 +6404,87 @@ describe("operational management pages", () => {
     expect(await screen.findByText("Filesystem MCP")).not.toBeNull();
     expect(screen.getByText("还没有运行时能力")).not.toBeNull();
     expect(screen.queryByRole("table", { name: "运行时能力注册表" })).toBeNull();
+  });
+
+  it("manages HTTP JSON plugin resources from the MCP page", async () => {
+    const user = userEvent.setup();
+
+    render(<TestApp initialPath="/mcp" />);
+
+    expect(await screen.findByRole("heading", { name: "已配置插件" })).not.toBeNull();
+    expect(screen.getByText("Calendar HTTP")).not.toBeNull();
+    expect(screen.getByText("https://plugins.example/invoke")).not.toBeNull();
+    expect(screen.getByText("plugins.example")).not.toBeNull();
+    expect(screen.getByText("calendar.create_event")).not.toBeNull();
+    expect(screen.getByText("secret://calendar")).not.toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "重载插件 Calendar HTTP" }));
+    await waitFor(() =>
+      expect(
+        requests.find(
+          (request) =>
+            request.path === "/api/v1/admin/plugins/calendar/reload" &&
+            request.method === "POST",
+        ),
+      ).toBeTruthy(),
+    );
+
+    await user.clear(screen.getByLabelText("插件 ID"));
+    await user.type(screen.getByLabelText("插件 ID"), "search");
+    await user.clear(screen.getByLabelText("插件名称"));
+    await user.type(screen.getByLabelText("插件名称"), "Search HTTP");
+    await user.clear(screen.getByLabelText("HTTP Endpoint"));
+    await user.type(screen.getByLabelText("HTTP Endpoint"), "https://search.example/invoke");
+    await user.clear(screen.getByLabelText("允许域名，英文逗号分隔"));
+    await user.type(screen.getByLabelText("允许域名，英文逗号分隔"), "search.example");
+    await user.clear(screen.getByLabelText("Credential Ref"));
+    await user.type(screen.getByLabelText("Credential Ref"), "secret://search");
+    await user.clear(screen.getByLabelText("能力 ID"));
+    await user.type(screen.getByLabelText("能力 ID"), "search.query");
+    await user.clear(screen.getByLabelText("权限类"));
+    await user.type(screen.getByLabelText("权限类"), "search.read");
+    await user.clear(screen.getByLabelText("能力别名，英文逗号分隔"));
+    await user.type(screen.getByLabelText("能力别名，英文逗号分隔"), "web_search");
+    await user.click(screen.getByRole("button", { name: "保存插件" }));
+
+    await waitFor(() =>
+      expect(
+        requests.find(
+          (request) =>
+            request.path === "/api/v1/admin/plugins" &&
+            request.method === "POST" &&
+            (request.body as { id?: string }).id === "search",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(
+      requests.find(
+        (request) =>
+          request.path === "/api/v1/admin/plugins" &&
+          request.method === "POST" &&
+          (request.body as { id?: string }).id === "search",
+      )?.body,
+    ).toMatchObject({
+      id: "search",
+      name: "Search HTTP",
+      enabled: true,
+      endpoint_url: "https://search.example/invoke",
+      domain_allowlist: ["search.example"],
+      credential_ref: "secret://search",
+      credential_header: "X-Plugin-Credential",
+      credential_scheme: "Bearer",
+      capabilities: [
+        {
+          id: "search.query",
+          adapter: "http_json",
+          permission_class: "search.read",
+          sandbox_profile: "remote_connector",
+          replay_safe: false,
+          aliases: ["web_search"],
+        },
+      ],
+    });
+    expect(await screen.findByText("插件配置已保存。运行时能力注册表会重新加载。")).not.toBeNull();
   });
 
   it("shows MCP, memory, and modular log pages", async () => {

@@ -221,4 +221,123 @@ describe("api client transport", () => {
       aliases: ["workspace_read"],
     });
   });
+
+  it("loads plugin resources and preserves HTTP credential metadata", async () => {
+    const plugin = {
+      id: "calendar",
+      name: "Calendar HTTP",
+      enabled: true,
+      description: "Calendar connector",
+      version: "local",
+      endpoint_url: "https://plugins.example/invoke",
+      domain_allowlist: ["plugins.example"],
+      timeout_seconds: 4,
+      credential_ref: "secret://calendar",
+      credential_header: "X-Plugin-Key",
+      credential_scheme: "",
+      capabilities: [
+        {
+          id: "calendar.create_event",
+          adapter: "http_json",
+          permission_class: "calendar.write",
+          sandbox_profile: "remote_connector",
+          replay_safe: false,
+          aliases: ["calendar_create"],
+        },
+      ],
+      status: "running",
+      health: "healthy",
+      last_error_type: null,
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify([plugin]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.plugins();
+
+    expect(fetchMock.mock.calls[0]?.[0]).toMatch(/^\/api\/v1\/admin\/plugins\?_=/);
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({ cache: "no-store" }));
+    expect(result[0]).toEqual(plugin);
+  });
+
+  it("posts plugin resources to the admin API", async () => {
+    const plugin = {
+      id: "calendar",
+      name: "Calendar HTTP",
+      enabled: true,
+      description: null,
+      version: "local",
+      endpoint_url: "https://plugins.example/invoke",
+      domain_allowlist: ["plugins.example"],
+      timeout_seconds: 4,
+      credential_ref: "secret://calendar",
+      credential_header: "X-Plugin-Credential",
+      credential_scheme: "Bearer",
+      capabilities: [
+        {
+          id: "calendar.create_event",
+          adapter: "http_json",
+          permission_class: "calendar.write",
+          sandbox_profile: "remote_connector",
+          replay_safe: false,
+          aliases: ["calendar_create"],
+        },
+      ],
+      status: "stopped",
+      health: "stopped",
+      last_error_type: null,
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(plugin), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.createPlugin({
+      id: plugin.id,
+      name: plugin.name,
+      enabled: true,
+      description: null,
+      version: "local",
+      endpoint_url: plugin.endpoint_url,
+      domain_allowlist: plugin.domain_allowlist,
+      timeout_seconds: plugin.timeout_seconds,
+      credential_ref: plugin.credential_ref,
+      credential_header: plugin.credential_header,
+      credential_scheme: plugin.credential_scheme,
+      capabilities: plugin.capabilities,
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/admin/plugins");
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+      id: "calendar",
+      name: "Calendar HTTP",
+      enabled: true,
+      description: null,
+      version: "local",
+      endpoint_url: "https://plugins.example/invoke",
+      domain_allowlist: ["plugins.example"],
+      timeout_seconds: 4,
+      credential_ref: "secret://calendar",
+      credential_header: "X-Plugin-Credential",
+      credential_scheme: "Bearer",
+      capabilities: [
+        {
+          id: "calendar.create_event",
+          adapter: "http_json",
+          permission_class: "calendar.write",
+          sandbox_profile: "remote_connector",
+          replay_safe: false,
+          aliases: ["calendar_create"],
+        },
+      ],
+    });
+    expect(result.status).toBe("stopped");
+  });
 });
