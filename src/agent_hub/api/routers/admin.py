@@ -564,6 +564,9 @@ class PluginResourceRequest(NamedResourceRequest):
         max_length=128,
         pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:+-]*$",
     )
+    endpoint_url: str | None = Field(default=None, max_length=2048)
+    domain_allowlist: list[str] = Field(default_factory=list, max_length=64)
+    timeout_seconds: float = Field(default=10, gt=0, le=120)
     capabilities: list[PluginCapabilityRequest] = Field(default_factory=list, max_length=256)
 
     @field_validator("capabilities")

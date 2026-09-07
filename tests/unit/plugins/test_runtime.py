@@ -13,7 +13,11 @@ from agent_hub.api.routers.admin import (
     PluginResourceResponse,
 )
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
-from agent_hub.plugins.runtime import PluginInvocationContext, build_runtime_plugin_service
+from agent_hub.plugins.runtime import (
+    HttpJsonPluginAdapter,
+    PluginInvocationContext,
+    build_runtime_plugin_service,
+)
 from agent_hub.runtime.contracts import JsonValue
 
 TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -56,15 +60,23 @@ def plugin(
     status: str = "running",
     health: str = "healthy",
     capability_id: str = "calendar.create_event",
+    adapter: str = "plugin_runtime",
+    endpoint_url: str | None = None,
+    domain_allowlist: tuple[str, ...] = (),
+    timeout_seconds: float = 10,
 ) -> PluginResourceResponse:
     return PluginResourceResponse(
         **PluginResourceRequest(
             id=plugin_id,
             name=plugin_id,
             enabled=enabled,
+            endpoint_url=endpoint_url,
+            domain_allowlist=list(domain_allowlist),
+            timeout_seconds=timeout_seconds,
             capabilities=[
                 PluginCapabilityRequest(
                     id=capability_id,
+                    adapter=adapter,
                     permission_class="calendar.write",
                     sandbox_profile="remote_connector",
                     aliases=["calendar_create"],
@@ -174,6 +186,92 @@ async def test_runtime_plugin_service_rejects_unavailable_plugin_capability() ->
             name="calendar.create_event",
             arguments={"title": "review"},
             idempotency_key="plugin_1",
+        )
+
+
+async def test_http_json_plugin_adapter_posts_context_to_allowed_endpoint() -> None:
+    posts: list[tuple[str, Mapping[str, JsonValue], float]] = []
+
+    async def post_json(
+        url: str,
+        payload: Mapping[str, JsonValue],
+        timeout_seconds: float,
+    ) -> Mapping[str, JsonValue]:
+        posts.append((url, payload, timeout_seconds))
+        return {"created": True, "remote_id": "evt_1"}
+
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(
+            (
+                plugin(
+                    "calendar",
+                    adapter="http_json",
+                    endpoint_url="https://plugins.example/invoke",
+                    domain_allowlist=("plugins.example",),
+                    timeout_seconds=3,
+                ),
+            )
+        ),
+        adapters={"http_json": HttpJsonPluginAdapter(post_json=post_json)},
+    )
+
+    result = await service.invoke(
+        tenant_id=TENANT_ID,
+        user_id=TENANT_ID,
+        run_id=TENANT_ID,
+        actor="scheduler",
+        name="calendar.create_event",
+        arguments={"title": "review"},
+        idempotency_key="plugin_1",
+    )
+
+    assert result == {"created": True, "remote_id": "evt_1"}
+    assert len(posts) == 1
+    url, payload, timeout_seconds = posts[0]
+    assert url == "https://plugins.example/invoke"
+    assert timeout_seconds == 3
+    assert payload["plugin_id"] == "calendar"
+    assert payload["capability_id"] == "calendar.create_event"
+    assert payload["arguments"] == {"title": "review"}
+    assert payload["context"] == {
+        "tenant_id": str(TENANT_ID),
+        "user_id": str(TENANT_ID),
+        "run_id": str(TENANT_ID),
+        "actor": "scheduler",
+        "idempotency_key": "plugin_1",
+    }
+
+
+async def test_http_json_plugin_adapter_requires_allowed_endpoint_domain() -> None:
+    async def post_json(
+        url: str,
+        payload: Mapping[str, JsonValue],
+        timeout_seconds: float,
+    ) -> Mapping[str, JsonValue]:
+        del url, payload, timeout_seconds
+        return {"created": True}
+
+    adapter = HttpJsonPluginAdapter(post_json=post_json)
+    target = plugin(
+        "calendar",
+        adapter="http_json",
+        endpoint_url="https://plugins.example/invoke",
+        domain_allowlist=("api.example",),
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin endpoint not allowed"):
+        await adapter.invoke(
+            plugin=target,
+            capability=target.capabilities[0],
+            arguments={"title": "review"},
+            context=PluginInvocationContext(
+                tenant_id=TENANT_ID,
+                user_id=TENANT_ID,
+                run_id=TENANT_ID,
+                actor="scheduler",
+                idempotency_key="plugin_1",
+            ),
         )
 
 

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
+from urllib.parse import urlsplit
 from uuid import UUID
+
+import httpx
 
 from agent_hub.api.routers.admin import PluginCapabilityRequest, PluginResourceResponse
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
@@ -35,6 +38,54 @@ class PluginAdapter(Protocol):
     ) -> Mapping[str, JsonValue]: ...
 
 
+type HttpJsonPost = Callable[
+    [str, Mapping[str, JsonValue], float],
+    Awaitable[Mapping[str, JsonValue]],
+]
+
+
+class HttpJsonPluginAdapter:
+    def __init__(self, *, post_json: HttpJsonPost | None = None) -> None:
+        self._post_json = _httpx_post_json if post_json is None else post_json
+
+    async def invoke(
+        self,
+        *,
+        plugin: PluginResourceResponse,
+        capability: PluginCapabilityRequest,
+        arguments: Mapping[str, JsonValue],
+        context: PluginInvocationContext,
+    ) -> Mapping[str, JsonValue]:
+        url = _plugin_endpoint_url(plugin)
+        if not _endpoint_domain_allowed(url, plugin.domain_allowlist):
+            raise RuntimeCapabilityError("Plugin endpoint not allowed")
+        payload: Mapping[str, JsonValue] = {
+            "plugin_id": plugin.id,
+            "capability_id": capability.id,
+            "arguments": arguments,
+            "context": {
+                "tenant_id": str(context.tenant_id),
+                "user_id": str(context.user_id),
+                "run_id": str(context.run_id),
+                "actor": context.actor,
+                "idempotency_key": context.idempotency_key,
+            },
+        }
+        try:
+            result = await self._post_json(url, payload, plugin.timeout_seconds)
+        except TimeoutError as error:
+            raise RuntimeCapabilityError("Plugin tool timed out") from error
+        except httpx.TimeoutException as error:
+            raise RuntimeCapabilityError("Plugin tool timed out") from error
+        except RuntimeCapabilityError:
+            raise
+        except Exception as error:
+            raise RuntimeCapabilityError("Plugin tool failed") from error
+        if not isinstance(result, Mapping):
+            raise RuntimeCapabilityError("Plugin result is invalid")
+        return result
+
+
 class RuntimePluginService:
     def __init__(
         self,
@@ -45,7 +96,8 @@ class RuntimePluginService:
     ) -> None:
         self._tenant_id = tenant_id
         self._admin_service = admin_service
-        self._adapters = dict(adapters or {})
+        self._adapters = _default_plugin_adapters()
+        self._adapters.update(adapters or {})
         self._plugins: tuple[PluginResourceResponse, ...] = ()
 
     async def start(self) -> None:
@@ -151,7 +203,50 @@ def _plugin_is_running(plugin: PluginResourceResponse) -> bool:
     )
 
 
+def _default_plugin_adapters() -> dict[str, PluginAdapter]:
+    return {"http_json": HttpJsonPluginAdapter()}
+
+
+def _plugin_endpoint_url(plugin: PluginResourceResponse) -> str:
+    url = plugin.endpoint_url
+    if not isinstance(url, str) or not url.strip() or url != url.strip():
+        raise RuntimeCapabilityError("Plugin endpoint unavailable")
+    parts = urlsplit(url)
+    if parts.scheme not in {"http", "https"} or not parts.netloc or parts.hostname is None:
+        raise RuntimeCapabilityError("Plugin endpoint unavailable")
+    return url
+
+
+def _endpoint_domain_allowed(url: str, domain_allowlist: Sequence[str]) -> bool:
+    host = urlsplit(url).hostname
+    if host is None:
+        return False
+    normalized_host = host.lower()
+    allowed = {
+        domain.lower().strip()
+        for domain in domain_allowlist
+        if isinstance(domain, str) and domain.strip()
+    }
+    return normalized_host in allowed
+
+
+async def _httpx_post_json(
+    url: str,
+    payload: Mapping[str, JsonValue],
+    timeout_seconds: float,
+) -> Mapping[str, JsonValue]:
+    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+        response = await client.post(url, json=payload)
+        response.raise_for_status()
+        data = response.json()
+    if not isinstance(data, Mapping):
+        raise RuntimeCapabilityError("Plugin result is invalid")
+    return cast(Mapping[str, JsonValue], data)
+
+
 __all__ = [
+    "HttpJsonPluginAdapter",
+    "HttpJsonPost",
     "PluginAdapter",
     "PluginConfigService",
     "PluginInvocationContext",
