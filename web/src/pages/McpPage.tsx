@@ -6,6 +6,7 @@ import {
   formatApiError,
   type CapabilityManifestItem,
   type McpServer,
+  type PluginAdapterDescriptor,
   type PluginResource,
 } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
@@ -70,6 +71,17 @@ function approvalLabel(capability: CapabilityManifestItem) {
   return capability.replay_safe ? "无需审批" : "运行时策略";
 }
 
+function schemaRequiredFields(schema: PluginAdapterDescriptor["resource_schema"]) {
+  const required = schema.required;
+  return Array.isArray(required) ? required.filter((field): field is string => typeof field === "string") : [];
+}
+
+function schemaPropertyNames(schema: PluginAdapterDescriptor["resource_schema"]) {
+  const properties = schema.properties;
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) return [];
+  return Object.keys(properties);
+}
+
 export function McpPage() {
   const auth = useAuth();
   const canReadCapabilityManifest = auth.hasPermission("plugin:read");
@@ -79,6 +91,17 @@ export function McpPage() {
   const plugins = useQuery({
     queryKey: ["plugins", auth.user?.tenant_id, auth.user?.user_id, auth.user?.role, canReadCapabilityManifest],
     queryFn: () => api.plugins(),
+    enabled: canReadCapabilityManifest,
+  });
+  const pluginAdapters = useQuery({
+    queryKey: [
+      "plugin-adapters",
+      auth.user?.tenant_id,
+      auth.user?.user_id,
+      auth.user?.role,
+      canReadCapabilityManifest,
+    ],
+    queryFn: () => api.pluginAdapters(),
     enabled: canReadCapabilityManifest,
   });
   const capabilityManifest = useQuery({
@@ -180,6 +203,8 @@ export function McpPage() {
             sandbox_profile: pluginSandboxProfile.trim() || "remote_connector",
             replay_safe: pluginReplaySafe,
             aliases: parseCsv(pluginAliases),
+            input_schema: null,
+            output_schema: null,
           },
         ],
       }),
@@ -272,6 +297,7 @@ export function McpPage() {
 
   const items = servers.data ?? [];
   const pluginItems = canReadCapabilityManifest ? plugins.data ?? [] : [];
+  const adapterItems = canReadCapabilityManifest ? pluginAdapters.data ?? [] : [];
   const isStdio = transport === "stdio";
 
   return (
@@ -483,71 +509,107 @@ export function McpPage() {
           ) : null}
         </form>
 
-        <section aria-label="已配置插件">
-          <h3>已配置插件</h3>
-          {!canReadCapabilityManifest ? <p className="field-help">当前账号无权查看插件配置。</p> : null}
-          {plugins.isLoading ? <p>正在加载插件...</p> : null}
-          {plugins.isError ? <p role="alert">{formatApiError(plugins.error, "插件加载失败")}</p> : null}
-          {canReadCapabilityManifest && pluginItems.length === 0 ? (
-            <article>
-              <h4>还没有插件</h4>
-              <p>添加 HTTP JSON 插件后，它的能力会进入运行时注册表。</p>
-            </article>
-          ) : null}
-          {pluginItems.length > 0 ? (
-            <div className="card-grid">
-              {pluginItems.map((plugin) => (
-                <article key={plugin.id}>
-                  <span className="eyebrow">插件 {plugin.health}</span>
-                  <h3>{plugin.name}</h3>
-                  <p>ID：<span>{plugin.id}</span></p>
-                  <p>状态：<span>{plugin.status}</span></p>
-                  <p>Endpoint：<span>{plugin.endpoint_url ?? "未填写"}</span></p>
-                  <p>允许域名：<span>{plugin.domain_allowlist.join(", ") || "未配置"}</span></p>
-                  <p>Credential：<span>{plugin.credential_ref ?? "未配置"}</span></p>
-                  <p>Header：<span>{plugin.credential_header}</span></p>
-                  <p>能力：<span>{plugin.capabilities.map((capability) => capability.id).join(", ") || "未配置"}</span></p>
-                  <button type="button" onClick={() => editPlugin(plugin)}>
-                    编辑
-                  </button>
-                  <button
-                    type="button"
-                    disabled={pluginLifecycle.isPending || !canWritePlugins}
-                    onClick={() => pluginLifecycle.mutate({ id: plugin.id, action: "start" })}
-                    aria-label={`启动插件 ${plugin.name}`}
-                  >
-                    启动
-                  </button>
-                  <button
-                    type="button"
-                    disabled={pluginLifecycle.isPending || !canWritePlugins}
-                    onClick={() => pluginLifecycle.mutate({ id: plugin.id, action: "stop" })}
-                    aria-label={`停止插件 ${plugin.name}`}
-                  >
-                    停止
-                  </button>
-                  <button
-                    type="button"
-                    disabled={pluginLifecycle.isPending || !canWritePlugins}
-                    onClick={() => pluginLifecycle.mutate({ id: plugin.id, action: "reload" })}
-                    aria-label={`重载插件 ${plugin.name}`}
-                  >
-                    重载
-                  </button>
-                  <button
-                    type="button"
-                    className="danger-action"
-                    disabled={pluginLifecycle.isPending || !canWritePlugins}
-                    onClick={() => confirmPluginDelete(plugin)}
-                    aria-label={`删除插件 ${plugin.name}`}
-                  >
-                    删除
-                  </button>
-                </article>
-              ))}
-            </div>
-          ) : null}
-        </section>
+        <div>
+          <section aria-label="插件适配器目录">
+            <h3>插件适配器目录</h3>
+            {!canReadCapabilityManifest ? <p className="field-help">当前账号无权查看插件适配器。</p> : null}
+            {pluginAdapters.isLoading ? <p>正在加载插件适配器...</p> : null}
+            {pluginAdapters.isError ? (
+              <p role="alert">{formatApiError(pluginAdapters.error, "插件适配器加载失败")}</p>
+            ) : null}
+            {canReadCapabilityManifest && adapterItems.length === 0 ? (
+              <article>
+                <h4>还没有适配器</h4>
+                <p>运行时暂未暴露可插拔适配器目录。</p>
+              </article>
+            ) : null}
+            {adapterItems.length > 0 ? (
+              <div className="card-grid compact">
+                {adapterItems.map((adapter) => (
+                  <article key={adapter.id}>
+                    <span className="eyebrow">{adapter.id}</span>
+                    <h3>{adapter.name}</h3>
+                    {adapter.description ? <p>{adapter.description}</p> : null}
+                    <p>必填资源字段：<span>{schemaRequiredFields(adapter.resource_schema).join(", ") || "无"}</span></p>
+                    <p>资源字段：<span>{schemaPropertyNames(adapter.resource_schema).join(", ") || "无"}</span></p>
+                    <p>能力字段：</p>
+                    <div className="toolbar">
+                      {schemaPropertyNames(adapter.capability_schema).map((field) => (
+                        <span key={field} className="status-chip">{field}</span>
+                      ))}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            ) : null}
+          </section>
+
+          <section aria-label="已配置插件">
+            <h3>已配置插件</h3>
+            {!canReadCapabilityManifest ? <p className="field-help">当前账号无权查看插件配置。</p> : null}
+            {plugins.isLoading ? <p>正在加载插件...</p> : null}
+            {plugins.isError ? <p role="alert">{formatApiError(plugins.error, "插件加载失败")}</p> : null}
+            {canReadCapabilityManifest && pluginItems.length === 0 ? (
+              <article>
+                <h4>还没有插件</h4>
+                <p>添加 HTTP JSON 插件后，它的能力会进入运行时注册表。</p>
+              </article>
+            ) : null}
+            {pluginItems.length > 0 ? (
+              <div className="card-grid">
+                {pluginItems.map((plugin) => (
+                  <article key={plugin.id}>
+                    <span className="eyebrow">插件 {plugin.health}</span>
+                    <h3>{plugin.name}</h3>
+                    <p>ID：<span>{plugin.id}</span></p>
+                    <p>状态：<span>{plugin.status}</span></p>
+                    <p>Endpoint：<span>{plugin.endpoint_url ?? "未填写"}</span></p>
+                    <p>允许域名：<span>{plugin.domain_allowlist.join(", ") || "未配置"}</span></p>
+                    <p>Credential：<span>{plugin.credential_ref ?? "未配置"}</span></p>
+                    <p>Header：<span>{plugin.credential_header}</span></p>
+                    <p>能力：<span>{plugin.capabilities.map((capability) => capability.id).join(", ") || "未配置"}</span></p>
+                    <button type="button" onClick={() => editPlugin(plugin)}>
+                      编辑
+                    </button>
+                    <button
+                      type="button"
+                      disabled={pluginLifecycle.isPending || !canWritePlugins}
+                      onClick={() => pluginLifecycle.mutate({ id: plugin.id, action: "start" })}
+                      aria-label={`启动插件 ${plugin.name}`}
+                    >
+                      启动
+                    </button>
+                    <button
+                      type="button"
+                      disabled={pluginLifecycle.isPending || !canWritePlugins}
+                      onClick={() => pluginLifecycle.mutate({ id: plugin.id, action: "stop" })}
+                      aria-label={`停止插件 ${plugin.name}`}
+                    >
+                      停止
+                    </button>
+                    <button
+                      type="button"
+                      disabled={pluginLifecycle.isPending || !canWritePlugins}
+                      onClick={() => pluginLifecycle.mutate({ id: plugin.id, action: "reload" })}
+                      aria-label={`重载插件 ${plugin.name}`}
+                    >
+                      重载
+                    </button>
+                    <button
+                      type="button"
+                      className="danger-action"
+                      disabled={pluginLifecycle.isPending || !canWritePlugins}
+                      onClick={() => confirmPluginDelete(plugin)}
+                      aria-label={`删除插件 ${plugin.name}`}
+                    >
+                      删除
+                    </button>
+                  </article>
+                ))}
+              </div>
+            ) : null}
+          </section>
+        </div>
       </div>
 
       <div className="two-column">

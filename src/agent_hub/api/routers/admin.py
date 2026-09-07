@@ -539,6 +539,8 @@ class PluginCapabilityRequest(BaseModel):
     )
     replay_safe: bool = False
     aliases: list[str] = Field(default_factory=list, max_length=128)
+    input_schema: dict[str, JsonValue] | None = None
+    output_schema: dict[str, JsonValue] | None = None
 
     @field_validator("aliases")
     @classmethod
@@ -554,6 +556,18 @@ class PluginCapabilityRequest(BaseModel):
         if len(set(aliases)) != len(aliases):
             raise ValueError("plugin capability aliases must be unique")
         return aliases
+
+    @field_validator("input_schema", "output_schema")
+    @classmethod
+    def validate_capability_schema(
+        cls, value: dict[str, JsonValue] | None
+    ) -> dict[str, JsonValue] | None:
+        if value is None:
+            return None
+        schema_type = value.get("type")
+        if schema_type is not None and not isinstance(schema_type, str):
+            raise ValueError("plugin capability schema type must be a string")
+        return value
 
 
 class PluginResourceRequest(NamedResourceRequest):
@@ -592,6 +606,17 @@ class PluginResourceResponse(PluginResourceRequest):
     status: str = Field(pattern=r"^(disabled|stopped|running|failed)$")
     health: str = Field(pattern=r"^(disabled|stopped|healthy|unhealthy|failed|unknown)$")
     last_error_type: str | None = Field(default=None, max_length=128)
+
+
+class PluginAdapterDescriptorResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=128, pattern=r"^[a-z0-9][a-z0-9_.-]*$")
+    name: str = Field(min_length=1, max_length=128)
+    description: str | None = Field(default=None, max_length=1000)
+    resource_schema: dict[str, JsonValue]
+    capability_schema: dict[str, JsonValue]
+    argument_schema: dict[str, JsonValue]
 
 
 class McpServerResponse(BaseModel):
@@ -637,6 +662,8 @@ class CapabilityManifestItemResponse(BaseModel):
     availability_reason: str | None = None
     replay_safe: bool
     aliases: list[str] = Field(default_factory=list, max_length=128)
+    input_schema: dict[str, JsonValue] | None = None
+    output_schema: dict[str, JsonValue] | None = None
 
 
 class CapabilityManifestResponse(BaseModel):
@@ -2901,6 +2928,81 @@ def _plugin_stopped_response(plugin: PluginResourceResponse) -> PluginResourceRe
         return plugin.model_copy(update={"status": "disabled", "health": "disabled"})
     return plugin.model_copy(
         update={"status": "stopped", "health": "stopped", "last_error_type": None}
+    )
+
+
+def _plugin_adapter_descriptors(request: Request) -> tuple[PluginAdapterDescriptorResponse, ...]:
+    plugin_service = getattr(request.app.state, "plugin_service", None)
+    provider = getattr(plugin_service, "adapter_descriptors", None)
+    if callable(provider):
+        try:
+            descriptors = tuple(
+                PluginAdapterDescriptorResponse.model_validate(item)
+                for item in provider()
+            )
+        except Exception:
+            _LOGGER.warning("plugin adapter descriptor catalog failed", exc_info=True)
+        else:
+            if descriptors:
+                return descriptors
+    return (_default_http_json_adapter_descriptor(),)
+
+
+def _default_http_json_adapter_descriptor() -> PluginAdapterDescriptorResponse:
+    return PluginAdapterDescriptorResponse(
+        id="http_json",
+        name="HTTP JSON",
+        description="POSTs plugin invocations to an allowlisted HTTP endpoint.",
+        resource_schema={
+            "type": "object",
+            "required": ("endpoint_url", "domain_allowlist"),
+            "properties": {
+                "endpoint_url": {
+                    "type": "string",
+                    "format": "uri",
+                },
+                "domain_allowlist": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "timeout_seconds": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 120,
+                    "default": 10,
+                },
+                "credential_ref": {
+                    "type": "string",
+                },
+                "credential_header": {
+                    "type": "string",
+                    "default": "X-Plugin-Credential",
+                },
+                "credential_scheme": {
+                    "type": "string",
+                    "default": "Bearer",
+                },
+            },
+            "additionalProperties": False,
+        },
+        capability_schema={
+            "type": "object",
+            "required": ("id",),
+            "properties": {
+                "id": {"type": "string"},
+                "permission_class": {"type": "string", "default": "plugin.use"},
+                "sandbox_profile": {"type": "string", "default": "remote_connector"},
+                "replay_safe": {"type": "boolean", "default": False},
+                "aliases": {"type": "array", "items": {"type": "string"}},
+                "input_schema": {"type": "object"},
+                "output_schema": {"type": "object"},
+            },
+            "additionalProperties": False,
+        },
+        argument_schema={
+            "type": "object",
+            "additionalProperties": True,
+        },
     )
 
 
@@ -9760,6 +9862,19 @@ async def upsert_plugin(
     response = await service.upsert_plugin(body)
     await _reload_plugin_runtime_config(request, principal.tenant_id)
     return response
+
+
+@router.get(
+    "/plugins/adapters",
+    response_model=list[PluginAdapterDescriptorResponse],
+    responses=error_responses(401, 403),
+)
+async def list_plugin_adapters(
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+) -> list[PluginAdapterDescriptorResponse]:
+    _require(principal, "plugin:read")
+    return list(_plugin_adapter_descriptors(request))
 
 
 @router.post(

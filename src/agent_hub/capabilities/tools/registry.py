@@ -120,18 +120,25 @@ class PluginConfigCapabilityManifestSource:
             )
             reason = None if available else _plugin_availability_reason(plugin)
             for capability in plugin.capabilities:
+                item: dict[str, JsonValue] = {
+                    "id": capability.id,
+                    "kind": "plugin",
+                    "adapter": capability.adapter,
+                    "permission_class": capability.permission_class,
+                    "sandbox_profile": capability.sandbox_profile,
+                    "available": available,
+                    "availability_reason": reason,
+                    "replay_safe": capability.replay_safe is True,
+                    "aliases": tuple(capability.aliases),
+                }
+                input_schema = getattr(capability, "input_schema", None)
+                if isinstance(input_schema, Mapping):
+                    item["input_schema"] = cast(JsonValue, input_schema)
+                output_schema = getattr(capability, "output_schema", None)
+                if isinstance(output_schema, Mapping):
+                    item["output_schema"] = cast(JsonValue, output_schema)
                 capabilities.append(
-                    {
-                        "id": capability.id,
-                        "kind": "plugin",
-                        "adapter": capability.adapter,
-                        "permission_class": capability.permission_class,
-                        "sandbox_profile": capability.sandbox_profile,
-                        "available": available,
-                        "availability_reason": reason,
-                        "replay_safe": capability.replay_safe is True,
-                        "aliases": tuple(capability.aliases),
-                    }
+                    item
                 )
         return {
             "schema_version": 1,

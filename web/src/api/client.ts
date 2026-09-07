@@ -899,6 +899,8 @@ const McpServerSchema = z.object({
 
 export type McpServer = z.infer<typeof McpServerSchema>;
 
+const JsonObjectSchema = z.record(z.string(), z.unknown());
+
 const PluginCapabilitySchema = z.object({
   id: z.string(),
   adapter: z.string().default("plugin_runtime"),
@@ -906,6 +908,8 @@ const PluginCapabilitySchema = z.object({
   sandbox_profile: z.string().default("plugin"),
   replay_safe: z.boolean().default(false),
   aliases: z.array(z.string()).default([]),
+  input_schema: JsonObjectSchema.nullable().default(null),
+  output_schema: JsonObjectSchema.nullable().default(null),
 });
 
 const PluginResourceSchema = z.object({
@@ -943,6 +947,17 @@ export type PluginResourcePayload = {
   capabilities?: PluginCapability[];
 };
 
+const PluginAdapterDescriptorSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string().nullable().default(null),
+  resource_schema: JsonObjectSchema,
+  capability_schema: JsonObjectSchema,
+  argument_schema: JsonObjectSchema,
+});
+
+export type PluginAdapterDescriptor = z.infer<typeof PluginAdapterDescriptorSchema>;
+
 const CapabilityManifestItemSchema = z.object({
   id: z.string(),
   kind: z.string(),
@@ -953,6 +968,8 @@ const CapabilityManifestItemSchema = z.object({
   availability_reason: z.string().nullable(),
   replay_safe: z.boolean(),
   aliases: z.array(z.string()).default([]),
+  input_schema: JsonObjectSchema.nullable().default(null),
+  output_schema: JsonObjectSchema.nullable().default(null),
 });
 
 const CapabilityManifestSchema = z.object({
@@ -1916,6 +1933,13 @@ export const api = {
   },
   plugins(): Promise<PluginResource[]> {
     return request("/api/v1/admin/plugins", { method: "GET" }, z.array(PluginResourceSchema));
+  },
+  pluginAdapters(): Promise<PluginAdapterDescriptor[]> {
+    return request(
+      "/api/v1/admin/plugins/adapters",
+      { method: "GET" },
+      z.array(PluginAdapterDescriptorSchema),
+    );
   },
   createPlugin(payload: PluginResourcePayload): Promise<PluginResource> {
     return request(

@@ -121,6 +121,87 @@ async def test_runtime_plugin_service_exposes_running_plugins_as_manifest() -> N
     assert admin_service.calls == 1
 
 
+async def test_runtime_plugin_manifest_includes_capability_schemas() -> None:
+    admin_service = FakeAdminService(
+        (
+            PluginResourceResponse(
+                **PluginResourceRequest(
+                    id="calendar",
+                    name="calendar",
+                    capabilities=[
+                        PluginCapabilityRequest(
+                            id="calendar.create_event",
+                            adapter="http_json",
+                            permission_class="calendar.write",
+                            sandbox_profile="remote_connector",
+                            input_schema={
+                                "type": "object",
+                                "required": ("title",),
+                                "properties": {"title": {"type": "string"}},
+                            },
+                            output_schema={
+                                "type": "object",
+                                "properties": {"remote_id": {"type": "string"}},
+                            },
+                        )
+                    ],
+                ).model_dump(),
+                status="running",
+                health="healthy",
+                last_error_type=None,
+            ),
+        )
+    )
+
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+    )
+
+    manifest = service.capability_manifest_source().manifests_for_tenant(TENANT_ID)
+    capability = cast(tuple[Mapping[str, object], ...], manifest["capabilities"])[0]
+
+    assert capability["input_schema"] == {
+        "type": "object",
+        "required": ("title",),
+        "properties": {"title": {"type": "string"}},
+    }
+    assert capability["output_schema"] == {
+        "type": "object",
+        "properties": {"remote_id": {"type": "string"}},
+    }
+
+
+def test_http_json_plugin_adapter_exposes_safe_descriptor() -> None:
+    descriptor = HttpJsonPluginAdapter().descriptor()
+
+    assert descriptor["id"] == "http_json"
+    assert "Authorization" not in repr(descriptor)
+    resource_schema = cast(Mapping[str, object], descriptor["resource_schema"])
+    assert resource_schema["required"] == ("endpoint_url", "domain_allowlist")
+    properties = cast(Mapping[str, object], resource_schema["properties"])
+    assert "endpoint_url" in properties
+    assert "credential_ref" in properties
+    assert "credential_header" in properties
+
+
+async def test_runtime_plugin_service_lists_registered_adapter_descriptors() -> None:
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(()),
+        adapters={"plugin_runtime": RecordingPluginAdapter([])},
+    )
+
+    descriptors = {str(item["id"]): item for item in service.adapter_descriptors()}
+
+    assert "http_json" in descriptors
+    assert descriptors["plugin_runtime"]["id"] == "plugin_runtime"
+    assert descriptors["plugin_runtime"]["resource_schema"] == {
+        "type": "object",
+        "additionalProperties": True,
+    }
+
+
 async def test_runtime_plugin_service_invoke_fails_closed_until_backend_is_installed() -> None:
     service = await build_runtime_plugin_service(
         tenant_id=TENANT_ID,

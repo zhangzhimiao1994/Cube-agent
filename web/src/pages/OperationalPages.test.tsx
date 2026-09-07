@@ -426,16 +426,51 @@ const calendarPlugin = {
     {
       id: "calendar.create_event",
       adapter: "http_json",
-      permission_class: "calendar.write",
-      sandbox_profile: "remote_connector",
-      replay_safe: false,
-      aliases: ["calendar_create"],
-    },
-  ],
+          permission_class: "calendar.write",
+          sandbox_profile: "remote_connector",
+          replay_safe: false,
+          aliases: ["calendar_create"],
+          input_schema: {
+            type: "object",
+            required: ["title"],
+            properties: { title: { type: "string" } },
+          },
+          output_schema: null,
+        },
+      ],
   status: "running",
   health: "healthy",
   last_error_type: null,
 };
+
+const pluginAdapterDescriptors = [
+  {
+    id: "http_json",
+    name: "HTTP JSON",
+    description: "POSTs plugin invocations to an allowlisted HTTP endpoint.",
+    resource_schema: {
+      type: "object",
+      required: ["endpoint_url", "domain_allowlist"],
+      properties: {
+        endpoint_url: { type: "string", format: "uri" },
+        domain_allowlist: { type: "array", items: { type: "string" } },
+        credential_ref: { type: "string" },
+      },
+    },
+    capability_schema: {
+      type: "object",
+      required: ["id"],
+      properties: {
+        input_schema: { type: "object" },
+        output_schema: { type: "object" },
+      },
+    },
+    argument_schema: {
+      type: "object",
+      additionalProperties: true,
+    },
+  },
+];
 
 function jsonResponse(payload: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(payload), {
@@ -1172,6 +1207,9 @@ describe("operational management pages", () => {
         }
         if (path === "/api/v1/admin/plugins" && method === "GET") {
           return jsonResponse(visiblePlugins);
+        }
+        if (path === "/api/v1/admin/plugins/adapters" && method === "GET") {
+          return jsonResponse(pluginAdapterDescriptors);
         }
         if (path === "/api/v1/admin/plugins" && method === "POST") {
           const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
@@ -6412,6 +6450,10 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/mcp" />);
 
     expect(await screen.findByRole("heading", { name: "已配置插件" })).not.toBeNull();
+    expect(screen.getByRole("heading", { name: "插件适配器目录" })).not.toBeNull();
+    expect(screen.getByText("HTTP JSON")).not.toBeNull();
+    expect(screen.getByText("endpoint_url, domain_allowlist")).not.toBeNull();
+    expect(screen.getAllByText("input_schema").length).toBeGreaterThan(0);
     expect(screen.getByText("Calendar HTTP")).not.toBeNull();
     expect(screen.getByText("https://plugins.example/invoke")).not.toBeNull();
     expect(screen.getByText("plugins.example")).not.toBeNull();

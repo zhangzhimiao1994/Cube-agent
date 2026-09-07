@@ -109,6 +109,9 @@ class HttpJsonPluginAdapter:
         value = credential if not scheme else f"{scheme} {credential}"
         return {plugin.credential_header: value}
 
+    def descriptor(self) -> Mapping[str, JsonValue]:
+        return _http_json_adapter_descriptor()
+
 
 class RuntimePluginService:
     def __init__(
@@ -145,6 +148,12 @@ class RuntimePluginService:
         if tenant_id != self._tenant_id:
             return _empty_manifest()
         return PluginConfigCapabilityManifestSource(cast(Any, self._plugins)).manifests()
+
+    def adapter_descriptors(self) -> tuple[Mapping[str, JsonValue], ...]:
+        return tuple(
+            _adapter_descriptor(adapter_id, adapter)
+            for adapter_id, adapter in sorted(self._adapters.items())
+        )
 
     def is_available(self, tenant_id: UUID, name: str) -> bool:
         if tenant_id != self._tenant_id:
@@ -232,6 +241,92 @@ def _default_plugin_adapters(admin_service: object) -> dict[str, PluginAdapter]:
         "http_json": HttpJsonPluginAdapter(
             secret_resolver=_secret_resolver(admin_service),
         )
+    }
+
+
+def _adapter_descriptor(adapter_id: str, adapter: PluginAdapter) -> Mapping[str, JsonValue]:
+    descriptor = getattr(adapter, "descriptor", None)
+    if callable(descriptor):
+        try:
+            payload = descriptor()
+        except Exception:  # noqa: BLE001 - descriptor metadata must fail closed.
+            payload = None
+        if isinstance(payload, Mapping):
+            return cast(Mapping[str, JsonValue], payload)
+    return {
+        "id": adapter_id,
+        "name": adapter_id,
+        "description": None,
+        "resource_schema": {
+            "type": "object",
+            "additionalProperties": True,
+        },
+        "capability_schema": {
+            "type": "object",
+            "additionalProperties": True,
+        },
+        "argument_schema": {
+            "type": "object",
+            "additionalProperties": True,
+        },
+    }
+
+
+def _http_json_adapter_descriptor() -> Mapping[str, JsonValue]:
+    return {
+        "id": "http_json",
+        "name": "HTTP JSON",
+        "description": "POSTs plugin invocations to an allowlisted HTTP endpoint.",
+        "resource_schema": {
+            "type": "object",
+            "required": ("endpoint_url", "domain_allowlist"),
+            "properties": {
+                "endpoint_url": {
+                    "type": "string",
+                    "format": "uri",
+                },
+                "domain_allowlist": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "timeout_seconds": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 120,
+                    "default": 10,
+                },
+                "credential_ref": {
+                    "type": "string",
+                },
+                "credential_header": {
+                    "type": "string",
+                    "default": "X-Plugin-Credential",
+                },
+                "credential_scheme": {
+                    "type": "string",
+                    "default": "Bearer",
+                },
+            },
+            "additionalProperties": False,
+        },
+        "capability_schema": {
+            "type": "object",
+            "required": ("id",),
+            "properties": {
+                "id": {"type": "string"},
+                "permission_class": {"type": "string", "default": "plugin.use"},
+                "sandbox_profile": {"type": "string", "default": "remote_connector"},
+                "replay_safe": {"type": "boolean", "default": False},
+                "aliases": {"type": "array", "items": {"type": "string"}},
+                "input_schema": {"type": "object"},
+                "output_schema": {"type": "object"},
+            },
+            "additionalProperties": False,
+        },
+        "argument_schema": {
+            "type": "object",
+            "additionalProperties": True,
+        },
     }
 
 

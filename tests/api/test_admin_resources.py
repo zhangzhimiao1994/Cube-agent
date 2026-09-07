@@ -2344,6 +2344,8 @@ def test_capability_manifest_endpoint_exposes_runtime_gateway_manifest() -> None
         "availability_reason": None,
         "replay_safe": False,
         "aliases": ["search_web"],
+        "input_schema": None,
+        "output_schema": None,
     }
 
 
@@ -2384,6 +2386,8 @@ def test_capability_manifest_endpoint_includes_saved_mcp_config_tools() -> None:
         "availability_reason": "mcp_server_not_discovered",
         "replay_safe": False,
         "aliases": [],
+        "input_schema": None,
+        "output_schema": None,
     }
     assert capabilities["filesystem.read_file"]["sandbox_profile"] == "mcp_stdio"
 
@@ -2637,7 +2641,74 @@ def test_plugin_admin_api_exposes_running_plugin_capabilities_in_manifest() -> N
         "availability_reason": None,
         "replay_safe": False,
         "aliases": ["search_web"],
+        "input_schema": None,
+        "output_schema": None,
     }
+
+
+def test_plugin_admin_api_preserves_capability_schemas_in_manifest() -> None:
+    api = client()
+    cast(Any, api.app).state.runtime_capability_gateway = FakeRuntimeCapabilityGateway()
+
+    created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "calendar",
+            "name": "Calendar Plugin",
+            "capabilities": [
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "http_json",
+                    "permission_class": "calendar.write",
+                    "sandbox_profile": "remote_connector",
+                    "input_schema": {
+                        "type": "object",
+                        "required": ["title"],
+                        "properties": {"title": {"type": "string"}},
+                    },
+                    "output_schema": {
+                        "type": "object",
+                        "properties": {"remote_id": {"type": "string"}},
+                    },
+                }
+            ],
+        },
+    )
+    started = api.post("/api/v1/admin/plugins/calendar/start", headers=headers())
+    manifest = api.get("/api/v1/admin/capabilities/manifest", headers=headers())
+
+    assert created.status_code == 200
+    assert started.status_code == 200
+    capability = {
+        item["id"]: item
+        for item in manifest.json()["capabilities"]
+    }["calendar.create_event"]
+    assert capability["input_schema"] == {
+        "type": "object",
+        "required": ["title"],
+        "properties": {"title": {"type": "string"}},
+    }
+    assert capability["output_schema"] == {
+        "type": "object",
+        "properties": {"remote_id": {"type": "string"}},
+    }
+
+
+def test_plugin_adapter_catalog_endpoint_exposes_safe_http_json_descriptor() -> None:
+    api = client()
+
+    response = api.get("/api/v1/admin/plugins/adapters", headers=headers())
+
+    assert response.status_code == 200
+    descriptors = {item["id"]: item for item in response.json()}
+    assert "http_json" in descriptors
+    assert descriptors["http_json"]["resource_schema"]["required"] == [
+        "endpoint_url",
+        "domain_allowlist",
+    ]
+    assert "credential_ref" in descriptors["http_json"]["resource_schema"]["properties"]
+    assert "Authorization" not in response.text
 
 
 def test_capability_manifest_endpoint_requires_plugin_and_mcp_read(

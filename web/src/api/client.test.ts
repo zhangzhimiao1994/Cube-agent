@@ -219,6 +219,8 @@ describe("api client transport", () => {
       availability_reason: "workspace_root_not_configured",
       replay_safe: true,
       aliases: ["workspace_read"],
+      input_schema: null,
+      output_schema: null,
     });
   });
 
@@ -243,6 +245,15 @@ describe("api client transport", () => {
           sandbox_profile: "remote_connector",
           replay_safe: false,
           aliases: ["calendar_create"],
+          input_schema: {
+            type: "object",
+            required: ["title"],
+            properties: { title: { type: "string" } },
+          },
+          output_schema: {
+            type: "object",
+            properties: { remote_id: { type: "string" } },
+          },
         },
       ],
       status: "running",
@@ -285,6 +296,12 @@ describe("api client transport", () => {
           sandbox_profile: "remote_connector",
           replay_safe: false,
           aliases: ["calendar_create"],
+          input_schema: {
+            type: "object",
+            required: ["title"],
+            properties: { title: { type: "string" } },
+          },
+          output_schema: null,
         },
       ],
       status: "stopped",
@@ -335,9 +352,57 @@ describe("api client transport", () => {
           sandbox_profile: "remote_connector",
           replay_safe: false,
           aliases: ["calendar_create"],
+          input_schema: {
+            type: "object",
+            required: ["title"],
+            properties: { title: { type: "string" } },
+          },
+          output_schema: null,
         },
       ],
     });
     expect(result.status).toBe("stopped");
+  });
+
+  it("loads plugin adapter descriptors", async () => {
+    const descriptors = [
+      {
+        id: "http_json",
+        name: "HTTP JSON",
+        description: "POSTs plugin invocations to an allowlisted HTTP endpoint.",
+        resource_schema: {
+          type: "object",
+          required: ["endpoint_url", "domain_allowlist"],
+          properties: {
+            endpoint_url: { type: "string", format: "uri" },
+            credential_ref: { type: "string" },
+          },
+        },
+        capability_schema: {
+          type: "object",
+          required: ["id"],
+          properties: {
+            input_schema: { type: "object" },
+            output_schema: { type: "object" },
+          },
+        },
+        argument_schema: {
+          type: "object",
+          additionalProperties: true,
+        },
+      },
+    ];
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(descriptors), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.pluginAdapters();
+
+    expect(fetchMock.mock.calls[0]?.[0]).toMatch(/^\/api\/v1\/admin\/plugins\/adapters\?_=/);
+    expect(result).toEqual(descriptors);
   });
 });
