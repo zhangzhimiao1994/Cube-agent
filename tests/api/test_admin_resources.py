@@ -2837,6 +2837,58 @@ def test_plugin_admin_api_validates_descriptor_capability_config() -> None:
     }
 
 
+def test_plugin_admin_api_allows_descriptor_capability_additional_properties() -> None:
+    api = client()
+
+    class PluginServiceWithOpaqueCapabilityDescriptor:
+        def adapter_descriptors(self) -> tuple[dict[str, object], ...]:
+            return (
+                {
+                    "id": "opaque",
+                    "name": "Opaque",
+                    "description": "Accepts adapter-owned capability config.",
+                    "resource_schema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                    "capability_schema": {
+                        "type": "object",
+                        "properties": {"id": {"type": "string"}},
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    cast(Any, api.app).state.plugin_service = PluginServiceWithOpaqueCapabilityDescriptor()
+
+    created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "opaque-plugin",
+            "name": "Opaque Plugin",
+            "capabilities": [
+                {
+                    "id": "opaque.run",
+                    "adapter": "opaque",
+                    "capability_config": {
+                        "routing": {"mode": "fanout", "max_children": 3},
+                        "labels": ["daily", "parallel"],
+                    },
+                }
+            ],
+        },
+    )
+
+    assert created.status_code == 200
+    assert created.json()["capabilities"][0]["capability_config"] == {
+        "routing": {"mode": "fanout", "max_children": 3},
+        "labels": ["daily", "parallel"],
+    }
+
+
 def test_plugin_admin_api_preserves_capability_schemas_in_manifest() -> None:
     api = client()
     cast(Any, api.app).state.runtime_capability_gateway = FakeRuntimeCapabilityGateway()

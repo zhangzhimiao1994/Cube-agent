@@ -3121,9 +3121,14 @@ def _validate_plugin_capability_configs(request: Request, plugin: PluginResource
                     "invalid_plugin_capability_config",
                     f"plugin capability {capability.id} capability_config missing required field {name}",
                 )
+        allow_additional_properties = descriptor.capability_schema.get(
+            "additionalProperties"
+        ) is True
         for name, value in capability.capability_config.items():
             schema = fields.get(name)
             if schema is None:
+                if allow_additional_properties:
+                    continue
                 raise PublicAPIError(
                     422,
                     "invalid_plugin_capability_config",
