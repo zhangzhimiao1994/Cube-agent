@@ -65,7 +65,7 @@ def plugin(
     domain_allowlist: tuple[str, ...] = (),
     timeout_seconds: float = 10,
     credential_ref: str | None = None,
-    credential_header: str = "Authorization",
+    credential_header: str = "X-Plugin-Credential",
     credential_scheme: str = "Bearer",
 ) -> PluginResourceResponse:
     return PluginResourceResponse(

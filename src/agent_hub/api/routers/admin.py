@@ -569,7 +569,7 @@ class PluginResourceRequest(NamedResourceRequest):
     timeout_seconds: float = Field(default=10, gt=0, le=120)
     credential_ref: str | None = Field(default=None, max_length=128)
     credential_header: str = Field(
-        default="Authorization",
+        default="X-Plugin-Credential",
         min_length=1,
         max_length=128,
         pattern=r"^[A-Za-z][A-Za-z0-9-]*$",
