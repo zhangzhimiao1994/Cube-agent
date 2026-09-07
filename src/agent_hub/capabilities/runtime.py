@@ -547,7 +547,7 @@ def _project_registry_manifest_item(
     if item_id in seen_names or any(alias in seen_names for alias in aliases):
         return None
     item_id = cast(str, item_id)
-    return {
+    item: dict[str, JsonValue] = {
         "id": item_id,
         "kind": _string_or_default(raw_item.get("kind"), "plugin"),
         "adapter": _string_or_default(raw_item.get("adapter"), "tool_registry"),
@@ -564,6 +564,13 @@ def _project_registry_manifest_item(
         "replay_safe": raw_item.get("replay_safe") is True,
         "aliases": aliases,
     }
+    input_schema = raw_item.get("input_schema")
+    if isinstance(input_schema, Mapping):
+        item["input_schema"] = cast(JsonValue, input_schema)
+    output_schema = raw_item.get("output_schema")
+    if isinstance(output_schema, Mapping):
+        item["output_schema"] = cast(JsonValue, output_schema)
+    return item
 
 
 def _require_safe(name: str, value: str, *, max_length: int = 128) -> None:

@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -6481,12 +6481,12 @@ describe("operational management pages", () => {
     await user.type(screen.getByLabelText("允许域名，英文逗号分隔"), "search.example");
     await user.clear(screen.getByLabelText("Credential Ref"));
     await user.type(screen.getByLabelText("Credential Ref"), "secret://search");
-    await user.clear(screen.getByLabelText("能力 ID"));
-    await user.type(screen.getByLabelText("能力 ID"), "search.query");
-    await user.clear(screen.getByLabelText("权限类"));
-    await user.type(screen.getByLabelText("权限类"), "search.read");
-    await user.clear(screen.getByLabelText("能力别名，英文逗号分隔"));
-    await user.type(screen.getByLabelText("能力别名，英文逗号分隔"), "web_search");
+    await user.clear(screen.getByLabelText("能力 ID 1"));
+    await user.type(screen.getByLabelText("能力 ID 1"), "search.query");
+    await user.clear(screen.getByLabelText("权限类 1"));
+    await user.type(screen.getByLabelText("权限类 1"), "search.read");
+    await user.clear(screen.getByLabelText("能力别名 1，英文逗号分隔"));
+    await user.type(screen.getByLabelText("能力别名 1，英文逗号分隔"), "web_search");
     await user.click(screen.getByRole("button", { name: "保存插件" }));
 
     await waitFor(() =>
@@ -6523,10 +6523,149 @@ describe("operational management pages", () => {
           sandbox_profile: "remote_connector",
           replay_safe: false,
           aliases: ["web_search"],
+          input_schema: null,
+          output_schema: null,
         },
       ],
     });
     expect(await screen.findByText("插件配置已保存。运行时能力注册表会重新加载。")).not.toBeNull();
+  });
+
+  it("saves multiple plugin capabilities with JSON schemas from the MCP page", async () => {
+    const user = userEvent.setup();
+
+    render(<TestApp initialPath="/mcp" />);
+
+    expect(await screen.findByRole("heading", { name: "已配置插件" })).not.toBeNull();
+    await user.clear(screen.getByLabelText("插件 ID"));
+    await user.type(screen.getByLabelText("插件 ID"), "search");
+    await user.clear(screen.getByLabelText("插件名称"));
+    await user.type(screen.getByLabelText("插件名称"), "Search HTTP");
+    await user.clear(screen.getByLabelText("HTTP Endpoint"));
+    await user.type(screen.getByLabelText("HTTP Endpoint"), "https://search.example/invoke");
+    await user.clear(screen.getByLabelText("允许域名，英文逗号分隔"));
+    await user.type(screen.getByLabelText("允许域名，英文逗号分隔"), "search.example");
+    await user.clear(screen.getByLabelText("能力 ID 1"));
+    await user.type(screen.getByLabelText("能力 ID 1"), "search.query");
+    await user.clear(screen.getByLabelText("权限类 1"));
+    await user.type(screen.getByLabelText("权限类 1"), "search.read");
+    fireEvent.change(screen.getByLabelText("Input Schema 1"), {
+      target: {
+        value: JSON.stringify({ type: "object", required: ["query"], properties: { query: { type: "string" } } }),
+      },
+    });
+
+    await user.click(screen.getByRole("button", { name: "添加能力" }));
+    await user.type(screen.getByLabelText("能力 ID 2"), "search.summarize");
+    await user.clear(screen.getByLabelText("权限类 2"));
+    await user.type(screen.getByLabelText("权限类 2"), "search.write");
+    fireEvent.change(screen.getByLabelText("Input Schema 2"), {
+      target: {
+        value: JSON.stringify({ type: "object", required: ["url"], properties: { url: { type: "string" } } }),
+      },
+    });
+    fireEvent.change(screen.getByLabelText("Output Schema 2"), {
+      target: {
+        value: JSON.stringify({ type: "object", properties: { summary: { type: "string" } } }),
+      },
+    });
+
+    await user.click(screen.getByRole("button", { name: "保存插件" }));
+
+    await waitFor(() =>
+      expect(
+        requests.find(
+          (request) =>
+            request.path === "/api/v1/admin/plugins" &&
+            request.method === "POST" &&
+            (request.body as { id?: string }).id === "search",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(
+      requests.find(
+        (request) =>
+          request.path === "/api/v1/admin/plugins" &&
+          request.method === "POST" &&
+          (request.body as { id?: string }).id === "search",
+      )?.body,
+    ).toMatchObject({
+      capabilities: [
+        {
+          id: "search.query",
+          input_schema: {
+            type: "object",
+            required: ["query"],
+            properties: { query: { type: "string" } },
+          },
+          output_schema: null,
+        },
+        {
+          id: "search.summarize",
+          permission_class: "search.write",
+          input_schema: {
+            type: "object",
+            required: ["url"],
+            properties: { url: { type: "string" } },
+          },
+          output_schema: {
+            type: "object",
+            properties: { summary: { type: "string" } },
+          },
+        },
+      ],
+    });
+  });
+
+  it("loads existing plugin capability schemas into editable JSON fields", async () => {
+    const user = userEvent.setup();
+
+    render(<TestApp initialPath="/mcp" />);
+
+    expect(await screen.findByText("Calendar HTTP")).not.toBeNull();
+    const pluginSection = screen.getByRole("region", { name: "已配置插件" });
+    await user.click(within(pluginSection).getByRole("button", { name: "编辑" }));
+
+    expect((screen.getByLabelText("Input Schema 1") as HTMLTextAreaElement).value).toBe(
+      JSON.stringify(calendarPlugin.capabilities[0].input_schema, null, 2),
+    );
+    await user.clear(screen.getByLabelText("Output Schema 1"));
+    fireEvent.change(screen.getByLabelText("Output Schema 1"), {
+      target: {
+        value: JSON.stringify({ type: "object", properties: { event_id: { type: "string" } } }),
+      },
+    });
+    await user.click(screen.getByRole("button", { name: "保存插件" }));
+
+    await waitFor(() =>
+      expect(
+        requests.find(
+          (request) =>
+            request.path === "/api/v1/admin/plugins" &&
+            request.method === "POST" &&
+            (request.body as { id?: string }).id === "calendar",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(
+      requests.find(
+        (request) =>
+          request.path === "/api/v1/admin/plugins" &&
+          request.method === "POST" &&
+          (request.body as { id?: string }).id === "calendar",
+      )?.body,
+    ).toMatchObject({
+      capabilities: [
+        {
+          id: "calendar.create_event",
+          input_schema: calendarPlugin.capabilities[0].input_schema,
+          output_schema: {
+            type: "object",
+            properties: { event_id: { type: "string" } },
+          },
+        },
+      ],
+    });
   });
 
   it("shows MCP, memory, and modular log pages", async () => {

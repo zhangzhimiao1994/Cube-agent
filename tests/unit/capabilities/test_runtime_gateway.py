@@ -840,6 +840,15 @@ def test_runtime_gateway_capability_manifest_includes_extra_manifest_sources(
                     "availability_reason": "mcp_server_not_discovered",
                     "replay_safe": False,
                     "aliases": (),
+                    "input_schema": {
+                        "type": "object",
+                        "required": ("path",),
+                        "properties": {"path": {"type": "string"}},
+                    },
+                    "output_schema": {
+                        "type": "object",
+                        "properties": {"content": {"type": "string"}},
+                    },
                 },
             ),
         }
@@ -864,6 +873,15 @@ def test_runtime_gateway_capability_manifest_includes_extra_manifest_sources(
         "availability_reason": "mcp_server_not_discovered",
         "replay_safe": False,
         "aliases": (),
+        "input_schema": {
+            "type": "object",
+            "required": ("path",),
+            "properties": {"path": {"type": "string"}},
+        },
+        "output_schema": {
+            "type": "object",
+            "properties": {"content": {"type": "string"}},
+        },
     }
 
 

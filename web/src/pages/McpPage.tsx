@@ -7,6 +7,7 @@ import {
   type CapabilityManifestItem,
   type McpServer,
   type PluginAdapterDescriptor,
+  type PluginCapability,
   type PluginResource,
 } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
@@ -33,8 +34,66 @@ function fillFromServer(server: McpServer) {
   };
 }
 
+type PluginCapabilityForm = {
+  aliases: string;
+  adapter: string;
+  id: string;
+  inputSchema: string;
+  outputSchema: string;
+  permissionClass: string;
+  replaySafe: boolean;
+  sandboxProfile: string;
+};
+
+function createPluginCapabilityForm(
+  values: Partial<PluginCapabilityForm> = {},
+): PluginCapabilityForm {
+  return {
+    id: "calendar.create_event",
+    adapter: "http_json",
+    permissionClass: "plugin.use",
+    sandboxProfile: "remote_connector",
+    replaySafe: false,
+    aliases: "",
+    inputSchema: "",
+    outputSchema: "",
+    ...values,
+  };
+}
+
+function formatSchemaText(schema: PluginCapability["input_schema"]) {
+  return schema ? JSON.stringify(schema, null, 2) : "";
+}
+
+function parseSchemaText(value: string, label: string): PluginCapability["input_schema"] {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    throw new Error(`${label} 必须是合法 JSON。`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`${label} 必须是 JSON 对象。`);
+  }
+  return parsed as PluginCapability["input_schema"];
+}
+
+function pluginCapabilityFormFromCapability(capability: PluginCapability): PluginCapabilityForm {
+  return createPluginCapabilityForm({
+    id: capability.id,
+    adapter: capability.adapter,
+    permissionClass: capability.permission_class,
+    sandboxProfile: capability.sandbox_profile,
+    replaySafe: capability.replay_safe,
+    aliases: capability.aliases.join(","),
+    inputSchema: formatSchemaText(capability.input_schema),
+    outputSchema: formatSchemaText(capability.output_schema),
+  });
+}
+
 function fillFromPlugin(plugin: PluginResource) {
-  const capability = plugin.capabilities[0];
   return {
     id: plugin.id,
     name: plugin.name,
@@ -46,12 +105,9 @@ function fillFromPlugin(plugin: PluginResource) {
     credentialRef: plugin.credential_ref ?? "",
     credentialHeader: plugin.credential_header || "X-Plugin-Credential",
     credentialScheme: plugin.credential_scheme,
-    capabilityId: capability?.id ?? "",
-    capabilityAdapter: capability?.adapter ?? "http_json",
-    permissionClass: capability?.permission_class ?? "plugin.use",
-    sandboxProfile: capability?.sandbox_profile ?? "remote_connector",
-    replaySafe: capability?.replay_safe ?? false,
-    aliases: capability?.aliases.join(",") ?? "",
+    capabilities: plugin.capabilities.length > 0
+      ? plugin.capabilities.map(pluginCapabilityFormFromCapability)
+      : [createPluginCapabilityForm({ id: "" })],
   };
 }
 
@@ -137,12 +193,9 @@ export function McpPage() {
   const [pluginCredentialRef, setPluginCredentialRef] = useState("");
   const [pluginCredentialHeader, setPluginCredentialHeader] = useState("X-Plugin-Credential");
   const [pluginCredentialScheme, setPluginCredentialScheme] = useState("Bearer");
-  const [pluginCapabilityId, setPluginCapabilityId] = useState("calendar.create_event");
-  const [pluginCapabilityAdapter, setPluginCapabilityAdapter] = useState("http_json");
-  const [pluginPermissionClass, setPluginPermissionClass] = useState("plugin.use");
-  const [pluginSandboxProfile, setPluginSandboxProfile] = useState("remote_connector");
-  const [pluginReplaySafe, setPluginReplaySafe] = useState(false);
-  const [pluginAliases, setPluginAliases] = useState("");
+  const [pluginCapabilities, setPluginCapabilities] = useState<PluginCapabilityForm[]>([
+    createPluginCapabilityForm(),
+  ]);
   const [pluginMessage, setPluginMessage] = useState<string | null>(null);
 
   async function refreshPluginSurfaces() {
@@ -195,18 +248,16 @@ export function McpPage() {
         credential_ref: pluginCredentialRef.trim() || null,
         credential_header: pluginCredentialHeader.trim() || "X-Plugin-Credential",
         credential_scheme: pluginCredentialScheme.trim(),
-        capabilities: [
-          {
-            id: pluginCapabilityId.trim(),
-            adapter: pluginCapabilityAdapter.trim() || "http_json",
-            permission_class: pluginPermissionClass.trim() || "plugin.use",
-            sandbox_profile: pluginSandboxProfile.trim() || "remote_connector",
-            replay_safe: pluginReplaySafe,
-            aliases: parseCsv(pluginAliases),
-            input_schema: null,
-            output_schema: null,
-          },
-        ],
+        capabilities: pluginCapabilities.map((capability, index) => ({
+          id: capability.id.trim(),
+          adapter: capability.adapter.trim() || "http_json",
+          permission_class: capability.permissionClass.trim() || "plugin.use",
+          sandbox_profile: capability.sandboxProfile.trim() || "remote_connector",
+          replay_safe: capability.replaySafe,
+          aliases: parseCsv(capability.aliases),
+          input_schema: parseSchemaText(capability.inputSchema, `Input Schema ${index + 1}`),
+          output_schema: parseSchemaText(capability.outputSchema, `Output Schema ${index + 1}`),
+        })),
       }),
     onSuccess: async () => {
       setPluginMessage("插件配置已保存。运行时能力注册表会重新加载。");
@@ -271,13 +322,34 @@ export function McpPage() {
     setPluginCredentialRef(next.credentialRef);
     setPluginCredentialHeader(next.credentialHeader);
     setPluginCredentialScheme(next.credentialScheme);
-    setPluginCapabilityId(next.capabilityId);
-    setPluginCapabilityAdapter(next.capabilityAdapter);
-    setPluginPermissionClass(next.permissionClass);
-    setPluginSandboxProfile(next.sandboxProfile);
-    setPluginReplaySafe(next.replaySafe);
-    setPluginAliases(next.aliases);
+    setPluginCapabilities(next.capabilities);
     setPluginMessage(`已载入 ${plugin.name}，修改后点击保存。`);
+  }
+
+  function updatePluginCapability(
+    index: number,
+    patch: Partial<PluginCapabilityForm>,
+  ) {
+    setPluginCapabilities((capabilities) =>
+      capabilities.map((capability, capabilityIndex) =>
+        capabilityIndex === index ? { ...capability, ...patch } : capability,
+      ),
+    );
+  }
+
+  function addPluginCapability() {
+    setPluginCapabilities((capabilities) => [
+      ...capabilities,
+      createPluginCapabilityForm({ id: "", permissionClass: "plugin.use", aliases: "" }),
+    ]);
+  }
+
+  function removePluginCapability(index: number) {
+    setPluginCapabilities((capabilities) =>
+      capabilities.length === 1
+        ? capabilities
+        : capabilities.filter((_capability, capabilityIndex) => capabilityIndex !== index),
+    );
   }
 
   function confirmDelete(server: McpServer) {
@@ -447,56 +519,98 @@ export function McpPage() {
             placeholder="Bearer；留空表示直接写入 header 值"
           />
 
-          <label htmlFor="plugin-capability-id">能力 ID</label>
-          <input
-            id="plugin-capability-id"
-            value={pluginCapabilityId}
-            onChange={(event) => setPluginCapabilityId(event.target.value)}
-            placeholder="calendar.create_event"
-            required
-          />
+          <fieldset>
+            <legend>插件能力</legend>
+            {pluginCapabilities.map((capability, index) => {
+              const capabilityNumber = index + 1;
+              return (
+                <fieldset key={index}>
+                  <legend>能力 {capabilityNumber}</legend>
 
-          <label htmlFor="plugin-capability-adapter">能力适配器</label>
-          <input
-            id="plugin-capability-adapter"
-            value={pluginCapabilityAdapter}
-            onChange={(event) => setPluginCapabilityAdapter(event.target.value)}
-            placeholder="http_json"
-          />
+                  <label htmlFor={`plugin-capability-id-${index}`}>能力 ID {capabilityNumber}</label>
+                  <input
+                    id={`plugin-capability-id-${index}`}
+                    value={capability.id}
+                    onChange={(event) => updatePluginCapability(index, { id: event.target.value })}
+                    placeholder="calendar.create_event"
+                    required
+                  />
 
-          <label htmlFor="plugin-permission-class">权限类</label>
-          <input
-            id="plugin-permission-class"
-            value={pluginPermissionClass}
-            onChange={(event) => setPluginPermissionClass(event.target.value)}
-            placeholder="plugin.use"
-          />
+                  <label htmlFor={`plugin-capability-adapter-${index}`}>能力适配器 {capabilityNumber}</label>
+                  <input
+                    id={`plugin-capability-adapter-${index}`}
+                    value={capability.adapter}
+                    onChange={(event) => updatePluginCapability(index, { adapter: event.target.value })}
+                    placeholder="http_json"
+                  />
 
-          <label htmlFor="plugin-sandbox-profile">沙箱 Profile</label>
-          <input
-            id="plugin-sandbox-profile"
-            value={pluginSandboxProfile}
-            onChange={(event) => setPluginSandboxProfile(event.target.value)}
-            placeholder="remote_connector"
-          />
+                  <label htmlFor={`plugin-permission-class-${index}`}>权限类 {capabilityNumber}</label>
+                  <input
+                    id={`plugin-permission-class-${index}`}
+                    value={capability.permissionClass}
+                    onChange={(event) => updatePluginCapability(index, { permissionClass: event.target.value })}
+                    placeholder="plugin.use"
+                  />
 
-          <label htmlFor="plugin-replay-safe">
-            <input
-              id="plugin-replay-safe"
-              type="checkbox"
-              checked={pluginReplaySafe}
-              onChange={(event) => setPluginReplaySafe(event.target.checked)}
-            />
-            可安全重放
-          </label>
+                  <label htmlFor={`plugin-sandbox-profile-${index}`}>沙箱 Profile {capabilityNumber}</label>
+                  <input
+                    id={`plugin-sandbox-profile-${index}`}
+                    value={capability.sandboxProfile}
+                    onChange={(event) => updatePluginCapability(index, { sandboxProfile: event.target.value })}
+                    placeholder="remote_connector"
+                  />
 
-          <label htmlFor="plugin-aliases">能力别名，英文逗号分隔</label>
-          <textarea
-            id="plugin-aliases"
-            value={pluginAliases}
-            onChange={(event) => setPluginAliases(event.target.value)}
-            placeholder="calendar_create"
-          />
+                  <label htmlFor={`plugin-replay-safe-${index}`}>
+                    <input
+                      id={`plugin-replay-safe-${index}`}
+                      type="checkbox"
+                      checked={capability.replaySafe}
+                      onChange={(event) => updatePluginCapability(index, { replaySafe: event.target.checked })}
+                    />
+                    可安全重放 {capabilityNumber}
+                  </label>
+
+                  <label htmlFor={`plugin-aliases-${index}`}>能力别名 {capabilityNumber}，英文逗号分隔</label>
+                  <textarea
+                    id={`plugin-aliases-${index}`}
+                    value={capability.aliases}
+                    onChange={(event) => updatePluginCapability(index, { aliases: event.target.value })}
+                    placeholder="calendar_create"
+                  />
+
+                  <label htmlFor={`plugin-input-schema-${index}`}>Input Schema {capabilityNumber}</label>
+                  <textarea
+                    id={`plugin-input-schema-${index}`}
+                    value={capability.inputSchema}
+                    onChange={(event) => updatePluginCapability(index, { inputSchema: event.target.value })}
+                    placeholder='{"type":"object","properties":{}}'
+                  />
+
+                  <label htmlFor={`plugin-output-schema-${index}`}>Output Schema {capabilityNumber}</label>
+                  <textarea
+                    id={`plugin-output-schema-${index}`}
+                    value={capability.outputSchema}
+                    onChange={(event) => updatePluginCapability(index, { outputSchema: event.target.value })}
+                    placeholder='{"type":"object","properties":{}}'
+                  />
+
+                  {pluginCapabilities.length > 1 ? (
+                    <button
+                      type="button"
+                      className="danger-action"
+                      onClick={() => removePluginCapability(index)}
+                      aria-label={`删除能力 ${capabilityNumber}`}
+                    >
+                      删除能力
+                    </button>
+                  ) : null}
+                </fieldset>
+              );
+            })}
+            <button type="button" onClick={addPluginCapability}>
+              添加能力
+            </button>
+          </fieldset>
 
           <button type="submit" disabled={savePlugin.isPending || !canWritePlugins}>
             {savePlugin.isPending ? "正在保存..." : "保存插件"}
