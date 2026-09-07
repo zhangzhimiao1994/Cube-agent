@@ -15,11 +15,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.api.routers import admin
 from agent_hub.capabilities.defaults import build_runtime_capability_stack
+from agent_hub.capabilities.tools.registry import CompositeCapabilityManifestSource
 from agent_hub.config.service import ConfigService
 from agent_hub.db.session import Database, build_database
 from agent_hub.evolution_hooks import EvolutionExecutionIngestHook
 from agent_hub.hermes import PersistentHermesRunAdvisor
 from agent_hub.mcp.runtime import RuntimeMcpService
+from agent_hub.plugins.runtime import RuntimePluginService
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import RunService
 from agent_hub.runtime.defaults import configured_runtime_registry
@@ -36,6 +38,10 @@ class WorkerRunService(Protocol):
 
 
 class WorkerMcpRuntime(Protocol):
+    async def reload(self) -> None: ...
+
+
+class WorkerPluginRuntime(Protocol):
     async def reload(self) -> None: ...
 
 
@@ -98,6 +104,7 @@ class WorkerResources:
     service: RunService
     queue: LocalRunQueue
     runtime_mcp_service: RuntimeMcpService
+    runtime_plugin_service: RuntimePluginService
 
 
 async def run_worker_loop(
@@ -109,23 +116,40 @@ async def run_worker_loop(
     batch_limit: int = 100,
     max_idle_polls: int | None = None,
     mcp_runtime: WorkerMcpRuntime | None = None,
+    plugin_runtime: WorkerPluginRuntime | None = None,
     mcp_reload_interval_seconds: float = 30.0,
+    runtime_reload_interval_seconds: float | None = None,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> None:
     idle_polls = 0
-    last_mcp_reload_at = monotonic() if mcp_runtime is not None else 0.0
+    runtime_reload_interval = (
+        mcp_reload_interval_seconds
+        if runtime_reload_interval_seconds is None
+        else runtime_reload_interval_seconds
+    )
+    has_reloadable_runtime = mcp_runtime is not None or plugin_runtime is not None
+    last_runtime_reload_at = monotonic() if has_reloadable_runtime else 0.0
     while not stop.is_set():
-        if mcp_runtime is not None:
+        if has_reloadable_runtime:
             now = monotonic()
-            if now - last_mcp_reload_at >= mcp_reload_interval_seconds:
-                try:
-                    await mcp_runtime.reload()
-                except Exception as error:
-                    _LOGGER.exception(
-                        "run_worker_mcp_reload_failed error_type=%s",
-                        type(error).__name__,
-                    )
-                last_mcp_reload_at = now
+            if now - last_runtime_reload_at >= runtime_reload_interval:
+                if mcp_runtime is not None:
+                    try:
+                        await mcp_runtime.reload()
+                    except Exception as error:
+                        _LOGGER.exception(
+                            "run_worker_mcp_reload_failed error_type=%s",
+                            type(error).__name__,
+                        )
+                if plugin_runtime is not None:
+                    try:
+                        await plugin_runtime.reload()
+                    except Exception as error:
+                        _LOGGER.exception(
+                            "run_worker_plugin_reload_failed error_type=%s",
+                            type(error).__name__,
+                        )
+                last_runtime_reload_at = now
         try:
             delivered = await service.publish_pending(batch_limit)
         except Exception as error:
@@ -186,6 +210,10 @@ def build_worker_service(
         admin_service=admin_service,
         run_repository=run_repository,
     )
+    runtime_plugin_service = RuntimePluginService(
+        tenant_id=settings.bootstrap_tenant_id,
+        admin_service=admin_service,
+    )
     runtime_capability_stack = build_runtime_capability_stack(
         tenant_id=settings.bootstrap_tenant_id,
         run_repository=run_repository,
@@ -199,8 +227,14 @@ def build_worker_service(
         tool_approval_mode=lambda _tenant_id: _tool_approval_mode_from_settings(
             admin_service.get_settings
         ),
-        tool_registry=runtime_mcp_service.capability_manifest_source(),
+        tool_registry=CompositeCapabilityManifestSource(
+            (
+                runtime_mcp_service.capability_manifest_source(),
+                runtime_plugin_service.capability_manifest_source(),
+            )
+        ),
         mcp_backend=runtime_mcp_service,
+        plugin_backend=runtime_plugin_service,
     )
     service = RunService(
         run_repository,
@@ -231,6 +265,7 @@ def build_worker_service(
         service=service,
         queue=queue,
         runtime_mcp_service=runtime_mcp_service,
+        runtime_plugin_service=runtime_plugin_service,
     )
 
 
@@ -267,11 +302,13 @@ async def _run() -> None:
     resources = build_worker_service(get_settings())
     try:
         await resources.runtime_mcp_service.start()
+        await resources.runtime_plugin_service.start()
         await run_worker_loop(
             resources.service,
             resources.queue,
             stop=stop,
             mcp_runtime=resources.runtime_mcp_service,
+            plugin_runtime=resources.runtime_plugin_service,
         )
     finally:
         await resources.redis_client.aclose()

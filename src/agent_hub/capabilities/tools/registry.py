@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, cast
 
 from agent_hub.runtime.contracts import JsonValue
 
@@ -72,6 +72,20 @@ class ToolRegistry:
             "capabilities": tuple(
                 self._manifests[name].to_public_dict() for name in self.names()
             ),
+        }
+
+
+class CompositeCapabilityManifestSource:
+    def __init__(self, sources: Sequence[object]) -> None:
+        self._sources = tuple(sources)
+
+    def manifests_for_tenant(self, tenant_id: object) -> Mapping[str, JsonValue]:
+        capabilities: list[Mapping[str, JsonValue]] = []
+        for source in self._sources:
+            capabilities.extend(_source_manifest_items(source, tenant_id))
+        return {
+            "schema_version": 1,
+            "capabilities": tuple(capabilities),
         }
 
 
@@ -193,6 +207,33 @@ def _plugin_availability_reason(plugin: PluginConfig) -> str:
     if plugin.status in {"stopped", "disabled", "failed"}:
         return f"plugin_{plugin.status}"
     return "plugin_unavailable"
+
+
+def _source_manifest_items(
+    source: object,
+    tenant_id: object,
+) -> tuple[Mapping[str, JsonValue], ...]:
+    try:
+        tenant_manifest = getattr(source, "manifests_for_tenant", None)
+        if callable(tenant_manifest):
+            manifest = tenant_manifest(tenant_id)
+        else:
+            plain_manifest = getattr(source, "manifests", None)
+            if not callable(plain_manifest):
+                return ()
+            manifest = plain_manifest()
+    except Exception:  # noqa: BLE001 - optional sources must fail closed.
+        return ()
+    if not isinstance(manifest, Mapping) or manifest.get("schema_version") != 1:
+        return ()
+    raw_items = manifest.get("capabilities")
+    if not isinstance(raw_items, tuple | list):
+        return ()
+    return tuple(
+        cast(Mapping[str, JsonValue], item)
+        for item in raw_items
+        if isinstance(item, Mapping)
+    )
 
 
 def _nonblank(value: str, field_name: str) -> str:

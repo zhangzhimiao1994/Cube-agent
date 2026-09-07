@@ -2484,6 +2484,72 @@ def test_mcp_reload_callback_failure_does_not_fail_saved_config() -> None:
     assert "secret token" not in response.text
 
 
+def test_plugin_upsert_lifecycle_and_delete_trigger_runtime_reload_callback() -> None:
+    api = client()
+    reloaded: list[UUID] = []
+
+    async def reload_plugin_runtime_config(tenant_id: UUID) -> None:
+        reloaded.append(tenant_id)
+
+    cast(Any, api.app).state.reload_plugin_runtime_config = reload_plugin_runtime_config
+
+    created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "search",
+            "name": "Search Plugin",
+            "capabilities": [
+                {
+                    "id": "search.web",
+                    "permission_class": "network.read",
+                    "sandbox_profile": "remote_connector",
+                }
+            ],
+        },
+    )
+    started = api.post("/api/v1/admin/plugins/search/start", headers=headers())
+    stopped = api.post("/api/v1/admin/plugins/search/stop", headers=headers())
+    reloaded_response = api.post("/api/v1/admin/plugins/search/reload", headers=headers())
+    deleted = api.delete("/api/v1/admin/plugins/search", headers=headers())
+
+    assert created.status_code == 200
+    assert started.status_code == 200
+    assert stopped.status_code == 200
+    assert reloaded_response.status_code == 200
+    assert deleted.status_code == 200
+    assert reloaded == [TENANT_ID, TENANT_ID, TENANT_ID, TENANT_ID, TENANT_ID]
+
+
+def test_plugin_reload_callback_failure_does_not_fail_saved_config() -> None:
+    api = client()
+
+    async def reload_plugin_runtime_config(tenant_id: UUID) -> None:
+        assert tenant_id == TENANT_ID
+        raise RuntimeError("plugin reload failed with secret token")
+
+    cast(Any, api.app).state.reload_plugin_runtime_config = reload_plugin_runtime_config
+
+    response = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "search",
+            "name": "Search Plugin",
+            "capabilities": [
+                {
+                    "id": "search.web",
+                    "permission_class": "network.read",
+                    "sandbox_profile": "remote_connector",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert "secret token" not in response.text
+
+
 @pytest.mark.asyncio
 async def test_admin_plugin_lifecycle_updates_status_and_health() -> None:
     service = InMemoryAdminResourceService()

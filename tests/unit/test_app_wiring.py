@@ -447,12 +447,32 @@ def test_create_app_wires_harness_scheduler_from_published_config(tmp_path: Path
     ).selected_provider == "deepseek"
 
 
-def test_create_app_wires_runtime_mcp_manifest_source(
+def test_create_app_wires_runtime_mcp_and_plugin_manifest_sources(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     captured: dict[str, object] = {}
-    mcp_source = object()
+
+    class Source:
+        def __init__(self, capability_id: str, kind: str) -> None:
+            self.capability_id = capability_id
+            self.kind = kind
+
+        def manifests_for_tenant(self, tenant_id: UUID) -> dict[str, object]:
+            assert tenant_id == TENANT_ID
+            return {
+                "schema_version": 1,
+                "capabilities": (
+                    {
+                        "id": self.capability_id,
+                        "kind": self.kind,
+                        "adapter": f"{self.kind}_runtime",
+                    },
+                ),
+            }
+
+    mcp_source = Source("search.web_search", "mcp")
+    plugin_source = Source("calendar.create_event", "plugin")
 
     class FakeMcpService:
         async def reload(self, tenant_id: UUID | None = None) -> None:
@@ -460,6 +480,13 @@ def test_create_app_wires_runtime_mcp_manifest_source(
 
         def capability_manifest_source(self) -> object:
             return mcp_source
+
+    class FakePluginService:
+        async def reload(self, tenant_id: UUID | None = None) -> None:
+            captured["plugin_reload_tenant_id"] = tenant_id
+
+        def capability_manifest_source(self) -> object:
+            return plugin_source
 
     class FakeRuntimeStack:
         runtime_gateway = object()
@@ -469,6 +496,10 @@ def test_create_app_wires_runtime_mcp_manifest_source(
         captured["mcp_service_kwargs"] = kwargs
         return FakeMcpService()
 
+    async def fake_build_runtime_plugin_service(**kwargs: object) -> FakePluginService:
+        captured["plugin_service_kwargs"] = kwargs
+        return FakePluginService()
+
     def fake_build_runtime_capability_stack(**kwargs: object) -> FakeRuntimeStack:
         captured["runtime_stack_kwargs"] = kwargs
         return FakeRuntimeStack()
@@ -477,6 +508,11 @@ def test_create_app_wires_runtime_mcp_manifest_source(
         app_module,
         "build_runtime_mcp_service",
         fake_build_runtime_mcp_service,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "build_runtime_plugin_service",
+        fake_build_runtime_plugin_service,
     )
     monkeypatch.setattr(
         app_module,
@@ -501,10 +537,26 @@ def test_create_app_wires_runtime_mcp_manifest_source(
 
     runtime_kwargs = captured["runtime_stack_kwargs"]
     assert isinstance(runtime_kwargs, dict)
-    assert runtime_kwargs["tool_registry"] is mcp_source
+    tool_registry = runtime_kwargs["tool_registry"]
+    manifest = tool_registry.manifests_for_tenant(TENANT_ID)
+    assert manifest["capabilities"] == (
+        {
+            "id": "search.web_search",
+            "kind": "mcp",
+            "adapter": "mcp_runtime",
+        },
+        {
+            "id": "calendar.create_event",
+            "kind": "plugin",
+            "adapter": "plugin_runtime",
+        },
+    )
     assert runtime_kwargs["mcp_backend"] is application.state.mcp_service
+    assert runtime_kwargs["plugin_backend"] is application.state.plugin_service
     assert getattr(application.state, "mcp_service", None) is not None
+    assert getattr(application.state, "plugin_service", None) is not None
     assert callable(getattr(application.state, "reload_mcp_runtime_config", None))
+    assert callable(getattr(application.state, "reload_plugin_runtime_config", None))
 
 
 def test_feishu_media_factory_uses_memory_store_in_development(tmp_path: Path) -> None:

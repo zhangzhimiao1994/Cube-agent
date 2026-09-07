@@ -54,12 +54,37 @@ def test_worker_runtime_stack_uses_configured_generated_artifact_dir(
         runtime_gateway = object()
         harness_tool_gateway = object()
 
+    class Source:
+        def __init__(self, capability_id: str, kind: str) -> None:
+            self.capability_id = capability_id
+            self.kind = kind
+
+        def manifests_for_tenant(self, tenant_id: UUID) -> dict[str, object]:
+            assert tenant_id == TENANT_ID
+            return {
+                "schema_version": 1,
+                "capabilities": (
+                    {
+                        "id": self.capability_id,
+                        "kind": self.kind,
+                        "adapter": f"{self.kind}_runtime",
+                    },
+                ),
+            }
+
     class FakeMcpService:
         def __init__(self, **kwargs: object) -> None:
             captured["mcp_service"] = kwargs
 
         def capability_manifest_source(self) -> object:
-            return "mcp-source"
+            return Source("search.web_search", "mcp")
+
+    class FakePluginService:
+        def __init__(self, **kwargs: object) -> None:
+            captured["plugin_service"] = kwargs
+
+        def capability_manifest_source(self) -> object:
+            return Source("calendar.create_event", "plugin")
 
     def fake_build_runtime_capability_stack(**kwargs: object) -> FakeRuntimeStack:
         captured["runtime_stack"] = kwargs
@@ -76,20 +101,40 @@ def test_worker_runtime_stack_uses_configured_generated_artifact_dir(
     monkeypatch.setattr(worker, "configured_runtime_registry", lambda **kwargs: object())
     monkeypatch.setattr(worker, "RunService", lambda *args, **kwargs: object())
     monkeypatch.setattr(worker, "RuntimeMcpService", FakeMcpService)
+    monkeypatch.setattr(worker, "RuntimePluginService", FakePluginService)
     monkeypatch.setattr(worker, "build_runtime_capability_stack", fake_build_runtime_capability_stack)
 
     resources = worker.build_worker_service(cast(Settings, FakeSettings()))
 
     runtime_stack = captured["runtime_stack"]
     mcp_service = captured["mcp_service"]
+    plugin_service = captured["plugin_service"]
     assert isinstance(runtime_stack, dict)
     assert isinstance(mcp_service, dict)
+    assert isinstance(plugin_service, dict)
     assert resources.runtime_mcp_service is not None
+    assert resources.runtime_plugin_service is not None
     assert mcp_service["tenant_id"] == TENANT_ID
+    assert plugin_service["tenant_id"] == TENANT_ID
     assert runtime_stack["generated_artifact_dir"] == tmp_path / "generated"
     assert runtime_stack["project_workspace_dir"] == tmp_path / "workspaces"
-    assert runtime_stack["tool_registry"] == "mcp-source"
+    assert runtime_stack["tool_registry"].manifests_for_tenant(TENANT_ID) == {
+        "schema_version": 1,
+        "capabilities": (
+            {
+                "id": "search.web_search",
+                "kind": "mcp",
+                "adapter": "mcp_runtime",
+            },
+            {
+                "id": "calendar.create_event",
+                "kind": "plugin",
+                "adapter": "plugin_runtime",
+            },
+        ),
+    }
     assert runtime_stack["mcp_backend"] is resources.runtime_mcp_service
+    assert runtime_stack["plugin_backend"] is resources.runtime_plugin_service
 
 
 def test_worker_builds_evolution_terminal_hook(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:

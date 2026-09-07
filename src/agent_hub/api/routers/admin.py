@@ -9741,11 +9741,14 @@ async def list_plugins(
 )
 async def upsert_plugin(
     body: PluginResourceRequest,
+    request: Request,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> PluginResourceResponse:
     _require(principal, "plugin:write")
-    return await service.upsert_plugin(body)
+    response = await service.upsert_plugin(body)
+    await _reload_plugin_runtime_config(request, principal.tenant_id)
+    return response
 
 
 @router.post(
@@ -9755,14 +9758,17 @@ async def upsert_plugin(
 )
 async def start_plugin(
     plugin_id: str,
+    request: Request,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> PluginResourceResponse:
     _require(principal, "plugin:write")
     try:
-        return await service.start_plugin(plugin_id)
+        response = await service.start_plugin(plugin_id)
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
+    await _reload_plugin_runtime_config(request, principal.tenant_id)
+    return response
 
 
 @router.post(
@@ -9772,14 +9778,17 @@ async def start_plugin(
 )
 async def stop_plugin(
     plugin_id: str,
+    request: Request,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> PluginResourceResponse:
     _require(principal, "plugin:write")
     try:
-        return await service.stop_plugin(plugin_id)
+        response = await service.stop_plugin(plugin_id)
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
+    await _reload_plugin_runtime_config(request, principal.tenant_id)
+    return response
 
 
 @router.post(
@@ -9789,14 +9798,17 @@ async def stop_plugin(
 )
 async def reload_plugin(
     plugin_id: str,
+    request: Request,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> PluginResourceResponse:
     _require(principal, "plugin:write")
     try:
-        return await service.reload_plugin(plugin_id)
+        response = await service.reload_plugin(plugin_id)
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
+    await _reload_plugin_runtime_config(request, principal.tenant_id)
+    return response
 
 
 @router.delete(
@@ -9806,6 +9818,7 @@ async def reload_plugin(
 )
 async def delete_plugin(
     plugin_id: str,
+    request: Request,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> OperationStatusResponse:
@@ -9814,6 +9827,7 @@ async def delete_plugin(
         await service.delete_plugin(plugin_id)
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
+    await _reload_plugin_runtime_config(request, principal.tenant_id)
     return OperationStatusResponse(status="deleted")
 
 
@@ -9898,6 +9912,22 @@ async def _reload_mcp_runtime_config(request: Request, tenant_id: UUID) -> None:
     except Exception as error:  # noqa: BLE001 - MCP reload must not break config writes.
         _LOGGER.warning(
             "mcp runtime reload failed tenant_id=%s error_type=%s",
+            tenant_id,
+            type(error).__name__,
+        )
+
+
+async def _reload_plugin_runtime_config(request: Request, tenant_id: UUID) -> None:
+    callback = getattr(request.app.state, "reload_plugin_runtime_config", None)
+    if not callable(callback):
+        return
+    try:
+        result = callback(tenant_id)
+        if inspect.isawaitable(result):
+            await result
+    except Exception as error:  # noqa: BLE001 - plugin reload must not break config writes.
+        _LOGGER.warning(
+            "plugin runtime reload failed tenant_id=%s error_type=%s",
             tenant_id,
             type(error).__name__,
         )

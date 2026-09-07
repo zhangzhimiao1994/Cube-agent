@@ -38,6 +38,7 @@ from agent_hub.auth.service import AuthService
 from agent_hub.auth.tokens import AccessTokenService
 from agent_hub.auth.user_admin import PersistentUserAdminService
 from agent_hub.capabilities.defaults import build_runtime_capability_stack
+from agent_hub.capabilities.tools.registry import CompositeCapabilityManifestSource
 from agent_hub.channels.base import InboundMessage
 from agent_hub.channels.dedup import InboundDedupRepository
 from agent_hub.channels.feishu.media import FeishuOpenAPIMediaClient
@@ -94,6 +95,7 @@ from agent_hub.multimodal.minimax import MiniMaxVideoGenerationClient
 from agent_hub.multimodal.video_providers import TextToVideoProvider, TextToVideoProviderRouter
 from agent_hub.observability.logging import configure_logging
 from agent_hub.observability.metrics import default_metrics_registry
+from agent_hub.plugins.runtime import build_runtime_plugin_service
 from agent_hub.routing.classifier import GatewayRouteClassifier
 from agent_hub.routing.service import ModeRouter, RoutingPolicy
 from agent_hub.routing.types import (
@@ -844,6 +846,20 @@ def create_app(
                         application.state.reload_mcp_runtime_config = (
                             reload_mcp_runtime_config
                         )
+                    runtime_plugin_service = await build_runtime_plugin_service(
+                        tenant_id=configured.bootstrap_tenant_id,
+                        admin_service=admin_service_for_capabilities,
+                    )
+                    application.state.plugin_service = runtime_plugin_service
+                    reload_plugin_runtime_config = getattr(
+                        runtime_plugin_service,
+                        "reload",
+                        None,
+                    )
+                    if callable(reload_plugin_runtime_config):
+                        application.state.reload_plugin_runtime_config = (
+                            reload_plugin_runtime_config
+                        )
                     runtime_capability_stack = build_runtime_capability_stack(
                         tenant_id=configured.bootstrap_tenant_id,
                         run_repository=capability_run_repository,
@@ -857,8 +873,14 @@ def create_app(
                         tool_approval_mode=lambda _tenant_id: _tool_approval_mode_from_settings(
                             admin_service_for_capabilities.get_settings
                         ),
-                        tool_registry=runtime_mcp_service.capability_manifest_source(),
+                        tool_registry=CompositeCapabilityManifestSource(
+                            (
+                                runtime_mcp_service.capability_manifest_source(),
+                                runtime_plugin_service.capability_manifest_source(),
+                            )
+                        ),
                         mcp_backend=runtime_mcp_service,
+                        plugin_backend=runtime_plugin_service,
                     )
                     application.state.runtime_capability_gateway = (
                         runtime_capability_stack.runtime_gateway

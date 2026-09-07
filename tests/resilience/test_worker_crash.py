@@ -90,6 +90,33 @@ def test_worker_loop_refreshes_mcp_runtime_after_interval() -> None:
     asyncio.run(scenario())
 
 
+def test_worker_loop_refreshes_plugin_runtime_after_interval() -> None:
+    async def scenario() -> None:
+        run_id = uuid4()
+        queue = LocalRunQueue()
+        service = RecordingRunService(queue, run_id)
+        stop = asyncio.Event()
+        plugin_runtime = RecordingPluginRuntime()
+        clock_values = iter((0.0, 31.0, 32.0))
+
+        await run_worker_loop(
+            service,
+            queue,
+            stop=stop,
+            poll_interval_seconds=0.01,
+            batch_limit=10,
+            max_idle_polls=2,
+            plugin_runtime=plugin_runtime,
+            runtime_reload_interval_seconds=30,
+            monotonic=lambda: next(clock_values, 32.0),
+        )
+
+        assert plugin_runtime.reloads == 1
+        assert service.executed_run_ids == [run_id]
+
+    asyncio.run(scenario())
+
+
 def test_worker_loop_continues_when_mcp_runtime_reload_fails() -> None:
     async def scenario() -> None:
         run_id = uuid4()
@@ -147,6 +174,14 @@ class FailingMcpRuntime(RecordingMcpRuntime):
     async def reload(self) -> None:
         self.reloads += 1
         raise RuntimeError("raw mcp reload failure")
+
+
+class RecordingPluginRuntime:
+    def __init__(self) -> None:
+        self.reloads = 0
+
+    async def reload(self) -> None:
+        self.reloads += 1
 
 
 class FlakyPublishRunService:

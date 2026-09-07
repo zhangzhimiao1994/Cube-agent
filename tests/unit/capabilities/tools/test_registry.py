@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from agent_hub.capabilities.tools.registry import (
+    CompositeCapabilityManifestSource,
     PluginConfigCapabilityManifestSource,
     ToolRegistry,
     create_builtin_tool_registry,
@@ -190,6 +191,53 @@ def test_plugin_manifest_source_marks_stopped_plugins_unavailable() -> None:
                 "availability_reason": "plugin_disabled",
                 "replay_safe": False,
                 "aliases": (),
+            },
+        ),
+    }
+
+
+def test_composite_manifest_source_combines_sources_for_tenant() -> None:
+    class TenantSource:
+        def manifests_for_tenant(self, tenant_id: object) -> dict[str, object]:
+            assert str(tenant_id) == "tenant-1"
+            return {
+                "schema_version": 1,
+                "capabilities": (
+                    {
+                        "id": "search.web_search",
+                        "kind": "mcp",
+                        "adapter": "mcp_server",
+                    },
+                ),
+            }
+
+    class PlainSource:
+        def manifests(self) -> dict[str, object]:
+            return {
+                "schema_version": 1,
+                "capabilities": (
+                    {
+                        "id": "calendar.create_event",
+                        "kind": "plugin",
+                        "adapter": "plugin_runtime",
+                    },
+                ),
+            }
+
+    source = CompositeCapabilityManifestSource((TenantSource(), PlainSource()))
+
+    assert source.manifests_for_tenant("tenant-1") == {
+        "schema_version": 1,
+        "capabilities": (
+            {
+                "id": "search.web_search",
+                "kind": "mcp",
+                "adapter": "mcp_server",
+            },
+            {
+                "id": "calendar.create_event",
+                "kind": "plugin",
+                "adapter": "plugin_runtime",
             },
         ),
     }
