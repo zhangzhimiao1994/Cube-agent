@@ -2940,15 +2940,18 @@ def _plugin_adapter_descriptors(request: Request) -> tuple[PluginAdapterDescript
     provider = getattr(plugin_service, "adapter_descriptors", None)
     if callable(provider):
         try:
-            descriptors = tuple(
-                PluginAdapterDescriptorResponse.model_validate(item)
-                for item in provider()
-            )
+            raw_descriptors = tuple(provider())
         except Exception:
             _LOGGER.warning("plugin adapter descriptor catalog failed", exc_info=True)
         else:
+            descriptors: list[PluginAdapterDescriptorResponse] = []
+            for item in raw_descriptors:
+                try:
+                    descriptors.append(PluginAdapterDescriptorResponse.model_validate(item))
+                except Exception:
+                    _LOGGER.warning("plugin adapter descriptor skipped", exc_info=True)
             if descriptors:
-                return descriptors
+                return tuple(descriptors)
     return (_default_http_json_adapter_descriptor(),)
 
 

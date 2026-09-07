@@ -2954,6 +2954,38 @@ def test_plugin_adapter_catalog_endpoint_exposes_safe_http_json_descriptor() -> 
     assert "Authorization" not in response.text
 
 
+def test_plugin_adapter_catalog_skips_invalid_provider_descriptors() -> None:
+    api = client()
+
+    class PluginServiceWithMixedDescriptors:
+        def adapter_descriptors(self) -> tuple[dict[str, object], ...]:
+            return (
+                {
+                    "id": "workflow",
+                    "name": "Workflow",
+                    "description": "Runs workflows.",
+                    "resource_schema": {"type": "object", "additionalProperties": True},
+                    "capability_schema": {"type": "object", "additionalProperties": True},
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+                {
+                    "id": "broken",
+                    "name": "Broken",
+                    "resource_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    cast(Any, api.app).state.plugin_service = PluginServiceWithMixedDescriptors()
+
+    response = api.get("/api/v1/admin/plugins/adapters", headers=headers())
+
+    assert response.status_code == 200
+    descriptors = {item["id"]: item for item in response.json()}
+    assert "workflow" in descriptors
+    assert "broken" not in descriptors
+    assert "http_json" not in descriptors
+
+
 def test_capability_manifest_endpoint_requires_plugin_and_mcp_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
