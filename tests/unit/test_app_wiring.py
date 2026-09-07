@@ -502,6 +502,7 @@ def test_create_app_wires_runtime_mcp_manifest_source(
     runtime_kwargs = captured["runtime_stack_kwargs"]
     assert isinstance(runtime_kwargs, dict)
     assert runtime_kwargs["tool_registry"] is mcp_source
+    assert runtime_kwargs["mcp_backend"] is application.state.mcp_service
     assert getattr(application.state, "mcp_service", None) is not None
     assert callable(getattr(application.state, "reload_mcp_runtime_config", None))
 

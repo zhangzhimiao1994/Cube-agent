@@ -197,6 +197,17 @@ def test_default_policy_requires_approval_for_generated_files_when_configured() 
     assert decision.effect is PolicyEffect.REQUIRE_APPROVAL
 
 
+def test_default_policy_requires_approval_for_mcp_when_configured() -> None:
+    policy = default_capability_policy(TENANT_A, require_approval_for_tools=True)
+
+    decision = policy.evaluate(
+        request("mcp.invoke", resource="mcp/search/web_search"),
+        Role.OPERATOR,
+    )
+
+    assert decision.effect is PolicyEffect.REQUIRE_APPROVAL
+
+
 def test_default_policy_keeps_low_risk_tools_allowed_when_approval_is_required() -> None:
     policy = default_capability_policy(TENANT_A, require_approval_for_tools=True)
 

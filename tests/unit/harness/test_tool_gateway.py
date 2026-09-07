@@ -51,6 +51,49 @@ class FakeRuntimeCapabilityGateway:
         return {"value": "14"}
 
 
+class FakeMcpToolBackend:
+    def __init__(self, *, available: bool = True) -> None:
+        self.available = available
+        self.calls: list[tuple[str, Mapping[str, object], str]] = []
+
+    def is_available(self, tenant_id: UUID, name: str) -> bool:
+        self.calls.append(("available", {"tenant_id": str(tenant_id), "name": name}, ""))
+        return self.available
+
+    async def invoke(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        self.calls.append(
+            (
+                "invoke",
+                {
+                    "tenant_id": str(tenant_id),
+                    "user_id": str(user_id),
+                    "run_id": str(run_id),
+                    "actor": actor,
+                    "name": name,
+                    "arguments": arguments,
+                },
+                idempotency_key,
+            )
+        )
+        return {"content": {"result": "searched"}}
+
+
+class FailingAvailabilityMcpToolBackend(FakeMcpToolBackend):
+    def is_available(self, tenant_id: UUID, name: str) -> bool:
+        del tenant_id, name
+        raise RuntimeError("raw discovery failure")
+
+
 class DeterministicFailureRuntimeCapabilityGateway(FakeRuntimeCapabilityGateway):
     async def execute(
         self,
@@ -98,6 +141,18 @@ def request(*, approval_required: bool = False) -> HarnessToolCallRequest:
         approval_required=approval_required,
         sandbox="restricted",
         idempotency_key="calc_1",
+    )
+
+
+def mcp_request(*, approval_required: bool = False) -> HarnessToolCallRequest:
+    return HarnessToolCallRequest(
+        run_id=RUN_ID,
+        actor="researcher",
+        tool_name="search.web_search",
+        arguments={"query": "mofang"},
+        approval_required=approval_required,
+        sandbox="mcp_remote",
+        idempotency_key="mcp_1",
     )
 
 
@@ -184,6 +239,81 @@ async def test_harness_tool_gateway_executes_approved_available_tools() -> None:
     assert result.payload == {"value": "14"}
     assert runtime.calls[-1][0] == "execute"
     assert runtime.calls[-1][2] == "calc_1"
+
+
+async def test_harness_tool_gateway_routes_available_mcp_tool_through_policy() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    mcp_backend = FakeMcpToolBackend()
+    policy = FakePolicyGateway(CapabilityStatus.ALLOWED)
+    gateway = HarnessToolGateway(runtime, policy_gateway=policy, mcp_backend=mcp_backend)
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        mcp_request(),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "succeeded"
+    assert result.payload == {"content": {"result": "searched"}}
+    assert [call[0] for call in runtime.calls] == []
+    assert [call[0] for call in mcp_backend.calls] == ["available", "invoke"]
+    assert mcp_backend.calls[-1][2] == "mcp_1"
+    capability_request, role = policy.requests[0]
+    assert role is Role.OPERATOR
+    assert capability_request.capability == "mcp"
+    assert capability_request.operation == "invoke"
+    assert capability_request.resource == "mcp/search/web_search"
+    assert capability_request.arguments == {"query": "mofang"}
+
+
+async def test_harness_tool_gateway_does_not_invoke_mcp_when_policy_waits() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    mcp_backend = FakeMcpToolBackend()
+    policy = FakePolicyGateway(
+        CapabilityStatus.WAITING_APPROVAL,
+        reason="capability requires approval",
+        approval_id="approval_mcp",
+    )
+    gateway = HarnessToolGateway(runtime, policy_gateway=policy, mcp_backend=mcp_backend)
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        mcp_request(),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    assert result.failure_reason == "capability requires approval"
+    assert result.payload == {"approval_id": "approval_mcp"}
+    assert [call[0] for call in mcp_backend.calls] == ["available"]
+    assert runtime.calls == []
+
+
+async def test_harness_tool_gateway_fails_mcp_closed_without_identity() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    mcp_backend = FakeMcpToolBackend()
+    gateway = HarnessToolGateway(runtime, mcp_backend=mcp_backend)
+
+    result = await gateway.invoke(TENANT_ID, mcp_request())
+
+    assert result.status == "failed"
+    assert result.failure_reason == "capability identity unavailable"
+    assert [call[0] for call in mcp_backend.calls] == ["available"]
+    assert runtime.calls == []
+
+
+async def test_harness_tool_gateway_falls_back_when_mcp_availability_fails() -> None:
+    runtime = FakeRuntimeCapabilityGateway(available=False)
+    mcp_backend = FailingAvailabilityMcpToolBackend()
+    gateway = HarnessToolGateway(runtime, mcp_backend=mcp_backend)
+
+    result = await gateway.invoke(TENANT_ID, mcp_request())
+
+    assert result.status == "failed"
+    assert result.failure_reason == "tool unavailable"
+    assert [call[0] for call in runtime.calls] == ["available"]
 
 
 def test_harness_capability_policy_gateway_is_publicly_exported() -> None:

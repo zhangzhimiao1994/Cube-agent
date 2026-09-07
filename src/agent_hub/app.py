@@ -858,6 +858,7 @@ def create_app(
                             admin_service_for_capabilities.get_settings
                         ),
                         tool_registry=runtime_mcp_service.capability_manifest_source(),
+                        mcp_backend=runtime_mcp_service,
                     )
                     application.state.runtime_capability_gateway = (
                         runtime_capability_stack.runtime_gateway

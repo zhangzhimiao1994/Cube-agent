@@ -5,7 +5,7 @@ from uuid import UUID
 
 from agent_hub.mcp.client import InMemoryMcpClient
 from agent_hub.mcp.runtime import build_runtime_mcp_service
-from agent_hub.mcp.types import McpToolSchema, McpTransportKind
+from agent_hub.mcp.types import McpInvocationResult, McpToolSchema, McpTransportKind
 
 TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
 
@@ -152,3 +152,30 @@ async def test_runtime_mcp_service_skips_malformed_projection_config() -> None:
             "aliases": (),
         },
     )
+
+
+async def test_runtime_mcp_service_invokes_projected_tool_after_harness_policy() -> None:
+    admin_service = FakeAdminService((server_config("search", allowed_tools=["web_search"]),))
+    client = InMemoryMcpClient(
+        tools=(McpToolSchema(name="web_search"),),
+        responses={"web_search": McpInvocationResult(content={"answer": "42"})},
+    )
+    service = await build_runtime_mcp_service(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        run_repository=object(),
+        client_factory=lambda _server: client,
+    )
+
+    result = await service.invoke(
+        tenant_id=TENANT_ID,
+        user_id=TENANT_ID,
+        run_id=TENANT_ID,
+        actor="runtime_planning",
+        name="search.web_search",
+        arguments={"query": "mofang"},
+        idempotency_key="mcp_1",
+    )
+
+    assert result == {"answer": "42"}
+    assert client.invocations == [("web_search", {"query": "mofang"})]

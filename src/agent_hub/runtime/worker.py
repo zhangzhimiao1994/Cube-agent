@@ -180,6 +180,7 @@ def build_worker_service(
             admin_service.get_settings
         ),
         tool_registry=runtime_mcp_service.capability_manifest_source(),
+        mcp_backend=runtime_mcp_service,
     )
     service = RunService(
         run_repository,

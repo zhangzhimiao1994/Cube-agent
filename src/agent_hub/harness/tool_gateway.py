@@ -28,6 +28,22 @@ class RuntimeToolBackend(Protocol):
     ) -> Mapping[str, JsonValue]: ...
 
 
+class McpToolBackend(Protocol):
+    def is_available(self, tenant_id: UUID, name: str) -> bool: ...
+
+    async def invoke(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]: ...
+
+
 class HarnessCapabilityPolicyGateway(Protocol):
     async def invoke(self, request: CapabilityRequest, *, role: Role) -> CapabilityResult: ...
 
@@ -40,11 +56,13 @@ class HarnessToolGateway:
         backend: RuntimeToolBackend,
         *,
         policy_gateway: HarnessCapabilityPolicyGateway | None = None,
+        mcp_backend: McpToolBackend | None = None,
         require_actor_identity: bool = False,
         raise_backend_errors: bool = False,
     ) -> None:
         self._backend = backend
         self._policy_gateway = policy_gateway
+        self._mcp_backend = mcp_backend
         self._require_actor_identity = require_actor_identity
         self._raise_backend_errors = raise_backend_errors
 
@@ -60,25 +78,42 @@ class HarnessToolGateway:
             raise TypeError("request must be HarnessToolCallRequest")
         if request.approval_required and self._policy_gateway is None:
             return self._failure(request, "approval required")
+        mcp_backend = self._available_mcp_backend(tenant_id, request.tool_name)
+        if mcp_backend is not None and self._policy_gateway is None:
+            return self._failure(request, "capability identity unavailable")
         authorization_failure = await self._authorize(
             tenant_id,
             request,
             user_id=user_id,
             role=role,
+            capability_parts=_mcp_capability_parts(request) if mcp_backend is not None else None,
         )
         if authorization_failure is not None:
             return authorization_failure
         try:
-            if not self._backend.is_available(tenant_id, request.tool_name):
-                return self._failure(request, "tool unavailable")
-            payload = await self._backend.execute(
-                tenant_id=tenant_id,
-                run_id=request.run_id,
-                actor=request.actor,
-                name=request.tool_name,
-                arguments=request.arguments,
-                idempotency_key=request.idempotency_key,
-            )
+            if mcp_backend is not None:
+                if type(user_id) is not UUID:
+                    return self._failure(request, "capability identity unavailable")
+                payload = await mcp_backend.invoke(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    run_id=request.run_id,
+                    actor=request.actor,
+                    name=request.tool_name,
+                    arguments=request.arguments,
+                    idempotency_key=request.idempotency_key,
+                )
+            else:
+                if not self._backend.is_available(tenant_id, request.tool_name):
+                    return self._failure(request, "tool unavailable")
+                payload = await self._backend.execute(
+                    tenant_id=tenant_id,
+                    run_id=request.run_id,
+                    actor=request.actor,
+                    name=request.tool_name,
+                    arguments=request.arguments,
+                    idempotency_key=request.idempotency_key,
+                )
         except RuntimeCapabilityError as error:
             return self._failure(request, _deterministic_failure_reason(error))
         except Exception as error:
@@ -102,6 +137,7 @@ class HarnessToolGateway:
         *,
         user_id: UUID | None,
         role: Role | None,
+        capability_parts: tuple[str, str, str] | None = None,
     ) -> HarnessToolCallResult | None:
         if type(user_id) is not UUID or not isinstance(role, Role):
             if self._policy_gateway is not None or self._require_actor_identity:
@@ -110,7 +146,7 @@ class HarnessToolGateway:
         if self._policy_gateway is None:
             return None
         decision = await self._policy_gateway.invoke(
-            _capability_request(tenant_id, user_id, request),
+            _capability_request(tenant_id, user_id, request, capability_parts=capability_parts),
             role=role,
         )
         if decision.status is CapabilityStatus.ALLOWED:
@@ -139,13 +175,26 @@ class HarnessToolGateway:
             failure_reason=reason,
         )
 
+    def _available_mcp_backend(self, tenant_id: UUID, tool_name: str) -> McpToolBackend | None:
+        if self._mcp_backend is None:
+            return None
+        try:
+            available = self._mcp_backend.is_available(tenant_id, tool_name)
+        except Exception:  # noqa: BLE001 - MCP routing discovery must fail closed.
+            return None
+        if not available:
+            return None
+        return self._mcp_backend
+
 
 def _capability_request(
     tenant_id: UUID,
     user_id: UUID,
     request: HarnessToolCallRequest,
+    *,
+    capability_parts: tuple[str, str, str] | None = None,
 ) -> CapabilityRequest:
-    capability, operation, resource = _capability_parts(request)
+    capability, operation, resource = capability_parts or _capability_parts(request)
     return CapabilityRequest(
         tenant_id=tenant_id,
         user_id=user_id,
@@ -157,6 +206,10 @@ def _capability_request(
         idempotency_key=request.idempotency_key,
         run_id=request.run_id,
     )
+
+
+def _mcp_capability_parts(request: HarnessToolCallRequest) -> tuple[str, str, str]:
+    return "mcp", "invoke", f"mcp/{request.tool_name.replace('.', '/')}"
 
 
 def _capability_parts(request: HarnessToolCallRequest) -> tuple[str, str, str]:
@@ -216,5 +269,6 @@ def _mutable_json(value: object) -> MutableJson:
 __all__ = [
     "HarnessCapabilityPolicyGateway",
     "HarnessToolGateway",
+    "McpToolBackend",
     "RuntimeToolBackend",
 ]

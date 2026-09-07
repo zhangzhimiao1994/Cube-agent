@@ -187,10 +187,33 @@ class McpService:
                 reason=decision.reason,
             )
             raise McpToolDenied(decision.reason or "MCP capability denied")
+        return await self.invoke_projected_tool(tool_name, request.arguments, context=context)
+
+    async def invoke_projected_tool(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, object],
+        *,
+        context: McpInvocationContext,
+    ) -> McpInvocationResult:
+        tool = self._tool(tool_name)
+        allowed = self._tool_allowlist_by_agent.get(context.agent_id, frozenset())
+        if tool.qualified_name not in allowed:
+            self._audit("mcp.denied", server_id=tool.server_id, tool_name=tool.qualified_name, status="denied")
+            raise McpToolDenied("MCP tool is not projected for this agent")
+        server = self._servers[tool.server_id]
+        if server.tenant_id != context.tenant_id:
+            self._audit(
+                "mcp.denied",
+                server_id=tool.server_id,
+                tool_name=tool.qualified_name,
+                status="tenant_mismatch",
+            )
+            raise McpToolDenied("MCP server does not belong to tenant")
         client = self._clients[tool.server_id]
         try:
             result = await asyncio.wait_for(
-                client.invoke(server, tool.name, request.arguments),
+                client.invoke(server, tool.name, arguments),
                 timeout=server.timeout_seconds,
             )
         except TimeoutError as exc:

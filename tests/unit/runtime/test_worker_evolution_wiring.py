@@ -89,6 +89,7 @@ def test_worker_runtime_stack_uses_configured_generated_artifact_dir(
     assert runtime_stack["generated_artifact_dir"] == tmp_path / "generated"
     assert runtime_stack["project_workspace_dir"] == tmp_path / "workspaces"
     assert runtime_stack["tool_registry"] == "mcp-source"
+    assert runtime_stack["mcp_backend"] is resources.runtime_mcp_service
 
 
 def test_worker_builds_evolution_terminal_hook(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:

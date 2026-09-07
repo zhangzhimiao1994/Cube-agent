@@ -224,12 +224,14 @@ def test_default_capability_policy_allows_safe_runtime_tools_for_operators() -> 
         request("file", "create", "generated/project.generate_zip"), Role.OPERATOR
     )
     skill = policy.evaluate(request("skill", "use", "skill/docx"), Role.OPERATOR)
+    mcp = policy.evaluate(request("mcp", "invoke", "mcp/search/web_search"), Role.OPERATOR)
 
     assert calculator.effect is PolicyEffect.ALLOW
     assert read.effect is PolicyEffect.ALLOW
     assert create.effect is PolicyEffect.ALLOW
     assert project.effect is PolicyEffect.ALLOW
     assert skill.effect is PolicyEffect.ALLOW
+    assert mcp.effect is PolicyEffect.ALLOW
 
 
 def test_default_capability_policy_denies_viewer_runtime_tools() -> None:

@@ -23,7 +23,7 @@ from agent_hub.capabilities.gateway import (
 from agent_hub.capabilities.policy import CapabilityPolicy, CapabilityRule, normalize_resource
 from agent_hub.capabilities.runtime import CapabilityManifestProvider, RuntimeCapabilityGateway
 from agent_hub.capabilities.types import CapabilityRequest, PolicyEffect
-from agent_hub.harness.tool_gateway import HarnessToolGateway
+from agent_hub.harness.tool_gateway import HarnessToolGateway, McpToolBackend
 
 ToolApprovalPolicyGetter = Callable[[UUID], Awaitable[bool]]
 ToolApprovalModeGetter = Callable[[UUID], Awaitable[str]]
@@ -184,6 +184,7 @@ def default_capability_policy(
     skill_effect = (
         PolicyEffect.REQUIRE_APPROVAL if require_approval_for_tools else PolicyEffect.ALLOW
     )
+    mcp_effect = PolicyEffect.REQUIRE_APPROVAL if require_approval_for_tools else PolicyEffect.ALLOW
     return CapabilityPolicy(
         tuple(
             CapabilityRule(
@@ -202,6 +203,7 @@ def default_capability_policy(
                 ("file", "create", "generated", generated_effect),
                 ("context", "read", "context", PolicyEffect.ALLOW),
                 ("skill", "use", "skill", skill_effect),
+                ("mcp", "invoke", "mcp", mcp_effect),
             )
         )
     )
@@ -219,6 +221,7 @@ def build_runtime_capability_stack(
     tool_approval_mode: ToolApprovalModeGetter | None = None,
     approval_reviewer: ApprovalReviewer | None = None,
     tool_registry: CapabilityManifestProvider | None = None,
+    mcp_backend: McpToolBackend | None = None,
 ) -> RuntimeCapabilityStack:
     runtime_gateway = RuntimeCapabilityGateway(
         skill_store_dir=skill_store_dir,
@@ -243,6 +246,7 @@ def build_runtime_capability_stack(
     harness_tool_gateway = HarnessToolGateway(
         runtime_gateway,
         policy_gateway=policy_gateway,
+        mcp_backend=mcp_backend,
         raise_backend_errors=True,
     )
     return RuntimeCapabilityStack(

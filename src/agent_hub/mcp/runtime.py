@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -10,9 +10,10 @@ from agent_hub.auth.models import Role
 from agent_hub.capabilities.approvals import ApprovalService, InMemoryApprovalStore
 from agent_hub.capabilities.gateway import CapabilityGateway
 from agent_hub.capabilities.policy import CapabilityPolicy
+from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.mcp.client import McpClient, SseMcpClient, StdioMcpClient, StreamableHttpMcpClient
-from agent_hub.mcp.service import McpService
-from agent_hub.mcp.types import McpServerDefinition, McpTransportKind
+from agent_hub.mcp.service import McpService, McpTimeout, McpToolDenied, McpToolNotFound
+from agent_hub.mcp.types import McpInvocationContext, McpServerDefinition, McpTransportKind
 from agent_hub.runtime.contracts import JsonValue
 
 
@@ -102,6 +103,49 @@ class RuntimeMcpService:
         if self._service is None:
             return _empty_manifest()
         return self._service.capability_manifest_source().manifests_for_tenant(tenant_id)
+
+    def is_available(self, tenant_id: UUID, name: str) -> bool:
+        manifest = self.manifests_for_tenant(tenant_id)
+        capabilities = manifest.get("capabilities")
+        if not isinstance(capabilities, tuple):
+            return False
+        return any(
+            isinstance(capability, Mapping)
+            and capability.get("id") == name
+            and capability.get("available") is True
+            for capability in capabilities
+        )
+
+    async def invoke(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        if self._service is None:
+            raise RuntimeCapabilityError("MCP tool unavailable")
+        try:
+            result = await self._service.invoke_projected_tool(
+                name,
+                arguments,
+                context=McpInvocationContext(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    run_id=run_id,
+                    agent_id=actor,
+                    idempotency_key=idempotency_key,
+                ),
+            )
+        except (McpToolDenied, McpToolNotFound) as error:
+            raise RuntimeCapabilityError("MCP tool unavailable") from error
+        except McpTimeout as error:
+            raise RuntimeCapabilityError("MCP tool timed out") from error
+        return cast(Mapping[str, JsonValue], result.content)
 
 
 async def build_runtime_mcp_service(
