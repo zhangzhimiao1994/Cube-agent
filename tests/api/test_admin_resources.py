@@ -2554,6 +2554,12 @@ def test_plugin_reload_callback_failure_does_not_fail_saved_config() -> None:
     assert "secret token" not in response.text
 
 
+def test_plugin_capability_request_defaults_to_remote_connector_sandbox_profile() -> None:
+    capability = PluginCapabilityRequest(id="search.web")
+
+    assert capability.sandbox_profile == "remote_connector"
+
+
 @pytest.mark.asyncio
 async def test_admin_plugin_lifecycle_updates_status_and_health() -> None:
     service = InMemoryAdminResourceService()

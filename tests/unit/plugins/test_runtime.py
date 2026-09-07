@@ -284,6 +284,64 @@ async def test_runtime_plugin_service_invokes_registered_adapter_for_running_cap
     assert context.idempotency_key == "plugin_1"
 
 
+async def test_runtime_plugin_service_allows_remote_connector_sandbox_profile() -> None:
+    adapter = RecordingPluginAdapter([])
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(
+            (
+                plugin(
+                    "calendar",
+                    sandbox_profile="remote_connector",
+                ),
+            )
+        ),
+        adapters={"plugin_runtime": adapter},
+    )
+
+    result = await service.invoke(
+        tenant_id=TENANT_ID,
+        user_id=TENANT_ID,
+        run_id=TENANT_ID,
+        actor="scheduler",
+        name="calendar.create_event",
+        arguments={"title": "review"},
+        idempotency_key="plugin_1",
+    )
+
+    assert result["ok"] is True
+    assert len(adapter.calls) == 1
+
+
+async def test_runtime_plugin_service_rejects_default_plugin_sandbox_profile_before_adapter() -> None:
+    adapter = RecordingPluginAdapter([])
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(
+            (
+                plugin(
+                    "calendar",
+                    sandbox_profile="plugin",
+                ),
+            )
+        ),
+        adapters={"plugin_runtime": adapter},
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin sandbox profile unsupported"):
+        await service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="scheduler",
+            name="calendar.create_event",
+            arguments={"title": "review"},
+            idempotency_key="plugin_1",
+        )
+
+    assert adapter.calls == []
+
+
 async def test_runtime_plugin_service_exposes_policy_parts_from_permission_class() -> None:
     service = await build_runtime_plugin_service(
         tenant_id=TENANT_ID,
@@ -456,6 +514,56 @@ async def test_runtime_plugin_service_records_missing_adapter_audit() -> None:
             },
         }
     ]
+    assert "input-do-not-leak" not in repr(admin_service.audit_events)
+
+
+async def test_runtime_plugin_service_rejects_unsupported_sandbox_profile_before_adapter() -> None:
+    adapter = RecordingPluginAdapter([])
+    admin_service = FakeAdminService(
+        (
+            plugin(
+                "calendar",
+                sandbox_profile="host_shell",
+            ),
+        )
+    )
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        adapters={"plugin_runtime": adapter},
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin sandbox profile unsupported"):
+        await service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="scheduler",
+            name="calendar.create_event",
+            arguments={"title": "Mofang review", "secret": "input-do-not-leak"},
+            idempotency_key="plugin_1",
+        )
+
+    assert adapter.calls == []
+    assert admin_service.audit_events == [
+        {
+            "actor": "scheduler",
+            "action": "plugin.invoke.failed",
+            "resource": "plugin:calendar:calendar.create_event",
+            "details": {
+                "plugin_id": "calendar",
+                "capability_id": "calendar.create_event",
+                "adapter": "plugin_runtime",
+                "permission_class": "calendar.write",
+                "sandbox_profile": "host_shell",
+                "replay_safe": False,
+                "run_id": str(TENANT_ID),
+                "user_id": str(TENANT_ID),
+                "idempotency_key": "plugin_1",
+            },
+        }
+    ]
+    assert "Mofang review" not in repr(admin_service.audit_events)
     assert "input-do-not-leak" not in repr(admin_service.audit_events)
 
 

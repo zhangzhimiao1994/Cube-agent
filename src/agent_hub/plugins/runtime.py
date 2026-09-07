@@ -217,16 +217,11 @@ class RuntimePluginService:
             actor=actor,
             idempotency_key=idempotency_key,
         )
-        adapter = self._adapters.get(capability.adapter)
-        if adapter is None:
-            await self._record_invocation_audit(
-                plugin,
-                capability,
-                context,
-                action="plugin.invoke.failed",
-            )
-            raise RuntimeCapabilityError("Plugin backend unavailable")
         try:
+            _ensure_supported_plugin_sandbox_profile(capability.sandbox_profile)
+            adapter = self._adapters.get(capability.adapter)
+            if adapter is None:
+                raise RuntimeCapabilityError("Plugin backend unavailable")
             input_validator = _plugin_schema_validator(
                 schema=capability.input_schema,
                 invalid_schema_message="Plugin input schema is invalid",
@@ -357,6 +352,15 @@ def _plugin_policy_resource(
     capability: PluginCapabilityRequest,
 ) -> str:
     return f"plugin/{plugin.id}/{capability.id.replace('.', '/')}"
+
+
+def _ensure_supported_plugin_sandbox_profile(sandbox_profile: str) -> None:
+    if sandbox_profile in _SUPPORTED_PLUGIN_SANDBOX_PROFILES:
+        return
+    raise RuntimeCapabilityError("Plugin sandbox profile unsupported")
+
+
+_SUPPORTED_PLUGIN_SANDBOX_PROFILES = frozenset(("remote_connector",))
 
 
 def _default_plugin_adapters(admin_service: object) -> dict[str, PluginAdapter]:

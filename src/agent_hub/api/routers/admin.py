@@ -532,7 +532,7 @@ class PluginCapabilityRequest(BaseModel):
         pattern=r"^[a-z][a-z0-9_-]*\.[a-z][a-z0-9_-]*$|^[a-z][a-z0-9_-]*:[a-z][a-z0-9_-]*$",
     )
     sandbox_profile: str = Field(
-        default="plugin",
+        default="remote_connector",
         min_length=1,
         max_length=128,
         pattern=r"^[a-z0-9][a-z0-9_.-]*$",
