@@ -166,6 +166,35 @@ class ValidationFailurePluginToolBackend(FakePluginToolBackend):
         raise RuntimeCapabilityError("Plugin arguments do not match input schema: invalid type")
 
 
+class OutputValidationFailurePluginToolBackend(FakePluginToolBackend):
+    async def invoke(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        self.calls.append(
+            (
+                "invoke",
+                {
+                    "tenant_id": str(tenant_id),
+                    "user_id": str(user_id),
+                    "run_id": str(run_id),
+                    "actor": actor,
+                    "name": name,
+                    "arguments": arguments,
+                },
+                idempotency_key,
+            )
+        )
+        raise RuntimeCapabilityError("Plugin result does not match output schema: invalid type")
+
+
 class DeterministicFailureRuntimeCapabilityGateway(FakeRuntimeCapabilityGateway):
     async def execute(
         self,
@@ -507,6 +536,30 @@ async def test_harness_tool_gateway_reports_plugin_validation_error_without_raw_
     assert result.status == "failed"
     assert result.failure_reason == "Plugin arguments do not match input schema: invalid type"
     assert "do-not-leak" not in repr(result)
+    assert [call[0] for call in plugin_backend.calls] == ["available", "invoke"]
+    assert runtime.calls == []
+
+
+async def test_harness_tool_gateway_reports_plugin_output_validation_error_without_raw_result() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    plugin_backend = OutputValidationFailurePluginToolBackend()
+    policy = FakePolicyGateway(CapabilityStatus.ALLOWED)
+    gateway = HarnessToolGateway(
+        runtime,
+        policy_gateway=policy,
+        plugin_backend=plugin_backend,
+    )
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        plugin_request(arguments={"title": "Mofang review"}),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    assert result.failure_reason == "Plugin result does not match output schema: invalid type"
+    assert "sk-plugin-secret" not in repr(result)
     assert [call[0] for call in plugin_backend.calls] == ["available", "invoke"]
     assert runtime.calls == []
 

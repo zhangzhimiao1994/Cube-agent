@@ -8,6 +8,7 @@ from uuid import UUID
 
 import httpx
 from jsonschema import SchemaError, ValidationError  # type: ignore[import-untyped]
+from jsonschema.protocols import Validator  # type: ignore[import-untyped]
 from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 
 from agent_hub.api.routers.admin import PluginCapabilityRequest, PluginResourceResponse
@@ -182,11 +183,21 @@ class RuntimePluginService:
         adapter = self._adapters.get(capability.adapter)
         if adapter is None:
             raise RuntimeCapabilityError("Plugin backend unavailable")
-        _validate_plugin_arguments(
-            arguments=arguments,
+        input_validator = _plugin_schema_validator(
             schema=capability.input_schema,
+            invalid_schema_message="Plugin input schema is invalid",
         )
-        return await adapter.invoke(
+        output_validator = _plugin_schema_validator(
+            schema=capability.output_schema,
+            invalid_schema_message="Plugin output schema is invalid",
+        )
+        _validate_plugin_payload(
+            payload=arguments,
+            validator=input_validator,
+            validation_message="Plugin arguments do not match input schema",
+            include_location=True,
+        )
+        result = await adapter.invoke(
             plugin=plugin,
             capability=capability,
             arguments=arguments,
@@ -198,6 +209,13 @@ class RuntimePluginService:
                 idempotency_key=idempotency_key,
             ),
         )
+        _validate_plugin_payload(
+            payload=result,
+            validator=output_validator,
+            validation_message="Plugin result does not match output schema",
+            include_location=False,
+        )
+        return result
 
     def _available_plugin_capability(
         self,
@@ -359,41 +377,62 @@ def _endpoint_domain_allowed(url: str, domain_allowlist: Sequence[str]) -> bool:
     return normalized_host in allowed
 
 
-def _validate_plugin_arguments(
+def _plugin_schema_validator(
     *,
-    arguments: Mapping[str, JsonValue],
     schema: Mapping[str, JsonValue] | None,
-) -> None:
+    invalid_schema_message: str,
+) -> Validator | None:
     if schema is None:
-        return
+        return None
     schema_payload = cast(Any, _mutable_json(cast(JsonValue, schema)))
-    arguments_payload = cast(Any, _mutable_json(cast(JsonValue, arguments)))
     if _schema_contains_reference(schema_payload):
-        raise RuntimeCapabilityError("Plugin input schema is invalid")
+        raise RuntimeCapabilityError(invalid_schema_message)
     failure: str | None = None
+    validator_class: type[Validator] | None = None
     try:
         validator_class = validator_for(schema_payload)
         validator_class.check_schema(schema_payload)
-        validator = validator_class(schema_payload)
-        validator.validate(arguments_payload)
     except SchemaError:
-        failure = "Plugin input schema is invalid"
+        failure = invalid_schema_message
+    if failure is not None:
+        raise RuntimeCapabilityError(failure)
+    if validator_class is None:
+        raise RuntimeCapabilityError(invalid_schema_message)
+    return validator_class(schema_payload)
+
+
+def _validate_plugin_payload(
+    *,
+    payload: Mapping[str, JsonValue],
+    validator: Validator | None,
+    validation_message: str,
+    include_location: bool,
+) -> None:
+    if validator is None:
+        return
+    instance_payload = cast(Any, _mutable_json(cast(JsonValue, payload)))
+    failure: str | None = None
+    try:
+        validator.validate(instance_payload)
     except ValidationError as error:
-        location = _validation_error_location(error)
+        location = _validation_error_location(error) if include_location else ""
         reason = _validation_error_reason(error)
-        failure = f"Plugin arguments do not match input schema{location}: {reason}"
+        failure = f"{validation_message}{location}: {reason}"
     if failure is not None:
         raise RuntimeCapabilityError(failure)
 
 
 def _schema_contains_reference(value: object) -> bool:
     if isinstance(value, Mapping):
-        if "$ref" in value:
+        if _SCHEMA_REFERENCE_KEYWORDS.intersection(value):
             return True
         return any(_schema_contains_reference(item) for item in value.values())
     if isinstance(value, list):
         return any(_schema_contains_reference(item) for item in value)
     return False
+
+
+_SCHEMA_REFERENCE_KEYWORDS = frozenset(("$ref", "$dynamicRef", "$recursiveRef"))
 
 
 def _validation_error_location(error: ValidationError) -> str:

@@ -36,6 +36,7 @@ class FakeAdminService:
 @dataclass
 class RecordingPluginAdapter:
     calls: list[tuple[str, str, Mapping[str, JsonValue], PluginInvocationContext]]
+    result: Mapping[str, JsonValue] | None = None
 
     async def invoke(
         self,
@@ -46,6 +47,8 @@ class RecordingPluginAdapter:
         context: PluginInvocationContext,
     ) -> Mapping[str, JsonValue]:
         self.calls.append((plugin.id, capability.id, arguments, context))
+        if self.result is not None:
+            return self.result
         return {
             "ok": True,
             "plugin_id": plugin.id,
@@ -68,6 +71,7 @@ def plugin(
     credential_header: str = "X-Plugin-Credential",
     credential_scheme: str = "Bearer",
     input_schema: Mapping[str, JsonValue] | None = None,
+    output_schema: Mapping[str, JsonValue] | None = None,
 ) -> PluginResourceResponse:
     return PluginResourceResponse(
         **PluginResourceRequest(
@@ -88,6 +92,7 @@ def plugin(
                     sandbox_profile="remote_connector",
                     aliases=["calendar_create"],
                     input_schema=dict(input_schema) if input_schema is not None else None,
+                    output_schema=dict(output_schema) if output_schema is not None else None,
                 )
             ],
         ).model_dump(),
@@ -327,11 +332,113 @@ async def test_runtime_plugin_service_rejects_input_schema_references() -> None:
     adapter = RecordingPluginAdapter([])
     service = await build_runtime_plugin_service(
         tenant_id=TENANT_ID,
-        admin_service=FakeAdminService((plugin("calendar", input_schema={"$ref": "#/missing"}),)),
+        admin_service=FakeAdminService(
+            (plugin("calendar", input_schema={"properties": {"title": {"$ref": "#/missing"}}}),)
+        ),
         adapters={"plugin_runtime": adapter},
     )
 
     with pytest.raises(RuntimeCapabilityError, match="Plugin input schema is invalid") as exc_info:
+        await service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="scheduler",
+            name="calendar.create_event",
+            arguments={"title": "review"},
+            idempotency_key="plugin_1",
+        )
+
+    assert adapter.calls == []
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+async def test_runtime_plugin_service_rejects_results_that_violate_output_schema() -> None:
+    adapter = RecordingPluginAdapter([], result={"secret": "do-not-leak", "remote_id": 123})
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(
+            (
+                plugin(
+                    "calendar",
+                    output_schema={
+                        "type": "object",
+                        "required": ("remote_id",),
+                        "properties": {"remote_id": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                ),
+            )
+        ),
+        adapters={"plugin_runtime": adapter},
+    )
+
+    with pytest.raises(
+        RuntimeCapabilityError,
+        match="Plugin result does not match output schema",
+    ) as exc_info:
+        await service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="scheduler",
+            name="calendar.create_event",
+            arguments={"title": "review"},
+            idempotency_key="plugin_1",
+        )
+
+    assert len(adapter.calls) == 1
+    assert "do-not-leak" not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+async def test_runtime_plugin_service_rejects_invalid_output_schema_before_adapter_execution() -> None:
+    adapter = RecordingPluginAdapter([], result={"remote_id": "evt_1"})
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(
+            (plugin("calendar", output_schema={"type": "not-a-json-schema-type"}),)
+        ),
+        adapters={"plugin_runtime": adapter},
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin output schema is invalid") as exc_info:
+        await service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="scheduler",
+            name="calendar.create_event",
+            arguments={"title": "review"},
+            idempotency_key="plugin_1",
+        )
+
+    assert adapter.calls == []
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+@pytest.mark.parametrize("reference_keyword", ("$ref", "$dynamicRef", "$recursiveRef"))
+async def test_runtime_plugin_service_rejects_output_schema_references(
+    reference_keyword: str,
+) -> None:
+    adapter = RecordingPluginAdapter([], result={"remote_id": "evt_1"})
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(
+            (
+                plugin(
+                    "calendar",
+                    output_schema={"properties": {"remote_id": {reference_keyword: "#/missing"}}},
+                ),
+            )
+        ),
+        adapters={"plugin_runtime": adapter},
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin output schema is invalid") as exc_info:
         await service.invoke(
             tenant_id=TENANT_ID,
             user_id=TENANT_ID,
