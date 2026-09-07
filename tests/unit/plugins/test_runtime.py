@@ -27,10 +27,28 @@ class FakeAdminService:
     def __init__(self, plugins: tuple[PluginResourceResponse, ...]) -> None:
         self.plugins = plugins
         self.calls = 0
+        self.audit_events: list[dict[str, object]] = []
 
     async def list_plugins(self) -> tuple[PluginResourceResponse, ...]:
         self.calls += 1
         return self.plugins
+
+    async def record_audit_event(
+        self,
+        *,
+        actor: str,
+        action: str,
+        resource: str,
+        details: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        event: dict[str, object] = {
+            "actor": actor,
+            "action": action,
+            "resource": resource,
+            "details": {} if details is None else dict(details),
+        }
+        self.audit_events.append(event)
+        return event
 
 
 @dataclass
@@ -70,6 +88,9 @@ def plugin(
     credential_ref: str | None = None,
     credential_header: str = "X-Plugin-Credential",
     credential_scheme: str = "Bearer",
+    permission_class: str = "calendar.write",
+    sandbox_profile: str = "remote_connector",
+    replay_safe: bool = False,
     input_schema: Mapping[str, JsonValue] | None = None,
     output_schema: Mapping[str, JsonValue] | None = None,
 ) -> PluginResourceResponse:
@@ -88,8 +109,9 @@ def plugin(
                 PluginCapabilityRequest(
                     id=capability_id,
                     adapter=adapter,
-                    permission_class="calendar.write",
-                    sandbox_profile="remote_connector",
+                    permission_class=permission_class,
+                    sandbox_profile=sandbox_profile,
+                    replay_safe=replay_safe,
                     aliases=["calendar_create"],
                     input_schema=dict(input_schema) if input_schema is not None else None,
                     output_schema=dict(output_schema) if output_schema is not None else None,
@@ -260,6 +282,181 @@ async def test_runtime_plugin_service_invokes_registered_adapter_for_running_cap
     assert context.run_id == TENANT_ID
     assert context.actor == "scheduler"
     assert context.idempotency_key == "plugin_1"
+
+
+async def test_runtime_plugin_service_exposes_policy_parts_from_permission_class() -> None:
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService((plugin("calendar"),)),
+        adapters={"plugin_runtime": RecordingPluginAdapter([])},
+    )
+
+    assert service.capability_policy_parts(TENANT_ID, "calendar.create_event") == (
+        "calendar",
+        "write",
+        "plugin/calendar/calendar/create_event",
+    )
+
+
+async def test_runtime_plugin_service_preserves_generic_plugin_policy_parts() -> None:
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(
+            (
+                plugin(
+                    "calendar",
+                    permission_class="plugin.use",
+                ),
+            )
+        ),
+        adapters={"plugin_runtime": RecordingPluginAdapter([])},
+    )
+
+    assert service.capability_policy_parts(TENANT_ID, "calendar.create_event") is None
+
+
+async def test_runtime_plugin_service_records_invocation_audit_without_payloads() -> None:
+    adapter = RecordingPluginAdapter([], result={"remote_id": "evt_1", "secret": "do-not-leak"})
+    admin_service = FakeAdminService(
+        (
+            plugin(
+                "calendar",
+                permission_class="plugin.use",
+                replay_safe=True,
+            ),
+        )
+    )
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        adapters={"plugin_runtime": adapter},
+    )
+
+    result = await service.invoke(
+        tenant_id=TENANT_ID,
+        user_id=TENANT_ID,
+        run_id=TENANT_ID,
+        actor="scheduler",
+        name="calendar.create_event",
+        arguments={"title": "Mofang review", "secret": "input-do-not-leak"},
+        idempotency_key="plugin_1",
+    )
+
+    assert result == {"remote_id": "evt_1", "secret": "do-not-leak"}
+    assert admin_service.audit_events == [
+        {
+            "actor": "scheduler",
+            "action": "plugin.invoke.succeeded",
+            "resource": "plugin:calendar:calendar.create_event",
+            "details": {
+                "plugin_id": "calendar",
+                "capability_id": "calendar.create_event",
+                "adapter": "plugin_runtime",
+                "permission_class": "plugin.use",
+                "sandbox_profile": "remote_connector",
+                "replay_safe": True,
+                "run_id": str(TENANT_ID),
+                "user_id": str(TENANT_ID),
+                "idempotency_key": "plugin_1",
+            },
+        }
+    ]
+    assert "Mofang review" not in repr(admin_service.audit_events)
+    assert "input-do-not-leak" not in repr(admin_service.audit_events)
+    assert "do-not-leak" not in repr(admin_service.audit_events)
+
+
+async def test_runtime_plugin_service_records_validation_failure_audit_without_payloads() -> None:
+    adapter = RecordingPluginAdapter([])
+    admin_service = FakeAdminService(
+        (
+            plugin(
+                "calendar",
+                input_schema={
+                    "type": "object",
+                    "required": ("title",),
+                    "properties": {"title": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            ),
+        )
+    )
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        adapters={"plugin_runtime": adapter},
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin arguments do not match input schema"):
+        await service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="scheduler",
+            name="calendar.create_event",
+            arguments={"title": 123, "secret": "input-do-not-leak"},
+            idempotency_key="plugin_1",
+        )
+
+    assert adapter.calls == []
+    assert admin_service.audit_events == [
+        {
+            "actor": "scheduler",
+            "action": "plugin.invoke.failed",
+            "resource": "plugin:calendar:calendar.create_event",
+            "details": {
+                "plugin_id": "calendar",
+                "capability_id": "calendar.create_event",
+                "adapter": "plugin_runtime",
+                "permission_class": "calendar.write",
+                "sandbox_profile": "remote_connector",
+                "replay_safe": False,
+                "run_id": str(TENANT_ID),
+                "user_id": str(TENANT_ID),
+                "idempotency_key": "plugin_1",
+            },
+        }
+    ]
+    assert "input-do-not-leak" not in repr(admin_service.audit_events)
+
+
+async def test_runtime_plugin_service_records_missing_adapter_audit() -> None:
+    admin_service = FakeAdminService((plugin("calendar"),))
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin backend unavailable"):
+        await service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="scheduler",
+            name="calendar.create_event",
+            arguments={"title": "Mofang review", "secret": "input-do-not-leak"},
+            idempotency_key="plugin_1",
+        )
+
+    assert admin_service.audit_events == [
+        {
+            "actor": "scheduler",
+            "action": "plugin.invoke.failed",
+            "resource": "plugin:calendar:calendar.create_event",
+            "details": {
+                "plugin_id": "calendar",
+                "capability_id": "calendar.create_event",
+                "adapter": "plugin_runtime",
+                "permission_class": "calendar.write",
+                "sandbox_profile": "remote_connector",
+                "replay_safe": False,
+                "run_id": str(TENANT_ID),
+                "user_id": str(TENANT_ID),
+                "idempotency_key": "plugin_1",
+            },
+        }
+    ]
+    assert "input-do-not-leak" not in repr(admin_service.audit_events)
 
 
 async def test_runtime_plugin_service_rejects_arguments_that_violate_input_schema() -> None:

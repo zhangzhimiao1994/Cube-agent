@@ -125,6 +125,22 @@ class FakePluginToolBackend:
         return {"content": {"event_id": "evt_1"}}
 
 
+class PolicyPartsPluginToolBackend(FakePluginToolBackend):
+    def capability_policy_parts(
+        self,
+        tenant_id: UUID,
+        name: str,
+    ) -> tuple[str, str, str]:
+        self.calls.append(
+            (
+                "policy_parts",
+                {"tenant_id": str(tenant_id), "name": name},
+                "",
+            )
+        )
+        return "calendar", "write", "plugin/calendar/calendar/create_event"
+
+
 class FailingAvailabilityMcpToolBackend(FakeMcpToolBackend):
     def is_available(self, tenant_id: UUID, name: str) -> bool:
         del tenant_id, name
@@ -461,6 +477,36 @@ async def test_harness_tool_gateway_routes_available_plugin_tool_through_policy(
     assert capability_request.operation == "use"
     assert capability_request.resource == "plugin/calendar/create_event"
     assert capability_request.arguments == {"title": "Mofang review"}
+
+
+async def test_harness_tool_gateway_uses_plugin_declared_permission_for_policy() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    plugin_backend = PolicyPartsPluginToolBackend()
+    policy = FakePolicyGateway(CapabilityStatus.ALLOWED)
+    gateway = HarnessToolGateway(
+        runtime,
+        policy_gateway=policy,
+        plugin_backend=plugin_backend,
+    )
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        plugin_request(),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "succeeded"
+    assert [call[0] for call in plugin_backend.calls] == [
+        "available",
+        "policy_parts",
+        "invoke",
+    ]
+    capability_request, role = policy.requests[0]
+    assert role is Role.OPERATOR
+    assert capability_request.capability == "calendar"
+    assert capability_request.operation == "write"
+    assert capability_request.resource == "plugin/calendar/calendar/create_event"
 
 
 async def test_harness_tool_gateway_does_not_invoke_plugin_when_policy_waits() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Protocol
 from uuid import UUID
@@ -60,6 +61,9 @@ class PluginToolBackend(Protocol):
     ) -> Mapping[str, JsonValue]: ...
 
 
+type CapabilityPolicyParts = tuple[str, str, str]
+
+
 class HarnessCapabilityPolicyGateway(Protocol):
     async def invoke(self, request: CapabilityRequest, *, role: Role) -> CapabilityResult: ...
 
@@ -110,6 +114,7 @@ class HarnessToolGateway:
             user_id=user_id,
             role=role,
             capability_parts=_external_capability_parts(
+                tenant_id,
                 request,
                 mcp_backend=mcp_backend,
                 plugin_backend=plugin_backend,
@@ -258,28 +263,63 @@ def _capability_request(
     )
 
 
-def _mcp_capability_parts(request: HarnessToolCallRequest) -> tuple[str, str, str]:
+def _mcp_capability_parts(request: HarnessToolCallRequest) -> CapabilityPolicyParts:
     return "mcp", "invoke", f"mcp/{request.tool_name.replace('.', '/')}"
 
 
-def _plugin_capability_parts(request: HarnessToolCallRequest) -> tuple[str, str, str]:
+def _plugin_capability_parts(request: HarnessToolCallRequest) -> CapabilityPolicyParts:
     return "plugin", "use", f"plugin/{request.tool_name.replace('.', '/')}"
 
 
 def _external_capability_parts(
+    tenant_id: UUID,
     request: HarnessToolCallRequest,
     *,
     mcp_backend: McpToolBackend | None,
     plugin_backend: PluginToolBackend | None,
-) -> tuple[str, str, str] | None:
+) -> CapabilityPolicyParts | None:
     if mcp_backend is not None:
         return _mcp_capability_parts(request)
     if plugin_backend is not None:
+        declared = _plugin_declared_capability_parts(plugin_backend, tenant_id, request.tool_name)
+        if declared is not None:
+            return declared
         return _plugin_capability_parts(request)
     return None
 
 
-def _capability_parts(request: HarnessToolCallRequest) -> tuple[str, str, str]:
+def _plugin_declared_capability_parts(
+    plugin_backend: PluginToolBackend,
+    tenant_id: UUID,
+    tool_name: str,
+) -> CapabilityPolicyParts | None:
+    capability_policy_parts = getattr(plugin_backend, "capability_policy_parts", None)
+    if not callable(capability_policy_parts):
+        return None
+    try:
+        parts = capability_policy_parts(tenant_id, tool_name)
+    except Exception:  # noqa: BLE001 - plugin policy discovery must fail closed to generic plugin policy.
+        return None
+    if (
+        not isinstance(parts, tuple)
+        or len(parts) != 3
+        or not all(isinstance(part, str) and part.strip() == part for part in parts)
+    ):
+        return None
+    capability, operation, resource = parts
+    if _SAFE_POLICY_TOKEN.fullmatch(capability) is None:
+        return None
+    if _SAFE_POLICY_TOKEN.fullmatch(operation) is None:
+        return None
+    if not resource:
+        return None
+    return capability, operation, resource
+
+
+_SAFE_POLICY_TOKEN = re.compile(r"^[a-z][a-z0-9_-]{0,127}$")
+
+
+def _capability_parts(request: HarnessToolCallRequest) -> CapabilityPolicyParts:
     if request.tool_name in {"calculator", "calculator_evaluate", "calculator.evaluate"}:
         return "calculator", "evaluate", "calculator"
     if request.tool_name in {"document.generate_docx", "presentation.generate_pptx", "project.generate_zip"}:

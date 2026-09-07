@@ -21,6 +21,17 @@ class PluginConfigService(Protocol):
     async def list_plugins(self) -> Sequence[Any]: ...
 
 
+class PluginAuditRecorder(Protocol):
+    async def record_audit_event(
+        self,
+        *,
+        actor: str,
+        action: str,
+        resource: str,
+        details: dict[str, object] | None = None,
+    ) -> object: ...
+
+
 @dataclass(frozen=True, slots=True)
 class PluginInvocationContext:
     tenant_id: UUID
@@ -163,6 +174,25 @@ class RuntimePluginService:
             return False
         return self._available_plugin_capability(name) is not None
 
+    def capability_policy_parts(self, tenant_id: UUID, name: str) -> tuple[str, str, str] | None:
+        if tenant_id != self._tenant_id:
+            return None
+        target = self._available_plugin_capability(name)
+        if target is None:
+            return None
+        plugin, capability = target
+        if capability.permission_class == "plugin.use":
+            return None
+        permission = _permission_class_parts(capability.permission_class)
+        if permission is None:
+            return None
+        policy_capability, policy_operation = permission
+        return (
+            policy_capability,
+            policy_operation,
+            _plugin_policy_resource(plugin, capability),
+        )
+
     async def invoke(
         self,
         *,
@@ -180,40 +210,62 @@ class RuntimePluginService:
         if target is None:
             raise RuntimeCapabilityError("Plugin tool unavailable")
         plugin, capability = target
+        context = PluginInvocationContext(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            run_id=run_id,
+            actor=actor,
+            idempotency_key=idempotency_key,
+        )
         adapter = self._adapters.get(capability.adapter)
         if adapter is None:
+            await self._record_invocation_audit(
+                plugin,
+                capability,
+                context,
+                action="plugin.invoke.failed",
+            )
             raise RuntimeCapabilityError("Plugin backend unavailable")
-        input_validator = _plugin_schema_validator(
-            schema=capability.input_schema,
-            invalid_schema_message="Plugin input schema is invalid",
-        )
-        output_validator = _plugin_schema_validator(
-            schema=capability.output_schema,
-            invalid_schema_message="Plugin output schema is invalid",
-        )
-        _validate_plugin_payload(
-            payload=arguments,
-            validator=input_validator,
-            validation_message="Plugin arguments do not match input schema",
-            include_location=True,
-        )
-        result = await adapter.invoke(
-            plugin=plugin,
-            capability=capability,
-            arguments=arguments,
-            context=PluginInvocationContext(
-                tenant_id=tenant_id,
-                user_id=user_id,
-                run_id=run_id,
-                actor=actor,
-                idempotency_key=idempotency_key,
-            ),
-        )
-        _validate_plugin_payload(
-            payload=result,
-            validator=output_validator,
-            validation_message="Plugin result does not match output schema",
-            include_location=False,
+        try:
+            input_validator = _plugin_schema_validator(
+                schema=capability.input_schema,
+                invalid_schema_message="Plugin input schema is invalid",
+            )
+            output_validator = _plugin_schema_validator(
+                schema=capability.output_schema,
+                invalid_schema_message="Plugin output schema is invalid",
+            )
+            _validate_plugin_payload(
+                payload=arguments,
+                validator=input_validator,
+                validation_message="Plugin arguments do not match input schema",
+                include_location=True,
+            )
+            result = await adapter.invoke(
+                plugin=plugin,
+                capability=capability,
+                arguments=arguments,
+                context=context,
+            )
+            _validate_plugin_payload(
+                payload=result,
+                validator=output_validator,
+                validation_message="Plugin result does not match output schema",
+                include_location=False,
+            )
+        except Exception:
+            await self._record_invocation_audit(
+                plugin,
+                capability,
+                context,
+                action="plugin.invoke.failed",
+            )
+            raise
+        await self._record_invocation_audit(
+            plugin,
+            capability,
+            context,
+            action="plugin.invoke.succeeded",
         )
         return result
 
@@ -228,6 +280,37 @@ class RuntimePluginService:
                 if capability.id == name or name in capability.aliases:
                     return plugin, capability
         return None
+
+    async def _record_invocation_audit(
+        self,
+        plugin: PluginResourceResponse,
+        capability: PluginCapabilityRequest,
+        context: PluginInvocationContext,
+        *,
+        action: str,
+    ) -> None:
+        recorder = getattr(self._admin_service, "record_audit_event", None)
+        if not callable(recorder):
+            return
+        try:
+            await cast(PluginAuditRecorder, self._admin_service).record_audit_event(
+                actor=context.actor,
+                action=action,
+                resource=f"plugin:{plugin.id}:{capability.id}",
+                details={
+                    "plugin_id": plugin.id,
+                    "capability_id": capability.id,
+                    "adapter": capability.adapter,
+                    "permission_class": capability.permission_class,
+                    "sandbox_profile": capability.sandbox_profile,
+                    "replay_safe": capability.replay_safe is True,
+                    "run_id": str(context.run_id),
+                    "user_id": str(context.user_id),
+                    "idempotency_key": context.idempotency_key,
+                },
+            )
+        except Exception:  # noqa: BLE001 - plugin execution must not leak audit backend failures.
+            return
 
 
 async def build_runtime_plugin_service(
@@ -258,6 +341,22 @@ def _plugin_is_running(plugin: PluginResourceResponse) -> bool:
         and plugin.status == "running"
         and plugin.health == "healthy"
     )
+
+
+def _permission_class_parts(permission_class: str) -> tuple[str, str] | None:
+    separator = "." if "." in permission_class else ":"
+    parts = permission_class.split(separator, 1)
+    if len(parts) != 2 or not all(parts):
+        return None
+    capability, operation = parts
+    return capability, operation
+
+
+def _plugin_policy_resource(
+    plugin: PluginResourceResponse,
+    capability: PluginCapabilityRequest,
+) -> str:
+    return f"plugin/{plugin.id}/{capability.id.replace('.', '/')}"
 
 
 def _default_plugin_adapters(admin_service: object) -> dict[str, PluginAdapter]:
