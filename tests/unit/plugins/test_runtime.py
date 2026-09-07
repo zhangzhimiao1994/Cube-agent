@@ -64,6 +64,9 @@ def plugin(
     endpoint_url: str | None = None,
     domain_allowlist: tuple[str, ...] = (),
     timeout_seconds: float = 10,
+    credential_ref: str | None = None,
+    credential_header: str = "Authorization",
+    credential_scheme: str = "Bearer",
 ) -> PluginResourceResponse:
     return PluginResourceResponse(
         **PluginResourceRequest(
@@ -73,6 +76,9 @@ def plugin(
             endpoint_url=endpoint_url,
             domain_allowlist=list(domain_allowlist),
             timeout_seconds=timeout_seconds,
+            credential_ref=credential_ref,
+            credential_header=credential_header,
+            credential_scheme=credential_scheme,
             capabilities=[
                 PluginCapabilityRequest(
                     id=capability_id,
@@ -190,14 +196,15 @@ async def test_runtime_plugin_service_rejects_unavailable_plugin_capability() ->
 
 
 async def test_http_json_plugin_adapter_posts_context_to_allowed_endpoint() -> None:
-    posts: list[tuple[str, Mapping[str, JsonValue], float]] = []
+    posts: list[tuple[str, Mapping[str, JsonValue], float, Mapping[str, str]]] = []
 
     async def post_json(
         url: str,
         payload: Mapping[str, JsonValue],
         timeout_seconds: float,
+        headers: Mapping[str, str],
     ) -> Mapping[str, JsonValue]:
-        posts.append((url, payload, timeout_seconds))
+        posts.append((url, payload, timeout_seconds, headers))
         return {"created": True, "remote_id": "evt_1"}
 
     service = await build_runtime_plugin_service(
@@ -228,9 +235,10 @@ async def test_http_json_plugin_adapter_posts_context_to_allowed_endpoint() -> N
 
     assert result == {"created": True, "remote_id": "evt_1"}
     assert len(posts) == 1
-    url, payload, timeout_seconds = posts[0]
+    url, payload, timeout_seconds, headers = posts[0]
     assert url == "https://plugins.example/invoke"
     assert timeout_seconds == 3
+    assert headers == {}
     assert payload["plugin_id"] == "calendar"
     assert payload["capability_id"] == "calendar.create_event"
     assert payload["arguments"] == {"title": "review"}
@@ -248,8 +256,9 @@ async def test_http_json_plugin_adapter_requires_allowed_endpoint_domain() -> No
         url: str,
         payload: Mapping[str, JsonValue],
         timeout_seconds: float,
+        headers: Mapping[str, str],
     ) -> Mapping[str, JsonValue]:
-        del url, payload, timeout_seconds
+        del url, payload, timeout_seconds, headers
         return {"created": True}
 
     adapter = HttpJsonPluginAdapter(post_json=post_json)
@@ -273,6 +282,62 @@ async def test_http_json_plugin_adapter_requires_allowed_endpoint_domain() -> No
                 idempotency_key="plugin_1",
             ),
         )
+
+
+async def test_http_json_plugin_adapter_resolves_secret_into_configured_header() -> None:
+    posts: list[tuple[str, Mapping[str, JsonValue], float, Mapping[str, str]]] = []
+    resolved_refs: list[str] = []
+
+    async def post_json(
+        url: str,
+        payload: Mapping[str, JsonValue],
+        timeout_seconds: float,
+        headers: Mapping[str, str],
+    ) -> Mapping[str, JsonValue]:
+        posts.append((url, payload, timeout_seconds, headers))
+        return {"ok": True}
+
+    async def resolve_secret(ref: str) -> str:
+        resolved_refs.append(ref)
+        return "sk-plugin-secret"
+
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(
+            (
+                plugin(
+                    "calendar",
+                    adapter="http_json",
+                    endpoint_url="https://plugins.example/invoke",
+                    domain_allowlist=("plugins.example",),
+                    credential_ref="secret://calendar",
+                    credential_header="X-Plugin-Key",
+                    credential_scheme="",
+                ),
+            )
+        ),
+        adapters={
+            "http_json": HttpJsonPluginAdapter(
+                post_json=post_json,
+                secret_resolver=resolve_secret,
+            )
+        },
+    )
+
+    result = await service.invoke(
+        tenant_id=TENANT_ID,
+        user_id=TENANT_ID,
+        run_id=TENANT_ID,
+        actor="scheduler",
+        name="calendar.create_event",
+        arguments={"title": "review"},
+        idempotency_key="plugin_1",
+    )
+
+    assert result == {"ok": True}
+    assert resolved_refs == ["secret://calendar"]
+    assert posts[0][3] == {"X-Plugin-Key": "sk-plugin-secret"}
+    assert "sk-plugin-secret" not in str(posts[0][1])
 
 
 async def test_runtime_plugin_service_fails_closed_when_admin_listing_fails() -> None:

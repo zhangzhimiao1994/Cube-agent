@@ -567,6 +567,14 @@ class PluginResourceRequest(NamedResourceRequest):
     endpoint_url: str | None = Field(default=None, max_length=2048)
     domain_allowlist: list[str] = Field(default_factory=list, max_length=64)
     timeout_seconds: float = Field(default=10, gt=0, le=120)
+    credential_ref: str | None = Field(default=None, max_length=128)
+    credential_header: str = Field(
+        default="Authorization",
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z][A-Za-z0-9-]*$",
+    )
+    credential_scheme: str = Field(default="Bearer", max_length=32)
     capabilities: list[PluginCapabilityRequest] = Field(default_factory=list, max_length=256)
 
     @field_validator("capabilities")

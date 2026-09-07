@@ -39,14 +39,21 @@ class PluginAdapter(Protocol):
 
 
 type HttpJsonPost = Callable[
-    [str, Mapping[str, JsonValue], float],
+    [str, Mapping[str, JsonValue], float, Mapping[str, str]],
     Awaitable[Mapping[str, JsonValue]],
 ]
+type PluginSecretResolver = Callable[[str], Awaitable[str]]
 
 
 class HttpJsonPluginAdapter:
-    def __init__(self, *, post_json: HttpJsonPost | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        post_json: HttpJsonPost | None = None,
+        secret_resolver: PluginSecretResolver | None = None,
+    ) -> None:
         self._post_json = _httpx_post_json if post_json is None else post_json
+        self._secret_resolver = secret_resolver
 
     async def invoke(
         self,
@@ -71,8 +78,9 @@ class HttpJsonPluginAdapter:
                 "idempotency_key": context.idempotency_key,
             },
         }
+        headers = await self._headers_for_plugin(plugin)
         try:
-            result = await self._post_json(url, payload, plugin.timeout_seconds)
+            result = await self._post_json(url, payload, plugin.timeout_seconds, headers)
         except TimeoutError as error:
             raise RuntimeCapabilityError("Plugin tool timed out") from error
         except httpx.TimeoutException as error:
@@ -85,6 +93,22 @@ class HttpJsonPluginAdapter:
             raise RuntimeCapabilityError("Plugin result is invalid")
         return result
 
+    async def _headers_for_plugin(self, plugin: PluginResourceResponse) -> Mapping[str, str]:
+        credential_ref = plugin.credential_ref
+        if credential_ref is None:
+            return {}
+        if self._secret_resolver is None:
+            raise RuntimeCapabilityError("Plugin credential unavailable")
+        try:
+            credential = await self._secret_resolver(credential_ref)
+        except Exception as error:
+            raise RuntimeCapabilityError("Plugin credential unavailable") from error
+        if not isinstance(credential, str) or not credential:
+            raise RuntimeCapabilityError("Plugin credential unavailable")
+        scheme = plugin.credential_scheme.strip()
+        value = credential if not scheme else f"{scheme} {credential}"
+        return {plugin.credential_header: value}
+
 
 class RuntimePluginService:
     def __init__(
@@ -96,7 +120,7 @@ class RuntimePluginService:
     ) -> None:
         self._tenant_id = tenant_id
         self._admin_service = admin_service
-        self._adapters = _default_plugin_adapters()
+        self._adapters = _default_plugin_adapters(admin_service)
         self._adapters.update(adapters or {})
         self._plugins: tuple[PluginResourceResponse, ...] = ()
 
@@ -203,8 +227,12 @@ def _plugin_is_running(plugin: PluginResourceResponse) -> bool:
     )
 
 
-def _default_plugin_adapters() -> dict[str, PluginAdapter]:
-    return {"http_json": HttpJsonPluginAdapter()}
+def _default_plugin_adapters(admin_service: object) -> dict[str, PluginAdapter]:
+    return {
+        "http_json": HttpJsonPluginAdapter(
+            secret_resolver=_secret_resolver(admin_service),
+        )
+    }
 
 
 def _plugin_endpoint_url(plugin: PluginResourceResponse) -> str:
@@ -234,14 +262,22 @@ async def _httpx_post_json(
     url: str,
     payload: Mapping[str, JsonValue],
     timeout_seconds: float,
+    headers: Mapping[str, str],
 ) -> Mapping[str, JsonValue]:
     async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-        response = await client.post(url, json=payload)
+        response = await client.post(url, json=payload, headers=headers)
         response.raise_for_status()
         data = response.json()
     if not isinstance(data, Mapping):
         raise RuntimeCapabilityError("Plugin result is invalid")
     return cast(Mapping[str, JsonValue], data)
+
+
+def _secret_resolver(admin_service: object) -> PluginSecretResolver | None:
+    resolver = getattr(admin_service, "resolve_secret_value", None)
+    if not callable(resolver):
+        return None
+    return cast(PluginSecretResolver, resolver)
 
 
 __all__ = [
@@ -250,6 +286,7 @@ __all__ = [
     "PluginAdapter",
     "PluginConfigService",
     "PluginInvocationContext",
+    "PluginSecretResolver",
     "RuntimePluginService",
     "build_runtime_plugin_service",
 ]
