@@ -248,6 +248,7 @@ describe("api client transport", () => {
           policy_effect: "require_approval",
           replay_safe: false,
           aliases: ["calendar_create"],
+          capability_config: { workflow_stage: "daily" },
           input_schema: {
             type: "object",
             required: ["title"],
@@ -361,6 +362,7 @@ describe("api client transport", () => {
           policy_effect: "require_approval",
           replay_safe: false,
           aliases: ["calendar_create"],
+          capability_config: { workflow_stage: "daily" },
           input_schema: {
             type: "object",
             required: ["title"],
@@ -420,6 +422,7 @@ describe("api client transport", () => {
           policy_effect: "require_approval",
           replay_safe: false,
           aliases: ["calendar_create"],
+          capability_config: { workflow_stage: "daily" },
           input_schema: {
             type: "object",
             required: ["title"],

@@ -540,6 +540,7 @@ class PluginCapabilityRequest(BaseModel):
     policy_effect: Literal["inherit", "allow", "require_approval", "deny"] = "inherit"
     replay_safe: bool = False
     aliases: list[str] = Field(default_factory=list, max_length=128)
+    capability_config: dict[str, JsonValue] = Field(default_factory=dict, max_length=128)
     input_schema: dict[str, JsonValue] | None = None
     output_schema: dict[str, JsonValue] | None = None
 
@@ -3025,6 +3026,20 @@ _PLUGIN_BUILTIN_RESOURCE_FIELDS = frozenset(
     )
 )
 
+_PLUGIN_BUILTIN_CAPABILITY_FIELDS = frozenset(
+    (
+        "id",
+        "adapter",
+        "permission_class",
+        "sandbox_profile",
+        "policy_effect",
+        "replay_safe",
+        "aliases",
+        "input_schema",
+        "output_schema",
+    )
+)
+
 
 def _validate_plugin_resource_config(request: Request, plugin: PluginResourceRequest) -> None:
     descriptors = {descriptor.id: descriptor for descriptor in _plugin_adapter_descriptors(request)}
@@ -3074,6 +3089,52 @@ def _validate_plugin_resource_config(request: Request, plugin: PluginResourceReq
                 "invalid_plugin_resource_config",
                 f"plugin resource_config field {name} has invalid type",
             )
+
+
+def _validate_plugin_capability_configs(request: Request, plugin: PluginResourceRequest) -> None:
+    descriptors = {descriptor.id: descriptor for descriptor in _plugin_adapter_descriptors(request)}
+    for capability in plugin.capabilities:
+        descriptor = descriptors.get(capability.adapter)
+        if descriptor is None:
+            continue
+        fields: dict[str, Mapping[str, JsonValue]] = {}
+        required_fields: set[str] = set()
+        properties = descriptor.capability_schema.get("properties")
+        if isinstance(properties, Mapping):
+            for property_name, schema in properties.items():
+                if property_name in _PLUGIN_BUILTIN_CAPABILITY_FIELDS:
+                    continue
+                if isinstance(property_name, str) and isinstance(schema, Mapping):
+                    fields[property_name] = schema
+        required = descriptor.capability_schema.get("required")
+        if isinstance(required, (list, tuple)):
+            for required_name in required:
+                if (
+                    isinstance(required_name, str)
+                    and required_name not in _PLUGIN_BUILTIN_CAPABILITY_FIELDS
+                ):
+                    required_fields.add(required_name)
+        for name in sorted(required_fields):
+            if name not in capability.capability_config:
+                raise PublicAPIError(
+                    422,
+                    "invalid_plugin_capability_config",
+                    f"plugin capability {capability.id} capability_config missing required field {name}",
+                )
+        for name, value in capability.capability_config.items():
+            schema = fields.get(name)
+            if schema is None:
+                raise PublicAPIError(
+                    422,
+                    "invalid_plugin_capability_config",
+                    f"plugin capability {capability.id} capability_config field {name} is not supported by selected adapter",
+                )
+            if not _plugin_resource_value_matches_schema(value, schema):
+                raise PublicAPIError(
+                    422,
+                    "invalid_plugin_capability_config",
+                    f"plugin capability {capability.id} capability_config field {name} has invalid type",
+                )
 
 
 def _plugin_resource_value_matches_schema(value: JsonValue, schema: Mapping[str, JsonValue]) -> bool:
@@ -9961,6 +10022,7 @@ async def upsert_plugin(
 ) -> PluginResourceResponse:
     _require(principal, "plugin:write")
     _validate_plugin_resource_config(request, body)
+    _validate_plugin_capability_configs(request, body)
     response = await service.upsert_plugin(body)
     await _reload_plugin_runtime_config(request, principal.tenant_id)
     return response

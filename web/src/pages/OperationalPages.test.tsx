@@ -451,6 +451,7 @@ const calendarPlugin = {
           policy_effect: "require_approval",
           replay_safe: false,
           aliases: ["calendar_create"],
+          capability_config: {},
           input_schema: {
             type: "object",
             required: ["title"],
@@ -6859,6 +6860,255 @@ describe("operational management pages", () => {
     expect((screen.getByLabelText("沙箱 Profile 2") as HTMLInputElement).value).toBe("workflow_sandbox");
     expect((screen.getByLabelText("权限策略 2") as HTMLSelectElement).value).toBe("require_approval");
     expect((screen.getByLabelText("可安全重放 2") as HTMLInputElement).checked).toBe(true);
+  });
+
+  it("renders descriptor capability fields and saves them per capability", async () => {
+    const user = userEvent.setup();
+    visiblePluginAdapterDescriptors = [
+      {
+        ...pluginAdapterDescriptors[1],
+        capability_schema: {
+          type: "object",
+          required: ["id", "workflow_stage", "parallelism"],
+          properties: {
+            id: { type: "string" },
+            workflow_stage: { type: "string" },
+            parallelism: { type: "integer", minimum: 1, maximum: 4 },
+          },
+        },
+      },
+      pluginAdapterDescriptors[0],
+    ];
+
+    render(<TestApp initialPath="/mcp" />);
+
+    expect(await screen.findByRole("heading", { name: "插件适配器目录" })).not.toBeNull();
+    await user.selectOptions(screen.getByLabelText("能力适配器 1"), "workflow");
+    await user.type(screen.getByLabelText("资源字段 workflow_id"), "daily-workflow");
+    await user.type(screen.getByLabelText("能力字段 workflow_stage 1"), "daily");
+    await user.type(screen.getByLabelText("能力字段 parallelism 1"), "2");
+    await user.clear(screen.getByLabelText("插件 ID"));
+    await user.type(screen.getByLabelText("插件 ID"), "workflow-capability-plugin");
+    await user.clear(screen.getByLabelText("插件名称"));
+    await user.type(screen.getByLabelText("插件名称"), "Workflow Capability Plugin");
+    await user.clear(screen.getByLabelText("能力 ID 1"));
+    await user.type(screen.getByLabelText("能力 ID 1"), "workflow.daily");
+    await user.click(screen.getByRole("button", { name: "保存插件" }));
+
+    await waitFor(() =>
+      expect(
+        requests.find(
+          (request) =>
+            request.path === "/api/v1/admin/plugins" &&
+            request.method === "POST" &&
+            (request.body as { id?: string }).id === "workflow-capability-plugin",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(
+      requests.find(
+        (request) =>
+          request.path === "/api/v1/admin/plugins" &&
+          request.method === "POST" &&
+          (request.body as { id?: string }).id === "workflow-capability-plugin",
+      )?.body,
+    ).toMatchObject({
+      capabilities: [
+        {
+          id: "workflow.daily",
+          adapter: "workflow",
+          capability_config: { workflow_stage: "daily", parallelism: 2 },
+        },
+      ],
+    });
+  });
+
+  it("blocks unsupported required descriptor capability fields before saving a plugin", async () => {
+    const user = userEvent.setup();
+    visiblePluginAdapterDescriptors = [
+      {
+        ...pluginAdapterDescriptors[1],
+        capability_schema: {
+          type: "object",
+          required: ["id", "workflow_options"],
+          properties: {
+            id: { type: "string" },
+            workflow_options: { type: "object" },
+          },
+        },
+      },
+      pluginAdapterDescriptors[0],
+    ];
+
+    render(<TestApp initialPath="/mcp" />);
+
+    expect(await screen.findByRole("heading", { name: "插件适配器目录" })).not.toBeNull();
+    await user.selectOptions(screen.getByLabelText("能力适配器 1"), "workflow");
+    await user.type(screen.getByLabelText("资源字段 workflow_id"), "daily-workflow");
+    expect(screen.queryByLabelText("能力字段 workflow_options 1")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "保存插件" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("能力字段 workflow_options 1 暂不支持在表单中配置");
+    expect(
+      requests.find(
+        (request) => request.path === "/api/v1/admin/plugins" && request.method === "POST",
+      ),
+    ).toBeUndefined();
+  });
+
+  it("does not reuse descriptor capability fields after switching plugin capability adapters", async () => {
+    const user = userEvent.setup();
+    visiblePluginAdapterDescriptors = [
+      {
+        ...pluginAdapterDescriptors[1],
+        capability_schema: {
+          type: "object",
+          required: ["id"],
+          properties: {
+            id: { type: "string" },
+            stage: { type: "string", default: "workflow-default" },
+          },
+        },
+      },
+      {
+        ...pluginAdapterDescriptors[0],
+        capability_schema: {
+          type: "object",
+          required: ["id"],
+          properties: {
+            id: { type: "string" },
+            stage: { type: "string", default: "http-default" },
+          },
+        },
+      },
+    ];
+
+    render(<TestApp initialPath="/mcp" />);
+
+    expect(await screen.findByRole("heading", { name: "插件适配器目录" })).not.toBeNull();
+    await user.selectOptions(screen.getByLabelText("能力适配器 1"), "workflow");
+    await user.type(screen.getByLabelText("资源字段 workflow_id"), "daily-workflow");
+    await user.clear(screen.getByLabelText("能力字段 stage 1"));
+    await user.type(screen.getByLabelText("能力字段 stage 1"), "workflow-live");
+    await user.selectOptions(screen.getByLabelText("能力适配器 1"), "http_json");
+    expect((screen.getByLabelText("能力字段 stage 1") as HTMLInputElement).value).toBe(
+      "http-default",
+    );
+
+    await user.clear(screen.getByLabelText("插件 ID"));
+    await user.type(screen.getByLabelText("插件 ID"), "switched-capability-plugin");
+    await user.clear(screen.getByLabelText("插件名称"));
+    await user.type(screen.getByLabelText("插件名称"), "Switched Capability Plugin");
+    await user.clear(screen.getByLabelText("能力 ID 1"));
+    await user.type(screen.getByLabelText("能力 ID 1"), "http.stage");
+    await user.click(screen.getByRole("button", { name: "保存插件" }));
+
+    await waitFor(() =>
+      expect(
+        requests.find(
+          (request) =>
+            request.path === "/api/v1/admin/plugins" &&
+            request.method === "POST" &&
+            (request.body as { id?: string }).id === "switched-capability-plugin",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(
+      requests.find(
+        (request) =>
+          request.path === "/api/v1/admin/plugins" &&
+          request.method === "POST" &&
+          (request.body as { id?: string }).id === "switched-capability-plugin",
+      )?.body,
+    ).toMatchObject({
+      capabilities: [
+        {
+          adapter: "http_json",
+          capability_config: { stage: "http-default" },
+        },
+      ],
+    });
+  });
+
+  it("preserves optional unsupported descriptor capability config when editing a plugin", async () => {
+    const user = userEvent.setup();
+    visiblePluginAdapterDescriptors = [
+      {
+        ...pluginAdapterDescriptors[1],
+        capability_schema: {
+          type: "object",
+          required: ["id"],
+          properties: {
+            id: { type: "string" },
+            workflow_stage: { type: "string" },
+            workflow_options: { type: "object" },
+          },
+        },
+      },
+      pluginAdapterDescriptors[0],
+    ];
+    visiblePlugins = [
+      {
+        ...calendarPlugin,
+        id: "workflow-options-plugin",
+        name: "Workflow Options Plugin",
+        resource_config: { workflow_id: "daily-workflow" },
+        capabilities: [
+          {
+            ...calendarPlugin.capabilities[0],
+            id: "workflow.options",
+            adapter: "workflow",
+            capability_config: {
+              workflow_stage: "daily",
+              workflow_options: { retries: 2, notify: true },
+            },
+          },
+        ],
+      },
+    ];
+
+    render(<TestApp initialPath="/mcp" />);
+
+    expect(await screen.findByRole("heading", { name: "插件适配器目录" })).not.toBeNull();
+    const pluginCard = screen
+      .getByRole("heading", { name: "Workflow Options Plugin" })
+      .closest("article");
+    expect(pluginCard).not.toBeNull();
+    await user.click(within(pluginCard as HTMLElement).getByRole("button", { name: "编辑" }));
+    await user.clear(screen.getByLabelText("能力字段 workflow_stage 1"));
+    await user.type(screen.getByLabelText("能力字段 workflow_stage 1"), "weekly");
+    expect(screen.queryByLabelText("能力字段 workflow_options 1")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "保存插件" }));
+
+    await waitFor(() =>
+      expect(
+        requests.find(
+          (request) =>
+            request.path === "/api/v1/admin/plugins" &&
+            request.method === "POST" &&
+            (request.body as { id?: string }).id === "workflow-options-plugin",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(
+      requests.find(
+        (request) =>
+          request.path === "/api/v1/admin/plugins" &&
+          request.method === "POST" &&
+          (request.body as { id?: string }).id === "workflow-options-plugin",
+      )?.body,
+    ).toMatchObject({
+      capabilities: [
+        {
+          adapter: "workflow",
+          capability_config: {
+            workflow_stage: "weekly",
+            workflow_options: { retries: 2, notify: true },
+          },
+        },
+      ],
+    });
   });
 
   it("saves multiple plugin capabilities with JSON schemas from the MCP page", async () => {

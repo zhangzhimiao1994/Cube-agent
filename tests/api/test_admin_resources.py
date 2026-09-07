@@ -2578,6 +2578,16 @@ def test_plugin_resource_request_preserves_descriptor_resource_config() -> None:
     assert plugin.resource_config == {"workflow_id": "daily_report"}
 
 
+def test_plugin_capability_request_preserves_descriptor_capability_config() -> None:
+    capability = PluginCapabilityRequest(
+        id="workflow.daily",
+        adapter="workflow",
+        capability_config={"workflow_stage": "daily", "parallelism": 2},
+    )
+
+    assert capability.capability_config == {"workflow_stage": "daily", "parallelism": 2}
+
+
 @pytest.mark.asyncio
 async def test_admin_plugin_lifecycle_updates_status_and_health() -> None:
     service = InMemoryAdminResourceService()
@@ -2745,6 +2755,86 @@ def test_plugin_admin_api_validates_descriptor_resource_config() -> None:
     assert invalid.status_code == 422
     assert valid.status_code == 200
     assert valid.json()["resource_config"] == {"workflow_id": "daily_report", "retry_limit": 3}
+
+
+def test_plugin_admin_api_validates_descriptor_capability_config() -> None:
+    api = client()
+
+    class PluginServiceWithWorkflowDescriptor:
+        def adapter_descriptors(self) -> tuple[dict[str, object], ...]:
+            return (
+                {
+                    "id": "workflow",
+                    "name": "Workflow",
+                    "description": "Runs a workflow.",
+                    "resource_schema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                    "capability_schema": {
+                        "type": "object",
+                        "required": ("id", "workflow_stage", "parallelism"),
+                        "properties": {
+                            "id": {"type": "string"},
+                            "workflow_stage": {"type": "string"},
+                            "parallelism": {"type": "integer", "minimum": 1, "maximum": 4},
+                        },
+                        "additionalProperties": False,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    cast(Any, api.app).state.plugin_service = PluginServiceWithWorkflowDescriptor()
+
+    missing = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "workflow-plugin",
+            "name": "Workflow Plugin",
+            "capabilities": [{"id": "workflow.daily", "adapter": "workflow"}],
+        },
+    )
+    invalid = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "workflow-plugin",
+            "name": "Workflow Plugin",
+            "capabilities": [
+                {
+                    "id": "workflow.daily",
+                    "adapter": "workflow",
+                    "capability_config": {"workflow_stage": "daily", "parallelism": 8},
+                }
+            ],
+        },
+    )
+    valid = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "workflow-plugin",
+            "name": "Workflow Plugin",
+            "capabilities": [
+                {
+                    "id": "workflow.daily",
+                    "adapter": "workflow",
+                    "capability_config": {"workflow_stage": "daily", "parallelism": 2},
+                }
+            ],
+        },
+    )
+
+    assert missing.status_code == 422
+    assert invalid.status_code == 422
+    assert valid.status_code == 200
+    assert valid.json()["capabilities"][0]["capability_config"] == {
+        "workflow_stage": "daily",
+        "parallelism": 2,
+    }
 
 
 def test_plugin_admin_api_preserves_capability_schemas_in_manifest() -> None:

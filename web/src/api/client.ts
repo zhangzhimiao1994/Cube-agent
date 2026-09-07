@@ -909,6 +909,7 @@ const PluginCapabilitySchema = z.object({
   policy_effect: z.enum(["inherit", "allow", "require_approval", "deny"]).default("inherit"),
   replay_safe: z.boolean().default(false),
   aliases: z.array(z.string()).default([]),
+  capability_config: JsonObjectSchema.default({}),
   input_schema: JsonObjectSchema.nullable().default(null),
   output_schema: JsonObjectSchema.nullable().default(null),
 });

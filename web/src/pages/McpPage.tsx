@@ -37,6 +37,8 @@ function fillFromServer(server: McpServer) {
 type PluginCapabilityForm = {
   aliases: string;
   adapter: string;
+  capabilityConfig: Record<string, string>;
+  capabilityConfigPassthrough: Record<string, unknown>;
   id: string;
   inputSchema: string;
   outputSchema: string;
@@ -69,6 +71,18 @@ const BUILTIN_PLUGIN_RESOURCE_FIELDS = new Set([
   "credential_scheme",
 ]);
 
+const BUILTIN_PLUGIN_CAPABILITY_FIELDS = new Set([
+  "id",
+  "adapter",
+  "permission_class",
+  "sandbox_profile",
+  "policy_effect",
+  "replay_safe",
+  "aliases",
+  "input_schema",
+  "output_schema",
+]);
+
 function createPluginCapabilityForm(
   values: Partial<PluginCapabilityForm> = {},
 ): PluginCapabilityForm {
@@ -80,6 +94,8 @@ function createPluginCapabilityForm(
     policyEffect: "inherit",
     replaySafe: false,
     aliases: "",
+    capabilityConfig: {},
+    capabilityConfigPassthrough: {},
     inputSchema: "",
     outputSchema: "",
     ...values,
@@ -127,6 +143,8 @@ function pluginCapabilityFormFromCapability(capability: PluginCapability): Plugi
     policyEffect: capability.policy_effect,
     replaySafe: capability.replay_safe,
     aliases: capability.aliases.join(","),
+    capabilityConfig: formatResourceConfig(capability.capability_config),
+    capabilityConfigPassthrough: capability.capability_config,
     inputSchema: formatSchemaText(capability.input_schema),
     outputSchema: formatSchemaText(capability.output_schema),
   });
@@ -263,22 +281,22 @@ function mergeDescriptorResourceField(
   };
 }
 
-function descriptorResourceModel(
-  adapters: (PluginAdapterDescriptor | undefined)[],
+function descriptorConfigModelForSchemas(
+  schemas: PluginAdapterDescriptor["resource_schema"][],
+  builtinFields: Set<string>,
 ): DescriptorResourceModel {
   const fieldsByName = new Map<string, DescriptorResourceField>();
   const unsupportedRequiredFields = new Set<string>();
-  for (const adapter of adapters) {
-    if (!adapter) continue;
-    const requiredFields = new Set(schemaRequiredFields(adapter.resource_schema));
-    const properties = schemaProperties(adapter.resource_schema);
+  for (const schema of schemas) {
+    const requiredFields = new Set(schemaRequiredFields(schema));
+    const properties = schemaProperties(schema);
     for (const name of requiredFields) {
-      if (BUILTIN_PLUGIN_RESOURCE_FIELDS.has(name)) continue;
+      if (builtinFields.has(name)) continue;
       const field = descriptorResourceFieldFromSchema(name, properties[name], true);
       if (!field) unsupportedRequiredFields.add(name);
     }
     for (const [name, schema] of Object.entries(properties)) {
-      if (BUILTIN_PLUGIN_RESOURCE_FIELDS.has(name)) continue;
+      if (builtinFields.has(name)) continue;
       const field = descriptorResourceFieldFromSchema(name, schema, requiredFields.has(name));
       if (!field || unsupportedRequiredFields.has(name)) continue;
       const existing = fieldsByName.get(name);
@@ -304,39 +322,56 @@ function descriptorResourceModel(
   };
 }
 
+function descriptorResourceModel(
+  adapters: (PluginAdapterDescriptor | undefined)[],
+): DescriptorResourceModel {
+  return descriptorConfigModelForSchemas(
+    adapters.flatMap((adapter) => (adapter ? [adapter.resource_schema] : [])),
+    BUILTIN_PLUGIN_RESOURCE_FIELDS,
+  );
+}
+
 function descriptorResourceFields(adapter: PluginAdapterDescriptor | undefined) {
   return descriptorResourceModel([adapter]).fields;
+}
+
+function descriptorCapabilityModel(adapter: PluginAdapterDescriptor | undefined) {
+  return descriptorConfigModelForSchemas(
+    adapter ? [adapter.capability_schema] : [],
+    BUILTIN_PLUGIN_CAPABILITY_FIELDS,
+  );
 }
 
 function parseResourceConfig(
   fields: DescriptorResourceField[],
   values: Record<string, string>,
   unsupportedRequiredFields: string[] = [],
+  fieldLabel: (name: string) => string = (name) => `资源字段 ${name}`,
 ) {
   if (unsupportedRequiredFields.length > 0) {
-    throw new Error(`资源字段 ${unsupportedRequiredFields[0]} 暂不支持在表单中配置。`);
+    throw new Error(`${fieldLabel(unsupportedRequiredFields[0])} 暂不支持在表单中配置。`);
   }
   const entries: [string, unknown][] = [];
   for (const field of fields) {
     const value = values[field.name] ?? "";
     const trimmed = value.trim();
     if (!trimmed && field.fieldType !== "boolean") {
-      if (field.required) throw new Error(`资源字段 ${field.name} 为必填。`);
+      if (field.required) throw new Error(`${fieldLabel(field.name)} 为必填。`);
       continue;
     }
     if (field.fieldType === "number") {
       const numericValue = Number(trimmed);
       if (!Number.isFinite(numericValue)) {
-        throw new Error(`资源字段 ${field.name} 必须是数字。`);
+        throw new Error(`${fieldLabel(field.name)} 必须是数字。`);
       }
       if (field.integer && !Number.isInteger(numericValue)) {
-        throw new Error(`资源字段 ${field.name} 必须是整数。`);
+        throw new Error(`${fieldLabel(field.name)} 必须是整数。`);
       }
       if (field.minimum !== undefined && numericValue < field.minimum) {
-        throw new Error(`资源字段 ${field.name} 必须大于等于 ${field.minimum}。`);
+        throw new Error(`${fieldLabel(field.name)} 必须大于等于 ${field.minimum}。`);
       }
       if (field.maximum !== undefined && numericValue > field.maximum) {
-        throw new Error(`资源字段 ${field.name} 必须小于等于 ${field.maximum}。`);
+        throw new Error(`${fieldLabel(field.name)} 必须小于等于 ${field.maximum}。`);
       }
       entries.push([field.name, numericValue]);
     } else if (field.fieldType === "boolean") {
@@ -348,6 +383,11 @@ function parseResourceConfig(
     }
   }
   return Object.fromEntries(entries);
+}
+
+function omitConfigFields(config: Record<string, unknown>, fields: DescriptorResourceField[]) {
+  const omitted = new Set(fields.map((field) => field.name));
+  return Object.fromEntries(Object.entries(config).filter(([key]) => !omitted.has(key)));
 }
 
 function capabilityDefaultsForAdapter(
@@ -365,6 +405,21 @@ function capabilityDefaultsForAdapter(
     ...(isPolicyEffect(policyEffect) ? { policyEffect } : {}),
     ...(typeof replaySafe === "boolean" ? { replaySafe } : {}),
   };
+}
+
+function configDefaultsForFields(
+  schema: PluginAdapterDescriptor["resource_schema"],
+  fields: DescriptorResourceField[],
+  current: Record<string, string> = {},
+) {
+  const next = { ...current };
+  for (const field of fields) {
+    const defaultValue = schemaDefault(schema, field.name);
+    if (next[field.name] === undefined && defaultValue !== undefined) {
+      next[field.name] = formatResourceConfigValue(defaultValue);
+    }
+  }
+  return next;
 }
 
 function isPolicyEffect(value: unknown): value is PluginCapability["policy_effect"] {
@@ -500,6 +555,18 @@ export function McpPage() {
           policy_effect: capability.policyEffect,
           replay_safe: capability.replaySafe,
           aliases: parseCsv(capability.aliases),
+          capability_config: (() => {
+            const configModel = descriptorCapabilityModel(adapterById.get(capability.adapter));
+            return {
+              ...omitConfigFields(capability.capabilityConfigPassthrough, configModel.fields),
+              ...parseResourceConfig(
+                configModel.fields,
+                capability.capabilityConfig,
+                configModel.unsupportedRequiredFields,
+                (name) => `能力字段 ${name} ${index + 1}`,
+              ),
+            };
+          })(),
           input_schema: parseSchemaText(capability.inputSchema, `Input Schema ${index + 1}`),
           output_schema: parseSchemaText(capability.outputSchema, `Output Schema ${index + 1}`),
         })),
@@ -591,6 +658,13 @@ export function McpPage() {
         id: "",
         permissionClass: "plugin.use",
         aliases: "",
+        capabilityConfig: firstAdapter
+          ? configDefaultsForFields(
+              firstAdapter.capability_schema,
+              descriptorCapabilityModel(firstAdapter).fields,
+            )
+          : {},
+        capabilityConfigPassthrough: {},
         ...capabilityDefaultsForAdapter(firstAdapter),
       }),
     ]);
@@ -634,21 +708,28 @@ export function McpPage() {
   const isStdio = transport === "stdio";
 
   function updatePluginCapabilityAdapter(index: number, adapterId: string) {
-    updatePluginCapability(index, {
-      adapter: adapterId,
-      ...capabilityDefaultsForAdapter(adapterById.get(adapterId)),
-    });
     const adapter = adapterById.get(adapterId);
+    setPluginCapabilities((capabilities) =>
+      capabilities.map((capability, capabilityIndex) =>
+        capabilityIndex === index
+          ? {
+              ...capability,
+              adapter: adapterId,
+              ...capabilityDefaultsForAdapter(adapter),
+              capabilityConfig: adapter
+                ? configDefaultsForFields(
+                    adapter.capability_schema,
+                    descriptorCapabilityModel(adapter).fields,
+                  )
+                : {},
+              capabilityConfigPassthrough: {},
+            }
+          : capability,
+      ),
+    );
     const nextFields = descriptorResourceFields(adapter);
     setPluginResourceConfig((config) => {
-      const next = { ...config };
-      for (const field of nextFields) {
-        const defaultValue = schemaDefault(adapter?.resource_schema ?? {}, field.name);
-        if (next[field.name] === undefined && defaultValue !== undefined) {
-          next[field.name] = formatResourceConfigValue(defaultValue);
-        }
-      }
-      return next;
+      return adapter ? configDefaultsForFields(adapter.resource_schema, nextFields, config) : config;
     });
   }
 
@@ -846,6 +927,7 @@ export function McpPage() {
             <legend>插件能力</legend>
             {pluginCapabilities.map((capability, index) => {
               const capabilityNumber = index + 1;
+              const capabilityConfigModel = descriptorCapabilityModel(adapterById.get(capability.adapter));
               return (
                 <fieldset key={index}>
                   <legend>能力 {capabilityNumber}</legend>
@@ -933,6 +1015,53 @@ export function McpPage() {
                     onChange={(event) => updatePluginCapability(index, { aliases: event.target.value })}
                     placeholder="calendar_create"
                   />
+
+                  {capabilityConfigModel.fields.length > 0 ? (
+                    <fieldset>
+                      <legend>适配器能力字段 {capabilityNumber}</legend>
+                      {capabilityConfigModel.fields.map((field) => (
+                        <div key={field.name}>
+                          <label htmlFor={`plugin-capability-config-${index}-${field.name}`}>
+                            能力字段 {field.name} {capabilityNumber}
+                          </label>
+                          {field.fieldType === "boolean" ? (
+                            <select
+                              id={`plugin-capability-config-${index}-${field.name}`}
+                              value={capability.capabilityConfig[field.name] ?? "false"}
+                              onChange={(event) =>
+                                updatePluginCapability(index, {
+                                  capabilityConfig: {
+                                    ...capability.capabilityConfig,
+                                    [field.name]: event.target.value,
+                                  },
+                                })
+                              }
+                              required={field.required}
+                            >
+                              <option value="false">否</option>
+                              <option value="true">是</option>
+                            </select>
+                          ) : (
+                            <input
+                              id={`plugin-capability-config-${index}-${field.name}`}
+                              value={capability.capabilityConfig[field.name] ?? ""}
+                              onChange={(event) =>
+                                updatePluginCapability(index, {
+                                  capabilityConfig: {
+                                    ...capability.capabilityConfig,
+                                    [field.name]: event.target.value,
+                                  },
+                                })
+                              }
+                              inputMode={field.fieldType === "number" ? "decimal" : undefined}
+                              placeholder={field.fieldType === "array" ? "value-a,value-b" : undefined}
+                              required={field.required}
+                            />
+                          )}
+                        </div>
+                      ))}
+                    </fieldset>
+                  ) : null}
 
                   <label htmlFor={`plugin-input-schema-${index}`}>Input Schema {capabilityNumber}</label>
                   <textarea
