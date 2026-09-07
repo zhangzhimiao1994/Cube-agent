@@ -138,6 +138,33 @@ function schemaPropertyNames(schema: PluginAdapterDescriptor["resource_schema"])
   return Object.keys(properties);
 }
 
+function schemaProperties(schema: PluginAdapterDescriptor["resource_schema"]) {
+  const properties = schema.properties;
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) return {};
+  return properties as Record<string, unknown>;
+}
+
+function schemaDefault(schema: PluginAdapterDescriptor["resource_schema"], property: string) {
+  const field = schemaProperties(schema)[property];
+  if (!field || typeof field !== "object" || Array.isArray(field)) return undefined;
+  return (field as { default?: unknown }).default;
+}
+
+function capabilityDefaultsForAdapter(
+  adapter: PluginAdapterDescriptor | undefined,
+): Partial<PluginCapabilityForm> {
+  if (!adapter) return {};
+  const permissionClass = schemaDefault(adapter.capability_schema, "permission_class");
+  const sandboxProfile = schemaDefault(adapter.capability_schema, "sandbox_profile");
+  const replaySafe = schemaDefault(adapter.capability_schema, "replay_safe");
+  return {
+    adapter: adapter.id,
+    ...(typeof permissionClass === "string" ? { permissionClass } : {}),
+    ...(typeof sandboxProfile === "string" ? { sandboxProfile } : {}),
+    ...(typeof replaySafe === "boolean" ? { replaySafe } : {}),
+  };
+}
+
 export function McpPage() {
   const auth = useAuth();
   const canReadCapabilityManifest = auth.hasPermission("plugin:read");
@@ -338,9 +365,15 @@ export function McpPage() {
   }
 
   function addPluginCapability() {
+    const firstAdapter = adapterItems[0];
     setPluginCapabilities((capabilities) => [
       ...capabilities,
-      createPluginCapabilityForm({ id: "", permissionClass: "plugin.use", aliases: "" }),
+      createPluginCapabilityForm({
+        id: "",
+        permissionClass: "plugin.use",
+        aliases: "",
+        ...capabilityDefaultsForAdapter(firstAdapter),
+      }),
     ]);
   }
 
@@ -370,7 +403,15 @@ export function McpPage() {
   const items = servers.data ?? [];
   const pluginItems = canReadCapabilityManifest ? plugins.data ?? [] : [];
   const adapterItems = canReadCapabilityManifest ? pluginAdapters.data ?? [] : [];
+  const adapterById = new Map(adapterItems.map((adapter) => [adapter.id, adapter]));
   const isStdio = transport === "stdio";
+
+  function updatePluginCapabilityAdapter(index: number, adapterId: string) {
+    updatePluginCapability(index, {
+      adapter: adapterId,
+      ...capabilityDefaultsForAdapter(adapterById.get(adapterId)),
+    });
+  }
 
   return (
     <section>
@@ -537,12 +578,29 @@ export function McpPage() {
                   />
 
                   <label htmlFor={`plugin-capability-adapter-${index}`}>能力适配器 {capabilityNumber}</label>
-                  <input
-                    id={`plugin-capability-adapter-${index}`}
-                    value={capability.adapter}
-                    onChange={(event) => updatePluginCapability(index, { adapter: event.target.value })}
-                    placeholder="http_json"
-                  />
+                  {adapterItems.length > 0 ? (
+                    <select
+                      id={`plugin-capability-adapter-${index}`}
+                      value={capability.adapter}
+                      onChange={(event) => updatePluginCapabilityAdapter(index, event.target.value)}
+                    >
+                      {adapterItems.map((adapter) => (
+                        <option key={adapter.id} value={adapter.id}>
+                          {adapter.name}
+                        </option>
+                      ))}
+                      {!adapterById.has(capability.adapter) ? (
+                        <option value={capability.adapter}>{capability.adapter}</option>
+                      ) : null}
+                    </select>
+                  ) : (
+                    <input
+                      id={`plugin-capability-adapter-${index}`}
+                      value={capability.adapter}
+                      onChange={(event) => updatePluginCapability(index, { adapter: event.target.value })}
+                      placeholder="http_json"
+                    />
+                  )}
 
                   <label htmlFor={`plugin-permission-class-${index}`}>权限类 {capabilityNumber}</label>
                   <input

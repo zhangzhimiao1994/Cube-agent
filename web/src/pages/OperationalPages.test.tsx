@@ -470,6 +470,33 @@ const pluginAdapterDescriptors = [
       additionalProperties: true,
     },
   },
+  {
+    id: "workflow",
+    name: "Workflow",
+    description: "Runs a registered workflow as a plugin capability.",
+    resource_schema: {
+      type: "object",
+      required: ["workflow_id"],
+      properties: {
+        workflow_id: { type: "string" },
+      },
+    },
+    capability_schema: {
+      type: "object",
+      required: ["id"],
+      properties: {
+        permission_class: { type: "string", default: "workflow.run" },
+        sandbox_profile: { type: "string", default: "workflow_sandbox" },
+        replay_safe: { type: "boolean", default: true },
+        input_schema: { type: "object" },
+        output_schema: { type: "object" },
+      },
+    },
+    argument_schema: {
+      type: "object",
+      additionalProperties: true,
+    },
+  },
 ];
 
 function jsonResponse(payload: unknown, init: ResponseInit = {}) {
@@ -500,6 +527,7 @@ describe("operational management pages", () => {
   let visibleChannels = baseChannels;
   let visibleCapabilityManifest = capabilityManifest;
   let visiblePlugins = [calendarPlugin];
+  let visiblePluginAdapterDescriptors = pluginAdapterDescriptors;
   let failCapabilityManifest = false;
   let currentPrincipalRole = "super_admin";
   let visibleWorkspaceFiles = {
@@ -532,6 +560,7 @@ describe("operational management pages", () => {
     visibleChannels = baseChannels;
     visibleCapabilityManifest = capabilityManifest;
     visiblePlugins = [calendarPlugin];
+    visiblePluginAdapterDescriptors = pluginAdapterDescriptors;
     failCapabilityManifest = false;
     currentPrincipalRole = "super_admin";
     visibleWorkspaceFiles = {
@@ -1209,7 +1238,7 @@ describe("operational management pages", () => {
           return jsonResponse(visiblePlugins);
         }
         if (path === "/api/v1/admin/plugins/adapters" && method === "GET") {
-          return jsonResponse(pluginAdapterDescriptors);
+          return jsonResponse(visiblePluginAdapterDescriptors);
         }
         if (path === "/api/v1/admin/plugins" && method === "POST") {
           const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
@@ -6451,7 +6480,9 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("heading", { name: "已配置插件" })).not.toBeNull();
     expect(screen.getByRole("heading", { name: "插件适配器目录" })).not.toBeNull();
-    expect(screen.getByText("HTTP JSON")).not.toBeNull();
+    expect(within(screen.getByRole("region", { name: "插件适配器目录" })).getByRole("heading", {
+      name: "HTTP JSON",
+    })).not.toBeNull();
     expect(screen.getByText("endpoint_url, domain_allowlist")).not.toBeNull();
     expect(screen.getAllByText("input_schema").length).toBeGreaterThan(0);
     expect(screen.getByText("Calendar HTTP")).not.toBeNull();
@@ -6529,6 +6560,71 @@ describe("operational management pages", () => {
       ],
     });
     expect(await screen.findByText("插件配置已保存。运行时能力注册表会重新加载。")).not.toBeNull();
+  });
+
+  it("uses adapter descriptors to choose capability adapter defaults", async () => {
+    const user = userEvent.setup();
+
+    render(<TestApp initialPath="/mcp" />);
+
+    expect(await screen.findByRole("heading", { name: "插件适配器目录" })).not.toBeNull();
+    await user.selectOptions(screen.getByLabelText("能力适配器 1"), "workflow");
+
+    expect((screen.getByLabelText("权限类 1") as HTMLInputElement).value).toBe("workflow.run");
+    expect((screen.getByLabelText("沙箱 Profile 1") as HTMLInputElement).value).toBe("workflow_sandbox");
+    expect((screen.getByLabelText("可安全重放 1") as HTMLInputElement).checked).toBe(true);
+
+    await user.clear(screen.getByLabelText("插件 ID"));
+    await user.type(screen.getByLabelText("插件 ID"), "daily-workflow");
+    await user.clear(screen.getByLabelText("插件名称"));
+    await user.type(screen.getByLabelText("插件名称"), "Daily Workflow");
+    await user.clear(screen.getByLabelText("能力 ID 1"));
+    await user.type(screen.getByLabelText("能力 ID 1"), "workflow.daily");
+    await user.click(screen.getByRole("button", { name: "保存插件" }));
+
+    await waitFor(() =>
+      expect(
+        requests.find(
+          (request) =>
+            request.path === "/api/v1/admin/plugins" &&
+            request.method === "POST" &&
+            (request.body as { id?: string }).id === "daily-workflow",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(
+      requests.find(
+        (request) =>
+          request.path === "/api/v1/admin/plugins" &&
+          request.method === "POST" &&
+          (request.body as { id?: string }).id === "daily-workflow",
+      )?.body,
+    ).toMatchObject({
+      capabilities: [
+        {
+          id: "workflow.daily",
+          adapter: "workflow",
+          permission_class: "workflow.run",
+          sandbox_profile: "workflow_sandbox",
+          replay_safe: true,
+        },
+      ],
+    });
+  });
+
+  it("uses the first adapter descriptor defaults when adding plugin capabilities", async () => {
+    const user = userEvent.setup();
+    visiblePluginAdapterDescriptors = [pluginAdapterDescriptors[1], pluginAdapterDescriptors[0]];
+
+    render(<TestApp initialPath="/mcp" />);
+
+    expect(await screen.findByRole("heading", { name: "插件适配器目录" })).not.toBeNull();
+    await user.click(screen.getByRole("button", { name: "添加能力" }));
+
+    expect((screen.getByLabelText("能力适配器 2") as HTMLSelectElement).value).toBe("workflow");
+    expect((screen.getByLabelText("权限类 2") as HTMLInputElement).value).toBe("workflow.run");
+    expect((screen.getByLabelText("沙箱 Profile 2") as HTMLInputElement).value).toBe("workflow_sandbox");
+    expect((screen.getByLabelText("可安全重放 2") as HTMLInputElement).checked).toBe(true);
   });
 
   it("saves multiple plugin capabilities with JSON schemas from the MCP page", async () => {
