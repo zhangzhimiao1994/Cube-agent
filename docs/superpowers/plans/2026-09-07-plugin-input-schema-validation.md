@@ -129,8 +129,8 @@ Expected: PASS and adapter is not invoked on validation failures.
 - Produces: pushed commit and deployed prod release.
 
 - [x] Run ruff, mypy, targeted backend plugin tests, relevant gateway tests, `git diff --check`, and any dependency lock verification required by the local toolchain.
-- [ ] Commit and push.
-- [ ] Check GitHub Actions. Fix and repeat if needed.
-- [ ] Deploy to `prod-web-03`.
-- [ ] Run prod doctor, service checks, OpenAPI/dependency checks, and recent log checks.
+- [x] Commit and push.
+- [x] Check GitHub Actions. Fix and repeat if needed.
+- [x] Deploy to `prod-web-03`.
+- [x] Run prod doctor, service checks, OpenAPI/dependency checks, and recent log checks.
 - [ ] Update `HANDOFF.md`.
