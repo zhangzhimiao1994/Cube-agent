@@ -88,10 +88,53 @@ class FakeMcpToolBackend:
         return {"content": {"result": "searched"}}
 
 
+class FakePluginToolBackend:
+    def __init__(self, *, available: bool = True) -> None:
+        self.available = available
+        self.calls: list[tuple[str, Mapping[str, object], str]] = []
+
+    def is_available(self, tenant_id: UUID, name: str) -> bool:
+        self.calls.append(("available", {"tenant_id": str(tenant_id), "name": name}, ""))
+        return self.available
+
+    async def invoke(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        self.calls.append(
+            (
+                "invoke",
+                {
+                    "tenant_id": str(tenant_id),
+                    "user_id": str(user_id),
+                    "run_id": str(run_id),
+                    "actor": actor,
+                    "name": name,
+                    "arguments": arguments,
+                },
+                idempotency_key,
+            )
+        )
+        return {"content": {"event_id": "evt_1"}}
+
+
 class FailingAvailabilityMcpToolBackend(FakeMcpToolBackend):
     def is_available(self, tenant_id: UUID, name: str) -> bool:
         del tenant_id, name
         raise RuntimeError("raw discovery failure")
+
+
+class FailingAvailabilityPluginToolBackend(FakePluginToolBackend):
+    def is_available(self, tenant_id: UUID, name: str) -> bool:
+        del tenant_id, name
+        raise RuntimeError("raw plugin discovery failure")
 
 
 class DeterministicFailureRuntimeCapabilityGateway(FakeRuntimeCapabilityGateway):
@@ -153,6 +196,18 @@ def mcp_request(*, approval_required: bool = False) -> HarnessToolCallRequest:
         approval_required=approval_required,
         sandbox="mcp_remote",
         idempotency_key="mcp_1",
+    )
+
+
+def plugin_request(*, approval_required: bool = False) -> HarnessToolCallRequest:
+    return HarnessToolCallRequest(
+        run_id=RUN_ID,
+        actor="scheduler",
+        tool_name="calendar.create_event",
+        arguments={"title": "Mofang review"},
+        approval_required=approval_required,
+        sandbox="remote_connector",
+        idempotency_key="plugin_1",
     )
 
 
@@ -310,6 +365,89 @@ async def test_harness_tool_gateway_falls_back_when_mcp_availability_fails() -> 
     gateway = HarnessToolGateway(runtime, mcp_backend=mcp_backend)
 
     result = await gateway.invoke(TENANT_ID, mcp_request())
+
+    assert result.status == "failed"
+    assert result.failure_reason == "tool unavailable"
+    assert [call[0] for call in runtime.calls] == ["available"]
+
+
+async def test_harness_tool_gateway_routes_available_plugin_tool_through_policy() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    plugin_backend = FakePluginToolBackend()
+    policy = FakePolicyGateway(CapabilityStatus.ALLOWED)
+    gateway = HarnessToolGateway(
+        runtime,
+        policy_gateway=policy,
+        plugin_backend=plugin_backend,
+    )
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        plugin_request(),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "succeeded"
+    assert result.payload == {"content": {"event_id": "evt_1"}}
+    assert runtime.calls == []
+    assert [call[0] for call in plugin_backend.calls] == ["available", "invoke"]
+    assert plugin_backend.calls[-1][2] == "plugin_1"
+    capability_request, role = policy.requests[0]
+    assert role is Role.OPERATOR
+    assert capability_request.capability == "plugin"
+    assert capability_request.operation == "use"
+    assert capability_request.resource == "plugin/calendar/create_event"
+    assert capability_request.arguments == {"title": "Mofang review"}
+
+
+async def test_harness_tool_gateway_does_not_invoke_plugin_when_policy_waits() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    plugin_backend = FakePluginToolBackend()
+    policy = FakePolicyGateway(
+        CapabilityStatus.WAITING_APPROVAL,
+        reason="capability requires approval",
+        approval_id="approval_plugin",
+    )
+    gateway = HarnessToolGateway(
+        runtime,
+        policy_gateway=policy,
+        plugin_backend=plugin_backend,
+    )
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        plugin_request(),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    assert result.failure_reason == "capability requires approval"
+    assert result.payload == {"approval_id": "approval_plugin"}
+    assert [call[0] for call in plugin_backend.calls] == ["available"]
+    assert runtime.calls == []
+
+
+async def test_harness_tool_gateway_fails_plugin_closed_without_identity() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    plugin_backend = FakePluginToolBackend()
+    gateway = HarnessToolGateway(runtime, plugin_backend=plugin_backend)
+
+    result = await gateway.invoke(TENANT_ID, plugin_request())
+
+    assert result.status == "failed"
+    assert result.failure_reason == "capability identity unavailable"
+    assert [call[0] for call in plugin_backend.calls] == ["available"]
+    assert runtime.calls == []
+
+
+async def test_harness_tool_gateway_falls_back_when_plugin_availability_fails() -> None:
+    runtime = FakeRuntimeCapabilityGateway(available=False)
+    plugin_backend = FailingAvailabilityPluginToolBackend()
+    gateway = HarnessToolGateway(runtime, plugin_backend=plugin_backend)
+
+    result = await gateway.invoke(TENANT_ID, plugin_request())
 
     assert result.status == "failed"
     assert result.failure_reason == "tool unavailable"

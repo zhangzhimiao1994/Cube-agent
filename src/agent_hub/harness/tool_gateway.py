@@ -44,6 +44,22 @@ class McpToolBackend(Protocol):
     ) -> Mapping[str, JsonValue]: ...
 
 
+class PluginToolBackend(Protocol):
+    def is_available(self, tenant_id: UUID, name: str) -> bool: ...
+
+    async def invoke(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]: ...
+
+
 class HarnessCapabilityPolicyGateway(Protocol):
     async def invoke(self, request: CapabilityRequest, *, role: Role) -> CapabilityResult: ...
 
@@ -57,12 +73,14 @@ class HarnessToolGateway:
         *,
         policy_gateway: HarnessCapabilityPolicyGateway | None = None,
         mcp_backend: McpToolBackend | None = None,
+        plugin_backend: PluginToolBackend | None = None,
         require_actor_identity: bool = False,
         raise_backend_errors: bool = False,
     ) -> None:
         self._backend = backend
         self._policy_gateway = policy_gateway
         self._mcp_backend = mcp_backend
+        self._plugin_backend = plugin_backend
         self._require_actor_identity = require_actor_identity
         self._raise_backend_errors = raise_backend_errors
 
@@ -79,14 +97,23 @@ class HarnessToolGateway:
         if request.approval_required and self._policy_gateway is None:
             return self._failure(request, "approval required")
         mcp_backend = self._available_mcp_backend(tenant_id, request.tool_name)
-        if mcp_backend is not None and self._policy_gateway is None:
+        plugin_backend = (
+            None
+            if mcp_backend is not None
+            else self._available_plugin_backend(tenant_id, request.tool_name)
+        )
+        if (mcp_backend is not None or plugin_backend is not None) and self._policy_gateway is None:
             return self._failure(request, "capability identity unavailable")
         authorization_failure = await self._authorize(
             tenant_id,
             request,
             user_id=user_id,
             role=role,
-            capability_parts=_mcp_capability_parts(request) if mcp_backend is not None else None,
+            capability_parts=_external_capability_parts(
+                request,
+                mcp_backend=mcp_backend,
+                plugin_backend=plugin_backend,
+            ),
         )
         if authorization_failure is not None:
             return authorization_failure
@@ -95,6 +122,18 @@ class HarnessToolGateway:
                 if type(user_id) is not UUID:
                     return self._failure(request, "capability identity unavailable")
                 payload = await mcp_backend.invoke(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    run_id=request.run_id,
+                    actor=request.actor,
+                    name=request.tool_name,
+                    arguments=request.arguments,
+                    idempotency_key=request.idempotency_key,
+                )
+            elif plugin_backend is not None:
+                if type(user_id) is not UUID:
+                    return self._failure(request, "capability identity unavailable")
+                payload = await plugin_backend.invoke(
                     tenant_id=tenant_id,
                     user_id=user_id,
                     run_id=request.run_id,
@@ -186,6 +225,17 @@ class HarnessToolGateway:
             return None
         return self._mcp_backend
 
+    def _available_plugin_backend(self, tenant_id: UUID, tool_name: str) -> PluginToolBackend | None:
+        if self._plugin_backend is None:
+            return None
+        try:
+            available = self._plugin_backend.is_available(tenant_id, tool_name)
+        except Exception:  # noqa: BLE001 - plugin routing discovery must fail closed.
+            return None
+        if not available:
+            return None
+        return self._plugin_backend
+
 
 def _capability_request(
     tenant_id: UUID,
@@ -210,6 +260,23 @@ def _capability_request(
 
 def _mcp_capability_parts(request: HarnessToolCallRequest) -> tuple[str, str, str]:
     return "mcp", "invoke", f"mcp/{request.tool_name.replace('.', '/')}"
+
+
+def _plugin_capability_parts(request: HarnessToolCallRequest) -> tuple[str, str, str]:
+    return "plugin", "use", f"plugin/{request.tool_name.replace('.', '/')}"
+
+
+def _external_capability_parts(
+    request: HarnessToolCallRequest,
+    *,
+    mcp_backend: McpToolBackend | None,
+    plugin_backend: PluginToolBackend | None,
+) -> tuple[str, str, str] | None:
+    if mcp_backend is not None:
+        return _mcp_capability_parts(request)
+    if plugin_backend is not None:
+        return _plugin_capability_parts(request)
+    return None
 
 
 def _capability_parts(request: HarnessToolCallRequest) -> tuple[str, str, str]:
@@ -270,5 +337,6 @@ __all__ = [
     "HarnessCapabilityPolicyGateway",
     "HarnessToolGateway",
     "McpToolBackend",
+    "PluginToolBackend",
     "RuntimeToolBackend",
 ]

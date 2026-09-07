@@ -225,6 +225,7 @@ def test_default_capability_policy_allows_safe_runtime_tools_for_operators() -> 
     )
     skill = policy.evaluate(request("skill", "use", "skill/docx"), Role.OPERATOR)
     mcp = policy.evaluate(request("mcp", "invoke", "mcp/search/web_search"), Role.OPERATOR)
+    plugin = policy.evaluate(request("plugin", "use", "plugin/calendar/create_event"), Role.OPERATOR)
 
     assert calculator.effect is PolicyEffect.ALLOW
     assert read.effect is PolicyEffect.ALLOW
@@ -232,6 +233,7 @@ def test_default_capability_policy_allows_safe_runtime_tools_for_operators() -> 
     assert project.effect is PolicyEffect.ALLOW
     assert skill.effect is PolicyEffect.ALLOW
     assert mcp.effect is PolicyEffect.ALLOW
+    assert plugin.effect is PolicyEffect.ALLOW
 
 
 def test_default_capability_policy_denies_viewer_runtime_tools() -> None:

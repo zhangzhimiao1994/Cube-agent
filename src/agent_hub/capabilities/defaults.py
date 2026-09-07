@@ -23,7 +23,7 @@ from agent_hub.capabilities.gateway import (
 from agent_hub.capabilities.policy import CapabilityPolicy, CapabilityRule, normalize_resource
 from agent_hub.capabilities.runtime import CapabilityManifestProvider, RuntimeCapabilityGateway
 from agent_hub.capabilities.types import CapabilityRequest, PolicyEffect
-from agent_hub.harness.tool_gateway import HarnessToolGateway, McpToolBackend
+from agent_hub.harness.tool_gateway import HarnessToolGateway, McpToolBackend, PluginToolBackend
 
 ToolApprovalPolicyGetter = Callable[[UUID], Awaitable[bool]]
 ToolApprovalModeGetter = Callable[[UUID], Awaitable[str]]
@@ -185,6 +185,9 @@ def default_capability_policy(
         PolicyEffect.REQUIRE_APPROVAL if require_approval_for_tools else PolicyEffect.ALLOW
     )
     mcp_effect = PolicyEffect.REQUIRE_APPROVAL if require_approval_for_tools else PolicyEffect.ALLOW
+    plugin_effect = (
+        PolicyEffect.REQUIRE_APPROVAL if require_approval_for_tools else PolicyEffect.ALLOW
+    )
     return CapabilityPolicy(
         tuple(
             CapabilityRule(
@@ -204,6 +207,7 @@ def default_capability_policy(
                 ("context", "read", "context", PolicyEffect.ALLOW),
                 ("skill", "use", "skill", skill_effect),
                 ("mcp", "invoke", "mcp", mcp_effect),
+                ("plugin", "use", "plugin", plugin_effect),
             )
         )
     )
@@ -222,6 +226,7 @@ def build_runtime_capability_stack(
     approval_reviewer: ApprovalReviewer | None = None,
     tool_registry: CapabilityManifestProvider | None = None,
     mcp_backend: McpToolBackend | None = None,
+    plugin_backend: PluginToolBackend | None = None,
 ) -> RuntimeCapabilityStack:
     runtime_gateway = RuntimeCapabilityGateway(
         skill_store_dir=skill_store_dir,
@@ -247,6 +252,7 @@ def build_runtime_capability_stack(
         runtime_gateway,
         policy_gateway=policy_gateway,
         mcp_backend=mcp_backend,
+        plugin_backend=plugin_backend,
         raise_backend_errors=True,
     )
     return RuntimeCapabilityStack(

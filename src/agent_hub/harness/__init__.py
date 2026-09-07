@@ -21,6 +21,7 @@ from agent_hub.harness.streaming import (
 from agent_hub.harness.tool_gateway import (
     HarnessCapabilityPolicyGateway,
     HarnessToolGateway,
+    PluginToolBackend,
     RuntimeToolBackend,
 )
 from agent_hub.harness.types import (
@@ -51,6 +52,7 @@ __all__ = [
     "NormalizedProviderEvent",
     "OpenAICompatibleChunkTransport",
     "OpenAICompatibleStreamDecoder",
+    "PluginToolBackend",
     "PrefixCacheEstimate",
     "ProviderCapabilityProfile",
     "ProviderErrorEnvelope",

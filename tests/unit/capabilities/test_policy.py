@@ -208,6 +208,17 @@ def test_default_policy_requires_approval_for_mcp_when_configured() -> None:
     assert decision.effect is PolicyEffect.REQUIRE_APPROVAL
 
 
+def test_default_policy_requires_approval_for_plugins_when_configured() -> None:
+    policy = default_capability_policy(TENANT_A, require_approval_for_tools=True)
+
+    decision = policy.evaluate(
+        request("plugin.use", resource="plugin/calendar/create_event"),
+        Role.OPERATOR,
+    )
+
+    assert decision.effect is PolicyEffect.REQUIRE_APPROVAL
+
+
 def test_default_policy_keeps_low_risk_tools_allowed_when_approval_is_required() -> None:
     policy = default_capability_policy(TENANT_A, require_approval_for_tools=True)
 
