@@ -919,6 +919,7 @@ const PluginResourceSchema = z.object({
   enabled: z.boolean().default(true),
   description: z.string().nullable().default(null),
   version: z.string().default("local"),
+  resource_config: JsonObjectSchema.default({}),
   endpoint_url: z.string().nullable().default(null),
   domain_allowlist: z.array(z.string()).default([]),
   timeout_seconds: z.number().default(10),
@@ -939,6 +940,7 @@ export type PluginResourcePayload = {
   enabled: boolean;
   description?: string | null;
   version?: string;
+  resource_config?: Record<string, unknown>;
   endpoint_url?: string | null;
   domain_allowlist?: string[];
   timeout_seconds?: number;
@@ -1158,7 +1160,9 @@ function formatApiErrorDetails(details: ApiErrorDetails | null): string {
 }
 
 export function formatApiError(error: unknown, fallback: string): string {
-  if (!(error instanceof ApiError)) return fallback;
+  if (!(error instanceof ApiError)) {
+    return error instanceof Error && error.message ? `${fallback}: ${error.message}` : fallback;
+  }
   const parts = [error.code, `HTTP ${error.status}`];
   if (error.errorId) parts.push(`error ${error.errorId}`);
   const details = formatApiErrorDetails(error.details);

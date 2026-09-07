@@ -579,6 +579,7 @@ class PluginResourceRequest(NamedResourceRequest):
         max_length=128,
         pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:+-]*$",
     )
+    resource_config: dict[str, JsonValue] = Field(default_factory=dict, max_length=128)
     endpoint_url: str | None = Field(default=None, max_length=2048)
     domain_allowlist: list[str] = Field(default_factory=list, max_length=64)
     timeout_seconds: float = Field(default=10, gt=0, le=120)
@@ -3010,6 +3011,99 @@ def _default_http_json_adapter_descriptor() -> PluginAdapterDescriptorResponse:
             "type": "object",
             "additionalProperties": True,
         },
+    )
+
+
+_PLUGIN_BUILTIN_RESOURCE_FIELDS = frozenset(
+    (
+        "endpoint_url",
+        "domain_allowlist",
+        "timeout_seconds",
+        "credential_ref",
+        "credential_header",
+        "credential_scheme",
+    )
+)
+
+
+def _validate_plugin_resource_config(request: Request, plugin: PluginResourceRequest) -> None:
+    descriptors = {descriptor.id: descriptor for descriptor in _plugin_adapter_descriptors(request)}
+    fields: dict[str, Mapping[str, JsonValue]] = {}
+    required_fields: set[str] = set()
+    has_selected_descriptor = False
+    for capability in plugin.capabilities:
+        descriptor = descriptors.get(capability.adapter)
+        if descriptor is None:
+            continue
+        has_selected_descriptor = True
+        properties = descriptor.resource_schema.get("properties")
+        if isinstance(properties, Mapping):
+            for property_name, schema in properties.items():
+                if property_name in _PLUGIN_BUILTIN_RESOURCE_FIELDS:
+                    continue
+                if isinstance(property_name, str) and isinstance(schema, Mapping):
+                    fields[property_name] = schema
+        required = descriptor.resource_schema.get("required")
+        if isinstance(required, (list, tuple)):
+            for required_name in required:
+                if (
+                    isinstance(required_name, str)
+                    and required_name not in _PLUGIN_BUILTIN_RESOURCE_FIELDS
+                ):
+                    required_fields.add(required_name)
+    for name in sorted(required_fields):
+        if name not in plugin.resource_config:
+            raise PublicAPIError(
+                422,
+                "invalid_plugin_resource_config",
+                f"plugin resource_config missing required field {name}",
+            )
+    for name, value in plugin.resource_config.items():
+        schema = fields.get(name)
+        if schema is None:
+            if has_selected_descriptor:
+                raise PublicAPIError(
+                    422,
+                    "invalid_plugin_resource_config",
+                    f"plugin resource_config field {name} is not supported by selected adapters",
+                )
+            continue
+        if not _plugin_resource_value_matches_schema(value, schema):
+            raise PublicAPIError(
+                422,
+                "invalid_plugin_resource_config",
+                f"plugin resource_config field {name} has invalid type",
+            )
+
+
+def _plugin_resource_value_matches_schema(value: JsonValue, schema: Mapping[str, JsonValue]) -> bool:
+    schema_type = schema.get("type")
+    if schema_type == "string":
+        return isinstance(value, str)
+    if schema_type == "boolean":
+        return isinstance(value, bool)
+    if schema_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool) and _number_in_bounds(value, schema)
+    if schema_type == "number":
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and _number_in_bounds(float(value), schema)
+        )
+    if schema_type == "array":
+        items = schema.get("items")
+        if isinstance(items, Mapping) and items.get("type") == "string":
+            return isinstance(value, list) and all(isinstance(item, str) for item in value)
+    return True
+
+
+def _number_in_bounds(value: float, schema: Mapping[str, JsonValue]) -> bool:
+    minimum = schema.get("minimum")
+    if isinstance(minimum, (int, float)) and not isinstance(minimum, bool) and value < minimum:
+        return False
+    maximum = schema.get("maximum")
+    return not (
+        isinstance(maximum, (int, float)) and not isinstance(maximum, bool) and value > maximum
     )
 
 
@@ -9866,6 +9960,7 @@ async def upsert_plugin(
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> PluginResourceResponse:
     _require(principal, "plugin:write")
+    _validate_plugin_resource_config(request, body)
     response = await service.upsert_plugin(body)
     await _reload_plugin_runtime_config(request, principal.tenant_id)
     return response

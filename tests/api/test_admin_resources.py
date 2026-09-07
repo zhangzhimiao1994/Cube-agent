@@ -2568,6 +2568,16 @@ def test_plugin_capability_request_defaults_to_inherited_policy_effect() -> None
     assert capability.policy_effect == "inherit"
 
 
+def test_plugin_resource_request_preserves_descriptor_resource_config() -> None:
+    plugin = PluginResourceRequest(
+        id="workflow-plugin",
+        name="Workflow Plugin",
+        resource_config={"workflow_id": "daily_report"},
+    )
+
+    assert plugin.resource_config == {"workflow_id": "daily_report"}
+
+
 @pytest.mark.asyncio
 async def test_admin_plugin_lifecycle_updates_status_and_health() -> None:
     service = InMemoryAdminResourceService()
@@ -2609,12 +2619,19 @@ async def test_persistent_admin_plugin_lifecycle_persists_status() -> None:
         actor_id=ACTOR_ID,
     )
 
-    await service.upsert_plugin(PluginResourceRequest(id="search", name="Search Plugin"))
+    await service.upsert_plugin(
+        PluginResourceRequest(
+            id="search",
+            name="Search Plugin",
+            resource_config={"workflow_id": "daily_report"},
+        )
+    )
     started = await service.start_plugin("search")
     listed = await service.list_plugins()
 
     assert started.status == "running"
     assert started.health == "healthy"
+    assert started.resource_config == {"workflow_id": "daily_report"}
     assert listed == (started,)
 
 
@@ -2660,6 +2677,74 @@ def test_plugin_admin_api_exposes_running_plugin_capabilities_in_manifest() -> N
         "input_schema": None,
         "output_schema": None,
     }
+
+
+def test_plugin_admin_api_validates_descriptor_resource_config() -> None:
+    api = client()
+
+    class PluginServiceWithWorkflowDescriptor:
+        def adapter_descriptors(self) -> tuple[dict[str, object], ...]:
+            return (
+                {
+                    "id": "workflow",
+                    "name": "Workflow",
+                    "description": "Runs a workflow.",
+                    "resource_schema": {
+                        "type": "object",
+                        "required": ("workflow_id", "retry_limit"),
+                        "properties": {
+                            "workflow_id": {"type": "string"},
+                            "retry_limit": {"type": "integer", "minimum": 1, "maximum": 5},
+                        },
+                        "additionalProperties": False,
+                    },
+                    "capability_schema": {
+                        "type": "object",
+                        "required": ("id",),
+                        "properties": {"id": {"type": "string"}},
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    cast(Any, api.app).state.plugin_service = PluginServiceWithWorkflowDescriptor()
+
+    missing = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "workflow-plugin",
+            "name": "Workflow Plugin",
+            "capabilities": [{"id": "workflow.daily", "adapter": "workflow"}],
+            "resource_config": {"workflow_id": "daily_report"},
+        },
+    )
+    invalid = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "workflow-plugin",
+            "name": "Workflow Plugin",
+            "capabilities": [{"id": "workflow.daily", "adapter": "workflow"}],
+            "resource_config": {"workflow_id": "daily_report", "retry_limit": "nope"},
+        },
+    )
+    valid = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "workflow-plugin",
+            "name": "Workflow Plugin",
+            "capabilities": [{"id": "workflow.daily", "adapter": "workflow"}],
+            "resource_config": {"workflow_id": "daily_report", "retry_limit": 3},
+        },
+    )
+
+    assert missing.status_code == 422
+    assert invalid.status_code == 422
+    assert valid.status_code == 200
+    assert valid.json()["resource_config"] == {"workflow_id": "daily_report", "retry_limit": 3}
 
 
 def test_plugin_admin_api_preserves_capability_schemas_in_manifest() -> None:

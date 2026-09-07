@@ -46,6 +46,29 @@ type PluginCapabilityForm = {
   sandboxProfile: string;
 };
 
+type DescriptorResourceField = {
+  fieldType: "array" | "boolean" | "number" | "string";
+  integer?: boolean;
+  maximum?: number;
+  minimum?: number;
+  name: string;
+  required: boolean;
+};
+
+type DescriptorResourceModel = {
+  fields: DescriptorResourceField[];
+  unsupportedRequiredFields: string[];
+};
+
+const BUILTIN_PLUGIN_RESOURCE_FIELDS = new Set([
+  "endpoint_url",
+  "domain_allowlist",
+  "timeout_seconds",
+  "credential_ref",
+  "credential_header",
+  "credential_scheme",
+]);
+
 function createPluginCapabilityForm(
   values: Partial<PluginCapabilityForm> = {},
 ): PluginCapabilityForm {
@@ -65,6 +88,19 @@ function createPluginCapabilityForm(
 
 function formatSchemaText(schema: PluginCapability["input_schema"]) {
   return schema ? JSON.stringify(schema, null, 2) : "";
+}
+
+function formatResourceConfigValue(value: unknown) {
+  if (Array.isArray(value)) return value.map((item) => String(item)).join(",");
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return "";
+}
+
+function formatResourceConfig(config: PluginResource["resource_config"]) {
+  return Object.fromEntries(
+    Object.entries(config).map(([key, value]) => [key, formatResourceConfigValue(value)]),
+  );
 }
 
 function parseSchemaText(value: string, label: string): PluginCapability["input_schema"] {
@@ -108,6 +144,7 @@ function fillFromPlugin(plugin: PluginResource) {
     credentialRef: plugin.credential_ref ?? "",
     credentialHeader: plugin.credential_header || "X-Plugin-Credential",
     credentialScheme: plugin.credential_scheme,
+    resourceConfig: formatResourceConfig(plugin.resource_config),
     capabilities: plugin.capabilities.length > 0
       ? plugin.capabilities.map(pluginCapabilityFormFromCapability)
       : [createPluginCapabilityForm({ id: "" })],
@@ -158,6 +195,159 @@ function schemaDefault(schema: PluginAdapterDescriptor["resource_schema"], prope
   const field = schemaProperties(schema)[property];
   if (!field || typeof field !== "object" || Array.isArray(field)) return undefined;
   return (field as { default?: unknown }).default;
+}
+
+function schemaNumericBound(
+  schema: Record<string, unknown>,
+  bound: "maximum" | "minimum",
+) {
+  const value = schema[bound];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function descriptorResourceFieldFromSchema(
+  name: string,
+  schema: unknown,
+  required: boolean,
+): DescriptorResourceField | null {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return null;
+  const fieldSchema = schema as { items?: unknown; type?: unknown };
+  if (fieldSchema.type === "string") {
+    return { name, fieldType: "string", required };
+  }
+  if (fieldSchema.type === "number" || fieldSchema.type === "integer") {
+    const schemaRecord = fieldSchema as Record<string, unknown>;
+    return {
+      name,
+      fieldType: "number",
+      integer: fieldSchema.type === "integer",
+      maximum: schemaNumericBound(schemaRecord, "maximum"),
+      minimum: schemaNumericBound(schemaRecord, "minimum"),
+      required,
+    };
+  }
+  if (fieldSchema.type === "boolean") {
+    return { name, fieldType: "boolean", required };
+  }
+  if (fieldSchema.type === "array") {
+    const items = fieldSchema.items;
+    if (items && typeof items === "object" && !Array.isArray(items)) {
+      const itemType = (items as { type?: unknown }).type;
+      if (itemType === "string") {
+        return { name, fieldType: "array", required };
+      }
+    }
+  }
+  return null;
+}
+
+function mergeDescriptorResourceField(
+  existing: DescriptorResourceField,
+  next: DescriptorResourceField,
+): DescriptorResourceField | null {
+  if (existing.fieldType !== next.fieldType) return null;
+  if (existing.fieldType === "number" && Boolean(existing.integer) !== Boolean(next.integer)) {
+    return null;
+  }
+  const minima = [existing.minimum, next.minimum].filter(
+    (value): value is number => value !== undefined,
+  );
+  const maxima = [existing.maximum, next.maximum].filter(
+    (value): value is number => value !== undefined,
+  );
+  return {
+    ...existing,
+    maximum: maxima.length > 0 ? Math.min(...maxima) : undefined,
+    minimum: minima.length > 0 ? Math.max(...minima) : undefined,
+    required: existing.required || next.required,
+  };
+}
+
+function descriptorResourceModel(
+  adapters: (PluginAdapterDescriptor | undefined)[],
+): DescriptorResourceModel {
+  const fieldsByName = new Map<string, DescriptorResourceField>();
+  const unsupportedRequiredFields = new Set<string>();
+  for (const adapter of adapters) {
+    if (!adapter) continue;
+    const requiredFields = new Set(schemaRequiredFields(adapter.resource_schema));
+    const properties = schemaProperties(adapter.resource_schema);
+    for (const name of requiredFields) {
+      if (BUILTIN_PLUGIN_RESOURCE_FIELDS.has(name)) continue;
+      const field = descriptorResourceFieldFromSchema(name, properties[name], true);
+      if (!field) unsupportedRequiredFields.add(name);
+    }
+    for (const [name, schema] of Object.entries(properties)) {
+      if (BUILTIN_PLUGIN_RESOURCE_FIELDS.has(name)) continue;
+      const field = descriptorResourceFieldFromSchema(name, schema, requiredFields.has(name));
+      if (!field || unsupportedRequiredFields.has(name)) continue;
+      const existing = fieldsByName.get(name);
+      if (!existing) {
+        fieldsByName.set(name, field);
+        continue;
+      }
+      const merged = mergeDescriptorResourceField(existing, field);
+      if (merged) {
+        fieldsByName.set(name, merged);
+      } else {
+        fieldsByName.delete(name);
+        if (existing.required || field.required) unsupportedRequiredFields.add(name);
+      }
+    }
+  }
+  for (const name of unsupportedRequiredFields) {
+    fieldsByName.delete(name);
+  }
+  return {
+    fields: Array.from(fieldsByName.values()),
+    unsupportedRequiredFields: Array.from(unsupportedRequiredFields).sort(),
+  };
+}
+
+function descriptorResourceFields(adapter: PluginAdapterDescriptor | undefined) {
+  return descriptorResourceModel([adapter]).fields;
+}
+
+function parseResourceConfig(
+  fields: DescriptorResourceField[],
+  values: Record<string, string>,
+  unsupportedRequiredFields: string[] = [],
+) {
+  if (unsupportedRequiredFields.length > 0) {
+    throw new Error(`资源字段 ${unsupportedRequiredFields[0]} 暂不支持在表单中配置。`);
+  }
+  const entries: [string, unknown][] = [];
+  for (const field of fields) {
+    const value = values[field.name] ?? "";
+    const trimmed = value.trim();
+    if (!trimmed && field.fieldType !== "boolean") {
+      if (field.required) throw new Error(`资源字段 ${field.name} 为必填。`);
+      continue;
+    }
+    if (field.fieldType === "number") {
+      const numericValue = Number(trimmed);
+      if (!Number.isFinite(numericValue)) {
+        throw new Error(`资源字段 ${field.name} 必须是数字。`);
+      }
+      if (field.integer && !Number.isInteger(numericValue)) {
+        throw new Error(`资源字段 ${field.name} 必须是整数。`);
+      }
+      if (field.minimum !== undefined && numericValue < field.minimum) {
+        throw new Error(`资源字段 ${field.name} 必须大于等于 ${field.minimum}。`);
+      }
+      if (field.maximum !== undefined && numericValue > field.maximum) {
+        throw new Error(`资源字段 ${field.name} 必须小于等于 ${field.maximum}。`);
+      }
+      entries.push([field.name, numericValue]);
+    } else if (field.fieldType === "boolean") {
+      if (trimmed || field.required) entries.push([field.name, trimmed === "true"]);
+    } else if (field.fieldType === "array") {
+      entries.push([field.name, parseCsv(value)]);
+    } else {
+      entries.push([field.name, trimmed]);
+    }
+  }
+  return Object.fromEntries(entries);
 }
 
 function capabilityDefaultsForAdapter(
@@ -241,6 +431,7 @@ export function McpPage() {
   const [pluginCredentialRef, setPluginCredentialRef] = useState("");
   const [pluginCredentialHeader, setPluginCredentialHeader] = useState("X-Plugin-Credential");
   const [pluginCredentialScheme, setPluginCredentialScheme] = useState("Bearer");
+  const [pluginResourceConfig, setPluginResourceConfig] = useState<Record<string, string>>({});
   const [pluginCapabilities, setPluginCapabilities] = useState<PluginCapabilityForm[]>([
     createPluginCapabilityForm(),
   ]);
@@ -290,6 +481,11 @@ export function McpPage() {
         enabled: pluginEnabled,
         description: pluginDescription.trim() || null,
         version: "local",
+        resource_config: parseResourceConfig(
+          pluginDescriptorResourceFields,
+          pluginResourceConfig,
+          pluginDescriptorUnsupportedRequiredFields,
+        ),
         endpoint_url: pluginEndpointUrl.trim() || null,
         domain_allowlist: parseCsv(pluginDomainAllowlist),
         timeout_seconds: Number(pluginTimeoutSeconds) || 10,
@@ -371,6 +567,7 @@ export function McpPage() {
     setPluginCredentialRef(next.credentialRef);
     setPluginCredentialHeader(next.credentialHeader);
     setPluginCredentialScheme(next.credentialScheme);
+    setPluginResourceConfig(next.resourceConfig);
     setPluginCapabilities(next.capabilities);
     setPluginMessage(`已载入 ${plugin.name}，修改后点击保存。`);
   }
@@ -426,12 +623,32 @@ export function McpPage() {
   const pluginItems = canReadCapabilityManifest ? plugins.data ?? [] : [];
   const adapterItems = canReadCapabilityManifest ? pluginAdapters.data ?? [] : [];
   const adapterById = new Map(adapterItems.map((adapter) => [adapter.id, adapter]));
+  const pluginResourceAdapterIds = Array.from(
+    new Set(pluginCapabilities.map((capability) => capability.adapter).filter(Boolean)),
+  );
+  const pluginResourceModel = descriptorResourceModel(
+    pluginResourceAdapterIds.map((adapterId) => adapterById.get(adapterId)),
+  );
+  const pluginDescriptorResourceFields = pluginResourceModel.fields;
+  const pluginDescriptorUnsupportedRequiredFields = pluginResourceModel.unsupportedRequiredFields;
   const isStdio = transport === "stdio";
 
   function updatePluginCapabilityAdapter(index: number, adapterId: string) {
     updatePluginCapability(index, {
       adapter: adapterId,
       ...capabilityDefaultsForAdapter(adapterById.get(adapterId)),
+    });
+    const adapter = adapterById.get(adapterId);
+    const nextFields = descriptorResourceFields(adapter);
+    setPluginResourceConfig((config) => {
+      const next = { ...config };
+      for (const field of nextFields) {
+        const defaultValue = schemaDefault(adapter?.resource_schema ?? {}, field.name);
+        if (next[field.name] === undefined && defaultValue !== undefined) {
+          next[field.name] = formatResourceConfigValue(defaultValue);
+        }
+      }
+      return next;
     });
   }
 
@@ -583,6 +800,47 @@ export function McpPage() {
             onChange={(event) => setPluginCredentialScheme(event.target.value)}
             placeholder="Bearer；留空表示直接写入 header 值"
           />
+
+          {pluginDescriptorResourceFields.length > 0 ? (
+            <fieldset>
+              <legend>适配器资源字段</legend>
+              {pluginDescriptorResourceFields.map((field) => (
+                <div key={field.name}>
+                  <label htmlFor={`plugin-resource-config-${field.name}`}>资源字段 {field.name}</label>
+                  {field.fieldType === "boolean" ? (
+                    <select
+                      id={`plugin-resource-config-${field.name}`}
+                      value={pluginResourceConfig[field.name] ?? "false"}
+                      onChange={(event) =>
+                        setPluginResourceConfig((config) => ({
+                          ...config,
+                          [field.name]: event.target.value,
+                        }))
+                      }
+                      required={field.required}
+                    >
+                      <option value="false">否</option>
+                      <option value="true">是</option>
+                    </select>
+                  ) : (
+                    <input
+                      id={`plugin-resource-config-${field.name}`}
+                      value={pluginResourceConfig[field.name] ?? ""}
+                      onChange={(event) =>
+                        setPluginResourceConfig((config) => ({
+                          ...config,
+                          [field.name]: event.target.value,
+                        }))
+                      }
+                      inputMode={field.fieldType === "number" ? "decimal" : undefined}
+                      placeholder={field.fieldType === "array" ? "value-a,value-b" : undefined}
+                      required={field.required}
+                    />
+                  )}
+                </div>
+              ))}
+            </fieldset>
+          ) : null}
 
           <fieldset>
             <legend>插件能力</legend>
@@ -779,6 +1037,14 @@ export function McpPage() {
                     <p>允许域名：<span>{plugin.domain_allowlist.join(", ") || "未配置"}</span></p>
                     <p>Credential：<span>{plugin.credential_ref ?? "未配置"}</span></p>
                     <p>Header：<span>{plugin.credential_header}</span></p>
+                    <p>
+                      资源配置：
+                      <span>
+                        {Object.entries(plugin.resource_config)
+                          .map(([key, value]) => `${key}: ${formatResourceConfigValue(value)}`)
+                          .join(", ") || "未配置"}
+                      </span>
+                    </p>
                     <p>能力：<span>{plugin.capabilities.map((capability) => capability.id).join(", ") || "未配置"}</span></p>
                     <p>
                       策略：
