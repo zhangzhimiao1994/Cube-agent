@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Protocol, cast
 from uuid import UUID
 
-from agent_hub.api.routers.admin import PluginResourceResponse
+from agent_hub.api.routers.admin import PluginCapabilityRequest, PluginResourceResponse
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.capabilities.tools.registry import PluginConfigCapabilityManifestSource
 from agent_hub.runtime.contracts import JsonValue
@@ -14,15 +15,37 @@ class PluginConfigService(Protocol):
     async def list_plugins(self) -> Sequence[Any]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class PluginInvocationContext:
+    tenant_id: UUID
+    user_id: UUID
+    run_id: UUID
+    actor: str
+    idempotency_key: str
+
+
+class PluginAdapter(Protocol):
+    async def invoke(
+        self,
+        *,
+        plugin: PluginResourceResponse,
+        capability: PluginCapabilityRequest,
+        arguments: Mapping[str, JsonValue],
+        context: PluginInvocationContext,
+    ) -> Mapping[str, JsonValue]: ...
+
+
 class RuntimePluginService:
     def __init__(
         self,
         *,
         tenant_id: UUID,
         admin_service: PluginConfigService,
+        adapters: Mapping[str, PluginAdapter] | None = None,
     ) -> None:
         self._tenant_id = tenant_id
         self._admin_service = admin_service
+        self._adapters = dict(adapters or {})
         self._plugins: tuple[PluginResourceResponse, ...] = ()
 
     async def start(self) -> None:
@@ -48,16 +71,9 @@ class RuntimePluginService:
         return PluginConfigCapabilityManifestSource(cast(Any, self._plugins)).manifests()
 
     def is_available(self, tenant_id: UUID, name: str) -> bool:
-        manifest = self.manifests_for_tenant(tenant_id)
-        capabilities = manifest.get("capabilities")
-        if not isinstance(capabilities, tuple):
+        if tenant_id != self._tenant_id:
             return False
-        return any(
-            isinstance(capability, Mapping)
-            and capability.get("id") == name
-            and capability.get("available") is True
-            for capability in capabilities
-        )
+        return self._available_plugin_capability(name) is not None
 
     async def invoke(
         self,
@@ -70,18 +86,51 @@ class RuntimePluginService:
         arguments: Mapping[str, JsonValue],
         idempotency_key: str,
     ) -> Mapping[str, JsonValue]:
-        del tenant_id, user_id, run_id, actor, name, arguments, idempotency_key
-        raise RuntimeCapabilityError("Plugin backend unavailable")
+        if tenant_id != self._tenant_id:
+            raise RuntimeCapabilityError("Plugin tool unavailable")
+        target = self._available_plugin_capability(name)
+        if target is None:
+            raise RuntimeCapabilityError("Plugin tool unavailable")
+        plugin, capability = target
+        adapter = self._adapters.get(capability.adapter)
+        if adapter is None:
+            raise RuntimeCapabilityError("Plugin backend unavailable")
+        return await adapter.invoke(
+            plugin=plugin,
+            capability=capability,
+            arguments=arguments,
+            context=PluginInvocationContext(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                run_id=run_id,
+                actor=actor,
+                idempotency_key=idempotency_key,
+            ),
+        )
+
+    def _available_plugin_capability(
+        self,
+        name: str,
+    ) -> tuple[PluginResourceResponse, PluginCapabilityRequest] | None:
+        for plugin in self._plugins:
+            if not _plugin_is_running(plugin):
+                continue
+            for capability in plugin.capabilities:
+                if capability.id == name or name in capability.aliases:
+                    return plugin, capability
+        return None
 
 
 async def build_runtime_plugin_service(
     *,
     tenant_id: UUID,
     admin_service: PluginConfigService,
+    adapters: Mapping[str, PluginAdapter] | None = None,
 ) -> RuntimePluginService:
     service = RuntimePluginService(
         tenant_id=tenant_id,
         admin_service=admin_service,
+        adapters=adapters,
     )
     await service.start()
     return service
@@ -94,8 +143,18 @@ def _empty_manifest() -> Mapping[str, JsonValue]:
     }
 
 
+def _plugin_is_running(plugin: PluginResourceResponse) -> bool:
+    return (
+        plugin.enabled is True
+        and plugin.status == "running"
+        and plugin.health == "healthy"
+    )
+
+
 __all__ = [
+    "PluginAdapter",
     "PluginConfigService",
+    "PluginInvocationContext",
     "RuntimePluginService",
     "build_runtime_plugin_service",
 ]
