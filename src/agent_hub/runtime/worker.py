@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,10 @@ class WorkerRunService(Protocol):
     async def publish_pending(self, limit: int) -> int: ...
 
     async def execute(self, run_id: UUID) -> object: ...
+
+
+class WorkerMcpRuntime(Protocol):
+    async def reload(self) -> None: ...
 
 
 async def _require_tool_approval_from_settings(
@@ -103,9 +108,24 @@ async def run_worker_loop(
     poll_interval_seconds: float = 1.0,
     batch_limit: int = 100,
     max_idle_polls: int | None = None,
+    mcp_runtime: WorkerMcpRuntime | None = None,
+    mcp_reload_interval_seconds: float = 30.0,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> None:
     idle_polls = 0
+    last_mcp_reload_at = monotonic() if mcp_runtime is not None else 0.0
     while not stop.is_set():
+        if mcp_runtime is not None:
+            now = monotonic()
+            if now - last_mcp_reload_at >= mcp_reload_interval_seconds:
+                try:
+                    await mcp_runtime.reload()
+                except Exception as error:
+                    _LOGGER.exception(
+                        "run_worker_mcp_reload_failed error_type=%s",
+                        type(error).__name__,
+                    )
+                last_mcp_reload_at = now
         try:
             delivered = await service.publish_pending(batch_limit)
         except Exception as error:
@@ -247,7 +267,12 @@ async def _run() -> None:
     resources = build_worker_service(get_settings())
     try:
         await resources.runtime_mcp_service.start()
-        await run_worker_loop(resources.service, resources.queue, stop=stop)
+        await run_worker_loop(
+            resources.service,
+            resources.queue,
+            stop=stop,
+            mcp_runtime=resources.runtime_mcp_service,
+        )
     finally:
         await resources.redis_client.aclose()
         await resources.database.dispose()

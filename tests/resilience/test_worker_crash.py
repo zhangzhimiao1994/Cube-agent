@@ -63,6 +63,60 @@ def test_worker_recovers_after_publish_pending_failure() -> None:
     asyncio.run(scenario())
 
 
+def test_worker_loop_refreshes_mcp_runtime_after_interval() -> None:
+    async def scenario() -> None:
+        run_id = uuid4()
+        queue = LocalRunQueue()
+        service = RecordingRunService(queue, run_id)
+        stop = asyncio.Event()
+        mcp_runtime = RecordingMcpRuntime()
+        clock_values = iter((0.0, 31.0, 32.0))
+
+        await run_worker_loop(
+            service,
+            queue,
+            stop=stop,
+            poll_interval_seconds=0.01,
+            batch_limit=10,
+            max_idle_polls=2,
+            mcp_runtime=mcp_runtime,
+            mcp_reload_interval_seconds=30,
+            monotonic=lambda: next(clock_values, 32.0),
+        )
+
+        assert mcp_runtime.reloads == 1
+        assert service.executed_run_ids == [run_id]
+
+    asyncio.run(scenario())
+
+
+def test_worker_loop_continues_when_mcp_runtime_reload_fails() -> None:
+    async def scenario() -> None:
+        run_id = uuid4()
+        queue = LocalRunQueue()
+        service = RecordingRunService(queue, run_id)
+        stop = asyncio.Event()
+        mcp_runtime = FailingMcpRuntime()
+        clock_values = iter((0.0, 31.0, 32.0))
+
+        await run_worker_loop(
+            service,
+            queue,
+            stop=stop,
+            poll_interval_seconds=0.01,
+            batch_limit=10,
+            max_idle_polls=2,
+            mcp_runtime=mcp_runtime,
+            mcp_reload_interval_seconds=30,
+            monotonic=lambda: next(clock_values, 32.0),
+        )
+
+        assert mcp_runtime.reloads == 1
+        assert service.executed_run_ids == [run_id]
+
+    asyncio.run(scenario())
+
+
 class RecordingRunService:
     def __init__(self, queue: LocalRunQueue, run_id: UUID) -> None:
         self._queue = queue
@@ -79,6 +133,20 @@ class RecordingRunService:
 
     async def execute(self, run_id: UUID) -> None:
         self.executed_run_ids.append(run_id)
+
+
+class RecordingMcpRuntime:
+    def __init__(self) -> None:
+        self.reloads = 0
+
+    async def reload(self) -> None:
+        self.reloads += 1
+
+
+class FailingMcpRuntime(RecordingMcpRuntime):
+    async def reload(self) -> None:
+        self.reloads += 1
+        raise RuntimeError("raw mcp reload failure")
 
 
 class FlakyPublishRunService:
