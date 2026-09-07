@@ -169,6 +169,30 @@ class AvailableMcpManifestCapabilityGateway(FakeCapabilityAvailability):
         }
 
 
+class AvailablePluginManifestCapabilityGateway(FakeCapabilityAvailability):
+    def __init__(self) -> None:
+        super().__init__({"calendar.create_event"})
+
+    def capability_manifest(self, tenant_id: UUID) -> Mapping[str, JsonValue]:
+        assert tenant_id == TENANT_ID
+        return {
+            "schema_version": 1,
+            "capabilities": (
+                {
+                    "id": "calendar.create_event",
+                    "kind": "plugin",
+                    "adapter": "plugin_runtime",
+                    "permission_class": "calendar.write",
+                    "sandbox_profile": "remote_connector",
+                    "available": True,
+                    "availability_reason": None,
+                    "replay_safe": False,
+                    "aliases": ("calendar_create",),
+                },
+            ),
+        }
+
+
 class BadManifestCapabilityGateway(FakeCapabilityAvailability):
     def __init__(self, manifest: Mapping[str, JsonValue] | Exception) -> None:
         super().__init__(set())
@@ -2535,6 +2559,102 @@ def test_dispatch_plan_does_not_add_mcp_tool_for_partial_task_text_match() -> No
 
     researcher = next(agent for agent in plan.agents if agent.id == "researcher")
     assert researcher.allowed_tools == ("read_context",)
+
+
+def test_dispatch_plan_adds_explicitly_mentioned_available_plugin_tool() -> None:
+    roles = (
+        RoleAssignment(
+            id="scheduler",
+            role="Scheduler",
+            purpose=RolePurpose.EXECUTE,
+            mission="Schedule the work.",
+            must_answer=("What event was scheduled?",),
+            allowed_tools=("read_context",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Use calendar.create_event to schedule the review.",
+        ),
+        capability_gateway=AvailablePluginManifestCapabilityGateway(),
+    )
+
+    scheduler = next(agent for agent in plan.agents if agent.id == "scheduler")
+    scheduler_step = next(step for step in plan.steps if step.agent == "scheduler")
+    assert scheduler.allowed_tools == ("read_context", "calendar.create_event")
+    assert scheduler_step.tools == ("read_context", "calendar.create_event")
+    assert "calendar.create_event" in plan.allowed_tools
+
+
+def test_dispatch_plan_adds_available_plugin_tool_when_role_requests_alias() -> None:
+    roles = (
+        RoleAssignment(
+            id="scheduler",
+            role="Scheduler",
+            purpose=RolePurpose.EXECUTE,
+            mission="Schedule the work.",
+            must_answer=("What event was scheduled?",),
+            allowed_tools=("read_context",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=("calendar_create",),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Schedule the review.",
+        ),
+        capability_gateway=AvailablePluginManifestCapabilityGateway(),
+    )
+
+    scheduler = next(agent for agent in plan.agents if agent.id == "scheduler")
+    assert scheduler.allowed_tools == ("read_context", "calendar.create_event")
+
+
+def test_dispatch_plan_does_not_add_plugin_tool_for_partial_task_text_match() -> None:
+    roles = (
+        RoleAssignment(
+            id="scheduler",
+            role="Scheduler",
+            purpose=RolePurpose.EXECUTE,
+            mission="Schedule the work.",
+            must_answer=("What event was scheduled?",),
+            allowed_tools=("read_context",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Put the review on the calendar.",
+        ),
+        capability_gateway=AvailablePluginManifestCapabilityGateway(),
+    )
+
+    scheduler = next(agent for agent in plan.agents if agent.id == "scheduler")
+    assert scheduler.allowed_tools == ("read_context",)
 
 
 def test_dispatch_plan_requires_verification_before_final_project_zip() -> None:

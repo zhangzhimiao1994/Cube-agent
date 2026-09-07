@@ -1171,7 +1171,7 @@ def _available_inventory_tools_for_role(
     for item in raw_items:
         if not isinstance(item, Mapping):
             continue
-        if item.get("kind") != "mcp" or item.get("available") is not True:
+        if item.get("kind") not in {"mcp", "plugin"} or item.get("available") is not True:
             continue
         tool_id = item.get("id")
         if not isinstance(tool_id, str) or not _is_safe_inventory_token(tool_id, max_length=128):
