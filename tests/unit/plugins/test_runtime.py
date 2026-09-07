@@ -67,6 +67,7 @@ def plugin(
     credential_ref: str | None = None,
     credential_header: str = "X-Plugin-Credential",
     credential_scheme: str = "Bearer",
+    input_schema: Mapping[str, JsonValue] | None = None,
 ) -> PluginResourceResponse:
     return PluginResourceResponse(
         **PluginResourceRequest(
@@ -86,6 +87,7 @@ def plugin(
                     permission_class="calendar.write",
                     sandbox_profile="remote_connector",
                     aliases=["calendar_create"],
+                    input_schema=dict(input_schema) if input_schema is not None else None,
                 )
             ],
         ).model_dump(),
@@ -253,6 +255,96 @@ async def test_runtime_plugin_service_invokes_registered_adapter_for_running_cap
     assert context.run_id == TENANT_ID
     assert context.actor == "scheduler"
     assert context.idempotency_key == "plugin_1"
+
+
+async def test_runtime_plugin_service_rejects_arguments_that_violate_input_schema() -> None:
+    adapter = RecordingPluginAdapter([])
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(
+            (
+                plugin(
+                    "calendar",
+                    input_schema={
+                        "type": "object",
+                        "required": ("title",),
+                        "properties": {"title": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                ),
+            )
+        ),
+        adapters={"plugin_runtime": adapter},
+    )
+
+    with pytest.raises(
+        RuntimeCapabilityError,
+        match="Plugin arguments do not match input schema",
+    ) as exc_info:
+        await service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="scheduler",
+            name="calendar.create_event",
+            arguments={"title": 123, "secret": "do-not-leak"},
+            idempotency_key="plugin_1",
+        )
+
+    assert adapter.calls == []
+    assert "do-not-leak" not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+async def test_runtime_plugin_service_rejects_invalid_input_schema_before_adapter_execution() -> None:
+    adapter = RecordingPluginAdapter([])
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(
+            (plugin("calendar", input_schema={"type": "not-a-json-schema-type"}),)
+        ),
+        adapters={"plugin_runtime": adapter},
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin input schema is invalid") as exc_info:
+        await service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="scheduler",
+            name="calendar.create_event",
+            arguments={"title": "review"},
+            idempotency_key="plugin_1",
+        )
+
+    assert adapter.calls == []
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+async def test_runtime_plugin_service_rejects_input_schema_references() -> None:
+    adapter = RecordingPluginAdapter([])
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService((plugin("calendar", input_schema={"$ref": "#/missing"}),)),
+        adapters={"plugin_runtime": adapter},
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin input schema is invalid") as exc_info:
+        await service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="scheduler",
+            name="calendar.create_event",
+            arguments={"title": "review"},
+            idempotency_key="plugin_1",
+        )
+
+    assert adapter.calls == []
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
 
 async def test_runtime_plugin_service_rejects_unavailable_plugin_capability() -> None:

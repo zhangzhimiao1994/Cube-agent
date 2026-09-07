@@ -137,6 +137,35 @@ class FailingAvailabilityPluginToolBackend(FakePluginToolBackend):
         raise RuntimeError("raw plugin discovery failure")
 
 
+class ValidationFailurePluginToolBackend(FakePluginToolBackend):
+    async def invoke(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        run_id: UUID,
+        actor: str,
+        name: str,
+        arguments: Mapping[str, JsonValue],
+        idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        self.calls.append(
+            (
+                "invoke",
+                {
+                    "tenant_id": str(tenant_id),
+                    "user_id": str(user_id),
+                    "run_id": str(run_id),
+                    "actor": actor,
+                    "name": name,
+                    "arguments": arguments,
+                },
+                idempotency_key,
+            )
+        )
+        raise RuntimeCapabilityError("Plugin arguments do not match input schema: invalid type")
+
+
 class DeterministicFailureRuntimeCapabilityGateway(FakeRuntimeCapabilityGateway):
     async def execute(
         self,
@@ -199,12 +228,16 @@ def mcp_request(*, approval_required: bool = False) -> HarnessToolCallRequest:
     )
 
 
-def plugin_request(*, approval_required: bool = False) -> HarnessToolCallRequest:
+def plugin_request(
+    *,
+    approval_required: bool = False,
+    arguments: Mapping[str, JsonValue] | None = None,
+) -> HarnessToolCallRequest:
     return HarnessToolCallRequest(
         run_id=RUN_ID,
         actor="scheduler",
         tool_name="calendar.create_event",
-        arguments={"title": "Mofang review"},
+        arguments={"title": "Mofang review"} if arguments is None else arguments,
         approval_required=approval_required,
         sandbox="remote_connector",
         idempotency_key="plugin_1",
@@ -452,6 +485,30 @@ async def test_harness_tool_gateway_falls_back_when_plugin_availability_fails() 
     assert result.status == "failed"
     assert result.failure_reason == "tool unavailable"
     assert [call[0] for call in runtime.calls] == ["available"]
+
+
+async def test_harness_tool_gateway_reports_plugin_validation_error_without_raw_arguments() -> None:
+    runtime = FakeRuntimeCapabilityGateway()
+    plugin_backend = ValidationFailurePluginToolBackend()
+    policy = FakePolicyGateway(CapabilityStatus.ALLOWED)
+    gateway = HarnessToolGateway(
+        runtime,
+        policy_gateway=policy,
+        plugin_backend=plugin_backend,
+    )
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        plugin_request(arguments={"title": 123, "note": "do-not-leak"}),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "failed"
+    assert result.failure_reason == "Plugin arguments do not match input schema: invalid type"
+    assert "do-not-leak" not in repr(result)
+    assert [call[0] for call in plugin_backend.calls] == ["available", "invoke"]
+    assert runtime.calls == []
 
 
 def test_harness_capability_policy_gateway_is_publicly_exported() -> None:

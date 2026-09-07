@@ -7,11 +7,13 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
+from jsonschema import SchemaError, ValidationError  # type: ignore[import-untyped]
+from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 
 from agent_hub.api.routers.admin import PluginCapabilityRequest, PluginResourceResponse
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.capabilities.tools.registry import PluginConfigCapabilityManifestSource
-from agent_hub.runtime.contracts import JsonValue
+from agent_hub.runtime.contracts import JsonValue, _mutable_json
 
 
 class PluginConfigService(Protocol):
@@ -180,6 +182,10 @@ class RuntimePluginService:
         adapter = self._adapters.get(capability.adapter)
         if adapter is None:
             raise RuntimeCapabilityError("Plugin backend unavailable")
+        _validate_plugin_arguments(
+            arguments=arguments,
+            schema=capability.input_schema,
+        )
         return await adapter.invoke(
             plugin=plugin,
             capability=capability,
@@ -351,6 +357,74 @@ def _endpoint_domain_allowed(url: str, domain_allowlist: Sequence[str]) -> bool:
         if isinstance(domain, str) and domain.strip()
     }
     return normalized_host in allowed
+
+
+def _validate_plugin_arguments(
+    *,
+    arguments: Mapping[str, JsonValue],
+    schema: Mapping[str, JsonValue] | None,
+) -> None:
+    if schema is None:
+        return
+    schema_payload = cast(Any, _mutable_json(cast(JsonValue, schema)))
+    arguments_payload = cast(Any, _mutable_json(cast(JsonValue, arguments)))
+    if _schema_contains_reference(schema_payload):
+        raise RuntimeCapabilityError("Plugin input schema is invalid")
+    failure: str | None = None
+    try:
+        validator_class = validator_for(schema_payload)
+        validator_class.check_schema(schema_payload)
+        validator = validator_class(schema_payload)
+        validator.validate(arguments_payload)
+    except SchemaError:
+        failure = "Plugin input schema is invalid"
+    except ValidationError as error:
+        location = _validation_error_location(error)
+        reason = _validation_error_reason(error)
+        failure = f"Plugin arguments do not match input schema{location}: {reason}"
+    if failure is not None:
+        raise RuntimeCapabilityError(failure)
+
+
+def _schema_contains_reference(value: object) -> bool:
+    if isinstance(value, Mapping):
+        if "$ref" in value:
+            return True
+        return any(_schema_contains_reference(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_schema_contains_reference(item) for item in value)
+    return False
+
+
+def _validation_error_location(error: ValidationError) -> str:
+    path = ".".join(str(item) for item in error.absolute_path)
+    if not path:
+        return ""
+    return f" at {path}"
+
+
+def _validation_error_reason(error: ValidationError) -> str:
+    match error.validator:
+        case "additionalProperties":
+            return "unexpected field"
+        case "enum":
+            return "unsupported value"
+        case "format":
+            return "invalid format"
+        case "maxItems" | "minItems":
+            return "invalid item count"
+        case "maxLength" | "minLength":
+            return "invalid string length"
+        case "maximum" | "minimum" | "exclusiveMaximum" | "exclusiveMinimum":
+            return "number is outside the allowed range"
+        case "pattern":
+            return "invalid string pattern"
+        case "required":
+            return "required field is missing"
+        case "type":
+            return "invalid type"
+        case _:
+            return "validation failed"
 
 
 async def _httpx_post_json(
