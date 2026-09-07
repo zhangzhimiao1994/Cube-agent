@@ -1121,7 +1121,22 @@ def _role_allowed_tools(
     capability_gateway: RuntimeCapabilityGatewayProtocol | None,
 ) -> tuple[str, ...]:
     requested = tuple(dict.fromkeys((*role.allowed_tools, *role.skills)))
-    if not requested or context is None or capability_gateway is None:
+    if context is None or capability_gateway is None:
+        return ()
+    requested = tuple(
+        dict.fromkeys(
+            (
+                *requested,
+                *_available_inventory_tools_for_role(
+                    role,
+                    context,
+                    requested=requested,
+                    capability_gateway=capability_gateway,
+                ),
+            )
+        )
+    )
+    if not requested:
         return ()
     is_available = getattr(capability_gateway, "is_available", None)
     filtered: list[str] = []
@@ -1132,6 +1147,64 @@ def _role_allowed_tools(
         if callable(is_available) and is_available(context.tenant_id, name):
             filtered.append(name)
     return tuple(dict.fromkeys(filtered))
+
+
+def _available_inventory_tools_for_role(
+    role: RoleAssignment,
+    context: TaskContext,
+    *,
+    requested: tuple[str, ...],
+    capability_gateway: RuntimeCapabilityGatewayProtocol,
+) -> tuple[str, ...]:
+    inventory = _capability_inventory_payload(
+        context.tenant_id,
+        capability_gateway=capability_gateway,
+    )
+    if inventory is None:
+        return ()
+    raw_items = inventory.get("items")
+    if not isinstance(raw_items, tuple | list):
+        return ()
+    requested_tokens = {item.casefold() for item in requested}
+    match_text = _role_capability_match_text(role, context)
+    tools: list[str] = []
+    for item in raw_items:
+        if not isinstance(item, Mapping):
+            continue
+        if item.get("kind") != "mcp" or item.get("available") is not True:
+            continue
+        tool_id = item.get("id")
+        if not isinstance(tool_id, str) or not _is_safe_inventory_token(tool_id, max_length=128):
+            continue
+        aliases = item.get("aliases")
+        candidates = (tool_id, *_tool_names(aliases))
+        if any(
+            candidate.casefold() in requested_tokens
+            or _capability_token_mentioned(match_text, candidate)
+            for candidate in candidates
+        ):
+            tools.append(tool_id)
+    return tuple(dict.fromkeys(tools))
+
+
+def _role_capability_match_text(role: RoleAssignment, context: TaskContext) -> str:
+    return "\n".join(
+        (
+            str(context.request),
+            role.id,
+            role.role,
+            role.mission,
+            " ".join(role.allowed_tools),
+            " ".join(role.skills),
+        )
+    ).casefold()
+
+
+def _capability_token_mentioned(text: str, token: str) -> bool:
+    if not _is_safe_inventory_token(token, max_length=128):
+        return False
+    pattern = rf"(?<![a-z0-9_.-]){re.escape(token.casefold())}(?![a-z0-9_.-])"
+    return re.search(pattern, text) is not None
 
 
 def _plan_allowed_tools(

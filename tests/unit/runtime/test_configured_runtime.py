@@ -145,6 +145,30 @@ class ManifestCapabilityGateway(FakeCapabilityAvailability):
         }
 
 
+class AvailableMcpManifestCapabilityGateway(FakeCapabilityAvailability):
+    def __init__(self) -> None:
+        super().__init__({"search.web_search"})
+
+    def capability_manifest(self, tenant_id: UUID) -> Mapping[str, JsonValue]:
+        assert tenant_id == TENANT_ID
+        return {
+            "schema_version": 1,
+            "capabilities": (
+                {
+                    "id": "search.web_search",
+                    "kind": "mcp",
+                    "adapter": "mcp_server",
+                    "permission_class": "mcp.invoke",
+                    "sandbox_profile": "mcp_remote",
+                    "available": True,
+                    "availability_reason": None,
+                    "replay_safe": False,
+                    "aliases": ("search_web",),
+                },
+            ),
+        }
+
+
 class BadManifestCapabilityGateway(FakeCapabilityAvailability):
     def __init__(self, manifest: Mapping[str, JsonValue] | Exception) -> None:
         super().__init__(set())
@@ -2415,6 +2439,102 @@ def test_dispatch_plan_filters_unavailable_skills_from_executable_steps() -> Non
     assert writer.allowed_tools == ("read_context",)
     assert writer_step.tools == ("read_context",)
     assert plan.allowed_tools == ("read_context",)
+
+
+def test_dispatch_plan_adds_explicitly_mentioned_available_mcp_tool() -> None:
+    roles = (
+        RoleAssignment(
+            id="researcher",
+            role="Researcher",
+            purpose=RolePurpose.EXECUTE,
+            mission="Research the answer.",
+            must_answer=("What did the researcher find?",),
+            allowed_tools=("read_context",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Use search.web_search for external research.",
+        ),
+        capability_gateway=AvailableMcpManifestCapabilityGateway(),
+    )
+
+    researcher = next(agent for agent in plan.agents if agent.id == "researcher")
+    researcher_step = next(step for step in plan.steps if step.agent == "researcher")
+    assert researcher.allowed_tools == ("read_context", "search.web_search")
+    assert researcher_step.tools == ("read_context", "search.web_search")
+    assert "search.web_search" in plan.allowed_tools
+
+
+def test_dispatch_plan_adds_available_mcp_tool_when_role_requests_alias() -> None:
+    roles = (
+        RoleAssignment(
+            id="researcher",
+            role="Researcher",
+            purpose=RolePurpose.EXECUTE,
+            mission="Research the answer.",
+            must_answer=("What did the researcher find?",),
+            allowed_tools=("read_context",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=("search_web",),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Research the topic.",
+        ),
+        capability_gateway=AvailableMcpManifestCapabilityGateway(),
+    )
+
+    researcher = next(agent for agent in plan.agents if agent.id == "researcher")
+    assert researcher.allowed_tools == ("read_context", "search.web_search")
+
+
+def test_dispatch_plan_does_not_add_mcp_tool_for_partial_task_text_match() -> None:
+    roles = (
+        RoleAssignment(
+            id="researcher",
+            role="Researcher",
+            purpose=RolePurpose.EXECUTE,
+            mission="Research the answer.",
+            must_answer=("What did the researcher find?",),
+            allowed_tools=("read_context",),
+            forbidden_actions=("Do not perform dangerous operations.",),
+            skills=(),
+            output_schema={"summary": "string"},
+            model="main",
+        ),
+    )
+
+    plan = _dispatch_plan(
+        roles,
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Search the topic broadly.",
+        ),
+        capability_gateway=AvailableMcpManifestCapabilityGateway(),
+    )
+
+    researcher = next(agent for agent in plan.agents if agent.id == "researcher")
+    assert researcher.allowed_tools == ("read_context",)
 
 
 def test_dispatch_plan_requires_verification_before_final_project_zip() -> None:
