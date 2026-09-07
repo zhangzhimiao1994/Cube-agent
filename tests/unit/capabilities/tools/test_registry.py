@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from agent_hub.capabilities.tools.registry import ToolRegistry, create_builtin_tool_registry
+from types import SimpleNamespace
+
+from agent_hub.capabilities.tools.registry import (
+    PluginConfigCapabilityManifestSource,
+    ToolRegistry,
+    create_builtin_tool_registry,
+)
 
 
 def test_registry_registers_builtin_tool_names() -> None:
@@ -120,3 +126,70 @@ def test_registry_registers_pluggable_capability_manifest_without_callable() -> 
         ),
     }
     assert repr(executor) not in repr(manifest)
+
+
+def test_plugin_manifest_source_marks_stopped_plugins_unavailable() -> None:
+    source = PluginConfigCapabilityManifestSource(
+        (
+            SimpleNamespace(
+                id="search",
+                enabled=True,
+                status="stopped",
+                health="stopped",
+                capabilities=(
+                    SimpleNamespace(
+                        id="search.web",
+                        adapter="plugin_runtime",
+                        permission_class="network.read",
+                        sandbox_profile="remote_connector",
+                        replay_safe=False,
+                        aliases=("search_web",),
+                    ),
+                ),
+            ),
+            SimpleNamespace(
+                id="calendar",
+                enabled=False,
+                status="disabled",
+                health="disabled",
+                capabilities=(
+                    SimpleNamespace(
+                        id="calendar.create_event",
+                        adapter="plugin_runtime",
+                        permission_class="calendar.write",
+                        sandbox_profile="remote_connector",
+                        replay_safe=False,
+                        aliases=(),
+                    ),
+                ),
+            ),
+        )
+    )
+
+    assert source.manifests() == {
+        "schema_version": 1,
+        "capabilities": (
+            {
+                "id": "search.web",
+                "kind": "plugin",
+                "adapter": "plugin_runtime",
+                "permission_class": "network.read",
+                "sandbox_profile": "remote_connector",
+                "available": False,
+                "availability_reason": "plugin_stopped",
+                "replay_safe": False,
+                "aliases": ("search_web",),
+            },
+            {
+                "id": "calendar.create_event",
+                "kind": "plugin",
+                "adapter": "plugin_runtime",
+                "permission_class": "calendar.write",
+                "sandbox_profile": "remote_connector",
+                "available": False,
+                "availability_reason": "plugin_disabled",
+                "replay_safe": False,
+                "aliases": (),
+            },
+        ),
+    }

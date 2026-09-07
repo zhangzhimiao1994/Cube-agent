@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 from agent_hub.runtime.contracts import JsonValue
 
@@ -74,6 +75,56 @@ class ToolRegistry:
         }
 
 
+class PluginCapabilityConfig(Protocol):
+    id: str
+    adapter: str
+    permission_class: str
+    sandbox_profile: str
+    replay_safe: bool
+    aliases: Sequence[str]
+
+
+class PluginConfig(Protocol):
+    id: str
+    enabled: bool
+    status: str
+    health: str
+    capabilities: Sequence[PluginCapabilityConfig]
+
+
+class PluginConfigCapabilityManifestSource:
+    def __init__(self, plugins: Sequence[PluginConfig]) -> None:
+        self._plugins = tuple(plugins)
+
+    def manifests(self) -> Mapping[str, JsonValue]:
+        capabilities: list[Mapping[str, JsonValue]] = []
+        for plugin in self._plugins:
+            available = (
+                plugin.enabled
+                and plugin.status == "running"
+                and plugin.health == "healthy"
+            )
+            reason = None if available else _plugin_availability_reason(plugin)
+            for capability in plugin.capabilities:
+                capabilities.append(
+                    {
+                        "id": capability.id,
+                        "kind": "plugin",
+                        "adapter": capability.adapter,
+                        "permission_class": capability.permission_class,
+                        "sandbox_profile": capability.sandbox_profile,
+                        "available": available,
+                        "availability_reason": reason,
+                        "replay_safe": capability.replay_safe is True,
+                        "aliases": tuple(capability.aliases),
+                    }
+                )
+        return {
+            "schema_version": 1,
+            "capabilities": tuple(capabilities),
+        }
+
+
 def create_builtin_tool_registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(
@@ -132,6 +183,16 @@ def create_builtin_tool_registry() -> ToolRegistry:
         aliases=("workspace_read",),
     )
     return registry
+
+
+def _plugin_availability_reason(plugin: PluginConfig) -> str:
+    if not plugin.enabled:
+        return "plugin_disabled"
+    if plugin.status == "running" and plugin.health != "healthy":
+        return "plugin_unhealthy"
+    if plugin.status in {"stopped", "disabled", "failed"}:
+        return f"plugin_{plugin.status}"
+    return "plugin_unavailable"
 
 
 def _nonblank(value: str, field_name: str) -> str:

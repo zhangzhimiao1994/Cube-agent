@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from agent_hub.api.dependencies import current_principal
 from agent_hub.api.errors import BASE_ERROR_RESPONSES, PublicAPIError, error_responses
 from agent_hub.auth.models import AuthenticatedPrincipal, Authorizer, PermissionDenied, Role
+from agent_hub.capabilities.tools.registry import PluginConfigCapabilityManifestSource
 from agent_hub.config.schema import PlatformConfig
 from agent_hub.config.service import ConfigService, ConfigValidationError
 from agent_hub.db.models import AdminResourceRow
@@ -512,6 +513,74 @@ class SkillArchiveUploadResponse(BaseModel):
     bundle: bool
     items: list[SkillResponse]
     skipped: list[SkillArchiveSkippedResponse] = Field(default_factory=list)
+
+
+class PluginCapabilityRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=128, pattern=r"^[a-z0-9][a-z0-9_.-]*$")
+    adapter: str = Field(
+        default="plugin_runtime",
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-z0-9][a-z0-9_.-]*$",
+    )
+    permission_class: str = Field(
+        default="plugin.use",
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-z][a-z0-9_-]*\.[a-z][a-z0-9_-]*$|^[a-z][a-z0-9_-]*:[a-z][a-z0-9_-]*$",
+    )
+    sandbox_profile: str = Field(
+        default="plugin",
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-z0-9][a-z0-9_.-]*$",
+    )
+    replay_safe: bool = False
+    aliases: list[str] = Field(default_factory=list, max_length=128)
+
+    @field_validator("aliases")
+    @classmethod
+    def validate_aliases(cls, value: list[str]) -> list[str]:
+        aliases: list[str] = []
+        for alias in value:
+            if (
+                not isinstance(alias, str)
+                or re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,127}", alias) is None
+            ):
+                raise ValueError("plugin capability alias is invalid")
+            aliases.append(alias)
+        if len(set(aliases)) != len(aliases):
+            raise ValueError("plugin capability aliases must be unique")
+        return aliases
+
+
+class PluginResourceRequest(NamedResourceRequest):
+    description: str | None = Field(default=None, max_length=1000)
+    version: str = Field(
+        default="local",
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:+-]*$",
+    )
+    capabilities: list[PluginCapabilityRequest] = Field(default_factory=list, max_length=256)
+
+    @field_validator("capabilities")
+    @classmethod
+    def validate_capability_ids(
+        cls, value: list[PluginCapabilityRequest]
+    ) -> list[PluginCapabilityRequest]:
+        ids = [item.id for item in value]
+        if len(set(ids)) != len(ids):
+            raise ValueError("plugin capability ids must be unique")
+        return value
+
+
+class PluginResourceResponse(PluginResourceRequest):
+    status: str = Field(pattern=r"^(disabled|stopped|running|failed)$")
+    health: str = Field(pattern=r"^(disabled|stopped|healthy|unhealthy|failed|unknown)$")
+    last_error_type: str | None = Field(default=None, max_length=128)
 
 
 class McpServerResponse(BaseModel):
@@ -1931,6 +2000,18 @@ class AdminResourceService(Protocol):
 
     async def delete_skill(self, skill_id: str) -> None: ...
 
+    async def list_plugins(self) -> tuple[PluginResourceResponse, ...]: ...
+
+    async def upsert_plugin(self, request: PluginResourceRequest) -> PluginResourceResponse: ...
+
+    async def start_plugin(self, plugin_id: str) -> PluginResourceResponse: ...
+
+    async def stop_plugin(self, plugin_id: str) -> PluginResourceResponse: ...
+
+    async def reload_plugin(self, plugin_id: str) -> PluginResourceResponse: ...
+
+    async def delete_plugin(self, plugin_id: str) -> None: ...
+
     async def list_mcp_servers(
         self,
         *,
@@ -2768,6 +2849,50 @@ class CapabilityManifestProvider(Protocol):
     ) -> Mapping[str, JsonValue]: ...
 
 
+def _plugin_response_from_request(
+    request: PluginResourceRequest,
+    *,
+    current: PluginResourceResponse | None = None,
+) -> PluginResourceResponse:
+    payload = request.model_dump()
+    if not request.enabled:
+        return PluginResourceResponse(
+            **payload,
+            status="disabled",
+            health="disabled",
+            last_error_type=None,
+        )
+    if current is not None and current.status == "running":
+        return PluginResourceResponse(
+            **payload,
+            status="running",
+            health="healthy",
+            last_error_type=None,
+        )
+    return PluginResourceResponse(
+        **payload,
+        status="stopped",
+        health="stopped",
+        last_error_type=None,
+    )
+
+
+def _plugin_started_response(plugin: PluginResourceResponse) -> PluginResourceResponse:
+    if not plugin.enabled:
+        raise PublicAPIError(409, "plugin_disabled", "plugin is disabled")
+    return plugin.model_copy(
+        update={"status": "running", "health": "healthy", "last_error_type": None}
+    )
+
+
+def _plugin_stopped_response(plugin: PluginResourceResponse) -> PluginResourceResponse:
+    if not plugin.enabled:
+        return plugin.model_copy(update={"status": "disabled", "health": "disabled"})
+    return plugin.model_copy(
+        update={"status": "stopped", "health": "stopped", "last_error_type": None}
+    )
+
+
 @dataclass(slots=True)
 class InMemoryAdminResourceService:
     models: dict[UUID, ModelDeploymentResponse] = field(default_factory=dict)
@@ -2784,6 +2909,7 @@ class InMemoryAdminResourceService:
     runs: dict[UUID, RunDetailResponse] = field(default_factory=dict)
     skills: dict[str, SkillResponse] = field(default_factory=dict)
     skill_active_versions: dict[str, str] = field(default_factory=dict)
+    plugins: dict[str, PluginResourceResponse] = field(default_factory=dict)
     mcp_servers: dict[str, McpServerResponse] = field(default_factory=dict)
     channel_config: dict[str, dict[str, str]] = field(default_factory=dict)
     memory: dict[str, MemoryRecordResponse] = field(default_factory=dict)
@@ -3432,6 +3558,36 @@ class InMemoryAdminResourceService:
 
     async def delete_skill(self, skill_id: str) -> None:
         del self.skills[skill_id]
+
+    async def list_plugins(self) -> tuple[PluginResourceResponse, ...]:
+        return tuple(self.plugins.values())
+
+    async def upsert_plugin(self, request: PluginResourceRequest) -> PluginResourceResponse:
+        current = self.plugins.get(request.id)
+        response = _plugin_response_from_request(request, current=current)
+        self.plugins[response.id] = response
+        return response
+
+    async def start_plugin(self, plugin_id: str) -> PluginResourceResponse:
+        current = self.plugins[plugin_id]
+        updated = _plugin_started_response(current)
+        self.plugins[plugin_id] = updated
+        return updated
+
+    async def stop_plugin(self, plugin_id: str) -> PluginResourceResponse:
+        current = self.plugins[plugin_id]
+        updated = _plugin_stopped_response(current)
+        self.plugins[plugin_id] = updated
+        return updated
+
+    async def reload_plugin(self, plugin_id: str) -> PluginResourceResponse:
+        current = self.plugins[plugin_id]
+        updated = _plugin_started_response(current)
+        self.plugins[plugin_id] = updated
+        return updated
+
+    async def delete_plugin(self, plugin_id: str) -> None:
+        del self.plugins[plugin_id]
 
     async def list_mcp_servers(
         self,
@@ -5181,6 +5337,81 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 details={"feature": "skills", "skill_id": skill_id},
             )
         await self._record_audit("skill.delete", f"skill:{skill_id}", {"id": skill_id})
+
+    async def list_plugins(self) -> tuple[PluginResourceResponse, ...]:
+        resources = await self._list_admin_payloads("plugin")
+        if resources is None:
+            return await super().list_plugins()
+        return tuple(PluginResourceResponse.model_validate(payload) for payload in resources)
+
+    async def upsert_plugin(self, request: PluginResourceRequest) -> PluginResourceResponse:
+        current = await self._plugin_response(request.id)
+        response = _plugin_response_from_request(request, current=current)
+        if not await self._upsert_admin_payload(
+            "plugin", response.id, response.model_dump(mode="json")
+        ):
+            return await super().upsert_plugin(request)
+        await self._record_audit("plugin.upsert", f"plugin:{response.id}", {"id": response.id})
+        return response
+
+    async def start_plugin(self, plugin_id: str) -> PluginResourceResponse:
+        return await self._set_plugin_lifecycle(plugin_id, "start")
+
+    async def stop_plugin(self, plugin_id: str) -> PluginResourceResponse:
+        return await self._set_plugin_lifecycle(plugin_id, "stop")
+
+    async def reload_plugin(self, plugin_id: str) -> PluginResourceResponse:
+        return await self._set_plugin_lifecycle(plugin_id, "reload")
+
+    async def delete_plugin(self, plugin_id: str) -> None:
+        deleted = await self._delete_admin_payload("plugin", plugin_id)
+        if deleted is None:
+            await super().delete_plugin(plugin_id)
+            return
+        if not deleted:
+            raise KeyError(plugin_id)
+        await self._record_audit("plugin.delete", f"plugin:{plugin_id}", {"id": plugin_id})
+
+    async def _plugin_response(self, plugin_id: str) -> PluginResourceResponse | None:
+        payload = await self._get_admin_payload("plugin", plugin_id)
+        if payload is None:
+            for plugin in await super().list_plugins():
+                if plugin.id == plugin_id:
+                    return plugin
+            return None
+        if not payload:
+            return None
+        return PluginResourceResponse.model_validate(payload)
+
+    async def _set_plugin_lifecycle(
+        self,
+        plugin_id: str,
+        action: str,
+    ) -> PluginResourceResponse:
+        payload = await self._get_admin_payload("plugin", plugin_id)
+        if payload is None:
+            if action == "start":
+                return await super().start_plugin(plugin_id)
+            if action == "stop":
+                return await super().stop_plugin(plugin_id)
+            return await super().reload_plugin(plugin_id)
+        if not payload:
+            raise KeyError(plugin_id)
+        current = PluginResourceResponse.model_validate(payload)
+        if action == "stop":
+            updated = _plugin_stopped_response(current)
+        else:
+            updated = _plugin_started_response(current)
+        if not await self._upsert_admin_payload(
+            "plugin", updated.id, updated.model_dump(mode="json")
+        ):
+            raise KeyError(plugin_id)
+        await self._record_audit(
+            f"plugin.{action}",
+            f"plugin:{updated.id}",
+            {"id": updated.id},
+        )
+        return updated
 
     def _skill_archive_path(self, skill_id: str) -> Path:
         if not _is_safe_admin_identifier(skill_id):
@@ -9491,6 +9722,102 @@ async def delete_skill(
 
 
 @router.get(
+    "/plugins",
+    response_model=list[PluginResourceResponse],
+    responses=error_responses(401, 403, 422),
+)
+async def list_plugins(
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> list[PluginResourceResponse]:
+    _require(principal, "plugin:read")
+    return list(await service.list_plugins())
+
+
+@router.post(
+    "/plugins",
+    response_model=PluginResourceResponse,
+    responses=error_responses(401, 403, 409, 422),
+)
+async def upsert_plugin(
+    body: PluginResourceRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> PluginResourceResponse:
+    _require(principal, "plugin:write")
+    return await service.upsert_plugin(body)
+
+
+@router.post(
+    "/plugins/{plugin_id}/start",
+    response_model=PluginResourceResponse,
+    responses=error_responses(401, 403, 404, 409, 422),
+)
+async def start_plugin(
+    plugin_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> PluginResourceResponse:
+    _require(principal, "plugin:write")
+    try:
+        return await service.start_plugin(plugin_id)
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+
+
+@router.post(
+    "/plugins/{plugin_id}/stop",
+    response_model=PluginResourceResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def stop_plugin(
+    plugin_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> PluginResourceResponse:
+    _require(principal, "plugin:write")
+    try:
+        return await service.stop_plugin(plugin_id)
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+
+
+@router.post(
+    "/plugins/{plugin_id}/reload",
+    response_model=PluginResourceResponse,
+    responses=error_responses(401, 403, 404, 409, 422),
+)
+async def reload_plugin(
+    plugin_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> PluginResourceResponse:
+    _require(principal, "plugin:write")
+    try:
+        return await service.reload_plugin(plugin_id)
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+
+
+@router.delete(
+    "/plugins/{plugin_id}",
+    response_model=OperationStatusResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def delete_plugin(
+    plugin_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> OperationStatusResponse:
+    _require(principal, "plugin:write")
+    try:
+        await service.delete_plugin(plugin_id)
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+    return OperationStatusResponse(status="deleted")
+
+
+@router.get(
     "/capabilities/manifest",
     response_model=CapabilityManifestResponse,
     responses=error_responses(401, 403, 503),
@@ -9502,13 +9829,16 @@ async def capability_manifest(
 ) -> CapabilityManifestResponse:
     _require(principal, "plugin:read")
     _require(principal, "mcp:read")
+    plugin_source = PluginConfigCapabilityManifestSource(
+        cast(Any, await service.list_plugins())
+    )
     mcp_source = McpConfigCapabilityManifestSource(
         await service.list_mcp_servers(tenant_id=principal.tenant_id)
     )
     return CapabilityManifestResponse.model_validate(
         _runtime_capability_gateway(request).capability_manifest(
             principal.tenant_id,
-            extra_sources=(mcp_source,),
+            extra_sources=(plugin_source, mcp_source),
         )
     )
 

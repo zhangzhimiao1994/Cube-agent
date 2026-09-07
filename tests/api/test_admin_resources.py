@@ -29,6 +29,8 @@ from agent_hub.api.routers.admin import (
     McpServerResponse,
     ModelDeploymentRequest,
     PersistentAdminResourceService,
+    PluginCapabilityRequest,
+    PluginResourceRequest,
     RunArtifactResponse,
     RunDetailResponse,
     RunEventResponse,
@@ -2405,6 +2407,9 @@ def test_capability_manifest_endpoint_reads_mcp_config_for_principal_tenant() ->
             self.tenant_ids.append(tenant_id)
             return ()
 
+        async def list_plugins(self) -> tuple[object, ...]:
+            return ()
+
     api = create_app(auth_service=OtherTenantAuthService(), rate_limiter=object())
     service = RecordingMcpService()
     gateway = FakeRuntimeCapabilityGateway()
@@ -2477,6 +2482,96 @@ def test_mcp_reload_callback_failure_does_not_fail_saved_config() -> None:
 
     assert response.status_code == 200
     assert "secret token" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_admin_plugin_lifecycle_updates_status_and_health() -> None:
+    service = InMemoryAdminResourceService()
+
+    created = await service.upsert_plugin(
+        PluginResourceRequest(
+            id="search",
+            name="Search Plugin",
+            capabilities=[
+                PluginCapabilityRequest(
+                    id="search.web",
+                    permission_class="network.read",
+                    sandbox_profile="remote_connector",
+                    aliases=["search_web"],
+                )
+            ],
+        )
+    )
+    started = await service.start_plugin("search")
+    stopped = await service.stop_plugin("search")
+    reloaded = await service.reload_plugin("search")
+
+    assert created.status == "stopped"
+    assert created.health == "stopped"
+    assert started.status == "running"
+    assert started.health == "healthy"
+    assert stopped.status == "stopped"
+    assert stopped.health == "stopped"
+    assert reloaded.status == "running"
+    assert reloaded.health == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_persistent_admin_plugin_lifecycle_persists_status() -> None:
+    service = PersistentAdminResourceService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+    )
+
+    await service.upsert_plugin(PluginResourceRequest(id="search", name="Search Plugin"))
+    started = await service.start_plugin("search")
+    listed = await service.list_plugins()
+
+    assert started.status == "running"
+    assert started.health == "healthy"
+    assert listed == (started,)
+
+
+def test_plugin_admin_api_exposes_running_plugin_capabilities_in_manifest() -> None:
+    api = client()
+    cast(Any, api.app).state.runtime_capability_gateway = FakeRuntimeCapabilityGateway()
+
+    created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "search",
+            "name": "Search Plugin",
+            "capabilities": [
+                {
+                    "id": "search.web",
+                    "permission_class": "network.read",
+                    "sandbox_profile": "remote_connector",
+                    "aliases": ["search_web"],
+                }
+            ],
+        },
+    )
+    started = api.post("/api/v1/admin/plugins/search/start", headers=headers())
+    manifest = api.get("/api/v1/admin/capabilities/manifest", headers=headers())
+
+    assert created.status_code == 200
+    assert started.status_code == 200
+    assert started.json()["status"] == "running"
+    capabilities = {item["id"]: item for item in manifest.json()["capabilities"]}
+    assert capabilities["search.web"] == {
+        "id": "search.web",
+        "kind": "plugin",
+        "adapter": "plugin_runtime",
+        "permission_class": "network.read",
+        "sandbox_profile": "remote_connector",
+        "available": True,
+        "availability_reason": None,
+        "replay_safe": False,
+        "aliases": ["search_web"],
+    }
 
 
 def test_capability_manifest_endpoint_requires_plugin_and_mcp_read(
