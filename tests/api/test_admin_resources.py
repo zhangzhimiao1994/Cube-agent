@@ -4733,8 +4733,52 @@ def test_plugin_adapter_catalog_endpoint_exposes_safe_http_json_descriptor() -> 
         "endpoint_url",
         "domain_allowlist",
     ]
+    assert descriptors["http_json"]["capability_contract"] == {
+        "schema_version": 1,
+        "declared_sandbox_profiles": [],
+        "runtime_sandbox_profiles": ["remote_connector"],
+    }
     assert "credential_ref" in descriptors["http_json"]["resource_schema"]["properties"]
     assert "Authorization" not in response.text
+
+
+def test_plugin_adapter_catalog_exposes_runtime_contract_for_declared_sandboxes() -> None:
+    api = client()
+
+    class PluginServiceWithSandboxDescriptor:
+        def adapter_descriptors(self) -> tuple[dict[str, object], ...]:
+            return (
+                {
+                    "id": "browser",
+                    "name": "Browser",
+                    "description": "Reads allowlisted web resources.",
+                    "resource_schema": {"type": "object", "additionalProperties": True},
+                    "capability_schema": {
+                        "type": "object",
+                        "properties": {
+                            "sandbox_profile": {
+                                "type": "string",
+                                "enum": ("http_read", "local_process"),
+                            }
+                        },
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    cast(Any, api.app).state.plugin_service = PluginServiceWithSandboxDescriptor()
+
+    response = api.get("/api/v1/admin/plugins/adapters", headers=headers())
+
+    assert response.status_code == 200
+    descriptor = response.json()[0]
+    assert descriptor["id"] == "browser"
+    assert descriptor["capability_contract"] == {
+        "schema_version": 1,
+        "declared_sandbox_profiles": ["http_read", "local_process"],
+        "runtime_sandbox_profiles": ["http_read", "remote_connector"],
+    }
 
 
 def test_plugin_adapter_catalog_skips_invalid_provider_descriptors() -> None:

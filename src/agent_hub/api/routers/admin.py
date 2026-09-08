@@ -83,6 +83,11 @@ from agent_hub.openclaw.remote_adapter import (
     OpenClawRemoteAdapterError,
     run_remote_openclaw_operation,
 )
+from agent_hub.plugins.contracts import (
+    adapter_declared_sandbox_profiles,
+    adapter_runtime_sandbox_profiles,
+    http_json_adapter_descriptor,
+)
 from agent_hub.plugins.schemas import PluginSchemaError, plugin_schema_validator
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRecord, RunRepository
 from agent_hub.runtime.contracts import JsonValue
@@ -669,6 +674,14 @@ class PluginPolicyReviewResponse(BaseModel):
     plugins: list[PluginPolicySummaryResponse] = Field(default_factory=list, max_length=256)
 
 
+class PluginAdapterCapabilityContractResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
+    declared_sandbox_profiles: list[str] = Field(default_factory=list, max_length=32)
+    runtime_sandbox_profiles: list[str] = Field(default_factory=list, max_length=32)
+
+
 class PluginAdapterDescriptorResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -678,6 +691,9 @@ class PluginAdapterDescriptorResponse(BaseModel):
     resource_schema: dict[str, JsonValue]
     capability_schema: dict[str, JsonValue]
     argument_schema: dict[str, JsonValue]
+    capability_contract: PluginAdapterCapabilityContractResponse = Field(
+        default_factory=PluginAdapterCapabilityContractResponse,
+    )
 
     @field_validator("resource_schema", "capability_schema", "argument_schema")
     @classmethod
@@ -695,6 +711,21 @@ class PluginAdapterDescriptorResponse(BaseModel):
         except PluginSchemaError as exc:
             raise ValueError(str(exc)) from None
         return value
+
+    @model_validator(mode="after")
+    def hydrate_capability_contract(self) -> PluginAdapterDescriptorResponse:
+        descriptor: Mapping[str, JsonValue] = {
+            "capability_schema": self.capability_schema,
+        }
+        self.capability_contract = PluginAdapterCapabilityContractResponse(
+            declared_sandbox_profiles=sorted(
+                adapter_declared_sandbox_profiles(descriptor),
+            ),
+            runtime_sandbox_profiles=list(
+                adapter_runtime_sandbox_profiles(descriptor),
+            ),
+        )
+        return self
 
 
 class McpServerResponse(BaseModel):
@@ -3214,66 +3245,7 @@ def _plugin_adapter_descriptors(request: Request) -> tuple[PluginAdapterDescript
 
 
 def _default_http_json_adapter_descriptor() -> PluginAdapterDescriptorResponse:
-    return PluginAdapterDescriptorResponse(
-        id="http_json",
-        name="HTTP JSON",
-        description="POSTs plugin invocations to an allowlisted HTTP endpoint.",
-        resource_schema={
-            "type": "object",
-            "required": ("endpoint_url", "domain_allowlist"),
-            "properties": {
-                "endpoint_url": {
-                    "type": "string",
-                    "format": "uri",
-                },
-                "domain_allowlist": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-                "timeout_seconds": {
-                    "type": "number",
-                    "minimum": 0,
-                    "maximum": 120,
-                    "default": 10,
-                },
-                "credential_ref": {
-                    "type": "string",
-                },
-                "credential_header": {
-                    "type": "string",
-                    "default": "X-Plugin-Credential",
-                },
-                "credential_scheme": {
-                    "type": "string",
-                    "default": "Bearer",
-                },
-            },
-            "additionalProperties": False,
-        },
-        capability_schema={
-            "type": "object",
-            "required": ("id",),
-            "properties": {
-                "id": {"type": "string"},
-                "permission_class": {"type": "string", "default": "plugin.use"},
-                "sandbox_profile": {"type": "string", "default": "remote_connector"},
-                "policy_effect": {
-                    "type": "string",
-                    "enum": ("inherit", "allow", "require_approval", "deny"),
-                    "default": "inherit",
-                },
-                "replay_safe": {"type": "boolean", "default": False},
-                "aliases": {"type": "array", "items": {"type": "string"}},
-                "input_schema": {"type": "object"},
-                "output_schema": {"type": "object"},
-            },
-            "additionalProperties": False,
-        },
-        argument_schema={
-            "type": "object",
-            "additionalProperties": True,
-        },
-    )
+    return PluginAdapterDescriptorResponse.model_validate(http_json_adapter_descriptor())
 
 
 _PLUGIN_BUILTIN_RESOURCE_FIELDS = frozenset(

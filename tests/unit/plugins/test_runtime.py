@@ -16,6 +16,10 @@ from agent_hub.auth.models import Role
 from agent_hub.capabilities.policy import CapabilityRule
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.capabilities.types import PolicyEffect
+from agent_hub.plugins.contracts import (
+    adapter_descriptor_with_contract,
+    http_json_adapter_descriptor,
+)
 from agent_hub.plugins.runtime import (
     HttpJsonPluginAdapter,
     PluginInvocationContext,
@@ -343,6 +347,7 @@ def test_http_json_plugin_adapter_exposes_safe_descriptor() -> None:
     descriptor = HttpJsonPluginAdapter().descriptor()
 
     assert descriptor["id"] == "http_json"
+    assert descriptor == adapter_descriptor_with_contract(http_json_adapter_descriptor())
     assert "Authorization" not in repr(descriptor)
     resource_schema = cast(Mapping[str, object], descriptor["resource_schema"])
     assert resource_schema["required"] == ("endpoint_url", "domain_allowlist")
@@ -373,6 +378,11 @@ async def test_runtime_plugin_service_lists_registered_adapter_descriptors() -> 
     assert descriptors["plugin_runtime"]["resource_schema"] == {
         "type": "object",
         "additionalProperties": True,
+    }
+    assert descriptors["plugin_runtime"]["capability_contract"] == {
+        "schema_version": 1,
+        "declared_sandbox_profiles": (),
+        "runtime_sandbox_profiles": ("remote_connector",),
     }
 
 

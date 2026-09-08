@@ -16,6 +16,13 @@ from agent_hub.capabilities.policy import CapabilityRule
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.capabilities.tools.registry import PluginConfigCapabilityManifestSource
 from agent_hub.capabilities.types import PolicyEffect
+from agent_hub.plugins.contracts import (
+    ADAPTER_DECLARABLE_PLUGIN_SANDBOX_PROFILES,
+    SUPPORTED_PLUGIN_SANDBOX_PROFILES,
+    adapter_declared_sandbox_profiles,
+    adapter_descriptor_with_contract,
+    http_json_adapter_descriptor,
+)
 from agent_hub.plugins.schemas import PluginSchemaError, plugin_schema_validator
 from agent_hub.runtime.contracts import JsonValue, _mutable_json
 
@@ -135,7 +142,7 @@ class HttpJsonPluginAdapter:
         return {plugin.credential_header: value}
 
     def descriptor(self) -> Mapping[str, JsonValue]:
-        return _http_json_adapter_descriptor()
+        return adapter_descriptor_with_contract(http_json_adapter_descriptor())
 
 
 class RuntimePluginService:
@@ -446,19 +453,17 @@ def _ensure_supported_plugin_sandbox_profile(
     *,
     descriptor: Mapping[str, JsonValue],
 ) -> None:
-    if sandbox_profile in _SUPPORTED_PLUGIN_SANDBOX_PROFILES:
+    if sandbox_profile in SUPPORTED_PLUGIN_SANDBOX_PROFILES:
         return
     declared_profiles = (
-        _adapter_declared_sandbox_profiles(descriptor)
-        & _ADAPTER_DECLARABLE_PLUGIN_SANDBOX_PROFILES
+        adapter_declared_sandbox_profiles(descriptor)
+        & ADAPTER_DECLARABLE_PLUGIN_SANDBOX_PROFILES
     )
     if sandbox_profile in declared_profiles:
         return
     raise RuntimeCapabilityError("Plugin sandbox profile unsupported")
 
 
-_SUPPORTED_PLUGIN_SANDBOX_PROFILES = frozenset(("remote_connector",))
-_ADAPTER_DECLARABLE_PLUGIN_SANDBOX_PROFILES = frozenset(("http_read", "in_process"))
 _PLUGIN_POLICY_ROLES = (Role.SUPER_ADMIN, Role.ADMIN, Role.OPERATOR)
 
 
@@ -478,8 +483,8 @@ def _adapter_descriptor(adapter_id: str, adapter: PluginAdapter) -> Mapping[str,
         except Exception:  # noqa: BLE001 - descriptor metadata must fail closed.
             payload = None
         if isinstance(payload, Mapping):
-            return cast(Mapping[str, JsonValue], payload)
-    return {
+            return adapter_descriptor_with_contract(cast(Mapping[str, JsonValue], payload))
+    return adapter_descriptor_with_contract({
         "id": adapter_id,
         "name": adapter_id,
         "description": None,
@@ -495,7 +500,7 @@ def _adapter_descriptor(adapter_id: str, adapter: PluginAdapter) -> Mapping[str,
             "type": "object",
             "additionalProperties": True,
         },
-    }
+    })
 
 
 def _adapter_argument_schema(
@@ -505,87 +510,6 @@ def _adapter_argument_schema(
     if isinstance(argument_schema, Mapping):
         return argument_schema
     return None
-
-
-def _adapter_declared_sandbox_profiles(
-    descriptor: Mapping[str, JsonValue],
-) -> frozenset[str]:
-    capability_schema = descriptor.get("capability_schema")
-    if not isinstance(capability_schema, Mapping):
-        return frozenset()
-    properties = capability_schema.get("properties")
-    if not isinstance(properties, Mapping):
-        return frozenset()
-    sandbox_schema = properties.get("sandbox_profile")
-    if not isinstance(sandbox_schema, Mapping):
-        return frozenset()
-    enum_values = sandbox_schema.get("enum")
-    if not isinstance(enum_values, Sequence) or isinstance(enum_values, str | bytes):
-        return frozenset()
-    return frozenset(value for value in enum_values if isinstance(value, str) and value)
-
-
-def _http_json_adapter_descriptor() -> Mapping[str, JsonValue]:
-    return {
-        "id": "http_json",
-        "name": "HTTP JSON",
-        "description": "POSTs plugin invocations to an allowlisted HTTP endpoint.",
-        "resource_schema": {
-            "type": "object",
-            "required": ("endpoint_url", "domain_allowlist"),
-            "properties": {
-                "endpoint_url": {
-                    "type": "string",
-                    "format": "uri",
-                },
-                "domain_allowlist": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-                "timeout_seconds": {
-                    "type": "number",
-                    "minimum": 0,
-                    "maximum": 120,
-                    "default": 10,
-                },
-                "credential_ref": {
-                    "type": "string",
-                },
-                "credential_header": {
-                    "type": "string",
-                    "default": "X-Plugin-Credential",
-                },
-                "credential_scheme": {
-                    "type": "string",
-                    "default": "Bearer",
-                },
-            },
-            "additionalProperties": False,
-        },
-        "capability_schema": {
-            "type": "object",
-            "required": ("id",),
-            "properties": {
-                "id": {"type": "string"},
-                "permission_class": {"type": "string", "default": "plugin.use"},
-                "sandbox_profile": {"type": "string", "default": "remote_connector"},
-                "policy_effect": {
-                    "type": "string",
-                    "enum": ("inherit", "allow", "require_approval", "deny"),
-                    "default": "inherit",
-                },
-                "replay_safe": {"type": "boolean", "default": False},
-                "aliases": {"type": "array", "items": {"type": "string"}},
-                "input_schema": {"type": "object"},
-                "output_schema": {"type": "object"},
-            },
-            "additionalProperties": False,
-        },
-        "argument_schema": {
-            "type": "object",
-            "additionalProperties": True,
-        },
-    }
 
 
 def _plugin_endpoint_url(plugin: PluginResourceResponse) -> str:
