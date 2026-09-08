@@ -242,13 +242,47 @@ test("operator inspects run detail and cancels safely", async ({ page }) => {
 
 async function mockCodingRunApi(
   page: Page,
-  options: { liveRefresh?: boolean; fullOutputSentinel?: string } = {},
+  options: { liveRefresh?: boolean; fullOutputSentinel?: string; largeWorkbench?: boolean } = {},
 ) {
   const finalArtifactId = "55555555-5555-4555-8555-555555555555";
   const intermediateArtifactId = "66666666-6666-4666-8666-666666666666";
   const finalDownloadPath = `/api/v1/runs/${codingRunId}/artifacts/${finalArtifactId}/download`;
   const intermediateDownloadPath = `/api/v1/runs/${codingRunId}/artifacts/${intermediateArtifactId}/download`;
   let detailRequests = 0;
+  const plannedRoles = options.largeWorkbench
+    ? [
+        {
+          id: "engineer",
+          name: "陆微",
+          role: "工程师",
+          logical_model: "vibe-engineer",
+          tools: ["terminal.run", "file.write"],
+        },
+        { id: "planner", name: "规划助手", role: "规划助手", logical_model: "deepseek-chat", tools: [] },
+        { id: "reviewer", name: "审查助手", role: "审查助手", logical_model: "qwen-max", tools: [] },
+        { id: "researcher", name: "资料助手", role: "资料助手", logical_model: "kimi-k2", tools: [] },
+        { id: "designer", name: "视觉助手", role: "视觉助手", logical_model: "minimax-m3", tools: [] },
+        { id: "operator", name: "运营助手", role: "运营助手", logical_model: "gpt-5.6", tools: [] },
+        { id: "publisher", name: "发布助手", role: "发布助手", logical_model: "qwen-plus", tools: [] },
+      ]
+    : [
+        {
+          id: "engineer",
+          name: "陆微",
+          role: "工程师",
+          logical_model: "vibe-engineer",
+          tools: ["terminal.run", "file.write"],
+        },
+      ];
+  const plannedSteps = [
+    {
+      id: "create_project",
+      title: "创建项目",
+      agent: "engineer",
+      summary: "创建 hello world 项目",
+      depends_on: [],
+    },
+  ];
   const runDetail = {
     id: codingRunId,
     status: "completed",
@@ -269,24 +303,8 @@ async function mockCodingRunApi(
         actor: "main_agent",
         step_id: "main_agent_plan",
         payload: {
-          roles: [
-            {
-              id: "engineer",
-              name: "陆微",
-              role: "工程师",
-              logical_model: "vibe-engineer",
-              tools: ["terminal.run", "file.write"],
-            },
-          ],
-          steps: [
-            {
-              id: "create_project",
-              title: "创建项目",
-              agent: "engineer",
-              summary: "创建 hello world 项目",
-              depends_on: [],
-            },
-          ],
+          roles: plannedRoles,
+          steps: plannedSteps,
         },
       },
       {
@@ -424,7 +442,14 @@ async function mockCodingRunApi(
     }
     if (path === "/api/v1/admin/agents") {
       await route.fulfill({
-        json: [{ id: "engineer", name: "陆微", enabled: true, role: "工程师", model: "vibe-engineer", skills: [] }],
+        json: plannedRoles.map((role) => ({
+          id: role.id,
+          name: role.name,
+          enabled: true,
+          role: role.role,
+          model: role.logical_model,
+          skills: [],
+        })),
       });
       return;
     }
@@ -597,14 +622,14 @@ test("operator validates a simple coding run and downloads final and intermediat
 });
 
 test("agent workbench keeps subagent scheduling compact on mobile", async ({ page }) => {
-  await mockCodingRunApi(page);
+  await mockCodingRunApi(page, { largeWorkbench: true });
   await page.setViewportSize({ width: 390, height: 844 });
 
   await page.goto("/");
   await page.getByLabel("发送消息").getByPlaceholder(/输入消息，继续当前对话/).fill("生成一个最简单的 hello world 项目。");
   await page.getByRole("button", { name: "发送" }).click();
 
-  const workbench = page.getByRole("button", { name: /Agent 工作席 1 个 Agent/ });
+  const workbench = page.getByRole("button", { name: /Agent 工作席 7 个 Agent/ });
   await expect(workbench).toBeVisible();
   await expect(page.getByRole("region", { name: "Agent 工作席详情" })).toHaveCount(0);
   await expect(page.getByText("工程师开始创建最小项目。")).toHaveCount(0);
@@ -612,6 +637,7 @@ test("agent workbench keeps subagent scheduling compact on mobile", async ({ pag
   expect(collapsedBox).not.toBeNull();
   expect(collapsedBox!.x).toBeGreaterThanOrEqual(0);
   expect(collapsedBox!.x + collapsedBox!.width).toBeLessThanOrEqual(390);
+  expect(collapsedBox!.height).toBeLessThanOrEqual(48);
 
   await workbench.click();
   const detail = page.getByRole("region", { name: "Agent 工作席详情" });

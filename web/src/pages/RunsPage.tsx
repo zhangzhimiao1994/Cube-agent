@@ -954,6 +954,10 @@ function agentWorkbenchStatusCounts(cards: AgentDispatchCard[]) {
   });
 }
 
+function agentWorkbenchMeta(cards: AgentDispatchCard[]) {
+  return [`${cards.length} 个 Agent`, ...agentWorkbenchStatusCounts(cards)].join(" · ");
+}
+
 function agentActivityItems(card: AgentDispatchCard, items: ProcessDetailTarget[]) {
   return items
     .filter((item) => item.sourceActor === card.id || item.rows.some((row) => row.value.includes(card.name) || row.value.includes(card.id)))
@@ -2860,7 +2864,7 @@ function RunProcessSummary({
   const [isWorkbenchOpen, setIsWorkbenchOpen] = useState(false);
   const items = runProcessItems(detail, agentNames, mainAgentModelName);
   const dispatchCards = dispatchAgentCards(detail, agentNames);
-  const workbenchStatusCounts = agentWorkbenchStatusCounts(dispatchCards);
+  const workbenchMeta = agentWorkbenchMeta(dispatchCards);
   const taskChain = plannedTaskChain(detail, agentNames);
   const failureDiagnostics = failureDiagnosticsForRun(detail, agentNames);
   const executionIntents = executionIntentsForRun(detail, agentNames);
@@ -2891,10 +2895,7 @@ function RunProcessSummary({
           >
             <span aria-hidden="true">⌘</span>
             <strong>Agent 工作席</strong>
-            <small>{dispatchCards.length} 个 Agent</small>
-            {workbenchStatusCounts.map((status) => (
-              <em key={status}>{status}</em>
-            ))}
+            <small className="agent-workbench-meta">{workbenchMeta}</small>
           </button>
           {isWorkbenchOpen ? (
             <div className="agent-workbench-detail" role="region" aria-label="Agent 工作席详情">

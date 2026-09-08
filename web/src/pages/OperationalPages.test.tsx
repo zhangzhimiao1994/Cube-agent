@@ -3354,8 +3354,7 @@ describe("operational management pages", () => {
     const stream = screen.getByRole("region", { name: "主对话内容" });
     const workbenchCard = within(stream).getByRole("button", { name: /Agent 工作席 2 个 Agent/ });
     expect(workbenchCard).not.toBeNull();
-    expect(within(workbenchCard).getByText("1 已完成")).not.toBeNull();
-    expect(within(workbenchCard).getByText("1 工作中")).not.toBeNull();
+    expect(within(workbenchCard).getByText("2 个 Agent · 1 工作中 · 1 已完成")).not.toBeNull();
     expect(within(stream).queryByRole("region", { name: "Agent 工作席详情" })).toBeNull();
     expect(within(stream).queryByText("负责输出可拍摄脚本文案。")).toBeNull();
 
@@ -3435,8 +3434,7 @@ describe("operational management pages", () => {
 
     const stream = screen.getByRole("region", { name: "主对话内容" });
     const workbenchCard = within(stream).getByRole("button", { name: /Agent 工作席 3 个 Agent/ });
-    expect(within(workbenchCard).getByText("1 异常")).not.toBeNull();
-    expect(within(workbenchCard).getByText("1 工作中")).not.toBeNull();
+    expect(within(workbenchCard).getByText("3 个 Agent · 1 异常 · 1 工作中 · 1 已安排")).not.toBeNull();
     await user.click(workbenchCard);
 
     const panel = within(stream).getByRole("region", { name: "Agent 工作席详情" });
