@@ -3709,6 +3709,16 @@ def _plugin_response_from_request(
             health="disabled",
             last_error_type=None,
         )
+    if _plugin_package_activation_blocked(package_metadata):
+        return PluginResourceResponse(
+            **payload,
+            source_filename=source_filename,
+            content_sha256=content_sha256,
+            package_metadata=package_metadata,
+            status="stopped",
+            health="stopped",
+            last_error_type=None,
+        )
     if current is not None and current.status == "running":
         return PluginResourceResponse(
             **payload,
@@ -3881,12 +3891,14 @@ def _sorted_csv(values: Iterable[str]) -> str:
 def _plugin_started_response(plugin: PluginResourceResponse) -> PluginResourceResponse:
     if not plugin.enabled:
         raise PublicAPIError(409, "plugin_disabled", "plugin is disabled")
+    _ensure_plugin_package_activation_allowed(plugin)
     return plugin.model_copy(
         update={"status": "running", "health": "healthy", "last_error_type": None}
     )
 
 
 def _plugin_enabled_response(plugin: PluginResourceResponse) -> PluginResourceResponse:
+    _ensure_plugin_package_activation_allowed(plugin)
     return plugin.model_copy(
         update={
             "enabled": True,
@@ -3913,6 +3925,25 @@ def _plugin_stopped_response(plugin: PluginResourceResponse) -> PluginResourceRe
         return plugin.model_copy(update={"status": "disabled", "health": "disabled"})
     return plugin.model_copy(
         update={"status": "stopped", "health": "stopped", "last_error_type": None}
+    )
+
+
+def _ensure_plugin_package_activation_allowed(plugin: PluginResourceResponse) -> None:
+    if _plugin_package_activation_blocked(plugin.package_metadata):
+        raise PublicAPIError(
+            409,
+            "plugin_package_not_eligible",
+            plugin.package_metadata.activation_reason
+            if plugin.package_metadata is not None
+            else "plugin package is not eligible for activation",
+        )
+
+
+def _plugin_package_activation_blocked(package: PluginPackageMetadata | None) -> bool:
+    return (
+        package is not None
+        and package.kind == "adapter_package"
+        and package.activation_state != "eligible"
     )
 
 
@@ -11666,7 +11697,7 @@ async def start_plugin(
 @router.post(
     "/plugins/{plugin_id}/enable",
     response_model=PluginResourceResponse,
-    responses=error_responses(401, 403, 404, 422),
+    responses=error_responses(401, 403, 404, 409, 422),
 )
 async def enable_plugin(
     plugin_id: str,

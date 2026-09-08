@@ -4566,6 +4566,82 @@ def test_plugin_listing_downgrades_verified_package_after_signing_key_expiry() -
     assert metadata["activation_reason"] == "package signature key is not trusted for this tenant"
 
 
+def test_scan_only_adapter_package_lifecycle_fails_closed() -> None:
+    api = client()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(private_key),
+    )
+    assert install.status_code == 200
+    assert install.json()["plugin"]["package_metadata"]["activation_state"] == "verified_scan_only"
+
+    started = api.post("/api/v1/admin/plugins/calendar/start", headers=headers())
+    reloaded = api.post("/api/v1/admin/plugins/calendar/reload", headers=headers())
+    disabled = api.post("/api/v1/admin/plugins/calendar/disable", headers=headers())
+    enabled = api.post("/api/v1/admin/plugins/calendar/enable", headers=headers())
+
+    assert started.status_code == 409
+    assert started.json()["error"]["code"] == "plugin_package_not_eligible"
+    assert reloaded.status_code == 409
+    assert reloaded.json()["error"]["code"] == "plugin_package_not_eligible"
+    assert disabled.status_code == 200
+    assert disabled.json()["status"] == "disabled"
+    assert enabled.status_code == 409
+    assert enabled.json()["error"]["code"] == "plugin_package_not_eligible"
+
+
+def test_scan_only_adapter_package_install_does_not_inherit_running_status() -> None:
+    api = client()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={"id": "calendar", "name": "Calendar HTTP"},
+    )
+    started = api.post("/api/v1/admin/plugins/calendar/start", headers=headers())
+
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(private_key),
+    )
+
+    assert created.status_code == 200
+    assert started.status_code == 200
+    assert install.status_code == 200
+    assert install.json()["plugin"]["package_metadata"]["activation_state"] == "verified_scan_only"
+    assert install.json()["plugin"]["status"] == "stopped"
+    assert install.json()["plugin"]["health"] == "stopped"
+
+
 def test_plugin_listing_downgrades_verified_package_after_signing_key_rotation() -> None:
     api = client()
     private_key = ed25519.Ed25519PrivateKey.generate()
