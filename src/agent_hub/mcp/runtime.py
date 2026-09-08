@@ -53,24 +53,23 @@ class RuntimeMcpService:
         self._admin_service = admin_service
         self._run_repository = run_repository
         self._client_factory = client_factory
-        self._service: McpService | None = None
+        self._services_by_tenant: dict[UUID, McpService | None] = {}
 
     async def start(self) -> None:
         await self.reload(self._tenant_id)
 
     async def reload(self, tenant_id: UUID | None = None) -> None:
-        if tenant_id is not None and tenant_id != self._tenant_id:
-            return
+        target_tenant_id = self._tenant_id if tenant_id is None else tenant_id
         try:
             configured_servers = await self._admin_service.list_mcp_servers(
-                tenant_id=self._tenant_id,
+                tenant_id=target_tenant_id,
             )
         except Exception:  # noqa: BLE001 - live MCP planning context is optional.
-            self._service = None
+            self._services_by_tenant[target_tenant_id] = None
             return
-        definitions = _server_definitions(self._tenant_id, configured_servers)
+        definitions = _server_definitions(target_tenant_id, configured_servers)
         if not definitions:
-            self._service = None
+            self._services_by_tenant[target_tenant_id] = None
             return
         clients = {
             server.id: (self._client_factory or _default_client_for_server)(server)
@@ -92,17 +91,22 @@ class RuntimeMcpService:
         try:
             await service.start()
         except Exception:  # noqa: BLE001 - a broken MCP server must not break startup.
-            self._service = None
+            self._services_by_tenant[target_tenant_id] = None
             return
-        self._service = service
+        self._services_by_tenant[target_tenant_id] = service
+
+    async def ensure_tenant_loaded(self, tenant_id: UUID) -> None:
+        if tenant_id not in self._services_by_tenant:
+            await self.reload(tenant_id)
 
     def capability_manifest_source(self) -> RuntimeMcpService:
         return self
 
     def manifests_for_tenant(self, tenant_id: UUID) -> Mapping[str, JsonValue]:
-        if self._service is None:
+        service = self._services_by_tenant.get(tenant_id)
+        if service is None:
             return _empty_manifest()
-        return self._service.capability_manifest_source().manifests_for_tenant(tenant_id)
+        return service.capability_manifest_source().manifests_for_tenant(tenant_id)
 
     def is_available(self, tenant_id: UUID, name: str) -> bool:
         manifest = self.manifests_for_tenant(tenant_id)
@@ -127,10 +131,12 @@ class RuntimeMcpService:
         arguments: Mapping[str, JsonValue],
         idempotency_key: str,
     ) -> Mapping[str, JsonValue]:
-        if self._service is None:
+        await self.ensure_tenant_loaded(tenant_id)
+        service = self._services_by_tenant.get(tenant_id)
+        if service is None:
             raise RuntimeCapabilityError("MCP tool unavailable")
         try:
-            result = await self._service.invoke_projected_tool(
+            result = await service.invoke_projected_tool(
                 name,
                 arguments,
                 context=McpInvocationContext(

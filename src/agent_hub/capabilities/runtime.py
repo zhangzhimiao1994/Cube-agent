@@ -130,6 +130,12 @@ class RuntimeCapabilityGateway:
         normalized_name = _normalize_tool_name(name)
         if normalized_name in _REPLAY_SAFE:
             return True
+        if self._tool_registry is not None and _manifest_available(
+            self._tool_registry,
+            tenant_id,
+            normalized_name,
+        ):
+            return True
         if _SAFE_CAPABILITY_NAME.fullmatch(normalized_name) is None:
             return False
         return self._skill_package_path(tenant_id, normalized_name).is_file()
@@ -560,6 +566,28 @@ def _manifest_replay_safe(
         if not item_names or any(item_name in ambiguous_names for item_name in item_names):
             continue
         if _RESERVED_REPLAY_SAFE_NAMES.intersection(item_names):
+            continue
+        item_id = item.get("id")
+        aliases = _tuple_strings(item.get("aliases"))
+        if item_id == name or name in aliases:
+            return True
+    return False
+
+
+def _manifest_available(
+    source: CapabilityManifestProvider,
+    tenant_id: UUID,
+    name: str,
+) -> bool:
+    if not _is_safe_manifest_name(name):
+        return False
+    items = _manifest_source_items(source, tenant_id)
+    ambiguous_names = _ambiguous_manifest_names(items)
+    for item in items:
+        if item.get("available") is not True:
+            continue
+        item_names = _manifest_item_names(item)
+        if not item_names or any(item_name in ambiguous_names for item_name in item_names):
             continue
         item_id = item.get("id")
         aliases = _tuple_strings(item.get("aliases"))

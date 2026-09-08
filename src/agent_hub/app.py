@@ -347,6 +347,20 @@ async def _tool_approval_mode_from_settings(
     return mode if mode in {"ask", "auto_review"} else "ask"
 
 
+def _admin_settings_getter_for_tenant(
+    service: admin.AdminResourceService,
+    tenant_id: UUID,
+) -> Callable[[], Awaitable[admin.SystemSettingsResponse]]:
+    scope_for_principal = getattr(service, "for_principal", None)
+    if callable(scope_for_principal):
+        scoped = cast(
+            admin.AdminResourceService,
+            scope_for_principal(tenant_id, tenant_id),
+        )
+        return scoped.get_settings
+    return service.get_settings
+
+
 class _ConfigBackedMultimediaGenerationExecutor:
     """Build a generation gateway from the current registered model resources."""
 
@@ -867,11 +881,17 @@ def create_app(
                         workspace_root=configured.attachment_store_dir,
                         generated_artifact_dir=configured.generated_artifact_dir,
                         project_workspace_dir=configured.project_workspace_dir,
-                        require_approval_for_tools=lambda _tenant_id: _require_tool_approval_from_settings(
-                            admin_service_for_capabilities.get_settings
+                        require_approval_for_tools=lambda tenant_id: _require_tool_approval_from_settings(
+                            _admin_settings_getter_for_tenant(
+                                admin_service_for_capabilities,
+                                tenant_id,
+                            )
                         ),
-                        tool_approval_mode=lambda _tenant_id: _tool_approval_mode_from_settings(
-                            admin_service_for_capabilities.get_settings
+                        tool_approval_mode=lambda tenant_id: _tool_approval_mode_from_settings(
+                            _admin_settings_getter_for_tenant(
+                                admin_service_for_capabilities,
+                                tenant_id,
+                            )
                         ),
                         tool_registry=CompositeCapabilityManifestSource(
                             (

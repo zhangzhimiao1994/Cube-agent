@@ -4,7 +4,7 @@ import threading
 from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Self, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -17,6 +17,7 @@ from agent_hub.api.routers.admin import (
     MainAgentConfigResponse,
     MainAgentModelConfig,
     ModelDeploymentResponse,
+    SystemSettingsResponse,
 )
 from agent_hub.app import (
     _ConfigBackedMultimediaGenerationExecutor,
@@ -47,6 +48,7 @@ from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.settings import Settings
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
+OTHER_TENANT_ID = UUID("00000000-0000-4000-8000-000000000002")
 
 
 class StubAuthService:
@@ -557,6 +559,93 @@ def test_create_app_wires_runtime_mcp_and_plugin_manifest_sources(
     assert getattr(application.state, "plugin_service", None) is not None
     assert callable(getattr(application.state, "reload_mcp_runtime_config", None))
     assert callable(getattr(application.state, "reload_plugin_runtime_config", None))
+
+
+def test_create_app_reads_tool_approval_settings_for_target_tenant(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class TenantScopedSettingsService(InMemoryAdminResourceService):
+        def __init__(self, tenant_id: UUID) -> None:
+            super().__init__()
+            self.tenant_id = tenant_id
+            self.scope_calls: list[tuple[UUID, UUID]] = []
+
+        def for_principal(
+            self, tenant_id: UUID, actor_id: UUID
+        ) -> "TenantScopedSettingsService":
+            self.scope_calls.append((tenant_id, actor_id))
+            return TenantScopedSettingsService(tenant_id)
+
+        async def get_settings(self) -> SystemSettingsResponse:
+            return SystemSettingsResponse(
+                require_approval_for_tools=self.tenant_id == OTHER_TENANT_ID,
+                tool_approval_mode="auto_review"
+                if self.tenant_id == OTHER_TENANT_ID
+                else "ask",
+            )
+
+    class FakeRuntimeService:
+        async def reload(self, tenant_id: UUID | None = None) -> None:
+            del tenant_id
+
+        def capability_manifest_source(self) -> object:
+            return object()
+
+    class FakeRuntimeStack:
+        runtime_gateway = object()
+        harness_tool_gateway = object()
+
+    async def fake_build_runtime_mcp_service(**kwargs: object) -> FakeRuntimeService:
+        return FakeRuntimeService()
+
+    async def fake_build_runtime_plugin_service(**kwargs: object) -> FakeRuntimeService:
+        return FakeRuntimeService()
+
+    def fake_build_runtime_capability_stack(**kwargs: object) -> FakeRuntimeStack:
+        captured["runtime_stack_kwargs"] = kwargs
+        return FakeRuntimeStack()
+
+    monkeypatch.setattr(app_module, "build_runtime_mcp_service", fake_build_runtime_mcp_service)
+    monkeypatch.setattr(
+        app_module,
+        "build_runtime_plugin_service",
+        fake_build_runtime_plugin_service,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "build_runtime_capability_stack",
+        fake_build_runtime_capability_stack,
+    )
+    monkeypatch.setattr(app_module, "configured_runtime_registry", lambda **kwargs: object())
+
+    admin_service = TenantScopedSettingsService(TENANT_ID)
+    application = create_app(
+        settings=valid_settings(tmp_path),
+        database=FakeDatabase(),
+        redis_client=FakeRedis(),
+        auth_service=StubAuthService(),
+        rate_limiter=StubRateLimiter(),
+        config_service=StubConfigService(),
+        admin_resource_service=admin_service,
+        user_admin_service=object(),
+    )
+
+    with TestClient(application):
+        pass
+
+    runtime_kwargs = cast(dict[str, object], captured["runtime_stack_kwargs"])
+    require_approval = cast(Any, runtime_kwargs["require_approval_for_tools"])
+    approval_mode = cast(Any, runtime_kwargs["tool_approval_mode"])
+
+    assert asyncio.run(require_approval(OTHER_TENANT_ID)) is True
+    assert asyncio.run(approval_mode(OTHER_TENANT_ID)) == "auto_review"
+    assert admin_service.scope_calls == [
+        (OTHER_TENANT_ID, OTHER_TENANT_ID),
+        (OTHER_TENANT_ID, OTHER_TENANT_ID),
+    ]
 
 
 def test_feishu_media_factory_uses_memory_store_in_development(tmp_path: Path) -> None:

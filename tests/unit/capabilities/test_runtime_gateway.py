@@ -1175,6 +1175,36 @@ def test_runtime_gateway_capability_manifest_uses_tenant_aware_sources(
     assert capabilities["mcp.live_search"]["adapter"] == "mcp_server"
 
 
+def test_runtime_gateway_availability_uses_registry_manifest_capabilities(
+    tmp_path: Path,
+) -> None:
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        tenant_id=TENANT_ID,
+        tool_registry=FakeManifestSource(
+            {
+                "schema_version": 1,
+                "capabilities": (
+                    {
+                        "id": "calendar.create_event",
+                        "kind": "plugin",
+                        "adapter": "plugin_runtime",
+                        "permission_class": "calendar.write",
+                        "sandbox_profile": "remote_connector",
+                        "available": True,
+                        "availability_reason": None,
+                        "replay_safe": False,
+                        "aliases": ("calendar_create",),
+                    },
+                ),
+            }
+        ),
+    )
+
+    assert gateway.is_available(TENANT_ID, "calendar.create_event") is True
+    assert gateway.is_available(TENANT_ID, "calendar_create") is True
+
+
 def test_runtime_gateway_capability_manifest_keeps_runtime_items_authoritative(
     tmp_path: Path,
 ) -> None:

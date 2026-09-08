@@ -4563,8 +4563,26 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         self._run_repository = run_repository
         self._session_factory = session_factory
         self._skill_store_dir = skill_store_dir or Path("/var/lib/agent-hub/skills")
+        self._generated_artifact_dir = generated_artifact_dir
         self._generated_file_store = (
             None if generated_artifact_dir is None else GeneratedFileStore(generated_artifact_dir)
+        )
+
+    def for_principal(
+        self, tenant_id: UUID, actor_id: UUID
+    ) -> PersistentAdminResourceService:
+        if tenant_id == self._tenant_id and actor_id == self._actor_id:
+            return self
+        return PersistentAdminResourceService(
+            config_service=self._config_service,
+            secret_service=self._secret_service,
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            model_transport=self._model_transport,
+            run_repository=self._run_repository,
+            session_factory=self._session_factory,
+            skill_store_dir=self._skill_store_dir,
+            generated_artifact_dir=self._generated_artifact_dir,
         )
 
     async def list_runs(self) -> tuple[RunListItem, ...]:
@@ -6795,10 +6813,19 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         )
 
 
-def _service(request: Request) -> AdminResourceService:
+def _service(
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+) -> AdminResourceService:
     service = getattr(request.app.state, "admin_resource_service", None)
     if service is None:
         raise PublicAPIError(503, "service_unavailable", "service unavailable")
+    scope_for_principal = getattr(service, "for_principal", None)
+    if callable(scope_for_principal):
+        return cast(
+            AdminResourceService,
+            scope_for_principal(principal.tenant_id, principal.user_id),
+        )
     return cast(AdminResourceService, service)
 
 

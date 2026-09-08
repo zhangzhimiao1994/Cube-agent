@@ -7,7 +7,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 from uuid import UUID
 
 from redis.asyncio import Redis
@@ -70,6 +70,20 @@ async def _tool_approval_mode_from_settings(
         )
         return "ask"
     return mode if mode in {"ask", "auto_review"} else "ask"
+
+
+def _admin_settings_getter_for_tenant(
+    service: admin.AdminResourceService,
+    tenant_id: UUID,
+) -> Callable[[], Awaitable[admin.SystemSettingsResponse]]:
+    scope_for_principal = getattr(service, "for_principal", None)
+    if callable(scope_for_principal):
+        scoped = cast(
+            admin.AdminResourceService,
+            scope_for_principal(tenant_id, tenant_id),
+        )
+        return scoped.get_settings
+    return service.get_settings
 
 
 class LocalRunQueue:
@@ -221,11 +235,11 @@ def build_worker_service(
         workspace_root=settings.attachment_store_dir,
         generated_artifact_dir=settings.generated_artifact_dir,
         project_workspace_dir=settings.project_workspace_dir,
-        require_approval_for_tools=lambda _tenant_id: _require_tool_approval_from_settings(
-            admin_service.get_settings
+        require_approval_for_tools=lambda tenant_id: _require_tool_approval_from_settings(
+            _admin_settings_getter_for_tenant(admin_service, tenant_id)
         ),
-        tool_approval_mode=lambda _tenant_id: _tool_approval_mode_from_settings(
-            admin_service.get_settings
+        tool_approval_mode=lambda tenant_id: _tool_approval_mode_from_settings(
+            _admin_settings_getter_for_tenant(admin_service, tenant_id)
         ),
         tool_registry=CompositeCapabilityManifestSource(
             (

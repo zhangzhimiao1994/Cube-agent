@@ -23,6 +23,7 @@ from agent_hub.api.errors import PublicAPIError
 from agent_hub.api.routers import admin as admin_router
 from agent_hub.api.routers.admin import (
     AgentResourceRequest,
+    AgentResourceResponse,
     InMemoryAdminResourceService,
     MainAgentConfigRequest,
     MainAgentModelConfig,
@@ -2296,6 +2297,49 @@ def client() -> TestClient:
 
 def headers() -> dict[str, str]:
     return {"Authorization": "Bearer valid-token"}
+
+
+def test_admin_service_dependency_scopes_service_to_principal_tenant() -> None:
+    class OtherTenantAuthService:
+        def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
+            if token != "valid-token":
+                raise InvalidCredentials("bad token")
+            return AuthenticatedPrincipal(USER_ID, OTHER_TENANT_ID, Role.SUPER_ADMIN)
+
+    class ScopedAdminService(InMemoryAdminResourceService):
+        def __init__(self, tenant_id: UUID) -> None:
+            super().__init__()
+            self.tenant_id = tenant_id
+            self.scope_calls: list[tuple[UUID, UUID]] = []
+
+        def for_principal(
+            self, tenant_id: UUID, actor_id: UUID
+        ) -> "ScopedAdminService":
+            self.scope_calls.append((tenant_id, actor_id))
+            return ScopedAdminService(tenant_id)
+
+        async def list_agents(self) -> tuple[AgentResourceResponse, ...]:
+            return (
+                AgentResourceResponse(
+                    id=f"agent-{self.tenant_id}",
+                    name=f"Agent {self.tenant_id}",
+                    enabled=True,
+                    role="assistant",
+                    prompt="help",
+                    model="main",
+                    skills=[],
+                ),
+            )
+
+    api = create_app(auth_service=OtherTenantAuthService(), rate_limiter=object())
+    service = ScopedAdminService(TENANT_ID)
+    cast(Any, api).state.admin_resource_service = service
+
+    response = TestClient(api).get("/api/v1/admin/agents", headers=headers())
+
+    assert response.status_code == 200
+    assert service.scope_calls == [(OTHER_TENANT_ID, USER_ID)]
+    assert response.json()[0]["id"] == f"agent-{OTHER_TENANT_ID}"
 
 
 class FakeRuntimeCapabilityGateway:
@@ -6971,6 +7015,68 @@ async def test_persistent_admin_models_write_to_published_config() -> None:
         },
         "agents": [],
     }
+
+
+@pytest.mark.asyncio
+async def test_persistent_admin_service_for_principal_reads_principal_tenant_config() -> None:
+    class TenantAwareConfigService:
+        def __init__(self) -> None:
+            self.tenant_ids: list[UUID] = []
+
+        async def get_current(self, tenant_id: UUID) -> ConfigRevision | None:
+            self.tenant_ids.append(tenant_id)
+            return ConfigRevision(
+                id=uuid4(),
+                tenant_id=tenant_id,
+                version=1,
+                status=ConfigStatus.PUBLISHED,
+                document={
+                    "models": {
+                        "main": {
+                            "deployments": [
+                                {
+                                    "provider": "openai-compatible",
+                                    "model": "model",
+                                    "api_base": "https://example.test/v1",
+                                    "credential_ref": f"secret://{SECRET_ID}",
+                                    "quota_scope_id": "tenant-test",
+                                    "max_concurrency": 1,
+                                    "target_utilization": 0.8,
+                                    "reserved_slots": 0,
+                                    "rpm": 60,
+                                    "tpm": 100000,
+                                    "capabilities": ["text"],
+                                }
+                            ]
+                        }
+                    },
+                    "agents": [
+                        {
+                            "id": f"agent-{tenant_id}",
+                            "role": "assistant",
+                            "prompt": "help",
+                            "model": "main",
+                            "skills": [],
+                        }
+                    ],
+                },
+                created_by=USER_ID,
+                created_at=datetime.now(UTC),
+            )
+
+    configs = TenantAwareConfigService()
+    service = PersistentAdminResourceService(
+        config_service=configs,  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+    )
+
+    scoped = service.for_principal(OTHER_TENANT_ID, USER_ID)
+    agents = await scoped.list_agents()
+
+    assert configs.tenant_ids == [OTHER_TENANT_ID]
+    assert agents[0].id == f"agent-{OTHER_TENANT_ID}"
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 from uuid import UUID
 
 from agent_hub.mcp.client import InMemoryMcpClient
@@ -8,6 +9,7 @@ from agent_hub.mcp.runtime import build_runtime_mcp_service
 from agent_hub.mcp.types import McpInvocationResult, McpToolSchema, McpTransportKind
 
 TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
+OTHER_TENANT_ID = UUID("22222222-2222-4222-8222-222222222222")
 
 
 class FakeAdminService:
@@ -19,6 +21,17 @@ class FakeAdminService:
         assert tenant_id is not None
         self.tenants.append(tenant_id)
         return self.servers
+
+
+class TenantMappedAdminService:
+    def __init__(self, servers_by_tenant: dict[UUID, tuple[object, ...]]) -> None:
+        self.servers_by_tenant = servers_by_tenant
+        self.tenants: list[UUID] = []
+
+    async def list_mcp_servers(self, *, tenant_id: UUID | None = None) -> tuple[object, ...]:
+        assert tenant_id is not None
+        self.tenants.append(tenant_id)
+        return self.servers_by_tenant.get(tenant_id, ())
 
 
 def server_config(
@@ -179,3 +192,43 @@ async def test_runtime_mcp_service_invokes_projected_tool_after_harness_policy()
 
     assert result == {"answer": "42"}
     assert client.invocations == [("web_search", {"query": "mofang"})]
+
+
+async def test_runtime_mcp_service_lazy_loads_invocation_tenant() -> None:
+    admin_service = TenantMappedAdminService(
+        {
+            TENANT_ID: (),
+            OTHER_TENANT_ID: (server_config("search", allowed_tools=["web_search"]),),
+        }
+    )
+    clients: dict[UUID, InMemoryMcpClient] = {}
+
+    def client_factory(server: Any) -> InMemoryMcpClient:
+        tenant_id = server.tenant_id
+        client = InMemoryMcpClient(
+            tools=(McpToolSchema(name="web_search"),),
+            responses={"web_search": McpInvocationResult(content={"answer": str(tenant_id)})},
+        )
+        clients[tenant_id] = client
+        return client
+
+    service = await build_runtime_mcp_service(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        run_repository=object(),
+        client_factory=client_factory,
+    )
+
+    result = await service.invoke(
+        tenant_id=OTHER_TENANT_ID,
+        user_id=OTHER_TENANT_ID,
+        run_id=OTHER_TENANT_ID,
+        actor="runtime_planning",
+        name="search.web_search",
+        arguments={"query": "tenant"},
+        idempotency_key="mcp_tenant",
+    )
+
+    assert result == {"answer": str(OTHER_TENANT_ID)}
+    assert admin_service.tenants == [TENANT_ID, OTHER_TENANT_ID]
+    assert clients[OTHER_TENANT_ID].invocations == [("web_search", {"query": "tenant"})]
