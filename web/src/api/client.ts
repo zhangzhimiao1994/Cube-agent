@@ -901,6 +901,49 @@ export type McpServer = z.infer<typeof McpServerSchema>;
 
 const JsonObjectSchema = z.record(z.string(), z.unknown());
 
+const PluginAdapterObjectJsonSchema = JsonObjectSchema.superRefine((schema, context) => {
+  if (schema.type !== undefined && schema.type !== "object") {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "plugin adapter descriptor schema must describe an object",
+      path: ["type"],
+    });
+  }
+  if (
+    schema.properties !== undefined &&
+    (!schema.properties || typeof schema.properties !== "object" || Array.isArray(schema.properties))
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "plugin adapter descriptor properties must be an object",
+      path: ["properties"],
+    });
+  }
+  if (
+    schema.required !== undefined &&
+    (!Array.isArray(schema.required) || schema.required.some((field) => typeof field !== "string"))
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "plugin adapter descriptor required fields must be strings",
+      path: ["required"],
+    });
+  }
+  if (
+    schema.additionalProperties !== undefined &&
+    typeof schema.additionalProperties !== "boolean" &&
+    (!schema.additionalProperties ||
+      typeof schema.additionalProperties !== "object" ||
+      Array.isArray(schema.additionalProperties))
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "plugin adapter descriptor additionalProperties must be a boolean or object",
+      path: ["additionalProperties"],
+    });
+  }
+});
+
 const PluginCapabilitySchema = z.object({
   id: z.string(),
   adapter: z.string().default("plugin_runtime"),
@@ -955,9 +998,9 @@ const PluginAdapterDescriptorSchema = z.object({
   id: z.string(),
   name: z.string(),
   description: z.string().nullable().default(null),
-  resource_schema: JsonObjectSchema,
-  capability_schema: JsonObjectSchema,
-  argument_schema: JsonObjectSchema,
+  resource_schema: PluginAdapterObjectJsonSchema,
+  capability_schema: PluginAdapterObjectJsonSchema,
+  argument_schema: PluginAdapterObjectJsonSchema,
 });
 
 export type PluginAdapterDescriptor = z.infer<typeof PluginAdapterDescriptorSchema>;

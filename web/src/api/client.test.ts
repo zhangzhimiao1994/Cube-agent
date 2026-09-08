@@ -476,4 +476,28 @@ describe("api client transport", () => {
     expect(fetchMock.mock.calls[0]?.[0]).toMatch(/^\/api\/v1\/admin\/plugins\/adapters\?_=/);
     expect(result).toEqual(descriptors);
   });
+
+  it("rejects plugin adapter descriptors with non-object resource schemas", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify([
+          {
+            id: "array_resource",
+            name: "Array Resource",
+            description: "Invalid descriptor.",
+            resource_schema: { type: "array" },
+            capability_schema: { type: "object", additionalProperties: true },
+            argument_schema: { type: "object", additionalProperties: true },
+          },
+        ]),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(api.pluginAdapters()).rejects.toThrow();
+  });
 });

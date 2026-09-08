@@ -7,9 +7,8 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
-from jsonschema import SchemaError, ValidationError  # type: ignore[import-untyped]
+from jsonschema import ValidationError  # type: ignore[import-untyped]
 from jsonschema.protocols import Validator  # type: ignore[import-untyped]
-from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 
 from agent_hub.api.routers.admin import PluginCapabilityRequest, PluginResourceResponse
 from agent_hub.auth.models import Role
@@ -17,6 +16,7 @@ from agent_hub.capabilities.policy import CapabilityRule
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.capabilities.tools.registry import PluginConfigCapabilityManifestSource
 from agent_hub.capabilities.types import PolicyEffect
+from agent_hub.plugins.schemas import PluginSchemaError, plugin_schema_validator
 from agent_hub.runtime.contracts import JsonValue, _mutable_json
 
 
@@ -539,23 +539,17 @@ def _plugin_schema_validator(
     schema: Mapping[str, JsonValue] | None,
     invalid_schema_message: str,
 ) -> Validator | None:
-    if schema is None:
-        return None
-    schema_payload = cast(Any, _mutable_json(cast(JsonValue, schema)))
-    if _schema_contains_reference(schema_payload):
-        raise RuntimeCapabilityError(invalid_schema_message)
-    failure: str | None = None
-    validator_class: type[Validator] | None = None
+    failure = False
     try:
-        validator_class = validator_for(schema_payload)
-        validator_class.check_schema(schema_payload)
-    except SchemaError:
-        failure = invalid_schema_message
-    if failure is not None:
-        raise RuntimeCapabilityError(failure)
-    if validator_class is None:
+        return plugin_schema_validator(
+            schema=schema,
+            invalid_schema_message=invalid_schema_message,
+        )
+    except PluginSchemaError:
+        failure = True
+    if failure:
         raise RuntimeCapabilityError(invalid_schema_message)
-    return validator_class(schema_payload)
+    return None
 
 
 def _validate_plugin_payload(
@@ -577,19 +571,6 @@ def _validate_plugin_payload(
         failure = f"{validation_message}{location}: {reason}"
     if failure is not None:
         raise RuntimeCapabilityError(failure)
-
-
-def _schema_contains_reference(value: object) -> bool:
-    if isinstance(value, Mapping):
-        if _SCHEMA_REFERENCE_KEYWORDS.intersection(value):
-            return True
-        return any(_schema_contains_reference(item) for item in value.values())
-    if isinstance(value, list):
-        return any(_schema_contains_reference(item) for item in value)
-    return False
-
-
-_SCHEMA_REFERENCE_KEYWORDS = frozenset(("$ref", "$dynamicRef", "$recursiveRef"))
 
 
 def _validation_error_location(error: ValidationError) -> str:

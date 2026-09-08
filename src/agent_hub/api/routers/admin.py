@@ -28,6 +28,7 @@ from pydantic import (
     Field,
     SecretStr,
     ValidationError,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -82,6 +83,7 @@ from agent_hub.openclaw.remote_adapter import (
     OpenClawRemoteAdapterError,
     run_remote_openclaw_operation,
 )
+from agent_hub.plugins.schemas import PluginSchemaError, plugin_schema_validator
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRecord, RunRepository
 from agent_hub.runtime.contracts import JsonValue
 from agent_hub.runtime.failure_reason import (
@@ -620,6 +622,23 @@ class PluginAdapterDescriptorResponse(BaseModel):
     resource_schema: dict[str, JsonValue]
     capability_schema: dict[str, JsonValue]
     argument_schema: dict[str, JsonValue]
+
+    @field_validator("resource_schema", "capability_schema", "argument_schema")
+    @classmethod
+    def validate_descriptor_schema(
+        cls,
+        value: dict[str, JsonValue],
+        info: ValidationInfo,
+    ) -> dict[str, JsonValue]:
+        try:
+            plugin_schema_validator(
+                schema=value,
+                invalid_schema_message=f"plugin adapter {info.field_name} is invalid",
+                require_object_schema=True,
+            )
+        except PluginSchemaError as exc:
+            raise ValueError(str(exc)) from None
+        return value
 
 
 class McpServerResponse(BaseModel):

@@ -3119,6 +3119,58 @@ def test_plugin_adapter_catalog_skips_invalid_provider_descriptors() -> None:
     assert "http_json" not in descriptors
 
 
+def test_plugin_adapter_catalog_skips_descriptors_with_invalid_schemas() -> None:
+    api = client()
+
+    class PluginServiceWithInvalidSchemaDescriptors:
+        def adapter_descriptors(self) -> tuple[dict[str, object], ...]:
+            return (
+                {
+                    "id": "workflow",
+                    "name": "Workflow",
+                    "description": "Runs workflows.",
+                    "resource_schema": {"type": "object", "additionalProperties": True},
+                    "capability_schema": {"type": "object", "additionalProperties": True},
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+                {
+                    "id": "bad-resource",
+                    "name": "Bad Resource",
+                    "description": "Has an invalid resource schema.",
+                    "resource_schema": {"type": "not-a-json-schema-type"},
+                    "capability_schema": {"type": "object", "additionalProperties": True},
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+                {
+                    "id": "array-resource",
+                    "name": "Array Resource",
+                    "description": "Has a non-object resource schema.",
+                    "resource_schema": {"type": "array"},
+                    "capability_schema": {"type": "object", "additionalProperties": True},
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+                {
+                    "id": "referenced-capability",
+                    "name": "Referenced Capability",
+                    "description": "Has an unsupported capability schema reference.",
+                    "resource_schema": {"type": "object", "additionalProperties": True},
+                    "capability_schema": {
+                        "type": "object",
+                        "properties": {"stage": {"$ref": "#/$defs/stage"}},
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    cast(Any, api.app).state.plugin_service = PluginServiceWithInvalidSchemaDescriptors()
+
+    response = api.get("/api/v1/admin/plugins/adapters", headers=headers())
+
+    assert response.status_code == 200
+    descriptors = {item["id"]: item for item in response.json()}
+    assert set(descriptors) == {"workflow"}
+
+
 def test_capability_manifest_endpoint_requires_plugin_and_mcp_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
