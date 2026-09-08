@@ -541,8 +541,10 @@ test("operator validates a simple coding run and downloads final and intermediat
 
   await expect(page.getByText("已生成一个最小 hello world 项目，并附上可下载压缩包。")).toBeVisible();
   await expect(page.getByRole("button", { name: /下载 hello-world\.zip/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Agent 工作席 1 个 Agent/ })).toBeVisible();
+  await page.getByRole("button", { name: /Agent 工作席 1 个 Agent/ }).click();
   await expect(page.getByText("hello-world-source.zip")).toHaveCount(1);
-  await expect(page.getByRole("region", { name: "助手派单状态" })).toContainText("陆微");
+  await expect(page.getByRole("region", { name: "Agent 工作席详情" })).toContainText("陆微");
   await expect(page.getByRole("region", { name: "Agent 集群动作" })).toContainText("生成中间项目文件。");
   await expect(page.getByRole("region", { name: "Agent 集群动作" })).not.toContainText("create_project");
 
@@ -594,6 +596,37 @@ test("operator validates a simple coding run and downloads final and intermediat
   await expect(page.getByRole("dialog", { name: "运行过程详情" })).toHaveCount(0);
 });
 
+test("agent workbench keeps subagent scheduling compact on mobile", async ({ page }) => {
+  await mockCodingRunApi(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+
+  await page.goto("/");
+  await page.getByLabel("发送消息").getByPlaceholder(/输入消息，继续当前对话/).fill("生成一个最简单的 hello world 项目。");
+  await page.getByRole("button", { name: "发送" }).click();
+
+  const workbench = page.getByRole("button", { name: /Agent 工作席 1 个 Agent/ });
+  await expect(workbench).toBeVisible();
+  await expect(page.getByRole("region", { name: "Agent 工作席详情" })).toHaveCount(0);
+  await expect(page.getByText("工程师开始创建最小项目。")).toHaveCount(0);
+  const collapsedBox = await workbench.boundingBox();
+  expect(collapsedBox).not.toBeNull();
+  expect(collapsedBox!.x).toBeGreaterThanOrEqual(0);
+  expect(collapsedBox!.x + collapsedBox!.width).toBeLessThanOrEqual(390);
+
+  await workbench.click();
+  const detail = page.getByRole("region", { name: "Agent 工作席详情" });
+  await expect(detail).toContainText("陆微");
+  await expect(detail).toContainText("工程师 · vibe-engineer");
+  await expect(detail).toContainText("工程师开始创建最小项目。");
+  const layout = await page.evaluate(() => ({
+    bodyScrollWidth: document.body.scrollWidth,
+    docScrollWidth: document.documentElement.scrollWidth,
+    innerWidth,
+  }));
+  expect(layout.bodyScrollWidth).toBeLessThanOrEqual(layout.innerWidth + 1);
+  expect(layout.docScrollWidth).toBeLessThanOrEqual(layout.innerWidth + 1);
+});
+
 test("opened agent process drawer refreshes when new step events arrive", async ({ page }) => {
   await mockCodingRunApi(page, { liveRefresh: true });
 
@@ -601,6 +634,7 @@ test("opened agent process drawer refreshes when new step events arrive", async 
   await page.getByLabel("发送消息").getByPlaceholder(/输入消息，继续当前对话/).fill("生成一个最简单的 hello world 项目。");
   await page.getByRole("button", { name: "发送" }).click();
 
+  await page.getByRole("button", { name: /Agent 工作席/ }).click();
   await page.getByRole("button", { name: /工程师开始创建最小项目。/ }).click();
   const drawer = page.getByRole("dialog", { name: "运行过程详情" });
   await expect(drawer).toBeVisible();
@@ -617,6 +651,7 @@ test("process drawer keeps long fields behind summary detail cards", async ({ pa
   await page.getByLabel("发送消息").getByPlaceholder(/输入消息，继续当前对话/).fill("生成一个最简单的 hello world 项目。");
   await page.getByRole("button", { name: "发送" }).click();
 
+  await page.getByRole("button", { name: /Agent 工作席/ }).click();
   await page.getByRole("button", { name: /生成中间项目文件。/ }).click();
   const drawer = page.getByRole("dialog", { name: "运行过程详情" });
   await expect(drawer).toBeVisible();

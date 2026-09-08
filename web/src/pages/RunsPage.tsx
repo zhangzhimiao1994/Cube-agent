@@ -946,6 +946,20 @@ function dispatchAgentCards(detail: RunDetail, agentNames: Map<string, string>):
     .filter((card): card is AgentDispatchCard => card !== null);
 }
 
+function agentWorkbenchStatusCounts(cards: AgentDispatchCard[]) {
+  const statuses: AgentDispatchCard["status"][] = ["异常", "工作中", "已完成", "已安排"];
+  return statuses.flatMap((status) => {
+    const count = cards.filter((card) => card.status === status).length;
+    return count > 0 ? [`${count} ${status}`] : [];
+  });
+}
+
+function agentActivityItems(card: AgentDispatchCard, items: ProcessDetailTarget[]) {
+  return items
+    .filter((item) => item.sourceActor === card.id || item.rows.some((row) => row.value.includes(card.name) || row.value.includes(card.id)))
+    .slice(0, 3);
+}
+
 function plannedTaskChain(detail: RunDetail, agentNames: Map<string, string>): TaskChainStep[] {
   const plan = mainAgentPlanEvent(detail);
   if (!plan) return [];
@@ -2843,11 +2857,14 @@ function RunProcessSummary({
   agentNames: Map<string, string>;
   mainAgentModelName?: string;
 }) {
+  const [isWorkbenchOpen, setIsWorkbenchOpen] = useState(false);
   const items = runProcessItems(detail, agentNames, mainAgentModelName);
   const dispatchCards = dispatchAgentCards(detail, agentNames);
+  const workbenchStatusCounts = agentWorkbenchStatusCounts(dispatchCards);
   const taskChain = plannedTaskChain(detail, agentNames);
   const failureDiagnostics = failureDiagnosticsForRun(detail, agentNames);
   const executionIntents = executionIntentsForRun(detail, agentNames);
+  const hasWorkbench = dispatchCards.length > 0;
   const shouldShowSummary =
     items.length > 0 ||
     dispatchCards.length > 0 ||
@@ -2864,7 +2881,99 @@ function RunProcessSummary({
           <small>{items.length} 个关键动作</small>
         </div>
       ) : null}
-      {taskChain.length > 0 ? (
+      {hasWorkbench ? (
+        <section className="agent-workbench" aria-label="Agent 工作席">
+          <button
+            type="button"
+            className="agent-workbench-trigger"
+            aria-expanded={isWorkbenchOpen}
+            onClick={() => setIsWorkbenchOpen((current) => !current)}
+          >
+            <span aria-hidden="true">⌘</span>
+            <strong>Agent 工作席</strong>
+            <small>{dispatchCards.length} 个 Agent</small>
+            {workbenchStatusCounts.map((status) => (
+              <em key={status}>{status}</em>
+            ))}
+          </button>
+          {isWorkbenchOpen ? (
+            <div className="agent-workbench-detail" role="region" aria-label="Agent 工作席详情">
+              <div className="agent-workbench-list">
+                {dispatchCards.map((card) => {
+                  const activityItems = agentActivityItems(card, items);
+                  return (
+                    <article key={card.id} className={`agent-workbench-agent-card status-${card.status}`}>
+                      <div className="agent-workbench-agent-header">
+                        <div className="agent-workbench-avatar" aria-hidden="true">
+                          {card.name.slice(0, 1)}
+                        </div>
+                        <div>
+                          <strong>{card.name}</strong>
+                          <small>
+                            {card.role} · {card.model}
+                          </small>
+                        </div>
+                        <span>{card.status}</span>
+                      </div>
+                      <p>{card.summary}</p>
+                      {activityItems.length > 0 ? (
+                        <div className="agent-workbench-activity">
+                          <small>活动轨迹</small>
+                          <ul>
+                            {activityItems.map((item) => (
+                              <li key={item.id}>{item.message}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      ) : null}
+                    </article>
+                  );
+                })}
+              </div>
+              {taskChain.length > 0 ? (
+                <section className="run-task-chain" aria-label="任务链路">
+                  <div className="run-task-chain-header">
+                    <span aria-hidden="true">⌁</span>
+                    <strong>任务链路</strong>
+                    <small>{taskChain.length} 个步骤</small>
+                  </div>
+                  <div className="run-task-chain-list">
+                    {taskChain.map((step, index) => (
+                      <article key={`${step.id}-${step.agentId}-${index}`} className={`run-task-chain-step step-${step.status}`}>
+                        <small>第 {index + 1} 步</small>
+                        <div>
+                          <strong>{step.agentName}</strong>
+                          <span>{step.status}</span>
+                        </div>
+                        <p>{step.summary || "等待执行"}</p>
+                      </article>
+                    ))}
+                  </div>
+                </section>
+              ) : null}
+              {items.length > 0 ? (
+                <section className="agent-workbench-actions" aria-label="重点摘要">
+                  <div className="agent-workbench-actions-header">
+                    <strong>重点摘要</strong>
+                    <small>{items.length} 个关键动作</small>
+                  </div>
+                  <div className="agent-cluster-actions">
+                    {items.map((item) => (
+                      <button key={item.id} type="button" className="run-process-toggle process-intermediate-card" onClick={() => onOpen(item)}>
+                        <span aria-hidden="true">›</span>
+                        <small className="process-card-badge">{item.badge}</small>
+                        <strong>{item.message}</strong>
+                        {item.artifact ? <small>{artifactDisplayName(item.artifact)}</small> : null}
+                      </button>
+                    ))}
+                  </div>
+                </section>
+              ) : null}
+            </div>
+          ) : null}
+        </section>
+      ) : null}
+      {!hasWorkbench && taskChain.length > 0 ? (
         <section className="run-task-chain" aria-label="任务链路">
           <div className="run-task-chain-header">
             <span aria-hidden="true">⌁</span>
@@ -2936,33 +3045,7 @@ function RunProcessSummary({
           </div>
         </section>
       ) : null}
-      {dispatchCards.length > 0 ? (
-        <section className="agent-recruitment" aria-label="助手派单状态">
-          <div className="agent-recruitment-header" role="status" aria-label={`已招募 ${dispatchCards.length} 个助手`}>
-            <span aria-hidden="true">⌁</span>
-            <strong>助手招募</strong>
-            <small>已招募 {dispatchCards.length} 个助手</small>
-          </div>
-          <div className="agent-recruitment-list">
-            {dispatchCards.map((card) => (
-              <article key={card.id} className="agent-recruitment-card">
-                <div className="agent-recruitment-avatar" aria-hidden="true">
-                  {card.name.slice(0, 1)}
-                </div>
-                <div>
-                  <strong>{card.name}</strong>
-                  <small>
-                    {card.role} · {card.model}
-                  </small>
-                  <p>{card.summary}</p>
-                </div>
-                <span>{card.status}</span>
-              </article>
-            ))}
-          </div>
-        </section>
-      ) : null}
-      {items.length > 0 ? (
+      {!hasWorkbench && items.length > 0 ? (
         <div className="agent-cluster-actions">
           {items.map((item) => (
             <button key={item.id} type="button" className="run-process-toggle process-intermediate-card" onClick={() => onOpen(item)}>

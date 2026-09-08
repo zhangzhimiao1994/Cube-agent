@@ -1960,6 +1960,226 @@ article:hover {
   padding-left: 0.55rem;
 }
 
+.agent-workbench {
+  display: grid;
+  gap: 0.5rem;
+  max-width: min(100%, 42rem);
+}
+
+.agent-workbench-trigger {
+  align-items: center;
+  background: linear-gradient(135deg, rgba(8, 24, 43, 0.96), rgba(8, 42, 52, 0.86));
+  border: 1px solid rgba(85, 215, 255, 0.24);
+  border-radius: 8px;
+  color: var(--text);
+  cursor: pointer;
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.42rem 0.56rem;
+  justify-content: flex-start;
+  min-height: 2.55rem;
+  min-width: min(100%, 17rem);
+  padding: 0.45rem 0.66rem;
+  text-align: left;
+  width: fit-content;
+}
+
+.agent-workbench-trigger:hover,
+.agent-workbench-trigger:focus-visible {
+  border-color: rgba(85, 215, 255, 0.46);
+  box-shadow: 0 0 0 3px rgba(85, 215, 255, 0.12);
+  outline: none;
+}
+
+.agent-workbench-trigger > span {
+  color: var(--accent);
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-weight: 950;
+}
+
+.agent-workbench-trigger strong {
+  font-size: 0.96rem;
+  font-weight: 950;
+}
+
+.agent-workbench-trigger small,
+.agent-workbench-trigger em {
+  color: var(--muted);
+  font-style: normal;
+  font-weight: 850;
+}
+
+.agent-workbench-trigger em {
+  background: rgba(255, 255, 255, 0.055);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  font-size: 0.72rem;
+  line-height: 1;
+  padding: 0.22rem 0.36rem;
+  white-space: nowrap;
+}
+
+.agent-workbench-detail {
+  background: rgba(3, 10, 20, 0.34);
+  border: 1px solid rgba(123, 225, 255, 0.12);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.52rem;
+  padding: 0.52rem;
+}
+
+.agent-workbench-list {
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: repeat(auto-fit, minmax(13.5rem, 1fr));
+}
+
+.agent-workbench-agent-card {
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(123, 225, 255, 0.12);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.42rem;
+  min-width: 0;
+  padding: 0.56rem;
+}
+
+.agent-workbench-agent-card.status-异常 {
+  border-color: rgba(255, 101, 118, 0.34);
+}
+
+.agent-workbench-agent-card.status-已完成 {
+  border-color: rgba(125, 255, 189, 0.25);
+}
+
+.agent-workbench-agent-card.status-工作中 {
+  border-color: rgba(85, 215, 255, 0.28);
+}
+
+.agent-workbench-agent-header {
+  align-items: center;
+  display: grid;
+  gap: 0.48rem;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  min-width: 0;
+}
+
+.agent-workbench-agent-header > div:nth-child(2) {
+  display: grid;
+  gap: 0.12rem;
+  min-width: 0;
+}
+
+.agent-workbench-agent-header strong,
+.agent-workbench-agent-header small,
+.agent-workbench-agent-card p,
+.agent-workbench-activity li {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agent-workbench-agent-header strong,
+.agent-workbench-agent-header small,
+.agent-workbench-activity li {
+  white-space: nowrap;
+}
+
+.agent-workbench-agent-header strong {
+  color: var(--text);
+  font-weight: 950;
+}
+
+.agent-workbench-agent-header small,
+.agent-workbench-agent-card p,
+.agent-workbench-activity small,
+.agent-workbench-activity li {
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.agent-workbench-agent-header > span {
+  color: var(--accent);
+  font-size: 0.76rem;
+  font-weight: 950;
+  white-space: nowrap;
+}
+
+.agent-workbench-agent-card.status-异常 .agent-workbench-agent-header > span {
+  color: var(--danger);
+}
+
+.agent-workbench-agent-card.status-已完成 .agent-workbench-agent-header > span {
+  color: var(--accent-2);
+}
+
+.agent-workbench-agent-card p {
+  line-height: 1.38;
+  margin: 0;
+}
+
+.agent-workbench-avatar {
+  align-items: center;
+  background: rgba(85, 215, 255, 0.12);
+  border: 1px solid rgba(85, 215, 255, 0.24);
+  border-radius: 999px;
+  color: var(--accent);
+  display: inline-flex;
+  font-weight: 950;
+  height: 2rem;
+  justify-content: center;
+  width: 2rem;
+}
+
+.agent-workbench-activity {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  display: grid;
+  gap: 0.28rem;
+  padding-top: 0.38rem;
+}
+
+.agent-workbench-activity ul {
+  display: grid;
+  gap: 0.16rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.agent-workbench-activity li::before {
+  color: var(--accent);
+  content: "•";
+  padding-right: 0.32rem;
+}
+
+.agent-workbench-actions {
+  display: grid;
+  gap: 0.38rem;
+  min-width: 0;
+}
+
+.agent-workbench-actions-header {
+  align-items: center;
+  display: flex;
+  gap: 0.45rem;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.agent-workbench-actions-header strong {
+  color: var(--text);
+  font-weight: 950;
+}
+
+.agent-workbench-actions-header small {
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.agent-workbench-detail .agent-cluster-actions {
+  padding-left: 0;
+}
+
 .agent-recruitment {
   border: 1px solid rgba(123, 225, 255, 0.12);
   border-radius: 8px;
