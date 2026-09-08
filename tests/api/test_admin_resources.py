@@ -4349,6 +4349,43 @@ def test_plugin_signing_key_upsert_and_delete_trigger_runtime_reload_callback() 
     assert reloaded == [TENANT_ID, TENANT_ID]
 
 
+def test_plugin_signing_key_mutations_require_plugin_approval_permission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    required_permissions: list[str] = []
+
+    class RecordingAuthorizer:
+        def require(
+            self,
+            principal: AuthenticatedPrincipal,
+            permission: str,
+        ) -> AuthenticatedPrincipal:
+            required_permissions.append(permission)
+            return principal
+
+    monkeypatch.setattr(admin_router, "Authorizer", RecordingAuthorizer)
+    api = client()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+
+    upsert = api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    deleted = api.delete(
+        "/api/v1/admin/plugins/signing-keys/calendar-prod",
+        headers=headers(),
+    )
+
+    assert upsert.status_code == 200
+    assert deleted.status_code == 200
+    assert required_permissions == ["plugin:approve", "plugin:approve"]
+
+
 @pytest.mark.parametrize(
     ("key_id", "window"),
     [

@@ -45,6 +45,7 @@ const ROLE_PERMISSIONS: Record<string, string[]> = {
     "plugin:read",
     "plugin:use",
     "plugin:write",
+    "plugin:approve",
     "user:read",
     "user:write",
     "audit:read",

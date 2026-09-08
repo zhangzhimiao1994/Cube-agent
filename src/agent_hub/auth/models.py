@@ -34,6 +34,7 @@ PERMISSIONS = MappingProxyType(
                 "plugin:read",
                 "plugin:use",
                 "plugin:write",
+                "plugin:approve",
                 "user:read",
                 "user:write",
                 "audit:read",

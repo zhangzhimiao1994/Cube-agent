@@ -11501,7 +11501,7 @@ async def upsert_plugin_signing_key(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> PluginSigningKeyResponse:
-    _require(principal, "plugin:write")
+    _require(principal, "plugin:approve")
     response = await service.upsert_plugin_signing_key(
         body,
         tenant_id=principal.tenant_id,
@@ -11522,7 +11522,7 @@ async def delete_plugin_signing_key(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> OperationStatusResponse:
-    _require(principal, "plugin:write")
+    _require(principal, "plugin:approve")
     try:
         await service.delete_plugin_signing_key(
             key_id,

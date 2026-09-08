@@ -464,6 +464,7 @@ export function McpPage() {
   const auth = useAuth();
   const canReadCapabilityManifest = auth.hasPermission("plugin:read");
   const canWritePlugins = auth.hasPermission("plugin:write");
+  const canApprovePlugins = auth.hasPermission("plugin:approve");
   const queryClient = useQueryClient();
   const servers = useQuery({ queryKey: ["mcp"], queryFn: () => api.mcpServers() });
   const plugins = useQuery({
@@ -958,10 +959,10 @@ export function McpPage() {
               placeholder="2026-10-08T00:00:00Z"
             />
 
-            <button type="submit" disabled={saveSigningKey.isPending || !canWritePlugins}>
+            <button type="submit" disabled={saveSigningKey.isPending || !canApprovePlugins}>
               {saveSigningKey.isPending ? "正在保存..." : "保存签名 Key"}
             </button>
-            {!canWritePlugins ? <p className="field-help">当前账号无权保存插件签名 Key。</p> : null}
+            {!canApprovePlugins ? <p className="field-help">当前账号无权保存插件签名 Key。</p> : null}
             {signingKeyMessage ? <p role="status">{signingKeyMessage}</p> : null}
             {saveSigningKey.isError ? (
               <p role="alert">{formatApiError(saveSigningKey.error, "签名 Key 保存失败")}</p>
@@ -1004,7 +1005,7 @@ export function McpPage() {
                           <button
                             type="button"
                             className="danger-action"
-                            disabled={deleteSigningKey.isPending || !canWritePlugins}
+                            disabled={deleteSigningKey.isPending || !canApprovePlugins}
                             onClick={() => confirmSigningKeyDelete(key)}
                             aria-label={`删除签名 Key ${key.key_id}`}
                           >
