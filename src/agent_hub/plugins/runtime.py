@@ -458,7 +458,7 @@ def _ensure_supported_plugin_sandbox_profile(
 
 
 _SUPPORTED_PLUGIN_SANDBOX_PROFILES = frozenset(("remote_connector",))
-_ADAPTER_DECLARABLE_PLUGIN_SANDBOX_PROFILES = frozenset(("in_process",))
+_ADAPTER_DECLARABLE_PLUGIN_SANDBOX_PROFILES = frozenset(("http_read", "in_process"))
 _PLUGIN_POLICY_ROLES = (Role.SUPER_ADMIN, Role.ADMIN, Role.OPERATOR)
 
 

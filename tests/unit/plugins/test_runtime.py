@@ -507,6 +507,28 @@ async def test_runtime_plugin_service_allows_adapter_declared_sandbox_profile() 
     assert len(adapter.calls) == 1
 
 
+async def test_runtime_plugin_service_rejects_http_read_sandbox_profile_without_adapter_declaration() -> None:
+    adapter = RecordingPluginAdapter([])
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService((plugin("calendar", sandbox_profile="http_read"),)),
+        adapters={"plugin_runtime": adapter},
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin sandbox profile unsupported"):
+        await service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="scheduler",
+            name="calendar.create_event",
+            arguments={"title": "review"},
+            idempotency_key="plugin_1",
+        )
+
+    assert adapter.calls == []
+
+
 async def test_runtime_plugin_service_rejects_unknown_adapter_declared_sandbox_profile() -> None:
     adapter = RecordingPluginAdapter(
         [],
@@ -890,6 +912,91 @@ async def test_runtime_plugin_service_rejects_unsupported_sandbox_profile_before
     ]
     assert "Mofang review" not in repr(admin_service.audit_events)
     assert "input-do-not-leak" not in repr(admin_service.audit_events)
+
+
+async def test_runtime_plugin_service_allows_adapter_declared_http_read_sandbox_profile() -> None:
+    adapter = RecordingPluginAdapter(
+        [],
+        descriptor_payload={
+            "id": "plugin_runtime",
+            "name": "Plugin Runtime",
+            "description": None,
+            "resource_schema": {"type": "object", "additionalProperties": True},
+            "capability_schema": {
+                "type": "object",
+                "properties": {
+                    "sandbox_profile": {
+                        "type": "string",
+                        "enum": ("http_read",),
+                    }
+                },
+                "additionalProperties": True,
+            },
+            "argument_schema": {"type": "object", "additionalProperties": True},
+        },
+    )
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService((plugin("calendar", sandbox_profile="http_read"),)),
+        adapters={"plugin_runtime": adapter},
+    )
+
+    result = await service.invoke(
+        tenant_id=TENANT_ID,
+        user_id=TENANT_ID,
+        run_id=TENANT_ID,
+        actor="scheduler",
+        name="calendar.create_event",
+        arguments={"title": "Mofang review"},
+        idempotency_key="plugin_1",
+    )
+
+    assert result["ok"] is True
+    assert adapter.calls[0][1] == "calendar.create_event"
+
+
+async def test_runtime_plugin_service_rejects_adapter_declared_local_process_sandbox_profile() -> None:
+    adapter = RecordingPluginAdapter(
+        [],
+        descriptor_payload={
+            "id": "plugin_runtime",
+            "name": "Plugin Runtime",
+            "description": None,
+            "resource_schema": {"type": "object", "additionalProperties": True},
+            "capability_schema": {
+                "type": "object",
+                "properties": {
+                    "sandbox_profile": {
+                        "type": "string",
+                        "enum": ("local_process",),
+                    }
+                },
+                "additionalProperties": True,
+            },
+            "argument_schema": {"type": "object", "additionalProperties": True},
+        },
+    )
+    admin_service = FakeAdminService((plugin("calendar", sandbox_profile="local_process"),))
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        adapters={"plugin_runtime": adapter},
+    )
+
+    with pytest.raises(RuntimeCapabilityError, match="Plugin sandbox profile unsupported"):
+        await service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="scheduler",
+            name="calendar.create_event",
+            arguments={"title": "Mofang review"},
+            idempotency_key="plugin_1",
+        )
+
+    assert adapter.calls == []
+    details = cast(dict[str, object], admin_service.audit_events[0]["details"])
+    assert details["sandbox_profile"] == "local_process"
 
 
 async def test_runtime_plugin_service_rejects_arguments_that_violate_input_schema() -> None:
