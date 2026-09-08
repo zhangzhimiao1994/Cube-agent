@@ -4224,6 +4224,51 @@ def test_plugin_signing_keys_are_tenant_scoped() -> None:
     assert other_tenant.json() == []
 
 
+def test_plugin_signing_key_delete_revokes_future_package_trust() -> None:
+    api = client()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    public_key = plugin_public_key_value(private_key)
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": public_key,
+        },
+    )
+
+    response = api.delete(
+        "/api/v1/admin/plugins/signing-keys/calendar-prod",
+        headers=headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "deleted"}
+    assert api.get("/api/v1/admin/plugins/signing-keys", headers=headers()).json() == []
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(private_key),
+    )
+    assert install.status_code == 200
+    assert install.json()["plugin"]["package_metadata"]["signature_verification"] == "untrusted_key"
+
+
+def test_plugin_signing_key_delete_missing_key_returns_not_found() -> None:
+    response = client().delete(
+        "/api/v1/admin/plugins/signing-keys/missing-key",
+        headers=headers(),
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
+
+
 def test_plugin_archive_install_verifies_trusted_ed25519_signature() -> None:
     api = client()
     private_key = ed25519.Ed25519PrivateKey.generate()
@@ -4376,6 +4421,114 @@ async def test_persistent_plugin_signing_keys_and_verification_status_survive_re
     assert plugins["calendar"].package_metadata.signature_verification == "verified"
     assert plugins["search"].package_metadata is not None
     assert plugins["search"].package_metadata.signature_verification == "untrusted_key"
+
+
+@pytest.mark.asyncio
+async def test_persistent_plugin_signing_key_delete_is_tenant_scoped_and_audited() -> None:
+    class StoredPersistentPluginService(PersistentAdminResourceService):
+        def __init__(
+            self,
+            payloads: dict[tuple[UUID, str, str], dict[str, object]] | None = None,
+        ) -> None:
+            super().__init__(
+                config_service=cast(Any, object()),
+                secret_service=cast(Any, object()),
+                tenant_id=TENANT_ID,
+                actor_id=USER_ID,
+            )
+            self._session_factory = cast(Any, object())
+            self.payloads = payloads if payloads is not None else {}
+
+        async def _get_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> dict[str, object] | None:
+            target_tenant_id = TENANT_ID if tenant_id is None else tenant_id
+            return self.payloads.get((target_tenant_id, kind, resource_id), {})
+
+        async def _upsert_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            payload: dict[str, object],
+            *,
+            tenant_id: UUID | None = None,
+        ) -> bool:
+            target_tenant_id = TENANT_ID if tenant_id is None else tenant_id
+            self.payloads[(target_tenant_id, kind, resource_id)] = payload
+            return True
+
+        async def _delete_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> bool | None:
+            target_tenant_id = TENANT_ID if tenant_id is None else tenant_id
+            key = (target_tenant_id, kind, resource_id)
+            if key not in self.payloads:
+                return False
+            del self.payloads[key]
+            return True
+
+        async def _list_admin_payloads(
+            self,
+            kind: str,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> list[dict[str, object]] | None:
+            target_tenant_id = TENANT_ID if tenant_id is None else tenant_id
+            return [
+                payload
+                for (payload_tenant_id, payload_kind, _resource_id), payload in self.payloads.items()
+                if payload_tenant_id == target_tenant_id and payload_kind == kind
+            ]
+
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    other_private_key = ed25519.Ed25519PrivateKey.generate()
+    service = StoredPersistentPluginService()
+    await service.upsert_plugin_signing_key(
+        PluginSigningKeyRequest(
+            key_id="calendar-prod",
+            algorithm="ed25519",
+            public_key=plugin_public_key_value(private_key),
+        ),
+        tenant_id=TENANT_ID,
+        actor_id=USER_ID,
+    )
+    await service.upsert_plugin_signing_key(
+        PluginSigningKeyRequest(
+            key_id="calendar-prod",
+            algorithm="ed25519",
+            public_key=plugin_public_key_value(other_private_key),
+        ),
+        tenant_id=OTHER_TENANT_ID,
+        actor_id=USER_ID,
+    )
+
+    await service.delete_plugin_signing_key(
+        "calendar-prod",
+        tenant_id=TENANT_ID,
+        actor_id=USER_ID,
+    )
+
+    assert await service.list_plugin_signing_keys(tenant_id=TENANT_ID) == ()
+    assert [
+        key.key_id for key in await service.list_plugin_signing_keys(tenant_id=OTHER_TENANT_ID)
+    ] == ["calendar-prod"]
+    audits = await service.list_audit_events("plugin.signing_key.delete")
+    assert len(audits) == 1
+    assert audits[0].actor == str(USER_ID)
+    assert audits[0].resource == "plugin_signing_key:calendar-prod"
+    assert audits[0].details == {
+        "key_id": "calendar-prod",
+        "algorithm": "ed25519",
+        "trusted": "False",
+    }
 
 
 def test_plugin_archive_install_rejects_invalid_trusted_signature() -> None:

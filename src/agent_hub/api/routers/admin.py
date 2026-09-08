@@ -2295,6 +2295,14 @@ class AdminResourceService(Protocol):
         actor_id: UUID | None = None,
     ) -> PluginSigningKeyResponse: ...
 
+    async def delete_plugin_signing_key(
+        self,
+        key_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> None: ...
+
     async def upsert_plugin(
         self,
         request: PluginResourceRequest,
@@ -4626,6 +4634,16 @@ class InMemoryAdminResourceService:
         self.plugin_signing_keys[(tenant_id, response.key_id)] = response
         return response
 
+    async def delete_plugin_signing_key(
+        self,
+        key_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> None:
+        del actor_id
+        del self.plugin_signing_keys[(tenant_id, key_id)]
+
     async def upsert_plugin(
         self,
         request: PluginResourceRequest,
@@ -6558,6 +6576,47 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             actor_id=actor_id,
         )
         return response
+
+    async def delete_plugin_signing_key(
+        self,
+        key_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> None:
+        current = await self._get_admin_payload(
+            "plugin_signing_key",
+            key_id,
+            tenant_id=tenant_id,
+        )
+        deleted = await self._delete_admin_payload(
+            "plugin_signing_key",
+            key_id,
+            tenant_id=tenant_id,
+        )
+        if deleted is None:
+            if tenant_id is not None and tenant_id != self._tenant_id:
+                raise KeyError(key_id)
+            await super().delete_plugin_signing_key(
+                key_id,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+            )
+            return
+        if not deleted:
+            raise KeyError(key_id)
+        key = PluginSigningKeyResponse.model_validate(current or {"key_id": key_id})
+        await self._record_audit(
+            "plugin.signing_key.delete",
+            f"plugin_signing_key:{key_id}",
+            {
+                "key_id": key.key_id,
+                "algorithm": key.algorithm,
+                "trusted": False,
+            },
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+        )
 
     async def upsert_plugin(
         self,
@@ -11267,6 +11326,28 @@ async def upsert_plugin_signing_key(
         tenant_id=principal.tenant_id,
         actor_id=principal.user_id,
     )
+
+
+@router.delete(
+    "/plugins/signing-keys/{key_id}",
+    response_model=OperationStatusResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def delete_plugin_signing_key(
+    key_id: str,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> OperationStatusResponse:
+    _require(principal, "plugin:write")
+    try:
+        await service.delete_plugin_signing_key(
+            key_id,
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+        )
+    except (KeyError, ValidationError):
+        raise PublicAPIError(404, "not_found", "not found") from None
+    return OperationStatusResponse(status="deleted")
 
 
 @router.post(

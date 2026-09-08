@@ -674,6 +674,41 @@ describe("api client transport", () => {
     );
   });
 
+  it("deletes trusted plugin signing keys", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ status: "deleted" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(api.deletePluginSigningKey("calendar-prod")).resolves.toEqual({
+      status: "deleted",
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/admin/plugins/signing-keys/calendar-prod",
+    );
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({ method: "DELETE" }));
+  });
+
+  it("encodes plugin signing key ids in delete paths", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ status: "deleted" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.deletePluginSigningKey("calendar:prod.v1");
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/admin/plugins/signing-keys/calendar%3Aprod.v1",
+    );
+  });
+
   it("rejects plugin adapter descriptors with non-object resource schemas", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(

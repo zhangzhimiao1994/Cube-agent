@@ -2075,6 +2075,13 @@ export const api = {
       PluginSigningKeySchema,
     );
   },
+  deletePluginSigningKey(keyId: string): Promise<{ status: string }> {
+    return request(
+      `/api/v1/admin/plugins/signing-keys/${encodeURIComponent(keyId)}`,
+      { method: "DELETE" },
+      z.object({ status: z.string() }),
+    );
+  },
   uploadPluginArchive(file: File): Promise<PluginArchiveInstall> {
     const filename = encodedFilenameHeader(file.name);
     return requestBinary(
