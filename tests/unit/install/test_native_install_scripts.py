@@ -28,6 +28,21 @@ def test_openclaw_local_adapter_has_cross_platform_and_installed_cli_entrypoints
     assert 'export PYTHONPATH="$SOURCE_DIR/src:$PYTHONPATH"' in command
     assert "-m agent_hub.openclaw.local_adapter" in command
 
+
+def test_release_packager_includes_built_web_dist() -> None:
+    launcher = read("scripts/agent-hub")
+    command = read("scripts/commands/package-release.sh")
+
+    assert "package-release     Build a deployable source archive including web/dist." in launcher
+    assert "doctor|status|logs|backup|restore|upgrade|openclaw-adapter|package-release" in launcher
+    assert "npm --prefix \"$SOURCE_DIR/web\" run build" in command
+    assert '[[ -f "$SOURCE_DIR/web/dist/index.html" ]]' in command
+    assert "--exclude='./web/node_modules'" in command
+    assert "--exclude='./.tmp'" in command
+    assert "--exclude='./web/dist'" not in command
+    assert 'tar -cf "$output"' in command
+
+
 def test_native_installer_deploys_release_before_starting_services() -> None:
     script = read("scripts/lib/install_native.sh")
 
