@@ -1,6 +1,8 @@
 import asyncio
+import importlib.util
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from time import monotonic
 from typing import cast
 
@@ -108,5 +110,27 @@ def test_admin_resource_kind_constraint_allows_all_persistent_admin_resources() 
         "openclaw_session",
         "schedule",
         "evolution",
+        "plugin",
+        "plugin_signing_key",
     ):
         assert kind in sqltext
+
+
+def test_latest_migration_allows_plugin_signing_key_admin_resources() -> None:
+    migration_path = (
+        Path(__file__).resolve().parents[2]
+        / "alembic"
+        / "versions"
+        / "0021_plugin_signing_key_admin_resources.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "migration_0021_plugin_signing_key_admin_resources", migration_path
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+
+    assert migration.down_revision == "0020_plugin_admin_resources"
+    assert "plugin_signing_key" in migration._NEXT_KINDS
+    assert "plugin_signing_key" not in migration._CURRENT_KINDS

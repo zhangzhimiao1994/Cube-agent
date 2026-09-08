@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.app import ensure_bootstrap_tenant
-from agent_hub.db.models import ConfigRevisionRow, TenantRow, UserRow
+from agent_hub.db.models import AdminResourceRow, ConfigRevisionRow, TenantRow, UserRow
 from agent_hub.db.session import build_database
 from alembic import command
 
@@ -61,6 +61,30 @@ async def test_bootstrap_tenant_creation_is_idempotent(
 def test_migrations_downgrade_to_base_and_upgrade_to_head(alembic_config: Config) -> None:
     command.downgrade(alembic_config, "base")
     command.upgrade(alembic_config, "head")
+
+
+@pytest.mark.integration
+async def test_migrated_admin_resource_constraint_allows_plugin_signing_keys(
+    db_session: AsyncSession,
+) -> None:
+    tenant = TenantRow(slug=f"plugin-signing-key-{uuid4()}", name="Plugin signing key")
+    db_session.add(tenant)
+    await db_session.flush()
+    db_session.add(
+        AdminResourceRow(
+            tenant_id=tenant.id,
+            kind="plugin_signing_key",
+            resource_id="calendar-prod",
+            payload={
+                "key_id": "calendar-prod",
+                "algorithm": "ed25519",
+                "public_key": "test-public-key",
+                "trusted": True,
+            },
+        )
+    )
+
+    await db_session.commit()
 
 
 @pytest.mark.integration
