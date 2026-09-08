@@ -108,6 +108,8 @@ def plugin(
     sandbox_profile: str = "remote_connector",
     policy_effect: Literal["inherit", "allow", "require_approval", "deny"] = "inherit",
     replay_safe: bool = False,
+    resource_config: Mapping[str, JsonValue] | None = None,
+    capability_config: Mapping[str, JsonValue] | None = None,
     input_schema: Mapping[str, JsonValue] | None = None,
     output_schema: Mapping[str, JsonValue] | None = None,
 ) -> PluginResourceResponse:
@@ -122,6 +124,7 @@ def plugin(
             credential_ref=credential_ref,
             credential_header=credential_header,
             credential_scheme=credential_scheme,
+            resource_config=dict(resource_config) if resource_config is not None else {},
             capabilities=[
                 PluginCapabilityRequest(
                     id=capability_id,
@@ -131,6 +134,9 @@ def plugin(
                     policy_effect=policy_effect,
                     replay_safe=replay_safe,
                     aliases=["calendar_create"],
+                    capability_config=dict(capability_config)
+                    if capability_config is not None
+                    else {},
                     input_schema=dict(input_schema) if input_schema is not None else None,
                     output_schema=dict(output_schema) if output_schema is not None else None,
                 )
@@ -1023,6 +1029,65 @@ async def test_http_json_plugin_adapter_posts_context_to_allowed_endpoint() -> N
         "run_id": str(TENANT_ID),
         "actor": "scheduler",
         "idempotency_key": "plugin_1",
+    }
+
+
+async def test_http_json_plugin_adapter_posts_descriptor_configs_to_allowed_endpoint() -> None:
+    posts: list[tuple[str, Mapping[str, JsonValue], float, Mapping[str, str]]] = []
+
+    async def post_json(
+        url: str,
+        payload: Mapping[str, JsonValue],
+        timeout_seconds: float,
+        headers: Mapping[str, str],
+    ) -> Mapping[str, JsonValue]:
+        posts.append((url, payload, timeout_seconds, headers))
+        return {"indexed": True}
+
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(
+            (
+                plugin(
+                    "search",
+                    adapter="http_json",
+                    capability_id="search.query",
+                    endpoint_url="https://plugins.example/invoke",
+                    domain_allowlist=("plugins.example",),
+                    resource_config={
+                        "base_url": "https://search.internal",
+                        "indexes": ("docs", "tickets"),
+                    },
+                    capability_config={
+                        "method": "semantic",
+                        "max_results": 8,
+                    },
+                ),
+            )
+        ),
+        adapters={"http_json": HttpJsonPluginAdapter(post_json=post_json)},
+    )
+
+    result = await service.invoke(
+        tenant_id=TENANT_ID,
+        user_id=TENANT_ID,
+        run_id=TENANT_ID,
+        actor="scheduler",
+        name="search.query",
+        arguments={"query": "adapter contract"},
+        idempotency_key="plugin_1",
+    )
+
+    assert result == {"indexed": True}
+    assert len(posts) == 1
+    payload = posts[0][1]
+    assert payload["resource_config"] == {
+        "base_url": "https://search.internal",
+        "indexes": ["docs", "tickets"],
+    }
+    assert payload["capability_config"] == {
+        "method": "semantic",
+        "max_results": 8,
     }
 
 

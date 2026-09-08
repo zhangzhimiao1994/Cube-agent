@@ -87,6 +87,8 @@ class HttpJsonPluginAdapter:
             "plugin_id": plugin.id,
             "capability_id": capability.id,
             "arguments": arguments,
+            "resource_config": plugin.resource_config,
+            "capability_config": capability.capability_config,
             "context": {
                 "tenant_id": str(context.tenant_id),
                 "user_id": str(context.user_id),
@@ -95,9 +97,10 @@ class HttpJsonPluginAdapter:
                 "idempotency_key": context.idempotency_key,
             },
         }
+        json_payload = cast(Mapping[str, JsonValue], _mutable_json(cast(JsonValue, payload)))
         headers = await self._headers_for_plugin(plugin)
         try:
-            result = await self._post_json(url, payload, plugin.timeout_seconds, headers)
+            result = await self._post_json(url, json_payload, plugin.timeout_seconds, headers)
         except TimeoutError as error:
             raise RuntimeCapabilityError("Plugin tool timed out") from error
         except httpx.TimeoutException as error:
