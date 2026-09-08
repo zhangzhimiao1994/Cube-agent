@@ -658,6 +658,15 @@ class PluginSigningKeyResponse(PluginSigningKeyRequest):
     trusted: bool = True
 
 
+PluginSignatureVerification = Literal[
+    "not_provided",
+    "not_verified",
+    "untrusted_key",
+    "verified",
+    "failed",
+]
+
+
 class PluginPackageMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -684,13 +693,17 @@ class PluginPackageMetadata(BaseModel):
         pattern=r"^[1-9][0-9]*\.[0-9]+$",
     )
     signature: PluginPackageSignatureMetadata | None = None
-    signature_verification: Literal[
-        "not_provided",
-        "not_verified",
-        "untrusted_key",
-        "verified",
-        "failed",
-    ] = "not_provided"
+    signature_verification: PluginSignatureVerification = "not_provided"
+    activation_state: Literal[
+        "not_applicable",
+        "blocked_unsigned",
+        "blocked_unverified_signature",
+        "blocked_untrusted_key",
+        "blocked_failed_signature",
+        "verified_scan_only",
+        "eligible",
+    ] = "not_applicable"
+    activation_reason: str = Field(default="", max_length=256)
     runtime: Literal["none", "python", "node", "container", "mcp_remote"] = "none"
     entrypoint: str | None = Field(default=None, max_length=255)
     isolation: Literal[
@@ -704,14 +717,17 @@ class PluginPackageMetadata(BaseModel):
     install_mode: Literal["scan_only"] = "scan_only"
 
     @model_validator(mode="after")
-    def derive_signature_verification(self) -> PluginPackageMetadata:
+    def derive_server_controlled_state(self) -> PluginPackageMetadata:
         if self.signature is None:
-            verification: Literal["not_provided", "not_verified"] = "not_provided"
+            verification: PluginSignatureVerification = "not_provided"
         elif self.signature_verification == "not_provided":
             verification = "not_verified"
         else:
-            return self
+            verification = self.signature_verification
+        state, reason = _plugin_package_activation_state(self, verification)
         self.signature_verification = verification
+        self.activation_state = state
+        self.activation_reason = reason
         return self
 
 
@@ -743,6 +759,54 @@ class PluginArchiveInstallResponse(BaseModel):
     filename: str
     content_sha256: str
     plugin: PluginResourceResponse
+
+
+PluginActivationState = Literal[
+    "not_applicable",
+    "blocked_unsigned",
+    "blocked_unverified_signature",
+    "blocked_untrusted_key",
+    "blocked_failed_signature",
+    "verified_scan_only",
+    "eligible",
+]
+
+
+def _plugin_package_activation_state(
+    package: PluginPackageMetadata,
+    signature_verification: PluginSignatureVerification,
+) -> tuple[PluginActivationState, str]:
+    if package.kind == "manifest_only":
+        return (
+            "not_applicable",
+            "manifest-only package has no executable activation target",
+        )
+    if package.signature is None or signature_verification == "not_provided":
+        return (
+            "blocked_unsigned",
+            "adapter packages must include a trusted verified signature before activation",
+        )
+    if signature_verification == "not_verified":
+        return (
+            "blocked_unverified_signature",
+            "package signature has not been verified by the server",
+        )
+    if signature_verification == "untrusted_key":
+        return (
+            "blocked_untrusted_key",
+            "package signature key is not trusted for this tenant",
+        )
+    if signature_verification == "failed":
+        return (
+            "blocked_failed_signature",
+            "package signature verification failed",
+        )
+    if package.install_mode == "scan_only":
+        return (
+            "verified_scan_only",
+            "package signature is verified, but install_mode=scan_only prevents activation",
+        )
+    return "eligible", "package signature and activation policy allow execution"
 
 
 class PluginPolicyCapabilitySummaryResponse(BaseModel):
@@ -3231,6 +3295,8 @@ def _validate_plugin_package_metadata(manifest: object) -> None:
     package = manifest.get("package")
     if not isinstance(package, Mapping):
         return
+    if "activation_state" in package or "activation_reason" in package:
+        raise InvalidSkillPackage("plugin package activation state is server-controlled")
     if "signature_verification" in package:
         raise InvalidSkillPackage("plugin package signature verification is server-controlled")
     if package.get("kind") == "manifest_only" and set(package) & {
@@ -3329,6 +3395,8 @@ def _plugin_signature_payload(manifest: PluginArchiveManifest, archive_bytes: by
     manifest_payload = manifest.model_dump(mode="json")
     package = manifest_payload.get("package")
     if isinstance(package, dict):
+        package.pop("activation_state", None)
+        package.pop("activation_reason", None)
         signature = package.get("signature")
         if isinstance(signature, dict):
             signature.pop("value", None)

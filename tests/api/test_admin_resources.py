@@ -3624,6 +3624,42 @@ def signed_plugin_archive_parts(archive_bytes: bytes) -> tuple[dict[str, object]
     return cast(dict[str, object], manifest), files
 
 
+def test_plugin_signature_payload_excludes_server_controlled_activation_fields() -> None:
+    archive_bytes = plugin_archive(
+        {
+            "id": "calendar",
+            "name": "Calendar HTTP",
+            "package": {
+                "kind": "adapter_package",
+                "package_version": "1.2.3",
+                "adapter_id": "calendar_python",
+                "sdk_api_version": "1.0",
+                "signature": {
+                    "algorithm": "ed25519",
+                    "key_id": "calendar-prod",
+                    "value": VALID_PLUGIN_SIGNATURE,
+                },
+                "runtime": "python",
+                "entrypoint": "adapter/main.py",
+                "isolation": "local_process",
+                "install_mode": "scan_only",
+            },
+        },
+        files={"adapter/main.py": "def invoke():\n    return {}\n"},
+    )
+
+    payload = json.loads(
+        _plugin_signature_payload(
+            _plugin_archive_manifest_from_archive(archive_bytes),
+            archive_bytes,
+        ).decode(),
+    )
+
+    signed_package = payload["manifest"]["package"]
+    assert "activation_state" not in signed_package
+    assert "activation_reason" not in signed_package
+
+
 def test_plugin_archive_install_scans_manifest_and_triggers_runtime_reload() -> None:
     api = client()
     reloaded: list[UUID] = []
@@ -3758,6 +3794,8 @@ def test_plugin_archive_install_persists_scan_only_package_metadata() -> None:
             "value": VALID_PLUGIN_SIGNATURE,
         },
         "signature_verification": "untrusted_key",
+        "activation_state": "blocked_untrusted_key",
+        "activation_reason": "package signature key is not trusted for this tenant",
         "runtime": "python",
         "entrypoint": "adapter/main.py",
         "isolation": "local_process",
@@ -4293,7 +4331,12 @@ def test_plugin_archive_install_verifies_trusted_ed25519_signature() -> None:
     )
 
     assert response.status_code == 200
-    assert response.json()["plugin"]["package_metadata"]["signature_verification"] == "verified"
+    metadata = response.json()["plugin"]["package_metadata"]
+    assert metadata["signature_verification"] == "verified"
+    assert metadata["activation_state"] == "verified_scan_only"
+    assert metadata["activation_reason"] == (
+        "package signature is verified, but install_mode=scan_only prevents activation"
+    )
 
 
 def test_plugin_archive_install_records_untrusted_signature_key() -> None:
@@ -4314,6 +4357,55 @@ def test_plugin_archive_install_records_untrusted_signature_key() -> None:
     assert (
         response.json()["plugin"]["package_metadata"]["signature_verification"]
         == "untrusted_key"
+    )
+    assert response.json()["plugin"]["package_metadata"]["activation_state"] == "blocked_untrusted_key"
+    assert response.json()["plugin"]["package_metadata"]["activation_reason"] == (
+        "package signature key is not trusted for this tenant"
+    )
+
+
+def test_plugin_archive_install_rejects_forged_activation_state() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "package": {
+                    "kind": "adapter_package",
+                    "package_version": "1.2.3",
+                    "adapter_id": "calendar_python",
+                    "sdk_api_version": "1.0",
+                    "signature": {
+                        "algorithm": "ed25519",
+                        "key_id": "calendar-prod",
+                        "value": VALID_PLUGIN_SIGNATURE,
+                    },
+                    "signature_verification": "verified",
+                    "activation_state": "eligible",
+                    "activation_reason": "trusted by manifest",
+                    "runtime": "python",
+                    "entrypoint": "adapter/main.py",
+                    "isolation": "local_process",
+                    "install_mode": "scan_only",
+                },
+            },
+            files={"adapter/main.py": "def invoke():\n    return {}\n"},
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    assert (
+        response.json()["error"]["details"]["reason"]
+        == "plugin package activation state is server-controlled"
     )
 
 

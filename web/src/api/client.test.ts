@@ -586,6 +586,8 @@ describe("api client transport", () => {
           value: "A".repeat(86),
         },
         signature_verification: "verified",
+        activation_state: "verified_scan_only",
+        activation_reason: "package signature is verified, but install_mode=scan_only prevents activation",
         runtime: "python",
         entrypoint: "adapter/main.py",
         isolation: "local_process",

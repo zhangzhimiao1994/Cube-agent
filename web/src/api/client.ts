@@ -974,6 +974,18 @@ const PluginPackageMetadataSchema = z.object({
   signature_verification: z
     .enum(["not_provided", "not_verified", "untrusted_key", "verified", "failed"])
     .default("not_provided"),
+  activation_state: z
+    .enum([
+      "not_applicable",
+      "blocked_unsigned",
+      "blocked_unverified_signature",
+      "blocked_untrusted_key",
+      "blocked_failed_signature",
+      "verified_scan_only",
+      "eligible",
+    ])
+    .default("not_applicable"),
+  activation_reason: z.string().default(""),
   runtime: z.enum(["none", "python", "node", "container", "mcp_remote"]).default("none"),
   entrypoint: z.string().nullable().default(null),
   isolation: z
