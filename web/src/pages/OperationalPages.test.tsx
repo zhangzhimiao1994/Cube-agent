@@ -1300,6 +1300,12 @@ describe("operational management pages", () => {
         if (path === "/api/v1/admin/plugins/calendar/start" && method === "POST") {
           return jsonResponse(calendarPlugin);
         }
+        if (path === "/api/v1/admin/plugins/calendar/disable" && method === "POST") {
+          return jsonResponse({ ...calendarPlugin, enabled: false, status: "disabled", health: "disabled" });
+        }
+        if (path === "/api/v1/admin/plugins/calendar/enable" && method === "POST") {
+          return jsonResponse({ ...calendarPlugin, enabled: true, status: "stopped", health: "stopped" });
+        }
         if (path === "/api/v1/admin/plugins/calendar/stop" && method === "POST") {
           return jsonResponse({ ...calendarPlugin, status: "stopped", health: "stopped" });
         }
@@ -6532,6 +6538,28 @@ describe("operational management pages", () => {
         requests.find(
           (request) =>
             request.path === "/api/v1/admin/plugins/calendar/reload" &&
+            request.method === "POST",
+        ),
+      ).toBeTruthy(),
+    );
+
+    await user.click(screen.getByRole("button", { name: "停用插件 Calendar HTTP" }));
+    await waitFor(() =>
+      expect(
+        requests.find(
+          (request) =>
+            request.path === "/api/v1/admin/plugins/calendar/disable" &&
+            request.method === "POST",
+        ),
+      ).toBeTruthy(),
+    );
+
+    await user.click(screen.getByRole("button", { name: "启用插件 Calendar HTTP" }));
+    await waitFor(() =>
+      expect(
+        requests.find(
+          (request) =>
+            request.path === "/api/v1/admin/plugins/calendar/enable" &&
             request.method === "POST",
         ),
       ).toBeTruthy(),

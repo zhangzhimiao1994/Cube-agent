@@ -498,6 +498,56 @@ describe("api client transport", () => {
     expect(result).toEqual({ status: "uninstalled" });
   });
 
+  it("enables and disables plugins through lifecycle endpoints", async () => {
+    const enabledPlugin: PluginResource = {
+      id: "calendar",
+      name: "Calendar HTTP",
+      enabled: true,
+      description: null,
+      version: "local",
+      endpoint_url: null,
+      domain_allowlist: [],
+      resource_config: {},
+      timeout_seconds: 10,
+      credential_ref: null,
+      credential_header: "X-Plugin-Credential",
+      credential_scheme: "Bearer",
+      capabilities: [],
+      status: "stopped",
+      health: "stopped",
+      last_error_type: null,
+    };
+    const disabledPlugin = {
+      ...enabledPlugin,
+      enabled: false,
+      status: "disabled",
+      health: "disabled",
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(disabledPlugin), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(enabledPlugin), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(api.disablePlugin("calendar")).resolves.toEqual(disabledPlugin);
+    await expect(api.enablePlugin("calendar")).resolves.toEqual(enabledPlugin);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/admin/plugins/calendar/disable");
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({ method: "POST" }));
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("/api/v1/admin/plugins/calendar/enable");
+    expect(fetchMock.mock.calls[1]?.[1]).toEqual(expect.objectContaining({ method: "POST" }));
+  });
+
   it("rejects plugin adapter descriptors with non-object resource schemas", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(

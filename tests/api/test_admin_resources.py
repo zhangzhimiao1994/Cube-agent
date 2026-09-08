@@ -3473,6 +3473,8 @@ def test_plugin_upsert_lifecycle_and_delete_trigger_runtime_reload_callback() ->
         headers=headers(),
         json={"id": "docs", "name": "Docs Plugin"},
     )
+    disabled = api.post("/api/v1/admin/plugins/search/disable", headers=headers())
+    enabled = api.post("/api/v1/admin/plugins/search/enable", headers=headers())
     started = api.post("/api/v1/admin/plugins/search/start", headers=headers())
     stopped = api.post("/api/v1/admin/plugins/search/stop", headers=headers())
     reloaded_response = api.post("/api/v1/admin/plugins/search/reload", headers=headers())
@@ -3481,6 +3483,14 @@ def test_plugin_upsert_lifecycle_and_delete_trigger_runtime_reload_callback() ->
 
     assert created.status_code == 200
     assert uninstall_created.status_code == 200
+    assert disabled.status_code == 200
+    assert disabled.json()["enabled"] is False
+    assert disabled.json()["status"] == "disabled"
+    assert disabled.json()["health"] == "disabled"
+    assert enabled.status_code == 200
+    assert enabled.json()["enabled"] is True
+    assert enabled.json()["status"] == "stopped"
+    assert enabled.json()["health"] == "stopped"
     assert started.status_code == 200
     assert stopped.status_code == 200
     assert reloaded_response.status_code == 200
@@ -3488,6 +3498,8 @@ def test_plugin_upsert_lifecycle_and_delete_trigger_runtime_reload_callback() ->
     assert uninstalled.json() == {"status": "uninstalled"}
     assert deleted.status_code == 200
     assert reloaded == [
+        TENANT_ID,
+        TENANT_ID,
         TENANT_ID,
         TENANT_ID,
         TENANT_ID,
@@ -3577,12 +3589,20 @@ async def test_admin_plugin_lifecycle_updates_status_and_health() -> None:
             ],
         )
     )
+    disabled = await service.disable_plugin("search")
+    enabled = await service.enable_plugin("search")
     started = await service.start_plugin("search")
     stopped = await service.stop_plugin("search")
     reloaded = await service.reload_plugin("search")
 
     assert created.status == "stopped"
     assert created.health == "stopped"
+    assert disabled.enabled is False
+    assert disabled.status == "disabled"
+    assert disabled.health == "disabled"
+    assert enabled.enabled is True
+    assert enabled.status == "stopped"
+    assert enabled.health == "stopped"
     assert started.status == "running"
     assert started.health == "healthy"
     assert stopped.status == "stopped"
@@ -3607,9 +3627,17 @@ async def test_persistent_admin_plugin_lifecycle_persists_status() -> None:
             resource_config={"workflow_id": "daily_report"},
         )
     )
+    disabled = await service.disable_plugin("search")
+    enabled = await service.enable_plugin("search")
     started = await service.start_plugin("search")
     listed = await service.list_plugins()
 
+    assert disabled.enabled is False
+    assert disabled.status == "disabled"
+    assert disabled.health == "disabled"
+    assert enabled.enabled is True
+    assert enabled.status == "stopped"
+    assert enabled.health == "stopped"
     assert started.status == "running"
     assert started.health == "healthy"
     assert started.resource_config == {"workflow_id": "daily_report"}
@@ -3708,6 +3736,8 @@ async def test_persistent_admin_plugin_lifecycle_is_scoped_to_requested_tenant()
         tenant_id=OTHER_TENANT_ID,
         actor_id=USER_ID,
     )
+    disabled = await service.disable_plugin("search", tenant_id=OTHER_TENANT_ID, actor_id=USER_ID)
+    enabled = await service.enable_plugin("search", tenant_id=OTHER_TENANT_ID, actor_id=USER_ID)
     started = await service.start_plugin("search", tenant_id=OTHER_TENANT_ID, actor_id=USER_ID)
     bootstrap_plugins = await service.list_plugins(tenant_id=TENANT_ID)
     tenant_plugins = await service.list_plugins(tenant_id=OTHER_TENANT_ID)
@@ -3721,7 +3751,25 @@ async def test_persistent_admin_plugin_lifecycle_is_scoped_to_requested_tenant()
         and kind == "audit"
         and payload["action"] == "plugin.start"
     ]
+    tenant_enable_audits = [
+        payload
+        for (tenant_id, kind, _resource_id), payload in service.payloads.items()
+        if tenant_id == OTHER_TENANT_ID
+        and kind == "audit"
+        and payload["action"] == "plugin.enable"
+    ]
+    tenant_disable_audits = [
+        payload
+        for (tenant_id, kind, _resource_id), payload in service.payloads.items()
+        if tenant_id == OTHER_TENANT_ID
+        and kind == "audit"
+        and payload["action"] == "plugin.disable"
+    ]
 
+    assert disabled.enabled is False
+    assert disabled.status == "disabled"
+    assert enabled.enabled is True
+    assert enabled.status == "stopped"
     assert started.name == "Tenant Search Plugin"
     assert started.status == "running"
     assert [plugin.name for plugin in bootstrap_plugins] == ["Bootstrap Search Plugin"]
@@ -3729,6 +3777,8 @@ async def test_persistent_admin_plugin_lifecycle_is_scoped_to_requested_tenant()
     assert [plugin.name for plugin in bootstrap_after_delete] == ["Bootstrap Search Plugin"]
     assert tenant_after_delete == ()
     assert tenant_start_audits[0]["actor"] == str(USER_ID)
+    assert tenant_enable_audits[0]["actor"] == str(USER_ID)
+    assert tenant_disable_audits[0]["actor"] == str(USER_ID)
 
 
 @pytest.mark.asyncio

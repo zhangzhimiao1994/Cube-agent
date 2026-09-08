@@ -2016,6 +2016,20 @@ export const api = {
       PluginResourceSchema,
     );
   },
+  enablePlugin(id: string): Promise<PluginResource> {
+    return request(
+      `/api/v1/admin/plugins/${encodeURIComponent(id)}/enable`,
+      { method: "POST" },
+      PluginResourceSchema,
+    );
+  },
+  disablePlugin(id: string): Promise<PluginResource> {
+    return request(
+      `/api/v1/admin/plugins/${encodeURIComponent(id)}/disable`,
+      { method: "POST" },
+      PluginResourceSchema,
+    );
+  },
   stopPlugin(id: string): Promise<PluginResource> {
     return request(
       `/api/v1/admin/plugins/${encodeURIComponent(id)}/stop`,

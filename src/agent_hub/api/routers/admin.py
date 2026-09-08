@@ -2170,6 +2170,22 @@ class AdminResourceService(Protocol):
         actor_id: UUID | None = None,
     ) -> PluginResourceResponse: ...
 
+    async def enable_plugin(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse: ...
+
+    async def disable_plugin(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse: ...
+
     async def stop_plugin(
         self,
         plugin_id: str,
@@ -3224,6 +3240,28 @@ def _plugin_started_response(plugin: PluginResourceResponse) -> PluginResourceRe
     )
 
 
+def _plugin_enabled_response(plugin: PluginResourceResponse) -> PluginResourceResponse:
+    return plugin.model_copy(
+        update={
+            "enabled": True,
+            "status": "stopped",
+            "health": "stopped",
+            "last_error_type": None,
+        }
+    )
+
+
+def _plugin_disabled_response(plugin: PluginResourceResponse) -> PluginResourceResponse:
+    return plugin.model_copy(
+        update={
+            "enabled": False,
+            "status": "disabled",
+            "health": "disabled",
+            "last_error_type": None,
+        }
+    )
+
+
 def _plugin_stopped_response(plugin: PluginResourceResponse) -> PluginResourceResponse:
     if not plugin.enabled:
         return plugin.model_copy(update={"status": "disabled", "health": "disabled"})
@@ -4114,6 +4152,32 @@ class InMemoryAdminResourceService:
         del tenant_id, actor_id
         current = self.plugins[plugin_id]
         updated = _plugin_started_response(current)
+        self.plugins[plugin_id] = updated
+        return updated
+
+    async def enable_plugin(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse:
+        del tenant_id, actor_id
+        current = self.plugins[plugin_id]
+        updated = _plugin_enabled_response(current)
+        self.plugins[plugin_id] = updated
+        return updated
+
+    async def disable_plugin(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse:
+        del tenant_id, actor_id
+        current = self.plugins[plugin_id]
+        updated = _plugin_disabled_response(current)
         self.plugins[plugin_id] = updated
         return updated
 
@@ -5984,6 +6048,34 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             actor_id=actor_id,
         )
 
+    async def enable_plugin(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse:
+        return await self._set_plugin_lifecycle(
+            plugin_id,
+            "enable",
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+        )
+
+    async def disable_plugin(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse:
+        return await self._set_plugin_lifecycle(
+            plugin_id,
+            "disable",
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+        )
+
     async def stop_plugin(
         self,
         plugin_id: str,
@@ -6096,13 +6188,21 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 raise KeyError(plugin_id)
             if action == "start":
                 return await super().start_plugin(plugin_id)
+            if action == "enable":
+                return await super().enable_plugin(plugin_id)
+            if action == "disable":
+                return await super().disable_plugin(plugin_id)
             if action == "stop":
                 return await super().stop_plugin(plugin_id)
             return await super().reload_plugin(plugin_id)
         if not payload:
             raise KeyError(plugin_id)
         current = PluginResourceResponse.model_validate(payload)
-        if action == "stop":
+        if action == "enable":
+            updated = _plugin_enabled_response(current)
+        elif action == "disable":
+            updated = _plugin_disabled_response(current)
+        elif action == "stop":
             updated = _plugin_stopped_response(current)
         else:
             updated = _plugin_started_response(current)
@@ -10600,6 +10700,54 @@ async def start_plugin(
     _require(principal, "plugin:write")
     try:
         response = await service.start_plugin(
+            plugin_id,
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+        )
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+    await _reload_plugin_runtime_config(request, principal.tenant_id)
+    return response
+
+
+@router.post(
+    "/plugins/{plugin_id}/enable",
+    response_model=PluginResourceResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def enable_plugin(
+    plugin_id: str,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> PluginResourceResponse:
+    _require(principal, "plugin:write")
+    try:
+        response = await service.enable_plugin(
+            plugin_id,
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+        )
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+    await _reload_plugin_runtime_config(request, principal.tenant_id)
+    return response
+
+
+@router.post(
+    "/plugins/{plugin_id}/disable",
+    response_model=PluginResourceResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def disable_plugin(
+    plugin_id: str,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> PluginResourceResponse:
+    _require(principal, "plugin:write")
+    try:
+        response = await service.disable_plugin(
             plugin_id,
             tenant_id=principal.tenant_id,
             actor_id=principal.user_id,

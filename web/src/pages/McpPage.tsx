@@ -609,8 +609,16 @@ export function McpPage() {
     },
   });
   const pluginLifecycle = useMutation({
-    mutationFn: ({ id, action }: { id: string; action: "start" | "stop" | "reload" | "delete" }) => {
+    mutationFn: ({
+      id,
+      action,
+    }: {
+      id: string;
+      action: "start" | "enable" | "disable" | "stop" | "reload" | "delete";
+    }) => {
       if (action === "start") return api.startPlugin(id);
+      if (action === "enable") return api.enablePlugin(id);
+      if (action === "disable") return api.disablePlugin(id);
       if (action === "stop") return api.stopPlugin(id);
       if (action === "reload") return api.reloadPlugin(id);
       return api.deletePlugin(id);
@@ -618,6 +626,8 @@ export function McpPage() {
     onSuccess: async (_result, variables) => {
       const messages = {
         start: "插件已启动。",
+        enable: "插件已启用。",
+        disable: "插件已停用。",
         stop: "插件已停止。",
         reload: "插件已重载。",
         delete: "插件已删除。",
@@ -1233,6 +1243,22 @@ export function McpPage() {
                       aria-label={`启动插件 ${plugin.name}`}
                     >
                       启动
+                    </button>
+                    <button
+                      type="button"
+                      disabled={pluginLifecycle.isPending || !canWritePlugins}
+                      onClick={() => pluginLifecycle.mutate({ id: plugin.id, action: "enable" })}
+                      aria-label={`启用插件 ${plugin.name}`}
+                    >
+                      启用
+                    </button>
+                    <button
+                      type="button"
+                      disabled={pluginLifecycle.isPending || !canWritePlugins}
+                      onClick={() => pluginLifecycle.mutate({ id: plugin.id, action: "disable" })}
+                      aria-label={`停用插件 ${plugin.name}`}
+                    >
+                      停用
                     </button>
                     <button
                       type="button"
