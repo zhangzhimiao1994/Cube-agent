@@ -535,6 +535,8 @@ export function McpPage() {
   const [pluginMessage, setPluginMessage] = useState<string | null>(null);
   const [signingKeyId, setSigningKeyId] = useState("calendar-prod");
   const [signingKeyPublicKey, setSigningKeyPublicKey] = useState("");
+  const [signingKeyNotBefore, setSigningKeyNotBefore] = useState("");
+  const [signingKeyNotAfter, setSigningKeyNotAfter] = useState("");
   const [signingKeyMessage, setSigningKeyMessage] = useState<string | null>(null);
 
   async function refreshPluginSurfaces() {
@@ -670,9 +672,13 @@ export function McpPage() {
         key_id: signingKeyId.trim(),
         algorithm: "ed25519",
         public_key: signingKeyPublicKey.trim(),
+        not_before: signingKeyNotBefore.trim() || null,
+        not_after: signingKeyNotAfter.trim() || null,
       }),
     onSuccess: async () => {
       setSigningKeyPublicKey("");
+      setSigningKeyNotBefore("");
+      setSigningKeyNotAfter("");
       setSigningKeyMessage("签名 Key 已保存。");
       await refreshSigningKeys();
     },
@@ -934,6 +940,22 @@ export function McpPage() {
               maxLength={43}
             />
 
+            <label htmlFor="plugin-signing-not-before">Not Before</label>
+            <input
+              id="plugin-signing-not-before"
+              value={signingKeyNotBefore}
+              onChange={(event) => setSigningKeyNotBefore(event.target.value)}
+              placeholder="2026-09-08T00:00:00Z"
+            />
+
+            <label htmlFor="plugin-signing-not-after">Not After</label>
+            <input
+              id="plugin-signing-not-after"
+              value={signingKeyNotAfter}
+              onChange={(event) => setSigningKeyNotAfter(event.target.value)}
+              placeholder="2026-10-08T00:00:00Z"
+            />
+
             <button type="submit" disabled={saveSigningKey.isPending || !canWritePlugins}>
               {saveSigningKey.isPending ? "正在保存..." : "保存签名 Key"}
             </button>
@@ -961,6 +983,8 @@ export function McpPage() {
                       <th>Key ID</th>
                       <th>算法</th>
                       <th>状态</th>
+                      <th>Not Before</th>
+                      <th>Not After</th>
                       <th>Public Key</th>
                       <th>操作</th>
                     </tr>
@@ -971,6 +995,8 @@ export function McpPage() {
                         <td><strong>{key.key_id}</strong></td>
                         <td>{key.algorithm}</td>
                         <td>{key.trusted ? "trusted" : "untrusted"}</td>
+                        <td>{key.not_before ?? "未设置"}</td>
+                        <td>{key.not_after ?? "未设置"}</td>
                         <td className="monospace-cell">{key.public_key}</td>
                         <td>
                           <button

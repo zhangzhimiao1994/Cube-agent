@@ -646,12 +646,33 @@ class PluginSigningKeyRequest(BaseModel):
         max_length=43,
         pattern=r"^[A-Za-z0-9_-]{43}$",
     )
+    not_before: datetime | None = None
+    not_after: datetime | None = None
 
     @field_validator("public_key")
     @classmethod
     def validate_public_key(cls, value: str) -> str:
         _decode_base64url_bytes(value, expected_length=32, label="public_key")
         return value
+
+    @field_validator("not_before", "not_after")
+    @classmethod
+    def validate_window_timestamp(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("signing key window timestamps must be timezone-aware")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_activation_window(self) -> PluginSigningKeyRequest:
+        if (
+            self.not_before is not None
+            and self.not_after is not None
+            and self.not_after <= self.not_before
+        ):
+            raise ValueError("not_after must be later than not_before")
+        return self
 
 
 class PluginSigningKeyResponse(PluginSigningKeyRequest):
@@ -3359,6 +3380,7 @@ def _verified_plugin_package_metadata(
     package = manifest.package
     if package is None or package.signature is None:
         return package
+    now = datetime.now(UTC)
     signing_key = next(
         (
             key
@@ -3366,6 +3388,7 @@ def _verified_plugin_package_metadata(
             if key.trusted
             and key.algorithm == package.signature.algorithm
             and key.key_id == package.signature.key_id
+            and _plugin_signing_key_is_active(key, now)
         ),
         None,
     )
@@ -3389,6 +3412,13 @@ def _verified_plugin_package_metadata(
     except ValueError:
         raise InvalidSkillPackage("trusted plugin signing key is invalid") from None
     return package.model_copy(update={"signature_verification": "verified"})
+
+
+def _plugin_signing_key_is_active(key: PluginSigningKeyResponse, now: datetime) -> bool:
+    active_at = now.astimezone(UTC)
+    if key.not_before is not None and active_at < key.not_before.astimezone(UTC):
+        return False
+    return key.not_after is None or active_at < key.not_after.astimezone(UTC)
 
 
 def _plugin_signature_payload(manifest: PluginArchiveManifest, archive_bytes: bytes) -> bytes:

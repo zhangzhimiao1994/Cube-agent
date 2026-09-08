@@ -561,6 +561,8 @@ const pluginSigningKeys: PluginSigningKey[] = [
     algorithm: "ed25519",
     public_key: "A".repeat(43),
     trusted: true,
+    not_before: "2026-09-08T00:00:00Z",
+    not_after: "2026-10-08T00:00:00Z",
   },
 ];
 
@@ -6746,6 +6748,8 @@ describe("operational management pages", () => {
     expect(within(region).getByText("calendar-prod")).not.toBeNull();
     expect(within(region).getByText("ed25519")).not.toBeNull();
     expect(within(region).getByText("trusted")).not.toBeNull();
+    expect(within(region).getByText("2026-09-08T00:00:00Z")).not.toBeNull();
+    expect(within(region).getByText("2026-10-08T00:00:00Z")).not.toBeNull();
 
     await user.click(screen.getByRole("button", { name: "删除签名 Key calendar-prod" }));
     await waitFor(() =>
@@ -6763,6 +6767,8 @@ describe("operational management pages", () => {
     await user.type(screen.getByLabelText("签名 Key ID"), "calendar-next");
     await user.clear(screen.getByLabelText("Ed25519 Public Key"));
     await user.type(screen.getByLabelText("Ed25519 Public Key"), "B".repeat(43));
+    await user.type(screen.getByLabelText("Not Before"), "2026-11-08T00:00:00Z");
+    await user.type(screen.getByLabelText("Not After"), "2026-12-08T00:00:00Z");
     await user.click(screen.getByRole("button", { name: "保存签名 Key" }));
 
     await waitFor(() =>
@@ -6784,6 +6790,8 @@ describe("operational management pages", () => {
       key_id: "calendar-next",
       algorithm: "ed25519",
       public_key: "B".repeat(43),
+      not_before: "2026-11-08T00:00:00Z",
+      not_after: "2026-12-08T00:00:00Z",
     });
     expect(await screen.findByText("签名 Key 已保存。")).not.toBeNull();
   });

@@ -633,6 +633,8 @@ describe("api client transport", () => {
       algorithm: "ed25519",
       public_key: "A".repeat(43),
       trusted: true,
+      not_before: "2026-09-08T00:00:00Z",
+      not_after: "2026-10-08T00:00:00Z",
     };
     const fetchMock = vi
       .fn()
@@ -656,6 +658,8 @@ describe("api client transport", () => {
         key_id: "calendar-prod",
         algorithm: "ed25519",
         public_key: "A".repeat(43),
+        not_before: "2026-09-08T00:00:00Z",
+        not_after: "2026-10-08T00:00:00Z",
       }),
     ).resolves.toEqual(signingKey);
 
@@ -671,6 +675,8 @@ describe("api client transport", () => {
           key_id: "calendar-prod",
           algorithm: "ed25519",
           public_key: "A".repeat(43),
+          not_before: "2026-09-08T00:00:00Z",
+          not_after: "2026-10-08T00:00:00Z",
         }),
       }),
     );

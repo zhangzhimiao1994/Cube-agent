@@ -8,7 +8,7 @@ import threading
 import zipfile
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
@@ -4226,6 +4226,8 @@ def test_plugin_signing_keys_are_tenant_scoped() -> None:
     api = client()
     private_key = ed25519.Ed25519PrivateKey.generate()
     public_key = plugin_public_key_value(private_key)
+    not_before = datetime.now(UTC) - timedelta(hours=1)
+    not_after = datetime.now(UTC) + timedelta(days=30)
 
     response = api.post(
         "/api/v1/admin/plugins/signing-keys",
@@ -4234,20 +4236,27 @@ def test_plugin_signing_keys_are_tenant_scoped() -> None:
             "key_id": "calendar-prod",
             "algorithm": "ed25519",
             "public_key": public_key,
+            "not_before": not_before.isoformat(),
+            "not_after": not_after.isoformat(),
         },
     )
 
     assert response.status_code == 200
-    assert response.json() == {
+    body = response.json()
+    assert body == {
         "key_id": "calendar-prod",
         "algorithm": "ed25519",
         "public_key": public_key,
         "trusted": True,
+        "not_before": body["not_before"],
+        "not_after": body["not_after"],
     }
+    assert datetime.fromisoformat(body["not_before"]) == not_before
+    assert datetime.fromisoformat(body["not_after"]) == not_after
 
     listed = api.get("/api/v1/admin/plugins/signing-keys", headers=headers())
     assert listed.status_code == 200
-    assert listed.json() == [response.json()]
+    assert listed.json() == [body]
 
     other_app = create_app(
         auth_service=OtherTenantAuthService(),
@@ -4260,6 +4269,66 @@ def test_plugin_signing_keys_are_tenant_scoped() -> None:
     )
     assert other_tenant.status_code == 200
     assert other_tenant.json() == []
+
+
+@pytest.mark.parametrize(
+    ("key_id", "window"),
+    [
+        ("calendar-future", {"not_before": (datetime.now(UTC) + timedelta(days=1)).isoformat()}),
+        ("calendar-expired", {"not_after": (datetime.now(UTC) - timedelta(days=1)).isoformat()}),
+    ],
+)
+def test_plugin_archive_install_does_not_verify_inactive_signing_key(
+    key_id: str,
+    window: dict[str, str],
+) -> None:
+    api = client()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": key_id,
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+            **window,
+        },
+    )
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(private_key, key_id=key_id),
+    )
+
+    assert response.status_code == 200
+    metadata = response.json()["plugin"]["package_metadata"]
+    assert metadata["signature_verification"] == "untrusted_key"
+    assert metadata["activation_state"] == "blocked_untrusted_key"
+
+
+def test_plugin_signing_key_rejects_invalid_activation_window() -> None:
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    not_before = datetime.now(UTC) + timedelta(days=1)
+    not_after = datetime.now(UTC) - timedelta(days=1)
+
+    response = client().post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+            "not_before": not_before.isoformat(),
+            "not_after": not_after.isoformat(),
+        },
+    )
+
+    assert response.status_code == 422
 
 
 def test_plugin_signing_key_delete_revokes_future_package_trust() -> None:

@@ -1032,6 +1032,8 @@ const PluginSigningKeySchema = z.object({
   algorithm: z.literal("ed25519"),
   public_key: z.string(),
   trusted: z.boolean().default(true),
+  not_before: z.string().nullable().default(null),
+  not_after: z.string().nullable().default(null),
 });
 
 export type PluginSigningKey = z.infer<typeof PluginSigningKeySchema>;
@@ -1040,6 +1042,8 @@ export type PluginSigningKeyPayload = {
   key_id: string;
   algorithm: "ed25519";
   public_key: string;
+  not_before?: string | null;
+  not_after?: string | null;
 };
 
 export type PluginResourcePayload = {
