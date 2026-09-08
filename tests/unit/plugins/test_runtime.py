@@ -256,6 +256,207 @@ async def test_runtime_plugin_service_blocks_scan_only_adapter_packages() -> Non
     assert adapter.calls == []
 
 
+async def test_runtime_plugin_service_invokes_runtime_registered_adapter_package() -> None:
+    package_metadata = PluginPackageMetadata.model_validate(
+        {
+            "kind": "adapter_package",
+            "package_version": "1.2.3",
+            "adapter_id": "calendar_python",
+            "sdk_api_version": "1.0",
+            "signature": {
+                "algorithm": "ed25519",
+                "key_id": "calendar-prod",
+                "value": "A" * 86,
+            },
+            "signature_verification": "verified",
+            "approval_state": "approved",
+            "runtime": "python",
+            "entrypoint": "adapter/main.py",
+            "isolation": "in_process",
+            "install_mode": "runtime_registered",
+        }
+    )
+    adapter = RecordingPluginAdapter(
+        calls=[],
+        descriptor_payload={
+            "id": "calendar_python",
+            "name": "Calendar Python",
+            "description": None,
+            "resource_schema": {"type": "object", "additionalProperties": True},
+            "capability_schema": {
+                "type": "object",
+                "properties": {
+                    "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                },
+                "additionalProperties": True,
+            },
+            "argument_schema": {"type": "object", "additionalProperties": True},
+        },
+    )
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(
+            (
+                plugin(
+                    "calendar",
+                    adapter="calendar_python",
+                    sandbox_profile="in_process",
+                    package_metadata=package_metadata,
+                ),
+            )
+        ),
+        adapters={"calendar_python": adapter},
+    )
+
+    result = await service.invoke(
+        tenant_id=TENANT_ID,
+        user_id=TENANT_ID,
+        run_id=TENANT_ID,
+        actor="tester",
+        name="calendar.create_event",
+        arguments={"title": "review"},
+        idempotency_key="invoke-1",
+    )
+
+    assert result["ok"] is True
+    assert adapter.calls[0][0] == "calendar"
+    assert adapter.calls[0][1] == "calendar.create_event"
+
+
+async def test_runtime_plugin_service_rechecks_runtime_registered_package_metadata() -> None:
+    package_metadata = PluginPackageMetadata.model_construct(
+        schema_version=1,
+        kind="adapter_package",
+        package_version="1.2.3",
+        adapter_id="calendar_python",
+        sdk_api_version="1.0",
+        signature={
+            "algorithm": "ed25519",
+            "key_id": "calendar-prod",
+            "value": "A" * 86,
+        },
+        signature_verification="not_verified",
+        verified_public_key_sha256=None,
+        approval_state="pending",
+        approval_reason="",
+        approved_by=None,
+        approved_at=None,
+        activation_state="eligible",
+        activation_reason="stale eligible state",
+        runtime="python",
+        entrypoint="adapter/main.py",
+        isolation="in_process",
+        install_mode="runtime_registered",
+    )
+    adapter = RecordingPluginAdapter(
+        calls=[],
+        descriptor_payload={
+            "id": "calendar_python",
+            "name": "Calendar Python",
+            "description": None,
+            "resource_schema": {"type": "object", "additionalProperties": True},
+            "capability_schema": {
+                "type": "object",
+                "properties": {
+                    "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                },
+                "additionalProperties": True,
+            },
+            "argument_schema": {"type": "object", "additionalProperties": True},
+        },
+    )
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(
+            (
+                plugin(
+                    "calendar",
+                    adapter="calendar_python",
+                    sandbox_profile="in_process",
+                    package_metadata=package_metadata,
+                ),
+            )
+        ),
+        adapters={"calendar_python": adapter},
+    )
+
+    manifest = service.capability_manifest_source().manifests_for_tenant(TENANT_ID)
+    capability_items = cast(tuple[Mapping[str, object], ...], manifest["capabilities"])
+    capabilities = {str(item["id"]): item for item in capability_items}
+
+    assert service.is_available(TENANT_ID, "calendar.create_event") is False
+    assert capabilities["calendar.create_event"]["available"] is False
+    assert capabilities["calendar.create_event"]["availability_reason"] == (
+        "plugin_package_not_eligible"
+    )
+    with pytest.raises(RuntimeCapabilityError, match="Plugin tool unavailable"):
+        await service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="tester",
+            name="calendar.create_event",
+            arguments={"title": "review"},
+            idempotency_key="invoke-1",
+        )
+    assert adapter.calls == []
+
+
+async def test_runtime_plugin_service_blocks_runtime_registered_package_without_adapter() -> None:
+    package_metadata = PluginPackageMetadata.model_validate(
+        {
+            "kind": "adapter_package",
+            "package_version": "1.2.3",
+            "adapter_id": "calendar_python",
+            "sdk_api_version": "1.0",
+            "signature": {
+                "algorithm": "ed25519",
+                "key_id": "calendar-prod",
+                "value": "A" * 86,
+            },
+            "signature_verification": "verified",
+            "approval_state": "approved",
+            "runtime": "python",
+            "entrypoint": "adapter/main.py",
+            "isolation": "in_process",
+            "install_mode": "runtime_registered",
+        }
+    )
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(
+            (
+                plugin(
+                    "calendar",
+                    adapter="calendar_python",
+                    sandbox_profile="in_process",
+                    package_metadata=package_metadata,
+                ),
+            )
+        ),
+    )
+
+    manifest = service.capability_manifest_source().manifests_for_tenant(TENANT_ID)
+    capability_items = cast(tuple[Mapping[str, object], ...], manifest["capabilities"])
+    capabilities = {str(item["id"]): item for item in capability_items}
+
+    assert service.is_available(TENANT_ID, "calendar.create_event") is False
+    assert capabilities["calendar.create_event"]["available"] is False
+    assert capabilities["calendar.create_event"]["availability_reason"] == (
+        "plugin_package_not_eligible"
+    )
+    with pytest.raises(RuntimeCapabilityError, match="Plugin tool unavailable"):
+        await service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="tester",
+            name="calendar.create_event",
+            arguments={"title": "review"},
+            idempotency_key="invoke-1",
+        )
+
+
 async def test_runtime_plugin_service_reloads_and_invokes_plugins_for_requested_tenant() -> None:
     class TenantPluginAdminService(FakeAdminService):
         def __init__(self) -> None:

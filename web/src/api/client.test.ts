@@ -698,6 +698,65 @@ describe("api client transport", () => {
     );
   });
 
+  it("parses runtime registered plugin package metadata", async () => {
+    const plugin = {
+      id: "calendar",
+      name: "Calendar Python",
+      enabled: true,
+      description: null,
+      version: "1.0.0",
+      endpoint_url: null,
+      domain_allowlist: [],
+      resource_config: {},
+      timeout_seconds: 10,
+      credential_ref: null,
+      credential_header: "X-Plugin-Credential",
+      credential_scheme: "Bearer",
+      capabilities: [],
+      source_filename: "calendar plugin.zip",
+      content_sha256: "abc123",
+      package_metadata: {
+        schema_version: 1,
+        kind: "adapter_package",
+        package_version: "1.2.3",
+        adapter_id: "calendar_python",
+        sdk_api_version: "1.0",
+        signature: {
+          algorithm: "ed25519",
+          key_id: "calendar-prod",
+          value: "A".repeat(86),
+        },
+        signature_verification: "verified",
+        verified_public_key_sha256: "a".repeat(64),
+        approval_state: "approved",
+        approval_reason: "reviewed",
+        approved_by: "11111111-1111-4111-8111-111111111111",
+        approved_at: "2026-09-09T04:00:00Z",
+        activation_state: "eligible",
+        activation_reason: "package signature, approval, SDK, adapter, and isolation policy allow execution",
+        runtime: "python",
+        entrypoint: "adapter/main.py",
+        isolation: "in_process",
+        install_mode: "runtime_registered",
+      },
+      status: "running",
+      health: "healthy",
+      last_error_type: null,
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify([plugin]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.plugins();
+
+    expect(result[0]?.package_metadata?.install_mode).toBe("runtime_registered");
+    expect(result[0]?.package_metadata?.activation_state).toBe("eligible");
+  });
+
   it("manages trusted plugin signing keys", async () => {
     const signingKey = {
       key_id: "calendar-prod",

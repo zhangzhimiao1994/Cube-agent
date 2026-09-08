@@ -686,6 +686,11 @@ PluginSignatureVerification = Literal[
     "verified",
     "failed",
 ]
+PluginPackageInstallMode = Literal["scan_only", "runtime_registered"]
+
+SUPPORTED_PLUGIN_PACKAGE_SDK_API_VERSIONS = frozenset(("1.0",))
+SUPPORTED_RUNTIME_REGISTERED_PACKAGE_RUNTIMES = frozenset(("python",))
+SUPPORTED_RUNTIME_REGISTERED_PACKAGE_ISOLATIONS = frozenset(("in_process",))
 
 
 class PluginPackageMetadata(BaseModel):
@@ -733,6 +738,7 @@ class PluginPackageMetadata(BaseModel):
         "blocked_failed_signature",
         "blocked_pending_approval",
         "blocked_rejected_approval",
+        "blocked_unsupported_runtime",
         "verified_scan_only",
         "eligible",
     ] = "not_applicable"
@@ -747,7 +753,7 @@ class PluginPackageMetadata(BaseModel):
         "container",
         "mcp_remote",
     ] = "none"
-    install_mode: Literal["scan_only"] = "scan_only"
+    install_mode: PluginPackageInstallMode = "scan_only"
 
     @model_validator(mode="after")
     def derive_server_controlled_state(self) -> PluginPackageMetadata:
@@ -824,6 +830,7 @@ PluginActivationState = Literal[
     "blocked_failed_signature",
     "blocked_pending_approval",
     "blocked_rejected_approval",
+    "blocked_unsupported_runtime",
     "verified_scan_only",
     "eligible",
 ]
@@ -873,7 +880,30 @@ def _plugin_package_activation_state(
             "verified_scan_only",
             "package signature is verified, but install_mode=scan_only prevents activation",
         )
-    return "eligible", "package signature and activation policy allow execution"
+    if package.install_mode != "runtime_registered":
+        return (
+            "blocked_unsupported_runtime",
+            "plugin package install mode is not supported for activation",
+        )
+    if package.sdk_api_version not in SUPPORTED_PLUGIN_PACKAGE_SDK_API_VERSIONS:
+        return (
+            "blocked_unsupported_runtime",
+            "plugin package SDK API version is not supported for activation",
+        )
+    if package.runtime not in SUPPORTED_RUNTIME_REGISTERED_PACKAGE_RUNTIMES:
+        return (
+            "blocked_unsupported_runtime",
+            "plugin package runtime is not supported for activation",
+        )
+    if package.isolation not in SUPPORTED_RUNTIME_REGISTERED_PACKAGE_ISOLATIONS:
+        return (
+            "blocked_unsupported_runtime",
+            "plugin package isolation is not supported for activation",
+        )
+    return (
+        "eligible",
+        "package signature, approval, SDK, adapter, and isolation policy allow execution",
+    )
 
 
 class PluginPolicyCapabilitySummaryResponse(BaseModel):
@@ -3443,6 +3473,156 @@ def _validate_plugin_package_contract(
         raise InvalidSkillPackage("adapter plugin package must declare runtime execution")
     if package.entrypoint is None or package.entrypoint not in archive_paths:
         raise InvalidSkillPackage("plugin package entrypoint is missing")
+    if package.install_mode == "runtime_registered":
+        if package.sdk_api_version not in SUPPORTED_PLUGIN_PACKAGE_SDK_API_VERSIONS:
+            raise InvalidSkillPackage("plugin package SDK API version is not supported")
+        if package.runtime not in SUPPORTED_RUNTIME_REGISTERED_PACKAGE_RUNTIMES:
+            raise InvalidSkillPackage("runtime-registered plugin package runtime is not supported")
+        if package.isolation not in SUPPORTED_RUNTIME_REGISTERED_PACKAGE_ISOLATIONS:
+            raise InvalidSkillPackage("runtime-registered plugin package isolation is not supported")
+
+
+def _validate_runtime_registered_plugin_package(
+    request: Request,
+    plugin: PluginResourceRequest,
+    package: PluginPackageMetadata | None,
+) -> None:
+    if package is None or package.kind != "adapter_package":
+        return
+    if package.install_mode != "runtime_registered":
+        return
+    descriptors = {descriptor.id: descriptor for descriptor in _plugin_adapter_descriptors(request)}
+    descriptor = descriptors.get(package.adapter_id or "")
+    if descriptor is None:
+        raise InvalidSkillPackage(
+            "runtime-registered adapter package requires a registered adapter descriptor"
+        )
+    runtime_profiles = set(descriptor.capability_contract.runtime_sandbox_profiles)
+    if package.isolation not in runtime_profiles:
+        raise InvalidSkillPackage(
+            "runtime-registered adapter package isolation is not supported by adapter"
+        )
+    if not plugin.capabilities:
+        raise InvalidSkillPackage(
+            "runtime-registered adapter packages must declare at least one capability"
+        )
+    for capability in plugin.capabilities:
+        if capability.adapter != package.adapter_id:
+            raise InvalidSkillPackage(
+                "runtime-registered adapter packages must route capabilities through package adapter_id"
+            )
+        if capability.sandbox_profile != package.isolation:
+            raise InvalidSkillPackage(
+                "runtime-registered adapter package capabilities must use package isolation"
+            )
+
+
+def _plugin_request_for_activation_check(
+    plugin: PluginResourceResponse,
+) -> PluginResourceRequest:
+    return PluginResourceRequest(
+        id=plugin.id,
+        name=plugin.name,
+        enabled=plugin.enabled,
+        description=plugin.description,
+        version=plugin.version,
+        resource_config=plugin.resource_config,
+        endpoint_url=plugin.endpoint_url,
+        domain_allowlist=plugin.domain_allowlist,
+        timeout_seconds=plugin.timeout_seconds,
+        credential_ref=plugin.credential_ref,
+        credential_header=plugin.credential_header,
+        credential_scheme=plugin.credential_scheme,
+        capabilities=list(plugin.capabilities),
+    )
+
+
+async def _current_plugin_for_activation_check(
+    service: AdminResourceService,
+    plugin_id: str,
+    *,
+    tenant_id: UUID,
+) -> PluginResourceResponse:
+    for plugin in await service.list_plugins(tenant_id=tenant_id):
+        if plugin.id == plugin_id:
+            return plugin
+    raise KeyError(plugin_id)
+
+
+def _ensure_runtime_registered_package_can_activate(
+    request: Request,
+    plugin: PluginResourceResponse,
+    *,
+    require_current_eligibility: bool = False,
+) -> None:
+    if require_current_eligibility:
+        _ensure_plugin_package_activation_allowed(plugin)
+    elif (
+        plugin.package_metadata is not None
+        and plugin.package_metadata.kind == "adapter_package"
+        and plugin.package_metadata.install_mode == "runtime_registered"
+        and plugin.package_metadata.signature_verification != "verified"
+    ):
+        raise PublicAPIError(
+            409,
+            "plugin_package_not_eligible",
+            plugin.package_metadata.activation_reason
+            or "adapter packages must include a trusted verified signature before activation",
+        )
+    try:
+        _validate_runtime_registered_plugin_package(
+            request,
+            _plugin_request_for_activation_check(plugin),
+            plugin.package_metadata,
+        )
+    except InvalidSkillPackage as error:
+        raise PublicAPIError(
+            409,
+            "plugin_package_not_eligible",
+            _safe_model_check_detail(str(error)),
+        ) from None
+
+
+def _plugins_with_runtime_registered_activation_check(
+    request: Request,
+    plugins: Iterable[PluginResourceResponse],
+) -> tuple[PluginResourceResponse, ...]:
+    return tuple(
+        _plugin_with_runtime_registered_activation_check(request, plugin)
+        for plugin in plugins
+    )
+
+
+def _plugin_with_runtime_registered_activation_check(
+    request: Request,
+    plugin: PluginResourceResponse,
+) -> PluginResourceResponse:
+    package = plugin.package_metadata
+    if (
+        package is None
+        or package.kind != "adapter_package"
+        or package.install_mode != "runtime_registered"
+        or package.activation_state != "eligible"
+    ):
+        return plugin
+    try:
+        _validate_runtime_registered_plugin_package(
+            request,
+            _plugin_request_for_activation_check(plugin),
+            package,
+        )
+    except InvalidSkillPackage as error:
+        return plugin.model_copy(
+            update={
+                "package_metadata": package.model_copy(
+                    update={
+                        "activation_state": "blocked_unsupported_runtime",
+                        "activation_reason": _safe_model_check_detail(str(error)),
+                    }
+                ),
+            }
+        )
+    return plugin
 
 
 def _verified_plugin_package_metadata(
@@ -11703,11 +11883,17 @@ async def delete_skill(
     responses=error_responses(401, 403, 422),
 )
 async def list_plugins(
+    request: Request,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> list[PluginResourceResponse]:
     _require(principal, "plugin:read")
-    return list(await service.list_plugins(tenant_id=principal.tenant_id))
+    return list(
+        _plugins_with_runtime_registered_activation_check(
+            request,
+            await service.list_plugins(tenant_id=principal.tenant_id),
+        )
+    )
 
 
 @router.get(
@@ -11883,6 +12069,15 @@ async def install_plugin_archive(
     )
     _validate_plugin_resource_config(request, plugin_request)
     _validate_plugin_capability_configs(request, plugin_request)
+    try:
+        _validate_runtime_registered_plugin_package(request, plugin_request, package_metadata)
+    except InvalidSkillPackage as error:
+        raise PublicAPIError(
+            422,
+            "invalid_plugin_package",
+            "plugin package is invalid",
+            details={"reason": _safe_model_check_detail(str(error))},
+        ) from None
     plugin = await service.upsert_plugin(
         plugin_request,
         tenant_id=principal.tenant_id,
@@ -11925,6 +12120,12 @@ async def approve_plugin_package(
 ) -> PluginResourceResponse:
     _require(principal, "plugin:approve")
     try:
+        current = await _current_plugin_for_activation_check(
+            service,
+            plugin_id,
+            tenant_id=principal.tenant_id,
+        )
+        _ensure_runtime_registered_package_can_activate(request, current)
         response = await service.approve_plugin_package(
             plugin_id,
             body,
@@ -11976,6 +12177,16 @@ async def start_plugin(
 ) -> PluginResourceResponse:
     _require(principal, "plugin:write")
     try:
+        current = await _current_plugin_for_activation_check(
+            service,
+            plugin_id,
+            tenant_id=principal.tenant_id,
+        )
+        _ensure_runtime_registered_package_can_activate(
+            request,
+            current,
+            require_current_eligibility=True,
+        )
         response = await service.start_plugin(
             plugin_id,
             tenant_id=principal.tenant_id,
@@ -12000,6 +12211,16 @@ async def enable_plugin(
 ) -> PluginResourceResponse:
     _require(principal, "plugin:write")
     try:
+        current = await _current_plugin_for_activation_check(
+            service,
+            plugin_id,
+            tenant_id=principal.tenant_id,
+        )
+        _ensure_runtime_registered_package_can_activate(
+            request,
+            current,
+            require_current_eligibility=True,
+        )
         response = await service.enable_plugin(
             plugin_id,
             tenant_id=principal.tenant_id,
@@ -12072,6 +12293,16 @@ async def reload_plugin(
 ) -> PluginResourceResponse:
     _require(principal, "plugin:write")
     try:
+        current = await _current_plugin_for_activation_check(
+            service,
+            plugin_id,
+            tenant_id=principal.tenant_id,
+        )
+        _ensure_runtime_registered_package_can_activate(
+            request,
+            current,
+            require_current_eligibility=True,
+        )
         response = await service.reload_plugin(
             plugin_id,
             tenant_id=principal.tenant_id,
@@ -12144,7 +12375,13 @@ async def capability_manifest(
     _require(principal, "plugin:read")
     _require(principal, "mcp:read")
     plugin_source = PluginConfigCapabilityManifestSource(
-        cast(Any, await service.list_plugins(tenant_id=principal.tenant_id))
+        cast(
+            Any,
+            _plugins_with_runtime_registered_activation_check(
+                request,
+                await service.list_plugins(tenant_id=principal.tenant_id),
+            ),
+        )
     )
     mcp_source = McpConfigCapabilityManifestSource(
         await service.list_mcp_servers(tenant_id=principal.tenant_id)

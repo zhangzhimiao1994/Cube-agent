@@ -10,7 +10,13 @@ import httpx
 from jsonschema import ValidationError  # type: ignore[import-untyped]
 from jsonschema.protocols import Validator  # type: ignore[import-untyped]
 
-from agent_hub.api.routers.admin import PluginCapabilityRequest, PluginResourceResponse
+from agent_hub.api.routers.admin import (
+    SUPPORTED_PLUGIN_PACKAGE_SDK_API_VERSIONS,
+    SUPPORTED_RUNTIME_REGISTERED_PACKAGE_ISOLATIONS,
+    SUPPORTED_RUNTIME_REGISTERED_PACKAGE_RUNTIMES,
+    PluginCapabilityRequest,
+    PluginResourceResponse,
+)
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.policy import CapabilityRule
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
@@ -192,7 +198,9 @@ class RuntimePluginService:
         plugins = self._plugins_for_tenant(tenant_id)
         if plugins is None:
             return _empty_manifest()
-        return PluginConfigCapabilityManifestSource(cast(Any, plugins)).manifests()
+        return PluginConfigCapabilityManifestSource(
+            cast(Any, _plugins_with_runtime_activation(plugins, self._adapters))
+        ).manifests()
 
     def adapter_descriptors(self) -> tuple[Mapping[str, JsonValue], ...]:
         return tuple(
@@ -216,7 +224,7 @@ class RuntimePluginService:
             return ()
         rules: list[CapabilityRule] = []
         for plugin in plugins:
-            if not _plugin_is_running(plugin):
+            if not _plugin_is_running(plugin, self._adapters):
                 continue
             for capability in plugin.capabilities:
                 effect = _plugin_policy_effect(capability.policy_effect)
@@ -336,7 +344,7 @@ class RuntimePluginService:
         if plugins is None:
             return None
         for plugin in plugins:
-            if not _plugin_is_running(plugin):
+            if not _plugin_is_running(plugin, self._adapters):
                 continue
             for capability in plugin.capabilities:
                 if capability.id == name or name in capability.aliases:
@@ -398,22 +406,99 @@ def _empty_manifest() -> Mapping[str, JsonValue]:
     }
 
 
-def _plugin_is_running(plugin: PluginResourceResponse) -> bool:
+def _plugin_is_running(
+    plugin: PluginResourceResponse,
+    adapters: Mapping[str, PluginAdapter] | None = None,
+) -> bool:
     return (
         plugin.enabled is True
         and plugin.status == "running"
         and plugin.health == "healthy"
-        and not _plugin_package_blocks_runtime_activation(plugin)
+        and not _plugin_package_blocks_runtime_activation(plugin, adapters or {})
     )
 
 
-def _plugin_package_blocks_runtime_activation(plugin: PluginResourceResponse) -> bool:
+def _plugin_package_blocks_runtime_activation(
+    plugin: PluginResourceResponse,
+    adapters: Mapping[str, PluginAdapter],
+) -> bool:
+    return _runtime_package_activation_block_reason(plugin, adapters) is not None
+
+
+def _plugins_with_runtime_activation(
+    plugins: tuple[PluginResourceResponse, ...],
+    adapters: Mapping[str, PluginAdapter],
+) -> tuple[PluginResourceResponse, ...]:
+    return tuple(_plugin_with_runtime_activation(plugin, adapters) for plugin in plugins)
+
+
+def _plugin_with_runtime_activation(
+    plugin: PluginResourceResponse,
+    adapters: Mapping[str, PluginAdapter],
+) -> PluginResourceResponse:
     package = plugin.package_metadata
-    return (
-        package is not None
-        and package.kind == "adapter_package"
-        and package.activation_state != "eligible"
+    reason = _runtime_package_activation_block_reason(plugin, adapters)
+    if (
+        reason is None
+        or package is None
+        or package.kind != "adapter_package"
+        or package.activation_state != "eligible"
+    ):
+        return plugin
+    return plugin.model_copy(
+        update={
+            "package_metadata": package.model_copy(
+                update={
+                    "activation_state": "blocked_unsupported_runtime",
+                    "activation_reason": reason,
+                }
+            ),
+        }
     )
+
+
+def _runtime_package_activation_block_reason(
+    plugin: PluginResourceResponse,
+    adapters: Mapping[str, PluginAdapter],
+) -> str | None:
+    package = plugin.package_metadata
+    if package is None or package.kind != "adapter_package":
+        return None
+    if package.activation_state != "eligible":
+        return package.activation_reason or "plugin package is not eligible for activation"
+    if package.install_mode != "runtime_registered":
+        return "plugin package install mode is not supported for activation"
+    if package.signature is None or package.signature_verification != "verified":
+        return "adapter packages must include a trusted verified signature before activation"
+    if package.approval_state != "approved":
+        return "adapter package requires plugin approval before activation"
+    if package.sdk_api_version not in SUPPORTED_PLUGIN_PACKAGE_SDK_API_VERSIONS:
+        return "plugin package SDK API version is not supported for activation"
+    if package.runtime not in SUPPORTED_RUNTIME_REGISTERED_PACKAGE_RUNTIMES:
+        return "plugin package runtime is not supported for activation"
+    if package.isolation not in SUPPORTED_RUNTIME_REGISTERED_PACKAGE_ISOLATIONS:
+        return "plugin package isolation is not supported for activation"
+    adapter = adapters.get(package.adapter_id or "")
+    if adapter is None:
+        return "runtime-registered adapter package requires a registered adapter"
+    descriptor = _adapter_descriptor(package.adapter_id or "", adapter)
+    if descriptor.get("id") != package.adapter_id:
+        return "runtime-registered adapter package descriptor id does not match package adapter_id"
+    try:
+        _ensure_supported_plugin_sandbox_profile(package.isolation, descriptor=descriptor)
+    except RuntimeCapabilityError:
+        return "runtime-registered adapter package isolation is not supported by adapter"
+    if not plugin.capabilities:
+        return "runtime-registered adapter packages must declare at least one capability"
+    for capability in plugin.capabilities:
+        if capability.adapter != package.adapter_id:
+            return (
+                "runtime-registered adapter packages must route capabilities "
+                "through package adapter_id"
+            )
+        if capability.sandbox_profile != package.isolation:
+            return "runtime-registered adapter package capabilities must use package isolation"
+    return None
 
 
 def _permission_class_parts(permission_class: str) -> tuple[str, str] | None:

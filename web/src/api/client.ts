@@ -991,6 +991,7 @@ const PluginPackageMetadataSchema = z.object({
       "blocked_failed_signature",
       "blocked_pending_approval",
       "blocked_rejected_approval",
+      "blocked_unsupported_runtime",
       "verified_scan_only",
       "eligible",
     ])
@@ -1001,7 +1002,7 @@ const PluginPackageMetadataSchema = z.object({
   isolation: z
     .enum(["none", "remote_connector", "in_process", "local_process", "container", "mcp_remote"])
     .default("none"),
-  install_mode: z.literal("scan_only").default("scan_only"),
+  install_mode: z.enum(["scan_only", "runtime_registered"]).default("scan_only"),
 });
 
 const PluginResourceSchema = z.object({

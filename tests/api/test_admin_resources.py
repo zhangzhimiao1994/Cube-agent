@@ -54,7 +54,6 @@ from agent_hub.api.routers.admin import (
     _mode_error_log_from_run,
     _model_check_failure_details,
     _openclaw_proposal,
-    _plugin_archive_manifest_from_archive,
     _plugin_signature_payload,
     _repair_proposal,
     _routing_details,
@@ -3568,8 +3567,10 @@ def signed_plugin_archive(
     *,
     key_id: str = "calendar-prod",
     files: dict[str, str] | None = None,
+    package_overrides: Mapping[str, object] | None = None,
+    capabilities: list[Mapping[str, object]] | None = None,
 ) -> bytes:
-    package = {
+    package: dict[str, object] = {
         "schema_version": 1,
         "kind": "adapter_package",
         "package_version": "1.2.3",
@@ -3584,7 +3585,14 @@ def signed_plugin_archive(
         "isolation": "local_process",
         "install_mode": "scan_only",
     }
-    manifest = {"id": "calendar", "name": "Calendar HTTP", "package": package}
+    package = {**package, **(package_overrides or {})}
+    manifest: dict[str, object] = {
+        "id": "calendar",
+        "name": "Calendar HTTP",
+        "package": package,
+    }
+    if capabilities is not None:
+        manifest["capabilities"] = capabilities
     package_files = files or {"adapter/main.py": "def invoke():\n    return {}\n"}
     unsigned_archive = plugin_archive(
         {
@@ -3602,7 +3610,18 @@ def signed_plugin_archive(
     signature = plugin_signature_value(
         private_key,
         _plugin_signature_payload(
-            _plugin_archive_manifest_from_archive(unsigned_archive),
+            PluginArchiveManifest.model_validate(
+                {
+                    **manifest,
+                    "package": {
+                        **package,
+                        "signature": {
+                            **cast(dict[str, object], package["signature"]),
+                            "value": VALID_PLUGIN_SIGNATURE,
+                        },
+                    },
+                }
+            ),
             unsigned_archive,
         ),
     )
@@ -4757,6 +4776,862 @@ def test_plugin_package_approval_updates_metadata_and_keeps_scan_only_closed() -
     assert rejected_metadata["activation_state"] == "blocked_rejected_approval"
     assert rejected_metadata["activation_reason"] == "requires isolation review"
     assert reloaded == [TENANT_ID, TENANT_ID, TENANT_ID, TENANT_ID]
+
+
+def test_runtime_registered_adapter_package_requires_known_adapter() -> None:
+    api = client()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(
+            private_key,
+            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            capabilities=[
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "calendar_python",
+                    "sandbox_profile": "in_process",
+                }
+            ],
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["details"]["reason"] == (
+        "runtime-registered adapter package requires a registered adapter descriptor"
+    )
+
+
+def test_runtime_registered_adapter_package_requires_capabilities_to_use_package_adapter() -> None:
+    class CalendarPluginService:
+        def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
+            return (
+                {
+                    "id": "calendar_python",
+                    "name": "Calendar Python",
+                    "description": None,
+                    "resource_schema": {"type": "object", "additionalProperties": True},
+                    "capability_schema": {
+                        "type": "object",
+                        "properties": {
+                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                        },
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    api = client()
+    cast(Any, api.app).state.plugin_service = CalendarPluginService()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(
+            private_key,
+            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            capabilities=[
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "other_adapter",
+                    "sandbox_profile": "in_process",
+                }
+            ],
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["details"]["reason"] == (
+        "runtime-registered adapter packages must route capabilities through package adapter_id"
+    )
+
+
+@pytest.mark.parametrize(
+    ("package_overrides", "capabilities", "expected_reason"),
+    (
+        (
+            {
+                "install_mode": "runtime_registered",
+                "sdk_api_version": "9.9",
+                "isolation": "in_process",
+            },
+            [
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "calendar_python",
+                    "sandbox_profile": "in_process",
+                }
+            ],
+            "plugin package SDK API version is not supported",
+        ),
+        (
+            {
+                "install_mode": "runtime_registered",
+                "runtime": "node",
+                "isolation": "in_process",
+            },
+            [
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "calendar_python",
+                    "sandbox_profile": "in_process",
+                }
+            ],
+            "runtime-registered plugin package runtime is not supported",
+        ),
+        (
+            {"install_mode": "runtime_registered"},
+            [
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "calendar_python",
+                    "sandbox_profile": "local_process",
+                }
+            ],
+            "runtime-registered plugin package isolation is not supported",
+        ),
+        (
+            {"install_mode": "runtime_registered", "isolation": "in_process"},
+            [],
+            "runtime-registered adapter packages must declare at least one capability",
+        ),
+        (
+            {"install_mode": "runtime_registered", "isolation": "in_process"},
+            [
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "calendar_python",
+                    "sandbox_profile": "remote_connector",
+                }
+            ],
+            "runtime-registered adapter package capabilities must use package isolation",
+        ),
+    ),
+)
+def test_runtime_registered_adapter_package_rejects_unsupported_activation_contract(
+    package_overrides: Mapping[str, object],
+    capabilities: list[Mapping[str, object]],
+    expected_reason: str,
+) -> None:
+    class CalendarPluginService:
+        def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
+            return (
+                {
+                    "id": "calendar_python",
+                    "name": "Calendar Python",
+                    "description": None,
+                    "resource_schema": {"type": "object", "additionalProperties": True},
+                    "capability_schema": {
+                        "type": "object",
+                        "properties": {
+                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                        },
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    api = client()
+    cast(Any, api.app).state.plugin_service = CalendarPluginService()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(
+            private_key,
+            package_overrides=package_overrides,
+            capabilities=capabilities,
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    assert response.json()["error"]["details"]["reason"] == expected_reason
+
+
+def test_runtime_registered_adapter_package_can_be_approved_and_started() -> None:
+    class CalendarPluginService:
+        def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
+            return (
+                {
+                    "id": "calendar_python",
+                    "name": "Calendar Python",
+                    "description": None,
+                    "resource_schema": {"type": "object", "additionalProperties": True},
+                    "capability_schema": {
+                        "type": "object",
+                        "properties": {
+                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                        },
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    api = client()
+    cast(Any, api.app).state.plugin_service = CalendarPluginService()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(
+            private_key,
+            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            capabilities=[
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "calendar_python",
+                    "sandbox_profile": "in_process",
+                }
+            ],
+        ),
+    )
+    approved = api.post(
+        "/api/v1/admin/plugins/calendar/package/approve",
+        headers=headers(),
+        json={},
+    )
+    started = api.post("/api/v1/admin/plugins/calendar/start", headers=headers())
+
+    assert install.status_code == 200
+    assert (
+        install.json()["plugin"]["package_metadata"]["activation_state"]
+        == "blocked_pending_approval"
+    )
+    assert approved.status_code == 200
+    assert approved.json()["package_metadata"]["activation_state"] == "eligible"
+    assert approved.json()["package_metadata"]["activation_reason"] == (
+        "package signature, approval, SDK, adapter, and isolation policy allow execution"
+    )
+    assert started.status_code == 200
+    assert started.json()["status"] == "running"
+
+
+def test_runtime_registered_adapter_package_approval_rechecks_registered_adapter() -> None:
+    class CalendarPluginService:
+        def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
+            return (
+                {
+                    "id": "calendar_python",
+                    "name": "Calendar Python",
+                    "description": None,
+                    "resource_schema": {"type": "object", "additionalProperties": True},
+                    "capability_schema": {
+                        "type": "object",
+                        "properties": {
+                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                        },
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    api = client()
+    cast(Any, api.app).state.plugin_service = CalendarPluginService()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(
+            private_key,
+            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            capabilities=[
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "calendar_python",
+                    "sandbox_profile": "in_process",
+                }
+            ],
+        ),
+    )
+    cast(Any, api.app).state.plugin_service = object()
+
+    approved = api.post(
+        "/api/v1/admin/plugins/calendar/package/approve",
+        headers=headers(),
+        json={},
+    )
+
+    assert install.status_code == 200
+    assert approved.status_code == 409
+    assert approved.json()["error"]["code"] == "plugin_package_not_eligible"
+    assert approved.json()["error"]["message"] == (
+        "runtime-registered adapter package requires a registered adapter descriptor"
+    )
+
+
+def test_runtime_registered_adapter_package_approval_rechecks_effective_trust() -> None:
+    class CalendarPluginService:
+        def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
+            return (
+                {
+                    "id": "calendar_python",
+                    "name": "Calendar Python",
+                    "description": None,
+                    "resource_schema": {"type": "object", "additionalProperties": True},
+                    "capability_schema": {
+                        "type": "object",
+                        "properties": {
+                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                        },
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    api = client()
+    cast(Any, api.app).state.plugin_service = CalendarPluginService()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(
+            private_key,
+            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            capabilities=[
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "calendar_python",
+                    "sandbox_profile": "in_process",
+                }
+            ],
+        ),
+    )
+    deleted_key = api.delete(
+        "/api/v1/admin/plugins/signing-keys/calendar-prod",
+        headers=headers(),
+    )
+
+    approved = api.post(
+        "/api/v1/admin/plugins/calendar/package/approve",
+        headers=headers(),
+        json={},
+    )
+
+    assert install.status_code == 200
+    assert deleted_key.status_code == 200
+    assert approved.status_code == 409
+    assert approved.json()["error"]["code"] == "plugin_package_not_eligible"
+    assert approved.json()["error"]["message"] == "package signature key is not trusted for this tenant"
+
+
+def test_runtime_registered_adapter_package_start_rechecks_registered_adapter() -> None:
+    class CalendarPluginService:
+        def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
+            return (
+                {
+                    "id": "calendar_python",
+                    "name": "Calendar Python",
+                    "description": None,
+                    "resource_schema": {"type": "object", "additionalProperties": True},
+                    "capability_schema": {
+                        "type": "object",
+                        "properties": {
+                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                        },
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    api = client()
+    cast(Any, api.app).state.plugin_service = CalendarPluginService()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(
+            private_key,
+            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            capabilities=[
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "calendar_python",
+                    "sandbox_profile": "in_process",
+                }
+            ],
+        ),
+    )
+    approved = api.post(
+        "/api/v1/admin/plugins/calendar/package/approve",
+        headers=headers(),
+        json={},
+    )
+    cast(Any, api.app).state.plugin_service = object()
+
+    started = api.post("/api/v1/admin/plugins/calendar/start", headers=headers())
+
+    assert install.status_code == 200
+    assert approved.status_code == 200
+    assert started.status_code == 409
+    assert started.json()["error"]["code"] == "plugin_package_not_eligible"
+    assert started.json()["error"]["message"] == (
+        "runtime-registered adapter package requires a registered adapter descriptor"
+    )
+
+
+def test_runtime_registered_adapter_package_start_rechecks_effective_trust() -> None:
+    class CalendarPluginService:
+        def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
+            return (
+                {
+                    "id": "calendar_python",
+                    "name": "Calendar Python",
+                    "description": None,
+                    "resource_schema": {"type": "object", "additionalProperties": True},
+                    "capability_schema": {
+                        "type": "object",
+                        "properties": {
+                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                        },
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    api = client()
+    cast(Any, api.app).state.plugin_service = CalendarPluginService()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(
+            private_key,
+            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            capabilities=[
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "calendar_python",
+                    "sandbox_profile": "in_process",
+                }
+            ],
+        ),
+    )
+    approved = api.post(
+        "/api/v1/admin/plugins/calendar/package/approve",
+        headers=headers(),
+        json={},
+    )
+    deleted_key = api.delete(
+        "/api/v1/admin/plugins/signing-keys/calendar-prod",
+        headers=headers(),
+    )
+
+    started = api.post("/api/v1/admin/plugins/calendar/start", headers=headers())
+
+    assert install.status_code == 200
+    assert approved.status_code == 200
+    assert approved.json()["package_metadata"]["activation_state"] == "eligible"
+    assert deleted_key.status_code == 200
+    assert started.status_code == 409
+    assert started.json()["error"]["code"] == "plugin_package_not_eligible"
+    assert started.json()["error"]["message"] == "package signature key is not trusted for this tenant"
+
+
+@pytest.mark.parametrize("endpoint", ("enable", "reload"))
+def test_runtime_registered_adapter_package_lifecycle_rechecks_registered_adapter(
+    endpoint: str,
+) -> None:
+    class CalendarPluginService:
+        def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
+            return (
+                {
+                    "id": "calendar_python",
+                    "name": "Calendar Python",
+                    "description": None,
+                    "resource_schema": {"type": "object", "additionalProperties": True},
+                    "capability_schema": {
+                        "type": "object",
+                        "properties": {
+                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                        },
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    api = client()
+    cast(Any, api.app).state.plugin_service = CalendarPluginService()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(
+            private_key,
+            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            capabilities=[
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "calendar_python",
+                    "sandbox_profile": "in_process",
+                }
+            ],
+        ),
+    )
+    approved = api.post(
+        "/api/v1/admin/plugins/calendar/package/approve",
+        headers=headers(),
+        json={},
+    )
+    cast(Any, api.app).state.plugin_service = object()
+
+    response = api.post(f"/api/v1/admin/plugins/calendar/{endpoint}", headers=headers())
+
+    assert install.status_code == 200
+    assert approved.status_code == 200
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "plugin_package_not_eligible"
+    assert response.json()["error"]["message"] == (
+        "runtime-registered adapter package requires a registered adapter descriptor"
+    )
+
+
+@pytest.mark.parametrize("endpoint", ("enable", "reload"))
+def test_runtime_registered_adapter_package_lifecycle_rechecks_effective_trust(
+    endpoint: str,
+) -> None:
+    class CalendarPluginService:
+        def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
+            return (
+                {
+                    "id": "calendar_python",
+                    "name": "Calendar Python",
+                    "description": None,
+                    "resource_schema": {"type": "object", "additionalProperties": True},
+                    "capability_schema": {
+                        "type": "object",
+                        "properties": {
+                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                        },
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    api = client()
+    cast(Any, api.app).state.plugin_service = CalendarPluginService()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(
+            private_key,
+            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            capabilities=[
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "calendar_python",
+                    "sandbox_profile": "in_process",
+                }
+            ],
+        ),
+    )
+    approved = api.post(
+        "/api/v1/admin/plugins/calendar/package/approve",
+        headers=headers(),
+        json={},
+    )
+    deleted_key = api.delete(
+        "/api/v1/admin/plugins/signing-keys/calendar-prod",
+        headers=headers(),
+    )
+
+    response = api.post(f"/api/v1/admin/plugins/calendar/{endpoint}", headers=headers())
+
+    assert install.status_code == 200
+    assert approved.status_code == 200
+    assert approved.json()["package_metadata"]["activation_state"] == "eligible"
+    assert deleted_key.status_code == 200
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "plugin_package_not_eligible"
+    assert response.json()["error"]["message"] == (
+        "package signature key is not trusted for this tenant"
+    )
+
+
+def test_capability_manifest_rechecks_runtime_registered_adapter_descriptor() -> None:
+    class CalendarPluginService:
+        def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
+            return (
+                {
+                    "id": "calendar_python",
+                    "name": "Calendar Python",
+                    "description": None,
+                    "resource_schema": {"type": "object", "additionalProperties": True},
+                    "capability_schema": {
+                        "type": "object",
+                        "properties": {
+                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                        },
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    api = client()
+    cast(Any, api.app).state.runtime_capability_gateway = FakeRuntimeCapabilityGateway()
+    cast(Any, api.app).state.plugin_service = CalendarPluginService()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(
+            private_key,
+            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            capabilities=[
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "calendar_python",
+                    "sandbox_profile": "in_process",
+                }
+            ],
+        ),
+    )
+    approved = api.post(
+        "/api/v1/admin/plugins/calendar/package/approve",
+        headers=headers(),
+        json={},
+    )
+    cast(Any, api.app).state.plugin_service = object()
+
+    manifest = api.get("/api/v1/admin/capabilities/manifest", headers=headers())
+    capabilities = {item["id"]: item for item in manifest.json()["capabilities"]}
+
+    assert install.status_code == 200
+    assert approved.status_code == 200
+    assert approved.json()["package_metadata"]["activation_state"] == "eligible"
+    assert manifest.status_code == 200
+    assert capabilities["calendar.create_event"]["available"] is False
+    assert capabilities["calendar.create_event"]["availability_reason"] == (
+        "plugin_package_not_eligible"
+    )
+
+
+def test_plugin_listing_rechecks_runtime_registered_adapter_descriptor() -> None:
+    class CalendarPluginService:
+        def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
+            return (
+                {
+                    "id": "calendar_python",
+                    "name": "Calendar Python",
+                    "description": None,
+                    "resource_schema": {"type": "object", "additionalProperties": True},
+                    "capability_schema": {
+                        "type": "object",
+                        "properties": {
+                            "sandbox_profile": {"type": "string", "enum": ("in_process",)}
+                        },
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    api = client()
+    cast(Any, api.app).state.plugin_service = CalendarPluginService()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(
+            private_key,
+            package_overrides={"install_mode": "runtime_registered", "isolation": "in_process"},
+            capabilities=[
+                {
+                    "id": "calendar.create_event",
+                    "adapter": "calendar_python",
+                    "sandbox_profile": "in_process",
+                }
+            ],
+        ),
+    )
+    approved = api.post(
+        "/api/v1/admin/plugins/calendar/package/approve",
+        headers=headers(),
+        json={},
+    )
+    cast(Any, api.app).state.plugin_service = object()
+
+    listed = api.get("/api/v1/admin/plugins", headers=headers())
+    metadata = listed.json()[0]["package_metadata"]
+
+    assert install.status_code == 200
+    assert approved.status_code == 200
+    assert approved.json()["package_metadata"]["activation_state"] == "eligible"
+    assert metadata["activation_state"] == "blocked_unsupported_runtime"
+    assert metadata["activation_reason"] == (
+        "runtime-registered adapter package requires a registered adapter descriptor"
+    )
 
 
 def test_plugin_package_approval_mutations_require_plugin_approval_permission(
