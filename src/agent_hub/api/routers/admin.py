@@ -2938,6 +2938,51 @@ def _plugin_response_from_request(
     )
 
 
+def _plugin_upsert_audit_details(plugin: PluginResourceResponse) -> dict[str, object]:
+    resource_config_keys, redacted_resource_config_keys = _safe_plugin_config_key_summary(
+        plugin.resource_config
+    )
+    capability_config_keys: set[str] = set()
+    redacted_capability_config_keys = 0
+    capability_config_key_count = 0
+    for capability in plugin.capabilities:
+        capability_config_key_count += len(capability.capability_config)
+        safe_keys, redacted_keys = _safe_plugin_config_key_summary(capability.capability_config)
+        capability_config_keys.update(safe_keys)
+        redacted_capability_config_keys += redacted_keys
+    return {
+        "id": plugin.id,
+        "capability_count": len(plugin.capabilities),
+        "capability_ids": _sorted_csv(capability.id for capability in plugin.capabilities),
+        "adapters": _sorted_csv(capability.adapter for capability in plugin.capabilities),
+        "permission_classes": _sorted_csv(
+            capability.permission_class for capability in plugin.capabilities
+        ),
+        "policy_effects": _sorted_csv(
+            capability.policy_effect for capability in plugin.capabilities
+        ),
+        "sandbox_profiles": _sorted_csv(
+            capability.sandbox_profile for capability in plugin.capabilities
+        ),
+        "resource_config_key_count": len(plugin.resource_config),
+        "resource_config_keys": ",".join(resource_config_keys),
+        "redacted_resource_config_key_count": redacted_resource_config_keys,
+        "capability_config_key_count": capability_config_key_count,
+        "capability_config_keys": ",".join(sorted(capability_config_keys)),
+        "redacted_capability_config_key_count": redacted_capability_config_keys,
+    }
+
+
+def _safe_plugin_config_key_summary(config: Mapping[str, JsonValue]) -> tuple[tuple[str, ...], int]:
+    keys = sorted(str(key) for key in config)
+    safe_keys = tuple(key for key in keys if not _contains_sensitive_marker(key))
+    return safe_keys, len(keys) - len(safe_keys)
+
+
+def _sorted_csv(values: Iterable[str]) -> str:
+    return ",".join(sorted(set(values)))
+
+
 def _plugin_started_response(plugin: PluginResourceResponse) -> PluginResourceResponse:
     if not plugin.enabled:
         raise PublicAPIError(409, "plugin_disabled", "plugin is disabled")
@@ -5656,7 +5701,11 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             "plugin", response.id, response.model_dump(mode="json")
         ):
             return await super().upsert_plugin(request)
-        await self._record_audit("plugin.upsert", f"plugin:{response.id}", {"id": response.id})
+        await self._record_audit(
+            "plugin.upsert",
+            f"plugin:{response.id}",
+            _plugin_upsert_audit_details(response),
+        )
         return response
 
     async def start_plugin(self, plugin_id: str) -> PluginResourceResponse:

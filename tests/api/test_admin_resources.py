@@ -2645,6 +2645,90 @@ async def test_persistent_admin_plugin_lifecycle_persists_status() -> None:
     assert listed == (started,)
 
 
+@pytest.mark.asyncio
+async def test_persistent_admin_plugin_upsert_audit_records_safe_policy_summary() -> None:
+    class StoredPersistentService(PersistentAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__(
+                config_service=FakeConfigService(),  # type: ignore[arg-type]
+                secret_service=FakeSecretService(),  # type: ignore[arg-type]
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+            )
+            self._session_factory = cast(Any, object())
+            self.payloads: dict[tuple[str, str], dict[str, object]] = {}
+
+        async def _get_admin_payload(self, kind: str, resource_id: str) -> dict[str, object] | None:
+            return self.payloads.get((kind, resource_id), {})
+
+        async def _upsert_admin_payload(
+            self, kind: str, resource_id: str, payload: dict[str, object]
+        ) -> bool:
+            self.payloads[(kind, resource_id)] = payload
+            return True
+
+        async def _list_admin_payloads(
+            self,
+            kind: str,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> list[dict[str, object]] | None:
+            del tenant_id
+            return [
+                payload
+                for (payload_kind, _resource_id), payload in self.payloads.items()
+                if payload_kind == kind
+            ]
+
+    service = StoredPersistentService()
+
+    await service.upsert_plugin(
+        PluginResourceRequest(
+            id="search",
+            name="Search Plugin",
+            resource_config={
+                "base_url": "https://search.internal",
+                "secret_token": "do-not-leak",
+            },
+            capabilities=[
+                PluginCapabilityRequest(
+                    id="search.web",
+                    adapter="http_json",
+                    permission_class="network.read",
+                    sandbox_profile="remote_connector",
+                    policy_effect="require_approval",
+                    capability_config={
+                        "mode": "semantic",
+                        "api_key": "sk-do-not-leak",
+                    },
+                )
+            ],
+        )
+    )
+
+    audits = await service.list_audit_events("plugin.upsert")
+
+    assert len(audits) == 1
+    details = audits[0].details
+    assert details["id"] == "search"
+    assert details["capability_count"] == "1"
+    assert details["capability_ids"] == "search.web"
+    assert details["adapters"] == "http_json"
+    assert details["permission_classes"] == "network.read"
+    assert details["policy_effects"] == "require_approval"
+    assert details["sandbox_profiles"] == "remote_connector"
+    assert details["resource_config_key_count"] == "2"
+    assert details["resource_config_keys"] == "base_url"
+    assert details["redacted_resource_config_key_count"] == "1"
+    assert details["capability_config_key_count"] == "2"
+    assert details["capability_config_keys"] == "mode"
+    assert details["redacted_capability_config_key_count"] == "1"
+    assert "do-not-leak" not in repr(details)
+    assert "sk-do-not-leak" not in repr(details)
+    assert "secret_token" not in repr(details)
+    assert "api_key" not in repr(details)
+
+
 def test_plugin_admin_api_exposes_running_plugin_capabilities_in_manifest() -> None:
     api = client()
     cast(Any, api.app).state.runtime_capability_gateway = FakeRuntimeCapabilityGateway()
