@@ -243,12 +243,16 @@ class RuntimePluginService:
             idempotency_key=idempotency_key,
         )
         try:
-            _ensure_supported_plugin_sandbox_profile(capability.sandbox_profile)
             adapter = self._adapters.get(capability.adapter)
             if adapter is None:
                 raise RuntimeCapabilityError("Plugin backend unavailable")
+            descriptor = _adapter_descriptor(capability.adapter, adapter)
+            _ensure_supported_plugin_sandbox_profile(
+                capability.sandbox_profile,
+                descriptor=descriptor,
+            )
             argument_validator = _plugin_schema_validator(
-                schema=_adapter_argument_schema(capability.adapter, adapter),
+                schema=_adapter_argument_schema(descriptor),
                 invalid_schema_message="Plugin adapter argument schema is invalid",
             )
             input_validator = _plugin_schema_validator(
@@ -415,13 +419,24 @@ def _plugin_policy_effect(value: str) -> PolicyEffect | None:
         return PolicyEffect.DENY
 
 
-def _ensure_supported_plugin_sandbox_profile(sandbox_profile: str) -> None:
+def _ensure_supported_plugin_sandbox_profile(
+    sandbox_profile: str,
+    *,
+    descriptor: Mapping[str, JsonValue],
+) -> None:
     if sandbox_profile in _SUPPORTED_PLUGIN_SANDBOX_PROFILES:
+        return
+    declared_profiles = (
+        _adapter_declared_sandbox_profiles(descriptor)
+        & _ADAPTER_DECLARABLE_PLUGIN_SANDBOX_PROFILES
+    )
+    if sandbox_profile in declared_profiles:
         return
     raise RuntimeCapabilityError("Plugin sandbox profile unsupported")
 
 
 _SUPPORTED_PLUGIN_SANDBOX_PROFILES = frozenset(("remote_connector",))
+_ADAPTER_DECLARABLE_PLUGIN_SANDBOX_PROFILES = frozenset(("in_process",))
 _PLUGIN_POLICY_ROLES = (Role.SUPER_ADMIN, Role.ADMIN, Role.OPERATOR)
 
 
@@ -462,13 +477,30 @@ def _adapter_descriptor(adapter_id: str, adapter: PluginAdapter) -> Mapping[str,
 
 
 def _adapter_argument_schema(
-    adapter_id: str,
-    adapter: PluginAdapter,
+    descriptor: Mapping[str, JsonValue],
 ) -> Mapping[str, JsonValue] | None:
-    argument_schema = _adapter_descriptor(adapter_id, adapter).get("argument_schema")
+    argument_schema = descriptor.get("argument_schema")
     if isinstance(argument_schema, Mapping):
         return argument_schema
     return None
+
+
+def _adapter_declared_sandbox_profiles(
+    descriptor: Mapping[str, JsonValue],
+) -> frozenset[str]:
+    capability_schema = descriptor.get("capability_schema")
+    if not isinstance(capability_schema, Mapping):
+        return frozenset()
+    properties = capability_schema.get("properties")
+    if not isinstance(properties, Mapping):
+        return frozenset()
+    sandbox_schema = properties.get("sandbox_profile")
+    if not isinstance(sandbox_schema, Mapping):
+        return frozenset()
+    enum_values = sandbox_schema.get("enum")
+    if not isinstance(enum_values, Sequence) or isinstance(enum_values, str | bytes):
+        return frozenset()
+    return frozenset(value for value in enum_values if isinstance(value, str) and value)
 
 
 def _http_json_adapter_descriptor() -> Mapping[str, JsonValue]:
