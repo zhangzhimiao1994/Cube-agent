@@ -6258,14 +6258,18 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
 
     async def get_hermes_insight(self, insight_id: str) -> HermesInsightResponse:
         payload = await self._get_admin_payload("hermes", insight_id)
-        if payload:
-            return _hermes_response_from_payload(payload)
-        return await super().get_hermes_insight(insight_id)
+        if payload is None:
+            return await super().get_hermes_insight(insight_id)
+        if not payload:
+            raise KeyError(insight_id)
+        return _hermes_response_from_payload(payload)
 
     async def confirm_hermes_insight(self, insight_id: str) -> HermesInsightResponse:
         payload = await self._get_admin_payload("hermes", insight_id)
-        if not payload:
+        if payload is None:
             return await super().confirm_hermes_insight(insight_id)
+        if not payload:
+            raise KeyError(insight_id)
         payload["confirmed_at"] = datetime.now(UTC).isoformat()
         if not await self._upsert_admin_payload("hermes", insight_id, payload):
             return await super().confirm_hermes_insight(insight_id)
@@ -6274,9 +6278,11 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
 
     async def delete_hermes_insight(self, insight_id: str) -> None:
         deleted = await self._delete_admin_payload("hermes", insight_id)
-        if not deleted:
+        if deleted is None:
             await super().delete_hermes_insight(insight_id)
             return
+        if not deleted:
+            raise KeyError(insight_id)
         await self._record_audit("hermes.delete", f"hermes:{insight_id}", {"id": insight_id})
 
     async def record_hermes_feedback(self, request: HermesFeedbackRequest) -> HermesInsightResponse:
@@ -10060,7 +10066,11 @@ async def download_operational_run_artifact(
 ) -> FileResponse:
     _require(principal, "run:read")
     try:
-        download = await service.download_run_artifact(run_id, artifact_id)
+        download = await service.download_run_artifact(
+            run_id,
+            artifact_id,
+            tenant_id=principal.tenant_id,
+        )
     except (KeyError, FileNotFoundError, ValueError):
         raise PublicAPIError(404, "not_found", "not found") from None
     return FileResponse(

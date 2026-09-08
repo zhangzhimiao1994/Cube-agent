@@ -27,6 +27,7 @@ from agent_hub.api.routers.admin import (
     AuditEventResponse,
     InMemoryAdminResourceService,
     MainAgentConfigRequest,
+    MainAgentConfigResponse,
     MainAgentModelConfig,
     McpServerRequest,
     McpServerResponse,
@@ -2487,6 +2488,187 @@ class TenantScopedAdminResourceService(InMemoryAdminResourceService):
         self.root.calls.append(("list_audit", action or "", self.tenant_id, self.actor_id))
         return await super().list_audit_events(action)
 
+    async def get_settings(self) -> SystemSettingsResponse:
+        self.root.calls.append(("get_settings", "", self.tenant_id, self.actor_id))
+        return await super().get_settings()
+
+    async def update_settings(
+        self, request: admin_router.SystemSettingsRequest
+    ) -> SystemSettingsResponse:
+        self.root.calls.append(("update_settings", request.default_mode, self.tenant_id, self.actor_id))
+        return await super().update_settings(request)
+
+    async def get_main_agent_config(self) -> MainAgentConfigResponse:
+        self.root.calls.append(("get_main_agent", "", self.tenant_id, self.actor_id))
+        return await super().get_main_agent_config()
+
+    async def update_main_agent_config(
+        self, request: MainAgentConfigRequest
+    ) -> MainAgentConfigResponse:
+        self.root.calls.append(
+            ("update_main_agent", request.control_mode, self.tenant_id, self.actor_id)
+        )
+        return await super().update_main_agent_config(request)
+
+    async def list_memory(self) -> tuple[admin_router.MemoryRecordResponse, ...]:
+        self.root.calls.append(("list_memory", "", self.tenant_id, self.actor_id))
+        return await super().list_memory()
+
+    async def create_memory(
+        self, request: admin_router.MemoryCreateRequest
+    ) -> admin_router.MemoryRecordResponse:
+        self.root.calls.append(("create_memory", request.id, self.tenant_id, self.actor_id))
+        return await super().create_memory(request)
+
+    async def update_memory(
+        self, memory_id: str, request: admin_router.MemoryRecordRequest
+    ) -> admin_router.MemoryRecordResponse:
+        self.root.calls.append(("update_memory", memory_id, self.tenant_id, self.actor_id))
+        return await super().update_memory(memory_id, request)
+
+    async def forget_memory(self, memory_id: str) -> None:
+        self.root.calls.append(("forget_memory", memory_id, self.tenant_id, self.actor_id))
+        await super().forget_memory(memory_id)
+
+    async def list_logs(self, category: str | None = None) -> tuple[admin_router.LogEntryResponse, ...]:
+        self.root.calls.append(("list_logs", category or "", self.tenant_id, self.actor_id))
+        return await super().list_logs(category)
+
+    async def record_hermes_feedback(
+        self, request: admin_router.HermesFeedbackRequest
+    ) -> admin_router.HermesInsightResponse:
+        self.root.calls.append(("hermes_feedback", request.outcome, self.tenant_id, self.actor_id))
+        return await super().record_hermes_feedback(request)
+
+    async def list_hermes_insights(self) -> tuple[admin_router.HermesInsightResponse, ...]:
+        self.root.calls.append(("list_hermes", "", self.tenant_id, self.actor_id))
+        return await super().list_hermes_insights()
+
+    async def get_hermes_insight(self, insight_id: str) -> admin_router.HermesInsightResponse:
+        self.root.calls.append(("get_hermes", insight_id, self.tenant_id, self.actor_id))
+        return await super().get_hermes_insight(insight_id)
+
+    async def confirm_hermes_insight(self, insight_id: str) -> admin_router.HermesInsightResponse:
+        self.root.calls.append(("confirm_hermes", insight_id, self.tenant_id, self.actor_id))
+        return await super().confirm_hermes_insight(insight_id)
+
+    async def delete_hermes_insight(self, insight_id: str) -> None:
+        self.root.calls.append(("delete_hermes", insight_id, self.tenant_id, self.actor_id))
+        await super().delete_hermes_insight(insight_id)
+
+    async def recommend_with_hermes(
+        self, request: admin_router.HermesRecommendationRequest
+    ) -> admin_router.HermesRecommendationResponse:
+        self.root.calls.append(("recommend_hermes", request.task, self.tenant_id, self.actor_id))
+        return await super().recommend_with_hermes(request)
+
+    async def list_runs(self) -> tuple[admin_router.RunListItem, ...]:
+        self.root.calls.append(("list_runs", "", self.tenant_id, self.actor_id))
+        return await super().list_runs()
+
+    async def get_run(self, run_id: UUID) -> RunDetailResponse:
+        self.root.calls.append(("get_run", str(run_id), self.tenant_id, self.actor_id))
+        return await super().get_run(run_id)
+
+    async def download_run_artifact(
+        self, run_id: UUID, artifact_id: UUID, *, tenant_id: UUID | None = None
+    ) -> admin_router.GeneratedArtifactDownload:
+        self.root.calls.append(
+            (
+                "download_artifact",
+                f"{run_id}:{tenant_id}",
+                self.tenant_id,
+                self.actor_id,
+            )
+        )
+        return await super().download_run_artifact(run_id, artifact_id, tenant_id=tenant_id)
+
+    async def pause_run(self, run_id: UUID) -> RunDetailResponse:
+        self.root.calls.append(("pause_run", str(run_id), self.tenant_id, self.actor_id))
+        return await super().pause_run(run_id)
+
+    async def resume_run(self, run_id: UUID) -> RunDetailResponse:
+        self.root.calls.append(("resume_run", str(run_id), self.tenant_id, self.actor_id))
+        return await super().resume_run(run_id)
+
+    async def cancel_run(self, run_id: UUID) -> RunDetailResponse:
+        self.root.calls.append(("cancel_run", str(run_id), self.tenant_id, self.actor_id))
+        return await super().cancel_run(run_id)
+
+    async def delete_run(self, run_id: UUID) -> admin_router.RunDeleteResponse:
+        self.root.calls.append(("delete_run", str(run_id), self.tenant_id, self.actor_id))
+        return await super().delete_run(run_id)
+
+    async def create_openclaw_session(
+        self,
+        request: admin_router.OpenClawSessionRequest,
+        *,
+        actor: str,
+        mode: str,
+        settings: SystemSettingsResponse,
+    ) -> admin_router.OpenClawSessionResponse:
+        self.root.calls.append(("create_openclaw_session", request.target, self.tenant_id, UUID(actor)))
+        return await super().create_openclaw_session(
+            request,
+            actor=actor,
+            mode=mode,
+            settings=settings,
+        )
+
+    async def list_openclaw_sessions(self) -> tuple[admin_router.OpenClawSessionResponse, ...]:
+        self.root.calls.append(("list_openclaw_sessions", "", self.tenant_id, self.actor_id))
+        return await super().list_openclaw_sessions()
+
+    async def update_openclaw_session(
+        self,
+        session_id: str,
+        request: admin_router.OpenClawSessionActionRequest,
+        *,
+        actor: str,
+    ) -> admin_router.OpenClawSessionResponse:
+        self.root.calls.append(("update_openclaw_session", session_id, self.tenant_id, UUID(actor)))
+        return await super().update_openclaw_session(session_id, request, actor=actor)
+
+    async def create_openclaw_operation(
+        self,
+        request: admin_router.OpenClawOperationRequest,
+        *,
+        actor: str,
+        mode: str,
+    ) -> admin_router.OpenClawOperationResponse:
+        self.root.calls.append(("create_openclaw_operation", request.target, self.tenant_id, UUID(actor)))
+        return await super().create_openclaw_operation(request, actor=actor, mode=mode)
+
+    async def get_openclaw_operation(self, operation_id: str) -> admin_router.OpenClawOperationResponse:
+        self.root.calls.append(("get_openclaw_operation", operation_id, self.tenant_id, self.actor_id))
+        return await super().get_openclaw_operation(operation_id)
+
+    async def resolve_openclaw_operation(
+        self,
+        operation_id: str,
+        request: admin_router.OpenClawResolveRequest,
+        *,
+        actor: str,
+    ) -> admin_router.OpenClawOperationResponse:
+        self.root.calls.append(("resolve_openclaw_operation", operation_id, self.tenant_id, UUID(actor)))
+        return await super().resolve_openclaw_operation(operation_id, request, actor=actor)
+
+    async def attach_openclaw_operation_to_session(
+        self,
+        session_id: str,
+        operation_id: str,
+        request: admin_router.OpenClawOperationRequest,
+        *,
+        actor: str,
+    ) -> admin_router.OpenClawSessionResponse:
+        self.root.calls.append(("attach_openclaw_operation", session_id, self.tenant_id, UUID(actor)))
+        return await super().attach_openclaw_operation_to_session(
+            session_id,
+            operation_id,
+            request,
+            actor=actor,
+        )
+
 
 def test_admin_service_dependency_scopes_service_to_principal_tenant() -> None:
     class ScopedAdminService(InMemoryAdminResourceService):
@@ -2563,6 +2745,209 @@ def test_admin_models_and_secrets_scope_to_principal_tenant_and_actor() -> None:
         ("for_principal", "", OTHER_TENANT_ID, USER_ID),
         ("get_secret", secret_ref, OTHER_TENANT_ID, USER_ID),
     ]
+
+
+def test_admin_settings_memory_logs_and_hermes_scope_to_principal_tenant_and_actor() -> None:
+    api = create_app(auth_service=OtherTenantAuthService(), rate_limiter=object())
+    service = TenantScopedAdminResourceService()
+    bootstrap_service = service.scopes[(TENANT_ID, ACTOR_ID)]
+    bootstrap_service.memory["bootstrap-only"] = admin_router.MemoryRecordResponse(
+        id="bootstrap-only",
+        scope="tenant",
+        value="bootstrap memory",
+    )
+    bootstrap_service.audit_events.append(
+        AuditEventResponse(
+            id="audit-bootstrap",
+            actor=str(ACTOR_ID),
+            action="bootstrap.only",
+            resource="bootstrap",
+            created_at=datetime.now(UTC),
+        )
+    )
+    bootstrap_service.hermes_insights["hermes-bootstrap"] = admin_router.HermesInsightResponse(
+        id="hermes-bootstrap",
+        category="conversation",
+        outcome="success",
+        lesson="bootstrap lesson",
+        summary="bootstrap summary",
+        user_summary="bootstrap user summary",
+        run_id=None,
+        conversation_id=None,
+        confirmed_at=None,
+        tags=["bootstrap"],
+        weight=1,
+        created_at=datetime.now(UTC),
+    )
+    service.for_principal(OTHER_TENANT_ID, USER_ID)
+    service.calls.clear()
+    cast(Any, api).state.admin_resource_service = service
+    test_client = TestClient(api)
+
+    settings_payload = SystemSettingsResponse(default_mode="hybrid").model_dump(mode="json")
+    updated_settings = test_client.put(
+        "/api/v1/admin/settings",
+        headers=headers(),
+        json=settings_payload,
+    )
+    fetched_settings = test_client.get("/api/v1/admin/settings", headers=headers())
+    updated_main_agent = test_client.put(
+        "/api/v1/admin/main-agent",
+        headers=headers(),
+        json={"control_mode": "planner"},
+    )
+    fetched_main_agent = test_client.get("/api/v1/admin/main-agent", headers=headers())
+    created_memory = test_client.post(
+        "/api/v1/admin/memory",
+        headers=headers(),
+        json={"id": "tenant-memory", "value": "tenant memory"},
+    )
+    listed_memory = test_client.get("/api/v1/admin/memory", headers=headers())
+    updated_memory = test_client.patch(
+        "/api/v1/admin/memory/tenant-memory",
+        headers=headers(),
+        json={"value": "tenant memory updated"},
+    )
+    logs = test_client.get("/api/v1/admin/logs?category=audit", headers=headers())
+    created_hermes = test_client.post(
+        "/api/v1/admin/hermes/feedback",
+        headers=headers(),
+        json={
+            "outcome": "success",
+            "lesson": "tenant lesson",
+            "tags": ["tenant"],
+            "weight": 2,
+        },
+    )
+    hermes_id = created_hermes.json()["id"]
+    listed_hermes = test_client.get("/api/v1/admin/hermes", headers=headers())
+    fetched_hermes = test_client.get(f"/api/v1/admin/hermes/{hermes_id}", headers=headers())
+    confirmed_hermes = test_client.post(
+        f"/api/v1/admin/hermes/{hermes_id}/confirm",
+        headers=headers(),
+    )
+    hermes_recommendation = test_client.post(
+        "/api/v1/admin/hermes/recommend",
+        headers=headers(),
+        json={"task": "tenant planning review", "mode_candidates": ["dispatch"]},
+    )
+    missing_bootstrap_hermes = test_client.get(
+        "/api/v1/admin/hermes/hermes-bootstrap",
+        headers=headers(),
+    )
+    deleted_hermes = test_client.delete(f"/api/v1/admin/hermes/{hermes_id}", headers=headers())
+    forgotten_memory = test_client.delete("/api/v1/admin/memory/tenant-memory", headers=headers())
+
+    assert updated_settings.status_code == 200
+    assert fetched_settings.status_code == 200
+    assert fetched_settings.json()["default_mode"] == "hybrid"
+    assert updated_main_agent.status_code == 200
+    assert fetched_main_agent.status_code == 200
+    assert fetched_main_agent.json()["control_mode"] == "planner"
+    assert created_memory.status_code == 200
+    assert listed_memory.status_code == 200
+    listed_memory_ids = {item["id"] for item in listed_memory.json()}
+    assert "tenant-memory" in listed_memory_ids
+    assert "bootstrap-only" not in listed_memory_ids
+    assert updated_memory.status_code == 200
+    assert updated_memory.json()["value"] == "tenant memory updated"
+    assert logs.status_code == 200
+    assert "bootstrap.only" not in {item["message"] for item in logs.json()}
+    assert created_hermes.status_code == 200
+    assert listed_hermes.status_code == 200
+    listed_hermes_ids = {item["id"] for item in listed_hermes.json()}
+    assert hermes_id in listed_hermes_ids
+    assert "hermes-bootstrap" not in listed_hermes_ids
+    assert fetched_hermes.status_code == 200
+    assert confirmed_hermes.status_code == 200
+    assert hermes_recommendation.status_code == 200
+    assert missing_bootstrap_hermes.status_code == 404
+    assert deleted_hermes.status_code == 200
+    assert forgotten_memory.status_code == 200
+    assert bootstrap_service.settings.default_mode == "auto"
+    assert bootstrap_service.main_agent_config.control_mode == "supervisor"
+    assert "tenant-memory" not in bootstrap_service.memory
+    assert all(call[2] == OTHER_TENANT_ID and call[3] == USER_ID for call in service.calls)
+
+
+def test_admin_run_artifact_debug_and_openclaw_scope_to_principal_tenant_and_actor(
+    tmp_path: Path,
+) -> None:
+    api = create_app(auth_service=OtherTenantAuthService(), rate_limiter=object())
+    service = TenantScopedAdminResourceService()
+    other_service = service.for_principal(OTHER_TENANT_ID, USER_ID)
+    run_id = next(iter(other_service.runs))
+    artifact_id = UUID("44444444-4444-4444-8444-444444444444")
+    artifact_path = tmp_path / "tenant-artifact.zip"
+    artifact_path.write_bytes(b"tenant zip")
+    other_service.generated_artifacts[(run_id, artifact_id)] = (
+        artifact_path,
+        "tenant-artifact.zip",
+        "application/zip",
+    )
+    other_service.settings = SystemSettingsResponse(openclaw_enabled=True)
+    other_service.runs[run_id] = other_service.runs[run_id].model_copy(
+        update={
+            "status": "waiting_approval",
+            "openclaw_proposal": {
+                "platform": "linux",
+                "kind": "server_command",
+                "target": "linux-server",
+                "operation_text": "date",
+                "source_conversation_id": "conv-tenant",
+            },
+        }
+    )
+    service.calls.clear()
+    cast(Any, api).state.admin_resource_service = service
+    test_client = TestClient(api)
+
+    listed_runs = test_client.get("/api/v1/admin/runs", headers=headers())
+    run_detail = test_client.get(f"/api/v1/admin/runs/{run_id}", headers=headers())
+    run_debug = test_client.get(f"/api/v1/admin/runs/{run_id}/debug", headers=headers())
+    downloaded = test_client.get(
+        f"/api/v1/admin/runs/{run_id}/artifacts/{artifact_id}/download",
+        headers=headers(),
+    )
+    operation_from_run = test_client.post(
+        f"/api/v1/admin/openclaw/operations/from-run/{run_id}",
+        headers=headers(),
+    )
+    operation_id = operation_from_run.json()["id"]
+    fetched_operation = test_client.get(
+        f"/api/v1/admin/openclaw/operations/{operation_id}",
+        headers=headers(),
+    )
+    created_session = test_client.post(
+        "/api/v1/admin/openclaw/sessions",
+        headers=headers(),
+        json={
+            "platform": "linux",
+            "target_type": "server",
+            "target": "agent-hub-server",
+            "purpose": "tenant session",
+        },
+    )
+    listed_sessions = test_client.get("/api/v1/admin/openclaw/sessions", headers=headers())
+
+    assert listed_runs.status_code == 200
+    assert {item["id"] for item in listed_runs.json()} == {str(run_id)}
+    assert run_detail.status_code == 200
+    assert run_debug.status_code == 200
+    assert downloaded.status_code == 200
+    assert downloaded.content == b"tenant zip"
+    assert operation_from_run.status_code == 202
+    assert fetched_operation.status_code == 200
+    assert created_session.status_code == 201
+    assert listed_sessions.status_code == 200
+    assert listed_sessions.json()[0]["id"] == created_session.json()["id"]
+    assert all(call[2] == OTHER_TENANT_ID and call[3] == USER_ID for call in service.calls)
+    assert (
+        "download_artifact",
+        f"{run_id}:{OTHER_TENANT_ID}",
+        OTHER_TENANT_ID,
+        USER_ID,
+    ) in service.calls
 
 
 class FakeRuntimeCapabilityGateway:
@@ -7433,6 +7818,48 @@ def test_hermes_feedback_rejects_sensitive_content_without_echoing_it() -> None:
 
     assert response.status_code == 422
     assert "sk-secret-value" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_persistent_hermes_missing_payload_does_not_fallback_to_in_memory_defaults() -> None:
+    class MissingHermesPayloadService(PersistentAdminResourceService):
+        async def _get_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> dict[str, object] | None:
+            del resource_id, tenant_id
+            if kind == "hermes":
+                return {}
+            return None
+
+        async def _delete_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> bool | None:
+            del resource_id, tenant_id
+            if kind == "hermes":
+                return False
+            return None
+
+    service = MissingHermesPayloadService(
+        config_service=FakeConfigService(),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+    )
+
+    with pytest.raises(KeyError):
+        await service.get_hermes_insight("hermes-1")
+    with pytest.raises(KeyError):
+        await service.confirm_hermes_insight("hermes-1")
+    with pytest.raises(KeyError):
+        await service.delete_hermes_insight("hermes-1")
 
 
 @pytest.mark.asyncio
