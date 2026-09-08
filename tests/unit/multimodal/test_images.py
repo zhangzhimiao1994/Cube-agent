@@ -29,6 +29,19 @@ from agent_hub.multimodal.types import (
 )
 
 
+def open_fd_targets_under(root: Path) -> list[str]:
+    root_text = str(root)
+    targets: list[str] = []
+    for descriptor in Path("/proc/self/fd").iterdir():
+        try:
+            target = os.readlink(descriptor)
+        except OSError:
+            continue
+        if target.startswith(root_text):
+            targets.append(target)
+    return targets
+
+
 def encoded_image(
     image_format: str = "PNG",
     *,
@@ -581,7 +594,6 @@ async def test_filesystem_store_rolls_back_every_post_publish_failure(
 async def test_filesystem_store_reports_commit_uncertain_when_rollback_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    baseline_descriptors = len(os.listdir("/proc/self/fd"))
     store = FilesystemImageStore(tmp_path)
     digest = hashlib.sha256(b"tenant").hexdigest()
     key = f"tenants/{digest}/123e4567-e89b-42d3-a456-426614174000.png"
@@ -608,4 +620,4 @@ async def test_filesystem_store_reports_commit_uncertain_when_rollback_fails(
     assert "canonical" not in repr(captured.value)
     await store.delete_by_object_key(key, hashlib.sha256(b"canonical").hexdigest())
     store.close()
-    assert len(os.listdir("/proc/self/fd")) == baseline_descriptors
+    assert open_fd_targets_under(tmp_path) == []
