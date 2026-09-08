@@ -125,6 +125,16 @@ class FakePluginToolBackend:
         return {"content": {"event_id": "evt_1"}}
 
 
+class TenantPreparedPluginToolBackend(FakePluginToolBackend):
+    def __init__(self) -> None:
+        super().__init__(available=False)
+        self.prepared_tenants: list[UUID] = []
+
+    async def ensure_tenant_loaded(self, tenant_id: UUID) -> None:
+        self.prepared_tenants.append(tenant_id)
+        self.available = True
+
+
 class PolicyPartsPluginToolBackend(FakePluginToolBackend):
     def capability_policy_parts(
         self,
@@ -477,6 +487,30 @@ async def test_harness_tool_gateway_routes_available_plugin_tool_through_policy(
     assert capability_request.operation == "use"
     assert capability_request.resource == "plugin/calendar/create_event"
     assert capability_request.arguments == {"title": "Mofang review"}
+
+
+async def test_harness_tool_gateway_loads_plugin_tenant_before_availability_and_policy() -> None:
+    runtime = FakeRuntimeCapabilityGateway(available=False)
+    plugin_backend = TenantPreparedPluginToolBackend()
+    policy = FakePolicyGateway(CapabilityStatus.ALLOWED)
+    gateway = HarnessToolGateway(
+        runtime,
+        policy_gateway=policy,
+        plugin_backend=plugin_backend,
+    )
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        plugin_request(),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "succeeded"
+    assert plugin_backend.prepared_tenants == [TENANT_ID]
+    assert [call[0] for call in plugin_backend.calls] == ["available", "invoke"]
+    assert len(policy.requests) == 1
+    assert runtime.calls == []
 
 
 async def test_harness_tool_gateway_uses_plugin_declared_permission_for_policy() -> None:

@@ -214,7 +214,14 @@ async def test_persistent_settings_missing_tool_approval_mode_migrates_to_ask() 
             self.payload = SystemSettingsResponse().model_dump(mode="json")
             self.payload.pop("tool_approval_mode")
 
-        async def _get_admin_payload(self, kind: str, resource_id: str) -> dict[str, object] | None:
+        async def _get_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> dict[str, object] | None:
+            del tenant_id
             assert (kind, resource_id) == ("setting", "system")
             return self.payload
 
@@ -240,7 +247,14 @@ async def test_persistent_settings_invalid_tool_approval_mode_migrates_to_ask() 
                 "tool_approval_mode": "trusted_auto",
             }
 
-        async def _get_admin_payload(self, kind: str, resource_id: str) -> dict[str, object] | None:
+        async def _get_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> dict[str, object] | None:
+            del tenant_id
             assert (kind, resource_id) == ("setting", "system")
             return self.payload
 
@@ -2416,7 +2430,12 @@ def test_capability_manifest_endpoint_reads_mcp_config_for_principal_tenant() ->
             self.tenant_ids.append(tenant_id)
             return ()
 
-        async def list_plugins(self) -> tuple[object, ...]:
+        async def list_plugins(
+            self,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> tuple[object, ...]:
+            del tenant_id
             return ()
 
     api = create_app(auth_service=OtherTenantAuthService(), rate_limiter=object())
@@ -2433,6 +2452,175 @@ def test_capability_manifest_endpoint_reads_mcp_config_for_principal_tenant() ->
     assert response.status_code == 200
     assert service.tenant_ids == [OTHER_TENANT_ID]
     assert gateway.tenant_ids == [OTHER_TENANT_ID]
+
+
+def test_plugin_admin_endpoints_read_plugin_config_for_principal_tenant() -> None:
+    class OtherTenantAuthService:
+        def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
+            if token != "valid-token":
+                raise InvalidCredentials("bad token")
+            return AuthenticatedPrincipal(USER_ID, OTHER_TENANT_ID, Role.SUPER_ADMIN)
+
+    class TenantScopedPluginService:
+        def __init__(self) -> None:
+            self.tenant_ids: list[UUID | None] = []
+
+        async def list_plugins(
+            self,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> tuple[PluginResourceResponse, ...]:
+            self.tenant_ids.append(tenant_id)
+            if tenant_id == OTHER_TENANT_ID:
+                return (
+                    PluginResourceResponse(
+                        id="tenant-search",
+                        name="Tenant Search Plugin",
+                        status="running",
+                        health="healthy",
+                        capabilities=[
+                            PluginCapabilityRequest(
+                                id="tenant_search.web",
+                                permission_class="network.read",
+                                sandbox_profile="remote_connector",
+                            )
+                        ],
+                    ),
+                )
+            return (
+                PluginResourceResponse(
+                    id="bootstrap-search",
+                    name="Bootstrap Search Plugin",
+                    status="running",
+                    health="healthy",
+                    capabilities=[
+                        PluginCapabilityRequest(
+                            id="bootstrap_search.web",
+                            permission_class="network.read",
+                            sandbox_profile="remote_connector",
+                        )
+                    ],
+                ),
+            )
+
+        async def list_mcp_servers(
+            self,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> tuple[McpServerResponse, ...]:
+            del tenant_id
+            return ()
+
+    api = create_app(auth_service=OtherTenantAuthService(), rate_limiter=object())
+    service = TenantScopedPluginService()
+    cast(Any, api).state.admin_resource_service = service
+    cast(Any, api).state.runtime_capability_gateway = FakeRuntimeCapabilityGateway()
+    test_client = TestClient(api)
+
+    plugins = test_client.get("/api/v1/admin/plugins", headers=headers())
+    summary = test_client.get("/api/v1/admin/plugins/policy-summary", headers=headers())
+    manifest = test_client.get("/api/v1/admin/capabilities/manifest", headers=headers())
+
+    assert plugins.status_code == 200
+    assert summary.status_code == 200
+    assert manifest.status_code == 200
+    assert service.tenant_ids == [OTHER_TENANT_ID, OTHER_TENANT_ID, OTHER_TENANT_ID]
+    assert [item["id"] for item in plugins.json()] == ["tenant-search"]
+    assert [item["id"] for item in summary.json()] == ["tenant-search"]
+    capabilities = {item["id"]: item for item in manifest.json()["capabilities"]}
+    assert "tenant_search.web" in capabilities
+    assert "bootstrap_search.web" not in capabilities
+
+
+def test_plugin_admin_write_endpoints_scope_writes_to_principal_tenant_and_actor() -> None:
+    class OtherTenantAuthService:
+        def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
+            if token != "valid-token":
+                raise InvalidCredentials("bad token")
+            return AuthenticatedPrincipal(USER_ID, OTHER_TENANT_ID, Role.SUPER_ADMIN)
+
+    class RecordingPluginWriteService(InMemoryAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[tuple[str, str, UUID | None, UUID | None]] = []
+
+        async def upsert_plugin(
+            self,
+            request: PluginResourceRequest,
+            *,
+            tenant_id: UUID | None = None,
+            actor_id: UUID | None = None,
+        ) -> PluginResourceResponse:
+            self.calls.append(("upsert", request.id, tenant_id, actor_id))
+            return await super().upsert_plugin(request, tenant_id=tenant_id, actor_id=actor_id)
+
+        async def start_plugin(
+            self,
+            plugin_id: str,
+            *,
+            tenant_id: UUID | None = None,
+            actor_id: UUID | None = None,
+        ) -> PluginResourceResponse:
+            self.calls.append(("start", plugin_id, tenant_id, actor_id))
+            return await super().start_plugin(plugin_id, tenant_id=tenant_id, actor_id=actor_id)
+
+        async def stop_plugin(
+            self,
+            plugin_id: str,
+            *,
+            tenant_id: UUID | None = None,
+            actor_id: UUID | None = None,
+        ) -> PluginResourceResponse:
+            self.calls.append(("stop", plugin_id, tenant_id, actor_id))
+            return await super().stop_plugin(plugin_id, tenant_id=tenant_id, actor_id=actor_id)
+
+        async def reload_plugin(
+            self,
+            plugin_id: str,
+            *,
+            tenant_id: UUID | None = None,
+            actor_id: UUID | None = None,
+        ) -> PluginResourceResponse:
+            self.calls.append(("reload", plugin_id, tenant_id, actor_id))
+            return await super().reload_plugin(plugin_id, tenant_id=tenant_id, actor_id=actor_id)
+
+        async def delete_plugin(
+            self,
+            plugin_id: str,
+            *,
+            tenant_id: UUID | None = None,
+            actor_id: UUID | None = None,
+        ) -> None:
+            self.calls.append(("delete", plugin_id, tenant_id, actor_id))
+            await super().delete_plugin(plugin_id, tenant_id=tenant_id, actor_id=actor_id)
+
+    api = create_app(auth_service=OtherTenantAuthService(), rate_limiter=object())
+    service = RecordingPluginWriteService()
+    cast(Any, api).state.admin_resource_service = service
+    test_client = TestClient(api)
+
+    created = test_client.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={"id": "search", "name": "Search Plugin"},
+    )
+    started = test_client.post("/api/v1/admin/plugins/search/start", headers=headers())
+    stopped = test_client.post("/api/v1/admin/plugins/search/stop", headers=headers())
+    reloaded = test_client.post("/api/v1/admin/plugins/search/reload", headers=headers())
+    deleted = test_client.delete("/api/v1/admin/plugins/search", headers=headers())
+
+    assert created.status_code == 200
+    assert started.status_code == 200
+    assert stopped.status_code == 200
+    assert reloaded.status_code == 200
+    assert deleted.status_code == 200
+    assert service.calls == [
+        ("upsert", "search", OTHER_TENANT_ID, USER_ID),
+        ("start", "search", OTHER_TENANT_ID, USER_ID),
+        ("stop", "search", OTHER_TENANT_ID, USER_ID),
+        ("reload", "search", OTHER_TENANT_ID, USER_ID),
+        ("delete", "search", OTHER_TENANT_ID, USER_ID),
+    ]
 
 
 def test_mcp_upsert_and_delete_trigger_runtime_reload_callback() -> None:
@@ -2649,6 +2837,121 @@ async def test_persistent_admin_plugin_lifecycle_persists_status() -> None:
 
 
 @pytest.mark.asyncio
+async def test_persistent_admin_plugin_lifecycle_is_scoped_to_requested_tenant() -> None:
+    class TenantScopedPersistentService(PersistentAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__(
+                config_service=FakeConfigService(),  # type: ignore[arg-type]
+                secret_service=FakeSecretService(),  # type: ignore[arg-type]
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+            )
+            self._session_factory = cast(Any, object())
+            self.payloads: dict[tuple[UUID, str, str], dict[str, object]] = {}
+
+        async def _get_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> dict[str, object] | None:
+            target_tenant_id = TENANT_ID if tenant_id is None else tenant_id
+            return self.payloads.get((target_tenant_id, kind, resource_id), {})
+
+        async def _upsert_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            payload: dict[str, object],
+            *,
+            tenant_id: UUID | None = None,
+        ) -> bool:
+            target_tenant_id = TENANT_ID if tenant_id is None else tenant_id
+            self.payloads[(target_tenant_id, kind, resource_id)] = payload
+            return True
+
+        async def _list_admin_payloads(
+            self,
+            kind: str,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> list[dict[str, object]] | None:
+            target_tenant_id = TENANT_ID if tenant_id is None else tenant_id
+            return [
+                payload
+                for (payload_tenant_id, payload_kind, _resource_id), payload in self.payloads.items()
+                if payload_tenant_id == target_tenant_id and payload_kind == kind
+            ]
+
+        async def _delete_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> bool | None:
+            target_tenant_id = TENANT_ID if tenant_id is None else tenant_id
+            key = (target_tenant_id, kind, resource_id)
+            if key not in self.payloads:
+                return False
+            del self.payloads[key]
+            return True
+
+        async def _record_audit(
+            self,
+            action: str,
+            resource: str,
+            payload: dict[str, object] | None = None,
+            *,
+            actor_id: UUID | None = None,
+            tenant_id: UUID | None = None,
+        ) -> None:
+            target_actor_id = ACTOR_ID if actor_id is None else actor_id
+            await super()._record_audit(
+                action,
+                resource,
+                payload,
+                actor_id=target_actor_id,
+                tenant_id=tenant_id,
+            )
+
+    service = TenantScopedPersistentService()
+
+    await service.upsert_plugin(
+        PluginResourceRequest(id="search", name="Bootstrap Search Plugin"),
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+    )
+    await service.upsert_plugin(
+        PluginResourceRequest(id="search", name="Tenant Search Plugin"),
+        tenant_id=OTHER_TENANT_ID,
+        actor_id=USER_ID,
+    )
+    started = await service.start_plugin("search", tenant_id=OTHER_TENANT_ID, actor_id=USER_ID)
+    bootstrap_plugins = await service.list_plugins(tenant_id=TENANT_ID)
+    tenant_plugins = await service.list_plugins(tenant_id=OTHER_TENANT_ID)
+    await service.delete_plugin("search", tenant_id=OTHER_TENANT_ID, actor_id=USER_ID)
+    bootstrap_after_delete = await service.list_plugins(tenant_id=TENANT_ID)
+    tenant_after_delete = await service.list_plugins(tenant_id=OTHER_TENANT_ID)
+    tenant_start_audits = [
+        payload
+        for (tenant_id, kind, _resource_id), payload in service.payloads.items()
+        if tenant_id == OTHER_TENANT_ID
+        and kind == "audit"
+        and payload["action"] == "plugin.start"
+    ]
+
+    assert started.name == "Tenant Search Plugin"
+    assert started.status == "running"
+    assert [plugin.name for plugin in bootstrap_plugins] == ["Bootstrap Search Plugin"]
+    assert [plugin.name for plugin in tenant_plugins] == ["Tenant Search Plugin"]
+    assert [plugin.name for plugin in bootstrap_after_delete] == ["Bootstrap Search Plugin"]
+    assert tenant_after_delete == ()
+    assert tenant_start_audits[0]["actor"] == str(USER_ID)
+
+
+@pytest.mark.asyncio
 async def test_persistent_admin_plugin_upsert_audit_records_safe_policy_summary() -> None:
     class StoredPersistentService(PersistentAdminResourceService):
         def __init__(self) -> None:
@@ -2661,12 +2964,25 @@ async def test_persistent_admin_plugin_upsert_audit_records_safe_policy_summary(
             self._session_factory = cast(Any, object())
             self.payloads: dict[tuple[str, str], dict[str, object]] = {}
 
-        async def _get_admin_payload(self, kind: str, resource_id: str) -> dict[str, object] | None:
+        async def _get_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> dict[str, object] | None:
+            del tenant_id
             return self.payloads.get((kind, resource_id), {})
 
         async def _upsert_admin_payload(
-            self, kind: str, resource_id: str, payload: dict[str, object]
+            self,
+            kind: str,
+            resource_id: str,
+            payload: dict[str, object],
+            *,
+            tenant_id: UUID | None = None,
         ) -> bool:
+            del tenant_id
             self.payloads[(kind, resource_id)] = payload
             return True
 
@@ -3686,7 +4002,13 @@ class PersistentScheduleResourceService(InMemoryAdminResourceService):
         super().__init__()
         self.payloads: dict[tuple[str, str], dict[str, object]] = {}
 
-    async def _list_admin_payloads(self, kind: str) -> list[dict[str, object]]:
+    async def _list_admin_payloads(
+        self,
+        kind: str,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> list[dict[str, object]]:
+        del tenant_id
         return [
             payload
             for (stored_kind, _resource_id), payload in sorted(self.payloads.items())
@@ -3694,12 +4016,25 @@ class PersistentScheduleResourceService(InMemoryAdminResourceService):
         ]
 
     async def _upsert_admin_payload(
-        self, kind: str, resource_id: str, payload: dict[str, object]
+        self,
+        kind: str,
+        resource_id: str,
+        payload: dict[str, object],
+        *,
+        tenant_id: UUID | None = None,
     ) -> bool:
+        del tenant_id
         self.payloads[(kind, resource_id)] = payload
         return True
 
-    async def _delete_admin_payload(self, kind: str, resource_id: str) -> bool:
+    async def _delete_admin_payload(
+        self,
+        kind: str,
+        resource_id: str,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> bool:
+        del tenant_id
         return self.payloads.pop((kind, resource_id), None) is not None
 
 
@@ -7709,12 +8044,25 @@ async def test_persistent_evolution_execution_result_ingest_uses_run_repository_
             )
             self.payloads: dict[tuple[str, str], dict[str, object]] = {}
 
-        async def _get_admin_payload(self, kind: str, resource_id: str) -> dict[str, object] | None:
+        async def _get_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> dict[str, object] | None:
+            del tenant_id
             return self.payloads.get((kind, resource_id), {})
 
         async def _upsert_admin_payload(
-            self, kind: str, resource_id: str, payload: dict[str, object]
+            self,
+            kind: str,
+            resource_id: str,
+            payload: dict[str, object],
+            *,
+            tenant_id: UUID | None = None,
         ) -> bool:
+            del tenant_id
             self.payloads[(kind, resource_id)] = payload
             return True
 

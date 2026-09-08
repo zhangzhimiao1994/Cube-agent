@@ -21,7 +21,11 @@ from agent_hub.runtime.contracts import JsonValue, _mutable_json
 
 
 class PluginConfigService(Protocol):
-    async def list_plugins(self) -> Sequence[Any]: ...
+    async def list_plugins(
+        self,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> Sequence[Any]: ...
 
 
 class PluginAuditRecorder(Protocol):
@@ -32,6 +36,7 @@ class PluginAuditRecorder(Protocol):
         action: str,
         resource: str,
         details: dict[str, object] | None = None,
+        tenant_id: UUID | None = None,
     ) -> object: ...
 
 
@@ -145,29 +150,35 @@ class RuntimePluginService:
         self._admin_service = admin_service
         self._adapters = _default_plugin_adapters(admin_service)
         self._adapters.update(adapters or {})
-        self._plugins: tuple[PluginResourceResponse, ...] = ()
+        self._plugins_by_tenant: dict[UUID, tuple[PluginResourceResponse, ...]] = {}
 
     async def start(self) -> None:
         await self.reload(self._tenant_id)
 
     async def reload(self, tenant_id: UUID | None = None) -> None:
-        if tenant_id is not None and tenant_id != self._tenant_id:
-            return
+        target_tenant_id = self._tenant_id if tenant_id is None else tenant_id
         try:
-            self._plugins = tuple(
+            self._plugins_by_tenant[target_tenant_id] = tuple(
                 PluginResourceResponse.model_validate(plugin)
-                for plugin in await self._admin_service.list_plugins()
+                for plugin in await self._admin_service.list_plugins(
+                    tenant_id=target_tenant_id,
+                )
             )
         except Exception:  # noqa: BLE001 - plugin runtime context must fail closed.
-            self._plugins = ()
+            self._plugins_by_tenant[target_tenant_id] = ()
+
+    async def ensure_tenant_loaded(self, tenant_id: UUID) -> None:
+        if tenant_id not in self._plugins_by_tenant:
+            await self.reload(tenant_id)
 
     def capability_manifest_source(self) -> RuntimePluginService:
         return self
 
     def manifests_for_tenant(self, tenant_id: UUID) -> Mapping[str, JsonValue]:
-        if tenant_id != self._tenant_id:
+        plugins = self._plugins_for_tenant(tenant_id)
+        if plugins is None:
             return _empty_manifest()
-        return PluginConfigCapabilityManifestSource(cast(Any, self._plugins)).manifests()
+        return PluginConfigCapabilityManifestSource(cast(Any, plugins)).manifests()
 
     def adapter_descriptors(self) -> tuple[Mapping[str, JsonValue], ...]:
         return tuple(
@@ -176,24 +187,21 @@ class RuntimePluginService:
         )
 
     def is_available(self, tenant_id: UUID, name: str) -> bool:
-        if tenant_id != self._tenant_id:
-            return False
-        return self._available_plugin_capability(name) is not None
+        return self._available_plugin_capability(tenant_id, name) is not None
 
     def capability_policy_parts(self, tenant_id: UUID, name: str) -> tuple[str, str, str] | None:
-        if tenant_id != self._tenant_id:
-            return None
-        target = self._available_plugin_capability(name)
+        target = self._available_plugin_capability(tenant_id, name)
         if target is None:
             return None
         plugin, capability = target
         return _plugin_capability_policy_parts(plugin, capability)
 
     def capability_policy_rules(self, tenant_id: UUID) -> tuple[CapabilityRule, ...]:
-        if tenant_id != self._tenant_id:
+        plugins = self._plugins_for_tenant(tenant_id)
+        if plugins is None:
             return ()
         rules: list[CapabilityRule] = []
-        for plugin in self._plugins:
+        for plugin in plugins:
             if not _plugin_is_running(plugin):
                 continue
             for capability in plugin.capabilities:
@@ -229,9 +237,8 @@ class RuntimePluginService:
         arguments: Mapping[str, JsonValue],
         idempotency_key: str,
     ) -> Mapping[str, JsonValue]:
-        if tenant_id != self._tenant_id:
-            raise RuntimeCapabilityError("Plugin tool unavailable")
-        target = self._available_plugin_capability(name)
+        await self.ensure_tenant_loaded(tenant_id)
+        target = self._available_plugin_capability(tenant_id, name)
         if target is None:
             raise RuntimeCapabilityError("Plugin tool unavailable")
         plugin, capability = target
@@ -303,11 +310,18 @@ class RuntimePluginService:
         )
         return result
 
+    def _plugins_for_tenant(self, tenant_id: UUID) -> tuple[PluginResourceResponse, ...] | None:
+        return self._plugins_by_tenant.get(tenant_id)
+
     def _available_plugin_capability(
         self,
+        tenant_id: UUID,
         name: str,
     ) -> tuple[PluginResourceResponse, PluginCapabilityRequest] | None:
-        for plugin in self._plugins:
+        plugins = self._plugins_for_tenant(tenant_id)
+        if plugins is None:
+            return None
+        for plugin in plugins:
             if not _plugin_is_running(plugin):
                 continue
             for capability in plugin.capabilities:
@@ -331,6 +345,7 @@ class RuntimePluginService:
                 actor=context.actor,
                 action=action,
                 resource=f"plugin:{plugin.id}:{capability.id}",
+                tenant_id=context.tenant_id,
                 details={
                     "plugin_id": plugin.id,
                     "capability_id": capability.id,

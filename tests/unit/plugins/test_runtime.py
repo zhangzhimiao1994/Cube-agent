@@ -24,6 +24,7 @@ from agent_hub.plugins.runtime import (
 from agent_hub.runtime.contracts import JsonValue
 
 TENANT_ID = UUID("11111111-1111-4111-8111-111111111111")
+OTHER_TENANT_ID = UUID("22222222-2222-4222-8222-222222222222")
 
 
 class FakeAdminService:
@@ -31,8 +32,14 @@ class FakeAdminService:
         self.plugins = plugins
         self.calls = 0
         self.audit_events: list[dict[str, object]] = []
+        self.audit_tenant_ids: list[UUID | None] = []
 
-    async def list_plugins(self) -> tuple[PluginResourceResponse, ...]:
+    async def list_plugins(
+        self,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> tuple[PluginResourceResponse, ...]:
+        del tenant_id
         self.calls += 1
         return self.plugins
 
@@ -43,7 +50,9 @@ class FakeAdminService:
         action: str,
         resource: str,
         details: dict[str, object] | None = None,
+        tenant_id: UUID | None = None,
     ) -> dict[str, object]:
+        self.audit_tenant_ids.append(tenant_id)
         event: dict[str, object] = {
             "actor": actor,
             "action": action,
@@ -172,6 +181,59 @@ async def test_runtime_plugin_service_exposes_running_plugins_as_manifest() -> N
     assert capabilities["calendar.create_event"]["available"] is True
     assert capabilities["stopped.run"]["available"] is False
     assert admin_service.calls == 1
+
+
+async def test_runtime_plugin_service_reloads_and_invokes_plugins_for_requested_tenant() -> None:
+    class TenantPluginAdminService(FakeAdminService):
+        def __init__(self) -> None:
+            super().__init__((plugin("bootstrap-calendar"),))
+            self.tenant_ids: list[UUID | None] = []
+
+        async def list_plugins(
+            self,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> tuple[PluginResourceResponse, ...]:
+            self.tenant_ids.append(tenant_id)
+            if tenant_id == OTHER_TENANT_ID:
+                return (
+                    plugin(
+                        "tenant-calendar",
+                        capability_id="tenant_calendar.create_event",
+                    ),
+                )
+            return await super().list_plugins(tenant_id=tenant_id)
+
+    admin_service = TenantPluginAdminService()
+    adapter = RecordingPluginAdapter(calls=[])
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        adapters={"plugin_runtime": adapter},
+    )
+
+    await service.reload(OTHER_TENANT_ID)
+    result = await service.invoke(
+        tenant_id=OTHER_TENANT_ID,
+        user_id=OTHER_TENANT_ID,
+        run_id=OTHER_TENANT_ID,
+        actor="tenant-admin",
+        name="tenant_calendar.create_event",
+        arguments={"title": "tenant review"},
+        idempotency_key="plugin_tenant_1",
+    )
+
+    assert admin_service.tenant_ids == [TENANT_ID, OTHER_TENANT_ID]
+    assert service.is_available(OTHER_TENANT_ID, "tenant_calendar.create_event") is True
+    assert service.is_available(TENANT_ID, "tenant_calendar.create_event") is False
+    assert service.is_available(OTHER_TENANT_ID, "calendar.create_event") is False
+    assert result == {
+        "ok": True,
+        "plugin_id": "tenant-calendar",
+        "capability_id": "tenant_calendar.create_event",
+    }
+    assert admin_service.audit_tenant_ids == [OTHER_TENANT_ID]
+    assert adapter.calls[0][3].tenant_id == OTHER_TENANT_ID
 
 
 async def test_runtime_plugin_manifest_includes_capability_schemas() -> None:
@@ -1280,7 +1342,12 @@ async def test_http_json_plugin_adapter_resolves_secret_into_configured_header()
 
 async def test_runtime_plugin_service_fails_closed_when_admin_listing_fails() -> None:
     class FailingAdminService:
-        async def list_plugins(self) -> tuple[PluginResourceResponse, ...]:
+        async def list_plugins(
+            self,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> tuple[PluginResourceResponse, ...]:
+            del tenant_id
             raise RuntimeError("raw plugin db failure")
 
     service = await build_runtime_plugin_service(

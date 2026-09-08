@@ -2104,17 +2104,51 @@ class AdminResourceService(Protocol):
 
     async def delete_skill(self, skill_id: str) -> None: ...
 
-    async def list_plugins(self) -> tuple[PluginResourceResponse, ...]: ...
+    async def list_plugins(
+        self,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> tuple[PluginResourceResponse, ...]: ...
 
-    async def upsert_plugin(self, request: PluginResourceRequest) -> PluginResourceResponse: ...
+    async def upsert_plugin(
+        self,
+        request: PluginResourceRequest,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse: ...
 
-    async def start_plugin(self, plugin_id: str) -> PluginResourceResponse: ...
+    async def start_plugin(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse: ...
 
-    async def stop_plugin(self, plugin_id: str) -> PluginResourceResponse: ...
+    async def stop_plugin(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse: ...
 
-    async def reload_plugin(self, plugin_id: str) -> PluginResourceResponse: ...
+    async def reload_plugin(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse: ...
 
-    async def delete_plugin(self, plugin_id: str) -> None: ...
+    async def delete_plugin(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> None: ...
 
     async def list_mcp_servers(
         self,
@@ -2159,6 +2193,7 @@ class AdminResourceService(Protocol):
         action: str,
         resource: str,
         details: dict[str, object] | None = None,
+        tenant_id: UUID | None = None,
     ) -> AuditEventResponse: ...
 
     async def create_openclaw_operation(
@@ -4008,34 +4043,74 @@ class InMemoryAdminResourceService:
     async def delete_skill(self, skill_id: str) -> None:
         del self.skills[skill_id]
 
-    async def list_plugins(self) -> tuple[PluginResourceResponse, ...]:
+    async def list_plugins(
+        self,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> tuple[PluginResourceResponse, ...]:
+        del tenant_id
         return tuple(self.plugins.values())
 
-    async def upsert_plugin(self, request: PluginResourceRequest) -> PluginResourceResponse:
+    async def upsert_plugin(
+        self,
+        request: PluginResourceRequest,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse:
+        del tenant_id, actor_id
         current = self.plugins.get(request.id)
         response = _plugin_response_from_request(request, current=current)
         self.plugins[response.id] = response
         return response
 
-    async def start_plugin(self, plugin_id: str) -> PluginResourceResponse:
+    async def start_plugin(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse:
+        del tenant_id, actor_id
         current = self.plugins[plugin_id]
         updated = _plugin_started_response(current)
         self.plugins[plugin_id] = updated
         return updated
 
-    async def stop_plugin(self, plugin_id: str) -> PluginResourceResponse:
+    async def stop_plugin(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse:
+        del tenant_id, actor_id
         current = self.plugins[plugin_id]
         updated = _plugin_stopped_response(current)
         self.plugins[plugin_id] = updated
         return updated
 
-    async def reload_plugin(self, plugin_id: str) -> PluginResourceResponse:
+    async def reload_plugin(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse:
+        del tenant_id, actor_id
         current = self.plugins[plugin_id]
         updated = _plugin_started_response(current)
         self.plugins[plugin_id] = updated
         return updated
 
-    async def delete_plugin(self, plugin_id: str) -> None:
+    async def delete_plugin(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> None:
+        del tenant_id, actor_id
         del self.plugins[plugin_id]
 
     async def list_mcp_servers(
@@ -4138,7 +4213,9 @@ class InMemoryAdminResourceService:
         action: str,
         resource: str,
         details: dict[str, object] | None = None,
+        tenant_id: UUID | None = None,
     ) -> AuditEventResponse:
+        del tenant_id
         event = AuditEventResponse(
             id=f"audit_{uuid4().hex}",
             actor=actor,
@@ -5787,47 +5864,120 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             )
         await self._record_audit("skill.delete", f"skill:{skill_id}", {"id": skill_id})
 
-    async def list_plugins(self) -> tuple[PluginResourceResponse, ...]:
-        resources = await self._list_admin_payloads("plugin")
+    async def list_plugins(
+        self,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> tuple[PluginResourceResponse, ...]:
+        resources = await self._list_admin_payloads("plugin", tenant_id=tenant_id)
         if resources is None:
+            if tenant_id is not None and tenant_id != self._tenant_id:
+                return ()
             return await super().list_plugins()
         return tuple(PluginResourceResponse.model_validate(payload) for payload in resources)
 
-    async def upsert_plugin(self, request: PluginResourceRequest) -> PluginResourceResponse:
-        current = await self._plugin_response(request.id)
+    async def upsert_plugin(
+        self,
+        request: PluginResourceRequest,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse:
+        current = await self._plugin_response(request.id, tenant_id=tenant_id)
         response = _plugin_response_from_request(request, current=current)
         if not await self._upsert_admin_payload(
-            "plugin", response.id, response.model_dump(mode="json")
+            "plugin",
+            response.id,
+            response.model_dump(mode="json"),
+            tenant_id=tenant_id,
         ):
+            if tenant_id is not None and tenant_id != self._tenant_id:
+                raise KeyError(response.id)
             return await super().upsert_plugin(request)
         await self._record_audit(
             "plugin.upsert",
             f"plugin:{response.id}",
             _plugin_upsert_audit_details(response),
+            tenant_id=tenant_id,
+            actor_id=actor_id,
         )
         return response
 
-    async def start_plugin(self, plugin_id: str) -> PluginResourceResponse:
-        return await self._set_plugin_lifecycle(plugin_id, "start")
+    async def start_plugin(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse:
+        return await self._set_plugin_lifecycle(
+            plugin_id,
+            "start",
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+        )
 
-    async def stop_plugin(self, plugin_id: str) -> PluginResourceResponse:
-        return await self._set_plugin_lifecycle(plugin_id, "stop")
+    async def stop_plugin(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse:
+        return await self._set_plugin_lifecycle(
+            plugin_id,
+            "stop",
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+        )
 
-    async def reload_plugin(self, plugin_id: str) -> PluginResourceResponse:
-        return await self._set_plugin_lifecycle(plugin_id, "reload")
+    async def reload_plugin(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse:
+        return await self._set_plugin_lifecycle(
+            plugin_id,
+            "reload",
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+        )
 
-    async def delete_plugin(self, plugin_id: str) -> None:
-        deleted = await self._delete_admin_payload("plugin", plugin_id)
+    async def delete_plugin(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> None:
+        deleted = await self._delete_admin_payload("plugin", plugin_id, tenant_id=tenant_id)
         if deleted is None:
+            if tenant_id is not None and tenant_id != self._tenant_id:
+                raise KeyError(plugin_id)
             await super().delete_plugin(plugin_id)
             return
         if not deleted:
             raise KeyError(plugin_id)
-        await self._record_audit("plugin.delete", f"plugin:{plugin_id}", {"id": plugin_id})
+        await self._record_audit(
+            "plugin.delete",
+            f"plugin:{plugin_id}",
+            {"id": plugin_id},
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+        )
 
-    async def _plugin_response(self, plugin_id: str) -> PluginResourceResponse | None:
-        payload = await self._get_admin_payload("plugin", plugin_id)
+    async def _plugin_response(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> PluginResourceResponse | None:
+        payload = await self._get_admin_payload("plugin", plugin_id, tenant_id=tenant_id)
         if payload is None:
+            if tenant_id is not None and tenant_id != self._tenant_id:
+                return None
             for plugin in await super().list_plugins():
                 if plugin.id == plugin_id:
                     return plugin
@@ -5840,9 +5990,14 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         self,
         plugin_id: str,
         action: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
     ) -> PluginResourceResponse:
-        payload = await self._get_admin_payload("plugin", plugin_id)
+        payload = await self._get_admin_payload("plugin", plugin_id, tenant_id=tenant_id)
         if payload is None:
+            if tenant_id is not None and tenant_id != self._tenant_id:
+                raise KeyError(plugin_id)
             if action == "start":
                 return await super().start_plugin(plugin_id)
             if action == "stop":
@@ -5856,13 +6011,18 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         else:
             updated = _plugin_started_response(current)
         if not await self._upsert_admin_payload(
-            "plugin", updated.id, updated.model_dump(mode="json")
+            "plugin",
+            updated.id,
+            updated.model_dump(mode="json"),
+            tenant_id=tenant_id,
         ):
             raise KeyError(plugin_id)
         await self._record_audit(
             f"plugin.{action}",
             f"plugin:{updated.id}",
             {"id": updated.id},
+            tenant_id=tenant_id,
+            actor_id=actor_id,
         )
         return updated
 
@@ -6312,14 +6472,21 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             }
         return config
 
-    async def _get_admin_payload(self, kind: str, resource_id: str) -> dict[str, object] | None:
+    async def _get_admin_payload(
+        self,
+        kind: str,
+        resource_id: str,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> dict[str, object] | None:
         if self._session_factory is None:
             return None
+        target_tenant_id = self._tenant_id if tenant_id is None else tenant_id
         async with self._session_factory() as session:
             row = (
                 await session.execute(
                     select(AdminResourceRow)
-                    .where(AdminResourceRow.tenant_id == self._tenant_id)
+                    .where(AdminResourceRow.tenant_id == target_tenant_id)
                     .where(AdminResourceRow.kind == kind)
                     .where(AdminResourceRow.resource_id == resource_id)
                 )
@@ -6327,15 +6494,21 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             return {} if row is None else dict(row.payload)
 
     async def _upsert_admin_payload(
-        self, kind: str, resource_id: str, payload: dict[str, object]
+        self,
+        kind: str,
+        resource_id: str,
+        payload: dict[str, object],
+        *,
+        tenant_id: UUID | None = None,
     ) -> bool:
         if self._session_factory is None:
             return False
+        target_tenant_id = self._tenant_id if tenant_id is None else tenant_id
         statement = (
             insert(AdminResourceRow)
             .values(
                 id=uuid4(),
-                tenant_id=self._tenant_id,
+                tenant_id=target_tenant_id,
                 kind=kind,
                 resource_id=resource_id,
                 payload=payload,
@@ -6353,35 +6526,54 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             await session.execute(statement)
         return True
 
-    async def _delete_admin_payload(self, kind: str, resource_id: str) -> bool | None:
+    async def _delete_admin_payload(
+        self,
+        kind: str,
+        resource_id: str,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> bool | None:
         if self._session_factory is None:
             return None
-        existing = await self._get_admin_payload(kind, resource_id)
+        target_tenant_id = self._tenant_id if tenant_id is None else tenant_id
+        existing = await self._get_admin_payload(kind, resource_id, tenant_id=target_tenant_id)
         if not existing:
             return False
         async with self._session_factory() as session, session.begin():
             await session.execute(
                 delete(AdminResourceRow)
-                .where(AdminResourceRow.tenant_id == self._tenant_id)
+                .where(AdminResourceRow.tenant_id == target_tenant_id)
                 .where(AdminResourceRow.kind == kind)
                 .where(AdminResourceRow.resource_id == resource_id)
             )
         return True
 
     async def _record_audit(
-        self, action: str, resource: str, payload: dict[str, object] | None = None
+        self,
+        action: str,
+        resource: str,
+        payload: dict[str, object] | None = None,
+        *,
+        actor_id: UUID | None = None,
+        tenant_id: UUID | None = None,
     ) -> None:
         if self._session_factory is None:
             return
+        target_actor_id = self._actor_id if actor_id is None else actor_id
         event = AuditEventResponse(
             id=f"audit_{uuid4().hex}",
-            actor=str(self._actor_id),
+            actor=str(target_actor_id),
             action=action,
             resource=resource,
             details=_safe_audit_details(payload),
             created_at=datetime.now(UTC),
         )
-        await self._upsert_admin_payload("audit", event.id, event.model_dump(mode="json"))
+        await self._upsert_admin_payload(
+            "audit",
+            event.id,
+            event.model_dump(mode="json"),
+            tenant_id=tenant_id,
+        )
 
     async def record_audit_event(
         self,
@@ -6390,6 +6582,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         action: str,
         resource: str,
         details: dict[str, object] | None = None,
+        tenant_id: UUID | None = None,
     ) -> AuditEventResponse:
         event = AuditEventResponse(
             id=f"audit_{uuid4().hex}",
@@ -6399,7 +6592,12 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             details=_safe_audit_details(details),
             created_at=datetime.now(UTC),
         )
-        await self._upsert_admin_payload("audit", event.id, event.model_dump(mode="json"))
+        await self._upsert_admin_payload(
+            "audit",
+            event.id,
+            event.model_dump(mode="json"),
+            tenant_id=tenant_id,
+        )
         return event
 
     async def _verify_model_availability(
@@ -10184,7 +10382,7 @@ async def list_plugins(
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> list[PluginResourceResponse]:
     _require(principal, "plugin:read")
-    return list(await service.list_plugins())
+    return list(await service.list_plugins(tenant_id=principal.tenant_id))
 
 
 @router.get(
@@ -10197,7 +10395,10 @@ async def list_plugin_policy_summary(
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> list[PluginPolicySummaryResponse]:
     _require(principal, "plugin:read")
-    return [_plugin_policy_summary(plugin) for plugin in await service.list_plugins()]
+    return [
+        _plugin_policy_summary(plugin)
+        for plugin in await service.list_plugins(tenant_id=principal.tenant_id)
+    ]
 
 
 @router.post(
@@ -10214,7 +10415,11 @@ async def upsert_plugin(
     _require(principal, "plugin:write")
     _validate_plugin_resource_config(request, body)
     _validate_plugin_capability_configs(request, body)
-    response = await service.upsert_plugin(body)
+    response = await service.upsert_plugin(
+        body,
+        tenant_id=principal.tenant_id,
+        actor_id=principal.user_id,
+    )
     await _reload_plugin_runtime_config(request, principal.tenant_id)
     return response
 
@@ -10245,7 +10450,11 @@ async def start_plugin(
 ) -> PluginResourceResponse:
     _require(principal, "plugin:write")
     try:
-        response = await service.start_plugin(plugin_id)
+        response = await service.start_plugin(
+            plugin_id,
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+        )
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
     await _reload_plugin_runtime_config(request, principal.tenant_id)
@@ -10265,7 +10474,11 @@ async def stop_plugin(
 ) -> PluginResourceResponse:
     _require(principal, "plugin:write")
     try:
-        response = await service.stop_plugin(plugin_id)
+        response = await service.stop_plugin(
+            plugin_id,
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+        )
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
     await _reload_plugin_runtime_config(request, principal.tenant_id)
@@ -10285,7 +10498,11 @@ async def reload_plugin(
 ) -> PluginResourceResponse:
     _require(principal, "plugin:write")
     try:
-        response = await service.reload_plugin(plugin_id)
+        response = await service.reload_plugin(
+            plugin_id,
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+        )
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
     await _reload_plugin_runtime_config(request, principal.tenant_id)
@@ -10305,7 +10522,11 @@ async def delete_plugin(
 ) -> OperationStatusResponse:
     _require(principal, "plugin:write")
     try:
-        await service.delete_plugin(plugin_id)
+        await service.delete_plugin(
+            plugin_id,
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+        )
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
     await _reload_plugin_runtime_config(request, principal.tenant_id)
@@ -10325,7 +10546,7 @@ async def capability_manifest(
     _require(principal, "plugin:read")
     _require(principal, "mcp:read")
     plugin_source = PluginConfigCapabilityManifestSource(
-        cast(Any, await service.list_plugins())
+        cast(Any, await service.list_plugins(tenant_id=principal.tenant_id))
     )
     mcp_source = McpConfigCapabilityManifestSource(
         await service.list_mcp_servers(tenant_id=principal.tenant_id)

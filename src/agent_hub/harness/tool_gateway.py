@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Mapping
 from typing import Protocol
@@ -12,6 +13,8 @@ from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult, JsonValue
 
 type MutableJson = None | bool | int | float | str | list["MutableJson"] | dict[str, "MutableJson"]
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class RuntimeToolBackend(Protocol):
@@ -100,6 +103,7 @@ class HarnessToolGateway:
             raise TypeError("request must be HarnessToolCallRequest")
         if request.approval_required and self._policy_gateway is None:
             return self._failure(request, "approval required")
+        await self._prepare_external_backends(tenant_id)
         mcp_backend = self._available_mcp_backend(tenant_id, request.tool_name)
         plugin_backend = (
             None
@@ -240,6 +244,24 @@ class HarnessToolGateway:
         if not available:
             return None
         return self._plugin_backend
+
+    async def _prepare_external_backends(self, tenant_id: UUID) -> None:
+        for backend in (self._mcp_backend, self._plugin_backend):
+            if backend is None:
+                continue
+            ensure_tenant_loaded = getattr(backend, "ensure_tenant_loaded", None)
+            if not callable(ensure_tenant_loaded):
+                continue
+            try:
+                await ensure_tenant_loaded(tenant_id)
+            except Exception as error:  # noqa: BLE001 - optional backend preparation fails closed.
+                _LOGGER.warning(
+                    "harness_external_backend_prepare_failed backend=%s tenant_id=%s error_type=%s",
+                    type(backend).__name__,
+                    tenant_id,
+                    type(error).__name__,
+                )
+                continue
 
 
 def _capability_request(

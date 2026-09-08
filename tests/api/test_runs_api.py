@@ -48,7 +48,9 @@ class StubSettingsService:
         action: str,
         resource: str,
         details: dict[str, object],
+        tenant_id: UUID | None = None,
     ) -> object:
+        del tenant_id
         self.audit_events.append({"actor": actor, "action": action, "resource": resource, "details": details})
         return object()
 
