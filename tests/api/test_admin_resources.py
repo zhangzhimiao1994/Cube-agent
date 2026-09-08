@@ -3510,6 +3510,82 @@ def test_plugin_upsert_lifecycle_and_delete_trigger_runtime_reload_callback() ->
     ]
 
 
+def plugin_archive(manifest: Mapping[str, object]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("plugin.json", json.dumps(manifest))
+        archive.writestr("README.md", "Plugin package.\n")
+    return buffer.getvalue()
+
+
+def test_plugin_archive_install_scans_manifest_and_triggers_runtime_reload() -> None:
+    api = client()
+    reloaded: list[UUID] = []
+
+    async def reload_plugin_runtime_config(tenant_id: UUID) -> None:
+        reloaded.append(tenant_id)
+
+    cast(Any, api.app).state.reload_plugin_runtime_config = reload_plugin_runtime_config
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": quote("calendar-plugin.zip"),
+            "X-Agent-Hub-Plugin-Filename-Encoding": "percent",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "version": "1.0.0",
+                "endpoint_url": "https://plugins.example/invoke",
+                "domain_allowlist": ["plugins.example"],
+                "capabilities": [
+                    {
+                        "id": "calendar.create_event",
+                        "adapter": "http_json",
+                        "permission_class": "calendar.write",
+                        "sandbox_profile": "remote_connector",
+                    }
+                ],
+            }
+        ),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["filename"] == "calendar-plugin.zip"
+    assert body["content_sha256"]
+    assert body["plugin"]["id"] == "calendar"
+    assert body["plugin"]["version"] == "1.0.0"
+    assert body["plugin"]["capabilities"][0]["id"] == "calendar.create_event"
+    assert reloaded == [TENANT_ID]
+    assert api.get("/api/v1/admin/plugins", headers=headers()).json()[0]["id"] == "calendar"
+
+
+def test_plugin_archive_install_rejects_archives_without_plugin_manifest() -> None:
+    api = client()
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("README.md", "No manifest.\n")
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "broken.zip",
+        },
+        content=buffer.getvalue(),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    assert response.json()["error"]["details"]["reason"] == "plugin archive is missing plugin.json"
+
+
 def test_plugin_reload_callback_failure_does_not_fail_saved_config() -> None:
     api = client()
 

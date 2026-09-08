@@ -548,6 +548,55 @@ describe("api client transport", () => {
     expect(fetchMock.mock.calls[1]?.[1]).toEqual(expect.objectContaining({ method: "POST" }));
   });
 
+  it("uploads plugin archives to the plugin install endpoint", async () => {
+    const plugin: PluginResource = {
+      id: "calendar",
+      name: "Calendar HTTP",
+      enabled: true,
+      description: null,
+      version: "1.0.0",
+      endpoint_url: null,
+      domain_allowlist: [],
+      resource_config: {},
+      timeout_seconds: 10,
+      credential_ref: null,
+      credential_header: "X-Plugin-Credential",
+      credential_scheme: "Bearer",
+      capabilities: [],
+      status: "stopped",
+      health: "stopped",
+      last_error_type: null,
+    };
+    const response = {
+      filename: "calendar plugin.zip",
+      content_sha256: "abc123",
+      plugin,
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      api.uploadPluginArchive(new File(["plugin-bytes"], "calendar plugin.zip", { type: "application/zip" })),
+    ).resolves.toEqual(response);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/admin/plugins/install");
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          "Content-Type": "application/zip",
+          "X-Agent-Hub-Plugin-Filename": "calendar%20plugin.zip",
+          "X-Agent-Hub-Plugin-Filename-Encoding": "percent",
+        }),
+      }),
+    );
+  });
+
   it("rejects plugin adapter descriptors with non-object resource schemas", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(

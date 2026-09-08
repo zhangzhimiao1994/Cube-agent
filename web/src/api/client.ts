@@ -978,6 +978,15 @@ const PluginResourceSchema = z.object({
 
 export type PluginCapability = z.infer<typeof PluginCapabilitySchema>;
 export type PluginResource = z.infer<typeof PluginResourceSchema>;
+
+const PluginArchiveInstallSchema = z.object({
+  filename: z.string(),
+  content_sha256: z.string(),
+  plugin: PluginResourceSchema,
+});
+
+export type PluginArchiveInstall = z.infer<typeof PluginArchiveInstallSchema>;
+
 export type PluginResourcePayload = {
   id: string;
   name: string;
@@ -2007,6 +2016,22 @@ export const api = {
       "/api/v1/admin/plugins",
       { method: "POST", body: JSON.stringify(payload) },
       PluginResourceSchema,
+    );
+  },
+  uploadPluginArchive(file: File): Promise<PluginArchiveInstall> {
+    const filename = encodedFilenameHeader(file.name);
+    return requestBinary(
+      "/api/v1/admin/plugins/install",
+      {
+        method: "POST",
+        body: file,
+        headers: {
+          "Content-Type": archiveContentType(file.name),
+          "X-Agent-Hub-Plugin-Filename": filename.encoded,
+          "X-Agent-Hub-Plugin-Filename-Encoding": filename.encoding,
+        },
+      },
+      PluginArchiveInstallSchema,
     );
   },
   startPlugin(id: string): Promise<PluginResource> {

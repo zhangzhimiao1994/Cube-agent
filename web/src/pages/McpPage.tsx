@@ -519,6 +519,7 @@ export function McpPage() {
   const [pluginCapabilities, setPluginCapabilities] = useState<PluginCapabilityForm[]>([
     createPluginCapabilityForm(),
   ]);
+  const [pluginArchiveFile, setPluginArchiveFile] = useState<File | null>(null);
   const [pluginMessage, setPluginMessage] = useState<string | null>(null);
 
   async function refreshPluginSurfaces() {
@@ -605,6 +606,14 @@ export function McpPage() {
       }),
     onSuccess: async () => {
       setPluginMessage("插件配置已保存。运行时能力注册表会重新加载。");
+      await refreshPluginSurfaces();
+    },
+  });
+  const installPluginArchive = useMutation({
+    mutationFn: (file: File) => api.uploadPluginArchive(file),
+    onSuccess: async (result) => {
+      setPluginArchiveFile(null);
+      setPluginMessage(`插件归档已安装：${result.plugin.name}`);
       await refreshPluginSurfaces();
     },
   });
@@ -1150,9 +1159,28 @@ export function McpPage() {
           <button type="submit" disabled={savePlugin.isPending || !canWritePlugins}>
             {savePlugin.isPending ? "正在保存..." : "保存插件"}
           </button>
+          <label htmlFor="plugin-archive">插件归档</label>
+          <input
+            id="plugin-archive"
+            type="file"
+            accept=".zip,.tar,.tar.gz,.tgz,application/zip,application/x-tar,application/gzip"
+            onChange={(event) => setPluginArchiveFile(event.target.files?.[0] ?? null)}
+          />
+          <button
+            type="button"
+            disabled={installPluginArchive.isPending || !pluginArchiveFile || !canWritePlugins}
+            onClick={() => {
+              if (pluginArchiveFile) installPluginArchive.mutate(pluginArchiveFile);
+            }}
+          >
+            {installPluginArchive.isPending ? "正在安装..." : "安装插件归档"}
+          </button>
           {!canWritePlugins ? <p className="field-help">当前账号无权保存插件配置。</p> : null}
           {pluginMessage ? <p role="status">{pluginMessage}</p> : null}
           {savePlugin.isError ? <p role="alert">{formatApiError(savePlugin.error, "插件保存失败")}</p> : null}
+          {installPluginArchive.isError ? (
+            <p role="alert">{formatApiError(installPluginArchive.error, "插件归档安装失败")}</p>
+          ) : null}
           {pluginLifecycle.isError ? (
             <p role="alert">{formatApiError(pluginLifecycle.error, "插件操作失败")}</p>
           ) : null}

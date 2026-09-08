@@ -618,6 +618,14 @@ class PluginResourceResponse(PluginResourceRequest):
     last_error_type: str | None = Field(default=None, max_length=128)
 
 
+class PluginArchiveInstallResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    filename: str
+    content_sha256: str
+    plugin: PluginResourceResponse
+
+
 class PluginPolicyCapabilitySummaryResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -2354,6 +2362,7 @@ _TAR_METADATA_TYPES = frozenset(
     }
 )
 _MAX_SKILL_BUNDLE_ITEMS = 4096
+_MAX_PLUGIN_ARCHIVE_BYTES = 2_000_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -3045,6 +3054,88 @@ def _tar_group_to_skill_archive(
             target_info.external_attr = (member.mode & 0o777) << 16
             output.writestr(target_info, source.read())
     return buffer.getvalue()
+
+
+def _plugin_request_from_archive(archive_bytes: bytes) -> PluginResourceRequest:
+    manifest_bytes = _plugin_manifest_bytes_from_archive(archive_bytes)
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except UnicodeDecodeError:
+        raise InvalidSkillPackage("plugin.json must be utf-8") from None
+    except json.JSONDecodeError:
+        raise InvalidSkillPackage("plugin.json must be valid json") from None
+    try:
+        return PluginResourceRequest.model_validate(manifest)
+    except ValidationError as exc:
+        raise InvalidSkillPackage(str(exc)) from None
+
+
+def _plugin_manifest_bytes_from_archive(archive_bytes: bytes) -> bytes:
+    if len(archive_bytes) > _MAX_PLUGIN_ARCHIVE_BYTES:
+        raise PublicAPIError(413, "request_too_large", "plugin archive exceeds size limit")
+    archive_buffer = io.BytesIO(archive_bytes)
+    if zipfile.is_zipfile(archive_buffer):
+        return _plugin_manifest_bytes_from_zip(archive_bytes)
+    return _plugin_manifest_bytes_from_tar(archive_bytes)
+
+
+def _plugin_manifest_bytes_from_zip(archive_bytes: bytes) -> bytes:
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+            candidates: list[tuple[str, bytes]] = []
+            for info in archive.infolist():
+                if info.is_dir() or info.filename.replace("\\", "/").endswith("/"):
+                    continue
+                mode = (info.external_attr >> 16) & 0o777777
+                if _skill_bundle_mode_is_unsafe(mode):
+                    raise InvalidSkillPackage("plugin archive contains links or device files")
+                path = _safe_plugin_archive_member_path(info.filename)
+                if PurePosixPath(path).name == "plugin.json":
+                    candidates.append((path, archive.read(info.filename)))
+    except zipfile.BadZipFile:
+        raise InvalidSkillPackage("plugin archive must be a valid zip file") from None
+    return _single_plugin_manifest(candidates)
+
+
+def _plugin_manifest_bytes_from_tar(archive_bytes: bytes) -> bytes:
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
+            candidates: list[tuple[str, bytes]] = []
+            for member in archive.getmembers():
+                if member.isdir():
+                    continue
+                if not member.isfile():
+                    raise InvalidSkillPackage("plugin archive contains links or device files")
+                path = _safe_plugin_archive_member_path(member.name)
+                source = archive.extractfile(member)
+                if source is None:
+                    raise InvalidSkillPackage("plugin.json cannot be read")
+                if PurePosixPath(path).name == "plugin.json":
+                    candidates.append((path, source.read()))
+    except tarfile.TarError:
+        raise InvalidSkillPackage("plugin archive must be a valid zip or tar archive") from None
+    return _single_plugin_manifest(candidates)
+
+
+def _safe_plugin_archive_member_path(name: str) -> str:
+    normalized = name.replace("\\", "/").strip()
+    path = PurePosixPath(normalized)
+    if (
+        not normalized
+        or normalized.startswith("/")
+        or path.is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise InvalidSkillPackage("plugin archive contains unsafe paths")
+    return normalized
+
+
+def _single_plugin_manifest(candidates: list[tuple[str, bytes]]) -> bytes:
+    if not candidates:
+        raise InvalidSkillPackage("plugin archive is missing plugin.json")
+    if len(candidates) > 1:
+        raise InvalidSkillPackage("plugin archive contains multiple plugin.json files")
+    return candidates[0][1]
 
 
 class CapabilityManifestProvider(Protocol):
@@ -7320,6 +7411,28 @@ def _safe_skill_upload_filename(value: str | None) -> str:
     return filename
 
 
+def _safe_plugin_upload_filename(value: str | None) -> str:
+    if value is None:
+        raise PublicAPIError(422, "request_validation", "plugin filename is required")
+    filename = value.strip()
+    lowered = filename.lower()
+    if (
+        not filename
+        or len(filename) > 255
+        or "/" in filename
+        or "\\" in filename
+        or filename in {".", ".."}
+        or not lowered.endswith((".zip", ".tar", ".tar.gz", ".tgz"))
+        or any(ord(character) < 32 or ord(character) == 127 for character in filename)
+    ):
+        raise PublicAPIError(
+            422,
+            "request_validation",
+            "plugin filename must be a safe .zip, .tar, .tar.gz, or .tgz name",
+        )
+    return filename
+
+
 def _normalize_model_request_api_base(request: ModelDeploymentRequest) -> ModelDeploymentRequest:
     normalized = _normalized_model_api_base(request.api_protocol, request.api_base)
     capabilities = [
@@ -10684,6 +10797,63 @@ async def list_plugin_adapters(
 ) -> list[PluginAdapterDescriptorResponse]:
     _require(principal, "plugin:read")
     return list(_plugin_adapter_descriptors(request))
+
+
+@router.post(
+    "/plugins/install",
+    response_model=PluginArchiveInstallResponse,
+    responses=error_responses(401, 403, 413, 422),
+)
+async def install_plugin_archive(
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> PluginArchiveInstallResponse:
+    _require(principal, "plugin:write")
+    filename = _safe_plugin_upload_filename(
+        _decode_upload_filename_header(
+            request.headers.get("x-agent-hub-plugin-filename"),
+            request.headers.get("x-agent-hub-plugin-filename-encoding"),
+        )
+    )
+    archive_bytes = await request.body()
+    if not archive_bytes:
+        raise PublicAPIError(422, "request_validation", "plugin archive is empty")
+    content_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+    try:
+        plugin_request = _plugin_request_from_archive(archive_bytes)
+    except InvalidSkillPackage as error:
+        raise PublicAPIError(
+            422,
+            "invalid_plugin_package",
+            "plugin package is invalid",
+            details={"reason": _safe_model_check_detail(str(error))},
+        ) from None
+    _validate_plugin_resource_config(request, plugin_request)
+    _validate_plugin_capability_configs(request, plugin_request)
+    plugin = await service.upsert_plugin(
+        plugin_request,
+        tenant_id=principal.tenant_id,
+        actor_id=principal.user_id,
+    )
+    await service.record_audit_event(
+        actor=str(principal.user_id),
+        action="plugin.install",
+        resource=f"plugin:{plugin.id}",
+        tenant_id=principal.tenant_id,
+        details={
+            "id": plugin.id,
+            "filename": filename,
+            "content_sha256": content_sha256,
+            "capability_count": len(plugin.capabilities),
+        },
+    )
+    await _reload_plugin_runtime_config(request, principal.tenant_id)
+    return PluginArchiveInstallResponse(
+        filename=filename,
+        content_sha256=content_sha256,
+        plugin=plugin,
+    )
 
 
 @router.post(

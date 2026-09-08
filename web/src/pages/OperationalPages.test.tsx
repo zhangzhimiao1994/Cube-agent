@@ -1294,6 +1294,14 @@ describe("operational management pages", () => {
           visiblePlugins = [saved];
           return jsonResponse(saved);
         }
+        if (path === "/api/v1/admin/plugins/install" && method === "POST") {
+          visiblePlugins = [calendarPlugin];
+          return jsonResponse({
+            filename: "calendar-plugin.zip",
+            content_sha256: "abc123",
+            plugin: calendarPlugin,
+          });
+        }
         if (path === "/api/v1/admin/plugins/calendar/reload" && method === "POST") {
           return jsonResponse(calendarPlugin);
         }
@@ -6531,6 +6539,21 @@ describe("operational management pages", () => {
     expect(screen.getAllByText("calendar.create_event").length).toBeGreaterThan(0);
     expect(screen.getByText("calendar.create_event:需要审批")).not.toBeNull();
     expect(screen.getByText("secret://calendar")).not.toBeNull();
+
+    await user.upload(
+      screen.getByLabelText("插件归档"),
+      new File(["plugin-bytes"], "calendar-plugin.zip", { type: "application/zip" }),
+    );
+    await user.click(screen.getByRole("button", { name: "安装插件归档" }));
+    await waitFor(() =>
+      expect(
+        requests.find(
+          (request) =>
+            request.path === "/api/v1/admin/plugins/install" &&
+            request.method === "POST",
+        ),
+      ).toBeTruthy(),
+    );
 
     await user.click(screen.getByRole("button", { name: "重载插件 Calendar HTTP" }));
     await waitFor(() =>
