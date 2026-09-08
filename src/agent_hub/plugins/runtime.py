@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from time import monotonic as default_monotonic
 from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -158,12 +159,17 @@ class RuntimePluginService:
         tenant_id: UUID,
         admin_service: PluginConfigService,
         adapters: Mapping[str, PluginAdapter] | None = None,
+        cache_ttl_seconds: float = 60.0,
+        monotonic: Callable[[], float] | None = None,
     ) -> None:
         self._tenant_id = tenant_id
         self._admin_service = admin_service
         self._adapters = _default_plugin_adapters(admin_service)
         self._adapters.update(adapters or {})
         self._plugins_by_tenant: dict[UUID, tuple[PluginResourceResponse, ...]] = {}
+        self._plugins_loaded_at: dict[UUID, float] = {}
+        self._cache_ttl_seconds = max(0.0, cache_ttl_seconds)
+        self._monotonic = default_monotonic if monotonic is None else monotonic
 
     async def start(self) -> None:
         await self.reload(self._tenant_id)
@@ -183,13 +189,20 @@ class RuntimePluginService:
             )
         except Exception:  # noqa: BLE001 - plugin runtime context must fail closed.
             self._plugins_by_tenant[target_tenant_id] = ()
+        self._plugins_loaded_at[target_tenant_id] = self._monotonic()
 
     async def ensure_tenant_loaded(self, tenant_id: UUID) -> None:
-        if tenant_id not in self._plugins_by_tenant:
+        if tenant_id not in self._plugins_by_tenant or self._tenant_cache_is_stale(tenant_id):
             await self.reload(tenant_id)
 
     def _loaded_tenant_ids(self) -> tuple[UUID, ...]:
         return tuple(dict.fromkeys((self._tenant_id, *self._plugins_by_tenant)))
+
+    def _tenant_cache_is_stale(self, tenant_id: UUID) -> bool:
+        loaded_at = self._plugins_loaded_at.get(tenant_id)
+        if loaded_at is None:
+            return True
+        return self._monotonic() - loaded_at >= self._cache_ttl_seconds
 
     def capability_manifest_source(self) -> RuntimePluginService:
         return self
@@ -389,11 +402,15 @@ async def build_runtime_plugin_service(
     tenant_id: UUID,
     admin_service: PluginConfigService,
     adapters: Mapping[str, PluginAdapter] | None = None,
+    cache_ttl_seconds: float = 60.0,
+    monotonic: Callable[[], float] | None = None,
 ) -> RuntimePluginService:
     service = RuntimePluginService(
         tenant_id=tenant_id,
         admin_service=admin_service,
         adapters=adapters,
+        cache_ttl_seconds=cache_ttl_seconds,
+        monotonic=monotonic,
     )
     await service.start()
     return service
