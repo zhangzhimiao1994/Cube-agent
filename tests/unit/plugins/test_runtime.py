@@ -63,6 +63,25 @@ class FakeAdminService:
         return event
 
 
+class TenantMappedPluginAdminService(FakeAdminService):
+    def __init__(
+        self,
+        plugins_by_tenant: dict[UUID, tuple[PluginResourceResponse, ...]],
+    ) -> None:
+        super().__init__(())
+        self.plugins_by_tenant = plugins_by_tenant
+        self.tenant_ids: list[UUID] = []
+
+    async def list_plugins(
+        self,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> tuple[PluginResourceResponse, ...]:
+        assert tenant_id is not None
+        self.tenant_ids.append(tenant_id)
+        return self.plugins_by_tenant.get(tenant_id, ())
+
+
 @dataclass
 class RecordingPluginAdapter:
     calls: list[tuple[str, str, Mapping[str, JsonValue], PluginInvocationContext]]
@@ -234,6 +253,39 @@ async def test_runtime_plugin_service_reloads_and_invokes_plugins_for_requested_
     }
     assert admin_service.audit_tenant_ids == [OTHER_TENANT_ID]
     assert adapter.calls[0][3].tenant_id == OTHER_TENANT_ID
+
+
+async def test_runtime_plugin_reload_without_tenant_refreshes_loaded_tenants() -> None:
+    admin_service = TenantMappedPluginAdminService(
+        {
+            TENANT_ID: (),
+            OTHER_TENANT_ID: (
+                plugin(
+                    "tenant-calendar",
+                    capability_id="tenant_calendar.create_event",
+                ),
+            ),
+        }
+    )
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+    )
+    await service.ensure_tenant_loaded(OTHER_TENANT_ID)
+
+    admin_service.plugins_by_tenant[OTHER_TENANT_ID] = ()
+    await service.reload()
+
+    assert admin_service.tenant_ids == [
+        TENANT_ID,
+        OTHER_TENANT_ID,
+        TENANT_ID,
+        OTHER_TENANT_ID,
+    ]
+    assert service.manifests_for_tenant(OTHER_TENANT_ID) == {
+        "schema_version": 1,
+        "capabilities": (),
+    }
 
 
 async def test_runtime_plugin_manifest_includes_capability_schemas() -> None:

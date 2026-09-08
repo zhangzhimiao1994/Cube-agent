@@ -156,6 +156,10 @@ class RuntimePluginService:
         await self.reload(self._tenant_id)
 
     async def reload(self, tenant_id: UUID | None = None) -> None:
+        if tenant_id is None:
+            for target_tenant_id in self._loaded_tenant_ids():
+                await self.reload(target_tenant_id)
+            return
         target_tenant_id = self._tenant_id if tenant_id is None else tenant_id
         try:
             self._plugins_by_tenant[target_tenant_id] = tuple(
@@ -170,6 +174,9 @@ class RuntimePluginService:
     async def ensure_tenant_loaded(self, tenant_id: UUID) -> None:
         if tenant_id not in self._plugins_by_tenant:
             await self.reload(tenant_id)
+
+    def _loaded_tenant_ids(self) -> tuple[UUID, ...]:
+        return tuple(dict.fromkeys((self._tenant_id, *self._plugins_by_tenant)))
 
     def capability_manifest_source(self) -> RuntimePluginService:
         return self

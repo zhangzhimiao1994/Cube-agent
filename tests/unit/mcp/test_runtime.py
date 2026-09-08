@@ -232,3 +232,35 @@ async def test_runtime_mcp_service_lazy_loads_invocation_tenant() -> None:
     assert result == {"answer": str(OTHER_TENANT_ID)}
     assert admin_service.tenants == [TENANT_ID, OTHER_TENANT_ID]
     assert clients[OTHER_TENANT_ID].invocations == [("web_search", {"query": "tenant"})]
+
+
+async def test_runtime_mcp_reload_without_tenant_refreshes_loaded_tenants() -> None:
+    admin_service = TenantMappedAdminService(
+        {
+            TENANT_ID: (),
+            OTHER_TENANT_ID: (server_config("search", allowed_tools=["web_search"]),),
+        }
+    )
+    service = await build_runtime_mcp_service(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        run_repository=object(),
+        client_factory=lambda _server: InMemoryMcpClient(
+            tools=(McpToolSchema(name="web_search"),)
+        ),
+    )
+    await service.ensure_tenant_loaded(OTHER_TENANT_ID)
+
+    admin_service.servers_by_tenant[OTHER_TENANT_ID] = ()
+    await service.reload()
+
+    assert admin_service.tenants == [
+        TENANT_ID,
+        OTHER_TENANT_ID,
+        TENANT_ID,
+        OTHER_TENANT_ID,
+    ]
+    assert service.manifests_for_tenant(OTHER_TENANT_ID) == {
+        "schema_version": 1,
+        "capabilities": (),
+    }

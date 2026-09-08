@@ -59,6 +59,10 @@ class RuntimeMcpService:
         await self.reload(self._tenant_id)
 
     async def reload(self, tenant_id: UUID | None = None) -> None:
+        if tenant_id is None:
+            for target_tenant_id in self._loaded_tenant_ids():
+                await self.reload(target_tenant_id)
+            return
         target_tenant_id = self._tenant_id if tenant_id is None else tenant_id
         try:
             configured_servers = await self._admin_service.list_mcp_servers(
@@ -98,6 +102,9 @@ class RuntimeMcpService:
     async def ensure_tenant_loaded(self, tenant_id: UUID) -> None:
         if tenant_id not in self._services_by_tenant:
             await self.reload(tenant_id)
+
+    def _loaded_tenant_ids(self) -> tuple[UUID, ...]:
+        return tuple(dict.fromkeys((self._tenant_id, *self._services_by_tenant)))
 
     def capability_manifest_source(self) -> RuntimeMcpService:
         return self
