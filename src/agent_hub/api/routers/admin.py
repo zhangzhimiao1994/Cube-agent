@@ -617,6 +617,16 @@ class PluginPackageMetadata(BaseModel):
 
     schema_version: Literal[1] = 1
     kind: Literal["manifest_only", "adapter_package"] = "manifest_only"
+    adapter_id: str | None = Field(
+        default=None,
+        max_length=128,
+        pattern=r"^[a-z0-9][a-z0-9_.-]{0,127}$",
+    )
+    sdk_api_version: str | None = Field(
+        default=None,
+        max_length=32,
+        pattern=r"^[1-9][0-9]*\.[0-9]+$",
+    )
     runtime: Literal["none", "python", "node", "container", "mcp_remote"] = "none"
     entrypoint: str | None = Field(default=None, max_length=255)
     isolation: Literal[
@@ -3144,7 +3154,9 @@ def _validate_plugin_package_contract(
         return
     if package.kind == "manifest_only":
         if (
-            package.runtime != "none"
+            package.adapter_id is not None
+            or package.sdk_api_version is not None
+            or package.runtime != "none"
             or package.entrypoint is not None
             or package.isolation != "none"
         ):
@@ -3152,6 +3164,8 @@ def _validate_plugin_package_contract(
                 "manifest-only plugin package cannot declare runtime execution"
             )
         return
+    if package.adapter_id is None or package.sdk_api_version is None:
+        raise InvalidSkillPackage("adapter plugin package must declare sdk contract")
     if package.runtime == "none" or package.isolation == "none":
         raise InvalidSkillPackage("adapter plugin package must declare runtime execution")
     if package.entrypoint is None or package.entrypoint not in archive_paths:

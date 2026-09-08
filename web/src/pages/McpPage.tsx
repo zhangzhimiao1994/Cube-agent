@@ -1257,6 +1257,8 @@ export function McpPage() {
                     </p>
                     <p>包入口：<span>{plugin.package_metadata?.entrypoint ?? "未配置"}</span></p>
                     <p>安装模式：<span>{plugin.package_metadata?.install_mode ?? "未配置"}</span></p>
+                    <p>适配器 ID：<span>{plugin.package_metadata?.adapter_id ?? "未配置"}</span></p>
+                    <p>SDK API：<span>{plugin.package_metadata?.sdk_api_version ?? "未配置"}</span></p>
                     <p>
                       资源配置：
                       <span>

@@ -3627,6 +3627,8 @@ def test_plugin_archive_install_persists_scan_only_package_metadata() -> None:
                 "package": {
                     "schema_version": 1,
                     "kind": "adapter_package",
+                    "adapter_id": "calendar_python",
+                    "sdk_api_version": "1.0",
                     "runtime": "python",
                     "entrypoint": "adapter/main.py",
                     "isolation": "local_process",
@@ -3652,6 +3654,8 @@ def test_plugin_archive_install_persists_scan_only_package_metadata() -> None:
     assert body["plugin"]["package_metadata"] == {
         "schema_version": 1,
         "kind": "adapter_package",
+        "adapter_id": "calendar_python",
+        "sdk_api_version": "1.0",
         "runtime": "python",
         "entrypoint": "adapter/main.py",
         "isolation": "local_process",
@@ -3678,6 +3682,8 @@ def test_plugin_archive_install_rejects_unsafe_package_entrypoint() -> None:
                 "name": "Calendar HTTP",
                 "package": {
                     "kind": "adapter_package",
+                    "adapter_id": "calendar_python",
+                    "sdk_api_version": "1.0",
                     "runtime": "python",
                     "entrypoint": "../adapter.py",
                     "isolation": "local_process",
@@ -3708,6 +3714,8 @@ def test_plugin_archive_install_rejects_missing_package_entrypoint_file() -> Non
                 "name": "Calendar HTTP",
                 "package": {
                     "kind": "adapter_package",
+                    "adapter_id": "calendar_python",
+                    "sdk_api_version": "1.0",
                     "runtime": "python",
                     "entrypoint": "adapter/main.py",
                     "isolation": "local_process",
@@ -3741,6 +3749,8 @@ def test_plugin_archive_install_rejects_manifest_only_package_with_runtime() -> 
                 "name": "Calendar HTTP",
                 "package": {
                     "kind": "manifest_only",
+                    "adapter_id": "calendar_python",
+                    "sdk_api_version": "1.0",
                     "runtime": "python",
                     "entrypoint": "adapter/main.py",
                     "isolation": "none",
@@ -3754,6 +3764,100 @@ def test_plugin_archive_install_rejects_manifest_only_package_with_runtime() -> 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "invalid_plugin_package"
     assert response.json()["error"]["details"]["reason"] == "manifest-only plugin package cannot declare runtime execution"
+
+
+def test_plugin_archive_install_rejects_manifest_only_package_with_sdk_contract() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "package": {
+                    "kind": "manifest_only",
+                    "adapter_id": "calendar_python",
+                    "sdk_api_version": "1.0",
+                    "install_mode": "scan_only",
+                },
+            },
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    assert response.json()["error"]["details"]["reason"] == "manifest-only plugin package cannot declare runtime execution"
+
+
+def test_plugin_archive_install_rejects_adapter_package_without_sdk_contract() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "package": {
+                    "kind": "adapter_package",
+                    "runtime": "python",
+                    "entrypoint": "adapter/main.py",
+                    "isolation": "local_process",
+                    "install_mode": "scan_only",
+                },
+            },
+            files={"adapter/main.py": "def invoke():\n    return {}\n"},
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    assert response.json()["error"]["details"]["reason"] == "adapter plugin package must declare sdk contract"
+
+
+def test_plugin_archive_install_rejects_invalid_package_sdk_contract() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "package": {
+                    "kind": "adapter_package",
+                    "adapter_id": "calendar_python",
+                    "sdk_api_version": "1",
+                    "runtime": "python",
+                    "entrypoint": "adapter/main.py",
+                    "isolation": "local_process",
+                    "install_mode": "scan_only",
+                },
+            },
+            files={"adapter/main.py": "def invoke():\n    return {}\n"},
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    reason = response.json()["error"]["details"]["reason"]
+    assert "package.sdk_api_version" in reason
 
 
 def test_plugin_resource_upsert_rejects_client_supplied_archive_provenance() -> None:
@@ -3786,6 +3890,8 @@ def test_plugin_resource_upsert_rejects_client_supplied_package_metadata() -> No
             "package_metadata": {
                 "schema_version": 1,
                 "kind": "adapter_package",
+                "adapter_id": "calendar_python",
+                "sdk_api_version": "1.0",
                 "runtime": "python",
                 "entrypoint": "adapter/main.py",
                 "isolation": "local_process",
