@@ -445,6 +445,14 @@ const calendarPlugin: PluginResource = {
   credential_scheme: "",
   source_filename: "calendar-plugin.zip",
   content_sha256: "abc123",
+  package_metadata: {
+    schema_version: 1,
+    kind: "adapter_package",
+    runtime: "python",
+    entrypoint: "adapter/main.py",
+    isolation: "local_process",
+    install_mode: "scan_only",
+  },
   capabilities: [
     {
       id: "calendar.create_event",
@@ -6545,6 +6553,14 @@ describe("operational management pages", () => {
     expect(screen.getByText("calendar-plugin.zip")).not.toBeNull();
     expect(screen.getByText("内容 SHA-256：")).not.toBeNull();
     expect(screen.getByText("abc123")).not.toBeNull();
+    expect(screen.getByText("包类型：")).not.toBeNull();
+    expect(screen.getByText("adapter_package")).not.toBeNull();
+    expect(screen.getByText("包运行时：")).not.toBeNull();
+    expect(screen.getByText("python / local_process")).not.toBeNull();
+    expect(screen.getByText("包入口：")).not.toBeNull();
+    expect(screen.getByText("adapter/main.py")).not.toBeNull();
+    expect(screen.getByText("安装模式：")).not.toBeNull();
+    expect(screen.getByText("scan_only")).not.toBeNull();
 
     await user.upload(
       screen.getByLabelText("插件归档"),

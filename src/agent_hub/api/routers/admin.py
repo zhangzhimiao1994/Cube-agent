@@ -612,6 +612,28 @@ class PluginResourceRequest(NamedResourceRequest):
         return value
 
 
+class PluginPackageMetadata(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
+    kind: Literal["manifest_only", "adapter_package"] = "manifest_only"
+    runtime: Literal["none", "python", "node", "container", "mcp_remote"] = "none"
+    entrypoint: str | None = Field(default=None, max_length=255)
+    isolation: Literal[
+        "none",
+        "remote_connector",
+        "in_process",
+        "local_process",
+        "container",
+        "mcp_remote",
+    ] = "none"
+    install_mode: Literal["scan_only"] = "scan_only"
+
+
+class PluginArchiveManifest(PluginResourceRequest):
+    package: PluginPackageMetadata | None = None
+
+
 class PluginResourceResponse(PluginResourceRequest):
     source_filename: str | None = Field(
         default=None,
@@ -624,6 +646,7 @@ class PluginResourceResponse(PluginResourceRequest):
         max_length=64,
         pattern=r"^[a-f0-9]{64}$",
     )
+    package_metadata: PluginPackageMetadata | None = None
     status: str = Field(pattern=r"^(disabled|stopped|running|failed)$")
     health: str = Field(pattern=r"^(disabled|stopped|healthy|unhealthy|failed|unknown)$")
     last_error_type: str | None = Field(default=None, max_length=128)
@@ -2181,6 +2204,7 @@ class AdminResourceService(Protocol):
         actor_id: UUID | None = None,
         source_filename: str | None = None,
         content_sha256: str | None = None,
+        package_metadata: PluginPackageMetadata | None = None,
     ) -> PluginResourceResponse: ...
 
     async def start_plugin(
@@ -3069,7 +3093,7 @@ def _tar_group_to_skill_archive(
     return buffer.getvalue()
 
 
-def _plugin_request_from_archive(archive_bytes: bytes) -> PluginResourceRequest:
+def _plugin_archive_manifest_from_archive(archive_bytes: bytes) -> PluginArchiveManifest:
     manifest_bytes = _plugin_manifest_bytes_from_archive(archive_bytes)
     try:
         manifest = json.loads(manifest_bytes.decode("utf-8"))
@@ -3077,10 +3101,99 @@ def _plugin_request_from_archive(archive_bytes: bytes) -> PluginResourceRequest:
         raise InvalidSkillPackage("plugin.json must be utf-8") from None
     except json.JSONDecodeError:
         raise InvalidSkillPackage("plugin.json must be valid json") from None
+    _validate_plugin_package_metadata(manifest)
     try:
-        return PluginResourceRequest.model_validate(manifest)
+        plugin_manifest = PluginArchiveManifest.model_validate(manifest)
     except ValidationError as exc:
         raise InvalidSkillPackage(str(exc)) from None
+    _validate_plugin_package_contract(
+        plugin_manifest.package,
+        archive_paths=_plugin_archive_member_paths(archive_bytes),
+    )
+    return plugin_manifest
+
+
+def _plugin_request_from_archive(archive_bytes: bytes) -> PluginResourceRequest:
+    manifest = _plugin_archive_manifest_from_archive(archive_bytes)
+    return PluginResourceRequest.model_validate(manifest.model_dump(exclude={"package"}))
+
+
+def _validate_plugin_package_metadata(manifest: object) -> None:
+    if not isinstance(manifest, Mapping):
+        return
+    package = manifest.get("package")
+    if not isinstance(package, Mapping):
+        return
+    entrypoint = package.get("entrypoint")
+    if entrypoint is None:
+        return
+    if not isinstance(entrypoint, str):
+        return
+    try:
+        _safe_plugin_archive_member_path(entrypoint)
+    except InvalidSkillPackage:
+        raise InvalidSkillPackage("plugin package entrypoint is unsafe") from None
+
+
+def _validate_plugin_package_contract(
+    package: PluginPackageMetadata | None,
+    *,
+    archive_paths: frozenset[str],
+) -> None:
+    if package is None:
+        return
+    if package.kind == "manifest_only":
+        if (
+            package.runtime != "none"
+            or package.entrypoint is not None
+            or package.isolation != "none"
+        ):
+            raise InvalidSkillPackage(
+                "manifest-only plugin package cannot declare runtime execution"
+            )
+        return
+    if package.runtime == "none" or package.isolation == "none":
+        raise InvalidSkillPackage("adapter plugin package must declare runtime execution")
+    if package.entrypoint is None or package.entrypoint not in archive_paths:
+        raise InvalidSkillPackage("plugin package entrypoint is missing")
+
+
+def _plugin_archive_member_paths(archive_bytes: bytes) -> frozenset[str]:
+    archive_buffer = io.BytesIO(archive_bytes)
+    if zipfile.is_zipfile(archive_buffer):
+        return _plugin_archive_member_paths_from_zip(archive_bytes)
+    return _plugin_archive_member_paths_from_tar(archive_bytes)
+
+
+def _plugin_archive_member_paths_from_zip(archive_bytes: bytes) -> frozenset[str]:
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+            paths: set[str] = set()
+            for info in archive.infolist():
+                if info.is_dir() or info.filename.replace("\\", "/").endswith("/"):
+                    continue
+                mode = (info.external_attr >> 16) & 0o777777
+                if _skill_bundle_mode_is_unsafe(mode):
+                    raise InvalidSkillPackage("plugin archive contains links or device files")
+                paths.add(_safe_plugin_archive_member_path(info.filename))
+    except zipfile.BadZipFile:
+        raise InvalidSkillPackage("plugin archive must be a valid zip file") from None
+    return frozenset(paths)
+
+
+def _plugin_archive_member_paths_from_tar(archive_bytes: bytes) -> frozenset[str]:
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
+            paths: set[str] = set()
+            for member in archive.getmembers():
+                if member.isdir():
+                    continue
+                if not member.isfile():
+                    raise InvalidSkillPackage("plugin archive contains links or device files")
+                paths.add(_safe_plugin_archive_member_path(member.name))
+    except tarfile.TarError:
+        raise InvalidSkillPackage("plugin archive must be a valid zip or tar archive") from None
+    return frozenset(paths)
 
 
 def _plugin_manifest_bytes_from_archive(archive_bytes: bytes) -> bytes:
@@ -3166,6 +3279,7 @@ def _plugin_response_from_request(
     current: PluginResourceResponse | None = None,
     source_filename: str | None = None,
     content_sha256: str | None = None,
+    package_metadata: PluginPackageMetadata | None = None,
 ) -> PluginResourceResponse:
     payload = request.model_dump()
     if not request.enabled:
@@ -3173,6 +3287,7 @@ def _plugin_response_from_request(
             **payload,
             source_filename=source_filename,
             content_sha256=content_sha256,
+            package_metadata=package_metadata,
             status="disabled",
             health="disabled",
             last_error_type=None,
@@ -3182,6 +3297,7 @@ def _plugin_response_from_request(
             **payload,
             source_filename=source_filename,
             content_sha256=content_sha256,
+            package_metadata=package_metadata,
             status="running",
             health="healthy",
             last_error_type=None,
@@ -3190,6 +3306,7 @@ def _plugin_response_from_request(
         **payload,
         source_filename=source_filename,
         content_sha256=content_sha256,
+        package_metadata=package_metadata,
         status="stopped",
         health="stopped",
         last_error_type=None,
@@ -4249,6 +4366,7 @@ class InMemoryAdminResourceService:
         actor_id: UUID | None = None,
         source_filename: str | None = None,
         content_sha256: str | None = None,
+        package_metadata: PluginPackageMetadata | None = None,
     ) -> PluginResourceResponse:
         del tenant_id, actor_id
         current = self.plugins.get(request.id)
@@ -4257,6 +4375,7 @@ class InMemoryAdminResourceService:
             current=current,
             source_filename=source_filename,
             content_sha256=content_sha256,
+            package_metadata=package_metadata,
         )
         self.plugins[response.id] = response
         return response
@@ -6134,6 +6253,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         actor_id: UUID | None = None,
         source_filename: str | None = None,
         content_sha256: str | None = None,
+        package_metadata: PluginPackageMetadata | None = None,
     ) -> PluginResourceResponse:
         current = await self._plugin_response(request.id, tenant_id=tenant_id)
         response = _plugin_response_from_request(
@@ -6141,6 +6261,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             current=current,
             source_filename=source_filename,
             content_sha256=content_sha256,
+            package_metadata=package_metadata,
         )
         if not await self._upsert_admin_payload(
             "plugin",
@@ -6154,6 +6275,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 request,
                 source_filename=source_filename,
                 content_sha256=content_sha256,
+                package_metadata=package_metadata,
             )
         await self._record_audit(
             "plugin.upsert",
@@ -10860,7 +10982,7 @@ async def install_plugin_archive(
         raise PublicAPIError(422, "request_validation", "plugin archive is empty")
     content_sha256 = hashlib.sha256(archive_bytes).hexdigest()
     try:
-        plugin_request = _plugin_request_from_archive(archive_bytes)
+        plugin_manifest = _plugin_archive_manifest_from_archive(archive_bytes)
     except InvalidSkillPackage as error:
         raise PublicAPIError(
             422,
@@ -10868,6 +10990,9 @@ async def install_plugin_archive(
             "plugin package is invalid",
             details={"reason": _safe_model_check_detail(str(error))},
         ) from None
+    plugin_request = PluginResourceRequest.model_validate(
+        plugin_manifest.model_dump(exclude={"package"})
+    )
     _validate_plugin_resource_config(request, plugin_request)
     _validate_plugin_capability_configs(request, plugin_request)
     plugin = await service.upsert_plugin(
@@ -10876,6 +11001,7 @@ async def install_plugin_archive(
         actor_id=principal.user_id,
         source_filename=filename,
         content_sha256=content_sha256,
+        package_metadata=plugin_manifest.package,
     )
     await service.record_audit_event(
         actor=str(principal.user_id),

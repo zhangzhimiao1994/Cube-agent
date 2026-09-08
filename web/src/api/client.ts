@@ -957,6 +957,17 @@ const PluginCapabilitySchema = z.object({
   output_schema: JsonObjectSchema.nullable().default(null),
 });
 
+const PluginPackageMetadataSchema = z.object({
+  schema_version: z.literal(1).default(1),
+  kind: z.enum(["manifest_only", "adapter_package"]).default("manifest_only"),
+  runtime: z.enum(["none", "python", "node", "container", "mcp_remote"]).default("none"),
+  entrypoint: z.string().nullable().default(null),
+  isolation: z
+    .enum(["none", "remote_connector", "in_process", "local_process", "container", "mcp_remote"])
+    .default("none"),
+  install_mode: z.literal("scan_only").default("scan_only"),
+});
+
 const PluginResourceSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -965,6 +976,7 @@ const PluginResourceSchema = z.object({
   version: z.string().default("local"),
   source_filename: z.string().nullable().default(null),
   content_sha256: z.string().nullable().default(null),
+  package_metadata: PluginPackageMetadataSchema.nullable().default(null),
   resource_config: JsonObjectSchema.default({}),
   endpoint_url: z.string().nullable().default(null),
   domain_allowlist: z.array(z.string()).default([]),

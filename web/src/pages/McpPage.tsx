@@ -1246,6 +1246,17 @@ export function McpPage() {
                     <p>Header：<span>{plugin.credential_header}</span></p>
                     <p>来源归档：<span>{plugin.source_filename ?? "未配置"}</span></p>
                     <p>内容 SHA-256：<span>{plugin.content_sha256 ?? "未配置"}</span></p>
+                    <p>包类型：<span>{plugin.package_metadata?.kind ?? "未配置"}</span></p>
+                    <p>
+                      包运行时：
+                      <span>
+                        {plugin.package_metadata
+                          ? `${plugin.package_metadata.runtime} / ${plugin.package_metadata.isolation}`
+                          : "未配置"}
+                      </span>
+                    </p>
+                    <p>包入口：<span>{plugin.package_metadata?.entrypoint ?? "未配置"}</span></p>
+                    <p>安装模式：<span>{plugin.package_metadata?.install_mode ?? "未配置"}</span></p>
                     <p>
                       资源配置：
                       <span>

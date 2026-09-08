@@ -35,6 +35,7 @@ from agent_hub.api.routers.admin import (
     ModelDeploymentResponse,
     PersistentAdminResourceService,
     PluginCapabilityRequest,
+    PluginPackageMetadata,
     PluginResourceRequest,
     PluginResourceResponse,
     RunArtifactResponse,
@@ -3236,6 +3237,7 @@ def test_plugin_admin_write_endpoints_scope_writes_to_principal_tenant_and_actor
             actor_id: UUID | None = None,
             source_filename: str | None = None,
             content_sha256: str | None = None,
+            package_metadata: PluginPackageMetadata | None = None,
         ) -> PluginResourceResponse:
             self.calls.append(("upsert", request.id, tenant_id, actor_id))
             return await super().upsert_plugin(
@@ -3244,6 +3246,7 @@ def test_plugin_admin_write_endpoints_scope_writes_to_principal_tenant_and_actor
                 actor_id=actor_id,
                 source_filename=source_filename,
                 content_sha256=content_sha256,
+                package_metadata=package_metadata,
             )
 
         async def start_plugin(
@@ -3518,11 +3521,17 @@ def test_plugin_upsert_lifecycle_and_delete_trigger_runtime_reload_callback() ->
     ]
 
 
-def plugin_archive(manifest: Mapping[str, object]) -> bytes:
+def plugin_archive(
+    manifest: Mapping[str, object],
+    *,
+    files: Mapping[str, str] | None = None,
+) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("plugin.json", json.dumps(manifest))
         archive.writestr("README.md", "Plugin package.\n")
+        for path, content in (files or {}).items():
+            archive.writestr(path, content)
     return buffer.getvalue()
 
 
@@ -3558,7 +3567,8 @@ def test_plugin_archive_install_scans_manifest_and_triggers_runtime_reload() -> 
                         "sandbox_profile": "remote_connector",
                     }
                 ],
-            }
+            },
+            files={"adapter/main.py": "def invoke():\n    return {}\n"},
         ),
     )
 
@@ -3599,6 +3609,153 @@ def test_plugin_archive_install_rejects_archives_without_plugin_manifest() -> No
     assert response.json()["error"]["details"]["reason"] == "plugin archive is missing plugin.json"
 
 
+def test_plugin_archive_install_persists_scan_only_package_metadata() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "version": "1.0.0",
+                "package": {
+                    "schema_version": 1,
+                    "kind": "adapter_package",
+                    "runtime": "python",
+                    "entrypoint": "adapter/main.py",
+                    "isolation": "local_process",
+                    "install_mode": "scan_only",
+                },
+                "endpoint_url": "https://plugins.example/invoke",
+                "domain_allowlist": ["plugins.example"],
+                "capabilities": [
+                    {
+                        "id": "calendar.create_event",
+                        "adapter": "http_json",
+                        "permission_class": "calendar.write",
+                        "sandbox_profile": "remote_connector",
+                    }
+                ],
+            },
+            files={"adapter/main.py": "def invoke():\n    return {}\n"},
+        ),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["plugin"]["package_metadata"] == {
+        "schema_version": 1,
+        "kind": "adapter_package",
+        "runtime": "python",
+        "entrypoint": "adapter/main.py",
+        "isolation": "local_process",
+        "install_mode": "scan_only",
+    }
+    assert api.get("/api/v1/admin/plugins", headers=headers()).json()[0]["package_metadata"] == body[
+        "plugin"
+    ]["package_metadata"]
+
+
+def test_plugin_archive_install_rejects_unsafe_package_entrypoint() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "package": {
+                    "kind": "adapter_package",
+                    "runtime": "python",
+                    "entrypoint": "../adapter.py",
+                    "isolation": "local_process",
+                    "install_mode": "scan_only",
+                },
+            }
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    assert response.json()["error"]["details"]["reason"] == "plugin package entrypoint is unsafe"
+
+
+def test_plugin_archive_install_rejects_missing_package_entrypoint_file() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "package": {
+                    "kind": "adapter_package",
+                    "runtime": "python",
+                    "entrypoint": "adapter/main.py",
+                    "isolation": "local_process",
+                    "install_mode": "scan_only",
+                },
+            }
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    assert (
+        response.json()["error"]["details"]["reason"]
+        == "plugin package entrypoint is missing"
+    )
+
+
+def test_plugin_archive_install_rejects_manifest_only_package_with_runtime() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "package": {
+                    "kind": "manifest_only",
+                    "runtime": "python",
+                    "entrypoint": "adapter/main.py",
+                    "isolation": "none",
+                    "install_mode": "scan_only",
+                },
+            },
+            files={"adapter/main.py": "def invoke():\n    return {}\n"},
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    assert response.json()["error"]["details"]["reason"] == "manifest-only plugin package cannot declare runtime execution"
+
+
 def test_plugin_resource_upsert_rejects_client_supplied_archive_provenance() -> None:
     api = client()
 
@@ -3610,6 +3767,30 @@ def test_plugin_resource_upsert_rejects_client_supplied_archive_provenance() -> 
             "name": "Calendar HTTP",
             "source_filename": "forged.zip",
             "content_sha256": "a" * 64,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "request_validation"
+
+
+def test_plugin_resource_upsert_rejects_client_supplied_package_metadata() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "calendar",
+            "name": "Calendar HTTP",
+            "package_metadata": {
+                "schema_version": 1,
+                "kind": "adapter_package",
+                "runtime": "python",
+                "entrypoint": "adapter/main.py",
+                "isolation": "local_process",
+                "install_mode": "scan_only",
+            },
         },
     )
 

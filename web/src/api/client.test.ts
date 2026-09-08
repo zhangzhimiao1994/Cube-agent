@@ -262,6 +262,7 @@ describe("api client transport", () => {
       ],
       source_filename: null,
       content_sha256: null,
+      package_metadata: null,
       status: "running",
       health: "healthy",
       last_error_type: null,
@@ -357,6 +358,7 @@ describe("api client transport", () => {
       credential_scheme: "Bearer",
       source_filename: null,
       content_sha256: null,
+      package_metadata: null,
       capabilities: [
         {
           id: "calendar.create_event",
@@ -519,6 +521,7 @@ describe("api client transport", () => {
       capabilities: [],
       source_filename: "calendar plugin.zip",
       content_sha256: "abc123",
+      package_metadata: null,
       status: "stopped",
       health: "stopped",
       last_error_type: null,
@@ -571,6 +574,14 @@ describe("api client transport", () => {
       capabilities: [],
       source_filename: "calendar plugin.zip",
       content_sha256: "abc123",
+      package_metadata: {
+        schema_version: 1,
+        kind: "adapter_package",
+        runtime: "python",
+        entrypoint: "adapter/main.py",
+        isolation: "local_process",
+        install_mode: "scan_only",
+      },
       status: "stopped",
       health: "stopped",
       last_error_type: null,
