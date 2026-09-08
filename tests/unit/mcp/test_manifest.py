@@ -182,6 +182,11 @@ def test_mcp_snapshot_manifest_source_projects_discovered_tools_for_tenant() -> 
                     server_id="search",
                     name="web_search",
                     description="Search docs",
+                    input_schema={
+                        "type": "object",
+                        "required": ("query",),
+                        "properties": {"query": {"type": "string"}},
+                    },
                 ),
                 DiscoveredMcpTool(
                     server_id="files",
@@ -245,6 +250,11 @@ def test_mcp_snapshot_manifest_source_projects_discovered_tools_for_tenant() -> 
                 "availability_reason": None,
                 "replay_safe": False,
                 "aliases": (),
+                "input_schema": {
+                    "type": "object",
+                    "required": ("query",),
+                    "properties": {"query": {"type": "string"}},
+                },
             },
         ),
     }

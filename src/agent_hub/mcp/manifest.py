@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Sequence
-from typing import Protocol
+from typing import Protocol, cast
 from uuid import UUID
 
 from agent_hub.mcp.types import McpGenerationSnapshot, McpServerDefinition
@@ -99,19 +99,20 @@ class McpSnapshotCapabilityManifestSource:
                 continue
             health = snapshot.health.get(tool.server_id, "unknown")
             available = health in {"healthy", "ok"}
-            items.append(
-                {
-                    "id": capability_id,
-                    "kind": "mcp",
-                    "adapter": "mcp_server",
-                    "permission_class": "mcp.invoke",
-                    "sandbox_profile": _sandbox_profile(str(server.transport)),
-                    "available": available,
-                    "availability_reason": None if available else _availability_reason(health),
-                    "replay_safe": False,
-                    "aliases": (),
-                }
-            )
+            item: dict[str, JsonValue] = {
+                "id": capability_id,
+                "kind": "mcp",
+                "adapter": "mcp_server",
+                "permission_class": "mcp.invoke",
+                "sandbox_profile": _sandbox_profile(str(server.transport)),
+                "available": available,
+                "availability_reason": None if available else _availability_reason(health),
+                "replay_safe": False,
+                "aliases": (),
+            }
+            if tool.input_schema:
+                item["input_schema"] = cast(JsonValue, tool.input_schema)
+            items.append(item)
         return {
             "schema_version": 1,
             "capabilities": tuple(items),
