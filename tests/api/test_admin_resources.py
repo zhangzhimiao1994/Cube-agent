@@ -2889,6 +2889,139 @@ def test_plugin_admin_api_allows_descriptor_capability_additional_properties() -
     }
 
 
+def test_plugin_admin_api_allows_descriptor_resource_additional_properties() -> None:
+    api = client()
+
+    class PluginServiceWithOpaqueResourceDescriptor:
+        def adapter_descriptors(self) -> tuple[dict[str, object], ...]:
+            return (
+                {
+                    "id": "opaque",
+                    "name": "Opaque",
+                    "description": "Accepts adapter-owned resource config.",
+                    "resource_schema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": True,
+                    },
+                    "capability_schema": {
+                        "type": "object",
+                        "properties": {"id": {"type": "string"}},
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+                {
+                    "id": "closed",
+                    "name": "Closed",
+                    "description": "Rejects adapter-owned resource config.",
+                    "resource_schema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                    "capability_schema": {
+                        "type": "object",
+                        "properties": {"id": {"type": "string"}},
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    cast(Any, api.app).state.plugin_service = PluginServiceWithOpaqueResourceDescriptor()
+
+    created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "opaque-resource-plugin",
+            "name": "Opaque Resource Plugin",
+            "capabilities": [{"id": "opaque.run", "adapter": "opaque"}],
+            "resource_config": {
+                "routing": {"mode": "fanout", "max_children": 3},
+                "labels": ["daily", "parallel"],
+            },
+        },
+    )
+    rejected = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "closed-resource-plugin",
+            "name": "Closed Resource Plugin",
+            "capabilities": [{"id": "closed.run", "adapter": "closed"}],
+            "resource_config": {"routing": {"mode": "fanout"}},
+        },
+    )
+
+    assert created.status_code == 200
+    assert created.json()["resource_config"] == {
+        "routing": {"mode": "fanout", "max_children": 3},
+        "labels": ["daily", "parallel"],
+    }
+    assert rejected.status_code == 422
+
+
+def test_plugin_admin_api_rejects_unknown_resource_config_when_any_descriptor_is_closed() -> None:
+    api = client()
+
+    class PluginServiceWithMixedResourceDescriptors:
+        def adapter_descriptors(self) -> tuple[dict[str, object], ...]:
+            return (
+                {
+                    "id": "opaque",
+                    "name": "Opaque",
+                    "description": "Accepts adapter-owned resource config.",
+                    "resource_schema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": True,
+                    },
+                    "capability_schema": {
+                        "type": "object",
+                        "properties": {"id": {"type": "string"}},
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+                {
+                    "id": "closed",
+                    "name": "Closed",
+                    "description": "Rejects adapter-owned resource config.",
+                    "resource_schema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                    "capability_schema": {
+                        "type": "object",
+                        "properties": {"id": {"type": "string"}},
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    cast(Any, api.app).state.plugin_service = PluginServiceWithMixedResourceDescriptors()
+
+    created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "mixed-resource-plugin",
+            "name": "Mixed Resource Plugin",
+            "capabilities": [
+                {"id": "opaque.run", "adapter": "opaque"},
+                {"id": "closed.run", "adapter": "closed"},
+            ],
+            "resource_config": {"routing": {"mode": "fanout"}},
+        },
+    )
+
+    assert created.status_code == 422
+
+
 def test_plugin_admin_api_preserves_capability_schemas_in_manifest() -> None:
     api = client()
     cast(Any, api.app).state.runtime_capability_gateway = FakeRuntimeCapabilityGateway()

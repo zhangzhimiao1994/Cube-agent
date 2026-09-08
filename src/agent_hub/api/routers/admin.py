@@ -3049,11 +3049,14 @@ def _validate_plugin_resource_config(request: Request, plugin: PluginResourceReq
     fields: dict[str, Mapping[str, JsonValue]] = {}
     required_fields: set[str] = set()
     has_selected_descriptor = False
+    all_selected_descriptors_allow_additional_properties = True
     for capability in plugin.capabilities:
         descriptor = descriptors.get(capability.adapter)
         if descriptor is None:
             continue
         has_selected_descriptor = True
+        if descriptor.resource_schema.get("additionalProperties") is not True:
+            all_selected_descriptors_allow_additional_properties = False
         properties = descriptor.resource_schema.get("properties")
         if isinstance(properties, Mapping):
             for property_name, schema in properties.items():
@@ -3079,7 +3082,7 @@ def _validate_plugin_resource_config(request: Request, plugin: PluginResourceReq
     for name, value in plugin.resource_config.items():
         schema = fields.get(name)
         if schema is None:
-            if has_selected_descriptor:
+            if has_selected_descriptor and not all_selected_descriptors_allow_additional_properties:
                 raise PublicAPIError(
                     422,
                     "invalid_plugin_resource_config",

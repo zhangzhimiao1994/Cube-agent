@@ -163,6 +163,7 @@ function fillFromPlugin(plugin: PluginResource) {
     credentialHeader: plugin.credential_header || "X-Plugin-Credential",
     credentialScheme: plugin.credential_scheme,
     resourceConfig: formatResourceConfig(plugin.resource_config),
+    resourceConfigPassthrough: plugin.resource_config,
     capabilities: plugin.capabilities.length > 0
       ? plugin.capabilities.map(pluginCapabilityFormFromCapability)
       : [createPluginCapabilityForm({ id: "" })],
@@ -390,6 +391,33 @@ function omitConfigFields(config: Record<string, unknown>, fields: DescriptorRes
   return Object.fromEntries(Object.entries(config).filter(([key]) => !omitted.has(key)));
 }
 
+function retainResourceConfigPassthrough(
+  config: Record<string, unknown>,
+  adapters: (PluginAdapterDescriptor | undefined)[],
+  fields: DescriptorResourceField[],
+) {
+  const selectedAdapters = adapters.filter(
+    (adapter): adapter is PluginAdapterDescriptor => adapter !== undefined,
+  );
+  if (selectedAdapters.length === 0) return config;
+  const visibleFields = new Set(fields.map((field) => field.name));
+  const explicitResourceFields = new Set<string>();
+  for (const adapter of selectedAdapters) {
+    for (const name of schemaPropertyNames(adapter.resource_schema)) {
+      if (!BUILTIN_PLUGIN_RESOURCE_FIELDS.has(name)) explicitResourceFields.add(name);
+    }
+  }
+  const allSelectedDescriptorsAllowAdditionalProperties = selectedAdapters.every(
+    (adapter) => adapter.resource_schema.additionalProperties === true,
+  );
+  return Object.fromEntries(
+    Object.entries(config).filter(([key]) => {
+      if (visibleFields.has(key)) return false;
+      return explicitResourceFields.has(key) || allSelectedDescriptorsAllowAdditionalProperties;
+    }),
+  );
+}
+
 function capabilityDefaultsForAdapter(
   adapter: PluginAdapterDescriptor | undefined,
 ): Partial<PluginCapabilityForm> {
@@ -487,6 +515,7 @@ export function McpPage() {
   const [pluginCredentialHeader, setPluginCredentialHeader] = useState("X-Plugin-Credential");
   const [pluginCredentialScheme, setPluginCredentialScheme] = useState("Bearer");
   const [pluginResourceConfig, setPluginResourceConfig] = useState<Record<string, string>>({});
+  const [pluginResourceConfigPassthrough, setPluginResourceConfigPassthrough] = useState<Record<string, unknown>>({});
   const [pluginCapabilities, setPluginCapabilities] = useState<PluginCapabilityForm[]>([
     createPluginCapabilityForm(),
   ]);
@@ -536,11 +565,14 @@ export function McpPage() {
         enabled: pluginEnabled,
         description: pluginDescription.trim() || null,
         version: "local",
-        resource_config: parseResourceConfig(
-          pluginDescriptorResourceFields,
-          pluginResourceConfig,
-          pluginDescriptorUnsupportedRequiredFields,
-        ),
+        resource_config: {
+          ...omitConfigFields(pluginResourceConfigPassthrough, pluginDescriptorResourceFields),
+          ...parseResourceConfig(
+            pluginDescriptorResourceFields,
+            pluginResourceConfig,
+            pluginDescriptorUnsupportedRequiredFields,
+          ),
+        },
         endpoint_url: pluginEndpointUrl.trim() || null,
         domain_allowlist: parseCsv(pluginDomainAllowlist),
         timeout_seconds: Number(pluginTimeoutSeconds) || 10,
@@ -635,6 +667,7 @@ export function McpPage() {
     setPluginCredentialHeader(next.credentialHeader);
     setPluginCredentialScheme(next.credentialScheme);
     setPluginResourceConfig(next.resourceConfig);
+    setPluginResourceConfigPassthrough(next.resourceConfigPassthrough);
     setPluginCapabilities(next.capabilities);
     setPluginMessage(`已载入 ${plugin.name}，修改后点击保存。`);
   }
@@ -709,6 +742,10 @@ export function McpPage() {
 
   function updatePluginCapabilityAdapter(index: number, adapterId: string) {
     const adapter = adapterById.get(adapterId);
+    const nextResourceAdapters = pluginCapabilities.map((capability, capabilityIndex) =>
+      adapterById.get(capabilityIndex === index ? adapterId : capability.adapter),
+    );
+    const nextResourceModel = descriptorResourceModel(nextResourceAdapters);
     setPluginCapabilities((capabilities) =>
       capabilities.map((capability, capabilityIndex) =>
         capabilityIndex === index
@@ -731,6 +768,9 @@ export function McpPage() {
     setPluginResourceConfig((config) => {
       return adapter ? configDefaultsForFields(adapter.resource_schema, nextFields, config) : config;
     });
+    setPluginResourceConfigPassthrough((config) =>
+      retainResourceConfigPassthrough(config, nextResourceAdapters, nextResourceModel.fields),
+    );
   }
 
   return (

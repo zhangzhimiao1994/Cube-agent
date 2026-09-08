@@ -8,6 +8,7 @@ import type {
   ChannelStatus,
   EvolutionRun,
   PluginAdapterDescriptor,
+  PluginResource,
   RunDetail,
   RunListItem,
 } from "../api/client";
@@ -429,7 +430,7 @@ const capabilityManifest = {
   ],
 };
 
-const calendarPlugin = {
+const calendarPlugin: PluginResource = {
   id: "calendar",
   name: "Calendar HTTP",
   enabled: true,
@@ -549,7 +550,7 @@ describe("operational management pages", () => {
   let visibleEvolutionRuns = [evolutionRun];
   let visibleChannels = baseChannels;
   let visibleCapabilityManifest = capabilityManifest;
-  let visiblePlugins = [calendarPlugin];
+  let visiblePlugins: PluginResource[] = [calendarPlugin];
   let visiblePluginAdapterDescriptors = pluginAdapterDescriptors;
   let failCapabilityManifest = false;
   let currentPrincipalRole = "super_admin";
@@ -6844,6 +6845,227 @@ describe("operational management pages", () => {
         (request) => request.path === "/api/v1/admin/plugins" && request.method === "POST",
       ),
     ).toBeUndefined();
+  });
+
+  it("preserves optional unsupported descriptor resource config when editing a plugin", async () => {
+    const user = userEvent.setup();
+    visiblePluginAdapterDescriptors = [
+      {
+        ...pluginAdapterDescriptors[1],
+        resource_schema: {
+          type: "object",
+          required: ["workflow_id"],
+          properties: {
+            workflow_id: { type: "string" },
+            workflow_options: { type: "object" },
+          },
+        },
+      },
+      pluginAdapterDescriptors[0],
+    ];
+    visiblePlugins = [
+      {
+        ...calendarPlugin,
+        id: "workflow-resource-options-plugin",
+        name: "Workflow Resource Options Plugin",
+        resource_config: {
+          workflow_id: "daily-workflow",
+          workflow_options: { retries: 2, notify: true },
+        },
+        capabilities: [
+          {
+            ...calendarPlugin.capabilities[0],
+            id: "workflow.resource.options",
+            adapter: "workflow",
+          },
+        ],
+      },
+    ];
+
+    render(<TestApp initialPath="/mcp" />);
+
+    expect(await screen.findByRole("heading", { name: "插件适配器目录" })).not.toBeNull();
+    const pluginCard = screen
+      .getByRole("heading", { name: "Workflow Resource Options Plugin" })
+      .closest("article");
+    expect(pluginCard).not.toBeNull();
+    await user.click(within(pluginCard as HTMLElement).getByRole("button", { name: "编辑" }));
+    await user.clear(screen.getByLabelText("资源字段 workflow_id"));
+    await user.type(screen.getByLabelText("资源字段 workflow_id"), "weekly-workflow");
+    expect(screen.queryByLabelText("资源字段 workflow_options")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "保存插件" }));
+
+    await waitFor(() =>
+      expect(
+        requests.find(
+          (request) =>
+            request.path === "/api/v1/admin/plugins" &&
+            request.method === "POST" &&
+            (request.body as { id?: string }).id === "workflow-resource-options-plugin",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(
+      requests.find(
+        (request) =>
+          request.path === "/api/v1/admin/plugins" &&
+          request.method === "POST" &&
+          (request.body as { id?: string }).id === "workflow-resource-options-plugin",
+      )?.body,
+    ).toMatchObject({
+      resource_config: {
+        workflow_id: "weekly-workflow",
+        workflow_options: { retries: 2, notify: true },
+      },
+    });
+  });
+
+  it("clears optional unsupported descriptor resource config after switching plugin adapters", async () => {
+    const user = userEvent.setup();
+    visiblePluginAdapterDescriptors = [
+      {
+        ...pluginAdapterDescriptors[1],
+        resource_schema: {
+          type: "object",
+          required: ["workflow_id"],
+          properties: {
+            workflow_id: { type: "string" },
+            workflow_options: { type: "object" },
+          },
+        },
+      },
+      pluginAdapterDescriptors[0],
+    ];
+    visiblePlugins = [
+      {
+        ...calendarPlugin,
+        id: "workflow-resource-options-plugin",
+        name: "Workflow Resource Options Plugin",
+        resource_config: {
+          workflow_id: "daily-workflow",
+          workflow_options: { retries: 2, notify: true },
+        },
+        capabilities: [
+          {
+            ...calendarPlugin.capabilities[0],
+            id: "workflow.resource.options",
+            adapter: "workflow",
+          },
+        ],
+      },
+    ];
+
+    render(<TestApp initialPath="/mcp" />);
+
+    expect(await screen.findByRole("heading", { name: "插件适配器目录" })).not.toBeNull();
+    const pluginCard = screen
+      .getByRole("heading", { name: "Workflow Resource Options Plugin" })
+      .closest("article");
+    expect(pluginCard).not.toBeNull();
+    await user.click(within(pluginCard as HTMLElement).getByRole("button", { name: "编辑" }));
+    await user.selectOptions(screen.getByLabelText("能力适配器 1"), "http_json");
+    await user.click(screen.getByRole("button", { name: "保存插件" }));
+
+    await waitFor(() =>
+      expect(
+        requests.find(
+          (request) =>
+            request.path === "/api/v1/admin/plugins" &&
+            request.method === "POST" &&
+            (request.body as { id?: string }).id === "workflow-resource-options-plugin",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(
+      requests.find(
+        (request) =>
+          request.path === "/api/v1/admin/plugins" &&
+          request.method === "POST" &&
+          (request.body as { id?: string }).id === "workflow-resource-options-plugin",
+      )?.body,
+    ).toMatchObject({
+      resource_config: {},
+      capabilities: [{ adapter: "http_json" }],
+    });
+  });
+
+  it("preserves unsupported descriptor resource config for remaining adapters after switching another capability", async () => {
+    const user = userEvent.setup();
+    visiblePluginAdapterDescriptors = [
+      {
+        ...pluginAdapterDescriptors[1],
+        resource_schema: {
+          type: "object",
+          required: ["workflow_id"],
+          properties: {
+            workflow_id: { type: "string" },
+            workflow_options: { type: "object" },
+          },
+        },
+      },
+      pluginAdapterDescriptors[0],
+    ];
+    visiblePlugins = [
+      {
+        ...calendarPlugin,
+        id: "mixed-resource-options-plugin",
+        name: "Mixed Resource Options Plugin",
+        resource_config: {
+          workflow_id: "daily-workflow",
+          workflow_options: { retries: 2, notify: true },
+        },
+        capabilities: [
+          {
+            ...calendarPlugin.capabilities[0],
+            id: "workflow.resource.options",
+            adapter: "workflow",
+          },
+          {
+            ...calendarPlugin.capabilities[0],
+            id: "search.query",
+            adapter: "http_json",
+          },
+        ],
+      },
+    ];
+
+    render(<TestApp initialPath="/mcp" />);
+
+    expect(await screen.findByRole("heading", { name: "插件适配器目录" })).not.toBeNull();
+    const pluginCard = screen
+      .getByRole("heading", { name: "Mixed Resource Options Plugin" })
+      .closest("article");
+    expect(pluginCard).not.toBeNull();
+    await user.click(within(pluginCard as HTMLElement).getByRole("button", { name: "编辑" }));
+    await user.selectOptions(screen.getByLabelText("能力适配器 2"), "workflow");
+    await user.clear(screen.getByLabelText("资源字段 workflow_id"));
+    await user.type(screen.getByLabelText("资源字段 workflow_id"), "weekly-workflow");
+    await user.click(screen.getByRole("button", { name: "保存插件" }));
+
+    await waitFor(() =>
+      expect(
+        requests.find(
+          (request) =>
+            request.path === "/api/v1/admin/plugins" &&
+            request.method === "POST" &&
+            (request.body as { id?: string }).id === "mixed-resource-options-plugin",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(
+      requests.find(
+        (request) =>
+          request.path === "/api/v1/admin/plugins" &&
+          request.method === "POST" &&
+          (request.body as { id?: string }).id === "mixed-resource-options-plugin",
+      )?.body,
+    ).toMatchObject({
+      resource_config: {
+        workflow_id: "weekly-workflow",
+        workflow_options: { retries: 2, notify: true },
+      },
+      capabilities: [{ adapter: "workflow" }, { adapter: "workflow" }],
+    });
   });
 
   it("uses the first adapter descriptor defaults when adding plugin capabilities", async () => {
