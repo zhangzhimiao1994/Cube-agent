@@ -492,6 +492,11 @@ const pluginAdapterDescriptors: PluginAdapterDescriptor[] = [
       type: "object",
       additionalProperties: true,
     },
+    capability_contract: {
+      schema_version: 1,
+      declared_sandbox_profiles: ["http_read"],
+      runtime_sandbox_profiles: ["http_read", "remote_connector"],
+    },
   },
   {
     id: "workflow",
@@ -519,6 +524,11 @@ const pluginAdapterDescriptors: PluginAdapterDescriptor[] = [
     argument_schema: {
       type: "object",
       additionalProperties: true,
+    },
+    capability_contract: {
+      schema_version: 1,
+      declared_sandbox_profiles: ["in_process"],
+      runtime_sandbox_profiles: ["remote_connector"],
     },
   },
 ];

@@ -461,6 +461,11 @@ describe("api client transport", () => {
           type: "object",
           additionalProperties: true,
         },
+        capability_contract: {
+          schema_version: 1,
+          declared_sandbox_profiles: ["http_read", "local_process"],
+          runtime_sandbox_profiles: ["http_read", "remote_connector"],
+        },
       },
     ];
     const fetchMock = vi.fn().mockResolvedValue(
@@ -475,6 +480,22 @@ describe("api client transport", () => {
 
     expect(fetchMock.mock.calls[0]?.[0]).toMatch(/^\/api\/v1\/admin\/plugins\/adapters\?_=/);
     expect(result).toEqual(descriptors);
+  });
+
+  it("uninstalls plugins through lifecycle endpoint", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ status: "uninstalled" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.uninstallPlugin("calendar");
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/admin/plugins/calendar/uninstall");
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({ method: "POST" }));
+    expect(result).toEqual({ status: "uninstalled" });
   });
 
   it("rejects plugin adapter descriptors with non-object resource schemas", async () => {

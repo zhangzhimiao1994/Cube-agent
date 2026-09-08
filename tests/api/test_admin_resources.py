@@ -3468,17 +3468,34 @@ def test_plugin_upsert_lifecycle_and_delete_trigger_runtime_reload_callback() ->
             ],
         },
     )
+    uninstall_created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={"id": "docs", "name": "Docs Plugin"},
+    )
     started = api.post("/api/v1/admin/plugins/search/start", headers=headers())
     stopped = api.post("/api/v1/admin/plugins/search/stop", headers=headers())
     reloaded_response = api.post("/api/v1/admin/plugins/search/reload", headers=headers())
+    uninstalled = api.post("/api/v1/admin/plugins/docs/uninstall", headers=headers())
     deleted = api.delete("/api/v1/admin/plugins/search", headers=headers())
 
     assert created.status_code == 200
+    assert uninstall_created.status_code == 200
     assert started.status_code == 200
     assert stopped.status_code == 200
     assert reloaded_response.status_code == 200
+    assert uninstalled.status_code == 200
+    assert uninstalled.json() == {"status": "uninstalled"}
     assert deleted.status_code == 200
-    assert reloaded == [TENANT_ID, TENANT_ID, TENANT_ID, TENANT_ID, TENANT_ID]
+    assert reloaded == [
+        TENANT_ID,
+        TENANT_ID,
+        TENANT_ID,
+        TENANT_ID,
+        TENANT_ID,
+        TENANT_ID,
+        TENANT_ID,
+    ]
 
 
 def test_plugin_reload_callback_failure_does_not_fail_saved_config() -> None:
@@ -3712,6 +3729,87 @@ async def test_persistent_admin_plugin_lifecycle_is_scoped_to_requested_tenant()
     assert [plugin.name for plugin in bootstrap_after_delete] == ["Bootstrap Search Plugin"]
     assert tenant_after_delete == ()
     assert tenant_start_audits[0]["actor"] == str(USER_ID)
+
+
+@pytest.mark.asyncio
+async def test_persistent_admin_plugin_uninstall_deletes_plugin_and_records_uninstall_audit() -> None:
+    class StoredPersistentService(PersistentAdminResourceService):
+        def __init__(self) -> None:
+            super().__init__(
+                config_service=FakeConfigService(),  # type: ignore[arg-type]
+                secret_service=FakeSecretService(),  # type: ignore[arg-type]
+                tenant_id=TENANT_ID,
+                actor_id=ACTOR_ID,
+            )
+            self._session_factory = cast(Any, object())
+            self.payloads: dict[tuple[str, str], dict[str, object]] = {}
+
+        async def _get_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> dict[str, object] | None:
+            del tenant_id
+            return self.payloads.get((kind, resource_id), {})
+
+        async def _upsert_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            payload: dict[str, object],
+            *,
+            tenant_id: UUID | None = None,
+        ) -> bool:
+            del tenant_id
+            self.payloads[(kind, resource_id)] = payload
+            return True
+
+        async def _delete_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> bool | None:
+            del tenant_id
+            key = (kind, resource_id)
+            if key not in self.payloads:
+                return False
+            del self.payloads[key]
+            return True
+
+        async def _list_admin_payloads(
+            self,
+            kind: str,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> list[dict[str, object]] | None:
+            del tenant_id
+            return [
+                payload
+                for (payload_kind, _resource_id), payload in self.payloads.items()
+                if payload_kind == kind
+            ]
+
+    service = StoredPersistentService()
+
+    await service.upsert_plugin(
+        PluginResourceRequest(id="search", name="Search Plugin"),
+        tenant_id=TENANT_ID,
+        actor_id=USER_ID,
+    )
+    await service.uninstall_plugin("search", tenant_id=TENANT_ID, actor_id=USER_ID)
+
+    assert await service.list_plugins(tenant_id=TENANT_ID) == ()
+    uninstall_audits = await service.list_audit_events("plugin.uninstall")
+    delete_audits = await service.list_audit_events("plugin.delete")
+    assert len(uninstall_audits) == 1
+    assert uninstall_audits[0].actor == str(USER_ID)
+    assert uninstall_audits[0].resource == "plugin:search"
+    assert uninstall_audits[0].details == {"id": "search"}
+    assert delete_audits == ()
 
 
 @pytest.mark.asyncio

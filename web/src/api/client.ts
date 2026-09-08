@@ -994,6 +994,12 @@ export type PluginResourcePayload = {
   capabilities?: PluginCapability[];
 };
 
+const PluginAdapterCapabilityContractSchema = z.object({
+  schema_version: z.number(),
+  declared_sandbox_profiles: z.array(z.string()).default([]),
+  runtime_sandbox_profiles: z.array(z.string()).default([]),
+});
+
 const PluginAdapterDescriptorSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -1001,6 +1007,11 @@ const PluginAdapterDescriptorSchema = z.object({
   resource_schema: PluginAdapterObjectJsonSchema,
   capability_schema: PluginAdapterObjectJsonSchema,
   argument_schema: PluginAdapterObjectJsonSchema,
+  capability_contract: PluginAdapterCapabilityContractSchema.default({
+    schema_version: 1,
+    declared_sandbox_profiles: [],
+    runtime_sandbox_profiles: [],
+  }),
 });
 
 export type PluginAdapterDescriptor = z.infer<typeof PluginAdapterDescriptorSchema>;
@@ -2017,6 +2028,13 @@ export const api = {
       `/api/v1/admin/plugins/${encodeURIComponent(id)}/reload`,
       { method: "POST" },
       PluginResourceSchema,
+    );
+  },
+  uninstallPlugin(id: string): Promise<{ status: string }> {
+    return request(
+      `/api/v1/admin/plugins/${encodeURIComponent(id)}/uninstall`,
+      { method: "POST" },
+      z.object({ status: z.string() }),
     );
   },
   deletePlugin(id: string): Promise<{ status: string }> {

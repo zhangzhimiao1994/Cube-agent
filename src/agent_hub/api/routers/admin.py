@@ -2186,6 +2186,14 @@ class AdminResourceService(Protocol):
         actor_id: UUID | None = None,
     ) -> PluginResourceResponse: ...
 
+    async def uninstall_plugin(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> None: ...
+
     async def delete_plugin(
         self,
         plugin_id: str,
@@ -4145,6 +4153,15 @@ class InMemoryAdminResourceService:
         del tenant_id, actor_id
         del self.plugins[plugin_id]
 
+    async def uninstall_plugin(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> None:
+        await self.delete_plugin(plugin_id, tenant_id=tenant_id, actor_id=actor_id)
+
     async def list_mcp_servers(
         self,
         *,
@@ -6002,6 +6019,35 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         tenant_id: UUID | None = None,
         actor_id: UUID | None = None,
     ) -> None:
+        await self._delete_plugin_resource(
+            plugin_id,
+            action="plugin.delete",
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+        )
+
+    async def uninstall_plugin(
+        self,
+        plugin_id: str,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> None:
+        await self._delete_plugin_resource(
+            plugin_id,
+            action="plugin.uninstall",
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+        )
+
+    async def _delete_plugin_resource(
+        self,
+        plugin_id: str,
+        *,
+        action: str,
+        tenant_id: UUID | None,
+        actor_id: UUID | None,
+    ) -> None:
         deleted = await self._delete_admin_payload("plugin", plugin_id, tenant_id=tenant_id)
         if deleted is None:
             if tenant_id is not None and tenant_id != self._tenant_id:
@@ -6011,7 +6057,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         if not deleted:
             raise KeyError(plugin_id)
         await self._record_audit(
-            "plugin.delete",
+            action,
             f"plugin:{plugin_id}",
             {"id": plugin_id},
             tenant_id=tenant_id,
@@ -10610,6 +10656,30 @@ async def reload_plugin(
         raise PublicAPIError(404, "not_found", "not found") from None
     await _reload_plugin_runtime_config(request, principal.tenant_id)
     return response
+
+
+@router.post(
+    "/plugins/{plugin_id}/uninstall",
+    response_model=OperationStatusResponse,
+    responses=error_responses(401, 403, 404, 422),
+)
+async def uninstall_plugin(
+    plugin_id: str,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> OperationStatusResponse:
+    _require(principal, "plugin:write")
+    try:
+        await service.uninstall_plugin(
+            plugin_id,
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+        )
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+    await _reload_plugin_runtime_config(request, principal.tenant_id)
+    return OperationStatusResponse(status="uninstalled")
 
 
 @router.delete(
