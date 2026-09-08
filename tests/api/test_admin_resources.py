@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import io
 import json
 import sys
@@ -15,6 +16,7 @@ from urllib.parse import quote
 from uuid import UUID, uuid4
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric import ed25519
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
@@ -38,6 +40,7 @@ from agent_hub.api.routers.admin import (
     PluginPackageMetadata,
     PluginResourceRequest,
     PluginResourceResponse,
+    PluginSigningKeyRequest,
     RunArtifactResponse,
     RunDetailResponse,
     RunEventResponse,
@@ -49,6 +52,8 @@ from agent_hub.api.routers.admin import (
     _mode_error_log_from_run,
     _model_check_failure_details,
     _openclaw_proposal,
+    _plugin_archive_manifest_from_archive,
+    _plugin_signature_payload,
     _repair_proposal,
     _routing_details,
     _run_debug_from_detail,
@@ -3538,6 +3543,87 @@ def plugin_archive(
 VALID_PLUGIN_SIGNATURE = "A" * 86
 
 
+def plugin_signature_value(private_key: ed25519.Ed25519PrivateKey, payload: bytes) -> str:
+    return base64.urlsafe_b64encode(private_key.sign(payload)).rstrip(b"=").decode("ascii")
+
+
+def plugin_public_key_value(private_key: ed25519.Ed25519PrivateKey) -> str:
+    return (
+        base64.urlsafe_b64encode(
+            private_key.public_key().public_bytes_raw(),
+        )
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+
+
+def signed_plugin_archive(
+    private_key: ed25519.Ed25519PrivateKey,
+    *,
+    key_id: str = "calendar-prod",
+    files: dict[str, str] | None = None,
+) -> bytes:
+    package = {
+        "schema_version": 1,
+        "kind": "adapter_package",
+        "package_version": "1.2.3",
+        "adapter_id": "calendar_python",
+        "sdk_api_version": "1.0",
+        "signature": {
+            "algorithm": "ed25519",
+            "key_id": key_id,
+        },
+        "runtime": "python",
+        "entrypoint": "adapter/main.py",
+        "isolation": "local_process",
+        "install_mode": "scan_only",
+    }
+    manifest = {"id": "calendar", "name": "Calendar HTTP", "package": package}
+    package_files = files or {"adapter/main.py": "def invoke():\n    return {}\n"}
+    unsigned_archive = plugin_archive(
+        {
+            **manifest,
+            "package": {
+                **package,
+                "signature": {
+                    **cast(dict[str, object], package["signature"]),
+                    "value": VALID_PLUGIN_SIGNATURE,
+                },
+            },
+        },
+        files=package_files,
+    )
+    signature = plugin_signature_value(
+        private_key,
+        _plugin_signature_payload(
+            _plugin_archive_manifest_from_archive(unsigned_archive),
+            unsigned_archive,
+        ),
+    )
+    signed_manifest = {
+        **manifest,
+        "package": {
+            **package,
+            "signature": {
+                **cast(dict[str, object], package["signature"]),
+                "value": signature,
+            },
+        },
+    }
+    return plugin_archive(signed_manifest, files=package_files)
+
+
+def signed_plugin_archive_parts(archive_bytes: bytes) -> tuple[dict[str, object], dict[str, str]]:
+    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+        manifest = json.loads(archive.read("plugin.json").decode())
+        files = {
+            info.filename: archive.read(info.filename).decode()
+            for info in archive.infolist()
+            if not info.is_dir() and info.filename not in {"plugin.json", "README.md"}
+        }
+    return cast(dict[str, object], manifest), files
+
+
 def test_plugin_archive_install_scans_manifest_and_triggers_runtime_reload() -> None:
     api = client()
     reloaded: list[UUID] = []
@@ -3671,7 +3757,7 @@ def test_plugin_archive_install_persists_scan_only_package_metadata() -> None:
             "key_id": "calendar-prod",
             "value": VALID_PLUGIN_SIGNATURE,
         },
-        "signature_verification": "not_verified",
+        "signature_verification": "untrusted_key",
         "runtime": "python",
         "entrypoint": "adapter/main.py",
         "isolation": "local_process",
@@ -4096,6 +4182,337 @@ def test_plugin_archive_install_rejects_invalid_package_signature() -> None:
     reason = response.json()["error"]["details"]["reason"]
     assert "package.signature.algorithm" in reason
     assert "package.signature.value" in reason
+
+
+def test_plugin_signing_keys_are_tenant_scoped() -> None:
+    api = client()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    public_key = plugin_public_key_value(private_key)
+
+    response = api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": public_key,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "key_id": "calendar-prod",
+        "algorithm": "ed25519",
+        "public_key": public_key,
+        "trusted": True,
+    }
+
+    listed = api.get("/api/v1/admin/plugins/signing-keys", headers=headers())
+    assert listed.status_code == 200
+    assert listed.json() == [response.json()]
+
+    other_app = create_app(
+        auth_service=OtherTenantAuthService(),
+        rate_limiter=object(),
+    )
+    other_app.state.admin_resource_service = cast(Any, api.app).state.admin_resource_service
+    other_tenant = TestClient(other_app).get(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+    )
+    assert other_tenant.status_code == 200
+    assert other_tenant.json() == []
+
+
+def test_plugin_archive_install_verifies_trusted_ed25519_signature() -> None:
+    api = client()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(private_key),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["plugin"]["package_metadata"]["signature_verification"] == "verified"
+
+
+def test_plugin_archive_install_records_untrusted_signature_key() -> None:
+    api = client()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(private_key),
+    )
+
+    assert response.status_code == 200
+    assert (
+        response.json()["plugin"]["package_metadata"]["signature_verification"]
+        == "untrusted_key"
+    )
+
+
+async def test_persistent_plugin_signing_keys_and_verification_status_survive_reload() -> None:
+    class StoredPersistentPluginService(PersistentAdminResourceService):
+        def __init__(
+            self,
+            payloads: dict[tuple[UUID, str, str], dict[str, object]] | None = None,
+        ) -> None:
+            super().__init__(
+                config_service=cast(Any, object()),
+                secret_service=cast(Any, object()),
+                tenant_id=TENANT_ID,
+                actor_id=USER_ID,
+            )
+            self._session_factory = cast(Any, object())
+            self.payloads = payloads if payloads is not None else {}
+
+        async def _get_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> dict[str, object] | None:
+            target_tenant_id = TENANT_ID if tenant_id is None else tenant_id
+            return self.payloads.get((target_tenant_id, kind, resource_id), {})
+
+        async def _upsert_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            payload: dict[str, object],
+            *,
+            tenant_id: UUID | None = None,
+        ) -> bool:
+            target_tenant_id = TENANT_ID if tenant_id is None else tenant_id
+            self.payloads[(target_tenant_id, kind, resource_id)] = payload
+            return True
+
+        async def _list_admin_payloads(
+            self,
+            kind: str,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> list[dict[str, object]] | None:
+            target_tenant_id = TENANT_ID if tenant_id is None else tenant_id
+            return [
+                payload
+                for (payload_tenant_id, payload_kind, _resource_id), payload in self.payloads.items()
+                if payload_tenant_id == target_tenant_id and payload_kind == kind
+            ]
+
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    writer = StoredPersistentPluginService()
+    await writer.upsert_plugin_signing_key(
+        PluginSigningKeyRequest(
+            key_id="calendar-prod",
+            algorithm="ed25519",
+            public_key=plugin_public_key_value(private_key),
+        ),
+        tenant_id=TENANT_ID,
+        actor_id=USER_ID,
+    )
+    signed_package = PluginPackageMetadata.model_validate(
+        {
+            "kind": "adapter_package",
+            "package_version": "1.2.3",
+            "adapter_id": "calendar_python",
+            "sdk_api_version": "1.0",
+            "signature": {
+                "algorithm": "ed25519",
+                "key_id": "calendar-prod",
+                "value": VALID_PLUGIN_SIGNATURE,
+            },
+            "signature_verification": "verified",
+            "runtime": "python",
+            "entrypoint": "adapter/main.py",
+            "isolation": "local_process",
+            "install_mode": "scan_only",
+        }
+    )
+    untrusted_package = signed_package.model_copy(
+        update={"signature_verification": "untrusted_key"}
+    )
+    await writer.upsert_plugin(
+        PluginResourceRequest(id="calendar", name="Calendar"),
+        tenant_id=TENANT_ID,
+        actor_id=USER_ID,
+        package_metadata=signed_package,
+    )
+    await writer.upsert_plugin(
+        PluginResourceRequest(id="search", name="Search"),
+        tenant_id=TENANT_ID,
+        actor_id=USER_ID,
+        package_metadata=untrusted_package,
+    )
+
+    reader = StoredPersistentPluginService(writer.payloads)
+    signing_keys = await reader.list_plugin_signing_keys(tenant_id=TENANT_ID)
+    plugins = {plugin.id: plugin for plugin in await reader.list_plugins(tenant_id=TENANT_ID)}
+
+    assert [key.key_id for key in signing_keys] == ["calendar-prod"]
+    assert plugins["calendar"].package_metadata is not None
+    assert plugins["calendar"].package_metadata.signature_verification == "verified"
+    assert plugins["search"].package_metadata is not None
+    assert plugins["search"].package_metadata.signature_verification == "untrusted_key"
+
+
+def test_plugin_archive_install_rejects_invalid_trusted_signature() -> None:
+    api = client()
+    reloaded: list[UUID] = []
+
+    async def reload_plugin_runtime_config(tenant_id: UUID) -> None:
+        reloaded.append(tenant_id)
+
+    cast(Any, api.app).state.reload_plugin_runtime_config = reload_plugin_runtime_config
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    wrong_private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(wrong_private_key),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    assert (
+        response.json()["error"]["details"]["reason"]
+        == "plugin package signature verification failed"
+    )
+    assert api.get("/api/v1/admin/plugins", headers=headers()).json() == []
+    assert reloaded == []
+
+
+def test_plugin_archive_install_rejects_signed_package_manifest_tampering() -> None:
+    api = client()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    manifest, files = signed_plugin_archive_parts(signed_plugin_archive(private_key))
+    package = cast(dict[str, object], manifest["package"])
+    package["package_version"] = "1.2.4"
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(manifest, files=files),
+    )
+
+    assert response.status_code == 422
+    assert (
+        response.json()["error"]["details"]["reason"]
+        == "plugin package signature verification failed"
+    )
+
+
+def test_plugin_archive_install_rejects_signed_package_file_tampering() -> None:
+    api = client()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    manifest, files = signed_plugin_archive_parts(signed_plugin_archive(private_key))
+    files["adapter/main.py"] = "def invoke():\n    return {'changed': True}\n"
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(manifest, files=files),
+    )
+
+    assert response.status_code == 422
+    assert (
+        response.json()["error"]["details"]["reason"]
+        == "plugin package signature verification failed"
+    )
+
+
+def test_plugin_archive_install_rejects_signed_package_extra_file_tampering() -> None:
+    api = client()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    manifest, files = signed_plugin_archive_parts(signed_plugin_archive(private_key))
+    files["adapter/extra.py"] = "EXTRA = True\n"
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(manifest, files=files),
+    )
+
+    assert response.status_code == 422
+    assert (
+        response.json()["error"]["details"]["reason"]
+        == "plugin package signature verification failed"
+    )
 
 
 def test_plugin_archive_install_records_unsigned_package_as_not_provided() -> None:

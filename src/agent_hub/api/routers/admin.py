@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import inspect
 import io
@@ -20,6 +22,8 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import yaml
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import (
@@ -628,6 +632,32 @@ class PluginPackageSignatureMetadata(BaseModel):
     )
 
 
+class PluginSigningKeyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+    )
+    algorithm: Literal["ed25519"]
+    public_key: str = Field(
+        min_length=43,
+        max_length=43,
+        pattern=r"^[A-Za-z0-9_-]{43}$",
+    )
+
+    @field_validator("public_key")
+    @classmethod
+    def validate_public_key(cls, value: str) -> str:
+        _decode_base64url_bytes(value, expected_length=32, label="public_key")
+        return value
+
+
+class PluginSigningKeyResponse(PluginSigningKeyRequest):
+    trusted: bool = True
+
+
 class PluginPackageMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -654,7 +684,13 @@ class PluginPackageMetadata(BaseModel):
         pattern=r"^[1-9][0-9]*\.[0-9]+$",
     )
     signature: PluginPackageSignatureMetadata | None = None
-    signature_verification: Literal["not_provided", "not_verified"] = "not_provided"
+    signature_verification: Literal[
+        "not_provided",
+        "not_verified",
+        "untrusted_key",
+        "verified",
+        "failed",
+    ] = "not_provided"
     runtime: Literal["none", "python", "node", "container", "mcp_remote"] = "none"
     entrypoint: str | None = Field(default=None, max_length=255)
     isolation: Literal[
@@ -669,9 +705,12 @@ class PluginPackageMetadata(BaseModel):
 
     @model_validator(mode="after")
     def derive_signature_verification(self) -> PluginPackageMetadata:
-        verification: Literal["not_provided", "not_verified"] = (
-            "not_verified" if self.signature is not None else "not_provided"
-        )
+        if self.signature is None:
+            verification: Literal["not_provided", "not_verified"] = "not_provided"
+        elif self.signature_verification == "not_provided":
+            verification = "not_verified"
+        else:
+            return self
         self.signature_verification = verification
         return self
 
@@ -2242,6 +2281,20 @@ class AdminResourceService(Protocol):
         tenant_id: UUID | None = None,
     ) -> tuple[PluginResourceResponse, ...]: ...
 
+    async def list_plugin_signing_keys(
+        self,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> tuple[PluginSigningKeyResponse, ...]: ...
+
+    async def upsert_plugin_signing_key(
+        self,
+        request: PluginSigningKeyRequest,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginSigningKeyResponse: ...
+
     async def upsert_plugin(
         self,
         request: PluginResourceRequest,
@@ -3224,6 +3277,129 @@ def _validate_plugin_package_contract(
         raise InvalidSkillPackage("plugin package entrypoint is missing")
 
 
+def _verified_plugin_package_metadata(
+    manifest: PluginArchiveManifest,
+    archive_bytes: bytes,
+    signing_keys: tuple[PluginSigningKeyResponse, ...],
+) -> PluginPackageMetadata | None:
+    package = manifest.package
+    if package is None or package.signature is None:
+        return package
+    signing_key = next(
+        (
+            key
+            for key in signing_keys
+            if key.trusted
+            and key.algorithm == package.signature.algorithm
+            and key.key_id == package.signature.key_id
+        ),
+        None,
+    )
+    if signing_key is None:
+        return package.model_copy(update={"signature_verification": "untrusted_key"})
+    payload = _plugin_signature_payload(manifest, archive_bytes)
+    try:
+        public_key_bytes = _decode_base64url_bytes(
+            signing_key.public_key,
+            expected_length=32,
+            label="public_key",
+        )
+        signature_bytes = _decode_base64url_bytes(
+            package.signature.value,
+            expected_length=64,
+            label="signature",
+        )
+        Ed25519PublicKey.from_public_bytes(public_key_bytes).verify(signature_bytes, payload)
+    except InvalidSignature:
+        raise InvalidSkillPackage("plugin package signature verification failed") from None
+    except ValueError:
+        raise InvalidSkillPackage("trusted plugin signing key is invalid") from None
+    return package.model_copy(update={"signature_verification": "verified"})
+
+
+def _plugin_signature_payload(manifest: PluginArchiveManifest, archive_bytes: bytes) -> bytes:
+    manifest_payload = manifest.model_dump(mode="json")
+    package = manifest_payload.get("package")
+    if isinstance(package, dict):
+        signature = package.get("signature")
+        if isinstance(signature, dict):
+            signature.pop("value", None)
+    payload = {
+        "schema": "mofang-plugin-package-v1",
+        "manifest": manifest_payload,
+        "files": [
+            {
+                "path": path,
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "size": len(content),
+            }
+            for path, content in _plugin_archive_signature_files(archive_bytes)
+        ],
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _plugin_archive_signature_files(archive_bytes: bytes) -> tuple[tuple[str, bytes], ...]:
+    archive_buffer = io.BytesIO(archive_bytes)
+    if zipfile.is_zipfile(archive_buffer):
+        return _plugin_archive_signature_files_from_zip(archive_bytes)
+    return _plugin_archive_signature_files_from_tar(archive_bytes)
+
+
+def _plugin_archive_signature_files_from_zip(archive_bytes: bytes) -> tuple[tuple[str, bytes], ...]:
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+            files: dict[str, bytes] = {}
+            for info in archive.infolist():
+                if info.is_dir() or info.filename.replace("\\", "/").endswith("/"):
+                    continue
+                mode = (info.external_attr >> 16) & 0o777777
+                if _skill_bundle_mode_is_unsafe(mode):
+                    raise InvalidSkillPackage("plugin archive contains links or device files")
+                path = _safe_plugin_archive_member_path(info.filename)
+                if PurePosixPath(path).name == "plugin.json":
+                    continue
+                if path in files:
+                    raise InvalidSkillPackage("plugin archive contains duplicate package files")
+                files[path] = archive.read(info.filename)
+    except zipfile.BadZipFile:
+        raise InvalidSkillPackage("plugin archive must be a valid zip file") from None
+    return tuple(sorted(files.items()))
+
+
+def _plugin_archive_signature_files_from_tar(archive_bytes: bytes) -> tuple[tuple[str, bytes], ...]:
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
+            files: dict[str, bytes] = {}
+            for member in archive.getmembers():
+                if member.isdir():
+                    continue
+                if not member.isfile():
+                    raise InvalidSkillPackage("plugin archive contains links or device files")
+                path = _safe_plugin_archive_member_path(member.name)
+                if PurePosixPath(path).name == "plugin.json":
+                    continue
+                if path in files:
+                    raise InvalidSkillPackage("plugin archive contains duplicate package files")
+                source = archive.extractfile(member)
+                if source is None:
+                    raise InvalidSkillPackage("plugin archive item cannot be read")
+                files[path] = source.read()
+    except tarfile.TarError:
+        raise InvalidSkillPackage("plugin archive must be a valid zip or tar archive") from None
+    return tuple(sorted(files.items()))
+
+
+def _decode_base64url_bytes(value: str, *, expected_length: int, label: str) -> bytes:
+    try:
+        decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    except (binascii.Error, ValueError):
+        raise ValueError(f"{label} must be base64url") from None
+    if len(decoded) != expected_length:
+        raise ValueError(f"{label} has invalid length")
+    return decoded
+
+
 def _plugin_archive_member_paths(archive_bytes: bytes) -> frozenset[str]:
     archive_buffer = io.BytesIO(archive_bytes)
     if zipfile.is_zipfile(archive_buffer):
@@ -3767,6 +3943,9 @@ class InMemoryAdminResourceService:
     skills: dict[str, SkillResponse] = field(default_factory=dict)
     skill_active_versions: dict[str, str] = field(default_factory=dict)
     plugins: dict[str, PluginResourceResponse] = field(default_factory=dict)
+    plugin_signing_keys: dict[tuple[UUID | None, str], PluginSigningKeyResponse] = field(
+        default_factory=dict
+    )
     mcp_servers: dict[str, McpServerResponse] = field(default_factory=dict)
     channel_config: dict[str, dict[str, str]] = field(default_factory=dict)
     memory: dict[str, MemoryRecordResponse] = field(default_factory=dict)
@@ -4423,6 +4602,29 @@ class InMemoryAdminResourceService:
     ) -> tuple[PluginResourceResponse, ...]:
         del tenant_id
         return tuple(self.plugins.values())
+
+    async def list_plugin_signing_keys(
+        self,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> tuple[PluginSigningKeyResponse, ...]:
+        return tuple(
+            key
+            for (key_tenant_id, _key_id), key in self.plugin_signing_keys.items()
+            if key_tenant_id == tenant_id
+        )
+
+    async def upsert_plugin_signing_key(
+        self,
+        request: PluginSigningKeyRequest,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginSigningKeyResponse:
+        del actor_id
+        response = PluginSigningKeyResponse(**request.model_dump(), trusted=True)
+        self.plugin_signing_keys[(tenant_id, response.key_id)] = response
+        return response
 
     async def upsert_plugin(
         self,
@@ -6310,6 +6512,52 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 return ()
             return await super().list_plugins()
         return tuple(PluginResourceResponse.model_validate(payload) for payload in resources)
+
+    async def list_plugin_signing_keys(
+        self,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> tuple[PluginSigningKeyResponse, ...]:
+        resources = await self._list_admin_payloads("plugin_signing_key", tenant_id=tenant_id)
+        if resources is None:
+            if tenant_id is not None and tenant_id != self._tenant_id:
+                return ()
+            return await super().list_plugin_signing_keys(tenant_id=tenant_id)
+        return tuple(PluginSigningKeyResponse.model_validate(payload) for payload in resources)
+
+    async def upsert_plugin_signing_key(
+        self,
+        request: PluginSigningKeyRequest,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginSigningKeyResponse:
+        response = PluginSigningKeyResponse(**request.model_dump(), trusted=True)
+        if not await self._upsert_admin_payload(
+            "plugin_signing_key",
+            response.key_id,
+            response.model_dump(mode="json"),
+            tenant_id=tenant_id,
+        ):
+            if tenant_id is not None and tenant_id != self._tenant_id:
+                raise KeyError(response.key_id)
+            return await super().upsert_plugin_signing_key(
+                request,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+            )
+        await self._record_audit(
+            "plugin.signing_key.upsert",
+            f"plugin_signing_key:{response.key_id}",
+            {
+                "key_id": response.key_id,
+                "algorithm": response.algorithm,
+                "trusted": response.trusted,
+            },
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+        )
+        return response
 
     async def upsert_plugin(
         self,
@@ -10990,6 +11238,37 @@ async def review_plugin_policy(
     return review
 
 
+@router.get(
+    "/plugins/signing-keys",
+    response_model=list[PluginSigningKeyResponse],
+    responses=error_responses(401, 403, 422),
+)
+async def list_plugin_signing_keys(
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> list[PluginSigningKeyResponse]:
+    _require(principal, "plugin:read")
+    return list(await service.list_plugin_signing_keys(tenant_id=principal.tenant_id))
+
+
+@router.post(
+    "/plugins/signing-keys",
+    response_model=PluginSigningKeyResponse,
+    responses=error_responses(401, 403, 422),
+)
+async def upsert_plugin_signing_key(
+    body: PluginSigningKeyRequest,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> PluginSigningKeyResponse:
+    _require(principal, "plugin:write")
+    return await service.upsert_plugin_signing_key(
+        body,
+        tenant_id=principal.tenant_id,
+        actor_id=principal.user_id,
+    )
+
+
 @router.post(
     "/plugins",
     response_model=PluginResourceResponse,
@@ -11049,6 +11328,11 @@ async def install_plugin_archive(
     content_sha256 = hashlib.sha256(archive_bytes).hexdigest()
     try:
         plugin_manifest = _plugin_archive_manifest_from_archive(archive_bytes)
+        package_metadata = _verified_plugin_package_metadata(
+            plugin_manifest,
+            archive_bytes,
+            await service.list_plugin_signing_keys(tenant_id=principal.tenant_id),
+        )
     except InvalidSkillPackage as error:
         raise PublicAPIError(
             422,
@@ -11067,7 +11351,7 @@ async def install_plugin_archive(
         actor_id=principal.user_id,
         source_filename=filename,
         content_sha256=content_sha256,
-        package_metadata=plugin_manifest.package,
+        package_metadata=package_metadata,
     )
     await service.record_audit_event(
         actor=str(principal.user_id),

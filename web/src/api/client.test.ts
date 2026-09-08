@@ -585,7 +585,7 @@ describe("api client transport", () => {
           key_id: "calendar-prod",
           value: "A".repeat(86),
         },
-        signature_verification: "not_verified",
+        signature_verification: "verified",
         runtime: "python",
         entrypoint: "adapter/main.py",
         isolation: "local_process",
@@ -620,6 +620,55 @@ describe("api client transport", () => {
           "Content-Type": "application/zip",
           "X-Agent-Hub-Plugin-Filename": "calendar%20plugin.zip",
           "X-Agent-Hub-Plugin-Filename-Encoding": "percent",
+        }),
+      }),
+    );
+  });
+
+  it("manages trusted plugin signing keys", async () => {
+    const signingKey = {
+      key_id: "calendar-prod",
+      algorithm: "ed25519",
+      public_key: "A".repeat(43),
+      trusted: true,
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify([signingKey]), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(signingKey), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(api.pluginSigningKeys()).resolves.toEqual([signingKey]);
+    await expect(
+      api.upsertPluginSigningKey({
+        key_id: "calendar-prod",
+        algorithm: "ed25519",
+        public_key: "A".repeat(43),
+      }),
+    ).resolves.toEqual(signingKey);
+
+    expect(String(fetchMock.mock.calls[0]?.[0])).toMatch(
+      /^\/api\/v1\/admin\/plugins\/signing-keys\?_/,
+    );
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({ method: "GET" }));
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("/api/v1/admin/plugins/signing-keys");
+    expect(fetchMock.mock.calls[1]?.[1]).toEqual(
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          key_id: "calendar-prod",
+          algorithm: "ed25519",
+          public_key: "A".repeat(43),
         }),
       }),
     );

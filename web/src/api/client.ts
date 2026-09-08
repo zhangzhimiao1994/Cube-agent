@@ -971,7 +971,9 @@ const PluginPackageMetadataSchema = z.object({
     })
     .nullable()
     .default(null),
-  signature_verification: z.enum(["not_provided", "not_verified"]).default("not_provided"),
+  signature_verification: z
+    .enum(["not_provided", "not_verified", "untrusted_key", "verified", "failed"])
+    .default("not_provided"),
   runtime: z.enum(["none", "python", "node", "container", "mcp_remote"]).default("none"),
   entrypoint: z.string().nullable().default(null),
   isolation: z
@@ -1012,6 +1014,21 @@ const PluginArchiveInstallSchema = z.object({
 });
 
 export type PluginArchiveInstall = z.infer<typeof PluginArchiveInstallSchema>;
+
+const PluginSigningKeySchema = z.object({
+  key_id: z.string(),
+  algorithm: z.literal("ed25519"),
+  public_key: z.string(),
+  trusted: z.boolean().default(true),
+});
+
+export type PluginSigningKey = z.infer<typeof PluginSigningKeySchema>;
+
+export type PluginSigningKeyPayload = {
+  key_id: string;
+  algorithm: "ed25519";
+  public_key: string;
+};
 
 export type PluginResourcePayload = {
   id: string;
@@ -2042,6 +2059,20 @@ export const api = {
       "/api/v1/admin/plugins",
       { method: "POST", body: JSON.stringify(payload) },
       PluginResourceSchema,
+    );
+  },
+  pluginSigningKeys(): Promise<PluginSigningKey[]> {
+    return request(
+      "/api/v1/admin/plugins/signing-keys",
+      { method: "GET" },
+      z.array(PluginSigningKeySchema),
+    );
+  },
+  upsertPluginSigningKey(payload: PluginSigningKeyPayload): Promise<PluginSigningKey> {
+    return request(
+      "/api/v1/admin/plugins/signing-keys",
+      { method: "POST", body: JSON.stringify(payload) },
+      PluginSigningKeySchema,
     );
   },
   uploadPluginArchive(file: File): Promise<PluginArchiveInstall> {
