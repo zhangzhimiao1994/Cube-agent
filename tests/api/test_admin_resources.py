@@ -5,6 +5,7 @@ import sys
 import tarfile
 import threading
 import zipfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,6 +32,7 @@ from agent_hub.api.routers.admin import (
     PersistentAdminResourceService,
     PluginCapabilityRequest,
     PluginResourceRequest,
+    PluginResourceResponse,
     RunArtifactResponse,
     RunDetailResponse,
     RunEventResponse,
@@ -64,9 +66,9 @@ from agent_hub.multimodal.generation import (
     MultimediaGenerationExecutor,
 )
 from agent_hub.multimodal.video_providers import VideoProviderGenerationError
-from agent_hub.plugins.runtime import build_runtime_plugin_service
+from agent_hub.plugins.runtime import PluginInvocationContext, build_runtime_plugin_service
 from agent_hub.runs.repository import RunRecord, _event_with_failure_diagnostic
-from agent_hub.runtime.contracts import EventKind, RunEvent
+from agent_hub.runtime.contracts import EventKind, JsonValue, RunEvent
 from agent_hub.scheduler.service import SchedulerService
 from agent_hub.scheduler.types import TaskRequest
 from agent_hub.security.secrets import SecretReference
@@ -3268,6 +3270,117 @@ async def test_plugin_admin_runtime_http_json_acceptance_records_safe_audit() ->
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_plugin_admin_runtime_in_process_adapter_acceptance_records_safe_audit() -> None:
+    adapter_calls: list[dict[str, object]] = []
+
+    class InProcessAdapter:
+        async def invoke(
+            self,
+            *,
+            plugin: PluginResourceResponse,
+            capability: PluginCapabilityRequest,
+            arguments: Mapping[str, JsonValue],
+            context: PluginInvocationContext,
+        ) -> Mapping[str, JsonValue]:
+            adapter_calls.append(
+                {
+                    "plugin_id": plugin.id,
+                    "capability_id": capability.id,
+                    "arguments": dict(arguments),
+                    "idempotency_key": context.idempotency_key,
+                }
+            )
+            return {"ok": True, "handled_by": "in_process"}
+
+        def descriptor(self) -> Mapping[str, JsonValue]:
+            return {
+                "id": "local_tool",
+                "name": "Local Tool",
+                "description": "Runs a trusted local test adapter.",
+                "resource_schema": {"type": "object", "additionalProperties": False},
+                "capability_schema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "sandbox_profile": {"type": "string", "enum": ("in_process",)},
+                    },
+                    "additionalProperties": True,
+                },
+                "argument_schema": {
+                    "type": "object",
+                    "required": ("command",),
+                    "properties": {"command": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            }
+
+    api = client()
+    admin_service = cast(
+        InMemoryAdminResourceService,
+        cast(Any, api.app).state.admin_resource_service,
+    )
+    runtime_plugin_service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        adapters={"local_tool": InProcessAdapter()},
+    )
+    cast(Any, api.app).state.plugin_service = runtime_plugin_service
+    cast(Any, api.app).state.reload_plugin_runtime_config = runtime_plugin_service.reload
+
+    created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "local",
+            "name": "Local Plugin",
+            "capabilities": [
+                {
+                    "id": "local.run",
+                    "adapter": "local_tool",
+                    "permission_class": "local.execute",
+                    "sandbox_profile": "in_process",
+                    "policy_effect": "require_approval",
+                }
+            ],
+        },
+    )
+    started = api.post("/api/v1/admin/plugins/local/start", headers=headers())
+
+    assert created.status_code == 200
+    assert started.status_code == 200
+    result = await runtime_plugin_service.invoke(
+        tenant_id=TENANT_ID,
+        user_id=TENANT_ID,
+        run_id=TENANT_ID,
+        actor="acceptance",
+        name="local.run",
+        arguments={"command": "status"},
+        idempotency_key="in-process-1",
+    )
+    audit = api.get(
+        "/api/v1/admin/audit?action=plugin.invoke.succeeded",
+        headers=headers(),
+    )
+
+    assert result == {"ok": True, "handled_by": "in_process"}
+    assert adapter_calls == [
+        {
+            "plugin_id": "local",
+            "capability_id": "local.run",
+            "arguments": {"command": "status"},
+            "idempotency_key": "in-process-1",
+        }
+    ]
+    assert audit.status_code == 200
+    event = audit.json()[0]
+    assert event["resource"] == "plugin:local:local.run"
+    assert event["details"]["adapter"] == "local_tool"
+    assert event["details"]["permission_class"] == "local.execute"
+    assert event["details"]["sandbox_profile"] == "in_process"
+    assert "status" not in audit.text
 
 
 def test_plugin_adapter_catalog_endpoint_exposes_safe_http_json_descriptor() -> None:
