@@ -131,6 +131,8 @@ def test_latest_migration_allows_plugin_signing_key_admin_resources() -> None:
     migration = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(migration)
 
+    assert migration.revision == "0021_plugin_key_resources"
+    assert len(migration.revision) <= 32
     assert migration.down_revision == "0020_plugin_admin_resources"
     assert "plugin_signing_key" in migration._NEXT_KINDS
     assert "plugin_signing_key" not in migration._CURRENT_KINDS
