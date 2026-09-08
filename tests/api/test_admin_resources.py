@@ -3799,6 +3799,7 @@ def test_plugin_archive_install_persists_scan_only_package_metadata() -> None:
             "value": VALID_PLUGIN_SIGNATURE,
         },
         "signature_verification": "untrusted_key",
+        "verified_public_key_sha256": None,
         "activation_state": "blocked_untrusted_key",
         "activation_reason": "package signature key is not trusted for this tenant",
         "runtime": "python",
