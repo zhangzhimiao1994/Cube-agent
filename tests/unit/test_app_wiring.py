@@ -880,6 +880,86 @@ async def test_multimedia_executor_uses_minimax_video_client_for_hailuo_files(tm
 
 
 @pytest.mark.asyncio
+async def test_multimedia_executor_for_tenant_uses_scoped_models_and_secrets(
+    tmp_path: Path,
+) -> None:
+    class RecordingAdminService:
+        def __init__(
+            self,
+            tenant_id: UUID = TENANT_ID,
+            *,
+            root: "RecordingAdminService | None" = None,
+        ) -> None:
+            self.tenant_id = tenant_id
+            self.root = root or self
+            if root is None:
+                self.calls: list[tuple[str, UUID, UUID | None]] = []
+                self.scopes: dict[UUID, RecordingAdminService] = {tenant_id: self}
+
+        def for_principal(self, tenant_id: UUID, actor_id: UUID) -> "RecordingAdminService":
+            self.root.calls.append(("for_principal", tenant_id, actor_id))
+            if tenant_id not in self.root.scopes:
+                self.root.scopes[tenant_id] = RecordingAdminService(tenant_id, root=self.root)
+            return self.root.scopes[tenant_id]
+
+        async def list_models(self) -> tuple[ModelDeploymentResponse, ...]:
+            self.root.calls.append(("list_models", self.tenant_id, None))
+            return (
+                ModelDeploymentResponse(
+                    provider="minimax",
+                    api_base="https://api.minimax.io/v1",
+                    api_protocol="openai_compatible",
+                    upstream_model="MiniMax-Hailuo-02",
+                    logical_model="video_primary",
+                    capabilities=["video_generation"],
+                    credential_ref=f"secret://{self.tenant_id}",
+                    quota_scope=f"minimax-{self.tenant_id}",
+                    max_concurrency=1,
+                    target_utilization=0.8,
+                    reserved_capacity=0,
+                    id=uuid4(),
+                    effective_slots=1,
+                    saturation_policy="queue_first_then_fallback",
+                ),
+            )
+
+    class RecordingSecretService:
+        def __init__(self) -> None:
+            self.calls: list[tuple[UUID, object]] = []
+
+        async def resolve(self, tenant_id: UUID, reference: object) -> str:
+            self.calls.append((tenant_id, reference))
+            return "sk-live"
+
+    admin_service = RecordingAdminService()
+    secret_service = RecordingSecretService()
+    video_provider = FakeTextToVideoProvider(tmp_path / "provider-output.mp4")
+    executor = _ConfigBackedMultimediaGenerationExecutor(
+        admin_service=cast(Any, admin_service),
+        secret_service=cast(Any, secret_service),
+        tenant_id=TENANT_ID,
+        redis_client=object(),
+        media_store_dir=tmp_path / "media",
+        video_provider_router=TextToVideoProviderRouter((("minimax", video_provider),)),
+    )
+
+    tenant_executor = executor.for_tenant(OTHER_TENANT_ID)
+    result = await tenant_executor.generate(
+        kind=MultimediaGenerationKind.VIDEO,
+        logical_model="video_primary",
+        prompt="make tenant scoped video",
+    )
+
+    assert result.deployment_id
+    assert secret_service.calls == [(OTHER_TENANT_ID, f"secret://{OTHER_TENANT_ID}")]
+    assert admin_service.calls == [
+        ("for_principal", OTHER_TENANT_ID, OTHER_TENANT_ID),
+        ("list_models", OTHER_TENANT_ID, None),
+    ]
+    assert video_provider.calls[0]["output_dir"] == tmp_path / "media" / str(OTHER_TENANT_ID)
+
+
+@pytest.mark.asyncio
 async def test_multimedia_executor_does_not_send_other_video_models_to_minimax(tmp_path: Path) -> None:
     transport = FakeTransport()
     video_provider = FakeTextToVideoProvider(tmp_path / "provider-output.mp4")

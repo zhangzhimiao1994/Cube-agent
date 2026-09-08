@@ -66,8 +66,12 @@ from agent_hub.models.types import (
     TokenUsage,
 )
 from agent_hub.multimodal.generation import (
+    InMemoryMultimediaGenerationJobStore,
     MultimediaDailyLimitExceeded,
     MultimediaGenerationExecutor,
+    MultimediaGenerationJob,
+    MultimediaGenerationKind,
+    MultimediaGenerationResult,
 )
 from agent_hub.multimodal.video_providers import VideoProviderGenerationError
 from agent_hub.plugins.runtime import PluginInvocationContext, build_runtime_plugin_service
@@ -186,6 +190,73 @@ class FakeGenerationGateway:
             logical_model=request.logical_model,
             provider_id="minimax",
             provider_model="minimax/MiniMax-Hailuo-02",
+        )
+
+
+class TenantAwareMultimediaExecutor:
+    def __init__(
+        self,
+        tenant_id: UUID | None = None,
+        *,
+        root: "TenantAwareMultimediaExecutor | None" = None,
+    ) -> None:
+        self.tenant_id = TENANT_ID if tenant_id is None else tenant_id
+        self.root = root or self
+        self._jobs = InMemoryMultimediaGenerationJobStore()
+        if root is None:
+            self.calls: list[tuple[str, UUID, str]] = []
+            self.scopes: dict[UUID, TenantAwareMultimediaExecutor] = {self.tenant_id: self}
+
+    def for_tenant(self, tenant_id: UUID) -> "TenantAwareMultimediaExecutor":
+        self.root.calls.append(("for_tenant", tenant_id, ""))
+        if tenant_id not in self.root.scopes:
+            self.root.scopes[tenant_id] = TenantAwareMultimediaExecutor(
+                tenant_id,
+                root=self.root,
+            )
+        return self.root.scopes[tenant_id]
+
+    def submit(
+        self,
+        *,
+        kind: MultimediaGenerationKind,
+        logical_model: str,
+        prompt: str,
+    ) -> MultimediaGenerationJob:
+        self.root.calls.append(("submit", self.tenant_id, logical_model))
+        return self._jobs.create(kind=kind, logical_model=logical_model, prompt=prompt)
+
+    def get_job(self, job_id: str) -> MultimediaGenerationJob:
+        self.root.calls.append(("get_job", self.tenant_id, job_id))
+        return self._jobs.get(job_id)
+
+    async def run_job(
+        self,
+        job_id: str,
+        *,
+        executor_id: str,
+    ) -> MultimediaGenerationJob:
+        self.root.calls.append(("run_job", self.tenant_id, executor_id))
+        running = self._jobs.start(job_id, executor_id=executor_id)
+        return self._jobs.succeed(
+            running.id,
+            artifacts=(),
+        )
+
+    async def generate(
+        self,
+        *,
+        kind: MultimediaGenerationKind,
+        logical_model: str,
+        prompt: str,
+    ) -> MultimediaGenerationResult:
+        del prompt
+        self.root.calls.append(("generate", self.tenant_id, logical_model))
+        return MultimediaGenerationResult(
+            kind=kind,
+            logical_model=logical_model,
+            deployment_id=f"{self.tenant_id}:media",
+            text="artifact://tenant-media",
         )
 
 
@@ -5090,6 +5161,58 @@ def test_multimedia_generation_provider_failure_returns_502() -> None:
         "provider_code": "2049",
         "reason": "MiniMax video submit failed: invalid api key",
     }
+
+
+def test_admin_multimedia_routes_use_principal_tenant_executor_scope() -> None:
+    api = create_app(auth_service=OtherTenantAuthService(), rate_limiter=object())
+    service = TenantScopedAdminResourceService()
+    tenant_service = service.for_principal(OTHER_TENANT_ID, USER_ID)
+    tenant_service.settings = SystemSettingsResponse(multimedia_generation_enabled=True)
+    executor = TenantAwareMultimediaExecutor()
+    cast(Any, api).state.admin_resource_service = service
+    cast(Any, api).state.multimedia_generation_executor = executor
+    test_client = TestClient(api)
+
+    submitted = test_client.post(
+        "/api/v1/admin/multimedia/jobs",
+        headers=headers(),
+        json={
+            "kind": "video",
+            "logical_model": "video_primary",
+            "prompt": "make a tenant video",
+        },
+    )
+    job_id = submitted.json()["id"]
+    fetched = test_client.get(f"/api/v1/admin/multimedia/jobs/{job_id}", headers=headers())
+    ran = test_client.post(
+        f"/api/v1/admin/multimedia/jobs/{job_id}/run",
+        headers=headers(),
+        json={"executor_id": "tenant_media_executor"},
+    )
+    generated = test_client.post(
+        "/api/v1/admin/multimedia/generate",
+        headers=headers(),
+        json={
+            "kind": "video",
+            "logical_model": "video_primary",
+            "prompt": "generate a tenant video",
+        },
+    )
+
+    assert submitted.status_code == 202
+    assert fetched.status_code == 200
+    assert ran.status_code == 202
+    assert generated.status_code == 202
+    assert executor.calls == [
+        ("for_tenant", OTHER_TENANT_ID, ""),
+        ("submit", OTHER_TENANT_ID, "video_primary"),
+        ("for_tenant", OTHER_TENANT_ID, ""),
+        ("get_job", OTHER_TENANT_ID, job_id),
+        ("for_tenant", OTHER_TENANT_ID, ""),
+        ("run_job", OTHER_TENANT_ID, "tenant_media_executor"),
+        ("for_tenant", OTHER_TENANT_ID, ""),
+        ("generate", OTHER_TENANT_ID, "video_primary"),
+    ]
 
 
 def test_multimedia_generation_job_can_be_run_by_executor_agent_and_read_by_main_agent() -> None:

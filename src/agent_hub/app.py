@@ -367,7 +367,8 @@ class _ConfigBackedMultimediaGenerationExecutor:
     def __init__(
         self,
         *,
-        list_models: RegisteredModelListGetter,
+        list_models: RegisteredModelListGetter | None = None,
+        admin_service: admin.AdminResourceService | None = None,
         secret_service: SecretService,
         tenant_id: UUID,
         redis_client: object,
@@ -376,7 +377,10 @@ class _ConfigBackedMultimediaGenerationExecutor:
         media_store_dir: Path | None = None,
         video_provider_router: TextToVideoProviderRouter | None = None,
     ) -> None:
-        self._list_models = list_models
+        if list_models is None and admin_service is None:
+            raise ValueError("list_models or admin_service is required")
+        self._admin_service = admin_service
+        self._list_models = list_models or cast(admin.AdminResourceService, admin_service).list_models
         self._secret_service = secret_service
         self._tenant_id = tenant_id
         self._redis_client = redis_client
@@ -388,6 +392,41 @@ class _ConfigBackedMultimediaGenerationExecutor:
         )
         self._daily_usage: dict[tuple[date, str, str], int] = {}
         self._job_store = InMemoryMultimediaGenerationJobStore()
+        self._scoped_executors: dict[UUID, _ConfigBackedMultimediaGenerationExecutor] = {
+            tenant_id: self
+        }
+
+    def for_tenant(self, tenant_id: UUID) -> "_ConfigBackedMultimediaGenerationExecutor":
+        if tenant_id in self._scoped_executors:
+            return self._scoped_executors[tenant_id]
+        admin_service = self._admin_service
+        scoped_admin_service = admin_service
+        if admin_service is not None:
+            scope_for_principal = getattr(admin_service, "for_principal", None)
+            if callable(scope_for_principal):
+                scoped_admin_service = cast(
+                    admin.AdminResourceService,
+                    scope_for_principal(tenant_id, tenant_id),
+                )
+        scoped_executor = _ConfigBackedMultimediaGenerationExecutor(
+            list_models=(
+                None
+                if scoped_admin_service is not None
+                and scoped_admin_service is not admin_service
+                else self._list_models
+            ),
+            admin_service=scoped_admin_service,
+            secret_service=self._secret_service,
+            tenant_id=tenant_id,
+            redis_client=self._redis_client,
+            transport=self._transport,
+            capacity_factory=self._capacity_factory,
+            media_store_dir=self._media_store_dir,
+            video_provider_router=self._video_provider_router,
+        )
+        scoped_executor._scoped_executors = self._scoped_executors
+        self._scoped_executors[tenant_id] = scoped_executor
+        return scoped_executor
 
     def submit(
         self,
@@ -1000,7 +1039,7 @@ def create_app(
                 )
                 application.state.multimedia_generation_executor = (
                     _ConfigBackedMultimediaGenerationExecutor(
-                        list_models=admin_service_for_generation.list_models,
+                        admin_service=admin_service_for_generation,
                         secret_service=active_secret_service,
                         tenant_id=configured.bootstrap_tenant_id,
                         redis_client=active_redis,

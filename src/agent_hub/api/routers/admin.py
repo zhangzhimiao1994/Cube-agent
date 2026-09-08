@@ -6852,6 +6852,17 @@ def _multimedia_generation_executor(request: Request) -> MultimediaGenerationExe
     return cast(MultimediaGenerationExecutorProtocol, executor)
 
 
+def _tenant_multimedia_generation_executor(
+    request: Request,
+    tenant_id: UUID,
+) -> MultimediaGenerationExecutorProtocol:
+    executor = _multimedia_generation_executor(request)
+    scope_for_tenant = getattr(executor, "for_tenant", None)
+    if callable(scope_for_tenant):
+        return cast(MultimediaGenerationExecutorProtocol, scope_for_tenant(tenant_id))
+    return executor
+
+
 def _scheduler_service(request: Request) -> SchedulerServiceProtocol:
     service = getattr(request.app.state, "schedule_service", None)
     required_methods = (
@@ -9578,7 +9589,7 @@ async def submit_multimedia_job(
 ) -> MultimediaGenerationJobResponse:
     _require(principal, "run:create")
     await _require_multimedia_generation_enabled(service)
-    executor = _multimedia_generation_executor(request)
+    executor = _tenant_multimedia_generation_executor(request, principal.tenant_id)
     job = executor.submit(
         kind=MultimediaGenerationKind(body.kind),
         logical_model=body.logical_model,
@@ -9598,7 +9609,7 @@ async def get_multimedia_job(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
 ) -> MultimediaGenerationJobResponse:
     _require(principal, "run:read")
-    executor = _multimedia_generation_executor(request)
+    executor = _tenant_multimedia_generation_executor(request, principal.tenant_id)
     try:
         return _multimedia_job_response(executor.get_job(job_id))
     except KeyError as error:
@@ -9622,7 +9633,7 @@ async def run_multimedia_job(
 ) -> MultimediaGenerationJobResponse:
     _require(principal, "run:create")
     await _require_multimedia_generation_enabled(service)
-    executor = _multimedia_generation_executor(request)
+    executor = _tenant_multimedia_generation_executor(request, principal.tenant_id)
     try:
         job = await executor.run_job(job_id, executor_id=body.executor_id)
     except KeyError as error:
@@ -9673,7 +9684,7 @@ async def generate_multimedia(
 ) -> MultimediaGenerationResponse:
     _require(principal, "run:create")
     await _require_multimedia_generation_enabled(service)
-    executor = _multimedia_generation_executor(request)
+    executor = _tenant_multimedia_generation_executor(request, principal.tenant_id)
     try:
         result = await executor.generate(
             kind=MultimediaGenerationKind(body.kind),
