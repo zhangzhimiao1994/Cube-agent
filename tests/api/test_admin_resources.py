@@ -3163,6 +3163,28 @@ def test_plugin_admin_endpoints_read_plugin_config_for_principal_tenant() -> Non
             del tenant_id
             return ()
 
+        async def record_audit_event(
+            self,
+            *,
+            actor: str,
+            action: str,
+            resource: str,
+            details: dict[str, object] | None = None,
+            tenant_id: UUID | None = None,
+        ) -> AuditEventResponse:
+            self.tenant_ids.append(tenant_id)
+            return AuditEventResponse(
+                id="audit-policy-review",
+                actor=actor,
+                action=action,
+                resource=resource,
+                details={
+                    key: str(value)
+                    for key, value in (details or {}).items()
+                },
+                created_at=datetime.now(UTC),
+            )
+
     api = create_app(auth_service=OtherTenantAuthService(), rate_limiter=object())
     service = TenantScopedPluginService()
     cast(Any, api).state.admin_resource_service = service
@@ -3171,14 +3193,24 @@ def test_plugin_admin_endpoints_read_plugin_config_for_principal_tenant() -> Non
 
     plugins = test_client.get("/api/v1/admin/plugins", headers=headers())
     summary = test_client.get("/api/v1/admin/plugins/policy-summary", headers=headers())
+    review = test_client.post("/api/v1/admin/plugins/policy-review", headers=headers())
     manifest = test_client.get("/api/v1/admin/capabilities/manifest", headers=headers())
 
     assert plugins.status_code == 200
     assert summary.status_code == 200
+    assert review.status_code == 200
     assert manifest.status_code == 200
-    assert service.tenant_ids == [OTHER_TENANT_ID, OTHER_TENANT_ID, OTHER_TENANT_ID]
+    assert service.tenant_ids == [
+        OTHER_TENANT_ID,
+        OTHER_TENANT_ID,
+        OTHER_TENANT_ID,
+        OTHER_TENANT_ID,
+        OTHER_TENANT_ID,
+    ]
     assert [item["id"] for item in plugins.json()] == ["tenant-search"]
     assert [item["id"] for item in summary.json()] == ["tenant-search"]
+    assert review.json()["plugin_count"] == 1
+    assert review.json()["policy_effect_counts"] == {"inherit": 1}
     capabilities = {item["id"]: item for item in manifest.json()["capabilities"]}
     assert "tenant_search.web" in capabilities
     assert "bootstrap_search.web" not in capabilities
@@ -3938,6 +3970,148 @@ def test_plugin_admin_api_exposes_safe_plugin_policy_summary() -> None:
     assert "api_key" not in summary.text
     assert "token" not in summary.text
     assert "credential" not in summary.text
+
+
+def test_plugin_admin_api_records_safe_plugin_policy_review_audit() -> None:
+    api = client()
+
+    class PluginServiceWithPolicyDescriptor:
+        def adapter_descriptors(self) -> tuple[dict[str, object], ...]:
+            return (
+                {
+                    "id": "http_json",
+                    "name": "HTTP JSON",
+                    "description": "Accepts descriptor-owned policy test config.",
+                    "resource_schema": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    },
+                    "capability_schema": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    cast(Any, api.app).state.plugin_service = PluginServiceWithPolicyDescriptor()
+
+    created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "search",
+            "name": "Search Plugin",
+            "endpoint_url": "https://search.internal/secret-path",
+            "credential_ref": "credential-do-not-leak",
+            "resource_config": {
+                "base_url": "https://search.internal",
+                "secret_token": "do-not-leak",
+                "mode": "semantic",
+            },
+            "capabilities": [
+                {
+                    "id": "search.web",
+                    "adapter": "http_json",
+                    "permission_class": "network.read",
+                    "sandbox_profile": "remote_connector",
+                    "policy_effect": "require_approval",
+                    "replay_safe": True,
+                    "capability_config": {
+                        "credential": "capability-do-not-leak",
+                        "mode": "semantic",
+                    },
+                },
+                {
+                    "id": "search.delete",
+                    "adapter": "http_json",
+                    "permission_class": "network.write",
+                    "sandbox_profile": "remote_connector",
+                    "policy_effect": "deny",
+                    "capability_config": {"mode": "delete"},
+                },
+            ],
+        },
+    )
+
+    review = api.post("/api/v1/admin/plugins/policy-review", headers=headers())
+    audit = api.get("/api/v1/admin/audit?action=plugin.policy_review", headers=headers())
+
+    assert created.status_code == 200
+    assert review.status_code == 200
+    assert review.json() == {
+        "plugin_count": 1,
+        "capability_count": 2,
+        "policy_effect_counts": {"deny": 1, "require_approval": 1},
+        "permission_class_counts": {"network.read": 1, "network.write": 1},
+        "sandbox_profile_counts": {"remote_connector": 2},
+        "plugins": [
+            {
+                "id": "search",
+                "name": "Search Plugin",
+                "version": "local",
+                "enabled": True,
+                "status": "stopped",
+                "health": "stopped",
+                "capability_count": 2,
+                "adapters": ["http_json"],
+                "permission_classes": ["network.read", "network.write"],
+                "policy_effects": ["deny", "require_approval"],
+                "sandbox_profiles": ["remote_connector"],
+                "resource_config_key_count": 3,
+                "resource_config_keys": ["base_url", "mode"],
+                "redacted_resource_config_key_count": 1,
+                "capabilities": [
+                    {
+                        "id": "search.web",
+                        "adapter": "http_json",
+                        "permission_class": "network.read",
+                        "sandbox_profile": "remote_connector",
+                        "policy_effect": "require_approval",
+                        "replay_safe": True,
+                        "aliases": [],
+                        "input_schema_declared": False,
+                        "output_schema_declared": False,
+                        "capability_config_key_count": 2,
+                        "capability_config_keys": ["mode"],
+                        "redacted_capability_config_key_count": 1,
+                    },
+                    {
+                        "id": "search.delete",
+                        "adapter": "http_json",
+                        "permission_class": "network.write",
+                        "sandbox_profile": "remote_connector",
+                        "policy_effect": "deny",
+                        "replay_safe": False,
+                        "aliases": [],
+                        "input_schema_declared": False,
+                        "output_schema_declared": False,
+                        "capability_config_key_count": 1,
+                        "capability_config_keys": ["mode"],
+                        "redacted_capability_config_key_count": 0,
+                    },
+                ],
+            }
+        ],
+    }
+    assert audit.status_code == 200
+    assert audit.json()[0]["actor"] == str(USER_ID)
+    assert audit.json()[0]["details"] == {
+        "capability_count": "2",
+        "deny_count": "1",
+        "permission_classes": "network.read,network.write",
+        "plugin_count": "1",
+        "policy_effects": "deny,require_approval",
+        "require_approval_count": "1",
+        "sandbox_profiles": "remote_connector",
+    }
+    serialized = review.text + audit.text
+    assert "do-not-leak" not in serialized
+    assert "credential-do-not-leak" not in serialized
+    assert "capability-do-not-leak" not in serialized
+    assert "secret-path" not in serialized
+    assert "secret_token" not in serialized
+    assert "credential" not in serialized
 
 
 def test_plugin_admin_api_validates_descriptor_resource_config() -> None:

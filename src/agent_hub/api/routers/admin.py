@@ -656,6 +656,19 @@ class PluginPolicySummaryResponse(BaseModel):
     )
 
 
+class PluginPolicyReviewResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    plugin_count: int
+    capability_count: int
+    policy_effect_counts: dict[
+        Literal["inherit", "allow", "require_approval", "deny"], int
+    ] = Field(default_factory=dict, max_length=4)
+    permission_class_counts: dict[str, int] = Field(default_factory=dict, max_length=256)
+    sandbox_profile_counts: dict[str, int] = Field(default_factory=dict, max_length=256)
+    plugins: list[PluginPolicySummaryResponse] = Field(default_factory=list, max_length=256)
+
+
 class PluginAdapterDescriptorResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -3101,6 +3114,53 @@ def _plugin_policy_capability_summary(
         capability_config_keys=list(capability_config_keys),
         redacted_capability_config_key_count=redacted_capability_config_keys,
     )
+
+
+def _plugin_policy_review(
+    plugins: Iterable[PluginResourceResponse],
+) -> PluginPolicyReviewResponse:
+    summaries = [_plugin_policy_summary(plugin) for plugin in plugins]
+    policy_effect_counts: dict[Literal["inherit", "allow", "require_approval", "deny"], int] = {}
+    permission_class_counts: dict[str, int] = {}
+    sandbox_profile_counts: dict[str, int] = {}
+    capability_count = 0
+    for summary in summaries:
+        for capability in summary.capabilities:
+            capability_count += 1
+            policy_effect_counts[capability.policy_effect] = (
+                policy_effect_counts.get(capability.policy_effect, 0) + 1
+            )
+            permission_class_counts[capability.permission_class] = (
+                permission_class_counts.get(capability.permission_class, 0) + 1
+            )
+            sandbox_profile_counts[capability.sandbox_profile] = (
+                sandbox_profile_counts.get(capability.sandbox_profile, 0) + 1
+            )
+    return PluginPolicyReviewResponse(
+        plugin_count=len(summaries),
+        capability_count=capability_count,
+        policy_effect_counts=dict(sorted(policy_effect_counts.items())),
+        permission_class_counts=dict(sorted(permission_class_counts.items())),
+        sandbox_profile_counts=dict(sorted(sandbox_profile_counts.items())),
+        plugins=summaries,
+    )
+
+
+def _plugin_policy_review_audit_details(
+    review: PluginPolicyReviewResponse,
+) -> dict[str, object]:
+    details: dict[str, object] = {
+        "plugin_count": review.plugin_count,
+        "capability_count": review.capability_count,
+        "policy_effects": _sorted_csv(review.policy_effect_counts),
+        "permission_classes": _sorted_csv(review.permission_class_counts),
+        "sandbox_profiles": _sorted_csv(review.sandbox_profile_counts),
+    }
+    for effect in ("allow", "deny", "inherit", "require_approval"):
+        count = review.policy_effect_counts.get(effect)
+        if count:
+            details[f"{effect}_count"] = count
+    return details
 
 
 def _safe_plugin_config_key_summary(config: Mapping[str, JsonValue]) -> tuple[tuple[str, ...], int]:
@@ -10447,6 +10507,29 @@ async def list_plugin_policy_summary(
         _plugin_policy_summary(plugin)
         for plugin in await service.list_plugins(tenant_id=principal.tenant_id)
     ]
+
+
+@router.post(
+    "/plugins/policy-review",
+    response_model=PluginPolicyReviewResponse,
+    responses=error_responses(401, 403, 422),
+)
+async def review_plugin_policy(
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> PluginPolicyReviewResponse:
+    _require(principal, "plugin:read")
+    review = _plugin_policy_review(
+        await service.list_plugins(tenant_id=principal.tenant_id)
+    )
+    await service.record_audit_event(
+        actor=str(principal.user_id),
+        action="plugin.policy_review",
+        resource="plugin:policy",
+        tenant_id=principal.tenant_id,
+        details=_plugin_policy_review_audit_details(review),
+    )
+    return review
 
 
 @router.post(
