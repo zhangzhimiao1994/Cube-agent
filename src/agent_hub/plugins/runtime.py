@@ -244,6 +244,10 @@ class RuntimePluginService:
             adapter = self._adapters.get(capability.adapter)
             if adapter is None:
                 raise RuntimeCapabilityError("Plugin backend unavailable")
+            argument_validator = _plugin_schema_validator(
+                schema=_adapter_argument_schema(capability.adapter, adapter),
+                invalid_schema_message="Plugin adapter argument schema is invalid",
+            )
             input_validator = _plugin_schema_validator(
                 schema=capability.input_schema,
                 invalid_schema_message="Plugin input schema is invalid",
@@ -251,6 +255,12 @@ class RuntimePluginService:
             output_validator = _plugin_schema_validator(
                 schema=capability.output_schema,
                 invalid_schema_message="Plugin output schema is invalid",
+            )
+            _validate_plugin_payload(
+                payload=arguments,
+                validator=argument_validator,
+                validation_message="Plugin arguments do not match adapter schema",
+                include_location=True,
             )
             _validate_plugin_payload(
                 payload=arguments,
@@ -446,6 +456,16 @@ def _adapter_descriptor(adapter_id: str, adapter: PluginAdapter) -> Mapping[str,
             "additionalProperties": True,
         },
     }
+
+
+def _adapter_argument_schema(
+    adapter_id: str,
+    adapter: PluginAdapter,
+) -> Mapping[str, JsonValue] | None:
+    argument_schema = _adapter_descriptor(adapter_id, adapter).get("argument_schema")
+    if isinstance(argument_schema, Mapping):
+        return argument_schema
+    return None
 
 
 def _http_json_adapter_descriptor() -> Mapping[str, JsonValue]:

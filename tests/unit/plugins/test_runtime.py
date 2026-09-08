@@ -58,6 +58,7 @@ class FakeAdminService:
 class RecordingPluginAdapter:
     calls: list[tuple[str, str, Mapping[str, JsonValue], PluginInvocationContext]]
     result: Mapping[str, JsonValue] | None = None
+    descriptor_payload: Mapping[str, JsonValue] | None = None
 
     async def invoke(
         self,
@@ -74,6 +75,18 @@ class RecordingPluginAdapter:
             "ok": True,
             "plugin_id": plugin.id,
             "capability_id": capability.id,
+        }
+
+    def descriptor(self) -> Mapping[str, JsonValue]:
+        if self.descriptor_payload is not None:
+            return self.descriptor_payload
+        return {
+            "id": "plugin_runtime",
+            "name": "Plugin Runtime",
+            "description": None,
+            "resource_schema": {"type": "object", "additionalProperties": True},
+            "capability_schema": {"type": "object", "additionalProperties": True},
+            "argument_schema": {"type": "object", "additionalProperties": True},
         }
 
 
@@ -697,6 +710,89 @@ async def test_runtime_plugin_service_rejects_arguments_that_violate_input_schem
 
     assert adapter.calls == []
     assert "do-not-leak" not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+async def test_runtime_plugin_service_rejects_arguments_that_violate_adapter_argument_schema() -> None:
+    adapter = RecordingPluginAdapter(
+        [],
+        descriptor_payload={
+            "id": "plugin_runtime",
+            "name": "Plugin Runtime",
+            "description": None,
+            "resource_schema": {"type": "object", "additionalProperties": True},
+            "capability_schema": {"type": "object", "additionalProperties": True},
+            "argument_schema": {
+                "type": "object",
+                "required": ("query",),
+                "properties": {"query": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        },
+    )
+    admin_service = FakeAdminService((plugin("calendar"),))
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=admin_service,
+        adapters={"plugin_runtime": adapter},
+    )
+
+    with pytest.raises(
+        RuntimeCapabilityError,
+        match="Plugin arguments do not match adapter schema",
+    ) as exc_info:
+        await service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="scheduler",
+            name="calendar.create_event",
+            arguments={"title": "review", "secret": "do-not-leak"},
+            idempotency_key="plugin_1",
+        )
+
+    assert adapter.calls == []
+    assert "do-not-leak" not in str(exc_info.value)
+    assert admin_service.audit_events[0]["action"] == "plugin.invoke.failed"
+
+
+async def test_runtime_plugin_service_rejects_invalid_adapter_argument_schema_before_execution() -> None:
+    adapter = RecordingPluginAdapter(
+        [],
+        descriptor_payload={
+            "id": "plugin_runtime",
+            "name": "Plugin Runtime",
+            "description": None,
+            "resource_schema": {"type": "object", "additionalProperties": True},
+            "capability_schema": {"type": "object", "additionalProperties": True},
+            "argument_schema": {
+                "type": "object",
+                "properties": {"query": {"$ref": "#/$defs/query"}},
+            },
+        },
+    )
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService((plugin("calendar"),)),
+        adapters={"plugin_runtime": adapter},
+    )
+
+    with pytest.raises(
+        RuntimeCapabilityError,
+        match="Plugin adapter argument schema is invalid",
+    ) as exc_info:
+        await service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="scheduler",
+            name="calendar.create_event",
+            arguments={"query": "review"},
+            idempotency_key="plugin_1",
+        )
+
+    assert adapter.calls == []
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
 
