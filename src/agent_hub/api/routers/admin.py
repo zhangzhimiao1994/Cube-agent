@@ -613,6 +613,49 @@ class PluginResourceResponse(PluginResourceRequest):
     last_error_type: str | None = Field(default=None, max_length=128)
 
 
+class PluginPolicyCapabilitySummaryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    adapter: str
+    permission_class: str
+    sandbox_profile: str
+    policy_effect: Literal["inherit", "allow", "require_approval", "deny"]
+    replay_safe: bool
+    aliases: list[str] = Field(default_factory=list, max_length=128)
+    input_schema_declared: bool
+    output_schema_declared: bool
+    capability_config_key_count: int
+    capability_config_keys: list[str] = Field(default_factory=list, max_length=128)
+    redacted_capability_config_key_count: int
+
+
+class PluginPolicySummaryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    name: str
+    version: str
+    enabled: bool
+    status: str
+    health: str
+    capability_count: int
+    adapters: list[str] = Field(default_factory=list, max_length=256)
+    permission_classes: list[str] = Field(default_factory=list, max_length=256)
+    policy_effects: list[Literal["inherit", "allow", "require_approval", "deny"]] = Field(
+        default_factory=list,
+        max_length=4,
+    )
+    sandbox_profiles: list[str] = Field(default_factory=list, max_length=256)
+    resource_config_key_count: int
+    resource_config_keys: list[str] = Field(default_factory=list, max_length=128)
+    redacted_resource_config_key_count: int
+    capabilities: list[PluginPolicyCapabilitySummaryResponse] = Field(
+        default_factory=list,
+        max_length=256,
+    )
+
+
 class PluginAdapterDescriptorResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -2973,9 +3016,65 @@ def _plugin_upsert_audit_details(plugin: PluginResourceResponse) -> dict[str, ob
     }
 
 
+def _plugin_policy_summary(plugin: PluginResourceResponse) -> PluginPolicySummaryResponse:
+    resource_config_keys, redacted_resource_config_keys = _safe_plugin_config_key_summary(
+        plugin.resource_config
+    )
+    capabilities = [
+        _plugin_policy_capability_summary(capability) for capability in plugin.capabilities
+    ]
+    return PluginPolicySummaryResponse(
+        id=plugin.id,
+        name=plugin.name,
+        version=plugin.version,
+        enabled=plugin.enabled,
+        status=plugin.status,
+        health=plugin.health,
+        capability_count=len(plugin.capabilities),
+        adapters=sorted({capability.adapter for capability in plugin.capabilities}),
+        permission_classes=sorted(
+            {capability.permission_class for capability in plugin.capabilities}
+        ),
+        policy_effects=sorted({capability.policy_effect for capability in plugin.capabilities}),
+        sandbox_profiles=sorted(
+            {capability.sandbox_profile for capability in plugin.capabilities}
+        ),
+        resource_config_key_count=len(plugin.resource_config),
+        resource_config_keys=list(resource_config_keys),
+        redacted_resource_config_key_count=redacted_resource_config_keys,
+        capabilities=capabilities,
+    )
+
+
+def _plugin_policy_capability_summary(
+    capability: PluginCapabilityRequest,
+) -> PluginPolicyCapabilitySummaryResponse:
+    capability_config_keys, redacted_capability_config_keys = _safe_plugin_config_key_summary(
+        capability.capability_config
+    )
+    return PluginPolicyCapabilitySummaryResponse(
+        id=capability.id,
+        adapter=capability.adapter,
+        permission_class=capability.permission_class,
+        sandbox_profile=capability.sandbox_profile,
+        policy_effect=capability.policy_effect,
+        replay_safe=capability.replay_safe,
+        aliases=capability.aliases,
+        input_schema_declared=capability.input_schema is not None,
+        output_schema_declared=capability.output_schema is not None,
+        capability_config_key_count=len(capability.capability_config),
+        capability_config_keys=list(capability_config_keys),
+        redacted_capability_config_key_count=redacted_capability_config_keys,
+    )
+
+
 def _safe_plugin_config_key_summary(config: Mapping[str, JsonValue]) -> tuple[tuple[str, ...], int]:
     keys = sorted(str(key) for key in config)
-    safe_keys = tuple(key for key in keys if not _contains_sensitive_marker(key))
+    safe_keys = tuple(
+        key
+        for key in keys
+        if not _contains_sensitive_marker(key) and not _is_sensitive_event_detail_key(key)
+    )
     return safe_keys, len(keys) - len(safe_keys)
 
 
@@ -10086,6 +10185,19 @@ async def list_plugins(
 ) -> list[PluginResourceResponse]:
     _require(principal, "plugin:read")
     return list(await service.list_plugins())
+
+
+@router.get(
+    "/plugins/policy-summary",
+    response_model=list[PluginPolicySummaryResponse],
+    responses=error_responses(401, 403, 422),
+)
+async def list_plugin_policy_summary(
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> list[PluginPolicySummaryResponse]:
+    _require(principal, "plugin:read")
+    return [_plugin_policy_summary(plugin) for plugin in await service.list_plugins()]
 
 
 @router.post(

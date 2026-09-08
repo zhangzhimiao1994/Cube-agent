@@ -2692,6 +2692,7 @@ async def test_persistent_admin_plugin_upsert_audit_records_safe_policy_summary(
             resource_config={
                 "base_url": "https://search.internal",
                 "secret_token": "do-not-leak",
+                "token": "also-do-not-leak",
             },
             capabilities=[
                 PluginCapabilityRequest(
@@ -2701,6 +2702,7 @@ async def test_persistent_admin_plugin_upsert_audit_records_safe_policy_summary(
                     sandbox_profile="remote_connector",
                     policy_effect="require_approval",
                     capability_config={
+                        "credential": "capability-do-not-leak",
                         "mode": "semantic",
                         "api_key": "sk-do-not-leak",
                     },
@@ -2720,16 +2722,20 @@ async def test_persistent_admin_plugin_upsert_audit_records_safe_policy_summary(
     assert details["permission_classes"] == "network.read"
     assert details["policy_effects"] == "require_approval"
     assert details["sandbox_profiles"] == "remote_connector"
-    assert details["resource_config_key_count"] == "2"
+    assert details["resource_config_key_count"] == "3"
     assert details["resource_config_keys"] == "base_url"
-    assert details["redacted_resource_config_key_count"] == "1"
-    assert details["capability_config_key_count"] == "2"
+    assert details["redacted_resource_config_key_count"] == "2"
+    assert details["capability_config_key_count"] == "3"
     assert details["capability_config_keys"] == "mode"
-    assert details["redacted_capability_config_key_count"] == "1"
+    assert details["redacted_capability_config_key_count"] == "2"
     assert "do-not-leak" not in repr(details)
     assert "sk-do-not-leak" not in repr(details)
+    assert "also-do-not-leak" not in repr(details)
+    assert "capability-do-not-leak" not in repr(details)
     assert "secret_token" not in repr(details)
     assert "api_key" not in repr(details)
+    assert "token" not in repr(details)
+    assert "credential" not in repr(details)
 
 
 def test_plugin_admin_api_exposes_running_plugin_capabilities_in_manifest() -> None:
@@ -2774,6 +2780,117 @@ def test_plugin_admin_api_exposes_running_plugin_capabilities_in_manifest() -> N
         "input_schema": None,
         "output_schema": None,
     }
+
+
+def test_plugin_admin_api_exposes_safe_plugin_policy_summary() -> None:
+    api = client()
+
+    class PluginServiceWithPolicyDescriptor:
+        def adapter_descriptors(self) -> tuple[dict[str, object], ...]:
+            return (
+                {
+                    "id": "http_json",
+                    "name": "HTTP JSON",
+                    "description": "Accepts descriptor-owned policy test config.",
+                    "resource_schema": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    },
+                    "capability_schema": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    },
+                    "argument_schema": {"type": "object", "additionalProperties": True},
+                },
+            )
+
+    cast(Any, api.app).state.plugin_service = PluginServiceWithPolicyDescriptor()
+
+    created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "search",
+            "name": "Search Plugin",
+            "version": "2026.09",
+            "resource_config": {
+                "base_url": "https://search.internal",
+                "secret_token": "do-not-leak",
+                "token": "also-do-not-leak",
+            },
+            "capabilities": [
+                {
+                    "id": "search.web",
+                    "adapter": "http_json",
+                    "permission_class": "network.read",
+                    "sandbox_profile": "remote_connector",
+                    "policy_effect": "require_approval",
+                    "replay_safe": True,
+                    "aliases": ["search_web"],
+                    "capability_config": {
+                        "credential": "capability-do-not-leak",
+                        "mode": "semantic",
+                        "api_key": "sk-do-not-leak",
+                    },
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                    "output_schema": {
+                        "type": "object",
+                        "properties": {"results": {"type": "array"}},
+                    },
+                }
+            ],
+        },
+    )
+
+    summary = api.get("/api/v1/admin/plugins/policy-summary", headers=headers())
+
+    assert created.status_code == 200
+    assert summary.status_code == 200
+    assert summary.json() == [
+        {
+            "id": "search",
+            "name": "Search Plugin",
+            "version": "2026.09",
+            "enabled": True,
+            "status": "stopped",
+            "health": "stopped",
+            "capability_count": 1,
+            "adapters": ["http_json"],
+            "permission_classes": ["network.read"],
+            "policy_effects": ["require_approval"],
+            "sandbox_profiles": ["remote_connector"],
+            "resource_config_key_count": 3,
+            "resource_config_keys": ["base_url"],
+            "redacted_resource_config_key_count": 2,
+            "capabilities": [
+                {
+                    "id": "search.web",
+                    "adapter": "http_json",
+                    "permission_class": "network.read",
+                    "sandbox_profile": "remote_connector",
+                    "policy_effect": "require_approval",
+                    "replay_safe": True,
+                    "aliases": ["search_web"],
+                    "input_schema_declared": True,
+                    "output_schema_declared": True,
+                    "capability_config_key_count": 3,
+                    "capability_config_keys": ["mode"],
+                    "redacted_capability_config_key_count": 2,
+                }
+            ],
+        }
+    ]
+    assert "do-not-leak" not in summary.text
+    assert "sk-do-not-leak" not in summary.text
+    assert "also-do-not-leak" not in summary.text
+    assert "capability-do-not-leak" not in summary.text
+    assert "secret_token" not in summary.text
+    assert "api_key" not in summary.text
+    assert "token" not in summary.text
+    assert "credential" not in summary.text
 
 
 def test_plugin_admin_api_validates_descriptor_resource_config() -> None:
