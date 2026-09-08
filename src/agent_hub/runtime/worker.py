@@ -7,7 +7,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 from uuid import UUID
 
 from redis.asyncio import Redis
@@ -25,6 +25,7 @@ from agent_hub.plugins.runtime import RuntimePluginService
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import RunService
 from agent_hub.runtime.defaults import configured_runtime_registry
+from agent_hub.runtime.invalidation import RuntimeConfigInvalidationBus
 from agent_hub.security.secrets import SecretCipher, SecretService
 from agent_hub.settings import Settings, get_settings
 
@@ -84,6 +85,33 @@ def _admin_settings_getter_for_tenant(
         )
         return scoped.get_settings
     return service.get_settings
+
+
+async def _run_runtime_config_invalidation_listener(
+    bus: RuntimeConfigInvalidationBus,
+    *,
+    mcp_runtime: object,
+    plugin_runtime: object,
+) -> None:
+    try:
+        await bus.listen(
+            mcp_runtime=cast(Any, mcp_runtime),
+            plugin_runtime=cast(Any, plugin_runtime),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:  # noqa: BLE001 - worker keeps polling as fallback.
+        _LOGGER.warning(
+            "run_worker_runtime_config_invalidation_listener_stopped error_type=%s",
+            type(error).__name__,
+        )
+
+
+async def _cancel_background_task(task: asyncio.Task[object] | None) -> None:
+    if task is None:
+        return
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
 
 
 class LocalRunQueue:
@@ -314,9 +342,20 @@ async def _run() -> None:
             pass
 
     resources = build_worker_service(get_settings())
+    invalidation_task: asyncio.Task[object] | None = None
     try:
         await resources.runtime_mcp_service.start()
         await resources.runtime_plugin_service.start()
+        invalidation_task = cast(
+            asyncio.Task[object],
+            asyncio.create_task(
+                _run_runtime_config_invalidation_listener(
+                    RuntimeConfigInvalidationBus(cast(Any, resources.redis_client)),
+                    mcp_runtime=resources.runtime_mcp_service,
+                    plugin_runtime=resources.runtime_plugin_service,
+                )
+            ),
+        )
         await run_worker_loop(
             resources.service,
             resources.queue,
@@ -325,6 +364,7 @@ async def _run() -> None:
             plugin_runtime=resources.runtime_plugin_service,
         )
     finally:
+        await _cancel_background_task(invalidation_task)
         await resources.redis_client.aclose()
         await resources.database.dispose()
 

@@ -4,7 +4,7 @@ import threading
 from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Self, cast
+from typing import Any, ClassVar, Self, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -559,6 +559,97 @@ def test_create_app_wires_runtime_mcp_and_plugin_manifest_sources(
     assert getattr(application.state, "plugin_service", None) is not None
     assert callable(getattr(application.state, "reload_mcp_runtime_config", None))
     assert callable(getattr(application.state, "reload_plugin_runtime_config", None))
+
+
+def test_create_app_publishes_runtime_invalidation_after_admin_reload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {"mcp_reloads": [], "plugin_reloads": []}
+
+    class FakeInvalidationBus:
+        instances: ClassVar[list["FakeInvalidationBus"]] = []
+
+        def __init__(self, redis_client: object) -> None:
+            self.redis_client = redis_client
+            self.published: list[tuple[UUID, str]] = []
+            self.listen_kwargs: dict[str, object] | None = None
+            FakeInvalidationBus.instances.append(self)
+
+        async def publish(self, tenant_id: UUID, target: object) -> None:
+            self.published.append((tenant_id, str(target)))
+
+        async def listen(self, **kwargs: object) -> None:
+            self.listen_kwargs = dict(kwargs)
+            await asyncio.Event().wait()
+
+    class FakeMcpService:
+        async def reload(self, tenant_id: UUID | None = None) -> None:
+            cast(list[UUID | None], captured["mcp_reloads"]).append(tenant_id)
+
+        def capability_manifest_source(self) -> object:
+            return object()
+
+    class FakePluginService:
+        async def reload(self, tenant_id: UUID | None = None) -> None:
+            cast(list[UUID | None], captured["plugin_reloads"]).append(tenant_id)
+
+        def capability_manifest_source(self) -> object:
+            return object()
+
+    class FakeRuntimeStack:
+        runtime_gateway = object()
+        harness_tool_gateway = object()
+
+    async def fake_build_runtime_mcp_service(**kwargs: object) -> FakeMcpService:
+        del kwargs
+        return FakeMcpService()
+
+    async def fake_build_runtime_plugin_service(**kwargs: object) -> FakePluginService:
+        del kwargs
+        return FakePluginService()
+
+    monkeypatch.setattr(app_module, "RuntimeConfigInvalidationBus", FakeInvalidationBus)
+    monkeypatch.setattr(
+        app_module,
+        "build_runtime_mcp_service",
+        fake_build_runtime_mcp_service,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "build_runtime_plugin_service",
+        fake_build_runtime_plugin_service,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "build_runtime_capability_stack",
+        lambda **kwargs: FakeRuntimeStack(),
+    )
+    monkeypatch.setattr(app_module, "configured_runtime_registry", lambda **kwargs: object())
+
+    application = create_app(
+        settings=valid_settings(tmp_path),
+        database=FakeDatabase(),
+        redis_client=FakeRedis(),
+        auth_service=StubAuthService(),
+        rate_limiter=StubRateLimiter(),
+        config_service=StubConfigService(),
+        admin_resource_service=InMemoryAdminResourceService(),
+        user_admin_service=object(),
+    )
+
+    with TestClient(application):
+        asyncio.run(application.state.reload_mcp_runtime_config(OTHER_TENANT_ID))
+        asyncio.run(application.state.reload_plugin_runtime_config(OTHER_TENANT_ID))
+
+    bus = FakeInvalidationBus.instances[0]
+    assert captured["mcp_reloads"] == [OTHER_TENANT_ID]
+    assert captured["plugin_reloads"] == [OTHER_TENANT_ID]
+    assert bus.published == [(OTHER_TENANT_ID, "mcp"), (OTHER_TENANT_ID, "plugin")]
+    assert bus.listen_kwargs == {
+        "mcp_runtime": application.state.mcp_service,
+        "plugin_runtime": application.state.plugin_service,
+    }
 
 
 def test_create_app_reads_tool_approval_settings_for_target_tenant(

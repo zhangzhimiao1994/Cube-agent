@@ -113,6 +113,10 @@ from agent_hub.runs.service import (
 )
 from agent_hub.runs.temporary_agents import AdminResourceTemporaryAgentPolicy
 from agent_hub.runtime.defaults import TenantSecretResolver, configured_runtime_registry
+from agent_hub.runtime.invalidation import (
+    RuntimeConfigInvalidationBus,
+    RuntimeConfigInvalidationTarget,
+)
 from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.scheduler.service import SchedulerService
 from agent_hub.scheduler.types import TaskRequest
@@ -121,6 +125,7 @@ from agent_hub.settings import Settings, get_settings
 
 ReadinessProbe = Callable[[], Awaitable[None]]
 CleanupCallback = tuple[str, Callable[[], Awaitable[None]]]
+RuntimeReloadCallback = Callable[[UUID | None], Awaitable[None]]
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -710,6 +715,46 @@ class InProcessRunQueue:
         self.enqueued.append((run_id, idempotency_key))
 
 
+def _runtime_reload_with_invalidation(
+    reload_config: RuntimeReloadCallback,
+    bus: RuntimeConfigInvalidationBus,
+    target: RuntimeConfigInvalidationTarget,
+) -> RuntimeReloadCallback:
+    async def reload_and_publish(tenant_id: UUID | None = None) -> None:
+        await reload_config(tenant_id)
+        if tenant_id is not None:
+            await bus.publish(tenant_id, target)
+
+    return reload_and_publish
+
+
+async def _run_runtime_config_invalidation_listener(
+    bus: RuntimeConfigInvalidationBus,
+    *,
+    mcp_runtime: object,
+    plugin_runtime: object,
+) -> None:
+    try:
+        await bus.listen(
+            mcp_runtime=cast(Any, mcp_runtime),
+            plugin_runtime=cast(Any, plugin_runtime),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:  # noqa: BLE001 - background listener must fail closed.
+        _LOGGER.warning(
+            "runtime_config_invalidation_listener_stopped error_type=%s",
+            type(error).__name__,
+        )
+
+
+def _task_cleanup_callback(task: asyncio.Task[object]) -> Callable[[], Awaitable[None]]:
+    async def cleanup() -> None:
+        await _cancel_background_tasks({task})
+
+    return cleanup
+
+
 async def _cleanup_owned_resources(
     cleanup_callbacks: list[CleanupCallback],
     *,
@@ -894,10 +939,20 @@ def create_app(
                         run_repository=capability_run_repository,
                     )
                     application.state.mcp_service = runtime_mcp_service
+                    runtime_config_invalidation_bus = RuntimeConfigInvalidationBus(
+                        cast(Any, active_redis)
+                    )
+                    application.state.runtime_config_invalidation_bus = (
+                        runtime_config_invalidation_bus
+                    )
                     reload_mcp_runtime_config = getattr(runtime_mcp_service, "reload", None)
                     if callable(reload_mcp_runtime_config):
                         application.state.reload_mcp_runtime_config = (
-                            reload_mcp_runtime_config
+                            _runtime_reload_with_invalidation(
+                                cast(RuntimeReloadCallback, reload_mcp_runtime_config),
+                                runtime_config_invalidation_bus,
+                                RuntimeConfigInvalidationTarget.MCP,
+                            )
                         )
                     runtime_plugin_service = await build_runtime_plugin_service(
                         tenant_id=configured.bootstrap_tenant_id,
@@ -911,8 +966,30 @@ def create_app(
                     )
                     if callable(reload_plugin_runtime_config):
                         application.state.reload_plugin_runtime_config = (
-                            reload_plugin_runtime_config
+                            _runtime_reload_with_invalidation(
+                                cast(RuntimeReloadCallback, reload_plugin_runtime_config),
+                                runtime_config_invalidation_bus,
+                                RuntimeConfigInvalidationTarget.PLUGIN,
+                            )
                         )
+                    runtime_config_invalidation_task = asyncio.create_task(
+                        _run_runtime_config_invalidation_listener(
+                            runtime_config_invalidation_bus,
+                            mcp_runtime=runtime_mcp_service,
+                            plugin_runtime=runtime_plugin_service,
+                        )
+                    )
+                    application.state.runtime_config_invalidation_task = (
+                        runtime_config_invalidation_task
+                    )
+                    cleanup_callbacks.append(
+                        (
+                            "runtime_config_invalidation_listener",
+                            _task_cleanup_callback(
+                                cast(asyncio.Task[object], runtime_config_invalidation_task)
+                            ),
+                        )
+                    )
                     runtime_capability_stack = build_runtime_capability_stack(
                         tenant_id=configured.bootstrap_tenant_id,
                         run_repository=capability_run_repository,
@@ -1117,6 +1194,8 @@ def create_app(
     application.state.run_service = run_service
     application.state.runtime_registry = active_runtime_registry
     application.state.runtime_capability_gateway = None
+    application.state.runtime_config_invalidation_bus = None
+    application.state.runtime_config_invalidation_task = None
     application.state.mode_router = mode_router
     application.state.run_queue = task_queue
     application.state.schedule_service = None

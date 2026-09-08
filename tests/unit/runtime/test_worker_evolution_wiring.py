@@ -235,6 +235,36 @@ def test_worker_runtime_stack_reads_tool_approval_settings_for_target_tenant(
     assert asyncio.run(approval_mode(OTHER_TENANT_ID)) == "auto_review"
 
 
+def test_worker_runtime_invalidation_listener_uses_mcp_and_plugin_runtimes() -> None:
+    class FakeBus:
+        def __init__(self) -> None:
+            self.kwargs: dict[str, object] | None = None
+
+        async def listen(self, **kwargs: object) -> None:
+            self.kwargs = dict(kwargs)
+
+    class Runtime:
+        async def reload(self, tenant_id: UUID | None = None) -> None:
+            del tenant_id
+
+    bus = FakeBus()
+    mcp_runtime = Runtime()
+    plugin_runtime = Runtime()
+
+    asyncio.run(
+        worker._run_runtime_config_invalidation_listener(
+            cast(Any, bus),
+            mcp_runtime=cast(Any, mcp_runtime),
+            plugin_runtime=cast(Any, plugin_runtime),
+        )
+    )
+
+    assert bus.kwargs == {
+        "mcp_runtime": mcp_runtime,
+        "plugin_runtime": plugin_runtime,
+    }
+
+
 def test_worker_builds_evolution_terminal_hook(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
     captured: dict[str, object] = {}
 
