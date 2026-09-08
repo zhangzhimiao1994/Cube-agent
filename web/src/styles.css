@@ -890,6 +890,23 @@ article:hover {
   color: var(--muted);
 }
 
+.plugin-signing-key-layout {
+  grid-template-columns: minmax(240px, 0.56fr) minmax(520px, 1fr);
+}
+
+.plugin-signing-key-layout > * {
+  min-width: 0;
+}
+
+.plugin-signing-key-table-shell table {
+  min-width: 560px;
+}
+
+.monospace-cell {
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
 .detail-list {
   display: grid;
   gap: 0.75rem;

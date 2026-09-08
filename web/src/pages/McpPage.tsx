@@ -9,6 +9,7 @@ import {
   type PluginAdapterDescriptor,
   type PluginCapability,
   type PluginResource,
+  type PluginSigningKey,
 } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
 
@@ -481,6 +482,17 @@ export function McpPage() {
     queryFn: () => api.pluginAdapters(),
     enabled: canReadCapabilityManifest,
   });
+  const pluginSigningKeys = useQuery({
+    queryKey: [
+      "plugin-signing-keys",
+      auth.user?.tenant_id,
+      auth.user?.user_id,
+      auth.user?.role,
+      canReadCapabilityManifest,
+    ],
+    queryFn: () => api.pluginSigningKeys(),
+    enabled: canReadCapabilityManifest,
+  });
   const capabilityManifest = useQuery({
     queryKey: [
       "capability-manifest",
@@ -521,12 +533,19 @@ export function McpPage() {
   ]);
   const [pluginArchiveFile, setPluginArchiveFile] = useState<File | null>(null);
   const [pluginMessage, setPluginMessage] = useState<string | null>(null);
+  const [signingKeyId, setSigningKeyId] = useState("calendar-prod");
+  const [signingKeyPublicKey, setSigningKeyPublicKey] = useState("");
+  const [signingKeyMessage, setSigningKeyMessage] = useState<string | null>(null);
 
   async function refreshPluginSurfaces() {
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ["plugins"] }),
       queryClient.invalidateQueries({ queryKey: ["capability-manifest"] }),
     ]);
+  }
+
+  async function refreshSigningKeys() {
+    await queryClient.invalidateQueries({ queryKey: ["plugin-signing-keys"] });
   }
 
   const saveServer = useMutation({
@@ -645,6 +664,26 @@ export function McpPage() {
       await refreshPluginSurfaces();
     },
   });
+  const saveSigningKey = useMutation({
+    mutationFn: () =>
+      api.upsertPluginSigningKey({
+        key_id: signingKeyId.trim(),
+        algorithm: "ed25519",
+        public_key: signingKeyPublicKey.trim(),
+      }),
+    onSuccess: async () => {
+      setSigningKeyPublicKey("");
+      setSigningKeyMessage("签名 Key 已保存。");
+      await refreshSigningKeys();
+    },
+  });
+  const deleteSigningKey = useMutation({
+    mutationFn: (key: PluginSigningKey) => api.deletePluginSigningKey(key.key_id),
+    onSuccess: async () => {
+      setSigningKeyMessage("签名 Key 已删除。");
+      await refreshSigningKeys();
+    },
+  });
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -656,6 +695,12 @@ export function McpPage() {
     event.preventDefault();
     setPluginMessage(null);
     savePlugin.mutate();
+  }
+
+  function submitSigningKey(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSigningKeyMessage(null);
+    saveSigningKey.mutate();
   }
 
   function edit(server: McpServer) {
@@ -740,6 +785,11 @@ export function McpPage() {
     pluginLifecycle.mutate({ id: plugin.id, action: "delete" });
   }
 
+  function confirmSigningKeyDelete(key: PluginSigningKey) {
+    if (!window.confirm(`确定删除签名 Key「${key.key_id}」吗？后续同 key_id 的插件包不会再被标记为 verified。`)) return;
+    deleteSigningKey.mutate(key);
+  }
+
   if (servers.isLoading) return <p>正在加载 MCP 工具...</p>;
   if (servers.isError) {
     return <p role="alert">{formatApiError(servers.error, "MCP 工具加载失败")}</p>;
@@ -748,6 +798,7 @@ export function McpPage() {
   const items = servers.data ?? [];
   const pluginItems = canReadCapabilityManifest ? plugins.data ?? [] : [];
   const adapterItems = canReadCapabilityManifest ? pluginAdapters.data ?? [] : [];
+  const signingKeyItems = canReadCapabilityManifest ? pluginSigningKeys.data ?? [] : [];
   const adapterById = new Map(adapterItems.map((adapter) => [adapter.id, adapter]));
   const pluginResourceAdapterIds = Array.from(
     new Set(pluginCapabilities.map((capability) => capability.adapter).filter(Boolean)),
@@ -853,6 +904,93 @@ export function McpPage() {
             </table>
           </div>
         ) : null}
+      </section>
+
+      <section aria-label="可信插件签名 Key">
+        <h3>可信插件签名 Key</h3>
+        {!canReadCapabilityManifest ? <p className="field-help">当前账号无权查看插件签名 Key。</p> : null}
+        {pluginSigningKeys.isLoading ? <p>正在加载插件签名 Key...</p> : null}
+        {pluginSigningKeys.isError ? (
+          <p role="alert">{formatApiError(pluginSigningKeys.error, "插件签名 Key 加载失败")}</p>
+        ) : null}
+        <div className="two-column plugin-signing-key-layout">
+          <form onSubmit={submitSigningKey} aria-label="保存签名 Key">
+            <label htmlFor="plugin-signing-key-id">签名 Key ID</label>
+            <input
+              id="plugin-signing-key-id"
+              value={signingKeyId}
+              onChange={(event) => setSigningKeyId(event.target.value)}
+              placeholder="calendar-prod"
+              required
+            />
+
+            <label htmlFor="plugin-signing-public-key">Ed25519 Public Key</label>
+            <input
+              id="plugin-signing-public-key"
+              value={signingKeyPublicKey}
+              onChange={(event) => setSigningKeyPublicKey(event.target.value)}
+              placeholder="43 字符 base64url"
+              required
+              maxLength={43}
+            />
+
+            <button type="submit" disabled={saveSigningKey.isPending || !canWritePlugins}>
+              {saveSigningKey.isPending ? "正在保存..." : "保存签名 Key"}
+            </button>
+            {!canWritePlugins ? <p className="field-help">当前账号无权保存插件签名 Key。</p> : null}
+            {signingKeyMessage ? <p role="status">{signingKeyMessage}</p> : null}
+            {saveSigningKey.isError ? (
+              <p role="alert">{formatApiError(saveSigningKey.error, "签名 Key 保存失败")}</p>
+            ) : null}
+            {deleteSigningKey.isError ? (
+              <p role="alert">{formatApiError(deleteSigningKey.error, "签名 Key 删除失败")}</p>
+            ) : null}
+          </form>
+
+          <div>
+            {canReadCapabilityManifest && signingKeyItems.length === 0 ? (
+              <article>
+                <h4>还没有可信签名 Key</h4>
+              </article>
+            ) : null}
+            {signingKeyItems.length > 0 ? (
+              <div className="table-shell plugin-signing-key-table-shell">
+                <table aria-label="可信插件签名 Key" className="dense-table">
+                  <thead>
+                    <tr>
+                      <th>Key ID</th>
+                      <th>算法</th>
+                      <th>状态</th>
+                      <th>Public Key</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {signingKeyItems.map((key) => (
+                      <tr key={key.key_id}>
+                        <td><strong>{key.key_id}</strong></td>
+                        <td>{key.algorithm}</td>
+                        <td>{key.trusted ? "trusted" : "untrusted"}</td>
+                        <td className="monospace-cell">{key.public_key}</td>
+                        <td>
+                          <button
+                            type="button"
+                            className="danger-action"
+                            disabled={deleteSigningKey.isPending || !canWritePlugins}
+                            onClick={() => confirmSigningKeyDelete(key)}
+                            aria-label={`删除签名 Key ${key.key_id}`}
+                          >
+                            删除
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : null}
+          </div>
+        </div>
       </section>
 
       <div className="two-column">

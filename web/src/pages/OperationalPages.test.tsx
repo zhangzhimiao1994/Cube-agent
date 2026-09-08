@@ -9,6 +9,7 @@ import type {
   EvolutionRun,
   PluginAdapterDescriptor,
   PluginResource,
+  PluginSigningKey,
   RunDetail,
   RunListItem,
 } from "../api/client";
@@ -552,6 +553,15 @@ const pluginAdapterDescriptors: PluginAdapterDescriptor[] = [
   },
 ];
 
+const pluginSigningKeys: PluginSigningKey[] = [
+  {
+    key_id: "calendar-prod",
+    algorithm: "ed25519",
+    public_key: "A".repeat(43),
+    trusted: true,
+  },
+];
+
 function jsonResponse(payload: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(payload), {
     status: 200,
@@ -581,6 +591,7 @@ describe("operational management pages", () => {
   let visibleCapabilityManifest = capabilityManifest;
   let visiblePlugins: PluginResource[] = [calendarPlugin];
   let visiblePluginAdapterDescriptors = pluginAdapterDescriptors;
+  let visiblePluginSigningKeys = pluginSigningKeys;
   let failCapabilityManifest = false;
   let currentPrincipalRole = "super_admin";
   let visibleWorkspaceFiles = {
@@ -614,6 +625,7 @@ describe("operational management pages", () => {
     visibleCapabilityManifest = capabilityManifest;
     visiblePlugins = [calendarPlugin];
     visiblePluginAdapterDescriptors = pluginAdapterDescriptors;
+    visiblePluginSigningKeys = pluginSigningKeys;
     failCapabilityManifest = false;
     currentPrincipalRole = "super_admin";
     visibleWorkspaceFiles = {
@@ -1292,6 +1304,19 @@ describe("operational management pages", () => {
         }
         if (path === "/api/v1/admin/plugins/adapters" && method === "GET") {
           return jsonResponse(visiblePluginAdapterDescriptors);
+        }
+        if (path === "/api/v1/admin/plugins/signing-keys" && method === "GET") {
+          return jsonResponse(visiblePluginSigningKeys);
+        }
+        if (path === "/api/v1/admin/plugins/signing-keys" && method === "POST") {
+          const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
+          const saved = { ...body, trusted: true };
+          visiblePluginSigningKeys = [saved];
+          return jsonResponse(saved);
+        }
+        if (path === "/api/v1/admin/plugins/signing-keys/calendar-prod" && method === "DELETE") {
+          visiblePluginSigningKeys = [];
+          return jsonResponse({ status: "deleted" });
         }
         if (path === "/api/v1/admin/plugins" && method === "POST") {
           const body = init?.body && typeof init.body === "string" ? JSON.parse(init.body) : {};
@@ -6687,6 +6712,57 @@ describe("operational management pages", () => {
       ],
     });
     expect(await screen.findByText("插件配置已保存。运行时能力注册表会重新加载。")).not.toBeNull();
+  });
+
+  it("manages trusted plugin signing keys from the MCP page", async () => {
+    const user = userEvent.setup();
+
+    render(<TestApp initialPath="/mcp" />);
+
+    const region = await screen.findByRole("region", { name: "可信插件签名 Key" });
+    expect(within(region).getByText("calendar-prod")).not.toBeNull();
+    expect(within(region).getByText("ed25519")).not.toBeNull();
+    expect(within(region).getByText("trusted")).not.toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "删除签名 Key calendar-prod" }));
+    await waitFor(() =>
+      expect(
+        requests.find(
+          (request) =>
+            request.path === "/api/v1/admin/plugins/signing-keys/calendar-prod" &&
+            request.method === "DELETE",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(await screen.findByText("签名 Key 已删除。")).not.toBeNull();
+
+    await user.clear(screen.getByLabelText("签名 Key ID"));
+    await user.type(screen.getByLabelText("签名 Key ID"), "calendar-next");
+    await user.clear(screen.getByLabelText("Ed25519 Public Key"));
+    await user.type(screen.getByLabelText("Ed25519 Public Key"), "B".repeat(43));
+    await user.click(screen.getByRole("button", { name: "保存签名 Key" }));
+
+    await waitFor(() =>
+      expect(
+        requests.find(
+          (request) =>
+            request.path === "/api/v1/admin/plugins/signing-keys" &&
+            request.method === "POST",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(
+      requests.find(
+        (request) =>
+          request.path === "/api/v1/admin/plugins/signing-keys" &&
+          request.method === "POST",
+      )?.body,
+    ).toEqual({
+      key_id: "calendar-next",
+      algorithm: "ed25519",
+      public_key: "B".repeat(43),
+    });
+    expect(await screen.findByText("签名 Key 已保存。")).not.toBeNull();
   });
 
   it("uses adapter descriptors to choose capability adapter defaults", async () => {
