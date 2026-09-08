@@ -24,12 +24,14 @@ from agent_hub.api.routers import admin as admin_router
 from agent_hub.api.routers.admin import (
     AgentResourceRequest,
     AgentResourceResponse,
+    AuditEventResponse,
     InMemoryAdminResourceService,
     MainAgentConfigRequest,
     MainAgentModelConfig,
     McpServerRequest,
     McpServerResponse,
     ModelDeploymentRequest,
+    ModelDeploymentResponse,
     PersistentAdminResourceService,
     PluginCapabilityRequest,
     PluginResourceRequest,
@@ -38,6 +40,7 @@ from agent_hub.api.routers.admin import (
     RunDetailResponse,
     RunEventResponse,
     SecretCreateRequest,
+    SecretReferenceResponse,
     SystemSettingsResponse,
     _admin_run_artifact,
     _admin_run_event,
@@ -2286,6 +2289,13 @@ class StubAuthService:
         return AuthenticatedPrincipal(USER_ID, TENANT_ID, Role.SUPER_ADMIN)
 
 
+class OtherTenantAuthService:
+    def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
+        if token != "valid-token":
+            raise InvalidCredentials("bad token")
+        return AuthenticatedPrincipal(USER_ID, OTHER_TENANT_ID, Role.SUPER_ADMIN)
+
+
 def client() -> TestClient:
     app = create_app(
         auth_service=StubAuthService(),
@@ -2299,13 +2309,115 @@ def headers() -> dict[str, str]:
     return {"Authorization": "Bearer valid-token"}
 
 
-def test_admin_service_dependency_scopes_service_to_principal_tenant() -> None:
-    class OtherTenantAuthService:
-        def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
-            if token != "valid-token":
-                raise InvalidCredentials("bad token")
-            return AuthenticatedPrincipal(USER_ID, OTHER_TENANT_ID, Role.SUPER_ADMIN)
+class TenantScopedAdminResourceService(InMemoryAdminResourceService):
+    def __init__(
+        self,
+        tenant_id: UUID = TENANT_ID,
+        actor_id: UUID = ACTOR_ID,
+        *,
+        root: "TenantScopedAdminResourceService | None" = None,
+    ) -> None:
+        super().__init__()
+        self.tenant_id = tenant_id
+        self.actor_id = actor_id
+        self.root = root or self
+        if root is None:
+            self.scopes: dict[tuple[UUID, UUID], TenantScopedAdminResourceService] = {
+                (tenant_id, actor_id): self
+            }
+            self.calls: list[tuple[str, str, UUID, UUID]] = []
 
+    def for_principal(
+        self, tenant_id: UUID, actor_id: UUID
+    ) -> "TenantScopedAdminResourceService":
+        root = self.root
+        root.calls.append(("for_principal", "", tenant_id, actor_id))
+        key = (tenant_id, actor_id)
+        if key not in root.scopes:
+            root.scopes[key] = TenantScopedAdminResourceService(
+                tenant_id,
+                actor_id,
+                root=root,
+            )
+        return root.scopes[key]
+
+    async def list_models(self) -> tuple[ModelDeploymentResponse, ...]:
+        self.root.calls.append(("list_models", "", self.tenant_id, self.actor_id))
+        return await super().list_models()
+
+    async def create_model(self, request: ModelDeploymentRequest) -> ModelDeploymentResponse:
+        self.root.calls.append(
+            ("create_model", request.logical_model, self.tenant_id, self.actor_id)
+        )
+        return await super().create_model(request)
+
+    async def create_secret(self, request: SecretCreateRequest) -> SecretReferenceResponse:
+        self.root.calls.append(("create_secret", request.label, self.tenant_id, self.actor_id))
+        return await super().create_secret(request)
+
+    async def get_secret(self, ref: str) -> SecretReferenceResponse:
+        self.root.calls.append(("get_secret", ref, self.tenant_id, self.actor_id))
+        return await super().get_secret(ref)
+
+    async def list_mcp_servers(
+        self,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> tuple[McpServerResponse, ...]:
+        target_tenant_id = self.tenant_id if tenant_id is None else tenant_id
+        self.root.calls.append(("list_mcp", "", target_tenant_id, self.actor_id))
+        if target_tenant_id != self.tenant_id:
+            return ()
+        return await super().list_mcp_servers(tenant_id=tenant_id)
+
+    async def upsert_mcp_server(self, request: McpServerRequest) -> McpServerResponse:
+        self.root.calls.append(("upsert_mcp", request.id, self.tenant_id, self.actor_id))
+        response = await super().upsert_mcp_server(request)
+        await self.record_audit_event(
+            actor=str(self.actor_id),
+            action="mcp.upsert",
+            resource=f"mcp:{request.id}",
+            details={"id": request.id},
+            tenant_id=self.tenant_id,
+        )
+        return response
+
+    async def delete_mcp_server(self, server_id: str) -> None:
+        self.root.calls.append(("delete_mcp", server_id, self.tenant_id, self.actor_id))
+        await super().delete_mcp_server(server_id)
+        await self.record_audit_event(
+            actor=str(self.actor_id),
+            action="mcp.delete",
+            resource=f"mcp:{server_id}",
+            details={"id": server_id},
+            tenant_id=self.tenant_id,
+        )
+
+    async def record_audit_event(
+        self,
+        *,
+        actor: str,
+        action: str,
+        resource: str,
+        details: dict[str, object] | None = None,
+        tenant_id: UUID | None = None,
+    ) -> AuditEventResponse:
+        target_tenant_id = self.tenant_id if tenant_id is None else tenant_id
+        self.root.calls.append(("audit", action, target_tenant_id, UUID(actor)))
+        return await super().record_audit_event(
+            actor=actor,
+            action=action,
+            resource=resource,
+            details=details,
+            tenant_id=tenant_id,
+        )
+
+    async def list_audit_events(self, action: str | None = None) -> tuple[AuditEventResponse, ...]:
+        self.root.calls.append(("list_audit", action or "", self.tenant_id, self.actor_id))
+        return await super().list_audit_events(action)
+
+
+def test_admin_service_dependency_scopes_service_to_principal_tenant() -> None:
     class ScopedAdminService(InMemoryAdminResourceService):
         def __init__(self, tenant_id: UUID) -> None:
             super().__init__()
@@ -2340,6 +2452,46 @@ def test_admin_service_dependency_scopes_service_to_principal_tenant() -> None:
     assert response.status_code == 200
     assert service.scope_calls == [(OTHER_TENANT_ID, USER_ID)]
     assert response.json()[0]["id"] == f"agent-{OTHER_TENANT_ID}"
+
+
+def test_admin_models_and_secrets_scope_to_principal_tenant_and_actor() -> None:
+    api = create_app(auth_service=OtherTenantAuthService(), rate_limiter=object())
+    service = TenantScopedAdminResourceService()
+    cast(Any, api).state.admin_resource_service = service
+    test_client = TestClient(api)
+
+    created_model = test_client.post(
+        "/api/v1/admin/models",
+        headers=headers(),
+        json=model_payload(),
+    )
+    listed_models = test_client.get("/api/v1/admin/models", headers=headers())
+    created_secret = test_client.post(
+        "/api/v1/admin/secrets",
+        headers=headers(),
+        json={"label": "deepseek", "value": "sk-other-tenant"},
+    )
+    secret_ref = created_secret.json()["ref"]
+    fetched_secret = test_client.get(f"/api/v1/admin/secrets/{secret_ref}", headers=headers())
+
+    assert created_model.status_code == 200
+    assert listed_models.status_code == 200
+    assert [item["logical_model"] for item in listed_models.json()] == ["planner"]
+    assert created_secret.status_code == 200
+    assert fetched_secret.status_code == 200
+    assert "sk-other-tenant" not in created_secret.text + fetched_secret.text
+    assert service.scopes[(TENANT_ID, ACTOR_ID)].models == {}
+    assert service.scopes[(TENANT_ID, ACTOR_ID)].secrets == {}
+    assert service.calls == [
+        ("for_principal", "", OTHER_TENANT_ID, USER_ID),
+        ("create_model", "planner", OTHER_TENANT_ID, USER_ID),
+        ("for_principal", "", OTHER_TENANT_ID, USER_ID),
+        ("list_models", "", OTHER_TENANT_ID, USER_ID),
+        ("for_principal", "", OTHER_TENANT_ID, USER_ID),
+        ("create_secret", "deepseek", OTHER_TENANT_ID, USER_ID),
+        ("for_principal", "", OTHER_TENANT_ID, USER_ID),
+        ("get_secret", secret_ref, OTHER_TENANT_ID, USER_ID),
+    ]
 
 
 class FakeRuntimeCapabilityGateway:
@@ -2664,6 +2816,85 @@ def test_plugin_admin_write_endpoints_scope_writes_to_principal_tenant_and_actor
         ("stop", "search", OTHER_TENANT_ID, USER_ID),
         ("reload", "search", OTHER_TENANT_ID, USER_ID),
         ("delete", "search", OTHER_TENANT_ID, USER_ID),
+    ]
+
+
+def test_admin_mcp_write_delete_and_audit_scope_to_principal_tenant_and_actor() -> None:
+    api = create_app(auth_service=OtherTenantAuthService(), rate_limiter=object())
+    service = TenantScopedAdminResourceService()
+    bootstrap_service = service.scopes[(TENANT_ID, ACTOR_ID)]
+    bootstrap_service.mcp_servers["filesystem"] = McpServerResponse(
+        id="filesystem",
+        name="Bootstrap Filesystem MCP",
+        health="configured",
+        allowed_tools=["list_directory"],
+        transport="stdio",
+        command="uvx",
+        args=["bootstrap-filesystem"],
+        executable_allowlist=["uvx"],
+    )
+    reloaded: list[UUID] = []
+
+    async def reload_mcp_runtime_config(tenant_id: UUID) -> None:
+        reloaded.append(tenant_id)
+
+    cast(Any, api).state.admin_resource_service = service
+    cast(Any, api).state.reload_mcp_runtime_config = reload_mcp_runtime_config
+    test_client = TestClient(api)
+
+    created = test_client.post(
+        "/api/v1/admin/mcp",
+        headers=headers(),
+        json={
+            "id": "filesystem",
+            "name": "Tenant Filesystem MCP",
+            "allowed_tools": ["read_file"],
+            "transport": "stdio",
+            "command": "uvx",
+            "args": ["tenant-filesystem"],
+            "executable_allowlist": ["uvx"],
+            "timeout_seconds": 10,
+        },
+    )
+    listed = test_client.get("/api/v1/admin/mcp", headers=headers())
+    upsert_audit = test_client.get(
+        "/api/v1/admin/audit?action=mcp.upsert",
+        headers=headers(),
+    )
+    deleted = test_client.delete("/api/v1/admin/mcp/filesystem", headers=headers())
+    listed_after_delete = test_client.get("/api/v1/admin/mcp", headers=headers())
+    delete_audit = test_client.get(
+        "/api/v1/admin/audit?action=mcp.delete",
+        headers=headers(),
+    )
+
+    assert created.status_code == 200
+    assert listed.status_code == 200
+    assert [item["name"] for item in listed.json()] == ["Tenant Filesystem MCP"]
+    assert upsert_audit.status_code == 200
+    assert upsert_audit.json()[0]["actor"] == str(USER_ID)
+    assert deleted.status_code == 200
+    assert listed_after_delete.status_code == 200
+    assert listed_after_delete.json() == []
+    assert delete_audit.status_code == 200
+    assert delete_audit.json()[0]["actor"] == str(USER_ID)
+    assert bootstrap_service.mcp_servers["filesystem"].name == "Bootstrap Filesystem MCP"
+    assert reloaded == [OTHER_TENANT_ID, OTHER_TENANT_ID]
+    assert service.calls == [
+        ("for_principal", "", OTHER_TENANT_ID, USER_ID),
+        ("upsert_mcp", "filesystem", OTHER_TENANT_ID, USER_ID),
+        ("audit", "mcp.upsert", OTHER_TENANT_ID, USER_ID),
+        ("for_principal", "", OTHER_TENANT_ID, USER_ID),
+        ("list_mcp", "", OTHER_TENANT_ID, USER_ID),
+        ("for_principal", "", OTHER_TENANT_ID, USER_ID),
+        ("list_audit", "mcp.upsert", OTHER_TENANT_ID, USER_ID),
+        ("for_principal", "", OTHER_TENANT_ID, USER_ID),
+        ("delete_mcp", "filesystem", OTHER_TENANT_ID, USER_ID),
+        ("audit", "mcp.delete", OTHER_TENANT_ID, USER_ID),
+        ("for_principal", "", OTHER_TENANT_ID, USER_ID),
+        ("list_mcp", "", OTHER_TENANT_ID, USER_ID),
+        ("for_principal", "", OTHER_TENANT_ID, USER_ID),
+        ("list_audit", "mcp.delete", OTHER_TENANT_ID, USER_ID),
     ]
 
 
@@ -4042,9 +4273,39 @@ class RecordingScheduledRunService:
 
 
 class PersistentScheduleResourceService(InMemoryAdminResourceService):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        tenant_id: UUID = TENANT_ID,
+        actor_id: UUID = ACTOR_ID,
+        *,
+        root: "PersistentScheduleResourceService | None" = None,
+    ) -> None:
         super().__init__()
-        self.payloads: dict[tuple[str, str], dict[str, object]] = {}
+        self.tenant_id = tenant_id
+        self.actor_id = actor_id
+        self.root = root or self
+        if root is None:
+            self.payloads: dict[tuple[UUID, str, str], dict[str, object]] = {}
+            self.scopes: dict[tuple[UUID, UUID], PersistentScheduleResourceService] = {
+                (tenant_id, actor_id): self
+            }
+            self.calls: list[tuple[str, str, UUID, UUID]] = []
+
+    def for_principal(
+        self,
+        tenant_id: UUID,
+        actor_id: UUID,
+    ) -> "PersistentScheduleResourceService":
+        root = self.root
+        root.calls.append(("for_principal", "", tenant_id, actor_id))
+        key = (tenant_id, actor_id)
+        if key not in root.scopes:
+            root.scopes[key] = PersistentScheduleResourceService(
+                tenant_id,
+                actor_id,
+                root=root,
+            )
+        return root.scopes[key]
 
     async def _list_admin_payloads(
         self,
@@ -4052,11 +4313,14 @@ class PersistentScheduleResourceService(InMemoryAdminResourceService):
         *,
         tenant_id: UUID | None = None,
     ) -> list[dict[str, object]]:
-        del tenant_id
+        target_tenant_id = self.tenant_id if tenant_id is None else tenant_id
+        self.root.calls.append(("list_payloads", kind, target_tenant_id, self.actor_id))
         return [
             payload
-            for (stored_kind, _resource_id), payload in sorted(self.payloads.items())
-            if stored_kind == kind
+            for (stored_tenant_id, stored_kind, _resource_id), payload in sorted(
+                self.root.payloads.items()
+            )
+            if stored_tenant_id == target_tenant_id and stored_kind == kind
         ]
 
     async def _upsert_admin_payload(
@@ -4067,8 +4331,9 @@ class PersistentScheduleResourceService(InMemoryAdminResourceService):
         *,
         tenant_id: UUID | None = None,
     ) -> bool:
-        del tenant_id
-        self.payloads[(kind, resource_id)] = payload
+        target_tenant_id = self.tenant_id if tenant_id is None else tenant_id
+        self.root.calls.append(("upsert_payload", kind, target_tenant_id, self.actor_id))
+        self.root.payloads[(target_tenant_id, kind, resource_id)] = payload
         return True
 
     async def _delete_admin_payload(
@@ -4078,17 +4343,38 @@ class PersistentScheduleResourceService(InMemoryAdminResourceService):
         *,
         tenant_id: UUID | None = None,
     ) -> bool:
-        del tenant_id
-        return self.payloads.pop((kind, resource_id), None) is not None
+        target_tenant_id = self.tenant_id if tenant_id is None else tenant_id
+        self.root.calls.append(("delete_payload", kind, target_tenant_id, self.actor_id))
+        return self.root.payloads.pop((target_tenant_id, kind, resource_id), None) is not None
+
+    async def record_audit_event(
+        self,
+        *,
+        actor: str,
+        action: str,
+        resource: str,
+        details: dict[str, object] | None = None,
+        tenant_id: UUID | None = None,
+    ) -> AuditEventResponse:
+        target_tenant_id = self.tenant_id if tenant_id is None else tenant_id
+        self.root.calls.append(("audit", action, target_tenant_id, UUID(actor)))
+        return await super().record_audit_event(
+            actor=actor,
+            action=action,
+            resource=resource,
+            details=details,
+            tenant_id=tenant_id,
+        )
 
 
 def scheduler_client(
     submitter: RecordingScheduleSubmitter,
     *,
     resource_service: InMemoryAdminResourceService | None = None,
+    auth_service: object | None = None,
 ) -> TestClient:
     app = create_app(
-        auth_service=StubAuthService(),
+        auth_service=auth_service or StubAuthService(),
         rate_limiter=object(),
     )
     app.state.admin_resource_service = resource_service or InMemoryAdminResourceService()
@@ -4217,7 +4503,7 @@ def test_schedule_api_persists_restores_and_deletes_tasks() -> None:
 
     assert created.status_code == 201
     schedule_id = created.json()["id"]
-    assert ("schedule", schedule_id) in resource_service.payloads
+    assert (TENANT_ID, "schedule", schedule_id) in resource_service.payloads
 
     restarted_api = scheduler_client(
         RecordingScheduleSubmitter(),
@@ -4230,11 +4516,88 @@ def test_schedule_api_persists_restores_and_deletes_tasks() -> None:
     deleted = restarted_api.delete(f"/api/v1/admin/schedules/{schedule_id}", headers=headers())
     assert deleted.status_code == 200
     assert deleted.json() == {"id": schedule_id, "deleted": True}
-    assert ("schedule", schedule_id) not in resource_service.payloads
+    assert (TENANT_ID, "schedule", schedule_id) not in resource_service.payloads
 
     listed_after_delete = restarted_api.get("/api/v1/admin/schedules", headers=headers())
     assert listed_after_delete.status_code == 200
     assert listed_after_delete.json() == []
+
+
+def test_schedule_api_persists_restores_and_deletes_only_principal_tenant() -> None:
+    resource_service = PersistentScheduleResourceService()
+    bootstrap_api = scheduler_client(
+        RecordingScheduleSubmitter(),
+        resource_service=resource_service,
+    )
+    other_api = scheduler_client(
+        RecordingScheduleSubmitter(),
+        resource_service=resource_service,
+        auth_service=OtherTenantAuthService(),
+    )
+
+    bootstrap = bootstrap_api.post(
+        "/api/v1/admin/schedules",
+        headers=headers(),
+        json={
+            "name": "bootstrap-report",
+            "message": "Run bootstrap report",
+            "mode": "dispatch",
+            "workflow_id": "daily_report",
+            "kind": "one_time",
+            "run_at": "2026-08-14T09:00:00+08:00",
+            "timezone": "Asia/Shanghai",
+        },
+    )
+    other = other_api.post(
+        "/api/v1/admin/schedules",
+        headers=headers(),
+        json={
+            "name": "tenant-report",
+            "message": "Run tenant report",
+            "mode": "dispatch",
+            "workflow_id": "daily_report",
+            "kind": "one_time",
+            "run_at": "2026-08-15T09:00:00+08:00",
+            "timezone": "Asia/Shanghai",
+        },
+    )
+
+    assert bootstrap.status_code == 201
+    assert other.status_code == 201
+    bootstrap_id = bootstrap.json()["id"]
+    other_id = other.json()["id"]
+    assert (TENANT_ID, "schedule", bootstrap_id) in resource_service.payloads
+    assert (OTHER_TENANT_ID, "schedule", other_id) in resource_service.payloads
+
+    restarted_other_api = scheduler_client(
+        RecordingScheduleSubmitter(),
+        resource_service=resource_service,
+        auth_service=OtherTenantAuthService(),
+    )
+    restored_other = restarted_other_api.get("/api/v1/admin/schedules", headers=headers())
+    missing_bootstrap_delete = restarted_other_api.delete(
+        f"/api/v1/admin/schedules/{bootstrap_id}",
+        headers=headers(),
+    )
+    deleted_other = restarted_other_api.delete(
+        f"/api/v1/admin/schedules/{other_id}",
+        headers=headers(),
+    )
+    restored_bootstrap = scheduler_client(
+        RecordingScheduleSubmitter(),
+        resource_service=resource_service,
+    ).get("/api/v1/admin/schedules", headers=headers())
+
+    assert restored_other.status_code == 200
+    assert [item["id"] for item in restored_other.json()] == [other_id]
+    assert missing_bootstrap_delete.status_code == 404
+    assert deleted_other.status_code == 200
+    assert (OTHER_TENANT_ID, "schedule", other_id) not in resource_service.payloads
+    assert (TENANT_ID, "schedule", bootstrap_id) in resource_service.payloads
+    assert restored_bootstrap.status_code == 200
+    assert [item["id"] for item in restored_bootstrap.json()] == [bootstrap_id]
+    assert ("audit", "schedule.create", OTHER_TENANT_ID, USER_ID) in resource_service.calls
+    assert ("audit", "schedule.delete", OTHER_TENANT_ID, USER_ID) in resource_service.calls
 
 
 def skill_archive() -> bytes:
