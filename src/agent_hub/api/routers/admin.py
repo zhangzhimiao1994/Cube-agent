@@ -715,6 +715,12 @@ class PluginPackageMetadata(BaseModel):
     )
     signature: PluginPackageSignatureMetadata | None = None
     signature_verification: PluginSignatureVerification = "not_provided"
+    verified_public_key_sha256: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[a-f0-9]{64}$",
+    )
     activation_state: Literal[
         "not_applicable",
         "blocked_unsigned",
@@ -3320,6 +3326,8 @@ def _validate_plugin_package_metadata(manifest: object) -> None:
         raise InvalidSkillPackage("plugin package activation state is server-controlled")
     if "signature_verification" in package:
         raise InvalidSkillPackage("plugin package signature verification is server-controlled")
+    if "verified_public_key_sha256" in package:
+        raise InvalidSkillPackage("plugin package verified public key is server-controlled")
     if package.get("kind") == "manifest_only" and set(package) & {
         "package_version",
         "adapter_id",
@@ -3411,7 +3419,12 @@ def _verified_plugin_package_metadata(
         raise InvalidSkillPackage("plugin package signature verification failed") from None
     except ValueError:
         raise InvalidSkillPackage("trusted plugin signing key is invalid") from None
-    return package.model_copy(update={"signature_verification": "verified"})
+    return package.model_copy(
+        update={
+            "signature_verification": "verified",
+            "verified_public_key_sha256": _plugin_public_key_sha256(public_key_bytes),
+        }
+    )
 
 
 def _plugin_signing_key_is_active(key: PluginSigningKeyResponse, now: datetime) -> bool:
@@ -3419,6 +3432,27 @@ def _plugin_signing_key_is_active(key: PluginSigningKeyResponse, now: datetime) 
     if key.not_before is not None and active_at < key.not_before.astimezone(UTC):
         return False
     return key.not_after is None or active_at < key.not_after.astimezone(UTC)
+
+
+def _plugin_public_key_sha256(public_key_bytes: bytes) -> str:
+    return hashlib.sha256(public_key_bytes).hexdigest()
+
+
+def _plugin_signing_key_matches_verified_package(
+    key: PluginSigningKeyResponse,
+    package: PluginPackageMetadata,
+) -> bool:
+    if package.verified_public_key_sha256 is None:
+        return False
+    try:
+        public_key_bytes = _decode_base64url_bytes(
+            key.public_key,
+            expected_length=32,
+            label="public_key",
+        )
+    except ValueError:
+        return False
+    return _plugin_public_key_sha256(public_key_bytes) == package.verified_public_key_sha256
 
 
 def _plugin_with_effective_package_trust(
@@ -3441,6 +3475,7 @@ def _plugin_with_effective_package_trust(
             and key.algorithm == package.signature.algorithm
             and key.key_id == package.signature.key_id
             and _plugin_signing_key_is_active(key, now)
+            and _plugin_signing_key_matches_verified_package(key, package)
         ),
         None,
     )

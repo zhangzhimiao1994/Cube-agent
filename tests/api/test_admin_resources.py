@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import sys
@@ -3557,6 +3558,10 @@ def plugin_public_key_value(private_key: ed25519.Ed25519PrivateKey) -> str:
     )
 
 
+def plugin_public_key_sha256(private_key: ed25519.Ed25519PrivateKey) -> str:
+    return hashlib.sha256(private_key.public_key().public_bytes_raw()).hexdigest()
+
+
 def signed_plugin_archive(
     private_key: ed25519.Ed25519PrivateKey,
     *,
@@ -4181,6 +4186,49 @@ def test_plugin_archive_install_rejects_forged_signature_verification() -> None:
     )
 
 
+def test_plugin_archive_install_rejects_forged_verified_public_key() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "package": {
+                    "kind": "adapter_package",
+                    "package_version": "1.2.3",
+                    "adapter_id": "calendar_python",
+                    "sdk_api_version": "1.0",
+                    "signature": {
+                        "algorithm": "ed25519",
+                        "key_id": "calendar-prod",
+                        "value": VALID_PLUGIN_SIGNATURE,
+                    },
+                    "verified_public_key_sha256": "a" * 64,
+                    "runtime": "python",
+                    "entrypoint": "adapter/main.py",
+                    "isolation": "local_process",
+                    "install_mode": "scan_only",
+                },
+            },
+            files={"adapter/main.py": "def invoke():\n    return {}\n"},
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    assert (
+        response.json()["error"]["details"]["reason"]
+        == "plugin package verified public key is server-controlled"
+    )
+
+
 def test_plugin_archive_install_rejects_invalid_package_signature() -> None:
     api = client()
 
@@ -4480,6 +4528,49 @@ def test_plugin_listing_downgrades_verified_package_after_signing_key_expiry() -
     assert metadata["activation_reason"] == "package signature key is not trusted for this tenant"
 
 
+def test_plugin_listing_downgrades_verified_package_after_signing_key_rotation() -> None:
+    api = client()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    rotated_private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(private_key),
+    )
+    assert install.status_code == 200
+    assert install.json()["plugin"]["package_metadata"]["signature_verification"] == "verified"
+
+    rotate_key = api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(rotated_private_key),
+        },
+    )
+
+    assert rotate_key.status_code == 200
+    listed = api.get("/api/v1/admin/plugins", headers=headers())
+    metadata = listed.json()[0]["package_metadata"]
+    assert metadata["signature_verification"] == "untrusted_key"
+    assert metadata["activation_state"] == "blocked_untrusted_key"
+    assert metadata["activation_reason"] == "package signature key is not trusted for this tenant"
+
+
 def test_plugin_signing_key_delete_missing_key_returns_not_found() -> None:
     response = client().delete(
         "/api/v1/admin/plugins/signing-keys/missing-key",
@@ -4665,6 +4756,7 @@ async def test_persistent_plugin_signing_keys_and_verification_status_survive_re
                 "value": VALID_PLUGIN_SIGNATURE,
             },
             "signature_verification": "verified",
+            "verified_public_key_sha256": plugin_public_key_sha256(private_key),
             "runtime": "python",
             "entrypoint": "adapter/main.py",
             "isolation": "local_process",
@@ -4827,7 +4919,7 @@ def test_plugin_archive_install_rejects_invalid_trusted_signature() -> None:
     cast(Any, api.app).state.reload_plugin_runtime_config = reload_plugin_runtime_config
     private_key = ed25519.Ed25519PrivateKey.generate()
     wrong_private_key = ed25519.Ed25519PrivateKey.generate()
-    api.post(
+    signing_key = api.post(
         "/api/v1/admin/plugins/signing-keys",
         headers=headers(),
         json={
@@ -4836,6 +4928,8 @@ def test_plugin_archive_install_rejects_invalid_trusted_signature() -> None:
             "public_key": plugin_public_key_value(private_key),
         },
     )
+    assert signing_key.status_code == 200
+    reloaded.clear()
 
     response = api.post(
         "/api/v1/admin/plugins/install",

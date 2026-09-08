@@ -458,6 +458,7 @@ const calendarPlugin: PluginResource = {
       value: "A".repeat(86),
     },
     signature_verification: "not_verified",
+    verified_public_key_sha256: null,
     activation_state: "blocked_unverified_signature",
     activation_reason: "package signature has not been verified by the server",
     runtime: "python",
@@ -6783,6 +6784,12 @@ describe("operational management pages", () => {
     await user.type(screen.getByLabelText("Ed25519 Public Key"), "B".repeat(43));
     await user.type(screen.getByLabelText("Not Before"), "2026-11-08T00:00:00Z");
     await user.type(screen.getByLabelText("Not After"), "2026-12-08T00:00:00Z");
+    const pluginGetCountBeforeSave = requests.filter(
+      (request) => request.path === "/api/v1/admin/plugins" && request.method === "GET",
+    ).length;
+    const manifestGetCountBeforeSave = requests.filter(
+      (request) => request.path === "/api/v1/admin/capabilities/manifest",
+    ).length;
     await user.click(screen.getByRole("button", { name: "保存签名 Key" }));
 
     await waitFor(() =>
@@ -6808,6 +6815,19 @@ describe("operational management pages", () => {
       not_after: "2026-12-08T00:00:00Z",
     });
     expect(await screen.findByText("签名 Key 已保存。")).not.toBeNull();
+    await waitFor(() =>
+      expect(
+        requests.filter(
+          (request) => request.path === "/api/v1/admin/plugins" && request.method === "GET",
+        ).length,
+      ).toBeGreaterThan(pluginGetCountBeforeSave),
+    );
+    await waitFor(() =>
+      expect(
+        requests.filter((request) => request.path === "/api/v1/admin/capabilities/manifest")
+          .length,
+      ).toBeGreaterThan(manifestGetCountBeforeSave),
+    );
   });
 
   it("uses adapter descriptors to choose capability adapter defaults", async () => {
