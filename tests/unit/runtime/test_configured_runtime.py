@@ -193,6 +193,26 @@ class AvailablePluginManifestCapabilityGateway(FakeCapabilityAvailability):
         }
 
 
+class TenantPreparedPluginManifestCapabilityGateway(FakeCapabilityAvailability):
+    def __init__(self) -> None:
+        super().__init__(set())
+        self.prepared_tenants: list[UUID] = []
+
+    async def ensure_tenant_loaded(self, tenant_id: UUID) -> None:
+        assert tenant_id == TENANT_ID
+        self.prepared_tenants.append(tenant_id)
+        self.available.add("calendar.create_event")
+
+    def capability_manifest(self, tenant_id: UUID) -> Mapping[str, JsonValue]:
+        assert tenant_id == TENANT_ID
+        if tenant_id not in self.prepared_tenants:
+            return {
+                "schema_version": 1,
+                "capabilities": (),
+            }
+        return AvailablePluginManifestCapabilityGateway().capability_manifest(tenant_id)
+
+
 class BadManifestCapabilityGateway(FakeCapabilityAvailability):
     def __init__(self, manifest: Mapping[str, JsonValue] | Exception) -> None:
         super().__init__(set())
@@ -1923,6 +1943,85 @@ async def test_config_backed_discussion_runtime_emits_main_agent_role_plan(
 
 
 @pytest.mark.asyncio
+async def test_config_backed_discussion_runtime_prepares_tenant_before_inventory_planning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDiscussionRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
+    capability_gateway = TenantPreparedPluginManifestCapabilityGateway()
+    runtime = ConfigBackedDiscussionRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-v4-flash",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://main",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [
+                    {
+                        "id": "scheduler",
+                        "role": "Scheduler",
+                        "prompt": "Schedule the work.",
+                        "model": "main",
+                        "skills": ["read_context"],
+                    },
+                    {
+                        "id": "reviewer",
+                        "role": "Reviewer",
+                        "prompt": "Review the schedule.",
+                        "model": "main",
+                        "skills": [],
+                    },
+                ],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id,
+            deployments,
+        ),
+        transport=FakeTransport(),
+        capability_gateway=capability_gateway,
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISCUSS,
+                request="Use calendar.create_event to schedule the review.",
+                routing_decision={
+                    "selected_agent_ids": ("scheduler", "reviewer"),
+                    "main_agent_model": "main",
+                },
+            )
+        )
+    ]
+
+    assert capability_gateway.prepared_tenants == [TENANT_ID]
+    roles = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["roles"])
+    scheduler = next(role for role in roles if role["id"] == "scheduler")
+    assert scheduler["tools"] == ("read_context", "calendar.create_event")
+    steps = cast(tuple[Mapping[str, JsonValue], ...], events[0].payload["steps"])
+    scheduler_step = next(step for step in steps if step["agent"] == "scheduler")
+    assert scheduler_step["tools"] == ("read_context", "calendar.create_event")
+
+
+@pytest.mark.asyncio
 async def test_config_backed_direct_runtime_uses_per_run_direct_model_override() -> None:
     transport = FakeTransport()
     runtime = ConfigBackedDirectRuntime(
@@ -2596,6 +2695,84 @@ def test_dispatch_plan_adds_explicitly_mentioned_available_plugin_tool() -> None
     assert scheduler.allowed_tools == ("read_context", "calendar.create_event")
     assert scheduler_step.tools == ("read_context", "calendar.create_event")
     assert "calendar.create_event" in plan.allowed_tools
+
+
+@pytest.mark.asyncio
+async def test_config_backed_dispatch_runtime_prepares_tenant_before_inventory_planning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ProbeDispatchRuntime.instances.clear()
+    monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
+    capability_gateway = TenantPreparedPluginManifestCapabilityGateway()
+    runtime = ConfigBackedDispatchRuntime(
+        config_service=FakeConfigService(
+            {
+                "models": {
+                    "main": {
+                        "deployments": [
+                            {
+                                "provider": "deepseek",
+                                "model": "deepseek-chat",
+                                "api_base": "https://api.deepseek.com/v1",
+                                "credential_ref": "secret://deepseek",
+                                "quota_scope_id": "deepseek_account",
+                                "max_concurrency": 2,
+                                "target_utilization": 0.8,
+                                "reserved_slots": 0,
+                                "capabilities": ["text"],
+                            }
+                        ]
+                    },
+                },
+                "agents": [
+                    {
+                        "id": "scheduler",
+                        "role": "Scheduler",
+                        "prompt": "Schedule the work.",
+                        "model": "main",
+                        "skills": ["read_context"],
+                    }
+                ],
+            }
+        ),  # type: ignore[arg-type]
+        secret_service=FakeSecretService(),  # type: ignore[arg-type]
+        capacity_factory=lambda tenant_id, deployments: _immediate_capacity(
+            tenant_id,
+            deployments,
+        ),
+        transport=FakeTransport(),
+        capability_gateway=capability_gateway,
+    )
+
+    events = [
+        event
+        async for event in runtime.run(
+            TaskContext(
+                run_id=uuid4(),
+                tenant_id=TENANT_ID,
+                mode=TaskMode.DISPATCH,
+                request="Use calendar.create_event to schedule the review.",
+                routing_decision={"selected_agent_ids": ("scheduler",)},
+            )
+        )
+    ]
+
+    assert capability_gateway.prepared_tenants == [TENANT_ID]
+    capability_plan = cast(
+        Mapping[str, JsonValue],
+        events[0].payload["capability_execution_plan"],
+    )
+    assignments = cast(
+        tuple[Mapping[str, JsonValue], ...],
+        capability_plan["role_capability_assignments"],
+    )
+    scheduler = next(
+        assignment for assignment in assignments if assignment["role_id"] == "scheduler"
+    )
+    assert tuple(
+        capability["name"]
+        for capability in cast(tuple[Mapping[str, JsonValue], ...], scheduler["capabilities"])
+    ) == ("read_context", "calendar.create_event")
 
 
 def test_dispatch_plan_adds_available_plugin_tool_when_role_requests_alias() -> None:

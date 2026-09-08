@@ -9,7 +9,7 @@ from zipfile import ZipFile
 import pytest
 
 from agent_hub.capabilities.runtime import RuntimeCapabilityError, RuntimeCapabilityGateway
-from agent_hub.capabilities.tools.registry import ToolRegistry
+from agent_hub.capabilities.tools.registry import CompositeCapabilityManifestSource, ToolRegistry
 from agent_hub.runtime.contracts import JsonValue
 from agent_hub.skills.sandbox.base import SkillInvocation, SkillResult
 from tests.unit.skills.test_package import skill_zip
@@ -93,6 +93,15 @@ class TenantAwareReplaySafeManifestSource:
         }
 
 
+class PreparedTenantManifestSource(TenantAwareManifestSource):
+    def __init__(self) -> None:
+        super().__init__()
+        self.prepared_tenants: list[UUID] = []
+
+    async def ensure_tenant_loaded(self, tenant_id: UUID) -> None:
+        self.prepared_tenants.append(tenant_id)
+
+
 class InvalidTenantManifestSource:
     def manifests_for_tenant(self, tenant_id: UUID) -> Mapping[str, JsonValue]:
         return cast(Mapping[str, JsonValue], None)
@@ -112,6 +121,16 @@ async def test_runtime_gateway_executes_calculator_without_external_side_effects
 
     assert result == {"value": "14"}
     assert gateway.is_replay_safe("calculator") is True
+
+
+async def test_runtime_gateway_prepares_manifest_sources_for_tenant(tmp_path: Path) -> None:
+    source = PreparedTenantManifestSource()
+    composite = CompositeCapabilityManifestSource((source, ToolRegistry()))
+    gateway = RuntimeCapabilityGateway(skill_store_dir=tmp_path, tool_registry=composite)
+
+    await gateway.ensure_tenant_loaded(TENANT_ID)
+
+    assert source.prepared_tenants == [TENANT_ID]
 
 
 async def test_runtime_gateway_reads_only_configured_workspace(tmp_path: Path) -> None:

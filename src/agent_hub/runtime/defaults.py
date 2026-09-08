@@ -387,6 +387,10 @@ class ConfigBackedDispatchRuntime:
             )
         except HarnessModelSelectionError:
             return UnavailableRuntime(TaskMode.DISPATCH, reason="harness_model_unavailable")
+        await _prepare_capability_gateway_for_tenant(
+            context.tenant_id,
+            capability_gateway=self._capability_gateway,
+        )
         selected_roles = _selected_config_role_assignments(
             context,
             config,
@@ -497,6 +501,10 @@ class ConfigBackedDiscussionRuntime:
             )
         except HarnessModelSelectionError:
             return UnavailableRuntime(TaskMode.DISCUSS, reason="harness_model_unavailable")
+        await _prepare_capability_gateway_for_tenant(
+            context.tenant_id,
+            capability_gateway=self._capability_gateway,
+        )
         selected_roles = _selected_config_role_assignments(
             context,
             config,
@@ -607,6 +615,10 @@ class ConfigBackedHybridRuntime:
             )
         except HarnessModelSelectionError:
             return UnavailableRuntime(TaskMode.HYBRID, reason="harness_model_unavailable")
+        await _prepare_capability_gateway_for_tenant(
+            context.tenant_id,
+            capability_gateway=self._capability_gateway,
+        )
         profile = _task_profile(context.request)
         profiles = _task_profiles(context.request)
         high_risk = _high_risk_task(context.request)
@@ -1223,6 +1235,22 @@ def _plan_allowed_tools(
             )
         )
     return tuple(dict.fromkeys(tools))
+
+
+async def _prepare_capability_gateway_for_tenant(
+    tenant_id: UUID,
+    *,
+    capability_gateway: RuntimeCapabilityGatewayProtocol | None,
+) -> None:
+    if capability_gateway is None:
+        return
+    ensure_tenant_loaded = getattr(capability_gateway, "ensure_tenant_loaded", None)
+    if not callable(ensure_tenant_loaded):
+        return
+    try:
+        await ensure_tenant_loaded(tenant_id)
+    except Exception:  # noqa: BLE001 - capability inventory remains optional planning context.
+        return
 
 
 def _selected_config_role_assignments(

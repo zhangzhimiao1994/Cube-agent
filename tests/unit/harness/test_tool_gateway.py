@@ -135,6 +135,16 @@ class TenantPreparedPluginToolBackend(FakePluginToolBackend):
         self.available = True
 
 
+class TenantPreparedMcpToolBackend(FakeMcpToolBackend):
+    def __init__(self) -> None:
+        super().__init__(available=False)
+        self.prepared_tenants: list[UUID] = []
+
+    async def ensure_tenant_loaded(self, tenant_id: UUID) -> None:
+        self.prepared_tenants.append(tenant_id)
+        self.available = True
+
+
 class PolicyPartsPluginToolBackend(FakePluginToolBackend):
     def capability_policy_parts(
         self,
@@ -509,6 +519,30 @@ async def test_harness_tool_gateway_loads_plugin_tenant_before_availability_and_
     assert result.status == "succeeded"
     assert plugin_backend.prepared_tenants == [TENANT_ID]
     assert [call[0] for call in plugin_backend.calls] == ["available", "invoke"]
+    assert len(policy.requests) == 1
+    assert runtime.calls == []
+
+
+async def test_harness_tool_gateway_loads_mcp_tenant_before_availability_and_policy() -> None:
+    runtime = FakeRuntimeCapabilityGateway(available=False)
+    mcp_backend = TenantPreparedMcpToolBackend()
+    policy = FakePolicyGateway(CapabilityStatus.ALLOWED)
+    gateway = HarnessToolGateway(
+        runtime,
+        policy_gateway=policy,
+        mcp_backend=mcp_backend,
+    )
+
+    result = await gateway.invoke(
+        TENANT_ID,
+        mcp_request(),
+        user_id=USER_ID,
+        role=Role.OPERATOR,
+    )
+
+    assert result.status == "succeeded"
+    assert mcp_backend.prepared_tenants == [TENANT_ID]
+    assert [call[0] for call in mcp_backend.calls] == ["available", "invoke"]
     assert len(policy.requests) == 1
     assert runtime.calls == []
 

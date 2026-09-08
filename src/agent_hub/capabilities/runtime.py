@@ -7,7 +7,8 @@ import re
 import shutil
 import tempfile
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
+from inspect import isawaitable
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Protocol, cast
 from uuid import UUID, uuid4
@@ -139,6 +140,19 @@ class RuntimeCapabilityGateway:
         if _SAFE_CAPABILITY_NAME.fullmatch(normalized_name) is None:
             return False
         return self._skill_package_path(tenant_id, normalized_name).is_file()
+
+    async def ensure_tenant_loaded(self, tenant_id: UUID) -> None:
+        if self._tool_registry is None:
+            return
+        ensure_tenant_loaded = getattr(self._tool_registry, "ensure_tenant_loaded", None)
+        if not callable(ensure_tenant_loaded):
+            return
+        try:
+            result = ensure_tenant_loaded(tenant_id)
+            if isawaitable(result):
+                await cast(Awaitable[object], result)
+        except Exception:  # noqa: BLE001 - optional inventory preparation must fail closed.
+            return
 
     def capability_manifest(
         self,

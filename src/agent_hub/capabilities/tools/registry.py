@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from inspect import isawaitable
 from typing import Protocol, cast
 
 from agent_hub.runtime.contracts import JsonValue
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +82,24 @@ class ToolRegistry:
 class CompositeCapabilityManifestSource:
     def __init__(self, sources: Sequence[object]) -> None:
         self._sources = tuple(sources)
+
+    async def ensure_tenant_loaded(self, tenant_id: object) -> None:
+        for source in self._sources:
+            ensure_tenant_loaded = getattr(source, "ensure_tenant_loaded", None)
+            if not callable(ensure_tenant_loaded):
+                continue
+            try:
+                result = ensure_tenant_loaded(tenant_id)
+                if isawaitable(result):
+                    await result
+            except Exception as error:  # noqa: BLE001 - optional inventory preparation must fail closed.
+                _LOGGER.warning(
+                    "capability_manifest_source_prepare_failed source=%s tenant_id=%s error_type=%s",
+                    type(source).__name__,
+                    tenant_id,
+                    type(error).__name__,
+                )
+                continue
 
     def manifests_for_tenant(self, tenant_id: object) -> Mapping[str, JsonValue]:
         capabilities: list[Mapping[str, JsonValue]] = []
