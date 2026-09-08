@@ -681,6 +681,7 @@ export function McpPage() {
       setSigningKeyNotAfter("");
       setSigningKeyMessage("签名 Key 已保存。");
       await refreshSigningKeys();
+      await refreshPluginSurfaces();
     },
   });
   const deleteSigningKey = useMutation({
@@ -688,6 +689,7 @@ export function McpPage() {
     onSuccess: async () => {
       setSigningKeyMessage("签名 Key 已删除。");
       await refreshSigningKeys();
+      await refreshPluginSurfaces();
     },
   });
 

@@ -9,6 +9,7 @@ import pytest
 
 from agent_hub.api.routers.admin import (
     PluginCapabilityRequest,
+    PluginPackageMetadata,
     PluginResourceRequest,
     PluginResourceResponse,
 )
@@ -144,6 +145,7 @@ def plugin(
     capability_config: Mapping[str, JsonValue] | None = None,
     input_schema: Mapping[str, JsonValue] | None = None,
     output_schema: Mapping[str, JsonValue] | None = None,
+    package_metadata: PluginPackageMetadata | None = None,
 ) -> PluginResourceResponse:
     return PluginResourceResponse(
         **PluginResourceRequest(
@@ -177,6 +179,7 @@ def plugin(
         status=status,
         health=health,
         last_error_type=None,
+        package_metadata=package_metadata,
     )
 
 
@@ -204,6 +207,53 @@ async def test_runtime_plugin_service_exposes_running_plugins_as_manifest() -> N
     assert capabilities["calendar.create_event"]["available"] is True
     assert capabilities["stopped.run"]["available"] is False
     assert admin_service.calls == 1
+
+
+async def test_runtime_plugin_service_blocks_scan_only_adapter_packages() -> None:
+    package_metadata = PluginPackageMetadata.model_validate(
+        {
+            "kind": "adapter_package",
+            "package_version": "1.2.3",
+            "adapter_id": "calendar_python",
+            "sdk_api_version": "1.0",
+            "signature": {
+                "algorithm": "ed25519",
+                "key_id": "calendar-prod",
+                "value": "A" * 86,
+            },
+            "signature_verification": "verified",
+            "runtime": "python",
+            "entrypoint": "adapter/main.py",
+            "isolation": "local_process",
+            "install_mode": "scan_only",
+        }
+    )
+    adapter = RecordingPluginAdapter(calls=[])
+    service = await build_runtime_plugin_service(
+        tenant_id=TENANT_ID,
+        admin_service=FakeAdminService(
+            (plugin("calendar", package_metadata=package_metadata),)
+        ),
+        adapters={"plugin_runtime": adapter},
+    )
+
+    manifest = service.capability_manifest_source().manifests_for_tenant(TENANT_ID)
+    capability_items = cast(tuple[Mapping[str, object], ...], manifest["capabilities"])
+    capabilities = {str(item["id"]): item for item in capability_items}
+
+    assert service.is_available(TENANT_ID, "calendar.create_event") is False
+    assert capabilities["calendar.create_event"]["available"] is False
+    with pytest.raises(RuntimeCapabilityError, match="Plugin tool unavailable"):
+        await service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="tester",
+            name="calendar.create_event",
+            arguments={},
+            idempotency_key="invoke-1",
+        )
+    assert adapter.calls == []
 
 
 async def test_runtime_plugin_service_reloads_and_invokes_plugins_for_requested_tenant() -> None:

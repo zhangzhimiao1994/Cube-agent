@@ -3421,6 +3421,40 @@ def _plugin_signing_key_is_active(key: PluginSigningKeyResponse, now: datetime) 
     return key.not_after is None or active_at < key.not_after.astimezone(UTC)
 
 
+def _plugin_with_effective_package_trust(
+    plugin: PluginResourceResponse,
+    signing_keys: Iterable[PluginSigningKeyResponse],
+    now: datetime,
+) -> PluginResourceResponse:
+    package = plugin.package_metadata
+    if (
+        package is None
+        or package.signature is None
+        or package.signature_verification != "verified"
+    ):
+        return plugin
+    active_signing_key = next(
+        (
+            key
+            for key in signing_keys
+            if key.trusted
+            and key.algorithm == package.signature.algorithm
+            and key.key_id == package.signature.key_id
+            and _plugin_signing_key_is_active(key, now)
+        ),
+        None,
+    )
+    if active_signing_key is not None:
+        return plugin
+    effective_package = PluginPackageMetadata.model_validate(
+        {
+            **package.model_dump(mode="json"),
+            "signature_verification": "untrusted_key",
+        }
+    )
+    return plugin.model_copy(update={"package_metadata": effective_package})
+
+
 def _plugin_signature_payload(manifest: PluginArchiveManifest, archive_bytes: bytes) -> bytes:
     manifest_payload = manifest.model_dump(mode="json")
     package = manifest_payload.get("package")
@@ -4706,8 +4740,12 @@ class InMemoryAdminResourceService:
         *,
         tenant_id: UUID | None = None,
     ) -> tuple[PluginResourceResponse, ...]:
-        del tenant_id
-        return tuple(self.plugins.values())
+        signing_keys = await self.list_plugin_signing_keys(tenant_id=tenant_id)
+        now = datetime.now(UTC)
+        return tuple(
+            _plugin_with_effective_package_trust(plugin, signing_keys, now)
+            for plugin in self.plugins.values()
+        )
 
     async def list_plugin_signing_keys(
         self,
@@ -6627,7 +6665,16 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             if tenant_id is not None and tenant_id != self._tenant_id:
                 return ()
             return await super().list_plugins()
-        return tuple(PluginResourceResponse.model_validate(payload) for payload in resources)
+        signing_keys = await self.list_plugin_signing_keys(tenant_id=tenant_id)
+        now = datetime.now(UTC)
+        return tuple(
+            _plugin_with_effective_package_trust(
+                PluginResourceResponse.model_validate(payload),
+                signing_keys,
+                now,
+            )
+            for payload in resources
+        )
 
     async def list_plugin_signing_keys(
         self,
@@ -11415,15 +11462,18 @@ async def list_plugin_signing_keys(
 )
 async def upsert_plugin_signing_key(
     body: PluginSigningKeyRequest,
+    request: Request,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> PluginSigningKeyResponse:
     _require(principal, "plugin:write")
-    return await service.upsert_plugin_signing_key(
+    response = await service.upsert_plugin_signing_key(
         body,
         tenant_id=principal.tenant_id,
         actor_id=principal.user_id,
     )
+    await _reload_plugin_runtime_config(request, principal.tenant_id)
+    return response
 
 
 @router.delete(
@@ -11433,6 +11483,7 @@ async def upsert_plugin_signing_key(
 )
 async def delete_plugin_signing_key(
     key_id: str,
+    request: Request,
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> OperationStatusResponse:
@@ -11445,6 +11496,7 @@ async def delete_plugin_signing_key(
         )
     except (KeyError, ValidationError):
         raise PublicAPIError(404, "not_found", "not found") from None
+    await _reload_plugin_runtime_config(request, principal.tenant_id)
     return OperationStatusResponse(status="deleted")
 
 

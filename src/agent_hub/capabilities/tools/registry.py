@@ -127,6 +127,7 @@ class PluginConfig(Protocol):
     status: str
     health: str
     capabilities: Sequence[PluginCapabilityConfig]
+    package_metadata: object | None
 
 
 class PluginConfigCapabilityManifestSource:
@@ -136,11 +137,7 @@ class PluginConfigCapabilityManifestSource:
     def manifests(self) -> Mapping[str, JsonValue]:
         capabilities: list[Mapping[str, JsonValue]] = []
         for plugin in self._plugins:
-            available = (
-                plugin.enabled
-                and plugin.status == "running"
-                and plugin.health == "healthy"
-            )
+            available = _plugin_config_available(plugin)
             reason = None if available else _plugin_availability_reason(plugin)
             for capability in plugin.capabilities:
                 item: dict[str, JsonValue] = {
@@ -239,11 +236,30 @@ def _policy_effect(value: object) -> str:
 def _plugin_availability_reason(plugin: PluginConfig) -> str:
     if not plugin.enabled:
         return "plugin_disabled"
+    if _plugin_package_blocks_activation(plugin):
+        return "plugin_package_not_eligible"
     if plugin.status == "running" and plugin.health != "healthy":
         return "plugin_unhealthy"
     if plugin.status in {"stopped", "disabled", "failed"}:
         return f"plugin_{plugin.status}"
     return "plugin_unavailable"
+
+
+def _plugin_config_available(plugin: PluginConfig) -> bool:
+    return (
+        plugin.enabled
+        and plugin.status == "running"
+        and plugin.health == "healthy"
+        and not _plugin_package_blocks_activation(plugin)
+    )
+
+
+def _plugin_package_blocks_activation(plugin: PluginConfig) -> bool:
+    package = getattr(plugin, "package_metadata", None)
+    return (
+        getattr(package, "kind", None) == "adapter_package"
+        and getattr(package, "activation_state", None) != "eligible"
+    )
 
 
 def _source_manifest_items(

@@ -403,6 +403,16 @@ def _plugin_is_running(plugin: PluginResourceResponse) -> bool:
         plugin.enabled is True
         and plugin.status == "running"
         and plugin.health == "healthy"
+        and not _plugin_package_blocks_runtime_activation(plugin)
+    )
+
+
+def _plugin_package_blocks_runtime_activation(plugin: PluginResourceResponse) -> bool:
+    package = plugin.package_metadata
+    return (
+        package is not None
+        and package.kind == "adapter_package"
+        and package.activation_state != "eligible"
     )
 
 

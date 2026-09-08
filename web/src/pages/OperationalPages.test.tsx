@@ -1320,6 +1320,19 @@ describe("operational management pages", () => {
         }
         if (path === "/api/v1/admin/plugins/signing-keys/calendar-prod" && method === "DELETE") {
           visiblePluginSigningKeys = [];
+          visiblePlugins = [
+            {
+              ...calendarPlugin,
+              package_metadata: calendarPlugin.package_metadata
+                ? {
+                    ...calendarPlugin.package_metadata,
+                    signature_verification: "untrusted_key",
+                    activation_state: "blocked_untrusted_key",
+                    activation_reason: "package signature key is not trusted for this tenant",
+                  }
+                : null,
+            },
+          ];
           return jsonResponse({ status: "deleted" });
         }
         if (path === "/api/v1/admin/plugins" && method === "POST") {
@@ -6762,6 +6775,7 @@ describe("operational management pages", () => {
       ).toBeTruthy(),
     );
     expect(await screen.findByText("签名 Key 已删除。")).not.toBeNull();
+    expect(await screen.findByText("blocked_untrusted_key")).not.toBeNull();
 
     await user.clear(screen.getByLabelText("签名 Key ID"));
     await user.type(screen.getByLabelText("签名 Key ID"), "calendar-next");

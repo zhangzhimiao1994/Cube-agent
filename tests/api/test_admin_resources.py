@@ -4271,6 +4271,35 @@ def test_plugin_signing_keys_are_tenant_scoped() -> None:
     assert other_tenant.json() == []
 
 
+def test_plugin_signing_key_upsert_and_delete_trigger_runtime_reload_callback() -> None:
+    api = client()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    reloaded: list[UUID] = []
+
+    async def reload_plugin_runtime_config(tenant_id: UUID) -> None:
+        reloaded.append(tenant_id)
+
+    cast(Any, api.app).state.reload_plugin_runtime_config = reload_plugin_runtime_config
+
+    upsert = api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    deleted = api.delete(
+        "/api/v1/admin/plugins/signing-keys/calendar-prod",
+        headers=headers(),
+    )
+
+    assert upsert.status_code == 200
+    assert deleted.status_code == 200
+    assert reloaded == [TENANT_ID, TENANT_ID]
+
+
 @pytest.mark.parametrize(
     ("key_id", "window"),
     [
@@ -4364,6 +4393,91 @@ def test_plugin_signing_key_delete_revokes_future_package_trust() -> None:
     )
     assert install.status_code == 200
     assert install.json()["plugin"]["package_metadata"]["signature_verification"] == "untrusted_key"
+
+
+def test_plugin_listing_downgrades_verified_package_after_signing_key_delete() -> None:
+    api = client()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(private_key),
+    )
+    assert install.status_code == 200
+    assert install.json()["plugin"]["package_metadata"]["signature_verification"] == "verified"
+
+    delete_response = api.delete(
+        "/api/v1/admin/plugins/signing-keys/calendar-prod",
+        headers=headers(),
+    )
+
+    assert delete_response.status_code == 200
+    listed = api.get("/api/v1/admin/plugins", headers=headers())
+    metadata = listed.json()[0]["package_metadata"]
+    assert metadata["signature_verification"] == "untrusted_key"
+    assert metadata["activation_state"] == "blocked_untrusted_key"
+    assert metadata["activation_reason"] == "package signature key is not trusted for this tenant"
+
+
+def test_plugin_listing_downgrades_verified_package_after_signing_key_expiry() -> None:
+    api = client()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    public_key = plugin_public_key_value(private_key)
+    active_window = {
+        "not_before": (datetime.now(UTC) - timedelta(hours=1)).isoformat(),
+        "not_after": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+    }
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": public_key,
+            **active_window,
+        },
+    )
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(private_key),
+    )
+    assert install.status_code == 200
+    assert install.json()["plugin"]["package_metadata"]["signature_verification"] == "verified"
+
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": public_key,
+            "not_after": (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+        },
+    )
+
+    listed = api.get("/api/v1/admin/plugins", headers=headers())
+    metadata = listed.json()[0]["package_metadata"]
+    assert metadata["signature_verification"] == "untrusted_key"
+    assert metadata["activation_state"] == "blocked_untrusted_key"
+    assert metadata["activation_reason"] == "package signature key is not trusted for this tenant"
 
 
 def test_plugin_signing_key_delete_missing_key_returns_not_found() -> None:
@@ -4582,6 +4696,17 @@ async def test_persistent_plugin_signing_keys_and_verification_status_survive_re
     assert plugins["calendar"].package_metadata.signature_verification == "verified"
     assert plugins["search"].package_metadata is not None
     assert plugins["search"].package_metadata.signature_verification == "untrusted_key"
+
+    revoked_payloads = dict(writer.payloads)
+    revoked_payloads.pop((TENANT_ID, "plugin_signing_key", "calendar-prod"))
+    revoked_reader = StoredPersistentPluginService(revoked_payloads)
+    revoked_plugins = {
+        plugin.id: plugin for plugin in await revoked_reader.list_plugins(tenant_id=TENANT_ID)
+    }
+
+    assert revoked_plugins["calendar"].package_metadata is not None
+    assert revoked_plugins["calendar"].package_metadata.signature_verification == "untrusted_key"
+    assert revoked_plugins["calendar"].package_metadata.activation_state == "blocked_untrusted_key"
 
 
 @pytest.mark.asyncio
