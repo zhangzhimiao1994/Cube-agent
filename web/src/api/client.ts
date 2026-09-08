@@ -960,8 +960,18 @@ const PluginCapabilitySchema = z.object({
 const PluginPackageMetadataSchema = z.object({
   schema_version: z.literal(1).default(1),
   kind: z.enum(["manifest_only", "adapter_package"]).default("manifest_only"),
+  package_version: z.string().nullable().default(null),
   adapter_id: z.string().nullable().default(null),
   sdk_api_version: z.string().nullable().default(null),
+  signature: z
+    .object({
+      algorithm: z.literal("ed25519"),
+      key_id: z.string(),
+      value: z.string(),
+    })
+    .nullable()
+    .default(null),
+  signature_verification: z.enum(["not_provided", "not_verified"]).default("not_provided"),
   runtime: z.enum(["none", "python", "node", "container", "mcp_remote"]).default("none"),
   entrypoint: z.string().nullable().default(null),
   isolation: z

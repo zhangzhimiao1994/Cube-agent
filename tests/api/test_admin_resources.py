@@ -3535,6 +3535,9 @@ def plugin_archive(
     return buffer.getvalue()
 
 
+VALID_PLUGIN_SIGNATURE = "A" * 86
+
+
 def test_plugin_archive_install_scans_manifest_and_triggers_runtime_reload() -> None:
     api = client()
     reloaded: list[UUID] = []
@@ -3627,8 +3630,14 @@ def test_plugin_archive_install_persists_scan_only_package_metadata() -> None:
                 "package": {
                     "schema_version": 1,
                     "kind": "adapter_package",
+                    "package_version": "1.2.3",
                     "adapter_id": "calendar_python",
                     "sdk_api_version": "1.0",
+                    "signature": {
+                        "algorithm": "ed25519",
+                        "key_id": "calendar-prod",
+                        "value": VALID_PLUGIN_SIGNATURE,
+                    },
                     "runtime": "python",
                     "entrypoint": "adapter/main.py",
                     "isolation": "local_process",
@@ -3654,8 +3663,15 @@ def test_plugin_archive_install_persists_scan_only_package_metadata() -> None:
     assert body["plugin"]["package_metadata"] == {
         "schema_version": 1,
         "kind": "adapter_package",
+        "package_version": "1.2.3",
         "adapter_id": "calendar_python",
         "sdk_api_version": "1.0",
+        "signature": {
+            "algorithm": "ed25519",
+            "key_id": "calendar-prod",
+            "value": VALID_PLUGIN_SIGNATURE,
+        },
+        "signature_verification": "not_verified",
         "runtime": "python",
         "entrypoint": "adapter/main.py",
         "isolation": "local_process",
@@ -3682,6 +3698,7 @@ def test_plugin_archive_install_rejects_unsafe_package_entrypoint() -> None:
                 "name": "Calendar HTTP",
                 "package": {
                     "kind": "adapter_package",
+                    "package_version": "1.2.3",
                     "adapter_id": "calendar_python",
                     "sdk_api_version": "1.0",
                     "runtime": "python",
@@ -3714,6 +3731,7 @@ def test_plugin_archive_install_rejects_missing_package_entrypoint_file() -> Non
                 "name": "Calendar HTTP",
                 "package": {
                     "kind": "adapter_package",
+                    "package_version": "1.2.3",
                     "adapter_id": "calendar_python",
                     "sdk_api_version": "1.0",
                     "runtime": "python",
@@ -3795,6 +3813,73 @@ def test_plugin_archive_install_rejects_manifest_only_package_with_sdk_contract(
     assert response.json()["error"]["details"]["reason"] == "manifest-only plugin package cannot declare runtime execution"
 
 
+def test_plugin_archive_install_rejects_manifest_only_package_with_version_or_signature() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "package": {
+                    "kind": "manifest_only",
+                    "package_version": "1.2.3",
+                    "signature": {
+                        "algorithm": "ed25519",
+                        "key_id": "calendar-prod",
+                        "value": VALID_PLUGIN_SIGNATURE,
+                    },
+                    "install_mode": "scan_only",
+                },
+            },
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    assert response.json()["error"]["details"]["reason"] == "manifest-only plugin package cannot declare runtime execution"
+
+
+def test_plugin_archive_install_rejects_manifest_only_package_with_explicit_execution_defaults() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "package": {
+                    "kind": "manifest_only",
+                    "package_version": None,
+                    "adapter_id": None,
+                    "sdk_api_version": None,
+                    "signature": None,
+                    "runtime": "none",
+                    "entrypoint": None,
+                    "isolation": "none",
+                    "install_mode": "scan_only",
+                },
+            },
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    assert response.json()["error"]["details"]["reason"] == "manifest-only plugin package cannot declare runtime execution"
+
+
 def test_plugin_archive_install_rejects_adapter_package_without_sdk_contract() -> None:
     api = client()
 
@@ -3811,6 +3896,7 @@ def test_plugin_archive_install_rejects_adapter_package_without_sdk_contract() -
                 "name": "Calendar HTTP",
                 "package": {
                     "kind": "adapter_package",
+                    "package_version": "1.2.3",
                     "runtime": "python",
                     "entrypoint": "adapter/main.py",
                     "isolation": "local_process",
@@ -3842,6 +3928,7 @@ def test_plugin_archive_install_rejects_invalid_package_sdk_contract() -> None:
                 "name": "Calendar HTTP",
                 "package": {
                     "kind": "adapter_package",
+                    "package_version": "1.2.3",
                     "adapter_id": "calendar_python",
                     "sdk_api_version": "1",
                     "runtime": "python",
@@ -3858,6 +3945,193 @@ def test_plugin_archive_install_rejects_invalid_package_sdk_contract() -> None:
     assert response.json()["error"]["code"] == "invalid_plugin_package"
     reason = response.json()["error"]["details"]["reason"]
     assert "package.sdk_api_version" in reason
+
+
+def test_plugin_archive_install_rejects_adapter_package_without_package_version() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "package": {
+                    "kind": "adapter_package",
+                    "adapter_id": "calendar_python",
+                    "sdk_api_version": "1.0",
+                    "runtime": "python",
+                    "entrypoint": "adapter/main.py",
+                    "isolation": "local_process",
+                    "install_mode": "scan_only",
+                },
+            },
+            files={"adapter/main.py": "def invoke():\n    return {}\n"},
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    assert response.json()["error"]["details"]["reason"] == "adapter plugin package must declare package version"
+
+
+def test_plugin_archive_install_rejects_invalid_package_version_prerelease_zero() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "package": {
+                    "kind": "adapter_package",
+                    "package_version": "1.2.3-01",
+                    "adapter_id": "calendar_python",
+                    "sdk_api_version": "1.0",
+                    "runtime": "python",
+                    "entrypoint": "adapter/main.py",
+                    "isolation": "local_process",
+                    "install_mode": "scan_only",
+                },
+            },
+            files={"adapter/main.py": "def invoke():\n    return {}\n"},
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    assert "package.package_version" in response.json()["error"]["details"]["reason"]
+
+
+def test_plugin_archive_install_rejects_forged_signature_verification() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "package": {
+                    "kind": "adapter_package",
+                    "package_version": "1.2.3",
+                    "adapter_id": "calendar_python",
+                    "sdk_api_version": "1.0",
+                    "signature": {
+                        "algorithm": "ed25519",
+                        "key_id": "calendar-prod",
+                        "value": VALID_PLUGIN_SIGNATURE,
+                    },
+                    "signature_verification": "verified",
+                    "runtime": "python",
+                    "entrypoint": "adapter/main.py",
+                    "isolation": "local_process",
+                    "install_mode": "scan_only",
+                },
+            },
+            files={"adapter/main.py": "def invoke():\n    return {}\n"},
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    assert (
+        response.json()["error"]["details"]["reason"]
+        == "plugin package signature verification is server-controlled"
+    )
+
+
+def test_plugin_archive_install_rejects_invalid_package_signature() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "package": {
+                    "kind": "adapter_package",
+                    "package_version": "1.2.3",
+                    "adapter_id": "calendar_python",
+                    "sdk_api_version": "1.0",
+                    "signature": {
+                        "algorithm": "rsa-pss-sha256",
+                        "key_id": "calendar-prod",
+                        "value": "bad-signature",
+                    },
+                    "runtime": "python",
+                    "entrypoint": "adapter/main.py",
+                    "isolation": "local_process",
+                    "install_mode": "scan_only",
+                },
+            },
+            files={"adapter/main.py": "def invoke():\n    return {}\n"},
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    reason = response.json()["error"]["details"]["reason"]
+    assert "package.signature.algorithm" in reason
+    assert "package.signature.value" in reason
+
+
+def test_plugin_archive_install_records_unsigned_package_as_not_provided() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "package": {
+                    "kind": "adapter_package",
+                    "package_version": "1.2.3",
+                    "adapter_id": "calendar_python",
+                    "sdk_api_version": "1.0",
+                    "runtime": "python",
+                    "entrypoint": "adapter/main.py",
+                    "isolation": "local_process",
+                    "install_mode": "scan_only",
+                },
+            },
+            files={"adapter/main.py": "def invoke():\n    return {}\n"},
+        ),
+    )
+
+    assert response.status_code == 200
+    assert (
+        response.json()["plugin"]["package_metadata"]["signature_verification"]
+        == "not_provided"
+    )
 
 
 def test_plugin_resource_upsert_rejects_client_supplied_archive_provenance() -> None:
@@ -3890,6 +4164,7 @@ def test_plugin_resource_upsert_rejects_client_supplied_package_metadata() -> No
             "package_metadata": {
                 "schema_version": 1,
                 "kind": "adapter_package",
+                "package_version": "1.2.3",
                 "adapter_id": "calendar_python",
                 "sdk_api_version": "1.0",
                 "runtime": "python",

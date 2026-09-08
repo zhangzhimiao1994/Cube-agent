@@ -1259,6 +1259,15 @@ export function McpPage() {
                     <p>安装模式：<span>{plugin.package_metadata?.install_mode ?? "未配置"}</span></p>
                     <p>适配器 ID：<span>{plugin.package_metadata?.adapter_id ?? "未配置"}</span></p>
                     <p>SDK API：<span>{plugin.package_metadata?.sdk_api_version ?? "未配置"}</span></p>
+                    <p>包版本：<span>{plugin.package_metadata?.package_version ?? "未配置"}</span></p>
+                    <p>
+                      签名：
+                      <span>
+                        {plugin.package_metadata?.signature
+                          ? `${plugin.package_metadata.signature.algorithm} / ${plugin.package_metadata.signature.key_id} / ${plugin.package_metadata.signature_verification}`
+                          : plugin.package_metadata?.signature_verification ?? "未配置"}
+                      </span>
+                    </p>
                     <p>
                       资源配置：
                       <span>

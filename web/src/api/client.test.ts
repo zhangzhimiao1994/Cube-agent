@@ -577,8 +577,15 @@ describe("api client transport", () => {
       package_metadata: {
         schema_version: 1,
         kind: "adapter_package",
+        package_version: "1.2.3",
         adapter_id: "calendar_python",
         sdk_api_version: "1.0",
+        signature: {
+          algorithm: "ed25519",
+          key_id: "calendar-prod",
+          value: "A".repeat(86),
+        },
+        signature_verification: "not_verified",
         runtime: "python",
         entrypoint: "adapter/main.py",
         isolation: "local_process",

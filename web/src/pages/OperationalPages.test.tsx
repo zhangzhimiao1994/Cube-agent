@@ -448,8 +448,15 @@ const calendarPlugin: PluginResource = {
   package_metadata: {
     schema_version: 1,
     kind: "adapter_package",
+    package_version: "1.2.3",
     adapter_id: "calendar_python",
     sdk_api_version: "1.0",
+    signature: {
+      algorithm: "ed25519",
+      key_id: "calendar-prod",
+      value: "A".repeat(86),
+    },
+    signature_verification: "not_verified",
     runtime: "python",
     entrypoint: "adapter/main.py",
     isolation: "local_process",
@@ -6561,6 +6568,10 @@ describe("operational management pages", () => {
     expect(screen.getByText("calendar_python")).not.toBeNull();
     expect(screen.getByText("SDK API：")).not.toBeNull();
     expect(screen.getByText("1.0")).not.toBeNull();
+    expect(screen.getByText("包版本：")).not.toBeNull();
+    expect(screen.getByText("1.2.3")).not.toBeNull();
+    expect(screen.getByText("签名：")).not.toBeNull();
+    expect(screen.getByText("ed25519 / calendar-prod / not_verified")).not.toBeNull();
     expect(screen.getByText("包运行时：")).not.toBeNull();
     expect(screen.getByText("python / local_process")).not.toBeNull();
     expect(screen.getByText("包入口：")).not.toBeNull();

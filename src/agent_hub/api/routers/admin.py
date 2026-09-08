@@ -612,11 +612,37 @@ class PluginResourceRequest(NamedResourceRequest):
         return value
 
 
+class PluginPackageSignatureMetadata(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    algorithm: Literal["ed25519"]
+    key_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$",
+    )
+    value: str = Field(
+        min_length=86,
+        max_length=86,
+        pattern=r"^[A-Za-z0-9_-]{86}$",
+    )
+
+
 class PluginPackageMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: Literal[1] = 1
     kind: Literal["manifest_only", "adapter_package"] = "manifest_only"
+    package_version: str | None = Field(
+        default=None,
+        max_length=64,
+        pattern=(
+            r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+            r"(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+            r"(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?"
+            r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+        ),
+    )
     adapter_id: str | None = Field(
         default=None,
         max_length=128,
@@ -627,6 +653,8 @@ class PluginPackageMetadata(BaseModel):
         max_length=32,
         pattern=r"^[1-9][0-9]*\.[0-9]+$",
     )
+    signature: PluginPackageSignatureMetadata | None = None
+    signature_verification: Literal["not_provided", "not_verified"] = "not_provided"
     runtime: Literal["none", "python", "node", "container", "mcp_remote"] = "none"
     entrypoint: str | None = Field(default=None, max_length=255)
     isolation: Literal[
@@ -638,6 +666,14 @@ class PluginPackageMetadata(BaseModel):
         "mcp_remote",
     ] = "none"
     install_mode: Literal["scan_only"] = "scan_only"
+
+    @model_validator(mode="after")
+    def derive_signature_verification(self) -> PluginPackageMetadata:
+        verification: Literal["not_provided", "not_verified"] = (
+            "not_verified" if self.signature is not None else "not_provided"
+        )
+        self.signature_verification = verification
+        return self
 
 
 class PluginArchiveManifest(PluginResourceRequest):
@@ -3134,6 +3170,18 @@ def _validate_plugin_package_metadata(manifest: object) -> None:
     package = manifest.get("package")
     if not isinstance(package, Mapping):
         return
+    if "signature_verification" in package:
+        raise InvalidSkillPackage("plugin package signature verification is server-controlled")
+    if package.get("kind") == "manifest_only" and set(package) & {
+        "package_version",
+        "adapter_id",
+        "sdk_api_version",
+        "signature",
+        "runtime",
+        "entrypoint",
+        "isolation",
+    }:
+        raise InvalidSkillPackage("manifest-only plugin package cannot declare runtime execution")
     entrypoint = package.get("entrypoint")
     if entrypoint is None:
         return
@@ -3154,7 +3202,9 @@ def _validate_plugin_package_contract(
         return
     if package.kind == "manifest_only":
         if (
-            package.adapter_id is not None
+            package.package_version is not None
+            or package.signature is not None
+            or package.adapter_id is not None
             or package.sdk_api_version is not None
             or package.runtime != "none"
             or package.entrypoint is not None
@@ -3166,6 +3216,8 @@ def _validate_plugin_package_contract(
         return
     if package.adapter_id is None or package.sdk_api_version is None:
         raise InvalidSkillPackage("adapter plugin package must declare sdk contract")
+    if package.package_version is None:
+        raise InvalidSkillPackage("adapter plugin package must declare package version")
     if package.runtime == "none" or package.isolation == "none":
         raise InvalidSkillPackage("adapter plugin package must declare runtime execution")
     if package.entrypoint is None or package.entrypoint not in archive_paths:
