@@ -1244,6 +1244,8 @@ export function McpPage() {
                     <p>允许域名：<span>{plugin.domain_allowlist.join(", ") || "未配置"}</span></p>
                     <p>Credential：<span>{plugin.credential_ref ?? "未配置"}</span></p>
                     <p>Header：<span>{plugin.credential_header}</span></p>
+                    <p>来源归档：<span>{plugin.source_filename ?? "未配置"}</span></p>
+                    <p>内容 SHA-256：<span>{plugin.content_sha256 ?? "未配置"}</span></p>
                     <p>
                       资源配置：
                       <span>

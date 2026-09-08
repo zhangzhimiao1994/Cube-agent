@@ -443,6 +443,8 @@ const calendarPlugin: PluginResource = {
   credential_ref: "secret://calendar",
   credential_header: "X-Plugin-Key",
   credential_scheme: "",
+  source_filename: "calendar-plugin.zip",
+  content_sha256: "abc123",
   capabilities: [
     {
       id: "calendar.create_event",
@@ -6539,6 +6541,10 @@ describe("operational management pages", () => {
     expect(screen.getAllByText("calendar.create_event").length).toBeGreaterThan(0);
     expect(screen.getByText("calendar.create_event:需要审批")).not.toBeNull();
     expect(screen.getByText("secret://calendar")).not.toBeNull();
+    expect(screen.getByText("来源归档：")).not.toBeNull();
+    expect(screen.getByText("calendar-plugin.zip")).not.toBeNull();
+    expect(screen.getByText("内容 SHA-256：")).not.toBeNull();
+    expect(screen.getByText("abc123")).not.toBeNull();
 
     await user.upload(
       screen.getByLabelText("插件归档"),

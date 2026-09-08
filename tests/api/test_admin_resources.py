@@ -3234,9 +3234,17 @@ def test_plugin_admin_write_endpoints_scope_writes_to_principal_tenant_and_actor
             *,
             tenant_id: UUID | None = None,
             actor_id: UUID | None = None,
+            source_filename: str | None = None,
+            content_sha256: str | None = None,
         ) -> PluginResourceResponse:
             self.calls.append(("upsert", request.id, tenant_id, actor_id))
-            return await super().upsert_plugin(request, tenant_id=tenant_id, actor_id=actor_id)
+            return await super().upsert_plugin(
+                request,
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                source_filename=source_filename,
+                content_sha256=content_sha256,
+            )
 
         async def start_plugin(
             self,
@@ -3559,10 +3567,15 @@ def test_plugin_archive_install_scans_manifest_and_triggers_runtime_reload() -> 
     assert body["filename"] == "calendar-plugin.zip"
     assert body["content_sha256"]
     assert body["plugin"]["id"] == "calendar"
+    assert body["plugin"]["source_filename"] == "calendar-plugin.zip"
+    assert body["plugin"]["content_sha256"] == body["content_sha256"]
     assert body["plugin"]["version"] == "1.0.0"
     assert body["plugin"]["capabilities"][0]["id"] == "calendar.create_event"
     assert reloaded == [TENANT_ID]
-    assert api.get("/api/v1/admin/plugins", headers=headers()).json()[0]["id"] == "calendar"
+    listed = api.get("/api/v1/admin/plugins", headers=headers()).json()[0]
+    assert listed["id"] == "calendar"
+    assert listed["source_filename"] == "calendar-plugin.zip"
+    assert listed["content_sha256"] == body["content_sha256"]
 
 
 def test_plugin_archive_install_rejects_archives_without_plugin_manifest() -> None:
@@ -3584,6 +3597,24 @@ def test_plugin_archive_install_rejects_archives_without_plugin_manifest() -> No
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "invalid_plugin_package"
     assert response.json()["error"]["details"]["reason"] == "plugin archive is missing plugin.json"
+
+
+def test_plugin_resource_upsert_rejects_client_supplied_archive_provenance() -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={
+            "id": "calendar",
+            "name": "Calendar HTTP",
+            "source_filename": "forged.zip",
+            "content_sha256": "a" * 64,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "request_validation"
 
 
 def test_plugin_reload_callback_failure_does_not_fail_saved_config() -> None:

@@ -963,6 +963,8 @@ const PluginResourceSchema = z.object({
   enabled: z.boolean().default(true),
   description: z.string().nullable().default(null),
   version: z.string().default("local"),
+  source_filename: z.string().nullable().default(null),
+  content_sha256: z.string().nullable().default(null),
   resource_config: JsonObjectSchema.default({}),
   endpoint_url: z.string().nullable().default(null),
   domain_allowlist: z.array(z.string()).default([]),

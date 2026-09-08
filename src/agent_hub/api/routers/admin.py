@@ -613,6 +613,17 @@ class PluginResourceRequest(NamedResourceRequest):
 
 
 class PluginResourceResponse(PluginResourceRequest):
+    source_filename: str | None = Field(
+        default=None,
+        max_length=255,
+        pattern=r"^[^/\\\x00]+$",
+    )
+    content_sha256: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[a-f0-9]{64}$",
+    )
     status: str = Field(pattern=r"^(disabled|stopped|running|failed)$")
     health: str = Field(pattern=r"^(disabled|stopped|healthy|unhealthy|failed|unknown)$")
     last_error_type: str | None = Field(default=None, max_length=128)
@@ -2168,6 +2179,8 @@ class AdminResourceService(Protocol):
         *,
         tenant_id: UUID | None = None,
         actor_id: UUID | None = None,
+        source_filename: str | None = None,
+        content_sha256: str | None = None,
     ) -> PluginResourceResponse: ...
 
     async def start_plugin(
@@ -3151,11 +3164,15 @@ def _plugin_response_from_request(
     request: PluginResourceRequest,
     *,
     current: PluginResourceResponse | None = None,
+    source_filename: str | None = None,
+    content_sha256: str | None = None,
 ) -> PluginResourceResponse:
     payload = request.model_dump()
     if not request.enabled:
         return PluginResourceResponse(
             **payload,
+            source_filename=source_filename,
+            content_sha256=content_sha256,
             status="disabled",
             health="disabled",
             last_error_type=None,
@@ -3163,12 +3180,16 @@ def _plugin_response_from_request(
     if current is not None and current.status == "running":
         return PluginResourceResponse(
             **payload,
+            source_filename=source_filename,
+            content_sha256=content_sha256,
             status="running",
             health="healthy",
             last_error_type=None,
         )
     return PluginResourceResponse(
         **payload,
+        source_filename=source_filename,
+        content_sha256=content_sha256,
         status="stopped",
         health="stopped",
         last_error_type=None,
@@ -4226,10 +4247,17 @@ class InMemoryAdminResourceService:
         *,
         tenant_id: UUID | None = None,
         actor_id: UUID | None = None,
+        source_filename: str | None = None,
+        content_sha256: str | None = None,
     ) -> PluginResourceResponse:
         del tenant_id, actor_id
         current = self.plugins.get(request.id)
-        response = _plugin_response_from_request(request, current=current)
+        response = _plugin_response_from_request(
+            request,
+            current=current,
+            source_filename=source_filename,
+            content_sha256=content_sha256,
+        )
         self.plugins[response.id] = response
         return response
 
@@ -6104,9 +6132,16 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         *,
         tenant_id: UUID | None = None,
         actor_id: UUID | None = None,
+        source_filename: str | None = None,
+        content_sha256: str | None = None,
     ) -> PluginResourceResponse:
         current = await self._plugin_response(request.id, tenant_id=tenant_id)
-        response = _plugin_response_from_request(request, current=current)
+        response = _plugin_response_from_request(
+            request,
+            current=current,
+            source_filename=source_filename,
+            content_sha256=content_sha256,
+        )
         if not await self._upsert_admin_payload(
             "plugin",
             response.id,
@@ -6115,7 +6150,11 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         ):
             if tenant_id is not None and tenant_id != self._tenant_id:
                 raise KeyError(response.id)
-            return await super().upsert_plugin(request)
+            return await super().upsert_plugin(
+                request,
+                source_filename=source_filename,
+                content_sha256=content_sha256,
+            )
         await self._record_audit(
             "plugin.upsert",
             f"plugin:{response.id}",
@@ -10835,6 +10874,8 @@ async def install_plugin_archive(
         plugin_request,
         tenant_id=principal.tenant_id,
         actor_id=principal.user_id,
+        source_filename=filename,
+        content_sha256=content_sha256,
     )
     await service.record_audit_event(
         actor=str(principal.user_id),
