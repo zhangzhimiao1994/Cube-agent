@@ -9,7 +9,6 @@ from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.db.models import (
-    AdminResourceRow,
     BootstrapCodeRow,
     ChannelDedupRow,
     ConfigRevisionRow,
@@ -84,7 +83,6 @@ async def db_session(database_url: str) -> AsyncIterator[AsyncSession]:
             await session.execute(delete(ChannelDedupRow))
             await session.execute(delete(BootstrapCodeRow))
             await session.execute(delete(SecretRow))
-            await session.execute(delete(AdminResourceRow))
             await session.execute(delete(ConfigRevisionRow))
             await session.execute(delete(UserRow))
             await session.execute(delete(TenantRow))
@@ -97,7 +95,6 @@ async def db_session(database_url: str) -> AsyncIterator[AsyncSession]:
                 await session.execute(delete(ChannelDedupRow))
                 await session.execute(delete(BootstrapCodeRow))
                 await session.execute(delete(SecretRow))
-                await session.execute(delete(AdminResourceRow))
                 await session.execute(delete(ConfigRevisionRow))
                 await session.execute(delete(UserRow))
                 await session.execute(delete(TenantRow))
@@ -140,7 +137,6 @@ async def _clean_database(
         await session.execute(delete(ChannelDedupRow))
         await session.execute(delete(BootstrapCodeRow))
         await session.execute(delete(SecretRow))
-        await session.execute(delete(AdminResourceRow))
         await session.execute(delete(ConfigRevisionRow))
         await session.execute(delete(UserRow))
         await session.execute(delete(TenantRow))
