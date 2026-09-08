@@ -64,6 +64,7 @@ from agent_hub.multimodal.generation import (
     MultimediaGenerationExecutor,
 )
 from agent_hub.multimodal.video_providers import VideoProviderGenerationError
+from agent_hub.plugins.runtime import build_runtime_plugin_service
 from agent_hub.runs.repository import RunRecord, _event_with_failure_diagnostic
 from agent_hub.runtime.contracts import EventKind, RunEvent
 from agent_hub.scheduler.service import SchedulerService
@@ -3153,6 +3154,120 @@ def test_plugin_admin_api_preserves_capability_schemas_in_manifest() -> None:
         "type": "object",
         "properties": {"remote_id": {"type": "string"}},
     }
+
+
+@pytest.mark.asyncio
+async def test_plugin_admin_runtime_http_json_acceptance_records_safe_audit() -> None:
+    adapter_calls: list[dict[str, object]] = []
+
+    class AdapterHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            adapter_calls.append(
+                {
+                    "path": self.path,
+                    "content_type": self.headers.get("Content-Type"),
+                    "body": body,
+                }
+            )
+            payload = json.dumps({"remote_id": "evt_123"}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), AdapterHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        api = client()
+        admin_service = cast(
+            InMemoryAdminResourceService,
+            cast(Any, api.app).state.admin_resource_service,
+        )
+        runtime_plugin_service = await build_runtime_plugin_service(
+            tenant_id=TENANT_ID,
+            admin_service=admin_service,
+        )
+        cast(Any, api.app).state.plugin_service = runtime_plugin_service
+        cast(Any, api.app).state.reload_plugin_runtime_config = runtime_plugin_service.reload
+
+        created = api.post(
+            "/api/v1/admin/plugins",
+            headers=headers(),
+            json={
+                "id": "calendar",
+                "name": "Calendar Plugin",
+                "endpoint_url": f"http://127.0.0.1:{server.server_port}/invoke",
+                "domain_allowlist": ["127.0.0.1"],
+                "capabilities": [
+                    {
+                        "id": "calendar.create_event",
+                        "adapter": "http_json",
+                        "permission_class": "calendar.write",
+                        "sandbox_profile": "remote_connector",
+                        "policy_effect": "require_approval",
+                        "input_schema": {
+                            "type": "object",
+                            "required": ["title"],
+                            "properties": {"title": {"type": "string"}},
+                        },
+                        "output_schema": {
+                            "type": "object",
+                            "required": ["remote_id"],
+                            "properties": {"remote_id": {"type": "string"}},
+                        },
+                    }
+                ],
+            },
+        )
+        started = api.post("/api/v1/admin/plugins/calendar/start", headers=headers())
+
+        assert created.status_code == 200
+        assert started.status_code == 200
+        result = await runtime_plugin_service.invoke(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="acceptance",
+            name="calendar.create_event",
+            arguments={"title": "Planning"},
+            idempotency_key="acceptance-1",
+        )
+        audit = api.get(
+            "/api/v1/admin/audit?action=plugin.invoke.succeeded",
+            headers=headers(),
+        )
+
+        assert result == {"remote_id": "evt_123"}
+        assert len(adapter_calls) == 1
+        call = adapter_calls[0]
+        assert call["path"] == "/invoke"
+        assert call["content_type"] == "application/json"
+        body = cast(dict[str, object], call["body"])
+        assert body["plugin_id"] == "calendar"
+        assert body["capability_id"] == "calendar.create_event"
+        assert body["arguments"] == {"title": "Planning"}
+        assert body["resource_config"] == {}
+        assert body["capability_config"] == {}
+        assert cast(dict[str, object], body["context"])["idempotency_key"] == "acceptance-1"
+        assert audit.status_code == 200
+        event = audit.json()[0]
+        assert event["resource"] == "plugin:calendar:calendar.create_event"
+        assert event["details"]["adapter"] == "http_json"
+        assert event["details"]["permission_class"] == "calendar.write"
+        assert event["details"]["sandbox_profile"] == "remote_connector"
+        assert "Planning" not in audit.text
+        assert "evt_123" not in audit.text
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_plugin_adapter_catalog_endpoint_exposes_safe_http_json_descriptor() -> None:
