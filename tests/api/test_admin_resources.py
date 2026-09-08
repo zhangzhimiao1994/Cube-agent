@@ -37,6 +37,7 @@ from agent_hub.api.routers.admin import (
     ModelDeploymentRequest,
     ModelDeploymentResponse,
     PersistentAdminResourceService,
+    PluginArchiveManifest,
     PluginCapabilityRequest,
     PluginPackageMetadata,
     PluginResourceRequest,
@@ -3644,6 +3645,10 @@ def test_plugin_signature_payload_excludes_server_controlled_activation_fields()
                     "key_id": "calendar-prod",
                     "value": VALID_PLUGIN_SIGNATURE,
                 },
+                "approval_state": "approved",
+                "approval_reason": "approved by admin",
+                "approved_by": str(USER_ID),
+                "approved_at": "2026-09-09T00:00:00Z",
                 "runtime": "python",
                 "entrypoint": "adapter/main.py",
                 "isolation": "local_process",
@@ -3652,10 +3657,37 @@ def test_plugin_signature_payload_excludes_server_controlled_activation_fields()
         },
         files={"adapter/main.py": "def invoke():\n    return {}\n"},
     )
+    manifest = PluginArchiveManifest.model_validate(
+        {
+            "id": "calendar",
+            "name": "Calendar HTTP",
+            "package": {
+                "kind": "adapter_package",
+                "package_version": "1.2.3",
+                "adapter_id": "calendar_python",
+                "sdk_api_version": "1.0",
+                "signature": {
+                    "algorithm": "ed25519",
+                    "key_id": "calendar-prod",
+                    "value": VALID_PLUGIN_SIGNATURE,
+                },
+                "approval_state": "approved",
+                "approval_reason": "approved by admin",
+                "approved_by": str(USER_ID),
+                "approved_at": "2026-09-09T00:00:00Z",
+                "activation_state": "eligible",
+                "activation_reason": "approved",
+                "runtime": "python",
+                "entrypoint": "adapter/main.py",
+                "isolation": "local_process",
+                "install_mode": "scan_only",
+            },
+        },
+    )
 
     payload = json.loads(
         _plugin_signature_payload(
-            _plugin_archive_manifest_from_archive(archive_bytes),
+            manifest,
             archive_bytes,
         ).decode(),
     )
@@ -3663,6 +3695,14 @@ def test_plugin_signature_payload_excludes_server_controlled_activation_fields()
     signed_package = payload["manifest"]["package"]
     assert "activation_state" not in signed_package
     assert "activation_reason" not in signed_package
+    assert "approval_state" not in signed_package
+    assert "approval_reason" not in signed_package
+    assert "approved_by" not in signed_package
+    assert "approved_at" not in signed_package
+    assert signed_package["signature"] == {
+        "algorithm": "ed25519",
+        "key_id": "calendar-prod",
+    }
 
 
 def test_plugin_archive_install_scans_manifest_and_triggers_runtime_reload() -> None:
@@ -3800,6 +3840,10 @@ def test_plugin_archive_install_persists_scan_only_package_metadata() -> None:
         },
         "signature_verification": "untrusted_key",
         "verified_public_key_sha256": None,
+        "approval_state": "pending",
+        "approval_reason": "adapter package requires plugin approval before activation",
+        "approved_by": None,
+        "approved_at": None,
         "activation_state": "blocked_untrusted_key",
         "activation_reason": "package signature key is not trusted for this tenant",
         "runtime": "python",
@@ -4588,7 +4632,13 @@ def test_scan_only_adapter_package_lifecycle_fails_closed() -> None:
         content=signed_plugin_archive(private_key),
     )
     assert install.status_code == 200
-    assert install.json()["plugin"]["package_metadata"]["activation_state"] == "verified_scan_only"
+    assert (
+        install.json()["plugin"]["package_metadata"]["activation_state"]
+        == "blocked_pending_approval"
+    )
+    assert install.json()["plugin"]["package_metadata"]["activation_reason"] == (
+        "adapter package requires plugin approval before activation"
+    )
 
     started = api.post("/api/v1/admin/plugins/calendar/start", headers=headers())
     reloaded = api.post("/api/v1/admin/plugins/calendar/reload", headers=headers())
@@ -4637,7 +4687,10 @@ def test_scan_only_adapter_package_install_does_not_inherit_running_status() -> 
     assert created.status_code == 200
     assert started.status_code == 200
     assert install.status_code == 200
-    assert install.json()["plugin"]["package_metadata"]["activation_state"] == "verified_scan_only"
+    assert (
+        install.json()["plugin"]["package_metadata"]["activation_state"]
+        == "blocked_pending_approval"
+    )
     assert install.json()["plugin"]["status"] == "stopped"
     assert install.json()["plugin"]["health"] == "stopped"
 
@@ -4721,9 +4774,9 @@ def test_plugin_archive_install_verifies_trusted_ed25519_signature() -> None:
     assert response.status_code == 200
     metadata = response.json()["plugin"]["package_metadata"]
     assert metadata["signature_verification"] == "verified"
-    assert metadata["activation_state"] == "verified_scan_only"
+    assert metadata["activation_state"] == "blocked_pending_approval"
     assert metadata["activation_reason"] == (
-        "package signature is verified, but install_mode=scan_only prevents activation"
+        "adapter package requires plugin approval before activation"
     )
 
 
@@ -4794,6 +4847,61 @@ def test_plugin_archive_install_rejects_forged_activation_state() -> None:
     assert (
         response.json()["error"]["details"]["reason"]
         == "plugin package activation state is server-controlled"
+    )
+
+
+@pytest.mark.parametrize(
+    ("approval_field", "approval_value"),
+    [
+        ("approval_state", "approved"),
+        ("approval_reason", "trusted by manifest"),
+        ("approved_by", str(USER_ID)),
+        ("approved_at", "2026-09-09T00:00:00Z"),
+    ],
+)
+def test_plugin_archive_install_rejects_forged_package_approval_state(
+    approval_field: str,
+    approval_value: str,
+) -> None:
+    api = client()
+
+    response = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=plugin_archive(
+            {
+                "id": "calendar",
+                "name": "Calendar HTTP",
+                "package": {
+                    "kind": "adapter_package",
+                    "package_version": "1.2.3",
+                    "adapter_id": "calendar_python",
+                    "sdk_api_version": "1.0",
+                    "signature": {
+                        "algorithm": "ed25519",
+                        "key_id": "calendar-prod",
+                        "value": VALID_PLUGIN_SIGNATURE,
+                    },
+                    approval_field: approval_value,
+                    "runtime": "python",
+                    "entrypoint": "adapter/main.py",
+                    "isolation": "local_process",
+                    "install_mode": "scan_only",
+                },
+            },
+            files={"adapter/main.py": "def invoke():\n    return {}\n"},
+        ),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_plugin_package"
+    assert (
+        response.json()["error"]["details"]["reason"]
+        == "plugin package approval state is server-controlled"
     )
 
 

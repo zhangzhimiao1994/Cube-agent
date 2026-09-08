@@ -459,6 +459,10 @@ const calendarPlugin: PluginResource = {
     },
     signature_verification: "not_verified",
     verified_public_key_sha256: null,
+    approval_state: "pending",
+    approval_reason: "adapter package requires plugin approval before activation",
+    approved_by: null,
+    approved_at: null,
     activation_state: "blocked_unverified_signature",
     activation_reason: "package signature has not been verified by the server",
     runtime: "python",
@@ -6633,6 +6637,10 @@ describe("operational management pages", () => {
     expect(screen.getByText("1.2.3")).not.toBeNull();
     expect(screen.getByText("签名：")).not.toBeNull();
     expect(screen.getByText("ed25519 / calendar-prod / not_verified")).not.toBeNull();
+    expect(screen.getByText("包审批：")).not.toBeNull();
+    expect(screen.getByText("pending")).not.toBeNull();
+    expect(screen.getByText("审批原因：")).not.toBeNull();
+    expect(screen.getByText("adapter package requires plugin approval before activation")).not.toBeNull();
     expect(screen.getByText("激活状态：")).not.toBeNull();
     expect(screen.getByText("blocked_unverified_signature")).not.toBeNull();
     expect(screen.getByText("package signature has not been verified by the server")).not.toBeNull();

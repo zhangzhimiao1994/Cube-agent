@@ -721,12 +721,18 @@ class PluginPackageMetadata(BaseModel):
         max_length=64,
         pattern=r"^[a-f0-9]{64}$",
     )
+    approval_state: Literal["not_required", "pending", "approved", "rejected"] = "not_required"
+    approval_reason: str = Field(default="", max_length=256)
+    approved_by: str | None = Field(default=None, max_length=128)
+    approved_at: datetime | None = None
     activation_state: Literal[
         "not_applicable",
         "blocked_unsigned",
         "blocked_unverified_signature",
         "blocked_untrusted_key",
         "blocked_failed_signature",
+        "blocked_pending_approval",
+        "blocked_rejected_approval",
         "verified_scan_only",
         "eligible",
     ] = "not_applicable"
@@ -751,8 +757,24 @@ class PluginPackageMetadata(BaseModel):
             verification = "not_verified"
         else:
             verification = self.signature_verification
-        state, reason = _plugin_package_activation_state(self, verification)
+        if self.kind == "manifest_only":
+            approval_state: Literal["not_required", "pending", "approved", "rejected"] = (
+                "not_required"
+            )
+            approval_reason = "manifest-only package has no executable activation target"
+        elif self.approval_state == "not_required":
+            approval_state = "pending"
+            approval_reason = "adapter package requires plugin approval before activation"
+        else:
+            approval_state = self.approval_state
+            approval_reason = self.approval_reason
         self.signature_verification = verification
+        self.approval_state = approval_state
+        self.approval_reason = approval_reason
+        if approval_state in {"not_required", "pending"}:
+            self.approved_by = None
+            self.approved_at = None
+        state, reason = _plugin_package_activation_state(self, verification)
         self.activation_state = state
         self.activation_reason = reason
         return self
@@ -794,6 +816,8 @@ PluginActivationState = Literal[
     "blocked_unverified_signature",
     "blocked_untrusted_key",
     "blocked_failed_signature",
+    "blocked_pending_approval",
+    "blocked_rejected_approval",
     "verified_scan_only",
     "eligible",
 ]
@@ -827,6 +851,16 @@ def _plugin_package_activation_state(
         return (
             "blocked_failed_signature",
             "package signature verification failed",
+        )
+    if package.approval_state == "pending":
+        return (
+            "blocked_pending_approval",
+            "adapter package requires plugin approval before activation",
+        )
+    if package.approval_state == "rejected":
+        return (
+            "blocked_rejected_approval",
+            package.approval_reason or "adapter package approval was rejected",
         )
     if package.install_mode == "scan_only":
         return (
@@ -3324,6 +3358,13 @@ def _validate_plugin_package_metadata(manifest: object) -> None:
         return
     if "activation_state" in package or "activation_reason" in package:
         raise InvalidSkillPackage("plugin package activation state is server-controlled")
+    if (
+        "approval_state" in package
+        or "approval_reason" in package
+        or "approved_by" in package
+        or "approved_at" in package
+    ):
+        raise InvalidSkillPackage("plugin package approval state is server-controlled")
     if "signature_verification" in package:
         raise InvalidSkillPackage("plugin package signature verification is server-controlled")
     if "verified_public_key_sha256" in package:
@@ -3494,8 +3535,15 @@ def _plugin_signature_payload(manifest: PluginArchiveManifest, archive_bytes: by
     manifest_payload = manifest.model_dump(mode="json")
     package = manifest_payload.get("package")
     if isinstance(package, dict):
-        package.pop("activation_state", None)
-        package.pop("activation_reason", None)
+        for field in (
+            "activation_state",
+            "activation_reason",
+            "approval_state",
+            "approval_reason",
+            "approved_by",
+            "approved_at",
+        ):
+            package.pop(field, None)
         signature = package.get("signature")
         if isinstance(signature, dict):
             signature.pop("value", None)

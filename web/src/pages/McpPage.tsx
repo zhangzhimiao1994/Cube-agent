@@ -1437,6 +1437,10 @@ export function McpPage() {
                     </p>
                     <p>激活状态：<span>{plugin.package_metadata?.activation_state ?? "未配置"}</span></p>
                     <p>激活原因：<span>{plugin.package_metadata?.activation_reason ?? "未配置"}</span></p>
+                    <p>包审批：<span>{plugin.package_metadata?.approval_state ?? "未配置"}</span></p>
+                    <p>审批原因：<span>{plugin.package_metadata?.approval_reason ?? "未配置"}</span></p>
+                    <p>审批人：<span>{plugin.package_metadata?.approved_by ?? "未配置"}</span></p>
+                    <p>审批时间：<span>{plugin.package_metadata?.approved_at ?? "未配置"}</span></p>
                     <p>
                       资源配置：
                       <span>

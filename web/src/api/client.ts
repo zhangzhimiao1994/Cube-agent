@@ -976,6 +976,12 @@ const PluginPackageMetadataSchema = z.object({
     .enum(["not_provided", "not_verified", "untrusted_key", "verified", "failed"])
     .default("not_provided"),
   verified_public_key_sha256: z.string().nullable().default(null),
+  approval_state: z
+    .enum(["not_required", "pending", "approved", "rejected"])
+    .default("not_required"),
+  approval_reason: z.string().default(""),
+  approved_by: z.string().nullable().default(null),
+  approved_at: z.string().nullable().default(null),
   activation_state: z
     .enum([
       "not_applicable",
@@ -983,6 +989,8 @@ const PluginPackageMetadataSchema = z.object({
       "blocked_unverified_signature",
       "blocked_untrusted_key",
       "blocked_failed_signature",
+      "blocked_pending_approval",
+      "blocked_rejected_approval",
       "verified_scan_only",
       "eligible",
     ])
