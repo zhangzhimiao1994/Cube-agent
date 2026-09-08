@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID
 
+import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -242,6 +243,7 @@ def test_worker_runtime_invalidation_listener_uses_mcp_and_plugin_runtimes() -> 
 
         async def listen(self, **kwargs: object) -> None:
             self.kwargs = dict(kwargs)
+            raise asyncio.CancelledError
 
     class Runtime:
         async def reload(self, tenant_id: UUID | None = None) -> None:
@@ -251,18 +253,63 @@ def test_worker_runtime_invalidation_listener_uses_mcp_and_plugin_runtimes() -> 
     mcp_runtime = Runtime()
     plugin_runtime = Runtime()
 
-    asyncio.run(
-        worker._run_runtime_config_invalidation_listener(
-            cast(Any, bus),
-            mcp_runtime=cast(Any, mcp_runtime),
-            plugin_runtime=cast(Any, plugin_runtime),
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            worker._run_runtime_config_invalidation_listener(
+                cast(Any, bus),
+                mcp_runtime=cast(Any, mcp_runtime),
+                plugin_runtime=cast(Any, plugin_runtime),
+            )
         )
-    )
 
     assert bus.kwargs == {
         "mcp_runtime": mcp_runtime,
         "plugin_runtime": plugin_runtime,
     }
+
+
+def test_worker_runtime_invalidation_listener_restarts_after_listen_failure(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    class FlakyBus:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.kwargs: list[dict[str, object]] = []
+
+        async def listen(self, **kwargs: object) -> None:
+            self.calls += 1
+            self.kwargs.append(dict(kwargs))
+            if self.calls == 1:
+                raise RuntimeError("lost connection")
+            raise asyncio.CancelledError
+
+    sleep_delays: list[float] = []
+
+    async def immediate_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+
+    monkeypatch.setattr("agent_hub.runtime.worker.asyncio.sleep", immediate_sleep)
+
+    bus = FlakyBus()
+    mcp_runtime = object()
+    plugin_runtime = object()
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            worker._run_runtime_config_invalidation_listener(
+                cast(Any, bus),
+                mcp_runtime=mcp_runtime,
+                plugin_runtime=plugin_runtime,
+                retry_delay_seconds=0.0,
+            )
+        )
+
+    assert bus.calls == 2
+    assert bus.kwargs == [
+        {"mcp_runtime": mcp_runtime, "plugin_runtime": plugin_runtime},
+        {"mcp_runtime": mcp_runtime, "plugin_runtime": plugin_runtime},
+    ]
+    assert sleep_delays == [0.0]
 
 
 def test_worker_builds_evolution_terminal_hook(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:

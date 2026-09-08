@@ -652,6 +652,50 @@ def test_create_app_publishes_runtime_invalidation_after_admin_reload(
     }
 
 
+def test_runtime_config_invalidation_listener_restarts_after_listen_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FlakyBus:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.kwargs: list[dict[str, object]] = []
+
+        async def listen(self, **kwargs: object) -> None:
+            self.calls += 1
+            self.kwargs.append(dict(kwargs))
+            if self.calls == 1:
+                raise RuntimeError("lost connection")
+            raise asyncio.CancelledError
+
+    sleep_delays: list[float] = []
+
+    async def immediate_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+
+    monkeypatch.setattr("agent_hub.app.asyncio.sleep", immediate_sleep)
+
+    bus = FlakyBus()
+    mcp_runtime = object()
+    plugin_runtime = object()
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            app_module._run_runtime_config_invalidation_listener(
+                cast(Any, bus),
+                mcp_runtime=mcp_runtime,
+                plugin_runtime=plugin_runtime,
+                retry_delay_seconds=0.0,
+            )
+        )
+
+    assert bus.calls == 2
+    assert bus.kwargs == [
+        {"mcp_runtime": mcp_runtime, "plugin_runtime": plugin_runtime},
+        {"mcp_runtime": mcp_runtime, "plugin_runtime": plugin_runtime},
+    ]
+    assert sleep_delays == [0.0]
+
+
 def test_create_app_reads_tool_approval_settings_for_target_tenant(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

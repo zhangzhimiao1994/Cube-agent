@@ -92,19 +92,23 @@ async def _run_runtime_config_invalidation_listener(
     *,
     mcp_runtime: object,
     plugin_runtime: object,
+    retry_delay_seconds: float = 1.0,
 ) -> None:
-    try:
-        await bus.listen(
-            mcp_runtime=cast(Any, mcp_runtime),
-            plugin_runtime=cast(Any, plugin_runtime),
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception as error:  # noqa: BLE001 - worker keeps polling as fallback.
-        _LOGGER.warning(
-            "run_worker_runtime_config_invalidation_listener_stopped error_type=%s",
-            type(error).__name__,
-        )
+    while True:
+        try:
+            await bus.listen(
+                mcp_runtime=cast(Any, mcp_runtime),
+                plugin_runtime=cast(Any, plugin_runtime),
+            )
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - worker keeps polling as fallback.
+            _LOGGER.warning(
+                "run_worker_runtime_config_invalidation_listener_restarting error_type=%s",
+                type(error).__name__,
+            )
+            await asyncio.sleep(retry_delay_seconds)
 
 
 async def _cancel_background_task(task: asyncio.Task[object] | None) -> None:
