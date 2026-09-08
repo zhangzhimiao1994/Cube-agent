@@ -810,6 +810,12 @@ class PluginArchiveInstallResponse(BaseModel):
     plugin: PluginResourceResponse
 
 
+class PluginPackageApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(default="", max_length=256)
+
+
 PluginActivationState = Literal[
     "not_applicable",
     "blocked_unsigned",
@@ -2479,6 +2485,24 @@ class AdminResourceService(Protocol):
         actor_id: UUID | None = None,
     ) -> PluginResourceResponse: ...
 
+    async def approve_plugin_package(
+        self,
+        plugin_id: str,
+        request: PluginPackageApprovalRequest,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse: ...
+
+    async def reject_plugin_package(
+        self,
+        plugin_id: str,
+        request: PluginPackageApprovalRequest,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse: ...
+
     async def uninstall_plugin(
         self,
         plugin_id: str,
@@ -3976,6 +4000,43 @@ def _plugin_stopped_response(plugin: PluginResourceResponse) -> PluginResourceRe
     )
 
 
+def _plugin_with_package_approval(
+    plugin: PluginResourceResponse,
+    approval_state: Literal["approved", "rejected"],
+    request: PluginPackageApprovalRequest,
+    *,
+    actor_id: UUID | None,
+) -> PluginResourceResponse:
+    package = plugin.package_metadata
+    if package is None or package.kind != "adapter_package":
+        raise PublicAPIError(
+            409,
+            "plugin_package_not_approvable",
+            "plugin does not have an adapter package requiring approval",
+        )
+    default_reason = (
+        "adapter package approved for activation"
+        if approval_state == "approved"
+        else "adapter package approval was rejected"
+    )
+    approval_reason = request.reason.strip() or default_reason
+    approved_package = PluginPackageMetadata.model_validate(
+        {
+            **package.model_dump(mode="json"),
+            "approval_state": approval_state,
+            "approval_reason": approval_reason,
+            "approved_by": str(actor_id) if actor_id is not None else None,
+            "approved_at": datetime.now(UTC).isoformat(),
+        }
+    )
+    lifecycle = (
+        {"status": "stopped", "health": "stopped", "last_error_type": None}
+        if plugin.enabled
+        else {"status": "disabled", "health": "disabled", "last_error_type": None}
+    )
+    return plugin.model_copy(update={"package_metadata": approved_package, **lifecycle})
+
+
 def _ensure_plugin_package_activation_allowed(plugin: PluginResourceResponse) -> None:
     if _plugin_package_activation_blocked(plugin.package_metadata):
         raise PublicAPIError(
@@ -4978,6 +5039,44 @@ class InMemoryAdminResourceService:
         del tenant_id, actor_id
         current = self.plugins[plugin_id]
         updated = _plugin_started_response(current)
+        self.plugins[plugin_id] = updated
+        return updated
+
+    async def approve_plugin_package(
+        self,
+        plugin_id: str,
+        request: PluginPackageApprovalRequest,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse:
+        del tenant_id
+        current = self.plugins[plugin_id]
+        updated = _plugin_with_package_approval(
+            current,
+            "approved",
+            request,
+            actor_id=actor_id,
+        )
+        self.plugins[plugin_id] = updated
+        return updated
+
+    async def reject_plugin_package(
+        self,
+        plugin_id: str,
+        request: PluginPackageApprovalRequest,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse:
+        del tenant_id
+        current = self.plugins[plugin_id]
+        updated = _plugin_with_package_approval(
+            current,
+            "rejected",
+            request,
+            actor_id=actor_id,
+        )
         self.plugins[plugin_id] = updated
         return updated
 
@@ -6988,6 +7087,38 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             actor_id=actor_id,
         )
 
+    async def approve_plugin_package(
+        self,
+        plugin_id: str,
+        request: PluginPackageApprovalRequest,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse:
+        return await self._set_plugin_package_approval(
+            plugin_id,
+            "approved",
+            request,
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+        )
+
+    async def reject_plugin_package(
+        self,
+        plugin_id: str,
+        request: PluginPackageApprovalRequest,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse:
+        return await self._set_plugin_package_approval(
+            plugin_id,
+            "rejected",
+            request,
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+        )
+
     async def delete_plugin(
         self,
         plugin_id: str,
@@ -7101,6 +7232,68 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             f"plugin.{action}",
             f"plugin:{updated.id}",
             {"id": updated.id},
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+        )
+        return updated
+
+    async def _set_plugin_package_approval(
+        self,
+        plugin_id: str,
+        approval_state: Literal["approved", "rejected"],
+        request: PluginPackageApprovalRequest,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
+    ) -> PluginResourceResponse:
+        payload = await self._get_admin_payload("plugin", plugin_id, tenant_id=tenant_id)
+        if payload is None:
+            if tenant_id is not None and tenant_id != self._tenant_id:
+                raise KeyError(plugin_id)
+            if approval_state == "approved":
+                return await super().approve_plugin_package(
+                    plugin_id,
+                    request,
+                    actor_id=actor_id,
+                )
+            return await super().reject_plugin_package(
+                plugin_id,
+                request,
+                actor_id=actor_id,
+            )
+        if not payload:
+            raise KeyError(plugin_id)
+        current = PluginResourceResponse.model_validate(payload)
+        updated = _plugin_with_package_approval(
+            current,
+            approval_state,
+            request,
+            actor_id=actor_id,
+        )
+        if not await self._upsert_admin_payload(
+            "plugin",
+            updated.id,
+            updated.model_dump(mode="json"),
+            tenant_id=tenant_id,
+        ):
+            raise KeyError(plugin_id)
+        await self._record_audit(
+            f"plugin.package.{approval_state}",
+            f"plugin:{updated.id}",
+            {
+                "id": updated.id,
+                "approval_state": approval_state,
+                "activation_state": (
+                    updated.package_metadata.activation_state
+                    if updated.package_metadata is not None
+                    else "not_applicable"
+                ),
+                "approval_reason": (
+                    updated.package_metadata.approval_reason
+                    if updated.package_metadata is not None
+                    else ""
+                ),
+            },
             tenant_id=tenant_id,
             actor_id=actor_id,
         )
@@ -11716,6 +11909,58 @@ async def install_plugin_archive(
         content_sha256=content_sha256,
         plugin=plugin,
     )
+
+
+@router.post(
+    "/plugins/{plugin_id}/package/approve",
+    response_model=PluginResourceResponse,
+    responses=error_responses(401, 403, 404, 409, 422),
+)
+async def approve_plugin_package(
+    plugin_id: str,
+    body: PluginPackageApprovalRequest,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> PluginResourceResponse:
+    _require(principal, "plugin:approve")
+    try:
+        response = await service.approve_plugin_package(
+            plugin_id,
+            body,
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+        )
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+    await _reload_plugin_runtime_config(request, principal.tenant_id)
+    return response
+
+
+@router.post(
+    "/plugins/{plugin_id}/package/reject",
+    response_model=PluginResourceResponse,
+    responses=error_responses(401, 403, 404, 409, 422),
+)
+async def reject_plugin_package(
+    plugin_id: str,
+    body: PluginPackageApprovalRequest,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
+    service: Annotated[AdminResourceService, Depends(_service)],
+) -> PluginResourceResponse:
+    _require(principal, "plugin:approve")
+    try:
+        response = await service.reject_plugin_package(
+            plugin_id,
+            body,
+            tenant_id=principal.tenant_id,
+            actor_id=principal.user_id,
+        )
+    except KeyError:
+        raise PublicAPIError(404, "not_found", "not found") from None
+    await _reload_plugin_runtime_config(request, principal.tenant_id)
+    return response
 
 
 @router.post(

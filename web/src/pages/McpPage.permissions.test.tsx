@@ -1,10 +1,13 @@
 import { render, screen, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { describe, expect, it, vi } from "vitest";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { api } from "../api/client";
 import { McpPage } from "./McpPage";
 
-const permissionGrants = new Set(["mcp:read", "plugin:read", "plugin:write"]);
+const defaultPermissionGrants = ["mcp:read", "plugin:read", "plugin:write"];
+const permissionGrants = new Set(defaultPermissionGrants);
 
 vi.mock("../auth/AuthProvider", () => ({
   useAuth: () => ({
@@ -26,7 +29,48 @@ vi.mock("../auth/AuthProvider", () => ({
 vi.mock("../api/client", () => ({
   api: {
     mcpServers: vi.fn(async () => []),
-    plugins: vi.fn(async () => []),
+    plugins: vi.fn(async () => [
+      {
+        id: "calendar",
+        name: "Calendar HTTP",
+        enabled: true,
+        description: null,
+        version: "1.0.0",
+        endpoint_url: null,
+        domain_allowlist: [],
+        resource_config: {},
+        timeout_seconds: 10,
+        credential_ref: null,
+        credential_header: "X-Plugin-Credential",
+        credential_scheme: "Bearer",
+        capabilities: [],
+        source_filename: "calendar-plugin.zip",
+        content_sha256: "abc123",
+        package_metadata: {
+          schema_version: 1,
+          kind: "adapter_package",
+          package_version: "1.2.3",
+          adapter_id: "calendar_python",
+          sdk_api_version: "1.0",
+          signature: null,
+          signature_verification: "not_provided",
+          verified_public_key_sha256: null,
+          approval_state: "pending",
+          approval_reason: "adapter package requires plugin approval before activation",
+          approved_by: null,
+          approved_at: null,
+          activation_state: "blocked_pending_approval",
+          activation_reason: "adapter package requires plugin approval before activation",
+          runtime: "python",
+          entrypoint: "adapter/main.py",
+          isolation: "local_process",
+          install_mode: "scan_only",
+        },
+        status: "stopped",
+        health: "stopped",
+        last_error_type: null,
+      },
+    ]),
     pluginAdapters: vi.fn(async () => []),
     capabilityManifest: vi.fn(async () => ({ schema_version: 1, capabilities: [] })),
     pluginSigningKeys: vi.fn(async () => [
@@ -49,6 +93,8 @@ vi.mock("../api/client", () => ({
     stopPlugin: vi.fn(),
     reloadPlugin: vi.fn(),
     deletePlugin: vi.fn(),
+    approvePluginPackage: vi.fn(async () => ({})),
+    rejectPluginPackage: vi.fn(async () => ({})),
     upsertPluginSigningKey: vi.fn(),
     deletePluginSigningKey: vi.fn(),
   },
@@ -70,6 +116,14 @@ function renderMcpPage() {
 }
 
 describe("McpPage plugin approval permissions", () => {
+  beforeEach(() => {
+    permissionGrants.clear();
+    for (const permission of defaultPermissionGrants) {
+      permissionGrants.add(permission);
+    }
+    vi.clearAllMocks();
+  });
+
   it("keeps ordinary plugin writes enabled while blocking trusted signing key mutations without plugin approval", async () => {
     renderMcpPage();
 
@@ -87,5 +141,29 @@ describe("McpPage plugin approval permissions", () => {
     expect((screen.getByRole("button", { name: "保存插件" }) as HTMLButtonElement).disabled).toBe(
       false,
     );
+    expect((screen.getByRole("button", { name: "审批插件包 Calendar HTTP" }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+    expect((screen.getByRole("button", { name: "拒绝插件包 Calendar HTTP" }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+    expect((screen.getByLabelText("插件包审批理由") as HTMLTextAreaElement).disabled).toBe(true);
+    expect(screen.getByText("当前账号无权审批插件包。")).not.toBeNull();
+  });
+
+  it("allows plugin package approval actions with plugin approval permission", async () => {
+    permissionGrants.add("plugin:approve");
+    const user = userEvent.setup();
+    renderMcpPage();
+
+    await screen.findByText("Calendar HTTP");
+    const reasonInput = screen.getByLabelText("插件包审批理由");
+    await user.type(reasonInput, "reviewed by security");
+    await user.click(screen.getByRole("button", { name: "审批插件包 Calendar HTTP" }));
+    await user.type(reasonInput, "requires isolation review");
+    await user.click(screen.getByRole("button", { name: "拒绝插件包 Calendar HTTP" }));
+
+    expect(api.approvePluginPackage).toHaveBeenCalledWith("calendar", { reason: "reviewed by security" });
+    expect(api.rejectPluginPackage).toHaveBeenCalledWith("calendar", { reason: "requires isolation review" });
   });
 });

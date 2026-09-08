@@ -381,11 +381,13 @@ describe("api client transport", () => {
       health: "stopped",
       last_error_type: null,
     };
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify(plugin), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
+    const fetchMock = vi.fn().mockImplementation(() =>
+      Promise.resolve(
+        new Response(JSON.stringify(plugin), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
     );
     vi.stubGlobal("fetch", fetchMock);
 
@@ -629,6 +631,70 @@ describe("api client transport", () => {
           "X-Agent-Hub-Plugin-Filename-Encoding": "percent",
         }),
       }),
+    );
+  });
+
+  it("updates plugin package approval state", async () => {
+    const plugin: PluginResource = {
+      id: "calendar",
+      name: "Calendar HTTP",
+      enabled: true,
+      description: null,
+      version: "1.0.0",
+      endpoint_url: null,
+      domain_allowlist: [],
+      resource_config: {},
+      timeout_seconds: 10,
+      credential_ref: null,
+      credential_header: "X-Plugin-Credential",
+      credential_scheme: "Bearer",
+      capabilities: [],
+      source_filename: "calendar plugin.zip",
+      content_sha256: "abc123",
+      package_metadata: {
+        schema_version: 1,
+        kind: "adapter_package",
+        package_version: "1.2.3",
+        adapter_id: "calendar_python",
+        sdk_api_version: "1.0",
+        signature: null,
+        signature_verification: "not_provided",
+        verified_public_key_sha256: null,
+        approval_state: "approved",
+        approval_reason: "reviewed",
+        approved_by: "11111111-1111-4111-8111-111111111111",
+        approved_at: "2026-09-09T04:00:00Z",
+        activation_state: "verified_scan_only",
+        activation_reason: "package signature is verified, but install_mode=scan_only prevents activation",
+        runtime: "python",
+        entrypoint: "adapter/main.py",
+        isolation: "local_process",
+        install_mode: "scan_only",
+      },
+      status: "stopped",
+      health: "stopped",
+      last_error_type: null,
+    };
+    const fetchMock = vi.fn().mockImplementation(() =>
+      Promise.resolve(
+        new Response(JSON.stringify(plugin), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(api.approvePluginPackage("calendar", { reason: "reviewed" })).resolves.toEqual(plugin);
+    await expect(api.rejectPluginPackage("calendar", { reason: "requires isolation" })).resolves.toEqual(plugin);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/admin/plugins/calendar/package/approve");
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ reason: "reviewed" }) }),
+    );
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("/api/v1/admin/plugins/calendar/package/reject");
+    expect(fetchMock.mock.calls[1]?.[1]).toEqual(
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ reason: "requires isolation" }) }),
     );
   });
 

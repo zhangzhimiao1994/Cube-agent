@@ -1056,6 +1056,10 @@ export type PluginSigningKeyPayload = {
   not_after?: string | null;
 };
 
+export type PluginPackageApprovalPayload = {
+  reason?: string;
+};
+
 export type PluginResourcePayload = {
   id: string;
   name: string;
@@ -2122,6 +2126,20 @@ export const api = {
         },
       },
       PluginArchiveInstallSchema,
+    );
+  },
+  approvePluginPackage(id: string, payload: PluginPackageApprovalPayload): Promise<PluginResource> {
+    return request(
+      `/api/v1/admin/plugins/${encodeURIComponent(id)}/package/approve`,
+      { method: "POST", body: JSON.stringify(payload) },
+      PluginResourceSchema,
+    );
+  },
+  rejectPluginPackage(id: string, payload: PluginPackageApprovalPayload): Promise<PluginResource> {
+    return request(
+      `/api/v1/admin/plugins/${encodeURIComponent(id)}/package/reject`,
+      { method: "POST", body: JSON.stringify(payload) },
+      PluginResourceSchema,
     );
   },
   startPlugin(id: string): Promise<PluginResource> {

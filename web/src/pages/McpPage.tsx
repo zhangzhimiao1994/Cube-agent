@@ -534,6 +534,7 @@ export function McpPage() {
   ]);
   const [pluginArchiveFile, setPluginArchiveFile] = useState<File | null>(null);
   const [pluginMessage, setPluginMessage] = useState<string | null>(null);
+  const [pluginPackageApprovalReasons, setPluginPackageApprovalReasons] = useState<Record<string, string>>({});
   const [signingKeyId, setSigningKeyId] = useState("calendar-prod");
   const [signingKeyPublicKey, setSigningKeyPublicKey] = useState("");
   const [signingKeyNotBefore, setSigningKeyNotBefore] = useState("");
@@ -664,6 +665,26 @@ export function McpPage() {
         delete: "插件已删除。",
       };
       setPluginMessage(messages[variables.action]);
+      await refreshPluginSurfaces();
+    },
+  });
+  const pluginPackageApproval = useMutation({
+    mutationFn: ({
+      id,
+      action,
+      reason,
+    }: {
+      id: string;
+      action: "approve" | "reject";
+      reason: string;
+    }) => {
+      const payload = { reason: reason.trim() };
+      if (action === "approve") return api.approvePluginPackage(id, payload);
+      return api.rejectPluginPackage(id, payload);
+    },
+    onSuccess: async (_result, variables) => {
+      setPluginPackageApprovalReasons((current) => ({ ...current, [variables.id]: "" }));
+      setPluginMessage(variables.action === "approve" ? "插件包已审批。" : "插件包已拒绝。");
       await refreshPluginSurfaces();
     },
   });
@@ -1351,6 +1372,9 @@ export function McpPage() {
           {pluginLifecycle.isError ? (
             <p role="alert">{formatApiError(pluginLifecycle.error, "插件操作失败")}</p>
           ) : null}
+          {pluginPackageApproval.isError ? (
+            <p role="alert">{formatApiError(pluginPackageApproval.error, "插件包审批失败")}</p>
+          ) : null}
         </form>
 
         <div>
@@ -1441,6 +1465,56 @@ export function McpPage() {
                     <p>审批原因：<span>{plugin.package_metadata?.approval_reason ?? "未配置"}</span></p>
                     <p>审批人：<span>{plugin.package_metadata?.approved_by ?? "未配置"}</span></p>
                     <p>审批时间：<span>{plugin.package_metadata?.approved_at ?? "未配置"}</span></p>
+                    {plugin.package_metadata?.kind === "adapter_package" ? (
+                      <>
+                        <label htmlFor={`plugin-package-approval-reason-${plugin.id}`}>
+                          插件包审批理由
+                        </label>
+                        <textarea
+                          id={`plugin-package-approval-reason-${plugin.id}`}
+                          value={pluginPackageApprovalReasons[plugin.id] ?? ""}
+                          onChange={(event) =>
+                            setPluginPackageApprovalReasons((current) => ({
+                              ...current,
+                              [plugin.id]: event.target.value,
+                            }))
+                          }
+                          placeholder="可选，记录通过或拒绝原因"
+                          disabled={pluginPackageApproval.isPending || !canApprovePlugins}
+                          maxLength={256}
+                        />
+                        <button
+                          type="button"
+                          disabled={pluginPackageApproval.isPending || !canApprovePlugins}
+                          onClick={() =>
+                            pluginPackageApproval.mutate({
+                              id: plugin.id,
+                              action: "approve",
+                              reason: pluginPackageApprovalReasons[plugin.id] ?? "",
+                            })
+                          }
+                          aria-label={`审批插件包 ${plugin.name}`}
+                        >
+                          审批包
+                        </button>
+                        <button
+                          type="button"
+                          className="danger-action"
+                          disabled={pluginPackageApproval.isPending || !canApprovePlugins}
+                          onClick={() =>
+                            pluginPackageApproval.mutate({
+                              id: plugin.id,
+                              action: "reject",
+                              reason: pluginPackageApprovalReasons[plugin.id] ?? "",
+                            })
+                          }
+                          aria-label={`拒绝插件包 ${plugin.name}`}
+                        >
+                          拒绝包
+                        </button>
+                        {!canApprovePlugins ? <p className="field-help">当前账号无权审批插件包。</p> : null}
+                      </>
+                    ) : null}
                     <p>
                       资源配置：
                       <span>

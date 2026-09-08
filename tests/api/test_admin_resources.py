@@ -4695,6 +4695,320 @@ def test_scan_only_adapter_package_install_does_not_inherit_running_status() -> 
     assert install.json()["plugin"]["health"] == "stopped"
 
 
+def test_plugin_package_approval_updates_metadata_and_keeps_scan_only_closed() -> None:
+    api = client()
+    reloaded: list[UUID] = []
+
+    async def reload_plugin_runtime_config(tenant_id: UUID) -> None:
+        reloaded.append(tenant_id)
+
+    cast(Any, api.app).state.reload_plugin_runtime_config = reload_plugin_runtime_config
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    install = api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(private_key),
+    )
+
+    approved = api.post(
+        "/api/v1/admin/plugins/calendar/package/approve",
+        headers=headers(),
+        json={"reason": "reviewed by security"},
+    )
+    started = api.post("/api/v1/admin/plugins/calendar/start", headers=headers())
+    rejected = api.post(
+        "/api/v1/admin/plugins/calendar/package/reject",
+        headers=headers(),
+        json={"reason": "requires isolation review"},
+    )
+
+    assert install.status_code == 200
+    assert approved.status_code == 200
+    approved_metadata = approved.json()["package_metadata"]
+    assert approved_metadata["approval_state"] == "approved"
+    assert approved_metadata["approval_reason"] == "reviewed by security"
+    assert approved_metadata["approved_by"] == str(USER_ID)
+    assert approved_metadata["approved_at"] is not None
+    assert approved_metadata["activation_state"] == "verified_scan_only"
+    assert approved_metadata["activation_reason"] == (
+        "package signature is verified, but install_mode=scan_only prevents activation"
+    )
+    assert started.status_code == 409
+    assert started.json()["error"]["code"] == "plugin_package_not_eligible"
+    assert rejected.status_code == 200
+    rejected_metadata = rejected.json()["package_metadata"]
+    assert rejected_metadata["approval_state"] == "rejected"
+    assert rejected_metadata["approval_reason"] == "requires isolation review"
+    assert rejected_metadata["approved_by"] == str(USER_ID)
+    assert rejected_metadata["approved_at"] is not None
+    assert rejected_metadata["activation_state"] == "blocked_rejected_approval"
+    assert rejected_metadata["activation_reason"] == "requires isolation review"
+    assert reloaded == [TENANT_ID, TENANT_ID, TENANT_ID, TENANT_ID]
+
+
+def test_plugin_package_approval_mutations_require_plugin_approval_permission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    required_permissions: list[str] = []
+
+    class RecordingAuthorizer:
+        def require(
+            self,
+            principal: AuthenticatedPrincipal,
+            permission: str,
+        ) -> AuthenticatedPrincipal:
+            required_permissions.append(permission)
+            return principal
+
+    monkeypatch.setattr(admin_router, "Authorizer", RecordingAuthorizer)
+    api = client()
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    )
+    api.post(
+        "/api/v1/admin/plugins/install",
+        headers={
+            **headers(),
+            "Content-Type": "application/zip",
+            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+        },
+        content=signed_plugin_archive(private_key),
+    )
+
+    approved = api.post(
+        "/api/v1/admin/plugins/calendar/package/approve",
+        headers=headers(),
+        json={"reason": "reviewed"},
+    )
+    rejected = api.post(
+        "/api/v1/admin/plugins/calendar/package/reject",
+        headers=headers(),
+        json={"reason": "rejected"},
+    )
+
+    assert approved.status_code == 200
+    assert rejected.status_code == 200
+    assert required_permissions[-2:] == ["plugin:approve", "plugin:approve"]
+
+
+def test_plugin_package_approval_mutations_forbid_non_approver() -> None:
+    class OperatorAuthService:
+        def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
+            if token != "valid-token":
+                raise InvalidCredentials("bad token")
+            return AuthenticatedPrincipal(USER_ID, TENANT_ID, Role.OPERATOR)
+
+    app = create_app(auth_service=OperatorAuthService(), rate_limiter=object())
+    app.state.admin_resource_service = InMemoryAdminResourceService()
+    api = TestClient(app)
+
+    approved = api.post(
+        "/api/v1/admin/plugins/calendar/package/approve",
+        headers=headers(),
+        json={"reason": "reviewed"},
+    )
+    rejected = api.post(
+        "/api/v1/admin/plugins/calendar/package/reject",
+        headers=headers(),
+        json={"reason": "rejected"},
+    )
+
+    assert approved.status_code == 403
+    assert approved.json()["error"]["code"] == "permission_denied"
+    assert rejected.status_code == 403
+    assert rejected.json()["error"]["code"] == "permission_denied"
+
+
+def test_plugin_package_approval_returns_not_found_for_unknown_plugin() -> None:
+    api = client()
+
+    approved = api.post(
+        "/api/v1/admin/plugins/missing/package/approve",
+        headers=headers(),
+        json={"reason": "reviewed"},
+    )
+    rejected = api.post(
+        "/api/v1/admin/plugins/missing/package/reject",
+        headers=headers(),
+        json={"reason": "rejected"},
+    )
+
+    assert approved.status_code == 404
+    assert approved.json()["error"]["code"] == "not_found"
+    assert rejected.status_code == 404
+    assert rejected.json()["error"]["code"] == "not_found"
+
+
+def test_plugin_package_approval_rejects_manifest_only_plugin() -> None:
+    api = client()
+    created = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={"id": "calendar", "name": "Calendar HTTP"},
+    )
+
+    approved = api.post(
+        "/api/v1/admin/plugins/calendar/package/approve",
+        headers=headers(),
+        json={"reason": "reviewed"},
+    )
+    rejected = api.post(
+        "/api/v1/admin/plugins/calendar/package/reject",
+        headers=headers(),
+        json={"reason": "rejected"},
+    )
+
+    assert created.status_code == 200
+    assert approved.status_code == 409
+    assert approved.json()["error"]["code"] == "plugin_package_not_approvable"
+    assert rejected.status_code == 409
+    assert rejected.json()["error"]["code"] == "plugin_package_not_approvable"
+
+
+@pytest.mark.asyncio
+async def test_persistent_plugin_package_approval_is_tenant_scoped_and_audited() -> None:
+    class StoredPersistentPluginService(PersistentAdminResourceService):
+        def __init__(
+            self,
+            payloads: dict[tuple[UUID, str, str], dict[str, object]] | None = None,
+        ) -> None:
+            super().__init__(
+                config_service=cast(Any, object()),
+                secret_service=cast(Any, object()),
+                tenant_id=TENANT_ID,
+                actor_id=USER_ID,
+            )
+            self._session_factory = cast(Any, object())
+            self.payloads = payloads if payloads is not None else {}
+
+        async def _get_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> dict[str, object] | None:
+            target_tenant_id = TENANT_ID if tenant_id is None else tenant_id
+            return self.payloads.get((target_tenant_id, kind, resource_id), {})
+
+        async def _upsert_admin_payload(
+            self,
+            kind: str,
+            resource_id: str,
+            payload: dict[str, object],
+            *,
+            tenant_id: UUID | None = None,
+        ) -> bool:
+            target_tenant_id = TENANT_ID if tenant_id is None else tenant_id
+            self.payloads[(target_tenant_id, kind, resource_id)] = payload
+            return True
+
+        async def _list_admin_payloads(
+            self,
+            kind: str,
+            *,
+            tenant_id: UUID | None = None,
+        ) -> list[dict[str, object]] | None:
+            target_tenant_id = TENANT_ID if tenant_id is None else tenant_id
+            return [
+                payload
+                for (payload_tenant_id, payload_kind, _resource_id), payload in self.payloads.items()
+                if payload_tenant_id == target_tenant_id and payload_kind == kind
+            ]
+
+    service = StoredPersistentPluginService()
+    package = PluginPackageMetadata.model_validate(
+        {
+            "kind": "adapter_package",
+            "package_version": "1.2.3",
+            "adapter_id": "calendar_python",
+            "sdk_api_version": "1.0",
+            "signature": {
+                "algorithm": "ed25519",
+                "key_id": "calendar-prod",
+                "value": VALID_PLUGIN_SIGNATURE,
+            },
+            "signature_verification": "verified",
+            "runtime": "python",
+            "entrypoint": "adapter/main.py",
+            "isolation": "local_process",
+            "install_mode": "scan_only",
+        }
+    )
+    await service.upsert_plugin(
+        PluginResourceRequest(id="calendar", name="Calendar"),
+        tenant_id=TENANT_ID,
+        actor_id=USER_ID,
+        package_metadata=package,
+    )
+
+    with pytest.raises(KeyError):
+        await service.approve_plugin_package(
+            "calendar",
+            admin_router.PluginPackageApprovalRequest(reason="wrong tenant"),
+            tenant_id=OTHER_TENANT_ID,
+            actor_id=USER_ID,
+        )
+
+    approved = await service.approve_plugin_package(
+        "calendar",
+        admin_router.PluginPackageApprovalRequest(reason="reviewed by security"),
+        tenant_id=TENANT_ID,
+        actor_id=USER_ID,
+    )
+    rejected = await service.reject_plugin_package(
+        "calendar",
+        admin_router.PluginPackageApprovalRequest(reason="requires isolation review"),
+        tenant_id=TENANT_ID,
+        actor_id=USER_ID,
+    )
+    approve_audits = await service.list_audit_events("plugin.package.approved")
+    reject_audits = await service.list_audit_events("plugin.package.rejected")
+    other_tenant_audits = [
+        payload
+        for (tenant_id, kind, _resource_id), payload in service.payloads.items()
+        if tenant_id == OTHER_TENANT_ID and kind == "audit"
+    ]
+
+    assert approved.package_metadata is not None
+    assert approved.package_metadata.approval_state == "approved"
+    assert approved.package_metadata.activation_state == "verified_scan_only"
+    assert rejected.package_metadata is not None
+    assert rejected.package_metadata.approval_state == "rejected"
+    assert len(approve_audits) == 1
+    assert approve_audits[0].actor == str(USER_ID)
+    assert approve_audits[0].resource == "plugin:calendar"
+    assert approve_audits[0].details == {
+        "id": "calendar",
+        "approval_state": "approved",
+        "activation_state": "verified_scan_only",
+        "approval_reason": "reviewed by security",
+    }
+    assert len(reject_audits) == 1
+    assert reject_audits[0].details["approval_reason"] == "requires isolation review"
+    assert other_tenant_audits == []
+
+
 def test_plugin_listing_downgrades_verified_package_after_signing_key_rotation() -> None:
     api = client()
     private_key = ed25519.Ed25519PrivateKey.generate()
