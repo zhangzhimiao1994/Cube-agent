@@ -79,6 +79,15 @@ const runDetail: RunDetail = {
   },
   failure_diagnostics: [],
   tool_lifecycle: [],
+  model_outcome_summary: {
+    completion_count: 0,
+    fallback_used: false,
+    fallback_attempt_count: 0,
+    requested_logical_models: [],
+    actual_logical_models: [],
+    attempted_logical_models: [],
+    provider_ids: [],
+  },
 };
 
 function jsonResponse(payload: unknown, init: ResponseInit = {}) {

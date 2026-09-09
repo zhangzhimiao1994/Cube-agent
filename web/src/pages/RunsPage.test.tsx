@@ -28,6 +28,15 @@ const baseRun: RunDetail = {
   explicit_details: {},
   failure_diagnostics: [],
   tool_lifecycle: [],
+  model_outcome_summary: {
+    completion_count: 0,
+    fallback_used: false,
+    fallback_attempt_count: 0,
+    requested_logical_models: [],
+    actual_logical_models: [],
+    attempted_logical_models: [],
+    provider_ids: [],
+  },
 };
 
 describe("runConversationId", () => {

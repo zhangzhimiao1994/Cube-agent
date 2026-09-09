@@ -709,6 +709,19 @@ const ToolLifecycleSchema = z.object({
   failure_kind: z.string().nullable().optional(),
 });
 
+const ModelOutcomeSummarySchema = z.object({
+  completion_count: z.number().default(0),
+  fallback_used: z.boolean().default(false),
+  fallback_attempt_count: z.number().default(0),
+  requested_logical_models: z.array(z.string()).default([]),
+  actual_logical_models: z.array(z.string()).default([]),
+  attempted_logical_models: z.array(z.string()).default([]),
+  provider_ids: z.array(z.string()).default([]),
+  last_requested_logical_model: z.string().nullable().optional(),
+  last_logical_model: z.string().nullable().optional(),
+  last_provider_id: z.string().nullable().optional(),
+});
+
 const RunDetailSchema = RunListItemSchema.extend({
   request: z.string(),
   events: z.array(RunEventSchema),
@@ -716,6 +729,10 @@ const RunDetailSchema = RunListItemSchema.extend({
   explicit_details: z.record(z.string(), z.string()),
   failure_diagnostics: z.array(FailureDiagnosticSchema).default([]),
   tool_lifecycle: z.array(ToolLifecycleSchema).default([]),
+  model_outcome_summary: z.preprocess(
+    (value) => value ?? {},
+    ModelOutcomeSummarySchema,
+  ),
   decision_token: z.string().nullable().optional(),
   temporary_agent_proposal: TemporaryAgentProposalSchema.nullable().optional(),
   schedule_proposal: ScheduleProposalSchema.nullable().optional(),

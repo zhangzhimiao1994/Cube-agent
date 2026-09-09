@@ -167,6 +167,101 @@ describe("api client transport", () => {
     );
   });
 
+  it("preserves model outcome summaries on run details", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: "run_1",
+          status: "completed",
+          mode: "dispatch",
+          version: 1,
+          request: "Draft copy.",
+          created_at: "2026-09-06T13:50:00Z",
+          queue_wait_ms: 0,
+          capacity_wait_ms: 0,
+          cost_usd: "0",
+          events: [],
+          artifacts: [],
+          explicit_details: {},
+          failure_diagnostics: [],
+          tool_lifecycle: [],
+          model_outcome_summary: {
+            completion_count: 2,
+            fallback_used: true,
+            fallback_attempt_count: 1,
+            requested_logical_models: ["planner", "main"],
+            actual_logical_models: ["planner", "backup"],
+            attempted_logical_models: ["planner", "main", "backup"],
+            provider_ids: ["deepseek", "openai"],
+            last_requested_logical_model: "main",
+            last_logical_model: "backup",
+            last_provider_id: "openai",
+          },
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const run = await api.run("run_1");
+
+    expect(run.model_outcome_summary).toEqual({
+      completion_count: 2,
+      fallback_used: true,
+      fallback_attempt_count: 1,
+      requested_logical_models: ["planner", "main"],
+      actual_logical_models: ["planner", "backup"],
+      attempted_logical_models: ["planner", "main", "backup"],
+      provider_ids: ["deepseek", "openai"],
+      last_requested_logical_model: "main",
+      last_logical_model: "backup",
+      last_provider_id: "openai",
+    });
+  });
+
+  it("defaults missing model outcome summaries on legacy run details", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: "run_1",
+          status: "completed",
+          mode: "dispatch",
+          version: 1,
+          request: "Draft copy.",
+          created_at: "2026-09-06T13:50:00Z",
+          queue_wait_ms: 0,
+          capacity_wait_ms: 0,
+          cost_usd: "0",
+          events: [],
+          artifacts: [],
+          explicit_details: {},
+          failure_diagnostics: [],
+          tool_lifecycle: [],
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const run = await api.run("run_1");
+
+    expect(run.model_outcome_summary).toEqual({
+      completion_count: 0,
+      fallback_used: false,
+      fallback_attempt_count: 0,
+      requested_logical_models: [],
+      actual_logical_models: [],
+      attempted_logical_models: [],
+      provider_ids: [],
+    });
+  });
+
   it("loads the runtime capability manifest without browser cache", async () => {
     const manifest = {
       schema_version: 1,

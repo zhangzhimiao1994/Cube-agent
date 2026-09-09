@@ -441,6 +441,66 @@ def test_openclaw_operation_can_be_created_from_chat_proposal() -> None:
     assert "conv-openclaw-api-test" in body["operation"]["reason"]
 
 
+def test_admin_run_detail_serializes_model_outcome_summary_without_capacity_internals() -> None:
+    api = client()
+    service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)
+    run_id = uuid4()
+    now = datetime.now(UTC)
+    service.runs[run_id] = RunDetailResponse(
+        id=run_id,
+        status="completed",
+        mode="dispatch",
+        request="route and execute models",
+        created_at=now,
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        events=[
+            _admin_run_event(
+                {
+                    "sequence": 1,
+                    "kind": "model.completed",
+                    "message": "model.completed",
+                    "created_at": now,
+                    "actor": "main_agent",
+                    "payload": {
+                        "requested_logical_model": "main",
+                        "logical_model": "backup",
+                        "provider_id": "openai",
+                        "fallback_used": True,
+                        "attempted_logical_models": ("main", "backup"),
+                        "fallback_attempt_count": 1,
+                        "quota_scope_id": "tenant-private-quota",
+                        "lease_id": "lease-private",
+                    },
+                }
+            )
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    response = api.get(f"/api/v1/admin/runs/{run_id}", headers=headers())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["model_outcome_summary"] == {
+        "completion_count": 1,
+        "fallback_used": True,
+        "fallback_attempt_count": 1,
+        "requested_logical_models": ["main"],
+        "actual_logical_models": ["backup"],
+        "attempted_logical_models": ["main", "backup"],
+        "provider_ids": ["openai"],
+        "last_requested_logical_model": "main",
+        "last_logical_model": "backup",
+        "last_provider_id": "openai",
+    }
+    serialized = json.dumps(body, ensure_ascii=False)
+    assert "lease-private" not in serialized
+    assert "tenant-private-quota" not in serialized
+
+
 def test_openclaw_operation_from_run_rejects_non_openclaw_proposal() -> None:
     api = client()
     service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)
@@ -1291,6 +1351,188 @@ def test_run_detail_response_can_expose_mode_decision_token() -> None:
     assert response.decision_token == token
 
 
+def test_run_detail_response_summarizes_model_outcomes_without_capacity_internals() -> None:
+    response = RunDetailResponse(
+        id=uuid4(),
+        status="completed",
+        mode="dispatch",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="use multiple models",
+        events=[
+            _admin_run_event(
+                {
+                    "sequence": 1,
+                    "kind": "model.completed",
+                    "message": "model.completed",
+                    "created_at": datetime.now(UTC),
+                    "actor": "planner",
+                    "payload": {
+                        "requested_logical_model": "planner",
+                        "logical_model": "planner",
+                        "provider_id": "deepseek",
+                        "fallback_used": False,
+                        "attempted_logical_models": ("planner",),
+                        "fallback_attempt_count": 0,
+                        "quota_scope_id": "tenant-private-quota",
+                        "lease_id": "lease-private",
+                    },
+                }
+            ),
+            _admin_run_event(
+                {
+                    "sequence": 2,
+                    "kind": "model.completed",
+                    "message": "model.completed",
+                    "created_at": datetime.now(UTC),
+                    "actor": "writer",
+                    "payload": {
+                        "requested_logical_model": "main",
+                        "logical_model": "backup",
+                        "provider_id": "openai",
+                        "fallback_used": True,
+                        "fallback_from_logical_model": "main",
+                        "fallback_reason": "capacity_unavailable",
+                        "attempted_logical_models": ("main", "backup"),
+                        "fallback_attempt_count": 1,
+                    },
+                }
+            ),
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    summary = response.model_outcome_summary
+
+    assert summary.completion_count == 2
+    assert summary.fallback_used is True
+    assert summary.fallback_attempt_count == 1
+    assert summary.requested_logical_models == ["planner", "main"]
+    assert summary.actual_logical_models == ["planner", "backup"]
+    assert summary.attempted_logical_models == ["planner", "main", "backup"]
+    assert summary.provider_ids == ["deepseek", "openai"]
+    assert summary.last_requested_logical_model == "main"
+    assert summary.last_logical_model == "backup"
+    assert summary.last_provider_id == "openai"
+    assert "lease-private" not in summary.model_dump_json()
+    assert "tenant-private-quota" not in summary.model_dump_json()
+
+
+def test_run_detail_response_summarizes_direct_runtime_outcome_once() -> None:
+    response = RunDetailResponse(
+        id=uuid4(),
+        status="completed",
+        mode="direct",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="direct answer",
+        events=[
+            RunEventResponse(
+                sequence=1,
+                kind="artifact.created",
+                message="模型已返回直连回答。",
+                created_at=datetime.now(UTC),
+                actor="main_agent",
+                payload={
+                    "requested_logical_model": "main",
+                    "logical_model": "backup",
+                    "provider": "openai",
+                    "fallback_used": True,
+                    "fallback_from_logical_model": "main",
+                    "fallback_reason": "capacity_unavailable",
+                    "attempted_logical_models": ("main", "backup"),
+                    "fallback_attempt_count": 1,
+                },
+            ),
+            RunEventResponse(
+                sequence=2,
+                kind="runtime.completed",
+                message="本次直连对话已完成。",
+                created_at=datetime.now(UTC),
+                actor="main_agent",
+                payload={
+                    "requested_logical_model": "main",
+                    "logical_model": "backup",
+                    "provider": "openai",
+                    "fallback_used": True,
+                    "fallback_from_logical_model": "main",
+                    "fallback_reason": "capacity_unavailable",
+                    "attempted_logical_models": ("main", "backup"),
+                    "fallback_attempt_count": 1,
+                },
+            ),
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    summary = response.model_outcome_summary
+
+    assert summary.completion_count == 1
+    assert summary.fallback_used is True
+    assert summary.fallback_attempt_count == 1
+    assert summary.requested_logical_models == ["main"]
+    assert summary.actual_logical_models == ["backup"]
+    assert summary.provider_ids == ["openai"]
+
+
+def test_run_detail_response_prefers_model_completed_for_mixed_model_events() -> None:
+    response = RunDetailResponse(
+        id=uuid4(),
+        status="completed",
+        mode="direct",
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        request="mixed legacy and model events",
+        events=[
+            RunEventResponse(
+                sequence=1,
+                kind="model.completed",
+                message="model.completed",
+                created_at=datetime.now(UTC),
+                actor="main_agent",
+                payload={
+                    "requested_logical_model": "main",
+                    "logical_model": "backup",
+                    "provider_id": "openai",
+                    "fallback_used": True,
+                    "attempted_logical_models": ("main", "backup"),
+                    "fallback_attempt_count": 1,
+                },
+            ),
+            RunEventResponse(
+                sequence=2,
+                kind="artifact.created",
+                message="artifact.created",
+                created_at=datetime.now(UTC),
+                actor="main_agent",
+                payload={
+                    "requested_logical_model": "ignored",
+                    "logical_model": "ignored",
+                    "provider": "ignored",
+                    "fallback_used": True,
+                    "attempted_logical_models": ("ignored",),
+                    "fallback_attempt_count": 9,
+                },
+            ),
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    summary = response.model_outcome_summary
+
+    assert summary.completion_count == 1
+    assert summary.fallback_attempt_count == 1
+    assert summary.requested_logical_models == ["main"]
+    assert summary.actual_logical_models == ["backup"]
+    assert summary.provider_ids == ["openai"]
+
+
 def test_admin_run_event_exposes_safe_process_details_without_secrets() -> None:
     response = _admin_run_event(
         {
@@ -1349,6 +1591,27 @@ def test_admin_run_event_preserves_tool_payload_approval_id_without_raw_details(
     }
     assert "private-token" not in serialized
     assert "private output" not in serialized
+
+
+def test_admin_run_event_redacts_capacity_internals_without_redacting_release() -> None:
+    response = _admin_run_event(
+        {
+            "sequence": 9,
+            "kind": "model.completed",
+            "message": "model.completed",
+            "payload": {
+                "release": "20260909134530-gateway-outcome-22940cf",
+                "release_id": "release-22940cf",
+                "lease_id": "lease-private",
+                "quota_scope_id": "tenant-private-quota",
+            },
+        }
+    )
+
+    assert response.payload["release"] == "20260909134530-gateway-outcome-22940cf"
+    assert response.payload["release_id"] == "release-22940cf"
+    assert response.payload["lease_id"] == "[redacted]"
+    assert response.payload["quota_scope_id"] == "[redacted]"
 
 
 def test_run_detail_response_exposes_structured_failure_diagnostics_without_raw_details() -> None:

@@ -380,6 +380,21 @@ class ToolLifecycleResponse(BaseModel):
     failure_kind: str | None = None
 
 
+class ModelOutcomeSummaryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    completion_count: int = Field(default=0, ge=0)
+    fallback_used: bool = False
+    fallback_attempt_count: int = Field(default=0, ge=0)
+    requested_logical_models: list[str] = Field(default_factory=list)
+    actual_logical_models: list[str] = Field(default_factory=list)
+    attempted_logical_models: list[str] = Field(default_factory=list)
+    provider_ids: list[str] = Field(default_factory=list)
+    last_requested_logical_model: str | None = None
+    last_logical_model: str | None = None
+    last_provider_id: str | None = None
+
+
 class RunDetailResponse(RunListItem):
     request: str
     events: list[RunEventResponse]
@@ -387,6 +402,9 @@ class RunDetailResponse(RunListItem):
     explicit_details: dict[str, str]
     failure_diagnostics: list[FailureDiagnosticResponse] = Field(default_factory=list)
     tool_lifecycle: list[ToolLifecycleResponse] = Field(default_factory=list)
+    model_outcome_summary: ModelOutcomeSummaryResponse = Field(
+        default_factory=ModelOutcomeSummaryResponse
+    )
     decision_token: str | None = None
     temporary_agent_proposal: dict[str, JsonValue] | None = None
     schedule_proposal: dict[str, JsonValue] | None = None
@@ -400,6 +418,7 @@ class RunDetailResponse(RunListItem):
             self.failure_diagnostics = _failure_diagnostics_from_run_events(self.events)
         if not self.tool_lifecycle:
             self.tool_lifecycle = _tool_lifecycle_from_run_events(self.events)
+        self.model_outcome_summary = _model_outcome_summary_from_run_events(self.events)
         return self
 
 
@@ -9010,6 +9029,113 @@ _MODE_ERROR_LEGACY_GENERIC_DIAGNOSIS = (
     "This run only recorded a legacy generic failure reason. Rerun the task after this update "
     "to capture safe diagnostics such as HTTP status, deployment availability, and capacity state."
 )
+_MODEL_OUTCOME_EVENT_PRIORITY = (
+    "model.completed",
+    "artifact.created",
+    "runtime.completed",
+)
+_MAX_MODEL_OUTCOME_VALUES = 16
+
+
+def _model_outcome_summary_from_run_events(
+    events: Iterable[RunEventResponse],
+) -> ModelOutcomeSummaryResponse:
+    selected = _model_outcome_events(events)
+    requested_models: list[str] = []
+    actual_models: list[str] = []
+    attempted_models: list[str] = []
+    provider_ids: list[str] = []
+    fallback_used = False
+    fallback_attempt_count = 0
+    last_requested_model: str | None = None
+    last_actual_model: str | None = None
+    last_provider_id: str | None = None
+
+    for event in selected:
+        payload = event.payload
+        actual_model = _model_outcome_string(payload.get("logical_model")) or _model_outcome_string(
+            payload.get("model")
+        )
+        requested_model = _model_outcome_string(payload.get("requested_logical_model")) or actual_model
+        provider_id = _model_outcome_string(payload.get("provider_id")) or _model_outcome_string(
+            payload.get("provider")
+        )
+        if requested_model is not None:
+            _append_unique_bounded(requested_models, requested_model)
+            last_requested_model = requested_model
+        if actual_model is not None:
+            _append_unique_bounded(actual_models, actual_model)
+            last_actual_model = actual_model
+        for attempted_model in _model_outcome_string_list(payload.get("attempted_logical_models")):
+            _append_unique_bounded(attempted_models, attempted_model)
+        if provider_id is not None:
+            _append_unique_bounded(provider_ids, provider_id)
+            last_provider_id = provider_id
+        fallback_used = fallback_used or payload.get("fallback_used") is True
+        fallback_attempt_count += _model_outcome_non_negative_int(
+            payload.get("fallback_attempt_count")
+        )
+
+    return ModelOutcomeSummaryResponse(
+        completion_count=len(selected),
+        fallback_used=fallback_used,
+        fallback_attempt_count=fallback_attempt_count,
+        requested_logical_models=requested_models,
+        actual_logical_models=actual_models,
+        attempted_logical_models=attempted_models,
+        provider_ids=provider_ids,
+        last_requested_logical_model=last_requested_model,
+        last_logical_model=last_actual_model,
+        last_provider_id=last_provider_id,
+    )
+
+
+def _model_outcome_events(events: Iterable[RunEventResponse]) -> list[RunEventResponse]:
+    ordered = sorted(events, key=lambda item: item.sequence)
+    for kind in _MODEL_OUTCOME_EVENT_PRIORITY:
+        selected = [
+            event
+            for event in ordered
+            if event.kind == kind
+            and (
+                _model_outcome_string(event.payload.get("logical_model")) is not None
+                or _model_outcome_string(event.payload.get("model")) is not None
+            )
+        ]
+        if selected:
+            return selected
+    return []
+
+
+def _model_outcome_string(value: object) -> str | None:
+    if type(value) is not str or not value:
+        return None
+    safe = _safe_event_detail(value)
+    if type(safe) is str and safe and safe != "[redacted]":
+        return safe[:128]
+    return None
+
+
+def _model_outcome_string_list(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list | tuple):
+        return ()
+    values: list[str] = []
+    for item in value:
+        text = _model_outcome_string(item)
+        if text is not None:
+            _append_unique_bounded(values, text)
+    return tuple(values)
+
+
+def _model_outcome_non_negative_int(value: object) -> int:
+    if type(value) is int and value > 0:
+        return value
+    return 0
+
+
+def _append_unique_bounded(values: list[str], value: str) -> None:
+    if value not in values and len(values) < _MAX_MODEL_OUTCOME_VALUES:
+        values.append(value)
 
 
 def _mode_error_display_reason(reason: str | None) -> str:
@@ -10101,6 +10227,12 @@ _SENSITIVE_EVENT_DETAIL_KEYS = frozenset(
         "traceback",
     }
 )
+_SENSITIVE_EVENT_DETAIL_EXACT_KEYS = frozenset(
+    {
+        "lease_id",
+        "quota_scope_id",
+    }
+)
 
 
 def _optional_event_string(value: object) -> str | None:
@@ -10191,6 +10323,8 @@ def _safe_event_detail(value: object, *, key: str | None = None, depth: int = 0)
 
 def _is_sensitive_event_detail_key(key: str) -> bool:
     lowered = key.lower()
+    if lowered in _SENSITIVE_EVENT_DETAIL_EXACT_KEYS:
+        return True
     return any(sensitive in lowered for sensitive in _SENSITIVE_EVENT_DETAIL_KEYS)
 
 
