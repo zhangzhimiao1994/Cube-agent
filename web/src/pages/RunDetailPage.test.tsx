@@ -664,6 +664,85 @@ describe("RunDetailPage", () => {
     expect(within(drawer).queryByText("internal.example.invalid")).toBeNull();
   });
 
+  it("renders model capability negotiation as a compact model outcome metric without internals", async () => {
+    const detailedRun: RunDetail = {
+      ...runDetail,
+      model_capability_negotiation_summary: {
+        role_count: 3,
+        satisfied_count: 1,
+        missing_count: 1,
+        unknown_count: 1,
+        truncated: true,
+      },
+      events: [
+        ...runDetail.events,
+        {
+          sequence: 8,
+          kind: "step.started",
+          message: "main_agent_plan",
+          created_at: "2026-08-20T00:00:08Z",
+          actor: "main_agent",
+          participants: [],
+          step_id: "main_agent_plan",
+          payload: {
+            model_execution_plan: {
+              schema_version: 1,
+              model_capability_negotiation: {
+                schema_version: 1,
+                items: [
+                  {
+                    role_id: "token_leak",
+                    logical_model: "sk_secret",
+                    required_capabilities: ["tool_calling"],
+                    matched_capabilities: [],
+                    missing_capabilities: ["tool_calling"],
+                    status: "missing_capability",
+                    api_base: "https://model-internal.example.invalid",
+                    quota_scope_id: "tenant-private-quota",
+                  },
+                ],
+                role_count: 3,
+                satisfied_count: 1,
+                missing_count: 1,
+                unknown_count: 1,
+                truncated: true,
+              },
+            },
+          },
+        },
+      ],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") {
+          return jsonResponse({
+            user_id: "11111111-1111-4111-8111-111111111111",
+            tenant_id: "33333333-3333-4333-8333-333333333333",
+            username: "admin",
+            role: "super_admin",
+            permissions: ["*"],
+          });
+        }
+        if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse(detailedRun);
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      }),
+    );
+
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+
+    const summary = await screen.findByRole("status", { name: "模型结果摘要" });
+    expect(within(summary).getByText("能力协商")).not.toBeNull();
+    expect(within(summary).getByText("3 个角色，满足 1，缺口 1，未知 1，已截断")).not.toBeNull();
+    expect(within(summary).getByText("已记录能力协商")).not.toBeNull();
+    expect(screen.queryByText("sk_secret")).toBeNull();
+    expect(screen.queryByText("token_leak")).toBeNull();
+    expect(screen.queryByText("model-internal.example.invalid")).toBeNull();
+    expect(screen.queryByText("tenant-private-quota")).toBeNull();
+    expect(screen.queryByText("tool_calling")).toBeNull();
+  });
+
   it("keeps model outcome fallback posture when outcome and handoff summaries both exist", async () => {
     const detailedRun: RunDetail = {
       ...runDetail,

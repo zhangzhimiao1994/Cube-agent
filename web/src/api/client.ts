@@ -734,6 +734,14 @@ const OrchestrationProtocolSummarySchema = z.object({
   truncated: z.boolean().default(false),
 });
 
+const ModelCapabilityNegotiationSummarySchema = z.object({
+  role_count: z.number().int().nonnegative().default(0),
+  satisfied_count: z.number().int().nonnegative().default(0),
+  missing_count: z.number().int().nonnegative().default(0),
+  unknown_count: z.number().int().nonnegative().default(0),
+  truncated: z.boolean().default(false),
+});
+
 const RunDetailSchema = RunListItemSchema.extend({
   request: z.string(),
   events: z.array(RunEventSchema),
@@ -749,6 +757,10 @@ const RunDetailSchema = RunListItemSchema.extend({
     (value) => value ?? null,
     OrchestrationProtocolSummarySchema.nullable(),
   ),
+  model_capability_negotiation_summary: z.preprocess(
+    (value) => value ?? null,
+    ModelCapabilityNegotiationSummarySchema.nullable(),
+  ).optional(),
   decision_token: z.string().nullable().optional(),
   temporary_agent_proposal: TemporaryAgentProposalSchema.nullable().optional(),
   schedule_proposal: ScheduleProposalSchema.nullable().optional(),

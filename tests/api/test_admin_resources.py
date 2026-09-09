@@ -594,6 +594,42 @@ def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() 
                                 "truncated": False,
                                 "lease_id": "lease-private",
                             },
+                            "model_capability_negotiation": {
+                                "schema_version": 1,
+                                "items": (
+                                    {
+                                        "role_id": "copywriter",
+                                        "logical_model": "creative",
+                                        "required_capabilities": ("text", "structured_output"),
+                                        "matched_capabilities": ("text",),
+                                        "missing_capabilities": ("structured_output",),
+                                        "status": "missing_capability",
+                                        "credential_ref": "credential-private",
+                                    },
+                                    {
+                                        "role_id": "final_synthesizer",
+                                        "logical_model": "main",
+                                        "required_capabilities": ("text", "structured_output"),
+                                        "matched_capabilities": ("text", "structured_output"),
+                                        "missing_capabilities": (),
+                                        "status": "satisfied",
+                                        "api_base": "https://model-internal.example.invalid",
+                                    },
+                                    {
+                                        "role_id": "token_leak",
+                                        "logical_model": "sk_secret",
+                                        "required_capabilities": ("tool_calling",),
+                                        "matched_capabilities": (),
+                                        "missing_capabilities": ("tool_calling",),
+                                        "status": "missing_capability",
+                                    },
+                                ),
+                                "role_count": 3,
+                                "satisfied_count": 1,
+                                "missing_count": 2,
+                                "unknown_count": 0,
+                                "truncated": True,
+                            },
                             "quota_scope_id": "tenant-private-quota",
                             "credential_ref": "credential-private",
                             "api_base": "https://internal.example.invalid",
@@ -663,6 +699,13 @@ def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() 
         "blocked_contract_count": 0,
         "truncated": False,
     }
+    assert body["model_capability_negotiation_summary"] == {
+        "role_count": 3,
+        "satisfied_count": 1,
+        "missing_count": 2,
+        "unknown_count": 0,
+        "truncated": True,
+    }
     serialized = json.dumps(body, ensure_ascii=False)
     assert "lease-private" not in serialized
     assert "tenant-private-quota" not in serialized
@@ -673,6 +716,9 @@ def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() 
     assert "contract-internal.example.invalid" not in serialized
     assert "credential-private" not in serialized
     assert "internal.example.invalid" not in serialized
+    assert "model-internal.example.invalid" not in serialized
+    assert "sk_secret" not in serialized
+    assert "token_leak" not in serialized
 
 
 def test_orchestration_protocol_summary_reports_blocked_and_completed_statuses() -> None:

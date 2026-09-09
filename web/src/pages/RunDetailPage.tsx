@@ -19,6 +19,7 @@ type RunEvent = RunDetail["events"][number];
 type RunArtifact = RunDetail["artifacts"][number];
 type ModelOutcomeSummary = RunDetail["model_outcome_summary"];
 type ApiOrchestrationProtocolSummary = RunDetail["orchestration_protocol_summary"];
+type ApiModelCapabilityNegotiationSummary = RunDetail["model_capability_negotiation_summary"];
 type OrchestrationHandoff = {
   sourceRoleId: string;
   targetRoleId: string;
@@ -49,6 +50,14 @@ type OrchestrationProtocolSummary = {
   roleCount: number;
   handoffCount: number;
   contractCount: number;
+  truncated: boolean;
+};
+
+type ModelCapabilityNegotiationSummary = {
+  roleCount: number;
+  satisfiedCount: number;
+  missingCount: number;
+  unknownCount: number;
   truncated: boolean;
 };
 
@@ -1045,6 +1054,19 @@ function orchestrationProtocolSummaryFromEvents(events: RunEvent[]): Orchestrati
   return latest;
 }
 
+function modelCapabilityNegotiationSummaryFromApi(
+  summary: ApiModelCapabilityNegotiationSummary,
+): ModelCapabilityNegotiationSummary | null {
+  if (!summary || summary.role_count === 0) return null;
+  return {
+    roleCount: summary.role_count,
+    satisfiedCount: summary.satisfied_count,
+    missingCount: summary.missing_count,
+    unknownCount: summary.unknown_count,
+    truncated: summary.truncated,
+  };
+}
+
 function orchestrationContractKey(contract: OrchestrationContract) {
   return contract.contractId || `${contract.sourceStepId}->${contract.targetStepId}:${contract.handoffKind}`;
 }
@@ -1141,6 +1163,17 @@ function orchestrationContractLabel(summary: OrchestrationContractSummary) {
 
 function orchestrationProtocolLabel(summary: OrchestrationProtocolSummary) {
   const parts = [`${summary.roleCount} 个角色，${summary.contractCount} 个契约`];
+  if (summary.truncated) parts.push("已截断");
+  return parts.join("，");
+}
+
+function modelCapabilityNegotiationLabel(summary: ModelCapabilityNegotiationSummary) {
+  const parts = [
+    `${summary.roleCount} 个角色`,
+    `满足 ${summary.satisfiedCount}`,
+    `缺口 ${summary.missingCount}`,
+  ];
+  if (summary.unknownCount > 0) parts.push(`未知 ${summary.unknownCount}`);
   if (summary.truncated) parts.push("已截断");
   return parts.join("，");
 }
@@ -1937,6 +1970,9 @@ export function RunDetailPage() {
   const protocolSummary =
     orchestrationProtocolSummaryFromApi(orderedRunData.orchestration_protocol_summary) ??
     orchestrationProtocolSummaryFromEvents(orderedRunData.events);
+  const capabilityNegotiationSummary = modelCapabilityNegotiationSummaryFromApi(
+    orderedRunData.model_capability_negotiation_summary,
+  );
 
   return (
     <section>
@@ -1979,7 +2015,7 @@ export function RunDetailPage() {
         </ul>
       </div>
 
-      {hasOutcomeSummary || handoffSummary || contractSummary || protocolSummary ? (
+      {hasOutcomeSummary || handoffSummary || contractSummary || protocolSummary || capabilityNegotiationSummary ? (
         <div className="run-model-outcome-summary" role="status" aria-label="模型结果摘要">
           <div>
             <span>Model outcome</span>
@@ -1993,7 +2029,9 @@ export function RunDetailPage() {
                   ? "已记录交接"
                   : contractSummary
                     ? "已记录契约"
-                    : "已记录协议"}
+                    : protocolSummary
+                      ? "已记录协议"
+                      : "已记录能力协商"}
             </small>
           </div>
           <ul aria-label="模型结果指标">
@@ -2029,6 +2067,12 @@ export function RunDetailPage() {
               <li>
                 <span>角色交接协议</span>
                 <strong>{orchestrationProtocolLabel(protocolSummary)}</strong>
+              </li>
+            ) : null}
+            {capabilityNegotiationSummary ? (
+              <li>
+                <span>能力协商</span>
+                <strong>{modelCapabilityNegotiationLabel(capabilityNegotiationSummary)}</strong>
               </li>
             ) : null}
             {handoffSummary ? (

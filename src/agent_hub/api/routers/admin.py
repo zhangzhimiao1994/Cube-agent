@@ -408,6 +408,16 @@ class OrchestrationProtocolSummaryResponse(BaseModel):
     truncated: bool = False
 
 
+class ModelCapabilityNegotiationSummaryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role_count: int = Field(default=0, ge=0)
+    satisfied_count: int = Field(default=0, ge=0)
+    missing_count: int = Field(default=0, ge=0)
+    unknown_count: int = Field(default=0, ge=0)
+    truncated: bool = False
+
+
 class RunDetailResponse(RunListItem):
     request: str
     events: list[RunEventResponse]
@@ -419,6 +429,9 @@ class RunDetailResponse(RunListItem):
         default_factory=ModelOutcomeSummaryResponse
     )
     orchestration_protocol_summary: OrchestrationProtocolSummaryResponse | None = None
+    model_capability_negotiation_summary: (
+        ModelCapabilityNegotiationSummaryResponse | None
+    ) = None
     decision_token: str | None = None
     temporary_agent_proposal: dict[str, JsonValue] | None = None
     schedule_proposal: dict[str, JsonValue] | None = None
@@ -435,6 +448,9 @@ class RunDetailResponse(RunListItem):
         self.model_outcome_summary = _model_outcome_summary_from_run_events(self.events)
         self.orchestration_protocol_summary = _orchestration_protocol_summary_from_run_events(
             self.events
+        )
+        self.model_capability_negotiation_summary = (
+            _model_capability_negotiation_summary_from_run_events(self.events)
         )
         return self
 
@@ -8745,6 +8761,7 @@ def _contains_sensitive_marker(value: str) -> bool:
             "private-token",
             "secret",
             "sk-",
+            "token_",
         )
     )
 
@@ -9188,6 +9205,40 @@ def _orchestration_protocol_summary_from_run_events(
         contract_count=contract_count,
         blocked_contract_count=blocked_contract_count,
         truncated=truncated,
+    )
+
+
+def _model_capability_negotiation_summary_from_run_events(
+    events: Iterable[RunEventResponse],
+) -> ModelCapabilityNegotiationSummaryResponse | None:
+    latest: Mapping[str, object] | None = None
+    for event in sorted(events, key=lambda item: item.sequence):
+        plan = event.payload.get("model_execution_plan")
+        if not isinstance(plan, Mapping):
+            continue
+        negotiation = plan.get("model_capability_negotiation")
+        if isinstance(negotiation, Mapping):
+            latest = cast(Mapping[str, object], negotiation)
+
+    if latest is None:
+        return None
+    role_count = _orchestration_protocol_int(latest.get("role_count"))
+    satisfied_count = _orchestration_protocol_int(latest.get("satisfied_count"))
+    missing_count = _orchestration_protocol_int(latest.get("missing_count"))
+    unknown_count = _orchestration_protocol_int(latest.get("unknown_count"))
+    if (
+        role_count is None
+        or satisfied_count is None
+        or missing_count is None
+        or unknown_count is None
+    ):
+        return None
+    return ModelCapabilityNegotiationSummaryResponse(
+        role_count=role_count,
+        satisfied_count=satisfied_count,
+        missing_count=missing_count,
+        unknown_count=unknown_count,
+        truncated=latest.get("truncated") is True,
     )
 
 
