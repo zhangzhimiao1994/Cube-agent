@@ -277,7 +277,7 @@ class PythonSubprocessPluginPackageRunner:
                 env=self._environment,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
             )
         except Exception as error:
             raise RuntimeCapabilityError("Plugin tool failed") from error

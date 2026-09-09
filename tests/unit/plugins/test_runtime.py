@@ -1288,6 +1288,44 @@ async def test_python_subprocess_plugin_package_runner_times_out(
         )
 
 
+async def test_python_subprocess_plugin_package_runner_discards_stderr(
+    tmp_path: Path,
+) -> None:
+    entrypoint = tmp_path / "adapter.py"
+    entrypoint.write_text(
+        "import json\n"
+        "import sys\n"
+        "sys.stderr.write('secret detail from plugin' * 200000)\n"
+        "json.load(sys.stdin)\n"
+        "json.dump({'ok': True}, sys.stdout)\n"
+    )
+    runner = PythonSubprocessPluginPackageRunner(
+        python_executable=sys.executable,
+        timeout_seconds=2,
+    )
+
+    result = await runner.invoke(
+        target=PluginPackageExecutionTarget(root=tmp_path, entrypoint=entrypoint),
+        plugin=plugin("calendar", adapter="calendar_python"),
+        capability=PluginCapabilityRequest(
+            id="calendar.create_event",
+            adapter="calendar_python",
+            permission_class="calendar.write",
+            sandbox_profile="in_process",
+        ),
+        arguments={"title": "review"},
+        context=PluginInvocationContext(
+            tenant_id=TENANT_ID,
+            user_id=TENANT_ID,
+            run_id=TENANT_ID,
+            actor="tester",
+            idempotency_key="invoke-1",
+        ),
+    )
+
+    assert result == {"ok": True}
+
+
 async def test_runtime_plugin_service_rechecks_runtime_registered_package_metadata() -> None:
     package_metadata = PluginPackageMetadata.model_construct(
         schema_version=1,
