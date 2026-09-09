@@ -55,6 +55,7 @@ from agent_hub.api.routers.admin import (
     _mode_error_log_from_run,
     _model_check_failure_details,
     _openclaw_proposal,
+    _orchestration_protocol_summary_from_run_events,
     _plugin_signature_payload,
     _repair_proposal,
     _routing_details,
@@ -574,6 +575,25 @@ def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() 
                                 ),
                                 "truncated": False,
                             },
+                            "orchestration_protocol": {
+                                "schema_version": 1,
+                                "protocol": "role_handoff_contract_v1",
+                                "mode": "dispatch",
+                                "role_count": 2,
+                                "handoff_count": 1,
+                                "contract_count": 1,
+                                "structured_output_schema": "dispatch_output_v1",
+                                "required_output_fields": (
+                                    "status",
+                                    "summary",
+                                    "evidence",
+                                ),
+                                "ready_status": "done",
+                                "blocking_statuses": ("blocked", "needs_user"),
+                                "recovery_hints": ("retry_blocked_contract_chain",),
+                                "truncated": False,
+                                "lease_id": "lease-private",
+                            },
                             "quota_scope_id": "tenant-private-quota",
                             "credential_ref": "credential-private",
                             "api_base": "https://internal.example.invalid",
@@ -634,6 +654,15 @@ def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() 
         ],
         "truncated": False,
     }
+    assert body["orchestration_protocol_summary"] == {
+        "protocol": "role_handoff_contract_v1",
+        "status": "planned",
+        "role_count": 2,
+        "handoff_count": 1,
+        "contract_count": 1,
+        "blocked_contract_count": 0,
+        "truncated": False,
+    }
     serialized = json.dumps(body, ensure_ascii=False)
     assert "lease-private" not in serialized
     assert "tenant-private-quota" not in serialized
@@ -644,6 +673,94 @@ def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() 
     assert "contract-internal.example.invalid" not in serialized
     assert "credential-private" not in serialized
     assert "internal.example.invalid" not in serialized
+
+
+def test_orchestration_protocol_summary_reports_blocked_and_completed_statuses() -> None:
+    now = datetime.now(UTC)
+    protocol_plan = {
+        "schema_version": 1,
+        "orchestration_protocol": {
+            "schema_version": 1,
+            "protocol": "role_handoff_contract_v1",
+            "mode": "dispatch",
+            "role_count": 2,
+            "handoff_count": 1,
+            "contract_count": 1,
+            "structured_output_schema": "dispatch_output_v1",
+            "required_output_fields": ("status", "summary"),
+            "ready_status": "done",
+            "blocking_statuses": ("blocked", "needs_user"),
+            "recovery_hints": ("retry_blocked_contract_chain",),
+            "truncated": False,
+        },
+        "orchestration_contracts": {
+            "schema_version": 1,
+            "items": (
+                {
+                    "contract_id": "writer_step-to-final_response_step",
+                    "source_step_id": "writer_step",
+                    "target_step_id": "final_response_step",
+                    "source_role_id": "writer",
+                    "target_role_id": "final_synthesizer",
+                    "handoff_kind": "step_dependency",
+                    "status": "planned",
+                    "blocking_statuses": ("blocked", "needs_user"),
+                },
+            ),
+            "truncated": False,
+        },
+    }
+    planned_event = RunEventResponse(
+        sequence=1,
+        kind="step.started",
+        message="main_agent_plan",
+        created_at=now,
+        actor="main_agent",
+        step_id="main_agent_plan",
+        payload={"model_execution_plan": cast(JsonValue, protocol_plan)},
+    )
+
+    blocked = _orchestration_protocol_summary_from_run_events(
+        (
+            planned_event,
+            RunEventResponse(
+                sequence=2,
+                kind="step.failed",
+                message="writer failed",
+                created_at=now,
+                actor="writer",
+                step_id="writer_step",
+            ),
+        )
+    )
+    completed = _orchestration_protocol_summary_from_run_events(
+        (
+            planned_event,
+            RunEventResponse(
+                sequence=2,
+                kind="step.completed",
+                message="writer done",
+                created_at=now,
+                actor="writer",
+                step_id="writer_step",
+            ),
+            RunEventResponse(
+                sequence=3,
+                kind="step.completed",
+                message="final done",
+                created_at=now,
+                actor="final_synthesizer",
+                step_id="final_response_step",
+            ),
+        )
+    )
+
+    assert blocked is not None
+    assert blocked.status == "blocked"
+    assert blocked.blocked_contract_count == 1
+    assert completed is not None
+    assert completed.status == "completed"
+    assert completed.blocked_contract_count == 0
 
 
 def test_openclaw_operation_from_run_rejects_non_openclaw_proposal() -> None:

@@ -395,6 +395,18 @@ class ModelOutcomeSummaryResponse(BaseModel):
     last_provider_id: str | None = None
 
 
+class OrchestrationProtocolSummaryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    protocol: str
+    status: Literal["planned", "active", "blocked", "completed", "unknown"] = "unknown"
+    role_count: int = Field(default=0, ge=0)
+    handoff_count: int = Field(default=0, ge=0)
+    contract_count: int = Field(default=0, ge=0)
+    blocked_contract_count: int = Field(default=0, ge=0)
+    truncated: bool = False
+
+
 class RunDetailResponse(RunListItem):
     request: str
     events: list[RunEventResponse]
@@ -405,6 +417,7 @@ class RunDetailResponse(RunListItem):
     model_outcome_summary: ModelOutcomeSummaryResponse = Field(
         default_factory=ModelOutcomeSummaryResponse
     )
+    orchestration_protocol_summary: OrchestrationProtocolSummaryResponse | None = None
     decision_token: str | None = None
     temporary_agent_proposal: dict[str, JsonValue] | None = None
     schedule_proposal: dict[str, JsonValue] | None = None
@@ -419,6 +432,9 @@ class RunDetailResponse(RunListItem):
         if not self.tool_lifecycle:
             self.tool_lifecycle = _tool_lifecycle_from_run_events(self.events)
         self.model_outcome_summary = _model_outcome_summary_from_run_events(self.events)
+        self.orchestration_protocol_summary = _orchestration_protocol_summary_from_run_events(
+            self.events
+        )
         return self
 
 
@@ -9088,6 +9104,99 @@ def _model_outcome_summary_from_run_events(
         last_logical_model=last_actual_model,
         last_provider_id=last_provider_id,
     )
+
+
+def _orchestration_protocol_summary_from_run_events(
+    events: Iterable[RunEventResponse],
+) -> OrchestrationProtocolSummaryResponse | None:
+    ordered = sorted(events, key=lambda item: item.sequence)
+    latest_protocol: Mapping[str, object] | None = None
+    latest_contracts: Mapping[str, object] | None = None
+    step_statuses: dict[str, str] = {}
+    active_steps: set[str] = set()
+
+    for event in ordered:
+        if event.step_id is not None:
+            if event.kind == "step.completed":
+                step_statuses[event.step_id] = "completed"
+            elif event.kind in {"step.failed", "runtime.failed"}:
+                step_statuses[event.step_id] = "failed"
+            elif event.step_id != "main_agent_plan" and (
+                event.kind.startswith("step.") or event.kind.startswith("model.")
+            ):
+                active_steps.add(event.step_id)
+        plan = event.payload.get("model_execution_plan")
+        if not isinstance(plan, Mapping):
+            continue
+        protocol = plan.get("orchestration_protocol")
+        if isinstance(protocol, Mapping):
+            latest_protocol = cast(Mapping[str, object], protocol)
+        contracts = plan.get("orchestration_contracts")
+        if isinstance(contracts, Mapping):
+            latest_contracts = cast(Mapping[str, object], contracts)
+
+    if latest_protocol is None:
+        return None
+    protocol_id = _orchestration_protocol_id(latest_protocol.get("protocol"))
+    if protocol_id is None:
+        return None
+
+    role_count = _orchestration_protocol_int(latest_protocol.get("role_count"))
+    handoff_count = _orchestration_protocol_int(latest_protocol.get("handoff_count"))
+    contract_count = _orchestration_protocol_int(latest_protocol.get("contract_count"))
+    if role_count is None or handoff_count is None or contract_count is None:
+        return None
+
+    blocked_contract_count = 0
+    completed_contract_count = 0
+    if latest_contracts is not None:
+        contract_items = latest_contracts.get("items")
+        if isinstance(contract_items, list | tuple):
+            for raw_item in contract_items:
+                if not isinstance(raw_item, Mapping):
+                    continue
+                source_step = _model_outcome_string(raw_item.get("source_step_id"))
+                target_step = _model_outcome_string(raw_item.get("target_step_id"))
+                blocking_statuses = set(_model_outcome_string_list(raw_item.get("blocking_statuses")))
+                contract_status = _model_outcome_string(raw_item.get("status"))
+                source_failed = source_step is not None and step_statuses.get(source_step) == "failed"
+                target_failed = target_step is not None and step_statuses.get(target_step) == "failed"
+                if source_failed or target_failed or contract_status in blocking_statuses:
+                    blocked_contract_count += 1
+                if target_step is not None and step_statuses.get(target_step) == "completed":
+                    completed_contract_count += 1
+
+    status: Literal["planned", "active", "blocked", "completed", "unknown"] = "planned"
+    if blocked_contract_count > 0:
+        status = "blocked"
+    elif contract_count > 0 and completed_contract_count >= contract_count:
+        status = "completed"
+    elif active_steps:
+        status = "active"
+    elif contract_count == 0 and handoff_count == 0:
+        status = "unknown"
+
+    truncated = latest_protocol.get("truncated") is True
+    if latest_contracts is not None:
+        truncated = truncated or latest_contracts.get("truncated") is True
+    return OrchestrationProtocolSummaryResponse(
+        protocol=protocol_id,
+        status=status,
+        role_count=role_count,
+        handoff_count=handoff_count,
+        contract_count=contract_count,
+        blocked_contract_count=blocked_contract_count,
+        truncated=truncated,
+    )
+
+
+def _orchestration_protocol_id(value: object) -> str | None:
+    protocol = _model_outcome_string(value)
+    return protocol if protocol == "role_handoff_contract_v1" else None
+
+
+def _orchestration_protocol_int(value: object) -> int | None:
+    return value if type(value) is int and value >= 0 else None
 
 
 def _model_outcome_events(events: Iterable[RunEventResponse]) -> list[RunEventResponse]:

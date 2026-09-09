@@ -197,6 +197,15 @@ describe("api client transport", () => {
             last_logical_model: "backup",
             last_provider_id: "openai",
           },
+          orchestration_protocol_summary: {
+            protocol: "role_handoff_contract_v1",
+            status: "blocked",
+            role_count: 3,
+            handoff_count: 2,
+            contract_count: 2,
+            blocked_contract_count: 1,
+            truncated: false,
+          },
         }),
         {
           status: 200,
@@ -219,6 +228,15 @@ describe("api client transport", () => {
       last_requested_logical_model: "main",
       last_logical_model: "backup",
       last_provider_id: "openai",
+    });
+    expect(run.orchestration_protocol_summary).toEqual({
+      protocol: "role_handoff_contract_v1",
+      status: "blocked",
+      role_count: 3,
+      handoff_count: 2,
+      contract_count: 2,
+      blocked_contract_count: 1,
+      truncated: false,
     });
   });
 
@@ -260,6 +278,7 @@ describe("api client transport", () => {
       attempted_logical_models: [],
       provider_ids: [],
     });
+    expect(run.orchestration_protocol_summary).toBeNull();
   });
 
   it("loads the runtime capability manifest without browser cache", async () => {

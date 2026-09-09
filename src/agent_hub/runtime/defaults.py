@@ -119,6 +119,8 @@ _MAX_ORCHESTRATION_HANDOFFS = 12
 _ORCHESTRATION_CONTRACT_READY_STATUS = "done"
 _ORCHESTRATION_CONTRACT_BLOCKING_STATUSES = ("blocked", "needs_user")
 _ORCHESTRATION_CONTRACT_RECOVERY_HINT = "retry_blocked_contract_chain"
+_ORCHESTRATION_PROTOCOL_ID = "role_handoff_contract_v1"
+_DISPATCH_OUTPUT_SCHEMA_ID = "dispatch_output_v1"
 _SAFE_CAPABILITY_INVENTORY_ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _SAFE_MODEL_SELECTION_TEXT = re.compile(r"^[A-Za-z0-9_.:/@ -]{1,128}$")
 _SENSITIVE_CAPABILITY_INVENTORY_TEXT = frozenset(
@@ -1756,6 +1758,11 @@ def _model_execution_plan_payload(
             roles=roles,
             steps=steps,
         ),
+        "orchestration_protocol": _orchestration_protocol_payload(
+            context,
+            roles=roles,
+            steps=steps,
+        ),
         "role_model_routing_matrix": model_routing_matrix,
         "role_model_routing_matrix_truncated": model_routing_matrix_truncated,
     }
@@ -1802,6 +1809,42 @@ def _orchestration_contracts_payload(
     return {
         "schema_version": 1,
         "items": tuple(items),
+        "truncated": truncated,
+    }
+
+
+def _orchestration_protocol_payload(
+    context: TaskContext,
+    *,
+    roles: tuple[Mapping[str, JsonValue], ...],
+    steps: tuple[Mapping[str, JsonValue], ...],
+) -> Mapping[str, JsonValue]:
+    handoffs, truncated = _orchestration_handoff_items(roles=roles, steps=steps)
+    role_ids = {
+        role_id
+        for handoff in handoffs
+        for role_id in (
+            handoff["source_role_id"],
+            handoff["target_role_id"],
+        )
+    }
+    recovery_hints = (
+        (_ORCHESTRATION_CONTRACT_RECOVERY_HINT,)
+        if handoffs
+        else ()
+    )
+    return {
+        "schema_version": 1,
+        "protocol": _ORCHESTRATION_PROTOCOL_ID,
+        "mode": context.mode.value,
+        "role_count": len(role_ids),
+        "handoff_count": len(handoffs),
+        "contract_count": len(handoffs),
+        "structured_output_schema": _DISPATCH_OUTPUT_SCHEMA_ID,
+        "required_output_fields": tuple(_DISPATCH_OUTPUT_SCHEMA),
+        "ready_status": _ORCHESTRATION_CONTRACT_READY_STATUS,
+        "blocking_statuses": _ORCHESTRATION_CONTRACT_BLOCKING_STATUSES,
+        "recovery_hints": recovery_hints,
         "truncated": truncated,
     }
 

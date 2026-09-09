@@ -18,6 +18,7 @@ type ManualRunMode = (typeof MANUAL_RUN_MODES)[number]["value"];
 type RunEvent = RunDetail["events"][number];
 type RunArtifact = RunDetail["artifacts"][number];
 type ModelOutcomeSummary = RunDetail["model_outcome_summary"];
+type ApiOrchestrationProtocolSummary = RunDetail["orchestration_protocol_summary"];
 type OrchestrationHandoff = {
   sourceRoleId: string;
   targetRoleId: string;
@@ -42,6 +43,13 @@ type OrchestrationContractSummary = {
   completedCount: number;
   blockedCount: number;
   recoveryHints: string[];
+};
+
+type OrchestrationProtocolSummary = {
+  roleCount: number;
+  handoffCount: number;
+  contractCount: number;
+  truncated: boolean;
 };
 
 type OrchestrationContract = {
@@ -1004,6 +1012,39 @@ function orchestrationContractSummary(events: RunEvent[]): OrchestrationContract
   };
 }
 
+function orchestrationProtocolSummaryFromApi(
+  summary: ApiOrchestrationProtocolSummary,
+): OrchestrationProtocolSummary | null {
+  if (!summary || summary.protocol !== "role_handoff_contract_v1") return null;
+  return {
+    roleCount: summary.role_count,
+    handoffCount: summary.handoff_count,
+    contractCount: summary.contract_count,
+    truncated: summary.truncated,
+  };
+}
+
+function orchestrationProtocolSummaryFromEvents(events: RunEvent[]): OrchestrationProtocolSummary | null {
+  let latest: OrchestrationProtocolSummary | null = null;
+  events.forEach((event) => {
+    const plan = objectPayload(event.payload.model_execution_plan);
+    const protocol = objectPayload(plan?.orchestration_protocol);
+    if (!protocol || safeOrchestrationToken(protocol.protocol) !== "role_handoff_contract_v1") return;
+    const roleCount = safeNonNegativeInteger(protocol.role_count);
+    const handoffCount = safeNonNegativeInteger(protocol.handoff_count);
+    const contractCount = safeNonNegativeInteger(protocol.contract_count);
+    if (roleCount === null || handoffCount === null || contractCount === null) return;
+    if (roleCount === 0 && handoffCount === 0 && contractCount === 0) return;
+    latest = {
+      roleCount,
+      handoffCount,
+      contractCount,
+      truncated: protocol.truncated === true,
+    };
+  });
+  return latest;
+}
+
 function orchestrationContractKey(contract: OrchestrationContract) {
   return contract.contractId || `${contract.sourceStepId}->${contract.targetStepId}:${contract.handoffKind}`;
 }
@@ -1073,6 +1114,10 @@ function safeOrchestrationToken(value: unknown) {
   return text;
 }
 
+function safeNonNegativeInteger(value: unknown) {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
+}
+
 function uniqueHandoffValues(values: string[]) {
   return [...new Set(values)].slice(0, 4);
 }
@@ -1091,6 +1136,12 @@ function orchestrationContractLabel(summary: OrchestrationContractSummary) {
   const parts = [`${summary.count} 个契约${summary.truncated ? "，已截断" : ""}`];
   if (summary.completedCount > 0) parts.push(`已完成 ${summary.completedCount}`);
   if (summary.blockedCount > 0) parts.push(`阻塞 ${summary.blockedCount}`);
+  return parts.join("，");
+}
+
+function orchestrationProtocolLabel(summary: OrchestrationProtocolSummary) {
+  const parts = [`${summary.roleCount} 个角色，${summary.contractCount} 个契约`];
+  if (summary.truncated) parts.push("已截断");
   return parts.join("，");
 }
 
@@ -1883,6 +1934,9 @@ export function RunDetailPage() {
   const hasOutcomeSummary = hasModelOutcomeSummary(modelOutcomeSummary);
   const handoffSummary = orchestrationHandoffSummary(orderedRunData.events);
   const contractSummary = orchestrationContractSummary(orderedRunData.events);
+  const protocolSummary =
+    orchestrationProtocolSummaryFromApi(orderedRunData.orchestration_protocol_summary) ??
+    orchestrationProtocolSummaryFromEvents(orderedRunData.events);
 
   return (
     <section>
@@ -1925,7 +1979,7 @@ export function RunDetailPage() {
         </ul>
       </div>
 
-      {hasOutcomeSummary || handoffSummary || contractSummary ? (
+      {hasOutcomeSummary || handoffSummary || contractSummary || protocolSummary ? (
         <div className="run-model-outcome-summary" role="status" aria-label="模型结果摘要">
           <div>
             <span>Model outcome</span>
@@ -1937,7 +1991,9 @@ export function RunDetailPage() {
                   : "未发生回退"
                 : handoffSummary
                   ? "已记录交接"
-                  : "已记录契约"}
+                  : contractSummary
+                    ? "已记录契约"
+                    : "已记录协议"}
             </small>
           </div>
           <ul aria-label="模型结果指标">
@@ -1968,6 +2024,12 @@ export function RunDetailPage() {
                   <strong>{modelOutcomeHandoff(modelOutcomeSummary)}</strong>
                 </li>
               </>
+            ) : null}
+            {protocolSummary ? (
+              <li>
+                <span>角色交接协议</span>
+                <strong>{orchestrationProtocolLabel(protocolSummary)}</strong>
+              </li>
             ) : null}
             {handoffSummary ? (
               <>

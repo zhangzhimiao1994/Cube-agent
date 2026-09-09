@@ -88,6 +88,7 @@ const runDetail: RunDetail = {
     attempted_logical_models: [],
     provider_ids: [],
   },
+  orchestration_protocol_summary: null,
 };
 
 function jsonResponse(payload: unknown, init: ResponseInit = {}) {
@@ -192,6 +193,15 @@ describe("RunDetailPage", () => {
     const user = userEvent.setup();
     const detailedRun: RunDetail = {
       ...runDetail,
+      orchestration_protocol_summary: {
+        protocol: "role_handoff_contract_v1",
+        status: "completed",
+        role_count: 2,
+        handoff_count: 1,
+        contract_count: 1,
+        blocked_contract_count: 0,
+        truncated: false,
+      },
       events: [
         {
           ...runDetail.events[0],
@@ -552,6 +562,21 @@ describe("RunDetailPage", () => {
                 ],
                 truncated: false,
               },
+              orchestration_protocol: {
+                schema_version: 1,
+                protocol: "role_handoff_contract_v1",
+                mode: "dispatch",
+                role_count: 2,
+                handoff_count: 1,
+                contract_count: 1,
+                structured_output_schema: "dispatch_output_v1",
+                required_output_fields: ["status", "summary", "evidence"],
+                ready_status: "done",
+                blocking_statuses: ["blocked", "needs_user"],
+                recovery_hints: ["retry_blocked_contract_chain"],
+                truncated: false,
+                lease_id: "lease-private",
+              },
             },
           },
         },
@@ -616,6 +641,8 @@ describe("RunDetailPage", () => {
     const summary = await screen.findByRole("status", { name: "模型结果摘要" });
     expect(summary.classList.contains("run-model-outcome-summary")).toBe(true);
     expect(within(summary).getByText("已记录交接")).not.toBeNull();
+    expect(within(summary).getByText("角色交接协议")).not.toBeNull();
+    expect(within(summary).getByText("2 个角色，1 个契约")).not.toBeNull();
     expect(within(summary).getByText("1 次交接")).not.toBeNull();
     expect(within(summary).getByText("1 个契约，已完成 1")).not.toBeNull();
     expect(within(summary).getByText("copywriter -> final_synthesizer")).not.toBeNull();
@@ -625,6 +652,7 @@ describe("RunDetailPage", () => {
     expect(screen.queryByText("final_response_step")).toBeNull();
     expect(screen.queryByText("copywriter_step-to-final_response_step")).toBeNull();
     expect(screen.queryByText("lease-private")).toBeNull();
+    expect(screen.queryByText("role_handoff_contract_v1")).toBeNull();
     expect(screen.queryByText("tenant-private-quota")).toBeNull();
     expect(screen.queryByText("internal.example.invalid")).toBeNull();
 

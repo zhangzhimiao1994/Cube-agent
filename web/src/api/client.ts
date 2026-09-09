@@ -722,6 +722,16 @@ const ModelOutcomeSummarySchema = z.object({
   last_provider_id: z.string().nullable().optional(),
 });
 
+const OrchestrationProtocolSummarySchema = z.object({
+  protocol: z.string(),
+  status: z.enum(["planned", "active", "blocked", "completed", "unknown"]).default("unknown"),
+  role_count: z.number().int().nonnegative().default(0),
+  handoff_count: z.number().int().nonnegative().default(0),
+  contract_count: z.number().int().nonnegative().default(0),
+  blocked_contract_count: z.number().int().nonnegative().default(0),
+  truncated: z.boolean().default(false),
+});
+
 const RunDetailSchema = RunListItemSchema.extend({
   request: z.string(),
   events: z.array(RunEventSchema),
@@ -732,6 +742,10 @@ const RunDetailSchema = RunListItemSchema.extend({
   model_outcome_summary: z.preprocess(
     (value) => value ?? {},
     ModelOutcomeSummarySchema,
+  ),
+  orchestration_protocol_summary: z.preprocess(
+    (value) => value ?? null,
+    OrchestrationProtocolSummarySchema.nullable(),
   ),
   decision_token: z.string().nullable().optional(),
   temporary_agent_proposal: TemporaryAgentProposalSchema.nullable().optional(),

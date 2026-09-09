@@ -1377,8 +1377,30 @@ def test_model_execution_plan_reports_safe_orchestration_handoffs() -> None:
         ),
         "truncated": False,
     }
+    assert plan["orchestration_protocol"] == {
+        "schema_version": 1,
+        "protocol": "role_handoff_contract_v1",
+        "mode": "dispatch",
+        "role_count": 2,
+        "handoff_count": 1,
+        "contract_count": 1,
+        "structured_output_schema": "dispatch_output_v1",
+        "required_output_fields": (
+            "status",
+            "summary",
+            "evidence",
+            "risks",
+            "artifacts",
+            "verification",
+        ),
+        "ready_status": "done",
+        "blocking_statuses": ("blocked", "needs_user"),
+        "recovery_hints": ("retry_blocked_contract_chain",),
+        "truncated": False,
+    }
     serialized_handoffs = json.dumps(plan["orchestration_handoffs"], ensure_ascii=False)
     serialized_contracts = json.dumps(plan["orchestration_contracts"], ensure_ascii=False)
+    serialized_protocol = json.dumps(plan["orchestration_protocol"], ensure_ascii=False)
     for unsafe_marker in (
         "sk_secret",
         "token_leak",
@@ -1390,6 +1412,7 @@ def test_model_execution_plan_reports_safe_orchestration_handoffs() -> None:
     ):
         assert unsafe_marker not in serialized_handoffs
         assert unsafe_marker not in serialized_contracts
+        assert unsafe_marker not in serialized_protocol
 
 
 def test_model_execution_plan_marks_handoffs_truncated_only_when_items_are_omitted() -> None:
@@ -1477,6 +1500,11 @@ def test_model_execution_plan_marks_handoffs_truncated_only_when_items_are_omitt
     assert isinstance(exact_contract_items, tuple)
     assert len(exact_contract_items) == 12
     assert exact_contracts["truncated"] is False
+    exact_protocol = exact_plan["orchestration_protocol"]
+    assert isinstance(exact_protocol, Mapping)
+    assert exact_protocol["handoff_count"] == 12
+    assert exact_protocol["contract_count"] == 12
+    assert exact_protocol["truncated"] is False
     overflow_handoffs = overflow_plan["orchestration_handoffs"]
     assert isinstance(overflow_handoffs, Mapping)
     overflow_items = overflow_handoffs["items"]
@@ -1489,6 +1517,11 @@ def test_model_execution_plan_marks_handoffs_truncated_only_when_items_are_omitt
     assert isinstance(overflow_contract_items, tuple)
     assert len(overflow_contract_items) == 12
     assert overflow_contracts["truncated"] is True
+    overflow_protocol = overflow_plan["orchestration_protocol"]
+    assert isinstance(overflow_protocol, Mapping)
+    assert overflow_protocol["handoff_count"] == 12
+    assert overflow_protocol["contract_count"] == 12
+    assert overflow_protocol["truncated"] is True
 
 
 @pytest.mark.asyncio
@@ -1852,6 +1885,7 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
         "role_model_routing_matrix_truncated": False,
         "orchestration_handoffs": model_execution_plan["orchestration_handoffs"],
         "orchestration_contracts": model_execution_plan["orchestration_contracts"],
+        "orchestration_protocol": model_execution_plan["orchestration_protocol"],
     }
 
 

@@ -137,6 +137,7 @@ const runDetail: RunDetail = {
     attempted_logical_models: [],
     provider_ids: [],
   },
+  orchestration_protocol_summary: null,
 };
 
 const settings = {
