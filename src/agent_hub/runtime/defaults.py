@@ -115,6 +115,7 @@ _DISPATCH_OUTPUT_SCHEMA: Mapping[str, str] = {
 _MAX_CAPABILITY_INVENTORY_ITEMS = 96
 _MAX_CAPABILITY_INVENTORY_ALIASES = 16
 _MAX_CAPABILITY_INVENTORY_SCAN_ITEMS = 512
+_MAX_ORCHESTRATION_HANDOFFS = 12
 _SAFE_CAPABILITY_INVENTORY_ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _SAFE_MODEL_SELECTION_TEXT = re.compile(r"^[A-Za-z0-9_.:/@ -]{1,128}$")
 _SENSITIVE_CAPABILITY_INVENTORY_TEXT = frozenset(
@@ -126,6 +127,16 @@ _SENSITIVE_CAPABILITY_INVENTORY_TEXT = frozenset(
         "password",
         "secret",
         "token",
+    }
+)
+_SENSITIVE_ORCHESTRATION_HANDOFF_TEXT = _SENSITIVE_CAPABILITY_INVENTORY_TEXT | frozenset(
+    {
+        "api_base",
+        "apibase",
+        "capacity",
+        "credential",
+        "lease",
+        "quota",
     }
 )
 _SOFTWARE_TASK_KEYWORDS = (
@@ -265,6 +276,7 @@ class _PlannedRuntime:
                         context,
                         main_agent_model=self._main_agent_model,
                         roles=self._roles,
+                        steps=self._steps,
                         model_routing_matrix=self._model_routing_matrix,
                         model_routing_matrix_truncated=self._model_routing_matrix_truncated,
                         deployment_constraints=self._deployment_constraints,
@@ -1680,6 +1692,7 @@ def _model_execution_plan_payload(
     *,
     main_agent_model: str,
     roles: tuple[Mapping[str, JsonValue], ...],
+    steps: tuple[Mapping[str, JsonValue], ...] = (),
     model_routing_matrix: tuple[Mapping[str, JsonValue], ...] = (),
     model_routing_matrix_truncated: bool = False,
     deployment_constraints: Mapping[str, JsonValue] | None = None,
@@ -1732,12 +1745,128 @@ def _model_execution_plan_payload(
             for role in roles
             if "id" in role and "purpose" in role and "logical_model" in role
         ),
+        "orchestration_handoffs": _orchestration_handoffs_payload(
+            roles=roles,
+            steps=steps,
+        ),
         "role_model_routing_matrix": model_routing_matrix,
         "role_model_routing_matrix_truncated": model_routing_matrix_truncated,
     }
     if deployment_constraints is not None:
         payload["deployment_constraints"] = deployment_constraints
     return payload
+
+
+def _orchestration_handoffs_payload(
+    *,
+    roles: tuple[Mapping[str, JsonValue], ...],
+    steps: tuple[Mapping[str, JsonValue], ...],
+) -> Mapping[str, JsonValue]:
+    safe_roles = {
+        role_id: role
+        for role in roles
+        if (role_id := _optional_orchestration_handoff_token(role.get("id"), max_length=128))
+        is not None
+        and _optional_orchestration_handoff_token(role.get("purpose"), max_length=64)
+        is not None
+        and _optional_orchestration_handoff_token(role.get("logical_model"), max_length=128)
+        is not None
+    }
+    safe_steps = {
+        step_id: step
+        for step in steps
+        if (step_id := _optional_orchestration_handoff_token(step.get("id"), max_length=128))
+        is not None
+        and _optional_orchestration_handoff_token(step.get("agent"), max_length=128)
+        in safe_roles
+    }
+    items: list[Mapping[str, JsonValue]] = []
+    truncated = False
+    for target_step_id, target_step in safe_steps.items():
+        target_role_id = _optional_orchestration_handoff_token(
+            target_step.get("agent"),
+            max_length=128,
+        )
+        if target_role_id is None:
+            continue
+        target_role = safe_roles[target_role_id]
+        depends_on = target_step.get("depends_on")
+        if not isinstance(depends_on, tuple | list):
+            continue
+        for raw_source_step_id in depends_on:
+            source_step_id = _optional_orchestration_handoff_token(
+                raw_source_step_id,
+                max_length=128,
+            )
+            if source_step_id is None or source_step_id not in safe_steps:
+                continue
+            source_step = safe_steps[source_step_id]
+            source_role_id = _optional_orchestration_handoff_token(
+                source_step.get("agent"),
+                max_length=128,
+            )
+            if source_role_id is None or source_role_id not in safe_roles:
+                continue
+            source_role = safe_roles[source_role_id]
+            source_purpose = _optional_orchestration_handoff_token(
+                source_role.get("purpose"),
+                max_length=64,
+            )
+            target_purpose = _optional_orchestration_handoff_token(
+                target_role.get("purpose"),
+                max_length=64,
+            )
+            source_logical_model = _optional_orchestration_handoff_token(
+                source_role.get("logical_model"),
+                max_length=128,
+            )
+            target_logical_model = _optional_orchestration_handoff_token(
+                target_role.get("logical_model"),
+                max_length=128,
+            )
+            if (
+                source_purpose is None
+                or target_purpose is None
+                or source_logical_model is None
+                or target_logical_model is None
+            ):
+                continue
+            if len(items) >= _MAX_ORCHESTRATION_HANDOFFS:
+                truncated = True
+                return {
+                    "schema_version": 1,
+                    "items": tuple(items),
+                    "truncated": truncated,
+                }
+            items.append(
+                {
+                    "source_step_id": source_step_id,
+                    "target_step_id": target_step_id,
+                    "source_role_id": source_role_id,
+                    "target_role_id": target_role_id,
+                    "source_purpose": source_purpose,
+                    "target_purpose": target_purpose,
+                    "source_logical_model": source_logical_model,
+                    "target_logical_model": target_logical_model,
+                    "handoff_kind": "step_dependency",
+                }
+            )
+    return {
+        "schema_version": 1,
+        "items": tuple(items),
+        "truncated": truncated,
+    }
+
+
+def _optional_orchestration_handoff_token(value: object, *, max_length: int) -> str | None:
+    if not isinstance(value, str) or not value or len(value) > max_length:
+        return None
+    normalized = value.casefold()
+    if any(part in normalized for part in _SENSITIVE_ORCHESTRATION_HANDOFF_TEXT):
+        return None
+    if _SAFE_CAPABILITY_INVENTORY_ID.fullmatch(value) is None:
+        return None
+    return value
 
 
 def _role_model_routing_matrix_payload(

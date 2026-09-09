@@ -10229,6 +10229,7 @@ _SENSITIVE_EVENT_DETAIL_KEYS = frozenset(
 )
 _SENSITIVE_EVENT_DETAIL_EXACT_KEYS = frozenset(
     {
+        "api_base",
         "lease_id",
         "quota_scope_id",
     }

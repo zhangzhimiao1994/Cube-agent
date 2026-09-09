@@ -501,6 +501,92 @@ def test_admin_run_detail_serializes_model_outcome_summary_without_capacity_inte
     assert "tenant-private-quota" not in serialized
 
 
+def test_admin_run_detail_keeps_safe_orchestration_handoffs_without_internals() -> None:
+    api = client()
+    service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)
+    run_id = uuid4()
+    now = datetime.now(UTC)
+    service.runs[run_id] = RunDetailResponse(
+        id=run_id,
+        status="completed",
+        mode="dispatch",
+        request="orchestrate roles",
+        created_at=now,
+        queue_wait_ms=0,
+        capacity_wait_ms=0,
+        cost_usd="0",
+        events=[
+            _admin_run_event(
+                {
+                    "sequence": 1,
+                    "kind": "step.started",
+                    "message": "main_agent_plan",
+                    "created_at": now,
+                    "actor": "main_agent",
+                    "step_id": "main_agent_plan",
+                    "payload": {
+                        "model_execution_plan": {
+                            "schema_version": 1,
+                            "orchestration_handoffs": {
+                                "schema_version": 1,
+                                "items": (
+                                    {
+                                        "source_step_id": "copywriter_step",
+                                        "target_step_id": "final_response_step",
+                                        "source_role_id": "copywriter",
+                                        "target_role_id": "final_synthesizer",
+                                        "source_purpose": "execute",
+                                        "target_purpose": "synthesize",
+                                        "source_logical_model": "creative",
+                                        "target_logical_model": "main",
+                                        "handoff_kind": "step_dependency",
+                                        "lease_id": "lease-private",
+                                    },
+                                ),
+                                "truncated": False,
+                            },
+                            "quota_scope_id": "tenant-private-quota",
+                            "credential_ref": "credential-private",
+                            "api_base": "https://internal.example.invalid",
+                        }
+                    },
+                }
+            )
+        ],
+        artifacts=[],
+        explicit_details={},
+    )
+
+    response = api.get(f"/api/v1/admin/runs/{run_id}", headers=headers())
+
+    assert response.status_code == 200
+    body = response.json()
+    model_execution_plan = body["events"][0]["payload"]["model_execution_plan"]
+    assert model_execution_plan["orchestration_handoffs"] == {
+        "schema_version": 1,
+        "items": [
+            {
+                "source_step_id": "copywriter_step",
+                "target_step_id": "final_response_step",
+                "source_role_id": "copywriter",
+                "target_role_id": "final_synthesizer",
+                "source_purpose": "execute",
+                "target_purpose": "synthesize",
+                "source_logical_model": "creative",
+                "target_logical_model": "main",
+                "handoff_kind": "step_dependency",
+                "lease_id": "[redacted]",
+            }
+        ],
+        "truncated": False,
+    }
+    serialized = json.dumps(body, ensure_ascii=False)
+    assert "lease-private" not in serialized
+    assert "tenant-private-quota" not in serialized
+    assert "credential-private" not in serialized
+    assert "internal.example.invalid" not in serialized
+
+
 def test_openclaw_operation_from_run_rejects_non_openclaw_proposal() -> None:
     api = client()
     service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)

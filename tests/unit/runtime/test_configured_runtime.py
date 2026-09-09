@@ -1,3 +1,4 @@
+import json
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import replace
@@ -1198,6 +1199,258 @@ def test_model_execution_plan_sanitizes_scheduler_selection_fields() -> None:
     }
 
 
+def test_model_execution_plan_reports_safe_orchestration_handoffs() -> None:
+    plan = defaults_module._model_execution_plan_payload(
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Draft and review a launch campaign.",
+        ),
+        main_agent_model="main",
+        roles=(
+            {
+                "id": "copywriter",
+                "role": "Copywriter",
+                "purpose": "execute",
+                "logical_model": "creative",
+                "tools": (),
+            },
+            {
+                "id": "final_synthesizer",
+                "role": "Final Synthesizer",
+                "purpose": "synthesize",
+                "logical_model": "main",
+                "tools": (),
+            },
+            {
+                "id": "token_leak",
+                "role": "Leaky",
+                "purpose": "execute",
+                "logical_model": "sk_secret",
+                "tools": (),
+            },
+            {
+                "id": "credential_ref",
+                "role": "Credential",
+                "purpose": "execute",
+                "logical_model": "creative",
+                "tools": (),
+            },
+            {
+                "id": "capacity_pool",
+                "role": "Capacity",
+                "purpose": "execute",
+                "logical_model": "creative",
+                "tools": (),
+            },
+            {
+                "id": "quota_scope_id",
+                "role": "Quota",
+                "purpose": "execute",
+                "logical_model": "creative",
+                "tools": (),
+            },
+            {
+                "id": "lease_id",
+                "role": "Lease",
+                "purpose": "execute",
+                "logical_model": "creative",
+                "tools": (),
+            },
+            {
+                "id": "api_base_role",
+                "role": "Api Base",
+                "purpose": "execute",
+                "logical_model": "api_base",
+                "tools": (),
+            },
+        ),
+        steps=(
+            {
+                "id": "copywriter_step",
+                "agent": "copywriter",
+                "depends_on": (),
+                "final_synthesizer": False,
+                "tools": (),
+            },
+            {
+                "id": "final_response_step",
+                "agent": "final_synthesizer",
+                "depends_on": (
+                    "copywriter_step",
+                    "token_leak_step",
+                    "credential_ref_step",
+                    "capacity_pool_step",
+                    "quota_scope_id_step",
+                    "lease_id_step",
+                    "api_base_step",
+                ),
+                "final_synthesizer": True,
+                "tools": (),
+            },
+            {
+                "id": "token_leak_step",
+                "agent": "token_leak",
+                "depends_on": (),
+                "final_synthesizer": False,
+                "tools": (),
+            },
+            {
+                "id": "credential_ref_step",
+                "agent": "credential_ref",
+                "depends_on": (),
+                "final_synthesizer": False,
+                "tools": (),
+            },
+            {
+                "id": "capacity_pool_step",
+                "agent": "capacity_pool",
+                "depends_on": (),
+                "final_synthesizer": False,
+                "tools": (),
+            },
+            {
+                "id": "quota_scope_id_step",
+                "agent": "quota_scope_id",
+                "depends_on": (),
+                "final_synthesizer": False,
+                "tools": (),
+            },
+            {
+                "id": "lease_id_step",
+                "agent": "lease_id",
+                "depends_on": (),
+                "final_synthesizer": False,
+                "tools": (),
+            },
+            {
+                "id": "api_base_step",
+                "agent": "api_base_role",
+                "depends_on": (),
+                "final_synthesizer": False,
+                "tools": (),
+            },
+        ),
+    )
+
+    assert plan["orchestration_handoffs"] == {
+        "schema_version": 1,
+        "items": (
+            {
+                "source_step_id": "copywriter_step",
+                "target_step_id": "final_response_step",
+                "source_role_id": "copywriter",
+                "target_role_id": "final_synthesizer",
+                "source_purpose": "execute",
+                "target_purpose": "synthesize",
+                "source_logical_model": "creative",
+                "target_logical_model": "main",
+                "handoff_kind": "step_dependency",
+            },
+        ),
+        "truncated": False,
+    }
+    serialized_handoffs = json.dumps(plan["orchestration_handoffs"], ensure_ascii=False)
+    for unsafe_marker in (
+        "sk_secret",
+        "token_leak",
+        "credential_ref",
+        "capacity_pool",
+        "quota_scope_id",
+        "lease_id",
+        "api_base",
+    ):
+        assert unsafe_marker not in serialized_handoffs
+
+
+def test_model_execution_plan_marks_handoffs_truncated_only_when_items_are_omitted() -> None:
+    source_roles: tuple[Mapping[str, JsonValue], ...] = tuple(
+        {
+            "id": f"worker_{index}",
+            "role": "Worker",
+            "purpose": "execute",
+            "logical_model": "creative",
+            "tools": (),
+        }
+        for index in range(13)
+    )
+    target_role: Mapping[str, JsonValue] = {
+        "id": "final_synthesizer",
+        "role": "Final Synthesizer",
+        "purpose": "synthesize",
+        "logical_model": "main",
+        "tools": (),
+    }
+    source_steps: tuple[Mapping[str, JsonValue], ...] = tuple(
+        {
+            "id": f"worker_{index}_step",
+            "agent": f"worker_{index}",
+            "depends_on": (),
+            "final_synthesizer": False,
+            "tools": (),
+        }
+        for index in range(13)
+    )
+    exact_target_step: Mapping[str, JsonValue] = {
+        "id": "final_response_step",
+        "agent": "final_synthesizer",
+        "depends_on": tuple(f"worker_{index}_step" for index in range(12)),
+        "final_synthesizer": True,
+        "tools": (),
+    }
+    overflow_target_step: Mapping[str, JsonValue] = {
+        "id": "final_response_step",
+        "agent": "final_synthesizer",
+        "depends_on": tuple(f"worker_{index}_step" for index in range(13)),
+        "final_synthesizer": True,
+        "tools": (),
+    }
+
+    exact_plan = defaults_module._model_execution_plan_payload(
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Draft a launch campaign.",
+        ),
+        main_agent_model="main",
+        roles=(*source_roles[:12], target_role),
+        steps=(
+            *source_steps[:12],
+            exact_target_step,
+        ),
+    )
+
+    overflow_plan = defaults_module._model_execution_plan_payload(
+        TaskContext(
+            run_id=uuid4(),
+            tenant_id=TENANT_ID,
+            mode=TaskMode.DISPATCH,
+            request="Draft a launch campaign.",
+        ),
+        main_agent_model="main",
+        roles=(*source_roles, target_role),
+        steps=(
+            *source_steps,
+            overflow_target_step,
+        ),
+    )
+
+    exact_handoffs = exact_plan["orchestration_handoffs"]
+    assert isinstance(exact_handoffs, Mapping)
+    exact_items = exact_handoffs["items"]
+    assert isinstance(exact_items, tuple)
+    assert len(exact_items) == 12
+    assert exact_handoffs["truncated"] is False
+    overflow_handoffs = overflow_plan["orchestration_handoffs"]
+    assert isinstance(overflow_handoffs, Mapping)
+    overflow_items = overflow_handoffs["items"]
+    assert isinstance(overflow_items, tuple)
+    assert len(overflow_items) == 12
+    assert overflow_handoffs["truncated"] is True
+
+
 @pytest.mark.asyncio
 async def test_config_backed_dispatch_runtime_emits_main_agent_role_plan(
     monkeypatch: pytest.MonkeyPatch,
@@ -1498,6 +1751,23 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
     assert isinstance(selected_reasons, tuple)
     assert "preference:role_model" in selected_reasons
     assert {candidate["logical_model"] for candidate in candidate_mappings} == {"creative"}
+    assert model_execution_plan["orchestration_handoffs"] == {
+        "schema_version": 1,
+        "items": (
+            {
+                "source_step_id": "copywriter_step",
+                "target_step_id": "final_response_step",
+                "source_role_id": "copywriter",
+                "target_role_id": "final_synthesizer",
+                "source_purpose": "execute",
+                "target_purpose": "synthesize",
+                "source_logical_model": "creative",
+                "target_logical_model": "main",
+                "handoff_kind": "step_dependency",
+            },
+        ),
+        "truncated": False,
+    }
     assert model_execution_plan == {
         "schema_version": 1,
         "main_agent": {
@@ -1540,6 +1810,7 @@ async def test_config_backed_dispatch_runtime_keeps_role_models_with_harness_con
         },
         "role_model_routing_matrix": model_execution_plan["role_model_routing_matrix"],
         "role_model_routing_matrix_truncated": False,
+        "orchestration_handoffs": model_execution_plan["orchestration_handoffs"],
     }
 
 
